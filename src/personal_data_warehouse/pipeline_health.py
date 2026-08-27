@@ -330,6 +330,21 @@ class StateSource:
     #: other uploader's run status green.
     scope_column: str = ""
     scope_value: str = ""
+    #: Only count failures newer than this. Leave unset for a genuine
+    #: current-state table -- every ``ops.*_sync_state`` holds ONE upserted row
+    #: per scope, so its error row IS the scope's state today and ageing it out
+    #: would hide a live outage.
+    #:
+    #: Set it when the StateSource is a HISTORY table, one row per attempt that
+    #: is never revisited. ``derived_voice_memos.transcription_runs`` is that
+    #: shape, and without a window a single dead row pins the pipeline red
+    #: forever: on 2026-08-27 two rows from 2026-05-02 read "Upload failed,
+    #: please try again" -- a retryable message, so correctly not 'rejected' --
+    #: on recordings of ``size_bytes = 0``, which the candidate query excludes,
+    #: so nothing will ever retry them and clear the row. A live outage is
+    #: recent by definition, because every retry re-stamps ``updated_column``;
+    #: an error that has stopped being re-stamped is history, not state.
+    error_window: timedelta | None = None
 
 
 #: ``expected_event_interval`` sentinel meaning "judge event time on the data
@@ -870,6 +885,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             updated_column="requested_at",
             status_column="status",
             error_column="error",
+            # This is a history table, not a current-state one, so a failure
+            # that has stopped being re-stamped is history. Seven days is well
+            # past the sensor's cadence: a live provider outage re-stamps its
+            # rows every run and stays inside the window, while the two
+            # 2026-05-02 rows that no retry can ever reach fall out of it.
+            error_window=timedelta(days=7),
         ),
     ),
     Pipeline(
@@ -2044,13 +2065,20 @@ class PipelineHealthCollector:
         relation = canonical_relation(source.table).with_namespace(self._warehouse.schema_namespace)
         updated = _ident(source.updated_column)
         selects = [f"max({updated})::timestamptz AS last_run_at", "count(*)::bigint AS rows"]
+        # A history table's old failures are not its current state -- see
+        # StateSource.error_window. Unset (the ops.*_sync_state default) keeps
+        # every row, because there one row IS the scope's state.
+        recent = ""
+        if source.error_window is not None:
+            recent = f" AND {updated} >= now() - %(error_window)s::interval"
         if source.status_column:
             status = _ident(source.status_column)
             selects.append(
-                f"count(*) FILTER (WHERE {status} = ANY(%(errors)s))::bigint AS error_rows"
+                f"count(*) FILTER (WHERE {status} = ANY(%(errors)s){recent})::bigint AS error_rows"
             )
             selects.append(
-                f"count(*) FILTER (WHERE {status} = ANY(%(attention)s))::bigint AS attention_rows"
+                f"count(*) FILTER (WHERE {status} = ANY(%(attention)s){recent})::bigint"
+                " AS attention_rows"
             )
         else:
             selects.append("0::bigint AS error_rows")
@@ -2065,6 +2093,9 @@ class PipelineHealthCollector:
             error_filter = f"COALESCE({error}, '') != ''"
             if source.status_column:
                 error_filter += f" AND {_ident(source.status_column)} = ANY(%(alarm)s)"
+            # Same window as the count, or the banner quotes a failure that no
+            # longer colours the row.
+            error_filter += recent
             selects.append(
                 f"(array_agg({error} ORDER BY {updated} DESC) "
                 f"FILTER (WHERE {error_filter}))[1] AS last_error"
@@ -2084,6 +2115,8 @@ class PipelineHealthCollector:
             "attention": list(source.attention_statuses),
             "alarm": list(source.error_statuses) + list(source.attention_statuses),
         }
+        if source.error_window is not None:
+            params["error_window"] = f"{int(source.error_window.total_seconds())} seconds"
         if source.scope_column:
             sql += f" WHERE {_ident(source.scope_column)} = %(scope)s"
             params["scope"] = source.scope_value

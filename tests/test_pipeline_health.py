@@ -819,6 +819,72 @@ def test_the_rejection_migration_runs_from_a_path_something_actually_calls() -> 
     assert not callers or "_ensure_transcription_runs_rejections_reclassified" in live
 
 
+def test_a_dead_retryable_failure_ages_out_while_a_live_one_stays_red(warehouse):
+    """The last way this row could be pinned red forever.
+
+    'Upload failed, please try again' is a RETRYABLE message, so it is
+    correctly not 'rejected'. But production had two such rows from 2026-05-02
+    on recordings of size_bytes = 0, which the candidate query excludes -- so
+    nothing would ever retry them and clear the row, and voice_memo_transcription
+    read failing on a four-month-old ghost. A live outage re-stamps
+    requested_at every run, so it stays inside the window; an error that has
+    stopped being re-stamped is history, not state.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_transcription_runs
+            (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+        VALUES ('apple_voice_memos', 'z', 'ancient', 'sha', 'assemblyai', 'error',
+                '422 Client Error: Upload failed, please try again', %s, 1)
+        """,
+        (now - timedelta(days=120),),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_error_rows, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_transcription'"
+    )[0]
+    assert row["state_error_rows"] == 0
+    assert row["status"] != "failing"
+    # The banner must not quote a failure that no longer colours the row.
+    assert "Upload failed" not in (row["last_error"] or "")
+
+    # The same message, today, is a live outage and must read failing.
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_transcription_runs
+            (source, account, recording_id, content_sha256, provider, status, error, requested_at, sync_version)
+        VALUES ('apple_voice_memos', 'z', 'today', 'sha', 'assemblyai', 'error',
+                '400 Client Error: account balance is negative', %s, 1)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_error_rows, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_transcription'"
+    )[0]
+    assert row["state_error_rows"] == 1
+    assert row["status"] == "failing"
+    assert "balance is negative" in row["last_error"]
+
+
+def test_only_a_history_state_source_ages_its_failures_out(warehouse):
+    """Every ops.*_sync_state row IS current state; ageing one out hides an outage."""
+    from personal_data_warehouse.pipeline_health import PIPELINES
+
+    windowed = {p.id for p in PIPELINES if p.state and p.state.error_window is not None}
+    for entry in PIPELINES:
+        if entry.state is None or entry.id in windowed:
+            continue
+        assert entry.state.error_window is None
+    # WHOOP went 26 hours hard-down reading 'ok' once; its failure must never age out.
+    whoop = next(p for p in PIPELINES if p.id == "whoop")
+    assert whoop.state is not None and whoop.state.error_window is None
+
+
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):
     """The dashboard must distrust itself when the collector stops running."""
     _provision_every_table(warehouse)

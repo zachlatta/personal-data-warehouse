@@ -1211,6 +1211,19 @@ hours while the row read green and 45 recordings across three sources sat untran
 attributed to a quiet uploader. A successful retry overwrites the error row, so the failure
 clears itself; a persistent one is a billing or credential action, not a pipeline bug.
 
+**A history table needs an `error_window`; a current-state table must never have one.**
+`StateSource` was built for `ops.*_sync_state`, where ONE upserted row per scope IS that
+scope's state today -- ageing a row out there would hide a live outage, which is why
+`whoop` (26 hours hard-down reading `ok` once) has no window. `transcription_runs` is the
+opposite shape: one row per attempt, never revisited. Measured 2026-08-27 after the
+`rejected` split landed, two rows from **2026-05-02** still pinned the pipeline red --
+`"Upload failed, please try again"`, a genuinely retryable message so correctly not
+`rejected`, on recordings of `size_bytes = 0`, which the candidate query excludes, so
+nothing would ever retry them and clear it. A live outage re-stamps `requested_at` on
+every run and stays inside the window; an error that has stopped being re-stamped is
+history, not state. Seven days, and the reported reason is windowed with the count so the
+banner cannot quote a failure that no longer colours the row.
+
 **A recording the provider will never accept is `rejected`, not `error`, and that
 distinction is what keeps the row readable.** The error count behind
 `state_error_rows` is over the WHOLE runs table with no time bound, so a single
