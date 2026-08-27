@@ -13,6 +13,7 @@
       "supportsTablet": true,
       "infoPlist": {
         "UIBackgroundModes": [
+          "remote-notification",
           "remote-notification"
         ],
         "ITSAppUsesNonExemptEncryption": false
@@ -62,6 +63,12 @@
         "projectId": "c5085048-1a90-4340-a13d-6624522b6589"
       }
     },
-    "owner": "zlatta"
+    "owner": "zlatta",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/c5085048-1a90-4340-a13d-6624522b6589"
+    }
   }
 }
