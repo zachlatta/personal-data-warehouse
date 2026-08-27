@@ -125,8 +125,15 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// (marts_files.attachments, marts_ops.timeline_priority_mix) and one
 	// schema line with them. Each is a headline agents need on the first call;
 	// the budget moves for those, not for prose.
-	if guidance > 8600 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 8600)", guidance)
+	//
+	// 8600 held for the rest of that day and was crossed by 869103b, which
+	// added marts_ops.search_benchmark — the C8 row that makes retrieval
+	// quality a measured fact rather than a doc line. marts_ops.agent_usage
+	// (C3) and marts_ops.pgbackrest_health (C10) landed in the same window.
+	// Those are contract surfaces, so the budget moves; 8800 leaves room for
+	// one more and not for prose.
+	if guidance > 8800 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 8800)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)
