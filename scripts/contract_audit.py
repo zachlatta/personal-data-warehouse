@@ -176,13 +176,16 @@ def c8_search_quality() -> Verdict:
     if rows is None:
         return _unavailable("C8", title, "marts_ops.search_health")
     statuses = {r["component"]: r["status"] for r in rows}
-    labels = (REPO_ROOT / ".search-eval" / "ground_truth.json").exists()
+    bench = pdw_sql("search benchmark", "SELECT mode, status, labeled_cases, mrr, latency_p50_ms, collected_at FROM marts_ops.search_benchmark")
+    b = (bench or [None])[0]
+    labels = bool(b and int(b.get("labeled_cases") or 0) > 0)
     status = GREEN
     if any(s in ("failing", "unknown") for s in statuses.values()):
         status = RED
-    elif any(s in ("late", "backfilling") for s in statuses.values()) or not labels:
+    elif any(s in ("late", "backfilling") for s in statuses.values()) or not labels or (b and b["status"] in ("attention", "unknown")):
         status = YELLOW
-    return Verdict("C8", title, status, f"search_health {statuses}; benchmark labels present={labels}")
+    bench_ev = f"benchmark {b['status']}: MRR {b['mrr']} over {b['labeled_cases']} cases, p50 {b['latency_p50_ms']}ms ({str(b['collected_at'])[:16]})" if b else "no benchmark row yet"
+    return Verdict("C8", title, status, f"search_health {statuses}; {bench_ev}")
 
 
 def c9_one_way() -> Verdict:
