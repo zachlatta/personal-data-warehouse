@@ -402,7 +402,13 @@ class CollationHealthCollector:
                     )
                     findings.append(finding)
                 previous = prior.get(name)
-                if previous:
+                # A previous "unavailable" only says the extension was missing
+                # on THAT day. Once amcheck is installed the index is simply
+                # unchecked and queued for the rotation; carrying "unavailable"
+                # forward kept 114 production indexes reading `attention` for
+                # weeks after the extension existed -- a measurement gap
+                # presented as a finding, which buries the real ones.
+                if previous and not (amcheck and str(previous.get("amcheck_status") or "") == "unavailable"):
                     self._restore_amcheck(finding, previous)
                 elif not amcheck:
                     finding.amcheck_status = "unavailable"

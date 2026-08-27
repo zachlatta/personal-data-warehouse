@@ -542,6 +542,65 @@ def test_rotation_emits_every_active_index_and_preserves_unvisited_results() -> 
     assert retained.amcheck_at == now - timedelta(days=1)
 
 
+def test_an_old_unavailable_verdict_becomes_unchecked_once_amcheck_is_installed() -> None:
+    """`unavailable` describes the extension, not the index.
+
+    Production carried 114 `unavailable` rows -- restored from a snapshot taken
+    before amcheck existed -- for weeks after the extension was installed, each
+    one read as `attention` on /pipelines. With the extension present an
+    unvisited index is `never_checked`: the view reports it as `unmeasured` and
+    the rotation reaches it, instead of a permanent warning nobody can act on.
+    """
+
+    class FakeWarehouse:
+        schema_namespace = "public"
+
+        def _raw_command(self, sql: str) -> None:
+            pass
+
+    now = datetime(2026, 8, 27, tzinfo=UTC)
+    collector = CollationHealthCollector(FakeWarehouse(), now=lambda: now)
+    collector._unique_index_candidates = lambda: []
+    collector._amcheck_function = lambda: "public"
+    candidates = [
+        {
+            "index_schema": "base_gmail",
+            "index_name": f"idx_{i:02d}",
+            "table_schema": "base_gmail",
+            "table_name": "messages",
+            "index_bytes": i,
+            "heap_bytes": 1,
+        }
+        for i in range(AMCHECK_MAX_PER_RUN + 3)
+    ]
+    collector._amcheck_candidates = lambda: candidates
+    stale_name = f"base_gmail.idx_{AMCHECK_MAX_PER_RUN + 2:02d}"
+    collector._previous_amcheck_results = lambda: {
+        stale_name: {
+            "amcheck_status": "unavailable",
+            "amcheck_detail": "amcheck extension/function is not installed",
+            "amcheck_ms": 0,
+            "amcheck_at": None,
+        }
+    }
+    # Make the rotation visit everything EXCEPT the stale one, so its restored
+    # state is what the snapshot carries.
+    collector._select_amcheck_candidates = lambda rows, prior, limit: [
+        row for row in rows if f"{row['index_schema']}.{row['index_name']}" != stale_name
+    ][:AMCHECK_MAX_PER_RUN]
+
+    def fake_check(row, finding, _schema, *, timeout_ms):
+        finding.amcheck_status = "ok"
+        finding.amcheck_at = now
+
+    collector._run_amcheck = fake_check
+
+    findings = collector._index_findings()
+    stale = next(f for f in findings if f.object_name == stale_name)
+    assert stale.amcheck_status == "never_checked"
+    assert "pending" in stale.amcheck_detail
+
+
 def test_the_detector_issues_no_ddl_and_no_repair():
     """Detector only: no REINDEX, no CREATE EXTENSION, no DDL.
 
