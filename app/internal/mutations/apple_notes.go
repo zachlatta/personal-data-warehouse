@@ -2,9 +2,6 @@ package mutations
 
 import (
 	"errors"
-	"fmt"
-	"html"
-	"net/http"
 	"strings"
 )
 
@@ -138,34 +135,4 @@ func appleNotesPreview(mutation MutationInput) map[string]any {
 		preview["note_id"] = strings.TrimSpace(mutation.NoteID)
 	}
 	return preview
-}
-
-func renderAppleNotesMutation(w http.ResponseWriter, mutation Mutation) {
-	note := mapFromAny(mutation.Preview["note"])
-	action := stringFromAny(note["action"])
-	heading := "Update Apple Note"
-	if action == "create" {
-		heading = "Create Apple Note"
-	}
-	fmt.Fprintf(w, `<article class="mutation apple-notes-mutation"><div class="mutation-head"><div><p class="eyebrow">Apple Notes</p><h3>%s</h3></div><span class="pill">%s</span></div>`,
-		html.EscapeString(heading),
-		html.EscapeString(mutation.Status),
-	)
-	fmt.Fprintf(w, `<p class="mutation-meta">%s for %s</p>`, html.EscapeString(mutation.Operation), html.EscapeString(mutation.Account))
-	if title := stringFromAny(note["name"]); title != "" {
-		fmt.Fprintf(w, `<p><strong>Title:</strong> %s</p>`, html.EscapeString(title))
-	}
-	if folder := stringFromAny(note["folder"]); folder != "" {
-		fmt.Fprintf(w, `<p><strong>Folder:</strong> %s</p>`, html.EscapeString(folder))
-	}
-	if noteID := stringFromAny(note["note_id"]); noteID != "" {
-		fmt.Fprintf(w, `<p><strong>Note:</strong> <code>%s</code></p>`, html.EscapeString(noteID))
-	}
-	if changes := stringSliceFromAny(note["changes"]); len(changes) > 0 {
-		fmt.Fprintf(w, `<p><strong>Changes:</strong> %s</p>`, html.EscapeString(strings.Join(changes, ", ")))
-	}
-	if body := stringFromAny(note["body_preview"]); body != "" {
-		fmt.Fprintf(w, `<pre class="apple-notes-body">%s</pre>`, html.EscapeString(body))
-	}
-	fmt.Fprint(w, `</article>`)
 }

@@ -40,9 +40,6 @@ type Config struct {
 	QueryCacheTTL           time.Duration
 	DebugCacheTool          bool
 	QueryTimeout            time.Duration
-	MutationUIPassword      string
-	MutationUISessionSecret string
-	MutationUISessionTTL    time.Duration
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
 	CalendarAccounts        []string
@@ -176,15 +173,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		// given up — and invited retry storms on top. Deployments that need
 		// longer diagnostics can raise MCP_QUERY_TIMEOUT; ad-hoc admin work
 		// should use a direct Postgres connection instead.
-		QueryTimeout:            60 * time.Second,
-		MutationUIPassword:      getenv("PDW_MUTATION_UI_PASSWORD"),
-		MutationUISessionSecret: getenv("PDW_MUTATION_UI_SESSION_SECRET"),
-		MutationUISessionTTL:    12 * time.Hour,
-		GmailAccounts:           parseCSV(getenv("GMAIL_ACCOUNTS")),
-		ContactGoogleAccounts:   parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
-		CalendarAccounts:        parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
-		AppleNotesAccounts:      parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
-		ExpoAccessToken:         strings.TrimSpace(getenv("PDW_EXPO_ACCESS_TOKEN")),
+		QueryTimeout:          60 * time.Second,
+		GmailAccounts:         parseCSV(getenv("GMAIL_ACCOUNTS")),
+		ContactGoogleAccounts: parseCSV(getenv("CONTACT_GOOGLE_ACCOUNTS")),
+		CalendarAccounts:      parseCSV(firstNonEmpty(getenv("CALENDAR_ACCOUNTS"), getenv("GMAIL_ACCOUNTS"))),
+		AppleNotesAccounts:    parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
+		ExpoAccessToken:       strings.TrimSpace(getenv("PDW_EXPO_ACCESS_TOKEN")),
 	}
 
 	var missing []string
@@ -289,6 +283,15 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	// them by rank, which measured materially better, so the knob is gone.
 	// A still-set value is reported rather than ignored: silently inert config
 	// is how a deployment ends up believing it is tuned when it is not.
+	// The mutation review UI used to be a server-rendered page behind its own
+	// password cookie. It is now the web SPA over the same bearer-protected
+	// JSON API the iOS app uses, so these three no longer do anything.
+	for _, name := range []string{"PDW_MUTATION_UI_PASSWORD", "PDW_MUTATION_UI_SESSION_SECRET", "PDW_MUTATION_UI_SESSION_TTL_SECONDS"} {
+		if strings.TrimSpace(getenv(name)) != "" {
+			cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
+				name+" (removed: mutation review is the web app at "+"/mutation-review"+", authenticated with PDW_SECRET_TOKEN like the API; unset it)")
+		}
+	}
 	if strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT")) != "" {
 		cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
 			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT (removed: the instructed and raw query vectors are now searched as separate ANN legs and fused by rank; unset it)")
@@ -303,16 +306,6 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		if err != nil || cfg.QueryTimeout <= 0 {
 			return Config{}, fmt.Errorf("MCP_QUERY_TIMEOUT must be a positive Go duration")
 		}
-	}
-	if raw := strings.TrimSpace(getenv("PDW_MUTATION_UI_SESSION_TTL_SECONDS")); raw != "" {
-		seconds, err := parsePositiveInt64(raw, int64(cfg.MutationUISessionTTL/time.Second), "PDW_MUTATION_UI_SESSION_TTL_SECONDS")
-		if err != nil {
-			return Config{}, err
-		}
-		cfg.MutationUISessionTTL = time.Duration(seconds) * time.Second
-	}
-	if cfg.MutationUIPassword != "" && cfg.MutationUISessionSecret != "" && len(cfg.MutationUISessionSecret) < MinSecretTokenLength {
-		return Config{}, fmt.Errorf("PDW_MUTATION_UI_SESSION_SECRET must be at least %d characters", MinSecretTokenLength)
 	}
 
 	return cfg, nil

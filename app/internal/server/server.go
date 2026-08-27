@@ -22,6 +22,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/webapp"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/whoopsession"
 )
 
@@ -214,10 +215,18 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	logger.Info("registering HTTP handlers", "base_url", baseURL, "git_sha", buildinfo.GitSHA())
 	authSvc.RegisterHandlers(mux, baseURL)
 	if mutationSvc != nil {
-		mux.Handle(mutations.ReviewPath+"/", mutationSvc.HTTPHandler())
-		mux.Handle(mutations.ReviewPath, mutationSvc.HTTPHandler())
-		// The iOS app's JSON twin of the review UI, behind the static bearer.
+		// The review surface: one JSON API behind the static bearer, read by
+		// the web SPA (below) and the iOS app alike.
 		mutationSvc.RegisterAPI(mux, authSvc.RequireStaticBearer())
+	}
+	// The browser UI is a static single-page app over the JSON API. It is
+	// mounted unconditionally: the shell is inert without a token, and a view
+	// whose backend is not configured reports the API's own error.
+	if spa, err := webapp.New(); err != nil {
+		logger.Error("web app failed to initialize; browser UI disabled", "error", err.Error())
+	} else {
+		webapp.Register(mux, spa)
+		logger.Info("web app enabled", "routes", strings.Join(webapp.Routes, ","))
 	}
 	// Push notifications for the iOS app. Devices register through
 	// /api/push/register; a new pending mutation request fans out to every
@@ -252,10 +261,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\nTimeline UI: /timeline\nPipeline freshness: " + pipelinesPagePath + "\nGit SHA: " + buildinfo.GitSHA() + "\n"
-		if mutationSvc != nil {
-			body += "Mutation review UI: " + mutations.ReviewPath + "\n"
-		}
+		body := "Personal Data Warehouse app\nMCP endpoint: /mcp\nHTTP API: /api/tools\nWeb app: /timeline, /search, " + webapp.ReviewPath + "\nPipeline freshness: " + pipelinesPagePath + "\nGit SHA: " + buildinfo.GitSHA() + "\n"
 		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

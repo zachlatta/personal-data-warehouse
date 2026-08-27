@@ -1204,12 +1204,6 @@ func (s *timelineService) registerRoutes(mux *http.ServeMux, requireAuth func(ht
 	mux.Handle("/api/timeline/item", requireAuth(http.HandlerFunc(s.handleItem)))
 	mux.Handle("/api/timeline/item/children", requireAuth(http.HandlerFunc(s.handleItemChildren)))
 	mux.Handle("/api/timeline/item/context", requireAuth(http.HandlerFunc(s.handleItemContext)))
-	mux.HandleFunc("/timeline", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		// The shell is tiny and iterated on; never let a browser cache a stale copy.
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write([]byte(timelinePageHTML))
-	})
 }
 
 func httpError(w http.ResponseWriter, status int, message string) {

@@ -18,28 +18,26 @@ func TestLoadFromEnvRequiresPostgresURLAndSecret(t *testing.T) {
 
 func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	env := map[string]string{
-		"POSTGRES_DATABASE_URL":               "postgres://default:secret@example.com/default",
-		"MCP_SECRET_TOKEN":                    "0123456789abcdef0123456789abcdef",
-		"MCP_ADDR":                            ":9090",
-		"MCP_BASE_URL":                        "https://mcp.example.com/",
-		"MCP_MAX_ROWS":                        "7",
-		"MCP_MAX_FIELD_CHARS":                 "12",
-		"MCP_QUERY_CACHE_MAX_BYTES":           "1048576",
-		"MCP_GET_FIELD_MAX_CHARS":             "345",
-		"MCP_QUERY_CACHE_TTL":                 "15m",
-		"MCP_DEBUG_CACHE_TOOL":                "true",
-		"MCP_QUERY_TIMEOUT":                   "42s",
-		"PDW_QUERY_POSTGRES_ROLE":             "warehouse_reader",
-		"PDW_MUTATION_UI_PASSWORD":            "review-password",
-		"PDW_MUTATION_UI_SESSION_SECRET":      "0123456789abcdef0123456789abcdef",
-		"PDW_MUTATION_UI_SESSION_TTL_SECONDS": "7200",
-		"GMAIL_ACCOUNTS":                      "zach@example.test, work@example.test",
-		"CONTACT_GOOGLE_ACCOUNTS":             "contacts@example.test",
-		"SEARCH_EMBEDDINGS_BASE_URL":          "https://embeddings.example.test/v1/",
-		"SEARCH_EMBEDDINGS_API_KEY":           "sk-embed-test",
-		"SEARCH_EMBEDDINGS_MODEL":             "custom-embedding-model",
-		"SEARCH_EMBEDDINGS_DIMENSIONS":        "256",
-		"SEARCH_EMBEDDINGS_QUERY_PREFIX":      "Instruct: retrieve personal data\nQuery:",
+		"POSTGRES_DATABASE_URL":          "postgres://default:secret@example.com/default",
+		"MCP_SECRET_TOKEN":               "0123456789abcdef0123456789abcdef",
+		"MCP_ADDR":                       ":9090",
+		"MCP_BASE_URL":                   "https://mcp.example.com/",
+		"MCP_MAX_ROWS":                   "7",
+		"MCP_MAX_FIELD_CHARS":            "12",
+		"MCP_QUERY_CACHE_MAX_BYTES":      "1048576",
+		"MCP_GET_FIELD_MAX_CHARS":        "345",
+		"MCP_QUERY_CACHE_TTL":            "15m",
+		"MCP_DEBUG_CACHE_TOOL":           "true",
+		"MCP_QUERY_TIMEOUT":              "42s",
+		"PDW_QUERY_POSTGRES_ROLE":        "warehouse_reader",
+		"PDW_MUTATION_UI_PASSWORD":       "review-password",
+		"GMAIL_ACCOUNTS":                 "zach@example.test, work@example.test",
+		"CONTACT_GOOGLE_ACCOUNTS":        "contacts@example.test",
+		"SEARCH_EMBEDDINGS_BASE_URL":     "https://embeddings.example.test/v1/",
+		"SEARCH_EMBEDDINGS_API_KEY":      "sk-embed-test",
+		"SEARCH_EMBEDDINGS_MODEL":        "custom-embedding-model",
+		"SEARCH_EMBEDDINGS_DIMENSIONS":   "256",
+		"SEARCH_EMBEDDINGS_QUERY_PREFIX": "Instruct: retrieve personal data\nQuery:",
 	}
 
 	cfg, err := LoadFromEnv(func(key string) string { return env[key] })
@@ -65,8 +63,10 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.QueryPostgresRole != "warehouse_reader" {
 		t.Fatalf("QueryPostgresRole = %q", cfg.QueryPostgresRole)
 	}
-	if cfg.MutationUIPassword != "review-password" || cfg.MutationUISessionSecret != "0123456789abcdef0123456789abcdef" || cfg.MutationUISessionTTL != 2*time.Hour {
-		t.Fatalf("mutation UI config = password %q ttl %s secret_len %d", cfg.MutationUIPassword, cfg.MutationUISessionTTL, len(cfg.MutationUISessionSecret))
+	// The review UI's own password is gone: the web app authenticates with
+	// the API token. A still-set value is reported, never silently ignored.
+	if !containsPrefix(cfg.DeprecatedEnvVars, "PDW_MUTATION_UI_PASSWORD") {
+		t.Fatalf("PDW_MUTATION_UI_PASSWORD should be reported as deprecated, got %v", cfg.DeprecatedEnvVars)
 	}
 	if strings.Join(cfg.GmailAccounts, ",") != "zach@example.test,work@example.test" {
 		t.Fatalf("GmailAccounts = %#v", cfg.GmailAccounts)
@@ -420,4 +420,13 @@ func TestLoadFromEnvDecodesDoubledPrefixEscapes(t *testing.T) {
 	if cfg.SearchEmbeddingsQueryPrefix != "Instruct: find it\nQuery: " {
 		t.Fatalf("prefix = %q", cfg.SearchEmbeddingsQueryPrefix)
 	}
+}
+
+func containsPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }

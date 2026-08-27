@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdw</title>
+<link rel="stylesheet" href="/app/app.css?v=__ASSET_VERSION__">
+<link rel="stylesheet" href="/app/mutations.css?v=__ASSET_VERSION__">
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <a id="wordmark" href="/timeline" data-link><span class="glyph">▤</span><span class="name">PDW</span><span class="sub" id="subtitle">timeline</span></a>
+    <nav id="nav">
+      <a href="/timeline" data-link data-nav="timeline">timeline</a>
+      <a href="/search" data-link data-nav="search">search</a>
+      <a href="/mutation-review" data-link data-nav="mutation-review">review<span id="pendingcount" class="count" hidden></span></a>
+      <a href="/pipelines">pipelines</a>
+    </nav>
+    <div id="topctl"></div>
+    <div id="spacer"></div>
+    <div id="stats"></div>
+    <button id="lock" title="change token">⚿</button>
+  </div>
+  <div id="view"></div>
+</div>
+
+<div id="drawer">
+  <div id="dhead">
+    <span class="k" id="dkind">—</span>
+    <span class="t" id="dtitle">—</span>
+    <button id="dclose">esc ✕</button>
+  </div>
+  <div id="dbody"></div>
+</div>
+
+<div id="gate">
+  <div class="card">
+    <h2>▤ PDW</h2>
+    <p>This app reads the warehouse through the bearer-protected API — the same one the phone uses. Paste the app secret token (PDW_SECRET_TOKEN); it stays in this browser's localStorage.</p>
+    <form id="gateform">
+      <input type="password" id="gatetoken" placeholder="secret token" autocomplete="off">
+      <button class="primary" type="submit">unlock</button>
+    </form>
+    <div class="bad" id="gatebad">rejected — check the token and try again.</div>
+  </div>
+</div>
+
+<script type="module" src="/app/app.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

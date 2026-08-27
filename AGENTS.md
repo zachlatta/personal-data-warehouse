@@ -1253,9 +1253,19 @@ path-drift gotcha described below) are unchanged.
 review queue, and push notifications; see `mobile/README.md`. Three server pieces
 back it, all behind the static bearer the CLI uses:
 
-- `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is the JSON
-  twin of the `/mutation-review` HTML UI: same store, same approve/deny/remove
-  semantics, actor `app:<client_name>`. It executes nothing.
+- `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is THE review
+  surface: list/get, approve, deny, drop one email, edit an email before approval
+  (`…/mutations/<id>/update-email`), and mark a dead request superseded
+  (`…/supersede`, offered when `can_supersede`). Every `gmail.send_email` mutation
+  carries an `email` view-model (delivery mode, variants with the selected one marked,
+  each body split into editable part / signature / quoted thread, the reply thread) so
+  no client re-derives it. The actor is `app:<client_name>`. It executes nothing.
+  **The browser UI is a client of this same API**: `/mutation-review`, `/timeline` and
+  `/search` are one static single-page app (`app/internal/webapp`, ES modules embedded in
+  the binary, no build step, no CDN) that renders nothing server-side and authenticates
+  with `PDW_SECRET_TOKEN` exactly like the phone (`Bearer web:<token>`). The old
+  server-rendered review pages and their password cookie are gone; a still-set
+  `PDW_MUTATION_UI_*` variable is reported as deprecated at startup.
 - `POST /api/push/register` stores the device's Expo push token in
   `private.push_devices` (`app/internal/push`); `POST /api/push/test` sends to every
   active device and returns the fan-out report.

@@ -258,3 +258,242 @@ type recordingCreateStore struct{ *apiFakeStore }
 func (s *recordingCreateStore) CreateRequest(_ context.Context, input CreateRequestInput) (Request, error) {
 	return Request{ID: "created-1", Status: "pending_review", Title: input.Title, Reason: input.Reason, MutationCount: len(input.Mutations)}, nil
 }
+
+func (s *apiFakeStore) recordSupersede(id, by, actor string) (Request, error) {
+	r, ok := s.requests[id]
+	if !ok {
+		return Request{}, ErrNotFound
+	}
+	if !requestIsSupersedable(r.Status) {
+		return Request{}, errors.New("request is not supersedable")
+	}
+	r.SupersededBy = by
+	s.requests[id] = r
+	s.actors = append(s.actors, actor)
+	return r, nil
+}
+
+// supersedingStore is the API fake with supersede and email edits wired up.
+type supersedingStore struct {
+	*apiFakeStore
+	emailEdits []UpdateGmailEmailMutationInput
+}
+
+func (s *supersedingStore) SupersedeRequest(_ context.Context, id, by, actor string) (Request, error) {
+	return s.recordSupersede(id, by, actor)
+}
+
+func (s *supersedingStore) UpdateGmailEmailMutation(_ context.Context, requestID, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error) {
+	r, ok := s.requests[requestID]
+	if !ok {
+		return Mutation{}, ErrNotFound
+	}
+	if r.Status != "pending_review" {
+		return Mutation{}, errors.New("cannot edit mutation for request with status " + r.Status)
+	}
+	s.emailEdits = append(s.emailEdits, input)
+	s.actors = append(s.actors, actor)
+	return Mutation{ID: mutationID, RequestID: requestID, Status: "pending_review", Payload: map[string]any{"message": input.Message, "delivery_mode": input.DeliveryMode}}, nil
+}
+
+func sendEmailFixture() Request {
+	return Request{
+		ID: "req-email", Status: "pending_review", Title: "Reply to the vendor", MutationCount: 1,
+		CreatedAt: time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC),
+		Mutations: []Mutation{{
+			ID: "mut-email", RequestID: "req-email", Provider: "gmail", Operation: GmailSendEmailOperation,
+			Account: "zach@example.test", Status: "pending_review",
+			Payload: map[string]any{
+				"delivery_mode": "send",
+				"message": map[string]any{
+					"to": []any{"vendor@example.test"}, "subject": "Re: quote",
+					"body_html":          `<div>Sounds good.</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div class="gmail_quote">On Mon, they wrote:<br>hi</div>`,
+					"reply_to_thread_id": "t-9",
+				},
+				"variants": []any{
+					map[string]any{"id": "variant-1", "title": "Direct", "message": map[string]any{"to": []any{"vendor@example.test"}, "subject": "Re: quote", "body_text": "Sounds good."}},
+					map[string]any{"id": "variant-2", "title": "Softer", "message": map[string]any{"to": []any{"vendor@example.test"}, "subject": "Re: quote", "body_text": "Maybe."}},
+				},
+				"selected_variant_id": "variant-2",
+			},
+			Preview: map[string]any{
+				"reply_threads": []any{map[string]any{"thread_id": "t-9", "subject": "quote", "messages": []any{map[string]any{"from_address": "vendor@example.test", "body_html": `<p>hi</p><div class="gmail_quote">older</div>`}}}},
+			},
+		}},
+	}
+}
+
+// The web SPA edits an email before approving it, exactly as the old HTML form
+// did; the JSON twin has to accept the same fields and hand the store the same
+// normalized input.
+func TestAPIUpdateEmailNormalizesTheMessageAndUsesTheAppActor(t *testing.T) {
+	store := &supersedingStore{apiFakeStore: newAPIFakeStore(sendEmailFixture())}
+	srv := newAPIServer(t, store)
+	body := `{"delivery_mode":"draft","selected_variant_id":"variant-1","message":{"to":"a@example.test, b@example.test","cc":["c@example.test"],"subject":"  Re: quote ","body_text":"hi","body_html":"<p>hi</p>","reply_to_thread_id":"t-9","references":"<x@y>\n<z@y>"}}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+APIPath+"/requests/req-email/mutations/mut-email/update-email", strings.NewReader(body))
+	req.Header.Set("X-PDW-Client", "web")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusOK || got["mutation"] == nil {
+		t.Fatalf("update-email failed: %d %v", resp.StatusCode, got)
+	}
+	if len(store.emailEdits) != 1 {
+		t.Fatalf("store received %d edits", len(store.emailEdits))
+	}
+	edit := store.emailEdits[0]
+	if edit.DeliveryMode != "draft" || edit.SelectedVariantID != "variant-1" {
+		t.Fatalf("edit = %+v", edit)
+	}
+	if to := edit.Message["to"].([]string); len(to) != 2 || to[0] != "a@example.test" || to[1] != "b@example.test" {
+		t.Fatalf("to not split: %v", edit.Message["to"])
+	}
+	if cc := edit.Message["cc"].([]string); len(cc) != 1 || cc[0] != "c@example.test" {
+		t.Fatalf("cc not normalized: %v", edit.Message["cc"])
+	}
+	if edit.Message["subject"] != "Re: quote" || edit.Message["reply_to_thread_id"] != "t-9" {
+		t.Fatalf("message = %v", edit.Message)
+	}
+	if refs := edit.Message["references"].([]string); len(refs) != 2 {
+		t.Fatalf("references = %v", edit.Message["references"])
+	}
+	if store.actors[0] != "app:web" {
+		t.Fatalf("actor = %q", store.actors[0])
+	}
+
+	bad, _ := http.Post(srv.URL+APIPath+"/requests/req-email/mutations/mut-email/update-email", "application/json", strings.NewReader(`{"message":`))
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed JSON must be 400, got %d", bad.StatusCode)
+	}
+	missing, _ := http.Post(srv.URL+APIPath+"/requests/nope/mutations/mut-email/update-email", "application/json", strings.NewReader(`{"message":{}}`))
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown request must be 404, got %d", missing.StatusCode)
+	}
+}
+
+// A terminally failed request is closed out by naming its replacement. The
+// API refuses a blank or self-referential replacement before touching the
+// store, and reports whether the control applies at all (can_supersede), so
+// no client has to keep its own copy of the supersedable status list.
+func TestAPISupersedeRecordsTheReplacementAndValidatesInput(t *testing.T) {
+	store := &supersedingStore{apiFakeStore: newAPIFakeStore(
+		Request{ID: "req-old", Status: "failed_terminal", Title: "Old"},
+		Request{ID: "req-pending", Status: "pending_review", Title: "Pending"},
+	)}
+	srv := newAPIServer(t, store)
+
+	old := decodeBody(t, mustGet(t, srv.URL+APIPath+"/requests/req-old"))
+	if old["request"].(map[string]any)["can_supersede"] != true {
+		t.Fatalf("failed request must be supersedable: %v", old)
+	}
+	pending := decodeBody(t, mustGet(t, srv.URL+APIPath+"/requests/req-pending"))
+	if pending["request"].(map[string]any)["can_supersede"] != false {
+		t.Fatalf("pending request must not be supersedable: %v", pending)
+	}
+
+	for _, body := range []string{`{"superseded_by":""}`, `{"superseded_by":"req-old"}`} {
+		resp, _ := http.Post(srv.URL+APIPath+"/requests/req-old/supersede", "application/json", strings.NewReader(body))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("body %s must be rejected with 400, got %d", body, resp.StatusCode)
+		}
+	}
+	resp, _ := http.Post(srv.URL+APIPath+"/requests/req-old/supersede", "application/json", strings.NewReader(`{"superseded_by":"req-new"}`))
+	got := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusOK || got["request"].(map[string]any)["superseded_by"] != "req-new" {
+		t.Fatalf("supersede failed: %d %v", resp.StatusCode, got)
+	}
+	if got["request"].(map[string]any)["can_supersede"] != false {
+		t.Fatalf("a superseded request must not offer supersede again: %v", got)
+	}
+	conflict, _ := http.Post(srv.URL+APIPath+"/requests/req-pending/supersede", "application/json", strings.NewReader(`{"superseded_by":"req-new"}`))
+	if conflict.StatusCode != http.StatusConflict {
+		t.Fatalf("superseding a pending request must conflict, got %d", conflict.StatusCode)
+	}
+}
+
+// The review surface needs the email the way the reviewer edits it: which
+// variant is selected, the editable body with the signature and quoted thread
+// split off, and the thread being replied to. Computing that once, server-side,
+// keeps every client (web, iOS) from re-deriving it differently.
+func TestAPIGetRendersTheGmailEmailView(t *testing.T) {
+	store := newAPIFakeStore(sendEmailFixture())
+	srv := newAPIServer(t, store)
+	body := decodeBody(t, mustGet(t, srv.URL+APIPath+"/requests/req-email"))
+	mutation := body["request"].(map[string]any)["mutations"].([]any)[0].(map[string]any)
+	email, _ := mutation["email"].(map[string]any)
+	if email == nil {
+		t.Fatalf("send_email mutation has no email view: %v", mutation)
+	}
+	if email["delivery_mode"] != "send" {
+		t.Fatalf("delivery_mode = %v", email["delivery_mode"])
+	}
+	variants := email["variants"].([]any)
+	if len(variants) != 2 {
+		t.Fatalf("variants = %v", variants)
+	}
+	second := variants[1].(map[string]any)
+	if second["id"] != "variant-2" || second["selected"] != true || second["title"] != "Softer" {
+		t.Fatalf("selected variant not marked: %v", second)
+	}
+	if second["editor_html"] == "" || !strings.Contains(second["editor_html"].(string), "Maybe.") {
+		t.Fatalf("plain-text variant must be offered as HTML for the editor: %v", second)
+	}
+	threads := email["reply_threads"].([]any)
+	if len(threads) != 1 || threads[0].(map[string]any)["thread_id"] != "t-9" {
+		t.Fatalf("reply threads = %v", threads)
+	}
+	message := threads[0].(map[string]any)["messages"].([]any)[0].(map[string]any)
+	if message["body_html"] != "<p>hi</p>" || message["quoted_html"] != `<div class="gmail_quote">older</div>` {
+		t.Fatalf("thread message body must be split from its quote: %v", message)
+	}
+
+	// The archive mutation is not an email and must not grow a view it cannot fill.
+	archive := decodeBody(t, mustGet(t, newAPIServer(t, newAPIFakeStore(pendingFixture())).URL+APIPath+"/requests/req-1"))
+	if _, ok := archive["request"].(map[string]any)["mutations"].([]any)[0].(map[string]any)["email"]; ok {
+		t.Fatal("archive mutation must not carry an email view")
+	}
+}
+
+// The merged email (payload message + preview) is what a read-only review shows.
+func TestGmailEmailViewSplitsSignatureAndQuoteFromTheBody(t *testing.T) {
+	view := gmailEmailView(sendEmailFixture().Mutations[0])
+	if view["delivery_mode"] != "send" {
+		t.Fatalf("delivery_mode = %v", view["delivery_mode"])
+	}
+	// The variants override the message body; the merged read view keeps the
+	// original message, split the same way.
+	read := view["message"].(map[string]any)
+	if read["editor_html"] != "<div>Sounds good.</div>" {
+		t.Fatalf("editor_html = %q", read["editor_html"])
+	}
+	if !strings.Contains(read["signature_html"].(string), "<b>Zach</b>") {
+		t.Fatalf("signature_html = %q", read["signature_html"])
+	}
+	if !strings.HasPrefix(read["quoted_html"].(string), `<div class="gmail_quote">`) {
+		t.Fatalf("quoted_html = %q", read["quoted_html"])
+	}
+}
+
+func TestAPIListHonorsALimit(t *testing.T) {
+	store := newAPIFakeStore(pendingFixture())
+	srv := newAPIServer(t, store)
+	mustGet(t, srv.URL+APIPath+"/requests?limit=120")
+	if len(store.listCalls) != 1 || store.listCalls[0].Limit != 120 {
+		t.Fatalf("limit not forwarded: %+v", store.listCalls)
+	}
+	resp, _ := http.Get(srv.URL + APIPath + "/requests?limit=9999")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("an absurd limit must be rejected, got %d", resp.StatusCode)
+	}
+}
+
+func mustGet(t *testing.T, url string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}

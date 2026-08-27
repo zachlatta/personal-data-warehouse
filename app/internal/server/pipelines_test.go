@@ -192,8 +192,10 @@ func TestPipelinesPageIsServedUnauthenticated(t *testing.T) {
 
 // The page has to be reachable: an unlinked dashboard is one nobody opens.
 func TestTimelinePageLinksToPipelines(t *testing.T) {
-	if !strings.Contains(timelinePageHTML, `href="`+pipelinesPagePath+`"`) {
-		t.Fatalf("the timeline page must link to %s", pipelinesPagePath)
+	srv := newTimelineTestServer(t, newPipelinesTestRunner())
+	_, shell := timelineGET(t, srv, "/timeline", false)
+	if !strings.Contains(string(shell), `href="`+pipelinesPagePath+`"`) {
+		t.Fatalf("the web app shell must link to %s", pipelinesPagePath)
 	}
 	if !strings.Contains(pipelinesPageHTML, `href="/timeline"`) {
 		t.Fatal("the pipelines page must link back to the timeline")
@@ -203,9 +205,14 @@ func TestTimelinePageLinksToPipelines(t *testing.T) {
 // Both pages read the same localStorage key and accept the same #token= handoff,
 // so unlocking one unlocks the other.
 func TestPipelinesPageSharesTheTimelineToken(t *testing.T) {
+	srv := newTimelineTestServer(t, newPipelinesTestRunner())
+	_, api := timelineGET(t, srv, "/app/api.js", false)
 	for _, needle := range []string{"pdw_timeline_token", "#token="} {
 		if !strings.Contains(pipelinesPageHTML, needle) {
 			t.Fatalf("pipelines page is missing the shared token handling %q", needle)
+		}
+		if !strings.Contains(string(api), needle) {
+			t.Fatalf("web app is missing the shared token handling %q", needle)
 		}
 	}
 }

@@ -35,9 +35,6 @@ MCP_GET_FIELD_MAX_CHARS=200000
 MCP_QUERY_CACHE_TTL=30m
 MCP_DEBUG_CACHE_TOOL=false
 MCP_QUERY_TIMEOUT=300s
-PDW_MUTATION_UI_PASSWORD=...
-PDW_MUTATION_UI_SESSION_SECRET=...
-PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
 PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON_B64=<authorized-user-token-json>
 PDW_INGEST_AGENT_SESSIONS_FOLDER_ID=<optional-source-folder-id>
@@ -62,10 +59,11 @@ who's calling. See the HTTP API and Claude Connector sections below.
 deployments keep working — set `PDW_SECRET_TOKEN` and drop the legacy var
 when convenient.
 
-Set `PDW_MUTATION_UI_PASSWORD` to enable the mutation proposal tools and the review UI at
-`/mutation-review`. `PDW_MUTATION_UI_SESSION_SECRET` should be a separate high-entropy value; if it
-is omitted, the process generates an ephemeral signing secret and browser sessions are invalidated
-on restart.
+The mutation proposal tools and the review UI at `/mutation-review` are always on: the review
+UI is the web app (`internal/webapp`, also serving `/timeline` and `/search`), a static SPA over
+the same JSON API the iOS app uses, authenticated with `PDW_SECRET_TOKEN` like every API client.
+The old `PDW_MUTATION_UI_PASSWORD` / `PDW_MUTATION_UI_SESSION_SECRET` /
+`PDW_MUTATION_UI_SESSION_TTL_SECONDS` settings are ignored and logged as deprecated.
 
 Set `PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID` and `PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON` (or
 `_B64`) to enable object downloads and client upload ingestion. Local uploaders POST signed domain
@@ -120,8 +118,6 @@ Set:
 POSTGRES_DATABASE_URL=...
 PDW_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
-PDW_MUTATION_UI_PASSWORD=...
-PDW_MUTATION_UI_SESSION_SECRET=...
 ```
 
 Do not reuse the root `Dockerfile`; that one runs Dagster.
@@ -226,8 +222,9 @@ When mutation review is enabled, the server also exposes:
   shape each mutation entry.
 
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
-They return an approval URL under `/mutation-review`; the actual Gmail, Calendar, or Contacts
-write is still performed later by the existing approved-mutation worker.
+They return an approval URL under `/mutation-review` (the web app, which reviews through
+`/api/mutations/*`); the actual Gmail, Calendar, or Contacts write is still performed later by the
+existing approved-mutation worker.
 
 SQL starting points:
 

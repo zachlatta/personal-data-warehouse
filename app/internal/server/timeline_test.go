@@ -132,23 +132,31 @@ func TestTimelineAPIRequiresBearer(t *testing.T) {
 	}
 }
 
+// The browser UI is the SPA shell: served without auth (it is inert until a
+// token is pasted), and it reads the same /api/timeline endpoints the phone does.
 func TestTimelinePageIsServedWithoutAuth(t *testing.T) {
 	srv := newTimelineTestServer(t, &fakeTimelineRunner{})
 	resp, body := timelineGET(t, srv, "/timeline", false)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), "PDW/TIMELINE") {
-		t.Fatalf("timeline page missing marker")
-	}
 	if !strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
 		t.Fatalf("timeline page content type = %q", resp.Header.Get("Content-Type"))
 	}
-	if !strings.Contains(string(body), `whoop: "#`) {
-		t.Fatal("timeline page is missing a distinct WHOOP source hue")
+	if !strings.Contains(string(body), `<div id="app"`) || !strings.Contains(string(body), "/app/app.js") {
+		t.Fatalf("timeline page is not the SPA shell: %q", body[:min(len(body), 200)])
 	}
-	if !strings.Contains(string(body), `api("/api/timeline/item/children"`) || !strings.Contains(string(body), "load more") {
-		t.Fatal("timeline page is missing pageable child controls")
+	_, inspector := timelineGET(t, srv, "/app/inspector.js", false)
+	for _, needle := range []string{"timeline.children(", "timeline.context(", "load more"} {
+		if !strings.Contains(string(inspector), needle) {
+			t.Fatalf("event inspector is missing %q", needle)
+		}
+	}
+	_, api := timelineGET(t, srv, "/app/api.js", false)
+	for _, needle := range []string{`"/api/timeline"`, `"/api/timeline/item/children"`, `"/api/timeline/item/context"`, `"/api/mutations/requests"`, `"/api/tools/search"`} {
+		if !strings.Contains(string(api), needle) {
+			t.Fatalf("the web app must call the same JSON API the phone does; missing %q", needle)
+		}
 	}
 }
 
@@ -158,9 +166,9 @@ func TestTimelineEndpointsAbsentWithoutArgsRunner(t *testing.T) {
 	mux := NewMux(cfg, authSvc, fakeRunner{})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	resp, _ := timelineGET(t, srv, "/timeline", false)
+	resp, _ := timelineGET(t, srv, "/api/timeline", false)
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("timeline should be unregistered for a runner without QueryArgs; got %d", resp.StatusCode)
+		t.Fatalf("timeline API should be unregistered for a runner without QueryArgs; got %d", resp.StatusCode)
 	}
 }
 

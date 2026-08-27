@@ -23,16 +23,15 @@ const (
 	AppleNotesUpdateNoteOperation  = "apple_notes.update_note"
 
 	defaultRequestedBy = "mcp"
-	reviewerActorID    = "web-ui"
+	// reviewerActorID is the actor recorded when a reviewer surface passes
+	// none; the JSON API always names its client (app:<name>).
+	reviewerActorID = "web-ui"
 )
 
 var ErrNotFound = errors.New("mutation request not found")
 
 type Config struct {
 	BaseURL               string
-	UIPassword            string
-	SessionSecret         string
-	SessionTTL            time.Duration
 	GmailAccounts         []string
 	ContactGoogleAccounts []string
 	CalendarAccounts      []string

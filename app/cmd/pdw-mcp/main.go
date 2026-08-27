@@ -33,30 +33,27 @@ func main() {
 	defer runner.Close()
 
 	authSvc := pdwauth.NewService([]byte(cfg.SecretToken), time.Now)
-	var mutationSvc *mutations.Service
-	if cfg.MutationUIPassword != "" {
-		mutationStore, err := mutations.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
-		if err != nil {
-			logger.Error("connect to mutation Postgres store failed", "error", err)
-			os.Exit(1)
-		}
-		defer mutationStore.Close()
-		if err := mutationStore.EnsureTables(context.Background()); err != nil {
-			logger.Error("ensure mutation tables failed", "error", err)
-			os.Exit(1)
-		}
-		mutationSvc = mutations.NewService(mutationStore, mutations.Config{
-			BaseURL:               cfg.BaseURL,
-			UIPassword:            cfg.MutationUIPassword,
-			SessionSecret:         cfg.MutationUISessionSecret,
-			SessionTTL:            cfg.MutationUISessionTTL,
-			GmailAccounts:         cfg.GmailAccounts,
-			ContactGoogleAccounts: cfg.ContactGoogleAccounts,
-			CalendarAccounts:      cfg.CalendarAccounts,
-			AppleNotesAccounts:    cfg.AppleNotesAccounts,
-		})
-		logger.Info("mutation review UI enabled", "path", mutations.ReviewPath)
+	// Reviewed mutations live in the same Postgres as the warehouse; the
+	// review surfaces are the JSON API (the web SPA and the iOS app) behind
+	// the app's static bearer, so nothing else gates them.
+	mutationStore, err := mutations.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+	if err != nil {
+		logger.Error("connect to mutation Postgres store failed", "error", err)
+		os.Exit(1)
 	}
+	defer mutationStore.Close()
+	if err := mutationStore.EnsureTables(context.Background()); err != nil {
+		logger.Error("ensure mutation tables failed", "error", err)
+		os.Exit(1)
+	}
+	mutationSvc := mutations.NewService(mutationStore, mutations.Config{
+		BaseURL:               cfg.BaseURL,
+		GmailAccounts:         cfg.GmailAccounts,
+		ContactGoogleAccounts: cfg.ContactGoogleAccounts,
+		CalendarAccounts:      cfg.CalendarAccounts,
+		AppleNotesAccounts:    cfg.AppleNotesAccounts,
+	})
+	logger.Info("mutation review enabled", "path", mutations.ReviewPath, "api", mutations.APIPath)
 	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, server.NewMux(cfg, authSvc, runner, mutationSvc)); err != nil {
 		logger.Error("HTTP server stopped", "error", err)

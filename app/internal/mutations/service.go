@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 )
 
 type Service struct {
@@ -30,14 +29,6 @@ type ProposeMutationInput struct {
 
 func NewService(store Store, cfg Config) *Service {
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if cfg.SessionTTL <= 0 {
-		cfg.SessionTTL = 12 * time.Hour
-	}
-	if strings.TrimSpace(cfg.SessionSecret) == "" {
-		if secret, err := randomToken(); err == nil {
-			cfg.SessionSecret = secret
-		}
-	}
 	cfg.GmailAccounts = normalizeAccountList(cfg.GmailAccounts)
 	cfg.ContactGoogleAccounts = normalizeAccountList(cfg.ContactGoogleAccounts)
 	cfg.CalendarAccounts = normalizeAccountList(cfg.CalendarAccounts)

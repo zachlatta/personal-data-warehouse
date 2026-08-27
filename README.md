@@ -207,37 +207,32 @@ Notes:
   schema. `WHOOP_TOKEN_JSON_B64` is retained only as a legacy first-run bootstrap for an empty
   database; it is ignored once a private row exists and must never be used for reauthorization.
 
-## Mutation Approval UI
+## Web app: timeline, search, and mutation review
 
-The Go MCP server can expose Gmail, Calendar, and Contacts mutation proposal tools plus a browser review UI for
-pending requests. Set a password before starting it:
+The Go app serves a browser single-page app at `/timeline`, `/search` and `/mutation-review`
+(`app/internal/webapp`, static ES modules embedded in the binary — no build step, no CDN). It
+renders nothing server-side: every view reads the **same bearer-protected JSON API the iOS app
+uses** (`/api/timeline*`, `/api/mutations/*`, `POST /api/tools/search`), so the web and the phone
+cannot disagree about what a request or an event looks like. Sign in by pasting
+`PDW_SECRET_TOKEN` once; the browser keeps it in localStorage and sends it as
+`Authorization: Bearer web:<token>`, the same credential the CLI and the phone use. There is no
+separate review password any more: `PDW_MUTATION_UI_PASSWORD`, `PDW_MUTATION_UI_SESSION_SECRET`
+and `PDW_MUTATION_UI_SESSION_TTL_SECONDS` are ignored and reported as deprecated at startup.
 
-```bash
-PDW_MUTATION_UI_PASSWORD=...
-```
-
-Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>` and redirect
-to `/mutation-review/login` until you sign in. The UI uses an HttpOnly session cookie plus per-form
-CSRF tokens for approve and deny actions. The old per-action `PDW_MUTATION_REVIEW_PIN` flow is no
-longer used.
+Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>`, which
+opens that request directly. The review view shows each mutation the way it will be applied —
+an editable Gmail composer (recipients, subject, rich body, proposed variants, send-vs-draft),
+the Gmail threads an archive touches, a calendar event card with its guests and the diff of an
+update, a contact change with before → after per field, an Apple Note — and lets you approve,
+deny with a reason, drop one email from a request, or edit an email before approving.
 
 A request that failed terminally can never run again, so it would otherwise sit in the review list
 forever looking unresolved. Such a request carries a **Mark superseded** control: give it the id of
 the request that replaced it, and both the list and the detail page link the two. The failed status
 is deliberately left alone — the request really did fail, and that stays the record; what is added
 is the link showing it was dealt with. Only `failed_terminal`, `failed_retryable`, and
-`blocked_missing_credentials` requests can be superseded, so live work cannot be closed out by
-mistake, and the replacement must already exist.
-
-Optional UI settings:
-
-```bash
-PDW_MUTATION_UI_SESSION_SECRET=<high-entropy-secret>
-PDW_MUTATION_UI_SESSION_TTL_SECONDS=43200
-```
-
-If `PDW_MUTATION_UI_SESSION_SECRET` is omitted, the process generates an ephemeral signing secret
-at startup, which logs out existing browser sessions on restart.
+`blocked_missing_credentials` requests can be superseded (`can_supersede` on the API), so live work
+cannot be closed out by mistake, and the replacement must already exist.
 
 ## Gmail Auth
 
