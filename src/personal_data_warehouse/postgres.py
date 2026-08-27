@@ -7116,6 +7116,23 @@ class PostgresWarehouse:
             return None
         return earliest.astimezone(UTC).date()
 
+    def prune_whoop_private_sync_state(
+        self, *, account: str, keep_collections: Sequence[str]
+    ) -> None:
+        """Drop state rows for collections this sync no longer has.
+
+        The read surfaces judge a pipeline from every row in its sync-state
+        table, so a retired collection's last status outlives it and nothing can
+        clear it -- a row left saying `action_required` would read as an open
+        incident forever. Retiring a collection has to remove its state the same
+        way retiring a table removes the table.
+        """
+        self._command(
+            "DELETE FROM @whoop_private_sync_state "
+            "WHERE account = %s AND NOT (collection = ANY(%s))",
+            (account, list(keep_collections)),
+        )
+
     def load_whoop_private_sync_state(self) -> dict[tuple[str, str], dict[str, Any]]:
         columns = WHOOP_PRIVATE_SYNC_STATE_COLUMNS
         rows = self._query(

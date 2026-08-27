@@ -739,8 +739,17 @@ class WhoopPrivateSyncRunner:
             return [self._skipped(config.account, "WHOOP_PRIVATE_ENABLED is false", record_state=False)]
 
         self._warehouse.ensure_whoop_private_tables()
-        state_by_key = self._warehouse.load_whoop_private_sync_state() or {}
         account = config.account
+        # A collection that no longer exists keeps whatever status it last
+        # recorded, forever: marts_ops.pipeline_health judges this pipeline from
+        # the status column of EVERY row in this table, and no run will ever
+        # touch a retired one again. `ok` is the lucky case, not the safe one.
+        _call_supported(
+            self._warehouse.prune_whoop_private_sync_state,
+            account=account,
+            keep_collections=WHOOP_PRIVATE_COLLECTIONS,
+        )
+        state_by_key = self._warehouse.load_whoop_private_sync_state() or {}
 
         session = self._load_session(config)
         if session is None:

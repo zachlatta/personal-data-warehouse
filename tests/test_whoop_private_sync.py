@@ -97,6 +97,7 @@ class FakeWhoopPrivateWarehouse:
         self.stored_documents: list[dict] = list(stored_documents or [])
         self.earliest_cycle_day = earliest_cycle_day
         self.state_rows: list[dict] = []
+        self.pruned: list[dict] = []
         self.rotations: list[dict] = []
 
     def ensure_whoop_private_tables(self) -> None:
@@ -178,6 +179,11 @@ class FakeWhoopPrivateWarehouse:
 
     def insert_whoop_private_sync_state(self, **row):
         self.state_rows.append(row)
+
+    def prune_whoop_private_sync_state(self, *, account, keep_collections):
+        self.pruned.append({"account": account, "keep_collections": tuple(keep_collections)})
+        for key in [key for key in self.state if key[0] == account and key[1] not in keep_collections]:
+            del self.state[key]
 
 
 CYCLE_RECORD = {
@@ -855,6 +861,44 @@ def test_the_heart_rate_backfill_stops_at_the_accounts_first_cycle(monkeypatch) 
     assert all(call["start"] >= floor for call in heart_rate_calls)
     recorded = next(row for row in warehouse.state_rows if row["collection"] == "heart_rate")
     assert recorded["watermark_updated_at"] == floor
+
+
+def test_a_retired_collections_state_row_is_removed_not_stranded(monkeypatch) -> None:
+    """A row nothing writes again can never be cleared, and it is still read.
+
+    `marts_ops.pipeline_health` judges this pipeline from the STATUS COLUMN of
+    every row in its sync-state table. A collection that no longer exists keeps
+    whatever status it last recorded forever -- and if that status was `failed`
+    or `action_required`, the pipeline reads broken permanently with nothing
+    able to fix it, because no run will ever touch that row again. `ok` is the
+    lucky case, not the safe one.
+    """
+    state = {
+        (ACCOUNT, "workout_heart_rate"): {
+            "watermark_updated_at": NOW - timedelta(days=1),
+            "last_sync_type": "follows_cycles",
+            "status": WHOOP_PRIVATE_STATUS_ACTION_REQUIRED,
+            "error": "a failure only a run of this collection could clear",
+            "updated_at": NOW - timedelta(days=1),
+        },
+        (ACCOUNT, "heart_rate"): {
+            "watermark_updated_at": NOW - timedelta(days=1),
+            "last_sync_type": "backfill",
+            "status": "ok",
+            "collection_signature": whoop_private_collection_signature("heart_rate"),
+            "updated_at": NOW,
+        },
+    }
+    warehouse = FakeWhoopPrivateWarehouse(state=state, session=_session_row())
+
+    _run(monkeypatch, warehouse=warehouse, client=FakeWhoopPrivateClient())
+
+    assert warehouse.pruned == [
+        {"account": ACCOUNT, "keep_collections": WHOOP_PRIVATE_COLLECTIONS}
+    ]
+    assert (ACCOUNT, "workout_heart_rate") not in warehouse.state
+    # The live collections are untouched by the prune.
+    assert (ACCOUNT, "heart_rate") in warehouse.state
 
 
 def test_tier_two_endpoints_land_in_documents_with_kind_and_key(monkeypatch) -> None:

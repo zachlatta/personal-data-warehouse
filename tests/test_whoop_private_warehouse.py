@@ -34,6 +34,7 @@ from personal_data_warehouse.postgres import (
     _postgres_type,
 )
 from personal_data_warehouse.relations import CATALOG, relation
+from personal_data_warehouse.whoop_private_sync import WHOOP_PRIVATE_COLLECTIONS
 from personal_data_warehouse.schema import (
     WHOOP_PRIVATE_CYCLE_COLUMNS,
     WHOOP_PRIVATE_DOCUMENT_COLUMNS,
@@ -413,6 +414,42 @@ def test_a_retired_grain_is_deleted_over_exactly_the_window_rewritten(
             (end, 60),
         ]
     )
+
+
+def test_pruning_state_removes_retired_collections_and_keeps_live_ones(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Scoped to the account, and to collections this sync no longer has."""
+    warehouse.ensure_whoop_private_tables()
+    synced_at = datetime(2026, 8, 23, 12, tzinfo=UTC)
+    for account, collection in (
+        (ACCOUNT, "heart_rate"),
+        (ACCOUNT, "workout_heart_rate"),
+        ("someone-else@example.com", "workout_heart_rate"),
+    ):
+        warehouse.insert_whoop_private_sync_state(
+            account=account,
+            collection=collection,
+            watermark_updated_at=synced_at,
+            last_sync_type="backfill",
+            status="action_required",
+            error="only a run of this collection could clear it",
+            updated_at=synced_at,
+        )
+
+    warehouse.prune_whoop_private_sync_state(
+        account=ACCOUNT, keep_collections=WHOOP_PRIVATE_COLLECTIONS
+    )
+
+    assert sorted(
+        warehouse._query(
+            "SELECT account, collection FROM @whoop_private_sync_state ORDER BY account, collection"
+        )
+    ) == [
+        # Another account's rows are none of this account's business.
+        ("someone-else@example.com", "workout_heart_rate"),
+        (ACCOUNT, "heart_rate"),
+    ]
 
 
 def test_the_retired_workout_sample_table_is_dropped_in_place(
