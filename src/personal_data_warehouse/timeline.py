@@ -2525,6 +2525,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Alice Voice Recordings
     "alice_voice_recordings": _events(),
     "alice_voice_recording_artifacts": _detail("alice_voice_recordings"),
+    "alice_voice_recordings_sync_state": _state("alice poll heartbeat, status and error"),
     # Apple Notes: every note has revision rows (the note row is the current
     # state; the revisions are the edit activity).
     "apple_notes": _entity("current note state; edits surface via apple_note_revisions"),

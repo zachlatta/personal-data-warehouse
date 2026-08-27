@@ -190,7 +190,13 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # snapshot behind marts_ops.timeline_priority_mix.
         # +1 ops: ops.agent_usage, the daily measurement of contract C3.
         # +1 ops: ops.search_benchmark_runs (C8, weekly).
-        "ops": 32,
+        # +1 ops: ops.alice_voice_recordings_sync_state. Alice is a daily
+        # Dagster poll, not a device uploader, so ops.uploader_heartbeats never
+        # covered it and it had no run state at all -- data freshness was its
+        # only signal, on a source Zach records on ~34 days in 17 months. It
+        # read 'stale' for weeks, with four marts views behind it, while the
+        # poll ran and succeeded daily.
+        "ops": 33,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

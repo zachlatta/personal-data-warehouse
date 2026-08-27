@@ -1121,6 +1121,87 @@ def test_the_bursty_sources_have_an_sla_that_can_catch_a_forty_four_day_silence(
         assert "heartbeat" in entry.data_basis or "heartbeat" in entry.note, entry_id
 
 
+def test_alice_is_judged_by_its_poller_running_not_by_zach_recording():
+    """A daily poller against a source used a few times a year.
+
+    Measured 2026-08-27: 34 days of use across 17 months (2024-12-07 to
+    2026-04-27), 33 gaps between them, p90 17 days and a longest of **223**.
+    Any data SLA tight enough to notice the poller dying is therefore far
+    tighter than the source's own longest legitimate silence, and would fire on
+    Zach simply not picking the device up -- which it did, holding four
+    marts_voice_memos / marts_calendar views 'stale' while the poller was
+    running daily and succeeding.
+
+    The two facts have to be separated: the RUN heartbeat says the poller is
+    alive, and only it may be tight. Data freshness here is nearly mute by
+    construction, and the basis has to admit that rather than imply the 240 days
+    is a real expectation about recordings.
+    """
+    entry = pipeline("alice_voice_recordings")
+    longest_observed_gap = timedelta(days=223)
+    assert entry.expected_data_interval is not None
+    assert entry.expected_data_interval >= longest_observed_gap, (
+        "alice goes 223 days between recordings; a tighter SLA alarms on Zach "
+        "not using the device, which is not a pipeline fact"
+    )
+    assert entry.event_interval is not None
+    assert entry.event_interval >= longest_observed_gap, (
+        "event lateness escalates the pipeline exactly like write lateness, so "
+        "loosening only the data side leaves it red"
+    )
+    assert entry.state is not None, "the poller needs a heartbeat to be judged by"
+    assert entry.expected_run_interval is not None
+    assert entry.expected_run_interval <= timedelta(days=2), (
+        "the heartbeat is the only tight signal left; keep it tight"
+    )
+    assert "heartbeat" in entry.data_basis or "heartbeat" in entry.note
+
+
+def test_alices_heartbeat_table_is_in_both_registries_and_the_catalog():
+    """The state table has to be a real, cataloged, monitored warehouse table."""
+    table = "alice_voice_recordings_sync_state"
+    assert table in TABLE_PIPELINES, "the heartbeat table needs a pipeline row"
+    assert TABLE_PIPELINES[table].role == "state"
+    assert TABLE_PIPELINES[table].pipeline == "alice_voice_recordings"
+    assert pipeline("alice_voice_recordings").state is not None
+    assert pipeline("alice_voice_recordings").state.table == table
+
+
+def test_pi_absorbs_its_longest_observed_gap_between_uses():
+    """The old 3-day number measured chattiness, not cadence.
+
+    ``pi``'s basis read "168 gaps, p95 0.06d, max 2.86d", which is the gap
+    between consecutive *events* -- and an agent session emits events seconds
+    apart, so that distribution describes how talkative a session is, never how
+    often Zach opens the tool. Measured properly on 2026-08-27, over distinct
+    days on which pi was used at all, the source has 8 such days in its whole
+    life (2026-05-19 to 2026-07-16) and 7 gaps between them, the longest **40
+    days** -- inside its active period, not counting the silence since. A 3-day
+    SLA against a source that legitimately goes 40 days between uses is a
+    guaranteed false positive, and it duly fired.
+
+    So the data interval has to clear the longest gap the source has actually
+    shown, and the run heartbeat -- which only began working on 2026-08-27, see
+    ``pdw_export_app_credentials`` -- is what catches the uploader dying.
+    """
+    longest_observed_gap = timedelta(days=40)
+    entry = pipeline("pi")
+    assert entry.expected_data_interval is not None
+    assert entry.expected_data_interval >= longest_observed_gap, (
+        "pi goes 40 days between uses; an SLA below that alarms on Zach not "
+        "using the tool, which is not a pipeline fact"
+    )
+    assert entry.state is not None and entry.expected_run_interval is not None, (
+        "pi is only allowed a loose data SLA because its uploader heartbeat is "
+        "the real detector"
+    )
+    basis = entry.data_basis.lower()
+    assert "usage" in basis or "between uses" in basis, (
+        "say that the number is a gap between USES, so the next reader does not "
+        "re-measure event gaps and get 3 days again"
+    )
+
+
 def test_run_cadence_and_data_arrival_are_separate_numbers():
     """The distinction the blunt 30 days collapsed.
 
@@ -1187,13 +1268,20 @@ def test_the_finance_ledger_event_interval_prevents_a_measured_false_positive():
     # And it must still be able to see a genuinely frozen ledger.
     assert ledger.event_interval <= timedelta(days=3)
 
-    # alice keeps event monitoring but on its own measured event cadence, which
-    # is far looser than its ingest cadence -- a person's recording habit is
-    # bursty, a daily poller writing nothing is not.
+    # alice USED to need the same override, for the opposite reason: its ingest
+    # interval was set from the poll cadence (7d) while its event interval came
+    # from Zach's bursty recording habit (30d). Both numbers were guesses
+    # standing in for a heartbeat the pipeline did not have. Now it has one, the
+    # two sides collapse into a single measured fact -- the poller writes when
+    # there IS a recording -- so the override is gone and the interval simply
+    # inherits. Splitting them again would only re-create a tight event
+    # threshold that fires on Zach not recording.
     alice = pipeline("alice_voice_recordings")
-    assert not alice.event_interval_is_inherited
-    assert alice.event_interval is not None
-    assert alice.event_interval > alice.expected_data_interval
+    assert alice.event_interval_is_inherited
+    assert alice.event_interval == alice.expected_data_interval
+    assert alice.state is not None, (
+        "the override is only safe to drop because a run heartbeat replaced it"
+    )
 
 
 # --- level 2 live behaviour (Postgres) ----------------------------------------
@@ -1283,22 +1371,23 @@ def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
     """Not simply the oldest input.
 
     ``marts_ai_conversations.events`` reads six sources whose expectations
-    differ by an order of magnitude (``pi`` at 3 days, ``codex`` at 7). Ranking
-    by raw age would permanently nominate whichever source is legitimately the
-    quietest and never notice the one actually misbehaving.
+    differ by an order of magnitude (``codex`` at 7 days, ``pi`` at 45, because
+    pi is used in bursts and leans on its run heartbeat instead). Ranking by raw
+    age would permanently nominate whichever source is legitimately the quietest
+    -- pi -- and never notice the one actually misbehaving.
     """
     _provision_every_table(warehouse)
     now = datetime.now(tz=UTC)
     codex_interval = pipeline("codex").expected_data_interval
     pi_interval = pipeline("pi").expected_data_interval
     assert codex_interval is not None and pi_interval is not None
-    assert codex_interval > pi_interval, "the fixture needs two different SLAs"
-    # codex is OLDER in absolute terms but still inside its own SLA; pi is
-    # younger yet past its tighter one. Raw-age ranking picks codex; the
-    # SLA-relative ranking that matters picks pi.
-    codex_age = codex_interval * LATE_MULTIPLIER - timedelta(hours=1)
-    pi_age = pi_interval * LATE_MULTIPLIER + timedelta(hours=1)
-    assert codex_age > pi_age
+    assert pi_interval > codex_interval, "the fixture needs two different SLAs"
+    # pi is OLDER in absolute terms but still inside its own loose SLA; codex is
+    # younger yet past its tighter one. Raw-age ranking picks pi; the
+    # SLA-relative ranking that matters picks codex.
+    pi_age = pi_interval * LATE_MULTIPLIER - timedelta(hours=1)
+    codex_age = codex_interval * LATE_MULTIPLIER + timedelta(hours=1)
+    assert pi_age > codex_age
     warehouse._command(
         """
         INSERT INTO @codex_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
@@ -1318,7 +1407,7 @@ def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
         "SELECT stalest_pipeline, input_status FROM @marts_mart_view_health"
         " WHERE view_id = 'ai_conversation_events'"
     )[0]
-    assert row["stalest_pipeline"] == "pi", (
+    assert row["stalest_pipeline"] == "codex", (
         "the input past its own SLA must win, not the one with the older timestamp"
     )
     assert row["input_status"] == "late"

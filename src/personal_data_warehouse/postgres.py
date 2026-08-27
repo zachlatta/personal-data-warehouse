@@ -24,6 +24,7 @@ from personal_data_warehouse.agent_usage import (
 )
 from personal_data_warehouse.schema import (
     ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
+    ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
     ALICE_VOICE_RECORDING_COLUMNS,
     AGENT_RUN_COLUMNS,
     AGENT_RUN_EVENT_COLUMNS,
@@ -699,6 +700,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "alice_voice_recording_artifacts": TableSpec(
         ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
         ("account", "recording_id", "artifact_id"),
+    ),
+    "alice_voice_recordings_sync_state": TableSpec(
+        ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
+        ("account",),
+        "updated_at",
     ),
     "apple_notes": TableSpec(APPLE_NOTE_COLUMNS, ("account", "note_id")),
     "apple_note_revisions": TableSpec(APPLE_NOTE_REVISION_COLUMNS, ("account", "note_id", "revision_id")),
@@ -2190,6 +2196,7 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    "recordings_seen",
     "probe_queries",
     "latency_p50_ms",
     "latency_p90_ms",
@@ -3764,6 +3771,7 @@ class PostgresWarehouse:
             [
                 "alice_voice_recordings",
                 "alice_voice_recording_artifacts",
+                "alice_voice_recordings_sync_state",
             ]
         )
         self._ensure_voice_memos_mart_views()
@@ -8605,6 +8613,20 @@ class PostgresWarehouse:
             "alice_voice_recording_artifacts",
             rows,
             ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
+        )
+
+    def upsert_alice_voice_recordings_sync_state(self, row: dict[str, Any]) -> None:
+        """Record one Alice poll: that it ran, and whether it worked.
+
+        The row is upserted per account and guarded by ``updated_at``, so a
+        late-committing run can never stamp over a newer one. It is the
+        pipeline's ONLY run signal -- Alice is a Dagster poller, not an
+        uploader, so nothing writes it an ops.uploader_heartbeats row.
+        """
+        self._insert_rows(
+            "alice_voice_recordings_sync_state",
+            [row],
+            ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
         )
 
     def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:

@@ -260,6 +260,24 @@ ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS = (
     "sync_version",
 )
 
+#: The Alice poller's run heartbeat. Alice is a DAILY Dagster poll against a
+#: third-party API, not an uploader, so it has no ops.uploader_heartbeats row
+#: and, until 2026-08-27, no run state of any kind -- data freshness was the
+#: only signal it had. That cannot work for a source recorded a few times a
+#: year: measured over 17 months, Zach used the device on 34 days with a
+#: longest gap of 223 days, so any SLA tight enough to catch the poller dying
+#: fires constantly on him simply not recording. One row per account.
+ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS = (
+    "account",
+    "last_sync_type",
+    "status",
+    "error",
+    "recordings_seen",
+    "last_success_at",
+    "updated_at",
+    "sync_version",
+)
+
 # The three derived voice tables are keyed by ``source`` first, because voice
 # is a MULTI-SOURCE domain and a recording_id is only unique inside its own
 # source. Without it, base_alice_voice_recordings could not be transcribed at

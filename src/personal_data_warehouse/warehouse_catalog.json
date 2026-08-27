@@ -2534,6 +2534,17 @@
       }
     },
     {
+      "id": "alice_voice_recordings_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "alice_voice_recordings_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "whoop_sync_state",
       "kind": "table",
       "layer": "ops",

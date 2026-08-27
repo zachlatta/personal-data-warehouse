@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from dagster import build_asset_context, build_schedule_context
 
 from personal_data_warehouse.alice_voice_recordings_drive_ingest import (
@@ -40,11 +41,8 @@ def test_alice_voice_recordings_schedule_uses_active_run_guard(monkeypatch) -> N
 
 
 def test_alice_voice_recordings_asset_writes_summary_metadata(monkeypatch) -> None:
-    monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
-    monkeypatch.setattr(alice_defs, "AliceApiClient", FakeAliceClient)
-    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
-    monkeypatch.setattr(alice_defs, "AliceVoiceRecordingsImportRunner", FakeRunner)
+    # The poller writes its own run heartbeat now, so it needs a warehouse.
+    _patch_import_asset(monkeypatch, RecordingWarehouse())
 
     result = alice_defs.alice_voice_recordings_import(build_asset_context())
 
@@ -84,6 +82,107 @@ def test_alice_gmail_recovery_asset_writes_summary_metadata(monkeypatch) -> None
     assert metadata["emails_seen"].value == 3
     assert metadata["attachments_uploaded"].value == 4
     assert metadata["metadata_uploaded"].value == 3
+
+
+# --- the poll heartbeat ------------------------------------------------------
+#
+# Alice is a DAILY Dagster poller, not a device uploader, so nothing writes it
+# an ops.uploader_heartbeats row and until 2026-08-27 it had no run state at
+# all -- data freshness was its only signal. That is unusable for a source Zach
+# records on ~34 days in 17 months (longest real gap 223 days): the poll ran and
+# succeeded every day while /pipelines called the pipeline 'stale' and dragged
+# four marts_voice_memos / marts_calendar views down with it. These three tests
+# pin the three outcomes a poll can have, because only two of them are a fact
+# about the poller.
+
+
+class RecordingWarehouse:
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+
+    def ensure_alice_voice_recordings_tables(self) -> None:
+        self.rows.append({"_ensured": True})
+
+    def upsert_alice_voice_recordings_sync_state(self, row) -> None:
+        self.rows.append(row)
+
+    @property
+    def state_rows(self) -> list[dict]:
+        return [row for row in self.rows if "_ensured" not in row]
+
+
+def _patch_import_asset(monkeypatch, warehouse, *, runner=None, lock=None):
+    monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
+    monkeypatch.setattr(alice_defs, "AliceApiClient", FakeAliceClient)
+    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_a, **_k: object())
+    monkeypatch.setattr(alice_defs, "exclusive_sync_lock", lock or fake_exclusive_sync_lock)
+    monkeypatch.setattr(alice_defs, "AliceVoiceRecordingsImportRunner", runner or FakeRunner)
+    monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _s: warehouse)
+
+
+def test_a_successful_poll_stamps_the_heartbeat(monkeypatch) -> None:
+    warehouse = RecordingWarehouse()
+    _patch_import_asset(monkeypatch, warehouse)
+
+    alice_defs.alice_voice_recordings_import(build_asset_context())
+
+    assert len(warehouse.state_rows) == 1, "one poll, one heartbeat row"
+    row = warehouse.state_rows[0]
+    assert row["account"] == "alice@example.com"
+    assert row["status"] == "ok"
+    assert row["error"] == ""
+    assert row["recordings_seen"] == 2
+    assert row["updated_at"] == row["last_success_at"]
+
+
+def test_a_failing_poll_records_the_error_and_still_raises(monkeypatch) -> None:
+    """The run must stay red in Dagster AND leave the reason on /pipelines."""
+
+    class ExplodingRunner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def sync(self):
+            raise RuntimeError("alice api said no")
+
+    warehouse = RecordingWarehouse()
+    _patch_import_asset(monkeypatch, warehouse, runner=ExplodingRunner)
+
+    with pytest.raises(RuntimeError, match="alice api said no"):
+        alice_defs.alice_voice_recordings_import(build_asset_context())
+
+    assert len(warehouse.state_rows) == 1
+    row = warehouse.state_rows[0]
+    assert row["status"] == "failed"
+    assert "alice api said no" in row["error"]
+    # A failure must not advance the last-success marker.
+    assert row["last_success_at"] < row["updated_at"]
+
+
+def test_a_lock_skipped_poll_does_not_stamp_the_heartbeat(monkeypatch) -> None:
+    """A skip is not evidence the poller works.
+
+    Stamping here would let an overlap storm hold the pipeline green forever
+    while no poll ever completes. Nothing is lost by staying silent: whichever
+    run holds the lock stamps it.
+    """
+
+    class BusyLock:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> bool:
+            return False
+
+        def __exit__(self, *_exc) -> bool:
+            return False
+
+    warehouse = RecordingWarehouse()
+    _patch_import_asset(monkeypatch, warehouse, lock=BusyLock)
+
+    alice_defs.alice_voice_recordings_import(build_asset_context())
+
+    assert warehouse.state_rows == []
 
 
 class FakeConfig:

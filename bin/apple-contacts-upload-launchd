@@ -5,11 +5,10 @@ REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 UV="/opt/homebrew/bin/uv"
 # Keep the self-updating pdw binary out of the Full Disk Access chain. The
 # uploader still reads pdw's config, so `pdw login` remains the setup step.
-PDW_CONFIG="$HOME/.config/pdw/config.json"
-if [ -r "$PDW_CONFIG" ]; then
-  export PDW_API_URL="${PDW_API_URL:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["base_url"])' "$PDW_CONFIG" 2>/dev/null)}"
-  export PDW_SECRET_TOKEN="${PDW_SECRET_TOKEN:-$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$PDW_CONFIG" 2>/dev/null)}"
-fi
+# Sourced up here, not just before the heartbeat: pdw_export_app_credentials
+# has to run BEFORE the uploader so the uploader gets the URL/token too.
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_export_app_credentials
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/apple-contacts-upload.run.log"
 HEARTBEAT_FILE="$LOG_DIR/apple-contacts-upload.heartbeat"
@@ -33,7 +32,6 @@ finished_at_epoch="$(date +%s)"
 finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
-. "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 PDW_REPO_DIR="$REPO_DIR" PDW_UV="${UV:-uv}" pdw_post_heartbeat "apple_contacts" "$finished_at_iso" "$exit_code" "$duration_seconds"
 echo "[$finished_at_iso] finished Apple Contacts upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"

@@ -1,7 +1,8 @@
 # Shared helpers for the personal-data-warehouse upload wrappers and their
 # status helpers. This file is *sourced* (never executed directly) by
 # bin/*-upload-launchd, bin/*-upload-systemd, and bin/*-status* so that a single
-# implementation governs how run health is recorded and reported.
+# implementation governs how run health is recorded, credentialed, and
+# reported.
 #
 # Why this exists: the wrappers used to stamp a bare ISO timestamp into the
 # heartbeat file on *every* run, regardless of exit code. A job that fired every
@@ -44,6 +45,63 @@ pdw_record_run() {
   fi
 }
 
+# _pdw_config_value FILE KEY -> prints the JSON string at FILE[KEY], or nothing.
+# Uses the system python3 (macOS ships one; Linux hosts have one on PATH) so
+# credential resolution never depends on the repo venv being built.
+_pdw_config_value() {
+  _py="/usr/bin/python3"
+  [ -x "$_py" ] || _py="$(command -v python3 2>/dev/null)"
+  [ -n "$_py" ] || return 0
+  "$_py" -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], "") or "")
+except Exception:
+    pass' "$1" "$2" 2>/dev/null
+}
+
+# pdw_export_app_credentials
+# Export PDW_API_URL / PDW_SECRET_TOKEN from pdw's own config file (whatever
+# `pdw login` wrote), so a caller that is NOT inside the pdw CLI can still reach
+# the app.
+#
+# Why this lives here rather than in each wrapper: the heartbeat post runs
+# `uv run python -m personal_data_warehouse.uploader_heartbeat` DIRECTLY, so it
+# inherits none of the URL/token that `pdw ingest` resolves for the uploader it
+# sits next to. The five Apple wrappers had each hand-rolled this same config
+# read for their own uploaders (they keep pdw out of the exec chain to protect
+# their TCC grants), which incidentally made their heartbeats work. The two
+# agent-sessions wrappers run their uploader THROUGH pdw and so never needed to
+# -- and their heartbeat consequently failed on every run from the day it
+# shipped, ~288 times a day per Mac, straight into a launchd error log nobody
+# reads. The visible damage was on /pipelines: claude_code, codex, pi and
+# openclaw all sat at last_run_at NULL, so for those four sources "the uploader
+# died" and "Zach is not using this tool" were indistinguishable -- the exact
+# gap the heartbeat exists to close, open on the four pipelines that had no
+# other signal.
+#
+# Idempotent and non-destructive: an already-set value always wins, so an
+# operator or a wrapper pointing at a different origin is never overridden, and
+# a missing or unreadable config is a silent no-op (openclaw and CI have none).
+pdw_export_app_credentials() {
+  _cfg="${PDW_CONFIG:-$HOME/.config/pdw/config.json}"
+  [ -r "$_cfg" ] || return 0
+  if [ -z "${PDW_API_URL:-}" ]; then
+    _url="$(_pdw_config_value "$_cfg" base_url)"
+    if [ -n "$_url" ]; then
+      PDW_API_URL="$_url"
+      export PDW_API_URL
+    fi
+  fi
+  if [ -z "${PDW_SECRET_TOKEN:-}" ]; then
+    _tok="$(_pdw_config_value "$_cfg" token)"
+    if [ -n "$_tok" ]; then
+      PDW_SECRET_TOKEN="$_tok"
+      export PDW_SECRET_TOKEN
+    fi
+  fi
+  return 0
+}
+
 # pdw_post_heartbeat PIPELINES ISO EXIT_CODE DURATION_SECONDS
 # Post the run's verdict to the warehouse (ops.uploader_heartbeats) so
 # marts_ops.pipeline_health can tell a failing uploader from a quiet source.
@@ -58,6 +116,7 @@ pdw_post_heartbeat() {
   if [ -z "${PDW_REPO_DIR:-}" ] || [ -z "${PDW_UV:-}" ]; then
     return 0
   fi
+  pdw_export_app_credentials
   "$PDW_UV" run --directory "$PDW_REPO_DIR" python -m personal_data_warehouse.uploader_heartbeat \
     --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
     >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2

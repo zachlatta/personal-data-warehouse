@@ -231,6 +231,7 @@ var Objects = []CatalogObject{
 	{ID: "calendar_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_calendar_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "contact_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_contacts_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "google_drive_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_drive_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
+	{ID: "alice_voice_recordings_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "alice_voice_recordings_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "whoop_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "whoop_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "whoop_private_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "whoop_private_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "plaid_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "plaid_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},

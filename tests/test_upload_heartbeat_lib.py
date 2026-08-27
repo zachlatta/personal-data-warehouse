@@ -146,3 +146,102 @@ def test_post_heartbeat_never_changes_the_wrappers_exit_code(tmp_path: Path):
 def test_post_heartbeat_is_a_noop_without_a_repo_and_uv():
     out = _run('pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1; echo "rc=$?"')
     assert out.strip() == "rc=0"
+
+
+# --- credential resolution ----------------------------------------------------
+#
+# The heartbeat post runs `uv run python -m ...` DIRECTLY, outside the pdw CLI,
+# so it inherits none of the URL/token pdw resolves for `pdw ingest`. The two
+# agent-sessions wrappers run their uploader THROUGH pdw and so never exported
+# those variables themselves -- and their heartbeat therefore failed on every
+# run from the day it shipped, leaving claude_code, codex, pi and openclaw with
+# last_run_at NULL on /pipelines while the uploads themselves worked fine. The
+# five Apple wrappers only escaped because each had hand-rolled the same config
+# read for its own uploader. Resolving credentials here, once, is what makes the
+# heartbeat independent of how a given wrapper chose to invoke its uploader.
+
+
+def _pdw_config(tmp_path: Path, url: str = "https://warehouse.example", token: str = "s3cret") -> Path:
+    config = tmp_path / "config.json"
+    config.write_text(f'{{"base_url": "{url}", "token": "{token}", "client_name": "test"}}')
+    return config
+
+
+def _argv_env(tmp_path: Path, name: str = "uv") -> tuple[Path, Path]:
+    """A fake uv that records the PDW_API_URL/PDW_SECRET_TOKEN it was handed."""
+    fake_uv = tmp_path / name
+    fake_uv.write_text('#!/bin/sh\nprintf "%s|%s\\n" "${PDW_API_URL-unset}" "${PDW_SECRET_TOKEN-unset}" > "$FAKE_UV_LOG"\n')
+    fake_uv.chmod(0o755)
+    return fake_uv, tmp_path / "uv.log"
+
+
+def test_post_heartbeat_reaches_the_app_when_only_pdw_login_is_configured(tmp_path: Path):
+    """The regression: `pdw login` alone must be enough, as it is for the uploader."""
+    config = _pdw_config(tmp_path)
+    fake_uv, log = _argv_env(tmp_path)
+    _run(
+        'pdw_post_heartbeat "claude_code,codex,pi" "2026-08-27T03:00:00-04:00" 0 1',
+        env={
+            "PDW_UV": str(fake_uv),
+            "PDW_REPO_DIR": str(tmp_path),
+            "FAKE_UV_LOG": str(log),
+            "PDW_CONFIG": str(config),
+            "PDW_API_URL": "",
+            "PDW_SECRET_TOKEN": "",
+        },
+    )
+    assert log.read_text().strip() == "https://warehouse.example|s3cret"
+
+
+def test_export_app_credentials_never_overrides_an_explicit_environment(tmp_path: Path):
+    """A wrapper or an operator that set the vars deliberately always wins."""
+    config = _pdw_config(tmp_path)
+    out = _run(
+        'pdw_export_app_credentials; printf "%s|%s\\n" "$PDW_API_URL" "$PDW_SECRET_TOKEN"',
+        env={
+            "PDW_CONFIG": str(config),
+            "PDW_API_URL": "https://direct.example",
+            "PDW_SECRET_TOKEN": "explicit",
+        },
+    )
+    assert out.strip() == "https://direct.example|explicit"
+
+
+def test_export_app_credentials_is_a_noop_without_a_readable_config(tmp_path: Path):
+    """No config is the openclaw/CI case: skip quietly, never fail the run."""
+    out = _run(
+        'pdw_export_app_credentials; echo "rc=$? url=${PDW_API_URL-unset}"',
+        env={"PDW_CONFIG": str(tmp_path / "absent.json"), "PDW_API_URL": ""},
+    )
+    assert out.strip() == "rc=0 url="
+
+
+def test_no_upload_wrapper_hand_rolls_the_pdw_config_read():
+    """One implementation, in the lib -- the duplication is what let this rot.
+
+    Five wrappers each carried their own copy of the config read and the two
+    that did not were exactly the two whose heartbeat was broken. A new wrapper
+    must inherit the behaviour by sourcing the lib, not by copying the snippet.
+    """
+    bin_dir = LIB.parent
+    offenders = sorted(
+        path.name
+        for path in bin_dir.iterdir()
+        if path.is_file() and path.name != LIB.name and "json.load(open(sys.argv[1]))" in path.read_text(errors="ignore")
+    )
+    assert offenders == [], f"these wrappers duplicate pdw_export_app_credentials: {offenders}"
+
+
+def test_every_heartbeat_posting_wrapper_can_resolve_credentials():
+    """Sourcing the lib is the contract; calling the poster without it is a bug."""
+    bin_dir = LIB.parent
+    missing = []
+    for path in sorted(bin_dir.iterdir()):
+        if not path.is_file() or path.name == LIB.name:
+            continue
+        text = path.read_text(errors="ignore")
+        if "pdw_post_heartbeat" not in text:
+            continue
+        if "_pdw-upload-lib.sh" not in text:
+            missing.append(path.name)
+    assert missing == [], f"these wrappers post a heartbeat without sourcing the lib: {missing}"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from dagster import (
     DefaultScheduleStatus,
     Definitions,
@@ -33,6 +35,39 @@ ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
 ALICE_VOICE_RECORDINGS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_854
 
 
+#: Absence is the epoch here, as everywhere in the warehouse -- a poll that has
+#: never succeeded carries the sentinel rather than NULL.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _alice_state_row(
+    *,
+    account: str,
+    status: str,
+    error: str,
+    recordings_seen: int,
+    now: datetime,
+    last_success_at: datetime | None = None,
+) -> dict[str, object]:
+    """One Alice poll's verdict, shaped for ops.alice_voice_recordings_sync_state.
+
+    ``last_success_at`` stays at the epoch on a failure so that "it ran" and "it
+    worked" remain separate facts -- the same split ``pdw_record_run`` keeps for
+    the device uploaders, and the reason a chronically failing poller cannot
+    look healthy just by continuing to fire.
+    """
+    return {
+        "account": account,
+        "last_sync_type": "incremental",
+        "status": status,
+        "error": error,
+        "recordings_seen": recordings_seen,
+        "last_success_at": last_success_at or _EPOCH,
+        "updated_at": now,
+        "sync_version": int(now.timestamp() * 1000),
+    }
+
+
 def alice_object_store(config, settings):
     return build_object_store(
         google_drive_spec(
@@ -52,8 +87,10 @@ def alice_object_store(config, settings):
     retry_policy=RetryPolicy(max_retries=3, delay=60),
 )
 def alice_voice_recordings_import(context) -> MaterializeResult:
+    # require_postgres: the poll now records its own run state, which is this
+    # pipeline's only heartbeat.
     settings = load_settings(
-        require_postgres=False,
+        require_postgres=True,
         require_gmail=False,
         require_alice_voice_recordings=True,
     )
@@ -67,6 +104,10 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
     ) as acquired:
         if not acquired:
             context.log.warning("Skipping Alice voice recordings import because another run is already active")
+            # Deliberately no heartbeat: a skip is not evidence the poller
+            # works, and stamping here would let an overlap storm hold the
+            # pipeline green while no poll ever completes. The run that holds
+            # the lock stamps it.
             summary = None
         else:
             client = AliceApiClient(
@@ -75,14 +116,47 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
                 base_url=config.base_url,
                 timeout_seconds=config.request_timeout_seconds,
             )
-            summary = AliceVoiceRecordingsImportRunner(
-                account=config.account,
-                upload_requests=client.iter_recordings(),
-                object_store=alice_object_store(config, settings),
-                logger=context.log,
-                mode="incremental",
-                stage="library",
-            ).sync()
+            # This asset is the POLLER, so it is the only place that can say
+            # whether the daily poll happened and whether it worked -- the two
+            # facts /pipelines needs and could not get from data freshness,
+            # because Zach records a few times a year. Stamped here rather than
+            # in the downstream ingest asset, which Dagster never reaches when
+            # this one raises, i.e. in exactly the case worth recording.
+            warehouse = warehouse_from_settings(settings)
+            warehouse.ensure_alice_voice_recordings_tables()
+            try:
+                summary = AliceVoiceRecordingsImportRunner(
+                    account=config.account,
+                    upload_requests=client.iter_recordings(),
+                    object_store=alice_object_store(config, settings),
+                    logger=context.log,
+                    mode="incremental",
+                    stage="library",
+                ).sync()
+            except Exception as error:
+                warehouse.upsert_alice_voice_recordings_sync_state(
+                    _alice_state_row(
+                        account=config.account,
+                        status="failed",
+                        error=str(error),
+                        recordings_seen=0,
+                        now=datetime.now(tz=UTC),
+                    )
+                )
+                # Re-raised: the run stays red in Dagster AND the reason is on
+                # /pipelines. Swallowing it would trade one signal for the other.
+                raise
+            polled_at = datetime.now(tz=UTC)
+            warehouse.upsert_alice_voice_recordings_sync_state(
+                _alice_state_row(
+                    account=config.account,
+                    status="ok",
+                    error="",
+                    recordings_seen=summary.upload_requests_seen,
+                    now=polled_at,
+                    last_success_at=polled_at,
+                )
+            )
 
     return MaterializeResult(
         metadata={

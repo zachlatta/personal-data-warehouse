@@ -741,6 +741,29 @@ week or more must carry a `data_basis` saying where it came from
 exception: measurement says contact edits really do go 51 days quiet, so its data SLA is
 deliberately loose and its **hourly run heartbeat** is what catches it breaking.
 
+**Measure the gap between USES, not between rows** — and check the pipeline has a heartbeat
+before you loosen anything. Two pipelines were re-set on 2026-08-27 and each had made the
+opposite half of the mistake:
+
+- `pi` carried a 3-day SLA whose basis read "168 gaps, p95 0.06d, max 2.86d". Those are gaps
+  between consecutive *events*, and an agent session emits events seconds apart — the number
+  described how talkative a session is, never how often Zach opens the tool. Measured over
+  distinct days of use, pi has **8 days in its whole life and a longest gap of 40 days**, so
+  a 3-day SLA was alarming on Zach not using pi. It is 45 days now, and the uploader
+  heartbeat is what says the uploader is alive.
+- `alice_voice_recordings` had no run state **at all** — its own registry entry said "a daily
+  poller with no heartbeat, so data freshness is the only signal there is." Measured over 17
+  months, Zach records on 34 days with a longest gap of **223 days**, so no data SLA can both
+  catch the poller dying and stay quiet while he is not recording. It sat `stale`, dragging
+  four `marts_voice_memos`/`marts_calendar` views down with it, while the daily poll ran and
+  succeeded every day. The poll now stamps `ops.alice_voice_recordings_sync_state` (status,
+  error, `last_success_at`) and its data interval is 240 days, which is honestly close to
+  mute — the heartbeat is the detector.
+
+The rule both cases point at: **a loose data SLA is only honest when something else is
+tight.** Loosening one without a heartbeat is how `manual_finance` (`data=None`) made its own
+pipeline stopping in March 2026 "by construction not a detectable event".
+
 `tests/test_pipeline_health.py` enforces this against `POSTGRES_TABLES`, the raw-DDL tables,
 and the live schema — the same contract `TIMELINE_TABLE_COVERAGE` has, and the tests also
 assert the two registries cover exactly the same tables. **Adding a warehouse table means
@@ -760,6 +783,21 @@ for fifteen days with no way to say whether the uploader was healthy or the sour
 The five-minute uploaders must report within `UPLOADER_RUN_INTERVAL` (30 min: late at 1h,
 stale at 3h); the heartbeat is best-effort and never changes the uploader's own exit code.
 The `uploader_heartbeats` pipeline row says whether ANY device is reporting at all.
+
+**The heartbeat post runs OUTSIDE the pdw CLI, so it needs credentials of its own.**
+`pdw_post_heartbeat` shells out to `uv run python -m personal_data_warehouse.uploader_heartbeat`
+directly, which inherits none of the URL/token `pdw ingest` resolves for the uploader beside
+it. The five Apple wrappers each happened to export `PDW_API_URL`/`PDW_SECRET_TOKEN` from
+`~/.config/pdw/config.json` for their own uploaders (they keep `pdw` out of the exec chain to
+protect their TCC grants); the two agent-sessions wrappers run *through* `pdw` and so never
+did — and their heartbeat therefore failed on **every** run from the day it shipped, ~288
+times a day per Mac, into a launchd error log nobody reads. `claude_code`, `codex`, `pi` and
+`openclaw` all sat at `last_run_at` NULL, so for those four "the uploader died" and "Zach is
+not using this tool" were indistinguishable — the exact gap the heartbeat exists to close,
+open on the four pipelines with no other signal. Credential resolution now lives once in
+`pdw_export_app_credentials` in `bin/_pdw-upload-lib.sh` and every wrapper inherits it by
+sourcing the lib; `tests/test_upload_heartbeat_lib.py` fails if a wrapper hand-rolls the
+config read again, or posts a heartbeat without sourcing the lib.
 
 - Collector: the `pipeline_health` Dagster asset (`*/10 * * * *`) probes `max(<column>)` per
   table and writes `ops.pipeline_health` + `ops.pipeline_table_freshness`. It only probes a

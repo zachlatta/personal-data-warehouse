@@ -665,20 +665,34 @@ PIPELINES: tuple[Pipeline, ...] = (
         "Alice Voice Recordings",
         cadence="daily 04:17",
         transport="Dagster alice_voice_recordings → Alice API",
-        data=7 * DAY,
-        # The event side is judged far more loosely than the ingest side, and
-        # on purpose: Zach's recording habit is bursty (51 measured event gaps,
-        # p90 16.19d, max 223.19d), but the DAILY POLLER writing nothing for
-        # weeks is not bursty, it is a poller that stopped.
-        event=30 * DAY,
+        data=240 * DAY,
+        # Deliberately NOT overridden: event lateness escalates the pipeline
+        # exactly like write lateness, so a loose data interval beside a tight
+        # event one leaves the pipeline just as red. Both sides are the same
+        # fact here -- the poller writes when there is a recording to write.
         basis=(
-            "a daily poller with no heartbeat, so data freshness is the only"
-            " signal there is. Ingest gaps carry none: every recording the"
-            " warehouse holds arrived in a single 53-row batch on 2026-07-10, so"
-            " 7d (late at 14d, stale at 42d) is set from the poll cadence with"
-            " headroom rather than from a distribution that does not exist"
+            "measured 2026-08-27 over gaps between USES: 34 days of use across"
+            " 17 months (2024-12-07 to 2026-04-27), 33 gaps, p90 17d and a"
+            " longest of 223d. 240d clears that longest real gap, which makes"
+            " data freshness nearly mute here — and that is the point. It is"
+            " not an expectation about recordings; the RUN HEARTBEAT is this"
+            " pipeline's detector, and it is the tight number. The previous 7d"
+            " ingest / 30d event pair was set from the poll cadence because"
+            " Alice had no heartbeat at all, and it duly reported 'stale' for"
+            " weeks — holding four marts_voice_memos / marts_calendar views"
+            " stale with it — while the daily poll ran and succeeded every day"
         ),
-        note="poller runs daily; a week of silence means it stopped, not that Zach went quiet",
+        run=2 * DAY,
+        state=StateSource(
+            table="alice_voice_recordings_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "quiet means Zach is not recording; the daily poll's own heartbeat"
+            " is what says the poller is alive"
+        ),
     ),
     _source(
         "apple_photos",
@@ -723,15 +737,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         "pi sessions",
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent tails ~/.pi/agent/sessions → /ingest/agent-sessions/batch",
-        data=3 * DAY,
+        data=45 * DAY,
         basis=(
-            "measured: 168 gaps, p95 0.06d, max 2.86d. The previous 30d could not"
-            " reach 'late' until sixty days, which is how this source sat quiet"
-            " for five weeks under a green dot; 3d puts late at 6d — still twice"
-            " the longest silence in two years — and stale at 18d"
+            "measured 2026-08-27 over gaps BETWEEN USES, not between events: 8"
+            " distinct days of use in the source's whole life (2026-05-19 to"
+            " 2026-07-16), 7 gaps, longest 40d. The previous 3d came from"
+            " measuring gaps between consecutive events, and an agent session"
+            " emits those seconds apart — that number described how talkative a"
+            " session is, never how often Zach opens the tool, so it alarmed on"
+            " him simply not using pi. 45d clears the longest real gap; late at"
+            " 90d and stale at 270d are deliberately far out because DATA"
+            " freshness is not this source's detector — the uploader heartbeat"
+            " is, and it is checked every 30 minutes"
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("pi"),
+        note=(
+            "quiet means Zach is not using pi; the run heartbeat, not data"
+            " freshness, is what says the uploader is alive"
+        ),
     ),
     _source(
         "claude_desktop",
@@ -1194,6 +1218,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # Alice
     "alice_voice_recordings": _data("alice_voice_recordings", "ingested_at", "recorded_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
+    "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos
     "apple_photos_files": _data("apple_photos", "ingested_at", "captured_at"),
     "photo_assets": _data("photo_identity", "updated_at", "capture_ts"),
