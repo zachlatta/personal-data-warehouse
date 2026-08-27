@@ -420,6 +420,40 @@ def test_publish_chatgpt_session_signs_json_body() -> None:
     assert b"__Secure-next-auth.session-token=tok" in call["data"]
 
 
+def test_post_heartbeat_signs_the_run_verdict() -> None:
+    session = _FakeJSONSession({"ok": True})
+    client = IngestClient(
+        base_url="https://app.example.test/",
+        signing_key=b"0123456789abcdef0123456789abcdef",
+        session=session,
+        now=lambda: 1700000000.0,
+        link_ttl_seconds=900,
+    )
+    client.post_heartbeat(
+        pipeline="apple_notes",
+        device="porygon",
+        ran_at="2026-08-27T03:00:00+00:00",
+        exit_code=1,
+        duration_seconds=12,
+        error="x" * 700,
+    )
+    call = session.calls[0]
+    parts = urlsplit(call["url"])
+    assert parts.path == "/ingest/heartbeat"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    expected_sha = hashlib.sha256(call["data"]).hexdigest()
+    assert q["content_sha256"] == expected_sha
+    assert q["sig"] == sign_object_upload(
+        b"0123456789abcdef0123456789abcdef", "/ingest/heartbeat", expected_sha, 1700000000 + 900
+    )
+    body = json.loads(call["data"])
+    assert body["pipeline"] == "apple_notes"
+    assert body["device"] == "porygon"
+    assert body["exit_code"] == 1
+    assert body["duration_seconds"] == 12
+    assert len(body["error"]) == 500
+
+
 # Object keys are now built only by the app (Go); see
 # app/internal/server/ingest_test.go for the key/tag assertions.
 

@@ -44,6 +44,26 @@ pdw_record_run() {
   fi
 }
 
+# pdw_post_heartbeat PIPELINES ISO EXIT_CODE DURATION_SECONDS
+# Post the run's verdict to the warehouse (ops.uploader_heartbeats) so
+# marts_ops.pipeline_health can tell a failing uploader from a quiet source.
+# PIPELINES is comma-separated (the agent-sessions uploader covers several).
+# Needs PDW_REPO_DIR and PDW_UV from the wrapper; best effort — never changes
+# the uploader's own exit code, and a missing config just skips.
+pdw_post_heartbeat() {
+  _pipelines="$1"
+  _iso="$2"
+  _code="$3"
+  _duration="${4:-0}"
+  if [ -z "${PDW_REPO_DIR:-}" ] || [ -z "${PDW_UV:-}" ]; then
+    return 0
+  fi
+  "$PDW_UV" run --directory "$PDW_REPO_DIR" python -m personal_data_warehouse.uploader_heartbeat \
+    --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
+    >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
+  return 0
+}
+
 # _pdw_file_mtime FILE -> epoch seconds of the file's mtime (GNU then BSD stat).
 _pdw_file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null

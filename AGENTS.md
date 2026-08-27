@@ -682,8 +682,18 @@ adding it to both.**
 
 Data freshness is measured only from `data` tables, deliberately: Slack refreshing its user
 directory daily must not make Slack look healthy while message ingestion is frozen. Run
-freshness comes from the `state` tables (an uploader pushing from a Mac has no in-warehouse
-heartbeat, so it only has data freshness — which is why a quiet uploader is worth alarming on).
+freshness comes from the `state` tables. **Remote-device uploaders report their runs too**:
+after every run, `bin/_pdw-upload-lib.sh` (`pdw_post_heartbeat`) posts the wrapper's observed
+exit code, duration and error to `POST /ingest/heartbeat`, which upserts one row per
+(pipeline, device) into `ops.uploader_heartbeats`. Each uploader pipeline
+(`apple_notes`, `apple_messages`, `apple_contacts`, `apple_voice_memos`, `apple_photos`,
+`claude_code`, `codex`, `pi`, `openclaw`) declares that table as its `StateSource` with a
+`scope_column`/`scope_value` filter, so a LaunchAgent that fires and fails reads `failing`
+on `/pipelines` instead of merely `late` — until 2026-08-27 `apple_voice_memos` sat `late`
+for fifteen days with no way to say whether the uploader was healthy or the source quiet.
+The five-minute uploaders must report within `UPLOADER_RUN_INTERVAL` (30 min: late at 1h,
+stale at 3h); the heartbeat is best-effort and never changes the uploader's own exit code.
+The `uploader_heartbeats` pipeline row says whether ANY device is reporting at all.
 
 - Collector: the `pipeline_health` Dagster asset (`*/10 * * * *`) probes `max(<column>)` per
   table and writes `ops.pipeline_health` + `ops.pipeline_table_freshness`. It only probes a
@@ -774,7 +784,11 @@ someone notices a gap in an answer).
    [Client uploads via the app](#client-uploads-via-the-app-the-write-path-for-remote-devices).
 3. **The Dagster reader** — the `<source>_drive_inbox_sensor` + `<source>_drive_ingest` asset
    that promotes inbox objects into the raw table, and its schedule/sensor wiring.
-   **SILENT.**
+   **SILENT.** A remote-device uploader also posts its run heartbeat via
+   `pdw_post_heartbeat` in its `bin/*-upload-*` wrapper and declares
+   `state=_uploader_heartbeat("<pipeline>")` in `PIPELINES` — **ENFORCED** for the
+   listed uploaders (`test_every_remote_device_uploader_declares_a_run_heartbeat`),
+   silent for a brand-new one.
 
 **Making it a warehouse object**
 
@@ -868,6 +882,12 @@ asset everyone ignores. Four things about it are load-bearing:
   ride the database default and **zero** use ICU, yet **871** ICU collations report drift;
   surfacing those buries the signal on day one, so the query joins through
   `pg_index`/`pg_attribute.attcollation` and reports only collations with a dependent index.
+- **`unavailable` describes the extension, not the index.** An index whose last recorded
+  amcheck verdict is `unavailable` is restored as `never_checked` (view status `unmeasured`)
+  once `amcheck` is installed, and the daily rotation reaches it. Production carried 114 such
+  rows as `attention` for weeks after the extension existed — a measurement gap presented as
+  a finding, which is the permanently-red-row pattern that buries real ones. `unavailable`
+  still reads `attention` while the extension is genuinely missing.
 - **The duplicate-key probe applies each index's partial predicate** and skips expression
   indexes (`indkey` containing 0) and heaps over `DIVERGENCE_MAX_HEAP_BYTES` (2 GiB, which
   still covers both tables that actually accumulated duplicates). It is corroboration only:

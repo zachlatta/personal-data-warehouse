@@ -38,6 +38,7 @@ duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 . "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+PDW_REPO_DIR="$REPO_DIR" PDW_UV="${UV:-uv}" pdw_post_heartbeat "claude_code,codex,pi" "$finished_at_iso" "$exit_code" "$duration_seconds"
 echo "[$finished_at_iso] finished agent sessions upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

@@ -293,6 +293,39 @@ class IngestClient:
             params={},
         )
 
+    def post_heartbeat(
+        self,
+        *,
+        pipeline: str,
+        device: str,
+        ran_at: str,
+        exit_code: int,
+        duration_seconds: int = 0,
+        error: str = "",
+    ) -> Mapping[str, Any]:
+        """Record one uploader run in ops.uploader_heartbeats via the app.
+
+        Posted by the upload wrapper AFTER the uploader exits, so the row
+        carries the real exit code; the wrapper's local heartbeat file is the
+        same fact for a person at the keyboard, this is the same fact for
+        marts_ops.pipeline_health.
+        """
+        payload = {
+            "pipeline": pipeline,
+            "device": device,
+            "ran_at": ran_at,
+            "exit_code": int(exit_code),
+            "duration_seconds": int(duration_seconds),
+            "error": error[:500],
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._signed_post(
+            "/ingest/heartbeat",
+            body=body,
+            content_type="application/json",
+            params={},
+        )
+
     def publish_whoop_private_session(
         self,
         *,

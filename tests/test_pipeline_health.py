@@ -127,7 +127,13 @@ def test_pipeline_metadata_is_complete():
         if entry.expected_run_interval is not None:
             assert entry.state is not None, entry.id
         if entry.state is not None:
-            assert pipeline_tables(entry.id, role="state"), entry.id
+            # A scoped StateSource reads a SHARED heartbeat table that belongs
+            # to another pipeline (ops.uploader_heartbeats holds every remote
+            # uploader's runs); an unscoped one must own a state table.
+            if entry.state.scope_column:
+                assert entry.state.table in TABLE_PIPELINES, entry.id
+            else:
+                assert pipeline_tables(entry.id, role="state"), entry.id
 
 
 def test_table_coverage_roles_and_columns_are_valid():
@@ -568,6 +574,65 @@ def test_terminal_gone_state_rows_do_not_surface_as_failures(warehouse):
     assert row["state_error_rows"] == 0
     assert row["last_error"] is None
     assert row["last_error_at"] is None
+
+
+def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(warehouse):
+    """A Mac uploader that fires and fails must read `failing`, not `late`.
+
+    Until ops.uploader_heartbeats the remote-device uploaders had no run
+    heartbeat at all, so apple_voice_memos sat `late` for fifteen days with no
+    way to say whether the LaunchAgent was healthy. The table holds every
+    uploader's runs keyed by (pipeline, device), and the StateSource scope
+    filter is what keeps one uploader's success from greening another.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @uploader_heartbeats
+            (pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at, sync_version)
+        VALUES
+            ('apple_notes', 'porygon', %s, 'error', 'PermissionError: Operation not permitted', 1, 3, %s, 2),
+            ('apple_messages', 'porygon', %s, 'ok', '', 0, 5, %s, 2),
+            ('claude_code', 'porygon', %s, 'ok', '', 0, 5, %s, 2)
+        """,
+        (now, now, now, now, now - timedelta(hours=5), now - timedelta(hours=5)),
+    )
+    PipelineHealthCollector(warehouse).run()
+
+    rows = {
+        row["pipeline"]: row
+        for row in warehouse._query_dicts(
+            "SELECT pipeline, status, run_status, state_rows, state_error_rows, last_error, last_run_at"
+            " FROM @marts_pipeline_health"
+            " WHERE pipeline IN ('apple_notes', 'apple_messages', 'claude_code', 'codex', 'uploader_heartbeats')"
+        )
+    }
+    assert rows["apple_notes"]["status"] == "failing"
+    assert rows["apple_notes"]["state_rows"] == 1
+    assert rows["apple_notes"]["last_error"] == "PermissionError: Operation not permitted"
+    # Only its own row: the notes failure does not leak into messages.
+    assert rows["apple_messages"]["state_error_rows"] == 0
+    assert rows["apple_messages"]["run_status"] == "ok"
+    # A heartbeat five hours old on a thirty-minute cadence is past stale (6x).
+    assert rows["claude_code"]["run_status"] == "stale"
+    # No row at all is not a failure, it is the absence of a heartbeat.
+    assert rows["codex"]["state_rows"] == 0
+    assert rows["codex"]["run_status"] in ("no_data", "unmonitored")
+    assert rows["uploader_heartbeats"]["status"] == "ok"
+
+
+def test_every_remote_device_uploader_declares_a_run_heartbeat():
+    """Every pipeline fed by a Mac/VM uploader reads ops.uploader_heartbeats."""
+    for pipeline_id in (
+        "apple_notes", "apple_messages", "apple_contacts", "apple_voice_memos",
+        "apple_photos", "claude_code", "codex", "openclaw", "pi",
+    ):
+        entry = pipeline(pipeline_id)
+        assert entry.state is not None, pipeline_id
+        assert entry.state.table == "uploader_heartbeats", pipeline_id
+        assert entry.state.scope_value == pipeline_id, pipeline_id
+        assert entry.expected_run_interval is not None, pipeline_id
 
 
 def test_a_stale_snapshot_reports_unknown_instead_of_stale_facts(warehouse):

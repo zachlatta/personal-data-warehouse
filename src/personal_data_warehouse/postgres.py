@@ -70,6 +70,7 @@ from personal_data_warehouse.schema import (
     PHOTO_SOURCE_FILE_COLUMNS,
     COLLATION_HEALTH_COLUMNS,
     PGBACKREST_HEALTH_COLUMNS,
+    UPLOADER_HEARTBEAT_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
     PIPELINE_TABLE_FRESHNESS_COLUMNS,
@@ -915,6 +916,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "mart_view_health": TableSpec(MART_VIEW_HEALTH_COLUMNS, ("view_id",), "collected_at"),
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
+    "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
 }
 
 # Every table whose rows belong to exactly one linked Plaid Item, data first
@@ -2060,6 +2062,7 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "ran_at",
     "amcheck_at",
     # search embedding drain cursors (search_chunk_sync_state)
     "embed_fresh_built_at",
@@ -4019,6 +4022,7 @@ class PostgresWarehouse:
                 "collation_health",
                 "search_health",
                 "pgbackrest_health",
+                "uploader_heartbeats",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing

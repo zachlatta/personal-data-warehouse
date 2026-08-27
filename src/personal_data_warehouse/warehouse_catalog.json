@@ -2074,6 +2074,17 @@
       "secret": false
     },
     {
+      "id": "uploader_heartbeats",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "uploader_heartbeats",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "pgbackrest_health",
       "kind": "table",
       "layer": "ops",

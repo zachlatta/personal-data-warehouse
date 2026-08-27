@@ -179,7 +179,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # browser-session credential. Search convergence adds one ops row;
         # slack_sessions adds the captured Slack client session that lets the
         # sync ask client.counts what changed instead of polling everything.
-        "ops": 28,
+        # +1 ops: ops.uploader_heartbeats, the run verdict every remote-device
+        # uploader posts, which is the first in-warehouse heartbeat those
+        # pipelines have had.
+        "ops": 29,
         # +1 private: push_devices, the iOS app's registered push tokens.
         "private": 8,
         "internal": 2,

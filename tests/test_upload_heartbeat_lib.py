@@ -110,3 +110,39 @@ def test_health_reports_never_when_no_success_yet(tmp_path: Path):
     out = _run(f'pdw_print_health "{hb}"')
     assert "Health: FAILING" in out
     assert "last success: never" in out
+
+
+def test_post_heartbeat_invokes_the_python_module_with_the_run_verdict(tmp_path: Path):
+    """The wrapper ships the exit code it observed; the fake uv records the argv."""
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_UV_LOG"\n')
+    fake_uv.chmod(0o755)
+    log = tmp_path / "uv.log"
+    out = _run(
+        'pdw_post_heartbeat "claude_code,codex" "2026-08-27T03:00:00-04:00" 1 42; echo "rc=$?"',
+        env={"PDW_UV": str(fake_uv), "PDW_REPO_DIR": str(tmp_path), "FAKE_UV_LOG": str(log)},
+    )
+    assert out.strip().endswith("rc=0")
+    argv = log.read_text().split("\n")
+    assert argv[:4] == ["run", "--directory", str(tmp_path), "python"]
+    assert "personal_data_warehouse.uploader_heartbeat" in argv
+    assert argv[argv.index("--pipeline") + 1] == "claude_code,codex"
+    assert argv[argv.index("--exit-code") + 1] == "1"
+    assert argv[argv.index("--duration-seconds") + 1] == "42"
+    assert argv[argv.index("--ran-at") + 1] == "2026-08-27T03:00:00-04:00"
+
+
+def test_post_heartbeat_never_changes_the_wrappers_exit_code(tmp_path: Path):
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\nexit 7\n")
+    fake_uv.chmod(0o755)
+    out = _run(
+        'pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1 2>/dev/null; echo "rc=$?"',
+        env={"PDW_UV": str(fake_uv), "PDW_REPO_DIR": str(tmp_path)},
+    )
+    assert out.strip() == "rc=0"
+
+
+def test_post_heartbeat_is_a_noop_without_a_repo_and_uv():
+    out = _run('pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1; echo "rc=$?"')
+    assert out.strip() == "rc=0"

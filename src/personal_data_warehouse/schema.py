@@ -2169,6 +2169,23 @@ MART_VIEW_HEALTH_COLUMNS = (
 #: production reported `status: error (no valid backups)` and had for a day,
 #: while WAL archiving kept working, every pipeline read green, and the loop
 #: logged "backup failed" to stdout every six hours where nothing escalated it.
+# One row per (pipeline, device) from the machines that push data through the
+# app's /ingest/* endpoints: the run's own verdict, posted by the upload
+# wrapper after the uploader exits. It is the only in-warehouse heartbeat a
+# laptop uploader has; without it a run that fires every five minutes and
+# fails every time is indistinguishable from a quiet source.
+UPLOADER_HEARTBEAT_COLUMNS = (
+    "pipeline",
+    "device",
+    "ran_at",
+    "status",
+    "error",
+    "exit_code",
+    "duration_seconds",
+    "updated_at",
+    "sync_version",
+)
+
 PGBACKREST_HEALTH_COLUMNS = (
     "stanza",
     # pgBackRest's own words, from `info --output=json`: "ok", "error", or the

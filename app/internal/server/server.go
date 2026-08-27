@@ -364,6 +364,23 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 			mux.Handle(claudeDesktopCredentialEndpoint, credSvc.handler())
 			logger.Info("claude desktop credential ingestion enabled", "endpoint", claudeDesktopCredentialEndpoint)
 		}
+
+		// Uploader run heartbeats: the only way a laptop uploader's run health
+		// reaches marts_ops.pipeline_health. Same signer, Postgres only.
+		hbStore, hbErr := newUploaderHeartbeatStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if hbErr != nil {
+			logger.Error("uploader heartbeat store failed to initialize; heartbeats disabled", "error", hbErr.Error())
+		} else {
+			hbSvc := &heartbeatIngestService{
+				store:    hbStore,
+				signer:   authSvc,
+				maxBytes: cfg.IngestMaxObjectBytes,
+				timeout:  cfg.QueryTimeout,
+				logger:   logger,
+			}
+			mux.Handle(uploaderHeartbeatEndpoint, hbSvc.handler())
+			logger.Info("uploader heartbeat ingestion enabled", "endpoint", uploaderHeartbeatEndpoint)
+		}
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())

@@ -299,6 +299,13 @@ class StateSource:
     #: deliberately unclassified.
     error_statuses: tuple[str, ...] = ("error", "failed")
     attention_statuses: tuple[str, ...] = ("action_required",)
+    #: Restrict the aggregate to rows whose ``scope_column`` equals
+    #: ``scope_value``. ``ops.uploader_heartbeats`` holds every uploader's runs
+    #: in one table keyed by (pipeline, device), so each pipeline reads only
+    #: its own rows; without the filter one healthy uploader would keep every
+    #: other uploader's run status green.
+    scope_column: str = ""
+    scope_value: str = ""
 
 
 #: ``expected_event_interval`` sentinel meaning "judge event time on the data
@@ -397,6 +404,23 @@ class TableFreshness:
     note: str = ""
 
 
+def _uploader_heartbeat(pipeline_id: str) -> StateSource:
+    """The run heartbeat a remote-device uploader posts after every run.
+
+    The wrapper posts one row per (pipeline, device) to /ingest/heartbeat with
+    the uploader's exit code, so a Mac LaunchAgent that fires and fails is
+    ``failing`` here instead of merely "quiet". Status is ``ok``/``error``.
+    """
+    return StateSource(
+        table="uploader_heartbeats",
+        updated_column="ran_at",
+        status_column="status",
+        error_column="error",
+        scope_column="pipeline",
+        scope_value=pipeline_id,
+    )
+
+
 def _source(
     id: str,
     label: str,
@@ -426,8 +450,14 @@ def _source(
 
 
 DAY = timedelta(days=1)
+
 HOUR = timedelta(hours=1)
 MINUTE = timedelta(minutes=1)
+
+#: How often the five-minute uploaders must report. The ladder's 2x/6x
+#: multipliers put late at one hour and stale at three: a laptop asleep for
+#: an evening reads late, a LaunchAgent that stopped firing reads stale.
+UPLOADER_RUN_INTERVAL = 30 * MINUTE
 
 # Every ``data_basis`` below that says "measured" was taken from the production
 # corpus on 2026-08-23 with this shape, over a 730-day window: the distinct
@@ -512,11 +542,12 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis=(
             "measured: only 6 gaps, p90 8.30d, max 8.43d — a sparse sample, so"
             " the interval is set well above it rather than fitted to it. 21d"
-            " (late at 42d) is the tightest honest bound: unlike google_contacts"
-            " this uploader keeps no heartbeat, so data freshness is the ONLY"
-            " in-warehouse signal that the Mac stopped pushing"
+            " (late at 42d) is the tightest honest bound; the run heartbeat in"
+            " ops.uploader_heartbeats is what catches the Mac not pushing"
         ),
-        note="no in-warehouse heartbeat; check bin/apple-contacts-upload-status on the Mac",
+        note="run heartbeat posted by bin/apple-contacts-upload-launchd",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("apple_contacts"),
     ),
     _source(
         "google_drive",
@@ -552,7 +583,9 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent → /ingest/apple-messages/batch → Drive inbox → Dagster",
         data=2 * DAY,
-        note="no in-warehouse heartbeat; check bin/apple-messages-upload-status on the Mac",
+        note="run heartbeat posted by bin/apple-messages-upload-launchd",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("apple_messages"),
     ),
     _source(
         "whatsapp",
@@ -571,6 +604,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Mac LaunchAgent → /ingest/apple-notes/* → Drive inbox → Dagster",
         data=3 * DAY,
         note="quiet usually means iCloud stopped delivering to the Mac, not that nothing changed",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("apple_notes"),
     ),
     _source(
         "apple_voice_memos",
@@ -583,6 +618,8 @@ PIPELINES: tuple[Pipeline, ...] = (
             " a voice memo hourly, but two years of history says they have never"
             " gone a week. 7d puts late at 14d and stale at 42d"
         ),
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("apple_voice_memos"),
     ),
     _source(
         "alice_voice_recordings",
@@ -610,6 +647,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="uploader every 30 min",
         transport="Mac LaunchAgent → PhotoKit export → /ingest/photos/* → Drive inbox → Dagster",
         data=3 * DAY,
+        run=2 * HOUR,
+        state=_uploader_heartbeat("apple_photos"),
     ),
     _source(
         "claude_code",
@@ -617,6 +656,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="uploader every 5 min",
         transport="Mac LaunchAgent tails ~/.claude/projects → /ingest/agent-sessions/batch",
         data=2 * DAY,
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("claude_code"),
     ),
     _source(
         "codex",
@@ -625,6 +666,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Mac LaunchAgent tails ~/.codex/sessions → /ingest/agent-sessions/batch",
         data=7 * DAY,
         basis="measured: 2,479 gaps, p95 0.06d, max 3.94d — 7d leaves ample headroom",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("codex"),
     ),
     _source(
         "openclaw",
@@ -633,6 +676,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="openclaw VM systemd timer → /ingest/agent-sessions/batch",
         data=7 * DAY,
         basis="measured: 5,558 gaps, p95 0.02d, max 1.14d — 7d leaves ample headroom",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("openclaw"),
     ),
     _source(
         "pi",
@@ -646,6 +691,8 @@ PIPELINES: tuple[Pipeline, ...] = (
             " for five weeks under a green dot; 3d puts late at 6d — still twice"
             " the longest silence in two years — and stale at 18d"
         ),
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("pi"),
     ),
     _source(
         "claude_desktop",
@@ -916,6 +963,19 @@ PIPELINES: tuple[Pipeline, ...] = (
         expected_run_interval=None,
     ),
     Pipeline(
+        id="uploader_heartbeats",
+        label="Uploader run heartbeats",
+        kind="internal",
+        cadence="every uploader run",
+        transport="bin/_pdw-upload-lib.sh → POST /ingest/heartbeat → ops.uploader_heartbeats",
+        expected_data_interval=30 * MINUTE,
+        expected_run_interval=None,
+        note=(
+            "one row per (pipeline, device); each uploader pipeline reads its own"
+            " rows as its run heartbeat, this row says whether ANY device is reporting"
+        ),
+    ),
+    Pipeline(
         # Separate from pipeline_health on purpose: this one costs a sequential
         # scan of every unique index's heap under the size ceiling (~2 GB of
         # reads on the production shape), which is a daily amount of work, not a
@@ -1176,6 +1236,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         "collected_at",
         note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
     ),
+    "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
     "pgbackrest_health": _data(
         "pgbackrest",
         "collected_at",
@@ -1887,11 +1948,14 @@ class PipelineHealthCollector:
         sql = (
             f"SELECT {', '.join(selects)} FROM {_ident(relation.schema)}.{_ident(relation.name)}"
         )
-        params = {
+        params: dict[str, Any] = {
             "errors": list(source.error_statuses),
             "attention": list(source.attention_statuses),
             "alarm": list(source.error_statuses) + list(source.attention_statuses),
         }
+        if source.scope_column:
+            sql += f" WHERE {_ident(source.scope_column)} = %(scope)s"
+            params["scope"] = source.scope_value
         try:
             rows = self._warehouse._query_dicts(sql, params)
         except psycopg2.Error as error:
