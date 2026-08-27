@@ -279,3 +279,27 @@ def test_health_is_reported_at_startup_before_the_first_sleep() -> None:
     startup = startup[: startup.index("local interval=")]
 
     assert 'report_health "" 1 ""' in startup, "startup must refresh the health row"
+
+
+def test_an_interrupted_restore_can_be_resumed_in_place() -> None:
+    """A 223 GB restore over SFTP is long enough to be interrupted.
+
+    Observed 2026-08-27: a diff restore aborted 52 minutes in with
+    `FileMissingError` on a file that then read back perfectly three times in a
+    row -- a transient SFTP read, not a damaged repository.  The wrapper refused
+    to restart into the partially-restored directory, so the only way forward
+    was to discard 219 GB and begin again, turning a blip into an hour.
+
+    pgBackRest already passes --delta and can reuse what is correct on disk.
+    Resuming must stay opt-in, because restoring over a live PGDATA is exactly
+    the accident the guard exists to prevent.
+    """
+
+    restore = (REPO_ROOT / "docker/postgres-pgbackrest/restore.sh").read_text()
+
+    assert "PDW_PGBACKREST_RESTORE_RESUME" in restore
+    assert "refusing to restore into non-empty PGDATA" in restore, (
+        "the default must still refuse"
+    )
+    # The guard must not be bypassable by accident: an unset variable refuses.
+    assert 'bool_enabled "${PDW_PGBACKREST_RESTORE_RESUME:-}"' in restore
