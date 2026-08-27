@@ -35,3 +35,24 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: npx eas-cli update --channel preview --auto --non-interactive
+      # An OTA update only reaches an install whose native fingerprint matches.
+      # When the fingerprint moved (new native package, iOS config), queue a
+      # new preview build; its link is on expo.dev and Zach reinstalls once.
+      - name: Queue a native build when the fingerprint changed
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          last=$(npx eas-cli build:list --platform ios --profile preview --status finished --limit 1 --json --non-interactive | python3 -c 'import json,sys; b=json.load(sys.stdin); print(b[0]["id"] if b else "")')
+          if [ -z "$last" ]; then echo "no finished preview build yet; building"; npx eas-cli build --platform ios --profile preview --non-interactive --no-wait; exit 0; fi
+          npx eas-cli fingerprint:compare --build-id "$last" --json --non-interactive > /tmp/fp.json
+          python3 - <<'PY'
+          import json,subprocess,sys
+          d=json.load(open('/tmp/fp.json'))
+          a=d['fingerprint1']['hash']; b=d['fingerprint2']['hash']
+          print('project', a, 'last build', b)
+          if a==b:
+              print('native fingerprint unchanged; OTA update is enough'); sys.exit(0)
+          print('native fingerprint changed; queueing a preview build')
+          subprocess.check_call(['npx','eas-cli','build','--platform','ios','--profile','preview','--non-interactive','--no-wait'])
+          PY

@@ -12,6 +12,13 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="search"
+        options={{
+          title: 'Search',
+          tabBarIcon: ({ color, size }) => <SymbolView name="magnifyingglass" tintColor={color} size={size} />,
+        }}
+      />
+      <Tabs.Screen
         name="mutations"
         options={{
           title: 'Mutations',

@@ -214,3 +214,53 @@ export async function sendTestPush(config: AppConfig): Promise<PushReport> {
 export async function probe(config: AppConfig): Promise<void> {
   await request<unknown>(config, '/api/timeline?limit=1');
 }
+
+// --- search (the app's hybrid search tool, POST /api/tools/search) --------
+
+export type SearchMode = 'hybrid' | 'keyword' | 'exact';
+
+export type SearchHit = {
+  source: string;
+  subsource?: string;
+  context?: string;
+  who?: string;
+  occurred_at: string;
+  account?: string;
+  ref: string;
+  text: string;
+  score?: number;
+  event_ts?: string;
+  title?: string;
+  source_table?: string;
+  source_pk?: Record<string, unknown> | string;
+  priority?: Priority;
+};
+
+export type SearchResult = {
+  query: string;
+  mode: string;
+  total_rows: number;
+  rows: SearchHit[];
+  hint?: string;
+  fallback_reason?: string;
+  error?: string;
+};
+
+export async function search(
+  config: AppConfig,
+  input: { query: string; mode?: SearchMode; max_results?: number; priorities?: Priority[]; sources?: string[]; since?: string },
+): Promise<SearchResult> {
+  const body = await request<{ data: SearchResult }>(config, '/api/tools/search', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return { ...body.data, rows: body.data.rows ?? [] };
+}
+
+// A search hit's ref is "<adapter>:<event_id>"; the timeline item endpoint
+// wants the two halves.
+export function splitRef(ref: string): { adapter: string; eventId: string } | null {
+  const idx = ref.indexOf(':');
+  if (idx <= 0) return null;
+  return { adapter: ref.slice(0, idx), eventId: ref.slice(idx + 1) };
+}
