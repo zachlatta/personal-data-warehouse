@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -502,6 +503,46 @@ func TestSearchHintsWhenTheQueryIsPhrasedAsASentence(t *testing.T) {
 	}
 	if !strings.Contains(resp.Hint, "record") {
 		t.Fatalf("the hint must say what to rewrite TOWARD; got %q", resp.Hint)
+	}
+}
+
+func bulkHits(tiers ...string) RawResult {
+	rows := make([]map[string]any, 0, len(tiers))
+	for i, tier := range tiers {
+		rows = append(rows, map[string]any{"source": "gmail", "ref": fmt.Sprintf("r%d", i), "priority": tier})
+	}
+	return RawResult{Columns: []string{"source", "ref", "priority"}, Rows: rows}
+}
+
+func TestSearchHintsWhenAnUnscopedResultIsMostlyNoise(t *testing.T) {
+	// 14 days of agent sessions: the priorities filter appeared on 6% of search
+	// calls, and unscoped searches came back 8/20 noise + 6/20 background. The
+	// hint is measured on THIS response, so a scoped call or a clean result
+	// set gets nothing.
+	mostlyBulk := bulkHits("noise", "noise", "background", "noise", "direct", "self")
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: mostlyBulk}}
+	resp := NewService(runner, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if !strings.Contains(resp.Hint, "priorities") || !strings.Contains(resp.Hint, "direct") {
+		t.Fatalf("an unscoped, mostly-noise result must suggest scoping by tier; got %q", resp.Hint)
+	}
+
+	scoped := NewService(runner, Options{}).Search(context.Background(), SearchRequest{
+		Query: "offer letter", Mode: "keyword", Priorities: []string{"noise"},
+	})
+	if strings.Contains(scoped.Hint, "priorities") {
+		t.Fatalf("a scoped call already chose its tiers; got %q", scoped.Hint)
+	}
+
+	clean := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: bulkHits("self", "direct", "cc", "noise", "direct")}}
+	resp = NewService(clean, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if strings.Contains(resp.Hint, "priorities") {
+		t.Fatalf("a mostly-attention result must not be nagged; got %q", resp.Hint)
+	}
+
+	tiny := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: bulkHits("noise", "noise")}}
+	resp = NewService(tiny, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if strings.Contains(resp.Hint, "priorities") {
+		t.Fatalf("two rows say nothing about the mix; got %q", resp.Hint)
 	}
 }
 

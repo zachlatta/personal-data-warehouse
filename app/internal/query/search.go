@@ -55,6 +55,38 @@ const searchPhrasingHint = "This query reads like a sentence. Retrieval here is 
 	"record itself would use (an email's subject line, a statement's column heading, the phrase a " +
 	"person would actually have typed)."
 
+// searchAttentionHint fires when an UNSCOPED search came back mostly noise and
+// background. `noise` alone is ~82% of the corpus, so leaving every tier in is
+// the usual reason a search returns newsletters and orchestrator turns; the
+// audit of 14 days of agent sessions found the priorities filter on 6% of
+// search calls. Measured on this response, not asserted in general: the hint
+// only appears when more than half of what came back is in those two tiers.
+const searchAttentionHint = "Most of these hits are noise/background (bulk mail, bots, the warehouse's " +
+	"own machinery). If the question is about attention or people rather than the whole corpus, " +
+	"re-issue with priorities [\"self\",\"direct\",\"cc\"] to search only what a person sent or received."
+
+// searchAttentionHintFor returns the attention hint when it applies to this
+// result set, or "". A scoped call already chose its tiers; a tiny result set
+// says nothing about the mix.
+func searchAttentionHintFor(requested []string, rows []map[string]any) string {
+	if len(requested) > 0 || len(rows) < searchAttentionHintMinRows {
+		return ""
+	}
+	bulk := 0
+	for _, row := range rows {
+		switch fmt.Sprint(row["priority"]) {
+		case "noise", "background":
+			bulk++
+		}
+	}
+	if bulk*2 <= len(rows) {
+		return ""
+	}
+	return searchAttentionHint
+}
+
+const searchAttentionHintMinRows = 5
+
 // searchSentenceWords are the function words that separate a question from a
 // bag of search terms. Counting them is crude, and deliberately so: the
 // alternative is another model call to classify a string. Two or more means the
@@ -327,6 +359,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	resp.ColumnNames = append([]string(nil), raw.Columns...)
 	resp.TotalRows = len(raw.Rows)
+	if attention := searchAttentionHintFor(req.Priorities, raw.Rows); attention != "" {
+		resp.Hint = strings.TrimSpace(resp.Hint + " " + attention)
+	}
 	if resp.TotalRows == 0 {
 		resp.Guidance = searchEmptyGuidance
 	} else {
