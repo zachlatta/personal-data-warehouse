@@ -4145,6 +4145,190 @@ def test_postgres_slack_conversation_loader_uses_stats_for_zero_message_filter(
     assert payloads == [{"id": "C-empty"}]
 
 
+def test_postgres_public_sweep_offers_hot_channels_then_the_least_recently_polled(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # The sweep is the only path that polls a public channel Zach is not in
+    # after its backfill, so it must not filter on membership, and it must pick
+    # by when we last LOOKED (sync_state.updated_at), not by when the channel
+    # last spoke — otherwise a busy channel starves the other thirteen thousand.
+    # Recency is judged against the database clock, so these anchor on real now.
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C-hot",
+                conversation_type="public_channel",
+                is_member=0,
+                raw_json='{"id":"C-hot"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="C-cold",
+                conversation_type="public_channel",
+                is_member=0,
+                raw_json='{"id":"C-cold"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="C-cold-polled",
+                conversation_type="public_channel",
+                is_member=0,
+                raw_json='{"id":"C-cold-polled"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="C-archived",
+                conversation_type="public_channel",
+                is_member=0,
+                is_archived=1,
+                raw_json='{"id":"C-archived"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="D-dm",
+                conversation_type="im",
+                raw_json='{"id":"D-dm"}',
+            ),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-hot",
+                message_ts="1770000000.000001",
+                message_datetime=now - timedelta(days=1),
+            ),
+            _slack_message_row(
+                conversation_id="C-cold",
+                message_ts="1770000000.000002",
+                message_datetime=now - timedelta(days=90),
+            ),
+            _slack_message_row(
+                conversation_id="C-cold-polled",
+                message_ts="1770000000.000003",
+                message_datetime=now - timedelta(days=90),
+            ),
+        ]
+    )
+    # C-cold-polled was looked at recently; C-cold has never been polled at all.
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C-cold-polled",
+        cursor_ts="1770000000.000003",
+        last_sync_type="full",
+        status="ok",
+        error="",
+        updated_at=datetime.now(tz=UTC),
+        sync_version=1,
+    )
+
+    hot_only = warehouse.load_slack_public_sweep_candidate_payloads(
+        account="zrl", team_id="T1", hot_within_days=7, hot_limit=10, cold_limit=0
+    )
+    assert [payload["id"] for payload in hot_only] == ["C-hot"]
+
+    both = warehouse.load_slack_public_sweep_candidate_payloads(
+        account="zrl", team_id="T1", hot_within_days=7, hot_limit=10, cold_limit=10
+    )
+    # Never-polled cold channels come before ones we already looked at, and
+    # neither archived channels nor other conversation types are candidates.
+    assert [payload["id"] for payload in both] == ["C-hot", "C-cold", "C-cold-polled"]
+
+
+def test_postgres_public_sweep_skips_a_conversation_known_gone(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C-gone",
+                conversation_type="public_channel",
+                is_member=0,
+                raw_json='{"id":"C-gone"}',
+            )
+        ]
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C-gone",
+        cursor_ts="",
+        last_sync_type="full",
+        status="gone",
+        error="channel_not_found",
+        updated_at=datetime(2026, 5, 1, tzinfo=UTC),
+        sync_version=1,
+    )
+
+    assert (
+        warehouse.load_slack_public_sweep_candidate_payloads(
+            account="zrl", team_id="T1", hot_limit=10, cold_limit=10
+        )
+        == []
+    )
+
+
+def test_postgres_touch_slack_conversation_sync_state_keeps_the_cursor_and_moves_the_clock(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # A poll that found nothing must still record that it happened, without
+    # claiming history it did not fetch: the cursor, sync type and status are the
+    # sweep's input on the next pass and overwriting them would lose progress.
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C1",
+        cursor_ts="1770000000.000009",
+        last_sync_type="full",
+        status="ok",
+        error="",
+        updated_at=datetime(2026, 4, 24, tzinfo=UTC),
+        sync_version=1,
+    )
+
+    polled_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.touch_slack_conversation_sync_state(
+        account="zrl",
+        team_id="T1",
+        conversation_id="C1",
+        updated_at=polled_at,
+        sync_version=2,
+    )
+
+    rows = warehouse._query(
+        """
+        SELECT cursor_ts, last_sync_type, status, updated_at
+        FROM @slack_sync_state
+        WHERE account = %s AND team_id = %s AND object_type = 'conversation' AND object_id = %s
+        """,
+        ("zrl", "T1", "C1"),
+    )
+    assert rows == [("1770000000.000009", "full", "ok", polled_at)]
+
+    # A conversation with no state yet is recorded rather than silently skipped,
+    # so it leaves the never-polled front of the rotation.
+    warehouse.touch_slack_conversation_sync_state(
+        account="zrl",
+        team_id="T1",
+        conversation_id="C2",
+        updated_at=polled_at,
+        sync_version=2,
+    )
+    fresh = warehouse._query(
+        """
+        SELECT cursor_ts, last_sync_type, status
+        FROM @slack_sync_state
+        WHERE account = %s AND team_id = %s AND object_type = 'conversation' AND object_id = %s
+        """,
+        ("zrl", "T1", "C2"),
+    )
+    assert fresh == [("", "sweep", "ok")]
+
+
 def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -6649,6 +6833,88 @@ def test_slack_conversation_health_catches_a_discovery_walk_that_never_advances(
     # judges the OLDEST one. Reporting max(synced_at) is what let page-1-only
     # discovery hide behind a fresh-looking timestamp for three months.
     assert rows["mpim"][3] >= fresh - timedelta(minutes=1)
+
+
+def test_slack_conversation_health_catches_public_channels_discovered_but_never_re_read(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The second, longer-lived Slack outage: discovered and then frozen.
+
+    A public channel Zach is not in is backfilled once, marked ``full``, and
+    from then on no stage asks it for anything — the change feed only reports
+    conversations he participates in and coverage only offers channels whose
+    history is incomplete. Measured 2026-08-27, 11,488 of them had not been
+    polled in a fortnight, and PDW held 40% of that month's public-channel
+    messages against Slack's own admin analytics, while this very view read
+    99.2% refreshed and ``ok`` — because it judged discovery only. Listing a
+    channel you never read again is not coverage.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    fresh = now - timedelta(minutes=30)
+
+    warehouse.insert_slack_conversations(
+        [
+            _health_conversation_row("C_POLLED", "public_channel", synced_at=fresh),
+            _health_conversation_row("C_FROZEN_A", "public_channel", synced_at=fresh),
+            _health_conversation_row("C_FROZEN_B", "public_channel", synced_at=fresh),
+            # A DM is judged on discovery alone: the change feed answers
+            # "did anything happen here" authoritatively, so an unpolled quiet
+            # DM is evidence of nothing.
+            _health_conversation_row("D_QUIET", "im", synced_at=fresh),
+        ]
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C_POLLED",
+        cursor_ts="1770000000.000001",
+        last_sync_type="full",
+        status="ok",
+        error="",
+        updated_at=fresh,
+        sync_version=1,
+    )
+    for frozen in ("C_FROZEN_A", "C_FROZEN_B"):
+        warehouse.insert_slack_sync_state(
+            account="zrl",
+            team_id="T1",
+            object_type="conversation",
+            object_id=frozen,
+            cursor_ts="1770000000.000001",
+            last_sync_type="full",
+            status="ok",
+            error="",
+            updated_at=now - timedelta(days=60),
+            sync_version=1,
+        )
+
+    rows = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, refreshed_fraction, history_polled_count,
+                   history_polled_fraction, history_status, status,
+                   expected_history_cycle_seconds
+            FROM @marts_ops_slack_conversation_health
+            WHERE account = 'zrl'
+            """
+        )
+    }
+
+    public = rows["public_channel"]
+    assert public[0] == 1  # discovery is perfect, which is exactly the trap
+    assert public[1] == 1
+    assert public[2] < 0.75
+    assert public[3] == "stale"
+    assert public[4] == "stale", "a frozen public channel must not hide behind healthy discovery"
+    assert public[5] == 345600
+
+    dm = rows["im"]
+    assert dm[5] is None, "types the change feed covers are not judged on poll age"
+    assert dm[3] == "ok"
+    assert dm[4] == "ok"
 
 
 def test_slack_conversation_health_reports_the_discovery_cursor(

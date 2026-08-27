@@ -818,12 +818,25 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     // that rule is permanently red.
     var pct = s.refreshed_fraction === null || s.refreshed_fraction === undefined
       ? "unknown" : (Number(s.refreshed_fraction) * 100).toFixed(1) + "%";
+    // Discovery is only half of it. A public channel Zach is not in is listed
+    // by discovery, backfilled once, and then asked for nothing ever again --
+    // the change feed only reports conversations he is in, and coverage drops a
+    // channel once its history is complete. 11,488 sat frozen behind a 99.2%
+    // re-listed number until 2026-08-27, so the poll share is shown beside it.
+    var polled = s.history_polled_fraction === null || s.history_polled_fraction === undefined
+      ? "n/a" : (Number(s.history_polled_fraction) * 100).toFixed(1) + "%";
     return healthRow(s, s.conversation_type,
       rows(s.live_count) + " live",
       [
         ["re-listed", pct,
           s.refreshed_count + " of " + s.live_count +
           " re-listed within one discovery cycle — the share, not the newest stamp", false],
+        ["re-read", polled,
+          s.expected_history_cycle_seconds
+            ? s.history_polled_count + " of " + s.live_count +
+              " asked for new messages within one sweep cycle — listing a channel is not reading it"
+            : "not judged: the change feed reports every conversation Zach is in, so an unpolled quiet one is evidence of nothing",
+          false],
         ["discovery", s.discovery_status || "unknown",
           s.last_discovery_at ? "last walk " + ago(ageOf(s.last_discovery_at)) + " ago" : "never walked", true],
         ["newest message", s.newest_message_at ? ago(ageOf(s.newest_message_at)) + " ago" : "none",

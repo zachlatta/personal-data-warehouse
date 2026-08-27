@@ -174,6 +174,10 @@ class SlackSyncRunner:
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
         sync_members_only: bool = False,
+        sync_public_sweep_only: bool = False,
+        sweep_hot_within_days: int = 7,
+        sweep_hot_limit: int = 0,
+        sweep_cold_limit: int = 0,
         sync_conversations_only: bool = False,
         sync_conversation_info_only: bool = False,
         skip_completed_full: bool = False,
@@ -211,6 +215,10 @@ class SlackSyncRunner:
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
         self._sync_members_only = sync_members_only
+        self._sync_public_sweep_only = sync_public_sweep_only
+        self._sweep_hot_within_days = sweep_hot_within_days
+        self._sweep_hot_limit = sweep_hot_limit
+        self._sweep_cold_limit = sweep_cold_limit
         self._sync_conversations_only = sync_conversations_only
         self._sync_conversation_info_only = sync_conversation_info_only
         self._skip_completed_full = skip_completed_full
@@ -307,6 +315,16 @@ class SlackSyncRunner:
 
         if self._sync_thread_replies_only:
             return self._sync_account_thread_replies(
+                account=account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                sync_version=sync_version,
+                state_by_key=state_by_key,
+            )
+
+        if self._sync_public_sweep_only:
+            return self._sync_account_public_sweep(
                 account=account,
                 team_id=team_id,
                 client=client,
@@ -1028,6 +1046,113 @@ class SlackSyncRunner:
             files_written=files_written,
         )
 
+    def _sync_account_public_sweep(
+        self,
+        *,
+        account: SlackAccount,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        sync_version: int,
+        state_by_key: Mapping[tuple[str, str, str, str], Any],
+    ) -> SlackSyncSummary:
+        """Keep every live public channel current, member or not.
+
+        This is the only stage that polls a public channel Zach has not joined
+        after its first backfill. Freshness asks ``client.counts``, which reports
+        only conversations he participates in; coverage offers only channels
+        whose history is not yet complete. So a public channel he can read but is
+        not in was fetched once and then frozen — measured 2026-08-27, 10,711 of
+        them had gone untouched for a fortnight while Slack's own analytics said
+        the workspace posted ~65k public messages a day and PDW was capturing
+        ~25k of them.
+
+        Each conversation is resumed from its own history cursor, so a quiet
+        channel costs exactly one ``conversations.history`` call; a channel that
+        has never been synced has no cursor and is streamed in full, which is how
+        newly created channels get their history. Every conversation polled is
+        stamped whether or not it produced messages, because the candidate order
+        is by last poll and an unstamped poll would repeat forever.
+        """
+        conversations = self._warehouse.load_slack_public_sweep_candidate_payloads(
+            account=account.account,
+            team_id=team_id,
+            hot_within_days=self._sweep_hot_within_days,
+            hot_limit=self._sweep_hot_limit,
+            cold_limit=self._sweep_cold_limit,
+        )
+        messages_written = 0
+        files_written = 0
+        conversations_seen = 0
+        for conversation in conversations:
+            if not isinstance(conversation, Mapping) or not conversation.get("id"):
+                continue
+            conversation_id = str(conversation["id"])
+            state = state_by_key.get((account.account, team_id, "conversation", conversation_id))
+            cursor_ts = self._state_cursor_ts(state)
+            conversations_seen += 1
+            try:
+                result = self._sync_conversation_messages(
+                    account=account.account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    client=client,
+                    synced_at=synced_at,
+                    sync_version=sync_version,
+                    # No cursor means no history at all yet: stream the channel in
+                    # full. Otherwise resume exactly at the cursor, so the common
+                    # case is a single page that comes back empty.
+                    oldest_ts=cursor_ts if cursor_ts else None,
+                    history_is_complete=self._state_is_completed_full(state),
+                )
+            except SlackRateLimitBudgetExceeded as exc:
+                # Every conversation persisted its own cursor as it went, and the
+                # ones already polled are stamped, so the next run resumes further
+                # down the rotation instead of restarting at the same channels.
+                self._logger.warning(
+                    "Stopping Slack public sweep for %s after the rate limit budget was exhausted at %s: %s",
+                    account.account,
+                    conversation_id,
+                    exc,
+                )
+                break
+            except SlackApiCallError as exc:
+                self._handle_conversation_sync_error(
+                    account=account.account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    sync_type="sweep",
+                    exc=exc,
+                    synced_at=synced_at,
+                    sync_version=sync_version,
+                )
+                continue
+            messages_written += result["messages_written"]
+            files_written += result["files_written"]
+            self._warehouse.touch_slack_conversation_sync_state(
+                account=account.account,
+                team_id=team_id,
+                conversation_id=conversation_id,
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
+
+        self._logger.info(
+            "Public sweep polled %s Slack channels for %s and wrote %s messages",
+            conversations_seen,
+            account.account,
+            messages_written,
+        )
+        return SlackSyncSummary(
+            account=account.account,
+            team_id=team_id,
+            sync_type="public_sweep",
+            conversations_seen=conversations_seen,
+            messages_written=messages_written,
+            users_written=0,
+            files_written=files_written,
+        )
+
     def _sync_account_members(
         self,
         *,
@@ -1264,6 +1389,7 @@ class SlackSyncRunner:
         synced_at: datetime,
         sync_version: int,
         oldest_ts: float | None,
+        history_is_complete: bool = False,
     ) -> dict[str, int]:
         if oldest_ts is None:
             return self._sync_full_conversation_messages_streaming(
@@ -1287,7 +1413,14 @@ class SlackSyncRunner:
                 object_type="conversation",
                 object_id=conversation_id,
                 cursor_ts=cursor_value,
-                last_sync_type="partial",
+                # A top-up of a channel whose backfill already reached the start
+                # of its history has not made that history incomplete, and
+                # saying otherwise has a cost: coverage selects on
+                # NOT (ok AND full), so demoting every swept channel to
+                # 'partial' would hand coverage all ~13k public channels as
+                # backfill candidates and have it re-fetch fourteen-day windows
+                # of them forever, out of the same rate budget the sweep needs.
+                last_sync_type="full" if history_is_complete else "partial",
                 status=status,
                 error="",
                 updated_at=synced_at,

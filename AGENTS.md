@@ -120,7 +120,10 @@ quietly becoming untrue, and several of these have been.
   by* per-source detectors where they exist — `marts_ops.slack_conversation_health` judges the
   SHARE of conversations re-listed per type, because `marts_ops.pipeline_health` rolls Slack up
   as one pipeline and ~19k public-channel messages a day kept it `ok` straight through a total
-  group-DM outage; `marts_ops.plaid_item_health` does the same per institution, because a
+  group-DM outage — and, since 2026-08-27, the share of live public channels actually
+  re-READ (`history_polled_fraction`), because being listed is not being read: 11,488
+  public channels Zach is not in sat frozen at their backfill behind a 99.2% discovery
+  number while PDW held 40% of the month's public-channel messages; `marts_ops.plaid_item_health` does the same per institution, because a
   re-link that mints a second live Item double-counts net worth while the pipeline stays
   green; `marts_finance.net_worth.staleness` judges each manual valuation against its own
   kind's refresh. *Gap:* every other source rides aggregate freshness. Latency, as opposed
@@ -2956,6 +2959,78 @@ eleven legitimate zero-message days between 2026-07-11 and 2026-08-18, so alerti
 group DM messages" is a guaranteed false positive. It would also have been wrong here —
 group DMs really were silent from 2026-08-20T18:57 onward, which is exactly what Slack
 itself reports.
+
+## Slack channels Zach is not in: discovery is not coverage
+
+**Being listed is not being read, and for four months those were the same word
+here.** Discovery walks `conversations.list` and stamps every public channel;
+`marts_ops.slack_conversation_health` reported 99.2% of them re-listed and `ok`.
+But nothing then *asked* most of them for messages. Freshness asks the change
+feed, which only knows the ~690 conversations Zach participates in; coverage
+only offers a channel whose history is not yet complete, so a channel drops out
+of it for good the moment its backfill finishes. A public channel he can read
+but has not joined was therefore fetched exactly once and then frozen.
+
+Measured 2026-08-27 against Slack's own admin analytics (`slack.public_channel_analytics`
+in the Hack Club warehouse, which is per-channel-per-day ground truth):
+
+| | Slack | PDW |
+| --- | --- | --- |
+| public channels posting on 2026-08-21 | 718 | 205 |
+| public-channel messages that day | 71,636 | 24,116 |
+| public-channel messages in August | 1,662,044 | 662,927 (40%) |
+| non-member public channels untouched for 14 days | — | 10,711 of 11,488 |
+
+`#arvutitrack` posted 17,646 messages that day and PDW held none of them.
+The monthly capture ratio ran 64-80% from December to June and fell to 51% in
+July and 40% in August as more channels finished their backfill and froze.
+
+**The fix is a sweep, and the thing that makes a sweep work is stamping a poll
+that found nothing.** `slack_workspace_public_sweep_sync` (`4-59/5 * * * *`, on
+its own advisory lock — it has ~13k conversations to walk and on the shared lock
+it would get whatever six stages with hundreds of candidates left over, the same
+reason freshness has its own) polls live public channels regardless of membership, in
+two buckets: `hot` (a message within `SLACK_ASSET_SWEEP_HOT_DAYS`, default 7) and
+`cold` (everything else), each ordered by *when we last polled it*
+(`ops.slack_sync_state.updated_at`, NULLS FIRST so a never-synced channel goes
+first). A channel with a cursor is resumed at it, so a quiet channel costs one
+`conversations.history` call; a channel with no cursor is streamed in full, which
+is how the 601 channels created in July 2026 and never fetched get their history.
+
+Thread replies are deliberately **not** fetched inline: a page of 200 parents can
+carry dozens of threads, and one busy channel would eat the whole run. They are
+drained by `slack_workspace_thread_backfill_sync`, which selects parents whose
+replies we do not hold from any conversation, newest first.
+
+`SLACK_ASSET_SWEEP_HOT_LIMIT` (20) and `SLACK_ASSET_SWEEP_COLD_LIMIT` (40) are a
+**rate budget, not a preference**: they are the sustained call rate this stage
+adds (~12/min) against a measured ~39/min `conversations.history` ceiling shared
+with freshness, threads, coverage and read-state. Cold is the larger bucket
+because there are ~11.8k cold channels to ~1.5k hot ones, which puts the full
+rotation at about a day — inside the four-day SLA the health view judges. Raise
+them for a catch-up and put them back; every stage aborts gracefully on the
+shared rate-limit budget, so over-asking does not fail runs, it starves the
+other stages.
+
+- **Membership is deliberately not a filter, and `is_member` is not trustworthy
+  anyway.** `base_slack.conversations.is_member` said 202 while the change feed
+  covers 316 channels; it is refreshed only by whatever last wrote the
+  conversation row.
+- **A poll that returns nothing must still be recorded**
+  (`touch_slack_conversation_sync_state`, which advances `updated_at` and
+  preserves the cursor, sync type and status). The candidate order is by last
+  poll, so an unstamped poll re-picks the same channels forever and the tail is
+  never reached. This is the one invariant that makes the rotation a rotation.
+- **`marts_ops.slack_conversation_health` now judges both halves.**
+  `history_polled_fraction` is the share of live conversations asked for new
+  messages within a cycle, and it is judged **only for `public_channel`** —
+  for the other three types the change feed authoritatively reports that nothing
+  happened, so "not polled" is evidence of nothing. `status` is the worse of the
+  two halves; both are on `/pipelines`.
+- **Ground truth for this lives outside PDW.** The Hack Club warehouse's
+  `slack.public_channel_analytics` is Slack's own admin analytics, one row per
+  channel per day with `messages_posted_count`. Compare against it rather than
+  against a feeling that search results look thin.
 
 ## Slack change feed: how the sync knows what to fetch
 

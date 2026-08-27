@@ -9206,6 +9206,110 @@ class PostgresWarehouse:
         )
         return _json_payloads(rows)
 
+    def load_slack_public_sweep_candidate_payloads(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        hot_within_days: int = 7,
+        hot_limit: int = 0,
+        cold_limit: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Live public channels due a history poll, hottest bucket first.
+
+        Membership is deliberately NOT a filter here. The change feed
+        (``client.counts``) only reports conversations Zach participates in, and
+        coverage only offers a channel whose history has never been completed, so
+        a public channel he is not in was polled exactly once — at backfill — and
+        then never again. Measured 2026-08-27 against Slack's own admin
+        analytics: 11,488 non-member public channels were marked ``full`` and
+        10,711 of those had not been touched in fourteen days, and PDW held 40%
+        of August's public-channel messages.
+
+        The two buckets are the whole design. ``hot`` is channels that have said
+        something recently, so they are re-polled often enough to be useful;
+        ``cold`` is a round-robin over everything else so a channel that wakes up
+        after months is still noticed. Both order by *when we last polled*
+        (``sync_state.updated_at``, NULLS FIRST so a never-synced channel is
+        picked up first), which is why the sweep must stamp that column even when
+        a poll returns nothing — otherwise the same channels are re-picked
+        forever and the tail never advances.
+        """
+        payloads: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hot in (True, False):
+            limit = hot_limit if hot else cold_limit
+            if limit <= 0:
+                continue
+            activity_predicate = (
+                "m.latest_message_at >= now() - make_interval(days => %s)"
+                if hot
+                else "(m.latest_message_at IS NULL"
+                " OR m.latest_message_at < now() - make_interval(days => %s))"
+            )
+            rows = self._query(
+                f"""
+                SELECT c.raw_json
+                FROM @slack_conversations AS c
+                LEFT JOIN @slack_sync_state AS s
+                  ON c.account = s.account
+                 AND c.team_id = s.team_id
+                 AND c.conversation_id = s.object_id
+                 AND s.object_type = 'conversation'
+                LEFT JOIN @slack_conversation_stats AS m
+                  ON c.account = m.account
+                 AND c.team_id = m.team_id
+                 AND c.conversation_id = m.conversation_id
+                WHERE c.account = %s
+                  AND c.team_id = %s
+                  AND c.conversation_type = 'public_channel'
+                  AND c.is_archived = 0
+                  AND COALESCE(s.status, '') <> 'gone'
+                  AND {activity_predicate}
+                ORDER BY s.updated_at ASC NULLS FIRST, c.conversation_id
+                LIMIT %s
+                """,
+                (account, team_id, int(hot_within_days), int(limit)),
+            )
+            for payload in _json_payloads(rows):
+                conversation_id = str(payload.get("id") or "")
+                if conversation_id and conversation_id in seen:
+                    continue
+                seen.add(conversation_id)
+                payloads.append(payload)
+        return payloads
+
+    def touch_slack_conversation_sync_state(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        updated_at: datetime,
+        sync_version: int,
+    ) -> None:
+        """Record that we polled a conversation, without claiming what we found.
+
+        A poll that returns no new messages writes no cursor, so nothing else
+        advances ``updated_at`` — and ``updated_at`` is what the sweep orders by.
+        Without this a quiet channel is re-polled every run and the rest of the
+        workspace is never reached. The existing cursor, sync type and status are
+        preserved on conflict: this says when we last looked, not what we know.
+        """
+        self._command(
+            """
+            INSERT INTO @slack_sync_state (
+                account, team_id, object_type, object_id,
+                cursor_ts, last_sync_type, status, error, updated_at, sync_version
+            )
+            VALUES (%s, %s, 'conversation', %s, '', 'sweep', 'ok', '', %s, %s)
+            ON CONFLICT (account, team_id, object_type, object_id) DO UPDATE
+               SET updated_at = EXCLUDED.updated_at,
+                   sync_version = EXCLUDED.sync_version
+            """,
+            (account, team_id, conversation_id, _ensure_utc(updated_at), int(sync_version)),
+        )
+
     def load_slack_thread_parent_refs(
         self,
         *,
@@ -9560,12 +9664,21 @@ class PostgresWarehouse:
             "marts_ops_slack_conversation_health",
             """
             CREATE OR REPLACE VIEW @marts_ops_slack_conversation_health AS
-            WITH expected(conversation_type, cycle_seconds) AS (
+            WITH expected(conversation_type, cycle_seconds, history_cycle_seconds) AS (
+                -- history_cycle_seconds is how often we must re-ASK a
+                -- conversation for new messages. It is NULL for the three types
+                -- the change feed covers (client.counts reports every
+                -- conversation Zach participates in), because there "we have not
+                -- polled it" is not evidence of anything: Slack told us nothing
+                -- happened. Public channels have no such signal -- he is not in
+                -- 13k of them -- so only a poll can find out, and only there is
+                -- the poll age judged. The number is the sweep's own rotation
+                -- (~2 days at its default limits) with margin.
                 VALUES
-                    ('im', 172800::bigint),
-                    ('mpim', 172800::bigint),
-                    ('private_channel', 172800::bigint),
-                    ('public_channel', 432000::bigint)
+                    ('im', 172800::bigint, NULL::bigint),
+                    ('mpim', 172800::bigint, NULL::bigint),
+                    ('private_channel', 172800::bigint, NULL::bigint),
+                    ('public_channel', 432000::bigint, 345600::bigint)
             ),
             per_type AS (
                 SELECT
@@ -9587,15 +9700,27 @@ class PostgresWarehouse:
                           AND c.synced_at > now() - make_interval(
                               secs => COALESCE(e.cycle_seconds, 172800))
                     )::bigint AS refreshed_count,
-                    max(s.latest_message_at) AS newest_message_at
+                    max(s.latest_message_at) AS newest_message_at,
+                    count(*) FILTER (
+                        WHERE c.is_archived = 0
+                          AND h.updated_at > now() - make_interval(
+                              secs => COALESCE(e.history_cycle_seconds, 345600))
+                    )::bigint AS history_polled_count,
+                    min(h.updated_at) FILTER (WHERE c.is_archived = 0)
+                        AS oldest_history_poll_at
                 FROM @slack_conversations AS c
                 LEFT JOIN @slack_conversation_stats AS s
                        ON s.account = c.account
                       AND s.team_id = c.team_id
                       AND s.conversation_id = c.conversation_id
+                LEFT JOIN @slack_sync_state AS h
+                       ON h.account = c.account
+                      AND h.team_id = c.team_id
+                      AND h.object_type = 'conversation'
+                      AND h.object_id = c.conversation_id
                 LEFT JOIN expected AS e ON e.conversation_type = c.conversation_type
                 WHERE c.conversation_type <> ''
-                GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds
+                GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds, e.history_cycle_seconds
             )
             SELECT
                 p.account,
@@ -9612,6 +9737,11 @@ class PostgresWarehouse:
                 (EXTRACT(EPOCH FROM now() - p.oldest_conversation_synced_at))::bigint
                     AS discovery_age_seconds,
                 COALESCE(e.cycle_seconds, 172800) AS expected_cycle_seconds,
+                p.history_polled_count,
+                round(p.history_polled_count::numeric / NULLIF(p.live_count, 0), 4)
+                    AS history_polled_fraction,
+                p.oldest_history_poll_at,
+                e.history_cycle_seconds AS expected_history_cycle_seconds,
                 CASE
                     WHEN st.status = 'complete' THEN ''
                     ELSE COALESCE(st.cursor_ts, '')
@@ -9626,8 +9756,26 @@ class PostgresWarehouse:
                 ))::bigint AS message_age_seconds,
                 CASE
                     WHEN p.live_count = 0 THEN 'unknown'
-                    WHEN p.refreshed_count::numeric / p.live_count < 0.75 THEN 'stale'
-                    WHEN p.refreshed_count::numeric / p.live_count < 0.95 THEN 'late'
+                    WHEN e.history_cycle_seconds IS NULL THEN 'ok'
+                    WHEN p.history_polled_count::numeric / p.live_count < 0.75 THEN 'stale'
+                    WHEN p.history_polled_count::numeric / p.live_count < 0.95 THEN 'late'
+                    ELSE 'ok'
+                END AS history_status,
+                -- Discovery and history are separate failures and either one
+                -- alone makes the type wrong, so the row reports the worse of
+                -- them. Listing a channel we then never read is the shape that
+                -- hid 11,488 frozen public channels behind a 99.2% discovery
+                -- number for four months.
+                CASE
+                    WHEN p.live_count = 0 THEN 'unknown'
+                    WHEN p.refreshed_count::numeric / p.live_count < 0.75
+                      OR (e.history_cycle_seconds IS NOT NULL
+                          AND p.history_polled_count::numeric / p.live_count < 0.75)
+                        THEN 'stale'
+                    WHEN p.refreshed_count::numeric / p.live_count < 0.95
+                      OR (e.history_cycle_seconds IS NOT NULL
+                          AND p.history_polled_count::numeric / p.live_count < 0.95)
+                        THEN 'late'
                     ELSE 'ok'
                 END AS status
             FROM per_type AS p

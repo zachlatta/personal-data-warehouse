@@ -15,6 +15,7 @@ from personal_data_warehouse.defs.slack_sync import (
     run_slack_freshness_sync,
     run_slack_member_sync,
     run_slack_metadata_sync,
+    run_slack_public_sweep_sync,
     run_slack_read_state_sync,
     run_slack_thread_backfill_sync,
     run_slack_thread_sync,
@@ -22,6 +23,7 @@ from personal_data_warehouse.defs.slack_sync import (
     slack_workspace_member_sync_hourly,
     slack_workspace_coverage_sync_every_seven_minutes,
     slack_workspace_metadata_sync_every_fifteen_minutes,
+    slack_workspace_public_sweep_sync_every_five_minutes,
     slack_workspace_read_state_sync_every_five_minutes,
     slack_workspace_sync_every_five_minutes,
     slack_workspace_thread_sync_every_five_minutes,
@@ -103,6 +105,10 @@ def test_slack_sync_schedule_runs_every_five_minutes_by_default() -> None:
     assert slack_workspace_read_state_sync_every_five_minutes.default_status.value == "RUNNING"
     assert slack_workspace_member_sync_hourly.cron_schedule == "17 * * * *"
     assert slack_workspace_member_sync_hourly.default_status.value == "RUNNING"
+    # Offset from the other */5 stages so they queue for the shared Slack lock
+    # rather than all firing on the same minute.
+    assert slack_workspace_public_sweep_sync_every_five_minutes.cron_schedule == "4-59/5 * * * *"
+    assert slack_workspace_public_sweep_sync_every_five_minutes.default_status.value == "RUNNING"
 
 
 def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
@@ -334,6 +340,110 @@ def test_slack_coverage_rotation_reaches_every_stage_under_seven_minute_cron(mon
     assert ("mpim",) in seen_types
     assert ("private_channel",) in seen_types
     assert ("public_channel",) in seen_types
+
+
+def test_slack_public_sweep_polls_public_channels_regardless_of_membership(monkeypatch) -> None:
+    # The sweep is the only stage that reaches a public channel Zach is not in
+    # once its backfill is complete: the change feed reports only conversations
+    # he participates in, and coverage drops a channel the moment its history is
+    # marked full. Its per-run limits are the sustained API call rate it adds.
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return [
+                SlackSyncSummary(
+                    account="zrl",
+                    team_id="T1",
+                    sync_type="public_sweep",
+                    conversations_seen=50,
+                    messages_written=7,
+                    users_written=0,
+                    files_written=0,
+                )
+            ]
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    monkeypatch.delenv("SLACK_ASSET_SWEEP_HOT_LIMIT", raising=False)
+    monkeypatch.delenv("SLACK_ASSET_SWEEP_COLD_LIMIT", raising=False)
+    monkeypatch.delenv("SLACK_ASSET_SWEEP_HOT_DAYS", raising=False)
+
+    summaries = run_slack_public_sweep_sync(
+        settings=_coverage_test_settings(),
+        warehouse=SimpleNamespace(),
+        logger=_NullLogger(),
+    )
+
+    assert len(summaries) == 1
+    call = calls[0]
+    assert call["sync_public_sweep_only"] is True
+    assert call["sweep_hot_limit"] == 20
+    # Cold is the bigger bucket because there are ~11.8k cold channels to ~1.5k
+    # hot ones; this is what makes the full rotation about a day.
+    assert call["sweep_cold_limit"] == 40
+    assert call["sweep_hot_within_days"] == 7
+    assert call["skip_known_errors"] is True
+    # Replies are left to the thread-backfill drain, as coverage does: fetching
+    # them inline would spend the whole rate budget inside one busy channel
+    # while thirteen thousand others wait for their turn.
+    assert call["sync_thread_replies"] is False
+
+
+def test_slack_public_sweep_runs_in_its_own_lane(monkeypatch) -> None:
+    # On the shared lock the stage with 13k conversations to walk would get
+    # whatever is left after six stages whose candidate sets are hundreds.
+    captured = {}
+
+    @contextmanager
+    def fake_lock(**kwargs):
+        captured.update(kwargs)
+        yield False
+
+    monkeypatch.setattr(slack_defs, "exclusive_sync_lock", fake_lock)
+    monkeypatch.setattr(slack_defs, "load_settings", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(slack_defs, "warehouse_from_settings", lambda settings: SimpleNamespace())
+    monkeypatch.setattr(slack_defs, "build_metadata", lambda: {"git_sha": "test"})
+
+    _run_locked_slack_stage(
+        SimpleNamespace(log=_NullLogger()),
+        stage_name="public_sweep",
+        run_fn=slack_defs.run_slack_public_sweep_sync,
+        lock_name="slack-public-sweep",
+        postgres_lock_id=slack_defs.SLACK_PUBLIC_SWEEP_POSTGRES_LOCK_ID,
+    )
+
+    assert captured["name"] == "slack-public-sweep"
+    assert captured["postgres_lock_id"] == slack_defs.SLACK_PUBLIC_SWEEP_POSTGRES_LOCK_ID
+    assert captured["postgres_lock_id"] != slack_defs.SLACK_SYNC_POSTGRES_LOCK_ID
+
+
+def test_slack_public_sweep_limits_are_tunable_for_a_catch_up(monkeypatch) -> None:
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def sync_all(self):
+            return []
+
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", FakeRunner)
+    monkeypatch.setenv("SLACK_ASSET_SWEEP_HOT_LIMIT", "80")
+    monkeypatch.setenv("SLACK_ASSET_SWEEP_COLD_LIMIT", "120")
+    monkeypatch.setenv("SLACK_ASSET_SWEEP_HOT_DAYS", "3")
+
+    run_slack_public_sweep_sync(
+        settings=_coverage_test_settings(),
+        warehouse=SimpleNamespace(),
+        logger=_NullLogger(),
+    )
+
+    assert calls[0]["sweep_hot_limit"] == 80
+    assert calls[0]["sweep_cold_limit"] == 120
+    assert calls[0]["sweep_hot_within_days"] == 3
 
 
 def test_slack_metadata_sync_refreshes_one_conversation_type(monkeypatch) -> None:
@@ -775,8 +885,9 @@ def test_slack_intelligent_sync_keeps_legacy_combined_behavior(monkeypatch) -> N
         now=datetime(2026, 4, 24, 17, 1, tzinfo=UTC),
     )
 
-    assert len(summaries) == 6
-    assert len(calls) == 6
+    # freshness (4 types) + read_state + coverage + public sweep.
+    assert len(summaries) == 7
+    assert len(calls) == 7
 
 
 def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:

@@ -56,6 +56,9 @@ class FakeWarehouse:
         self.ensure_calls = 0
         self.conversation_payloads = []
         self.conversation_payload_calls = []
+        self.public_sweep_payloads = []
+        self.public_sweep_calls = []
+        self.conversation_touches = []
         self.member_candidate_payloads = []
         self.member_candidate_calls = []
         self.read_state_candidate_calls = []
@@ -155,6 +158,29 @@ class FakeWarehouse:
         if limit is not None:
             payloads = payloads[:limit]
         return payloads
+
+    def load_slack_public_sweep_candidate_payloads(
+        self,
+        *,
+        account,
+        team_id,
+        hot_within_days=7,
+        hot_limit=0,
+        cold_limit=0,
+    ):
+        self.public_sweep_calls.append(
+            {
+                "account": account,
+                "team_id": team_id,
+                "hot_within_days": hot_within_days,
+                "hot_limit": hot_limit,
+                "cold_limit": cold_limit,
+            }
+        )
+        return list(self.public_sweep_payloads)
+
+    def touch_slack_conversation_sync_state(self, **kwargs):
+        self.conversation_touches.append(kwargs)
 
     def load_slack_thread_parent_refs(
         self,
@@ -2802,3 +2828,255 @@ def test_full_thread_backfill_walk_that_hits_its_limit_is_not_marked_drained(mon
     )
     _thread_backfill_runner(settings, warehouse, client, datetime(2026, 8, 26, tzinfo=UTC)).sync_all()
     assert not [u for u in warehouse.state_updates if u["object_type"] == THREAD_BACKFILL_WALK_TYPE]
+
+
+def _sweep_settings(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    return load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+
+
+def test_runner_public_sweep_resumes_a_frozen_non_member_channel_from_its_cursor(monkeypatch):
+    # The gap this stage exists to close: a public channel Zach is not in is
+    # backfilled once, marked 'full', and then never offered to coverage or the
+    # change feed again. The sweep must poll it anyway, resuming at its cursor so
+    # a quiet channel costs one call rather than a re-stream of its history.
+    settings = _sweep_settings(monkeypatch)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_FROZEN"): {
+                "status": "ok",
+                "last_sync_type": "full",
+                "cursor_ts": "1713974400.000100",
+            }
+        }
+    )
+    warehouse.public_sweep_payloads = [{"id": "C_FROZEN", "name": "not-a-member", "is_channel": True}]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1713980000.000100", "user": "U1", "text": "posted while frozen"}],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    summaries = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_within_days=7,
+        sweep_hot_limit=30,
+        sweep_cold_limit=20,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.public_sweep_calls == [
+        {
+            "account": "zrl",
+            "team_id": "T1",
+            "hot_within_days": 7,
+            "hot_limit": 30,
+            "cold_limit": 20,
+        }
+    ]
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert [params["channel"] for params in history_calls] == ["C_FROZEN"]
+    # Resumed at the cursor, not restreamed from the beginning of history.
+    assert history_calls[0]["oldest"] == pytest.approx(1713974400.000100)
+    assert [row["message_ts"] for row in warehouse.messages] == ["1713980000.000100"]
+    assert summaries[0].sync_type == "public_sweep"
+    assert summaries[0].conversations_seen == 1
+
+
+def test_runner_public_sweep_stamps_a_poll_that_found_nothing(monkeypatch):
+    # Candidates are ordered by when they were last polled, and a poll that
+    # returns no messages writes no cursor. Without an explicit stamp the same
+    # quiet channels sort first on every run and the other ~13k are never
+    # reached, which is the failure mode the rotation exists to avoid.
+    settings = _sweep_settings(monkeypatch)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_QUIET"): {
+                "status": "ok",
+                "last_sync_type": "full",
+                "cursor_ts": "1713974400.000100",
+            }
+        }
+    )
+    warehouse.public_sweep_payloads = [{"id": "C_QUIET", "name": "quiet", "is_channel": True}]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [{"ok": True, "messages": [], "response_metadata": {}}],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_limit=30,
+        sweep_cold_limit=20,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.messages == []
+    assert [touch["conversation_id"] for touch in warehouse.conversation_touches] == ["C_QUIET"]
+
+
+def test_runner_public_sweep_streams_a_channel_that_has_never_been_synced(monkeypatch):
+    # New channels are discovered constantly (601 created in July 2026 had still
+    # never been fetched by 2026-08-27). One with no cursor has no history at
+    # all, so the sweep streams it in full rather than asking for messages since
+    # an epoch it does not have.
+    settings = _sweep_settings(monkeypatch)
+    warehouse = FakeWarehouse()
+    warehouse.public_sweep_payloads = [{"id": "C_NEW", "name": "brand-new", "is_channel": True}]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "first post"}],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_limit=30,
+        sweep_cold_limit=20,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert history_calls[0].get("oldest") is None
+    assert [row["message_ts"] for row in warehouse.messages] == ["1713974400.000100"]
+    assert [touch["conversation_id"] for touch in warehouse.conversation_touches] == ["C_NEW"]
+
+
+def test_runner_public_sweep_records_a_gone_channel_and_keeps_going(monkeypatch):
+    settings = _sweep_settings(monkeypatch)
+    warehouse = FakeWarehouse()
+    warehouse.public_sweep_payloads = [
+        {"id": "C_GONE", "name": "gone", "is_channel": True},
+        {"id": "C_LIVE", "name": "live", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: channel_not_found", code="channel_not_found"),
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1713974400.000100", "user": "U1", "text": "still here"}],
+                    "response_metadata": {},
+                },
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_limit=30,
+        sweep_cold_limit=20,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert warehouse.inactivated_conversations == [
+        {"account": "zrl", "team_id": "T1", "conversation_id": "C_GONE"}
+    ]
+    assert [row["message_ts"] for row in warehouse.messages] == ["1713974400.000100"]
+    # The gone channel is recorded by the error path, not stamped as polled.
+    assert [touch["conversation_id"] for touch in warehouse.conversation_touches] == ["C_LIVE"]
+
+
+def test_runner_public_sweep_keeps_a_completed_backfill_marked_full(monkeypatch):
+    # Coverage selects backfill candidates with NOT (status ok AND type full).
+    # Topping a channel up does not make its history incomplete, and demoting it
+    # would hand coverage all ~13k public channels to re-walk out of the same
+    # rate budget the sweep needs.
+    settings = _sweep_settings(monkeypatch)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_FULL"): {
+                "status": "ok",
+                "last_sync_type": "full",
+                "cursor_ts": "1713974400.000100",
+            },
+            ("zrl", "T1", "conversation", "C_PARTIAL"): {
+                "status": "ok",
+                "last_sync_type": "partial",
+                "cursor_ts": "1713974400.000100",
+            },
+        }
+    )
+    warehouse.public_sweep_payloads = [
+        {"id": "C_FULL", "name": "backfilled", "is_channel": True},
+        {"id": "C_PARTIAL", "name": "mid-backfill", "is_channel": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1713980000.000100", "user": "U1", "text": "a"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1713980000.000200", "user": "U1", "text": "b"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_limit=30,
+        sweep_cold_limit=20,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    written = {update["object_id"]: update["last_sync_type"] for update in warehouse.state_updates}
+    assert written["C_FULL"] == "full"
+    # An unfinished backfill stays unfinished, so coverage keeps working on it.
+    assert written["C_PARTIAL"] == "partial"

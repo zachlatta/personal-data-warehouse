@@ -93,6 +93,8 @@ ORDER BY scope, object_name`
 var pipelineSlackConversationHealthSQL = `
 SELECT account, team_id, conversation_type, conversation_count, archived_count,
        live_count, refreshed_count, refreshed_fraction,
+       history_polled_count, history_polled_fraction, oldest_history_poll_at,
+       expected_history_cycle_seconds, history_status,
        oldest_conversation_synced_at, newest_conversation_synced_at,
        discovery_age_seconds, expected_cycle_seconds, discovery_status,
        last_discovery_at, newest_message_at, message_age_seconds, status

@@ -2246,7 +2246,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel). Judges the OLDEST conversation metadata stamp, because that is what a bounded discovery walk has to keep cycling; marts_ops.pipeline_health aggregates Slack as one pipeline and cannot see one type stall. Message ages are context only \u2014 mpim legitimately has zero-message days."
+      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel), in two independent halves. refreshed_fraction is discovery: the share of live conversations re-listed within a cycle, judged as a SHARE because a page-1-only walk re-stamps the newest rows hourly and looks perfect. history_polled_fraction is whether we then ASK them for messages, judged only for public_channel \u2014 the change feed answers that authoritatively for every conversation Zach is in, but he is not in ~13k public channels, and 11,488 of those sat frozen at their backfill behind a 99.2% discovery number until 2026-08-27. status is the worse of the two. Message ages are context only \u2014 mpim legitimately has zero-message days."
     },
     {
       "id": "marts_transaction_receipts",

@@ -57,6 +57,14 @@ SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
 # against calendar sync, then against an alice-voice derived id.
 SLACK_FRESHNESS_POSTGRES_LOCK_ID = 7_403_111_920
 
+# The public sweep gets its own lane for the same reason freshness did: it is
+# the stage with ~13k conversations to walk, and on the shared lock it would
+# take whatever is left after threads, thread-backfill, read-state, coverage,
+# metadata and members -- the stages whose candidate sets are hundreds, not
+# thousands. Rate limiting is per token and enforced by the runner's own budget,
+# so a second lane splits the same ceiling rather than raising it.
+SLACK_PUBLIC_SWEEP_POSTGRES_LOCK_ID = 7_403_111_921
+
 
 def _rate_limit_budget_seconds() -> int:
     return _int_env("SLACK_ASSET_RATE_LIMIT_BUDGET_SECONDS", 120)
@@ -272,6 +280,50 @@ def _record_coverage_stage_run(*, warehouse, stage, summaries, now: datetime) ->
         )
 
 
+def run_slack_public_sweep_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
+    """Poll live public channels for new history, member or not.
+
+    The other stages cannot reach these. Freshness asks the change feed, which
+    only knows conversations Zach participates in; coverage only offers channels
+    whose history is incomplete, so a public channel drops out of it for good the
+    moment its backfill finishes. That left 11,488 non-member public channels
+    frozen at their April backfill (measured 2026-08-27), and PDW holding 40% of
+    the month's public-channel messages against Slack's own analytics.
+
+    The per-run limits are a rate budget, not a preference. Each candidate costs
+    one ``conversations.history`` call when nothing happened in it, so
+    hot + cold per five minutes is the sustained call rate this stage adds
+    (~12/min at the defaults) against a measured ~39/min ceiling shared with
+    freshness, threads and coverage. Cold is the larger of the two on purpose:
+    hot is ~1.5k channels and cold is ~11.8k, so 40 cold per run is what makes
+    the full rotation about a day, inside the four-day SLA
+    marts_ops.slack_conversation_health judges. Raise them for a catch-up, not
+    forever; every stage aborts gracefully on the shared rate-limit budget, so
+    over-asking here does not fail runs, it just slows every other stage down.
+    """
+    return SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=logger,
+        sync_users=False,
+        sync_members=False,
+        sync_public_sweep_only=True,
+        sweep_hot_within_days=_int_env("SLACK_ASSET_SWEEP_HOT_DAYS", 7),
+        sweep_hot_limit=_int_env("SLACK_ASSET_SWEEP_HOT_LIMIT", 20),
+        sweep_cold_limit=_int_env("SLACK_ASSET_SWEEP_COLD_LIMIT", 40),
+        skip_known_errors=True,
+        # Decoupled from replies, like coverage and for the same reason: a page
+        # of 200 parents can carry dozens of threads, and fetching each one
+        # inline would spend this stage's whole rate budget inside one channel
+        # while 13k others wait. `slack_workspace_thread_backfill_sync` is the
+        # purpose-built drain — it selects parents with replies we do not hold,
+        # newest first, from any conversation — and it has ~29k threads/day of
+        # capacity against a workspace that opens far fewer.
+        sync_thread_replies=False,
+        max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
+    ).sync_all()
+
+
 def run_slack_metadata_sync(
     *,
     settings,
@@ -474,6 +526,7 @@ def run_intelligent_slack_sync(*, settings, warehouse, logger, now: datetime | N
     summaries = [
         *run_slack_freshness_sync(settings=settings, warehouse=warehouse, logger=logger),
         *run_slack_coverage_sync(settings=settings, warehouse=warehouse, logger=logger, now=current_time),
+        *run_slack_public_sweep_sync(settings=settings, warehouse=warehouse, logger=logger),
         *run_slack_metadata_sync(settings=settings, warehouse=warehouse, logger=logger, now=current_time, respect_interval=True),
     ]
     if current_time.minute == 0:
@@ -624,6 +677,20 @@ def slack_workspace_coverage_sync(context) -> MaterializeResult:
     group_name="slack",
     retry_policy=RetryPolicy(max_retries=3, delay=60),
 )
+def slack_workspace_public_sweep_sync(context) -> MaterializeResult:
+    return _run_locked_slack_stage(
+        context,
+        stage_name="public_sweep",
+        run_fn=run_slack_public_sweep_sync,
+        lock_name="slack-public-sweep",
+        postgres_lock_id=SLACK_PUBLIC_SWEEP_POSTGRES_LOCK_ID,
+    )
+
+
+@asset(
+    group_name="slack",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
 def slack_workspace_metadata_sync(context) -> MaterializeResult:
     return _run_locked_slack_stage(
         context,
@@ -757,6 +824,11 @@ slack_workspace_coverage_sync_job = define_asset_job(
     selection=[slack_workspace_coverage_sync],
 )
 
+slack_workspace_public_sweep_sync_job = define_asset_job(
+    "slack_workspace_public_sweep_sync_job",
+    selection=[slack_workspace_public_sweep_sync],
+)
+
 slack_workspace_metadata_sync_job = define_asset_job(
     "slack_workspace_metadata_sync_job",
     selection=[slack_workspace_metadata_sync],
@@ -804,6 +876,15 @@ def slack_workspace_sync_every_five_minutes(context):
 )
 def slack_workspace_coverage_sync_every_seven_minutes(context):
     return skip_if_job_active(context, job_name="slack_workspace_coverage_sync_job")
+
+
+@schedule(
+    cron_schedule="4-59/5 * * * *",
+    job=slack_workspace_public_sweep_sync_job,
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+def slack_workspace_public_sweep_sync_every_five_minutes(context):
+    return skip_if_job_active(context, job_name="slack_workspace_public_sweep_sync_job")
 
 
 @schedule(
@@ -871,6 +952,7 @@ def defs() -> Definitions:
         assets=[
             slack_workspace_sync,
             slack_workspace_coverage_sync,
+            slack_workspace_public_sweep_sync,
             slack_workspace_metadata_sync,
             slack_workspace_user_sync,
             slack_workspace_thread_sync,
@@ -881,6 +963,7 @@ def defs() -> Definitions:
         jobs=[
             slack_workspace_sync_job,
             slack_workspace_coverage_sync_job,
+            slack_workspace_public_sweep_sync_job,
             slack_workspace_metadata_sync_job,
             slack_workspace_user_sync_job,
             slack_workspace_thread_sync_job,
@@ -891,6 +974,7 @@ def defs() -> Definitions:
         schedules=[
             slack_workspace_sync_every_five_minutes,
             slack_workspace_coverage_sync_every_seven_minutes,
+            slack_workspace_public_sweep_sync_every_five_minutes,
             slack_workspace_metadata_sync_every_fifteen_minutes,
             slack_workspace_user_sync_daily,
             slack_workspace_thread_sync_every_five_minutes,
