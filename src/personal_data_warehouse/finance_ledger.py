@@ -101,6 +101,19 @@ VALUE_BASIS_TAX = "tax"
 # account statements, then reported the FUND's members' equity as his.
 UNIDENTIFIED_ACCOUNT_KEY = ""
 
+# Valuation `measure` (mirrors the extraction contract; pinned by
+# `test_ledger_and_extraction_contract_agree_on_scope_tokens`).
+VALUATION_MEASURE_POSITION = "position_value"
+VALUATION_MEASURE_COST_BASIS = "cost_basis"
+VALUATION_MEASURE_REFERENCE = "reference"
+VALUATION_MEASURE_UNKNOWN = "unknown"
+
+# Two DOCUMENTS disagreeing about one account-day is a conflict the ledger
+# cannot resolve, so it books neither and says so. These bound "disagree":
+# below them the two claims are the same fact rounded differently.
+OBSERVATION_CONFLICT_ABSOLUTE_TOLERANCE = Decimal("1")
+OBSERVATION_CONFLICT_RELATIVE_TOLERANCE = Decimal("0.01")
+
 ACCOUNT_SIDE_ASSET = "asset"
 ACCOUNT_SIDE_LIABILITY = "liability"
 
@@ -283,6 +296,7 @@ class FinanceLedgerSummary:
     # statement used to.
     documents_withheld_entity: int = 0
     documents_withheld_unidentified: int = 0
+    observation_conflicts: int = 0
     security_trades_upserted: int = 0
     security_trades_merged: int = 0
     security_trades_removed: int = 0
@@ -300,8 +314,12 @@ class FinanceLedgerRunner:
         self._warehouse = warehouse
         self._logger = logger or logging.getLogger(__name__)
         self._now = now
+        # Account-days two documents disagreed about, so the ledger booked
+        # neither. Nonzero means a source document needs a human.
+        self._observation_conflicts = 0
 
     def sync(self) -> FinanceLedgerSummary:
+        self._observation_conflicts = 0
         self._warehouse.ensure_finance_tables()
         # The ledger consumes manual_finance extractions; ensure that source's
         # tables so a fresh schema (or a deploy where the extraction asset has
@@ -639,6 +657,7 @@ class FinanceLedgerRunner:
             observations_removed=observations_removed,
             documents_withheld_entity=len(withheld_entity),
             documents_withheld_unidentified=len(withheld_unidentified),
+            observation_conflicts=self._observation_conflicts,
             security_trades_upserted=securities["upserted"],
             security_trades_merged=securities["merged"],
             security_trades_removed=securities["removed"],
@@ -648,7 +667,7 @@ class FinanceLedgerRunner:
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
             "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s "
             "links_relinked=%s links_removed=%s observations_removed=%s "
-            "withheld_entity=%s withheld_unidentified=%s "
+            "withheld_entity=%s withheld_unidentified=%s observation_conflicts=%s "
             "security_trades=%s security_merged=%s security_removed=%s tax_lots=%s",
             summary.accounts_seen,
             summary.accounts_created,
@@ -665,6 +684,7 @@ class FinanceLedgerRunner:
             summary.observations_removed,
             summary.documents_withheld_entity,
             summary.documents_withheld_unidentified,
+            summary.observation_conflicts,
             summary.security_trades_upserted,
             summary.security_trades_merged,
             summary.security_trades_removed,
@@ -1239,19 +1259,33 @@ class FinanceLedgerRunner:
     ) -> list[dict[str, Any]]:
         rows: dict[tuple[str, date, str], dict[str, Any]] = {}
         sources: dict[tuple[str, date, str], str] = {}
+        conflicted: set[tuple[str, date, str]] = set()
 
         def put(account_id: str, as_of: date, kind: str, value: Decimal, currency: str, sha: str) -> None:
-            # Two documents claiming the same account/day/kind is a real
-            # conflict, and a silent last-writer-wins is how the ledger lost
-            # the owner's own capital balance to the FUND's members' equity on
-            # the very same key -- three orders of magnitude apart, no trace.
-            # The write still resolves deterministically (documents are
-            # iterated in content-sha order), but it says so.
+            # Two DIFFERENT documents claiming one account-day is a conflict the
+            # ledger cannot resolve, so it books NEITHER and says which two
+            # documents to look at. Silent last-writer-wins is the mechanism
+            # behind both incidents this guard exists for: it replaced the
+            # owner's own capital balance with the FUND's members' equity, and
+            # it was about to replace a $2,000 angel position with the SAFE's
+            # $25,000,000 valuation cap -- in both cases because the wrong
+            # document happened to sort later by content sha. Refusing
+            # understates by one day, which the account's other observations
+            # and net_worth_history's forward fill absorb; guessing does not.
+            #
+            # Scoped to CROSS-document only. One document restating a running
+            # balance several times for one day (a credit-card statement does
+            # this constantly -- five entries on one day in this corpus) is the
+            # document restating itself, not two sources disagreeing, so the
+            # last entry still wins there.
             key = (account_id, as_of, kind)
             previous = rows.get(key)
-            if previous is not None and previous["value"] != value:
+            if previous is not None and sources[key] != sha and not _values_agree(previous["value"], value):
+                conflicted.add(key)
                 self._logger.warning(
-                    "Two documents disagree on %s %s %s: %s says %s, %s says %s; keeping %s",
+                    "Refusing %s %s %s: document %s says %s and document %s says %s. "
+                    "Two documents cannot both be right about one account-day, and the "
+                    "ledger will not pick one -- resolve the source documents.",
                     account_id,
                     as_of,
                     kind,
@@ -1259,8 +1293,8 @@ class FinanceLedgerRunner:
                     previous["value"],
                     sha,
                     value,
-                    value,
                 )
+                return
             rows[key] = {
                 "account_id": account_id,
                 "as_of": as_of,
@@ -1321,6 +1355,13 @@ class FinanceLedgerRunner:
                     if value is None:
                         continue
                     put(account_id, as_of, kind, value, currency, sha)
+        # A conflicted key keeps neither claim. Dropping it here rather than in
+        # `put` means the FIRST document's row is withdrawn too -- otherwise
+        # whichever document was read first would silently win, which is the
+        # same coin-flip by a different name.
+        for key in conflicted:
+            rows.pop(key, None)
+            self._observation_conflicts += 1
         return list(rows.values())
 
     # --- loading -------------------------------------------------------------
@@ -1630,15 +1671,30 @@ def _group_primary_mask(group: list[dict[str, Any]]) -> str:
 def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
     """Collapse a document's valuation entries to one value per day.
 
-    An entry described as a total wins (a fund export listing every entity
-    plus a totals row). Otherwise the FIRST entry of the day wins: valuation
-    documents usually restate the same asset several ways (point estimate,
-    low/high bounds, rental estimates, assessed-value variants) with the
-    primary figure listed first, and summing alternative measures of one
-    asset inflates it catastrophically. A parts-only multi-entity document
-    without a totals row undercounts to its first position — a visible,
-    benign failure the extraction's totals coverage makes rare.
+    **A `reference` entry is never a value.** A SAFE prints a post-money
+    valuation CAP — a contractual ceiling on the ISSUER's valuation — and it is
+    the biggest, most prominent number on the page, so every "primary figure
+    first" heuristic picks it. On one live angel position the cap was 12,500x
+    the cost basis, and the document is unambiguously the investor's own, so
+    `reporting_scope` cannot help: only the entry's own `measure` can.
+    `position_value` is preferred, `cost_basis` is the fallback (an angel SAFE
+    IS carried at cost), and `reference` is dropped outright.
+
+    Within the surviving entries, an entry described as a total wins (a fund
+    export listing every entity plus a totals row). Otherwise the FIRST entry
+    of the day wins: valuation documents usually restate the same asset several
+    ways (point estimate, low/high bounds, rental estimates, assessed-value
+    variants) with the primary figure listed first, and summing alternative
+    measures of one asset inflates it catastrophically. A parts-only
+    multi-entity document without a totals row undercounts to its first
+    position — a visible, benign failure the extraction's totals coverage makes
+    rare.
+
+    Pre-v3 entries carry no `measure` and are treated as `unknown`, which keeps
+    the whole existing corpus behaving exactly as before: the ONLY entries this
+    drops are ones an agent explicitly labelled `reference`.
     """
+    entries = _preferred_measure_entries(entries)
     by_day: dict[date, dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1660,6 +1716,59 @@ def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
         (as_of, day["total"] if day["total"] is not None else day["first"])
         for as_of, day in sorted(by_day.items())
     ]
+
+
+def _preferred_measure_entries(entries: list[Any]) -> list[Any]:
+    """Keep only the entries that measure the holder's own position.
+
+    Ranked, not filtered to one label: a document that states only a cost basis
+    (an angel investment record) must still produce a value, and one that
+    states both a carrying value and a cost basis must use the carrying value.
+    Entries an agent labelled `reference` are dropped at every rank, so a
+    valuation cap can never become a position value even when it is the only
+    number on the page — in that case the document contributes NO valuation,
+    which is the correct answer rather than a 12,500x wrong one.
+    """
+    ranked: dict[str, list[Any]] = {
+        VALUATION_MEASURE_POSITION: [],
+        VALUATION_MEASURE_COST_BASIS: [],
+        VALUATION_MEASURE_UNKNOWN: [],
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        measure = str(entry.get("measure") or "").strip().lower()
+        if measure == VALUATION_MEASURE_REFERENCE:
+            continue
+        ranked.get(measure, ranked[VALUATION_MEASURE_UNKNOWN]).append(entry)
+    for measure in (
+        VALUATION_MEASURE_POSITION,
+        VALUATION_MEASURE_COST_BASIS,
+        VALUATION_MEASURE_UNKNOWN,
+    ):
+        if ranked[measure]:
+            return ranked[measure]
+    return []
+
+
+def _values_agree(a: Decimal, b: Decimal) -> bool:
+    """Whether two documents' claims about one account-day are the same fact.
+
+    Measured over the whole production corpus 2026-08-28: 904 document claims,
+    17 account-days claimed by more than one document, and after the
+    unidentified-key guard exactly TWO genuine cross-document disagreements —
+    a $0.00-vs-$0.51 rounding difference on a 2018 brokerage statement, and the
+    12,500x SAFE valuation cap. The tolerance is set to keep the first and
+    catch the second, so refusing a conflict costs one 2018 half-dollar.
+    """
+    if a == b:
+        return True
+    if abs(a - b) <= OBSERVATION_CONFLICT_ABSOLUTE_TOLERANCE:
+        return True
+    larger = max(abs(a), abs(b))
+    if larger == 0:
+        return True
+    return abs(a - b) / larger <= OBSERVATION_CONFLICT_RELATIVE_TOLERANCE
 
 
 def _parse_iso_date(value: str) -> date | None:

@@ -19,6 +19,7 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 from personal_data_warehouse.finance_ledger import (
     NON_VALUE_OBSERVATION_KINDS,
+    _daily_valuations,
     REPORTING_SCOPE_ENTITY,
     UNIDENTIFIED_ACCOUNT_KEY,
     VALUE_BASIS_TAX,
@@ -2245,13 +2246,18 @@ def test_ledger_and_extraction_contract_agree_on_scope_tokens():
     """The ledger repeats the extraction contract's enums rather than importing
     them, to stay free of the extraction runner's agent/Docker dependencies.
     A silent divergence would make every entity document book again."""
-    from personal_data_warehouse.manual_finance_extraction import (
-        REPORTING_SCOPE_ENTITY as CONTRACT_ENTITY,
-        VALUE_BASIS_TAX as CONTRACT_TAX,
-    )
+    from personal_data_warehouse import finance_ledger as ledger
+    from personal_data_warehouse import manual_finance_extraction as contract
 
-    assert REPORTING_SCOPE_ENTITY == CONTRACT_ENTITY
-    assert VALUE_BASIS_TAX == CONTRACT_TAX
+    assert REPORTING_SCOPE_ENTITY == contract.REPORTING_SCOPE_ENTITY
+    assert VALUE_BASIS_TAX == contract.VALUE_BASIS_TAX
+    for name in (
+        "VALUATION_MEASURE_POSITION",
+        "VALUATION_MEASURE_COST_BASIS",
+        "VALUATION_MEASURE_REFERENCE",
+        "VALUATION_MEASURE_UNKNOWN",
+    ):
+        assert getattr(ledger, name) == getattr(contract, name), name
 
 
 def test_every_non_value_observation_kind_is_excluded_from_net_worth(warehouse):
@@ -2316,3 +2322,235 @@ def test_every_non_value_observation_kind_is_excluded_from_net_worth(warehouse):
     assert warehouse._query(
         "SELECT latest_observation_kind, latest_value FROM @marts_finance_accounts"
     ) == [("valuation", Decimal("100"))]
+
+
+# --- a contractual figure is not the holder's position value ----------------------
+
+
+def test_a_valuation_cap_is_never_the_holders_position_value():
+    """A SAFE's post-money valuation cap is a ceiling on the ISSUER.
+
+    It is the biggest and most prominent number on the page, so every
+    "primary figure first" heuristic picks it — and the document is
+    unambiguously the investor's own, so `reporting_scope` cannot help. Only
+    the entry's own `measure` can.
+    """
+    assert _daily_valuations(
+        [{"date": "2026-08-27", "value": "25000000", "description": "Post-Money Valuation Cap",
+          "measure": "reference"}]
+    ) == []
+    # A carrying value beats a cost basis on the same day...
+    assert _daily_valuations(
+        [
+            {"date": "2026-08-27", "value": "2000", "description": "Cost basis", "measure": "cost_basis"},
+            {"date": "2026-08-27", "value": "2400", "description": "Carrying value",
+             "measure": "position_value"},
+            {"date": "2026-08-27", "value": "25000000", "description": "Valuation cap",
+             "measure": "reference"},
+        ]
+    ) == [(date(2026, 8, 27), Decimal("2400"))]
+    # ...but a document stating ONLY a cost basis still produces a value: an
+    # angel SAFE really is carried at cost.
+    assert _daily_valuations(
+        [{"date": "2026-08-27", "value": "2000", "description": "Cost basis", "measure": "cost_basis"}]
+    ) == [(date(2026, 8, 27), Decimal("2000"))]
+    # Pre-v3 entries carry no measure and behave exactly as they always did,
+    # so re-extraction is what improves the corpus, never a silent regression.
+    assert _daily_valuations(
+        [{"date": "2026-08-27", "value": "468000", "description": "Estimate"}]
+    ) == [(date(2026, 8, 27), Decimal("468000"))]
+
+
+def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_another(warehouse):
+    """The live 2026-08-28 shape: one folder, three documents, one account.
+
+    An angel investment folder holds a position record (cost basis $2,000), the
+    executed SAFE (whose only valuation is the $25,000,000 cap) and the
+    company's wire instructions. All three share the folder, so all three map to
+    one account key, and the SAFE sorts LAST by content sha — which under plain
+    last-write-wins made the cap the account's value and would have moved net
+    worth by 12,500x.
+    """
+    warehouse.ensure_plaid_tables()
+    warehouse.ensure_manual_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(
+                content_sha256=sha,
+                source_native_id=sha,
+                filename=name,
+                original_path=f"example-angel-inc/{name}",
+            )
+            for sha, name in (
+                ("0036aaaa", "2026-08-27-investment-record.rtf"),
+                ("d752bbbb", "2026-08-27-wire-instructions.pdf"),
+                ("ec72cccc", "2026-08-27-safe-executed.pdf"),
+            )
+        ]
+    )
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256="0036aaaa",
+                document_type="other",
+                institution="Example Angel Inc.",
+                account_name_hint="Private investment position in Example Angel Inc.",
+                account_mask="",
+                closing_balance=Decimal("0"),
+                valuations_json=[
+                    {"date": "2026-08-27", "value": "2000.00", "description": "Cost basis",
+                     "measure": "cost_basis"},
+                ],
+            ),
+            _extraction_row(
+                content_sha256="d752bbbb",
+                document_type="other",
+                institution="Example Bank",
+                account_name_hint="Example Angel Inc. — Checking",
+                # The COMPANY's bank account number, on a document filed in the
+                # investor's folder. It must not become the investor's identity.
+                account_mask="1482",
+                closing_balance=Decimal("0"),
+                valuations_json=[],
+            ),
+            _extraction_row(
+                content_sha256="ec72cccc",
+                document_type="other",
+                institution="Example Angel Inc.",
+                account_name_hint="Example Angel Inc. SAFE",
+                account_mask="",
+                closing_balance=Decimal("0"),
+                valuations_json=[
+                    {"date": "2026-08-27", "value": "25000000",
+                     "description": "Post-Money Valuation Cap", "measure": "reference"},
+                ],
+            ),
+        ]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    # The cap is dropped, so there is no conflict left to refuse and the
+    # account carries the real position.
+    assert summary.observation_conflicts == 0
+    assert warehouse._query(
+        "SELECT kind, value FROM @finance_observations ORDER BY kind"
+    ) == [("valuation", Decimal("2000.00"))]
+    assert warehouse._query("SELECT sum(signed_value) FROM @marts_finance_net_worth") == [
+        (Decimal("2000.00"),)
+    ]
+    assert warehouse._query(
+        "SELECT count(*) FROM @finance_observations WHERE value > 1000000"
+    ) == [(0,)]
+
+
+def test_two_documents_disagreeing_about_one_account_day_book_neither(warehouse):
+    """The deterministic backstop, which needs no re-extraction.
+
+    This is the live 2026-08-28 corpus exactly as it stood: v2 extractions with
+    no `measure`, so the cap looks like an ordinary valuation. Silent
+    last-write-wins is the mechanism behind BOTH incidents — it replaced a real
+    capital balance with a fund's members' equity, and it was about to replace
+    an angel position with that SAFE's valuation cap. Refusing understates by
+    one day; guessing is how a wrong number gets quoted.
+    """
+    warehouse.ensure_plaid_tables()
+    warehouse.ensure_manual_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(content_sha256=sha, source_native_id=sha, filename=f"{sha}.pdf",
+                          original_path=f"example-angel-inc/{sha}.pdf")
+            for sha in ("0036aaaa", "ec72cccc")
+        ]
+    )
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256="0036aaaa",
+                institution="Example Angel Inc.",
+                account_name_hint="Private investment position",
+                account_mask="",
+                closing_balance=Decimal("0"),
+                # No `measure` anywhere: this is what a v2 row looks like.
+                valuations_json=[{"date": "2026-08-27", "value": "2000.00",
+                                  "description": "Cost basis"}],
+            ),
+            _extraction_row(
+                content_sha256="ec72cccc",
+                institution="Example Angel Inc.",
+                account_name_hint="Example Angel Inc. SAFE",
+                account_mask="",
+                closing_balance=Decimal("0"),
+                valuations_json=[{"date": "2026-08-27", "value": "25000000",
+                                  "description": "Post-Money Valuation Cap"}],
+            ),
+        ]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.observation_conflicts == 1
+    # NEITHER claim is booked — not the later one, and not the earlier one,
+    # because keeping the earlier is the same coin-flip by a different name.
+    assert warehouse._query("SELECT count(*) FROM @finance_observations") == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @marts_finance_net_worth") == [(0,)]
+
+
+def test_one_document_restating_a_running_balance_is_not_a_conflict(warehouse):
+    """A credit-card statement prints several running balances for one day.
+
+    Measured on the production corpus 2026-08-28, one statement claimed five
+    different balances for a single date. That is the document restating
+    itself, not two sources disagreeing, so the refusal must be scoped to
+    CROSS-document — otherwise the guard deletes real balance history.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-card", source_native_id="sha-card",
+                               original_path="example-card-4242/statement.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-card",
+            document_type="credit_card_statement",
+            institution="Example Card",
+            account_mask="4242",
+            balances_json=[
+                {"date": "2026-02-01", "balance": "6753.81"},
+                {"date": "2026-02-01", "balance": "3571.31"},
+                {"date": "2026-02-01", "balance": "668.99"},
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.observation_conflicts == 0
+    assert warehouse._query("SELECT value FROM @finance_observations") == [(Decimal("668.99"),)]
+
+
+def test_a_rounding_difference_between_two_documents_is_not_a_conflict(warehouse):
+    """The tolerance is measured, not guessed.
+
+    Over the whole production corpus the only genuine cross-document
+    disagreement other than the two incidents is a $0.00-vs-$0.51 rounding
+    difference on a 2018 brokerage statement. Refusing that would cost real
+    history for nothing.
+    """
+    warehouse.ensure_plaid_tables()
+    warehouse.ensure_manual_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(content_sha256=sha, source_native_id=sha, filename=f"{sha}.pdf",
+                          original_path=f"example-brokerage-5270/{sha}.pdf")
+            for sha in ("c716f1ee", "de2f9358")
+        ]
+    )
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(content_sha256="c716f1ee", account_mask="5270",
+                            institution="Example Brokerage",
+                            balances_json=[{"date": "2018-11-30", "balance": "0.00"}]),
+            _extraction_row(content_sha256="de2f9358", account_mask="5270",
+                            institution="Example Brokerage",
+                            balances_json=[{"date": "2018-11-30", "balance": "0.51"}]),
+        ]
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.observation_conflicts == 0
+    assert warehouse._query("SELECT value FROM @finance_observations") == [(Decimal("0.51"),)]
