@@ -21,7 +21,11 @@ and only ``--apply`` contacts the app at all.
     # see the plan
     uv run python scripts/refile_manual_finance_documents.py --map refile.json
 
-    # then, once the plan reads right
+    # then, once the plan reads right. --apply posts to the app, so it needs
+    # PDW_API_URL + PDW_SECRET_TOKEN: this runs OUTSIDE the pdw CLI, so it
+    # inherits nothing from `pdw login` on its own. Source the shared resolver
+    # rather than hand-rolling the config read (see bin/_pdw-upload-lib.sh):
+    . bin/_pdw-upload-lib.sh && pdw_export_app_credentials
     uv run python scripts/refile_manual_finance_documents.py --map refile.json --apply
 
 ``--map`` is a JSON object of ``{"<content_sha256 or filename substring>": "<folder>"}``.
@@ -103,11 +107,12 @@ def main() -> int:
         return 0
 
     # Imported here so a dry run needs no app credentials at all.
-    from personal_data_warehouse.config import load_settings
-    from personal_data_warehouse.ingest_client import IngestClient
+    # `ingest_client_from_env` is the shared builder every uploader uses --
+    # PDW_API_URL + PDW_SECRET_TOKEN, with the Tailscale-direct route resolved
+    # for it. This posts a small JSON envelope, so the body cap never applies.
+    from personal_data_warehouse.ingest_client import ingest_client_from_env
 
-    settings = load_settings(require_gmail=False, require_manual_finance=True)
-    client = IngestClient.from_settings(settings)
+    client = ingest_client_from_env()
     now = datetime.now(tz=UTC).isoformat()
     for doc, folder in planned:
         account = str(doc["account"])
