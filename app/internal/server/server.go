@@ -232,6 +232,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	// /api/push/register; a new pending mutation request fans out to every
 	// active device. The registry lives in Postgres when the app has it and
 	// in memory otherwise (tests, and local runs without a database).
+	var notifier *push.Notifier
 	{
 		var pushStore push.Store
 		if cfg.PostgresDatabaseURL != "" {
@@ -245,7 +246,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 		if pushStore == nil {
 			pushStore = push.NewMemoryStore()
 		}
-		notifier := push.NewNotifier(pushStore, push.NewExpoClient(cfg.ExpoAccessToken), time.Now, logger)
+		notifier = push.NewNotifier(pushStore, push.NewExpoClient(cfg.ExpoAccessToken), time.Now, logger)
 		push.NewHandler(pushStore, notifier, time.Now, logger).Register(mux, authSvc.RequireStaticBearer())
 		if mutationSvc != nil {
 			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
@@ -292,6 +293,10 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	} else if storeEnabled {
 		logger.Info("object storage enabled", "backend", cfg.ObjectStoreBackend, "folder", cfg.ObjectStoreGoogleDriveFolderID, "url_ttl", cfg.ObjectStoreURLTTL)
 	}
+	// The notify tool needs the object store only to sign image links; the
+	// notifier itself is always there. A storage id is refused, not
+	// guessed, when there is no /objects/ route to serve it.
+	extra = append(extra, notifyTool(notifier, authSvc, baseURL, cfg.ObjectStoreURLTTL, storeEnabled, time.Now))
 	if tokens := cfg.SlackTokens(); len(tokens) > 0 {
 		slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{Tokens: tokens})
 		if storeEnabled {
@@ -475,10 +480,16 @@ func mutationNotification(request mutations.Request) push.Notification {
 		title = fmt.Sprintf("%d mutations to review: %s", count, request.Title)
 	}
 	return push.Notification{
-		Title: title,
-		Body:  body,
+		Title:    title,
+		Body:     body,
+		Category: push.CategoryMutationReview,
+		Route:    "/mutations/" + request.ID,
+		ThreadID: "mutations",
+		// A request waits on a human, so it may break through a Focus
+		// that allows time-sensitive alerts; it is not critical (which
+		// would bypass silent mode).
+		InterruptionLevel: push.InterruptionTimeSensitive,
 		Data: map[string]any{
-			"route":      "/mutations/" + request.ID,
 			"request_id": request.ID,
 			"kind":       "mutation_request",
 		},

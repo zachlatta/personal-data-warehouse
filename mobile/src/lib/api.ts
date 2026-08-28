@@ -230,6 +230,22 @@ export async function registerPushDevice(
 
 export type PushReport = { devices: number; sent: number; failed: number; disabled: number; errors?: string[] };
 
+export type PushAction = {
+  id: string;
+  title: string;
+  destructive: boolean;
+  opens_app: boolean;
+  text_input?: { placeholder: string; submit_title: string };
+};
+export type PushCategory = { id: string; actions: PushAction[] };
+
+// The server owns the category list (app/internal/push/categories.go); the
+// app registers whatever it publishes so a new button needs no app release.
+export async function fetchPushCategories(config: AppConfig): Promise<PushCategory[]> {
+  const body = await request<{ categories: PushCategory[] }>(config, '/api/push/categories');
+  return body.categories;
+}
+
 export async function sendTestPush(config: AppConfig): Promise<PushReport> {
   const body = await request<{ report: PushReport }>(config, '/api/push/test', { method: 'POST' });
   return body.report;

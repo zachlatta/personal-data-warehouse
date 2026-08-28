@@ -16,7 +16,9 @@ import (
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
 const muxAPITestSecret = "test-secret-token-at-least-32-chars-x"
@@ -524,11 +526,97 @@ func TestMutationNotificationShape(t *testing.T) {
 	if n.Title != "2 mutations to review: Send reply" || n.Body != "asked for it" {
 		t.Fatalf("unexpected notification %+v", n)
 	}
-	if n.Data["route"] != "/mutations/r1" || n.Data["request_id"] != "r1" {
-		t.Fatalf("route data missing: %+v", n.Data)
+	if n.Route != "/mutations/r1" || n.Data["request_id"] != "r1" {
+		t.Fatalf("route or request id missing: %+v", n)
 	}
 	single := mutationNotification(mutations.Request{ID: "r2", Title: "Archive", Mutations: []mutations.Mutation{{}}})
 	if single.Title != "Mutation to review: Archive" || single.Body == "" {
 		t.Fatalf("single-mutation shape wrong: %+v", single)
 	}
+}
+
+func TestMutationNotificationIsActionableFromTheLockScreen(t *testing.T) {
+	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2})
+	if n.Category != push.CategoryMutationReview {
+		t.Fatalf("a review alert must carry the mutation_review category so Approve/Deny buttons appear: %+v", n)
+	}
+	if n.Route != "/mutations/r1" || n.ThreadID == "" || n.InterruptionLevel != push.InterruptionTimeSensitive {
+		t.Fatalf("route/thread/interruption not set: %+v", n)
+	}
+	if err := n.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNotifyToolIsExposedAndValidates(t *testing.T) {
+	srv := newMuxAPITestServer(t)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/notify", strings.NewReader(`{"title":"Hi","category":"nope"}`))
+	req.Header.Set("Authorization", "Bearer cli:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "category") {
+		t.Fatalf("invalid category should be a 400 naming the field, got %d: %s", resp.StatusCode, body)
+	}
+	// With no devices registered a valid notification reports zero sent
+	// rather than failing: an empty registry is a fact, not an error.
+	req, _ = http.NewRequest(http.MethodPost, srv.URL+"/api/tools/notify", strings.NewReader(`{"title":"Hi","body":"there","image_url":"https://example.com/a.png","route":"/timeline"}`))
+	req.Header.Set("Authorization", "Bearer cli:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"devices":0`) {
+		t.Fatalf("valid notify with no devices: %d %s", resp.StatusCode, body)
+	}
+	// This deployment has no object store, so a storage id is refused
+	// with a reason rather than turned into a link nothing would serve.
+	req, _ = http.NewRequest(http.MethodPost, srv.URL+"/api/tools/notify", strings.NewReader(`{"title":"Hi","image_storage_file_id":"file-123"}`))
+	req.Header.Set("Authorization", "Bearer cli:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "object storage") {
+		t.Fatalf("storage id without an object store should be a 400 saying so: %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestNotifyToolSignsAStorageImageLink(t *testing.T) {
+	store := push.NewMemoryStore()
+	notifier := push.NewNotifier(store, fakePushSender{}, nil, nil)
+	signer := pdwauth.NewService([]byte("secret"), func() time.Time { return time.Unix(0, 0) })
+	now := func() time.Time { return time.Unix(1_700_000_000, 0) }
+	tl := notifyTool(notifier, signer, "https://example.test/", time.Hour, true, now).(*tool.Typed[notifyInput, notifyOutput])
+	out, err := tl.Handle(context.Background(), notifyInput{Title: "Hi", ImageStorageFileID: "file-123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://example.test/objects/file-123?exp=1700003600&sig="
+	if !strings.HasPrefix(out.ImageURL, want) {
+		t.Fatalf("image_url = %q, want prefix %q", out.ImageURL, want)
+	}
+	if _, err := tl.Handle(context.Background(), notifyInput{Title: "Hi", ImageStorageFileID: "f", ImageURL: "https://x/y.png"}); err == nil {
+		t.Fatal("both image fields at once must be rejected")
+	}
+}
+
+type fakePushSender struct{}
+
+func (fakePushSender) Send(_ context.Context, messages []push.Message) ([]push.Ticket, error) {
+	tickets := make([]push.Ticket, len(messages))
+	for i := range tickets {
+		tickets[i].Status = "ok"
+	}
+	return tickets, nil
 }

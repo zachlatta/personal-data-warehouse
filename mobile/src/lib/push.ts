@@ -3,7 +3,7 @@ import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 
-import { registerPushDevice } from './api';
+import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest } from './api';
 import type { AppConfig } from './config';
 
 // Foreground notifications still show a banner; the default would swallow them.
@@ -55,9 +55,79 @@ export async function registerForPush(config: AppConfig): Promise<PushStatus> {
   }
 }
 
+// Register the server's notification categories so its categoryId values
+// put action buttons on alerts. Failure is logged, not fatal: the alert still
+// shows, only without buttons.
+export async function syncNotificationCategories(config: AppConfig): Promise<void> {
+  try {
+    const categories = await fetchPushCategories(config);
+    await Promise.all(
+      categories.map((category) =>
+        Notifications.setNotificationCategoryAsync(
+          category.id,
+          category.actions.map((action) => ({
+            identifier: action.id,
+            buttonTitle: action.title,
+            textInput: action.text_input
+              ? { placeholder: action.text_input.placeholder, submitButtonTitle: action.text_input.submit_title }
+              : undefined,
+            options: {
+              isDestructive: action.destructive,
+              opensAppToForeground: action.opens_app,
+              isAuthenticationRequired: false,
+            },
+          })),
+        ),
+      ),
+    );
+  } catch (error) {
+    console.warn('notification categories not registered', error);
+  }
+}
+
+type NotificationData = { route?: unknown; request_id?: unknown; kind?: unknown };
+
+function dataOf(response: Notifications.NotificationResponse | null | undefined): NotificationData {
+  return (response?.notification.request.content.data as NotificationData | undefined) ?? {};
+}
+
 // The server puts the screen to open under data.route (see mutationNotification
 // in the Go app).
 export function routeFromNotification(response: Notifications.NotificationResponse | null | undefined): string | null {
-  const data = response?.notification.request.content.data as { route?: unknown } | undefined;
-  return typeof data?.route === 'string' && data.route.startsWith('/') ? data.route : null;
+  const data = dataOf(response);
+  return typeof data.route === 'string' && data.route.startsWith('/') ? data.route : null;
+}
+
+export type NotificationOutcome = { route: string | null; message?: string };
+
+// What to do with a tap or an action button. Approve/Deny on a mutation
+// alert call the review API directly (the button does not open the app);
+// everything else opens the notification's route. A reply action's text
+// comes back in response.userText; it has no server endpoint yet, so it
+// opens the route with the text reported, rather than being dropped.
+export async function handleNotificationResponse(
+  config: AppConfig,
+  response: Notifications.NotificationResponse,
+): Promise<NotificationOutcome> {
+  const data = dataOf(response);
+  const route = routeFromNotification(response);
+  const action = response.actionIdentifier;
+  const requestId = typeof data.request_id === 'string' ? data.request_id : null;
+  if (requestId && (action === 'approve' || action === 'deny')) {
+    try {
+      if (action === 'approve') {
+        await approveMutationRequest(config, requestId);
+        return { route: null, message: 'Approved from the notification.' };
+      }
+      await rejectMutationRequest(config, requestId, 'Denied from the notification.');
+      return { route: null, message: 'Denied from the notification.' };
+    } catch (error) {
+      // The decision did not land; open the review screen so it can be made there.
+      return { route: route ?? `/mutations/${requestId}`, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  if (action === 'reply' && typeof response.userText === 'string') {
+    return { route, message: `Reply captured: ${response.userText}` };
+  }
+  return { route };
 }

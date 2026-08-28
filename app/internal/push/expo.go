@@ -19,15 +19,41 @@ const DefaultExpoEndpoint = "https://exp.host/--/api/v2/push/send"
 const expoBatchSize = 100
 
 // Message is one notification for one device.
+// Message is one Expo push message, in Expo's own wire shape
+// (https://docs.expo.dev/push-notifications/sending-notifications/#message-request-format).
+// Build it through Notification.message rather than by hand so the
+// validation there runs.
 type Message struct {
 	To       string         `json:"to"`
 	Title    string         `json:"title,omitempty"`
+	Subtitle string         `json:"subtitle,omitempty"`
 	Body     string         `json:"body,omitempty"`
 	Data     map[string]any `json:"data,omitempty"`
 	Sound    string         `json:"sound,omitempty"`
+	Badge    *int           `json:"badge,omitempty"`
 	Priority string         `json:"priority,omitempty"`
+	// CategoryID names a notification category the app registered
+	// (see Categories); it is what puts action buttons on the alert.
+	CategoryID string `json:"categoryId,omitempty"`
+	// ThreadID groups alerts visually in Notification Center.
+	ThreadID string `json:"threadId,omitempty"`
+	// CollapseID replaces an earlier alert with the same id instead of
+	// stacking a second one.
+	CollapseID        string `json:"collapseId,omitempty"`
+	InterruptionLevel string `json:"interruptionLevel,omitempty"`
+	// MutableContent lets the app's notification service extension rewrite
+	// the alert before it is shown; it is required for RichContent on iOS.
+	MutableContent bool         `json:"mutableContent,omitempty"`
+	RichContent    *RichContent `json:"richContent,omitempty"`
 	// ChannelID is Android-only; harmless on iOS.
 	ChannelID string `json:"channelId,omitempty"`
+}
+
+// RichContent is the media Expo attaches to a message. Android renders it
+// itself; iOS hands the payload to the app's notification service extension
+// (mobile/targets/notification-service), which downloads and attaches it.
+type RichContent struct {
+	Image string `json:"image,omitempty"`
 }
 
 // Ticket is Expo's per-message acknowledgement. A ticket with Status "error"
