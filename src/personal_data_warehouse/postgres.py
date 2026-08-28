@@ -3094,9 +3094,11 @@ class PostgresWarehouse:
                 COALESCE(i.error_json->>'error_type', '') AS error_type,
                 COALESCE(i.error_json->>'error_message', '') AS error_message,
                 CASE
-                    WHEN COALESCE(i.error_json->>'error_code', '') = '' THEN 'ok'
-                    ELSE 'action_required'
+                    WHEN COALESCE(i.error_json->>'error_code', '') <> '' THEN 'action_required'
+                    WHEN COALESCE(array_length(dup.item_ids, 1), 0) > 0 THEN 'duplicate'
+                    ELSE 'ok'
                 END AS status,
+                COALESCE(dup.item_ids, ARRAY[]::text[]) AS duplicate_item_ids,
                 linked.account_count,
                 COALESCE(linked.account_names, '') AS account_names,
                 linked.newest_transaction_at,
@@ -3118,6 +3120,31 @@ class PostgresWarehouse:
                 WHERE a.account = i.account
                   AND a.item_id = i.item_id
             ) AS linked ON TRUE
+            -- A re-link can mint a SECOND live Item for the same real
+            -- accounts (2026-07-25, and again 2026-08-28). Both then sync
+            -- and every balance is counted twice while each row reads ok,
+            -- so an Item is only ok when no OTHER live Item at the same
+            -- institution carries a live account with the same mask, type
+            -- and subtype.
+            LEFT JOIN LATERAL (
+                SELECT array_agg(DISTINCT o.item_id ORDER BY o.item_id) AS item_ids
+                FROM @plaid_accounts AS mine
+                JOIN @plaid_accounts AS theirs
+                  ON theirs.account = mine.account
+                 AND theirs.item_id <> mine.item_id
+                 AND theirs.mask = mine.mask
+                 AND theirs.type = mine.type
+                 AND theirs.subtype = mine.subtype
+                 AND theirs.is_removed = 0
+                JOIN @plaid_items AS o
+                  ON o.account = theirs.account
+                 AND o.item_id = theirs.item_id
+                 AND o.institution_id = i.institution_id
+                WHERE mine.account = i.account
+                  AND mine.item_id = i.item_id
+                  AND mine.is_removed = 0
+                  AND mine.mask <> ''
+            ) AS dup ON TRUE
             """),
         ]
         for logical, sql in view_sql:

@@ -2657,7 +2657,11 @@ balance is counted twice in `marts_finance.net_worth` and the transaction overla
 After any re-link, assert the item count too —
 `SELECT institution_name, count(*) FROM base_plaid.items GROUP BY 1 HAVING count(*) > 1` — and retire
 the leftover with `pdw ingest plaid unlink <item-id>` (`--dry-run` first; the id may be an
-unambiguous prefix). The ledger side self-heals from there: plaid account identity resolves by
+unambiguous prefix). Since 2026-08-28 `marts_ops.plaid_item_health` reads `duplicate` (with
+`duplicate_item_ids`) for every live Item whose live accounts share mask + type + subtype with
+another live Item at the same institution, because it happened a second time — two Capital One
+Items, both `ok`, both syncing, two `marts_finance.net_worth` rows per card — and every health
+surface stayed green for at least a day. The ledger side self-heals from there: plaid account identity resolves by
 owner + institution + mask + side, so the surviving Item's accounts merge back into the logical
 accounts they duplicated, and the residue is pruned.
 Optional products default to read-only `transactions,investments,liabilities`; no
