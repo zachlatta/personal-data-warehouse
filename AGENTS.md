@@ -55,6 +55,23 @@ quietly becoming untrue, and several of these have been.
   error sessions < 10%). The baseline on 2026-08-26 was 27% / 6% / 35% / 27%. The
   `search` tool hints when an unscoped result came back mostly noise, and the query tool
   hints before running a raw-table text scan; this row is how we know whether that lands.
+  **An instrument that greps for `pdw ` is not measuring invocations.** The collector reads
+  each call's tool INPUT, which is the tool's JSON, so until 2026-08-28 a bare `pdw `
+  substring also matched Claude Code's `description` field ("Read pdw skill"), another
+  program's flag (`pgbackrest --stanza=pdw info`), and `which pdw hcb`: 18 of 284 sessions
+  had never run the CLI, and the collector decided their opening move from prose. `pdw` now
+  has to sit at a shell command position and be followed by a real subcommand, and a
+  command-position `pdw` followed by anything else is `invented` — which is what the CLI
+  itself answers with `unknown command`. That correction alone took `invented_calls` over
+  the same fortnight from 18 to 144, because the old rule knew about `pdw call sql|query`
+  but not about the 81 `pdw call search` invocations the `runCall` fence redirects (C9).
+  **Admin calls are also not questions**: `pdw ingest`, `pdw version`, `pdw login` and the
+  credential publishers are counted in `admin_calls` and excluded from both the denominator
+  and the first-call decision, so a session that only ran an uploader is no longer recorded
+  as one that failed to start at the timeline. Re-measured on 2026-08-28 the fortnight read
+  24% search-first (44% opened with `pdw schema`, 21% with SQL), against the old
+  instrument's 21% — the correction is small, and the honest reading is that agents really
+  do open with schema discovery about twice as often as with a search.
 - **C4 — raw source data for every source is queryable via SQL.** `base_<source>` is a
   faithful copy, discoverable, and readable by the read-only `pdw_query` role. The timeline
   is the recommended entry point, never the only truth. *Held up by*
@@ -3375,6 +3392,26 @@ as an outage. Two halves fix it, and each was independently necessary:
   window and waited eight more hours for the coverage floor walk. Streaming in full is
   cheap precisely because the conversation is new — this branch is reachable only when we
   hold no row for it at all, so a busy channel Zach merely joined is not affected.
+
+**An `ok: true` payload about someone else's conversations is not a change feed, and it
+stopped Slack ingestion dead for eleven hours.** Hack Club is an Enterprise Grid org, and a
+session's `client.counts` can come back scoped to a sibling workspace. Production did it
+twice — 2026-08-27 18:15–19:15 and again from 2026-08-28 03:25 — going from 694
+conversations covered to **17**, whose ids `conversations.info` answered
+`channel_not_found`. `SlackChangePlan.usable` stayed True, so the freshness pass polled
+those 13 permanently-"changed" ids (unfetchable, so their cursors could never advance),
+logged `Freshness loaded 0 cached active Slack conversations` and `synced 0 Slack messages`
+on every five-minute tick, and **no other Slack health number moved**: discovery 100%,
+history polling `ok`, the pipeline green. The 18:15–19:15 episode is exactly the DM
+landing-latency spike that motivated `landing_p95_seconds` — that column is the only thing
+that saw it, and it saw it an hour late.
+
+The plan is now unusable unless at least `SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION` (half) of
+the conversations the feed names are ones we already hold, which degrades to the blanket
+poll — throughput, never coverage, the trade this whole path is built on. The threshold sits
+far below any honest miss rate (a conversation created since the discovery walk last ran is
+legitimately unknown, a handful against ~690), and a fresh warehouse that holds nothing to
+vouch with correctly falls back to the poll that fills the table in the first place.
 
 ## Slack change feed: how the sync knows what to fetch
 

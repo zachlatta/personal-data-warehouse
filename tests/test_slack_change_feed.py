@@ -103,15 +103,25 @@ def _settings(monkeypatch):
 
 
 class _Warehouse:
-    def __init__(self, session=None, cursors=None):
+    def __init__(self, session=None, cursors=None, known=None):
         self._session = session or {}
         self._cursors = cursors or {}
+        # Conversations already in base_slack.conversations. Default to "we hold
+        # whatever the feed names" so the tests written before the
+        # another-workspace guard keep describing the healthy case.
+        self._known = known
 
     def load_slack_session(self, **_):
         return self._session
 
     def load_slack_conversation_cursors(self, **_):
         return self._cursors
+
+    def load_slack_known_conversation_ids(self, *, account, team_id, conversation_ids):
+        wanted = {str(c) for c in conversation_ids}
+        if self._known is None:
+            return wanted
+        return wanted & self._known
 
 
 def test_freshness_limits_shrink_to_the_changed_set(monkeypatch):
@@ -229,3 +239,105 @@ def test_the_freshness_pass_may_look_up_conversations_the_feed_names_but_we_lack
     assert captured, "the freshness pass must build its per-type runners"
     assert all(kwargs["new_conversation_limit"] > 0 for kwargs in captured)
     assert all(kwargs["conversation_ids"] == ("D_NEW",) for kwargs in captured)
+
+
+def test_a_feed_describing_another_workspace_is_not_usable(monkeypatch):
+    """An `ok: true` payload about someone else's conversations is not a change feed.
+
+    Hack Club is an Enterprise Grid org, and a session's `client.counts` can come
+    back scoped to a sibling workspace. Production did exactly that twice:
+    2026-08-27 18:15-19:15 and again from 2026-08-28 03:25, when the feed went
+    from 694 conversations to 17 whose ids `conversations.info` answered
+    `channel_not_found`. `plan.usable` stayed True, so the freshness pass polled
+    those 13 "changed" ids -- which can never advance, because we cannot fetch
+    them -- and synced **zero** messages for eleven hours while every other Slack
+    health number read `ok`. That is the failure this module's docstring says must
+    never happen ("nothing changed" vs "we could not ask"), wearing an ok:true.
+
+    A feed naming conversations we do not hold degrades to polling, which costs
+    throughput and never coverage.
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    monkeypatch.setattr(
+        slack_defs,
+        "fetch_client_counts",
+        lambda **_: {
+            "ok": True,
+            "channels": [{"id": "C_OTHER_ORG", "latest": "99.0"}],
+            "ims": [{"id": "D_OTHER_ORG", "latest": "99.0"}],
+            "mpims": [],
+        },
+    )
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={"session_token": "xoxc-t", "session_cookie": "xoxd-c", "team_id": "T1"},
+            cursors={},
+            known={"D_OURS", "C_OURS"},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+
+    assert plan.usable is False
+    assert "we hold 0" in plan.reason
+
+
+def test_a_feed_naming_our_conversations_stays_usable_when_one_is_brand_new(monkeypatch):
+    """The guard must not fire on the normal case it sits next to.
+
+    A conversation created since the discovery walk last ran is legitimately
+    unknown, and fetching it is the point of the on-demand lookup. One new id
+    among the workspace's ~690 is nothing like a feed that names none of them.
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    monkeypatch.setattr(
+        slack_defs,
+        "fetch_client_counts",
+        lambda **_: {
+            "ok": True,
+            "channels": [],
+            "ims": [{"id": "D_OURS", "latest": "99.0"}, {"id": "D_BRAND_NEW", "latest": "99.0"}],
+            "mpims": [{"id": "C_OURS", "latest": "99.0"}],
+        },
+    )
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={"session_token": "xoxc-t", "session_cookie": "xoxd-c", "team_id": "T1"},
+            cursors={},
+            known={"D_OURS", "C_OURS"},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+
+    assert plan.usable is True
+    assert set(plan.changed_conversation_ids) == {"D_OURS", "D_BRAND_NEW", "C_OURS"}
+
+
+def test_a_warehouse_with_no_conversations_yet_polls_rather_than_trusting_the_feed(monkeypatch):
+    """First run of a fresh warehouse: nothing is known, so nothing can vouch for
+    the feed. Falling back to the blanket poll is what fills the conversations
+    table in the first place."""
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    monkeypatch.setattr(
+        slack_defs,
+        "fetch_client_counts",
+        lambda **_: {"ok": True, "ims": [{"id": "D1", "latest": "99.0"}], "channels": [], "mpims": []},
+    )
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={"session_token": "xoxc-t", "session_cookie": "xoxd-c", "team_id": "T1"},
+            cursors={},
+            known=set(),
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+
+    assert plan.usable is False

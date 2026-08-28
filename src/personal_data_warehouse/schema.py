@@ -2352,6 +2352,7 @@ AGENT_USAGE_COLUMNS = (
     "sql_error_sessions",
     "sql_timeouts",
     "invented_calls",
+    "admin_calls",
     "newest_session_at",
     "collected_at",
 )

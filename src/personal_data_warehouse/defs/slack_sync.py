@@ -79,6 +79,14 @@ def _user_sync_lock_wait_seconds() -> int:
     return _int_env("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", 1800)
 
 
+#: How much of a client.counts payload has to be conversations we already hold
+#: before the plan is trusted. A conversation created since the discovery walk
+#: last ran is legitimately unknown -- a handful against ~690 -- so this is set
+#: far below any honest miss rate and only fires when the feed is describing a
+#: different workspace, or a fresh warehouse holds nothing to vouch with.
+SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION = 0.5
+
+
 @dataclass(frozen=True)
 class SlackChangePlan:
     """What Slack says has moved, or why we could not ask."""
@@ -129,6 +137,31 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
         return SlackChangePlan(usable=False, reason=str(exc))
 
     team_id = str(session.get("team_id") or "")
+
+    # An `ok: true` payload about SOMEONE ELSE'S conversations is not a change
+    # feed. Hack Club is an Enterprise Grid org and a session's client.counts can
+    # come back scoped to a sibling workspace: production did it twice, on
+    # 2026-08-27 18:15-19:15 and again from 2026-08-28 03:25, going from 694
+    # conversations to 17 whose ids conversations.info answered
+    # `channel_not_found`. The plan stayed usable, so the freshness pass polled
+    # those 13 permanently-"changed" ids -- unfetchable, so their cursors could
+    # never advance -- and synced ZERO messages for eleven hours while every
+    # other Slack health number read `ok`. Only the DM landing-latency column
+    # noticed. Degrading to the blanket poll costs throughput and never coverage,
+    # which is the trade this whole module is built on.
+    covered = sorted(feed.covered_conversation_ids)
+    if covered and hasattr(warehouse, "load_slack_known_conversation_ids"):
+        known = warehouse.load_slack_known_conversation_ids(
+            account=account, team_id=team_id, conversation_ids=covered
+        )
+        if len(known) < SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION * len(covered):
+            reason = (
+                f"client.counts named {len(covered)} conversations and we hold {len(known)} of them; "
+                "the feed is not describing this workspace"
+            )
+            logger.warning("Slack change feed unusable, falling back to polling: %s", reason)
+            return SlackChangePlan(usable=False, reason=reason)
+
     cursors = warehouse.load_slack_conversation_cursors(account=account, team_id=team_id)
     changed = feed.changed_since(cursors)
     logger.info(
