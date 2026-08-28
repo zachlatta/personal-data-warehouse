@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -33,10 +34,10 @@ const (
 		"its thread or channel, a message its chat. If the hit is still insufficient, use source_table and " +
 		"source_pk for a one-hop drill-down to the authoritative row; raise max_results explicitly " +
 		"only when you need more recall."
-	searchEmptyGuidance = "No hits is not proof of absence. Retry once with fewer terms or the " +
-		"vocabulary the answering record would contain; use mode exact for an identifier or literal " +
-		"phrase, widen sources/since if scoped, or raise max_results for more recall. Do not fall " +
-		"back to ILIKE over raw body columns."
+	searchEmptyGuidance = "No hits is not proof of absence. Retry once with FEWER, more distinctive " +
+		"words -- a name, an id, a product, an amount, a subject-line phrase -- rather than more of " +
+		"them; use mode exact for an identifier or literal phrase, widen sources/since if scoped, " +
+		"or raise max_results for more recall. Do not fall back to ILIKE over raw body columns."
 )
 
 // searchPhrasingHint is advice for the caller's NEXT search, not an error. The
@@ -44,17 +45,41 @@ const (
 // guidance rather than in another model inside the search path: it costs
 // nothing and needs no new dependency.
 //
-// It is worth saying. On the labeled benchmark, sentence-shaped queries score
-// MRR 0.27 where term-bag queries score 0.53, and rewording the nine questions
-// that returned nothing useful -- as the words their ANSWERING RECORD would
-// contain rather than the words of the question -- recovered five of them, from
-// nothing in the top 50 to ranks 10, 10, 12, 15 and 48.
+// It is worth saying. On the labeled benchmark (re-measured 2026-08-27, 68
+// cases, hybrid), sentence-shaped queries score MRR 0.29 where term bags score
+// 0.42 and bare identifiers 0.68, and rewording the nine questions that
+// returned nothing useful -- as the words their ANSWERING RECORD would contain
+// rather than the words of the question -- recovered five of them, from nothing
+// in the top 50 to ranks 10, 10, 12, 15 and 48.
 const searchPhrasingHint = "This query reads like a sentence. Retrieval here is measurably better " +
-	"when a query is phrased as the words the ANSWERING RECORD would contain rather than the " +
-	"words of the question: \"how long our money lasts\" finds nothing, \"runway burn rate months " +
-	"of cash remaining\" finds it. If the results below miss, re-issue with the vocabulary the " +
-	"record itself would use (an email's subject line, a statement's column heading, the phrase a " +
-	"person would actually have typed)."
+	"when a query is the FEW most distinctive words the ANSWERING RECORD would contain rather than " +
+	"the words of the question: \"how long our money lasts\" finds nothing, \"runway burn rate months " +
+	"of cash remaining\" finds it. If the results below miss, re-issue with a short anchor in the " +
+	"record's own vocabulary (a name, an id, a product, an amount, an email's subject line, the " +
+	"phrase a person would actually have typed)."
+
+// searchLongBagHint fires on a long query that carries no anchor at all -- no
+// capitalized name, no number, no identifier punctuation. Measured on the
+// labeled set 2026-08-27, adding generic words to a distinctive anchor HURTS:
+// "Mt Foolery" ranks #1 and "Woody Mt Foolery cancelled postponed weather" is
+// not in the top 50; "Sunbeam Marrakesh" #5 against "customs duty charged to
+// receive package shirt Sunbeam" #41. Each generic term dilutes both the BM25
+// score and the embedding neighbourhood, and rank fusion then averages the
+// anchor away. The rule is deliberately crude (word count and a lexical anchor
+// test) for the same reason the sentence test is: the alternative is a model
+// call to classify a string.
+const searchLongBagHint = "This is a long query with no distinctive anchor (no name, id, number or " +
+	"identifier). Measured on the labeled benchmark, adding generic words to a distinctive term " +
+	"makes retrieval WORSE, not better: \"Mt Foolery\" ranks first while \"Woody Mt Foolery cancelled " +
+	"postponed weather\" is not in the top 50. If the results below miss, re-issue with the two to " +
+	"four most distinctive words the record itself would contain, and prefer several short " +
+	"searches over one long one."
+
+// searchLongBagMinWords is the length at which an unanchored query starts to
+// read as a generic bag: "vision insurance VSP EyeMed glasses member ID" is
+// seven words and anchored, "startup founder venture capital book
+// recommendations reading list" is eight and not.
+const searchLongBagMinWords = 7
 
 // searchAttentionHint fires when an UNSCOPED search came back mostly noise and
 // background. `noise` alone is ~82% of the corpus, so leaving every tier in is
@@ -138,10 +163,48 @@ func searchTermBag(query string) string {
 // in the shape that retrieves well. Hinting every response is noise nobody
 // reads, so the strong case gets nothing.
 func searchHintFor(query string) string {
-	if !searchQueryIsSentence(query) {
-		return ""
+	if searchQueryIsSentence(query) {
+		return searchPhrasingHint
 	}
-	return searchPhrasingHint
+	if searchQueryIsLongUnanchoredBag(query) {
+		return searchLongBagHint
+	}
+	return ""
+}
+
+// searchQueryIsLongUnanchoredBag reports a query of searchLongBagMinWords or
+// more words in which no word is an anchor. An anchor is a capitalized word
+// past the first (a name), a word carrying a digit (an amount, a code, a
+// date), or one carrying identifier punctuation (a path, a handle, a ticket).
+func searchQueryIsLongUnanchoredBag(query string) bool {
+	fields := strings.Fields(query)
+	if len(fields) < searchLongBagMinWords {
+		return false
+	}
+	for i, field := range fields {
+		if searchWordIsAnchor(field, i == 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func searchWordIsAnchor(word string, first bool) bool {
+	trimmed := strings.Trim(word, ".,!?;:'\"")
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		if unicode.IsDigit(r) || strings.ContainsRune("#$@/_-", r) {
+			return true
+		}
+	}
+	if first {
+		// A sentence-initial capital says nothing; only the acronym shape
+		// ("DDP", "VSP") counts at position zero.
+		return len(trimmed) > 1 && strings.ToUpper(trimmed) == trimmed
+	}
+	return unicode.IsUpper([]rune(trimmed)[0])
 }
 
 // ArgsRunner is the parameterized-query capability search needs: caller

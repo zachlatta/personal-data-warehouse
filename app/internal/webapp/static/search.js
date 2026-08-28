@@ -11,7 +11,7 @@ export function mount(container, ctx) {
     <div id="sv">
       <form id="sform">
         <div class="srow">
-          <input id="sq" type="search" placeholder="the words the answering record would contain — not the question" autocomplete="off" autofocus>
+          <input id="sq" type="search" placeholder="a few distinctive words the record would contain — a name, an id, an amount" autocomplete="off" autofocus>
           <select id="smode"></select>
           <button class="primary" type="submit">search</button>
         </div>
