@@ -6,6 +6,8 @@ import logging
 import pytest
 
 from personal_data_warehouse.receipt_enrichment import (
+    DEFAULT_MAX_TRANSACTION_AGE_DAYS,
+    DEFAULT_TRANSACTION_LIMIT,
     DECISION_FOUND,
     DECISION_INSUFFICIENT,
     DECISION_NOT_FOUND,
@@ -163,8 +165,15 @@ def test_worklist_is_recent_posted_transactions_not_artifacts():
 
     assert warehouse.ensured
     assert captured["since"] == NOW - timedelta(days=30)
+    assert captured["posted_floor"] == NOW - timedelta(days=DEFAULT_MAX_TRANSACTION_AGE_DAYS)
+    assert captured["limit"] == DEFAULT_TRANSACTION_LIMIT
     candidate_sql = next(sql for sql, _ in warehouse.queries if "FROM @finance_transactions AS t" in sql)
-    assert "t.posted_at >= %(since)s" in candidate_sql
+    # A transaction is due when it ARRIVED in the ledger recently, not only
+    # when it posted recently: audit 2026-08-28 found 506 of 976 transactions
+    # in 90 days never attempted, every one of them a statement transaction
+    # whose created_at trailed its posted_at by more than the 30-day window.
+    assert "(t.posted_at >= %(since)s OR t.created_at >= %(since)s)" in candidate_sql
+    assert "t.posted_at >= %(posted_floor)s" in candidate_sql
     assert "t.pending = 0" in candidate_sql
     assert "clean_photos" not in candidate_sql
     assert "gmail_messages" not in candidate_sql
@@ -351,11 +360,34 @@ def test_agent_failure_leaves_transaction_unwritten_for_next_run():
     assert warehouse.rows == []
 
 
+def test_the_arrival_window_and_the_posted_floor_are_both_hard_caps():
+    """Configuration can neither widen the arrival window nor lift the floor:
+    a bulk statement backfill must not turn into an archive-wide receipt scan."""
+    captured = {}
+
+    def capture(params):
+        captured.update(params)
+        return []
+
+    warehouse = FakeWarehouse({"FROM @finance_transactions AS t": capture})
+    _runner(warehouse, FakeAgent(), lookback_days=730).sync()
+    assert captured["since"] == NOW - timedelta(days=30)
+    assert captured["posted_floor"] == NOW - timedelta(days=DEFAULT_MAX_TRANSACTION_AGE_DAYS)
+    assert DEFAULT_MAX_TRANSACTION_AGE_DAYS == 90
+
+
+def test_the_per_run_budget_drains_a_statement_backlog_within_days():
+    """~500 late-arriving transactions at one agent call each, hourly."""
+    assert 24 * DEFAULT_TRANSACTION_LIMIT >= 400
+    assert DEFAULT_TRANSACTION_LIMIT <= 25
+
+
 def test_defaults_are_a_hard_30_day_window(monkeypatch):
     from personal_data_warehouse.defs import receipt_enrichment as defs_module
 
     monkeypatch.setenv("RECEIPT_LOOKBACK_DAYS", "730")
     assert defs_module.receipt_lookback_days() == 30
+    assert defs_module.receipt_transaction_limit() == DEFAULT_TRANSACTION_LIMIT
     assert defs_module.receipt_retry_after_days() == 7
     assert defs_module.receipt_max_attempts() == 2
     assert defs_module.receipt_model() == "gpt-5.6-terra"

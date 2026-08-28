@@ -136,6 +136,16 @@ COLLATION_SNAPSHOT_STALE_SECONDS = 2 * 24 * 3600
 #: cycles is one missed report plus margin.
 PGBACKREST_SNAPSHOT_STALE_SECONDS = 2 * 6 * 3600
 
+#: How old the last verified restore drill may be before
+#: marts_ops.pgbackrest_health reads `attention`. Fulls are weekly, the
+#: sysadmin runbook says "periodically", and a drill moves ~225 GB over SFTP
+#: and takes about an hour of a human's attention, so monthly is the honest
+#: cadence: 45 days is one missed month plus margin. The record is written by
+#: `uv run python -m personal_data_warehouse.pgbackrest_restore_drill record`
+#: after the restored cluster has been counted; without it the row cannot say
+#: the backups restore, only that they exist.
+PGBACKREST_RESTORE_DRILL_STALE_SECONDS = 45 * 24 * 3600
+
 #: Unarchived WAL segments (.ready files) above which archiving is judged to be
 #: losing ground. Steady state on this database is 0-160 segments; the
 #: 2026-08-26 incident reached 5,910 (96 GB) over two days while every other
@@ -929,6 +939,22 @@ PIPELINES: tuple[Pipeline, ...] = (
             "measured: 794 gaps, p95 0.71d, max 6.57d — same reasoning as"
             " voice_memo_transcription: it follows its input's cadence, not the clock"
         ),
+        # The enrichments table is also this pass's failure record: an agent
+        # run that raises lands as status='error' with the exception text,
+        # keyed by recording and prompt version, and a later success on the
+        # same key overwrites it. Audit 2026-08-28: this row read
+        # run_status='unmonitored', so a pass whose every agent call failed
+        # looked exactly like a fortnight with nothing to enrich.
+        state=StateSource(
+            table="apple_voice_memos_enrichments",
+            updated_column="created_at",
+            status_column="status",
+            error_column="error",
+            # History table, one row per (recording, prompt version): a failure
+            # the candidate query has stopped retrying (max_error_attempts) is
+            # history, not state. Same window as voice_memo_transcription.
+            error_window=timedelta(days=7),
+        ),
     ),
     Pipeline(
         id="manual_finance_extraction",
@@ -949,6 +975,26 @@ PIPELINES: tuple[Pipeline, ...] = (
         expected_data_interval=7 * DAY,
         expected_run_interval=None,
         data_basis="measured: 528 gaps, p95 0.36d, max 1.58d — 7d leaves ample headroom",
+        # A failed receipt agent run writes NO receipt row -- the transaction
+        # is left for the next run to retry -- so the receipts table cannot be
+        # this pass's failure record. The one durable trace of every attempt,
+        # successful or not, is ops.ai_processing_agent_runs, which every
+        # agent-backed pass shares; scoping to the receipt task_type is what
+        # keeps a vision-model outage in another pass from colouring this row.
+        # Audit 2026-08-28: run_status='unmonitored' here too.
+        state=StateSource(
+            table="agent_runs",
+            updated_column="started_at",
+            status_column="status",
+            error_column="error",
+            scope_column="task_type",
+            # Must equal receipt_enrichment.RECEIPT_AGENT_TASK_TYPE; pinned by
+            # test_receipt_heartbeat_reads_only_the_receipt_agents_runs.
+            scope_value="receipt_transaction_match",
+            # One row per agent run, never revisited: history, so windowed.
+            error_window=timedelta(days=7),
+        ),
+        note="the heartbeat advances only when a transaction was due; idle hours are not runs",
     ),
     Pipeline(
         id="photo_identity",

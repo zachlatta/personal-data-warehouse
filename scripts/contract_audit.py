@@ -203,14 +203,15 @@ def c9_one_way() -> Verdict:
 
 def c10_backups() -> Verdict:
     title = "backed up, restore performed"
-    rows = pdw_sql("backup posture", "SELECT stanza, status, backup_count, last_full_at, full_age_seconds, last_archived_at FROM marts_ops.pgbackrest_health")
+    rows = pdw_sql("backup posture", "SELECT stanza, status, backup_count, last_full_at, full_age_seconds, last_archived_at, restore_status, last_restore_label, restore_age_seconds FROM marts_ops.pgbackrest_health")
     if not rows:
         return Verdict("C10", title, RED, "marts_ops.pgbackrest_health has no row: backup existence is unobservable")
     r = rows[0]
     count = int(r["backup_count"] or 0)
     age_days = (float(r["full_age_seconds"]) / 86400) if r["full_age_seconds"] is not None else None
-    status = RED if count == 0 or r["status"] in ("failing",) else (YELLOW if r["status"] in ("late", "stale", "unknown") else GREEN)
-    return Verdict("C10", title, status, f"{count} backups, status {r['status']}, last full {age_days and f'{age_days:.1f}d'} ago; restore drills: see sysadmin/slowking notes")
+    restore_days = (float(r["restore_age_seconds"]) / 86400) if r.get("restore_age_seconds") is not None else None
+    status = RED if count == 0 or r["status"] in ("failing",) else (YELLOW if r["status"] in ("late", "stale", "unknown", "attention") else GREEN)
+    return Verdict("C10", title, status, f"{count} backups, status {r['status']}, last full {age_days and f'{age_days:.1f}d'} ago; restore {r.get('restore_status')} ({r.get('last_restore_label') or 'none'}, {restore_days and f'{restore_days:.1f}d'} ago)")
 
 
 def c11_source_slas() -> Verdict:

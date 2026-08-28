@@ -1769,8 +1769,12 @@ def test_no_valid_backup_is_the_loudest_state_there_is(warehouse):
 
 
 def test_a_healthy_repository_reads_ok(warehouse):
+    """Healthy means backups exist, WAL ships, AND a restore has been verified."""
+
     warehouse.ensure_pipeline_health_tables()
-    assert _backup_row(warehouse)["status"] == "ok"
+    _backup_row(warehouse)
+    warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="20260826-120000F", rows=1, note="")
+    assert warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]["status"] == "ok"
 
 
 def test_a_failing_loop_with_an_older_good_backup_is_attention_not_ok(warehouse):
@@ -1850,3 +1854,187 @@ def test_a_genuinely_abandoned_collation_snapshot_still_reads_unknown(warehouse)
     )
     row = warehouse._query_dicts("SELECT status FROM @marts_collation_health")[0]
     assert row["status"] == "unknown"
+
+
+def test_a_backup_nobody_has_restored_reads_attention(warehouse):
+    """A backup you have not restored is a hypothesis (C10).
+
+    Until 2026-08-28 the only record that a restore had ever been performed
+    was a commit message, and the view could not distinguish "restores fine"
+    from "never tried". A healthy repository with no drill on record reads
+    attention -- never failing, because the facts about the backups
+    themselves are all good and this is the row saying "unverified".
+    """
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(warehouse)
+    assert row["status"] == "attention"
+    assert row["restore_status"] == "never"
+    assert row["last_restore_verified_at"] is None
+
+
+def test_a_recorded_restore_drill_makes_the_row_ok(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    _backup_row(warehouse)
+    warehouse.record_pgbackrest_restore_drill(
+        stanza="pdw",
+        label="20260827-032703F_20260827-050637D",
+        rows=49_131_629,
+        note="restored into a fresh volume, promoted, counted",
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["status"] == "ok"
+    assert row["restore_status"] == "ok"
+    assert row["last_restore_label"] == "20260827-032703F_20260827-050637D"
+    assert row["last_restore_rows"] == 49_131_629
+    assert row["restore_age_seconds"] < 60
+    # The loop's own facts survive the drill record untouched.
+    assert row["backup_count"] == 3
+
+
+def test_a_stale_restore_drill_reads_attention_again(warehouse):
+    """Weekly fulls and a monthly drill: 45 days is one missed month plus margin."""
+
+    warehouse.ensure_pipeline_health_tables()
+    _backup_row(warehouse)
+    warehouse.record_pgbackrest_restore_drill(
+        stanza="pdw",
+        label="20260701-000000F",
+        rows=1,
+        note="old",
+        verified_at=datetime.now(UTC) - timedelta(days=46),
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["status"] == "attention"
+    assert row["restore_status"] == "stale"
+
+
+def test_a_restore_drill_never_stands_in_for_a_backup_report(warehouse):
+    """A drill recorded before the loop has reported must not read ok."""
+
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._command("DELETE FROM @pgbackrest_health")
+    warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="x", rows=1, note="")
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["status"] == "unknown"
+
+
+def test_a_restore_drill_must_carry_a_label_and_a_count(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    with pytest.raises(ValueError):
+        warehouse.record_pgbackrest_restore_drill(stanza="pdw", label=" ", rows=1, note="")
+    with pytest.raises(ValueError):
+        warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="x", rows=0, note="")
+
+
+AGENT_BACKED_ENRICHMENT_PIPELINES = (
+    "voice_memo_transcription",
+    "voice_memo_enrichment",
+    "receipt_enrichment",
+)
+
+
+def test_every_agent_backed_enrichment_pass_declares_a_heartbeat():
+    """A pass that calls a provider per row must be able to read `failing`.
+
+    Audit 2026-08-28: `voice_memo_enrichment` and `receipt_enrichment` read
+    `run_status = unmonitored` -- no StateSource -- so a pass whose every
+    agent call errored was indistinguishable from one with nothing to do.
+    Each of these already writes a status/error row per attempt somewhere
+    (the enrichments table, ops.ai_processing_agent_runs); the declaration is
+    what makes the dashboard read it. They are history tables, one row per
+    attempt, so each needs an error_window or a single dead row pins it red.
+    """
+    for pipeline_id in AGENT_BACKED_ENRICHMENT_PIPELINES:
+        entry = pipeline(pipeline_id)
+        assert entry.state is not None, f"{pipeline_id} has no heartbeat"
+        assert entry.state.status_column, pipeline_id
+        assert entry.state.error_column, pipeline_id
+        assert entry.state.error_window is not None, pipeline_id
+
+
+def test_receipt_heartbeat_reads_only_the_receipt_agents_runs():
+    """ops.ai_processing_agent_runs is shared by every agent-backed pass, so
+    the receipt StateSource must scope to its own task_type -- and to the one
+    the runner actually stamps, or the row is permanently no_data."""
+    from personal_data_warehouse.receipt_enrichment import RECEIPT_AGENT_TASK_TYPE
+
+    entry = pipeline("receipt_enrichment")
+    assert entry.state is not None
+    assert entry.state.table == "agent_runs"
+    assert entry.state.scope_column == "task_type"
+    assert entry.state.scope_value == RECEIPT_AGENT_TASK_TYPE
+
+
+def test_a_failed_voice_memo_enrichment_reads_failing(warehouse):
+    """The enrichment row IS the pass's state: a failed agent run lands as
+    status='error' with the exception text, and a later success overwrites it."""
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_enrichments
+            (source, account, recording_id, provider, model, prompt_version, status, error, created_at, sync_version)
+        VALUES ('apple_voice_memos', 'z', 'rec-1', 'agent_codex', 'm', 'v1', 'error',
+                'agent run failed: container exited 1', %s, 1)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, run_status, state_error_rows, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_enrichment'"
+    )[0]
+    assert row["run_status"] != "unmonitored"
+    assert row["status"] == "failing"
+    assert row["state_error_rows"] == 1
+    assert "container exited 1" in row["last_error"]
+
+
+def test_a_failed_receipt_agent_run_reads_failing_and_other_agents_do_not(warehouse):
+    """The receipt runner writes no receipt row on an agent failure (so the
+    transaction is retried next run), which is exactly why its heartbeat has
+    to come from the agent-runs table instead. Another pass's failure in that
+    shared table must not colour the receipt row."""
+    from personal_data_warehouse.receipt_enrichment import RECEIPT_AGENT_TASK_TYPE
+
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    for run_id, task_type, status, error in (
+        ("run-other", "gmail_attachment_enrichment", "error", "vision model timed out"),
+        ("run-receipt-ok", RECEIPT_AGENT_TASK_TYPE, "completed", ""),
+    ):
+        warehouse._command(
+            """
+            INSERT INTO @agent_runs
+                (run_id, provider, model, task_type, subject_id, prompt_version, status, error, started_at, completed_at, sync_version)
+            VALUES (%s, 'codex', 'm', %s, 'ft_1', 'v', %s, %s, %s, %s, 1)
+            """,
+            (run_id, task_type, status, error, now, now),
+        )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, run_status, state_error_rows, last_run_at FROM @marts_pipeline_health"
+        " WHERE pipeline = 'receipt_enrichment'"
+    )[0]
+    assert row["run_status"] != "unmonitored"
+    assert row["state_error_rows"] == 0
+    assert row["status"] != "failing"
+    assert row["last_run_at"] is not None
+
+    warehouse._command(
+        """
+        INSERT INTO @agent_runs
+            (run_id, provider, model, task_type, subject_id, prompt_version, status, error, started_at, completed_at, sync_version)
+        VALUES ('run-receipt-bad', 'codex', 'm', %s, 'ft_2', 'v', 'error', 'container exited 1', %s, %s, 1)
+        """,
+        (RECEIPT_AGENT_TASK_TYPE, now, now),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_error_rows, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'receipt_enrichment'"
+    )[0]
+    assert row["status"] == "failing"
+    assert row["state_error_rows"] == 1
+    assert "container exited 1" in row["last_error"]

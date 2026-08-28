@@ -117,12 +117,22 @@ quietly becoming untrue, and several of these have been.
   drift tests in `app/cmd/pdw-cli/usage_test.go`, which derive the command list from the
   dispatcher rather than a hand-kept list.
 - **C10 — the database is backed up, and a restore has actually been performed.** pgBackRest
-  ships WAL continuously to an encrypted S3 repository and takes periodic fulls. *Held up by*
-  `tests/test_pgbackrest_image.py` for the settings that make it possible, and by nothing at
-  all for the part that matters: whether a backup EXISTS. On 2026-08-26 the stanza reported
-  `status: error (no valid backups)` and had for a day, while WAL archiving kept working and
-  every PDW health surface stayed green, because backups appear in none of them. A backup you
-  have not restored is a hypothesis; the restore drill is the test.
+  ships WAL continuously to an encrypted SFTP repository on `slowking` and takes periodic
+  fulls. *Held up by* `tests/test_pgbackrest_image.py` for the settings that make it
+  possible, by `marts_ops.pgbackrest_health` (written by the backup loop itself, since
+  2026-08-26, because on that day the stanza reported `status: error (no valid backups)` for
+  a day while WAL archiving kept working and every other health surface stayed green), and
+  — since 2026-08-28 — by the **restore drill on the same row**: a backup you have not
+  restored is a hypothesis, so the row reads `attention` with `restore_status = never` or
+  `stale` until someone has restored a backup into a throwaway cluster, counted it, and
+  recorded it with
+  `uv run python -m personal_data_warehouse.pgbackrest_restore_drill record --label <backup> --restored-url <restored cluster> --note "..."`
+  (`--rows N` when the count was taken by hand). Older than
+  `PGBACKREST_RESTORE_DRILL_STALE_SECONDS` (45 days) it reads `attention` again. The drills
+  so far: 2026-08-25 against a local MinIO copy (sysadmin `slowking/` notes) and 2026-08-27
+  against the live SFTP repository (49,131,629 timeline rows, identical to production),
+  which lived only in a commit message until it was recorded here. The runbook is in
+  `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
   green.** A feed can be healthy in aggregate while the part that matters is frozen. *Held up
   by* per-source detectors where they exist — `marts_ops.slack_conversation_health` judges the

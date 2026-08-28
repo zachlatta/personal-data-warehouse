@@ -308,6 +308,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 }
 
+// schemaSearchFirstNudge is printed to stderr before every schema dump.
+const schemaSearchFirstNudge = "pdw schema: this is the relation list for writing SQL. For any text, topic, person or identifier question, start with `pdw search '<terms>'` (add --priority self,direct,cc for attention questions) — it needs no schema."
+
 // runSchema calls schema_overview and prints its CSV result blocks as plain
 // text so the no-args invocation is human-readable. Any extra args are
 // rejected to keep the command's contract narrow.
@@ -316,6 +319,11 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "pdw schema: unexpected arguments")
 		return 2
 	}
+	// Schema discovery is step 2's prerequisite, not step 1: measured over
+	// 14 days to 2026-08-28, 31% of PDW sessions opened with this command and
+	// 21% with a search, against a 60% search-first target. The nudge goes to
+	// stderr so scripted consumers keep clean rows on stdout.
+	fmt.Fprintln(stderr, schemaSearchFirstNudge)
 	out, err := client.CallTool(context.Background(), "schema_overview", nil)
 	if err != nil {
 		var apiErr *cliclient.APIError
