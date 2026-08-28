@@ -2773,6 +2773,37 @@ remaining a fact of record in `derived_finance.document_extractions`. **Absence 
 `account_holder`**: a pre-v3 row has no scope and is read as "not established", which is why
 the key guard exists — it is the half that protects a corpus nobody has re-extracted yet.
 
+**A contractual figure inside the holder's own document is not the holder's
+position.** An executed SAFE prints a **post-money valuation cap** — a ceiling on the
+ISSUER's valuation, contractually, not what the investor's stake is worth. It is the
+largest and most prominent number on the page, so every "primary figure first" heuristic
+picks it, and the document is unambiguously the investor's own, so `reporting_scope` cannot
+help. Found live 2026-08-28 on a small angel position whose SAFE stated a cap **12,500x
+its cost basis**, fifteen minutes before a scheduled ledger run. Two guards, because either
+alone is insufficient:
+
+- Each `valuations[]` entry now carries a **`measure`** — `position_value` / `cost_basis` /
+  `reference` / `unknown`. `_daily_valuations` prefers `position_value`, falls back to
+  `cost_basis` (an angel SAFE really is carried at cost), and **drops `reference`
+  outright**: a valuation cap, an option strike, a bond's face value, a discount rate, an
+  appraisal's high/low bound. A document whose only number is a `reference` contributes no
+  valuation at all, which is the correct answer rather than a 12,500x wrong one. Pre-v3
+  entries have no `measure`, are read as `unknown`, and behave exactly as before.
+- **Two DIFFERENT documents claiming one `(account, day, kind)` book NEITHER**, and the
+  runner logs both content shas. Silent last-writer-wins is the mechanism behind both
+  incidents — it replaced a real capital balance with a fund's members' equity, and it was
+  about to replace an angel position with that SAFE's valuation cap — and both times the
+  wrong document
+  won only because it sorted later by content sha. Refusing understates by one day, which
+  the account's other observations and `net_worth_history`'s forward fill absorb. The
+  refusal is **cross-document only**: one statement restating a running balance several
+  times for a day (a credit-card statement in this corpus does it five times) is the
+  document restating itself. Tolerance is measured, not guessed — over the whole corpus
+  (904 claims, 17 multi-document account-days) the only other genuine disagreement is a
+  $0.00-vs-$0.51 rounding difference on a 2018 statement, so 1% or $1 keeps it.
+  `observation_conflicts` on the `finance_ledger` asset counts refusals; unlike the
+  withholding counters it is **not self-healing** and means a source document needs a human.
+
 **`value_basis` keeps a tax number out of a market total.** A Schedule K-1's partner capital
 account is a *tax* basis. It sat in net worth beside the same fund's NAV: the position
 counted twice, and the second count on an incompatible measure. A `value_basis = 'tax'`

@@ -76,6 +76,12 @@ def finance_ledger(context) -> MaterializeResult:
             "documents_withheld_unidentified": MetadataValue.int(
                 summary.documents_withheld_unidentified if summary else 0
             ),
+            # Account-days two documents disagreed about, so the ledger booked
+            # neither. Any nonzero value is a source document needing a human;
+            # it is not self-healing.
+            "observation_conflicts": MetadataValue.int(
+                summary.observation_conflicts if summary else 0
+            ),
             # Security trades and the lots they reduce to. `security_trades_merged`
             # is the statement/Plaid overlap seam: a drop toward zero while both
             # sources are live would mean the overlap is double-counting.

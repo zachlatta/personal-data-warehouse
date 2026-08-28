@@ -85,6 +85,21 @@ VALUE_BASIS_TAX = "tax"
 VALUE_BASIS_UNKNOWN = "unknown"
 VALUE_BASES = (VALUE_BASIS_MARKET, VALUE_BASIS_TAX, VALUE_BASIS_UNKNOWN)
 
+# `measure` on a single valuations entry: what that number measures. A SAFE's
+# post-money valuation cap is the motivating case -- it is the biggest and most
+# prominent number on an investor's own executed SAFE, and it describes the
+# ISSUER's ceiling, not the investor's $2,000 stake.
+VALUATION_MEASURE_POSITION = "position_value"
+VALUATION_MEASURE_COST_BASIS = "cost_basis"
+VALUATION_MEASURE_REFERENCE = "reference"
+VALUATION_MEASURE_UNKNOWN = "unknown"
+VALUATION_MEASURES = (
+    VALUATION_MEASURE_POSITION,
+    VALUATION_MEASURE_COST_BASIS,
+    VALUATION_MEASURE_REFERENCE,
+    VALUATION_MEASURE_UNKNOWN,
+)
+
 STATUS_OK = "ok"
 STATUS_NOT_USEFUL = "not_useful"
 STATUS_ERROR = "error"
@@ -192,11 +207,26 @@ def finance_document_extraction_schema() -> dict[str, Any]:
     valuation_schema = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["date", "value", "description"],
+        "required": ["date", "value", "description", "measure"],
         "properties": {
             "date": {"type": "string", "description": "ISO date YYYY-MM-DD"},
             "value": {"type": "string", "description": "decimal string"},
             "description": {"type": "string"},
+            "measure": {
+                "type": "string",
+                "enum": ["position_value", "cost_basis", "reference", "unknown"],
+                "description": (
+                    "What this number measures. 'position_value' = what the holder's "
+                    "stake is worth (NAV, market value, carrying value, an appraisal's "
+                    "headline estimate). 'cost_basis' = what the holder paid. "
+                    "'reference' = a contractual or reference figure that is NOT the "
+                    "holder's position value -- a SAFE's valuation cap, an option strike "
+                    "price, a bond's face value, a note's principal ceiling, a discount "
+                    "rate, an appraisal's high/low bound, or any figure describing the "
+                    "issuer or the whole asset rather than the holder's share of it. "
+                    "'unknown' when the document does not make it clear."
+                ),
+            },
         },
     }
     commitment_schema = {
@@ -316,6 +346,8 @@ Say WHOSE money the amounts describe, in reporting_scope. This is the most conse
 
 Say what the amounts MEAN, in value_basis. A Schedule K-1's partner capital account, or any report that states only cost basis, is value_basis="tax"; a market value, NAV, or bank/brokerage balance is value_basis="market".
 
+Every valuations entry also carries a measure, and getting it wrong books somebody else's number as the holder's net worth. A SAFE or convertible note prints a POST-MONEY VALUATION CAP: that is a contractual ceiling on the ISSUER's valuation, not what the investor's stake is worth, so it is measure="reference" — even though it is the largest and most prominent number on the page, and even though the document is unambiguously the investor's own. The same is true of an option's strike price, a bond's face or par value, a discount rate, an appraisal's high and low bounds, and any total describing the whole company or asset rather than the holder's share of it. Use measure="position_value" only for what the holder's own stake is worth, measure="cost_basis" for what they paid, and measure="unknown" when the document does not say.
+
 Fill commitments when the document states a capital commitment: the total committed, the cumulative called/contributed to date, and the remaining unfunded/uncalled amount, with the as-of date and the vehicle's name. Capital call notices and capital account statements both print these. A capital call is money LEAVING the investor, so its contribution transaction is direction="out" — never "in" — and its date is the due date the notice states.
 
 Amounts must be copied exactly as printed (no rounding, no sign flips). Use empty strings/arrays for anything the document does not state — never invent or infer missing values. Put doubts, unreadable regions, ambiguous signs, or parsing caveats into uncertainties. Set is_financial=false only when the document contains no financial information at all.
@@ -395,6 +427,16 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
         issues.append(f"reporting_scope must be one of {', '.join(REPORTING_SCOPES)}")
     if isinstance(result.get("value_basis"), str) and result["value_basis"] not in VALUE_BASES:
         issues.append(f"value_basis must be one of {', '.join(VALUE_BASES)}")
+    valuations = result.get("valuations")
+    if isinstance(valuations, Sequence) and not isinstance(valuations, (str, bytes)):
+        for index, entry in enumerate(valuations):
+            if not isinstance(entry, Mapping):
+                continue
+            measure = entry.get("measure")
+            if isinstance(measure, str) and measure and measure not in VALUATION_MEASURES:
+                issues.append(
+                    f"valuations[{index}].measure must be one of {', '.join(VALUATION_MEASURES)}"
+                )
     for key, required_fields in (
         (
             "transactions",
@@ -413,7 +455,7 @@ def validate_finance_extraction_result(result: Mapping[str, Any]) -> list[str]:
             ),
         ),
         ("balances", ("date", "balance")),
-        ("valuations", ("date", "value", "description")),
+        ("valuations", ("date", "value", "description", "measure")),
         ("positions", ("date", "security_name", "ticker", "cusip", "quantity", "price", "market_value")),
         ("commitments", ("date", "committed", "called", "unfunded", "description")),
     ):
