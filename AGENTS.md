@@ -13,6 +13,14 @@ Development practices:
   `uv run pytest --unit-only` only as an explicit faster iteration, not final verification;
   missing environment variables never opt tests out. No production database URL is necessary or
   recommended for tests.
+* **`uv run pytest` does not run `go test ./...`, and CI does.** Anything under `app/` — and
+  anything that *generates* into it, which in practice means
+  `src/personal_data_warehouse/warehouse_catalog.json` — is verified locally only by the Python
+  contract tests and by Go tests only after a push. A catalog edit is one JSON file plus
+  `scripts/generate_go_warehouse_catalog.py`, so it looks purely Python and is not: on
+  2026-08-28 a new mart's catalog comment pushed `TestOverviewGuidanceStaysWithinBudget` past
+  its byte cap and reached `main` red behind a fully green `uv run pytest`. Run both when a
+  change touches the catalog or `app/`.
 
 ## The eleven contracts
 
