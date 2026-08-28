@@ -494,9 +494,12 @@ def test_plaid_item_health_names_the_broken_item(warehouse: PostgresWarehouse) -
             ),
         ]
     )
+    checking = _plaid_account_row("item-ok", "acc-ok", "Checking", now=now)
+    checking["mask"] = "1111"
+    checking["type"] = "depository"
     warehouse.insert_plaid_accounts(
         [
-            _plaid_account_row("item-ok", "acc-ok", "Checking", now=now),
+            checking,
             _plaid_account_row("item-broken", "acc-broken", "Venture X", now=now),
         ]
     )
@@ -581,3 +584,65 @@ def test_plaid_item_health_covers_an_item_with_no_accounts(
         """
     )
     assert rows == [("item-empty", "action_required", 0, "", None)]
+
+
+def test_plaid_item_health_flags_two_live_items_over_the_same_accounts(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A re-link that minted a second Item double-counts every balance.
+
+    Measured 2026-08-28: two Capital One Items, both ``ok``, both syncing,
+    both carrying the same two cards by mask, and marts_finance.net_worth
+    held two rows per mask -- while every health surface read green. An
+    Item is only healthy if it is also the ONLY live Item for its accounts;
+    the older one (by newest transaction) is the one to retire.
+    """
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 8, 28, 2, 0, tzinfo=UTC)
+    warehouse.insert_plaid_items(
+        [
+            _item_row("item-old", now=now),
+            _item_row("item-new", now=now),
+            _item_row("item-other", now=now),
+        ]
+    )
+    other = _plaid_account_row("item-other", "acc-other", "Checking", now=now)
+    other["mask"] = "1111"
+    other["type"] = "depository"
+    warehouse.insert_plaid_accounts(
+        [
+            _plaid_account_row("item-old", "acc-old", "Venture X", now=now),
+            _plaid_account_row("item-new", "acc-new", "Venture X", now=now),
+            other,
+        ]
+    )
+    rows = warehouse._query(
+        """
+        SELECT item_id, status, duplicate_item_ids
+        FROM @marts_ops_plaid_item_health
+        ORDER BY item_id
+        """
+    )
+    assert rows == [
+        ("item-new", "duplicate", ["item-old"]),
+        ("item-old", "duplicate", ["item-new"]),
+        ("item-other", "ok", []),
+    ]
+
+
+def test_plaid_item_health_ignores_removed_accounts_when_looking_for_duplicates(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A retired Item's tombstoned accounts must not haunt the survivor."""
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 8, 28, 2, 0, tzinfo=UTC)
+    warehouse.insert_plaid_items([_item_row("item-a", now=now), _item_row("item-b", now=now)])
+    removed = _plaid_account_row("item-b", "acc-b", "Venture X", now=now)
+    removed["is_removed"] = 1
+    warehouse.insert_plaid_accounts(
+        [_plaid_account_row("item-a", "acc-a", "Venture X", now=now), removed]
+    )
+    rows = warehouse._query(
+        "SELECT item_id, status FROM @marts_ops_plaid_item_health ORDER BY item_id"
+    )
+    assert rows == [("item-a", "ok"), ("item-b", "ok")]

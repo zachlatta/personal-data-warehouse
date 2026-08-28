@@ -63,8 +63,9 @@ COMMANDS
                              The one way to run read-only SQL. The SQL is the
                              single positional argument; it may instead be read
                              from --file or piped on stdin (which avoids
-                             shell-quoting multi-line SQL). Queries time out
-                             after 10 seconds by default.
+                             shell-quoting multi-line SQL). The server stops a
+                             statement after its 60s budget; the client waits
+                             75s so that error (with its hint) is what you see.
                                -q, --question TEXT  Concise plain-English
                                              description of what the SQL answers,
                                              logged server-side as the caller's
