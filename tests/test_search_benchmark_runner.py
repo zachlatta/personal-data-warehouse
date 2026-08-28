@@ -104,3 +104,65 @@ def test_runner_says_when_every_latency_probe_failed(warehouse: PostgresWarehous
     row = warehouse._query_dicts("SELECT status, note FROM @marts_search_benchmark")[0]
     assert row["status"] == "no_data"
     assert "unmeasured" in row["note"]
+
+
+def test_host_saturation_parses_psi_loadavg_and_cpu_count(tmp_path) -> None:
+    from personal_data_warehouse.search_benchmark_runner import sample_host_saturation
+
+    (tmp_path / "pressure").mkdir()
+    (tmp_path / "pressure" / "io").write_text(
+        "some avg10=31.42 avg60=25.10 avg300=18.00 total=123456\n"
+        "full avg10=20.15 avg60=15.02 avg300=9.87 total=98765\n"
+    )
+    (tmp_path / "pressure" / "cpu").write_text("some avg10=4.50 avg60=3.00 avg300=2.00 total=555\n")
+    (tmp_path / "loadavg").write_text("19.70 15.20 12.00 3/1200 4242\n")
+    sample = sample_host_saturation(tmp_path, cpu_count=28)
+    assert sample.io_pressure_full_avg10 == 20.15
+    assert sample.cpu_pressure_some_avg10 == 4.5
+    assert sample.load_1m == 19.7
+    assert sample.cpu_count == 28
+    assert sample.note == ""
+
+
+def test_host_saturation_reports_missing_procfs_as_minus_one_with_a_note(tmp_path) -> None:
+    from personal_data_warehouse.search_benchmark_runner import sample_host_saturation
+
+    # A kernel without PSI has /proc/loadavg but no /proc/pressure; a Mac has
+    # neither. Each field degrades on its own and the note names the file.
+    (tmp_path / "loadavg").write_text("1.25 1.00 0.90 1/100 1\n")
+    sample = sample_host_saturation(tmp_path, cpu_count=8)
+    assert sample.io_pressure_full_avg10 == -1 and sample.cpu_pressure_some_avg10 == -1
+    assert sample.load_1m == 1.25 and sample.cpu_count == 8
+    assert "pressure/io" in sample.note and "pressure/cpu" in sample.note and "loadavg" not in sample.note
+    # A file present but in an unexpected shape is unreadable too, never a 0.
+    (tmp_path / "pressure").mkdir()
+    (tmp_path / "pressure" / "io").write_text("garbage\n")
+    assert sample_host_saturation(tmp_path, cpu_count=8).io_pressure_full_avg10 == -1
+    assert sample_host_saturation(tmp_path / "nope", cpu_count=0).cpu_count == -1
+
+
+def test_runner_stores_the_worse_of_the_two_host_samples(warehouse: PostgresWarehouse) -> None:
+    from personal_data_warehouse.search_benchmark_runner import HostSaturation
+
+    warehouse.ensure_pipeline_health_tables()
+    samples = iter([
+        HostSaturation(io_pressure_full_avg10=0.2, cpu_pressure_some_avg10=60.0, load_1m=3.0, cpu_count=28),
+        HostSaturation(io_pressure_full_avg10=20.15, cpu_pressure_some_avg10=2.0, load_1m=19.7, cpu_count=28),
+    ])
+    result = SearchBenchmarkRunner(warehouse=warehouse, client=FakeClient({}, seconds=3.2),
+                                   probe_queries=("a b", "c d"), sample_host=lambda: next(samples)).run()
+    assert (result.io_pressure_full_avg10, result.cpu_pressure_some_avg10, result.load_1m, result.cpu_count) == (20.15, 60.0, 19.7, 28)
+    row = warehouse._query_dicts("SELECT saturation, io_pressure_full_avg10, load_1m FROM @marts_search_benchmark")[0]
+    assert row["saturation"] == "io_bound"
+    assert float(row["io_pressure_full_avg10"]) == 20.15
+
+
+def test_runner_notes_an_unmeasured_host(warehouse: PostgresWarehouse) -> None:
+    from personal_data_warehouse.search_benchmark_runner import sample_host_saturation
+
+    warehouse.ensure_pipeline_health_tables()
+    result = SearchBenchmarkRunner(warehouse=warehouse, client=FakeClient({}), probe_queries=("a b",),
+                                   sample_host=lambda: sample_host_saturation("/definitely/not/proc")).run()
+    assert result.io_pressure_full_avg10 == -1 and result.load_1m == -1
+    assert "stored -1" in result.note
+    assert warehouse._query_dicts("SELECT saturation FROM @marts_search_benchmark")[0]["saturation"] == "unmeasured"

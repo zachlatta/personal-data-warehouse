@@ -778,6 +778,13 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       a.invented_calls ? rows(a.invented_calls) + " invented pdw commands (pdw query, pdw --version, …)" : "");
   }
 
+  function saturationDetail(b) {
+    if (b.saturation === "unmeasured" || !b.saturation) { return "no /proc pressure sample during the probes"; }
+    var pct = function (v) { return v === null || v === undefined ? "—" : Number(v).toFixed(1) + "%"; };
+    return "io full " + pct(b.io_pressure_full_avg10) + " · cpu some " + pct(b.cpu_pressure_some_avg10) +
+      " · load " + (b.load_1m === null || b.load_1m === undefined ? "—" : Number(b.load_1m).toFixed(1)) + " / " + rows(b.cpu_count) + " cores (PSI avg10, worse of start/end)";
+  }
+
   function benchmarkNode(b) {
     return healthRow(b, b.mode + " search",
       rows(b.probe_queries) + " latency probes · " + rows(b.labeled_cases) + " labeled cases",
@@ -788,6 +795,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
           "max " + (b.latency_max_ms / 1000).toFixed(2) + "s", true],
         ["MRR", b.labeled_cases ? b.mrr : "—",
           b.labeled_cases ? "hit@1 " + rows(b.hit_at_1) + " · hit@5 " + rows(b.hit_at_5) + " · hit@10 " + rows(b.hit_at_10) + " of " + rows(b.labeled_cases) : "no labels published", true],
+        // C6: was the host being used while the probes ran? "idle" is the case
+        // to fix first -- slow on a machine doing nothing. io_bound means the
+        // disk was the saturated resource (2026-08-28: io full 20%, 38% iowait).
+        ["host", b.saturation || "unmeasured", saturationDetail(b), b.saturation === "idle" || b.saturation === "io_bound" || b.saturation === "cpu_bound"],
         ["measured", b.collected_at ? ago(ageOf(b.collected_at)) + " ago" : "never", stamp(b.collected_at), true]
       ],
       b.note || (b.errors ? rows(b.errors) + " searches failed during the run" : ""));
@@ -831,6 +842,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     // re-listed number until 2026-08-27, so the poll share is shown beside it.
     var polled = s.history_polled_fraction === null || s.history_polled_fraction === undefined
       ? "n/a" : (Number(s.history_polled_fraction) * 100).toFixed(1) + "%";
+    var landing = s.landing_p95_seconds === null || s.landing_p95_seconds === undefined
+      ? (s.expected_landing_p95_seconds ? "no messages in 24h" : "n/a")
+      : ago(Number(s.landing_p50_seconds)) + " / " + ago(Number(s.landing_p95_seconds)) +
+        " (" + (s.landing_status || "unknown") + ")";
     return healthRow(s, s.conversation_type,
       rows(s.live_count) + " live",
       [
@@ -845,6 +860,16 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
           false],
         ["discovery", s.discovery_status || "unknown",
           s.last_discovery_at ? "last walk " + ago(ageOf(s.last_discovery_at)) + " ago" : "never walked", true],
+        // Neither half above can see a DM that lands an hour after it was
+        // written -- measured 2026-08-28, 1:1 DMs p95 62 min and group DMs
+        // p50 46 min while both read perfect. Landing is judged for the two DM
+        // types only; a channel's landing time is the sweep rotation by design.
+        ["landing", landing,
+          s.expected_landing_p95_seconds
+            ? "p50 / p95 of first_seen_at - event_ts over " + rows(s.landing_sample_24h) +
+              " messages written in the last 24h; ok at p95 <= " + ago(Number(s.expected_landing_p95_seconds))
+            : "not judged: a channel's landing time is the sweep's rate budget, not a fault",
+          !s.expected_landing_p95_seconds],
         ["newest message", s.newest_message_at ? ago(ageOf(s.newest_message_at)) + " ago" : "none",
           "context only: mpim legitimately has zero-message days, so this is never the alarm", true]
       ], "");

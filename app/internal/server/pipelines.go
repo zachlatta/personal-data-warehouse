@@ -97,7 +97,9 @@ SELECT account, team_id, conversation_type, conversation_count, archived_count,
        expected_history_cycle_seconds, history_status,
        oldest_conversation_synced_at, newest_conversation_synced_at,
        discovery_age_seconds, expected_cycle_seconds, discovery_status,
-       last_discovery_at, newest_message_at, message_age_seconds, status
+       last_discovery_at, newest_message_at, message_age_seconds,
+       landing_sample_24h, landing_p50_seconds, landing_p95_seconds,
+       expected_landing_p95_seconds, landing_status, status
 FROM ` + warehouse.SQLRelation("marts_ops_slack_conversation_health") + `
 ORDER BY status, conversation_type`
 
@@ -146,6 +148,7 @@ ORDER BY (source = 'all') DESC, source`
 var pipelineSearchBenchmarkSQL = `
 SELECT mode, status, probe_queries, latency_p50_ms, latency_p90_ms, latency_max_ms,
        labeled_cases, found, hit_at_1, hit_at_5, hit_at_10, mrr, errors, note,
+       io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, saturation,
        collected_at, snapshot_age_seconds
 FROM ` + warehouse.SQLRelation("marts_search_benchmark") + `
 ORDER BY mode`

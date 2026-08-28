@@ -2198,7 +2198,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "The weekly search benchmark as a health row, per retrieval mode: latency_p50_ms / p90 / max over fixed term-bag probes through the app's search tool, and labeled quality (labeled_cases, found, hit_at_1/5/10, mrr) over private.search_benchmark_labels. Reads attention when p50 exceeds 2 seconds or MRR falls under 0.30; a run older than ten days reads unknown."
+      "comment": "The weekly search benchmark as a health row, per retrieval mode: latency_p50_ms / p90 / max over fixed term-bag probes through the app's search tool, and labeled quality (labeled_cases, found, hit_at_1/5/10, mrr) over private.search_benchmark_labels. Reads attention when p50 exceeds 2 seconds or MRR falls under 0.30; a run older than ten days reads unknown. The host columns (io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, from /proc during the probes) feed `saturation` (C6): io_bound, cpu_bound, idle (slow on an idle host -- fix that first), ok, or unmeasured when a sample is -1."
     },
     {
       "id": "marts_agent_usage",
@@ -2258,7 +2258,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel), in two independent halves. refreshed_fraction is discovery: the share of live conversations re-listed within a cycle, judged as a SHARE because a page-1-only walk re-stamps the newest rows hourly and looks perfect. history_polled_fraction is whether we then ASK them for messages, judged only for public_channel \u2014 the change feed answers that authoritatively for every conversation Zach is in, but he is not in ~13k public channels, and 11,488 of those sat frozen at their backfill behind a 99.2% discovery number until 2026-08-27. status is the worse of the two. Message ages are context only \u2014 mpim legitimately has zero-message days."
+      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel), in two independent halves. refreshed_fraction is discovery: the share of live conversations re-listed within a cycle, judged as a SHARE because a page-1-only walk re-stamps the newest rows hourly and looks perfect. history_polled_fraction is whether we then ASK them for messages, judged only for public_channel \u2014 the change feed answers that authoritatively for every conversation Zach is in, but he is not in ~13k public channels, and 11,488 of those sat frozen at their backfill behind a 99.2% discovery number until 2026-08-27. landing_p50_seconds/landing_p95_seconds are how long a message written in the last 24h took to reach timeline.events (first_seen_at - event_ts; base_slack.messages.synced_at is re-stamped by every re-fetch and cannot measure this), judged as landing_status only for im/mpim \u2014 measured 2026-08-28, DMs landed p95 62 min while the other two parts read ok. status is the worst of the three. Message ages are context only \u2014 mpim legitimately has zero-message days."
     },
     {
       "id": "marts_transaction_receipts",

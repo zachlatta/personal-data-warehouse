@@ -137,8 +137,14 @@ PROBE_STATEMENT_TIMEOUT_MS = 60_000
 # ``unknown`` rows after sixty seconds.
 AMCHECK_STATEMENT_TIMEOUT_MS = 15 * 60_000
 # Rotation bounds.  A 1,200-index database must make steady progress without a
-# daily job turning into an unbounded I/O sweep.
-AMCHECK_MAX_PER_RUN = 25
+# daily job turning into an unbounded I/O sweep -- but the rotation must also
+# lap the fleet comfortably inside AMCHECK_STALE_SECONDS, because the read view
+# turns a verdict older than fourteen days into `attention`.  At 25 a day
+# production's 252 indexes took ~10 days per lap, and up to ~12.6 once the
+# failure-retry cap ate its five slots: any skipped run (lock, budget) tipped
+# clean indexes amber.  Measured 2026-08-26/27 the whole daily slice cost 74s
+# and 452s of the 45-minute budget, so 50 a day (~5-6 days per lap) is cheap.
+AMCHECK_MAX_PER_RUN = 50
 AMCHECK_RUN_BUDGET_SECONDS = 45 * 60
 AMCHECK_STALE_SECONDS = 14 * 24 * 60 * 60
 AMCHECK_FAILURE_RETRY_CAP = 5

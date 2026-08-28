@@ -155,7 +155,23 @@ def c6_performance() -> Verdict:
         timings.append(time.time() - started)
     p50 = statistics.median(timings)
     status = GREEN if p50 < SEARCH_P50_TARGET_SECONDS else (YELLOW if p50 < SEARCH_P50_YELLOW_SECONDS else RED)
-    return Verdict("C6", title, status, f"hybrid search p50 {p50:.2f}s over {len(timings)} novel queries ({', '.join(f'{t:.1f}' for t in timings)})")
+    # The benchmark row records whether the host was saturated while ITS
+    # probes ran (C6: confirm the machine is being used before optimizing).
+    # `idle` beside a slow p50 is the finding to act on first.
+    bench = pdw_sql(
+        "search benchmark saturation",
+        "SELECT saturation, io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, latency_p50_ms, collected_at"
+        " FROM marts_ops.search_benchmark ORDER BY collected_at DESC NULLS LAST LIMIT 1",
+    )
+    b = (bench or [None])[0]
+    if b:
+        host = (f"benchmark host {b['saturation']} (io full {b['io_pressure_full_avg10']}%, cpu some {b['cpu_pressure_some_avg10']}%, "
+                f"load {b['load_1m']}/{b['cpu_count']}, p50 {b['latency_p50_ms']}ms, {str(b['collected_at'])[:16]})")
+        if b["saturation"] == "idle":
+            status = RED if status == RED else YELLOW
+    else:
+        host = "no benchmark row yet"
+    return Verdict("C6", title, status, f"hybrid search p50 {p50:.2f}s over {len(timings)} novel queries ({', '.join(f'{t:.1f}' for t in timings)}); {host}")
 
 
 def c7_pipeline_health() -> Verdict:
@@ -239,18 +255,36 @@ def s1_slack() -> Verdict:
 
 def s2_voice() -> Verdict:
     title = "voice memos: every source transcribed, enriched, calendar-matched"
+    # A recording the provider will never accept (rejected: no spoken audio,
+    # too short) and an empty upload (size_bytes = 0, which the candidate
+    # query excludes) are not a backlog; counting them read S2 red forever
+    # on eighteen recordings nothing could ever transcribe.
     rows = pdw_sql("voice coverage", """
+        WITH r AS (
+            -- Untranscribable: an empty upload, a provider rejection (no spoken
+            -- audio, too short), or a COMPLETED run whose transcript is empty
+            -- because the audio is silent -- the mart shows NULL for all three.
+            -- Joined on (source, recording_id): the id is unique within a source.
+            SELECT r.*, (r.size_bytes = 0 OR EXISTS (
+                        SELECT 1 FROM derived_voice_memos.transcription_runs run
+                        WHERE run.source = r.source AND run.recording_id = r.recording_id
+                          AND run.status IN ('rejected', 'completed'))) AS untranscribable
+            FROM marts_voice_memos.recordings r WHERE r.is_deleted = 0)
         SELECT source, count(*) AS recordings,
-               count(*) FILTER (WHERE transcript IS NULL AND recorded_at < now() - interval '2 days') AS untranscribed,
-               count(*) FILTER (WHERE summary IS NULL AND recorded_at < now() - interval '2 days') AS unenriched,
+               count(*) FILTER (WHERE transcript IS NULL AND NOT untranscribable
+                                  AND recorded_at < now() - interval '2 days') AS untranscribed,
+               count(*) FILTER (WHERE transcript IS NULL AND untranscribable) AS untranscribable,
+               count(*) FILTER (WHERE summary IS NULL AND transcript IS NOT NULL
+                                  AND recorded_at < now() - interval '2 days') AS unenriched,
                count(*) FILTER (WHERE calendar_event_id IS NOT NULL) AS matched
-        FROM marts_voice_memos.recordings WHERE is_deleted = 0 GROUP BY source ORDER BY source""")
+        FROM r GROUP BY source ORDER BY source""")
     if rows is None:
         return _unavailable("S2", title, "marts_voice_memos.recordings")
-    backlog = sum(int(r["untranscribed"] or 0) for r in rows)
+    backlog = sum(int(r["untranscribed"] or 0) + int(r["unenriched"] or 0) for r in rows)
     sources = {r["source"] for r in rows}
-    status = GREEN if backlog == 0 and "apple_notes" in sources else (YELLOW if backlog < 10 else RED)
-    return Verdict("S2", title, status, "; ".join(f"{r['source']}: {r['recordings']} rec, {r['untranscribed']} untranscribed, {r['unenriched']} unenriched, {r['matched']} matched" for r in rows))
+    expected = {"apple_voice_memos", "alice_voice_recordings", "apple_notes"}
+    status = GREEN if backlog == 0 and expected <= sources else (YELLOW if backlog < 10 else RED)
+    return Verdict("S2", title, status, "; ".join(f"{r['source']}: {r['recordings']} rec, {r['untranscribed']} untranscribed ({r['untranscribable']} untranscribable), {r['unenriched']} unenriched, {r['matched']} matched" for r in rows))
 
 
 def s3_finance() -> Verdict:

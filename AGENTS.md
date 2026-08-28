@@ -147,6 +147,29 @@ quietly becoming untrue, and several of these have been.
   kind's refresh. *Gap:* every other source rides aggregate freshness. Latency, as opposed
   to freshness, is still unmeasured almost everywhere.
 
+Three sources carry a contract of their own, because each is where "the pipeline is green"
+and "the data is right" have come apart:
+
+- **S1 — Slack: every message, DM, group DM, private channel, public channel and thread is
+  synced and current, and a DM lands fast.** *Held up by* `marts_ops.slack_conversation_health`
+  (discovery share, history-poll share, and — since 2026-08-28 — DM landing latency). See
+  [Slack conversation discovery](#slack-conversation-discovery-and-the-page-1-trap) and
+  [Slack channels Zach is not in](#slack-channels-zach-is-not-in-discovery-is-not-coverage).
+- **S2 — every voice source lands in `base_*`, unifies in `marts_voice_memos.recordings`, is
+  transcribed by AssemblyAI, enriched by an agent that can query PDW, and matched to a
+  calendar event, with unmatched memos kept in the same mart.** *Held up by*
+  `voice_memo_transcription` / `voice_memo_enrichment` reading `failing` on their own state
+  rows, and by C5's raw-read registry. See [Voice recordings](#voice-recordings-a-multi-source-domain-one-pipeline).
+- **S3 — finances from Plaid and manual documents cover expenses, investments, the mortgage,
+  liabilities and private equity, and receipts are linked to transactions.** *Held up by*
+  `marts_ops.plaid_item_health` (a dead or DUPLICATE Item is a named row),
+  `marts_finance.net_worth.staleness`, and the `receipt_enrichment` heartbeat. See
+  [Finance Ledger](#finance-ledger-stocks-and-flows).
+
+**The living grade is `uv run python scripts/contract_audit.py`**, one verdict per contract
+above from the production health surfaces, and `tests/test_repo_contracts.py` fails if a
+contract stated here has no check there. Grade from that, not from this prose.
+
 Adding a source touches all eleven. The step-by-step list, marked by which steps a test
 catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
 
@@ -3221,6 +3244,40 @@ other stages.
   `slack.public_channel_analytics` is Slack's own admin analytics, one row per
   channel per day with `messages_posted_count`. Compare against it rather than
   against a feeling that search results look thin.
+
+**A member channel discovered late holds nothing before the day it was found, unless
+coverage walks DOWN.** Measured 2026-08-28: of 15 member public channels created after
+2026-05-18 and first listed by the page-1 discovery fix on 08-24, 8 held nothing before
+08-24/25 — one of them a channel created in May that Slack shows posting ~3k messages a
+day. The change feed named them, freshness read its four-hour window and persisted the
+newest message as the cursor with `last_sync_type = 'partial'`, and coverage — which
+selects on `NOT (ok AND full)` — then topped each one up from `cursor - 14 days` on every
+rotation, which never reaches further back than the window it already had. A full stream
+cut short by the rate budget leaves the same shape. Coverage now reads each partial
+conversation's **floor** — the oldest top-level message in `base_slack.messages`, via
+`load_slack_conversation_message_low_water` — and streams `conversations.history` with
+`latest = floor` to the start of the conversation, never touching the forward cursor
+(every state write carries `cursor_ts = ''`, which the upsert preserves). The messages
+table is the cursor, so a budget abort resumes from a lower floor next slice, and the
+eight production channels heal on their first coverage slice after deploy with no state
+repair: their state already IS "ok, partial, cursor set", which is exactly the shape the
+floor lookup selects. `test_member_channel_first_seen_by_freshness_is_backfilled_below_its_floor_by_coverage`
+reproduces the whole round trip.
+
+**Landing latency is now a column, judged for DMs.** `marts_ops.slack_conversation_health`
+carries `landing_p50_seconds` / `landing_p95_seconds` (over messages written in the last
+24 hours, `timeline.events.first_seen_at - event_ts`) and `landing_status`, folded into
+`status` as the worst-of — but only for `im` and `mpim`, against
+`SLACK_DM_LANDING_P95_SECONDS` (15 min ok, 60 min late, else stale). Measured 2026-08-28
+while every other Slack health number read `ok`: 1:1 DMs p50 3.5 min / p95 62 min, group
+DMs p50 46 min, and one DM's 18:13–18:30 messages arrived together at 19:15:16 — a single
+`synced_at` stamp, twelve green five-minute freshness runs in between, and the timeline
+sync landing 80k public-channel rows the whole hour. So the stage ran and the feed did
+not name that conversation for an hour; not lock loss (freshness has its own lock), not
+the rate budget (DMs are fetched first). **`base_slack.messages.synced_at` is not a
+landing stamp**: that same 18:13 message read `synced_at = 19:15:16`, the re-fetch, which
+is why the view reads the timeline's `first_seen_at` instead (95ms warm, ~39k buffers,
+bounded by `timeline_events_source_time_idx`).
 
 ## Slack change feed: how the sync knows what to fetch
 

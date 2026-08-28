@@ -246,6 +246,25 @@ def test_agents_md_states_every_contract() -> None:
         assert re.search(rf"\*\*{marker}\b", section[:12000]), f"contract {marker} is not stated"
 
 
+def test_every_stated_contract_has_a_living_audit_check() -> None:
+    """A contract stated in prose and graded by nobody drifts to untrue.
+
+    scripts/contract_audit.py is the living grade: one verdict per contract,
+    read from the production health surfaces. Every C<n> and S<n> stated in
+    AGENTS.md must have a check registered there, so a new contract cannot be
+    written down without also being measured.
+    """
+    text = AGENTS_MD.read_text()
+    section = text.split("## The eleven contracts", 1)[1].split("\n## ", 1)[0]
+    stated = set(re.findall(r"\*\*([CS]\d+) —", section))
+    assert {"C1", "C11", "S1", "S2", "S3"} <= stated, stated
+    audit = (REPO_ROOT / "scripts/contract_audit.py").read_text()
+    checks = audit.split("CHECKS = [", 1)[1].split("]", 1)[0]
+    registered = {name.upper() for name in re.findall(r"\b([cs]\d+)_", checks)}
+    missing = sorted(stated - registered)
+    assert not missing, f"contracts stated in AGENTS.md with no check in scripts/contract_audit.py: {missing}"
+
+
 def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:
     """C5 must say what a transformation READS, not only where its output lives.
 
