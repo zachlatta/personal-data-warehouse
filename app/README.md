@@ -300,9 +300,11 @@ unified timeline document. Raw message/body columns are deliberately not text-in
   of rechecking multi-megabyte timeline documents. Matching conversation windows and ordinary
   alphabetic names retain full-document exact matching: a window's representative ref is its
   last event, which may not be the event containing the literal. It also
-  returns a `hint` on a sentence-shaped query, advising the
-  caller to re-issue with the vocabulary the answering record would use — measured to
-  recover five of nine otherwise-unanswerable benchmark questions. Instruction-tuned models can
+  returns a `hint` on a sentence-shaped query, advising the caller to re-issue with the few
+  most distinctive words the answering record would use — measured to recover five of nine
+  otherwise-unanswerable benchmark questions — and a second `hint` on a long query with no
+  anchor (no name, number or identifier), because adding generic words to a distinctive
+  term measurably hurts. Instruction-tuned models can
   prepend `SEARCH_EMBEDDINGS_QUERY_PREFIX` on queries only (write its newline as the two
   characters `\n`: a real newline in an environment value does not survive every deploy
   pipeline, and a truncated instruction retrieves measurably worse). With a prefix set the client embeds

@@ -553,14 +553,26 @@ ref has left the timeline and lists it under "NOT SCORED"; refs are still stampe
 73 cases as of 2026-08-26, 28 of them the exact queries live agents issued that week
 (`origin: live-agent-2026-08-26`), kept off-repo at `~/.config/pdw/search-eval/`.
 
-**Phrase a search as the words the answering record would contain, not as the question.**
-Sentence-shaped queries score MRR 0.27 on the labeled benchmark where term-bag queries score
-0.53, and rewording the nine questions that returned nothing useful — "how long our money
-lasts at the current pace of expenses" → "runway burn rate months of cash remaining" —
-recovered five of them, from nothing in the top 50 to ranks 10, 10, 12, 15 and 48. The
-`search` tool says this in its description and attaches a `hint` to any sentence-shaped
-query, because the caller is itself a model and can act on it; that is why query rewriting
-is guidance here rather than another model in the search path.
+**Search with the fewest, most distinctive words the answering record would contain — not
+the question, and not a long bag of generic terms.** Re-measured 2026-08-27 on the labeled
+benchmark (68 cases, hybrid, depth 50): bare identifiers score MRR 0.675 (hit@10 19/20),
+term bags 0.417 (23/30), sentence-shaped questions 0.290 (8/18). Rewording the nine
+questions that returned nothing useful — "how long our money lasts at the current pace of
+expenses" → "runway burn rate months of cash remaining" — recovered five of them, from
+nothing in the top 50 to ranks 10, 10, 12, 15 and 48. But the sharper finding is inside the
+term-bag stratum: **adding generic words to a distinctive anchor hurts.** "Mt Foolery" ranks
+#1 while "Woody Mt Foolery cancelled postponed weather" is absent from the top 50; "Sunbeam
+Marrakesh" #5 against "customs duty charged to receive package shirt Sunbeam" #41; the
+term bags that miss are the ones with no name, number or identifier in them ("meeting recording NASA", "DDP duties customs
+prepaid shipment AGH Fulfillment" #45). Each generic term dilutes both the BM25 score and the
+embedding neighbourhood, and rank fusion then averages the anchor away. So: search an
+identifier alone; anchor on a name, a product, an amount or a subject-line phrase; prefer
+several short searches over one long one; and on a miss drop words rather than add them.
+The `search` tool says this in its description and attaches a `hint` to a sentence-shaped
+query and to a long query with no anchor, because the caller is itself a model and can act
+on it; that is why query rewriting is guidance here rather than another model in the
+search path. Natural-language questions at 0.29 remain a retrieval-side problem — an agent
+will always sometimes pass a user's question through — and are not fixed by guidance.
 
 - The app's `search` tool — hybrid retrieval over **three** legs fused by reciprocal rank:
   BM25, pgvector ANN (one leg per query representation, see below), and — for a query of

@@ -546,6 +546,33 @@ func TestSearchHintsWhenAnUnscopedResultIsMostlyNoise(t *testing.T) {
 	}
 }
 
+func TestSearchHintsOnALongUnanchoredTermBag(t *testing.T) {
+	// Measured on the labeled set 2026-08-27: adding generic words to a
+	// distinctive anchor hurts ("Mt Foolery" #1, "Woody Mt Foolery cancelled
+	// postponed weather" absent from the top 50). A long query with no name,
+	// number or identifier in it is the shape that loses, so it gets told to
+	// shorten -- and told what an anchor is.
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
+	}
+	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	svc := NewService(runner, Options{SearchEmbedder: embedder})
+
+	for _, query := range []string{
+		"startup founder venture capital book recommendations reading list",
+		"street art political posters sidewalk tree lined murals",
+	} {
+		resp := svc.Search(context.Background(), SearchRequest{Query: query})
+		if resp.Hint == "" {
+			t.Fatalf("%q is a long unanchored bag and should be hinted", query)
+		}
+		if !strings.Contains(resp.Hint, "distinctive") {
+			t.Fatalf("the hint must say to shorten toward distinctive words; got %q", resp.Hint)
+		}
+	}
+}
+
 func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
 	// A hint on every response is noise nobody reads. Term-bag queries are
 	// already the strong case, so they get nothing.
@@ -560,6 +587,9 @@ func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
 		"vision insurance VSP EyeMed glasses member ID",
 		"Honda Ridgeline rear differential fluid",
 		"admin/api-keys",
+		"DDP duties customs prepaid shipment fulfillment quote",
+		"invoice 4086724 shipping duties customs prepaid quote order",
+		"mortgage interest rate refinance",
 	} {
 		resp := svc.Search(context.Background(), SearchRequest{Query: query})
 		if resp.Hint != "" {
