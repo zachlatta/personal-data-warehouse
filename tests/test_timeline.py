@@ -1002,7 +1002,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "whoop_sleep": "noise",
     "whoop_workout": "self",
     "whoop_private_journal": "self",
-    "finance_transaction": "background",
+    "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
     "mutation": "background",
@@ -2022,9 +2022,9 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("z@x.test|cal1|ev-allhands") == "cc", "an invite alongside a crowd is peripheral"
     assert priority_of("z@x.test|cal1|ev-room") == "direct", "a booked room is not an extra attendee"
     # finance
-    assert priority_of("ft-coffee") == "background", (
-        "a card purchase is a fact the bank recorded, not something he said or made; "
-        "it was a third of 'self' events a week and never something to read"
+    assert priority_of("ft-coffee") == "self", (
+        "a card purchase is money he chose to move -- an action he took, even if nobody "
+        "reads it (Zach, 2026-08-27, reversing a same-day move to background)"
     )
     assert priority_of("ft-sweep") == "noise", "brokerage cash sweeps are automated movement"
     assert priority_of("ft-interest") == "noise", "interest is credited by the institution"

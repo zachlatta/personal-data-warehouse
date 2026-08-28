@@ -2058,7 +2058,7 @@ _FINANCE_TRANSACTION = _simple_adapter(
         "\\mrecurring\\M|auto.?pay|automatic payment|payroll|direct deposit|"
         "\\mach (debit|credit|deposit|withdrawal)\\M)' "
         "  THEN 'noise' "
-        "ELSE 'background' END"
+        "ELSE 'self' END"
     ),
 )
 
