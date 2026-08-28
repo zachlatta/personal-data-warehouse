@@ -73,6 +73,20 @@ def _findings(warehouse) -> dict[str, dict]:
     return {row["object_id"]: row for row in rows}
 
 
+def _amcheck_installed(warehouse) -> bool:
+    rows = warehouse._query("SELECT 1 FROM pg_extension WHERE extname = 'amcheck'")
+    return bool(rows)
+
+
+def _require_amcheck(warehouse) -> None:
+    if _amcheck_installed(warehouse):
+        return
+    try:
+        warehouse._command("CREATE EXTENSION IF NOT EXISTS amcheck")
+    except Exception as exc:  # pragma: no cover - depends on the host image
+        pytest.skip(f"amcheck cannot be installed here: {exc}")
+
+
 # --- the headline finding -----------------------------------------------------
 
 
@@ -239,11 +253,13 @@ def test_a_partial_unique_index_with_rows_outside_its_predicate_has_a_clean_coun
     assert row["predicate"] == predicate
     assert row["finding"] == FINDING_OK, row["detail"]
     # This fixture deliberately does not run amcheck in its throwaway schema,
-    # so the holistic integrity status remains attention even though the
+    # so the holistic integrity status is never `ok` even though the
     # duplicate-key corroboration itself is clean. An unavailable structural
-    # check must never be presented as a clean bill of health.
+    # check must never be presented as a clean bill of health: it reads
+    # `attention` while the extension is genuinely missing and `unmeasured`
+    # (a gap, not a finding) once it exists.
     assert row["amcheck_status"] == "unavailable"
-    assert row["status"] == "attention"
+    assert row["status"] == ("unmeasured" if _amcheck_installed(warehouse) else "attention")
     assert row["excess_rows"] == 0
     # Only the two rows inside the predicate were counted, not all eight.
     assert row["heap_rows"] == 2
@@ -599,6 +615,107 @@ def test_an_old_unavailable_verdict_becomes_unchecked_once_amcheck_is_installed(
     stale = next(f for f in findings if f.object_name == stale_name)
     assert stale.amcheck_status == "never_checked"
     assert "pending" in stale.amcheck_detail
+
+
+def test_a_stale_unavailable_row_is_relabelled_on_the_first_run_with_amcheck(warehouse):
+    """The snapshot must not keep saying `unavailable` once the extension exists.
+
+    Production, 2026-08-27T03:45Z: 98 index rows read `attention` with
+    `amcheck_status = unavailable` while 48 rows in the SAME snapshot were
+    `ok` -- the rotation had run, so the extension was plainly installed, and
+    the 98 were verdicts restored from before it was. This runs the real
+    detector against a seeded `unavailable` row for a real index and expects it
+    either checked or re-labelled `never_checked`, whether or not the bounded
+    rotation happened to reach it, and never `attention` on the read view.
+    """
+    _require_amcheck(warehouse)
+    candidates = CollationHealthCollector(warehouse, run_amcheck=True)._amcheck_candidates()
+    assert candidates, "the throwaway schema should own at least one btree index"
+    name = f"{candidates[0]['index_schema']}.{candidates[0]['index_name']}"
+    warehouse.write_collation_health(
+        [
+            CollationFinding(
+                object_id=f"index:{name}",
+                scope=SCOPE_INDEX,
+                object_name=name,
+                provider="",
+                recorded_version="",
+                actual_version="",
+                dependent_indexes=0,
+                finding=FINDING_OK,
+                detail="",
+                amcheck_status="unavailable",
+                amcheck_detail="amcheck extension/function is not installed",
+            )
+        ],
+        collected_at=datetime.now(tz=UTC) - timedelta(days=1),
+    )
+    collector = CollationHealthCollector(warehouse, run_amcheck=True)
+    # Pin the rotation to visit NOTHING so the re-label is what the run proves,
+    # not a side effect of the index happening to be checked.
+    collector._select_amcheck_candidates = lambda rows, prior, limit: []
+    collector.run()
+    row = _findings(warehouse)[f"index:{name}"]
+    assert row["amcheck_status"] == "never_checked", row
+    assert row["status"] == "unmeasured", row
+
+
+def test_the_read_view_reads_unavailable_as_a_gap_once_amcheck_exists(warehouse):
+    """Belt to the detector's braces: even a snapshot written by older code
+    that carried `unavailable` forward must not read `attention` while the
+    extension is installed. The view asks pg_extension, so the surface is
+    right the moment the extension lands rather than after the next run."""
+    _require_amcheck(warehouse)
+    warehouse.write_collation_health(
+        [
+            CollationFinding(
+                object_id="index:base_gmail.messages_pkey",
+                scope=SCOPE_INDEX,
+                object_name="base_gmail.messages_pkey",
+                provider="",
+                recorded_version="",
+                actual_version="",
+                dependent_indexes=0,
+                finding=FINDING_OK,
+                detail="",
+                amcheck_status="unavailable",
+                amcheck_detail="amcheck extension/function is not installed",
+            ),
+            CollationFinding(
+                object_id="index:base_gmail.messages_thread_idx",
+                scope=SCOPE_INDEX,
+                object_name="base_gmail.messages_thread_idx",
+                provider="",
+                recorded_version="",
+                actual_version="",
+                dependent_indexes=0,
+                finding=FINDING_OK,
+                detail="",
+                amcheck_status="error",
+                amcheck_detail="bt_index_check raised",
+            ),
+        ],
+        collected_at=datetime.now(tz=UTC),
+    )
+    rows = _findings(warehouse)
+    assert rows["index:base_gmail.messages_pkey"]["status"] == "unmeasured"
+    # A real verdict is still a finding.
+    assert rows["index:base_gmail.messages_thread_idx"]["status"] == "attention"
+
+
+def test_rotation_laps_the_fleet_well_inside_the_stale_window() -> None:
+    """252 production indexes at the per-run limit, minus the failure-retry
+    slots, must complete a lap with margin under the 14-day window the view
+    judges against; at 25/day the lap was 10-12.6 days and any skipped run
+    tipped clean indexes amber."""
+    from personal_data_warehouse.collation_health import (
+        AMCHECK_FAILURE_RETRY_CAP,
+        AMCHECK_STALE_SECONDS,
+    )
+
+    production_indexes = 252
+    days_per_lap = production_indexes / (AMCHECK_MAX_PER_RUN - AMCHECK_FAILURE_RETRY_CAP)
+    assert days_per_lap * 2 <= AMCHECK_STALE_SECONDS / 86_400
 
 
 def test_the_detector_issues_no_ddl_and_no_repair():

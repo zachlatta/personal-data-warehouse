@@ -420,6 +420,12 @@ class SlackSyncRunner:
             conversations_seen += len(conversation_rows)
             self._logger.info("Discovered %s Slack conversations for %s so far", conversations_seen, account.account)
 
+            low_water_by_id = self._history_floor_by_conversation(
+                account=account.account,
+                team_id=team_id,
+                conversations=conversations,
+                state_by_key=state_by_key,
+            )
             for conversation in conversations:
                 if not isinstance(conversation, Mapping) or not conversation.get("id"):
                     continue
@@ -436,6 +442,57 @@ class SlackSyncRunner:
                         synced_at=synced_at,
                         sync_version=sync_version,
                     )
+                history_floor = low_water_by_id.get(conversation_id)
+                if history_floor is not None:
+                    # History below what we hold is missing: the conversation
+                    # was first read through a freshness window, or its full
+                    # stream was cut short. Walk downward from the oldest
+                    # stored message instead of topping up from the cursor --
+                    # the top-up is what left eight member channels holding
+                    # nothing before the day they were discovered.
+                    sync_type = "backfill"
+                    try:
+                        result = self._sync_conversation_history_below(
+                            account=account.account,
+                            team_id=team_id,
+                            conversation_id=conversation_id,
+                            client=client,
+                            synced_at=synced_at,
+                            sync_version=sync_version,
+                            latest_ts=history_floor,
+                        )
+                    except SlackRateLimitBudgetExceeded as exc:
+                        if self._skip_known_errors:
+                            self._logger.warning(
+                                "Stopping Slack conversation backfill for %s after rate limit budget was exhausted at %s: %s",
+                                account.account,
+                                conversation_id,
+                                exc,
+                            )
+                            return SlackSyncSummary(
+                                account=account.account,
+                                team_id=team_id,
+                                sync_type=sync_type,
+                                conversations_seen=conversations_seen,
+                                messages_written=messages_written,
+                                users_written=users_written,
+                                files_written=files_written,
+                            )
+                        raise
+                    except SlackApiCallError as exc:
+                        self._handle_conversation_sync_error(
+                            account=account.account,
+                            team_id=team_id,
+                            conversation_id=conversation_id,
+                            sync_type="backfill",
+                            exc=exc,
+                            synced_at=synced_at,
+                            sync_version=sync_version,
+                        )
+                        continue
+                    messages_written += result["messages_written"]
+                    files_written += result["files_written"]
+                    continue
                 oldest_ts = self._oldest_ts_for_conversation(state)
                 if oldest_ts is not None and not conversation_may_have_activity_since(
                     conversation,
@@ -1526,6 +1583,178 @@ class SlackSyncRunner:
 
         return {"messages_written": messages_written, "files_written": files_written}
 
+    def _history_floor_by_conversation(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversations: Sequence[object],
+        state_by_key: Mapping[tuple[str, str, str, str], Any],
+    ) -> dict[str, str]:
+        """Which conversations on this page need history BELOW what we hold.
+
+        A conversation is complete when its state reads ``ok``/``full``. One
+        that has a cursor but is not complete holds some messages and no
+        promise about anything older: the freshness pass gives a never-synced
+        member conversation a cursor at "now" from a four-hour window, and a
+        full stream the rate budget interrupted persists its newest page as
+        the cursor. The old coverage path then topped such a conversation up
+        from ``cursor - lookback`` forever and never reached further back, so
+        the state stayed ``partial`` while the history stayed missing --
+        measured 2026-08-28, eight of fifteen member channels discovered on
+        08-24 held nothing before that day, one of them a 3k-messages-a-day
+        channel created in May.
+
+        The floor is the oldest top-level message stored, read from the
+        messages table rather than from state: it is the only record of how
+        far down a conversation has actually been read, it needs no new state
+        shape, and it is exactly what the eight production channels already
+        carry -- so they heal on the first coverage slice after deploy.
+
+        Returns nothing for a conversation with no cursor (a full stream from
+        the top is the right call), for one already complete, or when the run
+        is a window/forced-full run that decides depth on its own.
+        """
+        if self._history_window is not None or self._settings.slack_force_full_sync:
+            return {}
+        candidates: list[str] = []
+        for conversation in conversations:
+            if not isinstance(conversation, Mapping) or not conversation.get("id"):
+                continue
+            conversation_id = str(conversation["id"])
+            state = state_by_key.get((account, team_id, "conversation", conversation_id))
+            if self._state_is_completed_full(state):
+                continue
+            if self._state_cursor_ts(state) is None:
+                continue
+            candidates.append(conversation_id)
+        if not candidates or not hasattr(self._warehouse, "load_slack_conversation_message_low_water"):
+            return {}
+        return self._warehouse.load_slack_conversation_message_low_water(
+            account=account,
+            team_id=team_id,
+            conversation_ids=candidates,
+        )
+
+    def _sync_conversation_history_below(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        client,
+        synced_at: datetime,
+        sync_version: int,
+        latest_ts: str,
+    ) -> dict[str, int]:
+        """Stream a conversation's history OLDER than ``latest_ts`` to its start.
+
+        The forward cursor is never touched: every state write here carries an
+        empty ``cursor_ts``, which the upsert preserves, so the freshness and
+        sweep paths keep resuming from the newest message we hold. Progress is
+        the messages themselves -- the next slice reads a lower floor -- so a
+        rate-budget abort partway down costs nothing but the pages not yet
+        fetched. Reaching the start of the conversation marks it ``full``.
+        """
+        messages_written = 0
+        files_written = 0
+
+        def persist(*, completed: bool) -> None:
+            self._warehouse.insert_slack_sync_state(
+                account=account,
+                team_id=team_id,
+                object_type="conversation",
+                object_id=conversation_id,
+                cursor_ts="",
+                last_sync_type="full" if completed else "partial",
+                status="ok",
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
+
+        try:
+            for messages in iter_cursor_pages(
+                client,
+                "conversations.history",
+                "messages",
+                limit=self._settings.slack_page_size,
+                call=self._call,
+                channel=conversation_id,
+                latest=latest_ts,
+                inclusive="false",
+            ):
+                page_written, page_files = self._ingest_history_page(
+                    account=account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    client=client,
+                    messages=messages,
+                    synced_at=synced_at,
+                )
+                messages_written += page_written
+                files_written += page_files
+                if page_written:
+                    persist(completed=False)
+        except SlackRateLimitBudgetExceeded:
+            persist(completed=False)
+            raise
+
+        persist(completed=True)
+        return {"messages_written": messages_written, "files_written": files_written}
+
+    def _ingest_history_page(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        client,
+        messages: Sequence[object],
+        synced_at: datetime,
+    ) -> tuple[int, int]:
+        rows, reaction_rows, file_rows = self._message_related_rows(
+            account=account,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            messages=messages,
+            synced_at=synced_at,
+        )
+
+        if self._sync_thread_replies:
+            thread_parent_ts = [
+                str(message["ts"])
+                for message in messages
+                if isinstance(message, Mapping) and message.get("ts") and int(message.get("reply_count") or 0) > 0
+            ]
+            for parent_ts in thread_parent_ts:
+                replies = list(
+                    iter_cursor_items(
+                        client,
+                        "conversations.replies",
+                        "messages",
+                        limit=self._settings.slack_page_size,
+                        call=self._call,
+                        channel=conversation_id,
+                        ts=parent_ts,
+                    )
+                )
+                reply_rows, reply_reactions, reply_files = self._message_related_rows(
+                    account=account,
+                    team_id=team_id,
+                    conversation_id=conversation_id,
+                    messages=replies,
+                    synced_at=synced_at,
+                )
+                rows.extend(reply_rows)
+                reaction_rows.extend(reply_reactions)
+                file_rows.extend(reply_files)
+
+        self._warehouse.insert_slack_messages(rows)
+        self._warehouse.insert_slack_message_reactions(reaction_rows)
+        self._warehouse.insert_slack_files(file_rows)
+        return len(rows), len(file_rows)
+
     def _sync_full_conversation_messages_streaming(
         self,
         *,
@@ -1566,48 +1795,16 @@ class SlackSyncRunner:
                 channel=conversation_id,
                 inclusive="true",
             ):
-                rows, reaction_rows, file_rows = self._message_related_rows(
+                page_written, page_files = self._ingest_history_page(
                     account=account,
                     team_id=team_id,
                     conversation_id=conversation_id,
+                    client=client,
                     messages=messages,
                     synced_at=synced_at,
                 )
-
-                if self._sync_thread_replies:
-                    thread_parent_ts = [
-                        str(message["ts"])
-                        for message in messages
-                        if isinstance(message, Mapping) and message.get("ts") and int(message.get("reply_count") or 0) > 0
-                    ]
-                    for parent_ts in thread_parent_ts:
-                        replies = list(
-                            iter_cursor_items(
-                                client,
-                                "conversations.replies",
-                                "messages",
-                                limit=self._settings.slack_page_size,
-                                call=self._call,
-                                channel=conversation_id,
-                                ts=parent_ts,
-                            )
-                        )
-                        reply_rows, reply_reactions, reply_files = self._message_related_rows(
-                            account=account,
-                            team_id=team_id,
-                            conversation_id=conversation_id,
-                            messages=replies,
-                            synced_at=synced_at,
-                        )
-                        rows.extend(reply_rows)
-                        reaction_rows.extend(reply_reactions)
-                        file_rows.extend(reply_files)
-
-                self._warehouse.insert_slack_messages(rows)
-                self._warehouse.insert_slack_message_reactions(reaction_rows)
-                self._warehouse.insert_slack_files(file_rows)
-                messages_written += len(rows)
-                files_written += len(file_rows)
+                messages_written += page_written
+                files_written += page_files
                 page_latest = max(
                     (str(message.get("ts")) for message in messages if isinstance(message, Mapping) and message.get("ts")),
                     default="",

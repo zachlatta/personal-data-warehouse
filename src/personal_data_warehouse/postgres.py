@@ -16,7 +16,12 @@ import psycopg2
 from psycopg2 import Binary
 from psycopg2.extras import Json, execute_values
 
-from personal_data_warehouse.search_benchmark_runner import LATENCY_P50_TARGET_MS, MRR_FLOOR
+from personal_data_warehouse.search_benchmark_runner import (
+    LATENCY_P50_TARGET_MS,
+    MRR_FLOOR,
+    SATURATION_CPU_SOME_AVG10,
+    SATURATION_IO_FULL_AVG10,
+)
 from personal_data_warehouse.agent_usage import (
     PRIORITY_FILTER_TARGET,
     SEARCH_FIRST_TARGET,
@@ -515,10 +520,39 @@ SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID = 8_407_112_478
 # then may run for minutes before committing, so rows can land carrying a stamp
 # older than a refresh that already ran. The overlap re-reads that window; a
 # stage longer than this is caught by the daily full refresh below.
-SLACK_ACCOUNT_STATE_REFRESH_OVERLAP = timedelta(hours=1)
+#
+# Measured 2026-08-28 on production: with a one-hour overlap every incremental
+# call re-selected ~1,085 "changed" conversations -- 280 of them member
+# channels holding ~400k messages in the 30-day window, re-stamped by the
+# five-minute polls whether or not anything arrived -- and took 26s, 66 times
+# an hour, the largest statement on the host and the reason the search working
+# set kept being evicted. A ten-minute window selected 178. Fifteen minutes
+# still covers a stage that stamps at start and commits minutes later.
+SLACK_ACCOUNT_STATE_REFRESH_OVERLAP = timedelta(minutes=15)
+# Every Slack stage ends by refreshing, so the refresh ran up to 66 times an
+# hour for a snapshot whose inputs change every five minutes. A refresh that
+# ran this recently is skipped; the next one's overlap covers the gap.
+SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE = timedelta(minutes=5)
 SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL = timedelta(hours=24)
 SLACK_ACCOUNT_STATE_REFRESH_OBJECT_TYPE = "account_state_refresh"
 SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
+
+# How fast a direct message must LAND to read `ok` on
+# marts_ops.slack_conversation_health, as the p95 of
+# timeline.events.first_seen_at - event_ts over the last 24 hours of im/mpim
+# messages. The numbers come from the 2026-08-28 production audit: 1:1 DMs
+# landed p50 3.5 min / p95 62 min and group DMs p50 46 min, with multi-hour
+# tails where a whole conversation arrived in one batch an hour or more after
+# it was written -- while every Slack pipeline row read green, because nothing
+# measured landing at all. The ok bound is what the machinery promises when it
+# works: a five-minute freshness tick plus a five-minute timeline sync, with
+# one tick of slack. `late` is one hour, the batch shape the audit found;
+# anything past that is the DM outage this row exists to name. Judged only for
+# im and mpim: a public channel Zach is not in is polled by the sweep on a
+# rotation measured in days, and its landing time is a rate budget, not a
+# fault.
+SLACK_DM_LANDING_P95_SECONDS = 900
+SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
 
 # marts_ops.search_health reports `late` once the oldest timeline row the chunk
 # builder has not reached has waited this long. The builder runs every five
@@ -2218,6 +2252,7 @@ INTEGER_COLUMNS = {
     "hit_at_10",
     "mrr_milli",
     "errors",
+    "cpu_count",
     "window_days",
     "sessions",
     "pdw_sessions",
@@ -2429,6 +2464,10 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    # search_benchmark_runs: host saturation sampled beside the latency probes
+    "io_pressure_full_avg10",
+    "cpu_pressure_some_avg10",
+    "load_1m",
     "confidence",
     "calendar_confidence",
     "height_meter",
@@ -4312,6 +4351,19 @@ class PostgresWarehouse:
                 f"ALTER TABLE @collation_health ADD COLUMN IF NOT EXISTS "
                 f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
             )
+        for column, ddl_type, default in (
+            # Host saturation beside the latency number (C6), added
+            # 2026-08-28. -1 is "unmeasured", never 0: a zero would read as an
+            # idle host, which is the one verdict C6 acts on.
+            ("io_pressure_full_avg10", "double precision", "-1"),
+            ("cpu_pressure_some_avg10", "double precision", "-1"),
+            ("load_1m", "double precision", "-1"),
+            ("cpu_count", "bigint", "-1"),
+        ):
+            self._command(
+                f"ALTER TABLE @search_benchmark_runs ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
+            )
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
@@ -4780,8 +4832,21 @@ class PostgresWarehouse:
                     WHEN finding = 'no_baseline' THEN 'attention'
                     WHEN finding = 'unknown_actual' THEN 'attention'
                     WHEN scope = 'index'
-                      AND amcheck_status IN ('timeout', 'error', 'unavailable') THEN 'attention'
-                    WHEN scope = 'index' AND amcheck_status IN ('pending', 'never_checked')
+                      AND amcheck_status IN ('timeout', 'error') THEN 'attention'
+                    -- `unavailable` describes the EXTENSION, not the index. It
+                    -- is only a finding while amcheck is genuinely missing;
+                    -- once the extension exists a row still carrying it is a
+                    -- verdict recorded before the extension did -- a
+                    -- measurement gap, read `unmeasured` like `never_checked`.
+                    -- The view asks pg_extension itself rather than trusting
+                    -- the snapshot, because on 2026-08-27 production held 98
+                    -- such rows as `attention` beside 48 rows the same
+                    -- collector had just amchecked `ok`.
+                    WHEN scope = 'index' AND amcheck_status = 'unavailable'
+                      AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'amcheck')
+                      THEN 'attention'
+                    WHEN scope = 'index'
+                      AND amcheck_status IN ('pending', 'never_checked', 'unavailable')
                       THEN 'unmeasured'
                     WHEN scope = 'index' AND amcheck_at IS NOT NULL
                       AND now() - amcheck_at > interval '14 days' THEN 'attention'
@@ -4959,6 +5024,21 @@ class PostgresWarehouse:
                    labeled_cases, found, hit_at_1, hit_at_5, hit_at_10,
                    round(mrr_milli / 1000.0, 3) AS mrr,
                    errors, NULLIF(note, '') AS note,
+                   io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count,
+                   -- C6: was the host being used while the probes ran? io_bound
+                   -- and cpu_bound say the machine was busy; `idle` is the case
+                   -- C6 says to fix FIRST -- slow (p50 over the target) on a
+                   -- machine that was doing nothing, so the query was never
+                   -- allowed to use the host. -1 in any sample is unmeasured.
+                   CASE
+                       WHEN io_pressure_full_avg10 < 0 OR cpu_pressure_some_avg10 < 0
+                            OR load_1m < 0 OR cpu_count < 0 THEN 'unmeasured'
+                       WHEN io_pressure_full_avg10 >= {SATURATION_IO_FULL_AVG10} THEN 'io_bound'
+                       WHEN cpu_pressure_some_avg10 >= {SATURATION_CPU_SOME_AVG10}
+                            OR load_1m >= cpu_count THEN 'cpu_bound'
+                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS} THEN 'idle'
+                       ELSE 'ok'
+                   END AS saturation,
                    NULLIF(collected_at, {epoch}) AS collected_at,
                    (EXTRACT(EPOCH FROM now() - NULLIF(collected_at, {epoch})))::bigint AS snapshot_age_seconds
             FROM @search_benchmark_runs
@@ -9884,12 +9964,28 @@ class PostgresWarehouse:
     # Expected cycle intervals are per type because list sizes differ by two
     # orders of magnitude (114 private channels versus ~13k public ones), so one
     # threshold would either cry wolf on public_channel or never fire on mpim.
+    #
+    # The third half, since 2026-08-28, is LANDING: how long a message takes to
+    # become visible. Discovery and polling can both read perfect while a DM
+    # written at 18:13 lands at 19:15 -- measured that day, 1:1 DMs p95 62 min,
+    # group DMs p50 46 min, with whole conversations arriving in one batch --
+    # and no row said so. The stamp is timeline.events.first_seen_at, not
+    # base_slack.messages.synced_at: synced_at is re-stamped by every re-fetch
+    # of the freshness window (the same 18:13 message read synced_at 19:15:16
+    # after landing), so it cannot distinguish arrival from re-reading. Judged
+    # only for im/mpim (see SLACK_DM_LANDING_P95_SECONDS); a channel's landing
+    # time is the sweep's rate budget, not a fault.
     def _ensure_slack_conversation_health_view(self) -> None:
+        # The view reads timeline.events. On a fresh database the Slack ensure
+        # can run before any timeline sync has created it; make it exist once
+        # rather than guard the view out of the inventory.
+        if not self._relation_exists("timeline_events"):
+            self.ensure_timeline_tables()
         self._ensure_view(
             "marts_ops_slack_conversation_health",
-            """
+            f"""
             CREATE OR REPLACE VIEW @marts_ops_slack_conversation_health AS
-            WITH expected(conversation_type, cycle_seconds, history_cycle_seconds) AS (
+            WITH expected(conversation_type, cycle_seconds, history_cycle_seconds, landing_p95_seconds) AS (
                 -- history_cycle_seconds is how often we must re-ASK a
                 -- conversation for new messages. It is NULL for the three types
                 -- the change feed covers (client.counts reports every
@@ -9899,11 +9995,17 @@ class PostgresWarehouse:
                 -- 13k of them -- so only a poll can find out, and only there is
                 -- the poll age judged. The number is the sweep's own rotation
                 -- (~2 days at its default limits) with margin.
+                --
+                -- landing_p95_seconds is the opposite way round: judged for the
+                -- two DM types only, where a person is waiting on the other end
+                -- and the change feed plus a five-minute tick is supposed to
+                -- deliver in minutes. NULL for channels, whose landing time is
+                -- the sweep rotation by design.
                 VALUES
-                    ('im', 172800::bigint, NULL::bigint),
-                    ('mpim', 172800::bigint, NULL::bigint),
-                    ('private_channel', 172800::bigint, NULL::bigint),
-                    ('public_channel', 432000::bigint, 345600::bigint)
+                    ('im', 172800::bigint, NULL::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('mpim', 172800::bigint, NULL::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('private_channel', 172800::bigint, NULL::bigint, NULL::bigint),
+                    ('public_channel', 432000::bigint, 345600::bigint, NULL::bigint)
             ),
             per_type AS (
                 SELECT
@@ -9946,6 +10048,66 @@ class PostgresWarehouse:
                 LEFT JOIN expected AS e ON e.conversation_type = c.conversation_type
                 WHERE c.conversation_type <> ''
                 GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds, e.history_cycle_seconds
+            ),
+            landing AS (
+                -- Landing latency = first_seen_at - event_ts, over the messages
+                -- WRITTEN in the last 24 hours (bounded by event_ts, which
+                -- timeline_events_source_time_idx serves; a backfill landing
+                -- old messages is therefore excluded rather than read as a
+                -- day-long delay). A message written in that window that has
+                -- not landed at all is invisible here -- discovery and the
+                -- change feed are the detectors for that, and this row is the
+                -- detector for "it landed, but late". Measured 2026-08-28 on
+                -- production: ~50k rows, 95ms warm, 39k shared buffers, all of
+                -- them the newest pages of the heap.
+                SELECT
+                    c.account,
+                    c.team_id,
+                    c.conversation_type,
+                    count(*)::bigint AS landing_sample_24h,
+                    percentile_cont(0.5) WITHIN GROUP (
+                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.event_ts))
+                    ) AS landing_p50,
+                    percentile_cont(0.95) WITHIN GROUP (
+                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.event_ts))
+                    ) AS landing_p95
+                FROM @timeline_events AS e
+                JOIN @slack_conversations AS c
+                  ON c.account = e.source_pk ->> 'account'
+                 AND c.team_id = e.source_pk ->> 'team_id'
+                 AND c.conversation_id = e.source_pk ->> 'conversation_id'
+                WHERE e.source = 'slack'
+                  AND e.adapter = 'slack_message'
+                  AND e.event_ts >= now() - interval '24 hours'
+                GROUP BY c.account, c.team_id, c.conversation_type
+            ),
+            judged AS (
+                SELECT
+                    p.*,
+                    e.cycle_seconds,
+                    e.history_cycle_seconds,
+                    e.landing_p95_seconds AS expected_landing_p95_seconds,
+                    COALESCE(l.landing_sample_24h, 0)::bigint AS landing_sample_24h,
+                    round(l.landing_p50)::bigint AS landing_p50_seconds,
+                    round(l.landing_p95)::bigint AS landing_p95_seconds,
+                    CASE
+                        WHEN p.live_count = 0 THEN 'unknown'
+                        WHEN e.landing_p95_seconds IS NULL THEN 'ok'
+                        -- A DM type with nothing written in 24h has no
+                        -- latency to judge. mpim has real zero-message days,
+                        -- so this is 'unknown', never a fault, and the fold
+                        -- into status below ignores it.
+                        WHEN l.landing_p95 IS NULL THEN 'unknown'
+                        WHEN l.landing_p95 > {SLACK_DM_LANDING_LATE_P95_SECONDS} THEN 'stale'
+                        WHEN l.landing_p95 > e.landing_p95_seconds THEN 'late'
+                        ELSE 'ok'
+                    END AS landing_status
+                FROM per_type AS p
+                LEFT JOIN expected AS e ON e.conversation_type = p.conversation_type
+                LEFT JOIN landing AS l
+                       ON l.account = p.account
+                      AND l.team_id = p.team_id
+                      AND l.conversation_type = p.conversation_type
             )
             SELECT
                 p.account,
@@ -9961,12 +10123,12 @@ class PostgresWarehouse:
                 p.newest_conversation_synced_at,
                 (EXTRACT(EPOCH FROM now() - p.oldest_conversation_synced_at))::bigint
                     AS discovery_age_seconds,
-                COALESCE(e.cycle_seconds, 172800) AS expected_cycle_seconds,
+                COALESCE(p.cycle_seconds, 172800) AS expected_cycle_seconds,
                 p.history_polled_count,
                 round(p.history_polled_count::numeric / NULLIF(p.live_count, 0), 4)
                     AS history_polled_fraction,
                 p.oldest_history_poll_at,
-                e.history_cycle_seconds AS expected_history_cycle_seconds,
+                p.history_cycle_seconds AS expected_history_cycle_seconds,
                 CASE
                     WHEN st.status = 'complete' THEN ''
                     ELSE COALESCE(st.cursor_ts, '')
@@ -9981,30 +10143,38 @@ class PostgresWarehouse:
                 ))::bigint AS message_age_seconds,
                 CASE
                     WHEN p.live_count = 0 THEN 'unknown'
-                    WHEN e.history_cycle_seconds IS NULL THEN 'ok'
+                    WHEN p.history_cycle_seconds IS NULL THEN 'ok'
                     WHEN p.history_polled_count::numeric / p.live_count < 0.75 THEN 'stale'
                     WHEN p.history_polled_count::numeric / p.live_count < 0.95 THEN 'late'
                     ELSE 'ok'
                 END AS history_status,
-                -- Discovery and history are separate failures and either one
-                -- alone makes the type wrong, so the row reports the worse of
-                -- them. Listing a channel we then never read is the shape that
-                -- hid 11,488 frozen public channels behind a 99.2% discovery
-                -- number for four months.
+                p.landing_sample_24h,
+                p.landing_p50_seconds,
+                p.landing_p95_seconds,
+                p.expected_landing_p95_seconds,
+                p.landing_status,
+                -- Discovery, history and landing are separate failures and any
+                -- one alone makes the type wrong, so the row reports the worst
+                -- of them. Listing a channel we then never read is the shape
+                -- that hid 11,488 frozen public channels behind a 99.2%
+                -- discovery number for four months; a DM that lands an hour
+                -- after it was written is the shape both of those halves read
+                -- as healthy on 2026-08-28.
                 CASE
                     WHEN p.live_count = 0 THEN 'unknown'
                     WHEN p.refreshed_count::numeric / p.live_count < 0.75
-                      OR (e.history_cycle_seconds IS NOT NULL
+                      OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.75)
+                      OR p.landing_status = 'stale'
                         THEN 'stale'
                     WHEN p.refreshed_count::numeric / p.live_count < 0.95
-                      OR (e.history_cycle_seconds IS NOT NULL
+                      OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.95)
+                      OR p.landing_status = 'late'
                         THEN 'late'
                     ELSE 'ok'
                 END AS status
-            FROM per_type AS p
-            LEFT JOIN expected AS e ON e.conversation_type = p.conversation_type
+            FROM judged AS p
             LEFT JOIN @slack_sync_state AS st
                    ON st.account = p.account
                   AND st.team_id = p.team_id
@@ -10497,6 +10667,11 @@ class PostgresWarehouse:
                 or last_full_at is None
                 or synced_at - last_full_at >= SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL
             )
+            if not full and synced_at - watermark < SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE:
+                # ``debounced``: a refresh ran moments ago and would recompute
+                # the same rows; the next one's overlap covers this window.
+                self._command("ROLLBACK")
+                return SlackAccountStateRefresh(mode="debounced")
             changed: list[str] = []
             if not full:
                 since = watermark - SLACK_ACCOUNT_STATE_REFRESH_OVERLAP
@@ -10687,6 +10862,50 @@ class PostgresWarehouse:
             if numeric > 0:
                 high_water[str(conversation_id)] = numeric
         return high_water
+
+    def load_slack_conversation_message_low_water(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_ids: Sequence[str],
+    ) -> dict[str, str]:
+        """Oldest top-level message ts we hold per conversation, as Slack's string.
+
+        This is the backfill cursor. A conversation's forward cursor
+        (``ops.slack_sync_state.cursor_ts``) says how far *up* we have read; it
+        says nothing about how far *down*, and a conversation whose first fetch
+        was a freshness window -- or a full stream cut short by the rate budget
+        -- holds a cursor at "now" and no history below it. The messages
+        themselves are the only record of that floor, so coverage reads it here
+        and asks Slack for everything older (see ``_sync_conversation_history_below``).
+
+        One ordered index probe per conversation
+        (``slack_messages_conversation_time_idx``), never a ``min()`` over the
+        table: a busy channel holds millions of rows and the caller is bounded
+        to a coverage slice of a few dozen conversations.
+        """
+        unique_ids = sorted({str(conversation_id) for conversation_id in conversation_ids})
+        if not unique_ids:
+            return {}
+        rows = self._query(
+            """
+            SELECT ids.conversation_id, m.message_ts
+            FROM unnest(%s::text[]) AS ids(conversation_id)
+            CROSS JOIN LATERAL (
+                SELECT message_ts
+                FROM @slack_messages
+                WHERE account = %s
+                  AND team_id = %s
+                  AND conversation_id = ids.conversation_id
+                  AND is_thread_reply = 0
+                ORDER BY message_datetime ASC
+                LIMIT 1
+            ) AS m
+            """,
+            (unique_ids, account, team_id),
+        )
+        return {str(conversation_id): str(message_ts) for conversation_id, message_ts in rows if message_ts}
 
     # Every derived voice row written before the domain became multi-source
     # belongs to Apple Voice Memos; nothing else could write one, because the

@@ -80,6 +80,10 @@ class FakeWarehouse:
         # (account, team_id, conversation_id) -> high-water message ts, used to
         # derive a fallback cursor for conversations whose stored cursor was lost.
         self.message_high_water: dict[tuple[str, str, str], float] = {}
+        # (account, team_id, conversation_id) -> oldest top-level message ts we
+        # hold, the floor coverage backfills below.
+        self.message_low_water: dict[tuple[str, str, str], str] = {}
+        self.low_water_calls = []
 
     def ensure_slack_tables(self):
         self.ensure_calls += 1
@@ -316,6 +320,15 @@ class FakeWarehouse:
         # would cause every reply in the window to be tombstoned. Tests set
         # `existing_message_ids` to the set this returns.
         return set(self.existing_message_ids)
+
+    def load_slack_conversation_message_low_water(self, *, account, team_id, conversation_ids):
+        self.low_water_calls.append(list(conversation_ids))
+        wanted = {str(conversation_id) for conversation_id in conversation_ids}
+        return {
+            conversation_id: low_water
+            for (state_account, state_team_id, conversation_id), low_water in self.message_low_water.items()
+            if state_account == account and state_team_id == team_id and conversation_id in wanted
+        }
 
     def load_slack_conversation_message_high_water(self, *, account, team_id, conversation_ids):
         wanted = {str(conversation_id) for conversation_id in conversation_ids}
@@ -3080,3 +3093,218 @@ def test_runner_public_sweep_keeps_a_completed_backfill_marked_full(monkeypatch)
     assert written["C_FULL"] == "full"
     # An unfinished backfill stays unfinished, so coverage keeps working on it.
     assert written["C_PARTIAL"] == "partial"
+
+
+# --- coverage must backfill below a cursor that was set without history ------
+
+
+def _coverage_runner(settings, warehouse, client, **overrides):
+    kwargs = dict(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        not_full_only=True,
+        skip_known_errors=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    )
+    kwargs.update(overrides)
+    return SlackSyncRunner(**kwargs)
+
+
+def _history_calls(client):
+    return [params for method, params in client.calls if method == "conversations.history"]
+
+
+def test_member_channel_first_seen_by_freshness_is_backfilled_below_its_floor_by_coverage(monkeypatch):
+    """The 2026-08-28 hole: discovered late, cursor at "now", history never fetched.
+
+    A member channel that discovery first lists months after its creation
+    reaches the freshness stage through the change feed. Freshness fetches its
+    four-hour window, persists the newest message as the cursor and the state
+    as ``partial`` -- correct so far. Coverage then selected it (not full) and
+    topped it up from ``cursor - lookback``, which never reaches further back
+    than the window it already had, so the channel stayed ``partial`` forever
+    with nothing older than the day it was discovered. Eight of fifteen such
+    channels were in that state in production, one of them a 3k-messages-a-day
+    channel created in May holding nothing before 08-25.
+
+    Coverage must read the floor -- the oldest message stored -- and stream
+    everything older, leaving the forward cursor alone, until the start of the
+    conversation marks it ``full``.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+    channel = {"id": "C_LATE", "name": "late-discovered", "is_channel": True, "is_member": True}
+
+    # Step 1: the change feed names the channel; freshness reads its window.
+    freshness_warehouse = FakeWarehouse()
+    freshness_warehouse.conversation_payloads = [channel]
+    freshness_client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1787832000.000200", "user": "U2", "text": "newest"},
+                        {"ts": "1787830000.000100", "user": "U2", "text": "older, still in window"},
+                    ],
+                    "response_metadata": {},
+                }
+            ],
+        }
+    )
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=freshness_warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: freshness_client,
+        now=lambda: now,
+        history_window=timedelta(hours=4),
+        freshness_priority=True,
+        use_existing_conversations=True,
+        conversation_types=("public_channel",),
+        conversation_ids=("C_LATE",),
+        sync_users=False,
+        sync_members=False,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    window_call = _history_calls(freshness_client)[0]
+    assert "oldest" in window_call, "freshness reads a window, not the whole history"
+    state_write = [u for u in freshness_warehouse.state_updates if u["object_type"] == "conversation"][-1]
+    assert state_write["cursor_ts"] == "1787832000.000200"
+    assert state_write["last_sync_type"] == "partial", "a windowed first read must not claim complete history"
+
+    # Step 2: coverage sees exactly that state shape, plus the messages the
+    # window stored -- the oldest of which is the floor.
+    coverage_warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_LATE"): {
+                "cursor_ts": state_write["cursor_ts"],
+                "last_sync_type": state_write["last_sync_type"],
+                "status": state_write["status"],
+            }
+        }
+    )
+    coverage_warehouse.conversation_payloads = [channel]
+    coverage_warehouse.message_low_water[("zrl", "T1", "C_LATE")] = "1787830000.000100"
+    coverage_client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1779000000.000100", "user": "U2", "text": "from May"}],
+                    "response_metadata": {"next_cursor": "page2"},
+                },
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1778000000.000100", "user": "U2", "text": "first ever"}],
+                    "response_metadata": {},
+                },
+            ],
+        }
+    )
+    summary = _coverage_runner(settings, coverage_warehouse, coverage_client, now=lambda: now).sync_all()[0]
+
+    assert coverage_warehouse.low_water_calls == [["C_LATE"]]
+    calls = _history_calls(coverage_client)
+    assert calls, "coverage must still select a conversation whose history is incomplete"
+    assert calls[0]["latest"] == "1787830000.000100", "the walk starts below the oldest stored message"
+    assert "oldest" not in calls[0], "a backfill has no lower bound: it runs to the start of the conversation"
+    assert summary.messages_written == 2
+    assert {row["message_ts"] for row in coverage_warehouse.messages} == {"1779000000.000100", "1778000000.000100"}
+
+    state_writes = [u for u in coverage_warehouse.state_updates if u["object_type"] == "conversation"]
+    assert all(u["cursor_ts"] == "" for u in state_writes), (
+        "the forward cursor is preserved by the upsert on empty, and must never be regressed to May"
+    )
+    assert state_writes[-1]["last_sync_type"] == "full"
+    assert state_writes[-1]["status"] == "ok"
+    assert summary.sync_type == "backfill"
+
+
+def test_coverage_backfill_resumes_from_the_floor_after_a_rate_limit_abort(monkeypatch):
+    """A budget abort must leave the conversation partial with its cursor intact.
+
+    The floor is the messages table, so nothing else needs recording: the next
+    slice reads a lower floor and continues. What must NOT happen is the state
+    flipping to ``full`` (coverage would drop it) or the cursor being written.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_BIG"): {
+                "cursor_ts": "1787832000.000200",
+                "last_sync_type": "partial",
+                "status": "ok",
+            }
+        }
+    )
+    warehouse.conversation_payloads = [{"id": "C_BIG", "name": "big", "is_channel": True, "is_member": True}]
+    warehouse.message_low_water[("zrl", "T1", "C_BIG")] = "1787800000.000100"
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {
+                    "ok": True,
+                    "messages": [{"ts": "1787700000.000100", "user": "U2", "text": "one page down"}],
+                    "response_metadata": {"next_cursor": "page2"},
+                },
+                SlackRateLimitedError(retry_after=30),
+            ],
+        }
+    )
+
+    summary = _coverage_runner(settings, warehouse, client, max_rate_limit_sleep_seconds=1).sync_all()[0]
+
+    assert summary.sync_type == "backfill"
+    assert [row["message_ts"] for row in warehouse.messages] == ["1787700000.000100"], "the page before the abort is kept"
+    state_writes = [u for u in warehouse.state_updates if u["object_type"] == "conversation"]
+    assert state_writes, "progress below the floor is recorded as partial"
+    assert all(u["last_sync_type"] == "partial" for u in state_writes)
+    assert all(u["cursor_ts"] == "" for u in state_writes)
+
+
+def test_coverage_still_streams_a_conversation_with_no_cursor_from_the_top(monkeypatch):
+    """No state at all means no history at all: the existing full stream is right.
+
+    The floor lookup is only for conversations that hold *some* history, so a
+    never-synced channel must not be asked for a floor it cannot have.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [{"id": "C_FRESH", "name": "fresh", "is_channel": True}]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1787832000.000200", "user": "U2", "text": "hi"}], "response_metadata": {}}
+            ],
+        }
+    )
+
+    _coverage_runner(settings, warehouse, client).sync_all()
+
+    assert warehouse.low_water_calls == []
+    call = _history_calls(client)[0]
+    assert "latest" not in call and "oldest" not in call
+    assert [u for u in warehouse.state_updates if u["object_type"] == "conversation"][-1]["last_sync_type"] == "full"

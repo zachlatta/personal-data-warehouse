@@ -2038,3 +2038,62 @@ def test_a_failed_receipt_agent_run_reads_failing_and_other_agents_do_not(wareho
     assert row["status"] == "failing"
     assert row["state_error_rows"] == 1
     assert "container exited 1" in row["last_error"]
+
+
+# --- search benchmark: host saturation beside the latency number (C6) ---------
+
+
+def _seed_search_benchmark_run(warehouse, **over):
+    from personal_data_warehouse.search_benchmark_runner import SearchBenchmarkRun
+
+    base = dict(mode="hybrid", probe_queries=6, latency_p50_ms=900, latency_p90_ms=1800, latency_max_ms=2500,
+                labeled_cases=40, found=30, hit_at_1=10, hit_at_5=20, hit_at_10=25, mrr_milli=410, errors=0, note="",
+                io_pressure_full_avg10=0.5, cpu_pressure_some_avg10=3.0, load_1m=2.0, cpu_count=28)
+    base.update(over)
+    warehouse.write_search_benchmark_runs([SearchBenchmarkRun(**base)], collected_at=datetime.now(tz=UTC))
+    return warehouse._query_dicts(
+        "SELECT saturation, io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, status"
+        " FROM @marts_search_benchmark"
+    )[0]
+
+
+@pytest.mark.parametrize(
+    ("over", "expected"),
+    [
+        # quiet host, fast search
+        ({}, "ok"),
+        # the disk was the saturated resource: 2026-08-28 measured io full 20%
+        ({"io_pressure_full_avg10": 20.0, "latency_p50_ms": 3200}, "io_bound"),
+        ({"io_pressure_full_avg10": 10.0}, "io_bound"),
+        # cpu pressure or load past the core count
+        ({"cpu_pressure_some_avg10": 55.0}, "cpu_bound"),
+        ({"load_1m": 28.0, "cpu_count": 28, "latency_p50_ms": 3200}, "cpu_bound"),
+        # io wins over cpu when both fire: the io reading is the sharper one
+        ({"io_pressure_full_avg10": 12.0, "cpu_pressure_some_avg10": 80.0}, "io_bound"),
+        # slow on an idle machine -- the case C6 says to fix first
+        ({"latency_p50_ms": 2001}, "idle"),
+        ({"latency_p50_ms": 2000}, "ok"),
+        # any -1 sample is unmeasured, never a verdict
+        ({"io_pressure_full_avg10": -1.0, "latency_p50_ms": 3200}, "unmeasured"),
+        ({"cpu_count": -1}, "unmeasured"),
+    ],
+)
+def test_search_benchmark_view_judges_host_saturation(warehouse, over, expected):
+    warehouse.ensure_pipeline_health_tables()
+    row = _seed_search_benchmark_run(warehouse, **over)
+    assert row["saturation"] == expected
+    assert row["cpu_count"] == over.get("cpu_count", 28)
+    assert float(row["io_pressure_full_avg10"]) == over.get("io_pressure_full_avg10", 0.5)
+
+
+def test_search_benchmark_saturation_columns_are_added_to_an_existing_table(warehouse):
+    """The migration pattern pgbackrest_health uses: a pre-existing table is widened, not recreated."""
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._command("DROP VIEW @marts_search_benchmark")
+    for column in ("io_pressure_full_avg10", "cpu_pressure_some_avg10", "load_1m", "cpu_count"):
+        warehouse._command(f"ALTER TABLE @search_benchmark_runs DROP COLUMN {column}")
+    warehouse.ensure_pipeline_health_tables()
+    assert _seed_search_benchmark_run(warehouse, latency_p50_ms=3200)["saturation"] == "idle"
+    # A row written before the columns existed reads unmeasured, not idle.
+    warehouse._command("UPDATE @search_benchmark_runs SET load_1m = DEFAULT")
+    assert warehouse._query_dicts("SELECT saturation FROM @marts_search_benchmark")[0]["saturation"] == "unmeasured"

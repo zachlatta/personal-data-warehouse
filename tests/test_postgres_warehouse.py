@@ -6917,6 +6917,220 @@ def test_slack_conversation_health_catches_public_channels_discovered_but_never_
     assert dm[4] == "ok"
 
 
+def _landed_slack_messages(warehouse: PostgresWarehouse, *, now: datetime, written: dict[str, list[int]]) -> None:
+    """Seed DM/channel messages written N minutes ago and land them on the timeline now.
+
+    ``written`` maps a conversation id to the ages, in minutes, of its
+    messages. The timeline sync stamps ``first_seen_at`` with now(), so each
+    message's landing latency is exactly its age -- which is what the view
+    measures, and why the seed uses real ages rather than fixed dates.
+    """
+    rows = []
+    for conversation_id, ages in written.items():
+        for index, age in enumerate(ages):
+            written_at = now - timedelta(minutes=age)
+            rows.append(
+                _slack_message_row(
+                    conversation_id=conversation_id,
+                    message_ts=f"{written_at.timestamp():.6f}",
+                    message_datetime=written_at,
+                    user_id=f"U{index}",
+                    text=f"{conversation_id} message {index}",
+                )
+            )
+    warehouse.insert_slack_messages(rows)
+    # The engine runs every adapter and fails the run if any source table is
+    # missing, so the whole warehouse must exist before it lands the rows.
+    _ensure_all_table_groups(warehouse)
+    _sync_timeline(warehouse)
+
+
+def test_slack_conversation_health_judges_dm_landing_latency(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The third Slack outage shape: everything polled, everything listed, DMs late.
+
+    Measured 2026-08-28 in production while this view read ``ok`` on every
+    type: 1:1 DMs landed p50 3.5 min / p95 62 min, group DMs p50 46 min, and a
+    DM written at 18:13 arrived at 19:15 with the rest of its conversation in
+    one batch. Discovery and history polling are about whether we ASK; this is
+    about how long the answer takes, and it needs its own column because the
+    other two cannot see it.
+
+    The stamp is timeline.events.first_seen_at. base_slack.messages.synced_at
+    is re-stamped by every re-fetch of the freshness window, so that same
+    18:13 message read synced_at 19:15:16 -- the re-read, not the arrival.
+    """
+    from personal_data_warehouse.postgres import (
+        SLACK_DM_LANDING_LATE_P95_SECONDS,
+        SLACK_DM_LANDING_P95_SECONDS,
+    )
+
+    assert SLACK_DM_LANDING_P95_SECONDS < SLACK_DM_LANDING_LATE_P95_SECONDS
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    fresh = now - timedelta(minutes=30)
+    warehouse.insert_slack_conversations(
+        [
+            _health_conversation_row("D_FAST", "im", synced_at=fresh),
+            _health_conversation_row("G_SLOW", "mpim", synced_at=fresh),
+            _health_conversation_row("P_QUIET", "private_channel", synced_at=fresh),
+            _health_conversation_row("C_SWEPT", "public_channel", synced_at=fresh),
+        ]
+    )
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C_SWEPT",
+        cursor_ts="1770000000.000001",
+        last_sync_type="full",
+        status="ok",
+        error="",
+        updated_at=fresh,
+        sync_version=1,
+    )
+    _landed_slack_messages(
+        warehouse,
+        now=now,
+        written={
+            # A DM that landed within the ok bound: p95 of these is 4 minutes.
+            "D_FAST": [1, 2, 4],
+            # A group DM whose whole conversation arrived in one batch after
+            # two hours -- the production shape -- reads stale.
+            "G_SLOW": [121, 125, 130],
+            # A public channel Zach is not in landed a day late, and that is
+            # the sweep rotation working as designed, not a fault.
+            "C_SWEPT": [60 * 25, 60 * 26],
+        },
+    )
+
+    rows = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, landing_sample_24h, landing_p50_seconds, landing_p95_seconds,
+                   expected_landing_p95_seconds, landing_status, refreshed_fraction, history_status, status
+            FROM @marts_ops_slack_conversation_health
+            WHERE account = 'zrl'
+            """
+        )
+    }
+
+    im = rows["im"]
+    assert im[0] == 3
+    assert 60 <= im[1] <= 60 * 3 and 60 * 3 <= im[2] <= 60 * 5, im
+    assert im[3] == SLACK_DM_LANDING_P95_SECONDS
+    assert im[4] == "ok" and im[7] == "ok"
+
+    mpim = rows["mpim"]
+    assert mpim[0] == 3
+    assert mpim[2] > SLACK_DM_LANDING_LATE_P95_SECONDS
+    assert mpim[4] == "stale"
+    assert mpim[5] == 1 and mpim[6] == "ok", "discovery and polling read perfect -- that is the trap"
+    assert mpim[7] == "stale", "a DM type that lands hours late is the row's status, not a footnote"
+
+    private = rows["private_channel"]
+    assert private[0] == 0 and private[1] is None and private[2] is None
+    assert private[3] is None and private[4] == "ok" and private[7] == "ok", "channels are not judged on landing"
+
+    public = rows["public_channel"]
+    # A message written 25 hours ago is outside the window entirely; the one
+    # at 26h likewise. The sample is empty and nothing is judged.
+    assert public[0] == 0 and public[4] == "ok" and public[7] == "ok"
+
+
+def test_slack_conversation_health_reads_late_dms_as_late_and_quiet_dms_as_unknown(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Between ok and stale sits late; and a DM type with nothing written is unknown.
+
+    mpim genuinely has zero-message days, so an empty 24h sample must not be a
+    fault -- and must not fold into the row's status either.
+    """
+    from personal_data_warehouse.postgres import SLACK_DM_LANDING_P95_SECONDS
+
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    fresh = now - timedelta(minutes=30)
+    warehouse.insert_slack_conversations(
+        [
+            _health_conversation_row("D_LATE", "im", synced_at=fresh),
+            _health_conversation_row("G_SILENT", "mpim", synced_at=fresh),
+        ]
+    )
+    # Four fast messages and one forty-minute straggler: p50 is fine, p95 is
+    # past the ok bound and short of the hour that means stale.
+    _landed_slack_messages(warehouse, now=now, written={"D_LATE": [1, 2, 3, 4, 40]})
+
+    rows = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, landing_sample_24h, landing_p50_seconds, landing_p95_seconds,
+                   landing_status, status
+            FROM @marts_ops_slack_conversation_health
+            WHERE account = 'zrl'
+            """
+        )
+    }
+
+    im = rows["im"]
+    assert im[0] == 5
+    assert im[1] < SLACK_DM_LANDING_P95_SECONDS < im[2]
+    assert im[3] == "late" and im[4] == "late"
+
+    mpim = rows["mpim"]
+    assert mpim[0] == 0 and mpim[1] is None and mpim[2] is None
+    assert mpim[3] == "unknown"
+    assert mpim[4] == "ok", "no messages in a day is not a landing fault"
+
+
+def test_slack_conversation_message_low_water_is_the_oldest_top_level_message(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The backfill floor coverage walks below: oldest stored ts, replies excluded.
+
+    conversations.history never returns thread replies, so the floor mirrors
+    the forward cursor's rule and ignores them -- a reply's ts is never older
+    than its parent anyway, but a reply-only conversation (all parents
+    deleted) must not produce a floor the history call cannot step below.
+    """
+    warehouse.ensure_slack_tables()
+    base = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="C_HELD", conversation_type="public_channel"),
+            _slack_conversation_row(conversation_id="C_EMPTY", conversation_type="public_channel"),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(conversation_id="C_HELD", message_ts="300.000300", message_datetime=base),
+            _slack_message_row(
+                conversation_id="C_HELD",
+                message_ts="100.000100",
+                message_datetime=base - timedelta(days=2),
+            ),
+            # A reply older than every parent we hold must not become the floor.
+            _slack_message_row(
+                conversation_id="C_HELD",
+                message_ts="50.000050",
+                message_datetime=base - timedelta(days=3),
+                is_thread_reply=1,
+                thread_ts="40.000040",
+            ),
+        ]
+    )
+
+    floors = warehouse.load_slack_conversation_message_low_water(
+        account="zrl", team_id="T1", conversation_ids=["C_HELD", "C_EMPTY", "C_HELD"]
+    )
+
+    assert floors == {"C_HELD": "100.000100"}
+    assert warehouse.load_slack_conversation_message_low_water(account="zrl", team_id="T1", conversation_ids=[]) == {}
+
+
 def test_slack_conversation_health_reports_the_discovery_cursor(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -7245,3 +7459,31 @@ def test_slack_conversation_health_still_catches_the_page_one_outage_by_share(
     )[0]
     assert status == "stale"
     assert abs(float(fraction) - 0.08) < 0.001
+
+
+def test_postgres_slack_account_state_refresh_is_debounced(warehouse: PostgresWarehouse) -> None:
+    """Sixty-six refreshes an hour of a five-minute snapshot was the host's biggest cost.
+
+    Measured 2026-08-28: every Slack stage ended by refreshing, 1,308 calls in
+    20 hours at 26s each -- the largest statement on the box. A refresh that
+    ran within SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE is skipped; the next one's
+    overlap re-reads the window it would have covered.
+    """
+    from personal_data_warehouse.postgres import (
+        SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE,
+        SLACK_ACCOUNT_STATE_REFRESH_OVERLAP,
+    )
+
+    assert SLACK_ACCOUNT_STATE_REFRESH_OVERLAP > SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(hours=6))
+    assert warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=3)).mode == "full"
+    assert warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=2)).mode == "incremental"
+    debounced = warehouse.refresh_slack_account_state_items(
+        account="zrl", team_id="T1", synced_at=now - timedelta(hours=2) + timedelta(minutes=2)
+    )
+    assert debounced.mode == "debounced"
+    _seed_slack_dm(warehouse, conversation_id="D2", now=now, synced_at=now)
+    assert warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now).mode == "incremental"
+    assert _inbox_rows(warehouse)["D2"][0] == 0

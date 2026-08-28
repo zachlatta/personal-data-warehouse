@@ -2284,6 +2284,16 @@ MART_VIEW_HEALTH_COLUMNS = (
 # The weekly search benchmark, one row per retrieval mode: serial latency
 # over fixed probe queries and labeled quality (MRR, hit@k) through the app's
 # own search tool. mrr is stored x1000 as a bigint; the marts view divides.
+#
+# The four host columns are the C6 half of the row: whether the machine was
+# saturated WHILE the latency probes ran. Measured 2026-08-28 during three
+# concurrent hybrid searches on mew-coolify: CPU 42% idle / 38% iowait, PSI
+# io full avg10 20%, the semantic ANN leg ~100% shared-buffer-read wait --
+# I/O-bound, not CPU-bound -- and nothing recorded that beside the latency
+# number. Sampled from /proc/pressure/{io,cpu}, /proc/loadavg and
+# os.cpu_count() at the start and end of the probes; the worse sample is
+# stored. -1 means the file was unreadable (no PSI on this kernel, or not
+# Linux) and the note says so; the view reads it as `unmeasured`.
 SEARCH_BENCHMARK_RUN_COLUMNS = (
     "mode",
     "probe_queries",
@@ -2298,6 +2308,10 @@ SEARCH_BENCHMARK_RUN_COLUMNS = (
     "mrr_milli",
     "errors",
     "note",
+    "io_pressure_full_avg10",
+    "cpu_pressure_some_avg10",
+    "load_1m",
+    "cpu_count",
     "collected_at",
 )
 
