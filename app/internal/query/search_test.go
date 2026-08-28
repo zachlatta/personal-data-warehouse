@@ -558,7 +558,7 @@ func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
 
 	for _, query := range []string{
 		"vision insurance VSP EyeMed glasses member ID",
-		"Honda Ridgeline rear differential fluid",
+		"pickup truck rear differential fluid",
 		"admin/api-keys",
 	} {
 		resp := svc.Search(context.Background(), SearchRequest{Query: query})

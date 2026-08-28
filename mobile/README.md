@@ -22,6 +22,37 @@ app fans a notification out to every active device when a request lands in
 `pending_review` (tapping it opens that request). A `DeviceNotRegistered`
 ticket retires the device row rather than silently shrinking the fan-out.
 
+## Rich notifications
+
+Alerts can carry a subtitle, an image, action buttons, a thread, a collapse
+id, an interruption level and a badge. The server builds them
+(`app/internal/push.Notification`) and there are three ways to send one:
+
+```bash
+pdw call notify --data '{"title":"Wire due today","subtitle":"Invoice 4831","body":"Instructions in inbox.","image_url":"https://…/receipt.png","category":"link","route":"/timeline","interruption_level":"time-sensitive"}'
+curl -X POST "$PDW_API_URL/api/push/send" -H "Authorization: Bearer cli:$PDW_SECRET_TOKEN" -d '{"title":"…"}'
+# Settings → "Send test push" sends one with an image, subtitle and Open button.
+```
+
+Two pieces of the app make that work, and both are worth knowing when
+something looks plain:
+
+- **Images need the Notification Service Extension**, the
+  `targets/notification-service` Swift target that `@bacons/apple-targets`
+  adds at prebuild. iOS runs it for any push with `mutableContent`; it reads
+  the Expo payload's `body._richContent.image`, downloads it and attaches it.
+  Without the extension (Expo Go, or a build before it existed) the same push
+  is delivered as text only. Changing the Swift or the target config needs a
+  new native build (`eas build`), not an OTA update.
+- **Action buttons are categories the server publishes.** On launch the app
+  fetches `GET /api/push/categories` and registers each with
+  `setNotificationCategoryAsync`, so adding a button is a Go edit
+  (`app/internal/push/categories.go`). Handling a NEW action id is the one
+  thing that still needs app code (`handleNotificationResponse` in
+  `src/lib/push.ts`): `approve`/`deny` on a `mutation_review` alert call the
+  review API in the background without opening the app; `open` (and a plain
+  tap) opens `data.route`; a `reply` action's text arrives as `userText`.
+
 ## Run it
 
 ```bash

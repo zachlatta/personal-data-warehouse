@@ -2,9 +2,9 @@ import { DarkTheme, DefaultTheme, ThemeProvider, useRouter, Stack } from 'expo-r
 import * as Notifications from 'expo-notifications';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
-import { useColorScheme } from 'react-native';
+import { Alert, useColorScheme } from 'react-native';
 
-import { routeFromNotification } from '@/lib/push';
+import { handleNotificationResponse, syncNotificationCategories } from '@/lib/push';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
 
@@ -23,18 +23,26 @@ function Root() {
     void applyUpdateNow(() => {});
   }, []);
 
-  // Notification taps: the one that launched the app, and any while running.
+  // Categories give alerts their action buttons; the list is the server's.
+  useEffect(() => {
+    if (!ready || !config) return;
+    void syncNotificationCategories(config);
+  }, [ready, config]);
+
+  // Notification taps and action buttons: the one that launched the app,
+  // and any while running (including background actions like Approve).
   useEffect(() => {
     if (!ready || !config) return;
     let cancelled = false;
-    Notifications.getLastNotificationResponseAsync().then((response) => {
-      const route = routeFromNotification(response);
-      if (route && !cancelled) router.push(route as never);
-    });
-    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const route = routeFromNotification(response);
-      if (route) router.push(route as never);
-    });
+    const act = async (response: Notifications.NotificationResponse | null | undefined) => {
+      if (!response) return;
+      const outcome = await handleNotificationResponse(config, response);
+      if (cancelled) return;
+      if (outcome.message) Alert.alert('PDW', outcome.message);
+      if (outcome.route) router.push(outcome.route as never);
+    };
+    Notifications.getLastNotificationResponseAsync().then(act);
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => void act(response));
     return () => {
       cancelled = true;
       sub.remove();

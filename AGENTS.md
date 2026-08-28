@@ -1307,6 +1307,24 @@ Push is delivered through the Expo push service (`exp.host`), not APNs directly.
 `PDW_EXPO_ACCESS_TOKEN` is optional on the app deployment. A simulator cannot
 receive push; the app reports `unsupported` there and everything else still works.
 
+**Notifications are rich, and the server is where their UX is iterated.**
+`push.Notification` (`app/internal/push/notifier.go`) carries `subtitle`, an https
+`image_url` (or `image_storage_file_id`, signed into an `/objects/` link), a `category`
+for action buttons, `route`, `thread_id`, `collapse_id`, `interruption_level`, `badge`
+and `sound`, and `Validate()` refuses what iOS or Expo would otherwise drop silently — an
+unknown category shows no buttons, an `http` image is blocked by App Transport Security
+in the extension. Three senders share it: the `notify` tool (`pdw call notify --data
+'{…}'`, also on MCP), `POST /api/push/send` (same JSON, for curl), and the mutation hook,
+whose alert is now `mutation_review` with Approve / Deny / Review buttons that act without
+opening the app. Categories live in `app/internal/push/categories.go` and are published
+at `GET /api/push/categories`; the app registers them on launch, so a new button is a Go
+edit — only handling a *new action id* needs `mobile/src/lib/push.ts`. Images on iOS need
+the Notification Service Extension target (`mobile/targets/notification-service`, added
+at prebuild by `@bacons/apple-targets`), which reads Expo's `body._richContent.image`
+from the payload; a build without it shows the same push as text, and changing it is a
+native build, not an OTA update. Settings → "Send test push" sends an image + subtitle +
+Open button, which is how a phone proves the extension is installed.
+
 ## Voice recordings (a multi-source domain, one pipeline)
 
 Voice has **three** sources — `base_apple_voice_memos.files` (the Mac uploader),

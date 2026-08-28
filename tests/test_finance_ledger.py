@@ -837,13 +837,13 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
             account_mask="",
             valuations_json=[
                 {"date": "2026-04-11", "value": "5241.59", "description": "SPV A — NAV"},
-                {"date": "2026-04-11", "value": "6561.81", "description": "Fund I — NAV"},
+                {"date": "2026-04-11", "value": "7312.44", "description": "Fund I — NAV"},
                 {"date": "2026-04-11", "value": "4993.98", "description": "SPV B — NAV"},
-                {"date": "2026-04-11", "value": "16797.38", "description": "Totals — NAV"},
+                {"date": "2026-04-11", "value": "24680.15", "description": "Totals — NAV"},
                 # A same-day set WITHOUT a totals row restates one asset
                 # (estimate + low/high bounds + rental): the primary figure is
                 # listed first and alternatives must never sum.
-                {"date": "2026-05-11", "value": "468000", "description": "Estimate"},
+                {"date": "2026-05-11", "value": "525000", "description": "Estimate"},
                 {"date": "2026-05-11", "value": "445000", "description": "Estimated sale price — low"},
                 {"date": "2026-05-11", "value": "539000", "description": "Estimated sale price — high"},
                 {"date": "2026-05-11", "value": "1905", "description": "Rental estimate per month"},
@@ -859,8 +859,8 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
         "SELECT as_of, value FROM @finance_observations WHERE kind = 'valuation' ORDER BY as_of"
     )
     assert rows == [
-        (date(2026, 4, 11), Decimal("16797.38")),
-        (date(2026, 5, 11), Decimal("468000")),
+        (date(2026, 4, 11), Decimal("24680.15")),
+        (date(2026, 5, 11), Decimal("525000")),
         (date(2026, 6, 11), Decimal("16835")),
     ]
 
@@ -876,13 +876,13 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
         document=_document_row(
             content_sha256="sha-apex-era",
             source_native_id="sha-apex-era",
-            original_path="broker-individual-5270/statement-2018-11.pdf",
+            original_path="broker-individual-4417/statement-2018-11.pdf",
         ),
         extraction=_extraction_row(
             content_sha256="sha-apex-era",
             document_type="brokerage_statement",
             institution="Broker / Old Clearing Corp",
-            account_mask="5270",
+            account_mask="4417",
             balances_json=[{"date": "2018-11-30", "balance": "100.00"}],
         ),
     )
@@ -891,7 +891,7 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
         document=_document_row(
             content_sha256="sha-modern",
             source_native_id="sha-modern",
-            original_path="broker-individual-5270/statement-2026-03.pdf",
+            original_path="broker-individual-4417/statement-2026-03.pdf",
         ),
         extraction=_extraction_row(
             content_sha256="sha-modern",
@@ -909,7 +909,7 @@ def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
             "SELECT source_account_key, match_method FROM @finance_account_links WHERE source = 'manual_finance'"
         )
     )
-    assert links == {"broker-individual-5270": "mask"}
+    assert links == {"broker-individual-4417": "mask"}
     # Both eras' balances land on the one account.
     assert warehouse._query("SELECT count(*) FROM @finance_observations WHERE source='manual_finance'") == [(2,)]
 
