@@ -2771,8 +2771,10 @@ statements are the mortgage's only source.
   `manual-finance/inbox/<account-folder>/<date>-<sha><ext>`. Content-sha dedup + sha-keyed local
   state make re-runs cheap; `--limit`, `--mode full`, `--root` supported.
 - Transport: `/ingest/manual-finance/file` + `/metadata` (photos pattern, HMAC-signed,
-  provenance-sha metadata dedup that excludes `original_path` — moving a file updates the hint
-  instead of duplicating). Dagster `manual_finance_drive_inbox_sensor` + `manual_finance_drive_ingest`
+  provenance-sha metadata dedup that excludes `original_path`, so moving a file does not
+  duplicate the document — but note it does not update the hint either: an identical dedup
+  sha makes the app return the existing object and write nothing at all. See the re-filing
+  paragraph below). Dagster `manual_finance_drive_inbox_sensor` + `manual_finance_drive_ingest`
   consume the inbox and promote objects to `manual-finance/library/` keeping the account segment.
 - **Agent-first extraction** (`manual_finance_extraction.py`): bank files are structured in
   terrible ways, so there are NO format-specific parsers and no deterministic path that bypasses
@@ -2891,13 +2893,26 @@ returning NULL. The view is a `CASE` for that reason; do not simplify it back.
 
 **Re-filing an already-uploaded document needs no local copy of it.** A document upload is
 two posts and only the second carries the path: the blob is deduped by content sha and is
-already in Drive, and `provenance_dedup_sha256` deliberately excludes `original_path`, so
-re-posting the envelope updates the stored row's path hint instead of duplicating.
-Everything the envelope needs is in `base_manual_finance.documents`, so
-`scripts/refile_manual_finance_documents.py` reads the warehouse and re-posts — dry-run by
-default, `--apply` to write. That is the repair when files were uploaded bare and the
-identity guard is (correctly) withholding them; the local corpus is not needed and may not
-even exist on the machine you are on.
+already in Drive. Everything the envelope needs is in `base_manual_finance.documents`, so
+`scripts/refile_manual_finance_documents.py` reads the warehouse and re-posts only the
+metadata — dry-run by default, `--apply` to write. That is the repair when files were
+uploaded bare and the identity guard is (correctly) withholding them; the local corpus is
+not needed and may not even exist on the machine you are on.
+
+**The re-file's dedup sha folds in the destination folder, and it has to.** The obvious
+version re-posts under `provenance_dedup_sha256`, which excludes `original_path` — and
+that makes the re-post byte-identical to the original claim, so the app's `PutJSON` finds
+the existing object by that sha and returns it **without writing**. Measured 2026-08-28:
+19 re-posts, zero new inbox objects, and `manual_finance_drive_inbox_sensor` went on
+reporting *"No manual finance inbox metadata found in object storage"* while the script
+printed 19 successes. Excluding the path prevents a DUPLICATE; it does not perform an
+UPDATE. `refile_dedup_sha256` derives a sha from the provenance sha plus the folder, so a
+new inbox object is written, the reader upserts it onto the same document row — the PK is
+`source`/`account`/`source_native_id`/`content_sha256`, none of which a re-file moves —
+and `original_path` changes. Re-running the same map is still a no-op, because the same
+folder yields the same sha. **A script that reports success is not evidence the object
+landed**: check `manual_finance_drive_inbox_sensor`'s skip reason, or that
+`base_manual_finance.documents.original_path` actually moved.
 
 **`value_basis` keeps a tax number out of a market total.** A Schedule K-1's partner capital
 account is a *tax* basis. It sat in net worth beside the same fund's NAV: the position

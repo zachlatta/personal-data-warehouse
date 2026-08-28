@@ -9,11 +9,24 @@ the folder they should have had.
 
 **This needs no local copy of the files.** A document upload is two posts and
 only the second one carries the path: the blob is deduped by content sha and is
-already in Drive, and ``provenance_dedup_sha256`` deliberately EXCLUDES
-``original_path`` so re-posting the envelope updates the stored row's path hint
-instead of creating a second document. Everything the envelope needs --
-account, filename, mime type, size, content sha -- is already in
-``base_manual_finance.documents``, so this reads the warehouse and re-posts.
+already in Drive. Everything the envelope needs -- account, filename, mime
+type, size, content sha -- is already in ``base_manual_finance.documents``, so
+this reads the warehouse and re-posts only the metadata.
+
+**The metadata dedup sha must vary with the destination folder, and that is
+not what ``provenance_dedup_sha256`` gives you.** The app dedups a metadata
+envelope by the ``metadata_dedup_sha256`` it is handed, looking for an existing
+object carrying it and returning that object WITHOUT writing (see
+``PutJSON``/``findByAppProperty``). ``provenance_dedup_sha256`` excludes
+``original_path`` by design, so a plain re-post is byte-for-byte the same
+claim, gets deduped away, and writes nothing at all -- 19 re-posts produced
+zero inbox objects and the sensor kept reporting an empty inbox. Excluding the
+path prevents a DUPLICATE; it does not perform an UPDATE. So a re-file derives
+its own dedup sha from the provenance sha plus the destination folder: a new
+inbox object is written, the reader upserts it onto the same document row
+(the PK is source/account/native_id/content_sha256, none of which move), and
+``original_path`` changes. Re-running the same map is still a no-op, because
+the same folder yields the same sha.
 
 Read-only by default. It prints the plan and exits; ``--apply`` is what writes,
 and only ``--apply`` contacts the app at all.
@@ -37,6 +50,7 @@ things that lets a mask become account identity (see `mask_is_corroborated`).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -47,6 +61,21 @@ from personal_data_warehouse_manual_finance.envelope import (
     build_document_metadata,
     provenance_dedup_sha256,
 )
+
+
+def refile_dedup_sha256(*, account: str, content_sha256: str, folder: str) -> str:
+    """Metadata dedup sha for a re-file, stable per (document, destination).
+
+    Folding the folder in is what makes the app write a new inbox object at
+    all; see the module docstring. Deriving it FROM the provenance sha rather
+    than replacing it keeps a re-file distinguishable from an ordinary upload
+    of the same document, so the original envelope is never displaced.
+    """
+    seed = provenance_dedup_sha256(
+        source="manual", account=account, native_id=content_sha256,
+        file_content_sha256=content_sha256,
+    )
+    return hashlib.sha256(f"{seed}|refile|{folder}".encode("utf-8")).hexdigest()
 
 
 def pdw_json(intent: str, sql: str) -> list[dict[str, Any]]:
@@ -132,8 +161,8 @@ def main() -> int:
             modified_at=str(doc["file_modified_at"] or now),
             account_folder=folder,
             file_content_sha256=sha,
-            metadata_dedup_sha256=provenance_dedup_sha256(
-                source="manual", account=account, native_id=sha, file_content_sha256=sha
+            metadata_dedup_sha256=refile_dedup_sha256(
+                account=account, content_sha256=sha, folder=folder
             ),
         )
         print(f"  re-filed {doc['filename']} -> {folder}/")
