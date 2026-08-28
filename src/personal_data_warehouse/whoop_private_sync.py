@@ -1163,6 +1163,39 @@ class WhoopPrivateSyncRunner:
             day -= timedelta(days=1)
         return wanted, stored
 
+    def _cardio_details_targets(self, *, config) -> list[tuple[str, datetime]]:
+        """Which workouts to ask for ``cardio_details`` (the GPS route) this run.
+
+        The workouts this run just pulled come first, newest first, because an
+        in-progress or edited workout's route changes. What is left of the
+        budget goes to stored workouts that have no document at all -- the
+        documents table is the cursor, exactly as for the day-keyed kinds --
+        so a workout that landed late, after it had fallen out of the run's
+        window, is picked up on a later run instead of never.
+        """
+        budget = max(0, config.max_workout_requests)
+        targets: list[tuple[str, datetime]] = []
+        seen: set[str] = set()
+        for activity_id, start, _end in self._workout_windows:
+            if len(targets) >= budget:
+                break
+            if activity_id in seen:
+                continue
+            seen.add(activity_id)
+            targets.append((activity_id, start))
+        remaining = budget - len(targets)
+        if remaining > 0:
+            for activity_id, start in self._warehouse.whoop_private_workouts_without_cardio_details(
+                account=config.account, limit=remaining + len(seen)
+            ):
+                if len(targets) >= budget:
+                    break
+                if activity_id in seen:
+                    continue
+                seen.add(activity_id)
+                targets.append((activity_id, start))
+        return targets
+
     def _sync_documents(self, *, config, client, identity, state, synced_at, signature=""):
         offset = parse_timezone_offset(identity.timezone_offset)
         today = local_day(synced_at, offset)
@@ -1234,7 +1267,7 @@ class WhoopPrivateSyncRunner:
             if day_rows:
                 self._warehouse.insert_whoop_private_documents(day_rows)
                 written += len(day_rows)
-        for activity_id, start, _end in self._workout_windows[: config.max_workout_requests]:
+        for activity_id, start in self._cardio_details_targets(config=config):
             rows.append(
                 document_to_row(
                     account=account,

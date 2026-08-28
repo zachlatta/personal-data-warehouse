@@ -7617,6 +7617,29 @@ class PostgresWarehouse:
         )
         return {(str(row[0]), str(row[1])) for row in rows}
 
+    def whoop_private_workouts_without_cardio_details(
+        self, *, account: str, limit: int
+    ) -> list[tuple[str, datetime]]:
+        """Stored workouts with no ``cardio_details`` document, newest first.
+
+        The documents table is the cursor here too: a workout that landed
+        after it had fallen out of the run's newest-N window -- backdated,
+        edited, or restated by a later cycles pull -- would otherwise never be
+        asked for its GPS route. Bounded so the sweep shares the per-run
+        request budget rather than owning it.
+        """
+        if limit <= 0:
+            return []
+        rows = self._query(
+            "SELECT w.activity_id, w.start_at FROM @whoop_private_workouts w "
+            "LEFT JOIN @whoop_private_documents d "
+            "ON d.account = w.account AND d.kind = 'cardio_details' AND d.doc_key = w.activity_id "
+            "WHERE w.account = %s AND d.doc_key IS NULL AND w.start_at > %s "
+            "ORDER BY w.start_at DESC LIMIT %s",
+            (account, datetime.fromtimestamp(0, tz=UTC), limit),
+        )
+        return [(str(row[0]), row[1].astimezone(UTC)) for row in rows]
+
     def whoop_private_earliest_cycle_day(self, *, account: str) -> date | None:
         """The account's first cycle day -- the floor for the document backfill.
 

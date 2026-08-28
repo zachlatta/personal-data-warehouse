@@ -2476,6 +2476,18 @@ the other two, so lower it (not the kind list) if the pull ever needs to be ligh
 are *wire* bytes and they overstate the disk by ~13x: the walk finished 2026-08-24 at the
 first cycle (2025-10-23) with 306 days of each kind stored in a 75 MB table.
 
+**The GPS route is `cardio_details`, keyed by workout, and its sweep is cursored by the
+same table.** `kind = 'cardio_details'` (one row per `activity_id`) carries the workout's
+`map` — `gps_coordinates` as a lat/lng point list (a 1.7 mi run is ~1,200 points), plus
+display-string `gps_metrics` — and `base_whoop_private.workouts.gps_data_json` carries only
+the distance/elevation summary. Most workouts have no `map` because WHOOP had no phone GPS
+for them (measured 2026-08-27: 47 maps across 260 workouts), not because the pull skipped
+them. Each run asks for the workouts it just pulled first and then spends what is left of
+`WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS` (25) on stored workouts with no document at all,
+newest first. Until 2026-08-27 only the run's own newest-25 window was ever asked, so a
+workout that landed late — backdated, edited, or restated by a later cycles pull — fell
+out of the window and was never fetched; production held three such workouts.
+
 **Heart rate is one series at one grain, and it covers every hour, not just
 workouts.** Until 2026-08-26 it was minute-grain all day plus a six-second copy
 scoped to workouts, in a second table. The private API in fact serves true

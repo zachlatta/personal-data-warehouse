@@ -569,6 +569,77 @@ def test_every_insert_method_writes_its_table(warehouse: PostgresWarehouse) -> N
         assert warehouse._query(f"SELECT count(*) FROM @{table}") == [(1,)], table
 
 
+def test_workouts_without_a_cardio_details_document_are_listed_newest_first(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The GPS-route sweep's cursor is the documents table, like every other kind.
+
+    A workout with a document, one whose start is the absence sentinel, and
+    another account's workout are all excluded; the rest come newest first
+    under the limit.
+    """
+    warehouse.ensure_whoop_private_tables()
+    synced_at = datetime(2026, 8, 27, 12, tzinfo=UTC)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+    def workout(activity_id: str, start_at: datetime, account: str = ACCOUNT) -> dict:
+        row: dict = {}
+        for column in WHOOP_PRIVATE_WORKOUT_COLUMNS:
+            kind = _postgres_type(column, table="whoop_private_workouts")
+            if kind == "jsonb":
+                row[column] = {}
+            elif kind == "timestamptz":
+                row[column] = epoch
+            elif kind in ("bigint", "double precision", "numeric"):
+                row[column] = 0
+            else:
+                row[column] = ""
+        row.update(
+            {
+                "account": account,
+                "activity_id": activity_id,
+                "sport_id": 1,
+                "start_at": start_at,
+                "end_at": start_at + timedelta(hours=1) if start_at > epoch else epoch,
+                "synced_at": synced_at,
+                "sync_version": 1,
+            }
+        )
+        return row
+
+    warehouse.insert_whoop_private_workouts(
+        [
+            workout("covered", synced_at - timedelta(days=1)),
+            workout("newest-missing", synced_at - timedelta(days=2)),
+            workout("older-missing", synced_at - timedelta(days=30)),
+            workout("oldest-missing", synced_at - timedelta(days=60)),
+            workout("unstarted", epoch),
+            workout("someone-elses", synced_at - timedelta(days=3), account="other@example.com"),
+        ]
+    )
+    warehouse.insert_whoop_private_documents(
+        [
+            {
+                "account": ACCOUNT,
+                "kind": "cardio_details",
+                "doc_key": "covered",
+                "collected_at": synced_at - timedelta(days=1),
+                "raw_json": {"map": None},
+                "synced_at": synced_at,
+                "sync_version": 1,
+            }
+        ]
+    )
+
+    listed = warehouse.whoop_private_workouts_without_cardio_details(account=ACCOUNT, limit=2)
+
+    assert listed == [
+        ("newest-missing", synced_at - timedelta(days=2)),
+        ("older-missing", synced_at - timedelta(days=30)),
+    ]
+    assert warehouse.whoop_private_workouts_without_cardio_details(account=ACCOUNT, limit=0) == []
+
+
 def test_sync_state_round_trips_per_collection(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_whoop_private_tables()
     updated_at = datetime(2026, 8, 23, 12, tzinfo=UTC)

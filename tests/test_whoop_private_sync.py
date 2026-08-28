@@ -96,6 +96,9 @@ class FakeWhoopPrivateWarehouse:
         # cursor IS the table, so this is what makes a resumed run resume.
         self.stored_documents: list[dict] = list(stored_documents or [])
         self.earliest_cycle_day = earliest_cycle_day
+        # Stored workouts with no cardio_details document yet, newest first.
+        self.workouts_without_cardio_details: list[tuple[str, datetime]] = []
+        self.cardio_details_lookups: list[dict] = []
         self.state_rows: list[dict] = []
         self.pruned: list[dict] = []
         self.rotations: list[dict] = []
@@ -176,6 +179,10 @@ class FakeWhoopPrivateWarehouse:
 
     def whoop_private_earliest_cycle_day(self, *, account):
         return self.earliest_cycle_day
+
+    def whoop_private_workouts_without_cardio_details(self, *, account, limit):
+        self.cardio_details_lookups.append({"account": account, "limit": limit})
+        return list(self.workouts_without_cardio_details[:limit])
 
     def insert_whoop_private_sync_state(self, **row):
         self.state_rows.append(row)
@@ -916,6 +923,39 @@ def test_tier_two_endpoints_land_in_documents_with_kind_and_key(monkeypatch) -> 
     # Trends carry a UI template; none of it becomes a column.
     trend = next(row for row in warehouse.documents if row["kind"] == "trend")
     assert "header_name_display" in trend["raw_json"]
+
+
+def test_a_stored_workout_with_no_cardio_details_document_is_asked_for_its_route(monkeypatch) -> None:
+    # A workout that landed after it had fallen out of the run's newest-N
+    # window used to be skipped forever: production held three of them.
+    late_start = NOW - timedelta(days=60)
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.workouts_without_cardio_details = [
+        ("workout-xyz", NOW - timedelta(hours=3)),  # also in this run: fetched once
+        ("workout-late", late_start),
+    ]
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    fetched = [params["activity_id"] for endpoint, params in client.calls if endpoint == "cardio_details"]
+    assert fetched == ["workout-xyz", "workout-late"]
+    late = next(row for row in warehouse.documents if row["doc_key"] == "workout-late")
+    assert late["kind"] == "cardio_details"
+    assert late["collected_at"] == late_start
+
+
+def test_the_missing_route_sweep_shares_the_workout_request_budget(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.workouts_without_cardio_details = [
+        (f"workout-old-{index}", NOW - timedelta(days=index)) for index in range(1, 10)
+    ]
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client, WHOOP_PRIVATE_MAX_WORKOUT_REQUESTS="3")
+
+    fetched = [params["activity_id"] for endpoint, params in client.calls if endpoint == "cardio_details"]
+    assert fetched == ["workout-xyz", "workout-old-1", "workout-old-2"]
 
 
 def test_a_second_run_resumes_the_backfill_from_the_stored_watermark(monkeypatch) -> None:
