@@ -75,6 +75,14 @@ OBSERVATION_KIND_TAX_BASIS = "tax_basis"
 OBSERVATION_KIND_COMMITMENT = "commitment"
 OBSERVATION_KIND_CALLED_CAPITAL = "called_capital"
 OBSERVATION_KIND_UNFUNDED_COMMITMENT = "unfunded_commitment"
+# Commitment kinds are per-VEHICLE facts, so two of them on one account-day are
+# two different obligations rather than one restated. That makes a
+# within-document repeat a conflict here where it is normal for a balance.
+COMMITMENT_OBSERVATION_KINDS = (
+    OBSERVATION_KIND_COMMITMENT,
+    OBSERVATION_KIND_CALLED_CAPITAL,
+    OBSERVATION_KIND_UNFUNDED_COMMITMENT,
+)
 NON_VALUE_OBSERVATION_KINDS = (
     OBSERVATION_KIND_TAX_BASIS,
     OBSERVATION_KIND_COMMITMENT,
@@ -421,6 +429,12 @@ class FinanceLedgerRunner:
         self._warehouse.insert_finance_account_links(link_rows)
 
         # --- document accounts, observations, and the unified transactions -----
+        # Masks a PROVIDER vouches for. A document-extracted mask is only
+        # identity when this set or the upload folder corroborates it; see
+        # `mask_is_corroborated`.
+        provider_masks = {
+            str(row["mask"]).strip() for row in plaid_accounts if str(row["mask"]).strip()
+        }
         extractions = self._load_latest_extractions()
         manual_links = self._load_links(LEDGER_SOURCE_MANUAL)
         account_index = self._load_account_index()
@@ -497,7 +511,10 @@ class FinanceLedgerRunner:
             # account where nothing could dedupe them against the plaid rows
             # describing the same trades, double-booking the position.
             account_id, match_method, match_score = self._resolve_document_account_group(
-                group, account_index=account_index
+                group,
+                account_index=account_index,
+                account_key=key,
+                provider_masks=provider_masks,
             )
             if match_method == "new" and linked_account_id is not None:
                 # Nothing in the index claims any of this group's masks, which
@@ -521,7 +538,7 @@ class FinanceLedgerRunner:
                         "side": side,
                         "currency": str(founding["currency"]),
                         "institution": str(founding["institution"]),
-                        "mask": _group_primary_mask(group),
+                        "mask": _group_primary_mask(group, account_key=key, provider_masks=provider_masks),
                         "created_at": now,
                         "updated_at": now,
                         "sync_version": sync_version,
@@ -530,7 +547,7 @@ class FinanceLedgerRunner:
                 account_index.append(
                     {
                         "account_id": account_id,
-                        "mask": _group_primary_mask(group),
+                        "mask": _group_primary_mask(group, account_key=key, provider_masks=provider_masks),
                         "institution": str(founding["institution"]),
                         "kind": kind,
                         "side": side,
@@ -1217,13 +1234,26 @@ class FinanceLedgerRunner:
     # --- documents -> accounts/observations ------------------------------------
 
     def _resolve_document_account_group(
-        self, group: list[dict[str, Any]], *, account_index: list[dict[str, Any]]
+        self,
+        group: list[dict[str, Any]],
+        *,
+        account_index: list[dict[str, Any]],
+        account_key: str = "",
+        provider_masks: set[str] | None = None,
     ) -> tuple[str, str, float]:
         """Match a document group to an existing ledger account by any of the
         masks its documents report (most common first, institution tiebreak).
         Returns (account_id, match_method, match_score); method 'new' means
-        the caller must create the account."""
+        the caller must create the account.
+
+        Only CORROBORATED masks may match: an uncorroborated one is a number
+        the agent read off a page and may belong to a payee, so letting it
+        match would merge the owner's account with a counterparty's.
+        """
+        known = provider_masks or set()
         for mask in _group_masks_by_frequency(group):
+            if not mask_is_corroborated(mask, account_key=account_key, provider_masks=known):
+                continue
             institutions = {
                 str(extraction["institution"]).strip().lower()
                 for extraction in group
@@ -1281,18 +1311,32 @@ class FinanceLedgerRunner:
             # last entry still wins there.
             key = (account_id, as_of, kind)
             previous = rows.get(key)
-            if previous is not None and sources[key] != sha and not _values_agree(previous["value"], value):
+            # Within ONE document, a repeated balance is that document
+            # restating itself and the last entry wins. A repeated COMMITMENT
+            # is not: `commitments[]` is one entry per vehicle, so three
+            # entries for one day are three different obligations competing
+            # for one key, and sort order picks the winner. A fund-portfolio
+            # positions report did exactly that and published one vehicle's
+            # committed/called under another vehicle's name.
+            same_document = previous is not None and sources[key] == sha
+            conflicting_documents = previous is not None and not same_document
+            conflicting_within_document = same_document and kind in COMMITMENT_OBSERVATION_KINDS
+            if (
+                previous is not None
+                and (conflicting_documents or conflicting_within_document)
+                and not _values_agree(previous["value"], value)
+            ):
                 conflicted.add(key)
                 self._logger.warning(
-                    "Refusing %s %s %s: document %s says %s and document %s says %s. "
-                    "Two documents cannot both be right about one account-day, and the "
-                    "ledger will not pick one -- resolve the source documents.",
+                    "Refusing %s %s %s: %s says %s and %s says %s. Nothing here can "
+                    "say which claim is this account's, and the ledger will not pick "
+                    "one -- resolve the source documents.",
                     account_id,
                     as_of,
                     kind,
-                    sources[key],
+                    ("this document" if same_document else f"document {sources[key]}"),
                     previous["value"],
-                    sha,
+                    ("a later entry in it" if same_document else f"document {sha}"),
                     value,
                 )
                 return
@@ -1363,6 +1407,22 @@ class FinanceLedgerRunner:
         for key in conflicted:
             rows.pop(key, None)
             self._observation_conflicts += 1
+        # committed / called / unfunded are ONE fact about one vehicle, so an
+        # ambiguous day poisons the whole triple rather than the one kind that
+        # happened to collide. A multi-vehicle positions report states
+        # `unfunded` for only some of its vehicles, so without this the two
+        # colliding kinds are refused and the lone surviving `unfunded` is
+        # published on its own -- a commitment row with no commitment, from a
+        # set the ledger just said it could not attribute.
+        poisoned_days = {
+            (account_id, as_of)
+            for (account_id, as_of, kind) in conflicted
+            if kind in COMMITMENT_OBSERVATION_KINDS
+        }
+        for key in list(rows):
+            account_id, as_of, kind = key
+            if kind in COMMITMENT_OBSERVATION_KINDS and (account_id, as_of) in poisoned_days:
+                rows.pop(key, None)
         return list(rows.values())
 
     # --- loading -------------------------------------------------------------
@@ -1664,9 +1724,55 @@ def _group_masks_by_frequency(group: list[dict[str, Any]]) -> list[str]:
     return sorted(counts, key=lambda mask: (-counts[mask], mask))
 
 
-def _group_primary_mask(group: list[dict[str, Any]]) -> str:
-    masks = _group_masks_by_frequency(group)
-    return masks[0] if masks else ""
+def mask_is_corroborated(mask: str, *, account_key: str, provider_masks: set[str]) -> bool:
+    """Whether a document-reported mask really identifies the OWNER's account.
+
+    An extracted mask is whatever four digits the agent found most
+    account-number-shaped on the page, and a document routinely prints numbers
+    belonging to somebody else: a wire-instruction sheet prints the PAYEE's
+    bank account, a vehicle purchase order prints the dealer's stock number.
+    Stamping one of those on a ledger account makes a counterparty's account
+    number the owner's identity -- which is what put a company's bank mask on a
+    personal angel position, on all three documents in its folder, because the
+    agent carried it across from the wire sheet.
+
+    Two independent corroborations, and the mask needs either:
+
+    * **the upload folder names it.** The uploader's contract is
+      ``<institution>-<name>-<mask>/``, so a mask in the folder is one Zach
+      typed, not one an agent read off a page.
+    * **a provider reports it.** If Plaid lists an account with that mask, it is
+      an account of his by definition.
+
+    Measured over the whole corpus 2026-08-28, this keeps every real mask and
+    drops exactly the two counterparty numbers. It has to be BOTH tests, not
+    just the folder: one brokerage folder here is named for the account number
+    it had before a clearing-firm migration, while the live mask differs,
+    so folder-only corroboration would strip a mask Plaid confirms, and
+    provider-only would strip every statement-only account's mask.
+    """
+    mask = mask.strip()
+    if not mask:
+        return False
+    if mask in provider_masks:
+        return True
+    return mask.lower() in account_key.lower()
+
+
+def _group_primary_mask(
+    group: list[dict[str, Any]], *, account_key: str = "", provider_masks: set[str] | None = None
+) -> str:
+    """The group's mask, or empty when nothing corroborates it.
+
+    Default arguments corroborate nothing, so a caller that has not been
+    taught about provenance gets the conservative answer rather than the old
+    trusting one.
+    """
+    known = provider_masks or set()
+    for mask in _group_masks_by_frequency(group):
+        if mask_is_corroborated(mask, account_key=account_key, provider_masks=known):
+            return mask
+    return ""
 
 
 def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:

@@ -2849,6 +2849,48 @@ alone is insufficient:
   `observation_conflicts` on the `finance_ledger` asset counts refusals; unlike the
   withholding counters it is **not self-healing** and means a source document needs a human.
 
+**A mask is only identity when something other than the agent vouches for it.** An
+extracted `account_mask` is whatever looked most account-number-shaped on the page, and
+documents routinely print somebody else's number: a wire-instruction sheet prints the
+PAYEE's bank account, a vehicle purchase order the dealer's stock number. Both ended up
+stamped on personal ledger accounts. A mask now becomes identity only when the **upload
+folder names it** (the uploader's `<institution>-<name>-<mask>/` convention, so a human
+typed it) or a **provider reports it** (Plaid listing an account with that mask makes it
+his by definition) — `mask_is_corroborated`. It must be both tests: one brokerage folder is
+named for a retired account number while the live mask differs, so folder-only would strip
+a mask Plaid confirms, and provider-only would strip every statement-only account's. An
+uncorroborated mask is dropped rather than stamped, and cannot be matched on; the account
+keeps its folder identity and its values are untouched.
+
+**A commitment triple is one fact about one vehicle, so an ambiguous day publishes none of
+it.** `commitments[]` is one entry per vehicle, so a fund-administrator positions report
+states committed/called for every vehicle on a single as-of date — and they collide on
+`(account_id, as_of, kind)` where the account model has no vehicle key. Sort order picked
+the winner, and one vehicle's numbers were published under another's name. Unlike a
+repeated BALANCE (a statement restating a running balance, where the last entry is the
+closing one), a repeated commitment is a different obligation, so a within-document repeat
+is refused too. The refusal poisons the whole `(account, day)` triple, not just the kind
+that collided: a positions report states `unfunded` for only some vehicles, so refusing the
+two colliders alone would publish a lone surviving `unfunded` — a commitment row with no
+commitment, from a set the ledger just said it could not attribute.
+
+**A NULL `unfunded` means the document was silent, not that nothing is owed.**
+`marts_finance.commitments` publishes `unfunded_stated` (the document's own figure),
+`unfunded` (falling back to `committed - called`, floored at zero because an SPV routinely
+calls slightly more than the subscription and a negative "still owed" is not a refund) and
+`unfunded_basis` (`stated` / `derived` / `unknown`). Reading a NULL as no obligation is how
+a real five-figure future capital call stayed invisible.
+
+**Re-filing an already-uploaded document needs no local copy of it.** A document upload is
+two posts and only the second carries the path: the blob is deduped by content sha and is
+already in Drive, and `provenance_dedup_sha256` deliberately excludes `original_path`, so
+re-posting the envelope updates the stored row's path hint instead of duplicating.
+Everything the envelope needs is in `base_manual_finance.documents`, so
+`scripts/refile_manual_finance_documents.py` reads the warehouse and re-posts — dry-run by
+default, `--apply` to write. That is the repair when files were uploaded bare and the
+identity guard is (correctly) withholding them; the local corpus is not needed and may not
+even exist on the machine you are on.
+
 **`value_basis` keeps a tax number out of a market total.** A Schedule K-1's partner capital
 account is a *tax* basis. It sat in net worth beside the same fund's NAV: the position
 counted twice, and the second count on an incompatible measure. A `value_basis = 'tax'`

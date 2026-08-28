@@ -20,6 +20,7 @@ from tests.conftest import cleanup_test_warehouse, make_test_schema
 from personal_data_warehouse.finance_ledger import (
     NON_VALUE_OBSERVATION_KINDS,
     _daily_valuations,
+    mask_is_corroborated,
     REPORTING_SCOPE_ENTITY,
     UNIDENTIFIED_ACCOUNT_KEY,
     VALUE_BASIS_TAX,
@@ -2554,3 +2555,205 @@ def test_a_rounding_difference_between_two_documents_is_not_a_conflict(warehouse
     summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
     assert summary.observation_conflicts == 0
     assert warehouse._query("SELECT value FROM @finance_observations") == [(Decimal("0.51"),)]
+
+
+# --- a payee's account number is not the holder's identity ------------------------
+
+
+def test_a_mask_needs_the_folder_or_a_provider_to_vouch_for_it():
+    """Measured against the whole corpus 2026-08-28.
+
+    An extracted mask is whatever looked most account-number-shaped on the
+    page, and documents routinely print somebody else's: a wire-instruction
+    sheet prints the PAYEE's bank account, a vehicle purchase order the
+    dealer's stock number. Both corroborations are needed — the folder alone
+    strips a real mask (one brokerage folder is named for a retired account
+    number while the live mask differs), and a provider alone strips every
+    statement-only account's mask.
+    """
+    # Provider vouches: the folder disagrees, and the provider wins.
+    assert mask_is_corroborated("3311", account_key="broker-individual-8802", provider_masks={"3311"})
+    # Folder vouches: no provider feed at all behind a statement-only account.
+    assert mask_is_corroborated("6120", account_key="servicer-mortgage-6120", provider_masks=set())
+    # Neither vouches: a payee's bank account read off a wire sheet.
+    assert not mask_is_corroborated("7391", account_key="example-angel-inc", provider_masks={"3311"})
+    # Neither vouches: a dealer's stock number on a purchase order.
+    assert not mask_is_corroborated("4460", account_key="vehicle-2020-example", provider_masks=set())
+    assert not mask_is_corroborated("", account_key="anything", provider_masks={"7391"})
+
+
+def test_a_counterparty_account_number_never_becomes_the_holders_mask(warehouse):
+    """The live residual: three documents in one angel folder, all extracted
+    with the COMPANY's bank account as their account_mask because the agent
+    carried it across from the wire-instruction sheet. Nothing about the
+    documents is wrong — they are the holder's own, correctly scoped — but the
+    number belongs to the payee.
+    """
+    warehouse.ensure_plaid_tables()
+    warehouse.ensure_manual_finance_tables()
+    warehouse.insert_manual_finance_documents(
+        [
+            _document_row(content_sha256=sha, source_native_id=sha, filename=f"{sha}.pdf",
+                          original_path=f"example-angel-inc/{sha}.pdf")
+            for sha in ("aaa1record", "bbb2wire", "ccc3safe")
+        ]
+    )
+    warehouse.insert_manual_finance_extractions(
+        [
+            _extraction_row(
+                content_sha256=sha,
+                document_type="other",
+                institution="Example Angel Inc.",
+                account_name_hint="Private investment position in Example Angel Inc.",
+                # The payee's bank account, on all three.
+                account_mask="7391",
+                closing_balance=Decimal("0"),
+                valuations_json=[{"date": "2026-08-27", "value": "5000.00",
+                                  "description": "Cost basis", "measure": "cost_basis"}],
+            )
+            for sha in ("aaa1record", "bbb2wire", "ccc3safe")
+        ]
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert warehouse._query(
+        "SELECT name, mask FROM @finance_accounts"
+    ) == [("Private investment position in Example Angel Inc.", "")]
+    # The position itself is unaffected: dropping an uncorroborated mask costs
+    # identity evidence, never a value.
+    assert warehouse._query("SELECT sum(signed_value) FROM @marts_finance_net_worth") == [
+        (Decimal("5000.00"),)
+    ]
+
+
+def test_a_mask_plaid_reports_survives_a_folder_that_disagrees(warehouse):
+    """The regression the corroboration rule must not cause.
+
+    One brokerage folder is named for a retired account number while the
+    account's live mask is different — an Apex-era migration. Folder-only
+    corroboration would strip the live mask and break the mask match that
+    joins that folder's statements to the Plaid account.
+    """
+    _seed_plaid(warehouse, [_plaid_account_row(mask="3311", name="Individual")])
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-broker", source_native_id="sha-broker",
+                               original_path="broker-individual-8802/statement.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-broker",
+            institution="Acme Bank",
+            account_mask="3311",
+            balances_json=[{"date": "2026-06-30", "balance": "1234.56"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    # One account, not two: the statement resolved onto the Plaid account by a
+    # mask the provider vouches for.
+    assert warehouse._query("SELECT count(*) FROM @finance_accounts") == [(1,)]
+    assert warehouse._query("SELECT mask FROM @finance_accounts") == [("3311",)]
+
+
+# --- one document, several vehicles, one account-day ------------------------------
+
+
+def test_multi_vehicle_commitments_in_one_document_book_none_of_them(warehouse):
+    """The live residual: a fund-administrator positions report states a
+    committed/called pair for each of three vehicles, all on one as-of date.
+    They collide on (account_id, as_of, kind) and sort order picks a winner, so
+    the ledger published one vehicle's numbers under another vehicle's name.
+
+    A repeated BALANCE in one document is that document restating itself; a
+    repeated COMMITMENT is a different obligation. Nothing in the account model
+    can say which vehicle this account is, so it books none of them.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-positions", source_native_id="sha-positions",
+                               filename="positions.rtf",
+                               original_path="fundadmin-portfolio/positions.rtf"),
+        extraction=_extraction_row(
+            content_sha256="sha-positions",
+            document_type="fund_positions",
+            institution="Fundadmin Co",
+            account_name_hint="Example Fund I LP",
+            account_mask="",
+            valuations_json=[{"date": "2026-04-11", "value": "24680.15",
+                              "description": "Totals — Net Asset Value",
+                              "measure": "position_value"}],
+            commitments_json=[
+                {"date": "2026-04-11", "committed": "8000", "called": "8240",
+                 "unfunded": "", "description": "Example Alpha SPV I LLC"},
+                {"date": "2026-04-11", "committed": "40000", "called": "12000",
+                 "unfunded": "28000", "description": "Example Fund I LP"},
+                {"date": "2026-04-11", "committed": "8000", "called": "8120",
+                 "unfunded": "", "description": "Example Beta SPV I LLC"},
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.observation_conflicts >= 1
+    # No commitment survives, so the mart shows no row at all rather than one
+    # vehicle's numbers under another's name.
+    assert warehouse._query("SELECT count(*) FROM @marts_finance_commitments") == [(0,)]
+    # The valuation is untouched: only the commitments were ambiguous.
+    assert warehouse._query(
+        "SELECT kind, value FROM @finance_observations ORDER BY kind"
+    ) == [("valuation", Decimal("24680.15"))]
+
+
+def test_a_single_vehicle_commitment_still_books_and_derives_what_is_owed(warehouse):
+    """The other half: an unambiguous commitment must still land, and a
+    document that states committed and called but no unfunded must not read as
+    'nothing owed' — that is the shape that hid a real five-figure obligation.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-call", source_native_id="sha-call",
+                               filename="capital-call.pdf",
+                               original_path="fundadmin-example-fund-i-lp/capital-call.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-call",
+            document_type="capital_call_notice",
+            institution="Fundadmin Co",
+            account_name_hint="Example Fund I LP",
+            account_mask="",
+            commitments_json=[
+                {"date": "2026-04-22", "committed": "40000", "called": "15000",
+                 "unfunded": "", "description": "Example Fund I LP"},
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query(
+        "SELECT committed, called, unfunded_stated, unfunded, unfunded_basis "
+        "FROM @marts_finance_commitments"
+    ) == [(Decimal("40000"), Decimal("15000"), None, Decimal("25000"), "derived")]
+
+
+def test_calling_more_than_committed_owes_zero_not_a_negative(warehouse):
+    """An SPV routinely calls slightly more than the subscription (fees), and
+    a negative 'still owed' is not a refund."""
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-spv", source_native_id="sha-spv",
+                               original_path="fundadmin-example-spv/call.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-spv",
+            document_type="capital_call_notice",
+            institution="Fundadmin Co",
+            account_name_hint="Example SPV I LLC",
+            account_mask="",
+            commitments_json=[
+                {"date": "2026-02-18", "committed": "8000", "called": "8120",
+                 "unfunded": "", "description": "Example SPV I LLC"},
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query(
+        "SELECT unfunded, unfunded_basis FROM @marts_finance_commitments"
+    ) == [(Decimal("0"), "derived")]

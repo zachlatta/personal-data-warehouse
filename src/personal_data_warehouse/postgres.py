@@ -3428,7 +3428,20 @@ class PostgresWarehouse:
                 c.as_of,
                 c.committed,
                 c.called,
-                c.unfunded,
+                -- The document's own figure, NULL when it did not print one.
+                c.unfunded AS unfunded_stated,
+                -- What is actually still owed. A NULL `unfunded` read as "no
+                -- obligation" is backwards -- it means the document was silent,
+                -- not that the commitment is discharged -- so fall back to
+                -- committed - called. Floored at zero because an SPV routinely
+                -- calls slightly MORE than the subscription (fees), and a
+                -- negative "still owed" is not a refund.
+                COALESCE(c.unfunded, GREATEST(c.committed - c.called, 0)) AS unfunded,
+                CASE
+                    WHEN c.unfunded IS NOT NULL THEN 'stated'
+                    WHEN c.committed IS NOT NULL AND c.called IS NOT NULL THEN 'derived'
+                    ELSE 'unknown'
+                END AS unfunded_basis,
                 (CURRENT_DATE - c.as_of)::bigint AS age_days
             FROM @finance_accounts AS a
             JOIN LATERAL (
