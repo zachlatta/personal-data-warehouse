@@ -2862,7 +2862,14 @@ his by definition) — `mask_is_corroborated`. It must be both tests: one broker
 named for a retired account number while the live mask differs, so folder-only would strip
 a mask Plaid confirms, and provider-only would strip every statement-only account's. An
 uncorroborated mask is dropped rather than stamped, and cannot be matched on; the account
-keeps its folder identity and its values are untouched. **The voucher is the FOLDER, not
+keeps its folder identity and its values are untouched. **A mask is re-resolved every run,
+like an account link** — it used to be written only when a group FOUNDED its account, so an
+account created before this rule kept a number nothing vouched for, and two such accounts
+were still presenting a counterparty's number as the owner's identity a day after the guard
+shipped. `clear_uncorroborated_finance_account_masks` reconciles them, counted as
+`masks_cleared` on the run summary. It only ever CLEARS, and never an account a provider
+also links, so the failure direction is a missing mask rather than somebody else's. **The
+voucher is the FOLDER, not
 the account key** — `document_account_key` falls back to `institution|mask` for a document
 uploaded bare, which contains the agent's own mask by construction, so testing against the
 key would let the agent corroborate itself in exactly the case where no human typed

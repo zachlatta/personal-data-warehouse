@@ -2738,6 +2738,52 @@ def test_a_single_vehicle_commitment_still_books_and_derives_what_is_owed(wareho
     ) == [(Decimal("40000"), Decimal("15000"), None, Decimal("25000"), "derived")]
 
 
+def test_a_mask_no_longer_corroborated_is_cleared_on_a_later_run(warehouse):
+    """A mask was written only when a group FOUNDED its account, so an account
+    created before the corroboration rule kept a number nothing vouches for --
+    in production a dealer's stock number and a payee's bank account, both
+    still presented as the owner's identity after the guard had shipped. A mask
+    is a derived decision like an account link: it re-resolves every run.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-veh", source_native_id="sha-veh",
+                               filename="purchase-order.pdf",
+                               original_path="vehicle-2019-example/purchase-order.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-veh",
+            document_type="valuation",
+            institution="Example Motors",
+            account_name_hint="2019 EXAMPLE PICKUP",
+            account_mask="4460",
+            reporting_scope="account_holder",
+            valuations_json=[{"date": "2026-03-31", "value": "25000",
+                              "measure": "position_value", "description": "Trade-in"}],
+        ),
+    )
+    # Found the account the way a pre-guard run did: mask stamped, uncorroborated.
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    warehouse._command("UPDATE @finance_accounts SET mask = '4460' WHERE mask = ''")
+    assert warehouse._query("SELECT mask FROM @finance_accounts") == [("4460",)]
+
+    # The next ordinary run re-resolves it and finds nothing vouching for it.
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.masks_cleared == 1
+    assert warehouse._query("SELECT mask FROM @finance_accounts") == [("",)]
+
+
+def test_a_provider_backed_mask_survives_the_reconciliation(warehouse):
+    """It only ever CLEARS, and never a Plaid account: a provider-reported mask
+    is authoritative by definition, and no document group vouches for it.
+    """
+    _seed_plaid(warehouse, [_plaid_account_row(mask="3311")])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.masks_cleared == 0
+    assert warehouse._query("SELECT mask FROM @finance_accounts") == [("3311",)]
+
+
 def test_a_bare_upload_cannot_corroborate_its_own_mask(warehouse):
     """A document uploaded with no folder keys on `institution|mask`, which
     CONTAINS the agent's own mask, so a key-based corroboration test lets the

@@ -8894,6 +8894,60 @@ class PostgresWarehouse:
         )
         return int(removed[0][0]) if removed else 0
 
+    def clear_uncorroborated_finance_account_masks(
+        self, keep: set[tuple[str, str]], *, document_source: str
+    ) -> int:
+        """Blank the mask on document-founded accounts nothing vouches for.
+
+        A mask is a DERIVED decision, exactly like an account link, so it has
+        to be re-resolved rather than made once and frozen. It was written only
+        when a group FOUNDED its account, so an account created before the
+        corroboration rule existed kept a number no folder and no provider ever
+        confirmed -- in production, a vehicle purchase order's dealer stock
+        number and a payee's bank account, both still presented as the owner's
+        account identity through `marts_finance.accounts.mask` after the guard
+        that was supposed to stop exactly that had shipped.
+
+        `keep` is every (account_id, mask) the current run corroborated.
+        `document_source` is the caller's own link-source token, passed in
+        rather than spelled here, because the two differ ("manual_finance",
+        not "manual") and a literal that drifts would silently select nothing
+        and report a clean zero forever.
+
+        An account any non-document source also links is never touched: a
+        provider-reported mask is authoritative by definition. This only ever
+        CLEARS, so the failure direction is a missing mask, never somebody
+        else's.
+        """
+        rows = self._query(
+            """
+            SELECT a.account_id, a.mask
+            FROM @finance_accounts AS a
+            WHERE a.mask <> ''
+              AND EXISTS (
+                  SELECT 1 FROM @finance_account_links AS l
+                  WHERE l.account_id = a.account_id AND l.source = %s
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM @finance_account_links AS l
+                  WHERE l.account_id = a.account_id AND l.source <> %s
+              )
+            """,
+            (document_source, document_source),
+        )
+        stale = [
+            str(account_id)
+            for account_id, mask in rows
+            if (str(account_id), str(mask)) not in keep
+        ]
+        if not stale:
+            return 0
+        self._command(
+            "UPDATE @finance_accounts SET mask = '' WHERE account_id = ANY(%s)",
+            (stale,),
+        )
+        return len(stale)
+
     def insert_manual_finance_documents(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("manual_finance_documents", rows, MANUAL_FINANCE_DOCUMENT_COLUMNS)
 

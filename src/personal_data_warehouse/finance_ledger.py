@@ -307,6 +307,7 @@ class FinanceLedgerSummary:
     transactions_removed: int = 0
     accounts_merged: int = 0
     accounts_pruned: int = 0
+    masks_cleared: int = 0
     links_relinked: int = 0
     links_removed: int = 0
     observations_removed: int = 0
@@ -451,6 +452,7 @@ class FinanceLedgerRunner:
         manual_links = self._load_links(LEDGER_SOURCE_MANUAL)
         account_index = self._load_account_index()
         doc_account_rows: list[dict[str, Any]] = []
+        corroborated_masks: set[tuple[str, str]] = set()
         doc_link_rows: list[dict[str, Any]] = []
         doc_accounts: dict[str, str] = {}  # extraction sha -> ledger account id
         doc_account_kinds: dict[str, str] = {}
@@ -514,6 +516,9 @@ class FinanceLedgerRunner:
             # its folder, a bare one keys on institution|mask or its filename,
             # so the two shapes can never share a group.
             folder = document_account_folder(str(group[0]["original_path"]))
+            group_mask = _group_primary_mask(
+                group, account_folder=folder, provider_masks=provider_masks
+            )
             link_key = (owner, key)
             linked_account_id = manual_links.get(link_key)
             # A link is a derived decision, not a fact, so it is re-resolved
@@ -554,7 +559,7 @@ class FinanceLedgerRunner:
                         "side": side,
                         "currency": str(founding["currency"]),
                         "institution": str(founding["institution"]),
-                        "mask": _group_primary_mask(group, account_folder=folder, provider_masks=provider_masks),
+                        "mask": group_mask,
                         "created_at": now,
                         "updated_at": now,
                         "sync_version": sync_version,
@@ -563,7 +568,7 @@ class FinanceLedgerRunner:
                 account_index.append(
                     {
                         "account_id": account_id,
-                        "mask": _group_primary_mask(group, account_folder=folder, provider_masks=provider_masks),
+                        "mask": group_mask,
                         "institution": str(founding["institution"]),
                         "kind": kind,
                         "side": side,
@@ -572,6 +577,11 @@ class FinanceLedgerRunner:
                 accounts_created += 1
                 match_method = "document_new"
                 match_score = 1.0
+            # What THIS run can vouch for, for the mask reconciliation below.
+            # Recorded for a matched account too, not only a newly founded one:
+            # the point is that a stored mask has to keep earning its place.
+            if group_mask:
+                corroborated_masks.add((account_id, group_mask))
             # Only write when the decision actually changed, so an unchanged
             # link keeps the timestamp of the run that first made it.
             if match_method and account_id != linked_account_id:
@@ -673,6 +683,13 @@ class FinanceLedgerRunner:
         # account's links (they are only ever added or re-pointed), so this
         # cannot reach an account a live source still claims.
         accounts_pruned = self._warehouse.prune_unlinked_finance_accounts()
+        # A mask is a derived decision like a link, so it is re-resolved every
+        # run rather than frozen at founding. Clears only, and never an account
+        # a provider also links, so the failure direction is a missing mask
+        # rather than somebody else's.
+        masks_cleared = self._warehouse.clear_uncorroborated_finance_account_masks(
+            corroborated_masks, document_source=LEDGER_SOURCE_MANUAL
+        )
 
         summary = FinanceLedgerSummary(
             accounts_seen=len(plaid_accounts) + extractions_seen,
@@ -685,6 +702,7 @@ class FinanceLedgerRunner:
             transactions_removed=transactions["removed"],
             accounts_merged=accounts_merged,
             accounts_pruned=accounts_pruned,
+            masks_cleared=masks_cleared,
             links_relinked=links_relinked,
             links_removed=links_removed,
             observations_removed=observations_removed,
@@ -699,7 +717,7 @@ class FinanceLedgerRunner:
         self._logger.info(
             "Finance ledger: accounts_seen=%s accounts_created=%s links_created=%s observations=%s "
             "transactions=%s merged=%s skipped=%s removed=%s accounts_merged=%s accounts_pruned=%s "
-            "links_relinked=%s links_removed=%s observations_removed=%s "
+            "masks_cleared=%s links_relinked=%s links_removed=%s observations_removed=%s "
             "withheld_entity=%s withheld_unidentified=%s observation_conflicts=%s "
             "security_trades=%s security_merged=%s security_removed=%s tax_lots=%s",
             summary.accounts_seen,
@@ -712,6 +730,7 @@ class FinanceLedgerRunner:
             summary.transactions_removed,
             summary.accounts_merged,
             summary.accounts_pruned,
+            summary.masks_cleared,
             summary.links_relinked,
             summary.links_removed,
             summary.observations_removed,
