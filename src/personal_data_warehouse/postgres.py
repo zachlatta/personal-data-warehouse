@@ -3435,8 +3435,17 @@ class PostgresWarehouse:
                 -- not that the commitment is discharged -- so fall back to
                 -- committed - called. Floored at zero because an SPV routinely
                 -- calls slightly MORE than the subscription (fees), and a
-                -- negative "still owed" is not a refund.
-                COALESCE(c.unfunded, GREATEST(c.committed - c.called, 0)) AS unfunded,
+                -- negative "still owed" is not a refund. Written as a CASE and
+                -- not COALESCE(..., GREATEST(...)): GREATEST IGNORES its NULL
+                -- arguments, so a subscription that states committed with no
+                -- call yet would derive GREATEST(NULL, 0) = 0 and publish the
+                -- whole obligation as "nothing owed" -- the exact reading this
+                -- column exists to stop. Underivable stays NULL.
+                CASE
+                    WHEN c.unfunded IS NOT NULL THEN c.unfunded
+                    WHEN c.committed IS NOT NULL AND c.called IS NOT NULL
+                        THEN GREATEST(c.committed - c.called, 0)
+                END AS unfunded,
                 CASE
                     WHEN c.unfunded IS NOT NULL THEN 'stated'
                     WHEN c.committed IS NOT NULL AND c.called IS NOT NULL THEN 'derived'

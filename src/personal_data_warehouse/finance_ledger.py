@@ -219,6 +219,18 @@ def document_kind_side(document_type: str, *, name_hint: str = "", account_folde
     return ("other", ACCOUNT_SIDE_ASSET)
 
 
+def document_account_folder(original_path: str) -> str:
+    """The upload folder segment, or ``""`` when the document was uploaded bare.
+
+    Separate from ``document_account_key`` because only this is evidence a
+    HUMAN named the account: the key falls back to ``institution|mask``, and
+    that mask came from the agent, so letting the key corroborate a mask lets
+    the agent vouch for itself. See ``mask_is_corroborated``.
+    """
+    parts = [part for part in original_path.split("/") if part]
+    return parts[0].strip().lower() if len(parts) > 1 else ""
+
+
 def document_account_key(*, original_path: str, institution: str, mask: str, filename: str) -> str:
     """Stable per-account key for document-derived accounts.
 
@@ -498,6 +510,10 @@ class FinanceLedgerRunner:
 
         for (owner, key), group in sorted(groups.items()):
             group.sort(key=lambda e: str(e["content_sha256"]))
+            # One folder per group by construction: a foldered document keys on
+            # its folder, a bare one keys on institution|mask or its filename,
+            # so the two shapes can never share a group.
+            folder = document_account_folder(str(group[0]["original_path"]))
             link_key = (owner, key)
             linked_account_id = manual_links.get(link_key)
             # A link is a derived decision, not a fact, so it is re-resolved
@@ -513,7 +529,7 @@ class FinanceLedgerRunner:
             account_id, match_method, match_score = self._resolve_document_account_group(
                 group,
                 account_index=account_index,
-                account_key=key,
+                account_folder=folder,
                 provider_masks=provider_masks,
             )
             if match_method == "new" and linked_account_id is not None:
@@ -538,7 +554,7 @@ class FinanceLedgerRunner:
                         "side": side,
                         "currency": str(founding["currency"]),
                         "institution": str(founding["institution"]),
-                        "mask": _group_primary_mask(group, account_key=key, provider_masks=provider_masks),
+                        "mask": _group_primary_mask(group, account_folder=folder, provider_masks=provider_masks),
                         "created_at": now,
                         "updated_at": now,
                         "sync_version": sync_version,
@@ -547,7 +563,7 @@ class FinanceLedgerRunner:
                 account_index.append(
                     {
                         "account_id": account_id,
-                        "mask": _group_primary_mask(group, account_key=key, provider_masks=provider_masks),
+                        "mask": _group_primary_mask(group, account_folder=folder, provider_masks=provider_masks),
                         "institution": str(founding["institution"]),
                         "kind": kind,
                         "side": side,
@@ -1238,7 +1254,7 @@ class FinanceLedgerRunner:
         group: list[dict[str, Any]],
         *,
         account_index: list[dict[str, Any]],
-        account_key: str = "",
+        account_folder: str = "",
         provider_masks: set[str] | None = None,
     ) -> tuple[str, str, float]:
         """Match a document group to an existing ledger account by any of the
@@ -1252,7 +1268,7 @@ class FinanceLedgerRunner:
         """
         known = provider_masks or set()
         for mask in _group_masks_by_frequency(group):
-            if not mask_is_corroborated(mask, account_key=account_key, provider_masks=known):
+            if not mask_is_corroborated(mask, account_folder=account_folder, provider_masks=known):
                 continue
             institutions = {
                 str(extraction["institution"]).strip().lower()
@@ -1724,7 +1740,7 @@ def _group_masks_by_frequency(group: list[dict[str, Any]]) -> list[str]:
     return sorted(counts, key=lambda mask: (-counts[mask], mask))
 
 
-def mask_is_corroborated(mask: str, *, account_key: str, provider_masks: set[str]) -> bool:
+def mask_is_corroborated(mask: str, *, account_folder: str, provider_masks: set[str]) -> bool:
     """Whether a document-reported mask really identifies the OWNER's account.
 
     An extracted mask is whatever four digits the agent found most
@@ -1740,7 +1756,12 @@ def mask_is_corroborated(mask: str, *, account_key: str, provider_masks: set[str
 
     * **the upload folder names it.** The uploader's contract is
       ``<institution>-<name>-<mask>/``, so a mask in the folder is one Zach
-      typed, not one an agent read off a page.
+      typed, not one an agent read off a page. It must be the FOLDER and not
+      the account key: the key falls back to ``institution|mask`` for a
+      document uploaded bare, which contains the agent's own mask by
+      construction, so keying on it would let the agent corroborate itself --
+      and a bare upload is exactly the case with no human-typed evidence at
+      all.
     * **a provider reports it.** If Plaid lists an account with that mask, it is
       an account of his by definition.
 
@@ -1756,11 +1777,11 @@ def mask_is_corroborated(mask: str, *, account_key: str, provider_masks: set[str
         return False
     if mask in provider_masks:
         return True
-    return mask.lower() in account_key.lower()
+    return mask.lower() in account_folder.lower()
 
 
 def _group_primary_mask(
-    group: list[dict[str, Any]], *, account_key: str = "", provider_masks: set[str] | None = None
+    group: list[dict[str, Any]], *, account_folder: str = "", provider_masks: set[str] | None = None
 ) -> str:
     """The group's mask, or empty when nothing corroborates it.
 
@@ -1770,7 +1791,7 @@ def _group_primary_mask(
     """
     known = provider_masks or set()
     for mask in _group_masks_by_frequency(group):
-        if mask_is_corroborated(mask, account_key=account_key, provider_masks=known):
+        if mask_is_corroborated(mask, account_folder=account_folder, provider_masks=known):
             return mask
     return ""
 

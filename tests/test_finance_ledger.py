@@ -2572,14 +2572,19 @@ def test_a_mask_needs_the_folder_or_a_provider_to_vouch_for_it():
     statement-only account's mask.
     """
     # Provider vouches: the folder disagrees, and the provider wins.
-    assert mask_is_corroborated("3311", account_key="broker-individual-8802", provider_masks={"3311"})
+    assert mask_is_corroborated("3311", account_folder="broker-individual-8802", provider_masks={"3311"})
     # Folder vouches: no provider feed at all behind a statement-only account.
-    assert mask_is_corroborated("6120", account_key="servicer-mortgage-6120", provider_masks=set())
+    assert mask_is_corroborated("6120", account_folder="servicer-mortgage-6120", provider_masks=set())
     # Neither vouches: a payee's bank account read off a wire sheet.
-    assert not mask_is_corroborated("7391", account_key="example-angel-inc", provider_masks={"3311"})
+    assert not mask_is_corroborated("7391", account_folder="example-angel-inc", provider_masks={"3311"})
     # Neither vouches: a dealer's stock number on a purchase order.
-    assert not mask_is_corroborated("4460", account_key="vehicle-2020-example", provider_masks=set())
-    assert not mask_is_corroborated("", account_key="anything", provider_masks={"7391"})
+    assert not mask_is_corroborated("4460", account_folder="vehicle-2020-example", provider_masks=set())
+    assert not mask_is_corroborated("", account_folder="anything", provider_masks={"7391"})
+    # A document uploaded BARE has no folder, so nothing human-typed vouches
+    # for it. The account key would be `institution|mask` here, which contains
+    # the agent's own mask by construction -- keying corroboration on it would
+    # let the agent vouch for itself in exactly the case with no other evidence.
+    assert not mask_is_corroborated("7391", account_folder="", provider_masks={"3311"})
 
 
 def test_a_counterparty_account_number_never_becomes_the_holders_mask(warehouse):
@@ -2731,6 +2736,65 @@ def test_a_single_vehicle_commitment_still_books_and_derives_what_is_owed(wareho
         "SELECT committed, called, unfunded_stated, unfunded, unfunded_basis "
         "FROM @marts_finance_commitments"
     ) == [(Decimal("40000"), Decimal("15000"), None, Decimal("25000"), "derived")]
+
+
+def test_a_bare_upload_cannot_corroborate_its_own_mask(warehouse):
+    """A document uploaded with no folder keys on `institution|mask`, which
+    CONTAINS the agent's own mask, so a key-based corroboration test lets the
+    agent vouch for itself -- in precisely the case where no human typed
+    anything. A wire sheet's payee number must not become the account's mask
+    just because the upload was bare.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-bare", source_native_id="sha-bare",
+                               filename="wire-instructions.pdf",
+                               original_path="wire-instructions.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-bare",
+            document_type="statement",
+            institution="Example Angel Inc",
+            account_name_hint="Example Angel Inc position",
+            account_mask="7391",
+            reporting_scope="account_holder",
+            balances_json=[{"date": "2026-03-31", "amount": "5000", "kind": "balance"}],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query("SELECT mask FROM @finance_accounts") == [("",)]
+
+
+def test_a_stated_commitment_with_no_call_yet_owes_everything_not_nothing(warehouse):
+    """A signed subscription states committed and nothing else. GREATEST
+    ignores its NULL arguments, so the obvious COALESCE(unfunded,
+    GREATEST(committed - called, 0)) derives 0 and publishes the whole
+    obligation as 'nothing owed' -- the exact reading this column exists to
+    stop. Underivable must stay NULL, with the basis saying so.
+    """
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-sub", source_native_id="sha-sub",
+                               filename="subscription.pdf",
+                               original_path="fundadmin-example-spv-ii/subscription.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-sub",
+            document_type="capital_call_notice",
+            institution="Fundadmin Co",
+            account_name_hint="Example SPV II LLC",
+            account_mask="",
+            commitments_json=[
+                {"date": "2026-05-04", "committed": "50000", "called": "",
+                 "unfunded": "", "description": "Example SPV II LLC"},
+            ],
+        ),
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert warehouse._query(
+        "SELECT committed, called, unfunded_stated, unfunded, unfunded_basis "
+        "FROM @marts_finance_commitments"
+    ) == [(Decimal("50000"), None, None, None, "unknown")]
 
 
 def test_calling_more_than_committed_owes_zero_not_a_negative(warehouse):

@@ -2860,7 +2860,11 @@ his by definition) — `mask_is_corroborated`. It must be both tests: one broker
 named for a retired account number while the live mask differs, so folder-only would strip
 a mask Plaid confirms, and provider-only would strip every statement-only account's. An
 uncorroborated mask is dropped rather than stamped, and cannot be matched on; the account
-keeps its folder identity and its values are untouched.
+keeps its folder identity and its values are untouched. **The voucher is the FOLDER, not
+the account key** — `document_account_key` falls back to `institution|mask` for a document
+uploaded bare, which contains the agent's own mask by construction, so testing against the
+key would let the agent corroborate itself in exactly the case where no human typed
+anything. `document_account_folder` is the separate accessor that says so.
 
 **A commitment triple is one fact about one vehicle, so an ambiguous day publishes none of
 it.** `commitments[]` is one entry per vehicle, so a fund-administrator positions report
@@ -2879,7 +2883,11 @@ commitment, from a set the ledger just said it could not attribute.
 `unfunded` (falling back to `committed - called`, floored at zero because an SPV routinely
 calls slightly more than the subscription and a negative "still owed" is not a refund) and
 `unfunded_basis` (`stated` / `derived` / `unknown`). Reading a NULL as no obligation is how
-a real five-figure future capital call stayed invisible.
+a real five-figure future capital call stayed invisible. **`unfunded` is NULL, never zero,
+when the basis is `unknown`** — a signed subscription states committed and nothing else,
+and the obvious `COALESCE(unfunded, GREATEST(committed - called, 0))` publishes that whole
+obligation as `0`, because Postgres `GREATEST` **ignores** its NULL arguments rather than
+returning NULL. The view is a `CASE` for that reason; do not simplify it back.
 
 **Re-filing an already-uploaded document needs no local copy of it.** A document upload is
 two posts and only the second carries the path: the blob is deduped by content sha and is
