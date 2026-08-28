@@ -2013,7 +2013,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Capital commitments per account: total committed, cumulative called, and the unfunded balance still owed, as of the newest document that stated them. Unfunded capital is a real future cash obligation and is deliberately absent from marts_finance.net_worth, which reports what is owned today."
+      "comment": "Capital commitments per account: committed, called, and unfunded. Deliberately outside marts_finance.net_worth, which reports what is owned today; an unfunded commitment is contingent on the fund calling it."
     },
     {
       "id": "marts_finance_account_freshness",
