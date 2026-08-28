@@ -611,7 +611,7 @@ def test_an_institution_with_no_account_number_is_not_an_account_key():
     assert (
         document_account_key(
             original_path="1Q26 Unaudited Financials.pdf",
-            institution="Carta",
+            institution="Fundadmin Co",
             mask="",
             filename="1Q26 Unaudited Financials.pdf",
         )
@@ -629,7 +629,7 @@ def test_an_institution_with_no_account_number_is_not_an_account_key():
     assert (
         document_account_key(
             original_path="fundadmin-example-fund-i-lp/1Q26.pdf",
-            institution="Carta",
+            institution="Fundadmin Co",
             mask="",
             filename="1Q26.pdf",
         )
@@ -898,7 +898,7 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
         extraction=_extraction_row(
             content_sha256="sha-fund",
             document_type="fund_positions",
-            institution="Carta",
+            institution="Fundadmin Co",
             account_name_hint="Fund I LP",
             account_mask="",
             valuations_json=[
@@ -1906,7 +1906,7 @@ def _fund_level_financials(**overrides) -> dict:
     defaults = dict(
         content_sha256="sha-fund-financials",
         document_type="entity_financial_statement",
-        institution="Carta",
+        institution="Fundadmin Co",
         account_name_hint="Example Fund I LP",
         account_mask="",
         reporting_scope="entity",
@@ -2044,7 +2044,7 @@ def test_net_worth_stays_the_owners_when_an_entity_statement_arrives(warehouse):
             _extraction_row(
                 content_sha256="sha-capital-account",
                 document_type="capital_account_statement",
-                institution="Carta",
+                institution="Fundadmin Co",
                 account_name_hint="Example Fund I LP",
                 account_mask="",
                 reporting_scope="account_holder",
@@ -2144,7 +2144,7 @@ def test_unfunded_commitment_is_recorded_and_kept_out_of_net_worth(warehouse):
         extraction=_extraction_row(
             content_sha256="sha-capital-call",
             document_type="capital_call_notice",
-            institution="Carta",
+            institution="Fundadmin Co",
             account_name_hint="Example Fund I LP",
             account_mask="",
             reporting_scope="account_holder",
@@ -2224,7 +2224,7 @@ def test_a_link_whose_documents_are_gone_is_reconciled_away(warehouse):
                 content_sha256="sha-root",
                 ai_prompt_version="manual-finance-agent-v3",
                 document_type="fund_positions",
-                institution="Carta",
+                institution="Fundadmin Co",
                 account_name_hint="Example Fund",
                 account_mask="",
                 balances_json=[{"date": "2026-03-31", "balance": "1000"}],
@@ -2275,7 +2275,7 @@ def test_every_non_value_observation_kind_is_excluded_from_net_worth(warehouse):
                 "kind": "private_fund",
                 "side": "asset",
                 "currency": "USD",
-                "institution": "Carta",
+                "institution": "Fundadmin Co",
                 "mask": "",
                 "created_at": _TS,
                 "updated_at": _TS,
@@ -2336,24 +2336,24 @@ def test_a_valuation_cap_is_never_the_holders_position_value():
     the entry's own `measure` can.
     """
     assert _daily_valuations(
-        [{"date": "2026-08-27", "value": "25000000", "description": "Post-Money Valuation Cap",
+        [{"date": "2026-08-27", "value": "40000000", "description": "Post-Money Valuation Cap",
           "measure": "reference"}]
     ) == []
     # A carrying value beats a cost basis on the same day...
     assert _daily_valuations(
         [
-            {"date": "2026-08-27", "value": "2000", "description": "Cost basis", "measure": "cost_basis"},
-            {"date": "2026-08-27", "value": "2400", "description": "Carrying value",
+            {"date": "2026-08-27", "value": "5000", "description": "Cost basis", "measure": "cost_basis"},
+            {"date": "2026-08-27", "value": "5400", "description": "Carrying value",
              "measure": "position_value"},
-            {"date": "2026-08-27", "value": "25000000", "description": "Valuation cap",
+            {"date": "2026-08-27", "value": "40000000", "description": "Valuation cap",
              "measure": "reference"},
         ]
-    ) == [(date(2026, 8, 27), Decimal("2400"))]
+    ) == [(date(2026, 8, 27), Decimal("5400"))]
     # ...but a document stating ONLY a cost basis still produces a value: an
     # angel SAFE really is carried at cost.
     assert _daily_valuations(
-        [{"date": "2026-08-27", "value": "2000", "description": "Cost basis", "measure": "cost_basis"}]
-    ) == [(date(2026, 8, 27), Decimal("2000"))]
+        [{"date": "2026-08-27", "value": "5000", "description": "Cost basis", "measure": "cost_basis"}]
+    ) == [(date(2026, 8, 27), Decimal("5000"))]
     # Pre-v3 entries carry no measure and behave exactly as they always did,
     # so re-extraction is what improves the corpus, never a silent regression.
     assert _daily_valuations(
@@ -2364,8 +2364,8 @@ def test_a_valuation_cap_is_never_the_holders_position_value():
 def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_another(warehouse):
     """The live 2026-08-28 shape: one folder, three documents, one account.
 
-    An angel investment folder holds a position record (cost basis $2,000), the
-    executed SAFE (whose only valuation is the $25,000,000 cap) and the
+    An angel investment folder holds a position record (a cost basis), the
+    executed SAFE (whose only valuation is its cap) and the
     company's wire instructions. All three share the folder, so all three map to
     one account key, and the SAFE sorts LAST by content sha — which under plain
     last-write-wins made the cap the account's value and would have moved net
@@ -2398,7 +2398,7 @@ def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_anoth
                 account_mask="",
                 closing_balance=Decimal("0"),
                 valuations_json=[
-                    {"date": "2026-08-27", "value": "2000.00", "description": "Cost basis",
+                    {"date": "2026-08-27", "value": "5000.00", "description": "Cost basis",
                      "measure": "cost_basis"},
                 ],
             ),
@@ -2409,7 +2409,7 @@ def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_anoth
                 account_name_hint="Example Angel Inc. — Checking",
                 # The COMPANY's bank account number, on a document filed in the
                 # investor's folder. It must not become the investor's identity.
-                account_mask="1482",
+                account_mask="7391",
                 closing_balance=Decimal("0"),
                 valuations_json=[],
             ),
@@ -2421,7 +2421,7 @@ def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_anoth
                 account_mask="",
                 closing_balance=Decimal("0"),
                 valuations_json=[
-                    {"date": "2026-08-27", "value": "25000000",
+                    {"date": "2026-08-27", "value": "40000000",
                      "description": "Post-Money Valuation Cap", "measure": "reference"},
                 ],
             ),
@@ -2434,9 +2434,9 @@ def test_a_reference_figure_in_one_document_never_outvotes_the_position_in_anoth
     assert summary.observation_conflicts == 0
     assert warehouse._query(
         "SELECT kind, value FROM @finance_observations ORDER BY kind"
-    ) == [("valuation", Decimal("2000.00"))]
+    ) == [("valuation", Decimal("5000.00"))]
     assert warehouse._query("SELECT sum(signed_value) FROM @marts_finance_net_worth") == [
-        (Decimal("2000.00"),)
+        (Decimal("5000.00"),)
     ]
     assert warehouse._query(
         "SELECT count(*) FROM @finance_observations WHERE value > 1000000"
@@ -2471,7 +2471,7 @@ def test_two_documents_disagreeing_about_one_account_day_book_neither(warehouse)
                 account_mask="",
                 closing_balance=Decimal("0"),
                 # No `measure` anywhere: this is what a v2 row looks like.
-                valuations_json=[{"date": "2026-08-27", "value": "2000.00",
+                valuations_json=[{"date": "2026-08-27", "value": "5000.00",
                                   "description": "Cost basis"}],
             ),
             _extraction_row(
@@ -2480,7 +2480,7 @@ def test_two_documents_disagreeing_about_one_account_day_book_neither(warehouse)
                 account_name_hint="Example Angel Inc. SAFE",
                 account_mask="",
                 closing_balance=Decimal("0"),
-                valuations_json=[{"date": "2026-08-27", "value": "25000000",
+                valuations_json=[{"date": "2026-08-27", "value": "40000000",
                                   "description": "Post-Money Valuation Cap"}],
             ),
         ]

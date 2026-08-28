@@ -1267,9 +1267,10 @@ class FinanceLedgerRunner:
             # documents to look at. Silent last-writer-wins is the mechanism
             # behind both incidents this guard exists for: it replaced the
             # owner's own capital balance with the FUND's members' equity, and
-            # it was about to replace a $2,000 angel position with the SAFE's
-            # $25,000,000 valuation cap -- in both cases because the wrong
-            # document happened to sort later by content sha. Refusing
+            # it was about to replace an angel position with that SAFE's own
+            # valuation cap, four orders of magnitude larger -- both times
+            # because the wrong document happened to sort later by content
+            # sha. Refusing
             # understates by one day, which the account's other observations
             # and net_worth_history's forward fill absorb; guessing does not.
             #

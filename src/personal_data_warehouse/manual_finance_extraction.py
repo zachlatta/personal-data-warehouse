@@ -88,7 +88,7 @@ VALUE_BASES = (VALUE_BASIS_MARKET, VALUE_BASIS_TAX, VALUE_BASIS_UNKNOWN)
 # `measure` on a single valuations entry: what that number measures. A SAFE's
 # post-money valuation cap is the motivating case -- it is the biggest and most
 # prominent number on an investor's own executed SAFE, and it describes the
-# ISSUER's ceiling, not the investor's $2,000 stake.
+# ISSUER's ceiling, not the investor's much smaller stake.
 VALUATION_MEASURE_POSITION = "position_value"
 VALUATION_MEASURE_COST_BASIS = "cost_basis"
 VALUATION_MEASURE_REFERENCE = "reference"
@@ -299,7 +299,7 @@ def finance_document_extraction_schema() -> dict[str, Any]:
                 "type": "string",
                 "description": (
                     "The individual person or household the amounts belong to, exactly as "
-                    "printed (e.g. 'Zachary R Latta'). Empty when the document names no "
+                    "printed. Empty when the document names no "
                     "individual holder, which is itself evidence of entity scope."
                 ),
             },
