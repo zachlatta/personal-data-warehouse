@@ -985,6 +985,25 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
 }
 
+#: The marts_ops snapshot tables: one ensure path, and the only tables whose
+#: columns are reconciled against their TableSpec on every run. Their whole
+#: content is rewritten by each collection, so an added column is metadata-only
+#: and there is no heap to lock -- which is what makes reconciling safe here and
+#: not everywhere.
+PIPELINE_HEALTH_SNAPSHOT_TABLES = (
+    "pipeline_health",
+    "pipeline_table_freshness",
+    "mart_view_health",
+    "collation_health",
+    "search_health",
+    "pgbackrest_health",
+    "uploader_heartbeats",
+    "timeline_priority_mix",
+    "agent_usage",
+    "search_benchmark_runs",
+    "search_benchmark_labels",
+)
+
 # Every table whose rows belong to exactly one linked Plaid Item, data first
 # and the credential last. plaid_investment_securities is absent on purpose:
 # securities are keyed by account and shared across Items.
@@ -4315,89 +4334,21 @@ class PostgresWarehouse:
         See personal_data_warehouse/pipeline_health.py: the tables hold measured
         facts, the views turn them into a live status.
         """
-        self._ensure_table_group(
-            [
-                "pipeline_health",
-                "pipeline_table_freshness",
-                "mart_view_health",
-                "collation_health",
-                "search_health",
-                "pgbackrest_health",
-                "uploader_heartbeats",
-                "timeline_priority_mix",
-                "agent_usage",
-                "search_benchmark_runs",
-                "search_benchmark_labels",
-            ]
-        )
-        # _ensure_table_group only CREATEs; it does not widen an existing
-        # table. A warehouse provisioned before these columns existed would
-        # therefore keep the old shape and the marts views below -- which
-        # reference them -- would fail on every run. Fresh-database tests
-        # cannot catch that by construction, which is exactly how it reached
-        # production: the collector raised every ten minutes while the suite
-        # was green.
-        for column, ddl_type, default in (
-            ("data_basis", "text", "''"),
-            ("expected_event_interval_seconds", "bigint", "0"),
-            ("event_tables_probed", "bigint", "0"),
-        ):
-            self._command(
-                f"ALTER TABLE @pipeline_health ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
-            )
-        for column, ddl_type, default in (
-            # The archive backlog gauge, added 2026-08-27. The backup loop's
-            # INSERT names it, and a missing column makes that INSERT fail --
-            # silently, because the health report is deliberately best-effort.
-            # The monitor would then go stale rather than loud, which is the
-            # same class of dark failure it exists to prevent.
-            ("wal_ready_count", "bigint", "0"),
-            # The restore drill, added 2026-08-28. Same reason: the loop's
-            # upsert does not name these, but the view does.
-            ("last_restore_verified_at", "timestamptz", "'1970-01-01 00:00:00+00'"),
-            ("last_restore_label", "text", "''"),
-            ("last_restore_rows", "bigint", "0"),
-            ("last_restore_note", "text", "''"),
-        ):
-            self._command(
-                f"ALTER TABLE @pgbackrest_health ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
-            )
-        for column, ddl_type, default in (
-            ("amcheck_status", "text", "'unavailable'"),
-            ("amcheck_detail", "text", "''"),
-            ("amcheck_ms", "bigint", "0"),
-            ("amcheck_at", "timestamptz", "'1970-01-01 00:00:00+00'"),
-        ):
-            self._command(
-                f"ALTER TABLE @collation_health ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
-            )
-        for column, ddl_type, default in (
-            # Host saturation beside the latency number (C6), added
-            # 2026-08-28. -1 is "unmeasured", never 0: a zero would read as an
-            # idle host, which is the one verdict C6 acts on.
-            ("io_pressure_full_avg10", "double precision", "-1"),
-            ("cpu_pressure_some_avg10", "double precision", "-1"),
-            ("load_1m", "double precision", "-1"),
-            ("cpu_count", "bigint", "-1"),
-        ):
-            self._command(
-                f"ALTER TABLE @search_benchmark_runs ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
-            )
-        for column, ddl_type, default in (
-            # Admin calls (pdw ingest/version/login and the credential
-            # publishers), added 2026-08-28. They are excluded from the
-            # search-first denominator, and counted here so the exclusion is a
-            # number rather than a silent filter.
-            ("admin_calls", "bigint", "0"),
-        ):
-            self._command(
-                f"ALTER TABLE @agent_usage ADD COLUMN IF NOT EXISTS "
-                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
-            )
+        self._ensure_table_group(list(PIPELINE_HEALTH_SNAPSHOT_TABLES))
+        # _ensure_table_group only CREATEs; it does not widen an existing table,
+        # so a warehouse provisioned before any of these columns existed would
+        # keep the old shape and everything that names the column -- the
+        # collectors' inserts and the marts views below -- would fail on every
+        # run. Fresh-database tests cannot catch that by construction, which is
+        # exactly how it reached production three times (ops.pipeline_health
+        # 2026-08-23, ops.pgbackrest_health 2026-08-27, ops.agent_usage
+        # 2026-08-28). Derived from the TableSpec rather than hand-listed, so
+        # the next column added here needs no migration line and cannot be
+        # forgotten.
+        for table in PIPELINE_HEALTH_SNAPSHOT_TABLES:
+            added = self._reconcile_table_columns(table)
+            if added:
+                logger.info("widened %s with %s", table, ", ".join(added))
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
@@ -7071,6 +7022,55 @@ class PostgresWarehouse:
         for table in tables:
             self._ensure_table(table)
         self._ensure_indexes(tables)
+
+    def _reconcile_table_columns(self, table: str) -> list[str]:
+        """Add any ``TableSpec`` column an existing table is missing.
+
+        ``CREATE TABLE IF NOT EXISTS`` never revisits an existing table, so a
+        column added to a spec reaches every fresh database -- and every test,
+        and CI -- while a long-lived warehouse keeps the old shape. Whatever
+        names the column then fails on every run, and the suite stays green,
+        because no fresh-database test can reproduce "provisioned before the
+        column existed".
+
+        That has now happened three times on the health snapshots
+        (``ops.pipeline_health`` 2026-08-23, ``ops.pgbackrest_health``
+        2026-08-27, ``ops.agent_usage`` 2026-08-28), each time repaired by
+        hand-writing one more ``ADD COLUMN IF NOT EXISTS`` beside the last.
+        Hand-written lists are the bug: the author who adds the column is
+        exactly the author who does not know it needs a migration line. This
+        derives the same DDL from the spec the creation path already uses, so
+        the two cannot disagree.
+
+        Deliberately NOT applied to every table: it is called for the small
+        snapshot tables whose whole content is rewritten each collection, where
+        an added column is metadata-only and the lock is irrelevant. Returns the
+        columns it added, so a caller can log a real migration.
+        """
+        rel = canonical_relation(table).with_namespace(self._schema)
+        present = {
+            str(row[0])
+            for row in self._query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (rel.schema, rel.name),
+            )
+        }
+        if not present:
+            # The table does not exist yet; _ensure_table is about to create it
+            # with every column.
+            return []
+        added: list[str] = []
+        for column in POSTGRES_TABLES[table].columns:
+            if column in present:
+                continue
+            self._command(
+                f"ALTER TABLE {self.sql_relation(table)} ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {_postgres_type(column, table=table)} "
+                f"NOT NULL DEFAULT {_default_sql(column, table=table)}"
+            )
+            added.append(column)
+        return added
 
     def _ensure_table(self, table: str) -> None:
         spec = POSTGRES_TABLES[table]
@@ -14443,7 +14443,26 @@ def _postgres_type(column: str, *, table: str | None = None) -> str:
     return "text"
 
 
+#: Columns whose "absent" value is -1 rather than the warehouse's usual 0,
+#: because 0 is a meaningful reading there. The host-saturation gauges beside
+#: the search benchmark's latency (C6) are the case: a zero reads as an IDLE
+#: host, which is the one verdict C6 acts on, so an unmeasured field must not
+#: be able to produce it. Until 2026-08-28 only the hand-written migration used
+#: -1 and a freshly created table used 0, so a new warehouse's first benchmark
+#: row would have claimed an idle host it never measured.
+UNMEASURED_SENTINEL_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "search_benchmark_runs": (
+        "io_pressure_full_avg10",
+        "cpu_pressure_some_avg10",
+        "load_1m",
+        "cpu_count",
+    ),
+}
+
+
 def _default_sql(column: str, *, table: str | None = None) -> str:
+    if column in UNMEASURED_SENTINEL_COLUMNS_BY_TABLE.get(table or "", ()):
+        return "-1"
     if table == "timeline_events" and column == "priority":
         # A fail-loud sentinel, not a tier. Every adapter emits one of the five
         # real tiers, so a row can only carry 'unclassified' if it was inserted

@@ -240,17 +240,26 @@ def test_marts_view_escalates_on_a_growing_wal_backlog() -> None:
 def test_new_health_column_is_migrated_onto_existing_tables() -> None:
     """`CREATE TABLE IF NOT EXISTS` never widens a table that already exists.
 
-    Without an explicit ALTER, `wal_ready_count` would be absent in production
-    and the backup loop's INSERT would fail -- silently, because the health
-    report is best-effort by design.  The monitor would go stale rather than
-    loud, which is the same dark failure it exists to prevent.  Fresh-database
-    tests cannot catch this by construction.
+    Without a migration, `wal_ready_count` would be absent in production and the
+    backup loop's INSERT would fail -- silently, because the health report is
+    best-effort by design.  The monitor would go stale rather than loud, which is
+    the same dark failure it exists to prevent.  Fresh-database tests cannot
+    catch this by construction.
+
+    The migration used to be a hand-written line per column and this test read
+    the source for it.  Since 2026-08-28 the ensure path reconciles every
+    snapshot table against its own spec, so the contract is now "the column is
+    in the spec, and the spec is reconciled" -- proved end to end by
+    test_ensure_restores_any_missing_column_on_every_health_snapshot_table.
     """
 
-    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+    from personal_data_warehouse.postgres import (
+        PIPELINE_HEALTH_SNAPSHOT_TABLES,
+        POSTGRES_TABLES,
+    )
 
-    assert 'ALTER TABLE @pgbackrest_health ADD COLUMN IF NOT EXISTS' in postgres
-    assert '("wal_ready_count", "bigint", "0"),' in postgres
+    assert "pgbackrest_health" in PIPELINE_HEALTH_SNAPSHOT_TABLES
+    assert "wal_ready_count" in POSTGRES_TABLES["pgbackrest_health"].columns
 
 
 def test_repo_bytes_falls_back_to_the_block_incremental_delta() -> None:
@@ -329,13 +338,20 @@ def test_restore_drill_columns_are_migrated_and_never_written_by_the_loop() -> N
 
     The loop's upsert must not name the restore columns: it runs every six
     hours and would otherwise reset the one fact only a restore can produce.
-    And, as with wal_ready_count, CREATE TABLE IF NOT EXISTS cannot add them
-    to a live deployment, so the ALTER has to exist.
+    And, as with wal_ready_count, CREATE TABLE IF NOT EXISTS cannot add them to
+    a live deployment, so the column has to be one the ensure path reconciles.
     """
 
-    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+    from personal_data_warehouse.postgres import (
+        PIPELINE_HEALTH_SNAPSHOT_TABLES,
+        POSTGRES_TABLES,
+    )
+
     loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
 
+    assert "pgbackrest_health" in PIPELINE_HEALTH_SNAPSHOT_TABLES
     for column in ("last_restore_verified_at", "last_restore_label", "last_restore_rows", "last_restore_note"):
-        assert f'("{column}",' in postgres, f"{column} is not migrated onto existing tables"
+        assert column in POSTGRES_TABLES["pgbackrest_health"].columns, (
+            f"{column} is not in the spec the ensure path reconciles"
+        )
         assert column not in loop, f"the backup loop must never write {column}"

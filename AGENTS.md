@@ -740,6 +740,15 @@ search layer came from exactly this discipline in reverse — the pooled two-par
 scan replaced eighteen serial per-source branches whose wall clock was the SUM of every
 branch (6.9s warm, 21.7s cold) with two index-ordered scans.
 
+**The first measured verdict says the opposite of the 2026-08-23 one, and that is the point
+of measuring it.** `marts_ops.search_benchmark` carries the host's own pressure beside the
+latency (C6), and the first run to write it — 2026-08-28 15:45 — read **`io_bound`**: I/O
+pressure `full avg10` 11.4%, CPU pressure `some avg10` **0.04%**, load **3.12 on 28 cores**,
+with hybrid p50 2.59s. So the machine is not short of CPU and the query is not short of
+workers; it is waiting on pages, exactly as the working-set section below describes. Read
+`saturation` before deciding what kind of problem a slow search is: `cpu_bound` and `idle`
+call for a better plan or more parallelism, `io_bound` calls for keeping the index resident.
+
 **A documented performance number that silently regressed is itself a bug, so re-measure
 before you quote one — and prefer the living number.** Since 2026-08-27 the weekly
 `search_benchmark` asset writes p50/p90 hybrid latency and labeled MRR into
@@ -1019,6 +1028,24 @@ pdw sql -q "which marts read something stale" "SELECT view_schema, view_name, st
 pdw sql -q "collation and index integrity" "SELECT scope, object_name, status, finding, detail
   FROM marts_ops.collation_health WHERE status NOT IN ('ok') ORDER BY status"
 ```
+
+**Adding a column to a `marts_ops` snapshot table needs no migration line, and that is
+new.** `CREATE TABLE IF NOT EXISTS` never revisits an existing table, so until 2026-08-28 a
+column added to one of these `TableSpec`s reached every fresh database — and every test, and
+CI — while production kept the old shape, and everything naming the column failed on every
+run with the suite fully green. It happened three times (`pipeline_health` 2026-08-23,
+`pgbackrest_health` 2026-08-27, `agent_usage` 2026-08-28), each repaired by hand-writing one
+more `ADD COLUMN IF NOT EXISTS` beside the last — which is the bug, because the author who
+adds a column is exactly the author who does not know a migration line is also required.
+`ensure_pipeline_health_tables` now reconciles every table in
+`PIPELINE_HEALTH_SNAPSHOT_TABLES` against its own spec, and
+`test_ensure_restores_any_missing_column_on_every_health_snapshot_table` drops each column
+in turn and asserts it comes back. It is scoped to those tables on purpose: their whole
+content is rewritten by each collection, so an added column is metadata-only with no heap to
+lock. Deriving the DDL from the spec also exposed a disagreement it had been hiding — the
+hand-written migration gave the host-saturation gauges the `-1` "unmeasured" default while a
+freshly created table gave them `0`, which the view reads as an **idle host**, the one
+verdict C6 acts on. `UNMEASURED_SENTINEL_COLUMNS_BY_TABLE` is now the single source for both.
 
 ## Adding a warehouse source
 

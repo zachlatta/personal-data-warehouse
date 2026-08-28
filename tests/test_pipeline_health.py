@@ -2099,27 +2099,45 @@ def test_search_benchmark_saturation_columns_are_added_to_an_existing_table(ware
     assert warehouse._query_dicts("SELECT saturation FROM @marts_search_benchmark")[0]["saturation"] == "unmeasured"
 
 
-def test_ensure_widens_agent_usage_provisioned_before_admin_calls(warehouse):
-    """Same migration contract as pipeline_health, for the C3 snapshot.
+def test_ensure_restores_any_missing_column_on_every_health_snapshot_table(warehouse):
+    """Whichever column a long-lived warehouse predates, ensure must add it back.
 
-    `admin_calls` was added on 2026-08-28. A fresh database gets it from the
-    TableSpec and every test passes; a long-lived warehouse keeps the old shape,
-    and then both the collector's insert and marts_ops.agent_usage -- which
-    names the column -- fail on every daily run.
+    The per-column version of this test was written three times -- pipeline_health
+    2026-08-23, pgbackrest_health 2026-08-27, agent_usage 2026-08-28 -- and each
+    time only AFTER production had already broken, because the author who adds a
+    column is exactly the author who does not know a hand-written
+    `ADD COLUMN IF NOT EXISTS` is also required. So the contract is stated over
+    the whole group and every column of it: drop one, re-ensure, and it comes
+    back. A new column added to any of these TableSpecs is covered the day it is
+    written, with no migration line to remember.
     """
-    warehouse.ensure_pipeline_health_tables()
-    rel = relation("agent_usage").with_namespace(warehouse.schema_namespace)
-    warehouse._command(f'ALTER TABLE "{rel.schema}"."{rel.name}" DROP COLUMN IF EXISTS admin_calls CASCADE')
+    from personal_data_warehouse.postgres import PIPELINE_HEALTH_SNAPSHOT_TABLES, POSTGRES_TABLES
 
     warehouse.ensure_pipeline_health_tables()
+    for table in PIPELINE_HEALTH_SNAPSHOT_TABLES:
+        spec = POSTGRES_TABLES[table]
+        rel = relation(table).with_namespace(warehouse.schema_namespace)
+        droppable = [c for c in spec.columns if c not in spec.primary_key]
+        assert droppable, table
+        for column in droppable:
+            warehouse._command(
+                f'ALTER TABLE "{rel.schema}"."{rel.name}" DROP COLUMN IF EXISTS "{column}" CASCADE'
+            )
 
-    present = {
-        row[0]
-        for row in warehouse._query(
-            "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
-            (rel.schema, rel.name),
-        )
-    }
-    assert "admin_calls" in present
-    marts = relation("marts_agent_usage").with_namespace(warehouse.schema_namespace)
-    warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')
+        warehouse.ensure_pipeline_health_tables()
+
+        present = {
+            row[0]
+            for row in warehouse._query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (rel.schema, rel.name),
+            )
+        }
+        missing = [c for c in spec.columns if c not in present]
+        assert not missing, f"ensure did not widen {table}; missing {missing}"
+
+    # The views are what actually break, so prove each one still reads.
+    for view in ("marts_pipeline_health", "marts_agent_usage", "marts_search_benchmark"):
+        marts = relation(view).with_namespace(warehouse.schema_namespace)
+        warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')
