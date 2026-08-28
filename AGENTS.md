@@ -3279,6 +3279,31 @@ landing stamp**: that same 18:13 message read `synced_at = 19:15:16`, the re-fet
 is why the view reads the timeline's `first_seen_at` instead (95ms warm, ~39k buffers,
 bounded by `timeline_events_source_time_idx`).
 
+**The tail was a conversation we had never heard of, not a slow fetch.** The freshness
+pass takes its candidates from the *cached* `base_slack.conversations` rows, so an id
+`client.counts` names that has no row is loaded as nothing and silently dropped. Discovery
+is a paged `conversations.list` walk that rotates conversation types, so a conversation
+created since it last passed waits for it: measured 2026-08-28, `im` discovery was 14.3
+hours old, a group DM created 16:02 first reached `timeline.events` at **05:36 the next
+day** (13.6h), and a DM created 19:20 landed at 23:30 — the minute the walk cached it. The
+median DM was 3 minutes the whole time, which is why this reads as a p95 problem and not
+as an outage. Two halves fix it, and each was independently necessary:
+
+- **An id the feed names that we hold no row for is looked up with `conversations.info`
+  there and then**, written to `base_slack.conversations` (whatever its type, so every
+  other stage sees it too), and synced in the same pass. It costs one call for something
+  that happens a handful of times a day, bounded by `SLACK_ASSET_NEW_CONVERSATION_LIMIT`
+  (25) so a feed that suddenly names hundreds — a restored session, a lost conversations
+  table — cannot spend a whole pass on metadata against the ~39 calls/minute ceiling every
+  Slack stage shares.
+- **A brand-new conversation streams in full and skips the activity gate.** The freshness
+  window is four hours and the gate falls back to the cached `latest.ts` when there is no
+  cursor, so the pass that first finds a conversation would otherwise truncate it, or skip
+  it outright: one production DM's first message sat *eight minutes* outside the
+  window and waited eight more hours for the coverage floor walk. Streaming in full is
+  cheap precisely because the conversation is new — this branch is reachable only when we
+  hold no row for it at all, so a busy channel Zach merely joined is not affected.
+
 ## Slack change feed: how the sync knows what to fetch
 
 **Slack's public API cannot tell you which conversations have new messages.**

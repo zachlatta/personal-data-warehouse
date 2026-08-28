@@ -171,6 +171,7 @@ class SlackSyncRunner:
         conversation_limit: int | None = None,
         conversation_page_limit: int | None = None,
         conversation_ids: Sequence[str] | None = None,
+        new_conversation_limit: int = 25,
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
         sync_members_only: bool = False,
@@ -212,6 +213,10 @@ class SlackSyncRunner:
         # When set, only these conversations are candidates: the change feed has
         # already established that nothing else moved.
         self._conversation_ids = conversation_ids
+        # How many conversations one freshness pass may look up with
+        # conversations.info. Each unknown id costs one call out of the rate
+        # budget every stage shares, and the normal figure is a handful a day.
+        self._new_conversation_limit = new_conversation_limit
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
         self._sync_members_only = sync_members_only
@@ -630,6 +635,96 @@ class SlackSyncRunner:
         else:
             self._logger.warning("Could not sync Slack conversation %s: %s", conversation_id, exc)
 
+    def _discover_named_conversations(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        client,
+        synced_at: datetime,
+        conversations: list,
+    ) -> tuple[list, set[str]]:
+        """Fetch conversations the change feed named that we have never cached.
+
+        The freshness pass takes its candidates from ``base_slack.conversations``,
+        which is filled by the paged ``conversations.list`` walk. That walk rotates
+        conversation types and covers a few pages a run, so a conversation created
+        since it last passed is named by ``client.counts`` and then dropped on the
+        floor -- there is no cached row to load. Measured 2026-08-28, that was the
+        whole DM landing-latency tail: a group DM created at 16:02 first reached
+        ``timeline.events`` at 05:36 the next day, and a DM created at 19:20 landed at
+        23:30, the minute the discovery walk finally cached it. Both read `ok` on every
+        other Slack health number the whole time.
+
+        One ``conversations.info`` per genuinely unknown id closes that, and the
+        bound is what keeps it honest: a normal day names a handful, so the cost is
+        invisible against the ~39 calls/minute ceiling every Slack stage shares, but
+        a feed that suddenly names hundreds (a restored session, a lost conversations
+        table) must not spend the whole pass on metadata. The rest are picked up by
+        the next pass and by the discovery walk, exactly as before.
+        """
+        newly_discovered: set[str] = set()
+        if not self._conversation_ids or self._new_conversation_limit <= 0:
+            return conversations, newly_discovered
+        if not hasattr(self._warehouse, "load_slack_known_conversation_ids"):
+            return conversations, newly_discovered
+        requested = [str(conversation_id) for conversation_id in self._conversation_ids if conversation_id]
+        if not requested:
+            return conversations, newly_discovered
+        known = self._warehouse.load_slack_known_conversation_ids(
+            account=account,
+            team_id=team_id,
+            conversation_ids=requested,
+        )
+        unknown = [conversation_id for conversation_id in requested if conversation_id not in known]
+        if not unknown:
+            return conversations, newly_discovered
+        if len(unknown) > self._new_conversation_limit:
+            self._logger.warning(
+                "Slack change feed named %s conversations we have never cached; looking up %s this pass",
+                len(unknown),
+                self._new_conversation_limit,
+            )
+            unknown = unknown[: self._new_conversation_limit]
+        rows = []
+        discovered_payloads = []
+        for conversation_id in unknown:
+            try:
+                response = self._call(client, "conversations.info", channel=conversation_id)
+            except SlackApiCallError as exc:
+                self._logger.warning(
+                    "Could not look up newly changed Slack conversation %s: %s", conversation_id, exc
+                )
+                continue
+            info = response.get("channel")
+            if not isinstance(info, Mapping) or not info.get("id"):
+                continue
+            rows.append(
+                conversation_to_row(
+                    account=account,
+                    team_id=team_id,
+                    conversation=info,
+                    synced_at=synced_at,
+                )
+            )
+            discovered_payloads.append(info)
+        if not rows:
+            return conversations, newly_discovered
+        # Write every one of them, whatever its type: this pass only syncs the types it
+        # was asked for, but the row makes the conversation visible to every other stage.
+        self._warehouse.insert_slack_conversations(rows)
+        self._logger.info(
+            "Discovered %s Slack conversations the change feed named but we had never cached for %s",
+            len(rows),
+            account,
+        )
+        for payload in discovered_payloads:
+            if self._conversation_types and conversation_type(payload) not in self._conversation_types:
+                continue
+            conversations = [*conversations, payload]
+            newly_discovered.add(str(payload["id"]))
+        return conversations, newly_discovered
+
     def _sync_account_freshness_priority(
         self,
         *,
@@ -653,6 +748,13 @@ class SlackSyncRunner:
                 conversation_ids=self._conversation_ids,
             )
             self._logger.info("Freshness loaded %s cached active Slack conversations for %s", len(conversations), account.account)
+            conversations, newly_discovered_ids = self._discover_named_conversations(
+                account=account.account,
+                team_id=team_id,
+                client=client,
+                synced_at=synced_at,
+                conversations=conversations,
+            )
         else:
             conversations = self._refresh_active_conversations(
                 account=account.account,
@@ -660,6 +762,7 @@ class SlackSyncRunner:
                 client=client,
                 synced_at=synced_at,
             )
+            newly_discovered_ids = set()
 
         # Conversations whose own cursor was lost — e.g. clobbered to '' by the
         # pre-"Preserve Slack cursor on empty partial sync" empty-window bug, which
@@ -730,7 +833,12 @@ class SlackSyncRunner:
                 if not conversation.get("id"):
                     continue
                 cursor_ts = _conversation_cursor_ts(conversation)
-                if not conversation_may_have_activity_since(
+                is_new = str(conversation["id"]) in newly_discovered_ids
+                # A conversation we have only just learned about is exempt from the
+                # activity gate: the gate falls back to the cached `latest.ts` when there
+                # is no cursor, and a DM created an hour outside the window would be
+                # skipped on exactly the pass that first found it.
+                if not is_new and not conversation_may_have_activity_since(
                     conversation,
                     oldest_ts,
                     cursor_ts=cursor_ts,
@@ -744,6 +852,12 @@ class SlackSyncRunner:
                 conversation_oldest_ts = oldest_ts
                 if cursor_ts is not None and 0 < cursor_ts < oldest_ts:
                     conversation_oldest_ts = cursor_ts
+                elif is_new:
+                    # We hold nothing for it, so the window is not a top-up, it is a
+                    # truncation: one production DM's first message sat eight
+                    # minutes outside the window and waited eight hours for the coverage
+                    # floor walk. Streaming in full is cheap for something this new.
+                    conversation_oldest_ts = None
                 conversations_seen += 1
                 try:
                     result = self._sync_conversation_messages(

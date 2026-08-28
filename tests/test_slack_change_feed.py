@@ -192,3 +192,40 @@ class NullLog:
 
     def error(self, *a, **k):
         pass
+
+
+def test_the_freshness_pass_may_look_up_conversations_the_feed_names_but_we_lack(monkeypatch):
+    """The change-feed path must be allowed to discover on demand.
+
+    The feed reports ids; the freshness pass loads its candidates from the cached
+    conversations table. Without a lookup budget those two disagree exactly when it
+    matters -- on a conversation created since the paged discovery walk last ran --
+    and the message waits for that walk. Measured 2026-08-28: a group DM created at
+    16:02 reached the timeline at 05:36 the next day.
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    captured: list[dict] = []
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+        def sync_all(self):
+            return []
+
+    monkeypatch.setattr(
+        slack_defs,
+        "slack_change_plan",
+        lambda **_: slack_defs.SlackChangePlan(usable=True, changed_conversation_ids=("D_NEW",)),
+    )
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", _Runner)
+    monkeypatch.setenv("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", "0")
+
+    slack_defs.run_slack_freshness_sync(
+        settings=_settings(monkeypatch), warehouse=_Warehouse(), logger=NullLog()
+    )
+
+    assert captured, "the freshness pass must build its per-type runners"
+    assert all(kwargs["new_conversation_limit"] > 0 for kwargs in captured)
+    assert all(kwargs["conversation_ids"] == ("D_NEW",) for kwargs in captured)

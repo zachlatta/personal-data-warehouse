@@ -84,6 +84,7 @@ class FakeWarehouse:
         # hold, the floor coverage backfills below.
         self.message_low_water: dict[tuple[str, str, str], str] = {}
         self.low_water_calls = []
+        self.known_conversation_id_calls: list[list[str]] = []
 
     def ensure_slack_tables(self):
         self.ensure_calls += 1
@@ -336,6 +337,15 @@ class FakeWarehouse:
             conversation_id: high_water
             for (state_account, state_team_id, conversation_id), high_water in self.message_high_water.items()
             if state_account == account and state_team_id == team_id and conversation_id in wanted
+        }
+
+    def load_slack_known_conversation_ids(self, *, account, team_id, conversation_ids):
+        wanted = {str(conversation_id) for conversation_id in conversation_ids}
+        self.known_conversation_id_calls.append(sorted(wanted))
+        return {
+            str(payload["id"])
+            for payload in self.conversation_payloads
+            if str(payload.get("id") or "") in wanted
         }
 
 
@@ -2665,6 +2675,10 @@ def test_freshness_pass_restricts_candidates_to_the_changed_conversations(monkey
         {
             "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
             "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            # Nothing is cached here, so the pass also looks the id up on demand -- see
+            # test_runner_freshness_priority_discovers_a_conversation_the_change_feed_names_but_never_cached.
+            "conversations.info": [{"ok": True, "channel": {"id": "D_CHANGED", "user": "U2", "is_im": True}}],
+            "conversations.history": [{"ok": True, "messages": [], "response_metadata": {}}],
         }
     )
     warehouse = FakeWarehouse()
@@ -3308,3 +3322,196 @@ def test_coverage_still_streams_a_conversation_with_no_cursor_from_the_top(monke
     call = _history_calls(client)[0]
     assert "latest" not in call and "oldest" not in call
     assert [u for u in warehouse.state_updates if u["object_type"] == "conversation"][-1]["last_sync_type"] == "full"
+
+
+def test_runner_freshness_priority_discovers_a_conversation_the_change_feed_names_but_never_cached(monkeypatch):
+    # Regression (new-DM landing latency): the change feed names a conversation id, but
+    # the freshness pass loads its candidates from the CACHED base_slack.conversations
+    # rows, so a DM or group DM created since the last conversations.list walk was named
+    # and then dropped. Discovery is paged and rotates types, so the wait was ~14 hours
+    # in production: measured 2026-08-28, a group DM created 16:02 first reached the
+    # timeline at 05:36 the next day (13.6h) and a DM created 19:20 landed at 23:30
+    # (3.9h) -- the exact minute the discovery walk finally cached it. A conversation the
+    # feed names and we have never seen must be fetched with conversations.info there and
+    # then, which costs one call for something that happens a handful of times a day.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    # Nothing cached: this conversation was created after the last discovery walk.
+    warehouse.conversation_payloads = []
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.info": [
+                {"ok": True, "channel": {"id": "D_BRAND_NEW", "user": "U1", "is_im": True}},
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1999.000000", "user": "U1", "text": "hi"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        conversation_types=("im",),
+        conversation_ids=("D_BRAND_NEW",),
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert [params["channel"] for method, params in client.calls if method == "conversations.info"] == ["D_BRAND_NEW"]
+    # It is written to base_slack.conversations, so every later stage can see it too.
+    assert [row["conversation_id"] for row in warehouse.conversations] == ["D_BRAND_NEW"]
+    assert [params["channel"] for method, params in client.calls if method == "conversations.history"] == ["D_BRAND_NEW"]
+
+
+def test_runner_freshness_priority_streams_a_brand_new_conversation_in_full(monkeypatch):
+    # The freshness window is four hours. A conversation we have only just learned about
+    # holds nothing at all, so fetching only its last four hours truncates it: production
+    # DM was created 19:20 and cached at 23:30, and its 19:22 message fell
+    # eight minutes outside the window -- it did not land until the coverage floor walk
+    # reached it eight hours later. A brand-new conversation streams in full instead,
+    # which is cheap precisely because it is brand new.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = []
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.info": [
+                # `latest.ts` predates the freshness window (oldest_ts = 1400), which the
+                # activity gate would otherwise read as "nothing happened here".
+                {
+                    "ok": True,
+                    "channel": {"id": "C_NEW_MPIM", "is_mpim": True, "latest": {"ts": "1100.000000"}},
+                },
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1100.000000", "user": "U1", "text": "first"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        conversation_types=("mpim",),
+        conversation_ids=("C_NEW_MPIM",),
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert [params["channel"] for params in history_calls] == ["C_NEW_MPIM"]
+    # Full stream: no `oldest` bound, so the conversation's whole (short) history lands.
+    assert "oldest" not in history_calls[0]
+    assert [row["message_ts"] for row in warehouse.messages] == ["1100.000000"]
+
+
+def test_runner_freshness_priority_does_not_refetch_conversations_it_already_has(monkeypatch):
+    # The on-demand lookup must be scoped to ids we genuinely do not hold. Asking
+    # conversations.info for every changed conversation would add ~50 calls per
+    # five-minute pass against a measured ~39/min ceiling shared with every other stage.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "D_KNOWN", "user": "U1", "is_im": True, "latest": {"ts": "1999.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1999.000000", "user": "U1", "text": "hi"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        conversation_types=("im",),
+        conversation_ids=("D_KNOWN",),
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert not any(method == "conversations.info" for method, _params in client.calls)
+
+
+def test_runner_freshness_priority_bounds_how_many_new_conversations_one_pass_discovers(monkeypatch):
+    # The lookup is one API call per unknown id, out of the shared rate budget. A feed
+    # that suddenly names hundreds of unseen conversations (a fresh workspace, a restored
+    # session, a lost conversations table) must not spend the whole pass on metadata:
+    # the rest are picked up by the next pass and by the discovery walk.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = []
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.info": [
+                {"ok": True, "channel": {"id": "D_1", "user": "U1", "is_im": True}},
+                {"ok": True, "channel": {"id": "D_2", "user": "U2", "is_im": True}},
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [], "response_metadata": {}},
+                {"ok": True, "messages": [], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        conversation_types=("im",),
+        conversation_ids=("D_1", "D_2", "D_3", "D_4"),
+        new_conversation_limit=2,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert [params["channel"] for method, params in client.calls if method == "conversations.info"] == ["D_1", "D_2"]

@@ -9511,6 +9511,33 @@ class PostgresWarehouse:
         )
         return _json_payloads(rows)
 
+    def load_slack_known_conversation_ids(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_ids: Sequence[str],
+    ) -> set[str]:
+        """Which of these conversation ids we already hold a row for.
+
+        The freshness pass asks this about the ids ``client.counts`` said moved, so it
+        can tell "nothing new happened here" from "we have never seen this conversation
+        at all". The second case used to be indistinguishable from the first and cost
+        hours of landing latency on every newly created DM and group DM.
+        """
+        wanted = [str(conversation_id) for conversation_id in conversation_ids if conversation_id]
+        if not wanted:
+            return set()
+        rows = self._query(
+            """
+            SELECT conversation_id
+            FROM @slack_conversations
+            WHERE account = %s AND team_id = %s AND conversation_id = ANY(%s)
+            """,
+            (account, team_id, wanted),
+        )
+        return {str(row[0]) for row in rows}
+
     def load_slack_public_sweep_candidate_payloads(
         self,
         *,

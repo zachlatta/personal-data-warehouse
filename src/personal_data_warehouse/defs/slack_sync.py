@@ -200,6 +200,11 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
                     _int_env("SLACK_ASSET_CHANGED_LIMIT", 500) if changed_ids is not None else conversation_limit
                 ),
                 conversation_ids=changed_ids,
+                # A conversation the feed names but we have never cached is fetched
+                # with conversations.info there and then, instead of waiting for the
+                # paged discovery walk to reach it -- which cost a new group DM 13.6
+                # hours of landing latency on 2026-08-27.
+                new_conversation_limit=_int_env("SLACK_ASSET_NEW_CONVERSATION_LIMIT", 25),
                 # Stop gracefully when the rate-limit budget is exhausted instead of
                 # failing the run. The history cursor is persisted per conversation as
                 # the pass proceeds, so the next freshness run resumes from there. (This

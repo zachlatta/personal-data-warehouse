@@ -4692,6 +4692,35 @@ def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
     assert sorted(p["id"] for p in payloads) == ["C-error", "C-fresh"]
 
 
+def test_postgres_known_slack_conversation_ids_separate_unseen_from_unchanged(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The freshness pass needs "we have never seen this" to be a distinct answer.
+
+    Its candidates come from the cached conversations table, so an id the change feed
+    names but no row exists for is silently dropped -- which is what made a newly
+    created group DM wait 13.6 hours for the paged discovery walk on 2026-08-27.
+    """
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="D-known", raw_json='{"id":"D-known"}')]
+    )
+
+    known = warehouse.load_slack_known_conversation_ids(
+        account="zrl", team_id="T1", conversation_ids=["D-known", "D-never-seen"]
+    )
+
+    assert known == {"D-known"}
+    assert warehouse.load_slack_known_conversation_ids(account="zrl", team_id="T1", conversation_ids=[]) == set()
+    # Scoped to the account/workspace: another workspace's id is not "known" here.
+    assert (
+        warehouse.load_slack_known_conversation_ids(
+            account="zrl", team_id="T-other", conversation_ids=["D-known"]
+        )
+        == set()
+    )
+
+
 def test_postgres_slack_member_candidates_skip_gone_but_retry_errors(
     warehouse: PostgresWarehouse,
 ) -> None:
