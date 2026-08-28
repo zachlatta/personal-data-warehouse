@@ -322,3 +322,20 @@ def test_archiving_freshness_is_judged_against_the_snapshot_not_now() -> None:
 
     assert "last_archived_at < collected_at - interval '1 hour'" in postgres
     assert "last_archived_at < now() - interval '1 hour'" not in postgres
+
+
+def test_restore_drill_columns_are_migrated_and_never_written_by_the_loop() -> None:
+    """The drill record is written by a human-run command, not the loop.
+
+    The loop's upsert must not name the restore columns: it runs every six
+    hours and would otherwise reset the one fact only a restore can produce.
+    And, as with wal_ready_count, CREATE TABLE IF NOT EXISTS cannot add them
+    to a live deployment, so the ALTER has to exist.
+    """
+
+    postgres = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+
+    for column in ("last_restore_verified_at", "last_restore_label", "last_restore_rows", "last_restore_note"):
+        assert f'("{column}",' in postgres, f"{column} is not migrated onto existing tables"
+        assert column not in loop, f"the backup loop must never write {column}"

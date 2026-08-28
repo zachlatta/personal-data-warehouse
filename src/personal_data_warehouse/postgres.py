@@ -152,6 +152,7 @@ from personal_data_warehouse.pipeline_health import (
     COLLATION_SNAPSHOT_STALE_SECONDS,
     COLLECTOR_STALE_SECONDS,
     PGBACKREST_SNAPSHOT_STALE_SECONDS,
+    PGBACKREST_RESTORE_DRILL_STALE_SECONDS,
     WAL_READY_ATTENTION,
     WAL_READY_FAILING,
     EPOCH as PIPELINE_HEALTH_EPOCH,
@@ -2111,6 +2112,7 @@ TIMESTAMP_COLUMNS = {
     "last_diff_at",
     "last_incr_at",
     "last_archived_at",
+    "last_restore_verified_at",
     "oldest_pending_at",
     "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -2237,6 +2239,7 @@ INTEGER_COLUMNS = {
     "backup_count",
     "repo_bytes",
     "wal_ready_count",
+    "last_restore_rows",
     "archived_count",
     "failed_count",
     "last_attempt_ok",
@@ -3149,6 +3152,44 @@ class PostgresWarehouse:
         ]
         for logical, sql in view_sql:
             self._ensure_view(logical, sql)
+
+    def record_pgbackrest_restore_drill(
+        self,
+        *,
+        stanza: str,
+        label: str,
+        rows: int,
+        note: str,
+        verified_at: datetime | None = None,
+    ) -> None:
+        """Record that a backup was restored and counted.
+
+        The row is keyed by stanza and normally written by the backup loop; a
+        drill only touches the four restore columns, so it never disturbs the
+        loop's facts and the loop never disturbs it. When no loop row exists
+        yet (a fresh deployment) the drill founds the row with its own
+        collected_at left at the epoch, so the view still reads `unknown`
+        until the loop reports -- a restore record must not stand in for a
+        backup report.
+        """
+        if not label.strip():
+            raise ValueError("a restore drill must name the backup label it restored")
+        if rows <= 0:
+            raise ValueError("a restore drill must report the rows it counted (> 0)")
+        self._command(
+            """
+            INSERT INTO @pgbackrest_health AS t
+                (stanza, last_restore_verified_at, last_restore_label,
+                 last_restore_rows, last_restore_note)
+            VALUES (%s, COALESCE(%s, now()), %s, %s, %s)
+            ON CONFLICT (stanza) DO UPDATE SET
+                last_restore_verified_at = EXCLUDED.last_restore_verified_at,
+                last_restore_label = EXCLUDED.last_restore_label,
+                last_restore_rows = EXCLUDED.last_restore_rows,
+                last_restore_note = EXCLUDED.last_restore_note
+            """,
+            (stanza, verified_at, label.strip(), int(rows), note.strip()),
+        )
 
     def ensure_finance_tables(self) -> None:
         self._ensure_table_group(
@@ -4250,6 +4291,12 @@ class PostgresWarehouse:
             # The monitor would then go stale rather than loud, which is the
             # same class of dark failure it exists to prevent.
             ("wal_ready_count", "bigint", "0"),
+            # The restore drill, added 2026-08-28. Same reason: the loop's
+            # upsert does not name these, but the view does.
+            ("last_restore_verified_at", "timestamptz", "'1970-01-01 00:00:00+00'"),
+            ("last_restore_label", "text", "''"),
+            ("last_restore_rows", "bigint", "0"),
+            ("last_restore_note", "text", "''"),
         ):
             self._command(
                 f"ALTER TABLE @pgbackrest_health ADD COLUMN IF NOT EXISTS "
@@ -4580,7 +4627,12 @@ class PostgresWarehouse:
                     NULLIF(last_attempt_type, '') AS last_attempt_type,
                     last_attempt_ok,
                     NULLIF(last_error, '') AS last_error,
-                    NULLIF(collected_at, '1970-01-01 00:00:00+00'::timestamptz) AS collected_at
+                    NULLIF(collected_at, '1970-01-01 00:00:00+00'::timestamptz) AS collected_at,
+                    NULLIF(last_restore_verified_at, '1970-01-01 00:00:00+00'::timestamptz)
+                        AS last_restore_verified_at,
+                    NULLIF(last_restore_label, '') AS last_restore_label,
+                    last_restore_rows,
+                    NULLIF(last_restore_note, '') AS last_restore_note
                 FROM @pgbackrest_health
             )
             SELECT
@@ -4621,8 +4673,30 @@ class PostgresWarehouse:
                     -- The loop is failing while an older good backup still
                     -- stands: not an outage yet, but the clock is running.
                     WHEN last_attempt_ok = 0 THEN 'attention'
+                    -- A backup nobody has restored is a hypothesis. The drill
+                    -- is recorded here by hand (pgbackrest_restore_drill), so
+                    -- an old or missing record is the row saying "unverified",
+                    -- not a fact about the repository -- attention, never
+                    -- failing, and only after every fact about the backups
+                    -- themselves has been judged.
+                    WHEN last_restore_verified_at IS NULL
+                      OR last_restore_verified_at
+                         < now() - interval '{PGBACKREST_RESTORE_DRILL_STALE_SECONDS} seconds'
+                        THEN 'attention'
                     ELSE 'ok'
                 END AS status,
+                CASE
+                    WHEN last_restore_verified_at IS NULL THEN 'never'
+                    WHEN last_restore_verified_at
+                         < now() - interval '{PGBACKREST_RESTORE_DRILL_STALE_SECONDS} seconds'
+                        THEN 'stale'
+                    ELSE 'ok'
+                END AS restore_status,
+                last_restore_verified_at,
+                last_restore_label,
+                last_restore_rows,
+                last_restore_note,
+                EXTRACT(EPOCH FROM now() - last_restore_verified_at)::bigint AS restore_age_seconds,
                 repo_status,
                 repo_message,
                 last_full_at,

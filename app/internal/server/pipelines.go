@@ -117,7 +117,9 @@ SELECT stanza, status, repo_status, repo_message,
        last_full_at, last_diff_at, last_incr_at, last_backup_label, last_backup_type,
        backup_count, repo_bytes, wal_min, wal_max, archived_count, failed_count,
        last_archived_at, last_attempt_at, last_attempt_type, last_attempt_ok,
-       last_error, collected_at, full_age_seconds, snapshot_age_seconds
+       last_error, collected_at, full_age_seconds, snapshot_age_seconds,
+       restore_status, last_restore_verified_at, last_restore_label,
+       last_restore_rows, last_restore_note, restore_age_seconds
 FROM ` + warehouse.SQLRelation("marts_pgbackrest_health") + `
 ORDER BY stanza`
 

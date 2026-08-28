@@ -582,10 +582,14 @@ func TestSchemaErrorHint(t *testing.T) {
 			want:    []string{"timeline.search_text_exact(query text", "max_results integer DEFAULT 50"},
 		},
 		{
-			name:    "wrong argument shape on a qualified hybrid search prints the signature",
-			message: "ERROR: function timeline.search_hybrid(unknown, unknown) does not exist (SQLSTATE 42883)",
-			sql:     "SELECT * FROM timeline.search_hybrid('invoice', '[0.1]')",
-			want:    []string{"timeline.search_hybrid(query text", "query_embedding text", "embedding_model text"},
+			// The SQL function needs query embeddings a caller cannot type, so
+			// the hint must send them to the ONE hybrid search — the tool —
+			// rather than print a signature that invites an invented vector.
+			name:     "a hybrid search attempted from SQL is redirected to the search tool",
+			message:  "ERROR: function timeline.search_hybrid(unknown, unknown) does not exist (SQLSTATE 42883)",
+			sql:      "SELECT * FROM timeline.search_hybrid('invoice', 10)",
+			want:     []string{"`search` tool", "pdw search", "timeline.search_text("},
+			wantNone: []string{"query_embedding text"},
 		},
 		{
 			name:    "hybrid search wrong column returns the shared result contract",

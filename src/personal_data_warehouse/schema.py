@@ -2409,6 +2409,15 @@ PGBACKREST_HEALTH_COLUMNS = (
     "last_attempt_ok",
     "last_error",
     "collected_at",
+    # The restore drill. A backup nobody has restored is a hypothesis, and
+    # until 2026-08-28 the only evidence a restore had ever worked was a
+    # commit message. Written by `personal_data_warehouse.pgbackrest_restore_drill`
+    # after a restore into a throwaway cluster has been counted, never by the
+    # backup loop (which must not overwrite it).
+    "last_restore_verified_at",
+    "last_restore_label",
+    "last_restore_rows",
+    "last_restore_note",
 )
 
 

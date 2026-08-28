@@ -1,7 +1,8 @@
 """Dagster wiring for transaction-first receipt research.
 
-The worklist is hard-capped to the most recent 30 days of posted ledger
-transactions. Configuration cannot widen it into an archive scan.
+The worklist is hard-capped to ledger transactions that arrived (posted, or
+were inserted from a statement) in the most recent 30 days, with a fixed
+90-day posted-date floor. Configuration cannot widen it into an archive scan.
 """
 
 from __future__ import annotations

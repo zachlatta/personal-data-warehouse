@@ -242,7 +242,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     // Backups first. It is the only level whose failure is unrecoverable, and
     // it was on no surface at all until 2026-08-26, when production ran a day
     // with no valid backup while every other level here read green.
-    ["backups", "backups — does a RESTORABLE backup exist, and is WAL still shipping"],
+    ["backups", "backups — does a RESTORABLE backup exist, has a restore been VERIFIED, and is WAL still shipping"],
     ["marts", "marts — the read interface, judged on the freshness of what it reads"],
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
@@ -805,7 +805,13 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         ["WAL shipped", b.last_archived_at ? ago(ageOf(b.last_archived_at)) + " ago" : "never",
           "archiving can be healthy while no base backup exists — that is a real state, not a contradiction", true],
         ["last attempt", b.last_attempt_at ? ago(ageOf(b.last_attempt_at)) + " ago" : "never",
-          (b.last_attempt_ok ? "succeeded" : "FAILED") + (b.last_attempt_type ? " (" + b.last_attempt_type + ")" : ""), true]
+          (b.last_attempt_ok ? "succeeded" : "FAILED") + (b.last_attempt_type ? " (" + b.last_attempt_type + ")" : ""), true],
+        // A backup nobody has restored is a hypothesis. The drill is recorded
+        // by hand after a restore into a throwaway cluster has been counted;
+        // "never" and a stale drill both read attention.
+        ["restore verified", b.last_restore_verified_at ? ago(ageOf(b.last_restore_verified_at)) + " ago" : "NEVER",
+          b.last_restore_label ? "restored " + b.last_restore_label + " (" + rows(b.last_restore_rows) + " timeline rows)" + (b.last_restore_note ? " — " + b.last_restore_note : "")
+            : "record one with personal_data_warehouse.pgbackrest_restore_drill after a restore drill", b.restore_status !== "ok"]
       ], b.last_error || b.repo_message || "");
   }
 

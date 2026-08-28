@@ -1270,6 +1270,14 @@ func undefinedFunctionHint(message string) string {
 		name = name[idx+1:]
 	}
 	if remap, ok := functionRemaps[name]; ok {
+		if name == "search_hybrid" {
+			// Hybrid search needs query embeddings the caller cannot produce
+			// by hand, so printing the seven-argument signature sends an
+			// agent to invent an embedding literal. There is one hybrid
+			// search: the search tool (pdw search on the CLI). Measured
+			// 2026-08-28: six sessions in 14 days tried this from SQL.
+			return "(hint: hybrid search is the `search` tool (`pdw search '<terms>'` on the CLI, \"priorities\": [...] / --priority to scope by tier) — it embeds the query for you and fuses the semantic, keyword and literal legs. From SQL, timeline.search_text('needle', 50, priorities => ARRAY['self','direct']) is the ranked keyword path.)"
+		}
 		signature, hasSignature := searchFunctionSignatures[name]
 		if hasSignature && (strings.HasPrefix(qualified, "timeline.") || strings.Contains(message, "=>")) {
 			// The caller already qualified the function (or used a named

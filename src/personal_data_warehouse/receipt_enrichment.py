@@ -1,10 +1,20 @@
 """Transaction-first receipt research.
 
-The ledger is the worklist. For each posted transaction in the most recent
-30 days, one PDW-enabled agent searches source emails, attachments, and photos,
-reads the best evidence, and returns the receipt facts and match decision
-together. There is no archive-wide receipt scan, no artifact triage, and no
-separate extraction or linking pass.
+The ledger is the worklist. For each posted transaction that ARRIVED in the
+ledger within the last 30 days -- posted recently, or landed recently from a
+statement -- one PDW-enabled agent searches source emails, attachments, and
+photos, reads the best evidence, and returns the receipt facts and match
+decision together. There is no archive-wide receipt scan, no artifact triage,
+and no separate extraction or linking pass.
+
+The window is on arrival, not on the posted date alone, because the ledger
+learns about a card transaction twice: from Plaid within a day, and again
+weeks later when the statement is uploaded and extracted. Audit 2026-08-28:
+506 of 976 posted transactions in 90 days had never been attempted, and every
+one of them had ``created_at - posted_at > 30 days`` -- they were already
+outside the posted-date window on the day they were inserted. A posted-date
+floor (``DEFAULT_MAX_TRANSACTION_AGE_DAYS``) still bounds it: a 2018
+statement uploaded today does not queue its transactions for research.
 
 One durable row per transaction records both positive and negative findings.
 Only high-confidence matches backed by a real source identifier publish receipt
@@ -62,10 +72,27 @@ NON_RETAIL_ACCOUNT_KINDS = frozenset(
 ABSENT_MONEY = "0"
 ABSENT_DATE = "1970-01-01"
 
+#: How recently a transaction must have arrived (posted or been inserted) to
+#: be due. A hard cap; configuration can only shrink it.
 DEFAULT_LOOKBACK_DAYS = 30
+#: The oldest posted date the pass will research at all, however recently the
+#: row arrived. Not configurable: it is what keeps a bulk statement backfill
+#: from becoming an archive scan at one agent call per transaction.
+DEFAULT_MAX_TRANSACTION_AGE_DAYS = 90
 DEFAULT_RETRY_AFTER_DAYS = 7
 DEFAULT_MAX_ATTEMPTS = 2
-DEFAULT_TRANSACTION_LIMIT = 10
+#: Agent calls per hourly run. 20 drains a ~500-transaction statement backlog
+#: in about a day and idles at a handful of Plaid arrivals a day afterwards;
+#: it was 10, which was already more than the hourly arrival rate and so was
+#: never the reason the backlog existed (the window was).
+DEFAULT_TRANSACTION_LIMIT = 20
+
+#: The ``task_type`` every receipt agent run is recorded under in
+#: ops.ai_processing_agent_runs. The receipt pipeline's heartbeat in
+#: pipeline_health.py scopes to this value; a failed run leaves no receipt
+#: row (so the transaction is retried), which is why the agent-runs table is
+#: the only record a dead pass leaves behind.
+RECEIPT_AGENT_TASK_TYPE = "receipt_transaction_match"
 
 
 def sync_version_for(moment: datetime) -> int:
@@ -340,7 +367,8 @@ FROM @finance_transactions AS t
 JOIN @finance_accounts AS a ON a.account_id = t.account_id
 LEFT JOIN @receipt_transaction_receipts AS r
     ON r.transaction_id = t.transaction_id
-WHERE t.posted_at >= %(since)s
+WHERE (t.posted_at >= %(since)s OR t.created_at >= %(since)s)
+  AND t.posted_at >= %(posted_floor)s
   AND t.pending = 0
   AND (
         r.transaction_id IS NULL
@@ -639,9 +667,10 @@ class ReceiptEnrichmentRunner:
         self._log = logger
         self._provider = provider
         self._model = model
-        # This pipeline is intentionally hard-capped at 30 days. A caller may
-        # choose a smaller diagnostic window, but configuration cannot turn it
-        # into an archive scan.
+        # The arrival window is intentionally hard-capped at 30 days, and the
+        # posted-date floor at DEFAULT_MAX_TRANSACTION_AGE_DAYS is not a
+        # parameter at all. A caller may choose a smaller diagnostic window,
+        # but configuration cannot turn this into an archive scan.
         self._lookback_days = min(max(1, lookback_days), DEFAULT_LOOKBACK_DAYS)
         self._retry_after_days = retry_after_days
         self._max_attempts = max_attempts
@@ -657,6 +686,7 @@ class ReceiptEnrichmentRunner:
             TRANSACTION_CANDIDATES_SQL,
             {
                 "since": now - timedelta(days=self._lookback_days),
+                "posted_floor": now - timedelta(days=DEFAULT_MAX_TRANSACTION_AGE_DAYS),
                 "retry_before": now - timedelta(days=self._retry_after_days),
                 "max_attempts": self._max_attempts,
                 "prompt_version": PROMPT_VERSION,
@@ -734,7 +764,7 @@ class ReceiptEnrichmentRunner:
             request = AgentRunRequest(
                 prompt=transaction_prompt(transaction),
                 schema=transaction_schema(),
-                task_type="receipt_transaction_match",
+                task_type=RECEIPT_AGENT_TASK_TYPE,
                 subject_id=transaction_id,
                 prompt_version=PROMPT_VERSION,
             )

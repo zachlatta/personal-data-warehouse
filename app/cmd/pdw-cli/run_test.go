@@ -415,6 +415,11 @@ func TestSchemaCommandRunsSchemaOverview(t *testing.T) {
 	if !strings.Contains(out, "default.gmail.messages") || !strings.Contains(out, "subject") {
 		t.Fatalf("schema CSV not printed:\n%s", out)
 	}
+	// Schema is step 2; the search-first nudge lands on stderr, where the
+	// sessions that open with `pdw schema` will read it, and never on stdout.
+	if !strings.Contains(errOut, "pdw search") || strings.Contains(out, "pdw search") {
+		t.Fatalf("search-first nudge missing from stderr or leaked to stdout:\nstdout=%s\nstderr=%s", out, errOut)
+	}
 }
 
 func TestSchemaCommandRejectsArguments(t *testing.T) {
