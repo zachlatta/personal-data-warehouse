@@ -2097,3 +2097,29 @@ def test_search_benchmark_saturation_columns_are_added_to_an_existing_table(ware
     # A row written before the columns existed reads unmeasured, not idle.
     warehouse._command("UPDATE @search_benchmark_runs SET load_1m = DEFAULT")
     assert warehouse._query_dicts("SELECT saturation FROM @marts_search_benchmark")[0]["saturation"] == "unmeasured"
+
+
+def test_ensure_widens_agent_usage_provisioned_before_admin_calls(warehouse):
+    """Same migration contract as pipeline_health, for the C3 snapshot.
+
+    `admin_calls` was added on 2026-08-28. A fresh database gets it from the
+    TableSpec and every test passes; a long-lived warehouse keeps the old shape,
+    and then both the collector's insert and marts_ops.agent_usage -- which
+    names the column -- fail on every daily run.
+    """
+    warehouse.ensure_pipeline_health_tables()
+    rel = relation("agent_usage").with_namespace(warehouse.schema_namespace)
+    warehouse._command(f'ALTER TABLE "{rel.schema}"."{rel.name}" DROP COLUMN IF EXISTS admin_calls CASCADE')
+
+    warehouse.ensure_pipeline_health_tables()
+
+    present = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+            (rel.schema, rel.name),
+        )
+    }
+    assert "admin_calls" in present
+    marts = relation("marts_agent_usage").with_namespace(warehouse.schema_namespace)
+    warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')

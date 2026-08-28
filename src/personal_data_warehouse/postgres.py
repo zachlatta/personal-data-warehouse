@@ -4387,6 +4387,17 @@ class PostgresWarehouse:
                 f"ALTER TABLE @search_benchmark_runs ADD COLUMN IF NOT EXISTS "
                 f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
             )
+        for column, ddl_type, default in (
+            # Admin calls (pdw ingest/version/login and the credential
+            # publishers), added 2026-08-28. They are excluded from the
+            # search-first denominator, and counted here so the exclusion is a
+            # number rather than a silent filter.
+            ("admin_calls", "bigint", "0"),
+        ):
+            self._command(
+                f"ALTER TABLE @agent_usage ADD COLUMN IF NOT EXISTS "
+                f"{_identifier(column)} {ddl_type} NOT NULL DEFAULT {default}"
+            )
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
