@@ -35,6 +35,11 @@ from personal_data_warehouse.gmail_mutations import (
     GmailMutationExecutor,
     GmailMutationResult,
 )
+from personal_data_warehouse.slack_mutations import (
+    SLACK_MARK_CONVERSATION_READ_OPERATION,
+    SLACK_PROVIDER,
+    SlackMutationExecutor,
+)
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -54,6 +59,7 @@ GMAIL_THREAD_LABEL_OPERATIONS = {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERAT
 RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_ARCHIVE_OPERATION),
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
+    (SLACK_PROVIDER, SLACK_MARK_CONVERSATION_READ_OPERATION),
 )
 
 # Providers whose upstream has no server API, so the only write path is an app running on
@@ -121,6 +127,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 gmail_executor=GmailMutationExecutor(settings=settings),
                 contact_executor=GoogleContactMutationExecutor(settings=settings),
                 calendar_executor=CalendarMutationExecutor(settings=settings),
+                slack_executor=SlackMutationExecutor(warehouse=warehouse),
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
@@ -276,6 +283,7 @@ def process_upstream_mutation_batch(
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
+    slack_executor: SlackMutationExecutor | None = None,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -320,6 +328,8 @@ def process_upstream_mutation_batch(
             result = calendar_executor.execute(mutation)
         elif provider == "gmail":
             result = gmail_executor.execute(mutation)
+        elif provider == SLACK_PROVIDER and slack_executor is not None:
+            result = slack_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker
             # version. Leave them claimable for a worker that understands them.
@@ -361,6 +371,7 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) ->
     observed += warehouse.observe_succeeded_gmail_email_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_contact_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_calendar_event_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_slack_mark_conversation_read_mutations(ensure_tables=False)
     return UpstreamMutationObservationSummary(observed=observed)
 
 

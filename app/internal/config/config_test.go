@@ -309,6 +309,9 @@ func TestLoadFromEnvParsesSlackAccounts(t *testing.T) {
 	if strings.Join(cfg.SlackTokens(), ",") != "xoxp-hackclub,xoxp-personal" {
 		t.Fatalf("SlackTokens = %#v", cfg.SlackTokens())
 	}
+	if strings.Join(cfg.SlackMutationAccounts, ",") != "hackclub,my-personal,tokenless" {
+		t.Fatalf("SlackMutationAccounts = %#v", cfg.SlackMutationAccounts)
+	}
 }
 
 func TestLoadFromEnvNoSlackAccounts(t *testing.T) {
@@ -320,7 +323,7 @@ func TestLoadFromEnvNoSlackAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFromEnv returned error: %v", err)
 	}
-	if len(cfg.SlackAccounts) != 0 || len(cfg.SlackTokens()) != 0 {
+	if len(cfg.SlackAccounts) != 0 || len(cfg.SlackTokens()) != 0 || len(cfg.SlackMutationAccounts) != 0 {
 		t.Fatalf("expected no slack accounts, got %#v", cfg.SlackAccounts)
 	}
 }

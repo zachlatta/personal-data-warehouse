@@ -157,6 +157,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
 	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
 	s.enrichContactPreviews(ctx, normalized)
+	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
@@ -1540,6 +1541,28 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					"context": input.Context,
 				},
 			})
+		case SlackMarkConversationReadOperation:
+			conversationID := strings.TrimSpace(mutation.ConversationID)
+			messageTS := strings.TrimSpace(mutation.MessageTS)
+			out = append(out, storedMutation{
+				Provider:  SlackProvider,
+				Operation: SlackMarkConversationReadOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, "Mark Slack conversation read"),
+				Reason:    reason,
+				Payload: map[string]any{
+					"conversation_id": conversationID,
+					"message_ts":      messageTS,
+				},
+				Preview: map[string]any{
+					"slack_read": map[string]any{
+						"conversation_id": conversationID,
+						"message_ts":      messageTS,
+						"effect":          "Moves the entire conversation read cursor through this message.",
+					},
+					"context": input.Context,
+				},
+			})
 		default:
 			return nil, fmt.Errorf("mutation %d has unsupported type %q", index, mutation.Type)
 		}
@@ -2331,4 +2354,274 @@ func (s *PostgresStore) enrichContactPreviews(ctx context.Context, mutations []s
 		return
 	}
 	applyContactCardRows(mutations, cards)
+}
+
+// enrichSlackMarkReadPreviews turns an opaque conversation id + timestamp into
+// a reviewable transcript with an explicit read boundary. It is deliberately
+// non-fatal like the contact enrichment: the executor independently requires
+// the exact source row and validates the live xoxc identity before writing.
+func (s *PostgresStore) enrichSlackMarkReadPreviews(ctx context.Context, mutations []storedMutation) {
+	if s == nil || s.db == nil {
+		return
+	}
+	targets := slackMarkReadPreviewTargets(mutations)
+	if len(targets) == 0 {
+		return
+	}
+	details := make([]slackMarkReadPreviewDetail, 0, len(targets))
+	contextRows := []slackMarkReadPreviewRow{}
+	for _, target := range targets {
+		detail, ok := s.loadSlackMarkReadPreviewDetail(ctx, target)
+		if !ok {
+			continue
+		}
+		rows, err := s.loadSlackMarkReadPreviewRows(ctx, detail)
+		if err != nil {
+			continue
+		}
+		details = append(details, detail)
+		contextRows = append(contextRows, rows...)
+	}
+	applySlackMarkReadPreviewRows(mutations, details, contextRows)
+}
+
+func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
+	ctx context.Context,
+	target slackMarkReadPreviewKey,
+) (slackMarkReadPreviewDetail, bool) {
+	rows, err := queryContext(ctx, s.db, `
+		SELECT
+			message.account,
+			message.team_id,
+			message.conversation_id,
+			message.message_ts,
+			conversation.conversation_type,
+			COALESCE(
+				NULLIF(conversation.name, ''),
+				NULLIF(peer.display_name, ''),
+				NULLIF(peer.real_name, ''),
+				NULLIF(peer.name, ''),
+				''
+			) AS conversation_name,
+			COALESCE(conversation.raw_json, '{}'),
+			COALESCE(message.thread_ts, ''),
+			COALESCE(message.parent_message_ts, ''),
+			message.is_thread_parent,
+			message.is_thread_reply,
+			message.reply_count,
+			COALESCE(identity.user_id, '')
+		FROM @slack_messages AS message
+		JOIN @slack_conversations AS conversation
+		  ON conversation.account = message.account
+		 AND conversation.team_id = message.team_id
+		 AND conversation.conversation_id = message.conversation_id
+		LEFT JOIN @slack_account_identities AS identity
+		  ON identity.account = message.account
+		 AND identity.team_id = message.team_id
+		LEFT JOIN @slack_users AS peer
+		  ON peer.account = conversation.account
+		 AND peer.team_id = conversation.team_id
+		 AND peer.user_id = COALESCE(conversation.raw_json::jsonb->>'user', '')
+		WHERE message.account = $1
+		  AND message.conversation_id = $2
+		  AND message.message_ts = $3
+		  AND message.is_deleted = 0
+		ORDER BY message.team_id ASC
+		LIMIT 1
+	`, target.Account, target.ConversationID, target.MessageTS)
+	if err != nil {
+		return slackMarkReadPreviewDetail{}, false
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return slackMarkReadPreviewDetail{}, false
+	}
+	var detail slackMarkReadPreviewDetail
+	var rawJSON, parentMessageTS string
+	var isThreadParent, isThreadReply, replyCount int64
+	if err := rows.Scan(
+		&detail.Account,
+		&detail.TeamID,
+		&detail.ConversationID,
+		&detail.MessageTS,
+		&detail.ConversationType,
+		&detail.ConversationName,
+		&rawJSON,
+		&detail.ThreadTS,
+		&parentMessageTS,
+		&isThreadParent,
+		&isThreadReply,
+		&replyCount,
+		&detail.SelfUserID,
+	); err != nil {
+		return slackMarkReadPreviewDetail{}, false
+	}
+	state := decodeJSONMap([]byte(rawJSON))
+	detail.CurrentLastRead = strings.TrimSpace(stringFromAny(state["last_read"]))
+	detail.CurrentUnreadCount = intFromPreviewAny(state["unread_count_display"])
+	if detail.CurrentUnreadCount == 0 {
+		detail.CurrentUnreadCount = intFromPreviewAny(state["unread_count"])
+	}
+	threaded := isThreadParent != 0 || isThreadReply != 0 || replyCount > 0 || strings.TrimSpace(parentMessageTS) != ""
+	if threaded {
+		detail.ContextKind = "thread"
+		if strings.TrimSpace(detail.ThreadTS) == "" {
+			detail.ThreadTS = detail.MessageTS
+		}
+	} else {
+		detail.ContextKind = "conversation"
+		detail.ThreadTS = ""
+	}
+	return detail, true
+}
+
+func (s *PostgresStore) loadSlackMarkReadPreviewRows(
+	ctx context.Context,
+	detail slackMarkReadPreviewDetail,
+) ([]slackMarkReadPreviewRow, error) {
+	if detail.ContextKind == "thread" {
+		return s.querySlackMarkReadPreviewRows(ctx, `
+			WITH selected AS (
+			SELECT
+				message.account,
+				message.conversation_id,
+				message.message_ts,
+				message.message_datetime,
+				message.user_id,
+				COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown') AS actor_name,
+				substring(COALESCE(message.text, '') from 1 for 4000) AS text,
+				message.message_datetime AS sort_at,
+				message.message_ts AS sort_ts
+			FROM @slack_messages AS message
+			LEFT JOIN @slack_users AS actor
+			  ON actor.account = message.account
+			 AND actor.team_id = message.team_id
+			 AND actor.user_id = message.user_id
+			WHERE message.account = $1
+			  AND message.team_id = $2
+			  AND message.conversation_id = $3
+			  AND (message.message_ts = $4 OR message.thread_ts = $4 OR message.parent_message_ts = $4)
+			  AND message.is_deleted = 0
+			ORDER BY
+				CASE WHEN message.message_ts = $4 THEN 0 ELSE 1 END,
+				abs(message.message_ts::numeric - $5::numeric) ASC
+			LIMIT 40
+			)
+			SELECT account, conversation_id, message_ts, message_datetime, user_id, actor_name, text
+			FROM selected
+			ORDER BY sort_at ASC, sort_ts ASC
+		`, detail, detail.ThreadTS, detail.MessageTS)
+	}
+	before, err := s.querySlackMarkReadPreviewRows(ctx, `
+		SELECT
+			message.account,
+			message.conversation_id,
+			message.message_ts,
+			message.message_datetime,
+			message.user_id,
+			COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown'),
+			substring(COALESCE(message.text, '') from 1 for 4000)
+		FROM @slack_messages AS message
+		LEFT JOIN @slack_users AS actor
+		  ON actor.account = message.account
+		 AND actor.team_id = message.team_id
+		 AND actor.user_id = message.user_id
+		WHERE message.account = $1
+		  AND message.team_id = $2
+		  AND message.conversation_id = $3
+		  AND (message.message_datetime, message.message_ts) <= (
+			SELECT target.message_datetime, target.message_ts
+			FROM @slack_messages AS target
+			WHERE target.account = $1 AND target.team_id = $2
+			  AND target.conversation_id = $3 AND target.message_ts = $4
+			LIMIT 1
+		  )
+		  AND message.is_deleted = 0
+		ORDER BY message.message_datetime DESC, message.message_ts DESC
+		LIMIT 6
+	`, detail, detail.MessageTS)
+	if err != nil {
+		return nil, err
+	}
+	after, err := s.querySlackMarkReadPreviewRows(ctx, `
+		SELECT
+			message.account,
+			message.conversation_id,
+			message.message_ts,
+			message.message_datetime,
+			message.user_id,
+			COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown'),
+			substring(COALESCE(message.text, '') from 1 for 4000)
+		FROM @slack_messages AS message
+		LEFT JOIN @slack_users AS actor
+		  ON actor.account = message.account
+		 AND actor.team_id = message.team_id
+		 AND actor.user_id = message.user_id
+		WHERE message.account = $1
+		  AND message.team_id = $2
+		  AND message.conversation_id = $3
+		  AND (message.message_datetime, message.message_ts) > (
+			SELECT target.message_datetime, target.message_ts
+			FROM @slack_messages AS target
+			WHERE target.account = $1 AND target.team_id = $2
+			  AND target.conversation_id = $3 AND target.message_ts = $4
+			LIMIT 1
+		  )
+		  AND message.is_deleted = 0
+		ORDER BY message.message_datetime ASC, message.message_ts ASC
+		LIMIT 5
+	`, detail, detail.MessageTS)
+	if err != nil {
+		return nil, err
+	}
+	return append(before, after...), nil
+}
+
+func (s *PostgresStore) querySlackMarkReadPreviewRows(
+	ctx context.Context,
+	query string,
+	detail slackMarkReadPreviewDetail,
+	boundaryTS string,
+	extra ...string,
+) ([]slackMarkReadPreviewRow, error) {
+	args := []any{detail.Account, detail.TeamID, detail.ConversationID, boundaryTS}
+	for _, value := range extra {
+		args = append(args, value)
+	}
+	rows, err := queryContext(
+		ctx,
+		s.db,
+		query,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []slackMarkReadPreviewRow{}
+	for rows.Next() {
+		var row slackMarkReadPreviewRow
+		if err := rows.Scan(
+			&row.Account,
+			&row.ConversationID,
+			&row.MessageTS,
+			&row.SentAt,
+			&row.UserID,
+			&row.ActorName,
+			&row.Text,
+		); err != nil {
+			return nil, err
+		}
+		row.IsTarget = row.MessageTS == detail.MessageTS
+		row.TargetMessageTS = detail.MessageTS
+		row.IsFromMe = detail.SelfUserID != "" && row.UserID == detail.SelfUserID
+		if row.IsFromMe {
+			row.ActorName = "You"
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

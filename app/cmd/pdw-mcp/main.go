@@ -52,6 +52,7 @@ func main() {
 		ContactGoogleAccounts: cfg.ContactGoogleAccounts,
 		CalendarAccounts:      cfg.CalendarAccounts,
 		AppleNotesAccounts:    cfg.AppleNotesAccounts,
+		SlackAccounts:         cfg.SlackMutationAccounts,
 	})
 	logger.Info("mutation review enabled", "path", mutations.ReviewPath, "api", mutations.APIPath)
 	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)

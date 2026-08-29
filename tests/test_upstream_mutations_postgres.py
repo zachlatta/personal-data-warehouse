@@ -13,7 +13,13 @@ from dotenv import load_dotenv
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
-from personal_data_warehouse.schema import CALENDAR_EVENT_COLUMNS, CONTACT_CARD_COLUMNS, MESSAGE_COLUMNS
+from personal_data_warehouse.schema import (
+    CALENDAR_EVENT_COLUMNS,
+    CONTACT_CARD_COLUMNS,
+    MESSAGE_COLUMNS,
+    SLACK_CONVERSATION_COLUMNS,
+    SLACK_MESSAGE_COLUMNS,
+)
 from personal_data_warehouse.warehouse_catalog import CATALOG
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
@@ -25,6 +31,8 @@ from personal_data_warehouse.postgres import (
     GMAIL_UNARCHIVE_OPERATION,
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
     INTEGER_COLUMNS,
+    SLACK_MARK_CONVERSATION_READ_OPERATION,
+    SLACK_PROVIDER,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _jsonb_param,
@@ -822,6 +830,107 @@ def test_calendar_event_mutation_claim_and_observe(warehouse: PostgresWarehouse)
     )
     assert warehouse.observe_succeeded_calendar_event_mutations() == 1
     assert _request_status(warehouse, request["id"]) == "observed"
+
+
+def test_slack_mark_read_target_and_observation_are_pinned_to_exact_message(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    conversation_id = "D1"
+    target_ts = "1593473566.000200"
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id=conversation_id, last_read="1593473500.000100")]
+    )
+    warehouse.insert_slack_messages(
+        [_slack_message_row(conversation_id=conversation_id, message_ts=target_ts)]
+    )
+
+    target = warehouse.load_slack_mark_read_target(
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        message_ts=target_ts,
+    )
+    assert target["team_id"] == "T1"
+    assert target["conversation_id"] == conversation_id
+    assert target["message_ts"] == target_ts
+    assert warehouse.load_slack_mark_read_target(
+        account="zrl", team_id="T1", conversation_id=conversation_id, message_ts="1593473566.000201"
+    ) == {}
+
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_slack_read",
+        title="Mark Slack DM read",
+        account="zrl",
+        mutations=[
+            {
+                "provider": SLACK_PROVIDER,
+                "operation": SLACK_MARK_CONVERSATION_READ_OPERATION,
+                "payload": {"conversation_id": conversation_id, "message_ts": target_ts},
+            }
+        ],
+    )
+    child = request["mutations"][0]
+    warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
+    warehouse.complete_upstream_mutation(
+        child["id"],
+        result_json={"conversation_id": conversation_id, "message_ts": target_ts, "team_id": "T1"},
+        actor_id="worker",
+    )
+    assert warehouse.observe_succeeded_slack_mark_conversation_read_mutations() == 0
+
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id=conversation_id, last_read=target_ts, sync_version=2)]
+    )
+    assert warehouse.observe_succeeded_slack_mark_conversation_read_mutations() == 1
+    assert _request_status(warehouse, request["id"]) == "observed"
+
+
+def _slack_conversation_row(
+    *, conversation_id: str, last_read: str, sync_version: int = 1
+) -> dict[str, Any]:
+    now = datetime(2026, 5, 22, 12, tzinfo=UTC)
+    return _default_row(
+        SLACK_CONVERSATION_COLUMNS,
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        conversation_type="im",
+        name="Direct message",
+        is_im=1,
+        is_member=1,
+        raw_json=json.dumps(
+            {
+                "id": conversation_id,
+                "last_read": last_read,
+                "unread_count": 0,
+                "unread_count_display": 0,
+                "is_open": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        synced_at=now,
+        sync_version=sync_version,
+    )
+
+
+def _slack_message_row(*, conversation_id: str, message_ts: str) -> dict[str, Any]:
+    now = datetime(2026, 5, 22, 12, tzinfo=UTC)
+    return _default_row(
+        SLACK_MESSAGE_COLUMNS,
+        account="zrl",
+        team_id="T1",
+        conversation_id=conversation_id,
+        message_ts=message_ts,
+        message_datetime=now,
+        thread_ts=message_ts,
+        text="please review",
+        raw_json="{}",
+        synced_at=now,
+        sync_version=1,
+    )
 
 
 def _message_row(

@@ -79,6 +79,9 @@ type Config struct {
 	// from the same SLACK_ACCOUNTS / SLACK_<SLUG>_TOKEN env vars as the Python
 	// sync; accounts without a token are skipped.
 	SlackAccounts []SlackAccount
+	// SlackMutationAccounts names every configured Slack account, including
+	// accounts that use only a private xoxc + d-cookie session for mutations.
+	SlackMutationAccounts []string
 
 	// Search embeddings (optional). The search tool's hybrid mode embeds the
 	// query through an OpenAI-compatible /embeddings endpoint; when neither the
@@ -250,7 +253,8 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
-	for _, name := range parseCSV(getenv("SLACK_ACCOUNTS")) {
+	cfg.SlackMutationAccounts = parseCSV(getenv("SLACK_ACCOUNTS"))
+	for _, name := range cfg.SlackMutationAccounts {
 		if token := strings.TrimSpace(getenv("SLACK_" + envSlug(name) + "_TOKEN")); token != "" {
 			cfg.SlackAccounts = append(cfg.SlackAccounts, SlackAccount{Name: name, Token: token})
 		}

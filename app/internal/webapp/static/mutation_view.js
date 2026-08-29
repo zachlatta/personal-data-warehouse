@@ -73,6 +73,7 @@ export function requestMutationCount(request) {
 export const GMAIL_ARCHIVE = "gmail.archive_threads";
 export const GMAIL_UNARCHIVE = "gmail.unarchive_threads";
 export const GMAIL_SEND_EMAIL = "gmail.send_email";
+export const SLACK_MARK_CONVERSATION_READ = "slack.mark_conversation_read";
 const CALENDAR_OPS = ["calendar.create_event", "calendar.update_event", "calendar.delete_event"];
 const APPLE_NOTES_OPS = ["apple_notes.create_note", "apple_notes.update_note"];
 
@@ -85,6 +86,9 @@ export function isContactMutation(m) {
 }
 export function isCalendarMutation(m) { return m.provider === "google_calendar" || CALENDAR_OPS.includes(m.operation); }
 export function isAppleNotesMutation(m) { return m.provider === "apple_notes" || APPLE_NOTES_OPS.includes(m.operation); }
+export function isSlackMarkReadMutation(m) {
+  return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
+}
 
 // groupMutations mirrors renderMutationList: gmail archive/unarchive mutations
 // group by operation+account, contact mutations by account, everything else
@@ -916,5 +920,48 @@ export function appleNotesView(mutation) {
     heading: str(note.action) === "create" ? "Create Apple Note" : "Update Apple Note",
     name: str(note.name), folder: str(note.folder), noteId: str(note.note_id),
     changes: stringSlice(note.changes), bodyPreview: str(note.body_preview),
+  };
+}
+
+// --- slack -------------------------------------------------------------------
+
+export function slackMarkReadView(mutation) {
+  const payload = asMap(mutation.payload);
+  const preview = asMap(asMap(mutation.preview).slack_read);
+  const conversationType = trimStr(preview.conversation_type);
+  let conversationLabel = trimStr(preview.conversation_name) || trimStr(preview.conversation_id) || trimStr(payload.conversation_id);
+  if ((conversationType === "public_channel" || conversationType === "private_channel") && conversationLabel && !conversationLabel.startsWith("#")) {
+    conversationLabel = "#" + conversationLabel;
+  }
+  const messages = mapSlice(preview.messages).map((message) => {
+    const position = trimStr(message.position) || (message.is_target === true ? "target" : "before");
+    return {
+      messageTs: trimStr(message.message_ts),
+      sentAt: trimStr(message.sent_at),
+      userId: trimStr(message.user_id),
+      actorName: trimStr(message.actor_name) || "Unknown",
+      text: str(message.text),
+      isTarget: message.is_target === true,
+      isFromMe: message.is_from_me === true,
+      position,
+      isAfterBoundary: position === "after",
+    };
+  });
+  const targetMessage = messages.find((message) => message.isTarget || message.position === "target") || null;
+  const contextKind = trimStr(preview.context_kind) || "conversation";
+  return {
+    heading: "Mark Slack conversation read",
+    conversationId: trimStr(preview.conversation_id) || trimStr(payload.conversation_id),
+    messageTs: trimStr(preview.message_ts) || trimStr(payload.message_ts),
+    effect: trimStr(preview.effect) || "Moves the entire conversation read cursor through this message.",
+    conversationType,
+    conversationLabel,
+    currentUnreadCount: intFromAny(preview.current_unread_count),
+    currentLastRead: trimStr(preview.current_last_read),
+    contextKind,
+    contextLabel: contextKind === "thread" ? "Thread context" : "Conversation context",
+    threadTs: trimStr(preview.thread_ts),
+    messages,
+    targetMessage,
   };
 }

@@ -9,18 +9,20 @@ import (
 const (
 	ReviewPath = "/mutation-review"
 
-	GmailArchiveOperation          = "gmail.archive_threads"
-	GmailUnarchiveOperation        = "gmail.unarchive_threads"
-	GmailSendEmailOperation        = "gmail.send_email"
-	GooglePeopleContactsOperation  = "google_people.contacts"
-	ContactsBatchMutationOperation = "contacts.batch_mutation"
-	CalendarProvider               = "google_calendar"
-	CalendarCreateEventOperation   = "calendar.create_event"
-	CalendarUpdateEventOperation   = "calendar.update_event"
-	CalendarDeleteEventOperation   = "calendar.delete_event"
-	AppleNotesProvider             = "apple_notes"
-	AppleNotesCreateNoteOperation  = "apple_notes.create_note"
-	AppleNotesUpdateNoteOperation  = "apple_notes.update_note"
+	GmailArchiveOperation              = "gmail.archive_threads"
+	GmailUnarchiveOperation            = "gmail.unarchive_threads"
+	GmailSendEmailOperation            = "gmail.send_email"
+	GooglePeopleContactsOperation      = "google_people.contacts"
+	ContactsBatchMutationOperation     = "contacts.batch_mutation"
+	CalendarProvider                   = "google_calendar"
+	CalendarCreateEventOperation       = "calendar.create_event"
+	CalendarUpdateEventOperation       = "calendar.update_event"
+	CalendarDeleteEventOperation       = "calendar.delete_event"
+	AppleNotesProvider                 = "apple_notes"
+	AppleNotesCreateNoteOperation      = "apple_notes.create_note"
+	AppleNotesUpdateNoteOperation      = "apple_notes.update_note"
+	SlackProvider                      = "slack"
+	SlackMarkConversationReadOperation = "slack.mark_conversation_read"
 
 	defaultRequestedBy = "mcp"
 	// reviewerActorID is the actor recorded when a reviewer surface passes
@@ -36,6 +38,7 @@ type Config struct {
 	ContactGoogleAccounts []string
 	CalendarAccounts      []string
 	AppleNotesAccounts    []string
+	SlackAccounts         []string
 	Now                   func() time.Time
 	// RequestCreated is called after a request lands in pending_review — the
 	// hook the push notifier hangs off. It must not block: the proposal has
@@ -74,26 +77,28 @@ type UpdateGmailEmailMutationInput struct {
 }
 
 type MutationInput struct {
-	Type          string
-	Account       string
-	Title         string
-	Reason        string
-	ThreadIDs     []string
-	DeliveryMode  string
-	Message       map[string]any
-	EmailVariants []GmailEmailVariantInput
-	Operations    []map[string]any
-	CalendarID    string
-	EventID       string
-	ExpectedEtag  string
-	SendUpdates   string
-	Event         map[string]any
-	Patch         map[string]any
-	Folder        string
-	NoteID        string
-	Name          string
-	Body          string
-	AppendBody    string
+	Type           string
+	Account        string
+	Title          string
+	Reason         string
+	ThreadIDs      []string
+	DeliveryMode   string
+	Message        map[string]any
+	EmailVariants  []GmailEmailVariantInput
+	Operations     []map[string]any
+	CalendarID     string
+	EventID        string
+	ExpectedEtag   string
+	SendUpdates    string
+	Event          map[string]any
+	Patch          map[string]any
+	Folder         string
+	NoteID         string
+	Name           string
+	Body           string
+	AppendBody     string
+	ConversationID string
+	MessageTS      string
 }
 
 type GmailEmailVariantInput struct {

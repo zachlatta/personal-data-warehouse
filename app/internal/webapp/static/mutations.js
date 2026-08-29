@@ -590,6 +590,70 @@ function renderAppleNotes(mutation) {
   return article;
 }
 
+function renderSlackMarkRead(mutation) {
+  const view = V.slackMarkReadView(mutation);
+  const article = h("article", "mut slack-read");
+  const title = view.conversationLabel ? "Mark " + view.conversationLabel + " read" : view.heading;
+  article.appendChild(mutationHead("Slack · reviewed action", title, mutation.status));
+  article.appendChild(h("p", "mmeta m", mutation.operation + " for " + mutation.account));
+
+  const action = h("div", "slack-action");
+  action.appendChild(h("strong", "", "What will happen"));
+  action.appendChild(h("p", "", "Everything in this conversation up to and including the highlighted message will be marked read."));
+  action.appendChild(h("p", "slack-boundary-note", "Messages shown after the boundary stay unread."));
+  action.appendChild(dl([
+    ["Conversation", view.conversationLabel || view.conversationId],
+    ["Unread now", view.currentUnreadCount ? String(view.currentUnreadCount) : ""],
+    ["Account", mutation.account],
+  ]));
+  article.appendChild(action);
+
+  const context = h("section", "slack-context");
+  const contextHead = h("div", "slack-context-head");
+  contextHead.appendChild(h("h4", "", view.contextLabel));
+  contextHead.appendChild(h("span", "m", view.messages.length + " message" + V.plural(view.messages.length)));
+  context.appendChild(contextHead);
+  if (!view.messages.length) {
+    context.appendChild(h("p", "slack-context-missing", "Conversation context was unavailable when this proposal was created. Verify the exact IDs below before approving."));
+  } else {
+    const transcript = h("div", "slack-transcript");
+    for (const message of view.messages) {
+      const row = h("article", "slack-msg" + (message.isTarget ? " target" : "") + (message.isAfterBoundary ? " after" : ""));
+      row.appendChild(h("span", "avatar", V.senderInitial(message.actorName)));
+      const copy = h("div", "slack-msg-copy");
+      const head = h("div", "slack-msg-head");
+      head.appendChild(h("strong", "", message.isFromMe ? "You" : message.actorName));
+      if (message.sentAt) {
+        const when = h("time", "", formatWhen(message.sentAt));
+        when.title = fmtFull(message.sentAt);
+        head.appendChild(when);
+      }
+      copy.appendChild(head);
+      copy.appendChild(h("p", "slack-msg-text", message.text || "(no text)"));
+      const tags = h("div", "slack-msg-tags");
+      if (message.isTarget) tags.appendChild(h("span", "slack-read-through", "read through here"));
+      if (message.isAfterBoundary) tags.appendChild(h("span", "slack-stays-unread", "stays unread"));
+      if (tags.childNodes.length) copy.appendChild(tags);
+      row.appendChild(copy);
+      transcript.appendChild(row);
+    }
+    context.appendChild(transcript);
+  }
+  article.appendChild(context);
+
+  const technical = details("Exact Slack target", "raw");
+  technical.appendChild(dl([
+    ["Conversation ID", view.conversationId],
+    ["Message timestamp", view.messageTs],
+    ["Thread timestamp", view.threadTs],
+    ["Current read cursor", view.currentLastRead],
+  ]));
+  article.appendChild(technical);
+  if (mutation.reason) article.appendChild(h("p", "mreason", mutation.reason));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  return article;
+}
+
 function renderGeneric(mutation) {
   const article = h("article", "mut generic");
   article.appendChild(mutationHead(mutation.provider || "mutation", mutation.title || mutation.operation || "mutation", mutation.status));
@@ -605,6 +669,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
+  if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(mutation);
   return renderGeneric(mutation);
 }
 

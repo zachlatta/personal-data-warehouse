@@ -224,7 +224,9 @@ opens that request directly. The review view shows each mutation the way it will
 an editable Gmail composer (recipients, subject, rich body, proposed variants, send-vs-draft),
 the Gmail threads an archive touches, a calendar event card with its guests and the diff of an
 update, a contact change with before → after per field, an Apple Note — and lets you approve,
-deny with a reason, drop one email from a request, or edit an email before approving.
+a Slack read-cursor change that states the exact conversation/message and its whole-conversation
+effect — and lets you approve, deny with a reason, drop one email from a request, or edit an email
+before approving.
 
 A request that failed terminally can never run again, so it would otherwise sit in the review list
 forever looking unresolved. Such a request carries a **Mark superseded** control: give it the id of

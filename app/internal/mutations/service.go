@@ -5,7 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
+)
+
+var (
+	slackConversationIDPattern = regexp.MustCompile(`^[CDG][A-Z0-9]+$`)
+	slackMessageTSPattern      = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 )
 
 type Service struct {
@@ -53,6 +59,7 @@ func NewService(store Store, cfg Config) *Service {
 	cfg.ContactGoogleAccounts = normalizeAccountList(cfg.ContactGoogleAccounts)
 	cfg.CalendarAccounts = normalizeAccountList(cfg.CalendarAccounts)
 	cfg.AppleNotesAccounts = normalizeAccountList(cfg.AppleNotesAccounts)
+	cfg.SlackAccounts = normalizeAccountList(cfg.SlackAccounts)
 	return &Service{store: store, cfg: cfg}
 }
 
@@ -212,8 +219,19 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if err := validateAppleNotesMutation(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
+	case SlackMarkConversationReadOperation:
+		if err := validateConfiguredAccount(account, s.cfg.SlackAccounts, "SLACK_ACCOUNTS"); err != nil {
+			return err
+		}
+		conversationID := strings.TrimSpace(mutation.ConversationID)
+		if !slackConversationIDPattern.MatchString(conversationID) {
+			return fmt.Errorf("mutation %d conversation_id must be a Slack C, D, or G conversation ID", index)
+		}
+		if !slackMessageTSPattern.MatchString(strings.TrimSpace(mutation.MessageTS)) {
+			return fmt.Errorf("mutation %d message_ts must be an exact Slack timestamp such as 1593473566.000200", index)
+		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, or apple_notes.update_note", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, or slack.mark_conversation_read", index, mutationType)
 	}
 	return nil
 }
@@ -260,26 +278,28 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		deliveryMode = "send"
 	}
 	return MutationInput{
-		Type:          strings.TrimSpace(mutationType),
-		Account:       normalizeAccount(stringFromAny(raw["account"])),
-		Title:         strings.TrimSpace(stringFromAny(raw["title"])),
-		Reason:        strings.TrimSpace(stringFromAny(raw["reason"])),
-		ThreadIDs:     stringSliceFromAny(raw["thread_ids"]),
-		DeliveryMode:  deliveryMode,
-		Message:       mapFromAny(raw["message"]),
-		EmailVariants: emailVariantInputsFromAny(raw["variants"]),
-		Operations:    mapSliceFromAny(raw["operations"]),
-		CalendarID:    normalizeCalendarID(stringFromAny(raw["calendar_id"])),
-		EventID:       strings.TrimSpace(stringFromAny(raw["event_id"])),
-		ExpectedEtag:  strings.TrimSpace(stringFromAny(raw["expected_etag"])),
-		SendUpdates:   strings.TrimSpace(stringFromAny(raw["send_updates"])),
-		Event:         mapFromAny(raw["event"]),
-		Patch:         mapFromAny(raw["patch"]),
-		Folder:        strings.TrimSpace(stringFromAny(raw["folder"])),
-		NoteID:        strings.TrimSpace(stringFromAny(raw["note_id"])),
-		Name:          strings.TrimSpace(stringFromAny(raw["name"])),
-		Body:          stringFromAny(raw["body"]),
-		AppendBody:    stringFromAny(raw["append_body"]),
+		Type:           strings.TrimSpace(mutationType),
+		Account:        normalizeAccount(stringFromAny(raw["account"])),
+		Title:          strings.TrimSpace(stringFromAny(raw["title"])),
+		Reason:         strings.TrimSpace(stringFromAny(raw["reason"])),
+		ThreadIDs:      stringSliceFromAny(raw["thread_ids"]),
+		DeliveryMode:   deliveryMode,
+		Message:        mapFromAny(raw["message"]),
+		EmailVariants:  emailVariantInputsFromAny(raw["variants"]),
+		Operations:     mapSliceFromAny(raw["operations"]),
+		CalendarID:     normalizeCalendarID(stringFromAny(raw["calendar_id"])),
+		EventID:        strings.TrimSpace(stringFromAny(raw["event_id"])),
+		ExpectedEtag:   strings.TrimSpace(stringFromAny(raw["expected_etag"])),
+		SendUpdates:    strings.TrimSpace(stringFromAny(raw["send_updates"])),
+		Event:          mapFromAny(raw["event"]),
+		Patch:          mapFromAny(raw["patch"]),
+		Folder:         strings.TrimSpace(stringFromAny(raw["folder"])),
+		NoteID:         strings.TrimSpace(stringFromAny(raw["note_id"])),
+		Name:           strings.TrimSpace(stringFromAny(raw["name"])),
+		Body:           stringFromAny(raw["body"]),
+		AppendBody:     stringFromAny(raw["append_body"]),
+		ConversationID: strings.TrimSpace(stringFromAny(raw["conversation_id"])),
+		MessageTS:      strings.TrimSpace(stringFromAny(raw["message_ts"])),
 	}, nil
 }
 

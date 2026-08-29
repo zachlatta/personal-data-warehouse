@@ -215,7 +215,8 @@ When mutation review is enabled, the server also exposes:
 
 - `propose_mutation` — single entry point that takes `title`, `reason`, `mutations: [...]`,
   and optional `context`. Each entry in `mutations` carries a `type` (e.g. `gmail.send_email`,
-  `gmail.archive_threads`, `calendar.update_event`) plus that type's payload fields. Batching
+  `gmail.archive_threads`, `calendar.update_event`, `slack.mark_conversation_read`) plus that
+  type's payload fields. Batching
   multiple mutations into one call groups them under one review request.
 - `propose_mutation_help` — zero-argument tool that returns the catalog of supported mutation
   types with field-by-field descriptions and worked examples. Call this first to see how to
@@ -223,8 +224,9 @@ When mutation review is enabled, the server also exposes:
 
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
 They return an approval URL under `/mutation-review` (the web app, which reviews through
-`/api/mutations/*`); the actual Gmail, Calendar, or Contacts write is still performed later by the
-existing approved-mutation worker.
+`/api/mutations/*`); the actual Gmail, Calendar, Contacts, or Slack write is still performed later
+by the existing approved-mutation worker. Slack mark-read uses the private xoxc + `d`-cookie pair
+published by `pdw slack publish-session`; credentials never enter the proposal payload.
 
 SQL starting points:
 

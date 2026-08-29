@@ -8,6 +8,7 @@ import {
   contactOperationSummary, contactFieldDisplayValue, canonicalContactOp, contactUpdateFields, contactEffect,
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
   groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView,
+  isSlackMarkReadMutation, slackMarkReadView,
 } from "../mutation_view.js";
 
 // --- gmail --------------------------------------------------------------------
@@ -24,6 +25,48 @@ test("gmailSenderDisplayName prefers the display name, then recognises known sen
   assert.equal(gmailSenderDisplayName("notifications@some-service.example", ""), "Some Service");
   assert.equal(gmailSenderDisplayName("", "Subject only"), "Subject only");
   assert.equal(gmailSenderDisplayName("nonsense", ""), "nonsense");
+});
+
+test("Slack mark-read view makes its whole-conversation effect explicit", () => {
+  const mutation = {
+    provider: "slack",
+    operation: "slack.mark_conversation_read",
+    payload: { conversation_id: "D1", message_ts: "1593473566.000200" },
+    preview: {},
+  };
+  assert.equal(isSlackMarkReadMutation(mutation), true);
+  const view = slackMarkReadView(mutation);
+  assert.equal(view.heading, "Mark Slack conversation read");
+  assert.equal(view.conversationId, "D1");
+  assert.equal(view.messageTs, "1593473566.000200");
+  assert.equal(view.effect, "Moves the entire conversation read cursor through this message.");
+  assert.equal(isSlackMarkReadMutation({ provider: "slack", operation: "slack.send_message" }), false);
+});
+
+test("Slack mark-read view exposes the target and surrounding messages", () => {
+  const view = slackMarkReadView({
+    provider: "slack",
+    operation: "slack.mark_conversation_read",
+    payload: { conversation_id: "D1", message_ts: "1593473566.000200" },
+    preview: { slack_read: {
+      conversation_name: "Marcus",
+      conversation_type: "im",
+      current_unread_count: 3,
+      context_kind: "conversation",
+      messages: [
+        { message_ts: "1593473500.000100", sent_at: "2026-08-29T14:00:00Z", actor_name: "You", text: "Did you see this?", is_from_me: true, position: "before" },
+        { message_ts: "1593473566.000200", sent_at: "2026-08-29T14:01:00Z", actor_name: "Marcus", text: "Yep — all handled.", is_target: true, position: "target" },
+        { message_ts: "1593473600.000300", sent_at: "2026-08-29T14:02:00Z", actor_name: "Marcus", text: "One more thing.", position: "after" },
+      ],
+    } },
+  });
+  assert.equal(view.conversationLabel, "Marcus");
+  assert.equal(view.currentUnreadCount, 3);
+  assert.equal(view.contextLabel, "Conversation context");
+  assert.equal(view.targetMessage.actorName, "Marcus");
+  assert.equal(view.targetMessage.text, "Yep — all handled.");
+  assert.equal(view.messages[2].position, "after");
+  assert.equal(view.messages[2].isAfterBoundary, true);
 });
 
 test("splitGmailQuotedHTML splits at the Gmail quote container and leaves a quote-first body alone", () => {

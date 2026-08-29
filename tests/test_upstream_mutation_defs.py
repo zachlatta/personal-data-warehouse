@@ -14,6 +14,10 @@ from personal_data_warehouse.gmail_mutations import (
     GMAIL_UNARCHIVE_OPERATION,
     GmailMutationResult,
 )
+from personal_data_warehouse.slack_mutations import (
+    SLACK_MARK_CONVERSATION_READ_OPERATION,
+    SlackMutationResult,
+)
 
 
 class FakeWarehouse:
@@ -91,6 +95,10 @@ class FakeWarehouse:
 
     def observe_succeeded_calendar_event_mutations(self, **_kwargs) -> int:
         self.calls.append("observe_calendar")
+        return 0
+
+    def observe_succeeded_slack_mark_conversation_read_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_slack")
         return 0
 
     def succeeded_upstream_mutation_count(self, *, ensure_tables=True, exclude_providers=None) -> int:
@@ -286,6 +294,7 @@ def test_upstream_mutation_sensor_emits_run_when_stale_reclaimable_work_exists(m
     assert stale_after == timedelta(seconds=upstream_mutation_defs.DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS)
     assert ("gmail", GMAIL_ARCHIVE_OPERATION) in idempotent_operations
     assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
+    assert ("slack", SLACK_MARK_CONVERSATION_READ_OPERATION) in idempotent_operations
     assert warehouse.closed is True
 
 
@@ -400,6 +409,7 @@ def test_observation_batch_is_separate_from_execution() -> None:
         "observe_gmail_email",
         "observe_contacts",
         "observe_calendar",
+        "observe_slack",
     ]
 
 
@@ -647,4 +657,41 @@ def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_e
 
     assert calendar_executor.seen == [mutation]
     assert warehouse.completed == [("mut-calendar", {"event_id": "evt-1"}, "worker-1")]
+    assert summary.succeeded == 1
+
+
+def test_process_upstream_mutation_batch_routes_slack_mark_read_to_slack_executor() -> None:
+    mutation = {
+        "id": "mut-slack",
+        "provider": "slack",
+        "operation": SLACK_MARK_CONVERSATION_READ_OPERATION,
+    }
+    warehouse = FakeWarehouse(claimed=[mutation])
+    slack_executor = FakeExecutor(
+        [
+            SlackMutationResult(
+                status="succeeded",
+                result_json={"conversation_id": "D1", "message_ts": "1.000001", "team_id": "T1"},
+            )
+        ]
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        slack_executor=slack_executor,
+        limit=5,
+        claimed_by="worker-1",
+    )
+
+    assert slack_executor.seen == [mutation]
+    assert warehouse.completed == [
+        (
+            "mut-slack",
+            {"conversation_id": "D1", "message_ts": "1.000001", "team_id": "T1"},
+            "worker-1",
+        )
+    ]
     assert summary.succeeded == 1

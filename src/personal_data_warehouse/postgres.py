@@ -472,6 +472,8 @@ GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION = "contacts.batch_mutation"
 GMAIL_ARCHIVE_OPERATION = "gmail.archive_threads"
 GMAIL_UNARCHIVE_OPERATION = "gmail.unarchive_threads"
 GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
+SLACK_PROVIDER = "slack"
+SLACK_MARK_CONVERSATION_READ_OPERATION = "slack.mark_conversation_read"
 CALENDAR_PROVIDER = "google_calendar"
 CALENDAR_CREATE_EVENT_OPERATION = "calendar.create_event"
 CALENDAR_UPDATE_EVENT_OPERATION = "calendar.update_event"
@@ -6826,6 +6828,55 @@ class PostgresWarehouse:
             ensure_tables=False,
         )
 
+    def observe_succeeded_slack_mark_conversation_read_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        """Mark a Slack read mutation observed once synced `last_read` reaches its target."""
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider=SLACK_PROVIDER,
+            operation=SLACK_MARK_CONVERSATION_READ_OPERATION,
+            limit=limit,
+        )
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            result = _as_json_dict(mutation["result_json"])
+            team_id = str(result.get("team_id") or "").strip()
+            conversation_id = str(payload.get("conversation_id") or "").strip()
+            message_ts = str(payload.get("message_ts") or "").strip()
+            if not team_id or not conversation_id or not re.fullmatch(r"[0-9]+\.[0-9]+", message_ts):
+                continue
+            rows = self._query(
+                """
+                SELECT 1
+                FROM @slack_conversations
+                WHERE account = %s
+                  AND team_id = %s
+                  AND conversation_id = %s
+                  AND CASE
+                        WHEN COALESCE(raw_json::jsonb->>'last_read', '') ~ '^[0-9]+(\\.[0-9]+)?$'
+                        THEN (raw_json::jsonb->>'last_read')::numeric
+                        ELSE 0::numeric
+                      END >= %s::numeric
+                LIMIT 1
+                """,
+                (mutation["account"], team_id, conversation_id, message_ts),
+            )
+            if rows:
+                observations.append(
+                    (
+                        str(mutation["id"]),
+                        {"conversation_id": conversation_id, "message_ts": message_ts},
+                    )
+                )
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
     def observe_succeeded_contact_mutations(
         self, *, limit: int | None = None, ensure_tables: bool = True
     ) -> int:
@@ -8079,6 +8130,50 @@ class PostgresWarehouse:
         if not rows:
             return {}
         return dict(zip(columns, rows[0], strict=True))
+
+    def load_slack_mark_read_target(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        message_ts: str,
+    ) -> dict[str, Any]:
+        """Return the exact live Slack message/conversation a reviewed read targets.
+
+        The team id comes from the private session, not from proposal input. That
+        keeps an Enterprise Grid client session pinned to the warehouse workspace
+        even when Slack temporarily reports a sibling workspace to client APIs.
+        """
+        rows = self._query_dicts(
+            """
+            SELECT
+                conversation.account,
+                conversation.team_id,
+                conversation.conversation_id,
+                conversation.name,
+                conversation.is_member,
+                conversation.is_im,
+                conversation.is_mpim,
+                conversation.is_archived,
+                message.message_ts,
+                message.message_datetime,
+                message.text
+            FROM @slack_conversations AS conversation
+            JOIN @slack_messages AS message
+              ON message.account = conversation.account
+             AND message.team_id = conversation.team_id
+             AND message.conversation_id = conversation.conversation_id
+            WHERE conversation.account = %s
+              AND conversation.team_id = %s
+              AND conversation.conversation_id = %s
+              AND message.message_ts = %s
+              AND message.is_deleted = 0
+            LIMIT 1
+            """,
+            (account, team_id, conversation_id, message_ts),
+        )
+        return rows[0] if rows else {}
 
     def load_slack_conversation_cursors(self, *, account: str, team_id: str) -> dict[str, float]:
         """Per-conversation high-water marks, for diffing against client.counts.

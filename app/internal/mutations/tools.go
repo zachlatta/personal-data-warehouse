@@ -270,6 +270,25 @@ func MutationHelp() MutationHelpDocument {
 					"it records the pre-edit body in the result JSON so an unwanted replacement is recoverable, but that is a repair, not a guard.",
 			},
 			{
+				Type:        SlackMarkConversationReadOperation,
+				Summary:     "Mark a Slack conversation read through one exact, already-synced message.",
+				RequiresEnv: "SLACK_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + SlackMarkConversationReadOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Slack account label"},
+					{Name: "conversation_id", JSONType: "string", Required: true, Description: "Slack C, D, or G conversation ID; use container_id from marts_inbox.slack_items"},
+					{Name: "message_ts", JSONType: "string", Required: true, Description: "exact Slack message timestamp; use message_id from marts_inbox.slack_items"},
+				},
+				Example: map[string]any{
+					"type":            SlackMarkConversationReadOperation,
+					"account":         "zrl",
+					"conversation_id": "D012ABCDEF",
+					"message_ts":      "1593473566.000200",
+				},
+				ExtraNotes: "This moves the whole conversation read cursor through message_ts; it does not mark only one message or only one thread. " +
+					"The executor requires an xoxc token and d cookie published with `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
+			},
+			{
 				Type:        CalendarDeleteEventOperation,
 				Summary:     "Delete a Google Calendar event. Use an instance event_id to cancel a single occurrence of a recurring series.",
 				RequiresEnv: "CALENDAR_ACCOUNTS",

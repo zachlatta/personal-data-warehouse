@@ -332,6 +332,7 @@ func TestMutationHelpDocumentsSupportedMutationTypes(t *testing.T) {
 		CalendarCreateEventOperation,
 		CalendarUpdateEventOperation,
 		CalendarDeleteEventOperation,
+		SlackMarkConversationReadOperation,
 	} {
 		if !types[expected] {
 			t.Fatalf("help missing mutation type %s", expected)

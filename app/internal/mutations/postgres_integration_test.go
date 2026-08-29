@@ -191,3 +191,78 @@ func TestCreateRequestFillsContactPreviewFromTheSyncedCard(t *testing.T) {
 		t.Fatalf("etag_is_current = %#v", previews[0]["etag_is_current"])
 	}
 }
+
+func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, logical := range []string{"slack_messages", "slack_conversations", "slack_account_identities", "slack_users"} {
+		if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf(logical))); err != nil {
+			t.Skipf("cannot create Slack schema in this database: %v", err)
+		}
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS @slack_conversations (
+			account text, team_id text, conversation_id text, conversation_type text,
+			name text, raw_json text, PRIMARY KEY (account, team_id, conversation_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS @slack_account_identities (
+			account text, team_id text, user_id text, PRIMARY KEY (account, team_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS @slack_users (
+			account text, team_id text, user_id text, display_name text, real_name text, name text,
+			PRIMARY KEY (account, team_id, user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS @slack_messages (
+			account text, team_id text, conversation_id text, message_ts text,
+			message_datetime timestamptz, thread_ts text, parent_message_ts text,
+			user_id text, bot_id text, username text, text text,
+			is_thread_parent bigint, is_thread_reply bigint, reply_count bigint, is_deleted bigint,
+			PRIMARY KEY (account, team_id, conversation_id, message_ts)
+		)`,
+	} {
+		if _, err := execContext(ctx, store.db, statement); err != nil {
+			t.Skipf("cannot create Slack source table in this database: %v", err)
+		}
+	}
+
+	account := fmt.Sprintf("slack-preview-%d", time.Now().UnixNano())
+	for _, statement := range []string{
+		`INSERT INTO @slack_account_identities (account, team_id, user_id) VALUES ($1, 'T1', 'U-ME')`,
+		`INSERT INTO @slack_users (account, team_id, user_id, display_name, real_name, name)
+		 VALUES ($1, 'T1', 'U-ME', 'Zach', 'Zach Latta', 'zach'),
+		        ($1, 'T1', 'U-MARCUS', 'Marcus', 'Marcus', 'marcus')`,
+		`INSERT INTO @slack_conversations (account, team_id, conversation_id, conversation_type, name, raw_json)
+		 VALUES ($1, 'T1', 'D1', 'im', '', '{"user":"U-MARCUS","last_read":"1593473500.000100","unread_count_display":2}')`,
+		`INSERT INTO @slack_messages (
+			account, team_id, conversation_id, message_ts, message_datetime, thread_ts,
+			parent_message_ts, user_id, bot_id, username, text,
+			is_thread_parent, is_thread_reply, reply_count, is_deleted
+		 ) VALUES
+			($1, 'T1', 'D1', '1593473500.000100', '2026-08-29 14:00:00+00', '1593473500.000100', '', 'U-ME', '', '', 'Did you see this?', 0, 0, 0, 0),
+			($1, 'T1', 'D1', '1593473566.000200', '2026-08-29 14:01:00+00', '1593473566.000200', '', 'U-MARCUS', '', '', 'Yep — all handled.', 0, 0, 0, 0),
+			($1, 'T1', 'D1', '1593473600.000300', '2026-08-29 14:02:00+00', '1593473600.000300', '', 'U-MARCUS', '', '', 'One more thing.', 0, 0, 0, 0)`,
+	} {
+		if _, err := execContext(ctx, store.db, statement, account); err != nil {
+			t.Fatalf("seed Slack context: %v", err)
+		}
+	}
+
+	request, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: "Mark Marcus read", Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type: SlackMarkConversationReadOperation, Account: account,
+			ConversationID: "D1", MessageTS: "1593473566.000200",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	preview := mapFromAny(request.Mutations[0].Preview["slack_read"])
+	if preview["conversation_name"] != "Marcus" || preview["current_unread_count"] != float64(2) {
+		t.Fatalf("Slack conversation preview = %#v", preview)
+	}
+	messages := mapSliceFromAny(preview["messages"])
+	if len(messages) != 3 || messages[1]["is_target"] != true || messages[1]["actor_name"] != "Marcus" {
+		t.Fatalf("Slack context messages = %#v", messages)
+	}
+}
