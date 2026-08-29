@@ -217,3 +217,35 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
   .crow { grid-template-columns: 1fr; }
   .slack-msg-head { display: block; }
 }
+
+@media (max-width: 640px) {
+  .mv {
+    padding: 10px max(10px, env(safe-area-inset-right)) calc(96px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+  }
+  .mv h1 { font-size: 14px; overflow-wrap: anywhere; }
+  .rhead, .mut { padding: 12px; }
+  .rtitle-row { align-items: flex-start; }
+
+  /* The title and decision state are the list's phone scan path; secondary
+     counts and dates remain available on the detail screen. */
+  table.rtable th:nth-child(3), table.rtable td:nth-child(3),
+  table.rtable th:nth-child(4), table.rtable td:nth-child(4) { display: none; }
+  table.rtable th:first-child, table.rtable td:first-child { width: 112px; }
+  table.rtable td { padding-top: 9px; padding-bottom: 9px; }
+
+  dl.mdl { grid-template-columns: 1fr; gap: 0; }
+  dl.mdl dt { margin-top: 7px; }
+  dl.mdl dt:first-child { margin-top: 0; }
+
+  .actions { display: grid; grid-template-columns: 1fr 1fr; align-items: stretch; }
+  .actions input.reason { grid-column: 1 / -1; min-width: 0; width: 100%; min-height: 44px; }
+  .actions button { min-height: 44px; }
+
+  .slack-action { padding: 10px; }
+  .slack-context-head { align-items: flex-start; }
+  .slack-msg { gap: 8px; padding: 9px 8px; }
+  .slack-msg .avatar { width: 26px; height: 26px; font-size: 10px; }
+  .slack-msg-head time { display: block; margin-top: 1px; }
+  .slack-msg-text { font-size: 12.5px; line-height: 1.5; }
+  .slack-read-through, .slack-stays-unread { font-size: 9.5px; padding: 2px 6px; }
+}

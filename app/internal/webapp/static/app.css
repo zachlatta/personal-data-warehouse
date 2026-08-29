@@ -241,3 +241,19 @@ a.filelink:hover { text-decoration: underline; }
   .row { grid-template-columns: 44px 3px 1fr auto; }
   .row .who { display: none; }
 }
+
+@media (max-width: 640px) {
+  #app { grid-template-rows: 46px 1fr; }
+  #topbar { gap: 6px; padding: 0 8px; padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
+  #wordmark { gap: 0; }
+  #wordmark .name, #wordmark .sub, #topctl { display: none; }
+  #nav { flex: 1; min-width: 0; justify-content: space-evenly; }
+  #nav a { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 5px; font-size: 10px; letter-spacing: .035em; }
+  #nav .count { margin-left: 3px; }
+  #spacer { display: none; }
+  #lock { min-width: 36px; min-height: 44px; padding: 4px 8px; }
+  #gate { padding: 12px; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+  #gate .card { width: 100%; padding: 20px; }
+  #gate form { display: grid; }
+  #gate input, #gate button { min-height: 44px; }
+}

@@ -146,6 +146,28 @@ func TestShellLoadsNoExternalAssets(t *testing.T) {
 	}
 }
 
+// Mutation decisions are routinely opened from push notifications. Keep the
+// phone layout intentional instead of relying on a squeezed desktop table and
+// 25px controls that happen to fit inside the viewport.
+func TestMutationReviewCSSIncludesPhoneLayoutAndTouchTargets(t *testing.T) {
+	css, err := fs.ReadFile(staticFS, "static/mutations.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(css)
+	for _, contract := range []string{
+		"@media (max-width: 640px)",
+		"table.rtable th:nth-child(3)",
+		".actions input.reason",
+		"min-height: 44px",
+		"env(safe-area-inset-bottom)",
+	} {
+		if !strings.Contains(text, contract) {
+			t.Fatalf("mutation review CSS has no phone contract %q", contract)
+		}
+	}
+}
+
 // The JS logic that used to be Go (contact summaries, calendar recurrence,
 // time formatting) has its own node tests. They run here when node is
 // available so `go test ./...` is still the one verification command.
