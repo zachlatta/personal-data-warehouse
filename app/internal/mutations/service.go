@@ -27,6 +27,26 @@ type ProposeMutationInput struct {
 	Context   map[string]any   `json:"context,omitempty" jsonschema:"optional source context for human review"`
 }
 
+// proposalInputError separates a caller's rejected proposal from a storage or
+// infrastructure failure. The tool adapter maps this type to HTTP 400; without
+// the distinction every validation message becomes an origin 502 that an edge
+// proxy may replace with a generic gateway-error body.
+type proposalInputError struct{ err error }
+
+func (e *proposalInputError) Error() string { return e.err.Error() }
+func (e *proposalInputError) Unwrap() error { return e.err }
+
+func invalidProposalInput(err error) error {
+	if err == nil {
+		return nil
+	}
+	var inputErr *proposalInputError
+	if errors.As(err, &inputErr) {
+		return err
+	}
+	return &proposalInputError{err: err}
+}
+
 func NewService(store Store, cfg Config) *Service {
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	cfg.GmailAccounts = normalizeAccountList(cfg.GmailAccounts)
@@ -41,7 +61,7 @@ func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInpu
 	for index, raw := range input.Mutations {
 		mutation, err := mutationInputFromMap(raw, index)
 		if err != nil {
-			return ProposalResponse{}, err
+			return ProposalResponse{}, invalidProposalInput(err)
 		}
 		mutations = append(mutations, mutation)
 	}
@@ -64,7 +84,7 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 		input.RequestedBy = defaultRequestedBy
 	}
 	if err := s.validateCreateInput(input); err != nil {
-		return ProposalResponse{}, err
+		return ProposalResponse{}, invalidProposalInput(err)
 	}
 	request, err := s.store.CreateRequest(ctx, input)
 	if err != nil {

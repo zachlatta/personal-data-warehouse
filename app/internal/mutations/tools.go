@@ -2,6 +2,7 @@ package mutations
 
 import (
 	"context"
+	"errors"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
@@ -23,7 +24,12 @@ func Tools(service *Service) []tool.Tool {
 			TitleStr:       "Propose Mutation",
 			DescriptionStr: proposeMutationDescription,
 			Handle: func(ctx context.Context, in ProposeMutationInput) (ProposalResponse, error) {
-				return service.ProposeMutation(ctx, in)
+				response, err := service.ProposeMutation(ctx, in)
+				var inputErr *proposalInputError
+				if errors.As(err, &inputErr) {
+					return response, &tool.InvalidInputError{Message: inputErr.Error()}
+				}
+				return response, err
 			},
 		},
 		&tool.Typed[ProposeMutationHelpInput, MutationHelpDocument]{

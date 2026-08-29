@@ -192,9 +192,9 @@ curl -sS https://your-host/api/tools/sql \
 |--------|----------------------|----------------------------------------------------------------------|
 | 401    | _(plain text)_       | Missing/invalid `Authorization: Bearer <name>:<token>` header        |
 | 404    | `tool_not_found`     | Unknown tool name, or unknown path under `/api`                      |
-| 400    | `invalid_input`      | Request body is not valid JSON for the tool's input schema           |
+| 400    | `invalid_input`      | Request body or proposal fails the tool's input validation           |
 | 405    | `method_not_allowed` | Wrong HTTP method (POST on `/api/tools`, GET on `/api/tools/{name}`) |
-| 502    | `tool_error`         | Tool handler returned an error (e.g. Postgres unreachable)           |
+| 502    | `tool_error`         | Tool infrastructure failed unexpectedly (e.g. Postgres unreachable)  |
 | 500    | `schema_error`       | Server-side schema derivation bug                                    |
 
 **Partial success returns 200.** A `query` call with three statements where

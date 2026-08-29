@@ -381,6 +381,39 @@ func TestAPIUnknownToolReturns404(t *testing.T) {
 	}
 }
 
+func TestAPIProposeMutationValidationReturnsActionable400(t *testing.T) {
+	// Mutation validation is a caller error, not an upstream failure. Returning
+	// 502 here is especially destructive in production: Cloudflare replaces an
+	// origin 502's JSON body with its own plain "error code: 502" response, so
+	// the caller loses the validation message and mistakes the rejection for an
+	// edge-routing outage.
+	srv := newMuxAPITestServer(t)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/tools/propose_mutation", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer test-client:"+muxAPITestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d error = %#v, want 400", resp.StatusCode, envelope.Error)
+	}
+	if envelope.Error.Code != "invalid_input" || envelope.Error.Message != "title must not be blank" {
+		t.Fatalf("error = %#v", envelope.Error)
+	}
+}
+
 // postAPITool is the shared "call a tool over the HTTP API" helper the
 // unknown-field tests use; it returns the status and the raw body so a test can
 // assert on the error envelope rather than only on decoded data.
