@@ -24,6 +24,15 @@ func TestUpstreamMutationDDLTargetsTheOpsSchema(t *testing.T) {
 	}
 }
 
+func TestMutationApprovalNotificationChannelMatchesTheResidentWorkers(t *testing.T) {
+	if UpstreamMutationNotificationChannel != "pdw_upstream_mutations" {
+		t.Fatalf("notification channel = %q", UpstreamMutationNotificationChannel)
+	}
+	if !strings.Contains(upstreamMutationApprovalNotificationStatement, "pg_notify") {
+		t.Fatalf("approval notification must use transactional pg_notify: %s", upstreamMutationApprovalNotificationStatement)
+	}
+}
+
 // Every mutation statement must name its relations through the catalog. A bare
 // name would resolve through whatever search_path the connection happens to
 // carry, which is how the pre-reorg rewriter silently shadowed relations.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
@@ -25,6 +26,8 @@ class FakeWarehouse:
         message_ids_by_thread_id=None,
         reclaimed: int = 0,
         stale_reclaimable_count: int = 0,
+        succeeded_count: int = 0,
+        succeeded_updated_at: datetime | None = None,
     ) -> None:
         self.approved_count = approved_count
         self.claimed = list(claimed or [])
@@ -45,6 +48,9 @@ class FakeWarehouse:
         self.stale_reclaimable_calls = []
         self.approved_count_ensure_flags = []
         self.stale_reclaimable_ensure_flags = []
+        self.calls = []
+        self.succeeded_count = succeeded_count
+        self.succeeded_updated_at = succeeded_updated_at or datetime(2026, 8, 29, tzinfo=UTC)
 
     def ensure_upstream_mutation_tables(self) -> None:
         self.ensure_called = True
@@ -67,20 +73,36 @@ class FakeWarehouse:
         self.stale_reclaimable_ensure_flags.append(ensure_tables)
         return self.stale_reclaimable_count
 
-    def observe_succeeded_gmail_archive_mutations(self) -> int:
+    def observe_succeeded_gmail_archive_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_gmail_archive")
         return self.observed
 
-    def observe_succeeded_gmail_unarchive_mutations(self) -> int:
+    def observe_succeeded_gmail_unarchive_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_gmail_unarchive")
         return 0
 
-    def observe_succeeded_gmail_email_mutations(self) -> int:
+    def observe_succeeded_gmail_email_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_gmail_email")
         return 0
 
-    def observe_succeeded_contact_mutations(self) -> int:
+    def observe_succeeded_contact_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_contacts")
         return 0
 
-    def observe_succeeded_calendar_event_mutations(self) -> int:
+    def observe_succeeded_calendar_event_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_calendar")
         return 0
+
+    def succeeded_upstream_mutation_count(self, *, ensure_tables=True, exclude_providers=None) -> int:
+        self.calls.append("count_succeeded")
+        return self.succeeded_count
+
+    def succeeded_upstream_mutation_observation_state(
+        self, *, ensure_tables=True, exclude_providers=None
+    ) -> tuple[int, datetime | None]:
+        self.calls.append("observation_state")
+        newest = self.succeeded_updated_at if self.succeeded_count else None
+        return self.succeeded_count, newest
 
     def claim_approved_upstream_mutations(
         self,
@@ -89,12 +111,16 @@ class FakeWarehouse:
         claimed_by: str,
         providers=None,
         exclude_providers=None,
+        ensure_tables=True,
     ):
+        self.calls.append("claim")
         self.claim_limit = limit
         self.claimed_by = claimed_by
         return self.claimed
 
-    def reclaim_stale_executing_mutations(self, *, stale_after, idempotent_operations, actor_id):
+    def reclaim_stale_executing_mutations(
+        self, *, stale_after, idempotent_operations, actor_id, ensure_tables=True
+    ):
         self.reclaim_calls.append((stale_after, tuple(idempotent_operations), actor_id))
         return self.reclaimed_count
 
@@ -105,7 +131,7 @@ class FakeWarehouse:
     def complete_upstream_mutation(self, mutation_id: str, *, result_json: dict, actor_id: str) -> None:
         self.completed.append((mutation_id, result_json, actor_id))
 
-    def complete_upstream_mutations(self, *, completions, actor_id: str) -> int:
+    def complete_upstream_mutations(self, *, completions, actor_id: str, ensure_tables=True) -> int:
         self.bulk_completed.append((list(completions), actor_id))
         for mutation_id, result_json in completions:
             self.completed.append((mutation_id, result_json, actor_id))
@@ -161,6 +187,52 @@ def test_upstream_mutation_sensor_runs_every_ten_seconds() -> None:
 
     assert sensor.minimum_interval_seconds == 10
     assert sensor.default_status.value == "RUNNING"
+
+
+def test_upstream_mutation_observation_sensor_runs_separately_every_thirty_seconds() -> None:
+    sensor = upstream_mutation_defs.upstream_mutation_observation_sensor
+
+    assert sensor.minimum_interval_seconds == 30
+    assert sensor.default_status.value == "RUNNING"
+
+
+def test_upstream_mutation_observation_sensor_emits_run_for_succeeded_backlog(monkeypatch) -> None:
+    warehouse = FakeWarehouse(succeeded_count=12)
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = upstream_mutation_defs.upstream_mutation_observation_sensor(
+            build_sensor_context(instance=instance)
+        )
+
+    assert isinstance(result, RunRequest)
+    assert result.tags == {
+        "upstream_mutation_trigger": "observation_backlog",
+        "succeeded_mutation_count": "12",
+    }
+
+
+def test_upstream_mutation_observation_sensor_backs_off_an_unchanged_backlog(monkeypatch) -> None:
+    updated_at = datetime(2026, 8, 29, tzinfo=UTC)
+    warehouse = FakeWarehouse(succeeded_count=1, succeeded_updated_at=updated_at)
+    cursor = json.dumps(
+        {
+            "watermark": updated_at.isoformat(),
+            "attempts": 1,
+            "next_retry_at": 4_102_444_800,
+        }
+    )
+    monkeypatch.setattr(upstream_mutation_defs, "load_settings", lambda **_kwargs: object())
+    monkeypatch.setattr(upstream_mutation_defs, "warehouse_from_settings", lambda _settings: warehouse)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = upstream_mutation_defs.upstream_mutation_observation_sensor(
+            build_sensor_context(instance=instance, cursor=cursor)
+        )
+
+    assert isinstance(result, SkipReason)
+    assert "next observation retry" in result.skip_message
 
 
 def test_upstream_mutation_sensor_skips_when_job_is_in_progress(monkeypatch) -> None:
@@ -298,7 +370,37 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
     assert summary.claimed == 2
     assert summary.succeeded == 1
     assert summary.failed_retryable == 1
-    assert summary.observed == 1
+    assert summary.observed == 0
+
+
+def test_process_upstream_mutation_batch_claims_before_any_observation_work() -> None:
+    warehouse = FakeWarehouse(claimed=[])
+
+    upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeGmailExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=5,
+        claimed_by="worker-1",
+    )
+
+    assert warehouse.calls == ["claim"]
+
+
+def test_observation_batch_is_separate_from_execution() -> None:
+    warehouse = FakeWarehouse(observed=2)
+
+    summary = upstream_mutation_defs.observe_upstream_mutation_batch(warehouse=warehouse)
+
+    assert summary.observed == 2
+    assert warehouse.calls == [
+        "observe_gmail_archive",
+        "observe_gmail_unarchive",
+        "observe_gmail_email",
+        "observe_contacts",
+        "observe_calendar",
+    ]
 
 
 def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_claiming() -> None:

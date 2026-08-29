@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/zrl/dev/zachlatta/personal-data-warehouse/bin/apple-notes-mutation-worker-launchd</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/zrl/Library/Logs/personal-data-warehouse/apple-notes-mutation-worker.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/zrl/Library/Logs/personal-data-warehouse/apple-notes-mutation-worker.log</string>
+  </dict>
+</plist>

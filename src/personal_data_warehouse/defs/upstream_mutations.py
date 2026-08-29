@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+import json
 import os
 import socket
+import time
 
 from dagster import (
     DefaultSensorStatus,
@@ -39,7 +41,10 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 
 UPSTREAM_MUTATION_WORKER_POSTGRES_LOCK_ID = 7_403_111_843
+UPSTREAM_MUTATION_OBSERVER_POSTGRES_LOCK_ID = 8_407_112_481
 UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS = 10
+UPSTREAM_MUTATION_OBSERVATION_SENSOR_INTERVAL_SECONDS = 30
+UPSTREAM_MUTATION_OBSERVATION_RETRY_DELAYS_SECONDS = (60, 300, 900, 3_600, 21_600)
 DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 500
 DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS = 900
 GMAIL_THREAD_LABEL_OPERATIONS = {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}
@@ -89,6 +94,12 @@ class UpstreamMutationWorkerSummary:
     skipped_due_to_lock: bool = False
 
 
+@dataclass(frozen=True)
+class UpstreamMutationObservationSummary:
+    observed: int = 0
+    skipped_due_to_lock: bool = False
+
+
 @op
 def process_upstream_mutations(context) -> dict[str, object]:
     settings = load_settings(require_gmail=False)
@@ -121,9 +132,33 @@ def process_upstream_mutations(context) -> dict[str, object]:
     return asdict(summary)
 
 
+@op
+def observe_upstream_mutations(context) -> dict[str, object]:
+    settings = load_settings(require_gmail=False)
+    warehouse = warehouse_from_settings(settings)
+    try:
+        with exclusive_sync_lock(
+            name="upstream_mutation_observer",
+            postgres_lock_id=UPSTREAM_MUTATION_OBSERVER_POSTGRES_LOCK_ID,
+        ) as acquired:
+            if not acquired:
+                context.log.warning("Skipping upstream mutation observer because another run is active")
+                return asdict(UpstreamMutationObservationSummary(skipped_due_to_lock=True))
+            summary = observe_upstream_mutation_batch(warehouse=warehouse)
+    finally:
+        warehouse.close()
+    context.log.info("Observed upstream mutations: %s", summary)
+    return asdict(summary)
+
+
 @job
 def upstream_mutation_worker_job():
     process_upstream_mutations()
+
+
+@job
+def upstream_mutation_observer_job():
+    observe_upstream_mutations()
 
 
 @sensor(
@@ -168,6 +203,69 @@ def upstream_mutation_sensor(context):
     return RunRequest(tags={"upstream_mutation_trigger": "approved_backlog", "approved_mutation_count": str(count)})
 
 
+@sensor(
+    job=upstream_mutation_observer_job,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=UPSTREAM_MUTATION_OBSERVATION_SENSOR_INTERVAL_SECONDS,
+)
+def upstream_mutation_observation_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="upstream_mutation_observer_job")
+    if isinstance(active, SkipReason):
+        return active
+    settings = load_settings(require_gmail=False)
+    warehouse = warehouse_from_settings(settings)
+    try:
+        _ensure_upstream_mutation_tables_once(warehouse)
+        count, newest_updated_at = warehouse.succeeded_upstream_mutation_observation_state(
+            ensure_tables=False,
+            exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+        )
+    finally:
+        warehouse.close()
+    if count <= 0:
+        context.update_cursor(
+            json.dumps({"watermark": None, "attempts": 0, "next_retry_at": 0})
+        )
+        return SkipReason("No succeeded upstream mutations await source observation.")
+
+    watermark = newest_updated_at.isoformat() if newest_updated_at is not None else None
+    cursor: dict[str, object] = {}
+    if context.cursor:
+        try:
+            loaded_cursor = json.loads(context.cursor)
+            if isinstance(loaded_cursor, dict):
+                cursor = loaded_cursor
+        except (TypeError, ValueError):
+            pass
+    unchanged = cursor.get("watermark") == watermark
+    attempts = int(cursor.get("attempts", 0)) if unchanged else 0
+    next_retry_at = float(cursor.get("next_retry_at", 0)) if unchanged else 0
+    now = time.time()
+    if next_retry_at > now:
+        return SkipReason(
+            f"Waiting {int(next_retry_at - now)}s for the next observation retry of an unchanged backlog."
+        )
+
+    retry_delay = UPSTREAM_MUTATION_OBSERVATION_RETRY_DELAYS_SECONDS[
+        min(attempts, len(UPSTREAM_MUTATION_OBSERVATION_RETRY_DELAYS_SECONDS) - 1)
+    ]
+    context.update_cursor(
+        json.dumps(
+            {
+                "watermark": watermark,
+                "attempts": attempts + 1,
+                "next_retry_at": now + retry_delay,
+            }
+        )
+    )
+    return RunRequest(
+        tags={
+            "upstream_mutation_trigger": "observation_backlog",
+            "succeeded_mutation_count": str(count),
+        }
+    )
+
+
 def process_upstream_mutation_batch(
     *,
     warehouse,
@@ -177,22 +275,21 @@ def process_upstream_mutation_batch(
     limit: int,
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
+    ensure_tables: bool = True,
 ) -> UpstreamMutationWorkerSummary:
-    warehouse.ensure_upstream_mutation_tables()
+    if ensure_tables:
+        warehouse.ensure_upstream_mutation_tables()
     reclaimed = warehouse.reclaim_stale_executing_mutations(
         stale_after=reclaim_after,
         idempotent_operations=RECLAIMABLE_IDEMPOTENT_OPERATIONS,
         actor_id=claimed_by,
+        ensure_tables=False,
     )
-    observed = warehouse.observe_succeeded_gmail_archive_mutations()
-    observed += warehouse.observe_succeeded_gmail_unarchive_mutations()
-    observed += warehouse.observe_succeeded_gmail_email_mutations()
-    observed += warehouse.observe_succeeded_contact_mutations()
-    observed += warehouse.observe_succeeded_calendar_event_mutations()
     claimed = warehouse.claim_approved_upstream_mutations(
         limit=limit,
         claimed_by=claimed_by,
         exclude_providers=LOCAL_ONLY_MUTATION_PROVIDERS,
+        ensure_tables=False,
     )
 
     succeeded = 0
@@ -252,9 +349,19 @@ def process_upstream_mutation_batch(
         failed_retryable=failed_retryable,
         failed_terminal=failed_terminal,
         blocked_missing_credentials=blocked_missing_credentials,
-        observed=observed,
         reclaimed=reclaimed,
     )
+
+
+def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) -> UpstreamMutationObservationSummary:
+    if ensure_tables:
+        warehouse.ensure_upstream_mutation_tables()
+    observed = warehouse.observe_succeeded_gmail_archive_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_gmail_unarchive_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_gmail_email_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_contact_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_calendar_event_mutations(ensure_tables=False)
+    return UpstreamMutationObservationSummary(observed=observed)
 
 
 def _upstream_mutation_batch_size() -> int:
@@ -427,6 +534,7 @@ def _record_successful_mutation_results(
         warehouse.complete_upstream_mutations(
             completions=[(str(mutation["id"]), result_json) for mutation, result_json in mutation_results],
             actor_id=claimed_by,
+            ensure_tables=False,
         )
         return
     for mutation, result_json in mutation_results:
@@ -497,6 +605,6 @@ def _unique(values) -> list[str]:
 @definitions
 def defs() -> Definitions:
     return Definitions(
-        jobs=[upstream_mutation_worker_job],
-        sensors=[upstream_mutation_sensor],
+        jobs=[upstream_mutation_worker_job, upstream_mutation_observer_job],
+        sensors=[upstream_mutation_sensor, upstream_mutation_observation_sensor],
     )

@@ -960,19 +960,31 @@ plist template lives at
 `bin/apple-notes-upload-launchd` every five minutes. The wrapper records each run, exit code,
 duration, and heartbeat under `~/Library/Logs/personal-data-warehouse/`.
 
+Reviewed Apple Notes writes do not wait for that five-minute upload cycle. A second, resident
+LaunchAgent (`com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker`) listens for the
+transactional Postgres notification emitted when a request is approved, drains the durable
+mutation table immediately, and polls every 30 seconds as a missed-notification fallback. The
+five-minute uploader still processes mutations before scanning as a second recovery path.
+
 Install or refresh the LaunchAgent:
 
 ```bash
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs/personal-data-warehouse
 cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist ~/Library/LaunchAgents/
 launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+cp ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker
 ```
 
 Run it immediately:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker
 ```
 
 Monitor it:
@@ -980,7 +992,9 @@ Monitor it:
 ```bash
 bin/apple-notes-upload-status
 launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-upload
+launchctl print gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-notes-mutation-worker
 tail -80 ~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log
+tail -80 ~/Library/Logs/personal-data-warehouse/apple-notes-mutation-worker.log
 cat ~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat
 ```
 

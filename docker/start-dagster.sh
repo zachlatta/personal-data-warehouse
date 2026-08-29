@@ -21,9 +21,10 @@ WORKSPACE="${DAGSTER_WORKSPACE:-/app/workspace.yaml}"
 grpc_pid=""
 daemon_pid=""
 webserver_pid=""
+mutation_worker_pid=""
 
 shutdown() {
-  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid"; do
+  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid" "$mutation_worker_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -33,6 +34,17 @@ shutdown() {
 trap shutdown INT TERM EXIT
 
 uv run python -m personal_data_warehouse.dagster_bootstrap
+
+# Reviewed mutations are latency-sensitive user actions, not batch ETL. Keep a
+# resident executor listening for the transactional PostgreSQL NOTIFY emitted
+# by the review API; its durable queue poll makes missed notifications safe.
+case "${UPSTREAM_MUTATION_RESIDENT_WORKER_ENABLED:-1}" in
+  0|false|False|no|No) ;;
+  *)
+    uv run python -m personal_data_warehouse.upstream_mutation_worker &
+    mutation_worker_pid="$!"
+    ;;
+esac
 
 # Long-lived code server. No --heartbeat => it does not self-terminate on missed
 # pings. The daemon/webserver reach it via workspace.yaml (grpc_server).
@@ -81,6 +93,10 @@ while :; do
   fi
   if ! kill -0 "$webserver_pid" 2>/dev/null; then
     wait "$webserver_pid"
+    exit $?
+  fi
+  if [ -n "$mutation_worker_pid" ] && ! kill -0 "$mutation_worker_pid" 2>/dev/null; then
+    wait "$mutation_worker_pid"
     exit $?
   fi
   sleep 2

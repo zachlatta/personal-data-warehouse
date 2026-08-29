@@ -315,6 +315,69 @@ def test_complete_upstream_mutations_bulk_updates_rows_and_events(warehouse: Pos
         assert events[-1]["event_json"]["archived_thread_ids"]
 
 
+def test_observe_upstream_mutations_bulk_updates_rows_and_events(warehouse: PostgresWarehouse) -> None:
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req-bulk-observe",
+        title="Observe two archive mutations",
+        status="approved",
+        mutations=[
+            _gmail_thread_label_mutation(thread_id="thread-1", archive=True),
+            _gmail_thread_label_mutation(thread_id="thread-2", archive=True),
+        ],
+    )
+    claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="worker-1")
+    warehouse.complete_upstream_mutations(
+        completions=[(row["id"], {"ok": True}) for row in claimed],
+        actor_id="worker-1",
+    )
+
+    observed = warehouse.observe_upstream_mutations(
+        observations=[
+            (str(row["id"]), {"thread_ids": [f"thread-{index + 1}"]})
+            for index, row in enumerate(claimed)
+        ],
+        actor_id="observer-1",
+    )
+
+    assert observed == 2
+    for mutation in warehouse.list_upstream_mutations_for_request(request["id"]):
+        assert mutation["status"] == "observed"
+        events = _mutation_events(warehouse, mutation["id"])
+        assert events[-1]["event_type"] == "observed"
+        assert events[-1]["actor_id"] == "observer-1"
+        assert events[-1]["event_json"]["thread_ids"]
+
+
+def test_succeeded_upstream_mutation_observation_state_tracks_backlog_watermark(
+    warehouse: PostgresWarehouse,
+) -> None:
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req-observation-state",
+        title="Track observation backlog",
+        status="approved",
+        mutations=[_gmail_thread_label_mutation(thread_id="thread-1", archive=True)],
+    )
+    claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker-1")
+    warehouse.complete_upstream_mutation(
+        claimed[0]["id"],
+        result_json={"ok": True},
+        actor_id="worker-1",
+    )
+
+    count, newest_updated_at = warehouse.succeeded_upstream_mutation_observation_state()
+
+    assert count == 1
+    assert newest_updated_at is not None
+    assert newest_updated_at.tzinfo is not None
+    warehouse.observe_upstream_mutations(
+        observations=[(request["mutations"][0]["id"], {"ok": True})],
+        actor_id="observer-1",
+    )
+    assert warehouse.succeeded_upstream_mutation_observation_state() == (0, None)
+
+
 def test_reclaim_stale_executing_mutations_resets_orphaned_gmail_rows(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     warehouse.insert_messages(

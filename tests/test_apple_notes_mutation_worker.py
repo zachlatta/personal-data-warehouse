@@ -27,11 +27,15 @@ class _FakeWarehouse:
     def ensure_upstream_mutation_tables(self):
         self.ensured += 1
 
-    def reclaim_stale_executing_mutations(self, *, stale_after, idempotent_operations, actor_id):
+    def reclaim_stale_executing_mutations(
+        self, *, stale_after, idempotent_operations, actor_id, ensure_tables=True
+    ):
         self.reclaim_calls.append(tuple(idempotent_operations))
         return 0
 
-    def claim_approved_upstream_mutations(self, *, limit, claimed_by, providers=None, exclude_providers=None):
+    def claim_approved_upstream_mutations(
+        self, *, limit, claimed_by, providers=None, exclude_providers=None, ensure_tables=True
+    ):
         self.claim_calls.append({"limit": limit, "providers": providers, "exclude": exclude_providers})
         return self._claimable
 

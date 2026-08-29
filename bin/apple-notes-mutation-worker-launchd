@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -eu
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+UV="/opt/homebrew/bin/uv"
+
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+mkdir -p "$HOME/Library/Logs/personal-data-warehouse"
+
+cd "$REPO_DIR"
+exec "$UV" run python -m personal_data_warehouse_apple_notes.mutation_worker

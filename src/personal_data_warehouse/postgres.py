@@ -6206,6 +6206,7 @@ class PostgresWarehouse:
         claimed_by: str,
         providers: Sequence[str] | None = None,
         exclude_providers: Sequence[str] | None = None,
+        ensure_tables: bool = True,
     ) -> list[dict[str, Any]]:
         """Claim approved mutations, optionally scoped to a set of providers.
 
@@ -6216,7 +6217,8 @@ class PostgresWarehouse:
         tick while the Mac never got a chance at it.
         """
 
-        self.ensure_upstream_mutation_tables()
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
         if limit <= 0:
             return []
         provider_filter, provider_params = _upstream_mutation_provider_filter(
@@ -6272,11 +6274,13 @@ class PostgresWarehouse:
         stale_after: timedelta,
         idempotent_operations: Sequence[tuple[str, str]],
         actor_id: str,
+        ensure_tables: bool = True,
     ) -> int:
         # Only safe to call while holding the upstream-mutation worker advisory lock. The reset
         # reuses approved_at ordering so reclaimed rows go to the head of the queue, but it does
         # not protect against a concurrent worker that still believes it owns the claim.
-        self.ensure_upstream_mutation_tables()
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
         if not idempotent_operations:
             return 0
         now = datetime.now(tz=UTC)
@@ -6384,8 +6388,10 @@ class PostgresWarehouse:
         *,
         completions: Sequence[tuple[str, Mapping[str, Any]]],
         actor_id: str,
+        ensure_tables: bool = True,
     ) -> int:
-        self.ensure_upstream_mutation_tables()
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
         if not completions:
             return 0
         now = datetime.now(tz=UTC)
@@ -6456,6 +6462,74 @@ class PostgresWarehouse:
             self._refresh_upstream_mutation_request_status(request_id)
         return len(rows)
 
+    def observe_upstream_mutations(
+        self,
+        *,
+        observations: Sequence[tuple[str, Mapping[str, Any]]],
+        actor_id: str,
+        ensure_tables: bool = True,
+    ) -> int:
+        """Mark many source-confirmed mutations observed in one transaction-sized pass."""
+
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        if not observations:
+            return 0
+        now = datetime.now(tz=UTC)
+        observation_rows = [
+            {"id": mutation_id, "event_json": dict(event_json)}
+            for mutation_id, event_json in observations
+        ]
+        rows = self._query_dicts(
+            """
+            WITH observation_data AS (
+                SELECT id, event_json
+                FROM jsonb_to_recordset(%s::jsonb) AS row(id text, event_json jsonb)
+            ),
+            updated AS (
+                UPDATE @upstream_mutations AS mutation
+                   SET status = 'observed',
+                       observed_at = %s,
+                       updated_at = %s
+                  FROM observation_data
+                 WHERE mutation.id = observation_data.id
+                   AND mutation.status = 'succeeded'
+                RETURNING mutation.id, mutation.request_id, observation_data.event_json
+            ),
+            inserted_events AS (
+                INSERT INTO @upstream_mutation_events (
+                    mutation_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+                )
+                SELECT
+                    updated.id,
+                    COALESCE(
+                        (
+                            SELECT max(event.event_index) + 1
+                            FROM @upstream_mutation_events AS event
+                            WHERE event.mutation_id = updated.id
+                        ),
+                        0
+                    ),
+                    'observed',
+                    'dagster',
+                    %s,
+                    updated.event_json,
+                    %s
+                FROM updated
+                RETURNING mutation_id
+            )
+            SELECT updated.id, updated.request_id
+            FROM updated
+            JOIN inserted_events ON inserted_events.mutation_id = updated.id
+            """,
+            (_jsonb_param(observation_rows), now, now, actor_id, now),
+        )
+        if not rows:
+            return 0
+        for request_id in sorted({str(row.get("request_id") or "") for row in rows if row.get("request_id")}):
+            self._refresh_upstream_mutation_request_status(request_id)
+        return len(rows)
+
     def fail_upstream_mutation(
         self,
         mutation_id: str,
@@ -6514,6 +6588,57 @@ class PostgresWarehouse:
         )
         return int(rows[0][0]) if rows else 0
 
+    def succeeded_upstream_mutation_count(
+        self,
+        *,
+        ensure_tables: bool = True,
+        providers: Sequence[str] | None = None,
+        exclude_providers: Sequence[str] | None = None,
+    ) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        provider_filter, provider_params = _upstream_mutation_provider_filter(
+            providers=providers,
+            exclude_providers=exclude_providers,
+        )
+        rows = self._query(
+            f"""
+            SELECT count(*)::bigint
+            FROM @upstream_mutations
+            WHERE status = 'succeeded'
+              {provider_filter}
+            """,
+            tuple(provider_params),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def succeeded_upstream_mutation_observation_state(
+        self,
+        *,
+        ensure_tables: bool = True,
+        providers: Sequence[str] | None = None,
+        exclude_providers: Sequence[str] | None = None,
+    ) -> tuple[int, datetime | None]:
+        """Return the observation backlog size and its newest update watermark."""
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        provider_filter, provider_params = _upstream_mutation_provider_filter(
+            providers=providers,
+            exclude_providers=exclude_providers,
+        )
+        rows = self._query(
+            f"""
+            SELECT count(*)::bigint, max(updated_at)
+            FROM @upstream_mutations
+            WHERE status = 'succeeded'
+              {provider_filter}
+            """,
+            tuple(provider_params),
+        )
+        if not rows:
+            return 0, None
+        return int(rows[0][0]), rows[0][1]
+
     def gmail_message_ids_for_thread_label_mutation(
         self,
         *,
@@ -6546,87 +6671,43 @@ class PostgresWarehouse:
                 ids_by_thread_id[normalized_thread_id].append(str(message_id))
         return ids_by_thread_id
 
-    def observe_succeeded_gmail_archive_mutations(self, *, limit: int = 100) -> int:
-        self.ensure_upstream_mutation_tables()
-        mutations = self._query_dicts(
-            """
+    def _succeeded_upstream_mutations(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        limit_sql = ""
+        params: list[Any] = [provider, operation]
+        if limit is not None:
+            limit_sql = "LIMIT %s"
+            params.append(max(1, int(limit)))
+        return self._query_dicts(
+            f"""
             SELECT *
             FROM @upstream_mutations
-            WHERE provider = 'gmail'
-              AND operation = 'gmail.archive_threads'
+            WHERE provider = %s
+              AND operation = %s
               AND status = 'succeeded'
             ORDER BY executed_at ASC, id ASC
-            LIMIT %s
+            {limit_sql}
             """,
-            (int(limit),),
+            tuple(params),
         )
-        observed = 0
-        for mutation in mutations:
-            payload = _as_json_dict(mutation["payload_json"])
-            thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
-            if not thread_ids:
-                continue
-            live_rows = self._query(
-                """
-                SELECT thread_id
-                FROM @gmail_messages
-                WHERE account = %s
-                  AND thread_id = ANY(%s)
-                  AND is_deleted = 0
-                  AND 'INBOX' = ANY(label_ids)
-                  AND NOT ('TRASH' = ANY(label_ids))
-                  AND NOT ('SPAM' = ANY(label_ids))
-                LIMIT 1
-                """,
-                (mutation["account"], list(thread_ids)),
-            )
-            if live_rows:
-                continue
-            now = datetime.now(tz=UTC)
-            self._command(
-                """
-                UPDATE @upstream_mutations
-                   SET status = 'observed',
-                       observed_at = %s,
-                       updated_at = %s
-                 WHERE id = %s
-                   AND status = 'succeeded'
-                """,
-                (now, now, mutation["id"]),
-            )
-            self._append_upstream_mutation_event(
-                str(mutation["id"]),
-                event_type="observed",
-                actor_type="dagster",
-                actor_id="upstream_mutation_worker",
-                event_json={"thread_ids": thread_ids},
-            )
-            if mutation.get("request_id"):
-                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
-            observed += 1
-        return observed
 
-    def observe_succeeded_gmail_unarchive_mutations(self, *, limit: int = 100) -> int:
-        self.ensure_upstream_mutation_tables()
-        mutations = self._query_dicts(
-            """
-            SELECT *
-            FROM @upstream_mutations
-            WHERE provider = 'gmail'
-              AND operation = 'gmail.unarchive_threads'
-              AND status = 'succeeded'
-            ORDER BY executed_at ASC, id ASC
-            LIMIT %s
-            """,
-            (int(limit),),
-        )
-        observed = 0
+    def _gmail_inbox_thread_ids_for_mutations(
+        self, mutations: Sequence[Mapping[str, Any]]
+    ) -> dict[str, set[str]]:
+        thread_ids_by_account: dict[str, set[str]] = {}
         for mutation in mutations:
-            payload = _as_json_dict(mutation["payload_json"])
-            thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
+            thread_ids = _normalize_thread_ids(_as_json_dict(mutation["payload_json"]).get("thread_ids") or [])
+            thread_ids_by_account.setdefault(str(mutation["account"]), set()).update(thread_ids)
+        inbox_by_account: dict[str, set[str]] = {}
+        for account, thread_ids in thread_ids_by_account.items():
             if not thread_ids:
                 continue
-            inbox_rows = self._query(
+            rows = self._query(
                 """
                 SELECT DISTINCT thread_id
                 FROM @gmail_messages
@@ -6637,60 +6718,83 @@ class PostgresWarehouse:
                   AND NOT ('TRASH' = ANY(label_ids))
                   AND NOT ('SPAM' = ANY(label_ids))
                 """,
-                (mutation["account"], list(thread_ids)),
+                (account, sorted(thread_ids)),
             )
-            observed_thread_ids = {str(row[0]) for row in inbox_rows}
-            if any(thread_id not in observed_thread_ids for thread_id in thread_ids):
-                continue
-            now = datetime.now(tz=UTC)
-            self._command(
-                """
-                UPDATE @upstream_mutations
-                   SET status = 'observed',
-                       observed_at = %s,
-                       updated_at = %s
-                 WHERE id = %s
-                   AND status = 'succeeded'
-                """,
-                (now, now, mutation["id"]),
-            )
-            self._append_upstream_mutation_event(
-                str(mutation["id"]),
-                event_type="observed",
-                actor_type="dagster",
-                actor_id="upstream_mutation_worker",
-                event_json={"thread_ids": thread_ids},
-            )
-            if mutation.get("request_id"):
-                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
-            observed += 1
-        return observed
+            inbox_by_account[account] = {str(row[0]) for row in rows}
+        return inbox_by_account
 
-    def observe_succeeded_gmail_email_mutations(self, *, limit: int = 100) -> int:
-        self.ensure_upstream_mutation_tables()
-        mutations = self._query_dicts(
-            """
-            SELECT *
-            FROM @upstream_mutations
-            WHERE provider = 'gmail'
-              AND operation = %s
-              AND status = 'succeeded'
-            ORDER BY executed_at ASC, id ASC
-            LIMIT %s
-            """,
-            (GMAIL_SEND_EMAIL_OPERATION, int(limit)),
+    def observe_succeeded_gmail_archive_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider="gmail",
+            operation="gmail.archive_threads",
+            limit=limit,
         )
-        observed = 0
+        inbox_by_account = self._gmail_inbox_thread_ids_for_mutations(mutations)
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            thread_ids = _normalize_thread_ids(_as_json_dict(mutation["payload_json"]).get("thread_ids") or [])
+            if thread_ids and not (set(thread_ids) & inbox_by_account.get(str(mutation["account"]), set())):
+                observations.append((str(mutation["id"]), {"thread_ids": thread_ids}))
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
+    def observe_succeeded_gmail_unarchive_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider="gmail",
+            operation="gmail.unarchive_threads",
+            limit=limit,
+        )
+        inbox_by_account = self._gmail_inbox_thread_ids_for_mutations(mutations)
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            thread_ids = _normalize_thread_ids(_as_json_dict(mutation["payload_json"]).get("thread_ids") or [])
+            if thread_ids and set(thread_ids) <= inbox_by_account.get(str(mutation["account"]), set()):
+                observations.append((str(mutation["id"]), {"thread_ids": thread_ids}))
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
+    def observe_succeeded_gmail_email_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider="gmail",
+            operation=GMAIL_SEND_EMAIL_OPERATION,
+            limit=limit,
+        )
+        ids_by_account: dict[str, set[str]] = {}
+        mutation_message_ids: dict[str, list[str]] = {}
         for mutation in mutations:
             result = _as_json_dict(mutation["result_json"])
-            message_ids = [
-                value
-                for value in [
-                    str(result.get("sent_message_id") or "").strip(),
-                    str(result.get("draft_message_id") or "").strip(),
-                ]
-                if value
-            ]
+            message_ids = list(
+                dict.fromkeys(
+                    value
+                    for value in (
+                        str(result.get("sent_message_id") or "").strip(),
+                        str(result.get("draft_message_id") or "").strip(),
+                    )
+                    if value
+                )
+            )
+            mutation_message_ids[str(mutation["id"])] = message_ids
+            ids_by_account.setdefault(str(mutation["account"]), set()).update(message_ids)
+        observed_by_account: dict[str, set[str]] = {}
+        for account, message_ids in ids_by_account.items():
             if not message_ids:
                 continue
             rows = self._query(
@@ -6701,51 +6805,39 @@ class PostgresWarehouse:
                   AND message_id = ANY(%s)
                   AND is_deleted = 0
                 """,
-                (mutation["account"], message_ids),
+                (account, sorted(message_ids)),
             )
-            observed_message_ids = {str(row[0]) for row in rows}
-            if any(message_id not in observed_message_ids for message_id in message_ids):
-                continue
-            now = datetime.now(tz=UTC)
-            self._command(
-                """
-                UPDATE @upstream_mutations
-                   SET status = 'observed',
-                       observed_at = %s,
-                       updated_at = %s
-                 WHERE id = %s
-                   AND status = 'succeeded'
-                """,
-                (now, now, mutation["id"]),
-            )
-            self._append_upstream_mutation_event(
-                str(mutation["id"]),
-                event_type="observed",
-                actor_type="dagster",
-                actor_id="upstream_mutation_worker",
-                event_json={"message_ids": message_ids, "delivery_mode": str(result.get("delivery_mode") or "")},
-            )
-            if mutation.get("request_id"):
-                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
-            observed += 1
-        return observed
-
-    def observe_succeeded_contact_mutations(self, *, limit: int = 100) -> int:
-        self.ensure_contacts_tables()
-        self.ensure_upstream_mutation_tables()
-        mutations = self._query_dicts(
-            """
-            SELECT *
-            FROM @upstream_mutations
-            WHERE provider = 'google_people'
-              AND operation = %s
-              AND status = 'succeeded'
-            ORDER BY executed_at ASC, id ASC
-            LIMIT %s
-            """,
-            (GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION, int(limit)),
+            observed_by_account[account] = {str(row[0]) for row in rows}
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            mutation_id = str(mutation["id"])
+            message_ids = mutation_message_ids[mutation_id]
+            result = _as_json_dict(mutation["result_json"])
+            if message_ids and set(message_ids) <= observed_by_account.get(str(mutation["account"]), set()):
+                observations.append(
+                    (
+                        mutation_id,
+                        {"message_ids": message_ids, "delivery_mode": str(result.get("delivery_mode") or "")},
+                    )
+                )
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
         )
-        observed = 0
+
+    def observe_succeeded_contact_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_contacts_tables()
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider="google_people",
+            operation=GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
+            limit=limit,
+        )
+        observations: list[tuple[str, Mapping[str, Any]]] = []
         for mutation in mutations:
             payload = _as_json_dict(mutation["payload_json"])
             result = _as_json_dict(mutation["result_json"])
@@ -6754,50 +6846,37 @@ class PostgresWarehouse:
                 continue
             if not self._contact_mutation_observed(account=str(mutation["account"]), operations=operations, result=result):
                 continue
-            now = datetime.now(tz=UTC)
-            self._command(
-                """
-                UPDATE @upstream_mutations
-                   SET status = 'observed',
-                       observed_at = %s,
-                       updated_at = %s
-                 WHERE id = %s
-                   AND status = 'succeeded'
-                """,
-                (now, now, mutation["id"]),
-            )
-            self._append_upstream_mutation_event(
-                str(mutation["id"]),
-                event_type="observed",
-                actor_type="dagster",
-                actor_id="upstream_mutation_worker",
-                event_json={"operation_count": len(operations)},
-            )
-            if mutation.get("request_id"):
-                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
-            observed += 1
-        return observed
+            observations.append((str(mutation["id"]), {"operation_count": len(operations)}))
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
 
-    def observe_succeeded_calendar_event_mutations(self, *, limit: int = 100) -> int:
-        self.ensure_calendar_tables()
-        self.ensure_upstream_mutation_tables()
+    def observe_succeeded_calendar_event_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_calendar_tables()
+            self.ensure_upstream_mutation_tables()
+        limit_sql = ""
+        params: list[Any] = [CALENDAR_PROVIDER, list(CALENDAR_EVENT_OPERATIONS)]
+        if limit is not None:
+            limit_sql = "LIMIT %s"
+            params.append(max(1, int(limit)))
         mutations = self._query_dicts(
-            """
+            f"""
             SELECT *
             FROM @upstream_mutations
             WHERE provider = %s
               AND operation = ANY(%s)
               AND status = 'succeeded'
             ORDER BY executed_at ASC, id ASC
-            LIMIT %s
+            {limit_sql}
             """,
-            (
-                CALENDAR_PROVIDER,
-                list(CALENDAR_EVENT_OPERATIONS),
-                int(limit),
-            ),
+            tuple(params),
         )
-        observed = 0
+        observations: list[tuple[str, Mapping[str, Any]]] = []
         for mutation in mutations:
             payload = _as_json_dict(mutation["payload_json"])
             result = _as_json_dict(mutation["result_json"])
@@ -6814,29 +6893,17 @@ class PostgresWarehouse:
                 result=result,
             ):
                 continue
-            now = datetime.now(tz=UTC)
-            self._command(
-                """
-                UPDATE @upstream_mutations
-                   SET status = 'observed',
-                       observed_at = %s,
-                       updated_at = %s
-                 WHERE id = %s
-                   AND status = 'succeeded'
-                """,
-                (now, now, mutation["id"]),
+            observations.append(
+                (
+                    str(mutation["id"]),
+                    {"calendar_id": calendar_id, "event_id": event_id, "operation": operation},
+                )
             )
-            self._append_upstream_mutation_event(
-                str(mutation["id"]),
-                event_type="observed",
-                actor_type="dagster",
-                actor_id="upstream_mutation_worker",
-                event_json={"calendar_id": calendar_id, "event_id": event_id, "operation": operation},
-            )
-            if mutation.get("request_id"):
-                self._refresh_upstream_mutation_request_status(str(mutation["request_id"]))
-            observed += 1
-        return observed
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
 
     def _calendar_event_mutation_observed(
         self,

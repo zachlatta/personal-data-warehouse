@@ -19,6 +19,13 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
+// UpstreamMutationNotificationChannel wakes the resident Python workers after
+// an approval commits. The operation rows remain the durable queue: NOTIFY is
+// only a low-latency hint, and workers also poll as a recovery fallback.
+const UpstreamMutationNotificationChannel = "pdw_upstream_mutations"
+
+const upstreamMutationApprovalNotificationStatement = `SELECT pg_notify($1, $2)`
+
 type PostgresStore struct {
 	db       *sql.DB
 	timeout  time.Duration
@@ -544,6 +551,18 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 		}
 	}
 	if err := appendRequestEvent(ctx, tx, id, "approved", "human", actor, map[string]any{"approved_mutation_ids": pendingIDs}); err != nil {
+		return Request{}, err
+	}
+	// PostgreSQL delivers NOTIFY only after this transaction commits, so a
+	// worker can never wake up before the approved rows are visible. A rolled
+	// back approval emits nothing.
+	if _, err := execContext(
+		ctx,
+		tx,
+		upstreamMutationApprovalNotificationStatement,
+		UpstreamMutationNotificationChannel,
+		id,
+	); err != nil {
 		return Request{}, err
 	}
 	if err := tx.Commit(); err != nil {
