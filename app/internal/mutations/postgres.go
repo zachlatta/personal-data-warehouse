@@ -1382,6 +1382,38 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					},
 				})
 			}
+		case GmailModifyThreadLabelsOperation:
+			addLabels := normalizeUniqueStringSlice(mutation.AddLabels)
+			createAndAddLabels := normalizeUniqueStringSlice(mutation.CreateAndAddLabels)
+			removeLabels := normalizeUniqueStringSlice(mutation.RemoveLabels)
+			if err := validateGmailLabelChanges(addLabels, createAndAddLabels, removeLabels); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			for _, threadID := range normalizeStringSlice(mutation.ThreadIDs) {
+				out = append(out, storedMutation{
+					Provider:  "gmail",
+					Operation: GmailModifyThreadLabelsOperation,
+					Account:   account,
+					Title:     optionalTitle(mutation.Title, "Update labels: "+threadID),
+					Reason:    reason,
+					Payload: map[string]any{
+						"thread_ids":            []string{threadID},
+						"add_labels":            addLabels,
+						"create_and_add_labels": createAndAddLabels,
+						"remove_labels":         removeLabels,
+					},
+					Preview: map[string]any{
+						"thread_count": 1,
+						"threads":      []map[string]any{{"thread_id": threadID}},
+						"label_changes": map[string]any{
+							"add":            addLabels,
+							"create_and_add": createAndAddLabels,
+							"remove":         removeLabels,
+						},
+						"context": input.Context,
+					},
+				})
+			}
 		case GmailSendEmailOperation:
 			deliveryMode, err := normalizeDeliveryMode(mutation.DeliveryMode)
 			if err != nil {

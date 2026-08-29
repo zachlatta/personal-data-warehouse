@@ -68,6 +68,14 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 			{Type: GmailArchiveOperation, Account: "zach@example.test", ThreadIDs: []string{"thread-1", "thread-2"}},
 			{Type: GmailUnarchiveOperation, Account: "zach@example.test", ThreadIDs: []string{"thread-3"}},
 			{
+				Type:               GmailModifyThreadLabelsOperation,
+				Account:            "zach@example.test",
+				ThreadIDs:          []string{"thread-4"},
+				AddLabels:          []string{"Receipts", "STARRED"},
+				CreateAndAddLabels: []string{"Projects/Launch"},
+				RemoveLabels:       []string{"UNREAD"},
+			},
+			{
 				Type:         GmailSendEmailOperation,
 				Account:      "zach@example.test",
 				DeliveryMode: "draft",
@@ -84,7 +92,7 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalizeForStorage returned error: %v", err)
 	}
-	if len(mutations) != 5 {
+	if len(mutations) != 6 {
 		t.Fatalf("mutation count = %d", len(mutations))
 	}
 
@@ -100,8 +108,27 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	if got := stringSliceFromAny(mutations[2].Payload["add_label_ids"]); len(got) != 1 || got[0] != "INBOX" {
 		t.Fatalf("unarchive add_label_ids = %#v", got)
 	}
+	if mutations[3].Operation != GmailModifyThreadLabelsOperation || mutations[3].Provider != "gmail" {
+		t.Fatalf("modify-labels mutation metadata = %#v", mutations[3])
+	}
+	if got := strings.Join(stringSliceFromAny(mutations[3].Payload["add_labels"]), ","); got != "Receipts,STARRED" {
+		t.Fatalf("modify-labels add_labels = %q", got)
+	}
+	if got := strings.Join(stringSliceFromAny(mutations[3].Payload["create_and_add_labels"]), ","); got != "Projects/Launch" {
+		t.Fatalf("modify-labels create_and_add_labels = %q", got)
+	}
+	if got := strings.Join(stringSliceFromAny(mutations[3].Payload["remove_labels"]), ","); got != "UNREAD" {
+		t.Fatalf("modify-labels remove_labels = %q", got)
+	}
+	changes := mapFromAny(mutations[3].Preview["label_changes"])
+	if got := strings.Join(stringSliceFromAny(changes["add"]), ","); got != "Receipts,STARRED" {
+		t.Fatalf("preview add labels = %q", got)
+	}
+	if got := strings.Join(stringSliceFromAny(changes["create_and_add"]), ","); got != "Projects/Launch" {
+		t.Fatalf("preview create-and-add labels = %q", got)
+	}
 
-	emailPayload := mutations[3].Payload
+	emailPayload := mutations[4].Payload
 	if emailPayload["delivery_mode"] != "draft" {
 		t.Fatalf("delivery_mode = %#v", emailPayload["delivery_mode"])
 	}
@@ -113,12 +140,12 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 		t.Fatalf("message = %#v", message)
 	}
 
-	contactOps, ok := mutations[4].Payload["operations"].([]map[string]any)
+	contactOps, ok := mutations[5].Payload["operations"].([]map[string]any)
 	if !ok || len(contactOps) != 1 {
-		t.Fatalf("contact operations = %#v", mutations[4].Payload["operations"])
+		t.Fatalf("contact operations = %#v", mutations[5].Payload["operations"])
 	}
-	if contactOps[0]["op"] != "delete_contact" || mutations[4].Operation != ContactsBatchMutationOperation {
-		t.Fatalf("contact mutation = %#v", mutations[4])
+	if contactOps[0]["op"] != "delete_contact" || mutations[5].Operation != ContactsBatchMutationOperation {
+		t.Fatalf("contact mutation = %#v", mutations[5])
 	}
 	if contactOps[0]["expected_etag"] != "etag-1" || contactOps[0]["client_op_id"] != "op-0" {
 		t.Fatalf("normalized contact operation = %#v", contactOps[0])

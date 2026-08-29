@@ -471,6 +471,7 @@ UPSTREAM_MUTATION_CLAIMABLE_STATUSES = ("approved", "failed_retryable")
 GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION = "contacts.batch_mutation"
 GMAIL_ARCHIVE_OPERATION = "gmail.archive_threads"
 GMAIL_UNARCHIVE_OPERATION = "gmail.unarchive_threads"
+GMAIL_MODIFY_THREAD_LABELS_OPERATION = "gmail.modify_thread_labels"
 GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
 SLACK_PROVIDER = "slack"
 SLACK_MARK_CONVERSATION_READ_OPERATION = "slack.mark_conversation_read"
@@ -6646,12 +6647,17 @@ class PostgresWarehouse:
         *,
         account: str,
         thread_ids: Sequence[str],
-        archive: bool,
+        archive: bool | None = None,
     ) -> dict[str, list[str]]:
         normalized_thread_ids = _normalize_thread_ids(thread_ids)
         if not normalized_thread_ids:
             return {}
-        inbox_filter = "AND 'INBOX' = ANY(label_ids)" if archive else ""
+        inbox_filter = "AND 'INBOX' = ANY(label_ids)" if archive is True else ""
+        mailbox_filter = (
+            "AND NOT ('TRASH' = ANY(label_ids)) AND NOT ('SPAM' = ANY(label_ids))"
+            if archive is not None
+            else ""
+        )
         rows = self._query(
             f"""
             SELECT thread_id, message_id
@@ -6659,8 +6665,7 @@ class PostgresWarehouse:
             WHERE account = %s
               AND thread_id = ANY(%s)
               AND is_deleted = 0
-              AND NOT ('TRASH' = ANY(label_ids))
-              AND NOT ('SPAM' = ANY(label_ids))
+              {mailbox_filter}
               {inbox_filter}
             ORDER BY thread_id ASC, internal_date ASC, message_id ASC
             """,
@@ -6763,6 +6768,66 @@ class PostgresWarehouse:
             thread_ids = _normalize_thread_ids(_as_json_dict(mutation["payload_json"]).get("thread_ids") or [])
             if thread_ids and set(thread_ids) <= inbox_by_account.get(str(mutation["account"]), set()):
                 observations.append((str(mutation["id"]), {"thread_ids": thread_ids}))
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
+    def observe_succeeded_gmail_thread_label_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider="gmail",
+            operation=GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            limit=limit,
+        )
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            payload = _as_json_dict(mutation["payload_json"])
+            result = _as_json_dict(mutation["result_json"])
+            thread_ids = _normalize_thread_ids(payload.get("thread_ids") or [])
+            add_label_ids = _normalize_thread_ids(result.get("add_label_ids") or [])
+            remove_label_ids = _normalize_thread_ids(result.get("remove_label_ids") or [])
+            if not thread_ids or (not add_label_ids and not remove_label_ids):
+                continue
+            message_rows = self._query(
+                """
+                SELECT thread_id, label_ids
+                FROM @gmail_messages
+                WHERE account = %s
+                  AND thread_id = ANY(%s)
+                  AND is_deleted = 0
+                """,
+                (mutation["account"], list(thread_ids)),
+            )
+            labels_by_thread: dict[str, list[set[str]]] = {thread_id: [] for thread_id in thread_ids}
+            for thread_id, label_ids in message_rows:
+                normalized_thread_id = str(thread_id)
+                if normalized_thread_id in labels_by_thread:
+                    labels_by_thread[normalized_thread_id].append({str(label_id) for label_id in label_ids})
+            if any(
+                not labels_by_thread[thread_id]
+                or any(
+                    not set(add_label_ids).issubset(message_labels)
+                    or not set(remove_label_ids).isdisjoint(message_labels)
+                    for message_labels in labels_by_thread[thread_id]
+                )
+                for thread_id in thread_ids
+            ):
+                continue
+            observations.append(
+                (
+                    str(mutation["id"]),
+                    {
+                        "thread_ids": thread_ids,
+                        "add_label_ids": add_label_ids,
+                        "remove_label_ids": remove_label_ids,
+                    },
+                )
+            )
         return self.observe_upstream_mutations(
             observations=observations,
             actor_id="upstream_mutation_observer",

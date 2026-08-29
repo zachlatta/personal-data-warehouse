@@ -87,6 +87,24 @@ func TestApplyGmailThreadPreviewRowsMergesWarehouseMessages(t *testing.T) {
 	}
 }
 
+func TestGmailThreadPreviewTargetsIncludeModifyLabels(t *testing.T) {
+	targets := gmailThreadPreviewTargets([]Mutation{{
+		ID:        "mut-labels",
+		Provider:  "gmail",
+		Operation: GmailModifyThreadLabelsOperation,
+		Account:   "zach@example.test",
+		Payload: map[string]any{
+			"thread_ids":    []any{"thread-1"},
+			"add_labels":    []any{"Receipts"},
+			"remove_labels": []any{"UNREAD"},
+		},
+	}})
+
+	if len(targets) != 1 || targets[0].ThreadID != "thread-1" {
+		t.Fatalf("targets = %#v", targets)
+	}
+}
+
 func TestApplyGmailThreadPreviewRowsAddsReplyThreadToGmailEmailMutations(t *testing.T) {
 	latest := time.Date(2026, 5, 22, 15, 45, 0, 0, time.UTC)
 	mutations := []Mutation{{

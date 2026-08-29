@@ -27,6 +27,7 @@ from personal_data_warehouse.postgres import (
     CALENDAR_PROVIDER,
     FLOAT_COLUMNS,
     GMAIL_ARCHIVE_OPERATION,
+    GMAIL_MODIFY_THREAD_LABELS_OPERATION,
     GMAIL_SEND_EMAIL_OPERATION,
     GMAIL_UNARCHIVE_OPERATION,
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
@@ -595,6 +596,69 @@ def test_gmail_unarchive_mutation_claim_and_observe(warehouse: PostgresWarehouse
         ]
     )
     assert warehouse.observe_succeeded_gmail_unarchive_mutations() == 1
+    assert _request_status(warehouse, request["id"]) == "observed"
+
+
+def test_gmail_modify_thread_labels_mutation_claim_and_observe(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_tables()
+    warehouse.insert_messages(
+        [
+            _message_row(
+                message_id="m1",
+                thread_id="receipt-thread",
+                subject="Receipt",
+                labels=["INBOX", "UNREAD"],
+                sync_version=1,
+            ),
+        ]
+    )
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_labels",
+        title="Label receipt",
+        reason="organize mail",
+        mutations=[
+            {
+                "provider": "gmail",
+                "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+                "payload": {
+                    "thread_ids": ["receipt-thread"],
+                    "add_labels": ["Receipts"],
+                    "create_and_add_labels": ["Projects/Launch"],
+                    "remove_labels": ["UNREAD"],
+                },
+            }
+        ],
+    )
+    mutation = request["mutations"][0]
+
+    claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
+    assert claimed[0]["operation"] == GMAIL_MODIFY_THREAD_LABELS_OPERATION
+    assert claimed[0]["payload_json"]["create_and_add_labels"] == ["Projects/Launch"]
+    warehouse.complete_upstream_mutation(
+        mutation["id"],
+        result_json={
+            "modified_thread_ids": ["receipt-thread"],
+            "add_label_ids": ["Label_42", "Label_99"],
+            "remove_label_ids": ["UNREAD"],
+            "created_labels": [{"id": "Label_99", "name": "Projects/Launch"}],
+        },
+        actor_id="worker",
+    )
+    assert warehouse.observe_succeeded_gmail_thread_label_mutations() == 0
+
+    warehouse.insert_messages(
+        [
+            _message_row(
+                message_id="m1",
+                thread_id="receipt-thread",
+                subject="Receipt",
+                labels=["INBOX", "Label_42", "Label_99"],
+                sync_version=2,
+            ),
+        ]
+    )
+    assert warehouse.observe_succeeded_gmail_thread_label_mutations() == 1
     assert _request_status(warehouse, request["id"]) == "observed"
 
 

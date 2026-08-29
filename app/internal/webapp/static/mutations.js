@@ -156,13 +156,47 @@ function renderGmailThread(thread, { open = false, afterMessages = null } = {}) 
   return node;
 }
 
+function renderGmailLabelChanges(payload, threadCount) {
+  const section = h("section", "glabel-delta");
+  section.setAttribute("aria-label", "Gmail label changes");
+  section.appendChild(h("div", "glabel-delta-heading", "Label changes after approval"));
+  const grid = h("div", "glabel-change-grid");
+  for (const change of V.gmailMutationLabelChanges(payload)) {
+    if (change.kind === "created" && change.labels.length === 0) continue;
+    const card = h("div", "glabel-change " + change.kind);
+    const heading = h("div", "glabel-change-heading");
+    heading.appendChild(h("span", "glabel-change-symbol", change.symbol));
+    heading.appendChild(h("strong", "", change.heading));
+    card.appendChild(heading);
+    const values = h("div", "glabel-change-values");
+    if (change.labels.length === 0) {
+      values.appendChild(h("span", "glabel-change-none", "None"));
+    } else {
+      change.labels.forEach((label) => values.appendChild(h("span", "glabel-change-chip", change.symbol + " " + label)));
+    }
+    card.appendChild(values);
+    if (change.kind === "created") {
+      card.appendChild(h("p", "glabel-create-note", "Existing same-name labels will be reused."));
+    }
+    grid.appendChild(card);
+  }
+  section.appendChild(grid);
+  section.appendChild(h("p", "glabel-delta-scope", "Applies to " + threadCount + " Gmail thread" + V.plural(threadCount) + "."));
+  return section;
+}
+
 function renderGmailGroup(group) {
-  const verb = group.operation === V.GMAIL_UNARCHIVE ? "Unarchive" : "Archive";
+  const verb = V.gmailMutationGroupVerb(group.operation);
   const threads = V.gmailMutationGroupThreads(group.mutations);
+  const payload = group.mutations.length > 0 ? group.mutations[0].payload : {};
   const article = h("article", "mut gmail");
   article.appendChild(mutationHead(verb, V.gmailMutationGroupTitle(verb, threads.length), V.gmailMutationGroupStatus(group.status, group.mutations.length)));
   article.appendChild(h("p", "mmeta m", group.operation + " for " + group.account));
-  article.appendChild(h("p", "mreason", V.gmailMutationGroupActionText(group.operation, threads.length)));
+  if (group.operation === V.GMAIL_MODIFY_THREAD_LABELS) {
+    article.appendChild(renderGmailLabelChanges(payload, threads.length));
+  } else {
+    article.appendChild(h("p", "mreason", V.gmailMutationGroupActionText(group.operation, threads.length, payload)));
+  }
   const list = h("div", "gthreads");
   threads.forEach((thread) => list.appendChild(renderGmailThread(thread)));
   article.appendChild(list);

@@ -203,7 +203,9 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 }
 
 func isGmailThreadMutation(mutation Mutation) bool {
-	return mutation.Provider == "gmail" && (mutation.Operation == GmailArchiveOperation || mutation.Operation == GmailUnarchiveOperation)
+	return mutation.Provider == "gmail" && (mutation.Operation == GmailArchiveOperation ||
+		mutation.Operation == GmailUnarchiveOperation ||
+		mutation.Operation == GmailModifyThreadLabelsOperation)
 }
 
 func gmailEmailReplyThreadIDs(mutation Mutation) []string {

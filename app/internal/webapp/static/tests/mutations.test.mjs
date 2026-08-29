@@ -9,6 +9,7 @@ import {
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
   groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView,
   isSlackMarkReadMutation, slackMarkReadView,
+  gmailMutationGroupActionText, gmailMutationGroupVerb, gmailMutationLabelChanges,
 } from "../mutation_view.js";
 
 // --- gmail --------------------------------------------------------------------
@@ -116,6 +117,32 @@ test("gmailMessageOpen opens unread messages, else the last one when only the th
   assert.equal(gmailMessageOpen(bare[0], 0, bare, true), false);
   assert.equal(gmailMessageOpen(bare[1], 1, bare, true), true);
   assert.equal(gmailMessageOpen(bare[1], 1, bare, false), false);
+});
+
+test("gmail label mutations describe additions and removals for review", () => {
+  const mutation = {
+    operation: "gmail.modify_thread_labels",
+    payload: {
+      add_labels: ["Receipts", "STARRED"],
+      create_and_add_labels: ["Projects/Launch"],
+      remove_labels: ["UNREAD"],
+    },
+  };
+  assert.equal(gmailMutationGroupVerb(mutation.operation), "Update labels");
+  assert.equal(
+    gmailMutationGroupActionText(mutation.operation, 2, mutation.payload),
+    "Creates and adds Projects/Launch, adds Receipts and STARRED, and removes UNREAD on these threads.",
+  );
+  assert.deepEqual(gmailMutationLabelChanges(mutation.payload), [
+    { kind: "created", heading: "Create if missing + add", symbol: "+", labels: ["Projects/Launch"] },
+    { kind: "added", heading: "Labels added", symbol: "+", labels: ["Receipts", "STARRED"] },
+    { kind: "removed", heading: "Labels removed", symbol: "−", labels: ["UNREAD"] },
+  ]);
+  assert.deepEqual(gmailMutationLabelChanges({ add_labels: ["Receipts"] }), [
+    { kind: "created", heading: "Create if missing + add", symbol: "+", labels: [] },
+    { kind: "added", heading: "Labels added", symbol: "+", labels: ["Receipts"] },
+    { kind: "removed", heading: "Labels removed", symbol: "−", labels: [] },
+  ]);
 });
 
 test("assembleEmailBody orders editor, signature, quote and joins text with blank lines", () => {
@@ -246,7 +273,7 @@ test("personFromFlatOperation synthesises a Person the person renderer understan
 
 // --- grouping and the list ---------------------------------------------------
 
-test("groupMutations groups gmail threads by operation+account, contacts by account, others alone", () => {
+test("groupMutations groups gmail threads by operation+account+label changes, contacts by account, others alone", () => {
   const m = (id, provider, operation, account, status) => ({ id, provider, operation, account, status: status || "pending_review" });
   const items = groupMutations([
     m("a1", "gmail", "gmail.archive_threads", "z@example.test"),
@@ -255,10 +282,14 @@ test("groupMutations groups gmail threads by operation+account, contacts by acco
     m("a2", "gmail", "gmail.archive_threads", "z@example.test", "approved"),
     m("a3", "gmail", "gmail.archive_threads", "other@example.test"),
     m("u1", "gmail", "gmail.unarchive_threads", "z@example.test"),
+    { ...m("l1", "gmail", "gmail.modify_thread_labels", "z@example.test"), payload: { add_labels: ["Receipts"] } },
+    { ...m("l2", "gmail", "gmail.modify_thread_labels", "z@example.test"), payload: { add_labels: ["Receipts"] } },
+    { ...m("l3", "gmail", "gmail.modify_thread_labels", "z@example.test"), payload: { remove_labels: ["Receipts"] } },
+    { ...m("l4", "gmail", "gmail.modify_thread_labels", "z@example.test"), payload: { create_and_add_labels: ["Receipts"] } },
     m("c2", "google_people", "google_people.contacts", "z@example.test"),
     m("cal", "google_calendar", "calendar.create_event", "z@example.test"),
   ]);
-  assert.deepEqual(items.map((i) => i.kind), ["gmail", "contact", "single", "gmail", "gmail", "single"]);
+  assert.deepEqual(items.map((i) => i.kind), ["gmail", "contact", "single", "gmail", "gmail", "gmail", "gmail", "gmail", "single"]);
   assert.deepEqual(items[0].mutations.map((x) => x.id), ["a1", "a2"]);
   assert.equal(items[0].status, "mixed");
   assert.deepEqual(items[1].mutations.map((x) => x.id), ["c1", "c2"]);
@@ -266,7 +297,10 @@ test("groupMutations groups gmail threads by operation+account, contacts by acco
   assert.equal(items[2].mutation.id, "e1");
   assert.equal(items[3].account, "other@example.test");
   assert.equal(items[4].operation, "gmail.unarchive_threads");
-  assert.equal(items[5].mutation.id, "cal");
+  assert.deepEqual(items[5].mutations.map((x) => x.id), ["l1", "l2"]);
+  assert.deepEqual(items[6].mutations.map((x) => x.id), ["l3"]);
+  assert.deepEqual(items[7].mutations.map((x) => x.id), ["l4"]);
+  assert.equal(items[8].mutation.id, "cal");
   assert.deepEqual(groupMutations(undefined), []);
 });
 

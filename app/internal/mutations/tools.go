@@ -110,6 +110,30 @@ func MutationHelp() MutationHelpDocument {
 				},
 			},
 			{
+				Type:        GmailModifyThreadLabelsOperation,
+				Summary:     "Add existing labels, explicitly create-and-add new labels, and/or remove labels on Gmail threads.",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailModifyThreadLabelsOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "thread_ids", JSONType: "array<string>", Required: true, Description: "Gmail thread IDs whose labels should change"},
+					{Name: "add_labels", JSONType: "array<string>", Required: false, Description: "exact Gmail label display names or immutable label IDs to add"},
+					{Name: "create_and_add_labels", JSONType: "array<string>", Required: false, Description: "Gmail user-label display names to create if missing and then add; never interpreted as immutable label IDs"},
+					{Name: "remove_labels", JSONType: "array<string>", Required: false, Description: "exact Gmail label display names or immutable label IDs to remove"},
+				},
+				Example: map[string]any{
+					"type":                  GmailModifyThreadLabelsOperation,
+					"account":               "you@example.com",
+					"thread_ids":            []string{"1899e1d3a4f0aaaa"},
+					"add_labels":            []string{"Receipts", "STARRED"},
+					"create_and_add_labels": []string{"Projects/Launch"},
+					"remove_labels":         []string{"UNREAD"},
+				},
+				ExtraNotes: "At least one label list is required, and the same label cannot appear in more than one list. " +
+					"add_labels and remove_labels accept a Gmail label's exact display name (for example Receipts) or immutable label ID (for example Label_42 or STARRED), and stay strict when a label is unknown. " +
+					"Labels are created only when explicitly listed in create_and_add_labels; the executor reuses an existing same-name label on retries before applying it to the reviewed threads.",
+			},
+			{
 				Type:        GmailSendEmailOperation,
 				Summary:     "Send or draft a Gmail message. Supports multiple titled variants for human reviewer to pick from.",
 				RequiresEnv: "GMAIL_ACCOUNTS",

@@ -131,6 +131,86 @@ func TestProposeMutationRejectsEmptyGmailThreadIDsBeforeStore(t *testing.T) {
 	}
 }
 
+func TestProposeMutationGmailModifyThreadLabels(t *testing.T) {
+	store := &recordingStore{request: Request{ID: "req-labels", Status: "pending_review"}}
+	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Title:  "Label receipts",
+		Reason: "organize processed mail",
+		Mutations: []map[string]any{{
+			"type":                  GmailModifyThreadLabelsOperation,
+			"account":               "ZACH@example.test",
+			"thread_ids":            []any{" thread-1 ", "", "thread-2"},
+			"add_labels":            []any{" Receipts ", "STARRED"},
+			"create_and_add_labels": []any{" Projects/Launch "},
+			"remove_labels":         []any{" UNREAD "},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ProposeMutation returned error: %v", err)
+	}
+
+	if len(store.createCalls) != 1 || len(store.createCalls[0].Mutations) != 1 {
+		t.Fatalf("unexpected create calls: %#v", store.createCalls)
+	}
+	mutation := store.createCalls[0].Mutations[0]
+	if mutation.Type != GmailModifyThreadLabelsOperation || mutation.Account != "zach@example.test" {
+		t.Fatalf("unexpected label mutation: %#v", mutation)
+	}
+	if got := strings.Join(mutation.ThreadIDs, ","); got != "thread-1,thread-2" {
+		t.Fatalf("ThreadIDs = %q", got)
+	}
+	if got := strings.Join(mutation.AddLabels, ","); got != "Receipts,STARRED" {
+		t.Fatalf("AddLabels = %q", got)
+	}
+	if got := strings.Join(mutation.CreateAndAddLabels, ","); got != "Projects/Launch" {
+		t.Fatalf("CreateAndAddLabels = %q", got)
+	}
+	if got := strings.Join(mutation.RemoveLabels, ","); got != "UNREAD" {
+		t.Fatalf("RemoveLabels = %q", got)
+	}
+}
+
+func TestProposeMutationRejectsInvalidGmailLabelChangesBeforeStore(t *testing.T) {
+	tests := []struct {
+		name         string
+		add          []any
+		createAndAdd []any
+		remove       []any
+		want         string
+	}{
+		{name: "no changes", want: "add_labels, create_and_add_labels, or remove_labels"},
+		{name: "same label in both", add: []any{"Receipts"}, remove: []any{" receipts "}, want: "both add_labels and remove_labels"},
+		{name: "create label also listed as existing", add: []any{"Projects"}, createAndAdd: []any{" projects "}, want: "both add_labels and create_and_add_labels"},
+		{name: "create label also removed", createAndAdd: []any{"Projects"}, remove: []any{" projects "}, want: "both create_and_add_labels and remove_labels"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &recordingStore{}
+			service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+			_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+				Title:  "Update labels",
+				Reason: "organize mail",
+				Mutations: []map[string]any{{
+					"type":                  GmailModifyThreadLabelsOperation,
+					"account":               "zach@example.test",
+					"thread_ids":            []any{"thread-1"},
+					"add_labels":            tt.add,
+					"create_and_add_labels": tt.createAndAdd,
+					"remove_labels":         tt.remove,
+				}},
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected error containing %q, got %v", tt.want, err)
+			}
+			if len(store.createCalls) != 0 {
+				t.Fatalf("CreateRequest should not have been called: %#v", store.createCalls)
+			}
+		})
+	}
+}
+
 func TestProposeMutationGmailSendEmail(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-email",
@@ -327,6 +407,7 @@ func TestMutationHelpDocumentsSupportedMutationTypes(t *testing.T) {
 	for _, expected := range []string{
 		GmailArchiveOperation,
 		GmailUnarchiveOperation,
+		GmailModifyThreadLabelsOperation,
 		GmailSendEmailOperation,
 		GooglePeopleContactsOperation,
 		CalendarCreateEventOperation,

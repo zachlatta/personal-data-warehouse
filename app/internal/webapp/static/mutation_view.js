@@ -72,13 +72,16 @@ export function requestMutationCount(request) {
 
 export const GMAIL_ARCHIVE = "gmail.archive_threads";
 export const GMAIL_UNARCHIVE = "gmail.unarchive_threads";
+export const GMAIL_MODIFY_THREAD_LABELS = "gmail.modify_thread_labels";
 export const GMAIL_SEND_EMAIL = "gmail.send_email";
 export const SLACK_MARK_CONVERSATION_READ = "slack.mark_conversation_read";
 const CALENDAR_OPS = ["calendar.create_event", "calendar.update_event", "calendar.delete_event"];
 const APPLE_NOTES_OPS = ["apple_notes.create_note", "apple_notes.update_note"];
 
 export function isGmailThreadMutation(m) {
-  return m.provider === "gmail" && (m.operation === GMAIL_ARCHIVE || m.operation === GMAIL_UNARCHIVE);
+  return m.provider === "gmail" && (
+    m.operation === GMAIL_ARCHIVE || m.operation === GMAIL_UNARCHIVE || m.operation === GMAIL_MODIFY_THREAD_LABELS
+  );
 }
 export function isGmailEmailMutation(m) { return m.provider === "gmail" && m.operation === GMAIL_SEND_EMAIL; }
 export function isContactMutation(m) {
@@ -90,15 +93,23 @@ export function isSlackMarkReadMutation(m) {
   return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
 }
 
-// groupMutations mirrors renderMutationList: gmail archive/unarchive mutations
-// group by operation+account, contact mutations by account, everything else
-// stands alone. Groups keep the position of their first member and report
+// groupMutations mirrors renderMutationList: Gmail thread mutations group by
+// operation+account+label changes, contact mutations by account, everything
+// else stands alone. Groups keep the position of their first member and report
 // "mixed" when members disagree on status.
 export function groupMutations(mutations) {
   const items = []; const gmail = new Map(); const contacts = new Map();
   for (const mutation of mutations || []) {
     if (isGmailThreadMutation(mutation)) {
-      const key = mutation.operation + "\0" + mutation.account;
+      const payload = asMap(mutation.payload);
+      const labelChangeKey = mutation.operation === GMAIL_MODIFY_THREAD_LABELS
+        ? JSON.stringify([
+          stringSlice(payload.add_labels),
+          stringSlice(payload.create_and_add_labels),
+          stringSlice(payload.remove_labels),
+        ])
+        : "";
+      const key = mutation.operation + "\0" + mutation.account + "\0" + labelChangeKey;
       let group = gmail.get(key);
       if (!group) {
         group = { kind: "gmail", operation: mutation.operation, account: mutation.account, status: mutation.status, mutations: [] };
@@ -251,9 +262,44 @@ export function gmailMutationThreadIDs(mutation) {
 
 export function gmailMutationGroupTitle(verb, threadCount) { return verb + " " + threadCount + " Gmail thread" + plural(threadCount); }
 
-export function gmailMutationGroupActionText(operation, threadCount) {
+export function gmailMutationGroupVerb(operation) {
+  if (operation === GMAIL_UNARCHIVE) return "Unarchive";
+  if (operation === GMAIL_MODIFY_THREAD_LABELS) return "Update labels";
+  return "Archive";
+}
+
+function humanList(values) {
+  values = stringSlice(values);
+  if (values.length <= 1) return values.join("");
+  if (values.length === 2) return values.join(" and ");
+  return values.slice(0, -1).join(", ") + ", and " + values[values.length - 1];
+}
+
+export function gmailMutationLabelChanges(payload = {}) {
+  payload = asMap(payload);
+  return [
+    { kind: "created", heading: "Create if missing + add", symbol: "+", labels: stringSlice(payload.create_and_add_labels) },
+    { kind: "added", heading: "Labels added", symbol: "+", labels: stringSlice(payload.add_labels) },
+    { kind: "removed", heading: "Labels removed", symbol: "−", labels: stringSlice(payload.remove_labels) },
+  ];
+}
+
+export function gmailMutationGroupActionText(operation, threadCount, payload = {}) {
   const noun = threadCount === 1 ? "this thread" : "these threads";
   if (operation === GMAIL_UNARCHIVE) return "Restores " + noun + " to the Inbox.";
+  if (operation === GMAIL_MODIFY_THREAD_LABELS) {
+    const [created, added, removed] = gmailMutationLabelChanges(payload);
+    const createAndAdd = humanList(created.labels);
+    const add = humanList(added.labels);
+    const remove = humanList(removed.labels);
+    const changes = [];
+    if (createAndAdd) changes.push("Creates and adds " + createAndAdd);
+    if (add) changes.push((changes.length ? "adds " : "Adds ") + add);
+    if (remove) changes.push((changes.length ? "removes " : "Removes ") + remove);
+    let summary = changes.join(" and ");
+    if (changes.length > 2) summary = changes.slice(0, -1).join(", ") + ", and " + changes[changes.length - 1];
+    return summary + " on " + noun + ".";
+  }
   return "Removes " + noun + " from the Inbox.";
 }
 

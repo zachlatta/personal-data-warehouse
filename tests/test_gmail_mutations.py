@@ -7,6 +7,7 @@ from email.parser import BytesParser
 from personal_data_warehouse import gmail_mutations
 from personal_data_warehouse.gmail_mutations import (
     GMAIL_ARCHIVE_OPERATION,
+    GMAIL_MODIFY_THREAD_LABELS_OPERATION,
     GMAIL_SEND_EMAIL_OPERATION,
     GMAIL_UNARCHIVE_OPERATION,
     GmailMutationExecutor,
@@ -48,7 +49,29 @@ class FakeMessagesResource:
 
     def send(self, **kwargs):
         self._service.send_calls.append(kwargs)
-        return FakeGmailRequest(response={"id": "sent-message-1", "threadId": kwargs["body"].get("threadId", "thread-new")})
+        return FakeGmailRequest(
+            response={"id": "sent-message-1", "threadId": kwargs["body"].get("threadId", "thread-new")}
+        )
+
+
+class FakeLabelsResource:
+    def __init__(self, service) -> None:
+        self._service = service
+
+    def list(self, **kwargs):
+        self._service.label_list_calls.append(kwargs)
+        return FakeGmailRequest(response={"labels": self._service.labels})
+
+    def create(self, **kwargs):
+        self._service.label_create_calls.append(kwargs)
+        if self._service.label_create_errors:
+            error = self._service.label_create_errors.pop(0)
+            if self._service.label_create_error_labels:
+                self._service.labels.append(self._service.label_create_error_labels.pop(0))
+            return FakeGmailRequest(error=error)
+        response = self._service.label_create_responses.pop(0)
+        self._service.labels.append(response)
+        return FakeGmailRequest(response=response)
 
 
 class FakeDraftsResource:
@@ -79,15 +102,33 @@ class FakeUsersResource:
     def drafts(self):
         return FakeDraftsResource(self._service)
 
+    def labels(self):
+        return FakeLabelsResource(self._service)
+
 
 class FakeGmailService:
-    def __init__(self, *, errors=None, batch_modify_errors=None) -> None:
+    def __init__(
+        self,
+        *,
+        errors=None,
+        batch_modify_errors=None,
+        labels=None,
+        label_create_responses=None,
+        label_create_errors=None,
+        label_create_error_labels=None,
+    ) -> None:
         self.errors = list(errors or [])
         self.batch_modify_errors = list(batch_modify_errors or [])
         self.modify_calls = []
         self.batch_modify_calls = []
         self.send_calls = []
         self.draft_create_calls = []
+        self.labels = list(labels or [])
+        self.label_list_calls = []
+        self.label_create_calls = []
+        self.label_create_responses = list(label_create_responses or [])
+        self.label_create_errors = list(label_create_errors or [])
+        self.label_create_error_labels = list(label_create_error_labels or [])
 
     def users(self):
         return FakeUsersResource(self)
@@ -140,6 +181,182 @@ def test_gmail_unarchive_executor_adds_inbox_to_threads() -> None:
     ]
 
 
+def test_gmail_modify_thread_labels_executor_resolves_names_and_ids() -> None:
+    service = FakeGmailService(
+        labels=[
+            {"id": "Label_42", "name": "Receipts", "type": "user"},
+            {"id": "STARRED", "name": "STARRED", "type": "system"},
+            {"id": "UNREAD", "name": "UNREAD", "type": "system"},
+        ]
+    )
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "thread_ids": ["thread-1"],
+                "add_labels": ["Receipts", "starred"],
+                "remove_labels": ["UNREAD"],
+            },
+        }
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["modified_thread_ids"] == ["thread-1"]
+    assert result.result_json["add_label_ids"] == ["Label_42", "STARRED"]
+    assert result.result_json["remove_label_ids"] == ["UNREAD"]
+    assert service.label_list_calls == [{"userId": "me"}]
+    assert service.modify_calls == [
+        {
+            "userId": "me",
+            "id": "thread-1",
+            "body": {
+                "addLabelIds": ["Label_42", "STARRED"],
+                "removeLabelIds": ["UNREAD"],
+            },
+        }
+    ]
+
+
+def test_gmail_modify_thread_labels_executor_rejects_unknown_label_before_writing() -> None:
+    service = FakeGmailService(labels=[{"id": "Label_42", "name": "Receipts", "type": "user"}])
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {"thread_ids": ["thread-1"], "add_labels": ["Missing label"]},
+        }
+    )
+
+    assert result.status == "failed_terminal"
+    assert "unknown Gmail label" in result.error
+    assert service.modify_calls == []
+
+
+def test_gmail_modify_thread_labels_executor_explicitly_creates_and_adds_missing_label() -> None:
+    service = FakeGmailService(
+        labels=[
+            {"id": "Label_42", "name": "Receipts", "type": "user"},
+            {"id": "UNREAD", "name": "UNREAD", "type": "system"},
+        ],
+        label_create_responses=[
+            {"id": "Label_99", "name": "Projects/Launch", "type": "user"},
+        ],
+    )
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "thread_ids": ["thread-1"],
+                "add_labels": ["Receipts"],
+                "create_and_add_labels": ["Projects/Launch"],
+                "remove_labels": ["UNREAD"],
+            },
+        }
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["add_label_ids"] == ["Label_42", "Label_99"]
+    assert result.result_json["created_labels"] == [{"id": "Label_99", "name": "Projects/Launch"}]
+    assert service.label_create_calls == [{"userId": "me", "body": {"name": "Projects/Launch"}}]
+    assert service.modify_calls == [
+        {
+            "userId": "me",
+            "id": "thread-1",
+            "body": {
+                "addLabelIds": ["Label_42", "Label_99"],
+                "removeLabelIds": ["UNREAD"],
+            },
+        }
+    ]
+
+
+def test_gmail_modify_thread_labels_executor_reuses_create_if_missing_label_on_retry() -> None:
+    service = FakeGmailService(labels=[{"id": "Label_99", "name": "Projects/Launch", "type": "user"}])
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "thread_ids": ["thread-1"],
+                "create_and_add_labels": ["projects/launch"],
+            },
+        }
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["add_label_ids"] == ["Label_99"]
+    assert result.result_json["created_labels"] == []
+    assert service.label_create_calls == []
+    assert service.modify_calls[0]["body"] == {"addLabelIds": ["Label_99"]}
+
+
+def test_gmail_modify_thread_labels_executor_recovers_create_conflict_by_relisting() -> None:
+    class ConflictResponse:
+        status = 409
+        reason = "Conflict"
+
+    service = FakeGmailService(
+        label_create_errors=[gmail_mutations.HttpError(ConflictResponse(), b'{"error":"already exists"}')],
+        label_create_error_labels=[{"id": "Label_99", "name": "Projects/Launch", "type": "user"}],
+    )
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "thread_ids": ["thread-1"],
+                "create_and_add_labels": ["Projects/Launch"],
+            },
+        }
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["add_label_ids"] == ["Label_99"]
+    assert result.result_json["created_labels"] == []
+    assert service.label_list_calls == [{"userId": "me"}, {"userId": "me"}]
+    assert service.modify_calls[0]["body"] == {"addLabelIds": ["Label_99"]}
+
+
+def test_gmail_modify_thread_labels_executor_validates_strict_labels_before_creating() -> None:
+    service = FakeGmailService(label_create_responses=[{"id": "Label_99", "name": "Projects/Launch", "type": "user"}])
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": {
+                "thread_ids": ["thread-1"],
+                "add_labels": ["Misspelled existing label"],
+                "create_and_add_labels": ["Projects/Launch"],
+            },
+        }
+    )
+
+    assert result.status == "failed_terminal"
+    assert "unknown Gmail label" in result.error
+    assert service.label_create_calls == []
+    assert service.modify_calls == []
+
+
 def test_gmail_archive_executor_batch_modifies_messages() -> None:
     service = FakeGmailService()
     executor = GmailMutationExecutor(
@@ -180,8 +397,44 @@ def test_gmail_unarchive_executor_batch_modifies_messages() -> None:
 
     assert result.status == "succeeded"
     assert result.result_json["unarchived_message_ids"] == ["message-1"]
+    assert service.batch_modify_calls == [{"userId": "me", "body": {"addLabelIds": ["INBOX"], "ids": ["message-1"]}}]
+
+
+def test_gmail_modify_thread_labels_executor_batch_modifies_messages() -> None:
+    service = FakeGmailService(
+        labels=[
+            {"id": "Label_42", "name": "Receipts", "type": "user"},
+            {"id": "UNREAD", "name": "UNREAD", "type": "system"},
+        ],
+        label_create_responses=[
+            {"id": "Label_99", "name": "Projects/Launch", "type": "user"},
+        ],
+    )
+    executor = GmailMutationExecutor(settings=object(), service_factory=lambda account: service)
+
+    result = executor.execute_message_batch_modify(
+        account="zach@example.test",
+        operation=GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+        message_ids=["message-1", "message-2"],
+        add_labels=["Receipts"],
+        create_and_add_labels=["Projects/Launch"],
+        remove_labels=["UNREAD"],
+    )
+
+    assert result.status == "succeeded"
+    assert result.result_json["add_label_ids"] == ["Label_42", "Label_99"]
+    assert result.result_json["created_labels"] == [{"id": "Label_99", "name": "Projects/Launch"}]
+    assert result.result_json["remove_label_ids"] == ["UNREAD"]
+    assert result.result_json["batch_modified_message_ids"] == ["message-1", "message-2"]
     assert service.batch_modify_calls == [
-        {"userId": "me", "body": {"addLabelIds": ["INBOX"], "ids": ["message-1"]}}
+        {
+            "userId": "me",
+            "body": {
+                "addLabelIds": ["Label_42", "Label_99"],
+                "removeLabelIds": ["UNREAD"],
+                "ids": ["message-1", "message-2"],
+            },
+        }
     ]
 
 
@@ -349,7 +602,7 @@ def test_gmail_send_email_executor_blocks_reply_without_message_headers() -> Non
 
 def test_build_email_raw_preserves_gmail_style_html_body() -> None:
     body_html = (
-        '<div>Hello from PDW.</div><div><br></div>'
+        "<div>Hello from PDW.</div><div><br></div>"
         '<div class="gmail_signature"><div dir="ltr"><span style="color:rgb(0,0,0);font-family:arial,sans-serif">--</span><br/>'
         '<font face="arial, sans-serif" color="#000000" style="background-color:rgb(255,255,255)">Zach Latta</font>'
         "</div></div>"

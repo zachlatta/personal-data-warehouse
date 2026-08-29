@@ -11,6 +11,7 @@ from personal_data_warehouse.calendar_mutations import CalendarMutationResult
 from personal_data_warehouse.contact_mutations import ContactMutationResult
 from personal_data_warehouse.gmail_mutations import (
     GMAIL_ARCHIVE_OPERATION,
+    GMAIL_MODIFY_THREAD_LABELS_OPERATION,
     GMAIL_UNARCHIVE_OPERATION,
     GmailMutationResult,
 )
@@ -85,6 +86,10 @@ class FakeWarehouse:
         self.calls.append("observe_gmail_unarchive")
         return 0
 
+    def observe_succeeded_gmail_thread_label_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_gmail_thread_labels")
+        return 0
+
     def observe_succeeded_gmail_email_mutations(self, **_kwargs) -> int:
         self.calls.append("observe_gmail_email")
         return 0
@@ -132,7 +137,9 @@ class FakeWarehouse:
         self.reclaim_calls.append((stale_after, tuple(idempotent_operations), actor_id))
         return self.reclaimed_count
 
-    def gmail_message_ids_for_thread_label_mutation(self, *, account: str, thread_ids: list[str], archive: bool):
+    def gmail_message_ids_for_thread_label_mutation(
+        self, *, account: str, thread_ids: list[str], archive: bool | None = None
+    ):
         self.message_id_lookups.append((account, thread_ids, archive))
         return {thread_id: list(self.message_ids_by_thread_id.get(thread_id, [])) for thread_id in thread_ids}
 
@@ -176,8 +183,26 @@ class FakeGmailExecutor(FakeExecutor):
         self.batch_results = list(batch_results or [])
         self.batch_calls = []
 
-    def execute_message_batch_modify(self, *, account: str, operation: str, message_ids: list[str]):
-        self.batch_calls.append((account, operation, message_ids))
+    def execute_message_batch_modify(
+        self,
+        *,
+        account: str,
+        operation: str,
+        message_ids: list[str],
+        add_labels=None,
+        create_and_add_labels=None,
+        remove_labels=None,
+    ):
+        self.batch_calls.append(
+            (
+                account,
+                operation,
+                message_ids,
+                list(add_labels or []),
+                list(create_and_add_labels or []),
+                list(remove_labels or []),
+            )
+        )
         return self.batch_results.pop(0)
 
 
@@ -294,6 +319,7 @@ def test_upstream_mutation_sensor_emits_run_when_stale_reclaimable_work_exists(m
     assert stale_after == timedelta(seconds=upstream_mutation_defs.DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS)
     assert ("gmail", GMAIL_ARCHIVE_OPERATION) in idempotent_operations
     assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
+    assert ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION) in idempotent_operations
     assert ("slack", SLACK_MARK_CONVERSATION_READ_OPERATION) in idempotent_operations
     assert warehouse.closed is True
 
@@ -406,6 +432,7 @@ def test_observation_batch_is_separate_from_execution() -> None:
     assert warehouse.calls == [
         "observe_gmail_archive",
         "observe_gmail_unarchive",
+        "observe_gmail_thread_labels",
         "observe_gmail_email",
         "observe_contacts",
         "observe_calendar",
@@ -433,6 +460,7 @@ def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_cl
     assert actor_id == "worker-1"
     assert ("gmail", GMAIL_ARCHIVE_OPERATION) in idempotent_operations
     assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
+    assert ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION) in idempotent_operations
 
 
 def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
@@ -478,7 +506,14 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
 
     assert warehouse.message_id_lookups == [("zach@example.test", ["thread-1", "thread-2"], True)]
     assert gmail_executor.batch_calls == [
-        ("zach@example.test", GMAIL_ARCHIVE_OPERATION, ["message-1", "message-2"])
+        (
+            "zach@example.test",
+            GMAIL_ARCHIVE_OPERATION,
+            ["message-1", "message-2"],
+            [],
+            [],
+            ["INBOX"],
+        )
     ]
     assert gmail_executor.seen == []
     assert warehouse.bulk_completed == [
@@ -497,6 +532,140 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
     assert warehouse.failed == []
     assert summary.claimed == 2
     assert summary.succeeded == 2
+
+
+def test_process_upstream_mutation_batch_batches_matching_gmail_label_changes_separately() -> None:
+    mutation_a = {
+        "id": "mut-a",
+        "provider": "gmail",
+        "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {
+            "thread_ids": ["thread-1"],
+            "add_labels": ["Receipts"],
+            "remove_labels": ["UNREAD"],
+        },
+    }
+    mutation_b = {
+        "id": "mut-b",
+        "provider": "gmail",
+        "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {
+            "thread_ids": ["thread-2"],
+            "add_labels": ["Receipts"],
+            "remove_labels": ["UNREAD"],
+        },
+    }
+    mutation_c = {
+        "id": "mut-c",
+        "provider": "gmail",
+        "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {
+            "thread_ids": ["thread-3"],
+            "create_and_add_labels": ["Follow up"],
+        },
+    }
+    warehouse = FakeWarehouse(
+        claimed=[mutation_a, mutation_b, mutation_c],
+        message_ids_by_thread_id={
+            "thread-1": ["message-1"],
+            "thread-2": ["message-2"],
+            "thread-3": ["message-3"],
+        },
+    )
+    gmail_executor = FakeGmailExecutor(
+        [],
+        batch_results=[
+            GmailMutationResult(
+                status="succeeded",
+                result_json={
+                    "batch_modified_message_ids": ["message-1", "message-2"],
+                    "add_label_ids": ["Label_42"],
+                    "remove_label_ids": ["UNREAD"],
+                    "created_labels": [],
+                },
+            ),
+            GmailMutationResult(
+                status="succeeded",
+                result_json={
+                    "batch_modified_message_ids": ["message-3"],
+                    "add_label_ids": ["Label_99"],
+                    "remove_label_ids": [],
+                    "created_labels": [{"id": "Label_99", "name": "Follow up"}],
+                },
+            ),
+        ],
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=gmail_executor,
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=100,
+        claimed_by="worker-1",
+    )
+
+    assert warehouse.message_id_lookups == [
+        ("zach@example.test", ["thread-1", "thread-2"], None),
+        ("zach@example.test", ["thread-3"], None),
+    ]
+    assert gmail_executor.batch_calls == [
+        (
+            "zach@example.test",
+            GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            ["message-1", "message-2"],
+            ["Receipts"],
+            [],
+            ["UNREAD"],
+        ),
+        (
+            "zach@example.test",
+            GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+            ["message-3"],
+            [],
+            ["Follow up"],
+            [],
+        ),
+    ]
+    assert warehouse.completed == [
+        (
+            "mut-a",
+            {
+                "modified_thread_ids": ["thread-1"],
+                "batch_modified_message_ids": ["message-1"],
+                "add_label_ids": ["Label_42"],
+                "remove_label_ids": ["UNREAD"],
+                "created_labels": [],
+            },
+            "worker-1",
+        ),
+        (
+            "mut-b",
+            {
+                "modified_thread_ids": ["thread-2"],
+                "batch_modified_message_ids": ["message-2"],
+                "add_label_ids": ["Label_42"],
+                "remove_label_ids": ["UNREAD"],
+                "created_labels": [],
+            },
+            "worker-1",
+        ),
+        (
+            "mut-c",
+            {
+                "modified_thread_ids": ["thread-3"],
+                "batch_modified_message_ids": ["message-3"],
+                "add_label_ids": ["Label_99"],
+                "remove_label_ids": [],
+                "created_labels": [{"id": "Label_99", "name": "Follow up"}],
+            },
+            "worker-1",
+        ),
+    ]
+    assert summary.succeeded == 3
 
 
 def test_process_upstream_mutation_batch_falls_back_when_batch_modify_has_no_messages() -> None:

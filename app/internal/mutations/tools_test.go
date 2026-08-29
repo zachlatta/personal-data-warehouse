@@ -49,3 +49,28 @@ func TestMutationHelpDocumentsContactUpdateAndDeleteShapes(t *testing.T) {
 		t.Fatalf("documented contacts example does not normalize: %v", err)
 	}
 }
+
+func TestMutationHelpDocumentsGmailThreadLabelChanges(t *testing.T) {
+	var labels MutationHelpType
+	for _, entry := range MutationHelp().Mutations {
+		if entry.Type == GmailModifyThreadLabelsOperation {
+			labels = entry
+			break
+		}
+	}
+	if labels.Type == "" {
+		t.Fatal("propose_mutation_help does not document Gmail label changes")
+	}
+	fieldNames := map[string]bool{}
+	for _, field := range labels.Fields {
+		fieldNames[field.Name] = true
+	}
+	for _, want := range []string{"thread_ids", "add_labels", "create_and_add_labels", "remove_labels"} {
+		if !fieldNames[want] {
+			t.Fatalf("Gmail label help is missing %q: %#v", want, labels.Fields)
+		}
+	}
+	if !strings.Contains(labels.ExtraNotes, "display name") || !strings.Contains(labels.ExtraNotes, "label ID") || !strings.Contains(labels.ExtraNotes, "created only when explicitly") {
+		t.Fatalf("Gmail label notes do not explain names and IDs: %q", labels.ExtraNotes)
+	}
+}

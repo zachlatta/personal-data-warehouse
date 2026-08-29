@@ -70,6 +70,28 @@ ul.evidence { margin: 6px 0 0 18px; color: var(--dim); font-size: 11.5px; }
   background: var(--surface2); border: 1px solid var(--line2); color: var(--dim); font-size: 11px; font-weight: 700; flex: none;
 }
 
+/* Gmail label mutations: make the direction impossible to miss. */
+.glabel-delta { margin: 10px 0 12px; }
+.glabel-delta-heading { color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }
+.glabel-change-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
+.glabel-change { border: 1px solid var(--line2); border-left-width: 4px; border-radius: 4px; padding: 9px 10px; background: var(--bg2); }
+.glabel-change.added { border-left-color: var(--green); background: rgba(111,207,151,.06); }
+.glabel-change.created { border-left-color: var(--amber); background: rgba(232,180,90,.06); }
+.glabel-change.removed { border-left-color: var(--red); background: rgba(224,108,95,.06); }
+.glabel-change-heading { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; font-size: 12px; }
+.glabel-change.added .glabel-change-heading { color: var(--green); }
+.glabel-change.created .glabel-change-heading { color: var(--amber); }
+.glabel-change.removed .glabel-change-heading { color: var(--red); }
+.glabel-change-symbol { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border: 1px solid currentColor; border-radius: 50%; font-size: 14px; line-height: 1; }
+.glabel-change-values { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-height: 20px; }
+.glabel-change-chip { border: 1px solid currentColor; border-radius: 3px; padding: 2px 7px; font-size: 11px; font-weight: 650; }
+.glabel-change.added .glabel-change-chip { color: var(--green); }
+.glabel-change.created .glabel-change-chip { color: var(--amber); }
+.glabel-change.removed .glabel-change-chip { color: var(--red); text-decoration: line-through; }
+.glabel-change-none { color: var(--faint); font-size: 11px; font-style: italic; }
+.glabel-create-note { color: var(--dim); font-size: 10px; margin: 6px 0 0; }
+.glabel-delta-scope { color: var(--dim); font-size: 11px; margin: 6px 0 0; }
+
 /* gmail threads: a dense inbox row that expands into the messages */
 .gthreads { display: grid; gap: 4px; margin-top: 8px; }
 details.gthread { border: 1px solid var(--line); border-radius: 3px; background: var(--bg2); }
@@ -211,6 +233,7 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
 
 @media (max-width: 860px) {
   .mv { padding: 10px 10px 100px; }
+  .glabel-change-grid { grid-template-columns: 1fr; }
   summary.grow { grid-template-columns: 1fr auto; }
   .glabels { display: none; }
   .gsubject { grid-column: 1 / 3; }

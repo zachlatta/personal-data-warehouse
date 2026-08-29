@@ -31,6 +31,7 @@ from personal_data_warehouse.contact_mutations import (
 )
 from personal_data_warehouse.gmail_mutations import (
     GMAIL_ARCHIVE_OPERATION,
+    GMAIL_MODIFY_THREAD_LABELS_OPERATION,
     GMAIL_UNARCHIVE_OPERATION,
     GmailMutationExecutor,
     GmailMutationResult,
@@ -52,13 +53,19 @@ UPSTREAM_MUTATION_OBSERVATION_SENSOR_INTERVAL_SECONDS = 30
 UPSTREAM_MUTATION_OBSERVATION_RETRY_DELAYS_SECONDS = (60, 300, 900, 3_600, 21_600)
 DEFAULT_UPSTREAM_MUTATION_BATCH_SIZE = 500
 DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS = 900
-GMAIL_THREAD_LABEL_OPERATIONS = {GMAIL_ARCHIVE_OPERATION, GMAIL_UNARCHIVE_OPERATION}
+GMAIL_THREAD_LABEL_OPERATIONS = {
+    GMAIL_ARCHIVE_OPERATION,
+    GMAIL_UNARCHIVE_OPERATION,
+    GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+}
 # Operations whose retry semantics make it safe to reclaim a stale `executing` row without
 # risking duplicate user-visible side effects. Gmail's batchModify is idempotent for label
-# add/remove; anything that creates or sends data (calendar events, emails, contacts) is not.
+# add/remove, and explicit label creation re-lists/reuses same-name labels (including a 409
+# race) before modifying messages. Other creates and sends (calendar, email, contacts) are not.
 RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_ARCHIVE_OPERATION),
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
+    ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION),
     (SLACK_PROVIDER, SLACK_MARK_CONVERSATION_READ_OPERATION),
 )
 
@@ -368,6 +375,7 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) ->
         warehouse.ensure_upstream_mutation_tables()
     observed = warehouse.observe_succeeded_gmail_archive_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_gmail_unarchive_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_gmail_thread_label_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_gmail_email_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_contact_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_calendar_event_mutations(ensure_tables=False)
@@ -391,11 +399,20 @@ def _upstream_mutation_reclaim_after() -> timedelta:
 
 
 def _gmail_thread_label_mutation_groups(claimed: list[dict]) -> list[list[dict]]:
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[
+        tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], list[dict]
+    ] = {}
     for mutation in claimed:
         if not _is_gmail_thread_label_mutation(mutation):
             continue
-        key = (str(mutation.get("account") or ""), str(mutation.get("operation") or ""))
+        add_labels, create_and_add_labels, remove_labels = _mutation_label_changes(mutation)
+        key = (
+            str(mutation.get("account") or ""),
+            str(mutation.get("operation") or ""),
+            tuple(add_labels),
+            tuple(create_and_add_labels),
+            tuple(remove_labels),
+        )
         groups.setdefault(key, []).append(mutation)
     return list(groups.values())
 
@@ -422,7 +439,13 @@ def _process_gmail_thread_label_mutation_group(
 
     account = str(mutations[0].get("account") or "")
     operation = str(mutations[0].get("operation") or "")
-    archive = operation == GMAIL_ARCHIVE_OPERATION
+    add_labels, create_and_add_labels, remove_labels = _mutation_label_changes(mutations[0])
+    if operation == GMAIL_ARCHIVE_OPERATION:
+        archive = True
+    elif operation == GMAIL_UNARCHIVE_OPERATION:
+        archive = False
+    else:
+        archive = None
     all_thread_ids = _unique(
         thread_id
         for mutation in mutations
@@ -463,6 +486,9 @@ def _process_gmail_thread_label_mutation_group(
             account=account,
             operation=operation,
             message_ids=batch_message_ids,
+            add_labels=add_labels,
+            create_and_add_labels=create_and_add_labels,
+            remove_labels=remove_labels,
         )
         if batch_result.status == "succeeded":
             successful_results: list[tuple[dict, dict[str, object]]] = []
@@ -475,6 +501,7 @@ def _process_gmail_thread_label_mutation_group(
                             operation=operation,
                             mutation=mutation,
                             message_ids=message_ids_by_mutation_id[mutation_id],
+                            batch_result_json=batch_result.result_json,
                         ),
                     )
                 )
@@ -501,6 +528,7 @@ def _process_gmail_thread_label_mutation_group(
                         for message_id in message_ids_by_mutation_id[mutation_id]
                         if message_id in modified_message_ids
                     ],
+                    batch_result_json=batch_result.result_json,
                 )
                 result = GmailMutationResult(
                     status=batch_result.status,
@@ -562,13 +590,24 @@ def _gmail_thread_label_batch_result_json(
     operation: str,
     mutation: dict,
     message_ids: list[str],
+    batch_result_json: dict,
 ) -> dict[str, object]:
     thread_ids = _mutation_thread_ids(mutation)
-    progress_key = "archived_thread_ids" if operation == GMAIL_ARCHIVE_OPERATION else "unarchived_thread_ids"
-    return {
+    if operation == GMAIL_ARCHIVE_OPERATION:
+        progress_key = "archived_thread_ids"
+    elif operation == GMAIL_UNARCHIVE_OPERATION:
+        progress_key = "unarchived_thread_ids"
+    else:
+        progress_key = "modified_thread_ids"
+    result: dict[str, object] = {
         progress_key: thread_ids,
         "batch_modified_message_ids": message_ids,
     }
+    if operation == GMAIL_MODIFY_THREAD_LABELS_OPERATION:
+        result["add_label_ids"] = list(batch_result_json.get("add_label_ids") or [])
+        result["remove_label_ids"] = list(batch_result_json.get("remove_label_ids") or [])
+        result["created_labels"] = list(batch_result_json.get("created_labels") or [])
+    return result
 
 
 def _record_mutation_result(*, warehouse, mutation: dict, result, claimed_by: str) -> str:
@@ -601,6 +640,28 @@ def _mutation_thread_ids(mutation: dict) -> list[str]:
     if isinstance(thread_ids, str) or not isinstance(thread_ids, list):
         return []
     return _unique(str(thread_id).strip() for thread_id in thread_ids if str(thread_id).strip())
+
+
+def _mutation_label_changes(mutation: dict) -> tuple[list[str], list[str], list[str]]:
+    operation = str(mutation.get("operation") or "")
+    if operation == GMAIL_ARCHIVE_OPERATION:
+        return [], [], ["INBOX"]
+    if operation == GMAIL_UNARCHIVE_OPERATION:
+        return ["INBOX"], [], []
+    payload = mutation.get("payload_json")
+    if not isinstance(payload, dict):
+        return [], [], []
+    return (
+        _mutation_label_tokens(payload.get("add_labels")),
+        _mutation_label_tokens(payload.get("create_and_add_labels")),
+        _mutation_label_tokens(payload.get("remove_labels")),
+    )
+
+
+def _mutation_label_tokens(value) -> list[str]:
+    if isinstance(value, str) or not isinstance(value, list):
+        return []
+    return _unique(str(label).strip() for label in value if str(label).strip())
 
 
 def _unique(values) -> list[str]:

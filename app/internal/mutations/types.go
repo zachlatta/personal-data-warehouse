@@ -11,6 +11,7 @@ const (
 
 	GmailArchiveOperation              = "gmail.archive_threads"
 	GmailUnarchiveOperation            = "gmail.unarchive_threads"
+	GmailModifyThreadLabelsOperation   = "gmail.modify_thread_labels"
 	GmailSendEmailOperation            = "gmail.send_email"
 	GooglePeopleContactsOperation      = "google_people.contacts"
 	ContactsBatchMutationOperation     = "contacts.batch_mutation"
@@ -77,28 +78,31 @@ type UpdateGmailEmailMutationInput struct {
 }
 
 type MutationInput struct {
-	Type           string
-	Account        string
-	Title          string
-	Reason         string
-	ThreadIDs      []string
-	DeliveryMode   string
-	Message        map[string]any
-	EmailVariants  []GmailEmailVariantInput
-	Operations     []map[string]any
-	CalendarID     string
-	EventID        string
-	ExpectedEtag   string
-	SendUpdates    string
-	Event          map[string]any
-	Patch          map[string]any
-	Folder         string
-	NoteID         string
-	Name           string
-	Body           string
-	AppendBody     string
-	ConversationID string
-	MessageTS      string
+	Type               string
+	Account            string
+	Title              string
+	Reason             string
+	ThreadIDs          []string
+	AddLabels          []string
+	CreateAndAddLabels []string
+	RemoveLabels       []string
+	DeliveryMode       string
+	Message            map[string]any
+	EmailVariants      []GmailEmailVariantInput
+	Operations         []map[string]any
+	CalendarID         string
+	EventID            string
+	ExpectedEtag       string
+	SendUpdates        string
+	Event              map[string]any
+	Patch              map[string]any
+	Folder             string
+	NoteID             string
+	Name               string
+	Body               string
+	AppendBody         string
+	ConversationID     string
+	MessageTS          string
 }
 
 type GmailEmailVariantInput struct {

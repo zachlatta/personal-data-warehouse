@@ -135,6 +135,16 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if len(normalizeStringSlice(mutation.ThreadIDs)) == 0 {
 			return fmt.Errorf("mutation %d must include thread_ids", index)
 		}
+	case GmailModifyThreadLabelsOperation:
+		if err := validateConfiguredAccount(account, s.cfg.GmailAccounts, "GMAIL_ACCOUNTS"); err != nil {
+			return err
+		}
+		if len(normalizeStringSlice(mutation.ThreadIDs)) == 0 {
+			return fmt.Errorf("mutation %d must include thread_ids", index)
+		}
+		if err := validateGmailLabelChanges(mutation.AddLabels, mutation.CreateAndAddLabels, mutation.RemoveLabels); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	case GmailSendEmailOperation:
 		if err := validateConfiguredAccount(account, s.cfg.GmailAccounts, "GMAIL_ACCOUNTS"); err != nil {
 			return err
@@ -231,7 +241,7 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d message_ts must be an exact Slack timestamp such as 1593473566.000200", index)
 		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, or slack.mark_conversation_read", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, or slack.mark_conversation_read", index, mutationType)
 	}
 	return nil
 }
@@ -278,29 +288,69 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		deliveryMode = "send"
 	}
 	return MutationInput{
-		Type:           strings.TrimSpace(mutationType),
-		Account:        normalizeAccount(stringFromAny(raw["account"])),
-		Title:          strings.TrimSpace(stringFromAny(raw["title"])),
-		Reason:         strings.TrimSpace(stringFromAny(raw["reason"])),
-		ThreadIDs:      stringSliceFromAny(raw["thread_ids"]),
-		DeliveryMode:   deliveryMode,
-		Message:        mapFromAny(raw["message"]),
-		EmailVariants:  emailVariantInputsFromAny(raw["variants"]),
-		Operations:     mapSliceFromAny(raw["operations"]),
-		CalendarID:     normalizeCalendarID(stringFromAny(raw["calendar_id"])),
-		EventID:        strings.TrimSpace(stringFromAny(raw["event_id"])),
-		ExpectedEtag:   strings.TrimSpace(stringFromAny(raw["expected_etag"])),
-		SendUpdates:    strings.TrimSpace(stringFromAny(raw["send_updates"])),
-		Event:          mapFromAny(raw["event"]),
-		Patch:          mapFromAny(raw["patch"]),
-		Folder:         strings.TrimSpace(stringFromAny(raw["folder"])),
-		NoteID:         strings.TrimSpace(stringFromAny(raw["note_id"])),
-		Name:           strings.TrimSpace(stringFromAny(raw["name"])),
-		Body:           stringFromAny(raw["body"]),
-		AppendBody:     stringFromAny(raw["append_body"]),
-		ConversationID: strings.TrimSpace(stringFromAny(raw["conversation_id"])),
-		MessageTS:      strings.TrimSpace(stringFromAny(raw["message_ts"])),
+		Type:               strings.TrimSpace(mutationType),
+		Account:            normalizeAccount(stringFromAny(raw["account"])),
+		Title:              strings.TrimSpace(stringFromAny(raw["title"])),
+		Reason:             strings.TrimSpace(stringFromAny(raw["reason"])),
+		ThreadIDs:          stringSliceFromAny(raw["thread_ids"]),
+		AddLabels:          stringSliceFromAny(raw["add_labels"]),
+		CreateAndAddLabels: stringSliceFromAny(raw["create_and_add_labels"]),
+		RemoveLabels:       stringSliceFromAny(raw["remove_labels"]),
+		DeliveryMode:       deliveryMode,
+		Message:            mapFromAny(raw["message"]),
+		EmailVariants:      emailVariantInputsFromAny(raw["variants"]),
+		Operations:         mapSliceFromAny(raw["operations"]),
+		CalendarID:         normalizeCalendarID(stringFromAny(raw["calendar_id"])),
+		EventID:            strings.TrimSpace(stringFromAny(raw["event_id"])),
+		ExpectedEtag:       strings.TrimSpace(stringFromAny(raw["expected_etag"])),
+		SendUpdates:        strings.TrimSpace(stringFromAny(raw["send_updates"])),
+		Event:              mapFromAny(raw["event"]),
+		Patch:              mapFromAny(raw["patch"]),
+		Folder:             strings.TrimSpace(stringFromAny(raw["folder"])),
+		NoteID:             strings.TrimSpace(stringFromAny(raw["note_id"])),
+		Name:               strings.TrimSpace(stringFromAny(raw["name"])),
+		Body:               stringFromAny(raw["body"]),
+		AppendBody:         stringFromAny(raw["append_body"]),
+		ConversationID:     strings.TrimSpace(stringFromAny(raw["conversation_id"])),
+		MessageTS:          strings.TrimSpace(stringFromAny(raw["message_ts"])),
 	}, nil
+}
+
+func validateGmailLabelChanges(addLabels []string, createAndAddLabels []string, removeLabels []string) error {
+	add := normalizeUniqueStringSlice(addLabels)
+	createAndAdd := normalizeUniqueStringSlice(createAndAddLabels)
+	remove := normalizeUniqueStringSlice(removeLabels)
+	if len(add) == 0 && len(createAndAdd) == 0 && len(remove) == 0 {
+		return errors.New("must include add_labels, create_and_add_labels, or remove_labels")
+	}
+	if len(add)+len(createAndAdd) > 100 {
+		return errors.New("add_labels and create_and_add_labels must include at most 100 labels combined")
+	}
+	if len(remove) > 100 {
+		return errors.New("remove_labels must include at most 100 labels")
+	}
+	adding := map[string]bool{}
+	for _, label := range add {
+		adding[strings.ToLower(label)] = true
+	}
+	for _, label := range createAndAdd {
+		key := strings.ToLower(label)
+		if adding[key] {
+			return fmt.Errorf("label %q must not appear in both add_labels and create_and_add_labels", label)
+		}
+		adding[key] = true
+	}
+	for _, label := range remove {
+		if adding[strings.ToLower(label)] {
+			for _, created := range createAndAdd {
+				if strings.EqualFold(created, label) {
+					return fmt.Errorf("label %q must not appear in both create_and_add_labels and remove_labels", label)
+				}
+			}
+			return fmt.Errorf("label %q must not appear in both add_labels and remove_labels", label)
+		}
+	}
+	return nil
 }
 
 func normalizeCalendarID(value string) string {
@@ -443,6 +493,18 @@ func normalizeStringSlice(values []string) []string {
 		trimmed := strings.TrimSpace(value)
 		if trimmed != "" {
 			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func normalizeUniqueStringSlice(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range normalizeStringSlice(values) {
+		if !seen[value] {
+			out = append(out, value)
+			seen[value] = true
 		}
 	}
 	return out
