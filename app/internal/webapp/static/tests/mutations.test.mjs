@@ -8,7 +8,7 @@ import {
   contactOperationSummary, contactFieldDisplayValue, canonicalContactOp, contactUpdateFields, contactEffect,
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
   groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView,
-  isSlackMarkReadMutation, slackMarkReadView,
+  isSlackMarkReadMutation, slackMarkReadView, slackMarkReadGroups, mutationReviewContext,
   gmailMutationGroupActionText, gmailMutationGroupVerb, gmailMutationLabelChanges,
 } from "../mutation_view.js";
 
@@ -68,6 +68,66 @@ test("Slack mark-read view exposes the target and surrounding messages", () => {
   assert.equal(view.targetMessage.text, "Yep — all handled.");
   assert.equal(view.messages[2].position, "after");
   assert.equal(view.messages[2].isAfterBoundary, true);
+});
+
+test("Slack review replaces raw DM and group-DM slugs with readable names", () => {
+  const direct = slackMarkReadView({ provider: "slack", operation: "slack.mark_conversation_read", preview: { slack_read: {
+    conversation_type: "im", conversation_name: "U012345", messages: [{ actor_name: "Grace Hopper", text: "done", is_target: true }],
+  } } });
+  assert.equal(direct.conversationLabel, "Grace Hopper");
+  const group = slackMarkReadView({ provider: "slack", operation: "slack.mark_conversation_read", preview: { slack_read: {
+    conversation_type: "mpim", conversation_name: "mpdm-review.owner--ada.lovelace--gracehopper-1",
+    messages: [{ actor_name: "Review Owner", text: "thanks", is_from_me: true }],
+  } } });
+  assert.equal(group.conversationLabel, "ada lovelace, gracehopper");
+});
+
+test("Slack mark-read groups turn a large request into scan-friendly conversation sections", () => {
+  const mutation = (id, conversation_type, conversation_name, text) => ({
+    id,
+    provider: "slack",
+    operation: "slack.mark_conversation_read",
+    preview: { slack_read: {
+      conversation_type,
+      conversation_name,
+      message_ts: id,
+      messages: [{ message_ts: id, actor_name: "Ada", text, is_target: true, position: "target" }],
+    } },
+  });
+  const groups = slackMarkReadGroups([
+    mutation("1", "public_channel", "announcements", "shipped"),
+    mutation("2", "im", "Grace", "done"),
+    mutation("3", "mpim", "project room", "thanks"),
+    mutation("4", "private_channel", "hq", "noted"),
+  ]);
+  assert.deepEqual(groups.map((group) => [group.key, group.label, group.items.length]), [
+    ["direct", "Direct messages", 1],
+    ["group", "Group DMs", 1],
+    ["private", "Private channels", 1],
+    ["public", "Public channels", 1],
+  ]);
+  assert.equal(groups[0].items[0].view.targetMessage.text, "done");
+  assert.equal(groups[3].items[0].view.conversationLabel, "#announcements");
+});
+
+test("mutation review context promotes batch counts and safety rules out of raw JSON", () => {
+  const view = mutationReviewContext({
+    source: "marts_inbox.slack_items",
+    snapshot_utc: "2026-08-29T20:48:19Z",
+    candidate_counts: { generic_channel: 173, automated_dm: 2, terminal_direct: 15, terminal_group: 8 },
+    selection: ["Only reviewed snapshots"],
+    preserved: ["Newer messages", "Mentions"],
+    opaque: { trace: 1 },
+  });
+  assert.equal(view.total, 198);
+  assert.deepEqual(view.counts.map((item) => [item.key, item.label, item.count]), [
+    ["generic_channel", "Generic channels", 173],
+    ["automated_dm", "Automated DMs", 2],
+    ["terminal_direct", "Direct acknowledgements", 15],
+    ["terminal_group", "Group acknowledgements", 8],
+  ]);
+  assert.deepEqual(view.preserved, ["Newer messages", "Mentions"]);
+  assert.deepEqual(view.leftover, { opaque: { trace: 1 } });
 });
 
 test("splitGmailQuotedHTML splits at the Gmail quote container and leaves a quote-first body alone", () => {

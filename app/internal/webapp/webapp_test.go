@@ -159,6 +159,10 @@ func TestMutationReviewCSSIncludesPhoneLayoutAndTouchTargets(t *testing.T) {
 		"@media (max-width: 640px)",
 		"table.rtable th:nth-child(3)",
 		".actions input.reason",
+		".decision-dock",
+		".review-metrics",
+		".slack-review-row",
+		".mutation-filter",
 		"min-height: 44px",
 		"env(safe-area-inset-bottom)",
 	} {

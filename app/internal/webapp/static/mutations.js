@@ -624,13 +624,8 @@ function renderAppleNotes(mutation) {
   return article;
 }
 
-function renderSlackMarkRead(mutation) {
-  const view = V.slackMarkReadView(mutation);
-  const article = h("article", "mut slack-read");
-  const title = view.conversationLabel ? "Mark " + view.conversationLabel + " read" : view.heading;
-  article.appendChild(mutationHead("Slack · reviewed action", title, mutation.status));
-  article.appendChild(h("p", "mmeta m", mutation.operation + " for " + mutation.account));
-
+function renderSlackMarkReadBody(mutation, view, requestReason) {
+  const body = h("div", "slack-review-body");
   const action = h("div", "slack-action");
   action.appendChild(h("strong", "", "What will happen"));
   action.appendChild(h("p", "", "Everything in this conversation up to and including the highlighted message will be marked read."));
@@ -640,7 +635,7 @@ function renderSlackMarkRead(mutation) {
     ["Unread now", view.currentUnreadCount ? String(view.currentUnreadCount) : ""],
     ["Account", mutation.account],
   ]));
-  article.appendChild(action);
+  body.appendChild(action);
 
   const context = h("section", "slack-context");
   const contextHead = h("div", "slack-context-head");
@@ -673,7 +668,7 @@ function renderSlackMarkRead(mutation) {
     }
     context.appendChild(transcript);
   }
-  article.appendChild(context);
+  body.appendChild(context);
 
   const technical = details("Exact Slack target", "raw");
   technical.appendChild(dl([
@@ -682,10 +677,50 @@ function renderSlackMarkRead(mutation) {
     ["Thread timestamp", view.threadTs],
     ["Current read cursor", view.currentLastRead],
   ]));
-  article.appendChild(technical);
-  if (mutation.reason) article.appendChild(h("p", "mreason", mutation.reason));
-  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
-  return article;
+  body.appendChild(technical);
+  if (mutation.reason && mutation.reason !== requestReason) body.appendChild(h("p", "mreason", mutation.reason));
+  if (mutation.error) body.appendChild(h("p", "bad", mutation.error));
+  return body;
+}
+
+function renderSlackMarkRead(request, mutation, suppliedView) {
+  const view = suppliedView || V.slackMarkReadView(mutation);
+  const node = h("details", "slack-review-row");
+  const summary = h("summary", "slack-review-summary");
+  const typeIcon = view.conversationType === "public_channel" ? "#"
+    : view.conversationType === "private_channel" ? "◈"
+      : view.conversationType === "mpim" ? "◎" : "@";
+  summary.appendChild(h("span", "slack-kind-icon", typeIcon));
+  const copy = h("span", "slack-row-copy");
+  const headline = h("span", "slack-row-headline");
+  headline.appendChild(h("strong", "", view.conversationLabel || view.conversationId || "Unknown conversation"));
+  headline.appendChild(h("span", "slack-context-chip", view.contextKind === "thread" ? "thread" : "conversation"));
+  copy.appendChild(headline);
+  const target = view.targetMessage;
+  const preview = h("span", "slack-row-preview");
+  if (target && target.actorName) preview.appendChild(h("b", "", (target.isFromMe ? "You" : target.actorName) + ": "));
+  preview.appendChild(document.createTextNode(target && target.text ? target.text : "Review exact read boundary"));
+  copy.appendChild(preview);
+  summary.appendChild(copy);
+  const trailing = h("span", "slack-row-trailing");
+  if (view.currentUnreadCount) trailing.appendChild(h("span", "slack-unread", view.currentUnreadCount + " unread"));
+  if (target && target.sentAt) {
+    const when = h("time", "", formatWhen(target.sentAt));
+    when.title = fmtFull(target.sentAt);
+    trailing.appendChild(when);
+  }
+  trailing.appendChild(h("span", "slack-chevron", "›"));
+  summary.appendChild(trailing);
+  node.appendChild(summary);
+  node.dataset.search = [view.conversationLabel, view.conversationId, view.conversationType, target && target.actorName, target && target.text]
+    .filter(Boolean).join(" ").toLowerCase();
+  let rendered = false;
+  node.addEventListener("toggle", () => {
+    if (!node.open || rendered) return;
+    rendered = true;
+    node.appendChild(renderSlackMarkReadBody(mutation, view, request && request.reason));
+  });
+  return node;
 }
 
 function renderGeneric(mutation) {
@@ -703,13 +738,71 @@ function renderMutation(request, mutation, actions) {
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
-  if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(mutation);
+  if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
   return renderGeneric(mutation);
 }
 
 // --- request context -----------------------------------------------------------------
 
 function renderContext(ctxMap) {
+  const review = V.mutationReviewContext(ctxMap);
+  if (review.counts.length || review.selection.length || review.preserved.length) {
+    const sect = h("section", "rsect review-overview");
+    const head = h("div", "review-section-head");
+    const headCopy = h("div");
+    headCopy.appendChild(h("div", "eyebrow", "Approval scope"));
+    headCopy.appendChild(h("h2", "", "What this request changes"));
+    head.appendChild(headCopy);
+    if (review.snapshotAt) {
+      const snapshot = h("span", "snapshot-chip", "snapshot " + formatWhen(review.snapshotAt));
+      snapshot.title = fmtFull(review.snapshotAt);
+      head.appendChild(snapshot);
+    }
+    sect.appendChild(head);
+
+    if (review.counts.length) {
+      const metrics = h("div", "review-metrics");
+      for (const item of review.counts) {
+        const metric = h("div", "review-metric metric-" + item.key.replaceAll("_", "-"));
+        metric.appendChild(h("span", "review-metric-icon", item.icon));
+        const copy = h("span", "review-metric-copy");
+        copy.appendChild(h("strong", "", item.count));
+        copy.appendChild(h("span", "", item.label));
+        metric.appendChild(copy);
+        metrics.appendChild(metric);
+      }
+      sect.appendChild(metrics);
+    }
+
+    const guardrails = h("div", "review-guardrails");
+    if (review.selection.length) {
+      const selected = h("article", "guardrail-card selected");
+      selected.appendChild(h("div", "guardrail-title", "→ Included"));
+      const ul = h("ul");
+      review.selection.forEach((line) => ul.appendChild(h("li", "", line)));
+      selected.appendChild(ul);
+      guardrails.appendChild(selected);
+    }
+    if (review.preserved.length) {
+      const preserved = h("article", "guardrail-card preserved");
+      preserved.appendChild(h("div", "guardrail-title", "✓ Preserved"));
+      const ul = h("ul");
+      review.preserved.forEach((line) => ul.appendChild(h("li", "", line)));
+      preserved.appendChild(ul);
+      guardrails.appendChild(preserved);
+    }
+    if (guardrails.childNodes.length) sect.appendChild(guardrails);
+    if (review.source) {
+      const source = h("p", "review-source");
+      source.appendChild(h("span", "lab", "Source "));
+      source.appendChild(document.createTextNode(review.source));
+      sect.appendChild(source);
+    }
+    if (Object.keys(review.leftover).length) {
+      const raw = details("Other context", "raw"); raw.appendChild(pre(review.leftover)); sect.appendChild(raw);
+    }
+    return sect;
+  }
   const c = V.splitRequestContext(ctxMap);
   if (c.empty) return null;
   const sect = h("section", "rsect");
@@ -785,54 +878,136 @@ async function renderList(root, ctx, alive) {
   root.appendChild(renderRequestTable("Past requests", past, "No approved or denied requests yet."));
 }
 
-function renderRequestHeader(request, actions) {
-  const sect = h("section", "rsect rhead");
-  const titleRow = h("div", "rtitle-row");
-  titleRow.appendChild(h("h1", "", request.title || request.id));
-  titleRow.appendChild(pill(V.requestListStatus(request)));
-  sect.appendChild(titleRow);
-  if (request.reason) sect.appendChild(h("p", "mreason", request.reason));
-  sect.appendChild(dl([
-    ["Requested by", request.requested_by], ["Created", fmtFull(request.created_at)],
-    ["Approved by", request.approved_by], ["Approved", fmtFull(request.approved_at)],
-    ["Executed", fmtFull(request.executed_at)], ["Updated", fmtFull(request.updated_at)],
-  ]));
-  if (request.error) sect.appendChild(h("p", "bad", request.error));
-  const errorNode = h("p", "bad");
-
-  if (request.status === "pending_review") {
-    const row = h("div", "actions");
-    const count = V.requestMutationCount(request);
-    row.appendChild(button("Approve", "ok", async () => {
-      if (!confirmDialog("Approve? " + count + " mutation" + V.plural(count) + " will run upstream.")) return;
-      errorNode.textContent = "";
-      try { await mutations.approve(request.id); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
-    }));
-    const reason = h("input"); reason.placeholder = "reason (optional)"; reason.className = "reason";
-    row.appendChild(reason);
-    row.appendChild(button("Deny", "danger", async () => {
-      errorNode.textContent = "";
-      try { await mutations.reject(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
-    }));
-    sect.appendChild(row);
+function renderRequestHeader(request) {
+  const sect = h("section", "rsect rhead review-hero");
+  sect.appendChild(h("div", "review-hero-icon", "✓"));
+  const main = h("div", "review-hero-main");
+  const eyebrow = h("div", "review-hero-eyebrow");
+  eyebrow.appendChild(h("span", "", "Mutation request"));
+  eyebrow.appendChild(pill(V.requestListStatus(request)));
+  main.appendChild(eyebrow);
+  main.appendChild(h("h1", "", request.title || request.id));
+  if (request.reason) main.appendChild(h("p", "mreason", request.reason));
+  const meta = h("div", "request-meta");
+  const metaPairs = [
+    ["By", request.requested_by, ""], ["Created", formatWhen(request.created_at), request.created_at],
+    ["Approved by", request.approved_by, ""], ["Approved", formatWhen(request.approved_at), request.approved_at],
+    ["Executed", formatWhen(request.executed_at), request.executed_at], ["Updated", formatWhen(request.updated_at), request.updated_at],
+  ];
+  for (const [label, value, rawTime] of metaPairs) {
+    if (!value) continue;
+    const item = h("span", "request-meta-item");
+    item.appendChild(h("span", "", label));
+    const strong = h("strong", "", value);
+    if (rawTime) strong.title = fmtFull(rawTime);
+    item.appendChild(strong);
+    meta.appendChild(item);
   }
+  main.appendChild(meta);
+  if (request.error) main.appendChild(h("p", "bad", request.error));
   const supersededBy = V.trimStr(request.superseded_by);
   if (supersededBy) {
     const p = h("p", "superseded", "Superseded by ");
     p.appendChild(link(requestPath(supersededBy), supersededBy, "code"));
     p.appendChild(document.createTextNode(". This request is kept as the record of what failed."));
-    sect.appendChild(p);
-  } else if (request.can_supersede === true) {
-    const row = h("div", "actions");
+    main.appendChild(p);
+  }
+  sect.appendChild(main);
+  return sect;
+}
+
+function renderDecisionDock(request, actions) {
+  const dock = h("section", "decision-dock");
+  const errorNode = h("span", "bad decision-error");
+  if (request.status === "pending_review") {
+    const count = V.requestMutationCount(request);
+    const copy = h("div", "decision-copy");
+    copy.appendChild(h("strong", "", "Ready to decide"));
+    copy.appendChild(h("span", "", count + " reviewed action" + V.plural(count)));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
+    controls.appendChild(button("Approve " + count, "ok", async () => {
+      if (!confirmDialog("Approve? " + count + " mutation" + V.plural(count) + " will run upstream.")) return;
+      errorNode.textContent = "";
+      try { await mutations.approve(request.id); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    const reason = h("input"); reason.placeholder = "denial reason (optional)"; reason.className = "reason";
+    controls.appendChild(reason);
+    controls.appendChild(button("Deny", "danger", async () => {
+      errorNode.textContent = "";
+      try { await mutations.reject(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    dock.appendChild(controls);
+  } else if (!V.trimStr(request.superseded_by) && request.can_supersede === true) {
+    const copy = h("div", "decision-copy");
+    copy.appendChild(h("strong", "", "Replace failed request"));
+    copy.appendChild(h("span", "", "Link this record to its replacement"));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
     const input = h("input"); input.placeholder = "replacement request id"; input.className = "reason";
-    row.appendChild(input);
-    row.appendChild(button("mark superseded", "", async () => {
+    controls.appendChild(input);
+    controls.appendChild(button("Mark superseded", "", async () => {
       errorNode.textContent = "";
       try { await mutations.supersede(request.id, input.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
     }));
-    sect.appendChild(row);
+    dock.appendChild(controls);
+  } else {
+    return null;
   }
-  sect.appendChild(errorNode);
+  dock.appendChild(errorNode);
+  return dock;
+}
+
+function renderSlackReviewGroup(request, group) {
+  const node = h("details", "slack-review-group group-" + group.key);
+  node.open = true;
+  const summary = h("summary", "slack-group-summary");
+  summary.appendChild(h("span", "slack-group-icon", group.icon));
+  const copy = h("span", "slack-group-copy");
+  copy.appendChild(h("strong", "", group.label));
+  copy.appendChild(h("span", "", group.description));
+  summary.appendChild(copy);
+  summary.appendChild(h("span", "slack-group-count", group.items.length));
+  node.appendChild(summary);
+  const rows = h("div", "slack-review-rows");
+  for (const item of group.items) rows.appendChild(renderSlackMarkRead(request, item.mutation, item.view));
+  node.appendChild(rows);
+  node._reviewRows = Array.from(rows.children);
+  return node;
+}
+
+function renderSlackBatch(request, list) {
+  const sect = h("section", "rsect slack-batch");
+  const toolbar = h("div", "mutation-toolbar");
+  const title = h("div");
+  title.appendChild(h("div", "eyebrow", "Reviewed boundaries"));
+  title.appendChild(h("h2", "", list.length + " Slack conversations"));
+  toolbar.appendChild(title);
+  const filter = h("input", "mutation-filter");
+  filter.type = "search";
+  filter.placeholder = "Filter conversations";
+  filter.setAttribute("aria-label", "Filter conversations");
+  toolbar.appendChild(filter);
+  sect.appendChild(toolbar);
+  const groups = V.slackMarkReadGroups(list).map((group) => renderSlackReviewGroup(request, group));
+  groups.forEach((group) => sect.appendChild(group));
+  const empty = h("p", "m mutation-filter-empty", "No conversations match that filter.");
+  empty.hidden = true;
+  sect.appendChild(empty);
+  filter.addEventListener("input", () => {
+    const query = filter.value.trim().toLowerCase();
+    let visible = 0;
+    for (const group of groups) {
+      let groupVisible = 0;
+      for (const row of group._reviewRows) {
+        const show = !query || row.dataset.search.includes(query);
+        row.hidden = !show;
+        if (show) { visible += 1; groupVisible += 1; }
+      }
+      group.hidden = groupVisible === 0;
+    }
+    empty.hidden = visible !== 0;
+  });
   return sect;
 }
 
@@ -854,18 +1029,25 @@ async function renderDetail(root, ctx, id, alive) {
   ctx.setStats(list.length + " mutation" + V.plural(list.length) + " · " + V.requestListStatus(request));
   clear(root);
   root.appendChild(link(LIST_PATH, "← all requests", "back"));
-  root.appendChild(renderRequestHeader(request, actions));
+  root.appendChild(renderRequestHeader(request));
+  const decision = renderDecisionDock(request, actions);
+  if (decision) root.appendChild(decision);
   const context = renderContext(request.context);
   if (context) root.appendChild(context);
-  const sect = h("section", "rsect");
-  sect.appendChild(h("h2", "", "Mutations"));
-  if (!list.length) sect.appendChild(h("p", "m", "This request carries no mutations."));
-  for (const item of V.groupMutations(list)) {
-    if (item.kind === "gmail") sect.appendChild(renderGmailGroup(item));
-    else if (item.kind === "contact") sect.appendChild(renderContactGroup(item));
-    else sect.appendChild(renderMutation(request, item.mutation, actions));
+  const slackBatch = list.length > 1 && list.every((mutation) => V.isSlackMarkReadMutation(mutation));
+  if (slackBatch) {
+    root.appendChild(renderSlackBatch(request, list));
+  } else {
+    const sect = h("section", "rsect");
+    sect.appendChild(h("h2", "", "Mutations"));
+    if (!list.length) sect.appendChild(h("p", "m", "This request carries no mutations."));
+    for (const item of V.groupMutations(list)) {
+      if (item.kind === "gmail") sect.appendChild(renderGmailGroup(item));
+      else if (item.kind === "contact") sect.appendChild(renderContactGroup(item));
+      else sect.appendChild(renderMutation(request, item.mutation, actions));
+    }
+    root.appendChild(sect);
   }
-  root.appendChild(sect);
   root.scrollTop = 0;
 }
 

@@ -1,6 +1,6 @@
 /* Mutation review: the same dark, dense, monospace system as app.css. The
    view container is a fixed-height box, so .mv owns the scrolling. */
-.mv { height: 100%; overflow-y: auto; padding: 14px 18px 120px; max-width: 1100px; }
+.mv { height: 100%; overflow-y: auto; padding: 14px 22px 120px; max-width: 1380px; }
 .mv h1 { font-size: 15px; letter-spacing: .04em; }
 .mv h2 { color: var(--faint); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; margin: 18px 0 8px; font-weight: 600; }
 .mv h3 { font-size: 13px; font-weight: 600; }
@@ -39,7 +39,7 @@ table.rtable td.rtitle a:hover { color: var(--amber); }
 table.rtable tr:hover td { background: var(--surface); }
 
 /* request header and actions */
-.rhead { border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; background: var(--surface); }
+.rhead { border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; background: var(--surface); }
 .rtitle-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
 .actions input.reason { min-width: 260px; }
@@ -48,6 +48,54 @@ table.rtable tr:hover td { background: var(--surface); }
 dl.mdl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 8px 0; font-size: 12px; }
 dl.mdl dt { color: var(--faint); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; padding-top: 2px; }
 dl.mdl dd { color: var(--text); word-break: break-word; }
+
+/* The request reads like a review dashboard rather than a database record. */
+.review-hero { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 14px; align-items: start; background: linear-gradient(135deg, rgba(232,180,90,.07), var(--surface) 42%); }
+.review-hero-icon {
+  width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid var(--amber-dim); border-radius: 12px;
+  color: var(--amber); background: rgba(232,180,90,.08); font-size: 19px; font-weight: 800;
+}
+.review-hero-main { min-width: 0; }
+.review-hero-eyebrow { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 10px; letter-spacing: .13em; text-transform: uppercase; margin-bottom: 4px; }
+.review-hero h1 { font-size: 18px; line-height: 1.3; letter-spacing: -.01em; }
+.review-hero .mreason { max-width: 1050px; margin: 5px 0 9px; line-height: 1.45; }
+.request-meta { display: flex; flex-wrap: wrap; gap: 5px 14px; }
+.request-meta-item { display: inline-flex; gap: 5px; align-items: baseline; color: var(--faint); font-size: 10px; }
+.request-meta-item > span { letter-spacing: .08em; text-transform: uppercase; }
+.request-meta-item strong { color: var(--dim); font-size: 10.5px; font-weight: 600; }
+
+.decision-dock {
+  position: sticky; top: 8px; z-index: 18; display: flex; align-items: center; gap: 14px; min-height: 50px;
+  margin: 0 0 14px; padding: 7px 9px 7px 12px; border: 1px solid rgba(111,207,151,.35); border-radius: 7px;
+  background: rgba(18,22,29,.94); box-shadow: 0 8px 26px rgba(0,0,0,.28); backdrop-filter: blur(12px);
+}
+.decision-copy { display: flex; flex-direction: column; min-width: 160px; }
+.decision-copy strong { color: var(--text); font-size: 11.5px; }
+.decision-copy span { color: var(--faint); font-size: 10px; }
+.decision-controls { display: flex; gap: 7px; align-items: center; flex: 1; }
+.decision-controls button { min-height: 34px; padding-inline: 14px; }
+.decision-controls input.reason { min-width: 180px; max-width: 380px; flex: 1; min-height: 34px; }
+.decision-error:empty { display: none; }
+
+.review-overview { padding: 2px 0 0; }
+.review-section-head { display: flex; align-items: end; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.review-section-head .eyebrow, .mutation-toolbar .eyebrow { margin-bottom: 1px; }
+.review-section-head h2, .mutation-toolbar h2 { margin: 0; color: var(--text); font-size: 13px; letter-spacing: .02em; text-transform: none; }
+.snapshot-chip { padding: 2px 7px; border: 1px solid var(--line); border-radius: 10px; color: var(--faint); font-size: 9.5px; white-space: nowrap; }
+.review-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.review-metric { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.review-metric-icon { display: grid; place-items: center; width: 27px; height: 27px; flex: none; border-radius: 7px; background: var(--surface2); color: var(--amber); font-weight: 800; }
+.review-metric-copy { display: flex; min-width: 0; flex-direction: column; }
+.review-metric-copy strong { color: var(--text); font-size: 16px; line-height: 1; }
+.review-metric-copy > span { overflow: hidden; color: var(--dim); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.review-guardrails { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 7px; }
+.guardrail-card { padding: 9px 11px; border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px; background: var(--bg2); }
+.guardrail-card.selected { border-left-color: var(--amber-dim); }
+.guardrail-card.preserved { border-left-color: rgba(111,207,151,.65); }
+.guardrail-title { color: var(--amber); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.guardrail-card.preserved .guardrail-title { color: var(--green); }
+.guardrail-card ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 18px; margin: 5px 0 0 16px; color: var(--dim); font-size: 10.5px; }
+.review-source { margin-top: 6px; color: var(--faint); font-size: 9.5px; }
 
 /* context */
 .idents { display: grid; gap: 6px; }
@@ -231,6 +279,51 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
 .slack-stays-unread { color: var(--dim); }
 .slack-context-missing { padding: 9px 10px; border: 1px solid rgba(224,108,95,.5); color: var(--red); border-radius: 3px; font-size: 12px; }
 
+/* Slack batches: one compact, searchable row per reviewed boundary. The full
+   transcript is created only after the row opens, keeping 198-item requests
+   fast and comprehensible. */
+.mutation-toolbar { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin: 18px 0 8px; }
+.mutation-filter { width: min(300px, 42vw); min-height: 34px; padding-inline: 10px; }
+.slack-review-group { margin-bottom: 8px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--surface); }
+.mv details.slack-review-group > summary.slack-group-summary {
+  display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 46px;
+  padding: 7px 10px; list-style: none; color: var(--text); background: var(--surface2);
+}
+summary.slack-group-summary::-webkit-details-marker, summary.slack-review-summary::-webkit-details-marker { display: none; }
+.slack-group-icon { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; border: 1px solid var(--line2); color: var(--amber); background: var(--bg2); font-size: 13px; font-weight: 800; }
+.slack-group-copy { display: flex; min-width: 0; flex-direction: column; }
+.slack-group-copy strong { font-size: 11.5px; }
+.slack-group-copy > span { color: var(--faint); font-size: 9.5px; }
+.slack-group-count { min-width: 28px; padding: 2px 7px; border: 1px solid var(--line2); border-radius: 10px; color: var(--dim); font-size: 10px; text-align: center; }
+.slack-review-rows { border-top: 1px solid var(--line); }
+.slack-review-row { border-bottom: 1px solid var(--line); background: var(--bg2); }
+.slack-review-row:last-child { border-bottom: 0; }
+.mv details.slack-review-row > summary.slack-review-summary {
+  display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 49px;
+  padding: 5px 10px; list-style: none; color: var(--text);
+}
+.mv details.slack-review-row > summary.slack-review-summary:hover { background: rgba(255,255,255,.025); }
+.slack-review-row[open] > summary.slack-review-summary { background: rgba(232,180,90,.055); box-shadow: inset 3px 0 0 var(--amber); }
+.slack-kind-icon { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 7px; background: var(--surface2); color: var(--dim); font-size: 11px; font-weight: 800; }
+.slack-review-row[open] .slack-kind-icon { color: var(--amber); }
+.slack-row-copy { display: flex; min-width: 0; flex-direction: column; line-height: 1.3; }
+.slack-row-headline { display: flex; align-items: center; min-width: 0; gap: 6px; }
+.slack-row-headline strong { overflow: hidden; color: var(--text); font-size: 11.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.slack-context-chip { padding: 0 4px; border: 1px solid var(--line); border-radius: 3px; color: var(--faint); font-size: 8px; letter-spacing: .05em; text-transform: uppercase; }
+.slack-row-preview { display: block; overflow: hidden; color: var(--faint); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.slack-row-preview b { color: var(--dim); font-weight: 600; }
+.slack-row-trailing { display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: var(--faint); font-size: 9.5px; white-space: nowrap; }
+.slack-unread { padding: 1px 5px; border-radius: 8px; color: var(--amber); background: rgba(232,180,90,.09); }
+.slack-chevron { font-size: 16px; line-height: 1; transition: transform .15s ease; }
+.slack-review-row[open] .slack-chevron { transform: rotate(90deg); color: var(--amber); }
+.slack-review-body { padding: 0 10px 10px 47px; border-top: 1px solid var(--line); background: var(--surface); }
+.slack-review-body .slack-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 18px; padding: 8px 10px; }
+.slack-review-body .slack-action > strong, .slack-review-body .slack-action > p { grid-column: 1; }
+.slack-review-body .slack-action dl { grid-column: 2; grid-row: 1 / span 3; margin: 0; }
+.slack-review-body .slack-context { margin-bottom: 7px; }
+.mutation-filter-empty { padding: 16px; text-align: center; border: 1px dashed var(--line); border-radius: 6px; }
+[hidden] { display: none !important; }
+
 @media (max-width: 860px) {
   .mv { padding: 10px 10px 100px; }
   .glabel-change-grid { grid-template-columns: 1fr; }
@@ -239,6 +332,8 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
   .gsubject { grid-column: 1 / 3; }
   .crow { grid-template-columns: 1fr; }
   .slack-msg-head { display: block; }
+  .review-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guardrail-card ul { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 640px) {
@@ -248,6 +343,28 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
   .mv h1 { font-size: 14px; overflow-wrap: anywhere; }
   .rhead, .mut { padding: 12px; }
   .rtitle-row { align-items: flex-start; }
+  .review-hero { grid-template-columns: 38px minmax(0, 1fr); gap: 10px; }
+  .review-hero-icon { width: 38px; height: 38px; border-radius: 9px; font-size: 15px; }
+  .review-hero h1 { font-size: 16px; }
+  .review-hero .mreason { font-size: 11px; }
+  .request-meta-item:nth-child(n+4) { display: none; }
+
+  .decision-dock { top: 4px; min-height: 48px; padding: 6px; gap: 6px; }
+  .decision-copy { display: none; }
+  .decision-controls { min-width: 0; }
+  .decision-controls input.reason { min-width: 0; min-height: 44px; }
+  .decision-controls button { min-height: 44px; padding-inline: 10px; white-space: nowrap; }
+  .decision-error { position: absolute; top: 100%; left: 0; right: 0; padding: 3px 7px; background: var(--bg2); }
+
+  .review-section-head { align-items: center; }
+  .snapshot-chip { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  .review-metrics { gap: 5px; }
+  .review-metric { gap: 7px; padding: 8px; }
+  .review-metric-icon { width: 24px; height: 24px; }
+  .review-metric-copy strong { font-size: 14px; }
+  .review-metric-copy > span { font-size: 9.5px; }
+  .review-guardrails { grid-template-columns: 1fr; gap: 5px; }
+  .guardrail-card { padding: 8px 9px; }
 
   /* The title and decision state are the list's phone scan path; secondary
      counts and dates remain available on the detail screen. */
@@ -271,4 +388,16 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
   .slack-msg-head time { display: block; margin-top: 1px; }
   .slack-msg-text { font-size: 12.5px; line-height: 1.5; }
   .slack-read-through, .slack-stays-unread { font-size: 9.5px; padding: 2px 6px; }
+  .mutation-toolbar { align-items: center; margin-top: 14px; }
+  .mutation-toolbar .eyebrow { display: none; }
+  .mutation-filter { width: 48vw; min-width: 0; }
+  .mv details.slack-review-group > summary.slack-group-summary { min-height: 44px; }
+  .mv details.slack-review-row > summary.slack-review-summary { grid-template-columns: 25px minmax(0, 1fr) auto; gap: 7px; min-height: 51px; padding: 5px 7px; }
+  .slack-kind-icon { width: 24px; height: 24px; }
+  .slack-row-trailing { gap: 5px; }
+  .slack-row-trailing time { display: none; }
+  .slack-unread { font-size: 9px; }
+  .slack-review-body { padding: 0 7px 8px; }
+  .slack-review-body .slack-action { display: block; }
+  .slack-review-body .slack-action dl { margin-top: 7px; }
 }
