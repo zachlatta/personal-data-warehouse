@@ -305,12 +305,105 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	if err != nil {
 		return Request{}, err
 	}
+	mutations = s.hydrateSlackMarkReadPreviewLinks(ctx, mutations)
 	request.Mutations = mutations
 	if request.MutationCount == 0 {
 		request.MutationCount = len(mutations)
 	}
 	return request, nil
 }
+
+// hydrateSlackMarkReadPreviewLinks resolves the workspace domain and the
+// speakers' avatars for every Slack mark-read mutation in one pair of
+// lookups, whatever the size of the batch, and hands them to
+// applySlackMarkReadPreviewLinks. Like the other preview enrichments it is
+// non-fatal: a review without faces is worse than one with them, and worth
+// far less than no review at all.
+func (s *PostgresStore) hydrateSlackMarkReadPreviewLinks(ctx context.Context, mutations []Mutation) []Mutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	teams, users := slackMarkReadPreviewLinkTargets(mutations)
+	if len(teams) == 0 {
+		return mutations
+	}
+	// A 277-conversation batch names a few hundred people; the cap is a
+	// backstop against a pathological request, not an expected limit.
+	if len(users) > slackPreviewAvatarLimit {
+		users = users[:slackPreviewAvatarLimit]
+	}
+	domains := map[slackTeamKey]string{}
+	teamArgs := make([]any, 0, len(teams)*2)
+	teamValues := make([]string, 0, len(teams))
+	for _, team := range teams {
+		teamArgs = append(teamArgs, team.Account, team.TeamID)
+		teamValues = append(teamValues, fmt.Sprintf("($%d, $%d)", len(teamArgs)-1, len(teamArgs)))
+	}
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
+		WITH wanted(account, team_id) AS (VALUES %s)
+		SELECT team.account, team.team_id, COALESCE(team.domain, '')
+		FROM @slack_teams AS team
+		JOIN wanted ON wanted.account = team.account AND wanted.team_id = team.team_id
+	`, strings.Join(teamValues, ", ")), teamArgs...)
+	if err != nil {
+		return mutations
+	}
+	for rows.Next() {
+		var key slackTeamKey
+		var domain string
+		if err := rows.Scan(&key.Account, &key.TeamID, &domain); err != nil {
+			rows.Close()
+			return mutations
+		}
+		domains[slackTeamKey{Account: normalizeAccount(key.Account), TeamID: key.TeamID}] = domain
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return mutations
+	}
+	rows.Close()
+
+	avatars := map[slackUserKey]string{}
+	if len(users) > 0 {
+		userArgs := make([]any, 0, len(users)*3)
+		userValues := make([]string, 0, len(users))
+		for _, user := range users {
+			userArgs = append(userArgs, user.Account, user.TeamID, user.UserID)
+			userValues = append(userValues, fmt.Sprintf("($%d, $%d, $%d)", len(userArgs)-2, len(userArgs)-1, len(userArgs)))
+		}
+		userRows, err := queryContext(ctx, s.db, fmt.Sprintf(`
+			WITH wanted(account, team_id, user_id) AS (VALUES %s)
+			SELECT
+				actor.account,
+				actor.team_id,
+				actor.user_id,
+				COALESCE(NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_72', '')
+			FROM @slack_users AS actor
+			JOIN wanted
+			  ON wanted.account = actor.account AND wanted.team_id = actor.team_id AND wanted.user_id = actor.user_id
+		`, strings.Join(userValues, ", ")), userArgs...)
+		if err != nil {
+			return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+		}
+		for userRows.Next() {
+			var key slackUserKey
+			var avatar string
+			if err := userRows.Scan(&key.Account, &key.TeamID, &key.UserID, &avatar); err != nil {
+				userRows.Close()
+				return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+			}
+			if avatar != "" {
+				avatars[slackUserKey{Account: normalizeAccount(key.Account), TeamID: key.TeamID, UserID: key.UserID}] = avatar
+			}
+		}
+		_ = userRows.Err()
+		userRows.Close()
+	}
+	return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+}
+
+// slackPreviewAvatarLimit bounds one read's avatar lookup.
+const slackPreviewAvatarLimit = 2000
 
 func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error) {
 	ctx, cancel := s.withTimeout(ctx)

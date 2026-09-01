@@ -226,3 +226,128 @@ func intFromPreviewAny(value any) int {
 		return parsed
 	}
 }
+
+type slackTeamKey struct {
+	Account string
+	TeamID  string
+}
+
+type slackUserKey struct {
+	Account string
+	TeamID  string
+	UserID  string
+}
+
+// applySlackMarkReadPreviewLinks puts the face and the permalink on an
+// already-snapshotted Slack mark-read preview.
+//
+// The conversation context is captured when the request is proposed, and it
+// stays captured: re-reading it for a 277-conversation batch would be ~1,100
+// queries on one page load. But a permalink is pure derivation from ids the
+// snapshot already holds, and an avatar URL goes stale the moment somebody
+// changes their picture — so both are resolved at READ time, from two bounded
+// lookups, and overwrite whatever the snapshot carried. Without this, a
+// request proposed before either shipped would never show them at all.
+func applySlackMarkReadPreviewLinks(
+	mutations []Mutation,
+	domains map[slackTeamKey]string,
+	avatars map[slackUserKey]string,
+) []Mutation {
+	out := make([]Mutation, len(mutations))
+	copy(out, mutations)
+	for index, mutation := range out {
+		if mutation.Provider != SlackProvider || mutation.Operation != SlackMarkConversationReadOperation {
+			continue
+		}
+		slackRead := cloneMap(mapFromAny(mutation.Preview["slack_read"]))
+		if len(slackRead) == 0 {
+			continue
+		}
+		account := normalizeAccount(mutation.Account)
+		teamID := strings.TrimSpace(stringFromAny(slackRead["team_id"]))
+		conversationID := strings.TrimSpace(stringFromAny(slackRead["conversation_id"]))
+		messageTS := strings.TrimSpace(stringFromAny(slackRead["message_ts"]))
+		conversationThreadTS := strings.TrimSpace(stringFromAny(slackRead["thread_ts"]))
+		domain := domains[slackTeamKey{Account: account, TeamID: teamID}]
+		slackRead["team_domain"] = domain
+
+		messages := make([]map[string]any, 0, len(mapSliceFromAny(slackRead["messages"])))
+		targetAvatar := ""
+		for _, stored := range mapSliceFromAny(slackRead["messages"]) {
+			message := cloneMap(stored)
+			userID := strings.TrimSpace(stringFromAny(message["user_id"]))
+			if avatar, ok := avatars[slackUserKey{Account: account, TeamID: teamID, UserID: userID}]; ok {
+				message["avatar_url"] = avatar
+			}
+			// A message in the surrounding window may be a reply of its own,
+			// and the snapshot records that per message where it knows it.
+			threadTS := strings.TrimSpace(stringFromAny(message["thread_ts"]))
+			if threadTS == "" {
+				threadTS = conversationThreadTS
+			}
+			if link := deeplink.Slack(teamID, conversationID, strings.TrimSpace(stringFromAny(message["message_ts"])), threadTS, domain); link != nil {
+				message["open"] = link
+			}
+			if message["is_target"] == true {
+				targetAvatar = strings.TrimSpace(stringFromAny(message["avatar_url"]))
+			}
+			messages = append(messages, message)
+		}
+		if len(messages) > 0 {
+			slackRead["messages"] = messages
+		}
+		if targetAvatar != "" {
+			slackRead["avatar_url"] = targetAvatar
+		}
+		if link := deeplink.Slack(teamID, conversationID, messageTS, conversationThreadTS, domain); link != nil {
+			slackRead["open"] = link
+		}
+		preview := cloneMap(mutation.Preview)
+		preview["slack_read"] = slackRead
+		out[index].Preview = preview
+	}
+	return out
+}
+
+// slackMarkReadPreviewLinkTargets is what the two lookups need: one workspace
+// per (account, team) and one row per person who spoke in any of the reviewed
+// conversations.
+func slackMarkReadPreviewLinkTargets(mutations []Mutation) ([]slackTeamKey, []slackUserKey) {
+	teams := []slackTeamKey{}
+	users := []slackUserKey{}
+	seenTeam := map[slackTeamKey]bool{}
+	seenUser := map[slackUserKey]bool{}
+	for _, mutation := range mutations {
+		if mutation.Provider != SlackProvider || mutation.Operation != SlackMarkConversationReadOperation {
+			continue
+		}
+		slackRead := mapFromAny(mutation.Preview["slack_read"])
+		if len(slackRead) == 0 {
+			continue
+		}
+		team := slackTeamKey{
+			Account: normalizeAccount(mutation.Account),
+			TeamID:  strings.TrimSpace(stringFromAny(slackRead["team_id"])),
+		}
+		if team.Account == "" || team.TeamID == "" {
+			continue
+		}
+		if !seenTeam[team] {
+			teams = append(teams, team)
+			seenTeam[team] = true
+		}
+		for _, message := range mapSliceFromAny(slackRead["messages"]) {
+			user := slackUserKey{
+				Account: team.Account,
+				TeamID:  team.TeamID,
+				UserID:  strings.TrimSpace(stringFromAny(message["user_id"])),
+			}
+			if user.UserID == "" || seenUser[user] {
+				continue
+			}
+			users = append(users, user)
+			seenUser[user] = true
+		}
+	}
+	return teams, users
+}

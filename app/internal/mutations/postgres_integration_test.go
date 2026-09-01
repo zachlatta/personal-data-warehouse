@@ -285,15 +285,92 @@ func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testin
 	if messages[1]["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
 		t.Fatalf("target avatar = %#v", messages[1]["avatar_url"])
 	}
-	open := mapFromAny(messages[1]["open"])
-	if open["url"] != "https://example.slack.com/archives/D1/p1593473566000200" {
-		t.Fatalf("target permalink = %#v", open)
+	target := previewLinkURL(messages[1]["open"])
+	if target != "https://example.slack.com/archives/D1/p1593473566000200" {
+		t.Fatalf("target permalink = %q", target)
 	}
-	if mapFromAny(preview["open"])["url"] != open["url"] {
+	if previewLinkURL(preview["open"]) != target {
 		t.Fatalf("conversation link = %#v", preview["open"])
 	}
 	if preview["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
 		t.Fatalf("conversation avatar = %#v", preview["avatar_url"])
+	}
+}
+
+// A request proposed before links and faces existed has to get them on read:
+// the Slack conversation context is snapshotted at proposal time and never
+// re-read, so a batch already sitting in the queue would otherwise show
+// neither, forever. This is the case that reached production.
+func TestGetRequestHydratesAnOlderSlackSnapshotWithLinksAndFaces(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedSlackPreviewSchema(t, store)
+
+	account := fmt.Sprintf("slack-hydrate-%d", time.Now().UnixNano())
+	for _, statement := range []string{
+		`INSERT INTO @slack_account_identities (account, team_id, user_id) VALUES ($1, 'T1', 'U-ME')`,
+		`INSERT INTO @slack_users (account, team_id, user_id, display_name, real_name, name, raw_json)
+		 VALUES ($1, 'T1', 'U-MARCUS', 'Marcus', 'Marcus', 'marcus', '{"profile":{"image_192":"https://avatars.example.test/marcus_192.png"}}')`,
+		`INSERT INTO @slack_teams (account, team_id, team_name, domain) VALUES ($1, 'T1', 'Example', 'example')`,
+		`INSERT INTO @slack_conversations (account, team_id, conversation_id, conversation_type, name, raw_json)
+		 VALUES ($1, 'T1', 'D1', 'im', '', '{"user":"U-MARCUS"}')`,
+		`INSERT INTO @slack_messages (
+			account, team_id, conversation_id, message_ts, message_datetime, thread_ts,
+			parent_message_ts, user_id, bot_id, username, text,
+			is_thread_parent, is_thread_reply, reply_count, is_deleted
+		 ) VALUES ($1, 'T1', 'D1', '1593473566.000200', '2026-08-29 14:01:00+00', '1593473566.000200', '', 'U-MARCUS', '', '', 'All handled.', 0, 0, 0, 0)`,
+	} {
+		if _, err := execContext(ctx, store.db, statement, account); err != nil {
+			t.Fatalf("seed Slack context: %v", err)
+		}
+	}
+
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: "Mark it read", Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type: SlackMarkConversationReadOperation, Account: account,
+			ConversationID: "D1", MessageTS: "1593473566.000200",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+
+	// Roll the stored preview back to the shape a request proposed before
+	// this feature carries: context, but no link, face or workspace domain.
+	if _, err := execContext(ctx, store.db, `
+		UPDATE @upstream_mutations
+		   SET preview_json = preview_json #- '{slack_read,open}' #- '{slack_read,avatar_url}'
+		                        #- '{slack_read,team_domain}' #- '{slack_read,messages,0,open}'
+		                        #- '{slack_read,messages,0,avatar_url}'
+		 WHERE request_id = $1`, created.ID); err != nil {
+		t.Fatalf("age the stored preview: %v", err)
+	}
+
+	got, err := store.GetRequest(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRequest: %v", err)
+	}
+	slackRead := mapFromAny(got.Mutations[0].Preview["slack_read"])
+	if slackRead["team_domain"] != "example" {
+		t.Fatalf("team_domain = %#v", slackRead["team_domain"])
+	}
+	want := "https://example.slack.com/archives/D1/p1593473566000200"
+	if url := previewLinkURL(slackRead["open"]); url != want {
+		t.Fatalf("conversation link = %q, want %q", url, want)
+	}
+	messages := mapSliceFromAny(slackRead["messages"])
+	if len(messages) != 1 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if url := previewLinkURL(messages[0]["open"]); url != want {
+		t.Fatalf("message link = %q, want %q", url, want)
+	}
+	if messages[0]["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
+		t.Fatalf("message avatar = %#v", messages[0]["avatar_url"])
+	}
+	if slackRead["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
+		t.Fatalf("row avatar = %#v", slackRead["avatar_url"])
 	}
 }
 
@@ -349,7 +426,7 @@ func TestSlackMarkReadPreviewLinksAReplyToItsThread(t *testing.T) {
 		t.Fatalf("reply = %#v", reply)
 	}
 	want := "https://example.slack.com/archives/C1/p1593473566000200?thread_ts=1593473500.000100&cid=C1"
-	if got := mapFromAny(reply["open"])["url"]; got != want {
-		t.Fatalf("reply permalink = %#v, want %s", got, want)
+	if got := previewLinkURL(reply["open"]); got != want {
+		t.Fatalf("reply permalink = %q, want %q", got, want)
 	}
 }

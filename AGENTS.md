@@ -1403,6 +1403,20 @@ back it, all behind the static bearer the CLI uses:
     a permalink on every message and every row, because the honest answer to "mark this
     read?" is often "let me reply first". A face identifies a DM row; a channel keeps its
     `#`/`◈` glyph, which is what tells public from private at a glance.
+  - **The Slack conversation context is snapshotted at PROPOSAL time and never re-read,
+    so anything derived from it has to be resolved on READ or it never reaches a request
+    already in the queue.** Only the Gmail previews are re-enriched in `GetRequest`;
+    `enrichSlackMarkReadPreviews` runs once, in `CreateRequest`, because re-reading a
+    277-conversation batch is ~1,100 queries on one page load. Faces and links shipped
+    into the creation path first and were invisible in production on the pending
+    277-conversation request — the only tell was that `team_domain` was absent, since
+    every other key had been stored hours earlier. `hydrateSlackMarkReadPreviewLinks`
+    now resolves both on read from **two** bounded lookups whatever the batch size (575
+    distinct speakers in that request; ~0.5s for the avatar query on production), and
+    overwrites rather than fills, because an avatar URL goes stale the moment somebody
+    changes their picture. The rule it leaves behind: anything cheap and derivable
+    belongs on the read path, and only the expensive conversation walk belongs in the
+    snapshot.
   - **One mutation can be dropped from a batch without denying it** —
     `POST …/mutations/<id>/remove`, which is operation-agnostic and has always been; the
     phone offers it per thread as "Keep this in the inbox", and the approve button then
