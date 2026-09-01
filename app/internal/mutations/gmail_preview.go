@@ -1,6 +1,8 @@
 package mutations
 
 import (
+	"encoding/json"
+	"net/mail"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +18,7 @@ type gmailThreadPreviewRow struct {
 	MessageID         string
 	Subject           string
 	FromAddress       string
+	FromName          string
 	ToAddresses       []string
 	CCAddresses       []string
 	LabelIDs          []string
@@ -165,6 +168,7 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 		message := map[string]any{
 			"message_id":    row.MessageID,
 			"from_address":  row.FromAddress,
+			"from_name":     row.FromName,
 			"to_addresses":  append([]string{}, row.ToAddresses...),
 			"cc_addresses":  append([]string{}, row.CCAddresses...),
 			"internal_date": formatPreviewTime(row.InternalDate),
@@ -193,6 +197,7 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 		"thread_id":           threadID,
 		"subject":             subject,
 		"latest_from_address": strings.TrimSpace(latest.FromAddress),
+		"latest_from_name":    strings.TrimSpace(latest.FromName),
 		"latest_at":           formatPreviewTime(latest.InternalDate),
 		"latest_preview":      bestGmailPreviewText(latest),
 		"message_count":       messageCount,
@@ -294,6 +299,8 @@ func formatGmailLabel(value string) string {
 		return "Important"
 	case "STARRED":
 		return "Starred"
+	case "SENT":
+		return "Sent"
 	case "CATEGORY_UPDATES":
 		return "Updates"
 	case "CATEGORY_PROMOTIONS":
@@ -324,4 +331,47 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// gmailHeaderDisplayName pulls the human name out of a raw RFC 5322 From
+// header ("HCB <hcb@hackclub.com>" -> "HCB"). base_gmail.messages stores only
+// the bare address in from_address, so a review list built from that column
+// alone reads as address soup — a column of "no-reply@t.<brand>.com" where
+// Gmail itself shows the brand. The header survives in payload_json; the
+// preview query lifts it out, still JSON-escaped, and this decodes it.
+//
+// An address with no display name returns "", never the address: the caller
+// derives its own fallback and must be able to tell the two cases apart.
+func gmailHeaderDisplayName(rawJSONEscaped string) string {
+	value := strings.TrimSpace(rawJSONEscaped)
+	if value == "" {
+		return ""
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(`"`+value+`"`), &decoded); err == nil {
+		value = decoded
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	// ParseAddress decodes RFC 2047 encoded words, which is why it is tried
+	// before the manual split.
+	if address, err := mail.ParseAddress(value); err == nil {
+		name := strings.TrimSpace(address.Name)
+		if !strings.EqualFold(name, strings.TrimSpace(address.Address)) {
+			return name
+		}
+		return ""
+	}
+	angle := strings.Index(value, "<")
+	if angle < 0 {
+		return ""
+	}
+	name := strings.TrimSpace(value[:angle])
+	name = strings.TrimSpace(strings.Trim(name, `"`))
+	if strings.ContainsAny(name, "@") {
+		return ""
+	}
+	return name
 }

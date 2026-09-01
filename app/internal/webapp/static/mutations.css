@@ -118,6 +118,19 @@ ul.evidence { margin: 6px 0 0 18px; color: var(--dim); font-size: 11.5px; }
   background: var(--surface2); border: 1px solid var(--line2); color: var(--dim); font-size: 11px; font-weight: 700; flex: none;
 }
 
+/* A real profile picture where the source has one: the same box as the letter
+   fallback, so a transcript does not reflow while images load. */
+.avatar-photo { object-fit: cover; background: var(--surface2); }
+/* "Open in Slack", on the row and on every message. 44px of touch target on a
+   phone, because answering a message is often what settles the review. */
+.slack-open {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 32px; min-height: 32px;
+  border: 1px solid var(--accent, #208AEF); border-radius: 999px; color: var(--accent, #208AEF);
+  text-decoration: none; font-weight: 700; font-size: 13px; flex: none;
+}
+.slack-open:hover { background: color-mix(in srgb, var(--accent, #208AEF) 12%, transparent); }
+@media (pointer: coarse) { .slack-open { min-width: 44px; min-height: 44px; } }
+
 /* Gmail label mutations: make the direction impossible to miss. */
 .glabel-delta { margin: 10px 0 12px; }
 .glabel-delta-heading { color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 6px; }

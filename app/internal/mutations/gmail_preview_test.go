@@ -199,3 +199,62 @@ func TestCleanGmailPreviewTextRemovesQuotedReply(t *testing.T) {
 		t.Fatalf("cleaned preview = %q", got)
 	}
 }
+
+func TestGmailHeaderDisplayName(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"plain name", `UPS <pkginfo@ups.test>`, "UPS"},
+		{"person", `Zach Lata <zach@example.test>`, "Zach Lata"},
+		// Gmail stores the header inside payload_json, so a quoted display
+		// name arrives with its quotes still escaped.
+		{"json escaped quotes", `\"A Foundation\" <grants@example.test>`, "A Foundation"},
+		{"rfc 2047", `=?UTF-8?B?VmlzdGFQcmludA==?= <no-reply@t.example.test>`, "VistaPrint"},
+		// A bare address has no display name; returning the address would be
+		// indistinguishable from a real one and would defeat every fallback.
+		{"bare address", `noreply@example.test`, ""},
+		{"name equals address", `<noreply@example.test> <noreply@example.test>`, ""},
+		{"empty", ``, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := gmailHeaderDisplayName(testCase.header); got != testCase.want {
+				t.Fatalf("gmailHeaderDisplayName(%q) = %q, want %q", testCase.header, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestApplyGmailThreadPreviewRowsCarriesTheSenderDisplayName(t *testing.T) {
+	mutations := []Mutation{{
+		ID:        "mut-1",
+		Provider:  "gmail",
+		Operation: GmailArchiveOperation,
+		Account:   "zach@example.test",
+		Payload:   map[string]any{"thread_ids": []any{"thread-1"}},
+		Preview:   map[string]any{"threads": []any{map[string]any{"thread_id": "thread-1"}}},
+	}}
+	got := applyGmailThreadPreviewRows(mutations, []gmailThreadPreviewRow{{
+		Account:      "zach@example.test",
+		ThreadID:     "thread-1",
+		MessageID:    "message-1",
+		Subject:      "Your order is confirmed",
+		FromAddress:  "no-reply@t.example.test",
+		FromName:     "VistaPrint",
+		InternalDate: time.Date(2026, 8, 29, 18, 15, 0, 0, time.UTC),
+		Snippet:      "Order confirmed.",
+	}})
+
+	thread := mapSliceFromAny(got[0].Preview["threads"])[0]
+	if thread["latest_from_name"] != "VistaPrint" {
+		t.Fatalf("latest_from_name = %#v", thread["latest_from_name"])
+	}
+	if thread["latest_from_address"] != "no-reply@t.example.test" {
+		t.Fatalf("latest_from_address = %#v", thread["latest_from_address"])
+	}
+	message := mapSliceFromAny(thread["messages"])[0]
+	if message["from_name"] != "VistaPrint" {
+		t.Fatalf("message from_name = %#v", message["from_name"])
+	}
+}

@@ -4,32 +4,12 @@ import { Pressable, RefreshControl, SectionList, StyleSheet, View } from 'react-
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { StatusPill } from '@/components/status-pill';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { listMutationRequests, type MutationRequest } from '@/lib/api';
 import { formatWhen } from '@/lib/format';
 import { useConfig } from '@/lib/session';
-
-export const STATUS_COLORS: Record<string, string> = {
-  pending_review: '#D97706',
-  approved: '#2563EB',
-  executing: '#2563EB',
-  executed: '#16A34A',
-  succeeded: '#16A34A',
-  observed: '#16A34A',
-  rejected: '#6B7280',
-  failed: '#DC2626',
-  superseded: '#6B7280',
-};
-
-export function StatusPill({ status }: { status: string }) {
-  const color = STATUS_COLORS[status] ?? '#6B7280';
-  return (
-    <View style={[styles.pill, { borderColor: color, backgroundColor: `${color}22` }]}>
-      <ThemedText style={[styles.pillText, { color }]}>{status.replace(/_/g, ' ')}</ThemedText>
-    </View>
-  );
-}
 
 export default function MutationsScreen() {
   const config = useConfig();
@@ -118,8 +98,6 @@ const styles = StyleSheet.create({
   sectionHeader: { paddingHorizontal: Spacing.three, paddingTop: Spacing.three, paddingBottom: Spacing.two },
   row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
   rowHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  pill: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1, alignSelf: 'flex-start' },
-  pillText: { fontSize: 11, fontWeight: '600', lineHeight: 14 },
   empty: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.three },
   errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
   errorText: { color: '#D0342C' },

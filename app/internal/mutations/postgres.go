@@ -715,6 +715,13 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 			message.message_id,
 			message.subject,
 			message.from_address,
+			-- Gmail's display name (the brand, the person) is not a column:
+			-- base_gmail.messages keeps only the bare address in from_address and
+			-- the real From header inside payload_json. Lifting it here, bounded
+			-- to the threads already joined, is what makes a review list of 43
+			-- threads scannable instead of a column of no-reply addresses. The
+			-- capture is still JSON-escaped; gmailHeaderDisplayName decodes it.
+			COALESCE(substring(message.payload_json from '"name"\s*:\s*"From"\s*,\s*"value"\s*:\s*"((?:[^"\\]|\\.)*)"'), '') AS from_header,
 			COALESCE(array_to_json(message.to_addresses)::text, '[]') AS to_addresses_json,
 			COALESCE(array_to_json(message.cc_addresses)::text, '[]') AS cc_addresses_json,
 			COALESCE(array_to_json(message.label_ids)::text, '[]') AS label_ids_json,
@@ -748,6 +755,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 	previewRows := []gmailThreadPreviewRow{}
 	for rows.Next() {
 		var row gmailThreadPreviewRow
+		var fromHeader string
 		var toAddressesJSON, ccAddressesJSON, labelIDsJSON string
 		var messageCount, inboxMessageCount int64
 		if err := rows.Scan(
@@ -756,6 +764,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 			&row.MessageID,
 			&row.Subject,
 			&row.FromAddress,
+			&fromHeader,
 			&toAddressesJSON,
 			&ccAddressesJSON,
 			&labelIDsJSON,
@@ -768,6 +777,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 		); err != nil {
 			return nil, err
 		}
+		row.FromName = gmailHeaderDisplayName(fromHeader)
 		row.ToAddresses = decodeJSONStringArray(toAddressesJSON)
 		row.CCAddresses = decodeJSONStringArray(ccAddressesJSON)
 		row.LabelIDs = decodeJSONStringArray(labelIDsJSON)
@@ -2441,7 +2451,8 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 			message.is_thread_parent,
 			message.is_thread_reply,
 			message.reply_count,
-			COALESCE(identity.user_id, '')
+			COALESCE(identity.user_id, ''),
+			COALESCE(team.domain, '')
 		FROM @slack_messages AS message
 		JOIN @slack_conversations AS conversation
 		  ON conversation.account = message.account
@@ -2454,6 +2465,9 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 		  ON peer.account = conversation.account
 		 AND peer.team_id = conversation.team_id
 		 AND peer.user_id = COALESCE(conversation.raw_json::jsonb->>'user', '')
+		LEFT JOIN @slack_teams AS team
+		  ON team.account = message.account
+		 AND team.team_id = message.team_id
 		WHERE message.account = $1
 		  AND message.conversation_id = $2
 		  AND message.message_ts = $3
@@ -2485,6 +2499,7 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 		&isThreadReply,
 		&replyCount,
 		&detail.SelfUserID,
+		&detail.TeamDomain,
 	); err != nil {
 		return slackMarkReadPreviewDetail{}, false
 	}
@@ -2522,6 +2537,11 @@ func (s *PostgresStore) loadSlackMarkReadPreviewRows(
 				message.user_id,
 				COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown') AS actor_name,
 				substring(COALESCE(message.text, '') from 1 for 4000) AS text,
+				COALESCE(NULLIF(message.thread_ts, ''), message.parent_message_ts, '') AS thread_ts,
+				-- Slack keeps the profile image in the user payload, not in a
+				-- column of its own; a review of 277 conversations reads far
+				-- faster with the faces on it.
+				COALESCE(NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_72', '') AS avatar_url,
 				message.message_datetime AS sort_at,
 				message.message_ts AS sort_ts
 			FROM @slack_messages AS message
@@ -2539,7 +2559,7 @@ func (s *PostgresStore) loadSlackMarkReadPreviewRows(
 				abs(message.message_ts::numeric - $5::numeric) ASC
 			LIMIT 40
 			)
-			SELECT account, conversation_id, message_ts, message_datetime, user_id, actor_name, text
+			SELECT account, conversation_id, message_ts, message_datetime, user_id, actor_name, text, thread_ts, avatar_url
 			FROM selected
 			ORDER BY sort_at ASC, sort_ts ASC
 		`, detail, detail.ThreadTS, detail.MessageTS)
@@ -2552,7 +2572,9 @@ func (s *PostgresStore) loadSlackMarkReadPreviewRows(
 			message.message_datetime,
 			message.user_id,
 			COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown'),
-			substring(COALESCE(message.text, '') from 1 for 4000)
+			substring(COALESCE(message.text, '') from 1 for 4000),
+			COALESCE(NULLIF(message.thread_ts, ''), message.parent_message_ts, ''),
+			COALESCE(NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_72', '')
 		FROM @slack_messages AS message
 		LEFT JOIN @slack_users AS actor
 		  ON actor.account = message.account
@@ -2583,7 +2605,9 @@ func (s *PostgresStore) loadSlackMarkReadPreviewRows(
 			message.message_datetime,
 			message.user_id,
 			COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown'),
-			substring(COALESCE(message.text, '') from 1 for 4000)
+			substring(COALESCE(message.text, '') from 1 for 4000),
+			COALESCE(NULLIF(message.thread_ts, ''), message.parent_message_ts, ''),
+			COALESCE(NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_72', '')
 		FROM @slack_messages AS message
 		LEFT JOIN @slack_users AS actor
 		  ON actor.account = message.account
@@ -2641,6 +2665,8 @@ func (s *PostgresStore) querySlackMarkReadPreviewRows(
 			&row.UserID,
 			&row.ActorName,
 			&row.Text,
+			&row.ThreadTS,
+			&row.AvatarURL,
 		); err != nil {
 			return nil, err
 		}

@@ -31,6 +31,11 @@ jobs:
           cache-dependency-path: mobile/package-lock.json
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npx expo lint
+      # The review logic (which mutations are a Gmail batch, how a thread reads
+      # as a row, how a day groups) is pure and has node tests. Nothing else in
+      # CI runs them, and an OTA publish is the last place to find out.
+      - run: npm test
       - name: Publish OTA update to the preview channel
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}

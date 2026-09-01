@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
@@ -18,11 +19,9 @@ import (
 // permalink where the source has one, otherwise the app's own scheme); AppURL
 // is an optional native-app scheme a phone should try first, because on iOS
 // the web permalink for some sources opens Safari rather than the app.
-type timelineDeepLink struct {
-	URL    string `json:"url"`
-	Label  string `json:"label"`
-	AppURL string `json:"app_url,omitempty"`
-}
+// The wire shape is the shared one: the mutation review sends the same JSON
+// for its Slack rows, and the iOS app opens both with one helper.
+type timelineDeepLink = deeplink.Link
 
 // timelineLinkEnv is what a deep link needs beyond the row itself: the Slack
 // workspace domains (a permalink is <domain>.slack.com/archives/...) and this
@@ -169,28 +168,13 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 
 func slackDeepLink(pk, meta map[string]any, env timelineLinkEnv) *timelineDeepLink {
 	teamID := linkString(pk, "team_id")
-	conversationID := linkString(pk, "conversation_id")
-	messageTS := linkString(pk, "message_ts")
-	if teamID == "" || conversationID == "" || messageTS == "" {
-		return nil
-	}
-	permalinkTS := "p" + strings.ReplaceAll(messageTS, ".", "")
-	link := &timelineDeepLink{
-		Label:  "Slack",
-		AppURL: "slack://channel?team=" + url.QueryEscape(teamID) + "&id=" + url.QueryEscape(conversationID) + "&message=" + url.QueryEscape(messageTS),
-	}
-	if domain := env.slackDomains[teamID]; domain != "" {
-		link.URL = "https://" + domain + ".slack.com/archives/" + url.PathEscape(conversationID) + "/" + permalinkTS
-		// A reply's permalink must name its thread or Slack opens the channel
-		// at the parent and the reply is nowhere on screen.
-		if threadTS := linkString(meta, "thread_ts"); threadTS != "" && threadTS != messageTS {
-			link.URL += "?thread_ts=" + url.QueryEscape(threadTS) + "&cid=" + url.QueryEscape(conversationID)
-		}
-		return link
-	}
-	// No workspace domain known: the client URL routes by team id alone.
-	link.URL = "https://app.slack.com/client/" + url.PathEscape(teamID) + "/" + url.PathEscape(conversationID) + "/" + permalinkTS
-	return link
+	return deeplink.Slack(
+		teamID,
+		linkString(pk, "conversation_id"),
+		linkString(pk, "message_ts"),
+		linkString(meta, "thread_ts"),
+		env.slackDomains[teamID],
+	)
 }
 
 // calendarDeepLink builds Google Calendar's event URL. The eid parameter is

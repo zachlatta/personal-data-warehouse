@@ -169,6 +169,15 @@ export function gmailSenderDisplayName(from, subject) {
   return from;
 }
 
+// gmailMessageSender labels one message's sender: the display name and the
+// address together, because a review has to be able to check the address.
+export function gmailMessageSender(message) {
+  const address = trimStr(asMap(message).from_address);
+  const name = trimStr(asMap(message).from_name);
+  if (name && address && name !== address) return name + " <" + address + ">";
+  return name || address || "Unknown sender";
+}
+
 export function senderInitial(value) {
   const m = /[A-Za-z0-9]/.exec(str(value).trim());
   return m ? m[0].toUpperCase() : "?";
@@ -190,6 +199,7 @@ export function formatGmailLabel(value) {
     case "UNREAD": return "Unread";
     case "IMPORTANT": return "Important";
     case "STARRED": return "Starred";
+    case "SENT": return "Sent";
     case "CATEGORY_UPDATES": return "Updates";
     case "CATEGORY_PROMOTIONS": return "Promotions";
     case "CATEGORY_SOCIAL": return "Social";
@@ -224,7 +234,10 @@ export function gmailThreadSummary(thread) {
   return {
     threadId: trimStr(thread.thread_id),
     subject,
-    senderName: gmailSenderDisplayName(sender, subject),
+    // The real Gmail display name when the preview carries it (the warehouse
+    // lifts the From header out of payload_json); the address-derived guess
+    // only when it does not.
+    senderName: trimStr(thread.latest_from_name) || gmailSenderDisplayName(sender, subject),
     latestPreview: truncateRunes(trimStr(thread.latest_preview), 420),
     latestAt: trimStr(thread.latest_at),
     messages,
@@ -991,6 +1004,8 @@ export function slackMarkReadView(mutation) {
       isFromMe: message.is_from_me === true,
       position,
       isAfterBoundary: position === "after",
+      avatarUrl: trimStr(message.avatar_url),
+      open: deepLink(message.open),
     };
   });
   const targetMessage = messages.find((message) => message.isTarget || message.position === "target") || null;
@@ -1019,9 +1034,20 @@ export function slackMarkReadView(mutation) {
     contextKind,
     contextLabel: contextKind === "thread" ? "Thread context" : "Conversation context",
     threadTs: trimStr(preview.thread_ts),
+    avatarUrl: trimStr(preview.avatar_url) || (targetMessage ? targetMessage.avatarUrl : ""),
+    open: deepLink(preview.open) || (targetMessage ? targetMessage.open : null),
     messages,
     targetMessage,
   };
+}
+
+// The link that opens a record in the app it came from, as both surfaces
+// receive it. Only an https url is usable in a browser; app_url is the phone's
+// native scheme and is ignored here.
+export function deepLink(value) {
+  const link = asMap(value);
+  const url = trimStr(link.url);
+  return url ? { url, label: trimStr(link.label) || "Slack" } : null;
 }
 
 const SLACK_REVIEW_GROUPS = [

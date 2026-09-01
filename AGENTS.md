@@ -1379,6 +1379,39 @@ back it, all behind the static bearer the CLI uses:
   with `PDW_SECRET_TOKEN` exactly like the phone (`Bearer web:<token>`). The old
   server-rendered review pages and their password cookie are gone; a still-set
   `PDW_MUTATION_UI_*` variable is reported as deprecated at startup.
+- **A batch is reviewed as the thing it is about, not as its payload.** A request is
+  n mutations, and n is routinely in the hundreds — 43 Gmail threads, 277 Slack
+  conversations — so a review that renders each mutation's JSON is a review that gets
+  approved unread. The preview the API already returns is what makes that avoidable, and
+  each surface renders it in the shape of its source:
+  - **Gmail thread batches** (`gmail.archive_threads` / `unarchive_threads` /
+    `modify_thread_labels`) read as an inbox: sender, subject, snippet, time, one row per
+    thread, grouped by the day it last moved (the reader's LOCAL day — keying on the UTC
+    prefix of the timestamp splits one evening into two sections and labels both the
+    same), with chips for unread / automated / kept and a filter box past eight threads.
+    Opening a row shows the messages themselves. **The sender's display name is not a
+    column**: `base_gmail.messages` stores only the bare address, and the review of an
+    archive batch is a column of `no-reply@t.<brand>.com` without it, so the preview
+    query lifts the `From` header out of `payload_json`
+    (`gmailHeaderDisplayName`, bounded to the threads already joined) and both clients
+    prefer it over the address-derived guess. Measured 2026-09-01 on the 43-thread
+    production batch, with the columns actually materialized rather than counted (a
+    `count(*)` wrapper lets the planner delete the expression and report it as free):
+    0.22s -> 0.30s for the whole preview query.
+  - **Slack mark-read batches** carry the actor's profile picture (Slack keeps it in the
+    user payload, not a column: `base_slack.users.raw_json -> profile -> image_192`) and
+    a permalink on every message and every row, because the honest answer to "mark this
+    read?" is often "let me reply first". A face identifies a DM row; a channel keeps its
+    `#`/`◈` glyph, which is what tells public from private at a glance.
+  - **One mutation can be dropped from a batch without denying it** —
+    `POST …/mutations/<id>/remove`, which is operation-agnostic and has always been; the
+    phone offers it per thread as "Keep this in the inbox", and the approve button then
+    counts what will still run rather than the request's original size.
+  - **The Slack URL shape lives in `app/internal/deeplink`**, used by both
+    `timeline_links.go` and the mutation preview, so a permalink cannot drift between
+    them. The part that drifts silently is the thread query string: without
+    `?thread_ts=…&cid=…` Slack opens the channel at the parent and the reply is nowhere
+    on screen.
 - `POST /api/push/register` stores the device's Expo push token in
   `private.push_devices` (`app/internal/push`); `POST /api/push/test` sends to every
   active device and returns the fan-out report.

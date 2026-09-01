@@ -163,6 +163,9 @@ func TestMutationReviewCSSIncludesPhoneLayoutAndTouchTargets(t *testing.T) {
 		".review-metrics",
 		".slack-review-row",
 		".mutation-filter",
+		// Answering a Slack message is often what settles a mark-read
+		// review, so its link is a real touch target, not a 13px glyph.
+		".slack-open",
 		"min-height: 44px",
 		"env(safe-area-inset-bottom)",
 	} {

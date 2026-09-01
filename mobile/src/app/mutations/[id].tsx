@@ -1,15 +1,27 @@
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { StatusPill } from '@/app/(tabs)/mutations';
+import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gmail-thread-review';
+import { SlackMarkReadCard } from '@/components/slack-read-review';
+import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, rejectMutationRequest, removeMutation, type Mutation, type MutationRequest } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
-import { isSlackMarkReadMutation, mutationReviewContext, slackMarkReadGroups, slackMarkReadReview, type SlackMarkReadReview } from '@/lib/mutation-review';
+import {
+  gmailBatchSummary,
+  gmailThreadDayGroups,
+  gmailThreadReviews,
+  isGmailThreadMutation,
+  isSlackMarkReadMutation,
+  mutationReviewContext,
+  slackMarkReadGroups,
+  type GmailThreadReview,
+} from '@/lib/mutation-review';
 import { useConfig } from '@/lib/session';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
@@ -39,105 +51,9 @@ function flattenPayload(payload: Record<string, unknown>): Record<string, unknow
 
 const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
 
-function SlackMarkReadCard({ mutation, review: suppliedReview, requestReason }: { mutation: Mutation; review?: SlackMarkReadReview; requestReason?: string }) {
+function MutationCard({ mutation, pending, onRemove, requestReason, alone }: { mutation: Mutation; pending: boolean; onRemove: () => void; requestReason?: string; alone?: boolean }) {
   const theme = useTheme();
-  const [expanded, setExpanded] = useState(false);
-  const review = suppliedReview ?? slackMarkReadReview(mutation);
-  const target = review.targetMessage;
-  const icon = review.conversationType === 'public_channel' ? '#'
-    : review.conversationType === 'private_channel' ? '◈'
-      : review.conversationType === 'mpim' ? '◎' : '@';
-  return (
-    <View style={[styles.slackCompactCard, { backgroundColor: theme.backgroundElement }]}>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityState={{ expanded }}
-        accessibilityLabel={`Review ${review.conversationLabel || 'Slack conversation'}`}
-        onPress={() => setExpanded((value) => !value)}
-        style={({ pressed }) => [styles.slackCompactHeader, pressed && { backgroundColor: theme.backgroundSelected }]}>
-        <View style={[styles.slackKindIcon, expanded && styles.slackKindIconOpen]}>
-          <ThemedText type="smallBold" style={expanded && styles.slackAccent}>{icon}</ThemedText>
-        </View>
-        <View style={styles.slackCompactCopy}>
-          <View style={styles.slackCompactTitleRow}>
-            <ThemedText type="smallBold" numberOfLines={1} style={styles.slackCompactTitle}>{review.conversationLabel || review.conversationId || 'Unknown conversation'}</ThemedText>
-            <View style={styles.contextChip}><ThemedText style={styles.contextChipText}>{review.contextLabel === 'Thread context' ? 'THREAD' : 'CHAT'}</ThemedText></View>
-          </View>
-          <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
-            {target ? `${target.actorName}: ${target.text}` : 'Review exact read boundary'}
-          </ThemedText>
-        </View>
-        <View style={styles.slackCompactTrailing}>
-          {review.currentUnreadCount ? <View style={styles.unreadBadge}><ThemedText style={styles.unreadBadgeText}>{review.currentUnreadCount}</ThemedText></View> : null}
-          <ThemedText themeColor="textSecondary" style={[styles.chevron, expanded && styles.chevronOpen]}>›</ThemedText>
-        </View>
-      </Pressable>
-
-      {expanded ? (
-        <View style={[styles.slackExpanded, { borderTopColor: theme.backgroundSelected }]}>
-          <View style={[styles.slackAction, { backgroundColor: theme.backgroundSelected }]}>
-            <ThemedText type="smallBold" style={styles.slackAccent}>READ BOUNDARY</ThemedText>
-            <ThemedText type="small">Everything through the highlighted message will be marked read.</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">{review.boundaryNote}</ThemedText>
-          </View>
-
-          <View style={styles.slackContextHeader}>
-            <ThemedText type="smallBold" themeColor="textSecondary">{review.contextLabel.toUpperCase()}</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">
-              {review.messages.length} message{review.messages.length === 1 ? '' : 's'}
-            </ThemedText>
-          </View>
-          {review.messages.length === 0 ? (
-            <View style={styles.slackMissing}>
-              <ThemedText type="small" style={styles.error}>Context was unavailable. Verify the exact target below before approving.</ThemedText>
-            </View>
-          ) : (
-            <View style={styles.slackTranscript}>
-              {review.messages.map((message, index) => (
-                <View
-                  key={`${message.messageTs}-${index}`}
-                  style={[
-                    styles.slackMessage,
-                    { backgroundColor: theme.background },
-                    message.isTarget && styles.slackMessageTarget,
-                    message.isAfterBoundary && styles.slackMessageAfter,
-                  ]}>
-                  <View style={[styles.slackAvatar, message.isTarget && styles.slackAvatarTarget]}>
-                    <ThemedText type="smallBold" style={message.isTarget && styles.slackAvatarTextTarget}>
-                      {(message.actorName.trim()[0] || '?').toUpperCase()}
-                    </ThemedText>
-                  </View>
-                  <View style={styles.slackMessageCopy}>
-                    <View style={styles.slackMessageHeader}>
-                      <ThemedText type="smallBold">{message.actorName}</ThemedText>
-                      <ThemedText type="small" themeColor="textSecondary">{formatWhen(message.sentAt)}</ThemedText>
-                    </View>
-                    <ThemedText type="small" style={message.isAfterBoundary && styles.slackMessageTextAfter}>{message.text}</ThemedText>
-                    {message.isTarget ? <ThemedText type="smallBold" style={styles.slackBoundaryTag}>READ THROUGH HERE</ThemedText> : null}
-                    {message.isAfterBoundary ? <ThemedText type="smallBold" themeColor="textSecondary" style={styles.slackAfterTag}>STAYS UNREAD</ThemedText> : null}
-                  </View>
-                </View>
-              ))}
-            </View>
-          )}
-
-          <View style={styles.slackTarget}>
-            <ThemedText type="smallBold" themeColor="textSecondary">EXACT TARGET</ThemedText>
-            <ThemedText type="code" selectable>Conversation {review.conversationId}</ThemedText>
-            <ThemedText type="code" selectable>Message {review.messageTs}</ThemedText>
-            {review.threadTs ? <ThemedText type="code" selectable>Thread {review.threadTs}</ThemedText> : null}
-          </View>
-          {mutation.reason && mutation.reason !== requestReason ? <ThemedText type="small" themeColor="textSecondary">{mutation.reason}</ThemedText> : null}
-          {mutation.error ? <ThemedText style={styles.error}>{mutation.error}</ThemedText> : null}
-        </View>
-      ) : null}
-    </View>
-  );
-}
-
-function MutationCard({ mutation, pending, onRemove, requestReason }: { mutation: Mutation; pending: boolean; onRemove: () => void; requestReason?: string }) {
-  const theme = useTheme();
-  if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} />;
+  if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
   const merged = flattenPayload(mutation.payload ?? {});
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
@@ -281,11 +197,12 @@ export default function MutationRequestScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const config = useConfig();
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const [request, setRequest] = useState<MutationRequest | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [reason, setReason] = useState('');
   const [filter, setFilter] = useState('');
+  const [scope, setScope] = useState<GmailScope>('all');
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -326,14 +243,59 @@ export default function MutationRequestScreen() {
 
   const approve = () => {
     if (!request) return;
-    Alert.alert('Approve request?', `${request.mutation_count} mutation${request.mutation_count === 1 ? '' : 's'} will run upstream.`, [
+    const running = request.mutations?.length
+      ? request.mutations.filter((mutation) => mutation.status === 'pending_review').length
+      : request.mutation_count;
+    Alert.alert('Approve request?', `${running} mutation${running === 1 ? '' : 's'} will run upstream.`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Approve', style: 'default', onPress: () => act(() => approveMutationRequest(config, request.id)) },
     ]);
   };
+  // The reason is asked for at the moment of denial rather than parked in a
+  // permanent text field: on a phone that field cost a row of the list on
+  // every screen, and it was empty almost every time.
   const deny = () => {
     if (!request) return;
-    act(() => rejectMutationRequest(config, request.id, reason));
+    const submit = (reason?: string) => act(() => rejectMutationRequest(config, request.id, (reason ?? '').trim()));
+    if (Platform.OS === 'ios') {
+      Alert.prompt('Deny this request?', 'Nothing runs upstream. A reason is optional.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Deny', style: 'destructive', onPress: submit },
+      ], 'plain-text');
+      return;
+    }
+    Alert.alert('Deny this request?', 'Nothing runs upstream.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Deny', style: 'destructive', onPress: () => submit('') },
+    ]);
+  };
+  const keepInInbox = (review: GmailThreadReview) => {
+    if (!request) return;
+    const count = review.threadsInMutation;
+    Alert.alert(
+      count > 1 ? `Keep ${count} threads in the inbox?` : 'Keep this thread in the inbox?',
+      count > 1
+        ? 'They are dropped from this request; everything else still runs.'
+        : `“${review.subject}” is dropped from this request; everything else still runs.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Keep',
+          style: 'destructive',
+          onPress: async () => {
+            setBusy(true);
+            try {
+              await removeMutation(config, request.id, review.mutationId);
+              await load();
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e));
+            } finally {
+              setBusy(false);
+            }
+          },
+        },
+      ],
+    );
   };
   const remove = (mutation: Mutation) => {
     if (!request) return;
@@ -365,7 +327,14 @@ export default function MutationRequestScreen() {
   const pending = request.status === 'pending_review';
   const requestMutations = request.mutations ?? [];
   const slackBatch = requestMutations.length > 1 && requestMutations.every((mutation) => isSlackMarkReadMutation(mutation));
+  const gmailBatch = requestMutations.length > 0 && requestMutations.every((mutation) => isGmailThreadMutation(mutation));
   const query = filter.trim().toLowerCase();
+  // A mutation kept out of the batch stays in the response as a rejected row,
+  // so the button has to count what is still going to run, not the request's
+  // original size.
+  const runningCount = requestMutations.length
+    ? requestMutations.filter((mutation) => mutation.status === 'pending_review').length
+    : request.mutation_count;
   const slackSections = slackBatch
     ? slackMarkReadGroups(requestMutations).map((group) => ({
         ...group,
@@ -376,12 +345,67 @@ export default function MutationRequestScreen() {
         }),
       })).filter((group) => group.data.length > 0)
     : [];
+  const gmailReviews = gmailBatch ? gmailThreadReviews(requestMutations) : [];
+  const gmailSummary = gmailBatchSummary(requestMutations, gmailReviews);
+  const gmailScopeCounts: Record<GmailScope, number> = {
+    all: gmailReviews.filter((review) => !review.removed).length,
+    unread: gmailReviews.filter((review) => !review.removed && review.unread).length,
+    automated: gmailReviews.filter((review) => !review.removed && review.automated).length,
+    kept: gmailReviews.filter((review) => review.removed).length,
+  };
+  const gmailVisible = gmailReviews.filter((review) => {
+    if (scope === 'kept' ? !review.removed : review.removed) return false;
+    if (scope === 'unread' && !review.unread) return false;
+    if (scope === 'automated' && !review.automated) return false;
+    if (!query) return true;
+    return [review.senderName, review.senderAddress, review.subject, review.preview, review.account]
+      .filter(Boolean).join(' ').toLowerCase().includes(query);
+  });
+  const gmailSections = gmailThreadDayGroups(gmailVisible);
   const overview = <RequestOverview request={request} error={error} filter={slackBatch ? filter : undefined} onFilter={slackBatch ? setFilter : undefined} />;
   return (
     <ThemedView style={styles.container}>
       <Stack.Screen options={{ title: pending ? 'Review' : request.status.replace(/_/g, ' ') }} />
       <KeyboardAvoidingView style={styles.reviewBody} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        {slackBatch ? (
+        {gmailBatch ? (
+          <SectionList
+            style={styles.scroll}
+            contentContainerStyle={styles.batchContent}
+            sections={gmailSections}
+            keyExtractor={(item) => item.key}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            stickySectionHeadersEnabled
+            initialNumToRender={12}
+            ListHeaderComponent={
+              <GmailOverview
+                request={request}
+                summary={gmailSummary}
+                error={error}
+                filter={filter}
+                onFilter={setFilter}
+                scope={scope}
+                onScope={setScope}
+                scopeCounts={gmailScopeCounts}
+                visible={gmailVisible.length}
+              />
+            }
+            ListEmptyComponent={
+              <ThemedText type="small" themeColor="textSecondary" style={styles.filterEmpty}>
+                No threads match that filter.
+              </ThemedText>
+            }
+            renderSectionHeader={({ section }) => (
+              <View style={[styles.dayHeader, { backgroundColor: theme.background, borderBottomColor: theme.backgroundSelected }]}>
+                <ThemedText type="smallBold" themeColor="textSecondary">{section.label.toUpperCase()}</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary">{section.data.length}</ThemedText>
+              </View>
+            )}
+            renderItem={({ item }) => (
+              <GmailThreadRow review={item} pending={pending} onKeep={keepInInbox} defaultOpen={gmailReviews.length === 1} />
+            )}
+          />
+        ) : slackBatch ? (
           <SectionList
             style={styles.scroll}
             contentContainerStyle={styles.batchContent}
@@ -409,7 +433,14 @@ export default function MutationRequestScreen() {
           <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
             {overview}
             {requestMutations.map((mutation) => (
-              <MutationCard key={mutation.id} mutation={mutation} pending={pending} onRemove={() => remove(mutation)} requestReason={request.reason} />
+              <MutationCard
+                key={mutation.id}
+                mutation={mutation}
+                pending={pending}
+                onRemove={() => remove(mutation)}
+                requestReason={request.reason}
+                alone={requestMutations.length === 1}
+              />
             ))}
             {Object.keys(request.context ?? {}).length > 0 && mutationReviewContext(request.context).counts.length === 0 ? (
               <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
@@ -420,20 +451,21 @@ export default function MutationRequestScreen() {
           </ScrollView>
         )}
         {pending ? (
-          <View style={[styles.actions, { backgroundColor: theme.background, borderTopColor: theme.backgroundSelected }]}>
-            <TextInput
-              placeholder="Reason for denying (optional)"
-              placeholderTextColor={theme.textSecondary}
-              value={reason}
-              onChangeText={setReason}
-              style={[styles.input, { backgroundColor: theme.backgroundElement, color: theme.text }]}
-            />
+          <View
+            style={[
+              styles.actions,
+              // Clear of the home indicator; the buttons are the two most
+              // consequential controls on the screen.
+              { backgroundColor: theme.background, borderTopColor: theme.backgroundSelected, paddingBottom: Spacing.three + insets.bottom },
+            ]}>
             <View style={styles.actionButtons}>
               <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, styles.deny, busy && styles.disabled]}>
-                <ThemedText style={styles.buttonText}>Deny</ThemedText>
+                <ThemedText style={styles.buttonText}>Deny all</ThemedText>
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy} style={[styles.button, styles.approve, busy && styles.disabled]}>
-                <ThemedText style={styles.buttonText}>Approve {request.mutation_count}</ThemedText>
+                <ThemedText style={styles.buttonText}>
+                  {gmailBatch ? `${gmailSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
+                </ThemedText>
               </Pressable>
             </View>
           </View>
@@ -468,6 +500,11 @@ const styles = StyleSheet.create({
   includedCard: { borderLeftColor: '#D97706' },
   preservedCard: { borderLeftColor: '#16A34A' },
   preservedTitle: { color: '#16A34A', letterSpacing: 0.8 },
+  scopeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two, marginTop: Spacing.one },
+  scopeChip: { minHeight: 34, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 17 },
+  scopeChipActive: { backgroundColor: '#D97706' },
+  scopeChipActiveText: { color: '#FFFFFF' },
+  dayHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.three, paddingVertical: 6, borderBottomWidth: StyleSheet.hairlineWidth },
   filterBlock: { gap: Spacing.two, marginTop: Spacing.one },
   filterTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   filterInput: { minHeight: 44, borderRadius: 11, paddingHorizontal: Spacing.three, fontSize: 15 },
@@ -492,36 +529,5 @@ const styles = StyleSheet.create({
   linkButton: { paddingTop: Spacing.one },
   linkDanger: { color: '#DC2626', fontWeight: '600' },
   error: { color: '#D0342C' },
-  slackCompactCard: { marginHorizontal: Spacing.three, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#6B728044', overflow: 'hidden' },
-  slackCompactHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 10, paddingVertical: 7 },
-  slackKindIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#6B728022' },
-  slackKindIconOpen: { backgroundColor: '#D977061A' },
-  slackCompactCopy: { flex: 1, minWidth: 0, gap: 2 },
-  slackCompactTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  slackCompactTitle: { flexShrink: 1 },
-  contextChip: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728066', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
-  contextChipText: { color: '#8B8F98', fontSize: 8, fontWeight: '700', letterSpacing: 0.5 },
-  slackCompactTrailing: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  unreadBadge: { minWidth: 25, height: 20, paddingHorizontal: 5, alignItems: 'center', justifyContent: 'center', borderRadius: 10, backgroundColor: '#D977061A' },
-  unreadBadgeText: { color: '#D97706', fontSize: 10, fontWeight: '700' },
-  chevron: { fontSize: 22, lineHeight: 22, transform: [{ rotate: '0deg' }] },
-  chevronOpen: { transform: [{ rotate: '90deg' }], color: '#D97706' },
-  slackExpanded: { gap: Spacing.two, padding: 10, borderTopWidth: StyleSheet.hairlineWidth },
-  slackAction: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: '#D97706', padding: 10, gap: Spacing.one },
   slackAccent: { color: '#D97706', letterSpacing: 0.8 },
-  slackContextHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: Spacing.one },
-  slackTranscript: { gap: Spacing.one },
-  slackMessage: { flexDirection: 'row', gap: 10, borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728044' },
-  slackMessageTarget: { borderColor: '#D97706', borderLeftWidth: 4, paddingLeft: 9 },
-  slackMessageAfter: { opacity: 0.58, borderStyle: 'dashed' },
-  slackAvatar: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: '#6B728044' },
-  slackAvatarTarget: { backgroundColor: '#D97706' },
-  slackAvatarTextTarget: { color: '#FFFFFF' },
-  slackMessageCopy: { flex: 1, minWidth: 0, gap: 3 },
-  slackMessageHeader: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: Spacing.one },
-  slackMessageTextAfter: { color: '#8B8F98' },
-  slackBoundaryTag: { alignSelf: 'flex-start', marginTop: 3, color: '#D97706', fontSize: 11, letterSpacing: 0.8 },
-  slackAfterTag: { alignSelf: 'flex-start', marginTop: 3, fontSize: 11, letterSpacing: 0.8 },
-  slackMissing: { borderWidth: 1, borderColor: '#D0342C66', borderRadius: 10, padding: 12 },
-  slackTarget: { marginTop: Spacing.one, gap: 2 },
 });

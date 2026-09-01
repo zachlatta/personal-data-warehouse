@@ -192,10 +192,13 @@ func TestCreateRequestFillsContactPreviewFromTheSyncedCard(t *testing.T) {
 	}
 }
 
-func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testing.T) {
-	store := testStore(t)
+// seedSlackPreviewSchema creates just enough of the Slack source layer for the
+// preview queries to run: the columns they read, under the catalog's own
+// schema names.
+func seedSlackPreviewSchema(t *testing.T, store *PostgresStore) {
+	t.Helper()
 	ctx := context.Background()
-	for _, logical := range []string{"slack_messages", "slack_conversations", "slack_account_identities", "slack_users"} {
+	for _, logical := range []string{"slack_messages", "slack_conversations", "slack_account_identities", "slack_users", "slack_teams"} {
 		if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf(logical))); err != nil {
 			t.Skipf("cannot create Slack schema in this database: %v", err)
 		}
@@ -210,7 +213,12 @@ func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testin
 		)`,
 		`CREATE TABLE IF NOT EXISTS @slack_users (
 			account text, team_id text, user_id text, display_name text, real_name text, name text,
+			raw_json text,
 			PRIMARY KEY (account, team_id, user_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS @slack_teams (
+			account text, team_id text, team_name text, domain text,
+			PRIMARY KEY (account, team_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS @slack_messages (
 			account text, team_id text, conversation_id text, message_ts text,
@@ -224,13 +232,20 @@ func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testin
 			t.Skipf("cannot create Slack source table in this database: %v", err)
 		}
 	}
+}
+
+func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedSlackPreviewSchema(t, store)
 
 	account := fmt.Sprintf("slack-preview-%d", time.Now().UnixNano())
 	for _, statement := range []string{
 		`INSERT INTO @slack_account_identities (account, team_id, user_id) VALUES ($1, 'T1', 'U-ME')`,
-		`INSERT INTO @slack_users (account, team_id, user_id, display_name, real_name, name)
-		 VALUES ($1, 'T1', 'U-ME', 'Zach', 'Zach Latta', 'zach'),
-		        ($1, 'T1', 'U-MARCUS', 'Marcus', 'Marcus', 'marcus')`,
+		`INSERT INTO @slack_users (account, team_id, user_id, display_name, real_name, name, raw_json)
+		 VALUES ($1, 'T1', 'U-ME', 'Zach', 'Zach Lata', 'zach', '{}'),
+		        ($1, 'T1', 'U-MARCUS', 'Marcus', 'Marcus', 'marcus', '{"profile":{"image_192":"https://avatars.example.test/marcus_192.png"}}')`,
+		`INSERT INTO @slack_teams (account, team_id, team_name, domain) VALUES ($1, 'T1', 'Example', 'example')`,
 		`INSERT INTO @slack_conversations (account, team_id, conversation_id, conversation_type, name, raw_json)
 		 VALUES ($1, 'T1', 'D1', 'im', '', '{"user":"U-MARCUS","last_read":"1593473500.000100","unread_count_display":2}')`,
 		`INSERT INTO @slack_messages (
@@ -264,5 +279,77 @@ func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testin
 	messages := mapSliceFromAny(preview["messages"])
 	if len(messages) != 3 || messages[1]["is_target"] != true || messages[1]["actor_name"] != "Marcus" {
 		t.Fatalf("Slack context messages = %#v", messages)
+	}
+	// Every message carries the face and the link that let a reviewer answer
+	// it in Slack instead of approving it unread.
+	if messages[1]["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
+		t.Fatalf("target avatar = %#v", messages[1]["avatar_url"])
+	}
+	open := mapFromAny(messages[1]["open"])
+	if open["url"] != "https://example.slack.com/archives/D1/p1593473566000200" {
+		t.Fatalf("target permalink = %#v", open)
+	}
+	if mapFromAny(preview["open"])["url"] != open["url"] {
+		t.Fatalf("conversation link = %#v", preview["open"])
+	}
+	if preview["avatar_url"] != "https://avatars.example.test/marcus_192.png" {
+		t.Fatalf("conversation avatar = %#v", preview["avatar_url"])
+	}
+}
+
+// The threaded branch is a different query with its own column list, and a
+// reply's permalink is the one that has to name its thread — without it Slack
+// opens the channel at the parent and the reply is nowhere on screen.
+func TestSlackMarkReadPreviewLinksAReplyToItsThread(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedSlackPreviewSchema(t, store)
+
+	account := fmt.Sprintf("slack-thread-%d", time.Now().UnixNano())
+	for _, statement := range []string{
+		`INSERT INTO @slack_account_identities (account, team_id, user_id) VALUES ($1, 'T1', 'U-ME')`,
+		`INSERT INTO @slack_users (account, team_id, user_id, display_name, real_name, name, raw_json)
+		 VALUES ($1, 'T1', 'U-MARCUS', 'Marcus', 'Marcus', 'marcus', '{"profile":{"image_72":"https://avatars.example.test/marcus_72.png"}}')`,
+		`INSERT INTO @slack_teams (account, team_id, team_name, domain) VALUES ($1, 'T1', 'Example', 'example')`,
+		`INSERT INTO @slack_conversations (account, team_id, conversation_id, conversation_type, name, raw_json)
+		 VALUES ($1, 'T1', 'C1', 'public_channel', 'general', '{"last_read":"1593473500.000100","unread_count_display":1}')`,
+		`INSERT INTO @slack_messages (
+			account, team_id, conversation_id, message_ts, message_datetime, thread_ts,
+			parent_message_ts, user_id, bot_id, username, text,
+			is_thread_parent, is_thread_reply, reply_count, is_deleted
+		 ) VALUES
+			($1, 'T1', 'C1', '1593473500.000100', '2026-08-29 14:00:00+00', '1593473500.000100', '', 'U-ME', '', '', 'Kicking this off.', 1, 0, 1, 0),
+			($1, 'T1', 'C1', '1593473566.000200', '2026-08-29 14:01:00+00', '1593473500.000100', '1593473500.000100', 'U-MARCUS', '', '', 'On it.', 0, 1, 0, 0)`,
+	} {
+		if _, err := execContext(ctx, store.db, statement, account); err != nil {
+			t.Fatalf("seed Slack thread: %v", err)
+		}
+	}
+
+	request, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: "Mark the reply read", Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type: SlackMarkConversationReadOperation, Account: account,
+			ConversationID: "C1", MessageTS: "1593473566.000200",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	preview := mapFromAny(request.Mutations[0].Preview["slack_read"])
+	if preview["context_kind"] != "thread" {
+		t.Fatalf("context_kind = %#v", preview["context_kind"])
+	}
+	messages := mapSliceFromAny(preview["messages"])
+	if len(messages) != 2 {
+		t.Fatalf("thread messages = %#v", messages)
+	}
+	reply := messages[1]
+	if reply["is_target"] != true || reply["avatar_url"] != "https://avatars.example.test/marcus_72.png" {
+		t.Fatalf("reply = %#v", reply)
+	}
+	want := "https://example.slack.com/archives/C1/p1593473566000200?thread_ts=1593473500.000100&cid=C1"
+	if got := mapFromAny(reply["open"])["url"]; got != want {
+		t.Fatalf("reply permalink = %#v, want %s", got, want)
 	}
 }

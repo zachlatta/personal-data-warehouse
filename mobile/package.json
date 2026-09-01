@@ -46,7 +46,7 @@
     "web": "expo start --web",
     "lint": "expo lint",
     "typecheck": "tsc --noEmit",
-    "test": "NODE_NO_WARNINGS=1 node --test src/lib/*.test.mjs"
+    "test": "NODE_NO_WARNINGS=1 node --experimental-strip-types --test src/lib/*.test.mjs"
   },
   "private": true
 }

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
 )
 
 type slackMarkReadPreviewKey struct {
@@ -26,6 +28,7 @@ type slackMarkReadPreviewDetail struct {
 	ContextKind        string
 	ThreadTS           string
 	SelfUserID         string
+	TeamDomain         string
 }
 
 type slackMarkReadPreviewRow struct {
@@ -37,6 +40,8 @@ type slackMarkReadPreviewRow struct {
 	UserID          string
 	ActorName       string
 	Text            string
+	ThreadTS        string
+	AvatarURL       string
 	IsTarget        bool
 	IsFromMe        bool
 }
@@ -129,16 +134,26 @@ func applySlackMarkReadPreviewRows(
 			} else if comparison > 0 {
 				position = "after"
 			}
-			messages = append(messages, map[string]any{
+			message := map[string]any{
 				"message_ts": strings.TrimSpace(row.MessageTS),
 				"sent_at":    formatPreviewTime(row.SentAt),
 				"user_id":    strings.TrimSpace(row.UserID),
 				"actor_name": strings.TrimSpace(row.ActorName),
+				"avatar_url": strings.TrimSpace(row.AvatarURL),
 				"text":       strings.TrimSpace(row.Text),
 				"is_target":  isTarget,
 				"is_from_me": row.IsFromMe,
 				"position":   position,
-			})
+			}
+			// Every message is openable in Slack, because the honest answer to
+			// "should this be marked read?" is often "let me reply first", and
+			// a review that cannot be acted on is a review that gets approved
+			// unread. Same JSON as a timeline row's `open`, so the clients
+			// open it with the helper they already have.
+			if link := deeplink.Slack(detail.TeamID, detail.ConversationID, row.MessageTS, row.ThreadTS, detail.TeamDomain); link != nil {
+				message["open"] = link
+			}
+			messages = append(messages, message)
 		}
 
 		preview := cloneMap(mutation.Preview)
@@ -150,6 +165,18 @@ func applySlackMarkReadPreviewRows(
 		slackRead["current_unread_count"] = detail.CurrentUnreadCount
 		slackRead["context_kind"] = strings.TrimSpace(detail.ContextKind)
 		slackRead["thread_ts"] = strings.TrimSpace(detail.ThreadTS)
+		slackRead["team_domain"] = strings.TrimSpace(detail.TeamDomain)
+		if link := deeplink.Slack(detail.TeamID, detail.ConversationID, detail.MessageTS, detail.ThreadTS, detail.TeamDomain); link != nil {
+			slackRead["open"] = link
+		}
+		// The face on the compact row is whoever wrote the message the read
+		// boundary lands on: in a DM that is the person, and in a channel it
+		// is the message actually being reviewed.
+		for _, row := range ordered {
+			if row.IsTarget && strings.TrimSpace(row.AvatarURL) != "" {
+				slackRead["avatar_url"] = strings.TrimSpace(row.AvatarURL)
+			}
+		}
 		slackRead["messages"] = messages
 		preview["slack_read"] = slackRead
 		mutation.Preview = preview

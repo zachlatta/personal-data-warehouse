@@ -75,7 +75,7 @@ function mutationHead(eyebrow, title, statusText) {
 // --- gmail threads --------------------------------------------------------------
 
 function renderGmailMessage(message, open) {
-  const from = V.trimStr(message.from_address) || "Unknown sender";
+  const from = V.gmailMessageSender(message);
   const to = V.stringSlice(message.to_addresses).join(", ");
   const cc = V.stringSlice(message.cc_addresses).join(", ");
   let preview = V.truncateRunes(V.trimStr(message.preview_text), 900);
@@ -648,7 +648,7 @@ function renderSlackMarkReadBody(mutation, view, requestReason) {
     const transcript = h("div", "slack-transcript");
     for (const message of view.messages) {
       const row = h("article", "slack-msg" + (message.isTarget ? " target" : "") + (message.isAfterBoundary ? " after" : ""));
-      row.appendChild(h("span", "avatar", V.senderInitial(message.actorName)));
+      row.appendChild(slackAvatar(message.avatarUrl, message.isFromMe ? "You" : message.actorName));
       const copy = h("div", "slack-msg-copy");
       const head = h("div", "slack-msg-head");
       head.appendChild(h("strong", "", message.isFromMe ? "You" : message.actorName));
@@ -664,6 +664,9 @@ function renderSlackMarkReadBody(mutation, view, requestReason) {
       if (message.isAfterBoundary) tags.appendChild(h("span", "slack-stays-unread", "stays unread"));
       if (tags.childNodes.length) copy.appendChild(tags);
       row.appendChild(copy);
+      // Answering a message is usually what settles whether it should be
+      // marked read, so every one of them opens in Slack.
+      if (message.open) row.appendChild(slackOpenLink(message.open, message.actorName));
       transcript.appendChild(row);
     }
     context.appendChild(transcript);
@@ -683,6 +686,32 @@ function renderSlackMarkReadBody(mutation, view, requestReason) {
   return body;
 }
 
+// A Slack profile picture, falling back to the initial when the workspace has
+// no image for that user or the CDN will not serve it.
+function slackAvatar(url, name) {
+  if (!url) return h("span", "avatar", V.senderInitial(name));
+  const image = document.createElement("img");
+  image.className = "avatar avatar-photo";
+  image.src = url;
+  image.alt = name;
+  image.loading = "lazy";
+  image.referrerPolicy = "no-referrer";
+  image.addEventListener("error", () => image.replaceWith(h("span", "avatar", V.senderInitial(name))));
+  return image;
+}
+
+function slackOpenLink(link, name) {
+  const anchor = document.createElement("a");
+  anchor.className = "slack-open";
+  anchor.href = link.url;
+  anchor.target = "_blank";
+  anchor.rel = "noopener";
+  anchor.title = "Open " + (name ? name + "'s message" : "this") + " in Slack";
+  anchor.textContent = "↗";
+  anchor.addEventListener("click", (event) => event.stopPropagation());
+  return anchor;
+}
+
 function renderSlackMarkRead(request, mutation, suppliedView) {
   const view = suppliedView || V.slackMarkReadView(mutation);
   const node = h("details", "slack-review-row");
@@ -690,7 +719,11 @@ function renderSlackMarkRead(request, mutation, suppliedView) {
   const typeIcon = view.conversationType === "public_channel" ? "#"
     : view.conversationType === "private_channel" ? "◈"
       : view.conversationType === "mpim" ? "◎" : "@";
-  summary.appendChild(h("span", "slack-kind-icon", typeIcon));
+  summary.appendChild(
+    view.avatarUrl && (view.conversationType === "im" || view.conversationType === "mpim")
+      ? slackAvatar(view.avatarUrl, view.conversationLabel)
+      : h("span", "slack-kind-icon", typeIcon),
+  );
   const copy = h("span", "slack-row-copy");
   const headline = h("span", "slack-row-headline");
   headline.appendChild(h("strong", "", view.conversationLabel || view.conversationId || "Unknown conversation"));
@@ -709,6 +742,7 @@ function renderSlackMarkRead(request, mutation, suppliedView) {
     when.title = fmtFull(target.sentAt);
     trailing.appendChild(when);
   }
+  if (view.open) trailing.appendChild(slackOpenLink(view.open, view.conversationLabel));
   trailing.appendChild(h("span", "slack-chevron", "›"));
   summary.appendChild(trailing);
   node.appendChild(summary);

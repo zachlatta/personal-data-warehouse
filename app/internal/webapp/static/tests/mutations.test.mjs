@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  gmailSenderDisplayName, splitGmailQuotedHTML, gmailBodyFrameHeight, htmlFragmentText, gmailThreadSummary,
+  gmailSenderDisplayName, splitGmailQuotedHTML, gmailBodyFrameHeight, htmlFragmentText, gmailThreadSummary, gmailMessageSender,
+  deepLink,
   gmailMessageOpen, formatGmailLabel, appendVisibleGmailLabels, assembleEmailBody, splitEmailAddressList,
   humanRecurrence, humanByDay, parseCalendarTime, calendarWhen, formatTimeRange, formatCalendarPatchTime,
   calendarPatchValue, calendarInitials, autolinkSegments, calendarTitle, calendarOperation,
@@ -42,6 +43,35 @@ test("Slack mark-read view makes its whole-conversation effect explicit", () => 
   assert.equal(view.messageTs, "1593473566.000200");
   assert.equal(view.effect, "Moves the entire conversation read cursor through this message.");
   assert.equal(isSlackMarkReadMutation({ provider: "slack", operation: "slack.send_message" }), false);
+});
+
+test("a Slack review row carries the face and the permalink of its target", () => {
+  const view = slackMarkReadView({
+    provider: "slack",
+    operation: "slack.mark_conversation_read",
+    payload: { conversation_id: "D1", message_ts: "1593473566.000200" },
+    preview: { slack_read: {
+      conversation_name: "Marcus",
+      conversation_type: "im",
+      messages: [
+        {
+          message_ts: "1593473566.000200", sent_at: "2026-08-29T14:01:00Z", actor_name: "Marcus",
+          text: "Yep — all handled.", is_target: true, position: "target",
+          avatar_url: "https://avatars.example.test/marcus.png",
+          open: { url: "https://example.slack.com/archives/D1/p1593473566000200", label: "Slack", app_url: "slack://channel?team=T1&id=D1" },
+        },
+      ],
+    } },
+  });
+  assert.equal(view.messages[0].avatarUrl, "https://avatars.example.test/marcus.png");
+  assert.equal(view.messages[0].open.url, "https://example.slack.com/archives/D1/p1593473566000200");
+  // The row inherits the target's face and link when the preview gives it none.
+  assert.equal(view.avatarUrl, "https://avatars.example.test/marcus.png");
+  assert.equal(view.open.url, "https://example.slack.com/archives/D1/p1593473566000200");
+  // app_url is a phone scheme; a browser has nothing to do with it.
+  assert.equal(view.open.app_url, undefined);
+  assert.equal(deepLink({ label: "Slack" }), null);
+  assert.equal(deepLink(null), null);
 });
 
 test("Slack mark-read view exposes the target and surrounding messages", () => {
@@ -167,6 +197,21 @@ test("gmail labels: Inbox is derived from the count and hidden labels are droppe
   assert.equal(t.messageCount, 2);
   assert.deepEqual(t.labels, ["Inbox", "Updates", "Unread"]);
   assert.equal(t.unread, true);
+});
+
+test("the warehouse's own From display name wins over the address-derived guess", () => {
+  const thread = {
+    thread_id: "t1", subject: "Your order is confirmed", latest_from_address: "no-reply@t.example.test",
+    latest_from_name: "VistaPrint", messages: [],
+  };
+  assert.equal(gmailThreadSummary(thread).senderName, "VistaPrint");
+  // Without the header the address-derived fallback still runs, and on a bulk
+  // subdomain sender it reads as badly as it looks — which is the reason the
+  // real header is worth lifting out of payload_json.
+  assert.equal(gmailThreadSummary({ ...thread, latest_from_name: "" }).senderName, "T");
+  assert.equal(gmailMessageSender({ from_name: "UPS", from_address: "pkginfo@ups.test" }), "UPS <pkginfo@ups.test>");
+  assert.equal(gmailMessageSender({ from_address: "pkginfo@ups.test" }), "pkginfo@ups.test");
+  assert.equal(gmailMessageSender({}), "Unknown sender");
 });
 
 test("gmailMessageOpen opens unread messages, else the last one when only the thread is known unread", () => {

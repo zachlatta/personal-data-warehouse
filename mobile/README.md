@@ -22,6 +22,27 @@ app fans a notification out to every active device when a request lands in
 `pending_review` (tapping it opens that request). A `DeviceNotRegistered`
 ticket retires the device row rather than silently shrinking the fan-out.
 
+## Reviewing a batch
+
+A mutation request is n mutations and n is routinely in the hundreds, so the
+review screen renders the batch as the thing it is about rather than as its
+payload. The pure part of that lives in `src/lib/mutation-review.ts` and has
+node tests (`npm test`, also run in CI before the OTA publish); the components
+are `src/components/gmail-thread-review.tsx` and
+`src/components/slack-read-review.tsx`.
+
+- **Gmail thread batches** (archive / unarchive / relabel) read as an inbox —
+  sender, subject, snippet, time — grouped by the day each thread last moved,
+  with chips for unread / automated / kept, a filter box past eight threads, an
+  ↗ to the thread in Gmail, and "Keep this in the inbox" to drop one thread from
+  the request without denying the rest. The approve button counts what will
+  still run.
+- **Slack mark-read batches** show each speaker's profile picture and open that
+  exact message in Slack on a tap, because the answer to "mark this read?" is
+  often "let me reply first". Faces identify DM rows; channels keep their glyph.
+- The day grouping keys on the reader's LOCAL day. Keying on the timestamp's UTC
+  prefix splits one evening across two sections and labels both of them the same.
+
 ## Rich notifications
 
 Alerts can carry a subtitle, an image, action buttons, a thread, a collapse
@@ -60,7 +81,7 @@ cd mobile
 npm install
 npx expo start --ios          # Expo Go on the simulator; push is unsupported there
 npx expo run:ios --device     # dev build on a phone (needs the Apple team in Xcode)
-npm run typecheck && npm run lint
+npm run typecheck && npm run lint && npm test
 ```
 
 EAS project: `pdw` under the `zlatta` account (`extra.eas.projectId` in
