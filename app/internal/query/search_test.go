@@ -288,6 +288,28 @@ func TestSearchHybridUsesSingleMeasuredQueryRepresentation(t *testing.T) {
 	}
 }
 
+func TestSearchHybridEncodesEmptySemanticEvidenceAsJSONArray(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridSemanticSQL: {},
+			searchHybridFuseSQL:     searchHit(),
+		},
+	}
+	svc := NewService(runner, Options{
+		SearchEmbedder: &fakeEmbedder{model: "test-model", vector: []float64{0.5}},
+	})
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "warehouse health"})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
+	}
+	calls := runner.callsFor(searchHybridFuseSQL)
+	if len(calls) != 1 || calls[0][3] != "[]" {
+		t.Fatalf("semantic JSON = %#v, want an empty array", calls)
+	}
+}
+
 func TestSearchHybridFallsBackWhenEmbeddingsUnconfigured(t *testing.T) {
 	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
 	svc := NewService(runner, Options{})

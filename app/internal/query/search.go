@@ -521,7 +521,13 @@ func (s *Service) runHybridSearch(
 		return RawResult{}, err
 	}
 
-	semanticJSON, err := json.Marshal(semantic.Rows)
+	// A source can legitimately have no embedded chunks. A nil Go slice
+	// marshals as JSON null, but search_hybrid_fuse consumes this value with
+	// jsonb_to_recordset and requires an array. Preserve the old fan-in's
+	// explicit empty-array shape after reducing it to one semantic leg.
+	semanticRows := make([]map[string]any, 0, len(semantic.Rows))
+	semanticRows = append(semanticRows, semantic.Rows...)
+	semanticJSON, err := json.Marshal(semanticRows)
 	if err != nil {
 		return RawResult{}, fmt.Errorf("encode hybrid semantic evidence: %w", err)
 	}
