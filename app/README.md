@@ -318,7 +318,7 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
 - Tool-level entry point: the `search` tool wraps this contract for callers that don't want to
   write SQL. Its default `hybrid` mode embeds the query through an OpenAI-compatible embeddings
   API (`SEARCH_EMBEDDINGS_BASE_URL`, `SEARCH_EMBEDDINGS_API_KEY`, `SEARCH_EMBEDDINGS_MODEL`,
-  `SEARCH_EMBEDDINGS_DIMENSIONS`) and fans BM25, one semantic leg per query representation,
+  `SEARCH_EMBEDDINGS_DIMENSIONS`) and fans BM25, one instructed semantic leg,
   and the short-literal leg over separate pooled Postgres connections. It then calls
   `timeline.search_hybrid_fuse`; `timeline.search_hybrid` remains the compatible direct-SQL
   wrapper over the same helpers. Machine tokens (ids, paths, emails and version-like strings) search
@@ -334,22 +334,19 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
   prepend `SEARCH_EMBEDDINGS_QUERY_PREFIX` on queries only (write its newline as the two
   characters `\n`: a real newline in an environment value does not survive every deploy
   pipeline, and a truncated instruction retrieves measurably worse). With a prefix set the client embeds
-  the instructed AND raw query in one batched request; sentence-shaped queries also get instructed
-  and raw deterministic content-word forms in that same request. Each vector gets an independent,
-  concurrent ANN leg. The instructed/raw forms land in different neighbourhoods and each retrieves
-  answers the other misses (blending them into a single vector measured MRR 0.234 against 0.300 for
-  separate legs); the content-word forms raised the expanded live-agent benchmark from MRR 0.305 to
-  0.321 and hit@1 from 7 to 8 without reducing hit@5, hit@10, or found@50. Their ANN legs use a
-  measured `max(200, 2 * max_results)` candidate bound instead of repeating the original vectors'
-  1,000-row floor. A pooled in-container A/B kept median latency flat while reducing mean latency
-  41%, p90 52%, and maximum 53%. When embeddings are not
+  only the instructed query. The former instructed/raw plus sentence content-word fanout was removed
+  after the benchmark grew to 73 live-agent-shaped cases, including source/time/priority scopes: the
+  single instructed ANN leg improved offline MRR from 0.342 to 0.361 and found@50 from 55 to 56 before
+  the accompanying fusion retune, while removing 50% of ANN scans for term bags and 75% for sentences.
+  A verified-hybrid, interleaved in-container A/B on the production host reduced mean warm
+  end-to-end latency 32%, p50 17%, and p90 10%, with the maximum flat. When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
   keyword search and reports a `fallback_reason`. Agent-session-only searches bound each ANN
   leg to 4x the requested depth (40-200 rows): those chunks are 3.05% of the global HNSW, and
-  the general 1,000-row floor made each filtered vector leg take about 31 seconds. Other scopes
-  retain the deeper pool. Drive-only semantic legs use a three-worker exact scan of the 223k
+  the former 1,000-row floor made each filtered vector leg take about 31 seconds. Other scopes
+  use a measured 400-800 row pool. Drive-only semantic legs use a three-worker exact scan of the 223k
   Drive chunks instead: even a 40-row filtered-HNSW leg took 16 seconds, while the exact scan
-  returned the full 1,000-row candidate pool in 7.0 seconds cold and 0.66 seconds warm. Broad
+  returned the then-full 1,000-row candidate pool in 7.0 seconds cold and 0.66 seconds warm. Broad
   and mixed-source searches keep the global HNSW. Modes `keyword` and `exact` force
   `timeline.search_text` / `timeline.search_text_exact` directly. Takes
   `query`, `max_results` (default 20; raise it explicitly for recall work), `sources`, `since`, and `mode`.

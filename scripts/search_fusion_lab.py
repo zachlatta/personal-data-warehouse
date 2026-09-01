@@ -6,9 +6,8 @@ and reports the benchmark metrics for every weighting -- so a fusion change
 is measured before it is written into ``search_hybrid_fuse``.
 
 Legs are collected through ``pdw sql`` against the deployment under test, the
-same functions the app calls, with the same query representations the Go
-client builds (instructed + raw, plus the content-word forms for a sentence
-query). Embeddings come from the deployment's own embedding endpoint.
+same functions the app calls, with the single instructed representation the
+Go client builds. Embeddings come from the deployment's own endpoint.
 
 Artifacts stay under the gitignored ``.search-eval/``; nothing here is a
 label and nothing is written elsewhere.
@@ -45,12 +44,22 @@ from personal_data_warehouse.search_benchmark import (  # noqa: E402
     resolve_truth_metadata,
     trim_to_json,
 )
+from personal_data_warehouse.postgres import (  # noqa: E402
+    SEARCH_HYBRID_EXACT_WEIGHT,
+    SEARCH_HYBRID_LEXICAL_HEAD_RANKS,
+    SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT,
+    SEARCH_HYBRID_SEMANTIC_WEIGHT,
+)
 
 EVIDENCE = Path(".search-eval/fusion_evidence.json")
 DEPTH = 50
 RRF_K = 60
-# The Go client's sentence detector and content-word rewrite, mirrored so the
-# lab embeds exactly the forms the app would.
+# Increment whenever collection changes the request shape. Evidence is costly
+# and cached, but reusing four-vector rows after production moved to one vector
+# would make a fast tuning run confidently score a ranker that no longer runs.
+COLLECTION_VERSION = 2
+# The Go client's sentence detector, mirrored so the lab applies the BM25 head
+# bonus to exactly the requests the production fuse does.
 SENTENCE_WORDS = {
     "a", "an", "the", "my", "our", "your", "their", "is", "are", "was", "were", "will",
     "would", "can", "of", "for", "with", "that", "this", "at", "on", "in", "to", "from",
@@ -64,10 +73,6 @@ def is_sentence(query: str) -> bool:
     if len(fields) < 5:
         return False
     return sum(1 for f in fields if f.strip(".,!?;:'\"") in SENTENCE_WORDS) >= 2
-
-
-def term_bag(query: str) -> str:
-    return " ".join(f for f in query.split() if f.lower().strip(".,!?;:'\"") not in SENTENCE_WORDS)
 
 
 def embed(texts: list[str]) -> list[list[float]]:
@@ -110,12 +115,35 @@ def _arr(values: tuple[str, ...]) -> str:
     return "ARRAY[" + ",".join(_lit(v) for v in values) + "]::text[]" if values else "NULL::text[]"
 
 
+def case_key(case) -> str:
+    """Cache evidence by the complete search request, not only its text."""
+
+    if not case.sources and not case.since:
+        # Preserve the existing unscoped evidence cache: collecting its ANN
+        # neighborhoods takes hours on a cold production index.
+        return case.query
+    return json.dumps(
+        [case.query, list(case.sources), case.since],
+        separators=(",", ":"),
+    )
+
+
+def production_fusion_config() -> dict[str, Any]:
+    """The ranker's live constants, imported so the tuning lab cannot drift."""
+
+    return {
+        "w_lex": 1.0,
+        "w_sem": SEARCH_HYBRID_SEMANTIC_WEIGHT,
+        "w_exact": SEARCH_HYBRID_EXACT_WEIGHT,
+        "lex_top": (
+            SEARCH_HYBRID_LEXICAL_HEAD_RANKS,
+            SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT,
+        ),
+    }
+
+
 def collect_case(case, model: str, prefix: str) -> dict[str, Any]:
-    forms = [prefix + case.query, case.query]
-    if is_sentence(case.query):
-        bag = term_bag(case.query)
-        forms += [prefix + bag, bag]
-    vectors = embed(forms)
+    vectors = embed([prefix + case.query])
     sources = _arr(case.sources)
     since = _lit(case.since) + "::timestamptz" if case.since else "NULL::timestamptz"
     q = _lit(case.query)
@@ -128,14 +156,14 @@ def collect_case(case, model: str, prefix: str) -> dict[str, Any]:
         f"SELECT ref FROM timeline.search_hybrid_exact({q}, {DEPTH}, {sources}, {since}, NULL)",
     )
     legs = []
-    for index, vec in enumerate(vectors):
-        cand = "NULL" if index < 2 else str(max(200, 2 * DEPTH))
+    for vec in vectors:
         legs.append(pdw_sql(
             "fusion lab: ANN leg",
             f"SELECT ref, best, fuse FROM timeline.search_hybrid_semantic({_lit(literal(vec))}, "
-            f"{_lit(model)}, {DEPTH}, {sources}, {since}, {cand})",
+            f"{_lit(model)}, {DEPTH}, {sources}, {since}, NULL)",
         ))
     return {
+        "collection_version": COLLECTION_VERSION,
         "query": case.query,
         "lexical": [r["ref"] for r in lexical],
         "exact": [r["ref"] for r in exact],
@@ -147,12 +175,16 @@ def collect(cases, *, workers: int, model: str, prefix: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if EVIDENCE.exists():
         out = json.loads(EVIDENCE.read_text())
-    todo = [c for c in cases if c.query not in out]
+    todo = [
+        c for c in cases
+        if not isinstance(out.get(case_key(c)), dict)
+        or out[case_key(c)].get("collection_version") != COLLECTION_VERSION
+    ]
     print(f"{len(todo)} queries to collect ({len(out)} cached)", flush=True)
 
     def run(case):
         try:
-            return case.query, collect_case(case, model, prefix)
+            return case_key(case), collect_case(case, model, prefix)
         except Exception as error:  # noqa: BLE001
             print(f"  ERR {case.query[:50]}: {str(error)[:120]}", flush=True)
             return case.query, None
@@ -167,24 +199,22 @@ def collect(cases, *, workers: int, model: str, prefix: str) -> dict[str, Any]:
 
 
 def fuse(evidence: dict[str, Any], *, w_lex: float = 1.0, w_sem: float = 1.5, w_exact: float = 2.0,
-         legs: int | None = None, sem_pool: int | None = None,
-         bag: dict[str, float] | None = None) -> list[str]:
+         sem_pool: int | None = None,
+         lex_top: tuple[int, float] | None = None) -> list[str]:
     """Replicates timeline.search_hybrid_fuse with adjustable weights.
 
-    ``bag`` overrides the three weights for a query that is NOT sentence
-    shaped -- the conditional scheme, where a term bag trusts BM25 more.
+    ``lex_top`` is conditionally applied only to a query that is not sentence
+    shaped, matching the production function.
     """
 
-    lex_top = None
-    if bag and not is_sentence(evidence["query"]):
-        w_lex, w_sem, w_exact = bag["w_lex"], bag["w_sem"], bag["w_exact"]
-        lex_top = bag.get("lex_top")  # (rank_cutoff, weight) for the BM25 head
+    if is_sentence(evidence["query"]):
+        lex_top = None
     score: dict[str, float] = {}
     for rank, ref in enumerate(evidence["lexical"], start=1):
         weight = lex_top[1] if lex_top and rank <= lex_top[0] else w_lex
         score[ref] = score.get(ref, 0.0) + weight / (RRF_K + rank)
     merged: dict[str, tuple[float, int]] = {}
-    for leg in evidence["semantic"][: legs if legs else None]:
+    for leg in evidence["semantic"]:
         for ref, best, f in leg:
             if sem_pool is not None and best > sem_pool:
                 continue
@@ -203,8 +233,10 @@ REF_META = Path(".search-eval/fusion_ref_meta.json")
 
 def load_ref_meta(refs: set[str]) -> dict[str, ResultRow]:
     cached: dict[str, list[str]] = json.loads(REF_META.read_text()) if REF_META.exists() else {}
-    out: dict[str, ResultRow] = {r: ResultRow(ref=r, source=v[0], context=v[1], event_ts=v[2])
-                                 for r, v in cached.items() if r in refs}
+    out: dict[str, ResultRow] = {
+        r: ResultRow(ref=r, source=v[0], context=v[1], event_ts=v[2])
+        for r, v in cached.items() if r in refs
+    }
     refs = sorted(r for r in refs if r not in cached)
     for start in range(0, len(refs), 400):
         chunk = refs[start:start + 400]
@@ -227,10 +259,14 @@ def load_ref_meta(refs: set[str]) -> dict[str, ResultRow]:
 
 def score(cases, evidence: dict[str, Any], grid: list[dict[str, Any]], contamination: ContaminationFilter):
     truth_meta = resolve_truth_metadata(sorted({r for c in cases for r in c.truth_refs}))
-    cases = [c for c in cases if c.query in evidence and (c.truth_predicate or any(r in truth_meta for r in c.truth_refs))]
+    cases = [
+        c for c in cases
+        if case_key(c) in evidence
+        and (c.truth_predicate or any(r in truth_meta for r in c.truth_refs))
+    ]
     candidates: set[str] = set()
     for c in cases:
-        ev = evidence[c.query]
+        ev = evidence[case_key(c)]
         candidates.update(ev["lexical"]); candidates.update(ev["exact"])
         for leg in ev["semantic"]:
             candidates.update(ref for ref, _, _ in leg)
@@ -240,7 +276,7 @@ def score(cases, evidence: dict[str, Any], grid: list[dict[str, Any]], contamina
     for cfg in grid:
         ranks_by_stratum: dict[str, list[int | None]] = {}
         for c in cases:
-            refs = fuse(evidence[c.query], **cfg)
+            refs = fuse(evidence[case_key(c)], **cfg)
             rows = [meta.get(r, ResultRow(ref=r)) for r in refs]
             rows, _ = contamination.apply(rows)
             tm = [truth_meta[r] for r in c.truth_refs if r in truth_meta]
@@ -288,30 +324,23 @@ def main() -> int:
     evidence = json.loads(EVIDENCE.read_text())
     cutoff = parse_timestamp(args.exclude_agent_sessions_since) if args.exclude_agent_sessions_since else None
     contamination = ContaminationFilter(cutoff=_as_utc(cutoff) if cutoff else None)
-    grid = [{"w_lex": 1.0, "w_sem": 1.5, "w_exact": 2.0}]  # production today
+    production = production_fusion_config()
+    grid = [production]
     for w_lex in (1.0, 1.5, 2.0, 3.0):
         for w_sem in (0.5, 1.0, 1.5):
             for w_exact in (2.0, 3.0):
                 cfg = {"w_lex": w_lex, "w_sem": w_sem, "w_exact": w_exact}
                 if cfg not in grid:
                     grid.append(cfg)
-    for legs in (1, 2):
-        grid.append({"w_lex": 1.0, "w_sem": 1.5, "w_exact": 2.0, "legs": legs})
-    for pool in (100, 300):
-        grid.append({"w_lex": 1.0, "w_sem": 1.5, "w_exact": 2.0, "sem_pool": pool})
-    # Conditional: sentence-shaped queries keep a semantic-leaning fusion,
-    # term bags and identifiers trust BM25 and the literal leg more.
-    for sent in ({"w_lex": 1.0, "w_sem": 1.5, "w_exact": 2.0}, {"w_lex": 1.0, "w_sem": 1.0, "w_exact": 2.0}):
-        for bag in ({"w_lex": 2.0, "w_sem": 0.5, "w_exact": 3.0}, {"w_lex": 2.0, "w_sem": 0.75, "w_exact": 3.0},
-                    {"w_lex": 1.5, "w_sem": 0.5, "w_exact": 3.0}, {"w_lex": 2.0, "w_sem": 1.0, "w_exact": 3.0},
-                    {"w_lex": 3.0, "w_sem": 0.5, "w_exact": 3.0}):
-            grid.append({**sent, "bag": bag})
-    sent = {"w_lex": 1.0, "w_sem": 1.0, "w_exact": 2.0}
+    for pool in (100, 200, 300, 500, 750, 1000):
+        grid.append({**production, "sem_pool": pool})
+    # Sentence queries ignore this head bonus in production; term bags and
+    # identifiers use it, so vary its width and strength directly.
     for cutoff in (3, 5, 10):
         for top_w in (2.0, 3.0):
             for w_sem in (0.75, 1.0):
-                grid.append({**sent, "bag": {"w_lex": 1.0, "w_sem": w_sem, "w_exact": 3.0,
-                                             "lex_top": (cutoff, top_w)}})
+                grid.append({"w_lex": 1.0, "w_sem": w_sem, "w_exact": 3.0,
+                             "lex_top": (cutoff, top_w)})
     results = score(cases, evidence, grid, contamination)
     args.output.write_text(json.dumps({
         "captured_at": datetime.now(timezone.utc).isoformat(), "results": results,

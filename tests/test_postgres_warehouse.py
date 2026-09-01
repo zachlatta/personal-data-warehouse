@@ -1764,9 +1764,9 @@ def test_search_hybrid_semantic_helper_runs_exactly_one_vector_leg() -> None:
     assert "chunk_id" in semantic
 
 
-def test_search_hybrid_semantic_helper_can_bound_extra_query_forms() -> None:
-    """Term-bag vectors improve quality from the top of their neighborhoods;
-    they must not each repeat the original vectors' measured 1,000-row floor.
+def test_search_hybrid_semantic_helper_can_override_its_candidate_pool() -> None:
+    """The private tuning lab can collect a bounded ANN neighborhood without
+    changing production defaults first.
     """
 
     sql = _search_text_function_sql()
@@ -1807,16 +1807,31 @@ def test_parallel_hybrid_helpers_reject_unknown_source_tokens() -> None:
 def test_search_hybrid_uses_a_deep_filtered_semantic_candidate_pool() -> None:
     sql = _search_text_function_sql()
 
-    # The full-depth formula is computed once per helper invocation; the app
-    # invokes the helper independently for each original query vector.
-    assert sql.count("least(greatest(per_source * 20, 1000), 2000)") >= 1
+    # One instructed leg needs far fewer rows than the superseded four-leg
+    # merge. On the 73-case scoped benchmark, a 400-row depth-50 pool improved
+    # MRR and hit@5 with unchanged hit@1/hit@10/found, so do not bring the old
+    # 1,000-2,000 row default back.
+    assert sql.count("least(greatest(per_source * 8, 400), 800)") >= 1
+
+
+def test_search_hybrid_promotes_only_the_measured_bm25_head() -> None:
+    """A narrow, stronger head bonus raises good lexical hits without
+    sacrificing semantic recall throughout the rest of the list.
+
+    The expanded 73-case live-agent benchmark measured top-2 at 3x versus the
+    previous top-5 at 2x: MRR 0.342 -> 0.399, hit@1 16 -> 22, hit@5 33 -> 38,
+    and found@50 55 -> 56 with the single instructed ANN leg.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    assert postgres_module.SEARCH_HYBRID_LEXICAL_HEAD_RANKS == 2
+    assert postgres_module.SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT == 3.0
 
 
 def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:
     sql = _search_text_function_sql()
 
-    # One helper invocation searches one vector; the app invokes that same
-    # measured plan concurrently for the instructed and raw representations.
+    # One helper invocation searches the single instructed vector.
     assert sql.count("sem_adapters <@ ARRAY[") >= 1
     assert sql.count("'agent_session', 'agent_session_turn'") >= 1
     assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 1
@@ -5987,26 +6002,13 @@ def test_search_text_broad_candidates_are_scored_through_their_own_partition_ind
         )
 
 
-def test_search_hybrid_accepts_a_second_query_embedding() -> None:
-    # Qwen3-Embedding is instruction-asymmetric: the instructed and the raw
-    # form of the same question land in different neighbourhoods, and each
-    # finds answers the other misses. Blending them into one vector averages
-    # those neighbourhoods away (measured MRR 0.234); searching BOTH and fusing
-    # by rank keeps them (0.300 on the same corpus and labels). The second
-    # embedding is optional so a deployment without an instruction prefix, and
-    # any direct SQL caller, keeps the single-vector behaviour.
+def test_search_hybrid_wrapper_uses_exactly_one_query_embedding() -> None:
+    # The public wrapper must not retain the superseded alternate-vector flow
+    # after the app moves to one instructed ANN leg.
     sql = _search_text_function_sql()
-    assert "query_embedding_alt text DEFAULT NULL" in sql
     wrapper = sql[sql.rindex("CREATE OR REPLACE FUNCTION @search_hybrid("):]
-    assert "query_embedding_alt" in wrapper
-    assert wrapper.count("FROM @search_hybrid_semantic(") == 2
-
-
-def test_search_hybrid_second_leg_is_skipped_when_no_alt_embedding() -> None:
-    # A NULL alt embedding must not cost a second ANN scan: the leg is gated on
-    # the parameter so the planner can drop it with a one-time filter.
-    sql = _search_text_function_sql()
-    assert "query_embedding_alt IS NOT NULL" in sql or "qvec_alt IS NOT NULL" in sql
+    assert "query_embedding_alt" not in wrapper
+    assert wrapper.count("FROM @search_hybrid_semantic(") == 1
 
 
 def test_search_hybrid_fuses_semantic_legs_by_rank_not_distance() -> None:
@@ -6055,14 +6057,12 @@ def test_search_schema_signature_covers_the_broad_pool_constants() -> None:
 
 def test_search_hybrid_drops_its_previous_signature() -> None:
     # CREATE OR REPLACE FUNCTION with a new parameter creates an OVERLOAD, it
-    # does not replace. Without an explicit drop, an upgraded warehouse keeps
-    # the six-argument search_hybrid alongside the seven-argument one, and any
-    # caller that omits the alternate embedding -- hand-written SQL, an agent
-    # copying the old signature -- silently gets the OLD implementation with
-    # the old ranking. Drop it as part of the same DDL.
+    # does not replace. Drop both superseded single-vector and alternate-vector
+    # signatures so an upgraded warehouse has exactly the new one-leg wrapper.
     sql = _search_text_function_sql()
     assert "DROP FUNCTION IF EXISTS" in sql
     assert "@search_hybrid(text, text, text, integer, text[], timestamptz)" in sql
+    assert "@search_hybrid(text, text, text, integer, text[], timestamptz, text, text[])" in sql
 
 
 def test_search_hybrid_fuses_a_literal_leg_for_short_queries() -> None:

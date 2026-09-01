@@ -108,8 +108,7 @@ func TestLoadFromEnvSearchEmbeddingsDefaults(t *testing.T) {
 }
 
 func TestLoadFromEnvReportsTheRemovedQueryRawWeight(t *testing.T) {
-	// The blend knob is gone (retrieval searches the instructed and raw
-	// neighbourhoods separately now). A deployment that still sets it must be
+	// The blend knob and the raw neighbourhood are gone. A deployment that still sets it must be
 	// told, not silently ignored: inert config that looks live is how a
 	// deployment ends up believing it is tuned when it is not.
 	env := map[string]string{

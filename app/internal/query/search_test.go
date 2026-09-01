@@ -65,17 +65,17 @@ func (r *fakeSearchRunner) callsFor(statement string) [][]any {
 }
 
 type fakeEmbedder struct {
-	model   string
-	vectors [][]float64
-	err     error
-	calls   int
+	model  string
+	vector []float64
+	err    error
+	calls  int
 }
 
 func (f *fakeEmbedder) Model() string { return f.model }
 
-func (f *fakeEmbedder) Embed(context.Context, string) ([][]float64, error) {
+func (f *fakeEmbedder) Embed(context.Context, string) ([]float64, error) {
 	f.calls++
-	return f.vectors, f.err
+	return f.vector, f.err
 }
 
 func searchHit() RawResult {
@@ -205,7 +205,7 @@ func TestSearchHybridModeFansIndependentLegsOutThenFuses(t *testing.T) {
 			searchHybridExactSQL:    25 * time.Millisecond,
 		},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5, -1.25}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
@@ -258,10 +258,10 @@ func TestSearchHybridModeFansIndependentLegsOutThenFuses(t *testing.T) {
 	}
 }
 
-func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
-	// An instruction-tuned deployment returns the instructed and the raw
-	// vector; both must reach search_hybrid, because each neighbourhood holds
-	// answers the other misses.
+func TestSearchHybridUsesSingleMeasuredQueryRepresentation(t *testing.T) {
+	// The live-agent benchmark now covers sentence, scoped, and priority-
+	// filtered calls. On that set the instructed vector alone improved MRR,
+	// hit@1, hit@5, and found@50 while eliminating the other ANN scans.
 	runner := &fakeSearchRunner{
 		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
 		argsResults: map[string]RawResult{
@@ -269,7 +269,7 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 			searchHybridFuseSQL:     searchHit(),
 		},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5, -1.25}, {1, 0}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5, -1.25}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
@@ -277,50 +277,14 @@ func TestSearchHybridPassesBothQueryRepresentations(t *testing.T) {
 		t.Fatalf("error: %s", resp.Error)
 	}
 	calls := runner.callsFor(searchHybridSemanticSQL)
-	if len(calls) != 2 {
+	if len(calls) != 1 {
 		t.Fatalf("semantic calls = %#v", calls)
 	}
-	want := map[any]bool{"[0.5,-1.25]": true, "[1,0]": true}
-	for _, args := range calls {
-		if !want[args[0]] {
-			t.Fatalf("unexpected semantic embedding = %#v", args[0])
-		}
+	if calls[0][0] != "[0.5,-1.25]" {
+		t.Fatalf("semantic embedding = %#v", calls[0][0])
 	}
 	if embedder.calls != 1 {
-		t.Fatalf("both representations must ride in one request; calls = %d", embedder.calls)
-	}
-}
-
-func TestSearchHybridBoundsOnlyTheExtraTermBagLegs(t *testing.T) {
-	runner := &fakeSearchRunner{
-		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
-		argsResults: map[string]RawResult{
-			searchHybridSemanticSQL: semanticHits(),
-			searchHybridFuseSQL:     searchHit(),
-		},
-	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{
-		{1, 0}, {0, 1}, {2, 0}, {0, 2},
-	}}
-	svc := NewService(runner, Options{SearchEmbedder: embedder})
-
-	resp := svc.Search(context.Background(), SearchRequest{Query: "what is still owed to the vet clinic"})
-	if resp.Error != "" {
-		t.Fatalf("error: %s", resp.Error)
-	}
-	calls := runner.callsFor(searchHybridSemanticSQL)
-	if len(calls) != 4 {
-		t.Fatalf("semantic calls = %#v", calls)
-	}
-	wantLimit := map[any]any{
-		"[1,0]": nil, "[0,1]": nil,
-		"[2,0]": searchHybridTermBagMinCandidates,
-		"[0,2]": searchHybridTermBagMinCandidates,
-	}
-	for _, args := range calls {
-		if len(args) != 6 || args[5] != wantLimit[args[0]] {
-			t.Fatalf("semantic args = %#v, want candidate limit %#v", args, wantLimit[args[0]])
-		}
+		t.Fatalf("embedding calls = %d", embedder.calls)
 	}
 }
 
@@ -348,7 +312,7 @@ func TestSearchHybridFallsBackWhenHybridFunctionMissing(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(false)},
 		argsResults: map[string]RawResult{searchTextSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{1}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
@@ -493,7 +457,7 @@ func TestSearchHintsWhenTheQueryIsPhrasedAsASentence(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
 		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	resp := svc.Search(context.Background(), SearchRequest{
@@ -608,7 +572,7 @@ func TestSearchHintsOnALongUnanchoredTermBag(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
 		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	for _, query := range []string{
@@ -632,7 +596,7 @@ func TestSearchDoesNotHintOnATermBagQuery(t *testing.T) {
 		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
 		argsResults: map[string]RawResult{searchHybridFuseSQL: searchHit()},
 	}
-	embedder := &fakeEmbedder{model: "test-model", vectors: [][]float64{{0.5}}}
+	embedder := &fakeEmbedder{model: "test-model", vector: []float64{0.5}}
 	svc := NewService(runner, Options{SearchEmbedder: embedder})
 
 	for _, query := range []string{
@@ -690,7 +654,7 @@ func TestSearchScopesEveryModeToPriorityTiers(t *testing.T) {
 			}
 			opts := Options{}
 			if tc.mode == SearchModeHybrid {
-				opts.SearchEmbedder = &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}}
+				opts.SearchEmbedder = &fakeEmbedder{model: "test-model", vector: []float64{1}}
 			}
 			svc := NewService(runner, opts)
 
@@ -719,7 +683,7 @@ func TestSearchScopesEveryModeToPriorityTiers(t *testing.T) {
 			},
 		}
 		svc := NewService(runner, Options{
-			SearchEmbedder: &fakeEmbedder{model: "test-model", vectors: [][]float64{{1}}},
+			SearchEmbedder: &fakeEmbedder{model: "test-model", vector: []float64{1}},
 		})
 
 		resp := svc.Search(context.Background(), SearchRequest{
@@ -814,9 +778,12 @@ func TestSearchSQLPassesPrioritiesToEverySQLFunction(t *testing.T) {
 	if !strings.Contains(searchHybridExactSQL, "$5::text[]") || !strings.Contains(searchHybridFuseSQL, "$6::text[]") {
 		t.Fatalf("parallel exact/fuse helpers must pass priorities: %q %q", searchHybridExactSQL, searchHybridFuseSQL)
 	}
-	for _, function := range []string{"search_hybrid", "search_hybrid_semantic", "search_hybrid_exact", "search_hybrid_fuse"} {
+	for _, function := range []string{"search_hybrid_semantic", "search_hybrid_exact", "search_hybrid_fuse"} {
 		if !strings.Contains(searchHybridProbeSQL, function) {
 			t.Fatalf("the hybrid probe must require %s: %q", function, searchHybridProbeSQL)
 		}
+	}
+	if strings.Contains(searchHybridProbeSQL, "timeline.search_hybrid(") {
+		t.Fatalf("the app never calls the compatibility wrapper; probing it wedges rolling signature upgrades: %q", searchHybridProbeSQL)
 	}
 }

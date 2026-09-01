@@ -282,9 +282,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	// missing and nothing reported it. Writing the escape as the two
 	// characters \n keeps the value single-line all the way through.
 	cfg.SearchEmbeddingsQueryPrefix = decodeEnvEscapes(getenv("SEARCH_EMBEDDINGS_QUERY_PREFIX"))
-	// SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT blended the instructed and raw query
-	// vectors into one. Retrieval now searches both neighbourhoods and fuses
-	// them by rank, which measured materially better, so the knob is gone.
+	// SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT blended instructed and raw vectors.
+	// Retrieval now uses only the measured-best instructed vector, so the knob
+	// and the raw-vector leg are both gone.
 	// A still-set value is reported rather than ignored: silently inert config
 	// is how a deployment ends up believing it is tuned when it is not.
 	// The mutation review UI used to be a server-rendered page behind its own
@@ -298,7 +298,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT")) != "" {
 		cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
-			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT (removed: the instructed and raw query vectors are now searched as separate ANN legs and fused by rank; unset it)")
+			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT (removed: search now uses the single measured-best instructed query vector; unset it)")
 	}
 	if cfg.SearchEmbeddingsDimensions, err = parsePositiveInt(getenv("SEARCH_EMBEDDINGS_DIMENSIONS"), 512, "SEARCH_EMBEDDINGS_DIMENSIONS"); err != nil {
 		return Config{}, err

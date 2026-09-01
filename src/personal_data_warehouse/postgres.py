@@ -387,18 +387,13 @@ SEARCH_HYBRID_RRF_K = 60
 # (MRR 0.429 -> 0.446); 1.7 crossed the safe boundary and regressed two labels.
 SEARCH_HYBRID_SEMANTIC_WEIGHT = 1.0
 # The BM25 head bonus for a query that is NOT sentence-shaped (a term bag or
-# an identifier): its top-ranked lexical hits count double. Re-measured on
-# the 73-case benchmark with the offline fusion lab
-# (scripts/search_fusion_lab.py) on 2026-08-26: four ANN legs each return
-# hundreds of candidates and the old 1.5 semantic weight let semantic ranks
-# 1-16 outvote a correct BM25 #1 on every term bag (keyword alone: hit@1 7/20,
-# hybrid: 2/20). Semantic 1.0 + literal 3.0 + this head bonus took hybrid from
-# MRR 0.339 / hit@1 15 / hit@10 40 to 0.394 / 20 / 44 on 67 scored queries
-# with no loss of found@50 (51 both ways); flat weights (lexical 2, semantic
-# 0.5) scored MRR 0.400 but lost seven found@50, which is why the bonus is a
-# head bonus and not a flat weight. Sentence-shaped queries keep 1.0 lexical
-# throughout: their BM25 head is where the wrong answers live.
-SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT = 2.0
+# identifier). Re-measured 2026-09-01 after adding recent live-agent queries
+# and source/time/priority scopes: one instructed ANN leg plus a 3x top-two
+# lexical head raised the 73-case offline fusion score from MRR 0.342 to 0.399,
+# hit@1 16 -> 22, hit@5 33 -> 38, and found@50 55 -> 56. The narrower head
+# avoids promoting middling lexical rows; sentence queries retain flat lexical
+# weight because their BM25 head is often the wrong answer.
+SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT = 3.0
 # The BM25 health probe's query: common, mixed-frequency terms so the scan
 # touches many posting lists across the index rather than one.
 BM25_PROBE_QUERY = "meeting order email update warehouse magazine budget photo call plan"
@@ -412,10 +407,13 @@ SEARCH_SENTENCE_WORDS = (
     "did", "does", "do", "should", "could", "me", "i",
 )
 SEARCH_SENTENCE_WORDS_SQL = ", ".join("'" + w + "'" for w in SEARCH_SENTENCE_WORDS)
-SEARCH_HYBRID_LEXICAL_HEAD_RANKS = 5
+SEARCH_HYBRID_LEXICAL_HEAD_RANKS = 2
 # Filtered ANN recall depends on asking the iterative scan for a deep enough
-# qualifying pool. A 4x pool was adequate at 30 days but became unstable at 90
-# days because the global HNSW index had three times as many filtered-out rows.
+# qualifying pool. The former four-vector fusion needed 1,000-2,000 rows per
+# leg. With one instructed leg, re-collecting all semantic evidence at 400 rows
+# on the expanded 73-case benchmark slightly improved MRR (0.399 -> 0.400) and
+# hit@5 (38 -> 39), with hit@1, hit@10, and found@50 unchanged. This formula is
+# 400 rows at benchmark depth 50 and grows to 800 for deep recall calls.
 # Hybrid retrieval also runs a LITERAL-SUBSTRING leg, but only for a short
 # query. Identifier-shaped questions ("admin/api-keys", a Drive file id, a
 # person's name) are exactly where BM25 tokenization and embeddings both fail
@@ -428,7 +426,7 @@ SEARCH_HYBRID_LEXICAL_HEAD_RANKS = 5
 # natural-language question gains nothing from it -- ungated it scored *worse*
 # (0.374) while making every long query pay. Machine tokens search the bounded
 # retrieval chunks; ordinary names retain the full-document exact path because
-# chunk anchoring regressed one proper-name label. Weight 2 because a literal
+# chunk anchoring regressed one proper-name label. Weight 3 because a literal
 # match on a short query is strong evidence, where a rank-1 BM25 hit on two
 # common words is not.
 SEARCH_HYBRID_EXACT_WEIGHT = 3.0
@@ -436,9 +434,9 @@ SEARCH_HYBRID_EXACT_MAX_WORDS = 3
 # search_text_exact() raises below this needle length, so the leg must not be
 # attempted for a shorter query.
 SEARCH_HYBRID_EXACT_MIN_CHARS = 3
-SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 20
-SEARCH_HYBRID_MIN_CANDIDATES = 1000
-SEARCH_HYBRID_MAX_CANDIDATES = 2000
+SEARCH_HYBRID_CANDIDATE_MULTIPLIER = 8
+SEARCH_HYBRID_MIN_CANDIDATES = 400
+SEARCH_HYBRID_MAX_CANDIDATES = 800
 # Agent-session chunks are only 3.05% of the global HNSW. Asking that index for
 # 1000 qualifying rows made each query-vector leg scan ~97k embeddings and take
 # 31.2s; two legs time out before fusion. LIMIT 40 took 2.25s. Agent sessions
@@ -1661,8 +1659,8 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     # content sha and needs only these columns, so the join is index-only and
     # never visits the 7 GB chunk heap. Measured cold on production
     # 2026-08-26, that heap probe was ~2.4ms per candidate on top of the ANN
-    # scan itself; with 1,000-2,000 candidates per leg and four legs per
-    # hybrid call it was seconds of random I/O per search.
+    # scan itself; before the one-leg/400-800-row retune, 1,000-2,000
+    # candidates across four legs added seconds of random I/O per search.
     IndexSpec(
         "search_chunks_sha_cover_idx",
         "search_chunks",
@@ -5261,7 +5259,8 @@ class PostgresWarehouse:
 
     def load_search_benchmark_labels(self) -> list[dict[str, Any]]:
         return self._query_dicts(
-            "SELECT query, stratum, verdict, truth_refs_json, truth_predicate_json, sources_json, since, note "
+            "SELECT query, stratum, verdict, truth_refs_json, truth_predicate_json, sources_json, "
+            "since, note "
             "FROM @search_benchmark_labels ORDER BY query"
         )
 
@@ -12474,6 +12473,7 @@ class PostgresWarehouse:
             -- replaces, so obsolete public signatures have to go explicitly.
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz);
             DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text);
+            DROP FUNCTION IF EXISTS @search_hybrid(text, text, text, integer, text[], timestamptz, text, text[]);
             DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz);
             CREATE OR REPLACE FUNCTION @search_hybrid_semantic(
                 query_embedding text,
@@ -12506,9 +12506,9 @@ class PostgresWarehouse:
                 qvec := query_embedding::public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
-                -- Each invocation owns exactly one vector. Running two calls
-                -- concurrently preserves the two distinct Qwen neighbourhoods
-                -- without making one Postgres backend scan them serially.
+                -- Each invocation owns exactly one vector. The app now sends
+                -- only the measured-best instructed form, so this is also the
+                -- only ANN scan in a normal hybrid request.
                 PERFORM set_config('hnsw.ef_search', least(1000, greatest(1000, per_source * 8))::text, true);
                 PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
                 PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
@@ -12993,7 +12993,6 @@ class PostgresWarehouse:
                 max_results integer DEFAULT 50,
                 sources text[] DEFAULT NULL,
                 since timestamptz DEFAULT NULL,
-                query_embedding_alt text DEFAULT NULL,
                 priorities text[] DEFAULT NULL
             )
             RETURNS SETOF @search_text_hit
@@ -13006,7 +13005,6 @@ class PostgresWarehouse:
                 + r""");
                 lexical_refs text[];
                 semantic_legs jsonb := '[]'::jsonb;
-                one_semantic_leg jsonb;
                 exact_refs text[];
                 requested_priority text;
             BEGIN
@@ -13028,14 +13026,6 @@ class PostgresWarehouse:
                   FROM @search_hybrid_semantic(
                       query_embedding, embedding_model, per_source, sources, since
                   ) s;
-                IF query_embedding_alt IS NOT NULL AND trim(query_embedding_alt) <> '' THEN
-                    SELECT coalesce(jsonb_agg(to_jsonb(s)), '[]'::jsonb)
-                      INTO one_semantic_leg
-                      FROM @search_hybrid_semantic(
-                          query_embedding_alt, embedding_model, per_source, sources, since
-                      ) s;
-                    semantic_legs := semantic_legs || one_semantic_leg;
-                END IF;
                 SELECT array_agg(x.ref ORDER BY x.rnk)
                   INTO exact_refs
                   FROM @search_hybrid_exact(
@@ -13054,7 +13044,7 @@ class PostgresWarehouse:
             # 20) and got 42883. The comment travels with the function so any
             # \df / describe surface says so before the call is made.
             self._command(
-                "COMMENT ON FUNCTION @search_hybrid(text, text, text, integer, text[], timestamptz, text, text[]) "
+                "COMMENT ON FUNCTION @search_hybrid(text, text, text, integer, text[], timestamptz, text[]) "
                 "IS $c$NOT callable from plain SQL: takes a precomputed query embedding only the app can "
                 "produce, so search_hybrid('terms', 20) fails with 42883. Hybrid retrieval is the search tool "
                 "/ pdw search; from SQL use timeline.search_text (BM25) or timeline.search_text_exact.$c$"

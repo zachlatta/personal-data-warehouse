@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -50,14 +49,10 @@ func TestEmbeddingsClientEmbedSendsOpenAICompatibleRequest(t *testing.T) {
 	defer srv.Close()
 
 	client := NewEmbeddingsClient(EmbeddingsOptions{BaseURL: srv.URL, APIKey: "sk-test", Model: "test-model", Dimensions: 3})
-	vectors, err := client.Embed(context.Background(), "offer letter")
+	vector, err := client.Embed(context.Background(), "offer letter")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vectors) != 1 {
-		t.Fatalf("want one vector without a query prefix, got %d", len(vectors))
-	}
-	vector := vectors[0]
 	if len(vector) != 3 || vector[0] != 0.5 || vector[1] != -1.25 || vector[2] != 0 {
 		t.Fatalf("vector = %v", vector)
 	}
@@ -78,12 +73,10 @@ func TestEmbeddingsClientEmbedSendsOpenAICompatibleRequest(t *testing.T) {
 	}
 }
 
-func TestEmbeddingsClientReturnsInstructedAndRawQueryVectors(t *testing.T) {
-	// Instruction-asymmetric models put the instructed and the raw form of one
-	// question in different neighbourhoods, each holding answers the other
-	// misses. The client returns BOTH so retrieval can scan both and fuse by
-	// rank; blending them into one vector averaged the difference away and
-	// measured materially worse (MRR 0.234 vs 0.300 on the labeled benchmark).
+func TestEmbeddingsClientReturnsOnlyTheInstructedQueryVector(t *testing.T) {
+	// Re-measuring after adding live-agent scopes and queries reversed the old
+	// result: the instructed vector alone raised every headline quality metric
+	// while deleting three quarters of the ANN work for sentence queries.
 	var gotInputs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -93,9 +86,7 @@ func TestEmbeddingsClientReturnsInstructedAndRawQueryVectors(t *testing.T) {
 			t.Errorf("decode request body: %v", err)
 		}
 		gotInputs = body.Input
-		// Return out of order to ensure the OpenAI `index` field, rather than
-		// response order, decides which vector is instructed versus raw.
-		_, _ = w.Write([]byte(`{"data":[{"index":1,"embedding":[0,3]},{"index":0,"embedding":[2,0]}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[2,0]}]}`))
 	}))
 	defer srv.Close()
 
@@ -104,32 +95,19 @@ func TestEmbeddingsClientReturnsInstructedAndRawQueryVectors(t *testing.T) {
 		Dimensions:  2,
 		QueryPrefix: "Instruct: retrieve personal data\nQuery:",
 	})
-	vectors, err := client.Embed(context.Background(), "lunch plans")
+	vector, err := client.Embed(context.Background(), "lunch plans")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vectors) != 2 {
-		t.Fatalf("want the instructed and the raw vector, got %d", len(vectors))
+	if len(vector) != 2 || vector[0] != 2 || vector[1] != 0 {
+		t.Fatalf("instructed vector = %v", vector)
 	}
-	// Instructed first: a caller that can only use one vector gets the better one.
-	if vectors[0][0] != 2 || vectors[0][1] != 0 {
-		t.Fatalf("instructed vector = %v", vectors[0])
-	}
-	if vectors[1][0] != 0 || vectors[1][1] != 3 {
-		t.Fatalf("raw vector = %v", vectors[1])
-	}
-	if len(gotInputs) != 2 || gotInputs[0] != "Instruct: retrieve personal data\nQuery:lunch plans" || gotInputs[1] != "lunch plans" {
+	if len(gotInputs) != 1 || gotInputs[0] != "Instruct: retrieve personal data\nQuery:lunch plans" {
 		t.Fatalf("inputs = %#v", gotInputs)
 	}
-	// One round trip, not two: both forms ride in the same batched request.
 }
 
-func TestEmbeddingsClientAlsoEmbedsTheQueriesTermBag(t *testing.T) {
-	// Sentence-shaped queries are the benchmark's weak stratum. Searching the
-	// instructed+raw vectors for both the original sentence and its deterministic
-	// content-word form improved labeled MRR without losing hit@5/hit@10/recall.
-	// All four inputs must ride in the same GPU request; only the independent ANN
-	// scans are fanned out by Search.
+func TestEmbeddingsClientDoesNotFanASentenceOutIntoLegacyExtraVectors(t *testing.T) {
 	var gotInputs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -139,11 +117,7 @@ func TestEmbeddingsClientAlsoEmbedsTheQueriesTermBag(t *testing.T) {
 			t.Errorf("decode request body: %v", err)
 		}
 		gotInputs = body.Input
-		_, _ = w.Write([]byte(`{"data":[` +
-			`{"index":0,"embedding":[1,0]},` +
-			`{"index":1,"embedding":[0,1]},` +
-			`{"index":2,"embedding":[2,0]},` +
-			`{"index":3,"embedding":[0,2]}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1,0]}]}`))
 	}))
 	defer srv.Close()
 
@@ -152,70 +126,18 @@ func TestEmbeddingsClientAlsoEmbedsTheQueriesTermBag(t *testing.T) {
 		Dimensions:  2,
 		QueryPrefix: "Instruct: retrieve personal data\nQuery:",
 	})
-	vectors, err := client.Embed(
+	vector, err := client.Embed(
 		context.Background(),
 		"what is still owed to the vet clinic",
 	)
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vectors) != 4 {
-		t.Fatalf("want original+term-bag instructed/raw vectors, got %d", len(vectors))
+	if len(vector) != 2 {
+		t.Fatalf("want one instructed vector, got %d dimensions", len(vector))
 	}
-	want := []string{
-		"Instruct: retrieve personal data\nQuery:what is still owed to the vet clinic",
-		"what is still owed to the vet clinic",
-		"Instruct: retrieve personal data\nQuery:still owed vet clinic",
-		"still owed vet clinic",
-	}
-	if !slices.Equal(gotInputs, want) {
-		t.Fatalf("inputs = %#v, want %#v", gotInputs, want)
-	}
-}
-
-func TestEmbeddingsClientDoesNotDuplicateAnExistingTermBag(t *testing.T) {
-	var gotInputs []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Input []string `json:"input"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotInputs = body.Input
-		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[2]}]}`))
-	}))
-	defer srv.Close()
-
-	client := NewEmbeddingsClient(EmbeddingsOptions{
-		BaseURL: srv.URL, Dimensions: 1, QueryPrefix: "Query:",
-	})
-	if _, err := client.Embed(context.Background(), "runway burn rate months cash remaining"); err != nil {
-		t.Fatalf("Embed: %v", err)
-	}
-	if len(gotInputs) != 2 {
-		t.Fatalf("an existing term bag must keep two inputs, got %#v", gotInputs)
-	}
-}
-
-func TestEmbeddingsClientDoesNotExpandAShortEntityQuery(t *testing.T) {
-	var gotInputs []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Input []string `json:"input"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotInputs = body.Input
-		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[2]}]}`))
-	}))
-	defer srv.Close()
-
-	client := NewEmbeddingsClient(EmbeddingsOptions{
-		BaseURL: srv.URL, Dimensions: 1, QueryPrefix: "Query:",
-	})
-	if _, err := client.Embed(context.Background(), "the kernel magazine"); err != nil {
-		t.Fatalf("Embed: %v", err)
-	}
-	if len(gotInputs) != 2 {
-		t.Fatalf("short entity query must keep two inputs, got %#v", gotInputs)
+	if len(gotInputs) != 1 || gotInputs[0] != "Instruct: retrieve personal data\nQuery:what is still owed to the vet clinic" {
+		t.Fatalf("inputs = %#v", gotInputs)
 	}
 }
 
@@ -264,12 +186,12 @@ func TestEmbeddingsClientRetriesOnceOnServerError(t *testing.T) {
 	defer srv.Close()
 
 	client := NewEmbeddingsClient(EmbeddingsOptions{BaseURL: srv.URL, Dimensions: 2})
-	vectors, err := client.Embed(context.Background(), "q")
+	vector, err := client.Embed(context.Background(), "q")
 	if err != nil {
 		t.Fatalf("Embed after retry: %v", err)
 	}
-	if len(vectors) != 1 || len(vectors[0]) != 2 {
-		t.Fatalf("vectors = %v", vectors)
+	if len(vector) != 2 {
+		t.Fatalf("vector = %v", vector)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())

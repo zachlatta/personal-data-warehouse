@@ -28,8 +28,9 @@ references, and this repository is public. They live under the gitignored `.sear
 and `assert_private_path` refuses to write an artifact anywhere else. Only this harness is
 version-controlled.
 
-The label file is the expensive artifact and it is deliberately *not* backed up by the
-repo. Copy it somewhere private if the machine holding it matters.
+The file is the private editing surface. The weekly runner reads the mirrored copy in
+`private.search_benchmark_labels`; use `publish-labels` after an edit and `pull-labels`
+to restore the private file in a fresh checkout.
 
 ## Running it
 
@@ -48,6 +49,9 @@ uv run python scripts/search_benchmark.py latency --sample 8
 
 # One call per source token: does every SCOPED search still answer?
 uv run python scripts/search_benchmark.py smoke
+
+# Publish an edited private label file for the weekly production run.
+uv run python scripts/search_benchmark.py publish-labels
 ```
 
 **Run `smoke` after touching the search indexes or the search SQL.** Labels
@@ -65,7 +69,7 @@ flag this way at 25-30s and measure 5-8s warm.
 
 **Run it in parallel.** A single hybrid call takes tens of seconds against the production
 corpus, so a serial pass over a few dozen queries takes half an hour. `--workers` fans the
-calls out and identical `(query, mode, priority scope)` tuples are executed once. Wall clock drops roughly
+calls out and identical `(query, mode, sources, since, priority scope)` requests are executed once. Wall clock drops roughly
 an order of magnitude.
 
 The cost of that: **timings collected under concurrency are not single-user latency**. The
@@ -85,6 +89,8 @@ to compare against a budget, use the `latency` subcommand, which runs strictly s
     "ambiguous": false,
     "truth_refs": ["gmail_email:<account>|<message-id>"],
     "truth_predicate": {"sources": ["gmail"], "since": "2025-01-01", "text_regex": "renew"},
+    "sources": ["gmail"],
+    "since": "2026-08-01",
     "note": "why this is the answer, and what the decoys are"
   }
 ]
@@ -98,6 +104,10 @@ to compare against a budget, use the `latency` subcommand, which runs strictly s
   have returned a sixth perfectly good one. A predicate accepts any result matching all of
   its conditions (`sources`, `since`, `until`, `text_regex`). An empty predicate matches
   nothing — that is a labeling mistake, not a wildcard.
+- `sources` and `since` — the source/time request scope the agent actually used. These
+  are search inputs, unlike similarly named fields inside `truth_predicate`, which are
+  relevance judgments. Priority scope is evaluated automatically in the paired all-tier
+  and catalog-defined attention-tier runs described above.
 - `verdict` — `FOUND`, `WEAK` (only tangential matches exist), or `NOT_IN_CORPUS` (skipped
   by default). Recording a query the corpus genuinely cannot answer is a useful label.
 - `stratum` — scores are broken out by it. Retrieval quality differs enormously between

@@ -201,6 +201,10 @@ func TestDescribeTableAnswersTimelineSearchFunctions(t *testing.T) {
 			t.Fatalf("search_text description missing %q, got: %s", want, msg)
 		}
 	}
+	hybrid := describeFunction("timeline.search_hybrid")
+	if strings.Contains(hybrid, "query_embedding_alt") || !strings.Contains(hybrid, "priorities text[]") {
+		t.Fatalf("hybrid signature is stale: %s", hybrid)
+	}
 
 	// A bare "context" stays a relation lookup — the name is far too generic to
 	// assume the timeline function.
