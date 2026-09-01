@@ -45,6 +45,30 @@ type StartHereGuidance struct {
 	Lines    []string
 }
 
+// TimelinePriorityTier is one real attention tier or the fail-loud sentinel.
+// Its prose is generated from the warehouse catalog; callers format it for
+// their own surface rather than maintaining another definition list.
+type TimelinePriorityTier struct {
+	Name        string
+	Meaning     string
+	TypicalRows string
+}
+
+type TimelinePrioritySelection struct {
+	Intent     string
+	Priorities []string
+	Guidance   string
+}
+
+type TimelinePriorityContract struct {
+	DefaultScope            string
+	AttentionPriorities     []string
+	OptimizedBM25Priorities []string
+	Tiers                   []TimelinePriorityTier
+	Sentinel                TimelinePriorityTier
+	SelectionGuide          []TimelinePrioritySelection
+}
+
 type Relation struct {
 	Schema string
 	Name   string
@@ -76,6 +100,72 @@ func QueryableSchemas() []string {
 	out := make([]string, len(queryableSchemas))
 	copy(out, queryableSchemas)
 	return out
+}
+
+// TimelinePriorityTierNames returns the five real tiers in attention order.
+func TimelinePriorityTierNames() []string {
+	out := make([]string, 0, len(TimelinePriorities.Tiers))
+	for _, tier := range TimelinePriorities.Tiers {
+		out = append(out, tier.Name)
+	}
+	return out
+}
+
+// TimelinePriorityAcceptedNames returns the real tiers followed by the
+// unclassified sentinel, matching the timeline enum and search validator.
+func TimelinePriorityAcceptedNames() []string {
+	out := TimelinePriorityTierNames()
+	return append(out, TimelinePriorities.Sentinel.Name)
+}
+
+func TimelineAttentionPriorities() []string {
+	return append([]string(nil), TimelinePriorities.AttentionPriorities...)
+}
+
+// TimelinePriorityEqualsDefinitions renders prose for instruction surfaces.
+func TimelinePriorityEqualsDefinitions() string {
+	parts := make([]string, 0, len(TimelinePriorities.Tiers))
+	for _, tier := range TimelinePriorities.Tiers {
+		parts = append(parts, tier.Name+" = "+tier.Meaning)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// TimelinePriorityParentheticalDefinitions renders compact prose for help and
+// schema descriptions without creating another hand-maintained definition.
+func TimelinePriorityParentheticalDefinitions() string {
+	parts := make([]string, 0, len(TimelinePriorities.Tiers))
+	for _, tier := range TimelinePriorities.Tiers {
+		parts = append(parts, tier.Name+" ("+tier.Meaning+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
+func TimelinePriorityHelpLines(indent string) string {
+	lines := make([]string, 0, len(TimelinePriorities.Tiers))
+	for _, tier := range TimelinePriorities.Tiers {
+		lines = append(lines, fmt.Sprintf("%s%-12s%s", indent, tier.Name, tier.Meaning))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TimelinePrioritySelectionHelpLines renders the catalog's intent-to-scope
+// guide for CLI help. Keeping both the priorities and the explanation here
+// prevents the most actionable part of the contract from becoming another
+// hand-maintained paragraph.
+func TimelinePrioritySelectionHelpLines(indent string) string {
+	lines := make([]string, 0, len(TimelinePriorities.SelectionGuide)*2)
+	for _, selection := range TimelinePriorities.SelectionGuide {
+		priorities := strings.Join(selection.Priorities, ",")
+		if priorities == "" {
+			priorities = "all tiers (omit --priority)"
+		}
+		lines = append(lines,
+			fmt.Sprintf("%s%s -> %s", indent, selection.Intent, priorities),
+			indent+"  "+selection.Guidance,
+		)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // SQLRelation renders a schema-qualified reference for a stable logical id.

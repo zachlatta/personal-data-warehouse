@@ -51,6 +51,7 @@ from psycopg2.extras import execute_values
 
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.relations import expand_relations, physical_schema_names
+from personal_data_warehouse.warehouse_catalog import CATALOG
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +70,11 @@ TIMELINE_DEFAULT_BATCH_SIZE = 2000
 # participates in the content guard, so seq bumps on change). Each constant is
 # a quoted SQL label literal so interpolating it into an adapter's SELECT emits
 # the enum label directly.
-TIMELINE_PRIORITY_SELF = "'self'"  # actions Zach initiated (his messages, sessions, memos, notes)
-TIMELINE_PRIORITY_DIRECT = "'direct'"  # real people reaching him directly (DMs, direct email, small groups)
-TIMELINE_PRIORITY_CC = "'cc'"  # real-people activity he is peripheral to (cc'd, channels, big groups)
-TIMELINE_PRIORITY_NOISE = "'noise'"  # bulk/automated traffic (newsletters, bots, non-member channels)
-TIMELINE_PRIORITY_BACKGROUND = "'background'"  # the warehouse's own machinery (enrichment, mutation workers)
+TIMELINE_PRIORITY_SELF = "'self'"
+TIMELINE_PRIORITY_DIRECT = "'direct'"
+TIMELINE_PRIORITY_CC = "'cc'"
+TIMELINE_PRIORITY_NOISE = "'noise'"
+TIMELINE_PRIORITY_BACKGROUND = "'background'"
 # The sixth enum label is the column DEFAULT and nothing else: no adapter may
 # emit it. It exists so a row inserted outside the sync engine is visibly
 # unclassified instead of silently mis-tiered, and its presence in
@@ -85,20 +86,15 @@ TIMELINE_PRIORITY_UNCLASSIFIED = "'unclassified'"
 # The definitions agents are told to filter on. Published verbatim as the
 # Postgres COMMENT on the enum type (postgres.py), because an agent reading the
 # schema directly never sees this module.
-TIMELINE_PRIORITY_DEFINITIONS: tuple[tuple[str, str], ...] = (
-    ("self", "actions Zach initiated"),
-    ("direct", "real people reaching him directly"),
-    ("cc", "real-people activity he is peripheral to"),
-    ("noise", "bulk/automated traffic"),
-    ("background", "the warehouse's own machinery"),
-    (
-        "unclassified",
-        "the column default and never valid in steady state; its presence is a bug",
-    ),
+TIMELINE_PRIORITY_DEFINITIONS: tuple[tuple[str, str], ...] = tuple(
+    (tier.name, tier.meaning)
+    for tier in (*CATALOG.timeline_priorities.tiers, CATALOG.timeline_priorities.sentinel)
 )
 # The five tiers an adapter may emit, in enum declaration (attention) order.
 TIMELINE_PRIORITY_LABELS: tuple[str, ...] = tuple(
-    label for label, _ in TIMELINE_PRIORITY_DEFINITIONS if label != "unclassified"
+    label
+    for label, _ in TIMELINE_PRIORITY_DEFINITIONS
+    if label != CATALOG.timeline_priorities.sentinel.name
 )
 
 _EPOCH = "'1970-01-01 00:00:00+00'::timestamptz"

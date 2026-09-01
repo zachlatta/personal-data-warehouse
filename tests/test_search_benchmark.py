@@ -23,6 +23,7 @@ from personal_data_warehouse.search_benchmark import (
     matches_predicate,
     parse_search_payload,
     partition_stale_cases,
+    scope_comparison,
     summarize,
     trim_to_json,
 )
@@ -139,14 +140,21 @@ class TestParseSearchPayload:
     def test_reads_rows_and_fallback(self):
         payload = {
             "mode": "hybrid",
+            "priority_scope": "selected",
+            "selected_priorities": ["self", "direct", "cc"],
+            "returned_priority_counts": {"self": 1},
             "fallback_reason": "",
             "rows": [{"ref": "a:1", "source": "gmail", "event_ts": "2026-01-01T00:00:00Z",
-                      "title": "t", "text": "b", "context": "c"}],
+                      "title": "t", "text": "b", "context": "c", "priority": "self"}],
         }
         result = parse_search_payload(json.dumps(payload))
         assert result.mode == "hybrid"
         assert [r.ref for r in result.rows] == ["a:1"]
         assert result.rows[0].source == "gmail"
+        assert result.rows[0].priority == "self"
+        assert result.priority_scope == "selected"
+        assert result.selected_priorities == ("self", "direct", "cc")
+        assert result.returned_priority_counts == {"self": 1}
 
     def test_missing_rows_is_empty_not_an_error(self):
         assert parse_search_payload(json.dumps({"mode": "keyword"})).rows == ()
@@ -195,6 +203,25 @@ class TestSummarize:
         summary = summarize(rows, depth=50)
         assert summary["by_stratum"]["natural_language"]["hybrid"]["hit_at_1"] == 1
         assert summary["by_stratum"]["entity"]["hybrid"]["found"] == 0
+
+    def test_scope_comparison_reports_recall_loss_and_gain(self):
+        rows = [
+            {"hybrid": {"rank": 2}, "attention": {"hybrid": {"rank": None}}},
+            {"hybrid": {"rank": 1}, "attention": {"hybrid": {"rank": 3}}},
+            {"hybrid": {"rank": None}, "attention": {"hybrid": {"rank": 4}}},
+            {
+                "hybrid": {"rank": 1},
+                "attention": {"hybrid": {"rank": None, "error": "timeout"}},
+            },
+        ]
+        compared = scope_comparison(rows, modes=("hybrid",), depth=50)["hybrid"]
+        assert compared["all"]["found"] == 3
+        assert compared["attention"]["found"] == 2
+        assert compared["lost_from_all"] == 1
+        assert compared["gained_over_all"] == 1
+        assert compared["retained_from_all"] == 1
+        assert compared["comparable_cases"] == 3
+        assert compared["recall_loss_rate"] == 0.5
 
 
 class TestLoadCases:
@@ -379,6 +406,8 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
                 {
                     "query": "budget approval",
                     "mode": "hybrid",
+                    "priority_scope": "selected",
+                    "selected_priorities": ["self", "direct", "cc"],
                     "rows": [{"ref": "slack_message:abc", "source": "slack"}],
                 }
             ),
@@ -392,6 +421,7 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
         7,
         sources=("slack", "gmail"),
         since="2026-08-01",
+        priorities=("self", "direct", "cc"),
     )
 
     assert seen["args"] == [
@@ -407,11 +437,35 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
         "slack,gmail",
         "--since",
         "2026-08-01",
+        "--priority",
+        "self,direct,cc",
         "--",
         "budget approval",
     ]
     assert seen["kwargs"]["timeout"] == 420.0
     assert result.rows[0].ref == "slack_message:abc"
+
+
+def test_run_search_rejects_a_response_that_did_not_apply_the_requested_scope(
+    monkeypatch,
+) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    monkeypatch.setattr(
+        module,
+        "_pdw_json",
+        lambda *_args, **_kwargs: {
+            "query": "budget",
+            "mode": "hybrid",
+            "priority_scope": "all",
+            "selected_priorities": [],
+            "rows": [],
+        },
+    )
+    result = module.run_search(
+        "budget", "hybrid", 20, priorities=("self", "direct", "cc")
+    )
+    assert "scope" in result.error.lower()
 
 
 class TestPartitionStaleCases:

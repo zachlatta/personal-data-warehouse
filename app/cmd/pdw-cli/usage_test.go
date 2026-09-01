@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 // The CLI's usage text is the only discovery surface an agent reads before it
@@ -106,6 +108,19 @@ func TestUsageDocumentsTheSearchPriorityFlagWithAnExample(t *testing.T) {
 	}
 	if !strings.Contains(usage, "pdw search --priority self,direct 'budget approval'") {
 		t.Fatalf("usage has no worked --priority example:\n%s", usage)
+	}
+}
+
+func TestSearchHelpRendersTheGeneratedPriorityContract(t *testing.T) {
+	for _, tier := range warehouse.TimelinePriorities.Tiers {
+		if !strings.Contains(searchUsage, tier.Name) || !strings.Contains(searchUsage, tier.Meaning) {
+			t.Fatalf("search help omitted generated tier %q: %s", tier.Name, searchUsage)
+		}
+	}
+	for _, selection := range warehouse.TimelinePriorities.SelectionGuide {
+		if !strings.Contains(searchUsage, selection.Intent) || !strings.Contains(searchUsage, selection.Guidance) {
+			t.Fatalf("search help omitted generated selection %q: %s", selection.Intent, searchUsage)
+		}
 	}
 }
 

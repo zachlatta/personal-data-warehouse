@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from personal_data_warehouse.agent_usage import AgentUsageCollector, AgentUsageSnapshot
+from personal_data_warehouse.agent_usage import (
+    AgentUsageCollector,
+    AgentUsageSnapshot,
+    analyze_search_calls,
+    parse_search_call,
+)
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
 from tests.test_postgres_warehouse import _default_row, warehouse  # noqa: F401 - fixture
@@ -33,10 +38,17 @@ def _seed(wh: PostgresWarehouse) -> None:
             _event("a", 3, tool="Bash", inp='{"command":"pdw sql -q x \"SELECT * FROM base_slack.messages WHERE text ILIKE \'%x%\'\""}'),
             _event("a", 4, res="ERROR: column x does not exist (SQLSTATE 42703)"),
             _event("a", 5, tool="Bash", inp='{"command":"pdw search --priority self,direct \"budget\""}'),
-            _event("a", 6, res="3 results"),
+            _event(
+                "a", 6,
+                res='Search: "budget" — 3 results (hybrid)\nScope: self, direct\n'
+                    'Returned priorities: self=1, direct=2',
+            ),
             # Session B: search first via MCP, no priorities.
             _event("b", 1, tool="mcp__claude_ai_Personal_Data_Warehouse__search", inp='{"query":"lease"}'),
-            _event("b", 2, res="rows"),
+            _event(
+                "b", 2,
+                res='{"query":"lease","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{"noise":4,"direct":1},"hint_codes":["consider_attention_scope"],"suggested_priorities":["self","direct","cc"],"total_rows":5,"rows":[]}',
+            ),
             # Session C: never touched PDW.
             _event("c", 1),
             # Session D (codex script mode): invented command first.
@@ -58,7 +70,11 @@ def _seed(wh: PostgresWarehouse) -> None:
             _event("f", 3, tool="Bash", inp='{"command":"pdw version"}'),
             _event("f", 4, res="pdw 1.2.3"),
             _event("f", 5, tool="Bash", inp='{"command":"pdw search --priority self \"lease\""}'),
-            _event("f", 6, res="2 results"),
+            _event(
+                "f", 6,
+                res='Search: "lease" — 2 results (hybrid)\nScope: self\n'
+                    'Returned priorities: self=2',
+            ),
             # Session G: only ever ran an uploader. Not a question, so not part of
             # the denominator of a metric about how questions start.
             _event("g", 1, tool="Bash", inp='{"command":"pdw ingest apple-notes"}'),
@@ -81,6 +97,13 @@ def test_agent_usage_measures_first_call_priority_filter_and_base_only_sql(wareh
     assert a.admin_calls == 3
     assert a.search_calls == 3
     assert a.search_with_priority == 2
+    assert a.search_attention_only == 2
+    assert a.search_including_lower_tiers == 0
+    assert a.search_noop_priority == 0
+    assert a.search_invalid_or_failed_priority == 0
+    assert a.bulk_hints_shown == 1
+    assert a.bulk_hint_scoped_retries == 0
+    assert a.bulk_hint_improved_retries == 0
     assert a.sql_calls == 1
     assert a.sql_base_only == 1
     assert a.sql_error_sessions == 1
@@ -90,6 +113,9 @@ def test_agent_usage_measures_first_call_priority_filter_and_base_only_sql(wareh
 
     rows = {row["source"]: row for row in warehouse._query_dicts("SELECT * FROM @marts_agent_usage")}
     assert float(rows["all"]["priority_filter_rate"]) == round(2 / 3, 3)
+    assert int(rows["all"]["search_attention_only"]) == 2
+    assert int(rows["all"]["bulk_hints_shown"]) == 1
+    assert float(rows["all"]["bulk_hint_retry_rate"]) == 0.0
     assert float(rows["all"]["sql_base_only_rate"]) == 1.0
     # Four PDW sessions is not a sample: the verdict withholds itself.
     assert rows["all"]["status"] == "no_data"
@@ -102,6 +128,10 @@ def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehous
     def snap(source: str, **over) -> AgentUsageSnapshot:
         base = dict(source=source, window_days=14, sessions=100, pdw_sessions=40, first_search=30,
                     first_schema=8, first_sql=2, first_invented=0, search_calls=50, search_with_priority=25,
+                    search_attention_only=20, search_including_lower_tiers=5,
+                    search_noop_priority=3, search_invalid_or_failed_priority=2,
+                    bulk_hints_shown=8, bulk_hint_scoped_retries=5,
+                    bulk_hint_improved_retries=4,
                     sql_calls=60, sql_base_only=10, sql_error_sessions=2, sql_timeouts=0, invented_calls=0,
                     admin_calls=4, newest_session_at=now)
         base.update(over)
@@ -114,6 +144,9 @@ def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehous
     rows = {row["source"]: row for row in warehouse._query_dicts("SELECT * FROM @marts_agent_usage")}
     assert rows["all"]["status"] == "ok"
     assert float(rows["all"]["search_first_rate"]) == 0.75
+    assert float(rows["all"]["attention_scope_rate"]) == 0.4
+    assert float(rows["all"]["bulk_hint_retry_rate"]) == 0.625
+    assert float(rows["all"]["bulk_hint_improvement_rate"]) == 0.8
     assert rows["codex"]["status"] == "attention"  # 5/40 search-first
     assert rows["pi"]["status"] == "no_data"
 
@@ -124,6 +157,118 @@ def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehous
     rows = {row["source"]: row for row in warehouse._query_dicts("SELECT * FROM @marts_agent_usage")}
     assert rows["all"]["status"] == "unknown"
     assert set(rows) == {"all"}
+
+
+def _search_row(inp: str, result: str, *, seq: int = 1, session: str = "s") -> dict:
+    return {
+        "source": "codex",
+        "session_id": session,
+        "seq": seq,
+        "occurred_at": datetime.now(tz=UTC) + timedelta(seconds=seq),
+        "tool_name": "Bash",
+        "inp": inp,
+        "result": result,
+        "is_mcp": False,
+    }
+
+
+def test_search_scope_measurement_requires_an_effective_successful_filter() -> None:
+    attention = parse_search_call(
+        _search_row(
+            '{"command":"pdw search --priority self,direct budget"}',
+            'Search: "budget" — 3 results (hybrid)\nScope: self, direct\n'
+            'Returned priorities: self=1, direct=2',
+        )
+    )
+    assert attention.explicit_filter and attention.success
+    assert attention.priorities == ("self", "direct")
+    assert attention.effective_filter and attention.attention_only
+    assert not attention.includes_lower_tiers
+    assert not attention.noop_filter
+    assert not attention.invalid_or_failed_filter
+
+    lower = parse_search_call(
+        _search_row(
+            '{"command":"pdw search --priority noise,background alerts"}',
+            'Search: "alerts" — 2 results (hybrid)\nScope: noise, background\n'
+            'Returned priorities: noise=1, background=1',
+        )
+    )
+    assert lower.effective_filter and lower.includes_lower_tiers
+    assert not lower.attention_only
+
+
+def test_empty_all_five_invalid_and_failed_filters_are_not_successes() -> None:
+    success = '{"query":"q","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"rows":[]}'
+    empty = parse_search_call(
+        {**_search_row('{"query":"q","priorities":[]}', success), "is_mcp": True}
+    )
+    assert empty.noop_filter and not empty.effective_filter
+
+    all_five = parse_search_call(
+        {**_search_row(
+            '{"query":"q","priorities":["background","noise","cc","direct","self"]}',
+            '{"query":"q","priority_scope":"selected","selected_priorities":["background","noise","cc","direct","self"],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"rows":[]}',
+        ), "is_mcp": True}
+    )
+    assert all_five.noop_filter and not all_five.effective_filter
+
+    all_with_sentinel = parse_search_call(
+        {**_search_row(
+            '{"query":"q","priorities":["self","direct","cc","noise","background","unclassified"]}',
+            '{"query":"q","priority_scope":"selected","selected_priorities":["self","direct","cc","noise","background","unclassified"],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"rows":[]}',
+        ), "is_mcp": True}
+    )
+    assert all_with_sentinel.noop_filter and not all_with_sentinel.effective_filter
+
+    invalid = parse_search_call(
+        {**_search_row(
+            '{"query":"q","priorities":["urgent"]}',
+            '{"query":"q","priority_scope":"invalid","selected_priorities":["urgent"],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"error":"unknown priority"}',
+        ), "is_mcp": True}
+    )
+    assert invalid.invalid_or_failed_filter and not invalid.effective_filter
+
+    failed = parse_search_call(
+        _search_row(
+            '{"command":"pdw search --priority self q"}',
+            'pdw search: connection reset',
+        )
+    )
+    assert failed.invalid_or_failed_filter and not failed.effective_filter
+
+    scope_mismatch = parse_search_call(
+        {**_search_row(
+            '{"query":"q","priorities":["self"]}',
+            '{"query":"q","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"rows":[]}',
+        ), "is_mcp": True}
+    )
+    assert scope_mismatch.invalid_or_failed_filter
+    assert not scope_mismatch.effective_filter
+
+
+def test_bulk_hint_retry_is_counted_only_when_the_mix_improves() -> None:
+    rows = [
+        _search_row(
+            '{"command":"pdw search budget"}',
+            'Search: "budget" — 6 results (hybrid)\nScope: all tiers\n'
+            'Returned priorities: direct=1, noise=4, background=1\n'
+            'Hint: Most of these hits are noise/background; retry with priorities.',
+            seq=1,
+        ),
+        _search_row(
+            '{"command":"pdw search --priority self,direct,cc budget"}',
+            'Search: "budget" — 3 results (hybrid)\nScope: self, direct, cc\n'
+            'Returned priorities: self=1, direct=2',
+            seq=2,
+        ),
+    ]
+    metrics = analyze_search_calls(rows)
+    assert metrics.search_calls == 2
+    assert metrics.search_with_priority == 1
+    assert metrics.bulk_hints_shown == 1
+    assert metrics.bulk_hint_scoped_retries == 1
+    assert metrics.bulk_hint_improved_retries == 1
 
 
 # --- what counts as a PDW invocation (the C3 instrument's own contract) -------

@@ -15,9 +15,10 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliconfig"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
-const usage = `pdw — talk to the personal data warehouse /api/tools surface.
+var usage = `pdw — talk to the personal data warehouse /api/tools surface.
 
 USAGE
   pdw [--base-url URL] [--token TOKEN] [--client NAME] [<command> [args]]
@@ -50,13 +51,10 @@ COMMANDS
                                --mode MODE       hybrid (default), keyword, or exact
                                -n, --max-results N  Maximum hits (default 20)
                                --source NAMES    Source aliases, comma-separated; repeatable
-                               --priority TIERS  Attention tiers, comma-separated:
-                                                 self (Zach initiated it), direct (a real
-                                                 person reaching him directly), cc (activity
-                                                 he is peripheral to), noise (bulk/automated),
-                                                 background (warehouse machinery). Omitting
-                                                 it searches every tier; "what needs my
-                                                 attention" means self,direct,cc.
+                               --priority TIERS  Timeline priority tiers, comma-separated.
+` + warehouse.TimelinePriorityHelpLines("                                                 ") + `
+                                                 Run "pdw search --help" for the generated
+                                                 scope-selection guide.
                                --since TIME      Lower event-time bound (e.g. 2026-08-01)
                                --output FMT      text (default) or json
   sql [--output FMT] [-q QUESTION] [--file PATH] [--no-timeout] [SQL]
@@ -309,7 +307,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 }
 
 // schemaSearchFirstNudge is printed to stderr before every schema dump.
-const schemaSearchFirstNudge = "pdw schema: this is the relation list for writing SQL. For any text, topic, person or identifier question, start with `pdw search '<terms>'` (add --priority self,direct,cc for attention questions) — it needs no schema."
+var schemaSearchFirstNudge = "pdw schema: this is the relation list for writing SQL. For any text, topic, person or identifier question, start with `pdw search '<terms>'` (add --priority " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + " for attention questions) — it needs no schema."
 
 // runSchema calls schema_overview and prints its CSV result blocks as plain
 // text so the no-args invocation is human-readable. Any extra args are

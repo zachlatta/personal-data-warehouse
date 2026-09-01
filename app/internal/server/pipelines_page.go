@@ -247,7 +247,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     ["adapters", "timeline adapters — is THIS kind of data reaching timeline.events"],
     ["search", "search — do chunks and embeddings converge with the timeline"],
     ["benchmark", "search benchmark — weekly latency and labeled quality through the search tool"],
-    ["priority", "priority tiers — how each source's last seven days split across self / direct / cc / noise / background"],
+    ["priority", "priority tiers — how each source's last seven days split across the catalog-defined attention order"],
     ["agents", "agent usage — do agents start at the timeline and scope by tier (measured from their sessions)"],
     // Per-source detectors. They are here because level 1 AGGREGATES a source
     // into one row, and that is how both of these outages hid: ~19k
@@ -768,8 +768,12 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       [
         ["search first", pct(a.search_first_rate),
           "share of PDW sessions whose FIRST call was a search (target 60%); schema-first " + rows(a.first_schema) + ", sql-first " + rows(a.first_sql), false],
-        ["priority filter", pct(a.priority_filter_rate),
-          "searches that carried a priority filter (target 40%)", true],
+        ["effective priority scope", pct(a.priority_filter_rate),
+          rows(a.search_with_priority) + " successful, non-no-op filters (target 40%); attention-only " + rows(a.search_attention_only) + ", including noise/background " + rows(a.search_including_lower_tiers), true],
+        ["scope mistakes", rows(a.search_noop_priority + a.search_invalid_or_failed_priority),
+          rows(a.search_noop_priority) + " empty/all-five no-ops · " + rows(a.search_invalid_or_failed_priority) + " invalid or failed filters", true],
+        ["bulk-hint retry", pct(a.bulk_hint_retry_rate),
+          rows(a.bulk_hint_scoped_retries) + " of " + rows(a.bulk_hints_shown) + " hints led to a scoped retry; " + rows(a.bulk_hint_improved_retries) + " improved the returned mix (" + pct(a.bulk_hint_improvement_rate) + ")", true],
         ["base-only SQL", pct(a.sql_base_only_rate),
           rows(a.sql_base_only) + " SQL calls went straight to base_* with no timeline reference", true],
         ["SQL errors", pct(a.sql_error_session_rate),
@@ -789,12 +793,16 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     return healthRow(b, b.mode + " search",
       rows(b.probe_queries) + " latency probes · " + rows(b.labeled_cases) + " labeled cases",
       [
-        ["p50", b.latency_p50_ms !== null && b.latency_p50_ms !== undefined ? (b.latency_p50_ms / 1000).toFixed(2) + "s" : "—",
-          "serial, through the app's search tool; the goal is under 2s", false],
+        ["all-tier p50", b.latency_p50_ms !== null && b.latency_p50_ms !== undefined ? (b.latency_p50_ms / 1000).toFixed(2) + "s" : "—",
+          "serial, through the app's search tool; the default remains all tiers and its goal is under 2s", false],
         ["p90", b.latency_p90_ms !== null && b.latency_p90_ms !== undefined ? (b.latency_p90_ms / 1000).toFixed(2) + "s" : "—",
           "max " + (b.latency_max_ms / 1000).toFixed(2) + "s", true],
-        ["MRR", b.labeled_cases ? b.mrr : "—",
+        ["all-tier MRR", b.labeled_cases ? b.mrr : "—",
           b.labeled_cases ? "hit@1 " + rows(b.hit_at_1) + " · hit@5 " + rows(b.hit_at_5) + " · hit@10 " + rows(b.hit_at_10) + " of " + rows(b.labeled_cases) : "no labels published", true],
+        ["attention p50", b.attention_probe_queries ? (b.attention_latency_p50_ms / 1000).toFixed(2) + "s" : "—",
+          "paired catalog attention-scope probes; delta from all tiers " + (b.attention_latency_p50_delta_ms === null ? "unavailable" : (b.attention_latency_p50_delta_ms >= 0 ? "+" : "") + (b.attention_latency_p50_delta_ms / 1000).toFixed(2) + "s"), true],
+        ["attention recall", b.attention_labeled_cases ? rows(b.attention_found) + "/" + rows(b.attention_labeled_cases) : "—",
+          "MRR " + b.attention_mrr + " · lost " + rows(b.attention_recall_lost) + " of " + rows(b.attention_recall_lost + b.attention_recall_retained) + " comparable all-tier finds (" + pct(b.attention_recall_loss_rate) + ") · gained " + rows(b.attention_recall_gained) + " · retained " + rows(b.attention_recall_retained) + " across " + rows(b.attention_comparable_cases) + " successful pairs · all-tier relevant lower-tier hits " + rows(b.all_relevant_lower_tier), true],
         // C6: was the host being used while the probes ran? "idle" is the case
         // to fix first -- slow on a machine doing nothing. io_bound means the
         // disk was the saturated resource (2026-08-28: io full 20%, 38% iowait).

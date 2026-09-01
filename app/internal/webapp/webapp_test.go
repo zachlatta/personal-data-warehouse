@@ -175,6 +175,25 @@ func TestMutationReviewCSSIncludesPhoneLayoutAndTouchTargets(t *testing.T) {
 	}
 }
 
+// Mobile deliberately opens with the attention tiers selected. The browser
+// does not: broad discovery remains all-tier until the reader chooses chips,
+// matching CLI and MCP. Keep that cross-surface difference explicit.
+func TestSearchWebDefaultsToAllTiers(t *testing.T) {
+	source, err := fs.ReadFile(staticFS, "static/search.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, contract := range []string{
+		"const state = { priorities: {}, dead: false }",
+		"if (tiers.length) input.priorities = tiers",
+	} {
+		if !strings.Contains(text, contract) {
+			t.Fatalf("browser search no longer has its intentional all-tier default: missing %q", contract)
+		}
+	}
+}
+
 // The JS logic that used to be Go (contact summaries, calendar recurrence,
 // time formatting) has its own node tests. They run here when node is
 // available so `go test ./...` is still the one verification command.

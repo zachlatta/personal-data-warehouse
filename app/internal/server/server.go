@@ -22,6 +22,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/webapp"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/whoopsession"
 )
@@ -108,7 +109,7 @@ type searchInput struct {
 	Sources    []string `json:"sources,omitempty" jsonschema:"optional source tokens or aliases (slack, gmail, apple_messages, drive, ...); an unknown token errors listing the valid set"`
 	Since      string   `json:"since,omitempty" jsonschema:"optional timestamptz lower bound on event time, e.g. 2026-03-01"`
 	Mode       string   `json:"mode,omitempty" jsonschema:"hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)"`
-	Priorities []string `json:"priorities,omitempty" jsonschema:"optional attention tiers: self (Zach initiated it), direct (a real person reaching him directly), cc (real-people activity he is peripheral to), noise (bulk/automated), background (warehouse machinery); default is every tier and an unknown token errors listing the valid set"`
+	Priorities []string `json:"priorities,omitempty" jsonschema:"optional values from the timeline priority contract; omit to search every tier; an unknown token errors listing the valid set"`
 }
 
 type debugCacheInput struct{}
@@ -129,9 +130,9 @@ type sqlInput struct {
 // a priority tier. So it now says the three things that change what an agent
 // does first: start at the timeline, here are the attention tiers, and here is
 // the layer order to walk when SQL really is needed.
-const serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
+var serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
-	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and 48M rows: self = Zach initiated it; direct = a real person reaching him directly; cc = real-people activity he is peripheral to; noise = bulk/automated traffic; background = the warehouse's own machinery. \"What needs my attention\" means priorities self/direct/cc, not everything. " +
+	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
 	"For an email, chat/channel, or agent-turn hit, read the conversation around it with timeline.context(ref, 5, 5) through the query tool — a Gmail hit returns its thread, a Slack hit its thread or channel, a message its chat; each hit's source_table/source_pk drill straight to the authoritative row. " +
 	"Only for structured predicates, aggregates, joins, or drill-down after a hit, write SQL — and walk the layers in order: timeline (the event stream) -> marts_* (stable per-domain read views) -> base_* (raw provider detail), with derived_* as the modelled facts between them. Call schema_overview, then describe_table on every relation you reference. Do not guess relation or column names."
 
@@ -145,10 +146,10 @@ const getFieldDescription = "Return a character chunk from a single cell in a ca
 
 const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
 
-const searchDescription = "FIRST tool for any text, topic, person, phrase, or identifier lookup across all synced sources; it searches the cross-source timeline and needs no schema discovery. " +
+var searchDescription = "FIRST tool for any text, topic, person, phrase, or identifier lookup across all synced sources; it searches the cross-source timeline and needs no schema discovery. " +
 	"Phrase query as words the ANSWERING RECORD would contain: use \"runway burn rate months cash remaining\", not \"how long our money lasts\". Add likely record-language synonyms. " +
 	"hybrid (default) fuses semantic, keyword, and short literal retrieval; exact is strongest when every hit must contain an identifier/path/filename/literal phrase; keyword is BM25-only. " +
-	"Scope with priorities when the question is about attention rather than content — self (Zach initiated it), direct (a real person reaching him directly), cc (real-people activity he is peripheral to), noise (bulk/automated), background (warehouse machinery); noise is 82% of the corpus, so leaving it in is usually why a search returns junk. Scope with sources/since only when known. " +
+	"Scope with priorities when the question is about attention rather than content — " + warehouse.TimelinePriorityParentheticalDefinitions() + ". The default is every tier; for attention or correspondence use " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + ". Scope with sources/since only when known. " +
 	"Every hit carries priority plus ref, source_table and source_pk: use ref with timeline.context(ref, 5, 5) for surrounding messages, source_table/source_pk to reach the raw row (timeline -> marts_* -> base_*). The response tells you how to recover from zero results."
 
 const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL. It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."

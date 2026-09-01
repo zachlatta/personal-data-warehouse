@@ -35,14 +35,25 @@ collector got both wrong:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import psycopg2
 
+from personal_data_warehouse.warehouse_catalog import CATALOG
+
 logger = logging.getLogger(__name__)
+
+_REAL_PRIORITY_TIERS = tuple(tier.name for tier in CATALOG.timeline_priorities.tiers)
+_ATTENTION_PRIORITY_TIERS = CATALOG.timeline_priorities.attention_priorities
+_LOWER_PRIORITY_TIERS = tuple(
+    priority for priority in _REAL_PRIORITY_TIERS if priority not in _ATTENTION_PRIORITY_TIERS
+)
+_ACCEPTED_PRIORITIES = {*_REAL_PRIORITY_TIERS, CATALOG.timeline_priorities.sentinel.name}
 
 #: Window measured per row. Two weeks is enough sessions to make a rate mean
 #: something and short enough that a guidance change shows within days.
@@ -124,6 +135,13 @@ class AgentUsageSnapshot:
     first_invented: int
     search_calls: int
     search_with_priority: int
+    search_attention_only: int
+    search_including_lower_tiers: int
+    search_noop_priority: int
+    search_invalid_or_failed_priority: int
+    bulk_hints_shown: int
+    bulk_hint_scoped_retries: int
+    bulk_hint_improved_retries: int
     sql_calls: int
     sql_base_only: int
     sql_error_sessions: int
@@ -133,7 +151,304 @@ class AgentUsageSnapshot:
     newest_session_at: datetime | None
 
 
-AGENT_USAGE_SQL = """
+@dataclass(frozen=True)
+class SearchCallObservation:
+    """The effective outcome of one search call, not merely its syntax."""
+
+    source: str
+    session_id: str
+    seq: int
+    occurred_at: datetime | None
+    query: str
+    explicit_filter: bool
+    priorities: tuple[str, ...]
+    success: bool
+    returned_priority_counts: dict[str, int]
+    bulk_hint_shown: bool
+
+    @property
+    def valid_filter(self) -> bool:
+        return all(priority in _ACCEPTED_PRIORITIES for priority in self.priorities)
+
+    @property
+    def noop_filter(self) -> bool:
+        """An explicitly empty or all-five scope that does not narrow real tiers."""
+        if not self.explicit_filter or not self.valid_filter:
+            return False
+        return not self.priorities or set(_REAL_PRIORITY_TIERS) <= set(self.priorities)
+
+    @property
+    def effective_filter(self) -> bool:
+        return (
+            self.explicit_filter
+            and self.success
+            and self.valid_filter
+            and bool(self.priorities)
+            and not self.noop_filter
+        )
+
+    @property
+    def attention_only(self) -> bool:
+        return self.effective_filter and set(self.priorities) <= set(_ATTENTION_PRIORITY_TIERS)
+
+    @property
+    def includes_lower_tiers(self) -> bool:
+        return self.effective_filter and bool(set(self.priorities) & set(_LOWER_PRIORITY_TIERS))
+
+    @property
+    def invalid_or_failed_filter(self) -> bool:
+        return self.explicit_filter and (not self.valid_filter or not self.success)
+
+    @property
+    def lower_tier_share(self) -> float | None:
+        total = sum(self.returned_priority_counts.values())
+        if total <= 0:
+            return None
+        lower = sum(
+            self.returned_priority_counts.get(name, 0) for name in _LOWER_PRIORITY_TIERS
+        )
+        return lower / total
+
+
+@dataclass(frozen=True)
+class SearchUsageMetrics:
+    search_calls: int = 0
+    search_with_priority: int = 0
+    search_attention_only: int = 0
+    search_including_lower_tiers: int = 0
+    search_noop_priority: int = 0
+    search_invalid_or_failed_priority: int = 0
+    bulk_hints_shown: int = 0
+    bulk_hint_scoped_retries: int = 0
+    bulk_hint_improved_retries: int = 0
+
+
+_CLI_PRIORITY_RE = re.compile(
+    r"--priorit(?:y|ies)(?:=|\s+)(?:\"([^\"]*)\"|'([^']*)'|([^\s\"';&|]+))",
+    re.IGNORECASE,
+)
+_CLI_SEARCH_QUERY_RE = re.compile(r'^Search:\s*["\'](.*?)["\']\s*[—-]', re.MULTILINE)
+_CLI_PRIORITY_COUNTS_RE = re.compile(r"^Returned priorities:\s*(.*)$", re.MULTILINE)
+
+
+def _walk_json(value: Any, *, depth: int = 0):
+    """Yield nested JSON containers, decoding text envelopes along the way."""
+    if depth > 8:
+        return
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped[0] in "[{\"":
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if decoded != value:
+                yield from _walk_json(decoded, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child, depth=depth + 1)
+    elif isinstance(value, list):
+        yield value
+        for child in value:
+            yield from _walk_json(child, depth=depth + 1)
+
+
+def _nested_strings(value: Any) -> list[str]:
+    strings: list[str] = []
+    if isinstance(value, str):
+        strings.append(value)
+        stripped = value.strip()
+        if stripped and stripped[0] in "[{\"":
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return strings
+            if decoded != value:
+                strings.extend(_nested_strings(decoded))
+    elif isinstance(value, dict):
+        for child in value.values():
+            strings.extend(_nested_strings(child))
+    elif isinstance(value, list):
+        for child in value:
+            strings.extend(_nested_strings(child))
+    return strings
+
+
+def _as_priorities(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    values = value if isinstance(value, list) else str(value).split(",")
+    return tuple(str(item).strip().lower() for item in values if str(item).strip())
+
+
+def _input_scope(raw: str, *, is_mcp: bool) -> tuple[bool, tuple[str, ...]]:
+    if is_mcp:
+        for value in _walk_json(raw):
+            if isinstance(value, dict) and "priorities" in value:
+                return True, _as_priorities(value.get("priorities"))
+        return False, ()
+
+    command_texts: list[str] = []
+    for value in _walk_json(raw):
+        if not isinstance(value, dict):
+            continue
+        for key in ("command", "cmd"):
+            if isinstance(value.get(key), str):
+                command_texts.append(value[key])
+    if not command_texts:
+        command_texts = [raw]
+    selected: list[str] = []
+    explicit = False
+    for command in command_texts:
+        if not re.search(r"(?:^|[\"`;|&(\n])\s*pdw\s+search(?:\s|$)", command):
+            continue
+        for match in _CLI_PRIORITY_RE.finditer(command):
+            explicit = True
+            value = next((group for group in match.groups() if group is not None), "")
+            selected.extend(_as_priorities(value))
+        if explicit:
+            break
+    return explicit, tuple(selected)
+
+
+def _response_dict(raw: str) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for value in _walk_json(raw):
+        if not isinstance(value, dict):
+            continue
+        if "priority_scope" in value or "returned_priority_counts" in value:
+            return value
+        if "query" in value and ("rows" in value or "total_rows" in value or "error" in value):
+            candidates.append(value)
+    return candidates[0] if candidates else None
+
+
+def _response_counts(response: dict[str, Any] | None, text: str) -> dict[str, int]:
+    if response is not None and isinstance(response.get("returned_priority_counts"), dict):
+        return {
+            str(name): int(count)
+            for name, count in response["returned_priority_counts"].items()
+            if isinstance(count, (int, float))
+        }
+    if response is not None and isinstance(response.get("rows"), list):
+        counts: dict[str, int] = {}
+        for row in response["rows"]:
+            if isinstance(row, dict) and row.get("priority"):
+                priority = str(row["priority"])
+                counts[priority] = counts.get(priority, 0) + 1
+        if counts:
+            return counts
+    match = _CLI_PRIORITY_COUNTS_RE.search(text)
+    if not match:
+        return {}
+    counts = {}
+    for name, count in re.findall(r"([A-Za-z_]+)\s*=\s*(\d+)", match.group(1)):
+        counts[name.lower()] = int(count)
+    return counts
+
+
+def parse_search_call(row: dict[str, Any]) -> SearchCallObservation:
+    """Parse request and result into the effective search-scope outcome."""
+    raw_input = str(row.get("inp") or "")
+    raw_result = str(row.get("result") or "")
+    explicit, priorities = _input_scope(raw_input, is_mcp=bool(row.get("is_mcp")))
+    response = _response_dict(raw_result)
+    text = "\n".join(_nested_strings(raw_result))
+
+    failed_envelope = any(
+        isinstance(value, dict) and value.get("isError") is True
+        for value in _walk_json(raw_result)
+    )
+    if response is not None:
+        scope = str(response.get("priority_scope") or "")
+        reported_priorities = _as_priorities(response.get("selected_priorities"))
+        if not explicit and scope in {"selected", "invalid"}:
+            explicit = True
+            priorities = reported_priorities
+        success = not failed_envelope and not response.get("error") and scope != "invalid"
+        # New responses echo the scope that actually ran. When present, make
+        # it part of success rather than crediting a syntactically scoped call
+        # whose result quietly came from another scope. Older responses had no
+        # echo and retain their historical success detection.
+        if scope:
+            if explicit and priorities:
+                success = (
+                    success
+                    and scope == "selected"
+                    and reported_priorities == priorities
+                )
+            elif explicit:
+                success = success and scope == "all" and not reported_priorities
+            else:
+                success = success and scope == "all" and not reported_priorities
+        query = str(response.get("query") or "").strip()
+        codes = response.get("hint_codes")
+        bulk_hint = isinstance(codes, list) and "consider_attention_scope" in codes
+    else:
+        # Older CLI results predate the explicit Scope line but the Search
+        # header was already emitted only after a successful API response.
+        success = bool(re.search(r"^Search:", text, re.MULTILINE))
+        query_match = _CLI_SEARCH_QUERY_RE.search(text)
+        query = query_match.group(1).strip() if query_match else ""
+        bulk_hint = False
+    lowered = text.lower()
+    bulk_hint = bulk_hint or "consider_attention_scope" in lowered or (
+        "most of these hits" in lowered and "noise/background" in lowered
+    )
+    return SearchCallObservation(
+        source=str(row.get("source") or ""),
+        session_id=str(row.get("session_id") or ""),
+        seq=int(row.get("seq") or 0),
+        occurred_at=row.get("occurred_at"),
+        query=query,
+        explicit_filter=explicit,
+        priorities=priorities,
+        success=success,
+        returned_priority_counts=_response_counts(response, text),
+        bulk_hint_shown=bulk_hint,
+    )
+
+
+def analyze_search_calls(rows: list[dict[str, Any]]) -> SearchUsageMetrics:
+    observations = [parse_search_call(row) for row in rows]
+    hints = sum(observation.bulk_hint_shown for observation in observations)
+    retries = 0
+    improved = 0
+    by_session: dict[tuple[str, str], list[SearchCallObservation]] = {}
+    for observation in observations:
+        by_session.setdefault((observation.source, observation.session_id), []).append(observation)
+    for calls in by_session.values():
+        calls.sort(key=lambda call: call.seq)
+        for before, after in zip(calls, calls[1:], strict=False):
+            if not before.bulk_hint_shown or not after.effective_filter:
+                continue
+            if before.query and after.query and before.query.casefold() != after.query.casefold():
+                continue
+            retries += 1
+            old_share = before.lower_tier_share
+            new_share = after.lower_tier_share
+            if old_share is not None and new_share is not None and new_share < old_share:
+                improved += 1
+    return SearchUsageMetrics(
+        search_calls=len(observations),
+        search_with_priority=sum(observation.effective_filter for observation in observations),
+        search_attention_only=sum(observation.attention_only for observation in observations),
+        search_including_lower_tiers=sum(
+            observation.includes_lower_tiers for observation in observations
+        ),
+        search_noop_priority=sum(observation.noop_filter for observation in observations),
+        search_invalid_or_failed_priority=sum(
+            observation.invalid_or_failed_filter for observation in observations
+        ),
+        bulk_hints_shown=hints,
+        bulk_hint_scoped_retries=retries,
+        bulk_hint_improved_retries=improved,
+    )
+
+
+_AGENT_USAGE_CALLS_CTE = """
 WITH ev AS (
   SELECT source, session_id, seq, occurred_at, tool_name,
          CASE WHEN source = 'codex' AND subtype = 'custom_tool_call' THEN raw_json ELSE tool_input_json END AS inp0,
@@ -148,7 +463,7 @@ ev2 AS (
   SELECT *, lead(res0) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_res FROM ev
 ),
 calls AS (
-  SELECT source, session_id, seq, tool_name, inp0 AS inp,
+  SELECT source, session_id, seq, occurred_at, tool_name, inp0 AS inp,
          coalesce(NULLIF(next_res, ''), res0) AS result,
          (tool_name ILIKE '%%personal_data_warehouse%%') AS is_mcp
   FROM ev2
@@ -174,7 +489,11 @@ pdw AS (
       ELSE 'other_read'
     END AS kind
   FROM calls
-),
+)
+"""
+
+
+AGENT_USAGE_SQL = _AGENT_USAGE_CALLS_CTE + """,
 reads AS (
   SELECT *, row_number() OVER (PARTITION BY source, session_id ORDER BY seq) AS nth
   FROM pdw WHERE kind <> 'admin'
@@ -186,8 +505,6 @@ per_session AS (
          max(CASE WHEN nth = 1 AND kind = 'sql' THEN 1 ELSE 0 END) AS first_sql,
          max(CASE WHEN nth = 1 AND kind = 'invented' THEN 1 ELSE 0 END) AS first_invented,
          count(*) FILTER (WHERE kind = 'search') AS search_calls,
-         count(*) FILTER (WHERE kind = 'search'
-                            AND (inp ~ '--priorit' OR inp ~ '"priorities"')) AS search_with_priority,
          count(*) FILTER (WHERE kind = 'sql') AS sql_calls,
          count(*) FILTER (WHERE kind = 'sql' AND inp ~* 'base_[a-z0-9_]+[.]'
                             AND inp !~* 'timeline[.]' AND inp !~* 'marts_') AS sql_base_only,
@@ -211,7 +528,6 @@ by_source AS (
          coalesce(sum(p.first_sql), 0) AS first_sql,
          coalesce(sum(p.first_invented), 0) AS first_invented,
          coalesce(sum(p.search_calls), 0) AS search_calls,
-         coalesce(sum(p.search_with_priority), 0) AS search_with_priority,
          coalesce(sum(p.sql_calls), 0) AS sql_calls,
          coalesce(sum(p.sql_base_only), 0) AS sql_base_only,
          coalesce(sum(p.sql_error_session), 0) AS sql_error_sessions,
@@ -227,21 +543,38 @@ by_source AS (
 SELECT * FROM by_source
 UNION ALL
 SELECT 'all', sum(sessions), sum(pdw_sessions), sum(first_search), sum(first_schema), sum(first_sql),
-       sum(first_invented), sum(search_calls), sum(search_with_priority), sum(sql_calls),
+       sum(first_invented), sum(search_calls), sum(sql_calls),
        sum(sql_base_only), sum(sql_error_sessions), sum(sql_timeouts), sum(invented_calls),
        sum(admin_calls), max(newest_session_at)
 FROM by_source
 """
 
 
-AGENT_USAGE_SQL = (
-    AGENT_USAGE_SQL.replace("{invoked}", CLI_INVOKED_RE)
-    .replace("{invented}", CLI_INVENTED_RE)
-    .replace("{search}", CLI_SEARCH_RE)
-    .replace("{sql}", CLI_SQL_RE)
-    .replace("{schema}", CLI_SCHEMA_RE)
-    .replace("{admin}", CLI_ADMIN_RE)
-)
+# Use the exact same call classifier for the outcome-aware search pass. The
+# aggregate above deliberately does not inspect priority syntax at all; only
+# the request/result pair below can tell whether a scope was valid, successful,
+# and actually narrower than the default.
+AGENT_USAGE_SEARCH_CALLS_SQL = _AGENT_USAGE_CALLS_CTE + """
+SELECT source, session_id, seq, occurred_at, tool_name, inp, result, is_mcp
+FROM pdw
+WHERE kind = 'search'
+ORDER BY source, session_id, seq
+"""
+
+
+def _expand_agent_usage_regexes(statement: str) -> str:
+    return (
+        statement.replace("{invoked}", CLI_INVOKED_RE)
+        .replace("{invented}", CLI_INVENTED_RE)
+        .replace("{search}", CLI_SEARCH_RE)
+        .replace("{sql}", CLI_SQL_RE)
+        .replace("{schema}", CLI_SCHEMA_RE)
+        .replace("{admin}", CLI_ADMIN_RE)
+    )
+
+
+AGENT_USAGE_SQL = _expand_agent_usage_regexes(AGENT_USAGE_SQL)
+AGENT_USAGE_SEARCH_CALLS_SQL = _expand_agent_usage_regexes(AGENT_USAGE_SEARCH_CALLS_SQL)
 
 
 class AgentUsageCollector:
@@ -253,15 +586,25 @@ class AgentUsageCollector:
         self._warehouse._raw_command(f"SET statement_timeout = {AGENT_USAGE_STATEMENT_TIMEOUT_MS}")
         try:
             rows = self._warehouse._query_dicts(AGENT_USAGE_SQL, {"days": self._window_days})
+            search_rows = self._warehouse._query_dicts(
+                AGENT_USAGE_SEARCH_CALLS_SQL, {"days": self._window_days}
+            )
         finally:
             self._warehouse._raw_command("SET statement_timeout = DEFAULT")
         out: list[AgentUsageSnapshot] = []
         for row in rows:
             if row.get("sessions") is None:
                 continue
+            source = str(row["source"])
+            scoped_rows = (
+                search_rows
+                if source == "all"
+                else [search_row for search_row in search_rows if str(search_row["source"]) == source]
+            )
+            search = analyze_search_calls(scoped_rows)
             out.append(
                 AgentUsageSnapshot(
-                    source=str(row["source"]),
+                    source=source,
                     window_days=self._window_days,
                     sessions=int(row["sessions"] or 0),
                     pdw_sessions=int(row["pdw_sessions"] or 0),
@@ -269,8 +612,15 @@ class AgentUsageCollector:
                     first_schema=int(row["first_schema"] or 0),
                     first_sql=int(row["first_sql"] or 0),
                     first_invented=int(row["first_invented"] or 0),
-                    search_calls=int(row["search_calls"] or 0),
-                    search_with_priority=int(row["search_with_priority"] or 0),
+                    search_calls=search.search_calls,
+                    search_with_priority=search.search_with_priority,
+                    search_attention_only=search.search_attention_only,
+                    search_including_lower_tiers=search.search_including_lower_tiers,
+                    search_noop_priority=search.search_noop_priority,
+                    search_invalid_or_failed_priority=search.search_invalid_or_failed_priority,
+                    bulk_hints_shown=search.bulk_hints_shown,
+                    bulk_hint_scoped_retries=search.bulk_hint_scoped_retries,
+                    bulk_hint_improved_retries=search.bulk_hint_improved_retries,
                     sql_calls=int(row["sql_calls"] or 0),
                     sql_base_only=int(row["sql_base_only"] or 0),
                     sql_error_sessions=int(row["sql_error_sessions"] or 0),

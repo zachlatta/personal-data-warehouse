@@ -92,7 +92,14 @@ export function mount(container, ctx) {
       if (state.dead) return;
       clear(hint);
       const ms = Math.round(performance.now() - started);
-      ctx.setStats(data.total_rows + " hits · " + data.mode + " · " + ms + "ms");
+      const reportedScope = data.priority_scope || (tiers.length ? "selected" : "all");
+      const selected = data.selected_priorities || tiers;
+      const scope = reportedScope === "all"
+        ? "all tiers"
+        : (reportedScope === "invalid" ? "invalid: " : "") + selected.join(", ");
+      ctx.setStats(data.total_rows + " hits · " + data.mode + " · scope " + scope + " · " + ms + "ms");
+      const mix = Object.entries(data.returned_priority_counts || {}).map(([tier, count]) => tier + "=" + count).join(", ");
+      if (mix) hint.appendChild(h("div", "m", "returned priorities: " + mix));
       if (data.error) hint.appendChild(h("div", "bad", data.error));
       if (data.fallback_reason) hint.appendChild(h("div", "m", "fell back: " + data.fallback_reason));
       if (data.hint) hint.appendChild(h("div", "m", data.hint));

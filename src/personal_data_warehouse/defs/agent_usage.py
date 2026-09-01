@@ -55,6 +55,13 @@ def agent_usage(context) -> MaterializeResult:
             "pdw_sessions": MetadataValue.int(overall.pdw_sessions if overall else 0),
             "first_search": MetadataValue.int(overall.first_search if overall else 0),
             "search_with_priority": MetadataValue.int(overall.search_with_priority if overall else 0),
+            "search_attention_only": MetadataValue.int(overall.search_attention_only if overall else 0),
+            "search_invalid_or_failed_priority": MetadataValue.int(
+                overall.search_invalid_or_failed_priority if overall else 0
+            ),
+            "bulk_hint_improved_retries": MetadataValue.int(
+                overall.bulk_hint_improved_retries if overall else 0
+            ),
             "sql_base_only": MetadataValue.int(overall.sql_base_only if overall else 0),
         }
     )

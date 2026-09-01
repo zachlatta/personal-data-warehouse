@@ -225,7 +225,7 @@ func wrapComment(line string, width int) []string {
 // overviewPreamble is everything a caller needs before writing SQL that no
 // per-relation lookup can tell them. Each paragraph earned its place from a
 // recurring failure in real transcripts.
-const overviewPreamble = `--
+var overviewPreamble = `--
 -- SCHEMA LAYERS (they sort in this order, which is also the order to reach for them):
 --   base_<source>    faithful provider data — every field the source gave us
 --   derived_<domain> modelled facts: identity resolution, enrichment, transcripts, ledger history
@@ -269,10 +269,7 @@ const overviewPreamble = `--
 --   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01',
 --   priorities => ARRAY['self','direct']) and return (source, subsource, context, who,
 --   occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk,
---   priority). ` + "`priorities`" + ` scopes to the attention tiers on timeline.events — self
---   (Zach initiated it), direct (a real person reaching him directly), cc (real-people
---   activity he is peripheral to), noise (bulk/automated, 82%% of the corpus), background
---   (warehouse machinery) — and is pushed into every scan, so a narrow tier still gets a full
+--   priority). ` + "`priorities`" + ` scopes to the attention tiers on timeline.events — ` + warehouse.TimelinePriorityParentheticalDefinitions() + ` — and is pushed into every scan, so a narrow tier still gets a full
 --   top-k. Omit it (or pass an empty array) for every tier; an unknown token raises listing
 --   the valid set. The ` + "`text`" + ` preview is windowed around the
 --   first matched term. event_ts = occurred_at (same value, both names accepted downstream).

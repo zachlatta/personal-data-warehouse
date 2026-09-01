@@ -36,6 +36,14 @@ async function request<T>(config: AppConfig, path: string, init: RequestInit = {
 
 export type Priority = 'self' | 'direct' | 'cc' | 'noise' | 'background' | 'unclassified';
 export const PRIORITIES: Priority[] = ['self', 'direct', 'cc', 'noise', 'background'];
+// Mobile intentionally opens at attention while CLI/MCP/web remain all-tier
+// by default. Chips make that narrower choice visible and let the reader widen
+// it; this constant is contract-tested against warehouse_catalog.json.
+export const MOBILE_DEFAULT_SEARCH_PRIORITIES: Priority[] = ['self', 'direct', 'cc'];
+
+export function effectiveMobileSearchPriorities(selected: Priority[]): Priority[] | undefined {
+  return selected.length === PRIORITIES.length ? undefined : selected;
+}
 
 // "Open in its source": url works anywhere a browser does; app_url is a
 // native scheme a phone should try first (Slack, Messages, Notes, WhatsApp).
@@ -280,6 +288,11 @@ export type SearchHit = {
 export type SearchResult = {
   query: string;
   mode: string;
+  priority_scope: 'all' | 'selected' | 'invalid';
+  selected_priorities: Priority[];
+  returned_priority_counts: Partial<Record<Priority, number>>;
+  hint_codes: string[];
+  suggested_priorities: Priority[];
   total_rows: number;
   rows: SearchHit[];
   hint?: string;
@@ -295,7 +308,16 @@ export async function search(
     method: 'POST',
     body: JSON.stringify(input),
   });
-  return { ...body.data, rows: body.data.rows ?? [] };
+  const selected = body.data.selected_priorities ?? input.priorities ?? [];
+  return {
+    ...body.data,
+    priority_scope: body.data.priority_scope ?? (selected.length ? 'selected' : 'all'),
+    selected_priorities: selected,
+    returned_priority_counts: body.data.returned_priority_counts ?? {},
+    hint_codes: body.data.hint_codes ?? [],
+    suggested_priorities: body.data.suggested_priorities ?? [],
+    rows: body.data.rows ?? [],
+  };
 }
 
 // A search hit's ref is "<adapter>:<event_id>"; the timeline item endpoint

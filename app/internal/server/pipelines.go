@@ -139,7 +139,12 @@ ORDER BY source, priority`
 var pipelineAgentUsageSQL = `
 SELECT source, status, window_days, sessions, pdw_sessions, first_search, first_schema, first_sql,
        first_invented, search_calls, search_with_priority, sql_calls, sql_base_only,
-       sql_error_sessions, sql_timeouts, invented_calls, search_first_rate, priority_filter_rate,
+       search_attention_only, search_including_lower_tiers, search_noop_priority,
+       search_invalid_or_failed_priority, bulk_hints_shown, bulk_hint_scoped_retries,
+       bulk_hint_improved_retries, sql_error_sessions, sql_timeouts, invented_calls,
+       search_first_rate, priority_filter_rate, attention_scope_rate, lower_tier_scope_rate,
+       noop_priority_rate, invalid_or_failed_priority_rate, bulk_hint_retry_rate,
+       bulk_hint_improvement_rate,
        sql_base_only_rate, sql_error_session_rate, newest_session_at, collected_at, snapshot_age_seconds
 FROM ` + warehouse.SQLRelation("marts_agent_usage") + `
 ORDER BY (source = 'all') DESC, source`
@@ -148,6 +153,13 @@ ORDER BY (source = 'all') DESC, source`
 var pipelineSearchBenchmarkSQL = `
 SELECT mode, status, probe_queries, latency_p50_ms, latency_p90_ms, latency_max_ms,
        labeled_cases, found, hit_at_1, hit_at_5, hit_at_10, mrr, errors, note,
+       attention_priorities_json, attention_probe_queries, attention_latency_p50_ms,
+       attention_latency_p90_ms, attention_latency_max_ms, attention_labeled_cases,
+       attention_comparable_cases, attention_found, attention_hit_at_1,
+       attention_hit_at_5, attention_hit_at_10,
+       attention_mrr, attention_errors, attention_recall_lost, attention_recall_gained,
+       attention_recall_retained, all_relevant_lower_tier,
+       attention_latency_p50_delta_ms, attention_recall_loss_rate,
        io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, saturation,
        collected_at, snapshot_age_seconds
 FROM ` + warehouse.SQLRelation("marts_search_benchmark") + `

@@ -1,5 +1,87 @@
 {
   "version": 1,
+  "timeline_priorities": {
+    "default_scope": "all",
+    "attention_priorities": [
+      "self",
+      "direct",
+      "cc"
+    ],
+    "optimized_bm25_priorities": [
+      "self",
+      "direct"
+    ],
+    "tiers": [
+      {
+        "name": "self",
+        "meaning": "Zach initiated it",
+        "typical_rows": "his sent mail and messages, his notes and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments"
+      },
+      {
+        "name": "direct",
+        "meaning": "a real person reaching him directly",
+        "typical_rows": "DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements"
+      },
+      {
+        "name": "cc",
+        "meaning": "real-people activity he is peripheral to",
+        "typical_rows": "cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns"
+      },
+      {
+        "name": "noise",
+        "meaning": "bulk or automated traffic",
+        "typical_rows": "newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member"
+      },
+      {
+        "name": "background",
+        "meaning": "the warehouse's own machinery and other people's background work",
+        "typical_rows": "enrichment runs, mutation workers, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change"
+      }
+    ],
+    "sentinel": {
+      "name": "unclassified",
+      "meaning": "the fail-loud sentinel and column default, never valid in steady state; its presence is a bug",
+      "typical_rows": "rows whose adapter classification did not run"
+    },
+    "selection_guide": [
+      {
+        "intent": "attention or correspondence",
+        "priorities": [
+          "self",
+          "direct",
+          "cc"
+        ],
+        "guidance": "Use the three attention tiers to leave out bulk and background traffic."
+      },
+      {
+        "intent": "Zach's own acts or words",
+        "priorities": [
+          "self"
+        ],
+        "guidance": "Use self for actions Zach took and words he wrote."
+      },
+      {
+        "intent": "prior agent conclusions",
+        "priorities": [
+          "self",
+          "background"
+        ],
+        "guidance": "Include background because model answers and tool output live there while Zach's prompts live in self."
+      },
+      {
+        "intent": "notifications, CI, or telemetry",
+        "priorities": [
+          "noise"
+        ],
+        "guidance": "Use noise when automated traffic is the subject rather than a distraction."
+      },
+      {
+        "intent": "broad topical discovery or uncertain scope",
+        "priorities": [],
+        "guidance": "Omit the filter and search all tiers when recall matters or the relevant tier is unknown."
+      }
+    ]
+  },
   "start_here": {
     "schema": "timeline",
     "headline": "Start with timeline.",
@@ -2198,7 +2280,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "The weekly search benchmark as a health row, per retrieval mode: latency_p50_ms / p90 / max over fixed term-bag probes through the app's search tool, and labeled quality (labeled_cases, found, hit_at_1/5/10, mrr) over private.search_benchmark_labels. Reads attention when p50 exceeds 2 seconds or MRR falls under 0.30; a run older than ten days reads unknown. The host columns (io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, from /proc during the probes) feed `saturation` (C6): io_bound, cpu_bound, idle (slow on an idle host -- fix that first), ok, or unmeasured when a sample is -1."
+      "comment": "The weekly search benchmark as a health row, per retrieval mode. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. The default remains all tiers and status is judged on its p50 (2-second goal) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
     },
     {
       "id": "marts_agent_usage",
@@ -2210,7 +2292,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "How agents use PDW, measured daily from their own sessions over a trailing window, per agent source plus 'all'. Rates: search_first_rate (sessions whose first PDW call was a search), priority_filter_rate (searches carrying a priority filter), sql_base_only_rate (SQL that went straight to base_* with no timeline reference), sql_error_session_rate. Reads attention when the guidance is not landing against the targets; fewer than 10 PDW sessions reads no_data."
+      "comment": "How agents use PDW, measured daily from request/result pairs over a trailing window, per agent source plus 'all'. Priority telemetry distinguishes successful effective filters, attention-only scopes, scopes including noise/background, empty or all-five no-ops, invalid or failed filters, and bulk-hint retries whose returned mix improved. Rates also cover search-first, base-only SQL, and SQL-error sessions. Reads attention when the guidance is not landing against the targets; fewer than 10 PDW sessions reads no_data."
     },
     {
       "id": "marts_timeline_priority_mix",

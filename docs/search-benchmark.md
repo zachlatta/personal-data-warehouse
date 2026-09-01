@@ -1,6 +1,14 @@
 # Labeled retrieval benchmark
 
-`search_benchmark` measures **where a known-correct answer actually ranks**. Labels are
+`search_benchmark` measures **where a known-correct answer actually ranks**. Every case is
+issued twice: once over all priority tiers (the product default) and once over the
+catalog-defined attention scope. The report retains each hit's priority and shows paired
+latency, MRR/hit@k, and the count and rate of all-tier finds lost by the attention filter.
+This measures the default tradeoff before changing it; it does not make the attention scope
+a global default. A response whose echoed scope does not match the requested half of the pair
+is recorded as an error rather than silently benchmarked under the wrong scope.
+
+Labels are
 produced independently of the ranker, so unlike the replay evaluator it can measure a
 retriever that is *better* than the incumbent, not only one that regressed.
 
@@ -57,7 +65,7 @@ flag this way at 25-30s and measure 5-8s warm.
 
 **Run it in parallel.** A single hybrid call takes tens of seconds against the production
 corpus, so a serial pass over a few dozen queries takes half an hour. `--workers` fans the
-calls out and identical `(query, mode)` pairs are executed once. Wall clock drops roughly
+calls out and identical `(query, mode, priority scope)` tuples are executed once. Wall clock drops roughly
 an order of magnitude.
 
 The cost of that: **timings collected under concurrency are not single-user latency**. The
@@ -115,7 +123,9 @@ per query so the exclusion is auditable rather than silent.
 ## Metrics
 
 `hit@1`, `hit@5`, `hit@10`, `found@depth`, `MRR`, and median rank when found — overall and
-per stratum, per mode. A result counts as relevant when it matches a labeled ref, satisfies
+per stratum, per mode. `priority_scope_comparison` adds the all-tier and attention-tier
+metrics, recall lost/gained/retained, MRR delta, and paired latency. Each case records
+`relevant_priority` and its returned priority mix. A result counts as relevant when it matches a labeled ref, satisfies
 the predicate, or is a neighbouring event in the same `(source, context)` window within an
 hour. That last allowance exists because the semantic branch chunks chat into per-hour
 windows and can legitimately return a different message from the window holding the answer;

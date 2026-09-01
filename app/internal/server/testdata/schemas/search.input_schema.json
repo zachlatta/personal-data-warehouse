@@ -10,7 +10,7 @@
       "type": "string"
     },
     "priorities": {
-      "description": "optional attention tiers: self (Zach initiated it), direct (a real person reaching him directly), cc (real-people activity he is peripheral to), noise (bulk/automated), background (warehouse machinery); default is every tier and an unknown token errors listing the valid set",
+      "description": "optional values from the timeline priority contract; omit to search every tier; an unknown token errors listing the valid set",
       "items": {
         "type": "string"
       },

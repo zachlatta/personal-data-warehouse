@@ -7,22 +7,18 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { PRIORITIES, search, splitRef, type Priority, type SearchHit, type SearchMode, type SearchResult } from '@/lib/api';
+import { effectiveMobileSearchPriorities, MOBILE_DEFAULT_SEARCH_PRIORITIES, PRIORITIES, search, splitRef, type Priority, type SearchHit, type SearchMode, type SearchResult } from '@/lib/api';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
 
 const MODES: SearchMode[] = ['hybrid', 'keyword', 'exact'];
-// Attention tiers by default, same reasoning as the timeline: noise is most
-// of the corpus and is what a search comes back full of otherwise.
-const DEFAULT_TIERS: Priority[] = ['self', 'direct', 'cc'];
-
 export default function SearchScreen() {
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState<SearchMode>('hybrid');
-  const [tiers, setTiers] = useState<Priority[]>(DEFAULT_TIERS);
+  const [tiers, setTiers] = useState<Priority[]>(MOBILE_DEFAULT_SEARCH_PRIORITIES);
   const [result, setResult] = useState<SearchResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,7 +39,7 @@ export default function SearchScreen() {
           mode: override?.mode ?? mode,
           max_results: 30,
           // Every tier selected means no filter: unclassified rows are then reachable too.
-          priorities: useTiers.length === PRIORITIES.length ? undefined : useTiers,
+          priorities: effectiveMobileSearchPriorities(useTiers),
         });
         if (gen !== generation.current) return;
         setResult(res);
@@ -59,7 +55,7 @@ export default function SearchScreen() {
 
   const toggleTier = (tier: Priority) => {
     const next = tiers.includes(tier) ? tiers.filter((t) => t !== tier) : [...tiers, tier];
-    const ordered = next.length === 0 ? DEFAULT_TIERS : PRIORITIES.filter((p) => next.includes(p));
+    const ordered = next.length === 0 ? MOBILE_DEFAULT_SEARCH_PRIORITIES : PRIORITIES.filter((p) => next.includes(p));
     setTiers(ordered);
     if (result) void run({ tiers: ordered });
   };
@@ -156,7 +152,7 @@ export default function SearchScreen() {
             </ThemedText>
           ) : null
         }
-        ListFooterComponent={result && result.rows.length > 0 ? <ThemedText type="small" themeColor="textSecondary" style={styles.footer}>{result.total_rows} hits · {result.mode}</ThemedText> : null}
+        ListFooterComponent={result ? <ThemedText type="small" themeColor="textSecondary" style={styles.footer}>{result.total_rows} hits · {result.mode} · scope {result.priority_scope === 'all' ? 'all tiers' : result.selected_priorities.join(', ')}</ThemedText> : null}
       />
     </ThemedView>
   );

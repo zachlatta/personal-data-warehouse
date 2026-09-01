@@ -296,7 +296,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 // attention first. 'unclassified' is intentionally omitted: every adapter emits
 // a real tier, so it only appears transiently on not-yet-synced rows and never
 // needs a sidebar filter chip.
-var timelinePriorityCatalog = []string{"self", "direct", "cc", "noise", "background"}
+var timelinePriorityCatalog = warehouse.TimelinePriorityTierNames()
 
 // handleSources serves the sidebar's counts. The aggregates behind them scan
 // the whole timeline (minutes on a cold multi-GB table), so the handler never

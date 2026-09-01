@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.search_benchmark import BenchmarkCase, ResultRow
 from personal_data_warehouse.search_benchmark_runner import (
+    AppSearchClient,
     SearchBenchmarkRun,
     SearchBenchmarkRunner,
     label_rows_to_cases,
@@ -15,15 +16,93 @@ from tests.test_postgres_warehouse import warehouse  # noqa: F401 - fixture
 
 
 class FakeClient:
-    def __init__(self, hits: dict[str, list[str]], seconds: float = 0.4) -> None:
+    def __init__(self, hits: dict, seconds: float = 0.4) -> None:
         self.hits = hits
         self.seconds = seconds
-        self.calls: list[tuple[str, str, int]] = []
+        self.calls: list[tuple[str, str, int, tuple[str, ...]]] = []
 
-    def search(self, query, *, mode, max_results, sources=(), since=""):
-        self.calls.append((query, mode, max_results))
-        refs = self.hits.get(query, [])
-        return [ResultRow(ref=ref, source="gmail") for ref in refs], self.seconds
+    def search(self, query, *, mode, max_results, sources=(), since="", priorities=()):
+        scope = tuple(priorities)
+        self.calls.append((query, mode, max_results, scope))
+        refs = self.hits.get((query, scope), self.hits.get(query, []))
+        elapsed = self.seconds * (0.5 if scope else 1.0)
+        return [ResultRow(ref=ref, source="gmail", priority="self") for ref in refs], elapsed
+
+
+def test_app_search_client_sends_scope_and_retains_hit_priority() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "data": {
+                    "priority_scope": "selected",
+                    "selected_priorities": ["self", "direct", "cc"],
+                    "rows": [
+                        {
+                            "ref": "agent_turn:bg",
+                            "source": "agent",
+                            "priority": "background",
+                        }
+                    ]
+                }
+            }
+
+    class Session:
+        def __init__(self) -> None:
+            self.payload = None
+
+        def post(self, _url, *, json, headers, timeout):
+            self.payload = json
+            return Response()
+
+    session = Session()
+    client = AppSearchClient(
+        base_url="https://warehouse.example",
+        secret_token="secret",
+        session=session,
+    )
+    rows, elapsed = client.search(
+        "prior conclusion",
+        mode="hybrid",
+        max_results=20,
+        priorities=("self", "direct", "cc"),
+    )
+
+    assert session.payload["priorities"] == ["self", "direct", "cc"]
+    assert rows[0].priority == "background"
+    assert elapsed >= 0
+
+
+def test_app_search_client_rejects_a_scope_mismatch() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": {"priority_scope": "all", "selected_priorities": [], "rows": []}}
+
+    class Session:
+        def post(self, _url, **_kwargs):
+            return Response()
+
+    client = AppSearchClient(
+        base_url="https://warehouse.example",
+        secret_token="secret",
+        session=Session(),
+    )
+    try:
+        client.search(
+            "prior conclusion",
+            mode="hybrid",
+            max_results=20,
+            priorities=("self", "direct", "cc"),
+        )
+    except RuntimeError as error:
+        assert "scope" in str(error).lower()
+    else:
+        raise AssertionError("scope mismatch was silently benchmarked")
 
 
 def test_labels_round_trip_through_the_private_table(warehouse: PostgresWarehouse) -> None:
@@ -64,11 +143,49 @@ def test_runner_measures_latency_and_mrr_and_writes_a_health_row(warehouse: Post
     assert result.hit_at_5 == 1 and result.hit_at_1 == 0
     assert result.mrr_milli == 250  # (1/2 + 0) / 2
     assert result.errors == 0
+    assert result.attention_probe_queries == 2
+    assert result.attention_latency_p50_ms == 125
+    assert result.attention_labeled_cases == 2
+    assert result.attention_comparable_cases == 2
+    assert result.attention_found == 1
+    assert result.attention_recall_lost == 0
 
     row = warehouse._query_dicts("SELECT * FROM @marts_search_benchmark")[0]
     assert row["mode"] == "hybrid"
     assert row["status"] == "attention"  # MRR 0.25 is under the 0.30 floor
     assert float(row["mrr"]) == 0.25
+    assert float(row["attention_mrr"]) == 0.25
+    assert int(row["attention_latency_p50_delta_ms"]) == -125
+
+
+def test_runner_pairs_all_and_attention_and_measures_recall_loss(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.publish_search_benchmark_labels([
+        BenchmarkCase(query="background answer", stratum="agent", verdict="FOUND",
+                      truth_refs=("agent_turn:bg",), truth_predicate=None, ambiguous=False, note=""),
+        BenchmarkCase(query="direct answer", stratum="gmail", verdict="FOUND",
+                      truth_refs=("gmail_email:self",), truth_predicate=None, ambiguous=False, note=""),
+    ])
+    attention = ("self", "direct", "cc")
+    client = FakeClient({
+        ("background answer", ()): ["agent_turn:bg"],
+        ("background answer", attention): [],
+        ("direct answer", ()): ["gmail_email:self"],
+        ("direct answer", attention): ["gmail_email:self"],
+    }, seconds=0.4)
+    result = SearchBenchmarkRunner(
+        warehouse=warehouse, client=client, probe_queries=("probe",)
+    ).run()
+
+    assert result.found == 2 and result.attention_found == 1
+    assert result.attention_recall_lost == 1
+    assert result.attention_recall_retained == 1
+    assert result.attention_recall_gained == 0
+    assert {scope for _, _, _, scope in client.calls} == {(), attention}
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_benchmark")[0]
+    assert float(row["attention_recall_loss_rate"]) == 0.5
 
 
 def test_benchmark_view_judges_latency_and_staleness(warehouse: PostgresWarehouse) -> None:
@@ -82,7 +199,11 @@ def test_benchmark_view_judges_latency_and_staleness(warehouse: PostgresWarehous
         return SearchBenchmarkRun(**base)
 
     warehouse.write_search_benchmark_runs([run()], collected_at=now)
-    assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "ok"
+    first = warehouse._query_dicts(
+        "SELECT status, attention_latency_p50_delta_ms FROM @marts_search_benchmark"
+    )[0]
+    assert first["status"] == "ok"
+    assert first["attention_latency_p50_delta_ms"] is None
     warehouse.write_search_benchmark_runs([run(latency_p50_ms=4200)], collected_at=now + timedelta(seconds=1))
     assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "attention"
     warehouse.write_search_benchmark_runs([run(labeled_cases=0, found=0, mrr_milli=0, note="no labels")], collected_at=now + timedelta(seconds=2))
@@ -95,7 +216,7 @@ def test_runner_says_when_every_latency_probe_failed(warehouse: PostgresWarehous
     warehouse.ensure_pipeline_health_tables()
 
     class FailingClient:
-        def search(self, query, *, mode, max_results, sources=(), since=""):
+        def search(self, query, *, mode, max_results, sources=(), since="", priorities=()):
             raise RuntimeError("statement timeout")
 
     result = SearchBenchmarkRunner(warehouse=warehouse, client=FailingClient(), probe_queries=("a", "b")).run()

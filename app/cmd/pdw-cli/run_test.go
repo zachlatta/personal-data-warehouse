@@ -996,3 +996,27 @@ func TestSearchCommandSendsPriorityTiers(t *testing.T) {
 		t.Fatalf("text output must show the hit's priority tier:\n%s", out)
 	}
 }
+
+func TestSearchCommandPrintsTheEffectiveScopeAndReturnedMix(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget","mode":"hybrid","priority_scope":"selected","selected_priorities":["self","direct"],"returned_priority_counts":{"self":1,"direct":2},"hint_codes":[],"suggested_priorities":[],"total_rows":3,"rows":[]}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "search", "budget", "--priority", "self,direct")
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d stderr=%q stdout=%q", code, errOut, out)
+	}
+	if !strings.Contains(out, "Scope: self, direct") {
+		t.Fatalf("selected scope is not visible:\n%s", out)
+	}
+	if !strings.Contains(out, "Returned priorities: self=1, direct=2") {
+		t.Fatalf("returned mix is not visible:\n%s", out)
+	}
+
+	srvAll := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget","mode":"hybrid","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{},"hint_codes":[],"suggested_priorities":[],"total_rows":0,"rows":[]}}`)
+	})
+	out, errOut, code = runCLI(t, srvAll.URL, "", "search", "budget")
+	if code != 0 || errOut != "" || !strings.Contains(out, "Scope: all tiers") {
+		t.Fatalf("all-tier scope is not visible: code=%d stderr=%q stdout=%q", code, errOut, out)
+	}
+}

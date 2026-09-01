@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -87,9 +88,10 @@ const searchLongBagMinWords = 7
 // audit of 14 days of agent sessions found the priorities filter on 6% of
 // search calls. Measured on this response, not asserted in general: the hint
 // only appears when more than half of what came back is in those two tiers.
-const searchAttentionHint = "Most of these hits are noise/background (bulk mail, bots, the warehouse's " +
+var searchAttentionHint = "Most of these hits are noise/background (bulk mail, bots, the warehouse's " +
 	"own machinery). If the question is about attention or people rather than the whole corpus, " +
-	"re-issue with priorities [\"self\",\"direct\",\"cc\"] to search only what a person sent or received."
+	"re-issue with priorities [\"" + strings.Join(warehouse.TimelineAttentionPriorities(), "\",\"") +
+	"\"] to search only what a person sent or received."
 
 // searchAttentionHintFor returns the attention hint when it applies to this
 // result set, or "". A scoped call already chose its tiers; a tiny result set
@@ -168,6 +170,16 @@ func searchHintFor(query string) string {
 	}
 	if searchQueryIsLongUnanchoredBag(query) {
 		return searchLongBagHint
+	}
+	return ""
+}
+
+func searchHintCodeFor(query string) string {
+	if searchQueryIsSentence(query) {
+		return "rephrase_sentence_query"
+	}
+	if searchQueryIsLongUnanchoredBag(query) {
+		return "shorten_unanchored_query"
 	}
 	return ""
 }
@@ -274,7 +286,7 @@ const (
 // here means a mistyped tier costs no round trip and the error can name the
 // tiers that exist. Use SearchPriorityTiers when the question is "what are the
 // tiers" rather than "is this accepted".
-var SearchPriorities = []string{"self", "direct", "cc", "noise", "background", "unclassified"}
+var SearchPriorities = warehouse.TimelinePriorityAcceptedNames()
 
 // SearchPriorityTiers are the five real attention tiers. 'unclassified' is
 // deliberately not one of them: it is the fail-loud sentinel for a row an
@@ -282,7 +294,12 @@ var SearchPriorities = []string{"self", "direct", "cc", "noise", "background", "
 // Scoping a search to it is how a classification outage is FOUND, so it stays
 // accepted -- but an error that lists it beside the five, as this one used to,
 // teaches the caller it is a sixth tier.
-var SearchPriorityTiers = []string{"self", "direct", "cc", "noise", "background"}
+var SearchPriorityTiers = warehouse.TimelinePriorityTierNames()
+
+// SearchAttentionPriorities is the recommended correspondence/attention scope.
+// It is guidance, never a global default: broad discovery still searches all
+// tiers unless the caller uses the one priorities mechanism explicitly.
+var SearchAttentionPriorities = warehouse.TimelineAttentionPriorities()
 
 // validateSearchPriorities returns an error naming the valid set on the first
 // unknown token. Silently dropping it would be the worst outcome: the caller
@@ -294,8 +311,10 @@ func validateSearchPriorities(priorities []string) error {
 			continue
 		}
 		return fmt.Errorf("unknown priority %q; the attention tiers are %s (most attention first). "+
-			"'unclassified' is also accepted, but it is a fail-loud sentinel for rows an adapter has not classified, not a sixth tier",
-			priority, strings.Join(SearchPriorityTiers, ", "))
+			"%q is also accepted, but it is %s, not a sixth tier",
+			priority, strings.Join(SearchPriorityTiers, ", "),
+			warehouse.TimelinePriorities.Sentinel.Name,
+			warehouse.TimelinePriorities.Sentinel.Meaning)
 	}
 	return nil
 }
@@ -317,16 +336,21 @@ type SearchRequest struct {
 // actually executed; FallbackReason is set when hybrid was requested but the
 // keyword path ran instead; Hint carries retrieval advice for the NEXT call.
 type SearchResponse struct {
-	Query          string            `json:"query"`
-	Mode           string            `json:"mode"`
-	FallbackReason string            `json:"fallback_reason,omitempty"`
-	Hint           string            `json:"hint,omitempty"`
-	Guidance       string            `json:"guidance,omitempty"`
-	TotalRows      int               `json:"total_rows"`
-	ColumnNames    []string          `json:"column_names,omitempty"`
-	Rows           any               `json:"rows,omitempty"`
-	Truncations    []FieldTruncation `json:"truncations,omitempty"`
-	Error          string            `json:"error,omitempty"`
+	Query                  string            `json:"query"`
+	Mode                   string            `json:"mode"`
+	PriorityScope          string            `json:"priority_scope"`
+	SelectedPriorities     []string          `json:"selected_priorities"`
+	ReturnedPriorityCounts map[string]int    `json:"returned_priority_counts"`
+	HintCodes              []string          `json:"hint_codes"`
+	SuggestedPriorities    []string          `json:"suggested_priorities"`
+	FallbackReason         string            `json:"fallback_reason,omitempty"`
+	Hint                   string            `json:"hint,omitempty"`
+	Guidance               string            `json:"guidance,omitempty"`
+	TotalRows              int               `json:"total_rows"`
+	ColumnNames            []string          `json:"column_names,omitempty"`
+	Rows                   any               `json:"rows,omitempty"`
+	Truncations            []FieldTruncation `json:"truncations,omitempty"`
+	Error                  string            `json:"error,omitempty"`
 }
 
 // Search runs one retrieval call against the timeline corpus. Hybrid mode
@@ -335,7 +359,17 @@ type SearchResponse struct {
 // failing, because a working keyword answer beats an error about
 // infrastructure the caller cannot fix mid-question.
 func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse {
-	resp := SearchResponse{Query: strings.TrimSpace(req.Query)}
+	resp := SearchResponse{
+		Query:                  strings.TrimSpace(req.Query),
+		PriorityScope:          warehouse.TimelinePriorities.DefaultScope,
+		SelectedPriorities:     append([]string{}, req.Priorities...),
+		ReturnedPriorityCounts: map[string]int{},
+		HintCodes:              []string{},
+		SuggestedPriorities:    []string{},
+	}
+	if len(req.Priorities) > 0 {
+		resp.PriorityScope = "selected"
+	}
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
 	if mode == "" {
 		mode = SearchModeHybrid
@@ -352,6 +386,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		return resp
 	}
 	if err := validateSearchPriorities(req.Priorities); err != nil {
+		resp.PriorityScope = "invalid"
 		resp.Error = err.Error()
 		return resp
 	}
@@ -367,6 +402,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	// Phrasing advice is about the query, not about which retriever ran, so it
 	// is set before the mode is decided and survives the keyword fallback.
 	resp.Hint = searchHintFor(resp.Query)
+	if code := searchHintCodeFor(resp.Query); code != "" {
+		resp.HintCodes = append(resp.HintCodes, code)
+	}
 
 	var sources any
 	if len(req.Sources) > 0 {
@@ -423,8 +461,15 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	resp.ColumnNames = append([]string(nil), raw.Columns...)
 	resp.TotalRows = len(raw.Rows)
+	for _, row := range raw.Rows {
+		if priority := strings.TrimSpace(fmt.Sprint(row["priority"])); priority != "" && priority != "<nil>" {
+			resp.ReturnedPriorityCounts[priority]++
+		}
+	}
 	if attention := searchAttentionHintFor(req.Priorities, raw.Rows); attention != "" {
 		resp.Hint = strings.TrimSpace(resp.Hint + " " + attention)
+		resp.HintCodes = append(resp.HintCodes, "consider_attention_scope")
+		resp.SuggestedPriorities = append(resp.SuggestedPriorities, SearchAttentionPriorities...)
 	}
 	if resp.TotalRows == 0 {
 		resp.Guidance = searchEmptyGuidance

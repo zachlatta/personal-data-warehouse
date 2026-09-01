@@ -100,9 +100,66 @@ class StartHere:
     lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class TimelinePriorityTier:
+    """One real timeline attention tier, in enum declaration order."""
+
+    name: str
+    meaning: str
+    typical_rows: str
+
+
+@dataclass(frozen=True)
+class TimelinePrioritySelection:
+    """A canonical example mapping a search intent onto the one scope knob."""
+
+    intent: str
+    priorities: tuple[str, ...]
+    guidance: str
+
+
+@dataclass(frozen=True)
+class TimelinePriorityContract:
+    """Machine-readable priority meanings and scope-selection guidance."""
+
+    default_scope: str
+    attention_priorities: tuple[str, ...]
+    optimized_bm25_priorities: tuple[str, ...]
+    tiers: tuple[TimelinePriorityTier, ...]
+    sentinel: TimelinePriorityTier
+    selection_guide: tuple[TimelinePrioritySelection, ...]
+
+
 class WarehouseCatalog:
     def __init__(self, payload: dict) -> None:
         self.version: int = int(payload["version"])
+        priorities = payload["timeline_priorities"]
+        self.timeline_priorities = TimelinePriorityContract(
+            default_scope=priorities["default_scope"],
+            attention_priorities=tuple(priorities["attention_priorities"]),
+            optimized_bm25_priorities=tuple(priorities["optimized_bm25_priorities"]),
+            tiers=tuple(
+                TimelinePriorityTier(
+                    name=row["name"],
+                    meaning=row["meaning"],
+                    typical_rows=row["typical_rows"],
+                )
+                for row in priorities["tiers"]
+            ),
+            sentinel=TimelinePriorityTier(
+                name=priorities["sentinel"]["name"],
+                meaning=priorities["sentinel"]["meaning"],
+                typical_rows=priorities["sentinel"]["typical_rows"],
+            ),
+            selection_guide=tuple(
+                TimelinePrioritySelection(
+                    intent=row["intent"],
+                    priorities=tuple(row["priorities"]),
+                    guidance=row["guidance"],
+                )
+                for row in priorities["selection_guide"]
+            ),
+        )
         start = payload["start_here"]
         self.start_here = StartHere(
             schema=start["schema"],
@@ -202,6 +259,42 @@ class WarehouseCatalog:
         seen_ids: set[str] = set()
         seen_physical: set[tuple[str, str, str]] = set()
         schema_names = {schema.name for schema in self.schemas}
+
+        priority_contract = self.timeline_priorities
+        priority_names = tuple(tier.name for tier in priority_contract.tiers)
+        if priority_contract.default_scope != "all":
+            raise ValueError("timeline priority default_scope must be 'all'")
+        if len(priority_names) != len(set(priority_names)) or not priority_names:
+            raise ValueError("timeline priority tier names must be non-empty and unique")
+        for tier in (*priority_contract.tiers, priority_contract.sentinel):
+            if not tier.name or not tier.meaning.strip() or not tier.typical_rows.strip():
+                raise ValueError(f"timeline priority {tier.name!r} needs complete documentation")
+        if priority_contract.sentinel.name in priority_names:
+            raise ValueError("timeline priority sentinel must not be a real tier")
+        real_tiers = set(priority_names)
+        for field_name, selected in (
+            ("attention_priorities", priority_contract.attention_priorities),
+            ("optimized_bm25_priorities", priority_contract.optimized_bm25_priorities),
+        ):
+            if not selected or len(selected) != len(set(selected)) or not set(selected) <= real_tiers:
+                raise ValueError(f"timeline priority {field_name} must be a unique non-empty tier subset")
+        if priority_contract.attention_priorities != priority_names[
+            : len(priority_contract.attention_priorities)
+        ]:
+            raise ValueError("timeline attention priorities must be a most-attention-first prefix")
+        if not set(priority_contract.optimized_bm25_priorities) <= set(
+            priority_contract.attention_priorities
+        ):
+            raise ValueError("optimized BM25 priorities must be attention priorities")
+        selection_intents: set[str] = set()
+        for entry in priority_contract.selection_guide:
+            if not entry.intent.strip() or entry.intent in selection_intents:
+                raise ValueError("timeline priority selection intents must be non-empty and unique")
+            selection_intents.add(entry.intent)
+            if len(entry.priorities) != len(set(entry.priorities)) or not set(entry.priorities) <= real_tiers:
+                raise ValueError(f"timeline priority selection {entry.intent!r} names an unknown tier")
+            if not entry.guidance.strip():
+                raise ValueError(f"timeline priority selection {entry.intent!r} needs guidance")
 
         for schema in self.schemas:
             _check_identifier(schema.name)

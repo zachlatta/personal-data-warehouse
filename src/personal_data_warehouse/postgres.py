@@ -265,7 +265,9 @@ SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME = 3
 # bytes (1,451 MB of 18.4 GB), so the partial index is a fraction of the global
 # index rather than a second copy of it. Adding `cc` would pull in 6.9M more
 # rows and most of that argument.
-SEARCH_TEXT_ATTENTION_PRIORITIES: tuple[str, ...] = ("self", "direct")
+SEARCH_TEXT_ATTENTION_PRIORITIES: tuple[str, ...] = (
+    CATALOG.timeline_priorities.optimized_bm25_priorities
+)
 SEARCH_TEXT_ATTENTION_PRIORITIES_SQL = ", ".join(
     f"'{priority}'" for priority in SEARCH_TEXT_ATTENTION_PRIORITIES
 )
@@ -2274,6 +2276,22 @@ INTEGER_COLUMNS = {
     "hit_at_10",
     "mrr_milli",
     "errors",
+    "attention_probe_queries",
+    "attention_latency_p50_ms",
+    "attention_latency_p90_ms",
+    "attention_latency_max_ms",
+    "attention_labeled_cases",
+    "attention_comparable_cases",
+    "attention_found",
+    "attention_hit_at_1",
+    "attention_hit_at_5",
+    "attention_hit_at_10",
+    "attention_mrr_milli",
+    "attention_errors",
+    "attention_recall_lost",
+    "attention_recall_gained",
+    "attention_recall_retained",
+    "all_relevant_lower_tier",
     "cpu_count",
     "window_days",
     "sessions",
@@ -2284,6 +2302,13 @@ INTEGER_COLUMNS = {
     "first_invented",
     "search_calls",
     "search_with_priority",
+    "search_attention_only",
+    "search_including_lower_tiers",
+    "search_noop_priority",
+    "search_invalid_or_failed_priority",
+    "bulk_hints_shown",
+    "bulk_hint_scoped_retries",
+    "bulk_hint_improved_retries",
     "sql_calls",
     "sql_base_only",
     "sql_error_sessions",
@@ -4967,12 +4992,22 @@ class PostgresWarehouse:
             rated AS (
                 SELECT source, window_days, sessions, pdw_sessions,
                        first_search, first_schema, first_sql, first_invented,
-                       search_calls, search_with_priority, sql_calls, sql_base_only,
+                       search_calls, search_with_priority, search_attention_only,
+                       search_including_lower_tiers, search_noop_priority,
+                       search_invalid_or_failed_priority, bulk_hints_shown,
+                       bulk_hint_scoped_retries, bulk_hint_improved_retries,
+                       sql_calls, sql_base_only,
                        sql_error_sessions, sql_timeouts, invented_calls, admin_calls,
                        newest_session AS newest_session_at,
                        collected AS collected_at,
                        CASE WHEN pdw_sessions > 0 THEN round(first_search::numeric / pdw_sessions, 3) END AS search_first_rate,
                        CASE WHEN search_calls > 0 THEN round(search_with_priority::numeric / search_calls, 3) END AS priority_filter_rate,
+                       CASE WHEN search_calls > 0 THEN round(search_attention_only::numeric / search_calls, 3) END AS attention_scope_rate,
+                       CASE WHEN search_calls > 0 THEN round(search_including_lower_tiers::numeric / search_calls, 3) END AS lower_tier_scope_rate,
+                       CASE WHEN search_calls > 0 THEN round(search_noop_priority::numeric / search_calls, 3) END AS noop_priority_rate,
+                       CASE WHEN search_calls > 0 THEN round(search_invalid_or_failed_priority::numeric / search_calls, 3) END AS invalid_or_failed_priority_rate,
+                       CASE WHEN bulk_hints_shown > 0 THEN round(bulk_hint_scoped_retries::numeric / bulk_hints_shown, 3) END AS bulk_hint_retry_rate,
+                       CASE WHEN bulk_hint_scoped_retries > 0 THEN round(bulk_hint_improved_retries::numeric / bulk_hint_scoped_retries, 3) END AS bulk_hint_improvement_rate,
                        CASE WHEN sql_calls > 0 THEN round(sql_base_only::numeric / sql_calls, 3) END AS sql_base_only_rate,
                        CASE WHEN pdw_sessions > 0 THEN round(sql_error_sessions::numeric / pdw_sessions, 3) END AS sql_error_session_rate
                 FROM measured
@@ -5012,6 +5047,23 @@ class PostgresWarehouse:
                    labeled_cases, found, hit_at_1, hit_at_5, hit_at_10,
                    round(mrr_milli / 1000.0, 3) AS mrr,
                    errors, NULLIF(note, '') AS note,
+                   attention_priorities_json, attention_probe_queries,
+                   attention_latency_p50_ms, attention_latency_p90_ms,
+                   attention_latency_max_ms, attention_labeled_cases,
+                   attention_comparable_cases,
+                   attention_found, attention_hit_at_1, attention_hit_at_5,
+                   attention_hit_at_10,
+                   round(attention_mrr_milli / 1000.0, 3) AS attention_mrr,
+                   attention_errors, attention_recall_lost,
+                   attention_recall_gained, attention_recall_retained,
+                   all_relevant_lower_tier,
+                   CASE WHEN probe_queries > 0 AND attention_probe_queries > 0
+                        THEN attention_latency_p50_ms - latency_p50_ms
+                   END AS attention_latency_p50_delta_ms,
+                   CASE WHEN attention_recall_lost + attention_recall_retained > 0
+                        THEN round(attention_recall_lost::numeric /
+                             (attention_recall_lost + attention_recall_retained), 3)
+                   END AS attention_recall_loss_rate,
                    io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count,
                    -- C6: was the host being used while the probes ran? io_bound
                    -- and cpu_bound say the machine was busy; `idle` is the case
@@ -11311,7 +11363,9 @@ class PostgresWarehouse:
     # the valid set, the same contract `sources` has, because the silent
     # alternative is a search that quietly widens back to the whole corpus and
     # answers a different question than the one asked.
-    _SEARCH_PRIORITY_TOKENS = ("self", "direct", "cc", "noise", "background", "unclassified")
+    _SEARCH_PRIORITY_TOKENS = tuple(
+        tier.name for tier in CATALOG.timeline_priorities.tiers
+    ) + (CATALOG.timeline_priorities.sentinel.name,)
 
     def _ensure_search_views_if_possible(self) -> None:
         # Several Dagster assets can call ensure_* concurrently on deploy. The

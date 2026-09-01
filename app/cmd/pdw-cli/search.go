@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 const cliSearchDefaultMaxResults = 20
@@ -28,14 +30,19 @@ func (s *searchSourcesFlag) Set(value string) error {
 }
 
 type cliSearchResponse struct {
-	Query          string         `json:"query"`
-	Mode           string         `json:"mode"`
-	FallbackReason string         `json:"fallback_reason,omitempty"`
-	Hint           string         `json:"hint,omitempty"`
-	Guidance       string         `json:"guidance,omitempty"`
-	TotalRows      int            `json:"total_rows"`
-	Rows           []cliSearchHit `json:"rows,omitempty"`
-	Error          string         `json:"error,omitempty"`
+	Query                  string         `json:"query"`
+	Mode                   string         `json:"mode"`
+	PriorityScope          string         `json:"priority_scope"`
+	SelectedPriorities     []string       `json:"selected_priorities"`
+	ReturnedPriorityCounts map[string]int `json:"returned_priority_counts"`
+	HintCodes              []string       `json:"hint_codes"`
+	SuggestedPriorities    []string       `json:"suggested_priorities"`
+	FallbackReason         string         `json:"fallback_reason,omitempty"`
+	Hint                   string         `json:"hint,omitempty"`
+	Guidance               string         `json:"guidance,omitempty"`
+	TotalRows              int            `json:"total_rows"`
+	Rows                   []cliSearchHit `json:"rows,omitempty"`
+	Error                  string         `json:"error,omitempty"`
 }
 
 type cliSearchHit struct {
@@ -53,7 +60,7 @@ type cliSearchHit struct {
 // undiscoverable from the command itself -- which is a large part of why
 // --priority was used six times in a month of real agent sessions while it
 // silently worked the whole time.
-const searchUsage = `pdw search - hybrid search across every synced source.
+var searchUsage = `pdw search - hybrid search across every synced source.
 
 USAGE
   pdw search [flags] QUERY...
@@ -69,19 +76,14 @@ FLAGS
                        (alias: --sources)
   --priority TIERS     Attention tiers, comma-separated; repeatable.
                        (alias: --priorities)
-                         self        Zach initiated it
-                         direct      a real person reaching him directly
-                         cc          real-people activity he is peripheral to
-                         noise       bulk or automated traffic
-                         background  the warehouse's own machinery
-                       Omitting it searches every tier. "What needs my
-                       attention" means self,direct,cc -- noise is most of the
-                       corpus, so leaving it in is usually why a search returns
-                       junk. (unclassified is also accepted, but it is a
-                       fail-loud sentinel for rows an adapter has not
-                       classified, not a sixth tier.)
+` + warehouse.TimelinePriorityHelpLines("                         ") + `
+                       Omitting it searches every tier. ` + warehouse.TimelinePriorities.Sentinel.Name + ` is also
+                       accepted for diagnosis, but is not a sixth tier: ` + warehouse.TimelinePriorities.Sentinel.Meaning + `.
   --since TIME         Lower event-time bound, e.g. 2026-08-01.
   --output FMT         text (default) or json.
+
+SCOPE GUIDE
+` + warehouse.TimelinePrioritySelectionHelpLines("  ") + `
 
 EXAMPLES
   pdw search 'runway burn rate months cash remaining'
@@ -112,7 +114,7 @@ func newSearchFlagSet(opts *searchOptions) *flag.FlagSet {
 	fs.StringVar(&opts.output, "output", "text", "text or json")
 	fs.Var(&opts.sources, "source", "source aliases, comma-separated; repeatable")
 	fs.Var(&opts.sources, "sources", "alias for --source")
-	fs.Var(&opts.priorities, "priority", "attention tiers (self, direct, cc, noise, background), comma-separated; repeatable")
+	fs.Var(&opts.priorities, "priority", "attention tiers ("+strings.Join(warehouse.TimelinePriorityTierNames(), ", ")+"), comma-separated; repeatable")
 	fs.Var(&opts.priorities, "priorities", "alias for --priority")
 	return fs
 }
@@ -165,6 +167,25 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, "pdw search:", resp.Error)
 		return 1
 	}
+	// A new CLI may briefly talk to an older server during a rolling deploy.
+	// The request still tells us the effective scope, and hit priorities can
+	// reconstruct the returned mix, so text output never regresses to silence.
+	if resp.PriorityScope == "" {
+		if len(opts.priorities) > 0 {
+			resp.PriorityScope = "selected"
+			resp.SelectedPriorities = append([]string(nil), opts.priorities...)
+		} else {
+			resp.PriorityScope = "all"
+		}
+	}
+	if resp.ReturnedPriorityCounts == nil {
+		resp.ReturnedPriorityCounts = map[string]int{}
+		for _, hit := range resp.Rows {
+			if hit.Priority != "" {
+				resp.ReturnedPriorityCounts[hit.Priority]++
+			}
+		}
+	}
 	if opts.output == "json" {
 		pretty, err := prettyJSON(raw)
 		if err != nil {
@@ -215,6 +236,14 @@ func printSearchText(w io.Writer, resp cliSearchResponse) {
 		noun = "result"
 	}
 	fmt.Fprintf(w, "Search: %q — %d %s (%s)\n", resp.Query, resp.TotalRows, noun, resp.Mode)
+	if resp.PriorityScope == "selected" || resp.PriorityScope == "invalid" {
+		fmt.Fprintf(w, "Scope: %s\n", strings.Join(resp.SelectedPriorities, ", "))
+	} else {
+		fmt.Fprintln(w, "Scope: all tiers")
+	}
+	if counts := orderedPriorityCounts(resp.ReturnedPriorityCounts); len(counts) > 0 {
+		fmt.Fprintf(w, "Returned priorities: %s\n", strings.Join(counts, ", "))
+	}
 	if resp.FallbackReason != "" {
 		fmt.Fprintf(w, "Fallback: %s\n", resp.FallbackReason)
 	}
@@ -236,6 +265,31 @@ func printSearchText(w io.Writer, resp cliSearchResponse) {
 	if resp.Guidance != "" {
 		fmt.Fprintf(w, "\nNext: %s\n", resp.Guidance)
 	}
+}
+
+func orderedPriorityCounts(counts map[string]int) []string {
+	if len(counts) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(counts))
+	seen := make(map[string]bool, len(counts))
+	for _, priority := range warehouse.TimelinePriorityAcceptedNames() {
+		if count, ok := counts[priority]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%d", priority, count))
+			seen[priority] = true
+		}
+	}
+	remaining := make([]string, 0)
+	for priority := range counts {
+		if !seen[priority] {
+			remaining = append(remaining, priority)
+		}
+	}
+	sort.Strings(remaining)
+	for _, priority := range remaining {
+		parts = append(parts, fmt.Sprintf("%s=%d", priority, counts[priority]))
+	}
+	return parts
 }
 
 func nonemptySearchParts(parts ...string) []string {

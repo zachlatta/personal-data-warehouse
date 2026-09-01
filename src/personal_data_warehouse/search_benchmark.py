@@ -21,7 +21,7 @@ and are reported separately from the optional serial latency sample.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -32,6 +32,8 @@ import statistics
 import subprocess
 import time
 
+from personal_data_warehouse.warehouse_catalog import CATALOG
+
 
 DEFAULT_LABELS = Path(".search-eval/ground_truth.json")
 DEFAULT_REPORT = Path(".search-eval/benchmark_report.json")
@@ -41,6 +43,7 @@ DEFAULT_MODES = ("hybrid", "keyword", "exact")
 DEFAULT_DEPTH = 50
 DEFAULT_WORKERS = 8
 SOFT_MATCH_SECONDS = 3600
+ATTENTION_PRIORITIES = CATALOG.timeline_priorities.attention_priorities
 
 HIT_THRESHOLDS = (1, 5, 10)
 # A scoped search slower than this is reported by the smoke check even though
@@ -81,6 +84,7 @@ class ResultRow:
     event_ts: str = ""
     title: str = ""
     text: str = ""
+    priority: str = ""
 
     @property
     def timestamp(self) -> datetime | None:
@@ -98,6 +102,9 @@ class SearchResult:
     fallback_reason: str = ""
     error: str = ""
     elapsed_seconds: float = 0.0
+    priority_scope: str = ""
+    selected_priorities: tuple[str, ...] = ()
+    returned_priority_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -222,6 +229,10 @@ def parse_search_payload(raw: str) -> SearchResult:
         payload = json.loads(raw)
     except (TypeError, ValueError) as error:
         return SearchResult(error=f"invalid JSON response: {error}")
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        payload = payload["data"]
+    if not isinstance(payload, dict):
+        return SearchResult(error="search response is not a JSON object")
     rows = []
     for item in payload.get("rows") or []:
         if not isinstance(item, dict):
@@ -234,13 +245,46 @@ def parse_search_payload(raw: str) -> SearchResult:
                 event_ts=str(item.get("event_ts") or item.get("occurred_at") or ""),
                 title=str(item.get("title") or ""),
                 text=str(item.get("text") or ""),
+                priority=str(item.get("priority") or ""),
             )
         )
     return SearchResult(
         mode=str(payload.get("mode") or ""),
         rows=tuple(rows),
         fallback_reason=str(payload.get("fallback_reason") or ""),
+        error=str(payload.get("error") or ""),
+        priority_scope=str(payload.get("priority_scope") or ""),
+        selected_priorities=tuple(str(value) for value in payload.get("selected_priorities") or ()),
+        returned_priority_counts={
+            str(name): int(count)
+            for name, count in (payload.get("returned_priority_counts") or {}).items()
+        },
     )
+
+
+def priority_scope_error(
+    result: SearchResult, requested_priorities: Sequence[str]
+) -> str:
+    """Explain why a response cannot prove it applied the requested scope."""
+    expected_scope = "selected" if requested_priorities else "all"
+    if result.priority_scope != expected_scope:
+        reported = result.priority_scope or "missing"
+        return (
+            f"search scope mismatch: requested {expected_scope}, response reported {reported}"
+        )
+    expected_priorities = tuple(requested_priorities)
+    if expected_scope == "selected" and result.selected_priorities != expected_priorities:
+        return (
+            "search scope mismatch: requested priorities "
+            f"{list(expected_priorities)!r}, response reported "
+            f"{list(result.selected_priorities)!r}"
+        )
+    if expected_scope == "all" and result.selected_priorities:
+        return (
+            "search scope mismatch: requested all tiers, response reported selected priorities "
+            f"{list(result.selected_priorities)!r}"
+        )
+    return ""
 
 
 def load_cases(path: Path, *, include_not_in_corpus: bool = False) -> list[BenchmarkCase]:
@@ -326,6 +370,51 @@ def summarize(rows: Sequence[dict[str, Any]], *, depth: int) -> dict[str, Any]:
     return {"overall": overall, "by_stratum": by_stratum}
 
 
+def scope_comparison(
+    rows: Sequence[dict[str, Any]], *, modes: Sequence[str], depth: int
+) -> dict[str, Any]:
+    """Paired all-tier versus attention-tier quality, including recall loss."""
+    compared: dict[str, Any] = {}
+    for mode in modes:
+        all_ranks = [row[mode]["rank"] for row in rows]
+        attention_ranks = [row["attention"][mode]["rank"] for row in rows]
+        comparable = [
+            not row[mode].get("error") and not row["attention"][mode].get("error")
+            for row in rows
+        ]
+        all_metrics = _metrics(all_ranks, depth)
+        attention_metrics = _metrics(attention_ranks, depth)
+        lost = sum(
+            1
+            for old, new, valid in zip(all_ranks, attention_ranks, comparable, strict=True)
+            if valid and old and not new
+        )
+        gained = sum(
+            1
+            for old, new, valid in zip(all_ranks, attention_ranks, comparable, strict=True)
+            if valid and not old and new
+        )
+        retained = sum(
+            1
+            for old, new, valid in zip(all_ranks, attention_ranks, comparable, strict=True)
+            if valid and old and new
+        )
+        compared[mode] = {
+            "all": all_metrics,
+            "attention": attention_metrics,
+            "lost_from_all": lost,
+            "gained_over_all": gained,
+            "retained_from_all": retained,
+            "comparable_cases": sum(comparable),
+            "recall_loss_rate": round(lost / (lost + retained), 4)
+            if lost + retained
+            else 0.0,
+            "found_delta": attention_metrics["found"] - all_metrics["found"],
+            "mrr_delta": round(attention_metrics["mrr"] - all_metrics["mrr"], 6),
+        }
+    return compared
+
+
 # --------------------------------------------------------------------------
 # Impure layer: talking to the deployment under test.
 # --------------------------------------------------------------------------
@@ -360,6 +449,7 @@ def _pdw_json(args: list[str], *, timeout: float) -> Any:
 
 def run_search(
     query: str, mode: str, depth: int, *, sources: Sequence[str] = (), since: str = "",
+    priorities: Sequence[str] = (),
     timeout: float = 420.0,
 ) -> SearchResult:
     args = [
@@ -375,6 +465,8 @@ def run_search(
         args.extend(("--source", ",".join(sources)))
     if since:
         args.extend(("--since", since))
+    if priorities:
+        args.extend(("--priority", ",".join(priorities)))
     # A literal identifier can itself begin with "-". Terminate option parsing
     # so the first-class CLI cannot mistake the benchmark query for a flag.
     args.extend(("--", query))
@@ -382,14 +474,22 @@ def run_search(
     try:
         payload = _pdw_json(args, timeout=timeout)
         result = parse_search_payload(json.dumps(payload))
+        if not result.error:
+            scope_error = priority_scope_error(result, priorities)
+        else:
+            scope_error = ""
     except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as error:
         result = SearchResult(mode=mode, error=str(error)[:400])
+        scope_error = ""
     return SearchResult(
         mode=result.mode or mode,
         rows=result.rows,
         fallback_reason=result.fallback_reason,
-        error=result.error,
+        error=result.error or scope_error,
         elapsed_seconds=time.time() - started,
+        priority_scope=result.priority_scope,
+        selected_priorities=result.selected_priorities,
+        returned_priority_counts=result.returned_priority_counts,
     )
 
 
@@ -479,6 +579,19 @@ def capture_environment(*, include_corpus: bool = True) -> dict[str, Any]:
     return env
 
 
+def _latency_summary(values: Sequence[float]) -> dict[str, Any]:
+    if not values:
+        return {}
+    ordered = sorted(values)
+    return {
+        "n": len(ordered),
+        "min": round(ordered[0], 2),
+        "p50": round(statistics.median(ordered), 2),
+        "p90": round(ordered[min(int(len(ordered) * 0.9), len(ordered) - 1)], 2),
+        "max": round(ordered[-1], 2),
+    }
+
+
 def run_benchmark(
     cases: Sequence[BenchmarkCase],
     *,
@@ -488,30 +601,39 @@ def run_benchmark(
     contamination: ContaminationFilter | None = None,
     progress: bool = True,
 ) -> dict[str, Any]:
+    """Score every label under paired all-tier and attention-tier searches."""
     contamination = contamination or ContaminationFilter()
     truth_meta = resolve_truth_metadata(sorted({r for c in cases for r in c.truth_refs}))
     unresolved = sorted({r for c in cases for r in c.truth_refs} - set(truth_meta))
-    # A case whose every ref has left the timeline cannot be answered by any
-    # retriever, so scoring it as a miss charges the ranker for a stale label.
-    # Set it aside and report it; a case that still has one live ref (or a
-    # predicate) is scored on what remains. On 2026-08-26 twelve voice-memo
-    # labels went stale in one day when that adapter's event ids changed
-    # shape, and the aggregate silently read as a 0.15 MRR regression.
     cases, stale_cases = partition_stale_cases(cases, truth_meta)
 
-    # Identical (query, mode) pairs across cases are executed once.  Searches
-    # cost tens of seconds, so the fan-out is what makes this runnable at all.
-    tasks = sorted({(c.query, m, tuple(c.sources), c.since) for c in cases for m in modes})
+    scopes: dict[str, tuple[str, ...]] = {
+        "all": (),
+        "attention": tuple(ATTENTION_PRIORITIES),
+    }
+    tasks = sorted(
+        {
+            (case.query, mode, tuple(case.sources), case.since, priorities)
+            for case in cases
+            for mode in modes
+            for priorities in scopes.values()
+        }
+    )
     done = {"n": 0}
 
-    def execute(task: tuple[str, str, tuple[str, ...], str]) -> tuple[tuple, SearchResult]:
-        query, mode, sources, since = task
-        result = run_search(query, mode, depth, sources=sources, since=since)
+    def execute(
+        task: tuple[str, str, tuple[str, ...], str, tuple[str, ...]]
+    ) -> tuple[tuple, SearchResult]:
+        query, mode, sources, since, priorities = task
+        result = run_search(
+            query, mode, depth, sources=sources, since=since, priorities=priorities
+        )
         done["n"] += 1
         if progress:
+            scope_name = "attention" if priorities else "all"
             print(
-                f"  [{done['n']:3d}/{len(tasks)}] {mode:8s} {result.elapsed_seconds:6.1f}s "
-                f"n={len(result.rows):3d}"
+                f"  [{done['n']:3d}/{len(tasks)}] {mode:8s} {scope_name:9s} "
+                f"{result.elapsed_seconds:6.1f}s n={len(result.rows):3d}"
                 f"{' FALLBACK' if result.fallback_reason else ''}"
                 f"{' ERR' if result.error else ''}  {query[:44]}",
                 flush=True,
@@ -532,54 +654,97 @@ def run_benchmark(
             "ambiguous": case.ambiguous,
             "relevance_basis": case.relevance_basis,
             "note": case.note,
+            "attention": {},
         }
-        meta = [truth_meta[r] for r in case.truth_refs if r in truth_meta]
+        meta = [truth_meta[ref] for ref in case.truth_refs if ref in truth_meta]
         for mode in modes:
-            result = results[(case.query, mode, tuple(case.sources), case.since)]
-            kept, dropped = contamination.apply(result.rows)
-            row[mode] = {
-                "rank": first_relevant_rank(kept, set(case.truth_refs), meta, case.truth_predicate),
-                "returned": len(kept),
-                "dropped_contaminated": dropped,
-                "fallback_reason": result.fallback_reason,
-                "error": result.error,
-                "elapsed_seconds_concurrent": round(result.elapsed_seconds, 2),
-            }
+            for scope_name, priorities in scopes.items():
+                result = results[
+                    (case.query, mode, tuple(case.sources), case.since, priorities)
+                ]
+                kept, dropped = contamination.apply(result.rows)
+                rank = first_relevant_rank(
+                    kept, set(case.truth_refs), meta, case.truth_predicate
+                )
+                counts: dict[str, int] = {}
+                for hit in kept:
+                    if hit.priority:
+                        counts[hit.priority] = counts.get(hit.priority, 0) + 1
+                entry = {
+                    "rank": rank,
+                    "relevant_priority": kept[rank - 1].priority if rank else "",
+                    "returned": len(kept),
+                    "returned_priority_counts": counts,
+                    "priority_scope": result.priority_scope or scope_name,
+                    "selected_priorities": list(result.selected_priorities or priorities),
+                    "dropped_contaminated": dropped,
+                    "fallback_reason": result.fallback_reason,
+                    "error": result.error,
+                    "elapsed_seconds_concurrent": round(result.elapsed_seconds, 2),
+                }
+                if scope_name == "all":
+                    row[mode] = entry
+                else:
+                    row["attention"][mode] = entry
         rows.append(row)
 
-    latency = {}
-    for mode in modes:
-        samples = sorted(
-            r.elapsed_seconds for (_, m, _, _), r in results.items() if m == mode and not r.error
-        )
-        if samples:
-            latency[mode] = {
-                "n": len(samples),
-                "min": round(samples[0], 2),
-                "p50": round(statistics.median(samples), 2),
-                "p90": round(samples[min(int(len(samples) * 0.9), len(samples) - 1)], 2),
-                "max": round(samples[-1], 2),
-            }
+    latency_by_scope: dict[str, dict[str, Any]] = {name: {} for name in scopes}
+    for scope_name, priorities in scopes.items():
+        for mode in modes:
+            values = [
+                result.elapsed_seconds
+                for (_, result_mode, _, _, result_priorities), result in results.items()
+                if result_mode == mode
+                and result_priorities == priorities
+                and not result.error
+            ]
+            latency = _latency_summary(values)
+            if latency:
+                latency_by_scope[scope_name][mode] = latency
+
+    summary = summarize(rows, depth=depth)
+    comparison = scope_comparison(rows, modes=modes, depth=depth)
+    for mode, compared in comparison.items():
+        all_latency = latency_by_scope["all"].get(mode, {})
+        attention_latency = latency_by_scope["attention"].get(mode, {})
+        compared["latency_seconds"] = {
+            "all": all_latency,
+            "attention": attention_latency,
+            "p50_delta": round(attention_latency["p50"] - all_latency["p50"], 2)
+            if all_latency and attention_latency
+            else None,
+        }
+    summary["priority_scope_comparison"] = comparison
 
     return {
         "environment": capture_environment(),
         "config": {
-            "depth": depth, "modes": list(modes), "workers": workers,
-            "queries": len(cases), "calls": len(tasks),
+            "depth": depth,
+            "modes": list(modes),
+            "workers": workers,
+            "queries": len(cases),
+            "calls": len(tasks),
+            "priority_scopes": {
+                "all": [],
+                "attention": list(ATTENTION_PRIORITIES),
+            },
             "contamination_session_ids": list(contamination.session_ids),
             "contamination_cutoff": (
                 contamination.cutoff.isoformat() if contamination.cutoff else None
             ),
         },
         "unresolved_truth_refs": unresolved,
-        "stale_cases": [c.query for c in stale_cases],
+        "stale_cases": [case.query for case in stale_cases],
         "wall_seconds": round(wall_seconds, 1),
-        "latency_under_concurrency": latency,
+        # Preserve the original all-tier key for report consumers while adding
+        # the explicit paired scope surface beside it.
+        "latency_under_concurrency": latency_by_scope["all"],
+        "latency_by_priority_scope_under_concurrency": latency_by_scope,
         "latency_note": (
             "measured with concurrent workers; NOT comparable to single-user latency. "
-            "Use `benchmark latency` for a serial sample."
+            "Use `benchmark latency` for a paired serial sample."
         ),
-        "summary": summarize(rows, depth=depth),
+        "summary": summary,
         "results": rows,
     }
 
@@ -589,26 +754,40 @@ def measure_serial_latency(
 ) -> dict[str, Any]:
     """Time searches one at a time, which is the only comparable latency number."""
 
-    samples: dict[str, list[float]] = {m: [] for m in modes}
+    scopes = {"all": (), "attention": tuple(ATTENTION_PRIORITIES)}
+    samples: dict[str, dict[str, list[float]]] = {
+        scope: {mode: [] for mode in modes} for scope in scopes
+    }
+    pair_index = 0
     for _ in range(repeats):
         for query in queries:
             for mode in modes:
-                result = run_search(query, mode, depth)
-                if not result.error:
-                    samples[mode].append(result.elapsed_seconds)
-                    print(f"  serial {mode:8s} {result.elapsed_seconds:6.1f}s  {query[:44]}",
-                          flush=True)
-    out = {}
-    for mode, values in samples.items():
-        if values:
-            ordered = sorted(values)
-            out[mode] = {
-                "n": len(ordered),
-                "min": round(ordered[0], 2),
-                "p50": round(statistics.median(ordered), 2),
-                "p90": round(ordered[min(int(len(ordered) * 0.9), len(ordered) - 1)], 2),
-                "max": round(ordered[-1], 2),
-            }
+                order = list(scopes.items())
+                if pair_index % 2:
+                    order.reverse()
+                pair_index += 1
+                for scope_name, priorities in order:
+                    result = run_search(query, mode, depth, priorities=priorities)
+                    if not result.error:
+                        samples[scope_name][mode].append(result.elapsed_seconds)
+                        print(
+                            f"  serial {mode:8s} {scope_name:9s} "
+                            f"{result.elapsed_seconds:6.1f}s  {query[:44]}",
+                            flush=True,
+                        )
+    out: dict[str, Any] = {"all": {}, "attention": {}, "p50_delta_seconds": {}}
+    for scope_name in scopes:
+        for mode, values in samples[scope_name].items():
+            summary = _latency_summary(values)
+            if summary:
+                out[scope_name][mode] = summary
+    for mode in modes:
+        all_latency = out["all"].get(mode)
+        attention_latency = out["attention"].get(mode)
+        if all_latency and attention_latency:
+            out["p50_delta_seconds"][mode] = round(
+                attention_latency["p50"] - all_latency["p50"], 2
+            )
     return out
 
 
@@ -704,6 +883,17 @@ def _print_report(report: dict[str, Any]) -> None:
             f"  {mode:8s} hit@1={m['hit_at_1']}/{m['queries']}  hit@5={m['hit_at_5']}/{m['queries']}"
             f"  hit@10={m['hit_at_10']}/{m['queries']}  found@{m['depth']}={m['found']}/{m['queries']}"
             f"  MRR={m['mrr']:.3f}"
+        )
+    print(f"\n=== ALL TIERS vs ATTENTION ({','.join(ATTENTION_PRIORITIES)}) ===")
+    for mode, compared in report["summary"]["priority_scope_comparison"].items():
+        latency = compared.get("latency_seconds", {})
+        print(
+            f"  {mode:8s} all found={compared['all']['found']} MRR={compared['all']['mrr']:.3f}; "
+            f"attention found={compared['attention']['found']} "
+            f"MRR={compared['attention']['mrr']:.3f}; "
+            f"lost={compared['lost_from_all']} ({compared['recall_loss_rate']:.1%}) "
+            f"gained={compared['gained_over_all']} retained={compared['retained_from_all']} "
+            f"p50 delta={latency.get('p50_delta')}s"
         )
     print("\n=== BY STRATUM ===")
     for stratum, modes_summary in report["summary"]["by_stratum"].items():
@@ -855,7 +1045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_ids=tuple(args.exclude_session),
         cutoff=_as_utc(cutoff) if cutoff else None,
     )
-    print(f"{len(cases)} labeled queries x {len(modes)} modes, depth={args.depth}, "
+    print(f"{len(cases)} labeled queries x {len(modes)} modes x 2 priority scopes, depth={args.depth}, "
           f"workers={args.workers}", flush=True)
     report = run_benchmark(
         cases, modes=modes, depth=args.depth, workers=args.workers,

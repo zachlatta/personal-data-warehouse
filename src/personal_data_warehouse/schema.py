@@ -2308,6 +2308,23 @@ SEARCH_BENCHMARK_RUN_COLUMNS = (
     "mrr_milli",
     "errors",
     "note",
+    "attention_priorities_json",
+    "attention_probe_queries",
+    "attention_latency_p50_ms",
+    "attention_latency_p90_ms",
+    "attention_latency_max_ms",
+    "attention_labeled_cases",
+    "attention_comparable_cases",
+    "attention_found",
+    "attention_hit_at_1",
+    "attention_hit_at_5",
+    "attention_hit_at_10",
+    "attention_mrr_milli",
+    "attention_errors",
+    "attention_recall_lost",
+    "attention_recall_gained",
+    "attention_recall_retained",
+    "all_relevant_lower_tier",
     "io_pressure_full_avg10",
     "cpu_pressure_some_avg10",
     "load_1m",
@@ -2334,8 +2351,9 @@ SEARCH_BENCHMARK_LABEL_COLUMNS = (
 
 # One row per agent source (plus 'all') measuring how agents use PDW over a
 # trailing window, from their own transcripts: what their first PDW call was,
-# how often searches carried a priority filter, how much SQL bypassed the
-# timeline. Contract C3, as a number that is re-taken daily.
+# how often searches completed with an effective priority scope, which scope
+# they chose, and how much SQL bypassed the timeline. Contract C3, as a number
+# that is re-taken daily.
 AGENT_USAGE_COLUMNS = (
     "source",
     "window_days",
@@ -2347,6 +2365,13 @@ AGENT_USAGE_COLUMNS = (
     "first_invented",
     "search_calls",
     "search_with_priority",
+    "search_attention_only",
+    "search_including_lower_tiers",
+    "search_noop_priority",
+    "search_invalid_or_failed_priority",
+    "bulk_hints_shown",
+    "bulk_hint_scoped_retries",
+    "bulk_hint_improved_retries",
     "sql_calls",
     "sql_base_only",
     "sql_error_sessions",

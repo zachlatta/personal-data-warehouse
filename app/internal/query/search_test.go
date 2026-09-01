@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -543,6 +544,57 @@ func TestSearchHintsWhenAnUnscopedResultIsMostlyNoise(t *testing.T) {
 	resp = NewService(tiny, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
 	if strings.Contains(resp.Hint, "priorities") {
 		t.Fatalf("two rows say nothing about the mix; got %q", resp.Hint)
+	}
+}
+
+func TestSearchResponseMakesTheEffectivePriorityScopeVisible(t *testing.T) {
+	mostlyBulk := bulkHits("noise", "noise", "background", "direct", "self", "noise")
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: mostlyBulk}}
+	svc := NewService(runner, Options{})
+
+	unscoped := svc.Search(context.Background(), SearchRequest{
+		Query: "offer letter", Mode: SearchModeKeyword,
+	})
+	if unscoped.PriorityScope != "all" {
+		t.Fatalf("priority_scope = %q, want all", unscoped.PriorityScope)
+	}
+	if len(unscoped.SelectedPriorities) != 0 {
+		t.Fatalf("selected_priorities = %#v, want empty", unscoped.SelectedPriorities)
+	}
+	wantCounts := map[string]int{"self": 1, "direct": 1, "noise": 3, "background": 1}
+	if !reflect.DeepEqual(unscoped.ReturnedPriorityCounts, wantCounts) {
+		t.Fatalf("returned_priority_counts = %#v, want %#v", unscoped.ReturnedPriorityCounts, wantCounts)
+	}
+	if !slices.Contains(unscoped.HintCodes, "consider_attention_scope") {
+		t.Fatalf("hint_codes = %#v, want consider_attention_scope", unscoped.HintCodes)
+	}
+	if !slices.Equal(unscoped.SuggestedPriorities, []string{"self", "direct", "cc"}) {
+		t.Fatalf("suggested_priorities = %#v", unscoped.SuggestedPriorities)
+	}
+
+	scoped := svc.Search(context.Background(), SearchRequest{
+		Query: "offer letter", Mode: SearchModeKeyword, Priorities: []string{"self", "background"},
+	})
+	if scoped.PriorityScope != "selected" || !slices.Equal(scoped.SelectedPriorities, []string{"self", "background"}) {
+		t.Fatalf("selected scope not echoed: scope=%q priorities=%#v", scoped.PriorityScope, scoped.SelectedPriorities)
+	}
+	if slices.Contains(scoped.HintCodes, "consider_attention_scope") || len(scoped.SuggestedPriorities) != 0 {
+		t.Fatalf("a selected scope must not receive the unscoped suggestion: %#v %#v", scoped.HintCodes, scoped.SuggestedPriorities)
+	}
+}
+
+func TestSearchResponseMarksAnInvalidPriorityScopeBeforeReturning(t *testing.T) {
+	resp := NewService(&fakeSearchRunner{}, Options{}).Search(context.Background(), SearchRequest{
+		Query: "offer letter", Mode: SearchModeKeyword, Priorities: []string{"urgent"},
+	})
+	if resp.Error == "" {
+		t.Fatal("expected an invalid priority error")
+	}
+	if resp.PriorityScope != "invalid" || !slices.Equal(resp.SelectedPriorities, []string{"urgent"}) {
+		t.Fatalf("invalid scope is invisible: scope=%q selected=%#v", resp.PriorityScope, resp.SelectedPriorities)
+	}
+	if resp.ReturnedPriorityCounts == nil || resp.HintCodes == nil {
+		t.Fatalf("structured scope fields must be present even on errors: %#v", resp)
 	}
 }
 

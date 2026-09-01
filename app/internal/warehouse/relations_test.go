@@ -11,7 +11,27 @@ import (
 const catalogJSON = "../../../src/personal_data_warehouse/warehouse_catalog.json"
 
 type jsonCatalog struct {
-	Version int `json:"version"`
+	Version            int `json:"version"`
+	TimelinePriorities struct {
+		DefaultScope            string   `json:"default_scope"`
+		AttentionPriorities     []string `json:"attention_priorities"`
+		OptimizedBM25Priorities []string `json:"optimized_bm25_priorities"`
+		Tiers                   []struct {
+			Name        string `json:"name"`
+			Meaning     string `json:"meaning"`
+			TypicalRows string `json:"typical_rows"`
+		} `json:"tiers"`
+		Sentinel struct {
+			Name        string `json:"name"`
+			Meaning     string `json:"meaning"`
+			TypicalRows string `json:"typical_rows"`
+		} `json:"sentinel"`
+		SelectionGuide []struct {
+			Intent     string   `json:"intent"`
+			Priorities []string `json:"priorities"`
+			Guidance   string   `json:"guidance"`
+		} `json:"selection_guide"`
+	} `json:"timeline_priorities"`
 	Schemas []struct {
 		Name         string `json:"name"`
 		Layer        string `json:"layer"`
@@ -50,6 +70,33 @@ func TestGeneratedCatalogMatchesJSON(t *testing.T) {
 	catalog := loadJSONCatalog(t)
 	if catalog.Version != CatalogVersion {
 		t.Fatalf("catalog version drift: json %d, generated %d", catalog.Version, CatalogVersion)
+	}
+	priorities := catalog.TimelinePriorities
+	if priorities.DefaultScope != TimelinePriorities.DefaultScope ||
+		!slices.Equal(priorities.AttentionPriorities, TimelinePriorities.AttentionPriorities) ||
+		!slices.Equal(priorities.OptimizedBM25Priorities, TimelinePriorities.OptimizedBM25Priorities) {
+		t.Fatalf("timeline priority scope contract drifted: json %+v generated %+v", priorities, TimelinePriorities)
+	}
+	if len(priorities.Tiers) != len(TimelinePriorities.Tiers) {
+		t.Fatalf("timeline priority tier count drift: json %d, generated %d", len(priorities.Tiers), len(TimelinePriorities.Tiers))
+	}
+	for i, want := range priorities.Tiers {
+		got := TimelinePriorities.Tiers[i]
+		if got.Name != want.Name || got.Meaning != want.Meaning || got.TypicalRows != want.TypicalRows {
+			t.Fatalf("timeline priority tier %d drifted: json %+v generated %+v", i, want, got)
+		}
+	}
+	if got, want := TimelinePriorities.Sentinel, priorities.Sentinel; got.Name != want.Name || got.Meaning != want.Meaning || got.TypicalRows != want.TypicalRows {
+		t.Fatalf("timeline priority sentinel drifted: json %+v generated %+v", want, got)
+	}
+	if len(priorities.SelectionGuide) != len(TimelinePriorities.SelectionGuide) {
+		t.Fatalf("timeline priority selection count drift: json %d, generated %d", len(priorities.SelectionGuide), len(TimelinePriorities.SelectionGuide))
+	}
+	for i, want := range priorities.SelectionGuide {
+		got := TimelinePriorities.SelectionGuide[i]
+		if got.Intent != want.Intent || got.Guidance != want.Guidance || !slices.Equal(got.Priorities, want.Priorities) {
+			t.Fatalf("timeline priority selection %d drifted: json %+v generated %+v", i, want, got)
+		}
 	}
 	if len(catalog.Objects) != len(Objects) {
 		t.Fatalf("object count drift: json %d, generated %d", len(catalog.Objects), len(Objects))
