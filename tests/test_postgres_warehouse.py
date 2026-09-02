@@ -1603,7 +1603,13 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     index_names = _index_names(warehouse, "slack_messages")
     assert "slack_messages_recent_scope_time_idx" in index_names
     assert "slack_messages_recent_thread_time_idx" in index_names
-    assert "slack_messages_thread_parents_idx" in index_names
+    # The historical missing-replies walk must stay inside two small covering
+    # partial indexes.  Reading parent fields from the heap and probing the
+    # all-messages thread index evicted the entire search working set every
+    # five minutes in production.
+    assert "slack_messages_thread_parent_walk_idx" in index_names
+    assert "slack_messages_thread_replies_live_idx" in index_names
+    assert "slack_messages_thread_parents_idx" not in index_names
     assert "slack_messages_user_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
     # Raw-table text search is retired: message text is searched through the
@@ -1613,6 +1619,27 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
 
     slack_user_index_names = _index_names(warehouse, "slack_users")
     assert "slack_users_email_lower_idx" in slack_user_index_names
+
+
+def test_slack_thread_backfill_indexes_cover_only_live_parent_and_reply_rows() -> None:
+    from personal_data_warehouse import postgres as postgres_module
+
+    specs = {spec.name: spec for spec in postgres_module.POSTGRES_INDEXES}
+
+    parent_sql = specs["slack_messages_thread_parent_walk_idx"].sql
+    assert (
+        "(account, team_id, message_datetime DESC, message_ts DESC, conversation_id DESC)"
+        in parent_sql
+    )
+    assert "INCLUDE (reply_count, latest_reply_ts)" in parent_sql
+    assert "is_thread_reply = 0 AND reply_count > 0" in parent_sql
+
+    reply_sql = specs["slack_messages_thread_replies_live_idx"].sql
+    assert "(account, team_id, conversation_id, thread_ts)" in reply_sql
+    assert "is_deleted = 0 AND is_thread_reply = 1" in reply_sql
+    assert ("slack_messages_thread_parents_idx", "slack_messages") in (
+        postgres_module.POSTGRES_OBSOLETE_INDEXES
+    )
 
 
 def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: PostgresWarehouse) -> None:

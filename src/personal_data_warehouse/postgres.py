@@ -1432,17 +1432,29 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS slack_messages_thread_idx ON @slack_messages (account, team_id, conversation_id, thread_ts)",
     ),
     IndexSpec(
-        # Thread-backfill candidate selection: only ~1.3M of 42M messages are
-        # live thread parents, and without this partial index the candidate
-        # query seq-scanned the whole 46 GB heap every ~5 minutes (the single
-        # largest query cost in production, and a page-cache thrasher for
-        # everything else). Ordered to serve the recent-first ORDER BY with an
-        # early-stopping range scan.
-        "slack_messages_thread_parents_idx",
+        # Historical thread-backfill candidate selection.  Keep every selected
+        # column in the index and the complete keyset in index order: the old
+        # parent index omitted conversation_id and the projected fields, so a
+        # sparse missing-replies page fetched hundreds of thousands of random
+        # heap pages and evicted the search working set every five minutes.
+        "slack_messages_thread_parent_walk_idx",
         "slack_messages",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_thread_parents_idx "
-        "ON @slack_messages (account, team_id, message_datetime DESC, message_ts DESC) "
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_thread_parent_walk_idx "
+        "ON @slack_messages "
+        "(account, team_id, message_datetime DESC, message_ts DESC, conversation_id DESC) "
+        "INCLUDE (reply_count, latest_reply_ts) "
         "WHERE is_deleted = 0 AND is_thread_reply = 0 AND reply_count > 0",
+    ),
+    IndexSpec(
+        # The missing-replies anti-join needs only live reply rows.  Probing the
+        # former all-message thread index pulled a multi-gigabyte index into
+        # cache while the historical walk was running; this small partial
+        # index makes the anti-join index-only instead.
+        "slack_messages_thread_replies_live_idx",
+        "slack_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_thread_replies_live_idx "
+        "ON @slack_messages (account, team_id, conversation_id, thread_ts) "
+        "WHERE is_deleted = 0 AND is_thread_reply = 1",
     ),
     IndexSpec(
         "slack_conversations_scope_idx",
@@ -1868,6 +1880,9 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
     # search_chunks_ts_chunk_sha_idx (same keys, INCLUDE columns added).
     ("search_chunks_sha_idx", "search_chunks"),
     ("search_chunks_ts_chunk_idx", "search_chunks"),
+    # Replaced by slack_messages_thread_parent_walk_idx, which contains the
+    # complete walk key and projected fields for an index-only ordered scan.
+    ("slack_messages_thread_parents_idx", "slack_messages"),
     # Replaced by the full-coverage slack_messages_text_trgm_idx.
     ("slack_messages_text_trgm_live_idx", "slack_messages"),
     # Legacy per-source BM25 indexes from the pre-timeline cross-source search.
