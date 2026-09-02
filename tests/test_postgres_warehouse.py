@@ -5814,7 +5814,7 @@ def _inbox_rows(warehouse: PostgresWarehouse) -> dict[str, tuple[int, int]]:
     return {str(container): (int(deleted), int(version)) for container, deleted, version in rows}
 
 
-def test_postgres_slack_account_state_refresh_only_recomputes_changed_conversations(
+def test_postgres_slack_account_state_refresh_combines_changes_with_bounded_reconciliation(
     warehouse: PostgresWarehouse,
 ) -> None:
     now = datetime.now(tz=UTC)
@@ -5831,10 +5831,12 @@ def test_postgres_slack_account_state_refresh_only_recomputes_changed_conversati
 
     assert second.mode == "incremental"
     assert second.changed_conversations == 1
+    assert second.reconciled_conversations == 2
     after = _inbox_rows(warehouse)
     assert after["D2"][0] == 0
-    # D1 was not touched since the last refresh, so its row is exactly as it was.
-    assert after["D1"] == before["D1"]
+    # The only older conversation is the bounded correctness-backstop slice.
+    assert after["D1"][0] == 0
+    assert after["D1"][1] > before["D1"][1]
 
 
 def test_postgres_slack_account_state_refresh_tombstones_items_of_changed_conversations(
@@ -5863,29 +5865,60 @@ def test_postgres_slack_account_state_refresh_ages_out_items_without_touching_th
     _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(hours=6))
     warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(hours=3))
     warehouse._command(
-        "UPDATE @slack_account_state_item_rows SET latest_activity_at = %s WHERE container_id = 'D1'",
+        "UPDATE @slack_account_state_item_rows"
+        " SET item_id = 'orphan', container_id = 'D-orphan', latest_activity_at = %s"
+        " WHERE container_id = 'D1'",
         (now - timedelta(days=40),),
     )
 
     result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
 
     assert result.mode == "incremental"
-    assert _inbox_rows(warehouse)["D1"][0] == 1
+    rows = _inbox_rows(warehouse)
+    assert rows["D-orphan"][0] == 1
+    assert rows["D1"][0] == 0
 
 
-def test_postgres_slack_account_state_refresh_reruns_fully_once_a_day(warehouse: PostgresWarehouse) -> None:
+def test_postgres_slack_account_state_refresh_reconciles_a_bounded_daily_slice(
+    warehouse: PostgresWarehouse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from personal_data_warehouse.postgres import SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE
+
     now = datetime.now(tz=UTC)
     _seed_slack_inbox_scope(warehouse, now=now)
-    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now - timedelta(days=3))
+    for index in range(SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE + 2):
+        _seed_slack_dm(
+            warehouse,
+            conversation_id=f"D{index:03d}",
+            now=now,
+            synced_at=now - timedelta(days=3),
+        )
     warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now - timedelta(days=2))
-    before = _inbox_rows(warehouse)
+
+    scoped_calls: list[bool] = []
+    original = warehouse._slack_account_state_items_select_sql
+
+    def recording_select_sql(*, scoped: bool = False) -> str:
+        scoped_calls.append(scoped)
+        return original(scoped=scoped)
+
+    monkeypatch.setattr(warehouse, "_slack_account_state_items_select_sql", recording_select_sql)
 
     result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
 
-    assert result.mode == "full"
-    after = _inbox_rows(warehouse)
-    assert after["D1"][0] == 0
-    assert after["D1"][1] > before["D1"][1]
+    # A daily all-conversation rebuild used to scan every member channel's
+    # thirty-day message history and evict the search working set.  Continuous
+    # bounded reconciliation gives every conversation the same <=24h backstop
+    # without ever issuing the unscoped query after bootstrap.
+    assert result.mode == "incremental"
+    assert result.reconciled_conversations == SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE
+    assert scoped_calls == [True]
+    assert warehouse._query(
+        "SELECT count(*) FROM @slack_sync_state"
+        " WHERE object_type = 'account_state_reconcile' AND updated_at = %s",
+        (now,),
+    ) == [(SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE,)]
 
 
 def test_postgres_slack_account_state_refresh_skips_while_another_refresh_holds_the_lock(

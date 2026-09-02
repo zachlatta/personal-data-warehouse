@@ -545,8 +545,13 @@ SLACK_ACCOUNT_STATE_REFRESH_OVERLAP = timedelta(minutes=15)
 # hour for a snapshot whose inputs change every five minutes. A refresh that
 # ran this recently is skipped; the next one's overlap covers the gap.
 SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE = timedelta(minutes=5)
-SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL = timedelta(hours=24)
 SLACK_ACCOUNT_STATE_REFRESH_OBJECT_TYPE = "account_state_refresh"
+SLACK_ACCOUNT_STATE_RECONCILE_OBJECT_TYPE = "account_state_reconcile"
+# Revisit this many otherwise-unchanged inbox conversations per five-minute
+# refresh. Production has 6,770 active member/DM conversations: 25 per tick is
+# 7,200/day, so every row gets a <=24h correctness backstop without the former
+# daily all-conversation scan (2.3M disk blocks plus 497k temp blocks per run).
+SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE = 25
 SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 
 # How fast a direct message must LAND to read `ok` on
@@ -585,6 +590,7 @@ class SlackAccountStateRefresh:
 
     mode: str
     changed_conversations: int = 0
+    reconciled_conversations: int = 0
     rows_tombstoned: int = 0
 
 
@@ -11339,9 +11345,10 @@ class PostgresWarehouse:
         it (minus SLACK_ACCOUNT_STATE_REFRESH_OVERLAP) are recomputed; their
         stale items are tombstoned by container, and items anywhere that have
         aged past the thirty-day window are tombstoned without touching their
-        conversation. A full rebuild still runs when there is no watermark and
-        once every SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL, so a row missed by
-        the overlap is wrong for at most a day, never forever.
+        conversation. The first refresh bootstraps the whole snapshot. After
+        that, a persisted round-robin reconciliation adds a bounded slice of
+        otherwise-unchanged conversations to every refresh, so a row missed by
+        the overlap is wrong for at most a day without a daily full-table scan.
         """
         synced_at = _ensure_utc(synced_at)
         sync_version = int(synced_at.timestamp() * 1_000_000)
@@ -11358,19 +11365,17 @@ class PostgresWarehouse:
             # for a statement that now touches a handful of conversations.
             self._command("SET LOCAL jit = off")
 
-            watermark, last_full_at = self._slack_account_state_watermark(account=account, team_id=team_id)
-            full = (
-                watermark is None
-                or last_full_at is None
-                or synced_at - last_full_at >= SLACK_ACCOUNT_STATE_FULL_REFRESH_INTERVAL
+            watermark, _last_full_at = self._slack_account_state_watermark(
+                account=account, team_id=team_id
             )
-            if not full and synced_at - watermark < SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE:
+            bootstrap = watermark is None
+            if not bootstrap and synced_at - watermark < SLACK_ACCOUNT_STATE_REFRESH_DEBOUNCE:
                 # ``debounced``: a refresh ran moments ago and would recompute
                 # the same rows; the next one's overlap covers this window.
                 self._command("ROLLBACK")
                 return SlackAccountStateRefresh(mode="debounced")
             changed: list[str] = []
-            if not full:
+            if not bootstrap:
                 since = watermark - SLACK_ACCOUNT_STATE_REFRESH_OVERLAP
                 # Slack's sync_version_from_datetime is epoch milliseconds
                 # (unlike several other sources, which use microseconds).
@@ -11389,11 +11394,18 @@ class PostgresWarehouse:
                     )
                 ]
 
-            if full or changed:
-                select_sql = self._slack_account_state_items_select_sql(scoped=not full)
+            reconciled = self._slack_account_state_reconcile_candidates(
+                account=account,
+                team_id=team_id,
+                limit=None if bootstrap else SLACK_ACCOUNT_STATE_RECONCILE_BATCH_SIZE,
+            )
+            scoped_conversations = sorted(set(changed) | set(reconciled))
+
+            if bootstrap or scoped_conversations:
+                select_sql = self._slack_account_state_items_select_sql(scoped=not bootstrap)
                 params: tuple[Any, ...] = (account, team_id, synced_at, sync_version)
-                if not full:
-                    params = (*params, changed)
+                if not bootstrap:
+                    params = (*params, scoped_conversations)
                 self._command(
                     f"""
                     INSERT INTO @slack_account_state_item_rows AS target ({columns})
@@ -11403,10 +11415,18 @@ class PostgresWarehouse:
                     params,
                 )
 
-            tombstone_scope = "" if full else "AND (container_id = ANY(%s::text[]) OR latest_activity_at < %s)"
+            tombstone_scope = (
+                ""
+                if bootstrap
+                else "AND (container_id = ANY(%s::text[]) OR latest_activity_at < %s)"
+            )
             tombstone_params: tuple[Any, ...] = (synced_at, sync_version, account, team_id, sync_version)
-            if not full:
-                tombstone_params = (*tombstone_params, changed, synced_at - SLACK_ACCOUNT_STATE_ITEM_WINDOW)
+            if not bootstrap:
+                tombstone_params = (
+                    *tombstone_params,
+                    scoped_conversations,
+                    synced_at - SLACK_ACCOUNT_STATE_ITEM_WINDOW,
+                )
             with self._connection.cursor() as cursor:
                 cursor.execute(
                     self._expand_relations(
@@ -11421,21 +11441,98 @@ class PostgresWarehouse:
                 )
                 tombstoned = int(cursor.rowcount or 0)
 
+            self._record_slack_account_state_reconciled(
+                account=account,
+                team_id=team_id,
+                conversation_ids=reconciled,
+                synced_at=synced_at,
+                sync_version=sync_version,
+            )
             self._record_slack_account_state_watermark(
                 account=account,
                 team_id=team_id,
                 synced_at=synced_at,
                 sync_version=sync_version,
-                full=full,
+                full=bootstrap,
             )
             self._command("COMMIT")
         except Exception:
             self._command("ROLLBACK")
             raise
         return SlackAccountStateRefresh(
-            mode="full" if full else "incremental",
+            mode="full" if bootstrap else "incremental",
             changed_conversations=len(changed),
+            reconciled_conversations=len(reconciled),
             rows_tombstoned=tombstoned,
+        )
+
+    def _slack_account_state_reconcile_candidates(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        limit: int | None,
+    ) -> list[str]:
+        """Oldest-reconciled live inbox conversations, in a persisted rotation."""
+        limit_clause = "LIMIT %s" if limit is not None else ""
+        params: tuple[Any, ...] = (
+            SLACK_ACCOUNT_STATE_RECONCILE_OBJECT_TYPE,
+            account,
+            team_id,
+        )
+        if limit is not None:
+            params = (*params, int(limit))
+        return [
+            str(row[0])
+            for row in self._query(
+                f"""
+                SELECT c.conversation_id
+                FROM @slack_conversations AS c
+                LEFT JOIN @slack_sync_state AS s
+                  ON s.account = c.account
+                 AND s.team_id = c.team_id
+                 AND s.object_type = %s
+                 AND s.object_id = c.conversation_id
+                WHERE c.account = %s
+                  AND c.team_id = %s
+                  AND c.is_archived = 0
+                  AND (c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)
+                ORDER BY s.updated_at ASC NULLS FIRST, c.conversation_id
+                {limit_clause}
+                """,
+                params,
+            )
+        ]
+
+    def _record_slack_account_state_reconciled(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_ids: Sequence[str],
+        synced_at: datetime,
+        sync_version: int,
+    ) -> None:
+        if not conversation_ids:
+            return
+        self._insert(
+            "slack_sync_state",
+            [
+                (
+                    account,
+                    team_id,
+                    SLACK_ACCOUNT_STATE_RECONCILE_OBJECT_TYPE,
+                    conversation_id,
+                    synced_at.isoformat(),
+                    "reconcile",
+                    "ok",
+                    "",
+                    synced_at,
+                    sync_version,
+                )
+                for conversation_id in conversation_ids
+            ],
+            SLACK_SYNC_STATE_COLUMNS,
         )
 
     def _slack_account_state_watermark(
