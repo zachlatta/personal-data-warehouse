@@ -158,6 +158,12 @@ class TimelineAdapter:
     # value lets unusually broad dimension invalidations make steady progress
     # without starving later adapters and their refresh windows.
     max_incremental_batches_per_run: int = 0
+    # Drain rows beyond the stored watermark before replaying the lag window.
+    # Sources that restamp more than ``max_stale_batches`` rows inside that
+    # window can otherwise hit the replay safety cap on every pass and never
+    # reach genuinely new rows. The replay still runs after forward catch-up,
+    # so the late-commit protection below remains intact.
+    incremental_forward_first: bool = False
     # When > 0, every sync pass re-walks rows whose event_ts falls in the last
     # N hours and re-upserts them. Classification signals that look forward or
     # arrive late (Zach replying in a chat promotes the surrounding window;
@@ -264,6 +270,7 @@ def _simple_adapter(
     signature_changed_join_sql: str | None = None,
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     max_incremental_batches_per_run: int = 0,
+    incremental_forward_first: bool = False,
     refresh_hours: float = 0.0,
     prune_sql: str = "",
     max_ingest_sql: str = "",
@@ -412,6 +419,7 @@ def _simple_adapter(
         priority_expression=priority,
         batch_size=batch_size,
         max_incremental_batches_per_run=max_incremental_batches_per_run,
+        incremental_forward_first=incremental_forward_first,
         refresh_hours=refresh_hours,
         prune_sql=prune_sql,
         signature_backfill_sql=signature_backfill_sql,
@@ -1072,6 +1080,10 @@ _SLACK_MESSAGE = _simple_adapter(
     search_text=_search_concat(_SLACK_DISPLAY_NAME, _SLACK_CONTEXT, "t.text"),
     priority=_SLACK_MESSAGE_PRIORITY,
     batch_size=5000,
+    # The public-channel sweep can restamp >40k rows inside the 15-minute lag
+    # window. Replay-first then hits its eight-page safety cap forever before
+    # reaching the real forward backlog.
+    incremental_forward_first=True,
     # 12h covers the +/-6h engagement window with margin while keeping the
     # per-tick re-walk (~9k rows with window probes) inside the work budget.
     refresh_hours=12,
@@ -1121,6 +1133,7 @@ _SLACK_FILE = _simple_adapter(
         _SLACK_CONTEXT,
     ),
     priority=_SLACK_FILE_PRIORITY,
+    incremental_forward_first=True,
     max_ingest_sql="SELECT max(synced_at) FROM @slack_files",
     changed_join_sql=_SLACK_FILE_INCREMENTAL_CANDIDATES,
     changed_join_anchor="@slack_files t",
@@ -3571,12 +3584,12 @@ class TimelineSyncEngine:
         # Counting them would make every converged run report progress it did
         # not make, and `incremental_rows` is what tells an operator whether an
         # adapter is actually moving.
-        start_ts, start_id = state.watermark_ts, state.watermark_id
-        if lag:
+        forward_phase = bool(lag) and adapter.incremental_forward_first
+        if forward_phase or not lag:
+            cursor_ts, cursor_id = state.watermark_ts, state.watermark_id
+        else:
             cursor_ts = max(state.watermark_ts - lag, datetime(1970, 1, 1, tzinfo=UTC))
             cursor_id = ""
-        else:
-            cursor_ts, cursor_id = state.watermark_ts, state.watermark_id
         while True:
             rows = self._fetch(
                 adapter.incremental_sql,
@@ -3587,9 +3600,30 @@ class TimelineSyncEngine:
                 },
             )
             if not rows:
+                # Forward-first sources replay only after the forward cursor is
+                # drained. Start behind the NEW high-water mark: this protects
+                # commits racing the catch-up pass without walking the entire
+                # just-drained backlog a second time.
+                if (
+                    forward_phase
+                    and not _past(deadline)
+                    and not (
+                        adapter.max_incremental_batches_per_run > 0
+                        and batches >= adapter.max_incremental_batches_per_run
+                    )
+                ):
+                    forward_phase = False
+                    cursor_ts = max(
+                        state.watermark_ts - lag,
+                        datetime(1970, 1, 1, tzinfo=UTC),
+                    )
+                    cursor_id = ""
+                    stale_batches = 0
+                    continue
                 break
+            watermark_before = (state.watermark_ts, state.watermark_id)
             self._upsert(adapter, rows)
-            fresh = sum(1 for row in rows if (row[12], row[0]) > (start_ts, start_id))
+            fresh = sum(1 for row in rows if (row[12], row[0]) > watermark_before)
             last = rows[-1]
             cursor_ts, cursor_id = last[12], last[0]
             # The STORED watermark only ever moves forward. Re-reading the lag
@@ -3614,14 +3648,24 @@ class TimelineSyncEngine:
                 batches += 1
             else:
                 stale_batches += 1
+            batch_cap_reached = (
+                adapter.max_incremental_batches_per_run > 0
+                and batches >= adapter.max_incremental_batches_per_run
+            )
+            stop_for_budget = _past(deadline) or batch_cap_reached
+            if forward_phase and len(rows) < limit and not stop_for_budget:
+                forward_phase = False
+                cursor_ts = max(
+                    state.watermark_ts - lag,
+                    datetime(1970, 1, 1, tzinfo=UTC),
+                )
+                cursor_id = ""
+                stale_batches = 0
+                continue
             if (
                 len(rows) < limit
-                or _past(deadline)
-                or stale_batches >= max_stale_batches
-                or (
-                    adapter.max_incremental_batches_per_run > 0
-                    and batches >= adapter.max_incremental_batches_per_run
-                )
+                or stop_for_budget
+                or (not forward_phase and stale_batches >= max_stale_batches)
             ):
                 break
         return total

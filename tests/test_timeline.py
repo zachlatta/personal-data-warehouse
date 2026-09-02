@@ -2638,9 +2638,10 @@ def test_coverage_reconcile_is_not_part_of_the_adapter_signature():
             reconcile_sql="SELECT 'obviously different'",
             reconcile_hours=adapter.reconcile_hours + 24,
             incremental_lag_hours=adapter.incremental_lag_hours + 1,
+            incremental_forward_first=not adapter.incremental_forward_first,
         )
         assert adapter_definition_signature(mutated) == baseline, (
-            f"{adapter.name}: reconcile/lag settings leaked into adapter_signature, "
+            f"{adapter.name}: reconcile/incremental tuning leaked into adapter_signature, "
             "which would reset every production backfill"
         )
 
@@ -2735,6 +2736,64 @@ def test_incremental_recovers_a_row_written_behind_the_watermark(warehouse):
         "this is the permanent-loss class that cost 3.0% of a settled Slack window"
     )
     assert landed[0]["snippet"] == "written behind the watermark"
+
+
+def test_slack_incremental_drains_forward_before_replaying_a_dense_lag_window(warehouse):
+    """Sweep-restamped Slack rows must not strand genuinely new work.
+
+    Slack's public-channel sweep can stamp more than eight full incremental
+    pages inside the 15-minute replay window.  If the engine always begins at
+    the lagged cursor, its stale-batch safety cap stops the pass before it ever
+    reaches the stored high-water mark; every later pass repeats the same
+    stale pages.  Production accumulated about four million rows beyond the
+    watermark this way while the adapter reported zero incremental progress.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse, batch_size=2)
+    try:
+        engine.run()
+        slack = adapter_by_name("slack_message")
+        state = engine._load_state(slack)
+        original_watermark = (state.watermark_ts, state.watermark_id)
+
+        stale = _NOW - timedelta(minutes=10)
+        warehouse._command(
+            """
+            INSERT INTO @slack_messages (
+                account, team_id, conversation_id, message_ts,
+                message_datetime, user_id, text, synced_at
+            )
+            SELECT 'z', 'T1', 'C1', 'stale-' || n::text,
+                   %s, 'U1', 'sweep-restamped row ' || n::text, %s
+            FROM generate_series(1, 20) AS n
+            """,
+            (stale, stale),
+        )
+        ahead = _NOW + timedelta(minutes=10)
+        warehouse._command(
+            """
+            INSERT INTO @slack_messages (
+                account, team_id, conversation_id, message_ts,
+                message_datetime, user_id, text, synced_at
+            )
+            VALUES ('z', 'T1', 'C1', 'forward-1', %s, 'U1',
+                    'genuinely new row', %s)
+            """,
+            (ahead, ahead),
+        )
+
+        advanced = engine._run_incremental(slack, state, None)
+    finally:
+        engine.close()
+
+    assert advanced == 1
+    assert (state.watermark_ts, state.watermark_id) > original_watermark
+    assert warehouse._query_dicts(
+        "SELECT 1 FROM @timeline_events "
+        "WHERE adapter = 'slack_message' AND event_id = 'z|T1|C1|forward-1'"
+    ), "dense stale replay pages stranded a row beyond the stored watermark"
 
 
 def test_incremental_picks_up_new_and_changed_rows(warehouse):
