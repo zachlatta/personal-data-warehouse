@@ -1690,6 +1690,7 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
     assert "slack_messages_thread_replies_live_idx" in index_names
     assert "slack_messages_thread_parents_idx" not in index_names
     assert "slack_messages_user_time_idx" in index_names
+    assert "slack_messages_user_conversation_time_idx" in index_names
     assert "slack_messages_time_idx" in index_names
     # Raw-table text search is retired: message text is searched through the
     # timeline document (timeline.search_text / timeline.search_text_exact).
@@ -1698,6 +1699,9 @@ def test_postgres_slack_tables_create_recent_message_indexes(warehouse: Postgres
 
     slack_user_index_names = _index_names(warehouse, "slack_users")
     assert "slack_users_email_lower_idx" in slack_user_index_names
+
+    slack_file_index_names = _index_names(warehouse, "slack_files")
+    assert "slack_files_event_time_idx" in slack_file_index_names
 
 
 def test_slack_thread_backfill_indexes_cover_only_live_parent_and_reply_rows() -> None:
@@ -1719,6 +1723,33 @@ def test_slack_thread_backfill_indexes_cover_only_live_parent_and_reply_rows() -
     assert ("slack_messages_thread_parents_idx", "slack_messages") in (
         postgres_module.POSTGRES_OBSOLETE_INDEXES
     )
+
+
+def test_slack_timeline_refresh_indexes_match_its_event_and_engagement_probes() -> None:
+    """Keep the five-minute refresh off both large Slack heaps.
+
+    File event time has an epoch/message-ts fallback, so ``created_at`` alone
+    cannot serve the adapter's ORDER BY.  Engagement probes constrain one
+    user in one conversation and a time range; the former user-only index made
+    Postgres choose the conversation index and filter hundreds of messages per
+    file in active channels.
+    """
+
+    from personal_data_warehouse import postgres as postgres_module
+
+    specs = {spec.name: spec for spec in postgres_module.POSTGRES_INDEXES}
+    event_sql = specs["slack_files_event_time_idx"].sql
+    assert "COALESCE(" in event_sql
+    assert "NULLIF(created_at" in event_sql
+    assert "to_timestamp(message_ts::numeric)" in event_sql
+    assert "NULLIF(synced_at" in event_sql
+
+    engagement_sql = specs["slack_messages_user_conversation_time_idx"].sql
+    assert (
+        "(user_id, account, team_id, conversation_id, message_datetime DESC)"
+        in engagement_sql
+    )
+    assert "WHERE is_deleted = 0" in engagement_sql
 
 
 def test_postgres_slack_messages_set_autovacuum_storage_parameters(warehouse: PostgresWarehouse) -> None:

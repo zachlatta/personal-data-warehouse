@@ -242,6 +242,25 @@ def test_slack_max_ingest_probes_do_not_join_the_message_heap():
     )
 
 
+def test_refresh_queries_bound_the_event_window_inside_postgres():
+    """A recent-content refresh must not fetch and normalize old rows.
+
+    The old refresh reused the backfill query and discarded rows older than
+    the cutoff in Python.  On ``base_slack.files`` that meant a full 1.7 GB
+    sort merely to learn that the 5,000th row was outside the 48-hour window,
+    evicting the hybrid-search working set every five minutes.  The database
+    must receive the cutoff so its event-time index can stop at the window.
+    """
+
+    refreshed = [adapter for adapter in TIMELINE_ADAPTERS if adapter.refresh_hours > 0]
+    assert refreshed
+    for adapter in refreshed:
+        assert adapter.refresh_sql, adapter.name
+        for param in ("%(cutoff_ts)s", "%(cursor_ts)s", "%(cursor_id)s", "%(limit)s"):
+            assert param in adapter.refresh_sql, (adapter.name, param)
+        assert ">= %(cutoff_ts)s" in adapter.refresh_sql, adapter.name
+
+
 def _priority_literals(sql: str) -> set[str]:
     """Every enum-label literal the adapter's SQL could emit as a priority.
 
@@ -2722,8 +2741,8 @@ def test_coverage_reconcile_repairs_a_gap_whatever_caused_it(warehouse):
     assert repaired == before
 
 
-def test_incremental_recovers_a_row_written_behind_the_watermark(warehouse):
-    """A source row whose ingest_ts predates the stored watermark must still land.
+def test_incremental_recovers_a_row_written_within_the_replay_window(warehouse):
+    """A late commit just behind the stored watermark must still land.
 
     This is the loss class C1 was quietly failing, measured in production on
     2026-08-26: `base_slack.messages` held 26,217 rows in a settled one-day
@@ -2735,9 +2754,10 @@ def test_incremental_recovers_a_row_written_behind_the_watermark(warehouse):
 
     The engine walks `(ingest_ts, event_id)` strictly ascending, so a row that
     commits after the pass has read -- but carries an ingest stamp from before
-    the watermark moved -- is skipped forever. `_run_refresh` cannot recover it
-    either: that pass re-walks by EVENT time (slack_message keeps 12h), and the
-    lost rows were 7-8 days old by event time. Permanent, silent loss.
+    the watermark moved -- needs the bounded 15-minute replay window. Older
+    gaps are closed by the separately tested hourly coverage reconcile; making
+    this test depend on that sweep running twice in one minute contradicted its
+    persisted cadence and hid the old last_reconcile_at reset bug.
     """
 
     _ensure_all_source_tables(warehouse)
@@ -2748,7 +2768,7 @@ def test_incremental_recovers_a_row_written_behind_the_watermark(warehouse):
 
         # The watermark now sits at _NOW. Write a row stamped BEHIND it, exactly
         # as a late-committing Slack backfill of a newly discovered channel does.
-        behind = _NOW - timedelta(hours=2)
+        behind = _NOW - timedelta(minutes=5)
         warehouse._command(
             """
             INSERT INTO @slack_messages (account, team_id, conversation_id, message_ts,

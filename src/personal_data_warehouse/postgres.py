@@ -1381,6 +1381,21 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_messages",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_messages_user_time_idx ON @slack_messages (user_id, message_datetime DESC)",
     ),
+    # Timeline priority asks whether Zach wrote in THIS conversation around a
+    # row.  With only the conversation-time and user-time indexes, Postgres
+    # chose the former and filtered ~800 public-channel messages per Slack file
+    # in production: 1.2M buffer hits for one 5k refresh page.  Equality on all
+    # four identity columns followed by the time range makes that probe a
+    # handful of leaf entries.  Keep the older user/time index for callers that
+    # intentionally search across conversations.
+    IndexSpec(
+        "slack_messages_user_conversation_time_idx",
+        "slack_messages",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "slack_messages_user_conversation_time_idx ON @slack_messages "
+        "(user_id, account, team_id, conversation_id, message_datetime DESC) "
+        "WHERE is_deleted = 0",
+    ),
     IndexSpec(
         "slack_messages_synced_at_idx",
         "slack_messages",
@@ -1823,6 +1838,24 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "slack_files_created_at_idx",
         "slack_files",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_created_at_idx ON @slack_files (created_at DESC)",
+    ),
+    # The Slack-file timeline event time falls back from the epoch sentinel to
+    # message_ts and then synced_at.  A created_at-only index therefore cannot
+    # serve the exact ORDER BY: production performed a five-worker seq scan and
+    # wrote ~1.6 GB of temp files every five minutes.  Match the adapter's
+    # immutable expression byte-for-byte so both backfill and bounded refresh
+    # can walk it directly.
+    IndexSpec(
+        "slack_files_event_time_idx",
+        "slack_files",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS slack_files_event_time_idx "
+        "ON @slack_files ((COALESCE("
+        "NULLIF(created_at, '1970-01-01 00:00:00+00'::timestamptz), "
+        "NULLIF((CASE WHEN message_ts ~ '^[0-9]+(\\.[0-9]+)?$' "
+        "THEN to_timestamp(message_ts::numeric) ELSE NULL END), "
+        "'1970-01-01 00:00:00+00'::timestamptz), "
+        "NULLIF(synced_at, '1970-01-01 00:00:00+00'::timestamptz), "
+        "'1970-01-01 00:00:00+00'::timestamptz)) DESC)",
     ),
     IndexSpec(
         "apple_messages_ingested_at_idx",

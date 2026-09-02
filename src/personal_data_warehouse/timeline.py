@@ -170,6 +170,12 @@ class TimelineAdapter:
     # his answer to an email promotes the thread) converge through this window
     # instead of freezing at first-ingest values.
     refresh_hours: float = 0.0
+    # Window-bounded normalization query used by ``_run_refresh``.  It has the
+    # same output and keyset as ``backfill_sql`` plus ``%(cutoff_ts)s``.  This
+    # is execution machinery, not normalized content, and is intentionally
+    # absent from ``adapter_definition_signature``: adding the lower bound must
+    # not reset a 47M-row adapter backfill.
+    refresh_sql: str = ""
     # How far BEHIND the stored watermark each incremental pass restarts.
     #
     # The engine walks (ingest_ts, event_id) strictly ascending, so a row whose
@@ -328,6 +334,20 @@ def _simple_adapter(
         ORDER BY 4 DESC, 1 DESC
         LIMIT %(limit)s
     """
+    # Refresh used to call ``backfill_sql`` and throw pre-cutoff rows away in
+    # Python.  That is logically correct but operationally disastrous for a
+    # computed event time: Slack files sorted its entire 1.7 GB heap every five
+    # minutes merely to fetch one old boundary row.  Put the lower bound in the
+    # source query so an event-time index can stop at the actual window.
+    refresh_sql = f"""
+        {select}
+          AND ({event_ts}) >= %(cutoff_ts)s
+          AND ({event_ts}) <= %(cursor_ts)s
+          AND (({event_ts}), COALESCE(({event_id}), ''))
+              < (%(cursor_ts)s, %(cursor_id)s)
+        ORDER BY 4 DESC, 1 DESC
+        LIMIT %(limit)s
+    """
     # When ingest_ts is a computed expression (GREATEST over attachment /
     # enrichment LATERALs) no index can serve the watermark predicate, so the
     # bare incremental query re-evaluates the full join for every source row
@@ -421,6 +441,7 @@ def _simple_adapter(
         max_incremental_batches_per_run=max_incremental_batches_per_run,
         incremental_forward_first=incremental_forward_first,
         refresh_hours=refresh_hours,
+        refresh_sql=refresh_sql,
         prune_sql=prune_sql,
         signature_backfill_sql=signature_backfill_sql,
         signature_incremental_sql=signature_incremental_sql,
@@ -3686,8 +3707,13 @@ class TimelineSyncEngine:
         limit = self._batch_limit(adapter)
         while not _past(deadline):
             rows = self._fetch(
-                adapter.backfill_sql,
-                {"cursor_ts": cursor_ts, "cursor_id": cursor_id, "limit": limit},
+                adapter.refresh_sql or adapter.backfill_sql,
+                {
+                    "cutoff_ts": cutoff,
+                    "cursor_ts": cursor_ts,
+                    "cursor_id": cursor_id,
+                    "limit": limit,
+                },
             )
             if not rows:
                 break
