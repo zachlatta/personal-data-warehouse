@@ -2584,12 +2584,12 @@ def test_coverage_reconcile_timestamp_persists_and_enforces_its_cadence(warehous
     adapter = adapter_by_name("slack_message")
     engine = _engine(warehouse, adapters=[adapter])
     try:
-        engine.run()
+        first_stats = engine.run()
         first = warehouse._query(
             "SELECT last_reconcile_at FROM @timeline_sync_state WHERE adapter = %s",
             (adapter.name,),
         )[0][0]
-        engine.run()
+        second_stats = engine.run()
         second = warehouse._query(
             "SELECT last_reconcile_at FROM @timeline_sync_state WHERE adapter = %s",
             (adapter.name,),
@@ -2599,6 +2599,8 @@ def test_coverage_reconcile_timestamp_persists_and_enforces_its_cadence(warehous
 
     assert first > datetime(2000, 1, 1, tzinfo=UTC)
     assert second == first, "the cadence gate did not skip the immediate second sweep"
+    assert first_stats[0].reconcile_ran is True
+    assert second_stats[0].reconcile_ran is False
 
 
 def test_no_adapter_declares_a_placeholder_priority_expression():

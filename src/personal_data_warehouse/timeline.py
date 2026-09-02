@@ -3315,6 +3315,7 @@ class AdapterSyncStats:
     incremental_rows: int = 0
     refreshed_rows: int = 0
     reconciled_rows: int = 0
+    reconcile_ran: bool = False
     pruned_rows: int = 0
     backfill_done: bool = False
     error: str = ""
@@ -4099,8 +4100,12 @@ class TimelineSyncEngine:
                 break
             state = states[adapter.name]
             try:
+                previous_reconcile_at = state.last_reconcile_at
                 stats[adapter.name].reconciled_rows = self._run_coverage_reconcile(
                     adapter, state, deadline
+                )
+                stats[adapter.name].reconcile_ran = (
+                    state.last_reconcile_at > previous_reconcile_at
                 )
             except Exception as exc:  # noqa: BLE001 - a sweep must never fail the run
                 # Reconcile is a repair pass over data every other pass already

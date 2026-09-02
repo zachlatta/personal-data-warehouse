@@ -366,7 +366,17 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
         "_search_index_fingerprint",
         lambda _targets: "fingerprint",
     )
-    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(now,)])
+    prewarm_calls: list[tuple[str, str]] = []
+
+    def query(sql, params=None):
+        if "pg_postmaster_start_time" in sql:
+            return [(now,)]
+        if "pg_prewarm" in sql:
+            prewarm_calls.append((params[0], params[1]))
+            return [(1,)]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(warehouse, "_query", query)
     monkeypatch.setattr(
         warehouse,
         "_command",
@@ -377,6 +387,13 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
 
     assert result == {"warmed": False, "reason": "current", "blocks": 0}
     assert calls == []
+
+    forced = warehouse.prewarm_search_indexes_if_needed(
+        schema_signature="sig", force=True
+    )
+    assert forced["warmed"] is True
+    assert prewarm_calls
+    assert calls, "a forced post-maintenance warm must update the state marker"
 
 
 def test_search_prewarm_fingerprint_tracks_relfilenodes_not_normal_growth() -> None:

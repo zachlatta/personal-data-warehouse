@@ -90,6 +90,47 @@ def test_timeline_sync_asset_passes_the_backfill_throttle_from_the_environment(m
     assert engine.backfill_budget == 45.0
 
 
+def test_timeline_sync_rewarms_search_after_a_high_volume_reconcile(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(timeline_defs, "exclusive_sync_lock", _acquired_lock)
+
+    def run_with_reconcile(self, **_kwargs):
+        return [
+            AdapterSyncStats(
+                adapter="slack_message",
+                backfill_done=True,
+                reconcile_ran=True,
+            )
+        ]
+
+    monkeypatch.setattr(_FakeEngine, "run", run_with_reconcile)
+
+    class FakeWarehouse:
+        instances = []
+
+        def __init__(self, url):
+            self.url = url
+            self.force_calls = []
+            self.closed = False
+            self.instances.append(self)
+
+        def prewarm_search_indexes_if_needed(self, *, force=False):
+            self.force_calls.append(force)
+            return {"warmed": True, "reason": "forced", "blocks": 10}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(timeline_defs, "PostgresWarehouse", FakeWarehouse)
+
+    timeline_defs.timeline_sync(build_asset_context())
+
+    [warehouse] = FakeWarehouse.instances
+    assert warehouse.url == "postgresql://example/warehouse"
+    assert warehouse.force_calls == [True]
+    assert warehouse.closed
+
+
 def test_timeline_sync_asset_skips_when_lock_busy(monkeypatch):
     _patch_common(monkeypatch)
     monkeypatch.setattr(timeline_defs, "exclusive_sync_lock", _busy_lock)

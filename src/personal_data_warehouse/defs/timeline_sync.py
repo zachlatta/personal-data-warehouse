@@ -15,6 +15,7 @@ from dagster import (
 )
 
 from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.timeline import TimelineSyncEngine, TimelineSyncError
@@ -34,6 +35,15 @@ TIMELINE_SYNC_RUN_BUDGET_SECONDS = 240
 # deployment to slow the re-walk while the archive catches up, and unset it
 # afterwards. Incremental sync is never throttled by it.
 TIMELINE_SYNC_BACKFILL_BUDGET_ENV = "TIMELINE_SYNC_BACKFILL_BUDGET_SECONDS"
+
+# Their independent coverage proof necessarily walks a large recent source
+# window even when it finds only a handful of gaps.  Restore the HNSW/BM25
+# working set after those hourly scans, once at the end of the timeline run;
+# otherwise a correctness pass makes interactive search cold until organic
+# traffic happens to repopulate it.
+CACHE_EVICTING_RECONCILE_ADAPTERS = frozenset(
+    {"gmail_email", "slack_message", "slack_file"}
+)
 
 
 def _backfill_budget_seconds() -> float | None:
@@ -74,11 +84,34 @@ def timeline_sync(context) -> MaterializeResult:
             finally:
                 engine.close()
 
+            if any(
+                stat.reconcile_ran
+                and stat.adapter in CACHE_EVICTING_RECONCILE_ADAPTERS
+                for stat in stats
+            ):
+                warehouse = PostgresWarehouse(settings.postgres_database_url or "")
+                try:
+                    warm = warehouse.prewarm_search_indexes_if_needed(force=True)
+                    context.log.info(
+                        "Restored search cache after high-volume timeline reconcile: %s",
+                        warm,
+                    )
+                except Exception as error:  # cache repair must not fail ingestion
+                    context.log.error(
+                        "Could not restore search cache after timeline reconcile: %s",
+                        error,
+                    )
+                finally:
+                    warehouse.close()
+
     return MaterializeResult(
         metadata={
             "adapters": MetadataValue.int(len(stats)),
             "backfill_rows": MetadataValue.int(sum(s.backfill_rows for s in stats)),
             "incremental_rows": MetadataValue.int(sum(s.incremental_rows for s in stats)),
+            "reconciled_adapters": MetadataValue.json(
+                sorted(s.adapter for s in stats if s.reconcile_ran)
+            ),
             "backfill_pending": MetadataValue.json(
                 sorted(s.adapter for s in stats if not s.backfill_done)
             ),

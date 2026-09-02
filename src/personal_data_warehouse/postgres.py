@@ -11875,14 +11875,17 @@ class PostgresWarehouse:
         return "", datetime.fromtimestamp(0, tz=UTC), ""
 
     def prewarm_search_indexes_if_needed(
-        self, *, schema_signature: str | None = None
+        self, *, schema_signature: str | None = None, force: bool = False
     ) -> dict[str, int | bool | str]:
         """Warm HNSW/BM25 once per deploy, DB restart, or index rebuild.
 
         A state match is a handful of catalog reads.  A mismatch performs the
         intentionally expensive sequential read and records state only after
         every existing target succeeds, so a partial warm is retried rather
-        than reported as current.
+        than reported as current. ``force`` is reserved for a known
+        cache-evicting maintenance pass (the high-volume timeline coverage
+        reconciles); it restores the search working set after that pass even
+        though none of the index identities changed.
         """
 
         if not self._pg_prewarm_available():
@@ -11898,7 +11901,7 @@ class PostgresWarehouse:
         old_signature, old_postmaster_started_at, old_fingerprint = (
             self._search_prewarm_state()
         )
-        if (
+        if not force and (
             old_signature == signature
             and old_postmaster_started_at == postmaster_started_at
             and old_fingerprint == fingerprint
@@ -11920,7 +11923,11 @@ class PostgresWarehouse:
             "WHERE id = 1",
             (signature, postmaster_started_at, fingerprint),
         )
-        return {"warmed": True, "reason": "stale", "blocks": blocks}
+        return {
+            "warmed": True,
+            "reason": "forced" if force else "stale",
+            "blocks": blocks,
+        }
 
     def _prewarm_search_indexes_best_effort(self, *, schema_signature: str) -> None:
         try:
