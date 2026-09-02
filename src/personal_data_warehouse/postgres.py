@@ -489,6 +489,11 @@ CALENDAR_EVENT_OPERATIONS = (
     CALENDAR_DELETE_EVENT_OPERATION,
 )
 SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
+# Index creation is shared DDL too.  Multiple Dagster assets call ensure_*
+# concurrently after a deploy; without one lock they can mistake another
+# process's in-progress concurrent index for an abandoned invalid index and
+# drop it underneath the builder.
+INDEX_SCHEMA_REFRESH_LOCK_ID = 8_407_112_484
 # Serializes _ensure_query_role's shared GRANT/REVOKEs across processes.
 # Distinct from TIMELINE_SYNC_POSTGRES_LOCK_ID, which held the same id: the two
 # happen to live in different databases today (this one on the warehouse, that
@@ -7707,6 +7712,13 @@ class PostgresWarehouse:
         return bool(rows)
 
     def _ensure_indexes(self, tables: Sequence[str]) -> None:
+        self._command("SELECT pg_advisory_lock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,))
+        try:
+            self._ensure_indexes_locked(tables)
+        finally:
+            self._command("SELECT pg_advisory_unlock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,))
+
+    def _ensure_indexes_locked(self, tables: Sequence[str]) -> None:
         table_names = set(tables)
         for index in POSTGRES_INDEXES:
             if index.table not in table_names or index.name in self._ensured_index_names:

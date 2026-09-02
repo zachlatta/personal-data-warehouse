@@ -42,6 +42,7 @@ from personal_data_warehouse.postgres import (
     ATTACHMENT_COLUMNS,
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
+    INDEX_SCHEMA_REFRESH_LOCK_ID,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
@@ -135,6 +136,44 @@ def test_search_view_refresh_takes_advisory_lock(monkeypatch) -> None:
 
     assert commands[0] == ("SELECT pg_advisory_lock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
     assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+
+
+def test_index_refresh_takes_advisory_lock(monkeypatch) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
+    warehouse._ensured_index_names = set()
+    commands: list[tuple[str, tuple | None]] = []
+
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
+    monkeypatch.setattr(warehouse, "_ensure_indexes_locked", lambda tables: commands.append(("locked", tuple(tables))))
+
+    warehouse._ensure_indexes(["slack_messages"])
+
+    assert commands == [
+        ("SELECT pg_advisory_lock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,)),
+        ("locked", ("slack_messages",)),
+        ("SELECT pg_advisory_unlock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,)),
+    ]
+
+
+def test_index_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    commands: list[tuple[str, tuple | None]] = []
+
+    monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append((sql, params)))
+    monkeypatch.setattr(
+        warehouse,
+        "_ensure_indexes_locked",
+        lambda _tables: (_ for _ in ()).throw(RuntimeError("ddl failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="ddl failed"):
+        warehouse._ensure_indexes(["slack_messages"])
+
+    assert commands[-1] == (
+        "SELECT pg_advisory_unlock(%s)",
+        (INDEX_SCHEMA_REFRESH_LOCK_ID,),
+    )
 
 
 def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:
