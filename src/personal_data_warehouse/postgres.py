@@ -7712,7 +7712,16 @@ class PostgresWarehouse:
         return bool(rows)
 
     def _ensure_indexes(self, tables: Sequence[str]) -> None:
-        self._command("SELECT pg_advisory_lock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,))
+        # Never queue here. CREATE INDEX CONCURRENTLY must wait for every older
+        # transaction that could hold a snapshot; a caller blocked inside
+        # pg_advisory_lock is itself such a transaction, producing a deadlock
+        # with the builder it is waiting for. A later ensure_* call retries any
+        # skipped work after the current builder releases the session lock.
+        acquired = self._query(
+            "SELECT pg_try_advisory_lock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,)
+        )
+        if not acquired or not bool(acquired[0][0]):
+            return
         try:
             self._ensure_indexes_locked(tables)
         finally:
