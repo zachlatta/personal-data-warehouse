@@ -333,6 +333,39 @@ def test_lean_slack_max_ingest_probe_does_not_reset_adapter_signature():
     ).hexdigest()
 
 
+def test_slack_incremental_prefilters_the_watermark_page_without_resetting_history():
+    """Normalize 5k candidates, not every row in a multi-day backlog.
+
+    The join is an execution-only LIMIT barrier and therefore must be absent
+    from the compatibility SQL used for adapter_signature. These hashes are
+    the deployed pre-barrier signatures; changing one would rewalk Slack's
+    47M timeline rows and generate avoidable WAL.
+    """
+
+    expected = {
+        "slack_message": (
+            "@slack_messages",
+            "2f8fcc39c5bd7e88469e43e2e5e93ee18217cc80aa303f529fb651c3279fb444",
+        ),
+        "slack_file": (
+            "@slack_files",
+            "516be8aaaefc200f99409b705d5f702d295f01b8334ed4da562f92551536fc4b",
+        ),
+    }
+    for name, (relation, deployed_signature) in expected.items():
+        adapter = adapter_by_name(name)
+        sql = adapter.incremental_sql
+        barrier = f"FROM {relation} changed_source"
+        assert barrier in sql
+        outer_from = sql.split(f"FROM {relation} t", 1)[1]
+        assert outer_from.index(barrier) < outer_from.index("LEFT JOIN @slack_users u")
+        candidate = sql.split(barrier, 1)[1].split(") changed ON", 1)[0]
+        assert "ORDER BY changed_source.synced_at ASC" in candidate
+        assert "LIMIT %(limit)s" in candidate
+        assert "changed_source" not in adapter.signature_incremental_sql
+        assert adapter_definition_signature(adapter) == deployed_signature
+
+
 def test_no_adapter_can_emit_the_unclassified_sentinel():
     """'unclassified' is the column DEFAULT and a bug marker, never a tier.
 
@@ -2450,6 +2483,45 @@ def test_refresh_window_converges_late_signals(warehouse):
         "SELECT priority FROM @timeline_events WHERE event_id = 'z|T1|C9|9000.1'"
     )
     assert row[0][0] == "direct", "his replies retroactively promote the conversation window"
+
+
+def test_every_incremental_adapter_runs_before_any_refresh(warehouse):
+    """An early adapter's history refresh cannot starve later live tails.
+
+    Gmail's 72-hour refresh consumed most of a production timeline tick while
+    Slack sat five days behind it in registry order. Incremental delivery is
+    the first phase for the whole registry; refresh is a second phase.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapters = [adapter_by_name("gmail_email"), adapter_by_name("slack_message")]
+    engine = _engine(warehouse, adapters=adapters)
+    try:
+        engine.run()
+        calls: list[str] = []
+
+        def incremental(adapter, state, deadline):
+            calls.append(f"incremental:{adapter.name}")
+            return 0
+
+        def refresh(adapter, deadline):
+            calls.append(f"refresh:{adapter.name}")
+            return 0
+
+        engine._run_incremental = incremental  # type: ignore[method-assign]
+        engine._run_refresh = refresh  # type: ignore[method-assign]
+        engine._run_coverage_reconcile = lambda adapter, state, deadline: 0  # type: ignore[method-assign]
+        engine.run()
+    finally:
+        engine.close()
+
+    assert calls == [
+        "incremental:gmail_email",
+        "incremental:slack_message",
+        "refresh:gmail_email",
+        "refresh:slack_message",
+    ]
 
 
 def test_coverage_reconcile_picks_the_stalest_adapter_not_the_first(warehouse):

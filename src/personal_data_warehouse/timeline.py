@@ -261,6 +261,7 @@ def _simple_adapter(
     where: str = "TRUE",
     changed_join_sql: str = "",
     changed_join_anchor: str = "",
+    signature_changed_join_sql: str | None = None,
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     max_incremental_batches_per_run: int = 0,
     refresh_hours: float = 0.0,
@@ -326,20 +327,33 @@ def _simple_adapter(
     # on every tick. Adapters with that shape pass changed_join_sql — an
     # incremental-only inner join to a watermark-driven candidate set covering
     # every input of ingest_ts — so per-tick cost scales with what changed.
-    incremental_from = from_sql
-    if changed_join_sql:
+    def with_changed_join(join_sql: str) -> str:
+        if not join_sql:
+            return from_sql
         if changed_join_anchor:
             if from_sql.count(changed_join_anchor) != 1:
                 raise ValueError(
                     f"changed join anchor must occur exactly once: {changed_join_anchor!r}"
                 )
-            incremental_from = from_sql.replace(
+            return from_sql.replace(
                 changed_join_anchor,
-                f"{changed_join_anchor}\n    {changed_join_sql}",
+                f"{changed_join_anchor}\n    {join_sql}",
                 1,
             )
-        else:
-            incremental_from = f"{from_sql}\n    {changed_join_sql}"
+        return f"{from_sql}\n    {join_sql}"
+
+    incremental_from = with_changed_join(changed_join_sql)
+    # Some joins are execution-plan barriers only: they preselect the exact
+    # same watermark page before expensive normalization joins, without
+    # changing which rows or normalized content the adapter emits. Such a
+    # join must not change adapter_signature and reset a 47M-row backfill.
+    # None means the join is semantic and belongs in the signature; an
+    # explicit empty string preserves the prior un-prefiltered fingerprint.
+    signature_incremental_from = with_changed_join(
+        changed_join_sql
+        if signature_changed_join_sql is None
+        else signature_changed_join_sql
+    )
     incremental_sql = f"""
         {build_select(incremental_from)}
           AND ({ingest_ts}) >= %(watermark_ts)s
@@ -349,7 +363,7 @@ def _simple_adapter(
         LIMIT %(limit)s
     """
     signature_incremental_sql = f"""
-        {build_select(incremental_from, legacy_priority_fallback=True)}
+        {build_select(signature_incremental_from, legacy_priority_fallback=True)}
           AND ({ingest_ts}) >= %(watermark_ts)s
           AND (({ingest_ts}), COALESCE(({event_id}), ''))
               > (%(watermark_ts)s, %(watermark_id)s)
@@ -708,6 +722,48 @@ _SLACK_JOINS = """
         ON ident.account = t.account AND ident.team_id = t.team_id
 """
 
+
+def _slack_incremental_candidate_join(
+    relation: str, key_columns: tuple[str, ...]
+) -> str:
+    """Preselect one indexed Slack watermark page before normalization.
+
+    A Slack timeline row needs user/conversation joins plus several bounded
+    priority probes.  When four million sweep-restamped messages accumulated
+    behind the watermark, Postgres evaluated those joins across the whole
+    eligible range before honoring the outer LIMIT; one 5,000-row page then
+    consumed most of a timeline tick.  This LIMIT is a plan barrier over the
+    source table alone.  The outer query repeats the same keyset predicate, so
+    it changes execution shape only, never row membership or normalization.
+    """
+
+    source_alias = "changed_source"
+    qualified = tuple(f"{source_alias}.{column}" for column in key_columns)
+    event_id = "concat_ws('|', " + ", ".join(qualified) + ")"
+    selected = ", ".join(qualified)
+    match = " AND ".join(
+        f"changed.{column} = t.{column}" for column in key_columns
+    )
+    return f"""
+    INNER JOIN (
+        SELECT {selected}
+        FROM {relation} {source_alias}
+        WHERE {source_alias}.synced_at >= %(watermark_ts)s
+          AND ({source_alias}.synced_at, {event_id})
+              > (%(watermark_ts)s, %(watermark_id)s)
+        ORDER BY {source_alias}.synced_at ASC, {event_id} ASC
+        LIMIT %(limit)s
+    ) changed ON {match}
+    """
+
+
+_SLACK_MESSAGE_INCREMENTAL_CANDIDATES = _slack_incremental_candidate_join(
+    "@slack_messages", ("account", "team_id", "conversation_id", "message_ts")
+)
+_SLACK_FILE_INCREMENTAL_CANDIDATES = _slack_incremental_candidate_join(
+    "@slack_files", ("account", "team_id", "file_id", "conversation_id", "message_ts")
+)
+
 # The root of this thread is one of Zach's own messages: a reply to him.
 # A single primary-key probe per threaded row.
 _SLACK_THREAD_ROOT_MINE = (
@@ -1023,6 +1079,12 @@ _SLACK_MESSAGE = _simple_adapter(
     # turned a btree-served max into a parallel scan of the 49 GB message heap
     # every five minutes.
     max_ingest_sql="SELECT max(synced_at) FROM @slack_messages",
+    changed_join_sql=_SLACK_MESSAGE_INCREMENTAL_CANDIDATES,
+    changed_join_anchor="@slack_messages t",
+    # The candidate subquery is a semantically identical plan barrier. Keep
+    # the deployed signature so installing it cannot reset Slack's 47M-row
+    # backfill.
+    signature_changed_join_sql="",
 )
 
 _SLACK_FILE = _simple_adapter(
@@ -1060,6 +1122,9 @@ _SLACK_FILE = _simple_adapter(
     ),
     priority=_SLACK_FILE_PRIORITY,
     max_ingest_sql="SELECT max(synced_at) FROM @slack_files",
+    changed_join_sql=_SLACK_FILE_INCREMENTAL_CANDIDATES,
+    changed_join_anchor="@slack_files t",
+    signature_changed_join_sql="",
     refresh_hours=48,
 )
 
@@ -3884,15 +3949,17 @@ class TimelineSyncEngine:
         except Exception:  # noqa: BLE001 - the gmail adapter degrades, others run
             logger.exception("timeline gmail correspondent refresh failed")
 
+        # Incremental is a distinct first phase. Refresh can be expensive even
+        # when it changes nothing (Gmail's 72-hour rewalk was consuming most
+        # of a production tick), so running each adapter's refresh immediately
+        # after its incremental pass let the first adapter starve every source
+        # behind it. C1 requires every source's new rows to get a turn before
+        # any already-present history is reconsidered.
         for adapter in self._adapters:
             try:
                 state = self._load_state(adapter)
                 states[adapter.name] = state
                 stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
-                if adapter.refresh_hours > 0 and state.backfill_done:
-                    stats[adapter.name].refreshed_rows = self._run_refresh(adapter, deadline)
-                if adapter.prune_sql and state.backfill_done:
-                    stats[adapter.name].pruned_rows = self._run_prune(adapter)
                 stats[adapter.name].backfill_done = state.backfill_done
                 # Heartbeat. `_save_state` stamps last_run_at, but every other
                 # caller only reaches it when rows were WRITTEN, so a healthy
@@ -3908,6 +3975,29 @@ class TimelineSyncEngine:
                 failed.append(adapter.name)
             if _past(deadline):
                 break
+
+        # Content refresh and source-authoritative pruning are lower priority
+        # than every adapter's incremental watermark. They retain registry
+        # order, but only begin after the incremental phase above and stop at
+        # the same whole-run deadline.
+        for adapter in self._adapters:
+            if _past(deadline):
+                break
+            state = states.get(adapter.name)
+            if state is None or stats[adapter.name].error or not state.backfill_done:
+                continue
+            try:
+                if adapter.refresh_hours > 0:
+                    stats[adapter.name].refreshed_rows = self._run_refresh(
+                        adapter, deadline
+                    )
+                if adapter.prune_sql and not _past(deadline):
+                    stats[adapter.name].pruned_rows = self._run_prune(adapter)
+            except Exception as exc:  # noqa: BLE001 - keep other adapters running
+                logger.exception("timeline refresh/prune failed for %s", adapter.name)
+                stats[adapter.name].error = str(exc)
+                self._save_state(adapter, state, error=str(exc))
+                failed.append(adapter.name)
 
         active = [
             adapter
