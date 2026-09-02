@@ -10068,7 +10068,9 @@ class PostgresWarehouse:
         self._command(
             """
             UPDATE @slack_conversations
-               SET is_archived = 1
+               SET is_archived = 1,
+                   synced_at = clock_timestamp(),
+                   sync_version = (extract(epoch from clock_timestamp()) * 1000000)::bigint
              WHERE account = %s
                AND team_id = %s
                AND conversation_id = %s
@@ -11370,17 +11372,18 @@ class PostgresWarehouse:
             changed: list[str] = []
             if not full:
                 since = watermark - SLACK_ACCOUNT_STATE_REFRESH_OVERLAP
+                since_version = int(since.timestamp() * 1_000_000)
                 changed = [
                     str(row[0])
                     for row in self._query(
                         """
                         SELECT conversation_id FROM @slack_conversations
-                        WHERE account = %s AND team_id = %s AND synced_at > %s
+                        WHERE account = %s AND team_id = %s AND sync_version > %s
                         UNION
                         SELECT DISTINCT conversation_id FROM @slack_messages
                         WHERE account = %s AND team_id = %s AND synced_at > %s
                         """,
-                        (account, team_id, since, account, team_id, since),
+                        (account, team_id, since_version, account, team_id, since),
                     )
                 ]
 
@@ -11512,8 +11515,12 @@ class PostgresWarehouse:
               AND conversation_id = %s
               AND is_deleted = 0
               AND is_thread_reply = 0
-              AND {_numeric_ts("message_ts")} >= %s
-              AND {_numeric_ts("message_ts")} <= %s
+              -- message_datetime is derived from message_ts at ingest.  Range
+              -- on the indexed timestamp rather than casting message_ts on
+              -- every stored row: the latter made each five-minute history
+              -- poll walk whole multi-million-message channels.
+              AND message_datetime >= to_timestamp(%s)
+              AND message_datetime <= to_timestamp(%s)
             """,
             (account, team_id, conversation_id, float(oldest_ts), float(latest_ts)),
         )
@@ -15358,6 +15365,19 @@ NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
     "slack_message_reactions": ("synced_at", "sync_version"),
 }
 
+# Slack conversation discovery has two independent clocks. ``synced_at`` says
+# the conversations.list walk observed the row and is the signal C11's
+# discovery-coverage health judges. ``sync_version`` says the provider content
+# (including read state) changed and is what the derived inbox refresh follows.
+# Treating the observation clock as the content clock made every list page look
+# changed, so the five-minute inbox refresh repeatedly scanned thirty days of
+# messages for ~1,000 unchanged conversations and evicted the search indexes.
+# These tables still update their observation columns on a no-op upsert, while
+# the version column advances only when another mutable column differs.
+OBSERVATION_ONLY_UPSERT_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "slack_conversations": ("synced_at",),
+}
+
 
 def _dedupe_conflict_rows(
     rows: list[tuple[Any, ...]],
@@ -15464,15 +15484,47 @@ def _upsert_clause(
         return f"ON CONFLICT ({conflict_columns}) DO NOTHING"
     preserve_non_empty_columns = PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE.get(table, ())
     target_ref = _identifier(target_alias) if target_alias else _identifier(table)
-    assignments = ", ".join(
-        _upsert_assignment(
-            target_ref=target_ref,
-            column=column,
-            preserve_non_empty=column in preserve_non_empty_columns,
-        )
-        for column in update_columns
-    )
     version_column = spec.version_column
+    observation_columns = OBSERVATION_ONLY_UPSERT_COLUMNS_BY_TABLE.get(table, ())
+    content_columns = [
+        column
+        for column in update_columns
+        if column != version_column and column not in observation_columns
+    ]
+    content_distinct = ""
+    if observation_columns and content_columns:
+        current_row = ", ".join(
+            f"{target_ref}.{_identifier(column)}" for column in content_columns
+        )
+        incoming_row = ", ".join(
+            f"EXCLUDED.{_identifier(column)}" for column in content_columns
+        )
+        content_distinct = (
+            f"ROW({current_row}) IS DISTINCT FROM ROW({incoming_row})"
+        )
+
+    assignments_list: list[str] = []
+    for column in update_columns:
+        quoted_column = _identifier(column)
+        if column in observation_columns:
+            assignments_list.append(
+                f"{quoted_column} = GREATEST({target_ref}.{quoted_column}, "
+                f"EXCLUDED.{quoted_column})"
+            )
+        elif column == version_column and content_distinct:
+            assignments_list.append(
+                f"{quoted_column} = CASE WHEN {content_distinct} "
+                f"THEN EXCLUDED.{quoted_column} ELSE {target_ref}.{quoted_column} END"
+            )
+        else:
+            assignments_list.append(
+                _upsert_assignment(
+                    target_ref=target_ref,
+                    column=column,
+                    preserve_non_empty=column in preserve_non_empty_columns,
+                )
+            )
+    assignments = ", ".join(assignments_list)
     predicates = [
         f"{target_ref}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
     ]

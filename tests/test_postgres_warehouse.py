@@ -1239,6 +1239,21 @@ def test_slack_message_upsert_compares_content_before_advancing_ingest_stamp() -
         assert f'"{table}"."sync_version"' not in current_row
 
 
+def test_slack_conversation_upsert_separates_observation_time_from_content_version() -> None:
+    clause = _upsert_clause("slack_conversations", POSTGRES_TABLES["slack_conversations"])
+
+    # Discovery health needs every successful conversations.list observation
+    # in synced_at.  Consumers looking for a conversation CONTENT change must
+    # not mistake that observation stamp for a changed read state/name/etc.
+    assert '"synced_at" = GREATEST("slack_conversations"."synced_at", EXCLUDED."synced_at")' in clause
+    assert '"sync_version" = CASE WHEN ROW(' in clause
+    assert 'THEN EXCLUDED."sync_version" ELSE "slack_conversations"."sync_version" END' in clause
+    comparison = clause.split('"sync_version" = CASE WHEN ROW(', 1)[1].split(" THEN ", 1)[0]
+    assert '"slack_conversations"."name"' in comparison
+    assert '"slack_conversations"."synced_at"' not in comparison
+    assert '"slack_conversations"."sync_version"' not in comparison
+
+
 def test_postgres_slack_message_refetch_is_a_noop_until_content_changes(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -1281,6 +1296,53 @@ def test_postgres_slack_message_refetch_is_a_noop_until_content_changes(
         "SELECT text, synced_at, sync_version FROM @slack_messages"
         " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
     ) == [("after edit", changed_sync, 3)]
+
+
+def test_postgres_slack_conversation_refetch_advances_observation_not_content_version(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    first_sync = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    second_sync = first_sync + timedelta(hours=1)
+    changed_sync = first_sync + timedelta(hours=2)
+    original = _slack_conversation_row(
+        conversation_id="C1",
+        name="before rename",
+        raw_json='{"id":"C1","name":"before rename"}',
+        synced_at=first_sync,
+        sync_version=int(first_sync.timestamp() * 1_000_000),
+    )
+    warehouse.insert_slack_conversations([original])
+
+    warehouse.insert_slack_conversations(
+        [
+            {
+                **original,
+                "synced_at": second_sync,
+                "sync_version": int(second_sync.timestamp() * 1_000_000),
+            }
+        ]
+    )
+    assert warehouse._query(
+        "SELECT name, synced_at, sync_version FROM @slack_conversations"
+        " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
+    ) == [("before rename", second_sync, int(first_sync.timestamp() * 1_000_000))]
+
+    warehouse.insert_slack_conversations(
+        [
+            {
+                **original,
+                "name": "after rename",
+                "raw_json": '{"id":"C1","name":"after rename"}',
+                "synced_at": changed_sync,
+                "sync_version": int(changed_sync.timestamp() * 1_000_000),
+            }
+        ]
+    )
+    assert warehouse._query(
+        "SELECT name, synced_at, sync_version FROM @slack_conversations"
+        " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
+    ) == [("after rename", changed_sync, int(changed_sync.timestamp() * 1_000_000))]
 
 
 def test_postgres_whatsapp_chat_name_survives_later_blank_history_row(warehouse: PostgresWarehouse) -> None:
@@ -4747,8 +4809,16 @@ def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads
     assert archived == [{"id": "C-gone"}]
 
     # Re-discovering the channel as active (is_archived=0) self-heals it.
+    rediscovered_at = datetime.now(tz=UTC) + timedelta(seconds=1)
     warehouse.insert_slack_conversations(
-        [_slack_conversation_row(conversation_id="C-gone", raw_json='{"id":"C-gone"}')]
+        [
+            _slack_conversation_row(
+                conversation_id="C-gone",
+                raw_json='{"id":"C-gone"}',
+                synced_at=rediscovered_at,
+                sync_version=int(rediscovered_at.timestamp() * 1_000_000),
+            )
+        ]
     )
     healed = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1")
     assert {payload["id"] for payload in healed} == {"C-gone", "C-live"}
@@ -5288,6 +5358,31 @@ def test_postgres_slack_account_state_query_does_not_materialize_recent_messages
     assert "current_conversations AS NOT MATERIALIZED" in sql
 
 
+def test_postgres_slack_account_state_refresh_uses_content_version_for_conversation_changes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    old = now - timedelta(hours=6)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=old)
+    warehouse.refresh_slack_account_state_items(
+        account="zrl", team_id="T1", synced_at=now - timedelta(hours=3)
+    )
+
+    # Re-listing the same conversation is an observation for discovery health,
+    # not an inbox-content change.  The message upsert is likewise a no-op.
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=now)
+    result = warehouse.refresh_slack_account_state_items(
+        account="zrl", team_id="T1", synced_at=now
+    )
+
+    assert result.mode == "incremental"
+    assert result.changed_conversations == 0
+    assert warehouse._query(
+        "SELECT synced_at FROM @slack_conversations WHERE conversation_id = 'D1'"
+    ) == [(now,)]
+
+
 def test_postgres_existing_slack_message_ids_only_returns_top_level_messages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5312,6 +5407,9 @@ def test_postgres_existing_slack_message_ids_only_returns_top_level_messages(
     assert message_ids == {"1713974400.000100"}
     assert "AND is_deleted = 0" in str(captured["sql"])
     assert "AND is_thread_reply = 0" in str(captured["sql"])
+    assert "message_datetime >= to_timestamp(%s)" in str(captured["sql"])
+    assert "message_datetime <= to_timestamp(%s)" in str(captured["sql"])
+    assert "NULLIF(message_ts" not in str(captured["sql"])
     assert captured["params"] == ("zrl", "T1", "C1", 1713974000.0, 1713975000.0)
 
 
@@ -5684,7 +5782,7 @@ def _seed_slack_dm(
                 raw_json='{"last_read":"0"}',
                 created_at=now,
                 synced_at=synced_at,
-                sync_version=int(synced_at.timestamp()),
+                sync_version=int(synced_at.timestamp() * 1_000_000),
             )
         ]
     )
@@ -5703,7 +5801,7 @@ def _seed_slack_dm(
                 raw_json="{}",
                 is_deleted=is_deleted,
                 synced_at=synced_at,
-                sync_version=int(synced_at.timestamp()),
+                sync_version=int(synced_at.timestamp() * 1_000_000),
             )
         ]
     )
