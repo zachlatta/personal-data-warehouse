@@ -30,7 +30,11 @@ from dagster import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
-from personal_data_warehouse.search_index import SearchChunkBuilder, SearchEmbeddingRunner
+from personal_data_warehouse.search_index import (
+    SearchChunkBuilder,
+    SearchEmbeddingRunner,
+    record_search_cache_residency,
+)
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
 # Keep these globally unique across every Dagster asset. Reusing the WhatsApp
@@ -119,6 +123,19 @@ def search_chunks(context) -> MaterializeResult:
                 )
                 if broken:
                     context.log.error("BM25 index probe failed: %s", broken)
+                # Cache warmth can change within minutes under the raw-source
+                # sync workload.  Publishing it only in the weekly benchmark
+                # left C6 pointing at a stale cause, so refresh the inexpensive
+                # pg_buffercache gauge on this five-minute health cadence.
+                try:
+                    record_search_cache_residency(warehouse)
+                except Exception as error:  # health fact, not a chunk failure
+                    context.log.error(
+                        "Could not measure search cache residency: %s", error
+                    )
+                    warehouse.write_search_health(
+                        "cache_residency", last_error=str(error)[:500]
+                    )
             except Exception as error:
                 warehouse.write_search_health("chunks", last_error=str(error)[:500])
                 raise

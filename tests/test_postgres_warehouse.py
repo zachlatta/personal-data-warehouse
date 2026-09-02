@@ -210,6 +210,133 @@ def test_search_cache_residency_query_executes_with_no_indexes_yet(
     assert measured["resident_fraction"] == 0.0
 
 
+def test_search_index_prewarm_buffers_hnsw_then_prefetches_every_bm25_index(
+    monkeypatch,
+) -> None:
+    """A new deploy/reindex warms the ANN graph in shared buffers first.
+
+    BM25 follows in kernel page cache so it does not evict the larger HNSW
+    graph from the eight-gigabyte Postgres buffer pool.  This order is the
+    production-measured shape that brought cold hybrid p50 back below two
+    seconds; a second call for the same postmaster/index fingerprint is free.
+    """
+
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
+    now = datetime(2026, 9, 2, 8, tzinfo=UTC)
+    prewarm_calls: list[tuple[str, str]] = []
+    state_updates: list[tuple[str, tuple | None]] = []
+
+    monkeypatch.setattr(warehouse, "_pg_prewarm_available", lambda: True)
+    monkeypatch.setattr(
+        warehouse,
+        "_search_prewarm_state",
+        # Same code and postmaster: only a REINDEX-style relfilenode change
+        # should be enough to trigger the warm.
+        lambda: ("new-signature", now, "old-fingerprint"),
+    )
+    monkeypatch.setattr(
+        warehouse,
+        "_existing_search_index_targets",
+        lambda targets: list(targets),
+    )
+    monkeypatch.setattr(
+        warehouse,
+        "_search_index_fingerprint",
+        lambda _targets: "new-fingerprint",
+    )
+
+    def query(sql, params=None):
+        if "pg_postmaster_start_time" in sql:
+            return [(now,)]
+        if "pg_prewarm" in sql:
+            prewarm_calls.append((params[0], params[1]))
+            return [(1,)]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(warehouse, "_query", query)
+    monkeypatch.setattr(
+        warehouse,
+        "_command",
+        lambda sql, params=None: state_updates.append((sql, params)),
+    )
+
+    result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
+
+    assert result["warmed"] is True
+    assert prewarm_calls[0] == (
+        "derived_search.search_chunk_embeddings_hnsw_idx",
+        "buffer",
+    )
+    assert prewarm_calls[1:] == [
+        (f"timeline.{name}", "prefetch")
+        for name in warehouse.bm25_timeline_index_names()
+    ]
+    assert "prewarmed_signature" in state_updates[-1][0]
+    assert state_updates[-1][1] == (
+        "new-signature",
+        now,
+        "new-fingerprint",
+    )
+
+
+def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
+    monkeypatch,
+) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
+    now = datetime(2026, 9, 2, 8, tzinfo=UTC)
+    calls: list[str] = []
+
+    monkeypatch.setattr(warehouse, "_pg_prewarm_available", lambda: True)
+    monkeypatch.setattr(
+        warehouse,
+        "_search_prewarm_state",
+        lambda: ("sig", now, "fingerprint"),
+    )
+    monkeypatch.setattr(
+        warehouse,
+        "_existing_search_index_targets",
+        lambda targets: list(targets),
+    )
+    monkeypatch.setattr(
+        warehouse,
+        "_search_index_fingerprint",
+        lambda _targets: "fingerprint",
+    )
+    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(now,)])
+    monkeypatch.setattr(
+        warehouse,
+        "_command",
+        lambda sql, params=None: calls.append(sql),
+    )
+
+    result = warehouse.prewarm_search_indexes_if_needed(schema_signature="sig")
+
+    assert result == {"warmed": False, "reason": "current", "blocks": 0}
+    assert calls == []
+
+
+def test_search_prewarm_fingerprint_tracks_relfilenodes_not_normal_growth() -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    seen: list[str] = []
+
+    def query(sql, params=None):
+        seen.append(sql)
+        return [("timeline.idx", 12345)]
+
+    warehouse._query = query
+    fingerprint = warehouse._search_index_fingerprint(
+        [("timeline.idx", "prefetch")]
+    )
+
+    assert fingerprint
+    assert "pg_relation_filenode" in seen[0]
+    assert "pg_relation_size" not in seen[0], (
+        "ordinary index growth must not trigger a multi-gigabyte prewarm every run"
+    )
+
+
 def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWarehouse) -> None:
     _ensure_all_table_groups(warehouse)
     assert warehouse._search_text_function_exists()

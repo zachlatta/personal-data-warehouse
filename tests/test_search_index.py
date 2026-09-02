@@ -21,6 +21,7 @@ from personal_data_warehouse.search_index import (
     SearchChunkBuilder,
     SearchEmbeddingRunner,
     _EmbedBudget,
+    record_search_cache_residency,
     split_text,
     vector_literal,
     window_start,
@@ -647,6 +648,34 @@ def test_cache_residency_is_visible_and_zero_is_attention(
     )[0]
     assert row["status"] == "ok"
     assert float(row["resident_fraction"]) == 0.25
+
+
+def test_record_search_cache_residency_refreshes_the_living_health_row() -> None:
+    class Warehouse:
+        def __init__(self) -> None:
+            self.writes = []
+
+        def measure_search_cache_residency(self):
+            return {
+                "target_count": 5,
+                "resident_bytes": 2_500,
+                "total_bytes": 10_000,
+                "resident_fraction": 0.25,
+            }
+
+        def write_search_health(self, component, **facts):
+            self.writes.append((component, facts))
+
+    warehouse = Warehouse()
+    measured = record_search_cache_residency(warehouse)
+
+    assert measured["resident_fraction"] == 0.25
+    component, facts = warehouse.writes[0]
+    assert component == "cache_residency"
+    assert facts["processed_rows"] == 5
+    assert facts["caught_up"] == 1
+    assert facts["last_error"] == ""
+    assert facts["last_success_at"].tzinfo is UTC
 
 
 def test_embedding_runner_resumes_a_bounded_backfill_across_runs(

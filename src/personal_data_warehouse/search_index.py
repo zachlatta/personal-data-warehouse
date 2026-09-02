@@ -90,6 +90,31 @@ EMBED_FRESH_SCAN_ROWS = 500_000
 EMBED_ORPHAN_RECHECK_INTERVAL = timedelta(hours=24)
 
 
+def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
+    """Measure and publish current search-index shared-buffer residency.
+
+    This belongs on the five-minute search health cadence, not only beside the
+    weekly benchmark: the whole point of the gauge is to explain a slow search
+    while the cache is cold, rather than preserve how warm it was days ago.
+    """
+
+    measured = warehouse.measure_search_cache_residency()
+    warehouse.write_search_health(
+        "cache_residency",
+        configured=1,
+        pgvector_available=1,
+        caught_up=1,
+        processed_rows=measured["target_count"],
+        pending_count=0,
+        resident_bytes=measured["resident_bytes"],
+        total_bytes=measured["total_bytes"],
+        resident_fraction=measured["resident_fraction"],
+        last_success_at=datetime.now(tz=UTC),
+        last_error="",
+    )
+    return measured
+
+
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 
 from dagster import (
     DefaultScheduleStatus,
@@ -18,6 +17,7 @@ from dagster import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.search_benchmark_runner import AppSearchClient, SearchBenchmarkRunner
+from personal_data_warehouse.search_index import record_search_cache_residency
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -64,20 +64,7 @@ def search_benchmark(context) -> MaterializeResult:
                     logger_=context.log,
                 ).run()
                 try:
-                    residency = warehouse.measure_search_cache_residency()
-                    warehouse.write_search_health(
-                        "cache_residency",
-                        configured=1,
-                        pgvector_available=1,
-                        caught_up=1,
-                        processed_rows=residency["target_count"],
-                        pending_count=0,
-                        resident_bytes=residency["resident_bytes"],
-                        total_bytes=residency["total_bytes"],
-                        resident_fraction=residency["resident_fraction"],
-                        last_success_at=datetime.now(tz=UTC),
-                        last_error="",
-                    )
+                    residency = record_search_cache_residency(warehouse)
                 except Exception as error:  # health fact, not a benchmark failure
                     context.log.error("Could not measure search cache residency: %s", error)
                     warehouse.write_search_health(
