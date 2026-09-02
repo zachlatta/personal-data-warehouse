@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,9 +16,11 @@ from personal_data_warehouse.postgres import (
 )
 from personal_data_warehouse.search_index import (
     CHUNK_MAX_CHARS,
+    EmbedStats,
     EmbeddingClient,
     SearchChunkBuilder,
     SearchEmbeddingRunner,
+    _EmbedBudget,
     split_text,
     vector_literal,
     window_start,
@@ -300,6 +304,58 @@ class _FakeEmbeddingClient(EmbeddingClient):
             norm = sum(v * v for v in vector) ** 0.5 or 1.0
             vectors.append([v / norm for v in vector])
         return vectors
+
+
+def test_embedding_backfill_keeps_interactive_embedding_latency_bounded(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Bulk embedding must leave the shared TEI endpoint responsive.
+
+    Production measurement with Qwen3-Embedding-4B showed a 128-text request
+    taking 11.7 seconds. Two such requests in flight made an interactive
+    hybrid search wait 23 seconds during a catch-up run. Thirty-two texts took
+    1.2 seconds *and had higher throughput*, so the background drain must send
+    bounded batches serially instead of continuously occupying both TEI lanes.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+
+    class TrackingClient(_FakeEmbeddingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.batch_sizes: list[int] = []
+            self.lock = threading.Lock()
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.batch_sizes.append(len(texts))
+            try:
+                time.sleep(0.01)
+                return [[0.0] * self.dimensions for _ in texts]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    client = TrackingClient()
+    runner = SearchEmbeddingRunner(warehouse, client)
+    stats = EmbedStats()
+    pending = [(f"sha-{i}", f"background embedding text {i}") for i in range(257)]
+    runner._embed_batches(
+        client,
+        pending,
+        stats,
+        _EmbedBudget(remaining=len(pending), deadline=None),
+    )
+
+    assert client.max_active == 1, "bulk embedding occupied every TEI request lane"
+    assert max(client.batch_sizes) <= 32, "one bulk request can block search for >2 seconds"
+    assert stats.embedded == len(pending)
 
 
 def test_embedding_runner_reports_unconfigured(warehouse: PostgresWarehouse) -> None:

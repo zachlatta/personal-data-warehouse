@@ -59,7 +59,12 @@ WINDOW_CHUNK_MAX_CHARS = 6000
 DOCUMENT_MAX_CHARS = 200_000
 CHUNK_MIN_CHARS = 3
 
-EMBED_BATCH_SIZE = 128
+# This endpoint also serves interactive hybrid searches. Production timing on
+# Qwen3-Embedding-4B (2026-09-02) was 1.2s for 32 texts, 3.6s for 64, and 11.7s
+# for 128; two concurrent 128-text backfill requests made an interactive query
+# wait 23s. Thirty-two was faster in texts/second as well as latency, so keep
+# one bounded background request in flight and leave TEI room for user traffic.
+EMBED_BATCH_SIZE = 32
 # Candidate rows fetched per keyset page (pre-dedupe); bounds memory while
 # amortizing the anti-join probe cost over many embed batches.
 EMBED_SLAB_SIZE = 5_000
@@ -796,41 +801,35 @@ class SearchEmbeddingRunner:
             pending[i : i + EMBED_BATCH_SIZE]
             for i in range(0, len(pending), EMBED_BATCH_SIZE)
         ]
-        # Two requests in flight keeps the GPU busy while the previous
-        # batch's rows insert; more would only queue inside TEI.
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [
-                pool.submit(client.embed, [text for _, text in batch])
-                for batch in batches
-            ]
-            for batch, future in zip(batches, futures, strict=True):
-                if budget.exhausted_by_deadline:
-                    future.cancel()
-                    continue
-                vectors = future.result()
-                with self._wh._connection.cursor() as db_cursor:
-                    execute_values(
-                        db_cursor,
-                        f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
-                        " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
-                        " token_count = EXCLUDED.token_count, embedded_at = now(),"
-                        " embedding = EXCLUDED.embedding",
-                        [
-                            (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
-                            for (sha, text), vector in zip(batch, vectors, strict=True)
-                        ],
-                        template=(
-                            "(%s, %s, %s, now(), %s::public.halfvec("
-                            + str(SEARCH_EMBEDDING_DIMENSIONS)
-                            + "))"
-                        ),
-                        page_size=200,
-                    )
-                stats.embedded += len(batch)
-                budget.remaining -= len(batch)
-                budget.check_deadline()
+        # Serial on purpose: TEI is also the latency-critical query embedder.
+        # Pre-submitting a whole run to a worker pool leaves its queue occupied
+        # continuously, so an interactive request waits behind bulk work. The
+        # DB insert between calls creates a natural scheduling gap as well.
+        for batch in batches:
+            if budget.exhausted():
+                break
+            vectors = client.embed([text for _, text in batch])
+            with self._wh._connection.cursor() as db_cursor:
+                execute_values(
+                    db_cursor,
+                    f"INSERT INTO {table} (text_sha256, model, token_count, embedded_at, embedding)"
+                    " VALUES %s ON CONFLICT (text_sha256, model) DO UPDATE SET"
+                    " token_count = EXCLUDED.token_count, embedded_at = now(),"
+                    " embedding = EXCLUDED.embedding",
+                    [
+                        (sha, client.model, max(1, len(text) // 4), vector_literal(vector))
+                        for (sha, text), vector in zip(batch, vectors, strict=True)
+                    ],
+                    template=(
+                        "(%s, %s, %s, now(), %s::public.halfvec("
+                        + str(SEARCH_EMBEDDING_DIMENSIONS)
+                        + "))"
+                    ),
+                    page_size=200,
+                )
+            stats.embedded += len(batch)
+            budget.remaining -= len(batch)
+            budget.check_deadline()
 
 
 @dataclass
