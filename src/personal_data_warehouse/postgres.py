@@ -11387,8 +11387,17 @@ class PostgresWarehouse:
                         SELECT conversation_id FROM @slack_conversations
                         WHERE account = %s AND team_id = %s AND sync_version > %s
                         UNION
-                        SELECT DISTINCT conversation_id FROM @slack_messages
-                        WHERE account = %s AND team_id = %s AND synced_at > %s
+                        SELECT DISTINCT m.conversation_id
+                        FROM @slack_messages AS m
+                        INNER JOIN @slack_conversations AS c
+                          ON c.account = m.account
+                         AND c.team_id = m.team_id
+                         AND c.conversation_id = m.conversation_id
+                        WHERE m.account = %s
+                          AND m.team_id = %s
+                          AND m.synced_at > %s
+                          AND c.is_archived = 0
+                          AND (c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)
                         """,
                         (account, team_id, since_version, account, team_id, since),
                     )

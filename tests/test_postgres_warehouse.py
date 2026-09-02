@@ -5839,6 +5839,61 @@ def test_postgres_slack_account_state_refresh_combines_changes_with_bounded_reco
     assert after["D1"][1] > before["D1"][1]
 
 
+def test_postgres_slack_account_state_refresh_ignores_messages_outside_the_inbox_scope(
+    warehouse: PostgresWarehouse,
+) -> None:
+    now = datetime.now(tz=UTC)
+    old = now - timedelta(hours=6)
+    _seed_slack_inbox_scope(warehouse, now=now)
+    _seed_slack_dm(warehouse, conversation_id="D1", now=now, synced_at=old)
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(
+                conversation_id="C-public",
+                conversation_type="public_channel",
+                is_member=0,
+                synced_at=old,
+                sync_version=int(old.timestamp() * 1_000),
+            )
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-public",
+                message_ts=f"{int(old.timestamp())}.000001",
+                message_datetime=old,
+                synced_at=old,
+                sync_version=int(old.timestamp() * 1_000),
+            )
+        ]
+    )
+    warehouse.refresh_slack_account_state_items(
+        account="zrl", team_id="T1", synced_at=now - timedelta(hours=3)
+    )
+
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C-public",
+                message_ts=f"{int(now.timestamp())}.000001",
+                message_datetime=now,
+                synced_at=now,
+                sync_version=int(now.timestamp() * 1_000),
+            )
+        ]
+    )
+    result = warehouse.refresh_slack_account_state_items(
+        account="zrl", team_id="T1", synced_at=now
+    )
+
+    # Public channels the account is not a member of can be extremely busy,
+    # but none of the four inbox branches can emit an item for them.  Feeding
+    # them into the scoped refresh was 118/145 production candidates and made
+    # one five-minute refresh read 154k heap blocks for no possible output.
+    assert result.changed_conversations == 0
+
+
 def test_postgres_slack_account_state_refresh_tombstones_items_of_changed_conversations(
     warehouse: PostgresWarehouse,
 ) -> None:
