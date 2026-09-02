@@ -1848,6 +1848,7 @@ def test_postgres_concurrent_indexes_are_disabled_only_in_test_namespaces(
     warehouse._pg_trgm_ensured = False
     warehouse._pg_textsearch_ensured = False
     commands: list[str] = []
+    monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(True,)])
     monkeypatch.setattr(warehouse, "_index_exists", lambda _name: False)
     monkeypatch.setattr(warehouse, "_drop_invalid_index", lambda _name: None)
     monkeypatch.setattr(warehouse, "_command", lambda sql, params=None: commands.append(sql))
