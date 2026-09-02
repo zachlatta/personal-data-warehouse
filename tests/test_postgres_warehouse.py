@@ -1310,7 +1310,7 @@ def test_postgres_slack_conversation_refetch_advances_observation_not_content_ve
         name="before rename",
         raw_json='{"id":"C1","name":"before rename"}',
         synced_at=first_sync,
-        sync_version=int(first_sync.timestamp() * 1_000_000),
+        sync_version=int(first_sync.timestamp() * 1_000),
     )
     warehouse.insert_slack_conversations([original])
 
@@ -1319,14 +1319,14 @@ def test_postgres_slack_conversation_refetch_advances_observation_not_content_ve
             {
                 **original,
                 "synced_at": second_sync,
-                "sync_version": int(second_sync.timestamp() * 1_000_000),
+                "sync_version": int(second_sync.timestamp() * 1_000),
             }
         ]
     )
     assert warehouse._query(
         "SELECT name, synced_at, sync_version FROM @slack_conversations"
         " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
-    ) == [("before rename", second_sync, int(first_sync.timestamp() * 1_000_000))]
+    ) == [("before rename", second_sync, int(first_sync.timestamp() * 1_000))]
 
     warehouse.insert_slack_conversations(
         [
@@ -1335,14 +1335,14 @@ def test_postgres_slack_conversation_refetch_advances_observation_not_content_ve
                 "name": "after rename",
                 "raw_json": '{"id":"C1","name":"after rename"}',
                 "synced_at": changed_sync,
-                "sync_version": int(changed_sync.timestamp() * 1_000_000),
+                "sync_version": int(changed_sync.timestamp() * 1_000),
             }
         ]
     )
     assert warehouse._query(
         "SELECT name, synced_at, sync_version FROM @slack_conversations"
         " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
-    ) == [("after rename", changed_sync, int(changed_sync.timestamp() * 1_000_000))]
+    ) == [("after rename", changed_sync, int(changed_sync.timestamp() * 1_000))]
 
 
 def test_postgres_whatsapp_chat_name_survives_later_blank_history_row(warehouse: PostgresWarehouse) -> None:
@@ -4816,7 +4816,7 @@ def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads
                 conversation_id="C-gone",
                 raw_json='{"id":"C-gone"}',
                 synced_at=rediscovered_at,
-                sync_version=int(rediscovered_at.timestamp() * 1_000_000),
+                sync_version=int(rediscovered_at.timestamp() * 1_000),
             )
         ]
     )
@@ -5782,7 +5782,7 @@ def _seed_slack_dm(
                 raw_json='{"last_read":"0"}',
                 created_at=now,
                 synced_at=synced_at,
-                sync_version=int(synced_at.timestamp() * 1_000_000),
+                sync_version=int(synced_at.timestamp() * 1_000),
             )
         ]
     )
@@ -5801,7 +5801,7 @@ def _seed_slack_dm(
                 raw_json="{}",
                 is_deleted=is_deleted,
                 synced_at=synced_at,
-                sync_version=int(synced_at.timestamp() * 1_000_000),
+                sync_version=int(synced_at.timestamp() * 1_000),
             )
         ]
     )

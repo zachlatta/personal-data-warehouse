@@ -10070,7 +10070,7 @@ class PostgresWarehouse:
             UPDATE @slack_conversations
                SET is_archived = 1,
                    synced_at = clock_timestamp(),
-                   sync_version = (extract(epoch from clock_timestamp()) * 1000000)::bigint
+                   sync_version = (extract(epoch from clock_timestamp()) * 1000)::bigint
              WHERE account = %s
                AND team_id = %s
                AND conversation_id = %s
@@ -11372,7 +11372,9 @@ class PostgresWarehouse:
             changed: list[str] = []
             if not full:
                 since = watermark - SLACK_ACCOUNT_STATE_REFRESH_OVERLAP
-                since_version = int(since.timestamp() * 1_000_000)
+                # Slack's sync_version_from_datetime is epoch milliseconds
+                # (unlike several other sources, which use microseconds).
+                since_version = int(since.timestamp() * 1_000)
                 changed = [
                     str(row[0])
                     for row in self._query(
