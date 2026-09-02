@@ -2569,6 +2569,38 @@ def test_coverage_reconcile_picks_the_stalest_adapter_not_the_first(warehouse):
     )
 
 
+def test_coverage_reconcile_timestamp_persists_and_enforces_its_cadence(warehouse):
+    """A completed sweep must not run again on the next five-minute tick.
+
+    ``last_reconcile_at`` used to appear only in the conflict UPDATE, not the
+    INSERT column list.  PostgreSQL therefore supplied its epoch default as
+    ``EXCLUDED.last_reconcile_at`` and every state heartbeat reset the field to
+    1970.  Slack's 48-hour coverage scans then ran every five minutes instead
+    of hourly and evicted the search working set on every pass.
+    """
+
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapter = adapter_by_name("slack_message")
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+        first = warehouse._query(
+            "SELECT last_reconcile_at FROM @timeline_sync_state WHERE adapter = %s",
+            (adapter.name,),
+        )[0][0]
+        engine.run()
+        second = warehouse._query(
+            "SELECT last_reconcile_at FROM @timeline_sync_state WHERE adapter = %s",
+            (adapter.name,),
+        )[0][0]
+    finally:
+        engine.close()
+
+    assert first > datetime(2000, 1, 1, tzinfo=UTC)
+    assert second == first, "the cadence gate did not skip the immediate second sweep"
+
+
 def test_no_adapter_declares_a_placeholder_priority_expression():
     """`priority_expression` must name a rule, not gesture at one.
 

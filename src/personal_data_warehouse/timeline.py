@@ -3477,9 +3477,9 @@ class TimelineSyncEngine:
                     INSERT INTO @timeline_sync_state (
                         adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
                         watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at,
-                        adapter_signature
+                        adapter_signature, last_reconcile_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now(), %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), %s, now(), %s, %s)
                     ON CONFLICT (adapter) DO UPDATE SET
                         backfill_cursor_event_ts = EXCLUDED.backfill_cursor_event_ts,
                         backfill_cursor_event_id = EXCLUDED.backfill_cursor_event_id,
@@ -3502,6 +3502,7 @@ class TimelineSyncEngine:
                     state.watermark_id,
                     error,
                     adapter_definition_signature(adapter),
+                    state.last_reconcile_at,
                 ),
             )
 
