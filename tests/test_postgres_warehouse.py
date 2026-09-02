@@ -272,15 +272,17 @@ def test_search_cache_residency_query_executes_with_no_indexes_yet(
     assert measured["resident_fraction"] == 0.0
 
 
-def test_search_index_prewarm_buffers_hnsw_then_prefetches_every_bm25_index(
+def test_search_index_prewarm_prefetches_then_buffers_hnsw_before_every_bm25_index(
     monkeypatch,
 ) -> None:
-    """A new deploy/reindex warms the ANN graph in shared buffers first.
+    """A new deploy/reindex warms the ANN graph through both cache layers.
 
-    BM25 follows in kernel page cache so it does not evict the larger HNSW
-    graph from the eight-gigabyte Postgres buffer pool.  This order is the
-    production-measured shape that brought cold hybrid p50 back below two
-    seconds; a second call for the same postmaster/index fingerprint is free.
+    Prefetching HNSW first is not redundant with ``buffer``: measured after a
+    production REINDEX, buffer-only left the HNSW relation ~9% resident in the
+    OS cache and contract-audit p50 at 2.44s; one prefetch made its first 6 GiB
+    resident and p50 0.21s.  Buffer HNSW second, then prefetch BM25 into the
+    kernel cache so it does not evict the graph from Postgres's 8 GiB pool. A
+    second call for the same postmaster/index fingerprint is free.
     """
 
     warehouse = object.__new__(PostgresWarehouse)
@@ -326,11 +328,11 @@ def test_search_index_prewarm_buffers_hnsw_then_prefetches_every_bm25_index(
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
 
     assert result["warmed"] is True
-    assert prewarm_calls[0] == (
-        "derived_search.search_chunk_embeddings_hnsw_idx",
-        "buffer",
-    )
-    assert prewarm_calls[1:] == [
+    assert prewarm_calls[:2] == [
+        ("derived_search.search_chunk_embeddings_hnsw_idx", "prefetch"),
+        ("derived_search.search_chunk_embeddings_hnsw_idx", "buffer"),
+    ]
+    assert prewarm_calls[2:] == [
         (f"timeline.{name}", "prefetch")
         for name in warehouse.bm25_timeline_index_names()
     ]

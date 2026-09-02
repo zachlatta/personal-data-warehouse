@@ -11956,11 +11956,13 @@ class PostgresWarehouse:
     def _search_index_prewarm_targets(self) -> list[tuple[str, str]]:
         """Search index regclass names and their measured-best warm modes.
 
-        The HNSW graph is larger than ``shared_buffers`` and random-walked, so
-        it gets the scarce Postgres buffers.  BM25 is then prefetched into the
-        kernel page cache; using ``buffer`` for it would evict the graph that
-        was just loaded.  Production on 2026-09-02 measured the sequence at
-        14s and took the contract-audit hybrid p50 from 2.8s to 1.5s.
+        HNSW is larger than ``shared_buffers`` and random-walked, so prefetch it
+        through the kernel cache before filling the scarce Postgres buffers.
+        ``buffer`` alone left only about 9% of the graph resident in the OS
+        cache after a production REINDEX on 2026-09-02; adding the prefetch
+        took contract-audit hybrid p50 from 2.44s to 0.21s.  BM25 is prefetched
+        last rather than buffered so it does not evict the ANN graph from
+        Postgres's 8 GiB pool.
         """
 
         hnsw = [
@@ -11973,9 +11975,11 @@ class PostgresWarehouse:
             for spec in POSTGRES_INDEXES
             if spec.table == "timeline_events" and spec.requires_pg_textsearch
         ]
-        return [
-            (f"{self._object_schema(spec.table)}.{spec.name}", "buffer")
-            for spec in hnsw
+        hnsw_names = [
+            f"{self._object_schema(spec.table)}.{spec.name}" for spec in hnsw
+        ]
+        return [(name, "prefetch") for name in hnsw_names] + [
+            (name, "buffer") for name in hnsw_names
         ] + [
             (f"{self._object_schema(spec.table)}.{spec.name}", "prefetch")
             for spec in bm25
