@@ -507,13 +507,28 @@ func TestDescribePrintsSchema(t *testing.T) {
 			{"name":"schema_overview","title":"Schema","description":"overview","input_schema":{"type":"object"}}
 		]}`)
 	})
-	out, _, code := runCLI(t, srv.URL, "", "describe", "query")
+	out, _, code := runCLI(t, srv.URL, "", "describe", "schema_overview")
 	if code != 0 {
 		t.Fatalf("exit code = %d", code)
 	}
-	for _, want := range []string{"query", "Query", "run SQL", "properties", "sql"} {
+	for _, want := range []string{"schema_overview", "Schema", "overview", "object"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("describe output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDescribeQueryRedirectsToTheOnlyCLI_SQLPath(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "describe", "query")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%s", code, errOut)
+	}
+	for _, want := range []string{"MCP-only", "pdw sql"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("redirect missing %q: %s", want, out)
 		}
 	}
 }

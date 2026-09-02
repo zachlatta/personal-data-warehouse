@@ -344,38 +344,6 @@ func TestMCPHandlerErrorWrapsAsIsError(t *testing.T) {
 	}
 }
 
-func TestMCPServerExposesDebugCacheStatusOnlyWhenEnabled(t *testing.T) {
-	runner := fakeRunner{results: map[string]query.RawResult{}}
-
-	// Off by default.
-	disabledSrv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100})
-	disabledNames := listToolNames(t, disabledSrv)
-	if disabledNames["_debug_cache_status"] {
-		t.Fatalf("_debug_cache_status must not be listed when DebugCacheTool is false: %v", disabledNames)
-	}
-
-	// On when enabled, returns a JSON DebugCacheStatus document.
-	enabledSrv := NewMCPServer(runner, query.Options{MaxRows: 5, MaxFieldChars: 100, DebugCacheTool: true})
-	enabledNames := listToolNames(t, enabledSrv)
-	if !enabledNames["_debug_cache_status"] {
-		t.Fatalf("_debug_cache_status must be listed when DebugCacheTool is true: %v", enabledNames)
-	}
-
-	text := callToolText(t, enabledSrv, "_debug_cache_status", map[string]any{})
-	var status struct {
-		TotalBytes int64 `json:"total_bytes"`
-		MaxBytes   int64 `json:"max_bytes"`
-		TTLSeconds int64 `json:"ttl_seconds"`
-		Queries    []any `json:"queries"`
-	}
-	if err := json.Unmarshal([]byte(text), &status); err != nil {
-		t.Fatalf("_debug_cache_status response was not JSON: %v\n%s", err, text)
-	}
-	if status.Queries == nil {
-		t.Fatalf("expected queries field to be present (empty array), got nil: %s", text)
-	}
-}
-
 func listToolNames(t *testing.T, srv *mcp.Server) map[string]bool {
 	t.Helper()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
@@ -512,16 +480,21 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 		// two-step discovery path: schema_overview for the relations, then
 		// describe_table for a relation's columns. Those two tools' own
 		// descriptions don't need the reminder.
-		if tool.Name == "query" || tool.Name == "get_rows" || tool.Name == "get_field" || tool.Name == "grep_rows" {
+		if tool.Name == "query" {
 			if !strings.Contains(tool.Description, "Call schema_overview first") ||
 				!strings.Contains(tool.Description, "describe_table") {
 				t.Fatalf("%s description should point callers at schema_overview then describe_table: %q", tool.Name, tool.Description)
 			}
 		}
 	}
-	for _, name := range []string{"query", "get_rows", "get_field", "grep_rows", "search", "schema_overview", "describe_table"} {
+	for _, name := range []string{"query", "search", "schema_overview", "describe_table"} {
 		if !found[name] {
 			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
+		}
+	}
+	for _, retired := range []string{"get_rows", "get_field", "grep_rows"} {
+		if found[retired] {
+			t.Fatalf("retired cursor helper %s is still listed: %#v", retired, tools.Tools)
 		}
 	}
 
@@ -577,8 +550,7 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 				"sql":      "SELECT subject FROM gmail_messages LIMIT 1",
 			},
 		},
-		"preview_rows": 1,
-		"format":       "csv",
+		"format": "csv",
 	}})
 	if err != nil {
 		t.Fatalf("query CallTool failed: %v", err)
@@ -586,17 +558,16 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	queryText := queryResult.Content[0].(*mcp.TextContent).Text
 	var queryPayload struct {
 		Results []struct {
-			QueryID     string   `json:"query_id"`
 			TotalRows   int      `json:"total_rows"`
 			ColumnNames []string `json:"column_names"`
-			Preview     string   `json:"preview"`
+			Rows        string   `json:"rows"`
 			Error       string   `json:"error"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal([]byte(queryText), &queryPayload); err != nil {
 		t.Fatalf("query response was not JSON: %v\n%s", err, queryText)
 	}
-	if queryPayload.Results[0].QueryID == "" || queryPayload.Results[0].Preview != "subject\nhello" {
+	if queryPayload.Results[0].Rows != "subject\nhello" {
 		t.Fatalf("unexpected query payload: %#v", queryPayload)
 	}
 
@@ -629,20 +600,6 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	}
 	if !blankQuestionResult.IsError || !strings.Contains(blankQuestionPayload.Results[0].Error, "queries[0].question") {
 		t.Fatalf("blank query question was not rejected: %#v", blankQuestionPayload)
-	}
-
-	fieldResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_field", Arguments: map[string]any{
-		"query_id": queryPayload.Results[0].QueryID,
-		"row":      0,
-		"column":   "subject",
-		"length":   20,
-	}})
-	if err != nil {
-		t.Fatalf("get_field CallTool failed: %v", err)
-	}
-	fieldText := fieldResult.Content[0].(*mcp.TextContent).Text
-	if !strings.Contains(fieldText, `"value": "hello"`) || strings.Contains(fieldText, "substring(") {
-		t.Fatalf("unexpected get_field response: %s", fieldText)
 	}
 
 	cancel()
@@ -679,9 +636,8 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 
 	stringifiedQueries := `[{"question":"ping","sql":"SELECT 1 AS n"}]`
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
-		"queries":      stringifiedQueries,
-		"preview_rows": 1,
-		"format":       "csv",
+		"queries": stringifiedQueries,
+		"format":  "csv",
 	}})
 	if err != nil {
 		t.Fatalf("query CallTool failed: %v", err)
@@ -689,8 +645,7 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 	text := result.Content[0].(*mcp.TextContent).Text
 	var payload struct {
 		Results []struct {
-			QueryID   string `json:"query_id"`
-			Preview   string `json:"preview"`
+			Rows      string `json:"rows"`
 			TotalRows int    `json:"total_rows"`
 			Error     string `json:"error"`
 		} `json:"results"`
@@ -700,8 +655,7 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 	}
 	if result.IsError ||
 		len(payload.Results) != 1 ||
-		payload.Results[0].QueryID == "" ||
-		payload.Results[0].Preview != "n\n1" ||
+		payload.Results[0].Rows != "n\n1" ||
 		payload.Results[0].TotalRows != 1 ||
 		payload.Results[0].Error != "" {
 		t.Fatalf("unexpected query response for stringified queries: isError=%v payload=%#v text=%s", result.IsError, payload, text)
@@ -709,9 +663,8 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 
 	stringifiedMultiQueries := `[{"question":"one","sql":"SELECT 1 AS n"},{"question":"two","sql":"SELECT 2 AS n"}]`
 	multiResult, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "query", Arguments: map[string]any{
-		"queries":      stringifiedMultiQueries,
-		"preview_rows": 1,
-		"format":       "csv",
+		"queries": stringifiedMultiQueries,
+		"format":  "csv",
 	}})
 	if err != nil {
 		t.Fatalf("multi-query CallTool failed: %v", err)
@@ -719,9 +672,8 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 	multiText := multiResult.Content[0].(*mcp.TextContent).Text
 	var multiPayload struct {
 		Results []struct {
-			QueryID string `json:"query_id"`
-			Preview string `json:"preview"`
-			Error   string `json:"error"`
+			Rows  string `json:"rows"`
+			Error string `json:"error"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal([]byte(multiText), &multiPayload); err != nil {
@@ -729,10 +681,8 @@ func TestMCPQueryAcceptsStringifiedQueriesArgument(t *testing.T) {
 	}
 	if multiResult.IsError ||
 		len(multiPayload.Results) != 2 ||
-		multiPayload.Results[0].QueryID == "" ||
-		multiPayload.Results[1].QueryID == "" ||
-		multiPayload.Results[0].Preview != "n\n1" ||
-		multiPayload.Results[1].Preview != "n\n2" ||
+		multiPayload.Results[0].Rows != "n\n1" ||
+		multiPayload.Results[1].Rows != "n\n2" ||
 		multiPayload.Results[0].Error != "" ||
 		multiPayload.Results[1].Error != "" {
 		t.Fatalf("unexpected multi-query response: isError=%v payload=%#v text=%s", multiResult.IsError, multiPayload, multiText)
@@ -857,6 +807,20 @@ func TestSearchDescriptionTellsAgentsAboutPriorityScoping(t *testing.T) {
 	for _, want := range []string{"priorities", "self", "direct", "noise", "priority"} {
 		if !strings.Contains(lowered, want) {
 			t.Fatalf("searchDescription must mention %q: %s", want, searchDescription)
+		}
+	}
+}
+
+func TestHighTrafficSQLDescriptionsPutPriorityGuidanceAtTheDecisionPoint(t *testing.T) {
+	for name, description := range map[string]string{
+		"sql":             sqlDescription,
+		"schema_overview": schemaOverviewDescription,
+	} {
+		lowered := strings.ToLower(description)
+		for _, want := range []string{"timeline.events", "priority", "self", "direct", "cc"} {
+			if !strings.Contains(lowered, want) {
+				t.Fatalf("%s description must mention %q: %s", name, want, description)
+			}
 		}
 	}
 }

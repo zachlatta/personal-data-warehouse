@@ -121,6 +121,83 @@ def test_agent_usage_measures_first_call_priority_filter_and_base_only_sql(wareh
     assert rows["all"]["status"] == "no_data"
 
 
+def test_codex_item_completed_pairs_its_input_and_output_from_the_same_row(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Modern Codex stores command + aggregated output in item_completed.
+
+    Treating the following transcript row as the result made the hint counters
+    permanently zero for Codex and could associate an unrelated call's output.
+    """
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    raw = (
+        '{"payload":{"item":{'
+        '"command":["/bin/zsh","-lc","pdw search budget"],'
+        '"aggregated_output":"Search: \\"budget\\" — 5 results (hybrid)\\n'
+        'Scope: all tiers\\nReturned priorities: noise=4, direct=1\\n'
+        'Hint: Most of these hits are noise/background; retry with priorities."}}}'
+    )
+    warehouse.insert_agent_session_events(
+        [
+            _event(
+                "codex-same-row",
+                1,
+                source="codex",
+                subtype="item_completed",
+                raw=raw,
+            )
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["codex"]
+    assert snapshot.pdw_sessions == 1
+    assert snapshot.first_search == 1
+    assert snapshot.search_calls == 1
+    assert snapshot.bulk_hints_shown == 1
+
+
+def test_codex_item_completed_is_not_double_counted_with_its_call_row(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.insert_agent_session_events(
+        [
+            _event(
+                "codex-pair",
+                1,
+                source="codex",
+                subtype="custom_tool_call",
+                tool="exec_command",
+                raw='{"cmd":"pdw search budget"}',
+            ),
+            _event(
+                "codex-pair",
+                2,
+                source="codex",
+                subtype="item_completed",
+                tool="exec_command",
+                raw=(
+                    '{"payload":{"item":{"command":"pdw search budget",'
+                    '"aggregated_output":"Search: budget — 1 result (hybrid)\\n'
+                    'Scope: all tiers"}}}'
+                ),
+            ),
+        ]
+    )
+
+    snapshot = {
+        row.source: row for row in AgentUsageCollector(warehouse, window_days=14).run()
+    }["codex"]
+    assert snapshot.pdw_sessions == 1
+    assert snapshot.first_search == 1
+    assert snapshot.search_calls == 1
+
+
 def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_pipeline_health_tables()
     now = datetime.now(tz=UTC)

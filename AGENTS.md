@@ -34,8 +34,12 @@ quietly becoming untrue, and several of these have been.
   authoritative row. *Held up by* `TIMELINE_TABLE_COVERAGE`: every warehouse table must
   declare itself as `events`, `detail`, `entity`, or `state`, and `tests/test_timeline.py`
   checks that against the **live** schema, so a new table that skips the registry fails the
-  suite. *Gap:* nothing forces a source's event table to actually have an adapter — the
-  classification is a human's word.
+  suite; every `events` table must have an adapter, while every `detail`/`entity` table must
+  carry a non-empty `no_adapter_reason`, so silence is not a classification. The adapter
+  health view judges `ingest_lag_seconds` (newest source write minus the consumed
+  watermark) against the source pipeline's own expected data interval, not merely whether
+  the adapter ran recently. `watermark_age_seconds` remains context; an idle event table is
+  not an adapter backlog.
 - **C2 — the timeline has five priority tiers and everything is properly categorized.**
   `self`, `direct`, `cc`, `noise`, `background`, in that attention order, stored in the
   `timeline.timeline_priority` enum. *Held up by* the enum itself (an invalid label is a
@@ -91,12 +95,16 @@ quietly becoming untrue, and several of these have been.
   catalog as the only editable authority, no pre-reorg name anywhere in the source **or the
   docs**) and, for the input half, `tests/test_repo_contracts.py`
   (`test_no_enrichment_runner_reads_a_raw_source_table_unaccounted_for`): every enrichment
-  runner's raw reads must be listed with a reason, a stale exemption fails, and a newly
-  added `*_enrichment.py` / `*_transcription.py` / `*_extraction.py` module that is not
-  registered fails too.
+  runner's raw reads must be listed with a reason, a stale exemption fails, and every
+  enrichment surface is registered explicitly — including Dagster `defs/`, ledgers,
+  identity, extraction, transcription, and fingerprinting modules — so adding a new
+  scanner without extending the contract fails too.
 - **C6 — PDW responds fast, and saturates the host before anyone optimizes further.**
-  *Held up by* nothing automatic. It is the contract that has cost the most: see
-  [Performance contract](#performance-contract).
+  *Held up by* the weekly benchmark's latency + host-pressure verdict and the
+  `cache_residency` row in `marts_ops.search_health`, which records how much of
+  the HNSW + BM25 working set is resident in PostgreSQL shared buffers (and says
+  explicitly that it does not measure the separate OS page cache). It is the
+  contract that has cost the most: see [Performance contract](#performance-contract).
 - **C7 — pipeline health for every source, mart, and timeline data type is inspectable via
   SQL and web.** Four levels, at parity in SQL and on `/pipelines`: pipelines
   (`marts_ops.pipeline_health` / `marts_ops.table_freshness`), the marts read interface
@@ -109,14 +117,16 @@ quietly becoming untrue, and several of these have been.
 - **C8 — search is one hybrid path over the timeline, and its quality is measured.** The
   `search` tool fuses BM25, pgvector ANN and a gated literal leg by reciprocal rank; the
   semantic corpus converges on `timeline.events.seq`, so embeddings track the timeline rather
-  than a schedule. *Held up by* `marts_ops.search_health` (chunk/embedding lag as data, not a
-  flag), the source-token and pool-partition tests in `tests/test_repo_contracts.py`, and the
+  than a schedule. *Held up by* `marts_ops.search_health` (chunk/embedding lag, an
+  independent orphaned-chunk anti-join proof, and shared-buffer residency as data, not
+  flags), the source-token and pool-partition tests in `tests/test_repo_contracts.py`, and the
   labeled benchmark in `src/personal_data_warehouse/search_benchmark.py`
   (`docs/search-benchmark.md`), and — since 2026-08-27 — the weekly `search_benchmark`
   Dagster asset, which runs the same measurement through the app's own `search` tool and
   writes p50/p90 latency over fixed term-bag probes plus MRR / hit@k over the labeled cases
   into `marts_ops.search_benchmark` (`attention` when p50 > 2s or MRR < 0.30; `unknown`
-  after ten days), rendered on `/pipelines`. The labels now live in
+  after ten days), appends every run to `marts_ops.search_benchmark_history`, and renders
+  the latest change on `/pipelines`. The labels now live in
   `private.search_benchmark_labels`, loaded with
   `uv run python -m personal_data_warehouse.search_benchmark publish-labels` and exported
   with `pull-labels`, so a lost gitignored directory can no longer make retrieval quality
@@ -132,7 +142,9 @@ quietly becoming untrue, and several of these have been.
   `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses
   `pdw call sql|query|search|schema_overview|describe_table` with a redirect, and the usage
   drift tests in `app/cmd/pdw-cli/usage_test.go`, which derive the command list from the
-  dispatcher rather than a hand-kept list.
+  dispatcher rather than a hand-kept list. MCP `query` returns one bounded complete result;
+  the former cursor helpers are removed. `timeline.search_hybrid` is explicitly commented
+  as an app-internal implementation function, not a second callable search entry point.
 - **C10 — the database is backed up, and a restore has actually been performed.** pgBackRest
   ships WAL continuously to an encrypted SFTP repository on `slowking` and takes periodic
   fulls. *Held up by* `tests/test_pgbackrest_image.py` for the settings that make it
@@ -295,11 +307,11 @@ The following contract is generated from `warehouse_catalog.json`:
 
 | tier | what it means | typical rows |
 | --- | --- | --- |
-| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
+| `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
-| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
 
@@ -802,8 +814,9 @@ I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either �
 searches the bounded `derived_search.chunks` documents, not multi-megabyte timeline ones.
 
 **The search working set does not fit in RAM, so what evicts it decides the latency.**
-Measured 2026-08-26 on `mew-coolify` (28 vCPU, 26 GB, `shared_buffers` 10 GB): the
-HNSW index is 8.5 GB, the global BM25 index 10.7 GB, the chunk heap 7.4 GB, the chunk
+Measured 2026-08-26 on `mew-coolify` (28 vCPU, 26 GB; `shared_buffers` was then 10 GB,
+and is **8 GB as of 2026-09-01**): the HNSW index was 8.5 GB, the global BM25 index
+10.7 GB, the chunk heap 7.4 GB, the chunk
 embeddings 8.6 GB. `fincore` on the data files found the HNSW index **2% resident** in the
 page cache and the BM25 index 34%, and `pg_stat_statements` put the semantic leg at
 **93% I/O wait** (2.5s of a 2.7s mean, ~12,400 blocks read per call). The same leg is
@@ -820,9 +833,9 @@ not the CPU -- and three jobs were the reason:
 | a leaked `pdw_test_*` schema probe | 28 GB | ~17 min, for a day | a test run pointed at the production URL left a full `base_slack` copy behind, and the freshness collector kept `max()`-ing it |
 
 Together that was on the order of 150 GB of reads an hour against a 12 GB page cache.
-The fixes are structural, not tuning: the drain now keeps **two persisted cursors** in
-`ops.search_chunk_sync_state` (row `embeddings`) -- a `built_at` watermark for freshly
-built chunks and a resumable newest-first keyset for the one-time historical walk -- and
+The fixes are structural, not tuning: the drain now keeps **two persisted keysets** in
+`ops.search_chunk_sync_state` (row `embeddings`) -- `(built_at, chunk_id)` for freshly
+built chunks and `(event_ts, chunk_id)` for the resumable one-time historical walk -- and
 both walks are index-only over `search_chunks_built_at_sha_idx` /
 `search_chunks_ts_chunk_sha_idx`, bounded to 500k / 250k index rows per run. The thread
 backfill remembers a drained walk (`ops.slack_sync_state` row
@@ -835,6 +848,28 @@ leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that s
 `hnsw.ef_search` 1000 -> 300 at the same 1,000-candidate pool kept a 9.2/10 top-10
 overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
 the index is resident.
+
+The second coordinate on the fresh keyset is non-negotiable: one chunk-builder batch
+stamps thousands of rows with the same `built_at`. A timestamp-only cursor once stopped in
+the middle of such a group and permanently skipped 2,525 chunks while every scheduled run
+reported green. After both cursors converge, a daily covering-index anti-join independently
+proves there are no chunk SHAs without an embedding and repairs any it finds; its own
+`orphaned_chunks` health row means cursor convergence can no longer hide that class of loss.
+
+**The 2026-09-01 recurrence had a different pair of evictors and is why the gauges and
+keysets are now stricter.** Both HNSW (then 9.2 GB) and BM25 (global 11 GB) were 0%
+resident in shared buffers *and* the OS cache. A Slack adapter watermark probe wrapped
+`max(synced_at)` around its full user/conversation joins every five minutes (~13 TB/day),
+although the bare indexed max takes about 0.15 ms; the adapter now uses the bare probe
+while retaining the old joined SQL only for signature compatibility, so deployment does
+not reset a 47M-row backfill. The unbounded missing-replies walk contributed another
+~16 TB/day: a public sweep kept discovering parents, so its drained cooldown never held.
+That walk now persists and resumes the full `(message_datetime, message_ts,
+conversation_id)` keyset on every bounded page. Slack upserts also refuse to update when
+only the local `synced_at`/`sync_version` observation changed, so a sweep does not keep
+feeding old rows back into either the thread walk or timeline adapter. Read the
+`cache_residency` row in `marts_ops.search_health` for the current **shared-buffer** fact;
+use `fincore`/`mincore` separately when the OS page-cache distinction matters.
 
 **A BM25 index can be corrupt while `indisvalid` says true, and only a scan finds out.**
 The OOM kill on 2026-08-27 (a backend at 6.5 GB anon RSS during a deploy build) took the
@@ -863,7 +898,13 @@ per source token, failing sources named.
 **What warm actually costs, measured 2026-08-27 after the rebuilds** (serial, depth 10,
 eight labeled queries, host quiet): hybrid p50 **3.2s**, p90 5.0s; keyword p50 0.56s.
 The same sample taken on the cold cache earlier that night was hybrid p50 26s with six of
-eight calls past the 60s budget. The BM25 index is 5.5 GB after a plain rebuild, so
+eight calls past the 60s budget. The BM25 global index is 5.5 GB **immediately after a
+plain rebuild**; that is a rebuild target, not a current-size promise. On 2026-09-01 the
+global/attention indexes were back at the concurrent-build sizes (about 11 GB / 1.08 GB,
+versus 5.5 GB / 527 MB after plain rebuild), which the living residency + latency rows now
+make visible. After a safe plain-`REINDEX` window, prewarm BM25 and then HNSW with
+`pg_prewarm`; the extension is provisioned with the health layer, but warming is an
+operator action rather than a startup scan that can fight recovery. Thus
 "HNSW and BM25 cannot both be resident" is no longer true as stated: 8.6 + 5.5 GB against
 ~11 GB of usable page cache plus 8 GB of shared buffers, warm BM25 first and HNSW last.
 
@@ -991,10 +1032,11 @@ config read again, or posts a heartbeat without sourcing the lib.
 | --- | --- | --- |
 | 1 — pipelines | `marts_ops.pipeline_health` (+ `marts_ops.table_freshness`) | is this feed still delivering |
 | 2 — marts | `marts_ops.mart_view_health` | is the read interface built on anything current |
-| 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events` |
+| 3 — timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events`, including source-cadence-judged ingest watermark lag |
 | 3b — priority tiers | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the five tiers; an `unclassified` row is `failing` |
 | 3c — agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier (C3), measured daily from their own sessions |
-| 3d — search benchmark | `marts_ops.search_benchmark` | weekly p50/p90 search latency and labeled MRR through the search tool (C8) |
+| 3d — search benchmark | `marts_ops.search_benchmark` + `search_benchmark_history` | weekly p50/p90 search latency and labeled MRR through the search tool, with retained trend (C8) |
+| 3e — search internals | `marts_ops.search_health` | chunk/vector convergence, orphan completeness, BM25 integrity, and shared-buffer residency |
 | 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
 
 **Level 2 exists because a view cannot be probed like a table.** `TABLE_PIPELINES` measures
@@ -3173,8 +3215,9 @@ rebuild from the complete source corpus produces exactly the same links, trades,
 ## Shared file-attachment enrichment
 
 **Start at `marts_files.attachments`**: one conformed row per attachment from every source
-that holds bytes — `base_gmail.attachments`, `base_whatsapp.media_items`,
-`base_apple_messages.attachments`, `base_apple_notes.attachments` — with `source`,
+that exposes attachment bytes or a retrievable provider URL — `base_gmail.attachments`,
+`base_whatsapp.media_items`, `base_apple_messages.attachments`,
+`base_apple_notes.attachments`, and `base_slack.files` — with `source`,
 `parent_id` (the message or note), `attachment_id`, `filename`, `mime_type`, `size_bytes`,
 `content_sha256`, `is_stored` (bigint 0/1: the bytes are in the object store), `is_deleted`,
 `occurred_at` and the `storage_*` columns. Apple Notes attachments appear once per note
@@ -3182,8 +3225,13 @@ revision. That view is the **input** to the file (vision), audio (AssemblyAI) an
 deterministic-text enrichment passes and to the receipt pass's attachment-evidence check —
 never the raw tables. Until 2026-08-27 each `FileEnrichmentSource` /
 `AudioEnrichmentSource` / `TextExtractionSource` named its raw table, which is the C5 hole:
-a receipt that arrived over WhatsApp was invisible to the receipt pass, and Apple Notes
-attachments were enriched by nothing. `ALLOWED_RAW_ATTACHMENT_SOURCES` in
+a receipt that arrived over WhatsApp was invisible to the receipt pass, Apple Notes
+attachments were enriched by nothing, and Slack image fingerprinting scanned its raw table.
+Apple Notes image/PDF vision and deterministic text extraction now have explicit descriptors;
+Notes audio remains in the multi-source `marts_voice_memos.recordings` transcription flow so
+it is not transcribed twice. Slack rows carry `storage_backend = 'slack'` and a live
+`storage_url` rather than claiming object-store residency; the fingerprint candidate scan
+reads this mart and the existing Slack fetcher retrieves the bytes. `ALLOWED_RAW_ATTACHMENT_SOURCES` in
 `tests/test_repo_contracts.py` is empty on purpose; adding an entry re-opens the hole.
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into

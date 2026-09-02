@@ -133,6 +133,24 @@ THREAD_BACKFILL_DRAINED_COOLDOWN = timedelta(hours=6)
 THREAD_BACKFILL_RECENT_WINDOW = timedelta(days=30)
 
 
+def _thread_backfill_cursor(ref: Mapping[str, Any]) -> str:
+    """Serialize the complete newest-first parent keyset into sync state."""
+
+    return f"{ref.get('thread_ts', '')}|{ref.get('conversation_id', '')}"
+
+
+def _parse_thread_backfill_cursor(value: object) -> tuple[str | None, str]:
+    raw = str(value or "")
+    if "|" not in raw:
+        return None, ""
+    thread_ts, conversation_id = raw.split("|", 1)
+    try:
+        float(thread_ts)
+    except (TypeError, ValueError):
+        return None, ""
+    return thread_ts, conversation_id
+
+
 def _state_updated_at(state: Mapping[str, Any]) -> datetime | None:
     value = state.get("updated_at")
     if isinstance(value, datetime):
@@ -1096,47 +1114,43 @@ class SlackSyncRunner:
         # elapses only the recent window is checked -- which is where a new
         # gap appears in practice (a newly synced parent), and which the
         # message_datetime index answers cheaply.
-        drained_walk_ok = False
+        full_walk = False
+        before_thread_ts: str | None = None
+        before_conversation_id = ""
         if self._thread_missing_replies_only and since_ts is None:
             drained_key = (account.account, team_id, THREAD_BACKFILL_WALK_TYPE, THREAD_BACKFILL_WALK_ID)
             drained = state_by_key.get(drained_key)
             drained_at = _state_updated_at(drained) if drained else None
-            if drained_at is not None and (
+            if self._state_has_status(drained, "ok") and drained_at is not None and (
                 self._now() - drained_at < THREAD_BACKFILL_DRAINED_COOLDOWN
             ):
                 since_ts = self._now().timestamp() - THREAD_BACKFILL_RECENT_WINDOW.total_seconds()
             else:
-                drained_walk_ok = True
+                full_walk = True
+                raw_cursor = (
+                    drained.get("cursor_ts", "")
+                    if isinstance(drained, Mapping)
+                    else getattr(drained, "cursor_ts", "")
+                )
+                before_thread_ts, before_conversation_id = _parse_thread_backfill_cursor(
+                    raw_cursor
+                )
         thread_refs = self._warehouse.load_slack_thread_parent_refs(
             account=account.account,
             team_id=team_id,
             since_ts=since_ts,
+            before_thread_ts=before_thread_ts,
+            before_conversation_id=before_conversation_id,
             limit=self._thread_limit,
             skip_completed=self._skip_completed_threads,
             skip_known_errors=self._skip_known_errors,
             order=self._thread_order,
             missing_replies_only=self._thread_missing_replies_only,
         )
-        if drained_walk_ok and (
-            self._thread_limit is None or len(thread_refs) < self._thread_limit
-        ):
-            # Fewer candidates than the limit means the walk saw the end of
-            # the backlog: everything it found is processed below, and the
-            # next full walk can wait out the cooldown.
-            self._warehouse.insert_slack_sync_state(
-                account=account.account,
-                team_id=team_id,
-                object_type=THREAD_BACKFILL_WALK_TYPE,
-                object_id=THREAD_BACKFILL_WALK_ID,
-                cursor_ts="",
-                last_sync_type="thread_backfill_walk",
-                status="ok",
-                error="",
-                updated_at=synced_at,
-                sync_version=sync_version,
-            )
         messages_written = 0
         files_written = 0
+        last_walk_ref: Mapping[str, Any] | None = None
+        walk_stopped_early = False
         for index, thread_ref in enumerate(thread_refs, start=1):
             conversation_id = str(thread_ref["conversation_id"])
             thread_ts = str(thread_ref["thread_ts"])
@@ -1146,11 +1160,13 @@ class SlackSyncRunner:
             # Only terminally-gone threads are dropped; a transient 'error' is
             # retried so it can heal instead of freezing as failing forever.
             if self._skip_known_errors and self._state_has_status(state, SLACK_SYNC_STATE_GONE):
+                last_walk_ref = thread_ref
                 continue
             if self._skip_completed_threads and self._thread_state_covers_latest_reply(
                 state,
                 latest_reply_ts=latest_reply_ts,
             ):
+                last_walk_ref = thread_ref
                 continue
             try:
                 result = self._sync_one_thread_replies(
@@ -1171,6 +1187,7 @@ class SlackSyncRunner:
                         thread_ts,
                         exc,
                     )
+                    walk_stopped_early = True
                     break
                 raise
             except SlackApiCallError as exc:
@@ -1201,11 +1218,48 @@ class SlackSyncRunner:
                         exc.code,
                         exc,
                     )
+                if full_walk and not thread_gone:
+                    # The historical keyset may advance only across terminal
+                    # outcomes. Leave a transiently failed parent below the
+                    # saved cursor so the next bounded page retries it.
+                    walk_stopped_early = True
+                    break
+                last_walk_ref = thread_ref
                 continue
             messages_written += result["messages_written"]
             files_written += result["files_written"]
+            last_walk_ref = thread_ref
             if index % 100 == 0:
                 self._logger.info("Synced Slack replies for %s threads on %s so far", index, account.account)
+
+        if full_walk:
+            reached_end = not walk_stopped_early and (
+                self._thread_limit is None or len(thread_refs) < self._thread_limit
+            )
+            # Persist progress after processing, never before: on a rate-limit
+            # break the current candidate must remain visible next run. Once a
+            # short page is fully handled the keyset reached the historical
+            # end and the cheap recent-window cooldown can begin.
+            self._warehouse.insert_slack_sync_state(
+                account=account.account,
+                team_id=team_id,
+                object_type=THREAD_BACKFILL_WALK_TYPE,
+                object_id=THREAD_BACKFILL_WALK_ID,
+                cursor_ts=(
+                    ""
+                    if reached_end
+                    else _thread_backfill_cursor(last_walk_ref)
+                    if last_walk_ref is not None
+                    else f"{before_thread_ts}|{before_conversation_id}"
+                    if before_thread_ts
+                    else ""
+                ),
+                last_sync_type="thread_backfill_walk",
+                status="ok" if reached_end else "running",
+                error="",
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
 
         return SlackSyncSummary(
             account=account.account,

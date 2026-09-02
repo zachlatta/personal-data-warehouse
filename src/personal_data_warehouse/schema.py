@@ -2105,9 +2105,9 @@ SEARCH_CHUNK_EMBEDDING_COLUMNS = (
 
 # One row per search-index stage. The chunk builder's row ("timeline") is a
 # cursor over timeline.events.seq. The embedding drain's row ("embeddings")
-# carries its two persisted cursors: the built_at watermark behind which every
-# chunk has been offered to the embedder, and the newest-first (event_ts,
-# chunk_id) keyset of the one-time historical backfill. Without persistence
+# carries its two persisted keysets: the (built_at, chunk_id) watermark behind
+# which every chunk has been offered to the embedder, and the newest-first
+# (event_ts, chunk_id) keyset of the one-time historical backfill. Without persistence
 # the drain restarted at the newest chunk on every run and re-scanned the
 # whole 7 GB chunk heap each time, which evicted the search indexes from the
 # page cache ten minutes after every search warmed them.
@@ -2116,9 +2116,14 @@ SEARCH_CHUNK_SYNC_STATE_COLUMNS = (
     "last_seq",
     "updated_at",
     "embed_fresh_built_at",
+    "embed_fresh_chunk_id",
     "embed_cursor_ts",
     "embed_cursor_id",
     "embed_backfill_status",
+    # Periodic index-only anti-join proof. Cursor convergence alone cannot see
+    # a row skipped by a formerly incomplete keyset.
+    "embed_orphan_checked_at",
+    "embed_orphan_status",
 )
 
 # One row per search stage.  Unlike generic table freshness this records the
@@ -2135,6 +2140,12 @@ SEARCH_HEALTH_COLUMNS = (
     # Exact when caught_up=1 (zero); -1 means the bounded worker proved a
     # backlog exists but deliberately did not scan millions of rows to count it.
     "pending_count",
+    # Shared-buffer residency of the HNSW + BM25 search indexes, sampled by
+    # the benchmark asset. This intentionally does not claim to measure the
+    # kernel's separate filesystem page cache.
+    "resident_bytes",
+    "total_bytes",
+    "resident_fraction",
     "oldest_pending_at",
     "last_success_at",
     "last_run_at",
@@ -2331,6 +2342,12 @@ SEARCH_BENCHMARK_RUN_COLUMNS = (
     "cpu_count",
     "collected_at",
 )
+
+# Append-only copy of every weekly measurement. ``search_benchmark_runs`` is
+# the current health snapshot keyed by mode; the history table uses the same
+# row contract but keys by (mode, collected_at), so regressions remain
+# inspectable instead of disappearing on the next run.
+SEARCH_BENCHMARK_HISTORY_COLUMNS = SEARCH_BENCHMARK_RUN_COLUMNS
 
 # The benchmark's labels, kept in the warehouse (private: they are Zach's own
 # queries and timeline refs) so losing a gitignored directory can no longer

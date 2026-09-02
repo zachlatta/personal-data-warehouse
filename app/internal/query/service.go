@@ -2,18 +2,14 @@ package query
 
 import (
 	"bytes"
-	"container/list"
 	"context"
-	"crypto/rand"
 	"encoding/csv"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -21,13 +17,9 @@ import (
 )
 
 type Options struct {
-	MaxRows            int
-	MaxFieldChars      int
-	QueryCacheMaxBytes int64
-	GetFieldMaxChars   int
-	QueryCacheTTL      time.Duration
-	DebugCacheTool     bool
-	Logger             *slog.Logger
+	MaxRows       int
+	MaxFieldChars int
+	Logger        *slog.Logger
 	// SearchEmbedder powers the search tool's hybrid mode. Nil means
 	// embeddings are unconfigured and hybrid searches fall back to keyword.
 	SearchEmbedder Embedder
@@ -67,7 +59,6 @@ type Service struct {
 	runner   Runner
 	opts     Options
 	logger   *slog.Logger
-	cache    *queryCache
 	embedder Embedder
 }
 
@@ -97,73 +88,16 @@ type Response struct {
 	Results []Result `json:"results"`
 }
 
-type QueryResponse struct {
-	Results []QueryResult `json:"results"`
-}
-
-type QueryResult struct {
-	SQL         string            `json:"sql"`
-	QueryID     string            `json:"query_id,omitempty"`
-	TotalRows   int               `json:"total_rows,omitempty"`
-	ColumnNames []string          `json:"column_names,omitempty"`
-	Format      string            `json:"format,omitempty"`
-	Preview     any               `json:"preview,omitempty"`
-	Truncations []FieldTruncation `json:"truncations,omitempty"`
-	Error       string            `json:"error,omitempty"`
-	// Hint is advice about the statement's SHAPE, attached before it runs and
-	// regardless of whether it succeeds: the query still executes.
-	Hint string `json:"hint,omitempty"`
-}
-
-type RowsResponse struct {
-	QueryID     string            `json:"query_id"`
-	Offset      int               `json:"offset"`
-	Limit       int               `json:"limit"`
-	TotalRows   int               `json:"total_rows"`
-	ColumnNames []string          `json:"column_names"`
-	Format      string            `json:"format"`
-	Rows        any               `json:"rows"`
-	Truncations []FieldTruncation `json:"truncations,omitempty"`
-	Error       string            `json:"error,omitempty"`
-}
-
-type FieldResponse struct {
-	QueryID       string `json:"query_id"`
-	Row           int    `json:"row"`
-	Column        string `json:"column"`
-	Offset        int    `json:"offset"`
-	TotalChars    int    `json:"total_chars"`
-	ReturnedChars int    `json:"returned_chars"`
-	Value         string `json:"value"`
-	EOF           bool   `json:"eof,omitempty"`
-	Error         string `json:"error,omitempty"`
-}
-
-type GrepResponse struct {
-	QueryID string      `json:"query_id"`
-	Pattern string      `json:"pattern"`
-	Matches []GrepMatch `json:"matches"`
-	Error   string      `json:"error,omitempty"`
-}
-
-type GrepMatch struct {
-	RowIndex   int    `json:"row_index"`
-	Column     string `json:"column"`
-	MatchStart int    `json:"match_start"`
-	MatchEnd   int    `json:"match_end"`
-	Context    string `json:"context"`
-}
-
 // FullQueryRowCap is the safety ceiling ExecuteFull applies to a single
 // statement. It exists so a stray `SELECT * FROM huge_table` does not stream
 // hundreds of millions of rows into a terminal; callers needing more should
 // page with LIMIT/OFFSET.
 const FullQueryRowCap = 1_000_000
 
-// FullQueryResponse is the response for the CLI sql tool. Rows holds the
+// FullQueryResponse is the response for a SQL tool. Rows holds the
 // formatted body (CSV string, JSON array, or NDJSON string depending on
 // Format). No caching, no per-field truncation — that's the whole point of
-// this surface vs. the MCP query tool.
+// this surface.
 type FullQueryResponse struct {
 	Question    string   `json:"question"`
 	SQL         string   `json:"sql"`
@@ -176,19 +110,11 @@ type FullQueryResponse struct {
 	Hint        string   `json:"hint,omitempty"`
 }
 
-type DebugCacheStatus struct {
-	TotalBytes int64             `json:"total_bytes"`
-	MaxBytes   int64             `json:"max_bytes"`
-	TTLSeconds int64             `json:"ttl_seconds"`
-	Queries    []DebugCacheEntry `json:"queries"`
-}
-
-type DebugCacheEntry struct {
-	QueryID    string `json:"query_id"`
-	SQL        string `json:"sql"`
-	Rows       int    `json:"rows"`
-	Bytes      int64  `json:"bytes"`
-	AgeSeconds int64  `json:"age_seconds"`
+// FullQueryBatchResponse is the MCP query surface: one bounded, complete
+// result per {question, sql} statement. It deliberately has no query_id or
+// cursor follow-up contract; query is the single SQL operation on MCP.
+type FullQueryBatchResponse struct {
+	Results []FullQueryResponse `json:"results"`
 }
 
 type Result struct {
@@ -250,20 +176,11 @@ func NewService(runner Runner, opts Options) *Service {
 	if opts.MaxFieldChars <= 0 {
 		opts.MaxFieldChars = 4000
 	}
-	if opts.QueryCacheMaxBytes <= 0 {
-		opts.QueryCacheMaxBytes = 256 * 1024 * 1024
-	}
-	if opts.GetFieldMaxChars <= 0 {
-		opts.GetFieldMaxChars = 200000
-	}
-	if opts.QueryCacheTTL <= 0 {
-		opts.QueryCacheTTL = 30 * time.Minute
-	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), cache: newQueryCache(opts.QueryCacheMaxBytes, opts.QueryCacheTTL), embedder: opts.SearchEmbedder}
+	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder}
 }
 
 func normalizeStatements(statements []Statement) ([]Statement, statementValidationError) {
@@ -305,226 +222,50 @@ func statementQuestions(statements []Statement) []string {
 	return questions
 }
 
-func (s *Service) Execute(ctx context.Context, statements []Statement, previewRows int, format string) QueryResponse {
-	statements, validationErr := normalizeStatements(statements)
-	if validationErr.Message != "" {
-		s.logger.WarnContext(ctx, "query batch rejected", validationErr.logFields()...)
-		return QueryResponse{Results: []QueryResult{{Error: validationErr.Message}}}
-	}
-	format = normalizeFormat(format)
-	if previewRows < 0 {
-		previewRows = 0
-	}
-	if previewRows == 0 {
-		previewRows = 20
-	}
-
-	started := time.Now()
-	questions := statementQuestions(statements)
-	s.logger.InfoContext(ctx, "query batch started", "statements", len(statements), "questions", questions, "max_rows", s.opts.MaxRows, "max_field_chars", s.opts.MaxFieldChars, "format", format, "preview_rows", previewRows)
-	results := make([]QueryResult, 0, len(statements))
-	for _, statement := range statements {
-		queryStarted := time.Now()
-		result := QueryResult{SQL: statement.SQL, Format: format, Hint: rawTextScanHint(statement.SQL)}
-		if err := ValidateReadOnlySQL(statement.SQL); err != nil {
-			result.Error = err.Error()
-			results = append(results, result)
-			s.logger.WarnContext(ctx, "query rejected by read-only validator", "question", statement.Question, "sql", statement.SQL, "error", result.Error)
-			continue
-		}
-		s.logger.DebugContext(ctx, "query started", "question", statement.Question, "sql", statement.SQL)
-		raw, err := s.runner.Query(ctx, statement.SQL, s.opts.MaxRows+1)
-		if err != nil {
-			result.Error = s.queryErrorMessage(ctx, err.Error(), statement.SQL)
-			results = append(results, result)
-			s.logger.ErrorContext(ctx, "query failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
-			continue
-		}
-		if len(raw.Rows) > s.opts.MaxRows {
-			result.Error = fmt.Sprintf("query returned more than MCP_MAX_ROWS (%d) rows; add a LIMIT or narrower WHERE clause and re-run the query", s.opts.MaxRows)
-			results = append(results, result)
-			s.logger.WarnContext(ctx, "query rejected by row cap", "question", statement.Question, "sql", statement.SQL, "rows_seen", len(raw.Rows), "max_rows", s.opts.MaxRows, "duration", time.Since(queryStarted))
-			continue
-		}
-		entry := &queryCacheEntry{
-			ID:        newQueryID(),
-			Question:  statement.Question,
-			SQL:       statement.SQL,
-			Columns:   append([]string(nil), raw.Columns...),
-			Rows:      copyRows(raw.Rows),
-			Format:    format,
-			CreatedAt: time.Now(),
-		}
-		entry.SizeBytes = estimateEntrySize(entry)
-		if err := s.cache.add(entry); err != nil {
-			result.Error = err.Error()
-			s.logger.ErrorContext(ctx, "query result encoding failed", "question", statement.Question, "sql", statement.SQL, "error", err, "duration", time.Since(queryStarted))
-		} else {
-			result.QueryID = entry.ID
-			result.TotalRows = len(entry.Rows)
-			result.ColumnNames = entry.Columns
-			result.Preview, result.Truncations, err = s.formatRows(entry.Columns, entry.Rows, 0, minInt(previewRows, len(entry.Rows)), format)
-			if err != nil {
-				result.Error = err.Error()
-			}
-			s.logger.InfoContext(ctx, "query completed", "question", statement.Question, "sql", statement.SQL, "query_id", entry.ID, "rows", len(entry.Rows), "columns", len(raw.Columns), "truncated_fields", len(result.Truncations), "duration", time.Since(queryStarted))
-		}
-		results = append(results, result)
-	}
-	s.logger.InfoContext(ctx, "query batch completed", "statements", len(statements), "questions", questions, "duration", time.Since(started))
-	return QueryResponse{Results: results}
-}
-
-func (s *Service) GetRows(ctx context.Context, queryID string, offset, limit int, format string) RowsResponse {
-	entry, err := s.cache.get(queryID)
-	if err != nil {
-		return RowsResponse{QueryID: queryID, Error: err.Error()}
-	}
-	s.logger.InfoContext(ctx, "get_rows using cached query", "query_id", queryID, "question", entry.Question, "offset", offset, "limit", limit)
-	if offset < 0 {
-		return RowsResponse{QueryID: queryID, Error: "offset must be >= 0"}
-	}
-	if limit <= 0 {
-		limit = 50
-	}
-	if offset > len(entry.Rows) {
-		offset = len(entry.Rows)
-	}
-	if format == "" {
-		format = entry.Format
-	}
-	format = normalizeFormat(format)
-	end := minInt(offset+limit, len(entry.Rows))
-	rows, truncations, err := s.formatRows(entry.Columns, entry.Rows, offset, end, format)
-	resp := RowsResponse{
-		QueryID:     queryID,
-		Offset:      offset,
-		Limit:       limit,
-		TotalRows:   len(entry.Rows),
-		ColumnNames: append([]string(nil), entry.Columns...),
-		Format:      format,
-		Rows:        rows,
-		Truncations: truncations,
-	}
-	if err != nil {
-		resp.Error = err.Error()
-	}
-	return resp
-}
-
-func (s *Service) GetField(ctx context.Context, queryID string, row int, column string, offset, length int) FieldResponse {
-	resp := FieldResponse{QueryID: queryID, Row: row, Column: column, Offset: offset}
-	entry, err := s.cache.get(queryID)
-	if err != nil {
-		resp.Error = err.Error()
-		return resp
-	}
-	s.logger.InfoContext(ctx, "get_field using cached query", "query_id", queryID, "question", entry.Question, "row", row, "column", column, "offset", offset, "length", length)
-	if row < 0 || row >= len(entry.Rows) {
-		if len(entry.Rows) == 0 {
-			resp.Error = fmt.Sprintf("row %d is out of range for query_id %s; the cached result has 0 rows", row, queryID)
-		} else {
-			resp.Error = fmt.Sprintf("row %d is out of range for query_id %s; valid rows are 0 through %d", row, queryID, len(entry.Rows)-1)
-		}
-		return resp
-	}
-	if !containsString(entry.Columns, column) {
-		resp.Error = fmt.Sprintf("unknown column %q for query_id %s; available columns: %s", column, queryID, strings.Join(entry.Columns, ", "))
-		return resp
-	}
-	if offset < 0 {
-		resp.Error = "offset must be >= 0"
-		return resp
-	}
-	if length <= 0 {
-		length = 50000
-	}
-	if length > s.opts.GetFieldMaxChars {
-		length = s.opts.GetFieldMaxChars
-	}
-	value := csvValue(entry.Rows[row][column])
-	runes := []rune(value)
-	resp.TotalChars = len(runes)
-	if offset > len(runes) {
-		offset = len(runes)
-		resp.Offset = offset
-	}
-	end := minInt(offset+length, len(runes))
-	resp.Value = string(runes[offset:end])
-	resp.ReturnedChars = end - offset
-	resp.EOF = end >= len(runes)
-	return resp
-}
-
-func (s *Service) GrepRows(ctx context.Context, queryID, pattern string, columns []string, limit, contextChars int) GrepResponse {
-	resp := GrepResponse{QueryID: queryID, Pattern: pattern}
-	entry, err := s.cache.get(queryID)
-	if err != nil {
-		resp.Error = err.Error()
-		return resp
-	}
-	s.logger.InfoContext(ctx, "grep_rows using cached query", "query_id", queryID, "question", entry.Question, "columns", len(columns), "limit", limit)
-	if pattern == "" {
-		resp.Error = "pattern must not be empty"
-		return resp
-	}
-	if limit <= 0 {
-		limit = 100
-	}
-	if contextChars < 0 {
-		contextChars = 0
-	} else if contextChars == 0 {
-		contextChars = 200
-	}
-	if len(columns) == 0 {
-		columns = entry.Columns
-	} else {
-		for _, column := range columns {
-			if !containsString(entry.Columns, column) {
-				resp.Error = fmt.Sprintf("unknown column %q for query_id %s; available columns: %s", column, queryID, strings.Join(entry.Columns, ", "))
-				return resp
-			}
-		}
-	}
-	re, err := regexp.Compile("(?i)" + pattern)
-	if err != nil {
-		resp.Error = "invalid regex pattern: " + err.Error()
-		return resp
-	}
-	for rowIndex, row := range entry.Rows {
-		for _, column := range columns {
-			value := csvValue(row[column])
-			runeOffsets := byteToRuneOffsets(value)
-			for _, loc := range re.FindAllStringIndex(value, -1) {
-				start := runeOffsets[loc[0]]
-				end := runeOffsets[loc[1]]
-				runes := []rune(value)
-				contextStart := maxInt(0, start-contextChars)
-				contextEnd := minInt(len(runes), end+contextChars)
-				resp.Matches = append(resp.Matches, GrepMatch{
-					RowIndex:   rowIndex,
-					Column:     column,
-					MatchStart: start,
-					MatchEnd:   end,
-					Context:    string(runes[contextStart:contextEnd]),
-				})
-				if len(resp.Matches) >= limit {
-					return resp
-				}
-			}
-		}
-	}
-	return resp
-}
-
 // ExecuteFull runs a single read-only SQL statement and returns the entire
-// result formatted as CSV/JSON/NDJSON. It bypasses the query cache, applies
-// no per-field truncation, and only enforces the FullQueryRowCap safety
+// result formatted as CSV/JSON/NDJSON. It applies no per-field truncation and
+// only enforces the FullQueryRowCap safety
 // limit. Used by the CLI-only sql tool. The question is a concise
 // plain-English description of what the SQL is trying to answer; it is
 // required so that server logs always carry the caller's intent alongside
 // the SQL, the same way the MCP query tool does.
 func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string) FullQueryResponse {
+	return s.executeFull(ctx, question, sql, format, FullQueryRowCap, true, "full SQL")
+}
+
+// ExecuteBatchFull is the sole MCP SQL flow. Results are complete (including
+// long fields) and bounded by MCP_MAX_ROWS. There is no cursor follow-up
+// flow: one call returns the complete bounded result.
+func (s *Service) ExecuteBatchFull(
+	ctx context.Context, statements []Statement, format string,
+) FullQueryBatchResponse {
+	statements, validationErr := normalizeStatements(statements)
+	if validationErr.Message != "" {
+		s.logger.WarnContext(ctx, "query batch rejected", validationErr.logFields()...)
+		return FullQueryBatchResponse{Results: []FullQueryResponse{{Error: validationErr.Message}}}
+	}
+	results := make([]FullQueryResponse, 0, len(statements))
+	for _, statement := range statements {
+		results = append(results, s.executeFull(
+			ctx,
+			statement.Question,
+			statement.SQL,
+			format,
+			s.opts.MaxRows,
+			false,
+			"MCP query",
+		))
+	}
+	return FullQueryBatchResponse{Results: results}
+}
+
+func (s *Service) executeFull(
+	ctx context.Context,
+	question, sql, format string,
+	rowCap int,
+	truncateAtCap bool,
+	logName string,
+) FullQueryResponse {
 	question = strings.TrimSpace(question)
 	sql = strings.TrimSpace(sql)
 	format = normalizeFormat(format)
@@ -544,17 +285,24 @@ func (s *Service) ExecuteFull(ctx context.Context, question, sql, format string)
 		return resp
 	}
 	started := time.Now()
-	s.logger.InfoContext(ctx, "sql started", "question", question, "sql", sql, "format", format, "row_cap", FullQueryRowCap)
-	resp.Hint = rawTextScanHint(sql)
-	raw, err := s.runner.Query(ctx, sql, FullQueryRowCap+1)
+	s.logger.InfoContext(ctx, "sql started", "surface", logName, "question", question, "sql", sql, "format", format, "row_cap", rowCap)
+	resp.Hint = sqlUsageHint(sql)
+	raw, err := s.runner.Query(ctx, sql, rowCap+1)
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), sql)
 		s.logger.ErrorContext(ctx, "sql failed", "question", question, "sql", sql, "error", err, "duration", time.Since(started))
 		return resp
 	}
 	rows := raw.Rows
-	if len(rows) > FullQueryRowCap {
-		rows = rows[:FullQueryRowCap]
+	if len(rows) > rowCap {
+		if !truncateAtCap {
+			resp.Error = fmt.Sprintf(
+				"query returned more than MCP_MAX_ROWS (%d) rows; add a LIMIT or narrower WHERE clause and re-run the query",
+				rowCap,
+			)
+			return resp
+		}
+		rows = rows[:rowCap]
 		resp.Truncated = true
 	}
 	resp.ColumnNames = append([]string(nil), raw.Columns...)
@@ -595,10 +343,6 @@ func formatFullRows(columns []string, rows []map[string]any, format string) (any
 	default:
 		return rowsToCSV(columns, rows)
 	}
-}
-
-func (s *Service) DebugCacheStatus() DebugCacheStatus {
-	return s.cache.status()
 }
 
 func (s *Service) formatRows(columns []string, rows []map[string]any, start, end int, format string) (any, []FieldTruncation, error) {
@@ -972,9 +716,33 @@ func rawTextScanHint(sql string) string {
 		"and drill to the raw row via source_table/source_pk; keep raw-table predicates to indexed columns and a time bound.)"
 }
 
+// timelinePriorityHint makes an unscoped timeline read an explicit decision.
+// The five-tier contract only helps if callers filter on it; 14 days of real
+// sessions showed SQL was the dominant surface while its description and
+// results never mentioned priorities.
+func timelinePriorityHint(sql string) string {
+	if !timelineEventsRef.MatchString(sql) || timelinePriorityPredicate.MatchString(sql) {
+		return ""
+	}
+	return "(hint: this reads timeline.events without a priority predicate. For attention or correspondence add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the filter only when broad recall or an unknown tier is intentional.)"
+}
+
+func sqlUsageHint(sql string) string {
+	hints := make([]string, 0, 2)
+	if hint := rawTextScanHint(sql); hint != "" {
+		hints = append(hints, hint)
+	}
+	if hint := timelinePriorityHint(sql); hint != "" {
+		hints = append(hints, hint)
+	}
+	return strings.Join(hints, " ")
+}
+
 var (
-	rawBaseTableRef = regexp.MustCompile(`\bbase_[a-z0-9_]+\.[a-z0-9_]+`)
-	rawTextScanOp   = regexp.MustCompile(`\bilike\b|\blike\b|\bsimilar to\b|~\*?|\bregexp_(?:matches|like|replace|count)\s*\(|\bposition\s*\(`)
+	rawBaseTableRef           = regexp.MustCompile(`\bbase_[a-z0-9_]+\.[a-z0-9_]+`)
+	rawTextScanOp             = regexp.MustCompile(`\bilike\b|\blike\b|\bsimilar to\b|~\*?|\bregexp_(?:matches|like|replace|count)\s*\(|\bposition\s*\(`)
+	timelineEventsRef         = regexp.MustCompile(`(?i)(?:"timeline"|timeline)\s*\.\s*(?:"events"|events\b)`)
+	timelinePriorityPredicate = regexp.MustCompile(`(?i)(?:[a-z_][a-z0-9_]*\s*\.\s*)?(?:"priority"|priority)\s*(?:=|<>|!=|\bin\s*\()`)
 )
 
 func queryErrorWithHint(message, sql string) string {
@@ -1524,151 +1292,6 @@ func quotePostgresIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
-type queryCache struct {
-	mu         sync.Mutex
-	entries    map[string]*list.Element
-	lru        *list.List
-	maxBytes   int64
-	ttl        time.Duration
-	totalBytes int64
-}
-
-type queryCacheEntry struct {
-	ID         string
-	Question   string
-	SQL        string
-	Columns    []string
-	Rows       []map[string]any
-	Format     string
-	SizeBytes  int64
-	CreatedAt  time.Time
-	LastAccess time.Time
-}
-
-func newQueryCache(maxBytes int64, ttl time.Duration) *queryCache {
-	return &queryCache{
-		entries:  make(map[string]*list.Element),
-		lru:      list.New(),
-		maxBytes: maxBytes,
-		ttl:      ttl,
-	}
-}
-
-func (c *queryCache) add(entry *queryCacheEntry) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.evictExpiredLocked(time.Now())
-	if entry.SizeBytes > c.maxBytes {
-		return fmt.Errorf("query result is %d bytes, which exceeds MCP_QUERY_CACHE_MAX_BYTES (%d); narrow the query or raise the cache limit", entry.SizeBytes, c.maxBytes)
-	}
-	for c.totalBytes+entry.SizeBytes > c.maxBytes {
-		c.evictOldestLocked()
-	}
-	entry.LastAccess = entry.CreatedAt
-	elem := c.lru.PushFront(entry)
-	c.entries[entry.ID] = elem
-	c.totalBytes += entry.SizeBytes
-	return nil
-}
-
-func (c *queryCache) get(queryID string) (*queryCacheEntry, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	c.evictExpiredLocked(now)
-	elem, ok := c.entries[queryID]
-	if !ok {
-		return nil, fmt.Errorf("unknown or expired query_id %q; re-run query to create a fresh query_id (server restarts invalidate cached query_ids)", queryID)
-	}
-	entry := elem.Value.(*queryCacheEntry)
-	entry.LastAccess = now
-	c.lru.MoveToFront(elem)
-	return entry, nil
-}
-
-func (c *queryCache) status() DebugCacheStatus {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	c.evictExpiredLocked(now)
-	status := DebugCacheStatus{
-		TotalBytes: c.totalBytes,
-		MaxBytes:   c.maxBytes,
-		TTLSeconds: int64(c.ttl.Seconds()),
-		Queries:    make([]DebugCacheEntry, 0, len(c.entries)),
-	}
-	for elem := c.lru.Front(); elem != nil; elem = elem.Next() {
-		entry := elem.Value.(*queryCacheEntry)
-		status.Queries = append(status.Queries, DebugCacheEntry{
-			QueryID:    entry.ID,
-			SQL:        entry.SQL,
-			Rows:       len(entry.Rows),
-			Bytes:      entry.SizeBytes,
-			AgeSeconds: int64(now.Sub(entry.CreatedAt).Seconds()),
-		})
-	}
-	return status
-}
-
-func (c *queryCache) evictExpiredLocked(now time.Time) {
-	for elem := c.lru.Back(); elem != nil; {
-		prev := elem.Prev()
-		entry := elem.Value.(*queryCacheEntry)
-		if now.Sub(entry.CreatedAt) > c.ttl {
-			c.removeLocked(elem)
-		}
-		elem = prev
-	}
-}
-
-func (c *queryCache) evictOldestLocked() {
-	elem := c.lru.Back()
-	if elem != nil {
-		c.removeLocked(elem)
-	}
-}
-
-func (c *queryCache) removeLocked(elem *list.Element) {
-	entry := elem.Value.(*queryCacheEntry)
-	delete(c.entries, entry.ID)
-	c.totalBytes -= entry.SizeBytes
-	c.lru.Remove(elem)
-}
-
-func copyRows(rows []map[string]any) []map[string]any {
-	out := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		copied := make(map[string]any, len(row))
-		for key, value := range row {
-			copied[key] = value
-		}
-		out = append(out, copied)
-	}
-	return out
-}
-
-func estimateEntrySize(entry *queryCacheEntry) int64 {
-	size := int64(len(entry.ID) + len(entry.Question) + len(entry.SQL) + len(entry.Format))
-	for _, column := range entry.Columns {
-		size += int64(len(column))
-	}
-	for _, row := range entry.Rows {
-		for _, column := range entry.Columns {
-			size += int64(len(column))
-			size += int64(len(csvValue(row[column])))
-		}
-	}
-	return size
-}
-
-func newQueryID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return hex.EncodeToString(b[:])
-	}
-	return strconv.FormatInt(time.Now().UnixNano(), 36)
-}
-
 func normalizeFormat(format string) string {
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "json", "ndjson":
@@ -1676,15 +1299,6 @@ func normalizeFormat(format string) string {
 	default:
 		return "csv"
 	}
-}
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func minInt(a, b int) int {
@@ -1699,15 +1313,4 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func byteToRuneOffsets(value string) map[int]int {
-	offsets := make(map[int]int, utf8.RuneCountInString(value)+1)
-	runeIndex := 0
-	for byteIndex := range value {
-		offsets[byteIndex] = runeIndex
-		runeIndex++
-	}
-	offsets[len(value)] = runeIndex
-	return offsets
 }

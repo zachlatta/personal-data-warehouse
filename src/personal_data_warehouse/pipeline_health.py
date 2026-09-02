@@ -1400,6 +1400,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
     "search_benchmark_runs": _data("search_benchmark", "collected_at"),
+    "search_benchmark_history": _support(
+        "search_benchmark", "collected_at", note="append-only benchmark trend"
+    ),
     "search_benchmark_labels": _support("search_benchmark", "updated_at", note="private labels; a mirror of the published file"),
     "pgbackrest_health": _data(
         "pgbackrest",
@@ -1638,6 +1641,7 @@ class PipelineHealthCollector:
                    max(event_ts) AS newest_event_at
             FROM @timeline_events
             WHERE event_ts >= now() - interval '7 days'
+              AND event_ts <= now()
             GROUP BY source, priority
         """
         try:

@@ -213,6 +213,11 @@ class TimelineAdapter:
     # safety rollout does not reset all 26 production backfills (48M rows).
     signature_backfill_sql: str = ""
     signature_incremental_sql: str = ""
+    # A source may provide a cheaper max-ingest probe than the SELECT generated
+    # from its full normalization join.  That probe changes no normalized row,
+    # so retain the former generated SQL solely for signature compatibility;
+    # otherwise an operational performance fix would reset a 47M-row backfill.
+    signature_max_ingest_sql: str = ""
     # Gap-only query for `reconcile_hours`, generated beside the others. It is
     # deliberately NOT part of `adapter_signature`: it changes no row's
     # normalized content, so including it would reset every adapter's backfill
@@ -260,6 +265,7 @@ def _simple_adapter(
     max_incremental_batches_per_run: int = 0,
     refresh_hours: float = 0.0,
     prune_sql: str = "",
+    max_ingest_sql: str = "",
 ) -> TimelineAdapter:
     if not priority.strip():
         raise ValueError(f"timeline adapter {name!r} must declare a priority expression")
@@ -350,7 +356,12 @@ def _simple_adapter(
         ORDER BY 13 ASC, 1 ASC
         LIMIT %(limit)s
     """
-    max_ingest_sql = f"SELECT max({ingest_ts}) FROM {from_sql} WHERE ({where})"
+    generated_max_ingest_sql = (
+        f"SELECT max({ingest_ts}) FROM {from_sql} WHERE ({where})"
+    )
+    signature_max_ingest_sql = generated_max_ingest_sql
+    if not max_ingest_sql:
+        max_ingest_sql = generated_max_ingest_sql
     # Rows the source has INGESTED recently that the timeline does not have.
     #
     # Windowed on ingest, never on event time: the rows most likely to be
@@ -391,6 +402,7 @@ def _simple_adapter(
         prune_sql=prune_sql,
         signature_backfill_sql=signature_backfill_sql,
         signature_incremental_sql=signature_incremental_sql,
+        signature_max_ingest_sql=signature_max_ingest_sql,
         reconcile_sql=reconcile_sql,
         event_id_expression=event_id,
     )
@@ -1007,6 +1019,10 @@ _SLACK_MESSAGE = _simple_adapter(
     # 12h covers the +/-6h engagement window with margin while keeping the
     # per-tick re-walk (~9k rows with window probes) inside the work budget.
     refresh_hours=12,
+    # This is only a high-water probe. Reusing the normalization joins here
+    # turned a btree-served max into a parallel scan of the 49 GB message heap
+    # every five minutes.
+    max_ingest_sql="SELECT max(synced_at) FROM @slack_messages",
 )
 
 _SLACK_FILE = _simple_adapter(
@@ -1043,6 +1059,7 @@ _SLACK_FILE = _simple_adapter(
         _SLACK_CONTEXT,
     ),
     priority=_SLACK_FILE_PRIORITY,
+    max_ingest_sql="SELECT max(synced_at) FROM @slack_files",
     refresh_hours=48,
 )
 
@@ -2859,7 +2876,7 @@ def adapter_definition_signature(adapter: TimelineAdapter) -> str:
             adapter.kind,
             backfill_sql,
             incremental_sql,
-            adapter.max_ingest_sql,
+            adapter.signature_max_ingest_sql or adapter.max_ingest_sql,
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -2935,7 +2952,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     ),
     # Alice Voice Recordings
     "alice_voice_recordings": _events(),
-    "alice_voice_recording_artifacts": _detail("alice_voice_recordings"),
+    "alice_voice_recording_artifacts": _detail(
+        "alice_voice_recordings", "provider audio/download artifacts behind the recording"
+    ),
     "alice_voice_recordings_sync_state": _state("alice poll heartbeat, status and error"),
     # Apple Notes: every note has revision rows (the note row is the current
     # state; the revisions are the edit activity).
@@ -2951,7 +2970,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "apple_message_chats": _entity("chat dimension joined into message events"),
     "apple_message_chat_handles": _entity("chat membership"),
     "apple_message_chat_messages": _detail("apple_messages", "chat<->message join rows"),
-    "apple_message_attachments": _detail("apple_messages"),
+    "apple_message_attachments": _detail(
+        "apple_messages", "media and extracted content shown with the parent message"
+    ),
     # Photos (per-source raw tables unified by the photos.* identity layer;
     # one timeline event per logical photo)
     "photo_assets": _events("one event per deduplicated logical photo"),
@@ -2963,7 +2984,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whatsapp_chats": _entity("chat dimension joined into message events"),
     "whatsapp_chat_participants": _entity("group rosters"),
     "whatsapp_contacts": _entity("sender dimension joined into message events"),
-    "whatsapp_media_items": _detail("whatsapp_messages"),
+    "whatsapp_media_items": _detail(
+        "whatsapp_messages", "media metadata and storage pointer on the parent message"
+    ),
     "whatsapp_client_sessions": _state("linked-device session snapshot"),
     # AI conversations. The adapter reads the marts_ai_conversations.events
     # union view and emits one row per session, so each source-owned raw table
@@ -2981,7 +3004,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Warehouse-internal enrichment agent
     "agent_runs": _events("the warehouse's own enrichment agent activity"),
     "agent_run_events": _detail("agent_runs", "raw agent stdout/stderr stream"),
-    "agent_run_tool_calls": _detail("agent_runs"),
+    "agent_run_tool_calls": _detail(
+        "agent_runs", "tool-call trace read as part of the enrichment run"
+    ),
     # Slack
     "slack_messages": _events(),
     "slack_files": _events("file shares; may exist without a synced message"),
@@ -2989,8 +3014,11 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "slack_files",
         "perceptual-hash link (file -> content sha) behind 'who sent this image?'",
     ),
-    "slack_message_reactions": _detail("slack_messages"),
-    "slack_teams": _entity(),
+    "slack_message_reactions": _detail(
+        "slack_messages",
+        "mutable reaction roster/count on the parent message; the message re-emits when it changes",
+    ),
+    "slack_teams": _entity("workspace identity and display-name dimension"),
     "slack_account_identities": _entity("which user_id is Zach per team"),
     "slack_users": _entity("author dimension joined into message events"),
     "slack_conversations": _entity("channel dimension joined into message events"),
@@ -3000,7 +3028,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "slack_account_state_item_rows": _state("remote inbox snapshot (derived, churn-heavy)"),
     # Google Drive
     "google_drive_files": _events(),
-    "google_drive_file_texts": _detail("google_drive_files"),
+    "google_drive_file_texts": _detail(
+        "google_drive_files", "extracted full text behind the file-change event"
+    ),
     "google_drive_sync_state": _state("drive sync cursor"),
     # WHOOP
     "whoop_profiles": _entity("current WHOOP user profile"),
@@ -3084,8 +3114,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Upstream mutations (the warehouse acting on the world)
     "upstream_mutations": _events(),
     "upstream_mutation_requests": _events(),
-    "upstream_mutation_events": _detail("upstream_mutations"),
-    "upstream_mutation_request_events": _detail("upstream_mutation_requests"),
+    "upstream_mutation_events": _detail(
+        "upstream_mutations", "execution/audit log under the mutation event"
+    ),
+    "upstream_mutation_request_events": _detail(
+        "upstream_mutation_requests", "review/audit log under the mutation request"
+    ),
     "push_devices": _state("iOS app devices registered for push notifications"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
@@ -3103,6 +3137,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
     "search_benchmark_runs": _state("weekly search benchmark: latency and labeled quality per mode"),
+    "search_benchmark_history": _state(
+        "append-only weekly search benchmark history; trends, not real-world events"
+    ),
     "search_benchmark_labels": _state("the benchmark's private labels (queries and truth refs)"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself

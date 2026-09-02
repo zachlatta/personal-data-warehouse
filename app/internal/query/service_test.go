@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 type fakeRunner struct {
@@ -300,88 +299,21 @@ func TestServiceSchemaOverviewSkipsRowCountWhenLookupFails(t *testing.T) {
 	}
 }
 
-func TestServiceExecuteTruncatesRowsAndFields(t *testing.T) {
-	longTranscript := strings.Repeat("x", 24000)
-	question := "What Gmail message bodies should be previewed?"
-	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT body FROM gmail_messages": {
-			Columns: []string{"body"},
-			Rows: []map[string]any{
-				{"body": longTranscript},
-				{"body": "second"},
-				{"body": "third"},
-			},
-		},
-	}}
-	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 4000, GetFieldMaxChars: 200000})
-
-	resp := svc.Execute(context.Background(), []Statement{statement(question, "SELECT body FROM gmail_messages")}, 1, "csv")
-	if len(resp.Results) != 1 {
-		t.Fatalf("results length = %d", len(resp.Results))
-	}
-	result := resp.Results[0]
-	if result.QueryID == "" {
-		t.Fatalf("query_id was empty: %#v", result)
-	}
-	entry, err := svc.cache.get(result.QueryID)
-	if err != nil {
-		t.Fatalf("cached query missing: %v", err)
-	}
-	if entry.Question != question {
-		t.Fatalf("cached question = %q, want %q", entry.Question, question)
-	}
-	if result.TotalRows != 3 {
-		t.Fatalf("total rows = %d", result.TotalRows)
-	}
-	preview, ok := result.Preview.(string)
-	if !ok {
-		t.Fatalf("preview type = %T", result.Preview)
-	}
-	if !strings.Contains(preview, "# TRUNCATIONS: ") {
-		t.Fatalf("CSV preview did not include truncation metadata line: %q", preview)
-	}
-	if strings.Contains(preview, "substring(") || strings.Contains(preview, "length(body)") {
-		t.Fatalf("preview leaked SQL substring instructions: %q", preview)
-	}
-	if len(result.Truncations) != 1 {
-		t.Fatalf("field truncations = %d", len(result.Truncations))
-	}
-	field := result.Truncations[0]
-	if field.Column != "body" || field.Row != 0 || field.Returned != 4000 || field.Total != 24000 {
-		t.Fatalf("unexpected field truncation: %#v", field)
-	}
-	rawTruncations := strings.TrimPrefix(preview[strings.LastIndex(preview, "# TRUNCATIONS: "):], "# TRUNCATIONS: ")
-	var parsed []FieldTruncation
-	if err := json.Unmarshal([]byte(rawTruncations), &parsed); err != nil {
-		t.Fatalf("truncation metadata is not parseable JSON: %v; %q", err, rawTruncations)
-	}
-	fieldResp := svc.GetField(context.Background(), result.QueryID, 0, "body", 0, 200000)
-	if fieldResp.Error != "" {
-		t.Fatalf("GetField returned error: %s", fieldResp.Error)
-	}
-	if fieldResp.Value != longTranscript || !fieldResp.EOF || fieldResp.TotalChars != 24000 || fieldResp.ReturnedChars != 24000 {
-		t.Fatalf("GetField did not return full transcript: %#v", fieldResp)
-	}
-	if len(runner.queries) != 1 {
-		t.Fatalf("expected one SQL execution, got %#v", runner.queries)
-	}
-}
-
 func TestServiceExecuteRequiresQuestionPerSQLStatement(t *testing.T) {
 	runner := &recordingRunner{results: map[string]RawResult{
 		"SELECT 1": {Columns: []string{"1"}, Rows: []map[string]any{{"1": 1}}},
 	}}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	noQueries := svc.Execute(context.Background(), nil, 20, "csv")
+	noQueries := svc.ExecuteBatchFull(context.Background(), nil, "csv")
 	if !strings.Contains(noQueries.Results[0].Error, "queries must contain at least one") {
 		t.Fatalf("missing queries error = %#v", noQueries.Results[0])
 	}
-	blankQuestion := svc.Execute(context.Background(), []Statement{statement(" ", "SELECT 1")}, 20, "csv")
+	blankQuestion := svc.ExecuteBatchFull(context.Background(), []Statement{statement(" ", "SELECT 1")}, "csv")
 	if !strings.Contains(blankQuestion.Results[0].Error, "queries[0].question") {
 		t.Fatalf("blank question error = %#v", blankQuestion.Results[0])
 	}
-	blankSQL := svc.Execute(context.Background(), []Statement{statement("What is one?", " ")}, 20, "csv")
+	blankSQL := svc.ExecuteBatchFull(context.Background(), []Statement{statement("What is one?", " ")}, "csv")
 	if !strings.Contains(blankSQL.Results[0].Error, "queries[0].sql") {
 		t.Fatalf("blank sql error = %#v", blankSQL.Results[0])
 	}
@@ -396,18 +328,18 @@ func TestServiceExecuteReportsPerQueryErrors(t *testing.T) {
 		errs:    map[string]error{"SELECT broken": errors.New("postgres failed")},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.Execute(context.Background(), []Statement{
+	resp := svc.ExecuteBatchFull(context.Background(), []Statement{
 		statement("What happens when Postgres returns an error?", "SELECT broken"),
 		statement("Does a simple read-only query work?", "SELECT 1"),
 		statement("Is a destructive query rejected?", "DROP TABLE x"),
-	}, 20, "csv")
+	}, "csv")
 	if len(resp.Results) != 3 {
 		t.Fatalf("results length = %d", len(resp.Results))
 	}
 	if !strings.Contains(resp.Results[0].Error, "postgres failed") {
 		t.Fatalf("first error = %q", resp.Results[0].Error)
 	}
-	if resp.Results[1].Error != "" || resp.Results[1].QueryID == "" || resp.Results[1].Preview != "1\n1" {
+	if resp.Results[1].Error != "" || resp.Results[1].Rows != "1\n1" {
 		t.Fatalf("second result = %#v", resp.Results[1])
 	}
 	if !strings.Contains(resp.Results[2].Error, "read-only") {
@@ -699,7 +631,7 @@ func TestServiceExecuteAppendsDatetimeHintToError(t *testing.T) {
 		errs: map[string]error{sql: errors.New("ERROR: operator does not exist: timestamp with time zone > integer (SQLSTATE 42883)")},
 	}, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.Execute(context.Background(), []Statement{statement("How many recent WhatsApp messages?", sql)}, 20, "csv")
+	resp := svc.ExecuteBatchFull(context.Background(), []Statement{statement("How many recent WhatsApp messages?", sql)}, "csv")
 	if len(resp.Results) != 1 {
 		t.Fatalf("results length = %d, want 1", len(resp.Results))
 	}
@@ -744,143 +676,11 @@ func TestServiceExecuteEscapesCSVValues(t *testing.T) {
 		},
 	}}, Options{MaxRows: 5, MaxFieldChars: 100})
 
-	resp := svc.Execute(context.Background(), []Statement{statement("What Gmail subjects and labels need CSV escaping?", "SELECT subject, labels FROM gmail_messages")}, 20, "csv")
+	resp := svc.ExecuteBatchFull(context.Background(), []Statement{statement("What Gmail subjects and labels need CSV escaping?", "SELECT subject, labels FROM gmail_messages")}, "csv")
 	want := "subject,labels\n\"hello, \"\"world\"\"\nnext\",\"[\"\"INBOX\"\",\"\"STARRED\"\"]\""
-	if resp.Results[0].Preview != want {
-		t.Fatalf("CSV = %q, want %q", resp.Results[0].Preview, want)
+	if resp.Results[0].Rows != want {
+		t.Fatalf("CSV = %q, want %q", resp.Results[0].Rows, want)
 	}
-}
-
-func TestServiceGetRowsPaginatesCachedRowsAndInheritsFormat(t *testing.T) {
-	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT id, body FROM gmail_messages ORDER BY id": {
-			Columns: []string{"id", "body"},
-			Rows: []map[string]any{
-				{"id": 1, "body": "one"},
-				{"id": 2, "body": "two"},
-				{"id": 3, "body": "three"},
-			},
-		},
-	}}
-	svc := NewService(runner, Options{MaxRows: 100000})
-	resp := svc.Execute(context.Background(), []Statement{statement("Which Gmail messages should be paginated by id?", "SELECT id, body FROM gmail_messages ORDER BY id")}, 1, "ndjson")
-
-	rows := svc.GetRows(context.Background(), resp.Results[0].QueryID, 1, 2, "")
-	if rows.Error != "" {
-		t.Fatalf("GetRows error: %s", rows.Error)
-	}
-	if rows.Format != "ndjson" || rows.Rows != "{\"body\":\"two\",\"id\":2}\n{\"body\":\"three\",\"id\":3}" {
-		t.Fatalf("unexpected paginated rows: %#v", rows)
-	}
-	if len(runner.queries) != 1 {
-		t.Fatalf("GetRows re-executed SQL: %#v", runner.queries)
-	}
-}
-
-func TestServiceGetFieldReadsTailsWithoutSQLSubstringArithmetic(t *testing.T) {
-	rows := make([]map[string]any, 18)
-	for i := range rows {
-		rows[i] = map[string]any{"recording_id": i, "transcript": strings.Repeat("head ", 1000) + "tail-marker"}
-	}
-	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18": {
-			Columns: []string{"recording_id", "transcript"},
-			Rows:    rows,
-		},
-	}}
-	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
-
-	resp := svc.Execute(context.Background(), []Statement{statement("Which transcript tails should be available without substring SQL?", "SELECT recording_id, transcript FROM apple_voice_memos_enrichments ORDER BY recording_id LIMIT 18")}, 18, "json")
-	queryID := resp.Results[0].QueryID
-	if queryID == "" {
-		t.Fatalf("missing query_id: %#v", resp.Results[0])
-	}
-	for i := range rows {
-		value := rows[i]["transcript"].(string)
-		field := svc.GetField(context.Background(), queryID, i, "transcript", utf8RuneLen(value)-11, 11)
-		if field.Error != "" {
-			t.Fatalf("row %d GetField error: %s", i, field.Error)
-		}
-		if field.Value != "tail-marker" {
-			t.Fatalf("row %d tail = %q", i, field.Value)
-		}
-	}
-	if len(runner.queries) != 1 {
-		t.Fatalf("expected one SQL execution, got %#v", runner.queries)
-	}
-	for _, sql := range runner.queries {
-		if strings.Contains(strings.ToLower(sql), "substring") {
-			t.Fatalf("unexpected substring SQL: %s", sql)
-		}
-	}
-}
-
-func TestServiceGrepRowsSearchesCachedResults(t *testing.T) {
-	runner := &recordingRunner{results: map[string]RawResult{
-		"SELECT recording_id, transcript FROM apple_voice_memos_enrichments": {
-			Columns: []string{"recording_id", "transcript"},
-			Rows: []map[string]any{
-				{"recording_id": "a", "transcript": "nothing here"},
-				{"recording_id": "b", "transcript": "we discussed weighted projects yesterday"},
-			},
-		},
-	}}
-	svc := NewService(runner, Options{MaxRows: 100000, MaxFieldChars: 20})
-	resp := svc.Execute(context.Background(), []Statement{statement("Which transcripts mention weighted projects?", "SELECT recording_id, transcript FROM apple_voice_memos_enrichments")}, 2, "json")
-
-	grep := svc.GrepRows(context.Background(), resp.Results[0].QueryID, "weighted projects", []string{"transcript"}, 100, 5)
-	if grep.Error != "" {
-		t.Fatalf("GrepRows error: %s", grep.Error)
-	}
-	if len(grep.Matches) != 1 {
-		t.Fatalf("matches = %#v", grep.Matches)
-	}
-	match := grep.Matches[0]
-	if match.RowIndex != 1 || match.Column != "transcript" || !strings.Contains(match.Context, "weighted projects") {
-		t.Fatalf("unexpected match: %#v", match)
-	}
-	if len(runner.queries) != 1 {
-		t.Fatalf("grep re-executed SQL: %#v", runner.queries)
-	}
-}
-
-func TestServiceUnknownAndExpiredQueryIDErrorsAreActionable(t *testing.T) {
-	svc := NewService(fakeRunner{results: map[string]RawResult{
-		"SELECT body FROM gmail_messages": {Columns: []string{"body"}, Rows: []map[string]any{{"body": "hello"}}},
-	}}, Options{QueryCacheTTL: time.Nanosecond})
-
-	unknown := svc.GetRows(context.Background(), "missing", 0, 1, "")
-	if !strings.Contains(unknown.Error, "unknown or expired query_id") || !strings.Contains(unknown.Error, "re-run query") {
-		t.Fatalf("unknown error not actionable: %q", unknown.Error)
-	}
-	resp := svc.Execute(context.Background(), []Statement{statement("Which Gmail body should expire from the query cache?", "SELECT body FROM gmail_messages")}, 1, "csv")
-	time.Sleep(time.Millisecond)
-	expired := svc.GetField(context.Background(), resp.Results[0].QueryID, 0, "body", 0, 10)
-	if !strings.Contains(expired.Error, "unknown or expired query_id") || !strings.Contains(expired.Error, "server restarts") {
-		t.Fatalf("expired error not actionable: %q", expired.Error)
-	}
-}
-
-func TestServiceRejectsQueriesOverRowCap(t *testing.T) {
-	svc := NewService(fakeRunner{results: map[string]RawResult{
-		"SELECT body FROM gmail_messages": {
-			Columns: []string{"body"},
-			Rows: []map[string]any{
-				{"body": "one"},
-				{"body": "two"},
-				{"body": "three"},
-			},
-		},
-	}}, Options{MaxRows: 2})
-
-	resp := svc.Execute(context.Background(), []Statement{statement("Does the Gmail body query exceed the row cap?", "SELECT body FROM gmail_messages")}, 20, "csv")
-	if !strings.Contains(resp.Results[0].Error, "more than MCP_MAX_ROWS") {
-		t.Fatalf("expected row cap error, got %#v", resp.Results[0])
-	}
-}
-
-func utf8RuneLen(value string) int {
-	return len([]rune(value))
 }
 
 func TestExecuteFullReturnsFullCSVWithoutCachingOrTruncation(t *testing.T) {
@@ -916,11 +716,56 @@ func TestExecuteFullReturnsFullCSVWithoutCachingOrTruncation(t *testing.T) {
 	if !slices.Equal(resp.ColumnNames, []string{"id", "body"}) {
 		t.Fatalf("column names = %#v", resp.ColumnNames)
 	}
-	if status := svc.DebugCacheStatus(); len(status.Queries) != 0 {
-		t.Fatalf("ExecuteFull populated query cache: %#v", status.Queries)
-	}
 	if len(runner.maxRows) != 1 || runner.maxRows[0] != FullQueryRowCap+1 {
 		t.Fatalf("runner maxRows = %#v, want [%d]", runner.maxRows, FullQueryRowCap+1)
+	}
+}
+
+func TestExecuteBatchFullIsTheBoundedCompleteMCPFlow(t *testing.T) {
+	bigBody := strings.Repeat("x", 250000)
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SELECT id, body FROM gmail_messages ORDER BY id": {
+			Columns: []string{"id", "body"},
+			Rows: []map[string]any{
+				{"id": 1, "body": bigBody},
+				{"id": 2, "body": "second"},
+			},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 2, MaxFieldChars: 10})
+
+	resp := svc.ExecuteBatchFull(context.Background(), []Statement{statement(
+		"Show both Gmail bodies.",
+		"SELECT id, body FROM gmail_messages ORDER BY id",
+	)}, "csv")
+
+	if len(resp.Results) != 1 || resp.Results[0].Error != "" {
+		t.Fatalf("ExecuteBatchFull response: %#v", resp)
+	}
+	body, ok := resp.Results[0].Rows.(string)
+	if !ok || !strings.Contains(body, bigBody) {
+		t.Fatalf("MCP result truncated a long field: %T len=%d", resp.Results[0].Rows, len(body))
+	}
+	if len(runner.maxRows) != 1 || runner.maxRows[0] != 3 {
+		t.Fatalf("runner maxRows = %#v, want MaxRows+1", runner.maxRows)
+	}
+}
+
+func TestExecuteBatchFullRejectsResultsPastMCPRowCap(t *testing.T) {
+	runner := &recordingRunner{results: map[string]RawResult{
+		"SELECT n FROM numbers": {
+			Columns: []string{"n"},
+			Rows:    []map[string]any{{"n": 1}, {"n": 2}, {"n": 3}},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 2})
+
+	resp := svc.ExecuteBatchFull(context.Background(), []Statement{statement(
+		"Which numbers exist?", "SELECT n FROM numbers",
+	)}, "json")
+
+	if len(resp.Results) != 1 || !strings.Contains(resp.Results[0].Error, "MCP_MAX_ROWS (2)") {
+		t.Fatalf("row cap was not enforced: %#v", resp)
 	}
 }
 
@@ -988,5 +833,42 @@ func TestRawTextScanHintFiresOnlyForRawPatternScansOutsideTheTimeline(t *testing
 	}
 	if hint := rawTextScanHint("SELECT * FROM base_slack.messages WHERE text ILIKE '%x%'"); !strings.Contains(hint, "timeline.search_text") {
 		t.Fatalf("the hint must say what to use instead; got %q", hint)
+	}
+}
+
+func TestTimelineEventsHintAsksForAnExplicitPriorityDecision(t *testing.T) {
+	cases := map[string]bool{
+		"SELECT event_ts, title FROM timeline.events ORDER BY event_ts DESC LIMIT 20": true,
+		"SELECT count(*) FROM \"timeline\".\"events\"":                                true,
+		"SELECT * FROM timeline.events WHERE priority IN ('self', 'direct', 'cc')":    false,
+		"SELECT * FROM timeline.events e WHERE e.priority = ANY(ARRAY['noise'])":      false,
+		"SELECT * FROM timeline.search_text('budget', priorities => ARRAY['self'])":   false,
+		"SELECT * FROM marts_messages.messages":                                       false,
+	}
+	for sql, want := range cases {
+		got := timelinePriorityHint(sql) != ""
+		if got != want {
+			t.Fatalf("timelinePriorityHint(%q) fired=%v, want %v", sql, got, want)
+		}
+	}
+	hint := timelinePriorityHint("SELECT * FROM timeline.events LIMIT 20")
+	for _, want := range []string{"priority IN", "self", "direct", "cc", "broad"} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("unscoped timeline hint must contain %q: %s", want, hint)
+		}
+	}
+}
+
+func TestExecuteFullReturnsTimelinePriorityHintBeforeRunning(t *testing.T) {
+	const sql = "SELECT event_ts FROM timeline.events ORDER BY event_ts DESC LIMIT 5"
+	runner := fakeRunner{results: map[string]RawResult{
+		sql: {Columns: []string{"event_ts"}, Rows: []map[string]any{}},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 200})
+
+	resp := svc.ExecuteFull(context.Background(), "What happened recently?", sql, "csv")
+
+	if !strings.Contains(resp.Hint, "priority IN") {
+		t.Fatalf("ExecuteFull hint = %q, want priority guidance", resp.Hint)
 	}
 }

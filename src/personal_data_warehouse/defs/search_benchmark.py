@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 
 from dagster import (
     DefaultScheduleStatus,
@@ -47,6 +48,7 @@ def search_benchmark(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False)
     warehouse = warehouse_from_settings(settings)
     result = None
+    residency = None
     try:
         with exclusive_sync_lock(
             name="search_benchmark",
@@ -61,6 +63,26 @@ def search_benchmark(context) -> MaterializeResult:
                     client=AppSearchClient(base_url=base_url, secret_token=secret_token),
                     logger_=context.log,
                 ).run()
+                try:
+                    residency = warehouse.measure_search_cache_residency()
+                    warehouse.write_search_health(
+                        "cache_residency",
+                        configured=1,
+                        pgvector_available=1,
+                        caught_up=1,
+                        processed_rows=residency["target_count"],
+                        pending_count=0,
+                        resident_bytes=residency["resident_bytes"],
+                        total_bytes=residency["total_bytes"],
+                        resident_fraction=residency["resident_fraction"],
+                        last_success_at=datetime.now(tz=UTC),
+                        last_error="",
+                    )
+                except Exception as error:  # health fact, not a benchmark failure
+                    context.log.error("Could not measure search cache residency: %s", error)
+                    warehouse.write_search_health(
+                        "cache_residency", last_error=str(error)[:500]
+                    )
     finally:
         warehouse.close()
     return MaterializeResult(
@@ -71,6 +93,9 @@ def search_benchmark(context) -> MaterializeResult:
             "mrr": MetadataValue.float((result.mrr_milli / 1000) if result else 0.0),
             "errors": MetadataValue.int(result.errors if result else 0),
             "note": MetadataValue.text(result.note if result else ""),
+            "shared_buffer_resident_fraction": MetadataValue.float(
+                float(residency["resident_fraction"]) if residency else 0.0
+            ),
         }
     )
 

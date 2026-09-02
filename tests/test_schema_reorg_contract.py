@@ -171,14 +171,15 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 marts: marts_ops.timeline_priority_mix, contract C2 made visible per
         # source so a tier that swallows a source is a row, not a hunch.
         # +1 marts: marts_ops.agent_usage.
-        # +1 marts: marts_ops.search_benchmark.
+            # +2 marts: marts_ops.search_benchmark (latest health verdict) and
+            # marts_ops.search_benchmark_history (append-only quality/latency trend).
         # +1 marts: marts_finance.commitments. Unfunded capital is a real future
         # cash obligation that had nowhere to live: a five-figure uncalled
         # commitment to a private fund was in the corpus and no finance surface
         # said so. It is deliberately not a
         # net-worth liability -- a commitment is contingent on the fund calling
         # it -- so it needed its own read interface.
-        "marts": 49,
+            "marts": 50,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -195,14 +196,15 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 ops: ops.timeline_priority_mix, the collector's per-source tier-mix
         # snapshot behind marts_ops.timeline_priority_mix.
         # +1 ops: ops.agent_usage, the daily measurement of contract C3.
-        # +1 ops: ops.search_benchmark_runs (C8, weekly).
+            # +2 ops: ops.search_benchmark_runs (current C8 health snapshot) and
+            # ops.search_benchmark_history (every weekly measurement retained).
         # +1 ops: ops.alice_voice_recordings_sync_state. Alice is a daily
         # Dagster poll, not a device uploader, so ops.uploader_heartbeats never
         # covered it and it had no run state at all -- data freshness was its
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-        "ops": 33,
+            "ops": 34,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

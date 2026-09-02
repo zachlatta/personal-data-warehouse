@@ -15,6 +15,7 @@ from personal_data_warehouse.file_attachment_enrichment import (
     AGENT_ATTACHMENT_TASK_TYPE,
     AMBIGUOUS_MIME_TYPES,
     APPLE_MESSAGES_SOURCE,
+    APPLE_NOTES_SOURCE,
     GMAIL_SOURCE,
     IMAGE_EXTENSIONS,
     IMAGE_MIME_TYPES,
@@ -528,7 +529,9 @@ def test_candidate_completion_identity_ignores_model() -> None:
     assert "unreadable.ai_model" not in sql
 
 
-@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
+@pytest.mark.parametrize(
+    "source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE, APPLE_NOTES_SOURCE]
+)
 @pytest.mark.parametrize("error_window_days", [14, 0])
 @pytest.mark.parametrize("retry_terminal", [False, True])
 def test_candidate_query_placeholder_count_matches_params(
@@ -551,7 +554,9 @@ def test_candidate_query_placeholder_count_matches_params(
     assert sql.count("%s") == len(params)
 
 
-@pytest.mark.parametrize("source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE])
+@pytest.mark.parametrize(
+    "source", [GMAIL_SOURCE, WHATSAPP_SOURCE, APPLE_MESSAGES_SOURCE, APPLE_NOTES_SOURCE]
+)
 def test_existence_probe_matches_candidate_query_terminal_rules(source) -> None:
     # The sensor's probe and the runner's loader must agree on what counts as a
     # candidate; otherwise the sensor launches runs that find nothing to do.

@@ -8,11 +8,10 @@ registry over two surfaces:
 
 Each tool declares which surfaces it appears on:
 
-- **MCP-only**: `query`, `get_rows`, `get_field`, `grep_rows` — cursor-style
-  tools designed for an LLM stepping through results.
-- **CLI-only**: `sql` — psql-style "give me the whole result"
-  for terminal/script use; no caching, no field truncation.
-- **Both**: `schema_overview`, `describe_table`, the `propose_*` mutation tools.
+- **MCP-only**: `query` — the single read-only SQL operation for an LLM; each bounded result is returned in full.
+- **CLI-only**: `sql` — psql-style "give me the whole result" for terminal/script use.
+- **Both**: `search`, `schema_overview`, `describe_table`, and the `propose_*`
+  mutation tools.
 
 ## Environment
 
@@ -30,11 +29,7 @@ Optional:
 MCP_ADDR=:8080
 MCP_MAX_ROWS=100000
 MCP_MAX_FIELD_CHARS=4000
-MCP_QUERY_CACHE_MAX_BYTES=268435456
-MCP_GET_FIELD_MAX_CHARS=200000
-MCP_QUERY_CACHE_TTL=30m
-MCP_DEBUG_CACHE_TOOL=false
-MCP_QUERY_TIMEOUT=300s
+MCP_QUERY_TIMEOUT=60s
 PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID=<drive-folder-id>
 PDW_OBJECT_STORE_GOOGLE_TOKEN_JSON_B64=<authorized-user-token-json>
 PDW_INGEST_AGENT_SESSIONS_FOLDER_ID=<optional-source-folder-id>
@@ -43,6 +38,10 @@ PDW_INGEST_WHATSAPP_FOLDER_ID=<optional-source-folder-id>
 PDW_INGEST_VOICE_MEMOS_FOLDER_ID=<optional-source-folder-id>
 PDW_INGEST_APPLE_NOTES_FOLDER_ID=<optional-source-folder-id>
 ```
+
+`MCP_MAX_FIELD_CHARS` bounds text previews and other descriptive tool fields;
+the MCP `query` result itself is returned without per-field truncation, up to
+`MCP_MAX_ROWS`.
 
 `PDW_SECRET_TOKEN` is the shared secret. It does triple duty: signing key for
 the MCP OAuth bearer tokens, the value entered on the OAuth authorize page
@@ -124,8 +123,7 @@ Do not reuse the root `Dockerfile`; that one runs Dagster.
 
 ## HTTP API
 
-Tools marked CLI-only or "both" are reachable here. MCP-only tools
-(`query`, `get_rows`, `get_field`, `grep_rows`) return `404 tool_not_found`.
+Tools marked CLI-only or "both" are reachable here. The MCP-only `query` tool returns `404 tool_not_found`.
 
 ### Auth
 
@@ -204,12 +202,7 @@ as MCP, where `IsError=true` would still carry the partial results. Inspect
 
 ## Tools
 
-The MCP server exposes cursor-based query tools. `query` executes SQL once, caches the full result in the server process, and returns a `query_id` handle for follow-up calls. Cached results expire after `MCP_QUERY_CACHE_TTL` and are evicted least-recently-used when the process-wide `MCP_QUERY_CACHE_MAX_BYTES` cap is reached. If the server restarts, old `query_id`s are invalid and the caller should re-run `query`.
-
-The CLI/HTTP API exposes a separate `sql` tool that runs one
-SQL statement and returns the entire result body in one response — no caching,
-no field truncation, just a safety cap of 1,000,000 rows. Use it the way
-you'd use `psql` interactively or from a shell script.
+There is one SQL operation on each surface. MCP `query` accepts a batch of `{question, sql}` statements and returns every bounded result in full. CLI/HTTP `sql` accepts one statement and returns its full result with a 1,000,000-row safety cap. Neither flow creates cursors or requires follow-up helper tools.
 
 When mutation review is enabled, the server also exposes:
 
@@ -254,11 +247,11 @@ unified timeline document. Raw message/body columns are deliberately not text-in
 
 | tier | what it means | typical rows |
 | --- | --- | --- |
-| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
+| `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
-| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
 
@@ -357,9 +350,7 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
 
 ### `query`
 
-Executes read-only Postgres SQL, caches each result under a generated `query_id`, and returns a preview.
-Each SQL statement must include `question`, a concise plain-English question this SQL statement is
-trying to answer. Legacy `sql` array input is rejected.
+The single MCP SQL operation. It executes read-only Postgres SQL and returns every bounded result in full, including long text fields. Each statement must include `question`, a concise plain-English description of the intent; legacy bare SQL arrays are rejected.
 
 ```json
 {
@@ -368,118 +359,17 @@ trying to answer. Legacy `sql` array input is rejected.
     "queries": [
       {
         "question": "What is the most recent completed Voice Memo transcript?",
-        "sql": "SELECT recording_id, transcript FROM apple_voice_memos_enrichments WHERE status = 'completed' ORDER BY created_at DESC LIMIT 1"
+        "sql": "SELECT recording_id, transcript FROM marts_voice_memos.recordings WHERE transcription_status = 'completed' ORDER BY recorded_at DESC LIMIT 1"
       }
     ],
-    "preview_rows": 1,
     "format": "csv"
   }
 }
 ```
 
-Apple Notes bodies can be long, so query the row first and then use `get_field` for the full body:
+Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`. `format` may be `csv` (default), `json`, or `ndjson`. Each query object produces one result with `question`, `sql`, `column_names`, `total_rows`, and `rows`; errors are per statement. Results over `MCP_MAX_ROWS` are rejected with a clear request to narrow the SQL. No field is silently truncated and no `query_id` cursor is created.
 
-```json
-{
-  "name": "query",
-  "input": {
-    "queries": [
-      {
-        "question": "What are the most recently modified non-deleted Apple Notes?",
-        "sql": "SELECT note_id, title, modified_at, body_text, body_html FROM apple_notes WHERE is_deleted = 0 ORDER BY modified_at DESC LIMIT 5"
-      }
-    ],
-    "preview_rows": 5,
-    "format": "csv"
-  }
-}
-```
-
-Only read-only statements are allowed: `SELECT`, `WITH`, `SHOW`, and `EXPLAIN`.
-
-Each query object in `queries` gets its own `query_id`. The server logs `question` with the SQL,
-query_id, row count, duration, errors, and follow-up cached-result tool calls. `format` may be `csv`,
-`json`, or `ndjson`; `csv` is the default. Query results over `MCP_MAX_ROWS` are rejected with a clear
-error. Long preview fields are truncated to `MCP_MAX_FIELD_CHARS`, and truncation metadata is returned as structured data:
-
-```json
-{
-  "query_id": "f00d...",
-  "total_rows": 1,
-  "column_names": ["recording_id", "transcript"],
-  "preview": "recording_id,transcript\nabc,first 4000 chars...\n# TRUNCATIONS: [{\"row\":0,\"column\":\"transcript\",\"returned\":4000,\"total\":24168}]",
-  "truncations": [
-    {"row": 0, "column": "transcript", "returned": 4000, "total": 24168}
-  ]
-}
-```
-
-For CSV previews, the same truncation array is also emitted as a trailing parseable line prefixed with `# TRUNCATIONS: `. Do not compute substring offsets in SQL. Use `get_field` for long fields.
-
-### `get_rows`
-
-Returns a row slice from a cached query result without re-executing SQL.
-
-```json
-{
-  "name": "get_rows",
-  "input": {
-    "query_id": "f00d...",
-    "offset": 50,
-    "limit": 25
-  }
-}
-```
-
-`format` can be overridden per call; otherwise it inherits the original `query` format. Long fields are truncated the same way as previews, with structured `truncations`.
-
-### `get_field`
-
-Returns a character chunk from one cached cell. This is the right tool for reading transcripts, email bodies, attachment text, or any long text column end-to-end.
-
-```json
-{
-  "name": "get_field",
-  "input": {
-    "query_id": "f00d...",
-    "row": 0,
-    "column": "transcript",
-    "offset": 0,
-    "length": 200000
-  }
-}
-```
-
-The response includes `total_chars`, `returned_chars`, `offset`, `value`, and `eof`. `length` is capped by `MCP_GET_FIELD_MAX_CHARS`.
-
-Use `get_field` the same way for Apple Notes `body_text`, `body_html`, `body_markdown`, Apple
-Messages `body_text`, or `raw_metadata_json` columns after querying the relevant tables.
-
-Reading a 24 KB transcript now takes exactly two MCP calls:
-
-1. `query` the row and receive a `query_id` plus a truncated preview.
-2. `get_field` with `row: 0`, `column: "transcript"`, `offset: 0`, and `length: 200000`.
-
-Do not use the old six-query `substring(transcript, start, length)` pattern.
-
-### `grep_rows`
-
-Regex-searches cached rows without re-executing SQL and returns match context.
-
-```json
-{
-  "name": "grep_rows",
-  "input": {
-    "query_id": "f00d...",
-    "pattern": "weighted projects",
-    "columns": ["transcript"],
-    "limit": 20,
-    "context_chars": 200
-  }
-}
-```
-
-Use this to find where a phrase appears across cached transcripts or email bodies before fetching the full field with `get_field`.
+For long transcripts, message bodies, attachment text, or Apple Notes bodies, select the needed row and column directly with a narrow predicate or `LIMIT`. For phrase discovery across large text, start with `search` rather than a raw-table pattern scan.
 
 ### `schema_overview`
 
@@ -555,10 +445,6 @@ it, an unknown name lists the closest matches, and a known-wrong name
 
 It is registered on both surfaces. `pdw columns <table>` is the CLI spelling
 and calls this tool, so both surfaces return byte-identical output.
-
-### `_debug_cache_status`
-
-When `MCP_DEBUG_CACHE_TOOL=true`, the server also exposes `_debug_cache_status` to show live `query_id`s, ages, and process-wide cache size.
 
 ## CLI: `pdw`
 

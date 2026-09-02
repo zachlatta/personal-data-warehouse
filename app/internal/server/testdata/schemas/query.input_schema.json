@@ -2,12 +2,8 @@
   "additionalProperties": false,
   "properties": {
     "format": {
-      "description": "preview format: csv, json, or ndjson; default csv",
+      "description": "result format: csv, json, or ndjson; default csv",
       "type": "string"
-    },
-    "preview_rows": {
-      "description": "number of initial rows to preview per statement, default 20",
-      "type": "integer"
     },
     "queries": {
       "description": "array of query objects; each must include question and sql",

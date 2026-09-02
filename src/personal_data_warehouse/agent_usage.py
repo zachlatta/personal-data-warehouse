@@ -450,8 +450,9 @@ def analyze_search_calls(rows: list[dict[str, Any]]) -> SearchUsageMetrics:
 
 _AGENT_USAGE_CALLS_CTE = """
 WITH ev AS (
-  SELECT source, session_id, seq, occurred_at, tool_name,
-         CASE WHEN source = 'codex' AND subtype = 'custom_tool_call' THEN raw_json ELSE tool_input_json END AS inp0,
+  SELECT source, session_id, seq, occurred_at, subtype, tool_name,
+         CASE WHEN source = 'codex' AND subtype IN ('custom_tool_call', 'item_completed')
+              THEN raw_json ELSE tool_input_json END AS inp0,
          CASE WHEN source = 'codex' THEN raw_json ELSE tool_result_json END AS res0
   FROM @ai_conversation_events
   WHERE occurred_at >= now() - make_interval(days => %(days)s)
@@ -460,17 +461,31 @@ sessions AS (
   SELECT source, session_id, max(occurred_at) AS newest FROM ev GROUP BY source, session_id
 ),
 ev2 AS (
-  SELECT *, lead(res0) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_res FROM ev
+  SELECT *,
+         lead(res0) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_res,
+         lead(subtype) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_subtype
+  FROM ev
 ),
 calls AS (
   SELECT source, session_id, seq, occurred_at, tool_name, inp0 AS inp,
-         coalesce(NULLIF(next_res, ''), res0) AS result,
+         CASE WHEN source = 'codex' AND subtype = 'item_completed' THEN res0
+              ELSE coalesce(NULLIF(next_res, ''), res0) END AS result,
          (tool_name ILIKE '%%personal_data_warehouse%%') AS is_mcp
   FROM ev2
-  WHERE tool_name ILIKE '%%personal_data_warehouse%%'
-     OR (tool_name IN ('Bash', 'bash', 'shell', 'exec_command', 'container.exec', 'exec')
-         AND inp0 ~ '{invoked}')
-     OR (source = 'codex' AND inp0 ~ '{invoked}')
+  WHERE (
+       tool_name ILIKE '%%personal_data_warehouse%%'
+       OR (tool_name IN ('Bash', 'bash', 'shell', 'exec_command', 'container.exec', 'exec')
+           AND inp0 ~ '{invoked}')
+       OR (source = 'codex' AND inp0 ~ '{invoked}')
+  )
+    -- Modern Codex repeats the command beside aggregated_output in the
+    -- item_completed row. Count that self-contained row, not both it and the
+    -- preceding custom_tool_call, regardless of which candidate branch the
+    -- latter matched. Older transcripts retain the lead()-based fallback.
+    AND NOT (
+      source = 'codex' AND subtype = 'custom_tool_call'
+      AND next_subtype = 'item_completed'
+    )
 ),
 pdw AS (
   SELECT *,
@@ -483,8 +498,8 @@ pdw AS (
       WHEN tool_name ILIKE '%%schema_overview' OR tool_name ILIKE '%%describe_table'
         OR (NOT is_mcp AND inp ~ '{schema}') THEN 'schema'
       WHEN NOT is_mcp AND inp ~ '{admin}' THEN 'admin'
-      -- Every remaining MCP tool (get_rows, grep_rows, get_field, get_object,
-      -- notify, propose_mutation) and `pdw call|list|describe` is a warehouse
+      -- Every remaining MCP tool (get_object, notify, propose_mutation) and
+      -- `pdw call|list|describe` is a warehouse
       -- call that is not one of the three named entry points.
       ELSE 'other_read'
     END AS kind

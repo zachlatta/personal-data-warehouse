@@ -29,6 +29,7 @@ from personal_data_warehouse.schema import (
     SLACK_ACCOUNT_IDENTITY_COLUMNS,
     SLACK_CONVERSATION_COLUMNS,
     SLACK_CONVERSATION_MEMBER_COLUMNS,
+    SLACK_FILE_COLUMNS,
     SLACK_MESSAGE_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
@@ -154,6 +155,59 @@ def test_search_view_refresh_releases_advisory_lock_on_error(monkeypatch) -> Non
         warehouse._ensure_search_views_if_possible()
 
     assert commands[-1] == ("SELECT pg_advisory_unlock(%s)", (SEARCH_SCHEMA_REFRESH_LOCK_ID,))
+
+
+def test_slack_fingerprint_candidates_read_the_conformed_attachment_mart() -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    calls: list[tuple[str, tuple]] = []
+    warehouse._query_dicts = lambda sql, params=(): calls.append((sql, params)) or []
+
+    warehouse.slack_file_fingerprint_candidates(
+        limit=5, now=datetime(2026, 9, 1, tzinfo=UTC)
+    )
+
+    sql, _ = calls[0]
+    assert "FROM @marts_files_attachments" in sql
+    assert "FROM @slack_files" not in sql
+
+
+def test_search_cache_residency_targets_hnsw_and_all_bm25_indexes() -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "test"
+    calls: list[tuple[str, tuple | None]] = []
+
+    def query(sql, params=None):
+        calls.append((sql, params))
+        if "FROM pg_extension" in sql:
+            return [("public",)]
+        return [(5, 10_000, 2_500)]
+
+    warehouse._query = query
+    measured = warehouse.measure_search_cache_residency()
+
+    assert measured == {
+        "target_count": 5,
+        "total_bytes": 10_000,
+        "resident_bytes": 2_500,
+        "resident_fraction": 0.25,
+    }
+    sql, params = calls[1]
+    assert '"public"."pg_buffercache"' in sql
+    assert "search_chunk_embeddings_hnsw_idx" in params[3]
+    assert set(params[1]) == set(warehouse.bm25_timeline_index_names())
+
+
+def test_search_cache_residency_query_executes_with_no_indexes_yet(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_pipeline_health_tables()
+
+    measured = warehouse.measure_search_cache_residency()
+
+    assert measured["target_count"] == 0
+    assert measured["total_bytes"] == 0
+    assert measured["resident_bytes"] == 0
+    assert measured["resident_fraction"] == 0.0
 
 
 def test_search_schema_rebuild_is_skipped_when_unchanged(warehouse: PostgresWarehouse) -> None:
@@ -965,6 +1019,64 @@ def test_whatsapp_chat_participant_upsert_preserves_display_name_when_blank() ->
     ) in clause
 
 
+def test_slack_message_upsert_compares_content_before_advancing_ingest_stamp() -> None:
+    for table, content_column in (
+        ("slack_messages", "text"),
+        ("slack_files", "title"),
+        ("slack_message_reactions", "reaction_count"),
+    ):
+        clause = _upsert_clause(table, POSTGRES_TABLES[table])
+        assert "IS DISTINCT FROM" in clause
+        current_row = clause.rsplit("ROW(", 2)[1]
+        assert f'"{table}"."{content_column}"' in current_row
+        assert f'"{table}"."synced_at"' not in current_row
+        assert f'"{table}"."sync_version"' not in current_row
+
+
+def test_postgres_slack_message_refetch_is_a_noop_until_content_changes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_tables()
+    occurred_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    first_sync = occurred_at + timedelta(minutes=1)
+    second_sync = occurred_at + timedelta(hours=1)
+    changed_sync = occurred_at + timedelta(hours=2)
+    original = _slack_message_row(
+        conversation_id="C1",
+        message_ts="1770000000.000001",
+        message_datetime=occurred_at,
+        synced_at=first_sync,
+        sync_version=1,
+        text="before edit",
+        raw_json='{"text":"before edit"}',
+    )
+    warehouse.insert_slack_messages([original])
+
+    warehouse.insert_slack_messages(
+        [{**original, "synced_at": second_sync, "sync_version": 2}]
+    )
+    assert warehouse._query(
+        "SELECT text, synced_at, sync_version FROM @slack_messages"
+        " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
+    ) == [("before edit", first_sync, 1)]
+
+    warehouse.insert_slack_messages(
+        [
+            {
+                **original,
+                "text": "after edit",
+                "raw_json": '{"text":"after edit"}',
+                "synced_at": changed_sync,
+                "sync_version": 3,
+            }
+        ]
+    )
+    assert warehouse._query(
+        "SELECT text, synced_at, sync_version FROM @slack_messages"
+        " WHERE account = 'zrl' AND team_id = 'T1' AND conversation_id = 'C1'"
+    ) == [("after edit", changed_sync, 3)]
+
+
 def test_postgres_whatsapp_chat_name_survives_later_blank_history_row(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_whatsapp_tables()
     base = datetime(2026, 5, 21, 12, tzinfo=UTC)
@@ -1702,7 +1814,7 @@ def _search_text_function_sql(*, include_all: bool = False) -> str:
     return "\n".join(sql for sql in captured if "CREATE OR REPLACE FUNCTION" in sql or "DO $do$" in sql)
 
 
-def test_search_hybrid_carries_a_comment_saying_it_is_not_callable_from_plain_sql() -> None:
+def test_search_hybrid_carries_a_comment_marking_it_as_internal_not_a_search_entry_point() -> None:
     """The function is a trap from `pdw schema`: agents found it and called
     search_hybrid('terms', 20), which fails with 42883 because it wants a
     precomputed embedding. The catalog cannot comment a function, so the
@@ -1710,7 +1822,9 @@ def test_search_hybrid_carries_a_comment_saying_it_is_not_callable_from_plain_sq
     statements = _search_text_function_sql(include_all=True)
     comments = [sql for sql in statements.split("\n") if "COMMENT ON FUNCTION @search_hybrid(" in sql]
     assert len(comments) == 1
-    assert "NOT callable from plain SQL" in comments[0]
+    assert "INTERNAL IMPLEMENTATION FUNCTION" in comments[0]
+    assert "not a second search entry point" in comments[0]
+    assert "not callable from plain SQL" in comments[0]
     assert "42883" in comments[0]
     assert "timeline.search_text" in comments[0]
 
@@ -4538,6 +4652,43 @@ def test_postgres_slack_thread_parent_refs_bound_since_on_indexed_datetime(
     assert captured["params"] == ("zrl", "T1", 1777000000.5, 1777000000.5, 5)
 
 
+def test_postgres_slack_thread_parent_refs_resume_from_a_complete_keyset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warehouse = object.__new__(PostgresWarehouse)
+    captured: dict[str, object] = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+
+    warehouse.load_slack_thread_parent_refs(
+        account="zrl",
+        team_id="T1",
+        before_thread_ts="1777000000.500001",
+        before_conversation_id="C123",
+        limit=5,
+    )
+
+    sql = str(captured["sql"])
+    assert (
+        "(m.message_datetime, m.message_ts, m.conversation_id)"
+        " < (to_timestamp(%s), %s, %s)"
+    ) in sql
+    assert "ORDER BY m.message_datetime DESC, m.message_ts DESC, m.conversation_id DESC" in sql
+    assert captured["params"] == (
+        "zrl",
+        "T1",
+        1777000000.500001,
+        "1777000000.500001",
+        "C123",
+        5,
+    )
+
+
 def test_postgres_slack_thread_parent_refs_since_filters_rows(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_conversations(
@@ -5397,7 +5548,7 @@ def test_postgres_slack_account_state_refresh_skips_while_another_refresh_holds_
 
 
 def test_files_attachments_mart_conforms_every_attachment_source(warehouse: PostgresWarehouse) -> None:
-    """One row per attachment from all four sources, in one column set.
+    """One row per attachment from all five sources, in one column set.
 
     Every enrichment pass and the receipt evidence check read this view, so a
     source missing here is a source that is silently never enriched -- the
@@ -5409,6 +5560,7 @@ def test_files_attachments_mart_conforms_every_attachment_source(warehouse: Post
     warehouse.ensure_whatsapp_tables()
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_apple_notes_tables()
+    warehouse.ensure_slack_tables()
     warehouse.insert_attachments(
         [
             _default_row(
@@ -5466,6 +5618,25 @@ def test_files_attachments_mart_conforms_every_attachment_source(warehouse: Post
             )
         ]
     )
+    warehouse.insert_slack_files(
+        [
+            _default_row(
+                SLACK_FILE_COLUMNS,
+                account="z",
+                team_id="T1",
+                file_id="sf1",
+                conversation_id="C1",
+                message_ts="123.456",
+                name="diagram.png",
+                mimetype="image/png",
+                size=50,
+                url_private="https://files.slack.example/sf1",
+                is_deleted=0,
+                created_at=now,
+                synced_at=now,
+            )
+        ]
+    )
 
     rows = {
         (row["source"], row["attachment_id"]): row
@@ -5473,7 +5644,7 @@ def test_files_attachments_mart_conforms_every_attachment_source(warehouse: Post
     }
     assert set(rows) == {
         ("gmail", "ga1"), ("gmail", "ga2"), ("whatsapp", "wm1"), ("whatsapp", "wm2"),
-        ("apple_messages", "aa1"), ("apple_notes", "na1"),
+        ("apple_messages", "aa1"), ("apple_notes", "na1"), ("slack", "sf1"),
     }
     assert rows[("gmail", "ga1")]["is_stored"] == 1
     assert rows[("gmail", "ga2")]["is_stored"] == 0
@@ -5486,7 +5657,14 @@ def test_files_attachments_mart_conforms_every_attachment_source(warehouse: Post
     assert note["mime_type"] == "audio/mp4a-latm"
     assert note["occurred_at"] == now
     assert note["is_stored"] == 1
-    assert {row["size_bytes"] for row in rows.values()} == {10, 20, 30, 40}
+    slack = rows[("slack", "sf1")]
+    assert slack["parent_id"] == "T1:C1:123.456"
+    assert slack["storage_backend"] == "slack"
+    assert slack["storage_key"] == "T1"
+    assert slack["storage_file_id"] == "sf1"
+    assert slack["storage_url"] == "https://files.slack.example/sf1"
+    assert slack["is_stored"] == 0  # remotely fetchable, not persisted in the object store
+    assert {row["size_bytes"] for row in rows.values()} == {10, 20, 30, 40, 50}
     assert all(row["is_deleted"] == 0 for row in rows.values())
 
 

@@ -54,8 +54,10 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.MaxRows != 7 || cfg.MaxFieldChars != 12 {
 		t.Fatalf("limits = rows %d chars %d", cfg.MaxRows, cfg.MaxFieldChars)
 	}
-	if cfg.QueryCacheMaxBytes != 1048576 || cfg.GetFieldMaxChars != 345 || cfg.QueryCacheTTL != 15*time.Minute || !cfg.DebugCacheTool {
-		t.Fatalf("cache limits = bytes %d field chars %d ttl %s debug %v", cfg.QueryCacheMaxBytes, cfg.GetFieldMaxChars, cfg.QueryCacheTTL, cfg.DebugCacheTool)
+	for _, retired := range []string{"MCP_QUERY_CACHE_MAX_BYTES", "MCP_GET_FIELD_MAX_CHARS", "MCP_QUERY_CACHE_TTL", "MCP_DEBUG_CACHE_TOOL"} {
+		if !containsPrefix(cfg.DeprecatedEnvVars, retired) {
+			t.Fatalf("%s should be reported as deprecated, got %v", retired, cfg.DeprecatedEnvVars)
+		}
 	}
 	if cfg.QueryTimeout != 42*time.Second {
 		t.Fatalf("QueryTimeout = %s", cfg.QueryTimeout)

@@ -265,6 +265,20 @@ def test_every_stated_contract_has_a_living_audit_check() -> None:
     assert not missing, f"contracts stated in AGENTS.md with no check in scripts/contract_audit.py: {missing}"
 
 
+def test_contract_audit_uses_the_benchmark_collectors_latency_target() -> None:
+    """The living grade must not drift from the health row it cites.
+
+    C6 used to duplicate the benchmark's two-second target as an unrelated
+    literal. A future tune could then make SQL green and the audit red (or the
+    reverse) while both appeared internally consistent.
+    """
+
+    from personal_data_warehouse.search_benchmark_runner import LATENCY_P50_TARGET_MS
+    from scripts import contract_audit
+
+    assert contract_audit.SEARCH_P50_TARGET_SECONDS == LATENCY_P50_TARGET_MS / 1000
+
+
 def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:
     """C5 must say what a transformation READS, not only where its output lives.
 
@@ -499,20 +513,37 @@ SRC_ROOT = REPO_ROOT / "src" / "personal_data_warehouse"
 # source in the domain gets the capability, not just the one whose raw table
 # somebody happened to name.
 #
-# Deliberately NOT in scope: derived builders (finance_ledger) and the identity
-# layer (photo_identity, the Slack file fingerprinter). Those legitimately read
-# raw -- resolving identity from source rows is exactly what `base_* ->
-# derived_*` means, and there is no intermediate for them to read because they
-# are the pass that creates it.
+# Derived builders, identity passes and Dagster wrappers are deliberately in
+# scope too. They may legitimately read raw rows, but that exception must be
+# named below; excluding their filenames from discovery is how a raw Slack-file
+# scan lived outside the contract while every registry stayed green.
 ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "apple_voice_memos_enrichment.py",
     "apple_voice_memos_transcription.py",
     "attachment_text_extraction.py",
     "audio_attachment_enrichment.py",
     "file_attachment_enrichment.py",
+    "finance_ledger.py",
     "manual_finance_extraction.py",
+    "photo_identity.py",
     "photo_context.py",
     "receipt_enrichment.py",
+    "securities_ledger.py",
+    "slack_file_fingerprints.py",
+    "defs/apple_messages_attachment_enrichment.py",
+    "defs/apple_messages_audio_transcription.py",
+    "defs/apple_notes_attachment_enrichment.py",
+    "defs/apple_voice_memos_enrichment.py",
+    "defs/apple_voice_memos_transcription.py",
+    "defs/finance_ledger.py",
+    "defs/gmail_attachment_enrichment.py",
+    "defs/manual_finance_extraction.py",
+    "defs/photo_enrichment.py",
+    "defs/photo_identity.py",
+    "defs/receipt_enrichment.py",
+    "defs/slack_file_fingerprints.py",
+    "defs/whatsapp_audio_transcription.py",
+    "defs/whatsapp_media_enrichment.py",
 )
 
 # Raw relations an enrichment runner may still name, each with the reason.
@@ -535,6 +566,17 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         # documents; there is no second source for a mart to conform. If one
         # is ever added, this entry is what has to be revisited.
         "manual_finance_documents": "single-source domain: no second document source exists",
+    },
+    "finance_ledger.py": {
+        # This pass CREATES derived_finance from the provider ledgers. Reading
+        # the raw sources is the identity/normalization step itself, not an
+        # enrichment candidate scan bypassing an existing mart.
+        "manual_finance_documents": "derived-ledger builder: authoritative manual source rows",
+        "plaid_accounts": "derived-ledger builder: normalize provider accounts",
+        "plaid_investment_securities": "derived-ledger builder: normalize security identities",
+        "plaid_investment_transactions": "derived-ledger builder: normalize investment activity",
+        "plaid_items": "derived-ledger builder: retain institution provenance",
+        "plaid_transactions": "derived-ledger builder: normalize transaction facts",
     },
     "photo_context.py": {
         # Context for the photo caption agent ("what was on the calendar when
@@ -580,9 +622,20 @@ def test_every_enrichment_runner_is_in_the_layering_registry() -> None:
     run one.
     """
     discovered = {
-        path.name
-        for path in SRC_ROOT.glob("*.py")
-        if path.name.endswith(("_enrichment.py", "_transcription.py", "_extraction.py"))
+        str(path.relative_to(SRC_ROOT))
+        for path in (*SRC_ROOT.glob("*.py"), *(SRC_ROOT / "defs").glob("*.py"))
+        if (
+            path.name.endswith(
+                (
+                    "_enrichment.py",
+                    "_transcription.py",
+                    "_extraction.py",
+                    "_ledger.py",
+                    "_fingerprints.py",
+                )
+            )
+            or path.name == "photo_identity.py"
+        )
         and not path.name.endswith("_eval.py")
     }
     missing = discovered - set(ENRICHMENT_RUNNER_MODULES)

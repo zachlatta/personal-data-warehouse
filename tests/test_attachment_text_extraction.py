@@ -6,6 +6,7 @@ import pytest
 
 from personal_data_warehouse.attachment_text_extraction import (
     APPLE_MESSAGES_TEXT_SOURCE,
+    APPLE_NOTES_TEXT_SOURCE,
     STATUS_EMPTY,
     STATUS_OK,
     STATUS_UNSUPPORTED,
@@ -372,11 +373,10 @@ def test_runner_records_unreadable_content_as_terminal_not_error() -> None:
     assert warehouse.enrichment_rows == []
 
 
-def test_candidate_query_skips_attachments_that_already_have_a_row() -> None:
+@pytest.mark.parametrize("source", [APPLE_MESSAGES_TEXT_SOURCE, APPLE_NOTES_TEXT_SOURCE])
+def test_candidate_query_skips_attachments_that_already_have_a_row(source) -> None:
     warehouse = FakeWarehouse([])
-    load_text_extraction_candidates(
-        warehouse, source=APPLE_MESSAGES_TEXT_SOURCE, limit=10
-    )
+    load_text_extraction_candidates(warehouse, source=source, limit=10)
     sql, params = warehouse.queries[0]
     assert "NOT EXISTS" in sql
     # The deterministic identity is the empty provider/model/prompt triple, the

@@ -21,15 +21,11 @@ import (
 var updateSchemaGoldens = flag.Bool("update", false, "regenerate input-schema golden files")
 
 // mcpSnapshotTools is the list of tool names we want byte-identical MCP
-// InputSchemas for across refactors. _debug_cache_status is excluded
-// because it is gated behind a config flag and covered separately. CLI-only
-// tools (e.g. sql) are checked from the HTTP API side via
+// InputSchemas for across refactors. CLI-only tools (e.g. sql) are checked
+// from the HTTP API side via
 // apiSnapshotTools in mux_api_test.go.
 var mcpSnapshotTools = []string{
 	"query",
-	"get_rows",
-	"get_field",
-	"grep_rows",
 	"search",
 	"schema_overview",
 	"describe_table",

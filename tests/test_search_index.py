@@ -392,7 +392,8 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
 
 def _embed_state(wh: PostgresWarehouse) -> tuple:
     rows = wh._query(
-        "SELECT embed_fresh_built_at, embed_cursor_ts, embed_cursor_id, embed_backfill_status"
+        "SELECT embed_fresh_built_at, embed_fresh_chunk_id, embed_cursor_ts,"
+        " embed_cursor_id, embed_backfill_status"
         " FROM @search_chunk_sync_state WHERE id = 'embeddings'"
     )
     return rows[0] if rows else None
@@ -422,9 +423,10 @@ def test_embedding_runner_persists_its_cursors_and_reads_only_new_chunks(
     client = _FakeEmbeddingClient()
     stats = SearchEmbeddingRunner(warehouse, client).run()
     assert stats.embedded > 0 and stats.caught_up
-    fresh_at, cursor_ts, cursor_id, status = _embed_state(warehouse)
+    fresh_at, fresh_chunk_id, cursor_ts, cursor_id, status = _embed_state(warehouse)
     assert status == "done"
     assert fresh_at.year >= 2026
+    assert isinstance(fresh_chunk_id, str)
 
     # New chunk after the watermark: only it is embedded next run.
     _seed_slack(warehouse, ["golf hotel india"], start_minute=120)
@@ -434,13 +436,161 @@ def test_embedding_runner_persists_its_cursors_and_reads_only_new_chunks(
     stats2 = SearchEmbeddingRunner(warehouse, client).run()
     assert stats2.embedded == 1 and stats2.caught_up
     assert client.calls == calls_before + 1
-    assert _embed_state(warehouse)[3] == "done"
+    assert _embed_state(warehouse)[4] == "done"
 
     # Nothing new: no embedding request at all.
     calls_before = client.calls
     stats3 = SearchEmbeddingRunner(warehouse, client).run()
     assert stats3.embedded == 0 and stats3.caught_up
     assert client.calls == calls_before
+
+
+def test_embedding_fresh_cursor_does_not_skip_chunks_with_the_same_built_at(
+    warehouse: PostgresWarehouse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fresh cursor is the complete ``(built_at, chunk_id)`` keyset.
+
+    A chunk-build transaction gives every row the same ``built_at``. The old
+    timestamp-only cursor advanced after the first 5,000-row slab and made the
+    rest of that transaction permanently invisible to the embedder.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    for i in range(3):
+        _seed_slack(warehouse, [f"same timestamp chunk {i}"], start_minute=120 * i)
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    built_at = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    warehouse._command("UPDATE @search_chunks SET built_at = %s", (built_at,))
+    warehouse._command("DELETE FROM @search_chunk_embeddings")
+    warehouse._command(
+        "INSERT INTO @search_chunk_sync_state"
+        " (id, last_seq, updated_at, embed_fresh_built_at, embed_fresh_chunk_id,"
+        "  embed_cursor_ts, embed_cursor_id, embed_backfill_status)"
+        " VALUES ('embeddings', 0, now(), %s, '', %s, '', 'done')"
+        " ON CONFLICT (id) DO UPDATE SET"
+        " embed_fresh_built_at = EXCLUDED.embed_fresh_built_at,"
+        " embed_fresh_chunk_id = '', embed_backfill_status = 'done'",
+        (built_at - timedelta(seconds=1), datetime(1970, 1, 1, tzinfo=UTC)),
+    )
+    monkeypatch.setattr("personal_data_warehouse.search_index.EMBED_SLAB_SIZE", 2)
+
+    stats = SearchEmbeddingRunner(warehouse, _FakeEmbeddingClient()).run()
+
+    expected = warehouse._query("SELECT count(DISTINCT text_sha256) FROM @search_chunks")[0][0]
+    embedded = warehouse._query(
+        "SELECT count(*) FROM @search_chunk_embeddings WHERE model = 'fake-model'"
+    )[0][0]
+    assert expected >= 3
+    assert stats.caught_up
+    assert embedded == expected
+
+
+def test_embedding_runner_repairs_orphans_behind_both_cursors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Cursor convergence is not proof that every chunk has a vector."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["orphan repair alpha", "orphan repair bravo"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    client = _FakeEmbeddingClient()
+    assert SearchEmbeddingRunner(warehouse, client).run().caught_up
+    warehouse._command(
+        "UPDATE @search_chunks SET built_at = now() - interval '3 days'"
+    )
+
+    orphan_sha = warehouse._query(
+        "SELECT text_sha256 FROM @search_chunk_embeddings"
+        " WHERE model = 'fake-model' ORDER BY text_sha256 LIMIT 1"
+    )[0][0]
+    warehouse._command(
+        "DELETE FROM @search_chunk_embeddings WHERE model = 'fake-model' AND text_sha256 = %s",
+        (orphan_sha,),
+    )
+    # Force the periodic completeness proof due without moving either normal
+    # cursor. This is the production shape: both cursor passes said done while
+    # a timestamp tie had stranded rows behind them.
+    warehouse._command(
+        "UPDATE @search_chunk_sync_state"
+        " SET embed_orphan_checked_at = TIMESTAMPTZ '1970-01-01 00:00:00+00',"
+        "     embed_orphan_status = 'done' WHERE id = 'embeddings'"
+    )
+
+    stats = SearchEmbeddingRunner(warehouse, client).run()
+
+    assert stats.orphaned_found == 1
+    assert stats.orphaned_repaired == 1
+    assert stats.orphans_caught_up
+    assert stats.caught_up
+    assert warehouse._query(
+        "SELECT count(*) FROM @search_chunk_embeddings"
+        " WHERE model = 'fake-model' AND text_sha256 = %s",
+        (orphan_sha,),
+    )[0][0] == 1
+
+
+def test_orphaned_chunks_is_a_first_class_search_health_component(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.write_search_health(
+        "orphaned_chunks",
+        model="fake-model",
+        caught_up=0,
+        pending_count=-1,
+        processed_rows=12,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'orphaned_chunks'"
+    )[0]
+    assert row["status"] == "backfilling"
+    assert row["pending_count"] is None
+
+
+def test_cache_residency_is_visible_and_zero_is_attention(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.write_search_health(
+        "cache_residency",
+        caught_up=1,
+        pending_count=0,
+        processed_rows=5,
+        resident_bytes=0,
+        total_bytes=10_000,
+        resident_fraction=0.0,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'cache_residency'"
+    )[0]
+    assert row["status"] == "attention"
+    assert row["resident_bytes"] == 0
+    assert row["total_bytes"] == 10_000
+    assert float(row["resident_fraction"]) == 0.0
+
+    warehouse.write_search_health(
+        "cache_residency",
+        resident_bytes=2_500,
+        resident_fraction=0.25,
+        last_success_at=datetime.now(tz=UTC),
+        last_error="",
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'cache_residency'"
+    )[0]
+    assert row["status"] == "ok"
+    assert float(row["resident_fraction"]) == 0.25
 
 
 def test_embedding_runner_resumes_a_bounded_backfill_across_runs(
@@ -469,7 +619,7 @@ def test_embedding_runner_resumes_a_bounded_backfill_across_runs(
 
     first = runner.run(limit=1)
     assert first.embedded == 1 and not first.caught_up
-    assert _embed_state(warehouse)[3] == "running"
+    assert _embed_state(warehouse)[4] == "running"
 
     embedded = first.embedded
     for _ in range(total + 2):
@@ -479,7 +629,7 @@ def test_embedding_runner_resumes_a_bounded_backfill_across_runs(
             break
     assert stats.caught_up
     assert embedded == total
-    assert _embed_state(warehouse)[3] == "done"
+    assert _embed_state(warehouse)[4] == "done"
     rows = warehouse._query(
         "SELECT count(*) FROM @search_chunk_embeddings WHERE model = 'fake-model'"
     )

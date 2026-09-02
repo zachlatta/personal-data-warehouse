@@ -255,8 +255,10 @@ the work item: do not scan the archive to extract unrelated receipts, and do not
 off to a separate extraction step.
 
 The `pdw` CLI is on PATH and already authenticated to a read-only warehouse surface.
-Use it actively. Start with `pdw schema` and `pdw columns <schema.table>` rather than
-guessing columns. Run SQL with:
+Use it actively. Start with a few short `pdw search --priority self,noise '<merchant or
+identifier>'` calls: purchases/photos are `self`, while automated emailed receipts are
+`noise`. Only then use `pdw schema` and `pdw columns <schema.table>` for structured SQL
+rather than guessing columns. Run SQL with:
 
     pdw sql --output json -q 'why you are asking' 'SELECT ...'
 

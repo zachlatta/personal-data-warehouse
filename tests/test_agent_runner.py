@@ -23,6 +23,7 @@ from personal_data_warehouse.agent_runner import (
     agent_run_tool_call_rows,
     agent_config_from_env,
     auth_docker_command,
+    cli_tool_manifest,
     default_agent_docker_image,
     default_agent_tool_proxy_public_host,
     ensure_agent_image,
@@ -479,6 +480,7 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
 def test_agent_run_tool_call_rows_names_each_pdw_subcommand() -> None:
     now = datetime.now(tz=UTC)
     commands = [
+        ("pdw search --priority self,direct,cc budget", "pdw search"),
         ("pdw schema", "pdw schema"),
         ("pdw columns gmail.messages", "pdw columns"),
         ("bash -lc \"pdw call get_object --data '{}'\"", "pdw call get_object"),
@@ -518,6 +520,13 @@ def test_agent_run_tool_call_rows_names_each_pdw_subcommand() -> None:
     )
 
     assert [row["tool_name"] for row in agent_run_tool_call_rows(result)] == [expected for _command, expected in commands]
+
+
+def test_agent_cli_manifest_teaches_search_before_schema() -> None:
+    manifest = cli_tool_manifest()
+
+    assert manifest.index("pdw search --priority") < manifest.index("pdw schema")
+    assert "Every hit includes `priority` and `ref`" in manifest
 
 
 def test_container_agent_runner_rejects_oversized_prompt_before_docker(tmp_path) -> None:

@@ -696,8 +696,13 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       "backfill " + (a.backfill_done ? "done" : "in progress") +
         " · " + rows(a.backfill_rows) + " backfilled · " + rows(a.incremental_rows) + " incremental",
       [
-        ["watermark", a.watermark_ingest_ts ? ago(ageOf(a.watermark_ingest_ts)) + " ago" : "—",
-          "the honest signal: how far this adapter has consumed its source", false],
+        ["ingest lag", a.ingest_lag_seconds === null || a.ingest_lag_seconds === undefined
+          ? "—" : interval(a.ingest_lag_seconds),
+          a.expected_ingest_interval_seconds
+            ? "newest source write minus consumed watermark, judged against " +
+              a.source_pipeline + "'s " + interval(a.expected_ingest_interval_seconds) +
+              " expected data interval; source newest " + stamp(a.source_newest_ingest_at)
+            : "this source has no automatic data-arrival SLA", false],
         ["last run", a.last_run_at ? ago(ageOf(a.last_run_at)) + " ago" : "—",
           "only stamped when a batch returned rows, so an idle adapter looks stalled — " +
           "do not alarm on this alone", true]
@@ -732,6 +737,9 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   }
 
   function searchNode(s) {
+    var residency = s.total_bytes
+      ? (Number(s.resident_fraction || 0) * 100).toFixed(1) + "%"
+      : "unmeasured";
     return healthRow(s, s.component,
       s.model ? "model " + s.model : "no active model",
       [
@@ -742,6 +750,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         ["backlog", s.pending_count === null || s.pending_count === undefined
           ? "exists (bounded)" : rows(s.pending_count),
           "pending_count is exact at convergence; otherwise the bounded worker reports existence without a full scan", true],
+        ["shared buffers", residency,
+          s.total_bytes ? rows(s.resident_bytes) + " of " + rows(s.total_bytes) +
+            " bytes of HNSW + BM25 indexes in PostgreSQL shared_buffers; this does not claim to measure the OS page cache"
+            : "measured beside the weekly benchmark through pg_buffercache", true],
         ["last success", s.last_success_at ? ago(ageOf(s.last_success_at)) + " ago" : "never",
           stamp(s.last_success_at), true]
       ], s.last_error || (!s.configured ? "hybrid falls back to keyword: embeddings unconfigured" : ""));
@@ -799,6 +811,11 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
           "max " + (b.latency_max_ms / 1000).toFixed(2) + "s", true],
         ["all-tier MRR", b.labeled_cases ? b.mrr : "—",
           b.labeled_cases ? "hit@1 " + rows(b.hit_at_1) + " · hit@5 " + rows(b.hit_at_5) + " · hit@10 " + rows(b.hit_at_10) + " of " + rows(b.labeled_cases) : "no labels published", true],
+        ["change vs prior", b.previous_collected_at ?
+          ((b.latency_p50_change_ms >= 0 ? "+" : "") + (b.latency_p50_change_ms / 1000).toFixed(2) + "s p50 · " +
+           (Number(b.mrr_change) >= 0 ? "+" : "") + Number(b.mrr_change).toFixed(3) + " MRR") : "first retained run",
+          rows(b.history_runs) + " retained measurements; prior " + (b.previous_collected_at ? stamp(b.previous_collected_at) : "unavailable") +
+          " · full trend in marts_ops.search_benchmark_history", true],
         ["attention p50", b.attention_probe_queries ? (b.attention_latency_p50_ms / 1000).toFixed(2) + "s" : "—",
           "paired catalog attention-scope probes; delta from all tiers " + (b.attention_latency_p50_delta_ms === null ? "unavailable" : (b.attention_latency_p50_delta_ms >= 0 ? "+" : "") + (b.attention_latency_p50_delta_ms / 1000).toFixed(2) + "s"), true],
         ["attention recall", b.attention_labeled_cases ? rows(b.attention_found) + "/" + rows(b.attention_labeled_cases) : "—",

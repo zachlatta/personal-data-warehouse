@@ -79,6 +79,10 @@ EMBED_BACKFILL_SCAN_ROWS = 250_000
 # Same bound for the fresh pass. Both walks are index-only, so a run's read
 # cost is a few hundred MB of index at most, never the chunk heap.
 EMBED_FRESH_SCAN_ROWS = 500_000
+# Cursors make the routine path cheap; this periodic covering-index anti-join
+# is the independent completeness proof. It also repairs rows stranded behind
+# a cursor by an old bug or interrupted migration.
+EMBED_ORPHAN_RECHECK_INTERVAL = timedelta(hours=24)
 
 
 def _sha256(text: str) -> str:
@@ -131,6 +135,9 @@ class ChunkBuildStats:
 @dataclass
 class EmbedStats:
     embedded: int = 0
+    orphaned_found: int = 0
+    orphaned_repaired: int = 0
+    orphans_caught_up: bool = False
     skipped_reason: str = ""
     caught_up: bool = False
 
@@ -467,40 +474,60 @@ class SearchEmbeddingRunner:
 
     def _load_state(self) -> dict[str, Any]:
         rows = self._wh._query(
-            "SELECT embed_fresh_built_at, embed_cursor_ts, embed_cursor_id, embed_backfill_status"
+            "SELECT embed_fresh_built_at, embed_fresh_chunk_id, embed_cursor_ts,"
+            " embed_cursor_id, embed_backfill_status, embed_orphan_checked_at,"
+            " embed_orphan_status"
             " FROM @search_chunk_sync_state WHERE id = %s",
             (_EMBED_STATE_ID,),
         )
         if not rows:
             return {}
-        fresh_at, cursor_ts, cursor_id, status = rows[0]
+        (
+            fresh_at,
+            fresh_chunk_id,
+            cursor_ts,
+            cursor_id,
+            status,
+            orphan_checked_at,
+            orphan_status,
+        ) = rows[0]
         # Warehouse-wide convention: absence is the epoch, never NULL. A
         # backfill that has not started yet has no keyset, and the walk
         # begins from the newest chunk.
         return {
             "fresh_built_at": fresh_at,
+            "fresh_chunk_id": fresh_chunk_id or "",
             "cursor_ts": None if cursor_ts is None or cursor_ts <= _EPOCH else cursor_ts,
             "cursor_id": cursor_id or "",
             "backfill_status": status or "",
+            "orphan_checked_at": orphan_checked_at,
+            "orphan_status": orphan_status or "",
         }
 
     def _save_state(self, state: dict[str, Any]) -> None:
         self._wh._command(
             "INSERT INTO @search_chunk_sync_state"
-            " (id, last_seq, updated_at, embed_fresh_built_at, embed_cursor_ts,"
-            "  embed_cursor_id, embed_backfill_status)"
-            " VALUES (%s, 0, now(), %s, %s, %s, %s)"
+            " (id, last_seq, updated_at, embed_fresh_built_at, embed_fresh_chunk_id,"
+            "  embed_cursor_ts, embed_cursor_id, embed_backfill_status,"
+            "  embed_orphan_checked_at, embed_orphan_status)"
+            " VALUES (%s, 0, now(), %s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT (id) DO UPDATE SET updated_at = now(),"
             "  embed_fresh_built_at = EXCLUDED.embed_fresh_built_at,"
+            "  embed_fresh_chunk_id = EXCLUDED.embed_fresh_chunk_id,"
             "  embed_cursor_ts = EXCLUDED.embed_cursor_ts,"
             "  embed_cursor_id = EXCLUDED.embed_cursor_id,"
-            "  embed_backfill_status = EXCLUDED.embed_backfill_status",
+            "  embed_backfill_status = EXCLUDED.embed_backfill_status,"
+            "  embed_orphan_checked_at = EXCLUDED.embed_orphan_checked_at,"
+            "  embed_orphan_status = EXCLUDED.embed_orphan_status",
             (
                 _EMBED_STATE_ID,
                 state["fresh_built_at"],
+                state["fresh_chunk_id"],
                 state["cursor_ts"] if state["cursor_ts"] is not None else _EPOCH,
                 state["cursor_id"],
                 state["backfill_status"],
+                state["orphan_checked_at"],
+                state["orphan_status"],
             ),
         )
 
@@ -550,9 +577,12 @@ class SearchEmbeddingRunner:
             # newest-first from the top exactly once.
             state = {
                 "fresh_built_at": run_started - timedelta(days=1),
+                "fresh_chunk_id": "",
                 "cursor_ts": None,
                 "cursor_id": "",
                 "backfill_status": "",
+                "orphan_checked_at": _EPOCH,
+                "orphan_status": "",
             }
         # Two passes, both resumable and both bounded, so a run over a
         # caught-up corpus reads a few index pages rather than the 7 GB chunk
@@ -563,9 +593,66 @@ class SearchEmbeddingRunner:
         backfill_done = state["backfill_status"] == "done"
         if fresh_done and not backfill_done and not budget.exhausted():
             backfill_done = self._drain_backfill(client, state, stats, budget)
+        orphan_done = self._orphan_check_is_current(state, run_started)
+        if fresh_done and backfill_done and not orphan_done and not budget.exhausted():
+            orphan_done = self._repair_orphans(client, state, stats, budget, run_started)
+        stats.orphans_caught_up = orphan_done
         self._save_state(state)
-        stats.caught_up = fresh_done and backfill_done
+        stats.caught_up = fresh_done and backfill_done and orphan_done
         return stats
+
+    def _orphan_check_is_current(
+        self, state: dict[str, Any], run_started: datetime
+    ) -> bool:
+        checked_at = state.get("orphan_checked_at") or _EPOCH
+        return (
+            state.get("orphan_status") == "done"
+            and checked_at > _EPOCH
+            and run_started - checked_at < EMBED_ORPHAN_RECHECK_INTERVAL
+        )
+
+    def _repair_orphans(
+        self,
+        client: EmbeddingClient,
+        state: dict[str, Any],
+        stats: EmbedStats,
+        budget: "_EmbedBudget",
+        run_started: datetime,
+    ) -> bool:
+        """Repair vectors missing behind otherwise-complete cursors.
+
+        The covering chunk-sha index and the embeddings primary key serve this
+        as an index-only anti-join. It runs at most daily after convergence,
+        not every ten minutes, so health independently proves completeness
+        without becoming another cache-evicting corpus scan.
+        """
+
+        if budget.exhausted():
+            state["orphan_status"] = "running"
+            return False
+        probe_limit = budget.remaining + 1
+        candidates = self._wh._query(
+            "SELECT DISTINCT ON (c.text_sha256) c.text_sha256, c.chunk_id"
+            " FROM @search_chunks c"
+            " WHERE NOT EXISTS ("
+            "   SELECT 1 FROM @search_chunk_embeddings e"
+            "   WHERE e.model = %s AND e.text_sha256 = c.text_sha256"
+            " )"
+            " ORDER BY c.text_sha256, c.chunk_id LIMIT %s",
+            (client.model, probe_limit),
+        )
+        stats.orphaned_found = len(candidates)
+        complete_probe = len(candidates) <= budget.remaining
+        offered = candidates if complete_probe else candidates[: budget.remaining]
+        embedded_before = stats.embedded
+        fully_embedded = self._embed_shas(client, offered, stats, budget)
+        stats.orphaned_repaired = stats.embedded - embedded_before
+        if complete_probe and fully_embedded:
+            state["orphan_checked_at"] = run_started
+            state["orphan_status"] = "done"
+            return True
+        state["orphan_status"] = "running"
+        return False
 
     def _drain_fresh(
         self,
@@ -587,22 +674,27 @@ class SearchEmbeddingRunner:
         """
 
         floor = state["fresh_built_at"]
+        floor_chunk_id = state["fresh_chunk_id"]
         scanned = 0
         while True:
             slab = self._wh._query(
                 "SELECT text_sha256, chunk_id, built_at FROM @search_chunks"
-                " WHERE built_at > %s ORDER BY built_at LIMIT %s",
-                (floor, EMBED_SLAB_SIZE),
+                " WHERE (built_at, chunk_id) > (%s, %s)"
+                " ORDER BY built_at, chunk_id LIMIT %s",
+                (floor, floor_chunk_id, EMBED_SLAB_SIZE),
             )
             if not slab:
                 state["fresh_built_at"] = max(floor, run_started - EMBED_FRESH_OVERLAP)
+                state["fresh_chunk_id"] = ""
                 return True
             scanned += len(slab)
             if not self._embed_shas(client, [(sha, cid) for sha, cid, _ in slab], stats, budget):
                 # Budget ran out mid-slab; resume from the same floor.
                 return False
+            floor_chunk_id = slab[-1][1]
             floor = slab[-1][2]
             state["fresh_built_at"] = floor
+            state["fresh_chunk_id"] = floor_chunk_id
             if scanned >= EMBED_FRESH_SCAN_ROWS:
                 # A timeline re-walk (an adapter's SQL changed) rebuilds
                 # millions of chunks in a day, nearly all with unchanged text.
@@ -610,6 +702,7 @@ class SearchEmbeddingRunner:
                 return False
             if len(slab) < EMBED_SLAB_SIZE:
                 state["fresh_built_at"] = max(floor, run_started - EMBED_FRESH_OVERLAP)
+                state["fresh_chunk_id"] = ""
                 return True
 
     def _drain_backfill(

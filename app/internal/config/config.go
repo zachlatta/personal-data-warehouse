@@ -35,10 +35,6 @@ type Config struct {
 	SecretToken             string
 	MaxRows                 int
 	MaxFieldChars           int
-	QueryCacheMaxBytes      int64
-	GetFieldMaxChars        int
-	QueryCacheTTL           time.Duration
-	DebugCacheTool          bool
 	QueryTimeout            time.Duration
 	GmailAccounts           []string
 	ContactGoogleAccounts   []string
@@ -165,10 +161,6 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
 		MaxRows:                 100000,
 		MaxFieldChars:           4000,
-		QueryCacheMaxBytes:      256 * 1024 * 1024,
-		GetFieldMaxChars:        200000,
-		QueryCacheTTL:           30 * time.Minute,
-		DebugCacheTool:          false,
 		// One end-to-end query budget. No caller can wait longer than the
 		// public edge allows (~100s at the CDN; the CLI default is aligned to
 		// this value), so a larger server-side ceiling only produced orphaned
@@ -207,18 +199,6 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if cfg.MaxFieldChars, err = parsePositiveInt(getenv("MCP_MAX_FIELD_CHARS"), cfg.MaxFieldChars, "MCP_MAX_FIELD_CHARS"); err != nil {
 		return Config{}, err
-	}
-	if cfg.QueryCacheMaxBytes, err = parsePositiveInt64(getenv("MCP_QUERY_CACHE_MAX_BYTES"), cfg.QueryCacheMaxBytes, "MCP_QUERY_CACHE_MAX_BYTES"); err != nil {
-		return Config{}, err
-	}
-	if cfg.GetFieldMaxChars, err = parsePositiveInt(getenv("MCP_GET_FIELD_MAX_CHARS"), cfg.GetFieldMaxChars, "MCP_GET_FIELD_MAX_CHARS"); err != nil {
-		return Config{}, err
-	}
-	if raw := strings.TrimSpace(getenv("MCP_QUERY_CACHE_TTL")); raw != "" {
-		cfg.QueryCacheTTL, err = time.ParseDuration(raw)
-		if err != nil || cfg.QueryCacheTTL <= 0 {
-			return Config{}, fmt.Errorf("MCP_QUERY_CACHE_TTL must be a positive Go duration")
-		}
 	}
 	cfg.ObjectStoreBackend = valueOrDefault(getenv("PDW_OBJECT_STORE_BACKEND"), "google_drive")
 	cfg.ObjectStoreGoogleDriveFolderID = strings.TrimSpace(getenv("PDW_OBJECT_STORE_GOOGLE_DRIVE_FOLDER_ID"))
@@ -296,6 +276,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 				name+" (removed: mutation review is the web app at "+"/mutation-review"+", authenticated with PDW_SECRET_TOKEN like the API; unset it)")
 		}
 	}
+	for _, name := range []string{"MCP_QUERY_CACHE_MAX_BYTES", "MCP_GET_FIELD_MAX_CHARS", "MCP_QUERY_CACHE_TTL", "MCP_DEBUG_CACHE_TOOL"} {
+		if strings.TrimSpace(getenv(name)) != "" {
+			cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
+				name+" (removed: MCP query now returns one bounded complete result and has no cursor cache; unset it)")
+		}
+	}
 	if strings.TrimSpace(getenv("SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT")) != "" {
 		cfg.DeprecatedEnvVars = append(cfg.DeprecatedEnvVars,
 			"SEARCH_EMBEDDINGS_QUERY_RAW_WEIGHT (removed: search now uses the single measured-best instructed query vector; unset it)")
@@ -304,7 +290,6 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
-	cfg.DebugCacheTool = parseBool(getenv("MCP_DEBUG_CACHE_TOOL"))
 	if raw := strings.TrimSpace(getenv("MCP_QUERY_TIMEOUT")); raw != "" {
 		cfg.QueryTimeout, err = time.ParseDuration(raw)
 		if err != nil || cfg.QueryTimeout <= 0 {

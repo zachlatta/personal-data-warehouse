@@ -86,6 +86,7 @@ from personal_data_warehouse.schema import (
     TIMELINE_PRIORITY_MIX_COLUMNS,
     AGENT_USAGE_COLUMNS,
     SEARCH_BENCHMARK_LABEL_COLUMNS,
+    SEARCH_BENCHMARK_HISTORY_COLUMNS,
     SEARCH_BENCHMARK_RUN_COLUMNS,
     MART_VIEW_HEALTH_COLUMNS,
     PIPELINE_HEALTH_COLUMNS,
@@ -163,6 +164,8 @@ from personal_data_warehouse.pipeline_health import (
     EPOCH as PIPELINE_HEALTH_EPOCH,
     LATE_MULTIPLIER,
     STALE_MULTIPLIER,
+    TABLE_PIPELINES,
+    pipeline,
 )
 from personal_data_warehouse.relations import (
     ALL_CANONICAL_SCHEMAS,
@@ -179,6 +182,7 @@ from personal_data_warehouse.relations import (
 # Postgres COMMENTs. timeline.py imports nothing from postgres.py, so there is
 # no cycle.
 from personal_data_warehouse.timeline import (
+    TIMELINE_ADAPTERS,
     TIMELINE_PRIORITY_DEFINITIONS,
     timeline_context_branch_sql,
 )
@@ -985,6 +989,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
     "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
     "search_benchmark_runs": TableSpec(SEARCH_BENCHMARK_RUN_COLUMNS, ("mode",), "collected_at"),
+    "search_benchmark_history": TableSpec(
+        SEARCH_BENCHMARK_HISTORY_COLUMNS, ("mode", "collected_at"), "collected_at"
+    ),
     "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
 }
 
@@ -2161,6 +2168,7 @@ TIMESTAMP_COLUMNS = {
     # search embedding drain cursors (search_chunk_sync_state)
     "embed_fresh_built_at",
     "embed_cursor_ts",
+    "embed_orphan_checked_at",
     # timeline: when the coverage reconcile last swept this adapter
     "last_reconcile_at",
     # backups: newest backup of each type, and when WAL last shipped
@@ -2331,6 +2339,7 @@ INTEGER_COLUMNS = {
     "caught_up",
     "processed_rows",
     "pending_count",
+    "resident_bytes",
     "amcheck_ms",
     # mart health: input counts and the bounded non-empty probe's answer
     "input_count",
@@ -2514,6 +2523,7 @@ FLOAT_COLUMNS = {
     "io_pressure_full_avg10",
     "cpu_pressure_some_avg10",
     "load_1m",
+    "resident_fraction",
     "confidence",
     "calendar_confidence",
     "height_meter",
@@ -4360,7 +4370,13 @@ class PostgresWarehouse:
         See personal_data_warehouse/pipeline_health.py: the tables hold measured
         facts, the views turn them into a live status.
         """
-        self._ensure_table_group(list(PIPELINE_HEALTH_SNAPSHOT_TABLES))
+        # The weekly benchmark records how much of the HNSW + BM25 working set
+        # is resident in Postgres shared buffers. pg_buffercache ships with the
+        # official image's contrib modules, but is per-database like pg_trgm.
+        self._command("CREATE EXTENSION IF NOT EXISTS pg_buffercache WITH SCHEMA public")
+        self._ensure_table_group(
+            [*PIPELINE_HEALTH_SNAPSHOT_TABLES, "search_benchmark_history"]
+        )
         # _ensure_table_group only CREATEs; it does not widen an existing table,
         # so a warehouse provisioned before any of these columns existed would
         # keep the old shape and everything that names the column -- the
@@ -4375,6 +4391,11 @@ class PostgresWarehouse:
             added = self._reconcile_table_columns(table)
             if added:
                 logger.info("widened %s with %s", table, ", ".join(added))
+        added = self._reconcile_table_columns("search_benchmark_history")
+        if added:
+            logger.info(
+                "widened search_benchmark_history with %s", ", ".join(added)
+            )
         self._ensure_pipeline_health_mart_views()
 
     def _ensure_pipeline_health_mart_views(self) -> None:
@@ -4907,6 +4928,7 @@ class PostgresWarehouse:
                        timeline_max_seq, chunk_cursor_seq, caught_up,
                        processed_rows,
                        CASE WHEN pending_count < 0 THEN NULL ELSE pending_count END AS pending_count,
+                       resident_bytes, total_bytes, resident_fraction,
                        NULLIF(oldest_pending_at, {epoch}) AS oldest_pending_at,
                        NULLIF(last_success_at, {epoch}) AS last_success_at,
                        NULLIF(last_run_at, {epoch}) AS last_run_at,
@@ -4916,9 +4938,12 @@ class PostgresWarehouse:
             )
             SELECT component,
                    CASE
-                     WHEN updated_at IS NULL OR now() - updated_at > interval '30 minutes' THEN 'unknown'
+                     WHEN updated_at IS NULL OR now() - updated_at >
+                       CASE WHEN component = 'cache_residency' THEN interval '10 days'
+                            ELSE interval '30 minutes' END THEN 'unknown'
                      WHEN configured = 0 OR pgvector_available = 0 THEN 'failing'
                      WHEN last_error IS NOT NULL THEN 'failing'
+                     WHEN component = 'cache_residency' AND resident_fraction <= 0 THEN 'attention'
                      WHEN caught_up = 0
                       AND oldest_pending_at < now() - interval '{SEARCH_HEALTH_LATE_AFTER_MINUTES} minutes'
                        THEN 'late'
@@ -4928,7 +4953,8 @@ class PostgresWarehouse:
                    model, configured, pgvector_available,
                    timeline_max_seq, chunk_cursor_seq,
                    GREATEST(0, timeline_max_seq - chunk_cursor_seq) AS seq_lag,
-                   caught_up, processed_rows, pending_count, oldest_pending_at,
+                   caught_up, processed_rows, pending_count,
+                   resident_bytes, total_bytes, resident_fraction, oldest_pending_at,
                    (EXTRACT(EPOCH FROM now() - oldest_pending_at))::bigint AS pending_age_seconds,
                    last_success_at, last_run_at, last_error, updated_at,
                    (EXTRACT(EPOCH FROM now() - updated_at))::bigint AS snapshot_age_seconds
@@ -5077,9 +5103,35 @@ class PostgresWarehouse:
                        WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS} THEN 'idle'
                        ELSE 'ok'
                    END AS saturation,
+                   (SELECT count(*) FROM @search_benchmark_history h
+                    WHERE h.mode = search_benchmark_runs.mode)::bigint AS history_runs,
+                   (SELECT h.collected_at FROM @search_benchmark_history h
+                    WHERE h.mode = search_benchmark_runs.mode
+                      AND h.collected_at < search_benchmark_runs.collected_at
+                    ORDER BY h.collected_at DESC LIMIT 1) AS previous_collected_at,
+                   (SELECT search_benchmark_runs.latency_p50_ms - h.latency_p50_ms
+                    FROM @search_benchmark_history h
+                    WHERE h.mode = search_benchmark_runs.mode
+                      AND h.collected_at < search_benchmark_runs.collected_at
+                    ORDER BY h.collected_at DESC LIMIT 1) AS latency_p50_change_ms,
+                   (SELECT round((search_benchmark_runs.mrr_milli - h.mrr_milli) / 1000.0, 3)
+                    FROM @search_benchmark_history h
+                    WHERE h.mode = search_benchmark_runs.mode
+                      AND h.collected_at < search_benchmark_runs.collected_at
+                    ORDER BY h.collected_at DESC LIMIT 1) AS mrr_change,
                    NULLIF(collected_at, {epoch}) AS collected_at,
                    (EXTRACT(EPOCH FROM now() - NULLIF(collected_at, {epoch})))::bigint AS snapshot_age_seconds
             FROM @search_benchmark_runs
+            """,
+        )
+        self._ensure_view(
+            "marts_search_benchmark_history",
+            """
+            CREATE OR REPLACE VIEW @marts_search_benchmark_history AS
+            SELECT h.*,
+                   round(h.mrr_milli / 1000.0, 3) AS mrr,
+                   round(h.attention_mrr_milli / 1000.0, 3) AS attention_mrr
+            FROM @search_benchmark_history h
             """,
         )
 
@@ -5102,30 +5154,101 @@ class PostgresWarehouse:
         # ensure_timeline_tables has created the state table it reads.
         if not self._relation_exists("timeline_sync_state"):
             return
+        adapter_expectations: list[str] = []
+        for adapter in TIMELINE_ADAPTERS:
+            coverage = TABLE_PIPELINES.get(adapter.source_table)
+            if coverage is not None:
+                source_pipeline_id = coverage.pipeline
+                expected = pipeline(source_pipeline_id).expected_data_interval
+            elif adapter.source_table == "ai_conversation_events":
+                # A virtual UNION over six providers with radically different
+                # human-use cadences. Their uploader/poller heartbeats are the
+                # real SLA; one aggregate last-data timestamp is not.
+                source_pipeline_id = "agent_sources"
+                expected = None
+            elif adapter.source_table == "marts_voice_memos_recordings":
+                # A virtual mart over three raw voice sources plus transcript
+                # and enrichment updates; judge it on the enrichment cadence.
+                source_pipeline_id = "voice_memo_enrichment"
+                expected = pipeline(source_pipeline_id).expected_data_interval
+            else:
+                raise ValueError(
+                    f"timeline adapter {adapter.name!r} has no pipeline coverage for "
+                    f"{adapter.source_table!r}"
+                )
+            expected_sql = (
+                str(int(expected.total_seconds())) if expected is not None else "NULL"
+            )
+            adapter_expectations.append(
+                "("
+                + _literal(adapter.name)
+                + ", "
+                + _literal(adapter.source_table)
+                + ", "
+                + _literal(source_pipeline_id)
+                + ", "
+                + expected_sql
+                + "::bigint)"
+            )
+        expectation_values = ",\n                    ".join(adapter_expectations)
         self._ensure_view(
             "marts_timeline_adapter_health",
             f"""
             CREATE OR REPLACE VIEW @marts_timeline_adapter_health AS
             SELECT
-                adapter,
-                backfill_done,
-                backfill_rows,
-                incremental_rows,
-                NULLIF(watermark_ingest_ts, {epoch}) AS watermark_ingest_ts,
-                NULLIF(last_run_at, {epoch}) AS last_run_at,
-                (EXTRACT(EPOCH FROM now() - NULLIF(watermark_ingest_ts, {epoch})))::bigint
+                s.adapter,
+                s.backfill_done,
+                s.backfill_rows,
+                s.incremental_rows,
+                expected.source_pipeline,
+                expected.expected_ingest_interval_seconds,
+                NULLIF(freshness.last_write_at, {epoch}) AS source_newest_ingest_at,
+                NULLIF(s.watermark_ingest_ts, {epoch}) AS watermark_ingest_ts,
+                NULLIF(s.last_run_at, {epoch}) AS last_run_at,
+                (EXTRACT(EPOCH FROM now() - NULLIF(s.watermark_ingest_ts, {epoch})))::bigint
                     AS watermark_age_seconds,
-                (EXTRACT(EPOCH FROM now() - NULLIF(last_run_at, {epoch})))::bigint
+                CASE
+                    WHEN NULLIF(freshness.last_write_at, {epoch}) IS NULL
+                      OR NULLIF(s.watermark_ingest_ts, {epoch}) IS NULL THEN NULL
+                    ELSE GREATEST(0, EXTRACT(EPOCH FROM (
+                        freshness.last_write_at - s.watermark_ingest_ts
+                    )))::bigint
+                END AS ingest_lag_seconds,
+                (EXTRACT(EPOCH FROM now() - NULLIF(s.last_run_at, {epoch})))::bigint
                     AS run_age_seconds,
                 CASE
-                    WHEN NULLIF(last_error, '') IS NOT NULL THEN 'failing'
-                    WHEN backfill_done = 0 THEN 'backfilling'
+                    WHEN NULLIF(s.last_error, '') IS NOT NULL THEN 'failing'
+                    WHEN s.backfill_done = 0 THEN 'backfilling'
+                    WHEN expected.expected_ingest_interval_seconds IS NULL THEN 'ok'
+                    -- No source write means there is no adapter backlog. The
+                    -- source pipeline's own row judges unexpected absence.
+                    WHEN NULLIF(freshness.last_write_at, {epoch}) IS NULL THEN 'ok'
+                    WHEN NULLIF(s.watermark_ingest_ts, {epoch}) IS NULL THEN 'failing'
+                    WHEN EXTRACT(EPOCH FROM (
+                           freshness.last_write_at - s.watermark_ingest_ts
+                         ))
+                         > expected.expected_ingest_interval_seconds * {STALE_MULTIPLIER}
+                        THEN 'failing'
+                    WHEN EXTRACT(EPOCH FROM (
+                           freshness.last_write_at - s.watermark_ingest_ts
+                         ))
+                         > expected.expected_ingest_interval_seconds * {LATE_MULTIPLIER}
+                        THEN 'late'
                     ELSE 'ok'
                 END AS status,
-                NULLIF(last_error, '') AS last_error,
-                NULLIF(updated_at, {epoch}) AS updated_at,
-                adapter_signature
-            FROM @timeline_sync_state
+                NULLIF(s.last_error, '') AS last_error,
+                NULLIF(s.updated_at, {epoch}) AS updated_at,
+                s.adapter_signature
+            FROM @timeline_sync_state s
+            LEFT JOIN (
+                VALUES
+                    {expectation_values}
+            ) AS expected(
+                adapter, source_table, source_pipeline, expected_ingest_interval_seconds
+            )
+              ON expected.adapter = s.adapter
+            LEFT JOIN @pipeline_table_freshness freshness
+              ON freshness.table_id = expected.source_table
             """,
         )
 
@@ -5205,6 +5328,72 @@ class PostgresWarehouse:
             if spec.table == "timeline_events" and spec.requires_pg_textsearch
         ]
 
+    def measure_search_cache_residency(self) -> dict[str, int | float]:
+        """Measure shared-buffer residency for the search working-set indexes.
+
+        This is intentionally named precisely: ``pg_buffercache`` observes
+        Postgres shared buffers, not the kernel's filesystem page cache. The
+        weekly benchmark samples it beside latency/host pressure so an
+        ``io_bound`` verdict can say whether the HNSW + BM25 working set was
+        actually warm rather than leaving the cause in an SSH transcript.
+        """
+
+        extension = self._query(
+            "SELECT n.nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace "
+            "WHERE e.extname = 'pg_buffercache'"
+        )
+        if not extension:
+            raise RuntimeError("pg_buffercache extension is not installed")
+        buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+
+        timeline_schema = self._object_schema("timeline_events")
+        embeddings_schema = self._object_schema("search_chunk_embeddings")
+        bm25_names = self.bm25_timeline_index_names()
+        hnsw_names = [
+            spec.name
+            for spec in POSTGRES_INDEXES
+            if spec.table == "search_chunk_embeddings" and "hnsw" in spec.name
+        ]
+        rows = self._query(
+            f"""
+            WITH targets AS (
+                SELECT c.oid, pg_relation_size(c.oid)::bigint AS total_bytes
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE (n.nspname = %s AND c.relname = ANY(%s))
+                   OR (n.nspname = %s AND c.relname = ANY(%s))
+            ), per_relation AS (
+                SELECT t.oid, t.total_bytes,
+                       (count(DISTINCT (b.relforknumber, b.relblocknumber))
+                           FILTER (WHERE b.relblocknumber IS NOT NULL))::bigint
+                           AS resident_blocks
+                FROM targets t
+                LEFT JOIN {buffer_view} b
+                  ON b.relfilenode = pg_relation_filenode(t.oid)
+                 AND b.reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+                GROUP BY t.oid, t.total_bytes
+            )
+            SELECT count(*)::bigint AS target_count,
+                   COALESCE(sum(total_bytes), 0)::bigint AS total_bytes,
+                   COALESCE(sum(LEAST(
+                       total_bytes,
+                       resident_blocks * current_setting('block_size')::bigint
+                   )), 0)::bigint AS resident_bytes
+            FROM per_relation
+            """,
+            (timeline_schema, bm25_names, embeddings_schema, hnsw_names),
+        )
+        target_count, total_bytes, resident_bytes = rows[0]
+        total = int(total_bytes or 0)
+        resident = int(resident_bytes or 0)
+        return {
+            "target_count": int(target_count or 0),
+            "total_bytes": total,
+            "resident_bytes": resident,
+            "resident_fraction": (resident / total if total else 0.0),
+        }
+
     def probe_bm25_indexes(self) -> dict[str, str]:
         """Scan one row through each timeline BM25 index; return errors by name.
 
@@ -5250,11 +5439,19 @@ class PostgresWarehouse:
         return errors
 
     def write_search_benchmark_runs(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
-        """Replace one mode's benchmark row with this run's measurement."""
+        """Publish the current row and retain the append-only measurement."""
+        materialized = [
+            _pipeline_health_row(run, collected_at=collected_at) for run in rows
+        ]
         self._insert_rows(
             "search_benchmark_runs",
-            [_pipeline_health_row(run, collected_at=collected_at) for run in rows],
+            materialized,
             SEARCH_BENCHMARK_RUN_COLUMNS,
+        )
+        self._insert_rows(
+            "search_benchmark_history",
+            materialized,
+            SEARCH_BENCHMARK_HISTORY_COLUMNS,
         )
 
     def load_search_benchmark_labels(self) -> list[dict[str, Any]]:
@@ -5323,7 +5520,13 @@ class PostgresWarehouse:
 
     def write_search_health(self, component: str, **facts: Any) -> None:
         """Upsert one search-stage heartbeat without scanning the corpus."""
-        if component not in {"chunks", "embeddings", "bm25_indexes"}:
+        if component not in {
+            "chunks",
+            "embeddings",
+            "orphaned_chunks",
+            "bm25_indexes",
+            "cache_residency",
+        }:
             raise ValueError(f"unknown search health component: {component}")
         now = datetime.now(tz=UTC)
         row = {
@@ -5336,6 +5539,9 @@ class PostgresWarehouse:
             "caught_up": 0,
             "processed_rows": 0,
             "pending_count": -1,
+            "resident_bytes": 0,
+            "total_bytes": 0,
+            "resident_fraction": 0.0,
             "oldest_pending_at": datetime.fromtimestamp(0, tz=UTC),
             "last_success_at": datetime.fromtimestamp(0, tz=UTC),
             "last_run_at": now,
@@ -5433,8 +5639,15 @@ class PostgresWarehouse:
         )
         # The embedding drain's persisted cursors joined an existing table;
         # CREATE TABLE IF NOT EXISTS cannot add them to a live deployment.
-        for column in ("embed_fresh_built_at", "embed_cursor_ts", "embed_cursor_id",
-                       "embed_backfill_status"):
+        for column in (
+            "embed_fresh_built_at",
+            "embed_fresh_chunk_id",
+            "embed_cursor_ts",
+            "embed_cursor_id",
+            "embed_backfill_status",
+            "embed_orphan_checked_at",
+            "embed_orphan_status",
+        ):
             self._command(
                 "ALTER TABLE @search_chunk_sync_state ADD COLUMN IF NOT EXISTS "
                 f"{_identifier(column)} {_postgres_type(column)} NOT NULL DEFAULT "
@@ -6098,6 +6311,7 @@ class PostgresWarehouse:
         self._ensure_slack_image_fingerprint_view()
         self._ensure_slack_huddles_view()
         self._ensure_slack_conversation_health_view()
+        self._ensure_files_mart_views()
         self._ensure_search_views_if_possible()
 
     def ensure_upstream_mutation_tables(self) -> None:
@@ -10014,6 +10228,8 @@ class PostgresWarehouse:
         account: str,
         team_id: str,
         since_ts: float | None = None,
+        before_thread_ts: str | None = None,
+        before_conversation_id: str = "",
         limit: int | None = None,
         skip_completed: bool = False,
         skip_known_errors: bool = False,
@@ -10042,6 +10258,17 @@ class PostgresWarehouse:
             # derived from message_ts, so the two predicates agree.
             where.append("m.message_datetime >= to_timestamp(%s)")
             params.append(since_ts)
+        if before_thread_ts:
+            # The unbounded missing-replies repair is a persisted keyset walk.
+            # Without this upper bound every 100-row page restarted at the
+            # newest parent and re-read progressively more of the 49 GB heap.
+            where.append(
+                "(m.message_datetime, m.message_ts, m.conversation_id)"
+                " < (to_timestamp(%s), %s, %s)"
+            )
+            params.extend(
+                [float(before_thread_ts), str(before_thread_ts), before_conversation_id]
+            )
         if skip_known_errors:
             # Terminally-gone threads (deleted parent, dead channel) are never
             # retried; transient 'error' threads are, so they self-heal.
@@ -10070,11 +10297,14 @@ class PostgresWarehouse:
                 "AND r.is_thread_reply = 1"
                 ")"
             )
-        order_by = "m.message_datetime DESC, m.message_ts DESC"
+        order_by = "m.message_datetime DESC, m.message_ts DESC, m.conversation_id DESC"
         if order == "reply_count":
-            order_by = "m.reply_count DESC, m.message_datetime DESC, m.message_ts DESC"
+            order_by = (
+                "m.reply_count DESC, m.message_datetime DESC, m.message_ts DESC,"
+                " m.conversation_id DESC"
+            )
         elif order == "oldest":
-            order_by = "m.message_datetime ASC, m.message_ts ASC"
+            order_by = "m.message_datetime ASC, m.message_ts ASC, m.conversation_id ASC"
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -10656,20 +10886,23 @@ class PostgresWarehouse:
             """
             SELECT
                 f.account,
-                f.team_id,
-                f.file_id,
-                max(f.url_private) AS url_private,
-                max(f.mimetype) AS mimetype,
-                max(f.name) AS name,
-                max(f.size) AS size,
-                max(f.created_at) AS created_at,
+                f.storage_key AS team_id,
+                f.attachment_id AS file_id,
+                max(f.storage_url) AS url_private,
+                max(f.mime_type) AS mimetype,
+                max(f.filename) AS name,
+                max(f.size_bytes) AS size,
+                max(f.occurred_at) AS created_at,
                 COALESCE(max(l.attempts), 0) AS attempts
-            FROM @slack_files f
+            FROM @marts_files_attachments f
             LEFT JOIN @slack_file_fingerprints l
-                ON l.account = f.account AND l.team_id = f.team_id AND l.file_id = f.file_id
-            WHERE f.mimetype LIKE %s
+                ON l.account = f.account
+               AND l.team_id = f.storage_key
+               AND l.file_id = f.attachment_id
+            WHERE f.source = 'slack'
+              AND f.mime_type LIKE %s
               AND f.is_deleted = 0
-              AND f.url_private <> ''
+              AND f.storage_url <> ''
               AND (
                     l.file_id IS NULL
                     OR (
@@ -10678,8 +10911,8 @@ class PostgresWarehouse:
                         AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= %s)
                     )
               )
-            GROUP BY f.account, f.team_id, f.file_id
-            ORDER BY max(f.created_at) DESC
+            GROUP BY f.account, f.storage_key, f.attachment_id
+            ORDER BY max(f.occurred_at) DESC
             LIMIT %s
             """,
             ("image/%", int(max_attempts), now, int(limit)),
@@ -13045,8 +13278,9 @@ class PostgresWarehouse:
             # \df / describe surface says so before the call is made.
             self._command(
                 "COMMENT ON FUNCTION @search_hybrid(text, text, text, integer, text[], timestamptz, text[]) "
-                "IS $c$NOT callable from plain SQL: takes a precomputed query embedding only the app can "
-                "produce, so search_hybrid('terms', 20) fails with 42883. Hybrid retrieval is the search tool "
+                "IS $c$INTERNAL IMPLEMENTATION FUNCTION; not a second search entry point and not callable "
+                "from plain SQL: it takes a precomputed query embedding only the app can produce, so "
+                "search_hybrid('terms', 20) fails with 42883. Hybrid retrieval is the search tool "
                 "/ pdw search; from SQL use timeline.search_text (BM25) or timeline.search_text_exact.$c$"
             )
         # to_bm25query() resolves the timeline BM25 index by NAME, and the
@@ -13684,8 +13918,8 @@ class PostgresWarehouse:
     def _ensure_files_mart_views(self) -> None:
         """marts_files.attachments: one entry point for every stored attachment.
 
-        Four sources hold attachment bytes -- Gmail, WhatsApp, iMessage and
-        Apple Notes -- each in its own raw table with its own column names
+        Five sources expose attachments -- Gmail, WhatsApp, iMessage, Apple
+        Notes and Slack -- each in its own raw table with its own column names
         (`size` vs `size_bytes`, `storage_status = 'stored'` vs `is_missing =
         0`, `mime_type` vs `content_type`). Until this view every attachment
         enrichment pass carried a per-source descriptor naming the raw table,
@@ -13705,6 +13939,7 @@ class PostgresWarehouse:
                 "apple_message_attachments",
                 "apple_note_attachments",
                 "apple_note_revisions",
+                "slack_files",
             ]
         )
         epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
@@ -13778,6 +14013,25 @@ class PostgresWarehouse:
             FROM @apple_note_attachments a
             LEFT JOIN @apple_note_revisions r
               ON r.account = a.account AND r.note_id = a.note_id AND r.revision_id = a.revision_id
+            UNION ALL
+            SELECT
+                'slack'::text,
+                a.account,
+                concat_ws(':', a.team_id, a.conversation_id, a.message_ts),
+                a.file_id,
+                COALESCE(NULLIF(a.name, ''), a.title),
+                a.mimetype,
+                a.size::bigint,
+                ''::text,
+                0::bigint,
+                a.is_deleted::bigint,
+                NULLIF(a.created_at, {epoch}),
+                'slack'::text,
+                a.team_id,
+                a.file_id,
+                a.url_private,
+                NULLIF(a.synced_at, {epoch})
+            FROM @slack_files a
             """,
         )
 
@@ -14728,6 +14982,12 @@ UNMEASURED_SENTINEL_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
         "load_1m",
         "cpu_count",
     ),
+    "search_benchmark_history": (
+        "io_pressure_full_avg10",
+        "cpu_pressure_some_avg10",
+        "load_1m",
+        "cpu_count",
+    ),
 }
 
 
@@ -14807,6 +15067,17 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
     # Per-conversation Slack errors record status/error with an empty cursor;
     # do not let that wipe the high-water mark from the last successful page.
     "slack_sync_state": ("cursor_ts",),
+}
+
+# A poll observation is not a provider-row change. Slack's public sweep
+# re-fetches hundreds of thousands of already-known messages each day; if the
+# only new values are the local ingest stamp/version, updating them makes the
+# timeline adapter re-walk old rows forever and hides genuine edit latency.
+# Compare every other mutable column before allowing the upsert.
+NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "slack_messages": ("synced_at", "sync_version"),
+    "slack_files": ("synced_at", "sync_version"),
+    "slack_message_reactions": ("synced_at", "sync_version"),
 }
 
 
@@ -14924,9 +15195,26 @@ def _upsert_clause(
         for column in update_columns
     )
     version_column = spec.version_column
+    predicates = [
+        f"{target_ref}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
+    ]
+    guard_excluded = NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE.get(table, ())
+    meaningful_columns = [
+        column for column in update_columns if column not in guard_excluded
+    ]
+    if guard_excluded and meaningful_columns:
+        current_row = ", ".join(
+            f"{target_ref}.{_identifier(column)}" for column in meaningful_columns
+        )
+        incoming_row = ", ".join(
+            f"EXCLUDED.{_identifier(column)}" for column in meaningful_columns
+        )
+        predicates.append(
+            f"ROW({current_row}) IS DISTINCT FROM ROW({incoming_row})"
+        )
     return (
         f"ON CONFLICT ({conflict_columns}) DO UPDATE SET {assignments} "
-        f"WHERE {target_ref}.{_identifier(version_column)} <= EXCLUDED.{_identifier(version_column)}"
+        f"WHERE {' AND '.join(predicates)}"
     )
 
 

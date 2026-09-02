@@ -282,6 +282,21 @@ APPLE_MESSAGES_SOURCE = FileEnrichmentSource(
     pdf_requires_prior_extraction=False,
 )
 
+APPLE_NOTES_SOURCE = FileEnrichmentSource(
+    name="apple_notes",
+    label="Apple Notes attachment",
+    task_type="apple_notes_attachment_enrichment",
+    prompt_version="apple-notes-attachment-agent-v1",
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'apple_notes' AND a.is_stored = 1",
+    size_column="size_bytes",
+    order_column="occurred_at",
+    # Apple Notes has no separate deterministic PDF extractor. Text-bearing
+    # formats are handled by AttachmentTextExtractionRunner; PDFs go directly
+    # through the vision/document path just like iMessage attachments.
+    pdf_requires_prior_extraction=False,
+)
+
 def photo_vision_instructions() -> str:
     """Personal-photo emphasis: the goal is finding the photo again later
     ("the whiteboard in Vermont", "dinner with the red bicycle"), not document

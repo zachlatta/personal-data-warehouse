@@ -15,7 +15,7 @@
       {
         "name": "self",
         "meaning": "Zach initiated it",
-        "typical_rows": "his sent mail and messages, his notes and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments"
+        "typical_rows": "his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments"
       },
       {
         "name": "direct",
@@ -30,12 +30,12 @@
       {
         "name": "noise",
         "meaning": "bulk or automated traffic",
-        "typical_rows": "newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member"
+        "typical_rows": "newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member"
       },
       {
         "name": "background",
         "meaning": "the warehouse's own machinery and other people's background work",
-        "typical_rows": "enrichment runs, mutation workers, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change"
+        "typical_rows": "enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change"
       }
     ],
     "sentinel": {
@@ -86,9 +86,9 @@
     "schema": "timeline",
     "headline": "Start with timeline.",
     "lines": [
-      "START HERE: timeline.events is the cross-source entry point \u2014 one row per real-world event from every source, with timeline.search_text() / timeline.search_text_exact() over the whole corpus.",
+      "START HERE: timeline.events is the cross-source entry point — one row per real-world event from every source, with timeline.search_text() / timeline.search_text_exact() over the whole corpus.",
       "Then: marts_* for structured domain analysis (finance, contacts, messages, photos, inbox, receipts, calendar, ai_conversations).",
-      "Then: base_* for complete, faithful source detail \u2014 every timeline row names its source_table + source_pk so you can drill straight back to it.",
+      "Then: base_* for complete, faithful source detail — every timeline row names its source_table + source_pk so you can drill straight back to it.",
       "derived_* holds the modelled facts in between (identity resolution, enrichment, transcripts, ledger history)."
     ]
   },
@@ -371,7 +371,7 @@
       "domain": "files",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable read interface over every attachment the warehouse holds bytes for, from any source. Start with marts_files.attachments: one conformed row per attachment from Gmail, WhatsApp, iMessage and Apple Notes. It is also the INPUT to attachment enrichment, so a new attachment source is enriched by existing code."
+      "comment": "Stable read interface over attachments from every source. Start with marts_files.attachments: one conformed row per attachment from Gmail, WhatsApp, iMessage, Apple Notes and Slack. It is the INPUT to attachment enrichment and Slack file fingerprinting."
     },
     {
       "name": "marts_finance",
@@ -467,7 +467,7 @@
       "domain": "health",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable health read interface conforming both WHOOP sources (base_whoop, the public API; base_whoop_private, the app API). Start with marts_health.cycles for a day's strain, then marts_health.sleeps, marts_health.recoveries and marts_health.workouts. Units are conformed \u2014 HRV in milliseconds, every duration in seconds \u2014 and the 1970-01-01 epoch sentinel is NULL on every timestamp."
+      "comment": "Stable health read interface conforming both WHOOP sources (base_whoop, the public API; base_whoop_private, the app API). Start with marts_health.cycles for a day's strain, then marts_health.sleeps, marts_health.recoveries and marts_health.workouts. Units are conformed — HRV in milliseconds, every duration in seconds — and the 1970-01-01 epoch sentinel is NULL on every timestamp."
     }
   ],
   "objects": [
@@ -1399,7 +1399,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Agent enrichment attempts, one row per (account, recording_id, provider, model, prompt_version) \u2014 so a recording has SEVERAL rows and a query that does not de-duplicate double-counts. Read marts_voice_memos.recordings for the resolved latest completed enrichment per recording.",
+      "comment": "Agent enrichment attempts, one row per (account, recording_id, provider, model, prompt_version) — so a recording has SEVERAL rows and a query that does not de-duplicate double-counts. Read marts_voice_memos.recordings for the resolved latest completed enrichment per recording.",
       "previous": {
         "schema": "apple_voice_memos",
         "name": "enrichments"
@@ -1471,7 +1471,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "One row per Slack huddle \u2014 who started it, when it started and ended, and every participant \u2014 parsed from the huddle_thread message Slack posts in the channel. METADATA ONLY: nothing said in a huddle is in PDW, so absence of a decision here is never evidence it was not made."
+      "comment": "One row per Slack huddle — who started it, when it started and ended, and every participant — parsed from the huddle_thread message Slack posts in the channel. METADATA ONLY: nothing said in a huddle is in PDW, so absence of a decision here is never evidence it was not made."
     },
     {
       "id": "slack_image_fingerprints",
@@ -1709,7 +1709,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Slack items that want attention \u2014 unread DMs, mentions, and participating threads \u2014 one row each with a priority rank.",
+      "comment": "Slack items that want attention — unread DMs, mentions, and participating threads — one row each with a priority rank.",
       "previous": {
         "schema": "marts",
         "name": "slack_inbox"
@@ -1789,7 +1789,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Start here for chat messages. One row per message across iMessage/SMS (base_apple_messages) and WhatsApp (base_whatsapp), conformed onto one column set so no caller has to hand-roll the cross-source UNION. chat_kind is the conformed vocabulary (direct/group/status/...); source_message_kind keeps the provider's own token. is_from_me and is_deleted are bigint 0/1, this warehouse's boolean. EVERY timestamp here is NULL when absent: the base tables are NOT NULL and store 'never' as 1970-01-01 (83% of recent messages have a sentinel date_delivered), so the sentinel is translated once here and ORDER BY, MIN() and IS NULL mean what they say. Tombstoned rows are included \u2014 filter is_deleted = 0 for live messages only."
+      "comment": "Start here for chat messages. One row per message across iMessage/SMS (base_apple_messages) and WhatsApp (base_whatsapp), conformed onto one column set so no caller has to hand-roll the cross-source UNION. chat_kind is the conformed vocabulary (direct/group/status/...); source_message_kind keeps the provider's own token. is_from_me and is_deleted are bigint 0/1, this warehouse's boolean. EVERY timestamp here is NULL when absent: the base tables are NOT NULL and store 'never' as 1970-01-01 (83% of recent messages have a sentinel date_delivered), so the sentinel is translated once here and ORDER BY, MIN() and IS NULL mean what they say. Tombstoned rows are included — filter is_deleted = 0 for live messages only."
     },
     {
       "id": "ai_conversation_events",
@@ -1865,7 +1865,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Exactly one enrichable still per logical photo (the 1280px thumbnail), shaped for the shared file-enrichment runner. Not a general photo listing \u2014 use marts_photos.photos.",
+      "comment": "Exactly one enrichable still per logical photo (the 1280px thumbnail), shaped for the shared file-enrichment runner. Not a general photo listing — use marts_photos.photos.",
       "previous": {
         "schema": "marts",
         "name": "photo_canonical_renditions"
@@ -1913,7 +1913,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Start here for attachments. One conformed row per attachment across EVERY attachment source \u2014 base_gmail.attachments, base_whatsapp.media_items, base_apple_messages.attachments and base_apple_notes.attachments \u2014 with source, parent_id (the message or note it belongs to), attachment_id, filename, mime_type, size_bytes, content_sha256, is_stored (bigint 0/1: the bytes are in the object store), is_deleted and the storage_* columns. This view is the INPUT to file, audio and text attachment enrichment and to receipt evidence checks, so a new attachment source gains all of them with no new code. Apple Notes attachments appear once per note revision. occurred_at and ingested_at are NULL when absent, translating the warehouse's 1970-01-01 epoch sentinel."
+      "comment": "Start here for attachments. One conformed row per attachment across EVERY attachment source — base_gmail.attachments, base_whatsapp.media_items, base_apple_messages.attachments, base_apple_notes.attachments and base_slack.files — with source, parent_id, attachment_id, filename, mime_type, size_bytes, content_sha256, is_stored (bigint 0/1: bytes persisted in the object store), is_deleted and storage_* columns. It is the INPUT to file/text attachment enrichment, receipt evidence checks and Slack file fingerprinting. Apple Notes audio is intentionally transcribed through marts_voice_memos.recordings rather than a duplicate generic audio pass; its other stored attachments have active vision/text assets. Slack rows are remotely fetchable (storage_backend=slack) but is_stored=0. Apple Notes attachments appear once per note revision. occurred_at and ingested_at are NULL when absent, translating the epoch sentinel."
     },
     {
       "id": "marts_voice_memos_recordings",
@@ -1925,7 +1925,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Start here for voice recordings. One row per recording across EVERY voice source \u2014 base_apple_voice_memos.files and base_alice_voice_recordings.recordings \u2014 with the latest completed derived_voice_memos.enrichments row resolved into title/summary/transcript/participants/action items/calendar match. This view is also the INPUT to transcription and enrichment, so a new voice source gains both without new code; transcript and summary are NULL only until a recording has been processed. Every timestamp is NULL when absent, translating the warehouse's NOT NULL 1970-01-01 epoch sentinel. is_deleted is bigint 0/1."
+      "comment": "Start here for voice recordings. One row per recording across EVERY voice source — base_apple_voice_memos.files and base_alice_voice_recordings.recordings — with the latest completed derived_voice_memos.enrichments row resolved into title/summary/transcript/participants/action items/calendar match. This view is also the INPUT to transcription and enrichment, so a new voice source gains both without new code; transcript and summary are NULL only until a recording has been processed. Every timestamp is NULL when absent, translating the warehouse's NOT NULL 1970-01-01 epoch sentinel. is_deleted is bigint 0/1."
     },
     {
       "id": "marts_voice_memos_transcript_segments",
@@ -2031,7 +2031,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Plaid-only passthrough of base_plaid.investment_transactions, and Plaid's lookback is a hard 730 days. For the full cross-source trade history \u2014 Plaid plus every statement the corpus holds \u2014 use marts_finance.security_transactions.",
+      "comment": "Plaid-only passthrough of base_plaid.investment_transactions, and Plaid's lookback is a hard 730 days. For the full cross-source trade history — Plaid plus every statement the corpus holds — use marts_finance.security_transactions.",
       "previous": {
         "schema": "marts",
         "name": "finance_investment_transactions"
@@ -2079,7 +2079,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Forward-filled daily assets/liabilities/net series built from derived_finance.observations. Plaid keeps no balance history \u2014 this is it.",
+      "comment": "Forward-filled daily assets/liabilities/net series built from derived_finance.observations. Plaid keeps no balance history — this is it.",
       "previous": {
         "schema": "marts",
         "name": "finance_net_worth_history"
@@ -2143,7 +2143,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Per-adapter timeline currency: is this kind of data actually reaching timeline.events? The single `timeline` row in marts_ops.pipeline_health is a max() over every adapter and hides a frozen one. Note last_run_at is only stamped when a batch returned rows, so an idle adapter looks stalled; compare watermark_ingest_ts against the source relation instead."
+      "comment": "Per-adapter timeline currency: is this kind of data actually reaching timeline.events? The single `timeline` row in marts_ops.pipeline_health is a max() over every adapter and hides a frozen one. ingest_lag_seconds is the newest source write minus watermark_ingest_ts and is judged against that source pipeline's cadence; watermark_age_seconds is context only, because an idle event table is not backlog."
     },
     {
       "id": "mart_view_health",
@@ -2174,6 +2174,17 @@
       "domain": "ops",
       "schema": "ops",
       "name": "search_benchmark_runs",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "search_benchmark_history",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "search_benchmark_history",
       "discoverable": false,
       "query_access": "denied",
       "secret": false
@@ -2232,7 +2243,7 @@
       "discoverable": false,
       "query_access": "app_only",
       "secret": false,
-      "comment": "Worker-owned convergence facts for search chunking and embeddings; timestamps alone cannot prove a backlog is drained."
+      "comment": "Worker-owned convergence and integrity facts for search chunking, embeddings, orphan completeness, BM25 scans, and search-index shared-buffer residency; timestamps or cursors alone cannot prove a backlog is drained."
     },
     {
       "id": "marts_mart_view_health",
@@ -2280,7 +2291,19 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "The weekly search benchmark as a health row, per retrieval mode. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. The default remains all tiers and status is judged on its p50 (2-second goal) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
+      "comment": "The latest weekly search benchmark as a health row, per retrieval mode. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. history_runs, previous_collected_at, latency_p50_change_ms and mrr_change compare it with the prior retained run. The default remains all tiers and status is judged on its p50 (2-second goal) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
+    },
+    {
+      "id": "marts_search_benchmark_history",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "search_benchmark_history",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Append-only history of every search benchmark measurement. Use this to distinguish a one-off slow run from a sustained latency or MRR regression; marts_ops.search_benchmark remains the latest health verdict."
     },
     {
       "id": "marts_agent_usage",
@@ -2316,7 +2339,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "First-class hybrid-search convergence: timeline seq versus chunk cursor, active embedding model/configuration, exact caught-up state, bounded backlog signal, last success, and errors. A fresh write timestamp alone is not health."
+      "comment": "First-class hybrid-search health: timeline seq versus chunk cursor, active embedding model/configuration, exact caught-up state, independent orphaned-chunk completeness, bounded backlog signal, BM25 scan integrity, HNSW + BM25 shared-buffer residency, last success, and errors. Residency explicitly measures PostgreSQL shared buffers, not the separate OS page cache. A fresh write timestamp alone is not health."
     },
     {
       "id": "marts_ops_plaid_item_health",
@@ -2340,7 +2363,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel), in two independent halves. refreshed_fraction is discovery: the share of live conversations re-listed within a cycle, judged as a SHARE because a page-1-only walk re-stamps the newest rows hourly and looks perfect. history_polled_fraction is whether we then ASK them for messages, judged only for public_channel \u2014 the change feed answers that authoritatively for every conversation Zach is in, but he is not in ~13k public channels, and 11,488 of those sat frozen at their backfill behind a 99.2% discovery number until 2026-08-27. landing_p50_seconds/landing_p95_seconds are how long a message written in the last 24h took to reach timeline.events (first_seen_at - event_ts; base_slack.messages.synced_at is re-stamped by every re-fetch and cannot measure this), judged as landing_status only for im/mpim \u2014 measured 2026-08-28, DMs landed p95 62 min while the other two parts read ok. status is the worst of the three. Message ages are context only \u2014 mpim legitimately has zero-message days."
+      "comment": "Slack sync health per conversation type (im/mpim/private_channel/public_channel), in two independent halves. refreshed_fraction is discovery: the share of live conversations re-listed within a cycle, judged as a SHARE because a page-1-only walk re-stamps the newest rows hourly and looks perfect. history_polled_fraction is whether we then ASK them for messages, judged only for public_channel — the change feed answers that authoritatively for every conversation Zach is in, but he is not in ~13k public channels, and 11,488 of those sat frozen at their backfill behind a 99.2% discovery number until 2026-08-27. landing_p50_seconds/landing_p95_seconds are how long a message written in the last 24h took to reach timeline.events (first_seen_at - event_ts; base_slack.messages.synced_at is re-stamped by every re-fetch and cannot measure this), judged as landing_status only for im/mpim — measured 2026-08-28, DMs landed p95 62 min while the other two parts read ok. status is the worst of the three. Message ages are context only — mpim legitimately has zero-message days."
     },
     {
       "id": "marts_transaction_receipts",
@@ -3055,7 +3078,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "One row per WHOOP cycle, conforming base_whoop.cycles with base_whoop_private.cycles. A cycle runs sleep-onset to next sleep-onset, so start_at is not midnight and the day it reports is the day it is awake for. strain is the displayed 0-21 score. end_at is NULL while the cycle is still running \u2014 the raw tables store the 1970-01-01 epoch sentinel there, so ORDER BY end_at DESC on them ranks the RUNNING cycle oldest. Every exposed timestamp is translated the same way; none is left as the sentinel."
+      "comment": "One row per WHOOP cycle, conforming base_whoop.cycles with base_whoop_private.cycles. A cycle runs sleep-onset to next sleep-onset, so start_at is not midnight and the day it reports is the day it is awake for. strain is the displayed 0-21 score. end_at is NULL while the cycle is still running — the raw tables store the 1970-01-01 epoch sentinel there, so ORDER BY end_at DESC on them ranks the RUNNING cycle oldest. Every exposed timestamp is translated the same way; none is left as the sentinel."
     },
     {
       "id": "marts_health_recoveries",

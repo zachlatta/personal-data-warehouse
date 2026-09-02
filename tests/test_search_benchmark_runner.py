@@ -205,9 +205,23 @@ def test_benchmark_view_judges_latency_and_staleness(warehouse: PostgresWarehous
     assert first["status"] == "ok"
     assert first["attention_latency_p50_delta_ms"] is None
     warehouse.write_search_benchmark_runs([run(latency_p50_ms=4200)], collected_at=now + timedelta(seconds=1))
-    assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "attention"
+    second = warehouse._query_dicts(
+        "SELECT status, history_runs, previous_collected_at, latency_p50_change_ms, mrr_change "
+        "FROM @marts_search_benchmark"
+    )[0]
+    assert second["status"] == "attention"
+    assert second["history_runs"] == 2
+    assert second["previous_collected_at"] == now
+    assert second["latency_p50_change_ms"] == 3300
+    assert float(second["mrr_change"]) == 0.0
     warehouse.write_search_benchmark_runs([run(labeled_cases=0, found=0, mrr_milli=0, note="no labels")], collected_at=now + timedelta(seconds=2))
     assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "ok"
+    history = warehouse._query_dicts(
+        "SELECT collected_at, latency_p50_ms, mrr FROM @marts_search_benchmark_history "
+        "ORDER BY collected_at"
+    )
+    assert len(history) == 3
+    assert [row["latency_p50_ms"] for row in history] == [900, 4200, 900]
     warehouse._command("UPDATE @search_benchmark_runs SET collected_at = %s", (now - timedelta(days=12),))
     assert warehouse._query_dicts("SELECT status FROM @marts_search_benchmark")[0]["status"] == "unknown"
 

@@ -37,7 +37,7 @@ var apiSnapshotTools = []string{
 }
 
 // mcpOnlyToolNames are exposed on MCP but must NOT appear on the HTTP API.
-var mcpOnlyToolNames = []string{"query", "get_rows", "get_field", "grep_rows"}
+var mcpOnlyToolNames = []string{"query"}
 
 // cliOnlyToolNames are exposed on the HTTP API but must NOT appear on MCP.
 var cliOnlyToolNames = []string{"sql"}

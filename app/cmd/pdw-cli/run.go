@@ -725,6 +725,10 @@ func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writ
 		return 2
 	}
 	name := args[0]
+	if name == "query" {
+		fmt.Fprintln(stdout, "query is MCP-only; use `pdw sql [-q QUESTION] SQL` on the CLI.")
+		return 0
+	}
 	tools, err := client.ListTools(context.Background())
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw describe:", err)

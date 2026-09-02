@@ -178,8 +178,26 @@ def search_chunk_embeddings(context) -> MaterializeResult:
                     ),
                     last_error=stats.skipped_reason,
                 )
+                warehouse.write_search_health(
+                    "orphaned_chunks",
+                    model=(client.model if client else ""),
+                    configured=1 if configured else 0,
+                    pgvector_available=1 if pgvector else 0,
+                    caught_up=1 if stats.orphans_caught_up else 0,
+                    processed_rows=stats.orphaned_repaired,
+                    pending_count=0 if stats.orphans_caught_up else -1,
+                    last_success_at=(
+                        datetime.now(tz=UTC)
+                        if configured and pgvector and stats.orphans_caught_up
+                        else datetime.fromtimestamp(0, tz=UTC)
+                    ),
+                    last_error=stats.skipped_reason,
+                )
             except Exception as error:
                 warehouse.write_search_health("embeddings", last_error=str(error)[:500])
+                warehouse.write_search_health(
+                    "orphaned_chunks", last_error=str(error)[:500]
+                )
                 raise
             finally:
                 warehouse.close()
@@ -188,6 +206,10 @@ def search_chunk_embeddings(context) -> MaterializeResult:
     return MaterializeResult(
         metadata={
             "embedded": MetadataValue.int(stats.embedded if stats else 0),
+            "orphaned_found": MetadataValue.int(stats.orphaned_found if stats else 0),
+            "orphaned_repaired": MetadataValue.int(
+                stats.orphaned_repaired if stats else 0
+            ),
             "caught_up": MetadataValue.bool(bool(stats.caught_up) if stats else False),
             "skipped_reason": MetadataValue.text((stats.skipped_reason if stats else "") or ""),
         }

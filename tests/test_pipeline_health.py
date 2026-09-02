@@ -655,6 +655,10 @@ def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse
         ("s3", "slack", "direct", 2),
         ("g1", "gmail", "unclassified", 3),
         ("old", "gmail", "self", 24 * 9),
+        # Future recurring calendar rows are not activity in either trailing
+        # window. Without an upper bound one source reported 2,484 events_1d
+        # against 26 events that had actually happened.
+        ("future", "calendar", "noise", -24),
     ):
         warehouse._command(
             "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
@@ -675,6 +679,7 @@ def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse
     assert rows[("slack", "direct")]["status"] == "ok"
     assert rows[("gmail", "unclassified")]["status"] == "failing"
     assert rows[("gmail", "unclassified")]["newest_event_at"] is not None
+    assert not any(source == "calendar" for source, _ in rows)
 
 
 def test_a_rejected_transcription_provider_call_reads_failing(warehouse):
@@ -1012,6 +1017,62 @@ def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehou
     # anything other than 'ok' here means the status expression is wrong rather
     # than that the fixture is unhealthy.
     assert {status for _, status in rows} == {"ok"}
+
+
+def test_timeline_adapter_health_judges_ingest_lag_against_source_cadence(warehouse):
+    """A watermark behind a newer source write must not still read ``ok``."""
+
+    _provision_every_table(warehouse)
+    warehouse.ensure_timeline_tables()
+    PipelineHealthCollector(warehouse).run()
+    now = datetime.now(tz=UTC)
+    for adapter, table_id, age in (
+        ("slack_message", "slack_messages", timedelta(days=2)),
+        ("finance_transaction", "finance_transactions", timedelta(hours=7)),
+        # Manual documents have no automatic arrival SLA and remain explicitly
+        # unjudged rather than inventing one from the timeline cadence.
+        ("manual_finance_document", "manual_finance_documents", timedelta(days=200)),
+    ):
+        warehouse._command(
+            "INSERT INTO @timeline_sync_state"
+            " (adapter, backfill_done, watermark_ingest_ts, last_run_at, updated_at)"
+            " VALUES (%s, 1, %s, %s, %s)",
+            (adapter, now - age, now, now),
+        )
+        warehouse._command(
+            "UPDATE @pipeline_table_freshness SET last_write_at = %s, collected_at = %s"
+            " WHERE table_id = %s",
+            (now, now, table_id),
+        )
+
+    rows = {
+        row["adapter"]: row
+        for row in warehouse._query_dicts(
+            "SELECT * FROM @marts_timeline_adapter_health"
+        )
+    }
+    assert rows["slack_message"]["source_pipeline"] == "slack"
+    assert rows["slack_message"]["expected_ingest_interval_seconds"] == 6 * 3600
+    assert rows["slack_message"]["source_newest_ingest_at"] == now
+    assert rows["slack_message"]["ingest_lag_seconds"] >= 2 * 24 * 3600 - 5
+    assert rows["slack_message"]["status"] == "failing"
+    assert rows["finance_transaction"]["status"] == "late"
+    assert rows["manual_finance_document"]["expected_ingest_interval_seconds"] is None
+    assert rows["manual_finance_document"]["status"] == "ok"
+
+    # Watermark age alone is not backlog: an event table can legitimately be
+    # idle. Once its newest source row equals the consumed watermark, the
+    # adapter is current even if both timestamps are several hours old.
+    warehouse._command(
+        "UPDATE @pipeline_table_freshness SET last_write_at = %s"
+        " WHERE table_id = 'finance_transactions'",
+        (now - timedelta(hours=7),),
+    )
+    finance = warehouse._query_dicts(
+        "SELECT status, ingest_lag_seconds FROM @marts_timeline_adapter_health"
+        " WHERE adapter = 'finance_transaction'"
+    )[0]
+    assert finance == {"status": "ok", "ingest_lag_seconds": 0}
 
 
 # --- level 2: the marts layer's own health (pure) -----------------------------

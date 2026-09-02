@@ -14,9 +14,6 @@ import (
 func readOnlyTools(svc *query.Service) []tool.Tool {
 	return []tool.Tool{
 		queryTool(svc),
-		getRowsTool(svc),
-		getFieldTool(svc),
-		grepRowsTool(svc),
 		searchTool(svc),
 		schemaOverviewTool(svc),
 		describeTableTool(svc),
@@ -25,13 +22,13 @@ func readOnlyTools(svc *query.Service) []tool.Tool {
 }
 
 func queryTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[queryInput, query.QueryResponse]{
+	return &tool.Typed[queryInput, query.FullQueryBatchResponse]{
 		NameStr:        "query",
 		TitleStr:       "Query Postgres",
 		DescriptionStr: queryDescription,
 		SurfacesField:  tool.SurfaceMCPOnly,
-		Handle: func(ctx context.Context, in queryInput) (query.QueryResponse, error) {
-			return svc.Execute(ctx, queryStatementsFromInput(in.Queries), in.PreviewRows, in.Format), nil
+		Handle: func(ctx context.Context, in queryInput) (query.FullQueryBatchResponse, error) {
+			return svc.ExecuteBatchFull(ctx, queryStatementsFromInput(in.Queries), in.Format), nil
 		},
 		IsError:               queryResponseHasError,
 		NormalizeMCPArguments: normalizeStringifiedQueriesArgument,
@@ -64,45 +61,6 @@ func normalizeStringifiedQueriesArgument(input json.RawMessage) (json.RawMessage
 		return nil, err
 	}
 	return normalized, nil
-}
-
-func getRowsTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[getRowsInput, query.RowsResponse]{
-		NameStr:        "get_rows",
-		TitleStr:       "Get Cached Rows",
-		DescriptionStr: getRowsDescription,
-		SurfacesField:  tool.SurfaceMCPOnly,
-		Handle: func(ctx context.Context, in getRowsInput) (query.RowsResponse, error) {
-			return svc.GetRows(ctx, in.QueryID, in.Offset, in.Limit, in.Format), nil
-		},
-		IsError: func(r query.RowsResponse) bool { return r.Error != "" },
-	}
-}
-
-func getFieldTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[getFieldInput, query.FieldResponse]{
-		NameStr:        "get_field",
-		TitleStr:       "Get Cached Field",
-		DescriptionStr: getFieldDescription,
-		SurfacesField:  tool.SurfaceMCPOnly,
-		Handle: func(ctx context.Context, in getFieldInput) (query.FieldResponse, error) {
-			return svc.GetField(ctx, in.QueryID, in.Row, in.Column, in.Offset, in.Length), nil
-		},
-		IsError: func(r query.FieldResponse) bool { return r.Error != "" },
-	}
-}
-
-func grepRowsTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[grepRowsInput, query.GrepResponse]{
-		NameStr:        "grep_rows",
-		TitleStr:       "Grep Cached Rows",
-		DescriptionStr: grepRowsDescription,
-		SurfacesField:  tool.SurfaceMCPOnly,
-		Handle: func(ctx context.Context, in grepRowsInput) (query.GrepResponse, error) {
-			return svc.GrepRows(ctx, in.QueryID, in.Pattern, in.Columns, in.Limit, in.ContextChars), nil
-		},
-		IsError: func(r query.GrepResponse) bool { return r.Error != "" },
-	}
 }
 
 // searchTool is registered on both MCP and the HTTP API. MCP agents call it

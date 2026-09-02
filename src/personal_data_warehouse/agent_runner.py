@@ -723,7 +723,7 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
     return ""
 
 
-PDW_CLI_SUBCOMMANDS = frozenset({"sql", "schema", "columns", "call", "list", "describe"})
+PDW_CLI_SUBCOMMANDS = frozenset({"search", "sql", "schema", "columns", "call", "list", "describe"})
 
 
 def pdw_cli_invocation(command: str) -> str:
@@ -995,8 +995,10 @@ on `PATH`. It is the way to reach warehouse data. Run `pdw help` for the full
 usage; the commands available to an agent run are:
 
 ```bash
-pdw schema                                  # every relation, with keys — start here
-pdw columns base_gmail.messages                  # exact columns + types for ONE relation
+pdw search --priority self,direct,cc 'distinctive terms' # FIRST for text/person/topic/id
+pdw sql -q 'read hit context' "SELECT * FROM timeline.context('REF', 5, 5)"
+pdw schema                                             # relations + keys, only for structured SQL
+pdw columns base_gmail.messages                        # exact columns + types for ONE relation
 pdw sql -q 'why you are asking' 'SELECT ...'   # read-only SQL
 pdw sql -q 'why you are asking' --file query.sql   # SQL from a file (no shell quoting)
 pdw call get_object --data '{"storage_file_id":"..."}'   # locate a stored blob
@@ -1004,6 +1006,11 @@ pdw call get_object --data '{"storage_file_id":"..."}'   # locate a stored blob
 
 Notes that save a round trip:
 
+- Start with `search`, using the priority scope that matches the question.
+  Use `self,direct,cc` for attention/correspondence, `self` for Zach's own
+  acts or words, `self,background` for prior agent conclusions, and `noise`
+  for automated traffic. Omit the filter only for broad recall or when the
+  relevant tier is genuinely unknown. Every hit includes `priority` and `ref`.
 - `schema` lists relations but NOT columns. Run `columns` on every relation you
   are about to reference; guessing column names is the top cause of failed SQL.
 - Always pass `-q` with a short plain-English intent. It is logged server-side.

@@ -77,11 +77,11 @@ uses of the single scope parameter are generated from the warehouse catalog:
 
 | tier | what it means | typical rows |
 | --- | --- | --- |
-| `self` | Zach initiated it | his sent mail and messages, his notes and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
+| `self` | Zach initiated it | his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments |
 | `direct` | a real person reaching him directly | DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements |
 | `cc` | real-people activity he is peripheral to | cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns |
-| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
-| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
+| `noise` | bulk or automated traffic | newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member |
+| `background` | the warehouse's own machinery and other people's background work | enrichment runs, mutation workers, contact-card churn, model answers and tool output in agent sessions, orchestrated (orchestrator-spawned) agent sessions, and Drive files other people change |
 
 **Scope selection guide** — use the single `priorities` mechanism; do not add a competing scope flag:
 
@@ -1418,9 +1418,10 @@ resource later.
 Inside the container the agent uses the same `pdw` commands a human would, already authenticated:
 
 ```bash
-pdw schema                                        # relations + keys
-pdw columns base_gmail.messages                        # exact columns and types
-pdw sql -q 'Find exact invoice references' "SELECT * FROM timeline.search_text_exact('invoice 4831', 50)"
+pdw search --priority self,direct,cc 'invoice 4831'    # first move for text/person/topic/id
+pdw sql -q 'Read the hit conversation' "SELECT * FROM timeline.context('gmail_email:...', 5, 5)"
+pdw schema                                             # only when structured SQL is actually needed
+pdw columns base_gmail.messages                        # exact columns and types before relation SQL
 pdw sql -q 'why you are asking' "SELECT summary, attendees_json FROM base_google_calendar.events LIMIT 5"
 pdw call get_object --data '{"storage_file_id":"..."}'   # then curl the signed download_url
 ```

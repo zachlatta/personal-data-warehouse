@@ -174,6 +174,22 @@ def test_detail_coverage_points_at_covered_tables():
         assert cursor.role == "events", f"{table} does not ultimately belong to a timeline event"
 
 
+def test_every_non_event_user_table_records_why_it_has_no_adapter():
+    """``detail``/``entity`` must be decisions, not convenient labels.
+
+    Requiring the reason is the timeline equivalent of the raw-enrichment-read
+    exemption registry: a new activity-shaped table cannot be classified away
+    without someone saying how users reach it instead.
+    """
+
+    missing = sorted(
+        table
+        for table, coverage in TIMELINE_TABLE_COVERAGE.items()
+        if coverage.role in {"detail", "entity"} and not coverage.note.strip()
+    )
+    assert missing == []
+
+
 def test_go_warming_filter_catalog_matches_runtime_event_sources():
     go_source = (
         Path(__file__).resolve().parents[1] / "app" / "internal" / "server" / "timeline.go"
@@ -207,6 +223,23 @@ def test_adapter_sql_carries_the_pagination_contract():
         assert ";" not in adapter.backfill_sql
         assert ";" not in adapter.incremental_sql
         assert adapter.max_ingest_sql.lstrip().upper().startswith("SELECT")
+
+
+def test_slack_max_ingest_probes_do_not_join_the_message_heap():
+    """A watermark probe must be an index-only max, not a 49 GB join.
+
+    The Slack adapters need user/conversation joins to normalize rows, but
+    ``max(synced_at)`` only needs the source table. Reusing the normalized
+    FROM clause here caused a parallel sequential scan every five minutes and
+    evicted the hybrid-search indexes from both Postgres and the OS cache.
+    """
+
+    assert adapter_by_name("slack_message").max_ingest_sql == (
+        "SELECT max(synced_at) FROM @slack_messages"
+    )
+    assert adapter_by_name("slack_file").max_ingest_sql == (
+        "SELECT max(synced_at) FROM @slack_files"
+    )
 
 
 def _priority_literals(sql: str) -> set[str]:
@@ -269,7 +302,30 @@ def test_generated_adapter_sql_has_no_silent_cc_fallback_and_keeps_rollout_signa
             adapter.kind,
             adapter.signature_backfill_sql,
             adapter.signature_incremental_sql,
-            adapter.max_ingest_sql,
+            adapter.signature_max_ingest_sql or adapter.max_ingest_sql,
+        ]
+    )
+    assert adapter_definition_signature(adapter) == hashlib.sha256(
+        legacy_payload.encode("utf-8")
+    ).hexdigest()
+
+
+def test_lean_slack_max_ingest_probe_does_not_reset_adapter_signature():
+    adapter = adapter_by_name("slack_message")
+
+    assert adapter.max_ingest_sql == "SELECT max(synced_at) FROM @slack_messages"
+    assert "LEFT JOIN @slack_users" in adapter.signature_max_ingest_sql
+    assert "LEFT JOIN @slack_conversations" in adapter.signature_max_ingest_sql
+
+    legacy_payload = "\n".join(
+        [
+            adapter.name,
+            adapter.source_table,
+            adapter.source,
+            adapter.kind,
+            adapter.signature_backfill_sql,
+            adapter.signature_incremental_sql,
+            adapter.signature_max_ingest_sql,
         ]
     )
     assert adapter_definition_signature(adapter) == hashlib.sha256(

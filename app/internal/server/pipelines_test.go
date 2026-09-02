@@ -269,7 +269,9 @@ func adapterHealthRow(adapter, status string) map[string]any {
 		"adapter": adapter, "status": status,
 		"backfill_done": int64(1), "backfill_rows": int64(1200), "incremental_rows": int64(34),
 		"watermark_ingest_ts": "2026-07-27T11:00:00Z", "last_run_at": "2026-07-27T11:20:00Z",
-		"watermark_age_seconds": int64(1260), "run_age_seconds": int64(60),
+		"source_pipeline": "gmail", "expected_ingest_interval_seconds": int64(86400),
+		"source_newest_ingest_at": "2026-07-27T11:21:00Z",
+		"watermark_age_seconds":   int64(1260), "ingest_lag_seconds": int64(1260), "run_age_seconds": int64(60),
 		"last_error": nil, "updated_at": "2026-07-27T11:20:00Z",
 	}
 }

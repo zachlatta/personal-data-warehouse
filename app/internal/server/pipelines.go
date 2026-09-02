@@ -67,7 +67,10 @@ ORDER BY view_schema, view_name`
 // a max() over every adapter, so one frozen adapter hides behind the rest.
 var pipelineAdapterHealthSQL = `
 SELECT adapter, status, backfill_done, backfill_rows, incremental_rows,
-       watermark_ingest_ts, last_run_at, watermark_age_seconds, run_age_seconds,
+       source_pipeline, expected_ingest_interval_seconds,
+       source_newest_ingest_at, watermark_ingest_ts, last_run_at,
+       watermark_age_seconds, ingest_lag_seconds,
+       run_age_seconds,
        last_error, updated_at
 FROM ` + warehouse.SQLRelation("marts_timeline_adapter_health") + `
 ORDER BY adapter`
@@ -161,6 +164,7 @@ SELECT mode, status, probe_queries, latency_p50_ms, latency_p90_ms, latency_max_
        attention_recall_retained, all_relevant_lower_tier,
        attention_latency_p50_delta_ms, attention_recall_loss_rate,
        io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, saturation,
+       history_runs, previous_collected_at, latency_p50_change_ms, mrr_change,
        collected_at, snapshot_age_seconds
 FROM ` + warehouse.SQLRelation("marts_search_benchmark") + `
 ORDER BY mode`
@@ -168,7 +172,8 @@ ORDER BY mode`
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
-       processed_rows, pending_count, oldest_pending_at,
+       processed_rows, pending_count, resident_bytes, total_bytes, resident_fraction,
+       oldest_pending_at,
        last_success_at, last_run_at, last_error, updated_at, snapshot_age_seconds
 FROM ` + warehouse.SQLRelation("marts_search_health") + `
 ORDER BY component`

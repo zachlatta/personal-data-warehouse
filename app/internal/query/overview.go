@@ -290,7 +290,7 @@ var overviewPreamble = `--
 --   and summary. Summaries are lossy — before calling a request unanswered, search transcript
 --   text and Slack DMs dated AFTER it; decisions are often made on calls only.
 --   The ` + "`search`" + ` tool wraps this contract: hybrid semantic+keyword retrieval through
---   timeline.search_hybrid when embeddings are configured, falling back to search_text keyword
+--   app-internal timeline implementation functions when embeddings are configured, falling back to search_text keyword
 --   search (reporting a fallback_reason) when they are not; modes keyword/exact force the
 --   corresponding SQL function.
 --

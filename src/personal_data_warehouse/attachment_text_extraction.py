@@ -173,6 +173,15 @@ WHATSAPP_TEXT_SOURCE = TextExtractionSource(
     order_column="occurred_at",
 )
 
+APPLE_NOTES_TEXT_SOURCE = TextExtractionSource(
+    name="apple_notes",
+    label="Apple Notes attachment",
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'apple_notes' AND a.is_stored = 1",
+    size_column="size_bytes",
+    order_column="occurred_at",
+)
+
 
 @dataclass(frozen=True)
 class AttachmentTextExtractionSummary:

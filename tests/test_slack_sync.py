@@ -193,6 +193,8 @@ class FakeWarehouse:
         account,
         team_id,
         since_ts=None,
+        before_thread_ts=None,
+        before_conversation_id="",
         limit=None,
         skip_completed=False,
         skip_known_errors=False,
@@ -204,6 +206,8 @@ class FakeWarehouse:
                 "account": account,
                 "team_id": team_id,
                 "since_ts": since_ts,
+                "before_thread_ts": before_thread_ts,
+                "before_conversation_id": before_conversation_id,
                 "limit": limit,
                 "skip_completed": skip_completed,
                 "skip_known_errors": skip_known_errors,
@@ -212,6 +216,22 @@ class FakeWarehouse:
             }
         )
         refs = list(self.thread_refs)
+        if before_thread_ts:
+            before_key = (
+                float(before_thread_ts),
+                str(before_thread_ts),
+                str(before_conversation_id),
+            )
+            refs = [
+                ref
+                for ref in refs
+                if (
+                    float(ref["thread_ts"]),
+                    str(ref["thread_ts"]),
+                    str(ref["conversation_id"]),
+                )
+                < before_key
+            ]
         if skip_known_errors:
             refs = [
                 ref
@@ -2833,11 +2853,14 @@ def test_drained_thread_backfill_walk_is_remembered_and_bounded_until_cooldown(m
     assert warehouse.thread_ref_calls[0]["since_ts"] is None
 
 
-def test_full_thread_backfill_walk_that_hits_its_limit_is_not_marked_drained(monkeypatch):
+def test_full_thread_backfill_walk_that_hits_its_limit_saves_a_keyset_cursor(monkeypatch):
     monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
     monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
     settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
-    from personal_data_warehouse.slack_sync import THREAD_BACKFILL_WALK_TYPE
+    from personal_data_warehouse.slack_sync import (
+        THREAD_BACKFILL_WALK_ID,
+        THREAD_BACKFILL_WALK_TYPE,
+    )
 
     warehouse = FakeWarehouse()
     warehouse.thread_refs = [
@@ -2854,7 +2877,104 @@ def test_full_thread_backfill_walk_that_hits_its_limit_is_not_marked_drained(mon
         }
     )
     _thread_backfill_runner(settings, warehouse, client, datetime(2026, 8, 26, tzinfo=UTC)).sync_all()
-    assert not [u for u in warehouse.state_updates if u["object_type"] == THREAD_BACKFILL_WALK_TYPE]
+    markers = [
+        update
+        for update in warehouse.state_updates
+        if update["object_type"] == THREAD_BACKFILL_WALK_TYPE
+        and update["object_id"] == THREAD_BACKFILL_WALK_ID
+    ]
+    assert len(markers) == 1
+    assert markers[0]["status"] == "running"
+    assert markers[0]["cursor_ts"] == "1713974499.000100|C1"
+
+
+def test_thread_backfill_walk_resumes_after_its_saved_keyset(monkeypatch):
+    from personal_data_warehouse.slack_sync import (
+        THREAD_BACKFILL_WALK_ID,
+        THREAD_BACKFILL_WALK_TYPE,
+    )
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", THREAD_BACKFILL_WALK_TYPE, THREAD_BACKFILL_WALK_ID): {
+                "status": "running",
+                "cursor_ts": "1713974499.000100|C1",
+                "updated_at": datetime(2026, 8, 26, tzinfo=UTC),
+            }
+        }
+    )
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+        }
+    )
+
+    _thread_backfill_runner(
+        settings, warehouse, client, datetime(2026, 8, 26, 0, 5, tzinfo=UTC)
+    ).sync_all()
+
+    call = warehouse.thread_ref_calls[0]
+    assert call["since_ts"] is None
+    assert call["before_thread_ts"] == "1713974499.000100"
+    assert call["before_conversation_id"] == "C1"
+
+
+def test_thread_backfill_cursor_does_not_advance_past_a_transient_error(monkeypatch):
+    """The persisted walk must leave a failed parent visible for retry."""
+
+    from personal_data_warehouse.slack_sync import (
+        THREAD_BACKFILL_WALK_ID,
+        THREAD_BACKFILL_WALK_TYPE,
+    )
+
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.thread_refs = [
+        {
+            "conversation_id": "C1",
+            "thread_ts": "1713974500.000100",
+            "reply_count": 1,
+            "latest_reply_ts": "",
+        },
+        {
+            "conversation_id": "C1",
+            "thread_ts": "1713974400.000100",
+            "reply_count": 1,
+            "latest_reply_ts": "",
+        },
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.replies": [
+                {"ok": True, "messages": [], "response_metadata": {}},
+                SlackApiCallError(
+                    "conversations.replies failed: internal_error",
+                    code="internal_error",
+                ),
+            ],
+        }
+    )
+
+    _thread_backfill_runner(
+        settings, warehouse, client, datetime(2026, 8, 26, tzinfo=UTC)
+    ).sync_all()
+
+    marker = next(
+        update
+        for update in warehouse.state_updates
+        if update["object_type"] == THREAD_BACKFILL_WALK_TYPE
+        and update["object_id"] == THREAD_BACKFILL_WALK_ID
+    )
+    assert marker["status"] == "running"
+    assert marker["cursor_ts"] == "1713974500.000100|C1"
 
 
 def _sweep_settings(monkeypatch):

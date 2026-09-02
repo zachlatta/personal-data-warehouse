@@ -28,12 +28,14 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from personal_data_warehouse.search_benchmark_runner import LATENCY_P50_TARGET_MS
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 GREEN, YELLOW, RED = "green", "yellow", "red"
 
 #: The search latency the goal set for the tool, end to end through the CLI.
-SEARCH_P50_TARGET_SECONDS = 2.0
+SEARCH_P50_TARGET_SECONDS = LATENCY_P50_TARGET_MS / 1000
 SEARCH_P50_YELLOW_SECONDS = 5.0
 SEARCH_PROBE_QUERIES = (
     "runway burn rate months cash remaining",
@@ -87,9 +89,11 @@ def c1_timeline_coverage() -> Verdict:
         return _unavailable("C1", title, "marts_ops.timeline_adapter_health")
     failing = sorted(r["adapter"] for r in rows if r["status"] == "failing")
     backfilling = sorted(r["adapter"] for r in rows if r["status"] == "backfilling")
-    status = RED if failing else (YELLOW if backfilling else GREEN)
+    late = sorted(r["adapter"] for r in rows if r["status"] == "late")
+    status = RED if failing else (YELLOW if backfilling or late else GREEN)
     return Verdict("C1", title, status,
-                   f"{len(rows)} adapters; failing={failing or 'none'}; backfilling={backfilling or 'none'}")
+                   f"{len(rows)} adapters; failing={failing or 'none'}; "
+                   f"late={late or 'none'}; backfilling={backfilling or 'none'}")
 
 
 def c2_priority_tiers() -> Verdict:
@@ -198,7 +202,7 @@ def c8_search_quality() -> Verdict:
     status = GREEN
     if any(s in ("failing", "unknown") for s in statuses.values()):
         status = RED
-    elif any(s in ("late", "backfilling") for s in statuses.values()) or not labels or (b and b["status"] in ("attention", "unknown")):
+    elif any(s in ("attention", "late", "backfilling") for s in statuses.values()) or not labels or (b and b["status"] in ("attention", "unknown")):
         status = YELLOW
     bench_ev = f"benchmark {b['status']}: MRR {b['mrr']} over {b['labeled_cases']} cases, p50 {b['latency_p50_ms']}ms ({str(b['collected_at'])[:16]})" if b else "no benchmark row yet"
     return Verdict("C8", title, status, f"search_health {statuses}; {bench_ev}")

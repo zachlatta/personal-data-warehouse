@@ -86,6 +86,30 @@ def test_agent_tool_proxy_forwards_allowlisted_call_with_the_real_token(fake_app
     assert json.loads(body)["sql"] == "SELECT 1 AS n"
 
 
+def test_agent_tool_proxy_allows_search_as_the_agents_first_warehouse_call(fake_app) -> None:
+    app = fake_app(
+        responses={
+            "search": {
+                "query": "budget",
+                "priority_scope": "selected",
+                "selected_priorities": ["self", "direct", "cc"],
+                "rows": [],
+            }
+        }
+    )
+
+    with proxy_for(app) as env:
+        status, payload = call_proxy(
+            env,
+            "/api/tools/search",
+            {"query": "budget", "priorities": ["self", "direct", "cc"]},
+        )
+
+    assert status == 200
+    assert payload["data"]["priority_scope"] == "selected"
+    assert app.tool_call_paths() == ["/api/tools/search"]
+
+
 def test_agent_tool_proxy_reports_the_run_to_the_app(fake_app) -> None:
     """Queries should be attributable to a run in the app's own request log."""
 

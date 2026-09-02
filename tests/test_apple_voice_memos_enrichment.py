@@ -1175,13 +1175,14 @@ def _command_event(index: int, command: str) -> AgentRunEvent:
 
 def test_count_warehouse_cli_calls_counts_executed_pdw_reads() -> None:
     events = [
-        _command_event(0, "pdw schema"),
-        _command_event(1, "pdw sql -q 'attendees' 'SELECT 1'"),
-        _command_event(2, "pdw columns google_calendar.events"),
-        _command_event(3, "pdw call get_object --data '{}'"),
+        _command_event(0, "pdw search --priority self,direct,cc 'event person'"),
+        _command_event(1, "pdw schema"),
+        _command_event(2, "pdw sql -q 'attendees' 'SELECT 1'"),
+        _command_event(3, "pdw columns google_calendar.events"),
+        _command_event(4, "pdw call get_object --data '{}'"),
     ]
 
-    assert count_warehouse_cli_calls(events) == 4
+    assert count_warehouse_cli_calls(events) == 5
 
 
 def test_count_warehouse_cli_calls_ignores_non_research_commands() -> None:

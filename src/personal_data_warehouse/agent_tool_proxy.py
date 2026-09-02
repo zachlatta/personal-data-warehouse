@@ -22,11 +22,13 @@ import threading
 from typing import Any
 from urllib import error, parse, request
 
-# Tools an agent may reach. The app's CLI surface also carries
-# propose_mutation / propose_mutation_help / _debug_cache_status; agent runs are
-# read-only research, so those stay off. `get_rows` / `get_field` / `grep_rows`
-# / `query` are MCP-only upstream and never appear here.
-DEFAULT_AGENT_TOOL_ALLOWLIST = frozenset({"sql", "schema_overview", "describe_table", "get_object"})
+# Tools an agent may reach. The app's CLI surface also carries mutation tools;
+# agent runs are read-only research, so those stay off. MCP ``query`` never
+# appears on the HTTP/CLI surface. Search must be present: agent instructions
+# deliberately make ``pdw search --priority ...`` their first warehouse call.
+DEFAULT_AGENT_TOOL_ALLOWLIST = frozenset(
+    {"search", "sql", "schema_overview", "describe_table", "get_object"}
+)
 
 DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS = 50
 DEFAULT_AGENT_TOOL_PROXY_CLIENT_NAME = "pdw-agent"

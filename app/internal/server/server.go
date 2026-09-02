@@ -27,8 +27,6 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/whoopsession"
 )
 
-const debugCacheStatusDescription = "Return live cached query_ids, ages, and total cache size for debugging."
-
 func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 	return tool.Hooks{
 		OnCall: func(ctx context.Context, name string) {
@@ -52,21 +50,9 @@ func marshalToolOutput(output any) string {
 	return string(data)
 }
 
-func debugCacheStatusTool(svc *query.Service) tool.Tool {
-	return &tool.Typed[debugCacheInput, query.DebugCacheStatus]{
-		NameStr:        "_debug_cache_status",
-		TitleStr:       "Debug Query Cache Status",
-		DescriptionStr: debugCacheStatusDescription,
-		Handle: func(_ context.Context, _ debugCacheInput) (query.DebugCacheStatus, error) {
-			return svc.DebugCacheStatus(), nil
-		},
-	}
-}
-
 type queryInput struct {
-	Queries     []queryStatementInput `json:"queries" jsonschema:"array of query objects; each must include question and sql"`
-	PreviewRows int                   `json:"preview_rows,omitempty" jsonschema:"number of initial rows to preview per statement, default 20"`
-	Format      string                `json:"format,omitempty" jsonschema:"preview format: csv, json, or ndjson; default csv"`
+	Queries []queryStatementInput `json:"queries" jsonschema:"array of query objects; each must include question and sql"`
+	Format  string                `json:"format,omitempty" jsonschema:"result format: csv, json, or ndjson; default csv"`
 }
 
 type queryStatementInput struct {
@@ -80,29 +66,6 @@ type describeTableInput struct {
 	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. base_gmail.messages; a bare table name resolves when only one schema has it"`
 }
 
-type getRowsInput struct {
-	QueryID string `json:"query_id" jsonschema:"query_id returned by query"`
-	Offset  int    `json:"offset,omitempty" jsonschema:"zero-based row offset, default 0"`
-	Limit   int    `json:"limit,omitempty" jsonschema:"number of rows to return, default 50"`
-	Format  string `json:"format,omitempty" jsonschema:"optional override: csv, json, or ndjson; default is the original query format"`
-}
-
-type getFieldInput struct {
-	QueryID string `json:"query_id" jsonschema:"query_id returned by query"`
-	Row     int    `json:"row" jsonschema:"zero-based row index in the cached result"`
-	Column  string `json:"column" jsonschema:"column name to read"`
-	Offset  int    `json:"offset,omitempty" jsonschema:"zero-based character offset, default 0"`
-	Length  int    `json:"length,omitempty" jsonschema:"number of characters to return, default 50000 and capped by MCP_GET_FIELD_MAX_CHARS"`
-}
-
-type grepRowsInput struct {
-	QueryID      string   `json:"query_id" jsonschema:"query_id returned by query"`
-	Pattern      string   `json:"pattern" jsonschema:"case-insensitive regex pattern to search"`
-	Columns      []string `json:"columns,omitempty" jsonschema:"optional list of columns to search; default all columns"`
-	Limit        int      `json:"limit,omitempty" jsonschema:"maximum matches to return, default 100"`
-	ContextChars int      `json:"context_chars,omitempty" jsonschema:"characters of context around each match, default 200"`
-}
-
 type searchInput struct {
 	Query      string   `json:"query" jsonschema:"search text to run against the cross-source timeline corpus"`
 	MaxResults int      `json:"max_results,omitempty" jsonschema:"maximum hits to return, default 20; request more only for recall work"`
@@ -111,8 +74,6 @@ type searchInput struct {
 	Mode       string   `json:"mode,omitempty" jsonschema:"hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)"`
 	Priorities []string `json:"priorities,omitempty" jsonschema:"optional values from the timeline priority contract; omit to search every tier; an unknown token errors listing the valid set"`
 }
-
-type debugCacheInput struct{}
 
 type sqlInput struct {
 	Question string `json:"question" jsonschema:"concise plain-English question this SQL statement is trying to answer"`
@@ -138,13 +99,7 @@ var serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail
 
 const schemaFirstReminder = "Call schema_overview first, then describe_table for each relation before SQL that references relations. A timeline.context(ref, before, after) follow-up to a search hit needs no relation discovery."
 
-const queryDescription = "Run read-only Postgres SQL against the personal data warehouse and cache the result under a query_id. " + schemaFirstReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
-
-const getRowsDescription = "Return a row slice from a cached query result by query_id. " + schemaFirstReminder
-
-const getFieldDescription = "Return a character chunk from a single cell in a cached query result. Use this to read long fields (transcripts, message bodies, email bodies, note bodies) end-to-end without putting substring offsets in SQL. " + schemaFirstReminder
-
-const grepRowsDescription = "Regex-search a cached query result and return match context. " + schemaFirstReminder
+const queryDescription = "The single MCP SQL entry point. Run read-only Postgres SQL and return each bounded result in full, without cursor helper tools or field truncation. " + schemaFirstReminder + timelinePrioritySQLReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
 var searchDescription = "FIRST tool for any text, topic, person, phrase, or identifier lookup across all synced sources; it searches the cross-source timeline and needs no schema discovery. " +
 	"Phrase query as words the ANSWERING RECORD would contain: use \"runway burn rate months cash remaining\", not \"how long our money lasts\". Add likely record-language synonyms. " +
@@ -152,11 +107,13 @@ var searchDescription = "FIRST tool for any text, topic, person, phrase, or iden
 	"Scope with priorities when the question is about attention rather than content — " + warehouse.TimelinePriorityParentheticalDefinitions() + ". The default is every tier; for attention or correspondence use " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + ". Scope with sources/since only when known. " +
 	"Every hit carries priority plus ref, source_table and source_pk: use ref with timeline.context(ref, 5, 5) for surrounding messages, source_table/source_pk to reach the raw row (timeline -> marts_* -> base_*). The response tells you how to recover from zero results."
 
-const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL. It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
+const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
+
+const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL." + timelinePrioritySQLReminder + " It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
 const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (base_gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
 
-const sqlDescription = "Run a read-only Postgres SQL statement and return its full result, like a psql session. Skips the query cache, pagination, and field truncation that the MCP query tool applies. Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
+const sqlDescription = "The single CLI SQL entry point. Run a read-only Postgres SQL statement and return its full result, like a psql session." + timelinePrioritySQLReminder + " Refuses write SQL and caps the response at 1,000,000 rows. Each call must include question, a concise plain-English question this SQL statement is trying to answer, so server logs capture the caller's intent."
 
 func NewMCPServer(runner query.Runner, opts query.Options) *mcp.Server {
 	return NewMCPServerWithMutations(runner, opts, nil)
@@ -172,15 +129,10 @@ func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutation
 }
 
 // buildRegistry constructs the shared query.Service and assembles the
-// tool.Registry that both surfaces (MCP and HTTP) consume. The query.Service
-// is returned so callers that want the cache (e.g. NewMux for shutdown) can
-// hold onto it; passing it back also makes the shared-cache contract obvious.
+// tool.Registry that both surfaces (MCP and HTTP) consume.
 func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger, extra ...tool.Tool) (*tool.Registry, *query.Service) {
 	svc := query.NewService(runner, opts)
 	tools := readOnlyTools(svc)
-	if opts.DebugCacheTool {
-		tools = append(tools, debugCacheStatusTool(svc))
-	}
 	tools = append(tools, extra...)
 	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
 }
@@ -273,7 +225,7 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 	for _, deprecated := range cfg.DeprecatedEnvVars {
 		logger.Warn("ignoring deprecated environment variable", "variable", deprecated)
 	}
-	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, QueryCacheMaxBytes: cfg.QueryCacheMaxBytes, GetFieldMaxChars: cfg.GetFieldMaxChars, QueryCacheTTL: cfg.QueryCacheTTL, DebugCacheTool: cfg.DebugCacheTool, Logger: slog.Default()}
+	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, Logger: slog.Default()}
 	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
 		BaseURL:     cfg.SearchEmbeddingsBaseURL,
 		APIKey:      cfg.SearchEmbeddingsAPIKey,
@@ -497,7 +449,7 @@ func mutationNotification(request mutations.Request) push.Notification {
 	}
 }
 
-func queryResponseHasError(resp query.QueryResponse) bool {
+func queryResponseHasError(resp query.FullQueryBatchResponse) bool {
 	for _, result := range resp.Results {
 		if result.Error != "" {
 			return true
