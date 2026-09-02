@@ -2015,7 +2015,9 @@ def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> Non
     sql = _search_text_function_sql()
 
     assert "set_config('hnsw.iterative_scan', 'relaxed_order', true)" in sql
-    assert "greatest(1000, per_source * 8)" in sql
+    assert "sem_adapters IS NULL AND since IS NULL" in sql
+    assert "greatest(requested_candidates, 100)" in sql
+    assert "ELSE 1000" in sql
     assert "set_config('hnsw.max_scan_tuples', '100000', true)" in sql
     assert "set_config('hnsw.scan_mem_multiplier', '4', true)" in sql
 
@@ -6210,7 +6212,7 @@ def test_search_hybrid_clamps_ef_search_to_pgvectors_maximum() -> None:
     assert "set_config('hnsw.ef_search', greatest(" not in sql, (
         "an unclamped ef_search errors for max_results > 125"
     )
-    assert "least(1000, greatest(1000, per_source * 8))" in sql
+    assert "least(1000, greatest(requested_candidates, 100))" in sql
 
 
 def test_search_schema_signature_covers_the_broad_pool_constants() -> None:

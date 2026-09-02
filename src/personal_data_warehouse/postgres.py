@@ -12742,10 +12742,6 @@ class PostgresWarehouse:
                 -- Each invocation owns exactly one vector. The app now sends
                 -- only the measured-best instructed form, so this is also the
                 -- only ANN scan in a normal hybrid request.
-                PERFORM set_config('hnsw.ef_search', least(1000, greatest(1000, per_source * 8))::text, true);
-                PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
-                PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
-                PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
                 """
                 + sources_alias_sql
                 + r"""
@@ -12788,6 +12784,26 @@ class PostgresWarehouse:
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
                 + r""")
                 END;
+                -- An unfiltered ANN scan only has to maintain the candidate
+                -- heap it will return.  Keeping ef_search at 1,000 for a
+                -- 400-row pool made every ordinary hybrid query read roughly
+                -- 12k cold HNSW blocks and spend ~1.8s in this leg alone on
+                -- 2026-09-02.  Source/time filters are different: iterative
+                -- scan may discard most visited rows, so they retain the
+                -- measured 1,000-row exploration budget.  Both branches stay
+                -- inside pgvector's hard 1,000 ceiling.
+                PERFORM set_config(
+                    'hnsw.ef_search',
+                    CASE
+                        WHEN sem_adapters IS NULL AND since IS NULL
+                            THEN least(1000, greatest(requested_candidates, 100))
+                        ELSE 1000
+                    END::text,
+                    true
+                );
+                PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
+                PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
+                PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
                 RETURN QUERY
                 WITH sem_chunks AS (
                     -- Most scopes use global HNSW. Drive is excluded because a
