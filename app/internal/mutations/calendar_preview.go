@@ -77,5 +77,17 @@ func calendarAttendeeEntry(item map[string]any) map[string]any {
 	if organizer, ok := item["organizer"].(bool); ok && organizer {
 		entry["organizer"] = true
 	}
+	if self, ok := item["self"].(bool); ok && self {
+		entry["self"] = true
+	}
+	if resource, ok := item["resource"].(bool); ok && resource {
+		entry["resource"] = true
+	}
+	if comment := strings.TrimSpace(stringFromAny(item["comment"])); comment != "" {
+		entry["comment"] = comment
+	}
+	if additionalGuests := intFromPreviewAny(item["additionalGuests"]); additionalGuests > 0 {
+		entry["additionalGuests"] = additionalGuests
+	}
 	return entry
 }

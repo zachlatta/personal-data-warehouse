@@ -8,6 +8,7 @@ type MutationLike = {
   status?: string;
   payload?: Record<string, unknown>;
   preview?: Record<string, unknown>;
+  result?: Record<string, unknown>;
 };
 
 export type SlackReviewMessage = {
@@ -208,6 +209,405 @@ export function mutationReviewContext(value: unknown): MutationReviewContext {
     preserved: stringList(context.preserved),
     selection: stringList(context.selection),
   };
+}
+
+// --- calendar review -------------------------------------------------------
+//
+// A calendar mutation is a scheduling decision, not a JSON-inspection task.
+// The server resolves the proposal's timezone and places the owner's synced
+// events for that day in preview.calendar_day. These helpers turn that stable
+// snapshot into the calendar, conflict summary, and guest list the phone
+// renders. Keeping the calculations pure makes the difficult parts — timezone
+// display, declined events, overlap lanes — testable without a simulator.
+
+export function isCalendarCreateMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'google_calendar' && mutation.operation === 'calendar.create_event';
+}
+
+export type CalendarReviewAttendee = {
+  email: string;
+  displayName: string;
+  responseStatus: string;
+  responseLabel: string;
+  organizer: boolean;
+  optional: boolean;
+  self: boolean;
+  resource: boolean;
+  comment: string;
+  additionalGuests: number;
+};
+
+export type CalendarReviewEvent = {
+  id: string;
+  calendarId: string;
+  title: string;
+  description: string;
+  location: string;
+  startAt: string;
+  endAt: string;
+  startDate: string;
+  endDate: string;
+  allDay: boolean;
+  status: string;
+  transparency: string;
+  visibility: string;
+  eventType: string;
+  colorId: string;
+  creatorEmail: string;
+  organizerEmail: string;
+  htmlLink: string;
+  conferenceLink: string;
+  attendees: CalendarReviewAttendee[];
+  recurrence: string[];
+  reminders: Record<string, unknown>;
+  proposed: boolean;
+  raw: Record<string, unknown>;
+};
+
+export type CalendarMutationReview = {
+  operation: 'create';
+  account: string;
+  calendarId: string;
+  sendUpdates: string;
+  title: string;
+  timeZone: string;
+  dateLabel: string;
+  timeLabel: string;
+  durationLabel: string;
+  dayStart: string;
+  dayEnd: string;
+  sourceSyncedAt: string;
+  availability: 'clear' | 'conflict' | 'unavailable';
+  proposed: CalendarReviewEvent;
+  attendees: CalendarReviewAttendee[];
+  otherAttendees: CalendarReviewAttendee[];
+  conflicts: CalendarReviewEvent[];
+  existingEvents: CalendarReviewEvent[];
+  timedEvents: CalendarReviewEvent[];
+  allDayEvents: CalendarReviewEvent[];
+};
+
+export type CalendarLayoutBlock = {
+  event: CalendarReviewEvent;
+  top: number;
+  height: number;
+  column: number;
+  columnCount: number;
+  conflict: boolean;
+};
+
+export type CalendarDayLayout = {
+  startHour: number;
+  endHour: number;
+  height: number;
+  hourHeight: number;
+  hours: { hour: number; label: string; top: number }[];
+  blocks: CalendarLayoutBlock[];
+};
+
+function calendarAttendees(value: unknown, account: string): CalendarReviewAttendee[] {
+  return records(value).map((item) => {
+    const email = text(item.email);
+    const displayName = text(item.displayName) || text(item.display_name);
+    const responseStatus = text(item.responseStatus) || text(item.response_status);
+    return {
+      email,
+      displayName,
+      responseStatus,
+      responseLabel: calendarResponseLabel(responseStatus),
+      organizer: item.organizer === true,
+      optional: item.optional === true,
+      self: item.self === true || (!!email && email.toLowerCase() === account.toLowerCase()),
+      resource: item.resource === true,
+      comment: text(item.comment),
+      additionalGuests: count(item.additionalGuests ?? item.additional_guests),
+    };
+  }).filter((attendee) => attendee.email || attendee.displayName);
+}
+
+function calendarResponseLabel(status: string): string {
+  switch (status) {
+    case 'accepted': return 'Accepted';
+    case 'declined': return 'Declined';
+    case 'tentative': return 'Maybe';
+    case 'needsAction': return 'Awaiting reply';
+    default: return status;
+  }
+}
+
+function calendarConferenceLink(event: Record<string, unknown>): string {
+  const direct = text(event.conference_link) || text(event.hangoutLink);
+  if (direct) return direct;
+  const entries = records(asRecord(event.conferenceData).entryPoints);
+  return text(entries.find((entry) => text(entry.uri))?.uri);
+}
+
+function calendarEventFromRecord(rawValue: unknown, account: string, proposed = false): CalendarReviewEvent {
+  const raw = asRecord(rawValue);
+  const start = asRecord(raw.start);
+  const end = asRecord(raw.end);
+  const allDay = raw.is_all_day === true || raw.is_all_day === 1 || !!text(raw.start_date) || !!text(start.date);
+  return {
+    id: text(raw.event_id) || (proposed ? 'proposed' : ''),
+    calendarId: text(raw.calendar_id) || 'primary',
+    title: text(raw.summary) || '(untitled event)',
+    description: text(raw.description),
+    location: text(raw.location),
+    startAt: text(raw.start_at) || text(start.dateTime),
+    endAt: text(raw.end_at) || text(end.dateTime),
+    startDate: text(raw.start_date) || text(start.date),
+    endDate: text(raw.end_date) || text(end.date),
+    allDay,
+    status: text(raw.status) || 'confirmed',
+    transparency: text(raw.transparency) || 'opaque',
+    visibility: text(raw.visibility) || 'default',
+    eventType: text(raw.event_type) || text(raw.eventType) || 'default',
+    colorId: text(raw.color_id) || text(raw.colorId),
+    creatorEmail: text(raw.creator_email) || text(asRecord(raw.creator).email),
+    organizerEmail: text(raw.organizer_email) || text(asRecord(raw.organizer).email),
+    htmlLink: text(raw.html_link) || text(raw.htmlLink),
+    conferenceLink: calendarConferenceLink(raw),
+    attendees: calendarAttendees(raw.attendees, account),
+    recurrence: stringList(raw.recurrence),
+    reminders: asRecord(raw.reminders),
+    proposed,
+    raw,
+  };
+}
+
+function proposalEventRecord(mutation: MutationLike): Record<string, unknown> {
+  const payload = asRecord(mutation.payload);
+  const preview = asRecord(mutation.preview);
+  const previewEvent = asRecord(preview.event);
+  const payloadEvent = mutation.operation === 'calendar.update_event' ? asRecord(payload.patch) : asRecord(payload.event);
+  const merged = { ...payloadEvent, ...previewEvent };
+  // The stored preview historically retained fewer attendee flags than the
+  // executable payload. Prefer the payload's full invite when it exists.
+  if (Array.isArray(payloadEvent.attendees)) merged.attendees = payloadEvent.attendees;
+  return merged;
+}
+
+function validDate(value: string): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function formatCalendarDate(instant: Date | null, dateValue: string, timeZone: string): string {
+  if (instant) return new Intl.DateTimeFormat('en-US', { timeZone: timeZone || undefined, weekday: 'long', month: 'long', day: 'numeric' }).format(instant);
+  if (dateValue) {
+    const date = new Date(`${dateValue}T12:00:00Z`);
+    if (!Number.isNaN(date.getTime())) return new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'long', month: 'long', day: 'numeric' }).format(date);
+  }
+  return 'Date unavailable';
+}
+
+function timeParts(instant: Date, timeZone: string): { clock: string; period: string; zone: string } {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timeZone || undefined,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  });
+  const parts: Record<string, string> = {};
+  for (const part of formatter.formatToParts(instant)) parts[part.type] = part.value;
+  return {
+    clock: `${parts.hour ?? ''}:${parts.minute ?? '00'}`,
+    period: parts.dayPeriod ?? '',
+    zone: parts.timeZoneName ?? '',
+  };
+}
+
+function calendarTimeRange(start: Date | null, end: Date | null, allDay: boolean, timeZone: string): string {
+  if (allDay) return 'All day';
+  if (!start) return 'Time unavailable';
+  const first = timeParts(start, timeZone);
+  if (!end) return `${first.clock} ${first.period} ${first.zone}`.trim();
+  const last = timeParts(end, timeZone);
+  const startPeriod = first.period === last.period ? '' : ` ${first.period}`;
+  const zone = first.zone === last.zone ? first.zone : `${first.zone}/${last.zone}`;
+  return `${first.clock}${startPeriod}–${last.clock} ${last.period}${zone ? ` ${zone}` : ''}`.trim();
+}
+
+function calendarDuration(start: Date | null, end: Date | null, allDay: boolean, startDate: string, endDate: string): string {
+  let minutes = start && end ? Math.round((end.getTime() - start.getTime()) / 60000) : 0;
+  if (allDay && startDate && endDate) minutes = Math.round((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 60000);
+  if (!Number.isFinite(minutes) || minutes <= 0) return '';
+  if (allDay) {
+    const days = Math.max(1, Math.round(minutes / 1440));
+    return days === 1 ? '1 day' : `${days} days`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  if (!hours) return `${remainder} min`;
+  if (!remainder) return `${hours} hr`;
+  return `${hours} hr ${remainder} min`;
+}
+
+function eventDeclinedByOwner(event: CalendarReviewEvent): boolean {
+  return event.attendees.some((attendee) => attendee.self && attendee.responseStatus === 'declined');
+}
+
+function calendarEventsOverlap(proposed: CalendarReviewEvent, existing: CalendarReviewEvent, dayStart: string, dayEnd: string): boolean {
+  if (existing.status === 'cancelled' || existing.transparency === 'transparent' || eventDeclinedByOwner(existing)) return false;
+  if (proposed.id && proposed.id !== 'proposed' && proposed.id === existing.id) return false;
+  if (existing.allDay) {
+    const proposalStartDate = (proposed.startDate || dayStart || proposed.startAt).slice(0, 10);
+    const proposalEndDate = (proposed.endDate || dayEnd).slice(0, 10);
+    return !!proposalStartDate
+      && (!existing.startDate || !proposalEndDate || existing.startDate < proposalEndDate)
+      && (!existing.endDate || existing.endDate > proposalStartDate);
+  }
+  const proposedStart = validDate(proposed.startAt);
+  const proposedEnd = validDate(proposed.endAt);
+  const existingStart = validDate(existing.startAt);
+  const existingEnd = validDate(existing.endAt);
+  if (!proposedStart || !proposedEnd || !existingStart || !existingEnd) return false;
+  return existingStart < proposedEnd && existingEnd > proposedStart;
+}
+
+export function calendarMutationReview(mutation: MutationLike): CalendarMutationReview {
+  const payload = asRecord(mutation.payload);
+  const result = asRecord(mutation.result);
+  const preview = asRecord(mutation.preview);
+  const day = asRecord(preview.calendar_day);
+  const proposedInput = proposalEventRecord(mutation);
+  // Once execution has returned, Google's response is the most complete form
+  // of the event (real id/link, organizer, conference data and RSVP state).
+  // Pending reviews still use the exact executable payload.
+  const executedEvent = asRecord(result.response);
+  const proposedRaw = { ...proposedInput, ...executedEvent };
+  const account = text(mutation.account);
+  const proposed = calendarEventFromRecord({
+    ...proposedRaw,
+    start_at: text(day.proposed_start_at) || text(proposedRaw.start_at),
+    end_at: text(day.proposed_end_at) || text(proposedRaw.end_at),
+    start_date: text(day.proposed_start_date) || text(proposedRaw.start_date),
+    end_date: text(day.proposed_end_date) || text(proposedRaw.end_date),
+    is_all_day: day.proposed_is_all_day === true || proposedRaw.is_all_day,
+  }, account, true);
+  proposed.id = text(proposedRaw.event_id) || text(payload.event_id) || text(result.event_id) || text(executedEvent.id) || proposed.id;
+  proposed.calendarId = text(proposedRaw.calendar_id) || text(payload.calendar_id) || text(result.calendar_id) || proposed.calendarId;
+
+  const existingEvents = records(day.events)
+    .map((event) => calendarEventFromRecord(event, account))
+    // The mutation calls the target calendar "primary" while the sync may
+    // store that same calendar by its email address. Google's event id is the
+    // stable identity across those aliases, so an executed add must not draw
+    // or conflict with itself a second time.
+    .filter((event) => proposed.id === 'proposed' || event.id !== proposed.id);
+  const conflicts = existingEvents.filter((event) => calendarEventsOverlap(proposed, event, text(day.day_start), text(day.day_end)));
+  const timedEvents = [...existingEvents.filter((event) => !event.allDay), ...(proposed.allDay ? [] : [proposed])]
+    .sort((a, b) => {
+      const start = (validDate(a.startAt)?.getTime() ?? Number.MAX_SAFE_INTEGER) - (validDate(b.startAt)?.getTime() ?? Number.MAX_SAFE_INTEGER);
+      if (start) return start;
+      if (a.proposed !== b.proposed) return a.proposed ? -1 : 1;
+      return a.title.localeCompare(b.title);
+    });
+  const allDayEvents = [...existingEvents.filter((event) => event.allDay), ...(proposed.allDay ? [proposed] : [])];
+  const start = validDate(proposed.startAt);
+  const end = validDate(proposed.endAt);
+  const timeZone = text(day.time_zone) || text(asRecord(proposedRaw.start).timeZone) || 'America/New_York';
+  const attendees = proposed.attendees;
+  const otherAttendees = attendees.filter((attendee) => !attendee.self && !attendee.resource);
+  return {
+    operation: 'create',
+    account,
+    calendarId: proposed.calendarId,
+    sendUpdates: text(proposedRaw.send_updates) || text(payload.send_updates) || 'all',
+    title: proposed.title,
+    timeZone,
+    dateLabel: formatCalendarDate(start, proposed.startDate, timeZone),
+    timeLabel: calendarTimeRange(start, end, proposed.allDay, timeZone),
+    durationLabel: calendarDuration(start, end, proposed.allDay, proposed.startDate, proposed.endDate),
+    dayStart: text(day.day_start),
+    dayEnd: text(day.day_end),
+    sourceSyncedAt: text(day.source_synced_at),
+    availability: Object.keys(day).length === 0 ? 'unavailable' : conflicts.length ? 'conflict' : 'clear',
+    proposed,
+    attendees,
+    otherAttendees,
+    conflicts,
+    existingEvents,
+    timedEvents,
+    allDayEvents,
+  };
+}
+
+function layoutMinute(iso: string, dayStartMs: number): number | null {
+  const value = validDate(iso);
+  if (!value) return null;
+  return Math.max(0, Math.min(1440, (value.getTime() - dayStartMs) / 60000));
+}
+
+function hourLabel(hour: number): string {
+  if (hour === 0 || hour === 24) return '12 AM';
+  if (hour === 12) return '12 PM';
+  return hour < 12 ? `${hour} AM` : `${hour - 12} PM`;
+}
+
+export function calendarDayLayout(review: CalendarMutationReview, hourHeight = 72): CalendarDayLayout {
+  let dayStartMs = validDate(review.dayStart)?.getTime();
+  if (!Number.isFinite(dayStartMs)) {
+    const proposedStart = validDate(review.proposed.startAt) ?? new Date();
+    const localStart = new Date(proposedStart.getFullYear(), proposedStart.getMonth(), proposedStart.getDate());
+    dayStartMs = localStart.getTime();
+  }
+  const conflictIDs = new Set(review.conflicts.map((event) => `${event.calendarId}\0${event.id}`));
+  const rawBlocks = review.timedEvents.flatMap((event) => {
+    const start = layoutMinute(event.startAt, dayStartMs as number);
+    const end = layoutMinute(event.endAt, dayStartMs as number);
+    if (start === null || end === null || end <= start) return [];
+    return [{ event, start, end, column: 0, columnCount: 1 }];
+  }).sort((a, b) => a.start - b.start || a.end - b.end || (a.event.proposed ? -1 : 1));
+
+  let cluster: typeof rawBlocks = [];
+  let clusterEnd = -1;
+  const flushCluster = () => {
+    if (!cluster.length) return;
+    const laneEnds: number[] = [];
+    for (const block of cluster) {
+      let lane = laneEnds.findIndex((end) => end <= block.start);
+      if (lane < 0) lane = laneEnds.length;
+      block.column = lane;
+      laneEnds[lane] = block.end;
+    }
+    const columns = Math.max(1, laneEnds.length);
+    for (const block of cluster) block.columnCount = columns;
+    cluster = [];
+  };
+  for (const block of rawBlocks) {
+    if (cluster.length && block.start >= clusterEnd) flushCluster();
+    cluster.push(block);
+    clusterEnd = Math.max(clusterEnd, block.end);
+  }
+  flushCluster();
+
+  const minimum = rawBlocks.length ? Math.min(...rawBlocks.map((block) => block.start)) : 8 * 60;
+  const maximum = rawBlocks.length ? Math.max(...rawBlocks.map((block) => block.end)) : 12 * 60;
+  let startHour = Math.max(0, Math.floor(minimum / 60) - 1);
+  let endHour = Math.min(24, Math.ceil(maximum / 60) + 1);
+  if (endHour - startHour < 4) {
+    const missing = 4 - (endHour - startHour);
+    startHour = Math.max(0, startHour - Math.floor(missing / 2));
+    endHour = Math.min(24, startHour + 4);
+    startHour = Math.max(0, endHour - 4);
+  }
+  const height = (endHour - startHour) * hourHeight;
+  const hours = Array.from({ length: endHour - startHour + 1 }, (_, index) => {
+    const hour = startHour + index;
+    return { hour, label: hourLabel(hour), top: index * hourHeight };
+  });
+  const blocks: CalendarLayoutBlock[] = rawBlocks.map((block) => ({
+    event: block.event,
+    top: Math.max(0, ((block.start - startHour * 60) / 60) * hourHeight),
+    height: Math.max(42, ((block.end - block.start) / 60) * hourHeight),
+    column: block.column,
+    columnCount: block.columnCount,
+    conflict: conflictIDs.has(`${block.event.calendarId}\0${block.event.id}`),
+  }));
+  return { startHour, endHour, height, hourHeight, hours, blocks };
 }
 
 // --- gmail thread review ----------------------------------------------------

@@ -305,12 +305,145 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	if err != nil {
 		return Request{}, err
 	}
+	mutations = s.hydrateCalendarDayPreviews(ctx, mutations)
 	mutations = s.hydrateSlackMarkReadPreviewLinks(ctx, mutations)
 	request.Mutations = mutations
 	if request.MutationCount == 0 {
 		request.MutationCount = len(mutations)
 	}
 	return request, nil
+}
+
+// hydrateCalendarDayPreviews places each calendar create proposal beside the
+// owner's other synced events. This belongs on the read path: it is one
+// date-bounded query, availability changes after a request is proposed, and a
+// read-time preview also upgrades requests that were already in the queue when
+// the calendar UI shipped. Failure is non-fatal; the client then says calendar
+// availability is unavailable instead of falsely claiming that the slot is
+// clear.
+func (s *PostgresStore) hydrateCalendarDayPreviews(ctx context.Context, mutations []Mutation) []Mutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	targets := calendarDayPreviewTargets(mutations)
+	if len(targets) == 0 {
+		return mutations
+	}
+	previewRows, err := s.loadCalendarDayPreviewRows(ctx, targets)
+	if err != nil {
+		return mutations
+	}
+	return applyCalendarDayPreviewRows(mutations, targets, previewRows)
+}
+
+func (s *PostgresStore) loadCalendarDayPreviewRows(ctx context.Context, targets []calendarDayPreviewTarget) ([]calendarDayPreviewRow, error) {
+	args := make([]any, 0, len(targets)*6)
+	values := make([]string, 0, len(targets))
+	for _, target := range targets {
+		args = append(args, target.MutationIndex, target.Account, target.DayStart, target.DayEnd, target.DayStart.Format("2006-01-02"), target.DayEnd.Format("2006-01-02"))
+		values = append(values, fmt.Sprintf(
+			"($%d::integer, $%d::text, $%d::timestamptz, $%d::timestamptz, $%d::text, $%d::text)",
+			len(args)-5, len(args)-4, len(args)-3, len(args)-2, len(args)-1, len(args),
+		))
+	}
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
+		WITH wanted(target_index, account, day_start, day_end, day_start_date, day_end_date) AS (
+			VALUES %s
+		), calendar_event AS (
+			-- The source has historically carried a small number of byte-identical
+			-- primary keys after a collation-corruption incident. Match the timeline
+			-- adapter's bytewise latest-row selection so a phone never draws both.
+			SELECT DISTINCT ON (
+				convert_to(account, 'UTF8'),
+				convert_to(calendar_id, 'UTF8'),
+				convert_to(event_id, 'UTF8')
+			) *
+			FROM @calendar_events
+			ORDER BY
+				convert_to(account, 'UTF8'),
+				convert_to(calendar_id, 'UTF8'),
+				convert_to(event_id, 'UTF8'),
+				sync_version DESC
+		)
+		SELECT
+			wanted.target_index,
+			event.calendar_id,
+			event.event_id,
+			event.status,
+			event.summary,
+			event.description,
+			event.location,
+			event.creator_email,
+			event.organizer_email,
+			event.start_at,
+			event.end_at,
+			event.start_date,
+			event.end_date,
+			event.is_all_day,
+			event.html_link,
+			COALESCE(NULLIF(event.attendees_json, ''), '[]'),
+			COALESCE(NULLIF(event.reminders_json, ''), '{}'),
+			COALESCE(array_to_json(event.recurrence)::text, '[]'),
+			event.event_type,
+			COALESCE(NULLIF(event.raw_json, ''), '{}'),
+			event.updated_at,
+			event.synced_at
+		FROM wanted
+		JOIN calendar_event AS event
+		  ON event.account = wanted.account
+		 AND (
+			(event.is_all_day = 0 AND event.start_at < wanted.day_end AND event.end_at > wanted.day_start)
+			OR
+			(event.is_all_day <> 0 AND event.start_date < wanted.day_end_date AND event.end_date > wanted.day_start_date)
+		 )
+		WHERE event.is_deleted = 0
+		  AND event.status <> 'cancelled'
+		  -- Recurring masters describe a series; expanded instances are the
+		  -- concrete blocks. Keeping both duplicates the series' first meeting.
+		  AND (event.recurring_event_id <> '' OR COALESCE(cardinality(event.recurrence), 0) = 0)
+		ORDER BY wanted.target_index ASC, event.is_all_day DESC, event.start_at ASC, event.end_at ASC, event.event_id ASC
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	previewRows := []calendarDayPreviewRow{}
+	for rows.Next() {
+		var row calendarDayPreviewRow
+		var allDay int64
+		if err := rows.Scan(
+			&row.TargetIndex,
+			&row.CalendarID,
+			&row.EventID,
+			&row.Status,
+			&row.Summary,
+			&row.Description,
+			&row.Location,
+			&row.CreatorEmail,
+			&row.OrganizerEmail,
+			&row.Start,
+			&row.End,
+			&row.StartDate,
+			&row.EndDate,
+			&allDay,
+			&row.HTMLLink,
+			&row.AttendeesJSON,
+			&row.RemindersJSON,
+			&row.RecurrenceJSON,
+			&row.EventType,
+			&row.RawJSON,
+			&row.UpdatedAt,
+			&row.SyncedAt,
+		); err != nil {
+			return nil, err
+		}
+		row.AllDay = allDay != 0
+		previewRows = append(previewRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return previewRows, nil
 }
 
 // hydrateSlackMarkReadPreviewLinks resolves the workspace domain and the

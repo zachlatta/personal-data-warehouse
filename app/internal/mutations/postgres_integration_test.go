@@ -192,6 +192,109 @@ func TestCreateRequestFillsContactPreviewFromTheSyncedCard(t *testing.T) {
 	}
 }
 
+// Calendar availability is hydrated on every read rather than frozen at
+// proposal time. That makes an already-pending request reflect a meeting that
+// landed later, and it upgrades old requests that predate the day view.
+func TestGetRequestHydratesCalendarCreateWithTheOwnersWholeDay(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("calendar_events"))); err != nil {
+		t.Skipf("cannot create the calendar schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @calendar_events (
+			account text, calendar_id text, event_id text, recurring_event_id text DEFAULT '', status text, is_deleted bigint,
+			summary text, description text, location text, creator_email text, organizer_email text,
+			start_at timestamptz, end_at timestamptz, start_date text, end_date text, is_all_day bigint,
+			html_link text, attendees_json text, reminders_json text, recurrence text[], event_type text,
+			raw_json text, updated_at timestamptz, synced_at timestamptz, sync_version bigint DEFAULT 0,
+			PRIMARY KEY (account, calendar_id, event_id)
+		)
+	`); err != nil {
+		t.Skipf("cannot create calendar_events in this database: %v", err)
+	}
+	account := fmt.Sprintf("calendar-preview-%d@example.test", time.Now().UnixNano())
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @calendar_events (
+			account, calendar_id, event_id, status, is_deleted, summary, description, location,
+			creator_email, organizer_email, start_at, end_at, start_date, end_date, is_all_day,
+			html_link, attendees_json, reminders_json, recurrence, event_type, raw_json, updated_at, synced_at
+		) VALUES
+			($1, 'primary', 'morning', 'confirmed', 0, 'Morning run', '', '', $1, $1,
+			 '2026-09-05 11:30:00+00', '2026-09-05 12:15:00+00', '', '', 0, '', '[]', '{}', ARRAY[]::text[], 'default', '{}', now(), '2026-09-02 20:45:00+00'),
+			($1, 'work', 'overlap', 'confirmed', 0, 'Breakfast with Ada', 'Planning over coffee', 'Davis Square', 'ada@example.test', 'ada@example.test',
+			 '2026-09-05 13:30:00+00', '2026-09-05 14:30:00+00', '', '', 0,
+			 'https://calendar.google.com/calendar/event?eid=abc',
+			 '[{"email":"zach@example.test","self":true,"responseStatus":"accepted"},{"email":"ada@example.test","displayName":"Ada Lovelace","organizer":true,"responseStatus":"accepted"}]',
+			 '{"useDefault":true}', ARRAY[]::text[], 'default',
+			 '{"transparency":"opaque","hangoutLink":"https://meet.google.com/abc-defg-hij"}', now(), '2026-09-02 20:46:00+00'),
+			($1, 'primary', 'cancelled', 'cancelled', 1, 'Cancelled thing', '', '', $1, $1,
+			 '2026-09-05 13:00:00+00', '2026-09-05 14:00:00+00', '', '', 0, '', '[]', '{}', ARRAY[]::text[], 'default', '{}', now(), now()),
+			-- All-day start_at is normalized to UTC midnight. A timestamp-only
+			-- overlap would wrongly pull this Sep 6 event into Sep 5 in New York.
+			($1, 'primary', 'tomorrow-all-day', 'confirmed', 0, 'Tomorrow', '', '', $1, $1,
+			 '2026-09-06 00:00:00+00', '2026-09-07 00:00:00+00', '2026-09-06', '2026-09-07', 1, '', '[]', '{}', ARRAY[]::text[], 'default', '{}', now(), now())
+	`, account); err != nil {
+		t.Fatalf("seed calendar: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @calendar_events (
+			account, calendar_id, event_id, recurring_event_id, status, is_deleted, summary,
+			description, location, creator_email, organizer_email,
+			start_at, end_at, start_date, end_date, is_all_day, attendees_json,
+			reminders_json, recurrence, event_type, raw_json, html_link, updated_at, synced_at
+		) VALUES
+			($1, 'primary', 'series', '', 'confirmed', 0, 'Weekly planning',
+			 '', '', $1, $1, '2026-09-05 15:00:00+00', '2026-09-05 15:30:00+00', '', '', 0,
+			 '[]', '{}', ARRAY['RRULE:FREQ=WEEKLY'], 'default', '{}', '', now(), now()),
+			($1, 'primary', 'series_20260905', 'series', 'confirmed', 0, 'Weekly planning',
+			 '', '', $1, $1, '2026-09-05 15:00:00+00', '2026-09-05 15:30:00+00', '', '', 0,
+			 '[]', '{}', ARRAY[]::text[], 'default', '{}', '', now(), now())
+	`, account); err != nil {
+		t.Fatalf("seed recurring calendar event: %v", err)
+	}
+
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: "Add pickleball", Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type: CalendarCreateEventOperation, Account: account, CalendarID: "primary", SendUpdates: "all",
+			Event: map[string]any{
+				"summary": "Pickleball",
+				"start":   map[string]any{"dateTime": "2026-09-05T09:00:00", "timeZone": "America/New_York"},
+				"end":     map[string]any{"dateTime": "2026-09-05T11:00:00", "timeZone": "America/New_York"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if len(created.Mutations) != 1 {
+		t.Fatalf("mutations = %#v", created.Mutations)
+	}
+	day := mapFromAny(created.Mutations[0].Preview["calendar_day"])
+	if len(day) == 0 {
+		targets := calendarDayPreviewTargets(created.Mutations)
+		_, loadErr := store.loadCalendarDayPreviewRows(ctx, targets)
+		t.Fatalf("calendar day was not hydrated (targets=%#v, query error=%v)", targets, loadErr)
+	}
+	if day["proposed_start_at"] != "2026-09-05T09:00:00-04:00" {
+		t.Fatalf("proposal time = %#v", day["proposed_start_at"])
+	}
+	events := mapSliceFromAny(day["events"])
+	if len(events) != 3 {
+		t.Fatalf("events = %#v", events)
+	}
+	if events[0]["event_id"] != "morning" || events[1]["event_id"] != "overlap" || events[2]["event_id"] != "series_20260905" {
+		t.Fatalf("day order = %#v", events)
+	}
+	if mapSliceFromAny(events[1]["attendees"])[1]["displayName"] != "Ada Lovelace" {
+		t.Fatalf("invite details = %#v", events[1]["attendees"])
+	}
+	if events[1]["conference_link"] != "https://meet.google.com/abc-defg-hij" {
+		t.Fatalf("conference link = %#v", events[1]["conference_link"])
+	}
+}
+
 // seedSlackPreviewSchema creates just enough of the Slack source layer for the
 // preview queries to run: the columns they read, under the catalog's own
 // schema names.

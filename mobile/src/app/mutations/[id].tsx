@@ -8,6 +8,7 @@ import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gmail-thread-review';
+import { CalendarMutationCard } from '@/components/calendar-mutation-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, rejectMutationRequest, removeMutation, type Mutation, type MutationRequest } from '@/lib/api';
@@ -16,6 +17,7 @@ import {
   gmailBatchSummary,
   gmailThreadDayGroups,
   gmailThreadReviews,
+  isCalendarCreateMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   mutationReviewContext,
@@ -54,6 +56,7 @@ const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 
 function MutationCard({ mutation, pending, onRemove, requestReason, alone }: { mutation: Mutation; pending: boolean; onRemove: () => void; requestReason?: string; alone?: boolean }) {
   const theme = useTheme();
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
+  if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   const merged = flattenPayload(mutation.payload ?? {});
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);

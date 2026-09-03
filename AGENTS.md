@@ -1485,6 +1485,19 @@ back it, all behind the static bearer the CLI uses:
     them. The part that drifts silently is the thread query string: without
     `?thread_ts=…&cid=…` Slack opens the channel at the parent and the reply is nowhere
     on screen.
+  - **Calendar create-event reviews are calendars, not payloads.** `GetRequest`
+    resolves the proposal in its named IANA timezone and date-bounds one read of
+    every synced `base_google_calendar.events` calendar for that account. The
+    phone places the proposal and existing timed/all-day events on one day grid,
+    flags opaque overlaps (excluding cancelled, transparent, and owner-declined
+    events), and renders the complete proposed invite. This enrichment stays on
+    the READ path so an old or pending request sees calendar changes that landed
+    after proposal; lookup failure is non-fatal and must render as availability
+    unknown, never as a clear slot. All-day overlap uses `start_date`/`end_date`,
+    not the UTC-midnight `start_at` values, which otherwise leak tomorrow into
+    today west of UTC. The read also applies the calendar adapter's bytewise
+    latest-row de-duplication and draws expanded recurring instances instead of
+    placing the series master on top of its first occurrence.
 - `POST /api/push/register` stores the device's Expo push token in
   `private.push_devices` (`app/internal/push`); `POST /api/push/test` sends to every
   active device and returns the fan-out report.

@@ -2,12 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  calendarDayLayout,
+  calendarMutationReview,
   formatGmailLabel,
   gmailBatchSummary,
   gmailSenderName,
   gmailThreadDayGroups,
   gmailThreadReviews,
   gmailThreadUrl,
+  isCalendarCreateMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   looksAutomatedSender,
@@ -15,6 +18,174 @@ import {
   slackMarkReadGroups,
   slackMarkReadReview,
 } from './mutation-review.ts';
+
+test('a calendar create mutation becomes a complete day view with real conflicts and guests', () => {
+  const mutation = {
+    id: 'mut-calendar',
+    provider: 'google_calendar',
+    operation: 'calendar.create_event',
+    account: 'zach@example.test',
+    status: 'pending_review',
+    title: 'Create event: Pickleball',
+    result: {
+      calendar_id: 'primary',
+      event_id: 'created-pickleball',
+      response: {
+        id: 'created-pickleball',
+        htmlLink: 'https://calendar.google.com/calendar/event?eid=created-pickleball',
+        organizer: { email: 'zach@example.test' },
+      },
+    },
+    payload: {
+      calendar_id: 'primary',
+      send_updates: 'all',
+      event: {
+        summary: 'Pickleball at Davis Park',
+        description: 'PlayTime Scheduler session, 4.0–4.5.',
+        location: 'Davis Park',
+        start: { dateTime: '2026-09-05T09:00:00', timeZone: 'America/New_York' },
+        end: { dateTime: '2026-09-05T11:00:00', timeZone: 'America/New_York' },
+        attendees: [
+          { email: 'zach@example.test', displayName: 'Zach', self: true, responseStatus: 'accepted' },
+          { email: 'ada@example.test', displayName: 'Ada Lovelace', organizer: true, responseStatus: 'accepted' },
+          { email: 'grace@example.test', displayName: 'Grace Hopper', optional: true, responseStatus: 'needsAction' },
+        ],
+      },
+    },
+    preview: {
+      event: {
+        operation: 'create', calendar_id: 'primary', send_updates: 'all', summary: 'Pickleball at Davis Park',
+        description: 'PlayTime Scheduler session, 4.0–4.5.', location: 'Davis Park',
+        start: { dateTime: '2026-09-05T09:00:00', timeZone: 'America/New_York' },
+        end: { dateTime: '2026-09-05T11:00:00', timeZone: 'America/New_York' },
+        attendees: [
+          { email: 'zach@example.test', displayName: 'Zach', self: true, responseStatus: 'accepted' },
+          { email: 'ada@example.test', displayName: 'Ada Lovelace', organizer: true, responseStatus: 'accepted' },
+          { email: 'grace@example.test', displayName: 'Grace Hopper', optional: true, responseStatus: 'needsAction' },
+        ],
+      },
+      calendar_day: {
+        time_zone: 'America/New_York',
+        day_start: '2026-09-05T00:00:00-04:00',
+        day_end: '2026-09-06T00:00:00-04:00',
+        proposed_start_at: '2026-09-05T09:00:00-04:00',
+        proposed_end_at: '2026-09-05T11:00:00-04:00',
+        source_synced_at: '2026-09-02T20:46:00Z',
+        events: [
+          { event_id: 'early', calendar_id: 'primary', summary: 'Morning run', start_at: '2026-09-05T07:30:00-04:00', end_at: '2026-09-05T08:15:00-04:00' },
+          {
+            event_id: 'conflict', calendar_id: 'work', summary: 'Breakfast with Ada', location: 'Davis Square',
+            start_at: '2026-09-05T09:30:00-04:00', end_at: '2026-09-05T10:30:00-04:00', transparency: 'opaque',
+            attendees: [{ email: 'zach@example.test', self: true, responseStatus: 'accepted' }, { email: 'ada@example.test', displayName: 'Ada Lovelace' }],
+          },
+          {
+            event_id: 'declined', calendar_id: 'primary', summary: 'Declined hold',
+            start_at: '2026-09-05T09:15:00-04:00', end_at: '2026-09-05T09:45:00-04:00',
+            attendees: [{ email: 'zach@example.test', self: true, responseStatus: 'declined' }],
+          },
+          {
+            event_id: 'transparent', calendar_id: 'primary', summary: 'Travel time',
+            start_at: '2026-09-05T10:00:00-04:00', end_at: '2026-09-05T10:30:00-04:00', transparency: 'transparent',
+          },
+          { event_id: 'later', calendar_id: 'primary', summary: 'Lunch', start_at: '2026-09-05T12:30:00-04:00', end_at: '2026-09-05T13:30:00-04:00' },
+          // An executed request can already be visible in the next calendar
+          // sync. It remains the blue proposal, not a fake conflict with itself.
+          { event_id: 'created-pickleball', calendar_id: 'zach@example.test', summary: 'Pickleball at Davis Park', start_at: '2026-09-05T09:00:00-04:00', end_at: '2026-09-05T11:00:00-04:00' },
+          { event_id: 'all-day', calendar_id: 'primary', summary: 'Hack Club retreat', start_date: '2026-09-05', end_date: '2026-09-06', is_all_day: true },
+        ],
+      },
+    },
+  };
+
+  assert.equal(isCalendarCreateMutation(mutation), true);
+  assert.equal(isCalendarCreateMutation({ provider: 'google_calendar', operation: 'calendar.update_event' }), false);
+  const review = calendarMutationReview(mutation);
+  assert.equal(review.operation, 'create');
+  assert.equal(review.title, 'Pickleball at Davis Park');
+  assert.equal(review.dateLabel, 'Saturday, September 5');
+  assert.equal(review.timeLabel, '9:00–11:00 AM EDT');
+  assert.equal(review.durationLabel, '2 hr');
+  assert.equal(review.otherAttendees.length, 2);
+  assert.deepEqual(review.otherAttendees.map((attendee) => attendee.displayName), ['Ada Lovelace', 'Grace Hopper']);
+  assert.equal(review.otherAttendees[0].organizer, true);
+  assert.equal(review.otherAttendees[1].responseLabel, 'Awaiting reply');
+  assert.equal(review.conflicts.length, 2);
+  assert.deepEqual(review.conflicts.map((event) => event.title), ['Breakfast with Ada', 'Hack Club retreat']);
+  assert.equal(review.availability, 'conflict');
+  assert.equal(review.proposed.id, 'created-pickleball');
+  assert.equal(review.proposed.htmlLink, 'https://calendar.google.com/calendar/event?eid=created-pickleball');
+  assert.equal(review.proposed.organizerEmail, 'zach@example.test');
+  assert.equal(review.existingEvents.some((event) => event.id === 'created-pickleball'), false);
+  assert.equal(review.allDayEvents[0].title, 'Hack Club retreat');
+  assert.deepEqual(review.timedEvents.map((event) => event.title), [
+    'Morning run', 'Pickleball at Davis Park', 'Declined hold', 'Breakfast with Ada', 'Travel time', 'Lunch',
+  ]);
+  assert.equal(review.sourceSyncedAt, '2026-09-02T20:46:00Z');
+
+  const layout = calendarDayLayout(review);
+  assert.equal(layout.startHour, 6);
+  assert.equal(layout.endHour, 15);
+  const proposed = layout.blocks.find((block) => block.event.proposed);
+  const conflict = layout.blocks.find((block) => block.event.id === 'conflict');
+  assert.ok(proposed);
+  assert.ok(conflict);
+  assert.ok(proposed.columnCount > 1, 'overlapping events should occupy calendar lanes');
+  assert.equal(conflict.conflict, true);
+});
+
+test('a calendar review says when availability could not be loaded instead of claiming the time is clear', () => {
+  const mutation = {
+    provider: 'google_calendar', operation: 'calendar.create_event', account: 'zach@example.test',
+    payload: { event: { summary: 'Focus', start: { dateTime: '2026-09-05T09:00:00Z' }, end: { dateTime: '2026-09-05T10:00:00Z' } } },
+    preview: { event: { summary: 'Focus', start: { dateTime: '2026-09-05T09:00:00Z' }, end: { dateTime: '2026-09-05T10:00:00Z' } } },
+  };
+  const review = calendarMutationReview(mutation);
+  assert.equal(review.availability, 'unavailable');
+  assert.equal(review.conflicts.length, 0);
+  assert.equal(review.otherAttendees.length, 0);
+
+  const loaded = calendarMutationReview({
+    ...mutation,
+    preview: {
+      ...mutation.preview,
+      calendar_day: {
+        time_zone: 'UTC', day_start: '2026-09-05T00:00:00Z', day_end: '2026-09-06T00:00:00Z',
+        proposed_start_at: '2026-09-05T09:00:00Z', proposed_end_at: '2026-09-05T10:00:00Z', events: [],
+      },
+    },
+  });
+  assert.equal(loaded.availability, 'clear');
+});
+
+test('a multi-day add detects an all-day conflict on any covered date', () => {
+  const review = calendarMutationReview({
+    provider: 'google_calendar', operation: 'calendar.create_event', account: 'zach@example.test',
+    payload: {
+      event: {
+        summary: 'Offsite',
+        start: { date: '2026-09-05' },
+        end: { date: '2026-09-07' },
+      },
+    },
+    preview: {
+      calendar_day: {
+        time_zone: 'America/New_York',
+        day_start: '2026-09-05T00:00:00-04:00',
+        day_end: '2026-09-07T00:00:00-04:00',
+        proposed_start_at: '2026-09-05T00:00:00-04:00',
+        proposed_end_at: '2026-09-07T00:00:00-04:00',
+        proposed_start_date: '2026-09-05',
+        proposed_end_date: '2026-09-07',
+        proposed_is_all_day: true,
+        events: [
+          { event_id: 'sunday', summary: 'Retreat', start_date: '2026-09-06', end_date: '2026-09-07', is_all_day: true },
+        ],
+      },
+    },
+  });
+  assert.equal(review.durationLabel, '2 days');
+  assert.deepEqual(review.conflicts.map((event) => event.title), ['Retreat']);
+});
 
 test('Slack mark-read review explains the whole-conversation boundary', () => {
   const review = slackMarkReadReview({

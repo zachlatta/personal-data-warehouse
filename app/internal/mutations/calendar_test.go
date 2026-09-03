@@ -277,7 +277,16 @@ func TestNormalizeForStorageCalendarCreateEvent(t *testing.T) {
 				"start":   map[string]any{"dateTime": "2030-01-01T10:00:00", "timeZone": "UTC"},
 				"end":     map[string]any{"dateTime": "2030-01-01T10:30:00", "timeZone": "UTC"},
 				"attendees": []any{
-					map[string]any{"email": "one@example.test"},
+					map[string]any{
+						"email": "zach@example.test", "displayName": "Zach",
+						"responseStatus": "accepted", "organizer": true, "self": true,
+					},
+					map[string]any{
+						"email": "ada@example.test", "displayName": "Ada Lovelace",
+						"optional": true, "comment": "Bringing a guest",
+						"additionalGuests": 1,
+					},
+					map[string]any{"email": "room@example.test", "displayName": "Board room", "resource": true},
 				},
 			},
 		}},
@@ -306,6 +315,26 @@ func TestNormalizeForStorageCalendarCreateEvent(t *testing.T) {
 	}
 	if preview["operation"] != "create" {
 		t.Fatalf("preview operation = %#v", preview["operation"])
+	}
+	attendees := mapSliceFromAny(preview["attendees"])
+	if len(attendees) != 3 {
+		t.Fatalf("preview attendees = %#v", preview["attendees"])
+	}
+	for key, want := range map[string]any{"displayName": "Zach", "responseStatus": "accepted", "organizer": true, "self": true} {
+		if attendees[0][key] != want {
+			t.Fatalf("preview attendee 0 %s = %#v, want %#v (attendee=%#v)", key, attendees[0][key], want, attendees[0])
+		}
+	}
+	for key, want := range map[string]any{
+		"displayName": "Ada Lovelace", "optional": true,
+		"comment": "Bringing a guest", "additionalGuests": 1,
+	} {
+		if attendees[1][key] != want {
+			t.Fatalf("preview attendee 1 %s = %#v, want %#v (attendee=%#v)", key, attendees[1][key], want, attendees[1])
+		}
+	}
+	if attendees[2]["resource"] != true {
+		t.Fatalf("preview resource attendee = %#v", attendees[2])
 	}
 }
 

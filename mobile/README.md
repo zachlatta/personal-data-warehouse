@@ -27,9 +27,8 @@ ticket retires the device row rather than silently shrinking the fan-out.
 A mutation request is n mutations and n is routinely in the hundreds, so the
 review screen renders the batch as the thing it is about rather than as its
 payload. The pure part of that lives in `src/lib/mutation-review.ts` and has
-node tests (`npm test`, also run in CI before the OTA publish); the components
-are `src/components/gmail-thread-review.tsx` and
-`src/components/slack-read-review.tsx`.
+node tests (`npm test`, also run in CI before the OTA publish); the source-shaped
+components live in `src/components/*-review.tsx`.
 
 - **Gmail thread batches** (archive / unarchive / relabel) read as an inbox —
   sender, subject, snippet, time — grouped by the day each thread last moved,
@@ -40,6 +39,14 @@ are `src/components/gmail-thread-review.tsx` and
 - **Slack mark-read batches** show each speaker's profile picture and open that
   exact message in Slack on a tap, because the answer to "mark this read?" is
   often "let me reply first". Faces identify DM rows; channels keep their glyph.
+- **Calendar create-event mutations** read as a day calendar, not a flattened Google
+  payload. The event to add sits in the same time grid as every synced event on
+  the covered day, real busy overlaps are called out, all-day events stay
+  visible, and the full invite shows names, addresses, RSVP state, organizer,
+  optional guests, notification policy, location, description, reminders, and
+  the remaining technical payload on demand. Availability is hydrated when the
+  request is opened, so a pending request reflects calendar changes that landed
+  after it was proposed; a failed lookup says unavailable rather than "clear."
 - The day grouping keys on the reader's LOCAL day. Keying on the timestamp's UTC
   prefix splits one evening across two sections and labels both of them the same.
 
