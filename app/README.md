@@ -84,8 +84,10 @@ Both flows accept `--no-browser`, `--host` (default `127.0.0.1`), and
 `--port` (default `0`, an available port). For execution on Porygon and a
 browser on Crobat, use `--no-browser --host 127.0.0.1 --port <port>` and tunnel
 Crobat's loopback port to Porygon's listener. Open that loopback URL on Crobat.
-OAuth needs a configured, Plaid-registered redirect URI matching the browser's
-callback address. Never share callback URLs or tokens in chat or logs.
+Desktop web OAuth opens the bank in a popup and works without a redirect URI. A redirect
+URI is required for mobile SDK/webview integrations and recommended for mobile web; when
+configured in Production it must be registered with Plaid and use HTTPS (HTTP localhost is
+allowed only in Sandbox). Never share callback URLs or tokens in chat or logs.
 The CLI needs its existing Plaid configuration and warehouse access on the
 execution host; no credentials belong in command arguments.
 

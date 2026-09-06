@@ -2829,35 +2829,47 @@ isolated in `private.plaid_item_tokens`. Warehouse initialization provisions the
 Python read-only query runners assume that role for every user-authored query; never bypass this
 boundary or expose the token table through normal query surfaces.
 
+For a finance read or investigation, start with `pdw search` or bounded SQL over
+`timeline.events`, move to `marts_finance.*` / `marts_ops.*`, and drill into `base_plaid.*`
+only when the stable read interfaces are insufficient. Before writing SQL, run
+`pdw columns <relation>` for every relation whose columns are not already known; do not guess.
+
 Configure `PLAID_ACCOUNT`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV` on the machine doing
-interactive linking and in the production Dagster deployment. `pdw ingest plaid link` opens the
-localhost Plaid Link flow and persists the exchanged token; repeat it once per institution.
+interactive linking and in the production Dagster deployment. Use `pdw ingest plaid link` only
+for a genuinely new institution: it opens the localhost Plaid Link flow and persists the exchanged
+token. Never use it to repair an existing Item.
 `pdw ingest plaid items` lists what is linked; `pdw ingest plaid unlink <item-id>` retires one
-(revokes it at Plaid, then deletes exactly that Item's rows — see the re-link trap below).
+(revokes it at Plaid, then deletes exactly that Item's rows — use it only after deliberately
+confirming a duplicate Item, never as an automatic repair).
 `pdw ingest plaid sync` performs an immediate pull. Production uses the `plaid_finance_sync` asset
 and `plaid_finance_sync_every_thirty_minutes` schedule. Account, holding, and liability responses
 are authoritative snapshots: reconcile missing accounts/holdings/liabilities rather than leaving
 stale current rows. Product errors must persist a redacted `ops.plaid_sync_state` row before the run
 fails. The exception is a permanent Item error — `NO_ACCOUNTS`, `ITEM_LOGIN_REQUIRED`, and the rest
 of `PLAID_ACTION_REQUIRED_ERROR_CODES` — which no retry can clear: those record status
-`action_required` (keeping the prior cursor and last-success time so re-linking resumes instead of
+`action_required` (keeping the prior cursor and last-success time so an Item update resumes instead of
 replaying), warn in the run log, count in the asset's `action_required` metadata, and leave the run
 green. Otherwise one dead institution keeps the every-30-minutes schedule permanently red and
-buries the transient failures that are worth paging on. Repair by re-running
-`pdw ingest plaid link` for that institution; find them with
-`SELECT * FROM ops.plaid_sync_state WHERE status = 'action_required'`.
-**A cleared `action_required` is not the finish line.** Link only sometimes repairs the existing
-Item; it can just as well mint a NEW `item_id` with NEW account ids for the same real accounts and
-leave the dead Item linked beside it (this happened on 2026-07-25). Both Items then sync: every
+buries the transient failures that are worth paging on. Run `pdw ingest plaid items` to identify
+the exact existing Item, then repair its consent with `pdw ingest plaid update <item-id>`.
+Update mode uses that Item's existing access token and account selection; it must report that the
+Item identity and credential are unchanged plus `accounts available: N` with `N > 0`. A failed
+verification or zero available accounts returns nonzero and leaves the existing Item in place.
+
+**Historical duplicate trap.** Before update mode existed, a fresh Link run used as a repair only
+sometimes repaired the existing Item; it could instead mint a NEW `item_id` with NEW account ids
+for the same real accounts and leave the dead Item linked beside it (this happened on 2026-07-25).
+Both Items then sync: every
 balance is counted twice in `marts_finance.net_worth` and the transaction overlap is duplicated.
-After any re-link, assert the item count too —
-`SELECT institution_name, count(*) FROM base_plaid.items GROUP BY 1 HAVING count(*) > 1` — and retire
-the leftover with `pdw ingest plaid unlink <item-id>` (`--dry-run` first; the id may be an
-unambiguous prefix). Since 2026-08-28 `marts_ops.plaid_item_health` reads `duplicate` (with
+When auditing an old repair or suspected duplicate, start with `marts_ops.plaid_item_health`, which
+reads `duplicate` (with
 `duplicate_item_ids`) for every live Item whose live accounts share mask + type + subtype with
 another live Item at the same institution, because it happened a second time — two Capital One
 Items, both `ok`, both syncing, two `marts_finance.net_worth` rows per card — and every health
-surface stayed green for at least a day. The ledger side self-heals from there: plaid account identity resolves by
+surface stayed green for at least a day. Only after confirming which Item is the duplicate should
+an operator deliberately retire it with `pdw ingest plaid unlink <item-id>` (`--dry-run` first; the
+id may be an unambiguous prefix). Unlink is never an automatic `action_required` remediation. The
+ledger side self-heals from there: plaid account identity resolves by
 owner + institution + mask + side, so the surviving Item's accounts merge back into the logical
 accounts they duplicated, and the residue is pruned.
 Optional products default to read-only `transactions,investments,liabilities`; no

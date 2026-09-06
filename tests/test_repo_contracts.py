@@ -50,6 +50,7 @@ from personal_data_warehouse.timeline import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 README_MD = REPO_ROOT / "README.md"
+APP_README_MD = REPO_ROOT / "app/README.md"
 PYTHON_TESTS_WORKFLOW = REPO_ROOT / ".github/workflows/python-tests.yml"
 
 # The tier labels are stored as quoted SQL literals so they can be interpolated
@@ -348,6 +349,57 @@ def test_the_unclassified_sentinel_is_not_presented_as_a_sixth_tier() -> None:
         assert "sentinel" in window, (
             f"{path.name} mentions unclassified without saying it is a fail-loud sentinel"
         )
+
+
+@pytest.mark.parametrize("path", (AGENTS_MD, README_MD))
+def test_plaid_docs_use_update_mode_for_existing_item_repairs(path: Path) -> None:
+    """Repairing consent must preserve the existing Plaid Item identity.
+
+    Running a new Link flow for ``action_required`` can mint a second Item for
+    the same institution. Both Items then sync, double-counting balances and
+    transactions. The docs may retain that incident as history, but their
+    executable repair guidance must use update mode and reserve Link for a
+    genuinely new institution.
+    """
+
+    text = path.read_text()
+    section = text.split("## Plaid Finance", 1)[1].split("\n## ", 1)[0]
+    update_command = "`pdw ingest plaid update <item-id>`"
+    assert update_command in section, f"{path.name} does not name the existing-Item repair command"
+
+    update_at = section.index(update_command)
+    update_window = section[max(0, update_at - 300) : update_at + 500].lower()
+    assert "existing item" in update_window, f"{path.name} does not bind update mode to an existing Item"
+    assert "identity" in update_window, f"{path.name} does not require the repaired Item identity check"
+    assert "accounts available" in update_window, (
+        f"{path.name} does not require the post-update account-availability check"
+    )
+
+    link_command = "`pdw ingest plaid link`"
+    for match in re.finditer(re.escape(link_command), section):
+        link_window = section[max(0, match.start() - 250) : match.end() + 250].lower()
+        assert "new institution" in link_window, (
+            f"{path.name} mentions the Link command without reserving it for a new institution"
+        )
+
+    for stale_instruction in (
+        "repair by re-running `pdw ingest plaid link`",
+        "re-link that institution with `pdw ingest plaid link` to clear it",
+    ):
+        assert stale_instruction.lower() not in section.lower(), (
+            f"{path.name} still teaches repair-by-Link: {stale_instruction}"
+        )
+
+
+def test_plaid_desktop_oauth_does_not_require_a_redirect_uri() -> None:
+    """Plaid's desktop popup works without the mobile redirect prerequisite."""
+
+    text = APP_README_MD.read_text()
+    section = text.split("## Plaid CLI: repair an existing Item", 1)[1].split("\n## ", 1)[0]
+    assert "desktop web" in section.lower() and "without a redirect URI" in section
+    assert "mobile" in section.lower() and "webview" in section.lower() and "required" in section
+    assert "Production" in section and "HTTPS" in section
+    assert "HTTP localhost" in section and "Sandbox" in section
 
 
 def test_agents_md_has_a_general_add_a_source_checklist() -> None:

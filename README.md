@@ -577,6 +577,11 @@ The activity timeline reads the deduplicated ledger rather than the raw Plaid ta
 from `derived_finance.observations`, and `finance.document` events from `base_manual_finance.documents`. This
 keeps finance visible without showing the same transaction once per source witness.
 
+For a finance read or investigation, start with `pdw search` or bounded SQL over
+`timeline.events`, move to `marts_finance.*` / `marts_ops.*`, and drill into `base_plaid.*`
+only when the stable read interfaces are insufficient. Before writing SQL, run
+`pdw columns <relation>` for every relation whose columns are not already known; do not guess.
+
 Configure the `PLAID_*` variables below and ensure `POSTGRES_DATABASE_URL` points at the target
 warehouse:
 
@@ -592,7 +597,8 @@ PDW_QUERY_POSTGRES_ROLE=pdw_query      # NOLOGIN role assumed by user-authored S
 # PLAID_REDIRECT_URI=https://registered.example/plaid/oauth-return
 ```
 
-Keep the client secret in uncommitted environment/config only. Link one institution at a time:
+Keep the client secret in uncommitted environment/config only. Use Link only for a genuinely new
+institution, never to repair an existing Item:
 
 ```bash
 pdw ingest plaid link
@@ -607,7 +613,8 @@ cancellation and Plaid errors stop the local server and return an actionable CLI
 redirects resume the same Link token via Plaid's `receivedRedirectUri`; configure a fixed
 `--host`/`--port` whose callback URL matches the redirect registered in the Plaid dashboard (or
 route the registered HTTPS URL to it). Never paste access/public tokens into logs, issues, or
-committed files. Repeat `link` for each personal institution, then sync all linked items:
+committed files. Repeat `link` for each genuinely new personal institution, then sync all linked
+items:
 
 When Transactions is enabled, Link requests `PLAID_TRANSACTIONS_LOOKBACK_DAYS` of history. The
 setting defaults to Plaid's maximum of 730 days and also controls the Investments transaction
@@ -649,19 +656,28 @@ FROM ops.plaid_sync_state
 WHERE status = 'action_required';
 ```
 
-Re-link that institution with `pdw ingest plaid link` to clear it. The prior cursor and last
-successful sync time are preserved, so re-linking resumes rather than replaying all history — but
-only when Link repairs the existing Item. Plaid may instead mint a **new** `item_id` with new
-account ids for the same real accounts, leaving the dead Item linked alongside it. Both then sync,
-so every balance is counted twice in `marts_finance.net_worth` and every transaction in the
-overlap window appears twice in `marts_finance.transactions`. A cleared `action_required` is
-therefore not the finish line; check the item count too:
+Run `pdw ingest plaid items` to identify the exact existing Item, then repair its consent with
+`pdw ingest plaid update <item-id>`. Update mode uses that Item's existing access token and account
+selection. Success must report that the Item identity and credential are unchanged plus
+`accounts available: N` with `N > 0`; a failed verification or zero available accounts returns
+nonzero and leaves the existing Item in place.
+
+Before update mode existed, using a fresh Link run as a repair could instead mint a **new**
+`item_id` with new account ids for the same real accounts, leaving the dead Item linked alongside
+it. Both then sync, so every balance is counted twice in `marts_finance.net_worth` and every
+transaction in the overlap window appears twice in `marts_finance.transactions`. Preserve that
+history as a diagnostic: start a suspected-duplicate check at the stable health interface, then
+drill into source rows only if needed:
 
 ```sql
-SELECT institution_name, count(*) FROM base_plaid.items GROUP BY 1 HAVING count(*) > 1;
+SELECT item_id, institution_name, status, duplicate_item_ids, account_count
+FROM marts_ops.plaid_item_health
+WHERE status = 'duplicate';
 ```
 
-Retire the leftover Item — this revokes it at Plaid (`/item/remove`) and deletes exactly that
+Do not automatically unlink an Item because update failed or `action_required` remains. Only after
+confirming which live Item duplicates the same real institution and accounts should an operator
+deliberately retire the loser. This revokes it at Plaid (`/item/remove`) and deletes exactly that
 Item's rows (accounts, transactions, holdings, liabilities, sync state, and its access token):
 
 ```bash
