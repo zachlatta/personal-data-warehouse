@@ -4665,28 +4665,44 @@ class PostgresWarehouse:
             classified AS (
                 SELECT
                     measured.*,
-                    -- A view is only ever as fresh as the stalest PIPELINE
-                    -- feeding it, and each is judged against ITS OWN expected
-                    -- interval: marts_ai_conversations.events unions six agent
-                    -- sources whose expectations differ by an order of
-                    -- magnitude, so a single global threshold would permanently
-                    -- nominate whichever one is legitimately the quietest.
-                    -- Per pipeline rather than per table -- see
-                    -- _roll_up_inputs: a pipeline's own freshness is a max()
-                    -- over its data tables, so judging one quiet table against
-                    -- the whole pipeline's interval manufactures staleness.
-                    CASE
-                        WHEN stalest_pipeline_at IS NULL
-                          OR stalest_pipeline_expected_seconds = 0 THEN 'unmeasured'
-                        WHEN now() - stalest_pipeline_at > make_interval(
-                            secs => stalest_pipeline_expected_seconds
-                                    * {STALE_MULTIPLIER}) THEN 'stale'
-                        WHEN now() - stalest_pipeline_at > make_interval(
-                            secs => stalest_pipeline_expected_seconds
-                                    * {LATE_MULTIPLIER}) THEN 'late'
-                        ELSE 'ok'
-                    END AS input_status
+                    input_health.input_status
                 FROM measured
+                CROSS JOIN LATERAL (
+                    -- Reuse the level-1 verdict for every DECLARED input. That
+                    -- keeps the per-pipeline freshness tradeoff in
+                    -- _roll_up_inputs / marts_ops.pipeline_health while also
+                    -- carrying declared state failures and attention through
+                    -- to the mart. A fresh write from one Plaid Item, for
+                    -- example, must not hide another Item's action_required
+                    -- state from every Plaid-backed mart.
+                    SELECT CASE
+                        WHEN cardinality(measured.input_pipelines) = 0 THEN 'unmeasured'
+                        WHEN bool_or(upstream.status = 'failing') THEN 'failing'
+                        WHEN bool_or(upstream.status = 'attention') THEN 'attention'
+                        WHEN bool_or(upstream.status = 'stale') THEN 'stale'
+                        WHEN bool_or(upstream.status = 'late') THEN 'late'
+                        -- A declared dependency with no level-1 row is a gap
+                        -- in the health snapshot, not evidence that the input
+                        -- is healthy. Unknown level-1 rows mean the same thing.
+                        WHEN count(upstream.pipeline)
+                             < cardinality(measured.input_pipelines)
+                          OR bool_or(upstream.status = 'unknown') THEN 'unknown'
+                        -- no_data and manual are not failures. Preserve the
+                        -- existing per-pipeline roll-up tradeoff: one healthy
+                        -- input keeps a multi-source mart current even when a
+                        -- quiet input has never emitted data. Unlike a declared
+                        -- failure/attention state, silence must not override a
+                        -- fresh successful writer.
+                        WHEN bool_or(upstream.status = 'ok') THEN 'ok'
+                        WHEN bool_or(upstream.status = 'manual') THEN 'manual'
+                        WHEN bool_or(upstream.status = 'no_data') THEN 'no_data'
+                        ELSE 'unknown'
+                    END AS input_status
+                    FROM unnest(measured.input_pipelines)
+                        AS declared_input(pipeline)
+                    LEFT JOIN @marts_pipeline_health AS upstream
+                      ON upstream.pipeline = declared_input.pipeline
+                ) AS input_health
             )
             SELECT
                 view_id,
@@ -4701,10 +4717,15 @@ class PostgresWarehouse:
                       OR now() - collected_at > make_interval(
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
                     WHEN probe_status IN ('error', 'missing') THEN 'failing'
+                    WHEN input_status = 'failing' THEN 'failing'
                     WHEN probe_status = 'timeout' THEN 'attention'
+                    WHEN input_status = 'attention' THEN 'attention'
                     WHEN input_status = 'stale' THEN 'stale'
                     WHEN input_status = 'late' THEN 'late'
+                    WHEN input_status = 'unknown' THEN 'unknown'
                     WHEN probe_status = 'empty' THEN 'no_data'
+                    WHEN input_status = 'no_data' THEN 'no_data'
+                    WHEN input_status = 'manual' THEN 'manual'
                     ELSE 'ok'
                 END AS status,
                 input_status,

@@ -1428,6 +1428,196 @@ def test_a_stale_input_makes_the_mart_that_reads_it_stale(warehouse):
     assert row["stalest_pipeline_expected_seconds"] == int(stale_by.total_seconds())
 
 
+def test_declared_upstream_failure_attention_and_recovery_reach_the_mart(warehouse):
+    """A fresh write from one Item cannot hide another Item's declared trouble.
+
+    The mart probe remains successful throughout: ``failing`` and ``attention``
+    come from the declared Plaid input, not from a fabricated SQL probe error.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @plaid_investment_holdings
+            (account, item_id, account_id, security_id, synced_at)
+        VALUES ('z@x.test', 'item-healthy', 'account-1', 'security-1', %s)
+        """,
+        (now,),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @plaid_sync_state
+            (account, item_id, product, status, error, updated_at)
+        VALUES ('z@x.test', 'item-troubled', 'transactions', %s, %s, %s)
+        """,
+        ("error", "upstream request failed", now),
+    )
+
+    def collect() -> tuple[dict, dict]:
+        PipelineHealthCollector(warehouse).run_all()
+        pipeline_row = warehouse._query_dicts(
+            "SELECT status FROM @marts_pipeline_health WHERE pipeline = 'plaid'"
+        )[0]
+        mart_row = warehouse._query_dicts(
+            "SELECT status, input_status, probe_status, probe_detail, input_pipelines"
+            " FROM @marts_mart_view_health"
+            " WHERE view_id = 'marts_finance_investment_holdings'"
+        )[0]
+        return pipeline_row, mart_row
+
+    pipeline_row, mart_row = collect()
+    assert pipeline_row["status"] == "failing"
+    assert mart_row["input_pipelines"] == ["plaid"]
+    assert mart_row["input_status"] == "failing"
+    assert mart_row["status"] == "failing"
+    assert mart_row["probe_status"] == PROBE_OK
+    assert mart_row["probe_detail"] is None
+
+    warehouse._command(
+        "UPDATE @plaid_sync_state"
+        " SET status = 'action_required', error = 're-link required', updated_at = %s",
+        (now,),
+    )
+    pipeline_row, mart_row = collect()
+    assert pipeline_row["status"] == "attention"
+    assert mart_row["input_status"] == "attention"
+    assert mart_row["status"] == "attention"
+    assert mart_row["probe_status"] == PROBE_OK
+
+    warehouse._command(
+        "UPDATE @plaid_sync_state SET status = 'ok', error = '', updated_at = %s",
+        (now,),
+    )
+    pipeline_row, mart_row = collect()
+    assert pipeline_row["status"] == "ok"
+    assert mart_row["input_status"] == "ok"
+    assert mart_row["status"] == "ok"
+
+
+def test_an_unrelated_failed_pipeline_does_not_colour_the_mart(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @plaid_investment_holdings
+            (account, item_id, account_id, security_id, synced_at)
+        VALUES ('z@x.test', 'item-healthy', 'account-1', 'security-1', %s)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+    warehouse._command(
+        "UPDATE @pipeline_health SET state_error_rows = 1 WHERE pipeline = 'gmail'"
+    )
+
+    gmail_status = warehouse._query_dicts(
+        "SELECT status FROM @marts_pipeline_health WHERE pipeline = 'gmail'"
+    )[0]["status"]
+    mart_row = warehouse._query_dicts(
+        "SELECT status, input_status FROM @marts_mart_view_health"
+        " WHERE view_id = 'marts_finance_investment_holdings'"
+    )[0]
+    assert gmail_status == "failing"
+    assert mart_row == {"status": "ok", "input_status": "ok"}
+
+
+def test_missing_declared_input_snapshot_is_unknown_not_accidentally_ok(warehouse):
+    _provision_every_table(warehouse)
+    PipelineHealthCollector(warehouse).run_all()
+    warehouse._command("DELETE FROM @pipeline_health WHERE pipeline = 'plaid'")
+
+    row = warehouse._query_dicts(
+        "SELECT status, input_status, input_pipelines"
+        " FROM @marts_mart_view_health"
+        " WHERE view_id = 'marts_finance_investment_holdings'"
+    )[0]
+    assert row["input_pipelines"] == ["plaid"]
+    assert row["input_status"] == "unknown"
+    assert row["status"] == "unknown"
+
+
+def test_manual_and_empty_input_states_remain_explicit_non_failures(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @plaid_investment_holdings
+            (account, item_id, account_id, security_id, synced_at)
+        VALUES ('z@x.test', 'item-healthy', 'account-1', 'security-1', %s)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    # Exercise the real read-time pipeline classifier with the same stored
+    # facts an intentional manual pipeline has: a fresh write and no cadence.
+    warehouse._command(
+        "UPDATE @pipeline_health"
+        " SET expected_data_interval_seconds = 0, expected_run_interval_seconds = 0"
+        " WHERE pipeline = 'plaid'"
+    )
+    manual = warehouse._query_dicts(
+        "SELECT status, input_status, probe_status FROM @marts_mart_view_health"
+        " WHERE view_id = 'marts_finance_investment_holdings'"
+    )[0]
+    assert manual == {
+        "status": "manual",
+        "input_status": "manual",
+        "probe_status": PROBE_OK,
+    }
+
+    warehouse._command("DELETE FROM @plaid_investment_holdings")
+    PipelineHealthCollector(warehouse).run_all()
+    empty = warehouse._query_dicts(
+        "SELECT status, input_status, probe_status FROM @marts_mart_view_health"
+        " WHERE view_id = 'marts_finance_investment_holdings'"
+    )[0]
+    assert empty == {
+        "status": "no_data",
+        "input_status": "no_data",
+        "probe_status": PROBE_EMPTY,
+    }
+
+
+def test_mart_probe_failures_keep_their_own_severity_and_detail(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @plaid_investment_holdings
+            (account, item_id, account_id, security_id, synced_at)
+        VALUES ('z@x.test', 'item-healthy', 'account-1', 'security-1', %s)
+        """,
+        (now,),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    def classify(probe_status: str) -> dict:
+        warehouse._command(
+            "UPDATE @mart_view_health SET probe_status = %s, probe_detail = 'probe fact'"
+            " WHERE view_id = 'marts_finance_investment_holdings'",
+            (probe_status,),
+        )
+        return warehouse._query_dicts(
+            "SELECT status, input_status, probe_status, probe_detail"
+            " FROM @marts_mart_view_health"
+            " WHERE view_id = 'marts_finance_investment_holdings'"
+        )[0]
+
+    assert classify("error") == {
+        "status": "failing",
+        "input_status": "ok",
+        "probe_status": "error",
+        "probe_detail": "probe fact",
+    }
+    assert classify("timeout") == {
+        "status": "attention",
+        "input_status": "ok",
+        "probe_status": "timeout",
+        "probe_detail": "probe fact",
+    }
+
+
 def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
     """Not simply the oldest input.
 
@@ -1648,10 +1838,11 @@ def test_a_mart_is_never_more_broken_than_the_pipelines_feeding_it(warehouse):
     ``finance_ledger``'s three-hour interval — while the ledger was writing
     balance observations every half hour exactly as designed.
 
-    So the invariant is: a mart's input_status can never be worse than the
-    worst data_status of the pipelines feeding it. The per-table detail lives in
-    marts_ops.table_freshness, which is where a quiet table inside a healthy
-    pipeline belongs.
+    So the freshness invariant is: a quiet table or no-data sibling cannot make
+    a mart more broken than the rolled-up pipelines feeding it. Declared
+    failure and attention states from those pipelines intentionally still pass
+    through. Per-table detail lives in marts_ops.table_freshness, which is where
+    a quiet table inside a healthy pipeline belongs.
     """
     _provision_every_table(warehouse)
     now = datetime.now(tz=UTC)
