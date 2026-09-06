@@ -3836,7 +3836,8 @@ class TimelineSyncEngine:
             total += len(rows)
             self._bump_counter(adapter, "incremental_rows", len(rows))
             last = rows[-1]
-            cursor_ts, cursor_id = last[3], last[0]
+            # Reconcile pages by ingest time, unlike the event-time backfill.
+            cursor_ts, cursor_id = last[12], last[0]
             if len(rows) < limit:
                 break
         state.last_reconcile_at = datetime.now(tz=UTC)

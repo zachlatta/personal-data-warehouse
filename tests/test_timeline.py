@@ -2741,6 +2741,77 @@ def test_coverage_reconcile_repairs_a_gap_whatever_caused_it(warehouse):
     assert repaired == before
 
 
+@pytest.mark.parametrize("event_skew_days", [-365, 1, 0], ids=["backdated", "future", "fresh"])
+def test_coverage_reconcile_pages_by_ingest_time(warehouse, monkeypatch, event_skew_days):
+    """The ingest keyset must cross pages even when event order disagrees."""
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse, batch_size=2)
+    try:
+        engine.run()
+        before = warehouse._query_dicts(
+            "SELECT adapter, event_id, seq FROM @timeline_events ORDER BY adapter, event_id"
+        )
+        slack = adapter_by_name("slack_message")
+        state = engine._load_state(slack)
+        state.last_reconcile_at = datetime(1970, 1, 1, tzinfo=UTC)
+        now = datetime.now(tz=UTC)
+        # Three equal ingest stamps straddle a page boundary. Event order is
+        # deliberately different, including for the fresh (zero-day skew) case.
+        stamps = {}
+        for n, minutes in enumerate([3, 1, 2, 1, 1]):
+            event_id = f"z|T1|C1|reconcile-{n}"
+            ingest = now - timedelta(minutes=minutes)
+            stamps[event_id] = ingest
+            warehouse._command(
+                """
+                INSERT INTO @slack_messages (
+                    account, team_id, conversation_id, message_ts,
+                    message_datetime, user_id, text, synced_at
+                ) VALUES ('z', 'T1', 'C1', %s, %s, 'U1', 'reconcile fixture', %s)
+                """,
+                (f"reconcile-{n}", now + timedelta(days=event_skew_days, minutes=-n), ingest),
+            )
+        warehouse._command(
+            """
+            INSERT INTO @slack_messages (
+                account, team_id, conversation_id, message_ts,
+                message_datetime, user_id, text, synced_at
+            ) VALUES ('z', 'T1', 'C1', 'outside-window', %s, 'U1', 'outside window', %s)
+            """,
+            (now, now - timedelta(hours=slack.reconcile_hours + 1)),
+        )
+        expected = sorted(stamps, key=lambda event_id: (stamps[event_id], event_id), reverse=True)
+        pages = []
+        fetch = engine._fetch
+
+        def record_fetch(sql, params):
+            assert len(pages) < 4, "reconciliation did not terminate"
+            rows = fetch(sql, params)
+            pages.append((params.copy(), [row[0] for row in rows]))
+            return rows
+
+        monkeypatch.setattr(engine, "_fetch", record_fetch)
+        # Do not run incremental/backfill: either could mask the missing rows.
+        repaired = engine._run_coverage_reconcile(slack, state, None)
+        after = warehouse._query_dicts(
+            "SELECT adapter, event_id, seq FROM @timeline_events ORDER BY adapter, event_id"
+        )
+        assert repaired == len(expected)
+        assert [event_id for _, ids in pages for event_id in ids] == expected
+        assert len(pages) == 3
+        for page, previous_last in zip(pages[1:], [expected[1], expected[3]], strict=True):
+            assert (page[0]["cursor_ts"], page[0]["cursor_id"]) == (
+                stamps[previous_last], previous_last
+            )
+        assert [row for row in after if row["event_id"] not in stamps] == before
+        assert [(row["adapter"], row["event_id"]) for row in after if row["event_id"] in stamps] == [
+            ("slack_message", event_id) for event_id in sorted(expected)
+        ]
+    finally:
+        engine.close()
+
+
 def test_incremental_recovers_a_row_written_within_the_replay_window(warehouse):
     """A late commit just behind the stored watermark must still land.
 
