@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 
+from personal_data_warehouse.agent_runner import AgentRunEvent, AgentRunResult
 from personal_data_warehouse.receipt_enrichment import (
     DECISION_FOUND,
     DECISION_INSUFFICIENT,
@@ -12,6 +13,7 @@ from personal_data_warehouse.receipt_enrichment import (
     SOURCE_GMAIL_ATTACHMENT,
     SOURCE_GMAIL_MESSAGE,
     SOURCE_PHOTO,
+    ReceiptEnrichmentRunner,
     merge_usage,
     record_id_for,
     transaction_prompt,
@@ -288,3 +290,94 @@ def test_row_builder_covers_the_transaction_receipt_table():
     from personal_data_warehouse.schema import RECEIPT_TRANSACTION_RECEIPT_COLUMNS
 
     assert set(RECEIPT_TRANSACTION_RECEIPT_COLUMNS) <= set(_row())
+
+
+def test_failed_receipt_run_persists_its_diagnostic_events_once() -> None:
+    class Warehouse:
+        def __init__(self) -> None:
+            self.agent_runs = []
+            self.agent_run_event_batches = []
+            self.receipt_rows = []
+            self.ensure_agent_calls = 0
+
+        def ensure_receipt_tables(self) -> None:
+            pass
+
+        def ensure_agent_tables(self) -> None:
+            self.ensure_agent_calls += 1
+
+        def _query_dicts(self, sql, params):
+            return [dict(TRANSACTION)]
+
+        def insert_agent_runs(self, rows) -> None:
+            self.agent_runs.extend(rows)
+
+        def insert_agent_run_events(self, rows) -> None:
+            self.agent_run_event_batches.append(list(rows))
+
+        def insert_receipt_transaction_receipts(self, rows) -> None:
+            self.receipt_rows.extend(rows)
+
+    class Agent:
+        def run_with_pdw(self, request):
+            return failed_result
+
+    class Logger:
+        def info(self, message) -> None:
+            pass
+
+        def warning(self, message) -> None:
+            pass
+
+    failed_result = AgentRunResult(
+        run_id="run-failed",
+        provider="codex",
+        model="gpt-test",
+        task_type="receipt_transaction_match",
+        subject_id="ft_1",
+        prompt_version=PROMPT_VERSION,
+        input_sha256="sha",
+        status="error",
+        final_output_json={},
+        error="agent container exited with code 1: fatal",
+        exit_code=1,
+        started_at=NOW,
+        completed_at=NOW,
+        events=[
+            AgentRunEvent(
+                event_index=0,
+                stream="stdout",
+                event_type="turn.failed",
+                event_json={"type": "turn.failed", "error": {"message": "fatal"}},
+                text='{"type":"turn.failed","error":{"message":"fatal"}}',
+                created_at=NOW,
+            ),
+            AgentRunEvent(
+                event_index=1,
+                stream="stderr",
+                event_type="text",
+                event_json={"text": "warning: executable directory is not on PATH"},
+                text="warning: executable directory is not on PATH",
+                created_at=NOW,
+            ),
+        ],
+    )
+    warehouse = Warehouse()
+    summary = ReceiptEnrichmentRunner(
+        warehouse=warehouse,
+        agent=Agent(),
+        logger=Logger(),
+        provider="codex",
+        model="gpt-test",
+        now=NOW,
+    ).sync()
+
+    assert summary.candidates == 1
+    assert summary.failed == 1
+    assert summary.researched == 0
+    assert warehouse.ensure_agent_calls == 1
+    assert [row["run_id"] for row in warehouse.agent_runs] == ["run-failed"]
+    assert len(warehouse.agent_run_event_batches) == 1
+    assert [row["event_index"] for row in warehouse.agent_run_event_batches[0]] == [0, 1]
+    assert warehouse.agent_run_event_batches[0][0]["event_type"] == "turn.failed"
+    assert warehouse.receipt_rows == []

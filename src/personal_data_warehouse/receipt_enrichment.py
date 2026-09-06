@@ -720,17 +720,27 @@ class ReceiptEnrichmentRunner:
         return claimed
 
     def _record_agent_result(self, result) -> None:
-        """Persist the agent run into ops.ai_processing_agent_runs.
+        """Persist the agent run and its diagnostic stream.
 
         Every other agent-backed enrichment records its runs there; receipts
         silently didn't, leaving weeks of decisions invisible to the shared
-        agent-run failure monitoring. Run row only — receipt decisions carry
-        their own audit trail in derived_finance.transaction_receipts.
+        agent-run failure monitoring. Receipt decisions keep their own audit
+        trail in derived_finance.transaction_receipts, while failed calls have
+        no decision row and need the shared event table to retain their bounded
+        stdout/stderr evidence.
         """
-        from personal_data_warehouse.agent_runner import agent_run_row
+        from personal_data_warehouse.agent_runner import agent_run_event_rows, agent_run_row
 
         self._warehouse.ensure_agent_tables()
         self._warehouse.insert_agent_runs([agent_run_row(result)])
+        insert_events = getattr(self._warehouse, "insert_agent_run_events", None)
+        if not callable(insert_events):
+            # Lightweight Warehouse protocol implementations predating the
+            # shared event table can still record the run-level heartbeat.
+            return
+        event_rows = agent_run_event_rows(result)
+        if event_rows:
+            insert_events(event_rows)
 
     def _known_evidence(self, result: Mapping[str, Any]) -> set[tuple[str, str]]:
         known: set[tuple[str, str]] = set()

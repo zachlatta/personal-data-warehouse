@@ -812,13 +812,65 @@ def load_agent_final_output(
 
 
 def agent_exit_error(*, exit_code: int, events: Sequence[AgentRunEvent]) -> str:
-    details = last_error_event_text(events)
-    if details:
-        return f"agent container exited with code {exit_code}: {details}"
+    fatal = _last_structured_failure_text(events)
+    if fatal:
+        return f"agent container exited with code {exit_code}: {fatal}"
+    diagnostic = _last_failure_diagnostic(events)
+    if diagnostic:
+        # stderr can contain a startup warning that is unrelated to the exit.
+        # Keep it useful without presenting a synthesized last line as the
+        # exact root cause when the agent emitted no structured fatal event.
+        return f"agent container exited with code {exit_code}; last diagnostic: {diagnostic}"
     return f"agent container exited with code {exit_code}"
 
 
 def last_error_event_text(events: Sequence[AgentRunEvent]) -> str:
+    return _last_structured_failure_text(events) or _last_failure_diagnostic(events)
+
+
+def _last_structured_failure_text(events: Sequence[AgentRunEvent]) -> str:
+    for event in reversed(events):
+        payload = event.event_json
+        event_type = event.event_type.strip().lower()
+        status = str(payload.get("status") or payload.get("subtype") or "").strip().lower()
+        is_failure = (
+            "error" in event_type
+            or "fatal" in event_type
+            or event_type.endswith(".failed")
+            or status in {"error", "failed", "fatal", "error_during_execution"}
+            or status.startswith("error_")
+            or payload.get("is_error") is True
+        )
+        if not is_failure:
+            continue
+        for value in (
+            payload.get("message"),
+            payload.get("error"),
+            payload.get("detail"),
+            payload.get("result"),
+        ):
+            text = _structured_diagnostic_text(value)
+            if text:
+                return text[-1000:]
+        text = event.text.strip()
+        if text:
+            return text[-1000:]
+    return ""
+
+
+def _structured_diagnostic_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("message", "error", "detail", "reason"):
+            text = _structured_diagnostic_text(value.get(key))
+            if text:
+                return text
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return ""
+
+
+def _last_failure_diagnostic(events: Sequence[AgentRunEvent]) -> str:
     for event in reversed(events):
         text = event.text.strip()
         if not text:

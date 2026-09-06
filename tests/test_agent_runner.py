@@ -579,6 +579,50 @@ def test_container_agent_runner_reports_nonzero_exit_stderr_before_json_parse_er
     assert "Input exceeds the maximum length" in result.error
 
 
+def test_container_agent_runner_prefers_structured_fatal_event_over_stderr_warning(tmp_path) -> None:
+    def fake_run(command, **kwargs):
+        if is_run_volume_copy(command):
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if is_agent_container_run(command):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout=(
+                    '{"type":"turn.failed","error":{"message":"structured fatal failure"}}\n'
+                ),
+                stderr="warning: executable directory is not on PATH\n",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"))
+
+    assert result.status == "error"
+    assert "structured fatal failure" in result.error
+    assert "not on PATH" not in result.error
+
+
+def test_container_agent_runner_labels_plain_stderr_as_a_bounded_diagnostic(tmp_path) -> None:
+    def fake_run(command, **kwargs):
+        if is_run_volume_copy(command):
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if is_agent_container_run(command):
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="x" * 1_200)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-1"))
+
+    assert result.status == "error"
+    assert "last diagnostic:" in result.error
+    assert result.error.endswith("x" * 1_000)
+    assert len(result.error) < 1_100
+
+
 def test_auth_command_uses_subscription_volume_without_api_keys() -> None:
     command = auth_docker_command(
         provider="codex",

@@ -355,6 +355,13 @@ class StateSource:
     #: recent by definition, because every retry re-stamps ``updated_column``;
     #: an error that has stopped being re-stamped is history, not state.
     error_window: timedelta | None = None
+    #: For an append-only attempt table, identify the logical work whose most
+    #: recent attempt is its current outcome.  This is deliberately opt-in:
+    #: ordinary sync-state tables already store one current row per scope and
+    #: must never have their distinct rows collapsed.  Raw attempt counts are
+    #: still reported through ``state_rows``; only alarm counts and banners use
+    #: the latest outcome for each declared work key.
+    history_key_columns: tuple[str, ...] = ()
 
 
 #: ``expected_event_interval`` sentinel meaning "judge event time on the data
@@ -993,6 +1000,15 @@ PIPELINES: tuple[Pipeline, ...] = (
             scope_value="receipt_transaction_match",
             # One row per agent run, never revisited: history, so windowed.
             error_window=timedelta(days=7),
+            # A retry is the same work only when the subject and the exact
+            # prompt/input identity agree.  A success for another transaction,
+            # prompt revision, or changed input must not hide this failure.
+            history_key_columns=(
+                "task_type",
+                "subject_id",
+                "prompt_version",
+                "input_sha256",
+            ),
         ),
         note="the heartbeat advances only when a transaction was due; idle hours are not runs",
     ),
@@ -2140,6 +2156,7 @@ class PipelineHealthCollector:
         relation = canonical_relation(source.table).with_namespace(self._warehouse.schema_namespace)
         updated = _ident(source.updated_column)
         selects = [f"max({updated})::timestamptz AS last_run_at", "count(*)::bigint AS rows"]
+        current_outcome = " AND __history_rank = 1" if source.history_key_columns else ""
         # A history table's old failures are not its current state -- see
         # StateSource.error_window. Unset (the ops.*_sync_state default) keeps
         # every row, because there one row IS the scope's state.
@@ -2149,10 +2166,10 @@ class PipelineHealthCollector:
         if source.status_column:
             status = _ident(source.status_column)
             selects.append(
-                f"count(*) FILTER (WHERE {status} = ANY(%(errors)s){recent})::bigint AS error_rows"
+                f"count(*) FILTER (WHERE {status} = ANY(%(errors)s){current_outcome}{recent})::bigint AS error_rows"
             )
             selects.append(
-                f"count(*) FILTER (WHERE {status} = ANY(%(attention)s){recent})::bigint"
+                f"count(*) FILTER (WHERE {status} = ANY(%(attention)s){current_outcome}{recent})::bigint"
                 " AS attention_rows"
             )
         else:
@@ -2168,6 +2185,7 @@ class PipelineHealthCollector:
             error_filter = f"COALESCE({error}, '') != ''"
             if source.status_column:
                 error_filter += f" AND {_ident(source.status_column)} = ANY(%(alarm)s)"
+            error_filter += current_outcome
             # Same window as the count, or the banner quotes a failure that no
             # longer colours the row.
             error_filter += recent
@@ -2182,9 +2200,20 @@ class PipelineHealthCollector:
         else:
             selects.append("'' AS last_error")
             selects.append("NULL::timestamptz AS last_error_at")
-        sql = (
-            f"SELECT {', '.join(selects)} FROM {_ident(relation.schema)}.{_ident(relation.name)}"
-        )
+        relation_sql = f"{_ident(relation.schema)}.{_ident(relation.name)}"
+        scope_sql = ""
+        if source.scope_column:
+            scope_sql = f" WHERE {_ident(source.scope_column)} = %(scope)s"
+        if source.history_key_columns:
+            work_key = ", ".join(_ident(column) for column in source.history_key_columns)
+            from_sql = (
+                "(SELECT state_history_source.*, row_number() OVER ("
+                f"PARTITION BY {work_key} ORDER BY {updated} DESC) AS __history_rank "
+                f"FROM {relation_sql} AS state_history_source{scope_sql}) AS state_history"
+            )
+        else:
+            from_sql = relation_sql
+        sql = f"SELECT {', '.join(selects)} FROM {from_sql}"
         params: dict[str, Any] = {
             "errors": list(source.error_statuses),
             "attention": list(source.attention_statuses),
@@ -2193,8 +2222,9 @@ class PipelineHealthCollector:
         if source.error_window is not None:
             params["error_window"] = f"{int(source.error_window.total_seconds())} seconds"
         if source.scope_column:
-            sql += f" WHERE {_ident(source.scope_column)} = %(scope)s"
             params["scope"] = source.scope_value
+            if not source.history_key_columns:
+                sql += scope_sql
         try:
             rows = self._warehouse._query_dicts(sql, params)
         except psycopg2.Error as error:

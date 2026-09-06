@@ -2025,6 +2025,12 @@ def test_receipt_heartbeat_reads_only_the_receipt_agents_runs():
     assert entry.state.table == "agent_runs"
     assert entry.state.scope_column == "task_type"
     assert entry.state.scope_value == RECEIPT_AGENT_TASK_TYPE
+    assert entry.state.history_key_columns == (
+        "task_type",
+        "subject_id",
+        "prompt_version",
+        "input_sha256",
+    )
 
 
 def test_a_failed_voice_memo_enrichment_reads_failing(warehouse):
@@ -2099,6 +2105,155 @@ def test_a_failed_receipt_agent_run_reads_failing_and_other_agents_do_not(wareho
     assert row["status"] == "failing"
     assert row["state_error_rows"] == 1
     assert "container exited 1" in row["last_error"]
+
+
+def test_receipt_health_reports_only_the_latest_outcome_for_the_same_work(warehouse):
+    """Recovered work is healthy without erasing distinct unresolved attempts.
+
+    ``agent_runs`` is append-only.  A successful retry therefore has to clear
+    the current incident by work identity, while failures for an old prompt or
+    changed input remain independent until their seven-day window expires.
+    """
+    from personal_data_warehouse.receipt_enrichment import RECEIPT_AGENT_TASK_TYPE
+
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+
+    def insert_run(
+        run_id: str,
+        *,
+        subject_id: str,
+        prompt_version: str,
+        input_sha256: str,
+        status: str,
+        error: str,
+        started_at: datetime,
+        task_type: str = RECEIPT_AGENT_TASK_TYPE,
+    ) -> None:
+        warehouse._command(
+            """
+            INSERT INTO @agent_runs
+                (run_id, provider, model, task_type, subject_id, prompt_version,
+                 status, input_sha256, error, started_at, completed_at, sync_version)
+            VALUES (%s, 'codex', 'm', %s, %s, %s, %s, %s, %s, %s, %s, 1)
+            """,
+            (
+                run_id,
+                task_type,
+                subject_id,
+                prompt_version,
+                status,
+                input_sha256,
+                error,
+                started_at,
+                started_at,
+            ),
+        )
+
+    insert_run(
+        "run-other-task",
+        subject_id="ft-a",
+        prompt_version="v1",
+        input_sha256="sha-a",
+        status="error",
+        error="other task failure",
+        started_at=now - timedelta(minutes=10),
+        task_type="gmail_attachment_enrichment",
+    )
+    insert_run(
+        "run-unrelated-success",
+        subject_id="ft-b",
+        prompt_version="v1",
+        input_sha256="sha-b",
+        status="completed",
+        error="",
+        started_at=now - timedelta(minutes=9),
+    )
+    insert_run(
+        "run-current-failure",
+        subject_id="ft-a",
+        prompt_version="v1",
+        input_sha256="sha-a",
+        status="error",
+        error="current receipt failure",
+        started_at=now - timedelta(minutes=8),
+    )
+    insert_run(
+        "run-ancient-failure",
+        subject_id="ft-old",
+        prompt_version="v1",
+        input_sha256="sha-old",
+        status="error",
+        error="ancient receipt failure",
+        started_at=now - timedelta(days=8),
+    )
+
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, state_rows, state_error_rows, last_error"
+        " FROM @marts_pipeline_health WHERE pipeline = 'receipt_enrichment'"
+    )[0]
+    assert row["status"] == "failing"
+    assert row["state_rows"] == 3  # all scoped attempt history remains visible
+    assert row["state_error_rows"] == 1
+    assert "current receipt failure" in row["last_error"]
+    assert "ancient receipt failure" not in row["last_error"]
+
+    insert_run(
+        "run-recovered",
+        subject_id="ft-a",
+        prompt_version="v1",
+        input_sha256="sha-a",
+        status="completed",
+        error="",
+        started_at=now - timedelta(minutes=7),
+    )
+    PipelineHealthCollector(warehouse).run()
+    recovered = warehouse._query_dicts(
+        "SELECT status, state_rows, state_error_rows, last_error"
+        " FROM @marts_pipeline_health WHERE pipeline = 'receipt_enrichment'"
+    )[0]
+    assert recovered["status"] != "failing"
+    assert recovered["state_rows"] == 4
+    assert recovered["state_error_rows"] == 0
+    assert not recovered["last_error"]
+
+    insert_run(
+        "run-regressed",
+        subject_id="ft-a",
+        prompt_version="v1",
+        input_sha256="sha-a",
+        status="error",
+        error="receipt failed again",
+        started_at=now - timedelta(minutes=6),
+    )
+    insert_run(
+        "run-changed-input",
+        subject_id="ft-a",
+        prompt_version="v1",
+        input_sha256="sha-new",
+        status="completed",
+        error="",
+        started_at=now - timedelta(minutes=5),
+    )
+    insert_run(
+        "run-changed-prompt",
+        subject_id="ft-a",
+        prompt_version="v2",
+        input_sha256="sha-a",
+        status="completed",
+        error="",
+        started_at=now - timedelta(minutes=4),
+    )
+    PipelineHealthCollector(warehouse).run()
+    regressed = warehouse._query_dicts(
+        "SELECT status, state_rows, state_error_rows, last_error"
+        " FROM @marts_pipeline_health WHERE pipeline = 'receipt_enrichment'"
+    )[0]
+    assert regressed["status"] == "failing"
+    assert regressed["state_rows"] == 7
+    assert regressed["state_error_rows"] == 1
+    assert "receipt failed again" in regressed["last_error"]
 
 
 # --- search benchmark: host saturation beside the latency number (C6) ---------
