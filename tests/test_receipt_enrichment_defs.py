@@ -5,6 +5,7 @@ import logging
 
 import pytest
 
+from personal_data_warehouse.agent_runner import AgentRunEvent
 from personal_data_warehouse.receipt_enrichment import (
     DEFAULT_MAX_TRANSACTION_AGE_DAYS,
     DEFAULT_TRANSACTION_LIMIT,
@@ -27,7 +28,20 @@ class FakeResult:
         self.exit_code = exit_code
         self.error = error
         self.events = [
-            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}}
+            AgentRunEvent(
+                event_index=0,
+                stream="stdout",
+                event_type="turn.completed",
+                event_json={
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                },
+                text=(
+                    '{"type":"turn.completed","usage":'
+                    '{"input_tokens":100,"output_tokens":10}}'
+                ),
+                created_at=NOW,
+            )
         ]
         # Fields agent_run_row() persists into ops.ai_processing_agent_runs.
         self.run_id = "agent-test"
@@ -63,6 +77,7 @@ class FakeWarehouse:
         self.queries = []
         self.ensured = False
         self.agent_runs = []
+        self.agent_run_events = []
 
     def ensure_receipt_tables(self):
         self.ensured = True
@@ -82,6 +97,9 @@ class FakeWarehouse:
 
     def insert_agent_runs(self, rows):
         self.agent_runs.extend(rows)
+
+    def insert_agent_run_events(self, rows):
+        self.agent_run_events.extend(rows)
 
 
 def _transaction(transaction_id="ft_1", **overrides):
@@ -186,13 +204,21 @@ def test_agent_runs_are_recorded_for_monitoring():
     # over weeks were invisible to the shared agent-run failure monitoring.
     warehouse = FakeWarehouse({"FROM @finance_transactions AS t": [_transaction()]})
 
-    _runner(warehouse, FakeAgent(_found_result())).sync()
+    summary = _runner(warehouse, FakeAgent(_found_result())).sync()
 
     assert len(warehouse.agent_runs) == 1
     run = warehouse.agent_runs[0]
     assert run["task_type"] == "receipt_transaction_match"
     assert run["subject_id"] == "ft_1"
     assert run["status"] == "completed"
+    assert len(warehouse.agent_run_events) == 1
+    assert warehouse.agent_run_events[0]["run_id"] == run["run_id"]
+    assert warehouse.agent_run_events[0]["event_index"] == 0
+    assert summary.usage == {
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "output_tokens": 10,
+    }
 
 
 def test_one_pdw_agent_operation_per_transaction():

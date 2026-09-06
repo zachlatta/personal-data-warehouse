@@ -733,14 +733,9 @@ class ReceiptEnrichmentRunner:
 
         self._warehouse.ensure_agent_tables()
         self._warehouse.insert_agent_runs([agent_run_row(result)])
-        insert_events = getattr(self._warehouse, "insert_agent_run_events", None)
-        if not callable(insert_events):
-            # Lightweight Warehouse protocol implementations predating the
-            # shared event table can still record the run-level heartbeat.
-            return
         event_rows = agent_run_event_rows(result)
         if event_rows:
-            insert_events(event_rows)
+            self._warehouse.insert_agent_run_events(event_rows)
 
     def _known_evidence(self, result: Mapping[str, Any]) -> set[tuple[str, str]]:
         known: set[tuple[str, str]] = set()

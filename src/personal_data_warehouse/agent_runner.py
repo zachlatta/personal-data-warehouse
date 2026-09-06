@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import threading
@@ -66,6 +67,78 @@ DEFAULT_AGENT_CLI_SOURCE_DIR = Path(__file__).resolve().parents[2] / "app"
 DEFAULT_AGENT_TOOL_PROXY_BIND_HOST = "0.0.0.0"
 DEFAULT_AGENT_TOOL_PROXY_PUBLIC_HOST = "host.docker.internal"
 DEFAULT_AGENT_MAX_PROMPT_CHARS = 900_000
+MAX_AGENT_RUN_EVENT_JSON_CHARS = 32_000
+MAX_AGENT_RUN_EVENT_TEXT_CHARS = 16_000
+MAX_AGENT_RUN_ERROR_CHARS = 4_000
+_REDACTED = "[REDACTED]"
+
+# These patterns cover recognizable provider credentials and conventional
+# secret assignments. Free-form text cannot be proven secret-free, so the
+# stronger structured-key guard below runs before these best-effort patterns.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"""
+    (?<![a-z0-9])
+    (?P<prefix>
+        ["']?
+        (?:
+            (?:[a-z0-9]{1,32}[_-])?api[_-]?key
+            | (?:access|refresh|id|bearer|secret)[_-]?token
+            | client[_-]?secret
+            | session[_-]?key
+            | passw(?:or)?d
+            | credentials?
+            | (?:set[_-]?)?cookie
+        )
+        ["']?\s*[:=]\s*
+    )
+    (?P<quote>["']?)
+    (?P<bare_secret>[^\s,"';}\]]+)
+    (?P=quote)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_AUTHORIZATION_RE = re.compile(
+    r"""
+    (?P<prefix>
+        \bauthorization["']?\s*[:=]\s*["']?
+        (?:(?:bearer|basic)\s+)?
+    )
+    (?P<secret>[^\s,"';}\]]+)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_PROVIDER_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}(?![A-Za-z0-9])"
+)
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
+_SENSITIVE_EVENT_KEYS = frozenset(
+    {
+        "access_token",
+        "anthropic_api_key",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer_token",
+        "client_secret",
+        "cookie",
+        "credential",
+        "credentials",
+        "id_token",
+        "mcp_secret_token",
+        "openai_api_key",
+        "password",
+        "passwd",
+        "proxy_authorization",
+        "refresh_token",
+        "secret",
+        "secret_token",
+        "session_key",
+        "sessionkey",
+        "set_cookie",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -648,7 +721,7 @@ def agent_run_row(result: AgentRunResult) -> dict[str, Any]:
         "status": result.status,
         "input_sha256": result.input_sha256,
         "final_output_json": json.dumps(result.final_output_json, sort_keys=True, separators=(",", ":"), default=str),
-        "error": result.error,
+        "error": _bounded_agent_diagnostic(result.error, MAX_AGENT_RUN_ERROR_CHARS),
         "exit_code": result.exit_code,
         "started_at": result.started_at,
         "completed_at": result.completed_at,
@@ -666,13 +739,134 @@ def agent_run_event_rows(result: AgentRunResult) -> list[dict[str, Any]]:
                 "event_index": event.event_index,
                 "stream": event.stream,
                 "event_type": event.event_type,
-                "event_json": json.dumps(event.event_json, sort_keys=True, separators=(",", ":"), default=str),
-                "text": event.text,
+                "event_json": _serialized_agent_event_json(
+                    event.event_json,
+                    event_type=event.event_type,
+                ),
+                "text": _bounded_agent_diagnostic(
+                    event.text,
+                    MAX_AGENT_RUN_EVENT_TEXT_CHARS,
+                ),
                 "created_at": event.created_at,
                 "sync_version": sync_version,
             }
         )
     return rows
+
+
+def _serialized_agent_event_json(
+    payload: Mapping[str, Any],
+    *,
+    event_type: str,
+) -> str:
+    """Return a redacted, valid, bounded JSON representation for durable storage.
+
+    Container stdout/stderr is an untrusted diagnostic boundary: a provider or
+    tool can echo an environment assignment or authorization header. Structured
+    secret fields are removed deterministically, recognizable secrets embedded
+    in strings are masked best-effort, and oversized payloads become an explicit
+    envelope that retains the event type plus a bounded preview.
+    """
+
+    sanitized = _redact_agent_diagnostic_value(payload)
+    serialized = json.dumps(sanitized, sort_keys=True, separators=(",", ":"), default=str)
+    if len(serialized) <= MAX_AGENT_RUN_EVENT_JSON_CHARS:
+        return serialized
+
+    envelope: dict[str, Any] = {
+        "_pdw_event_type": _truncate_with_marker(
+            _redact_recognizable_credentials(event_type),
+            256,
+        ),
+        "_pdw_original_chars": len(serialized),
+        "_pdw_truncated": True,
+    }
+    if isinstance(sanitized, Mapping):
+        for key in ("type", "event", "subtype", "status"):
+            value = sanitized.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                envelope[key] = (
+                    _truncate_with_marker(value, 256) if isinstance(value, str) else value
+                )
+
+    # JSON escaping makes preview size non-linear. Binary search keeps the
+    # stored envelope within the hard limit without ever emitting invalid JSON.
+    best = json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str)
+    low = 0
+    high = min(len(serialized), MAX_AGENT_RUN_EVENT_JSON_CHARS)
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = {
+            **envelope,
+            "_pdw_preview": _truncate_with_marker(serialized, midpoint),
+        }
+        candidate_json = json.dumps(
+            candidate,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if len(candidate_json) <= MAX_AGENT_RUN_EVENT_JSON_CHARS:
+            best = candidate_json
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return best
+
+
+def _redact_agent_diagnostic_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[Any, Any] = {}
+        for key, child in value.items():
+            if _is_sensitive_event_key(key):
+                redacted[key] = _REDACTED
+            else:
+                redacted[key] = _redact_agent_diagnostic_value(child)
+        return redacted
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_redact_agent_diagnostic_value(child) for child in value]
+    if isinstance(value, str):
+        return _redact_recognizable_credentials(value)
+    return value
+
+
+def _is_sensitive_event_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    return normalized in _SENSITIVE_EVENT_KEYS or normalized.endswith(
+        ("_api_key", "_access_token", "_refresh_token", "_client_secret", "_session_key")
+    )
+
+
+def _redact_recognizable_credentials(value: str) -> str:
+    def replace_assignment(match: re.Match[str]) -> str:
+        quote = match.group("quote") or ""
+        return f"{match.group('prefix')}{quote}{_REDACTED}{quote}"
+
+    redacted = _AUTHORIZATION_RE.sub(
+        lambda match: f"{match.group('prefix')}{_REDACTED}",
+        value,
+    )
+    redacted = _SECRET_ASSIGNMENT_RE.sub(replace_assignment, redacted)
+    redacted = _PROVIDER_TOKEN_RE.sub(_REDACTED, redacted)
+    return _JWT_RE.sub(_REDACTED, redacted)
+
+
+def _bounded_agent_diagnostic(value: str, max_chars: int) -> str:
+    return _truncate_with_marker(_redact_recognizable_credentials(str(value)), max_chars)
+
+
+def _truncate_with_marker(value: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(value) <= max_chars:
+        return value
+    marker = f"\n...[truncated; original length {len(value)} characters]...\n"
+    if len(marker) >= max_chars:
+        return marker[:max_chars]
+    remaining = max_chars - len(marker)
+    head_chars = remaining // 2
+    tail_chars = remaining - head_chars
+    return value[:head_chars] + marker + value[-tail_chars:]
 
 
 def agent_run_tool_call_rows(result: AgentRunResult) -> list[dict[str, Any]]:

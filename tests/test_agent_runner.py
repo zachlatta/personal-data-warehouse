@@ -477,6 +477,112 @@ def test_agent_result_rows_serialize_events_and_tool_calls() -> None:
     assert "pdw sql" in tool_rows[1]["arguments_json"]
 
 
+def test_agent_run_event_rows_redact_recognizable_credentials_in_json_and_text() -> None:
+    now = datetime.now(tz=UTC)
+    secrets = {
+        "access": "access-json-secret-123",
+        "bearer": "bearer-json-secret-456",
+        "embedded": "embedded-json-secret-789",
+        "text_bearer": "bearer-text-secret-012",
+        "text_api_key": "api-text-secret-345",
+        "text_refresh": "refresh-text-secret-678",
+        "provider_key": "sk-proj-FAKECREDENTIAL1234567890",
+        "jwt": "eyJFAKEHEADER.eyJFAKEPAYLOAD.eyJFAKESIGNATURE",
+        "run_error": "error-diagnostic-secret-901",
+    }
+    result = AgentRunResult(
+        run_id="run-sensitive",
+        provider="codex",
+        model="gpt-test",
+        task_type="receipt_transaction_match",
+        subject_id="ft-1",
+        prompt_version="prompt-v1",
+        input_sha256="sha",
+        status="error",
+        final_output_json={},
+        error=f"ANTHROPIC_API_KEY={secrets['run_error']}",
+        exit_code=1,
+        started_at=now,
+        completed_at=now,
+        events=[
+            AgentRunEvent(
+                event_index=7,
+                stream="stderr",
+                event_type="turn.failed",
+                event_json={
+                    "type": "turn.failed",
+                    "access_token": secrets["access"],
+                    "headers": {"Authorization": f"Bearer {secrets['bearer']}"},
+                    "message": f"OPENAI_API_KEY={secrets['embedded']}",
+                },
+                text=(
+                    f"Authorization: Bearer {secrets['text_bearer']} "
+                    f"OPENAI_API_KEY={secrets['text_api_key']} "
+                    f"\"refresh_token\":\"{secrets['text_refresh']}\" "
+                    f"{secrets['provider_key']} {secrets['jwt']}"
+                ),
+                created_at=now,
+            )
+        ],
+    )
+
+    row = agent_run_event_rows(result)[0]
+    run_row = agent_run_row(result)
+    serialized = row["event_json"] + "\n" + row["text"] + "\n" + run_row["error"]
+
+    assert all(secret not in serialized for secret in secrets.values())
+    assert json.loads(row["event_json"])["access_token"] == "[REDACTED]"
+    assert json.loads(row["event_json"])["headers"]["Authorization"] == "[REDACTED]"
+    assert serialized.count("[REDACTED]") >= 6
+    assert row["event_index"] == 7
+    assert row["event_type"] == "turn.failed"
+
+
+def test_agent_run_event_rows_bound_oversized_json_and_text_without_losing_event_identity() -> None:
+    now = datetime.now(tz=UTC)
+    result = AgentRunResult(
+        run_id="run-oversized",
+        provider="codex",
+        model="gpt-test",
+        task_type="receipt_transaction_match",
+        subject_id="ft-1",
+        prompt_version="prompt-v1",
+        input_sha256="sha",
+        status="error",
+        final_output_json={},
+        error="failed",
+        exit_code=1,
+        started_at=now,
+        completed_at=now,
+        events=[
+            AgentRunEvent(
+                event_index=23,
+                stream="stdout",
+                event_type="turn.failed",
+                event_json={"type": "turn.failed", "message": "j" * 100_000},
+                text="diagnostic-start " + ("t" * 100_000) + " diagnostic-end",
+                created_at=now,
+            )
+        ],
+    )
+
+    row = agent_run_event_rows(result)[0]
+    stored_json = json.loads(row["event_json"])
+
+    assert len(row["event_json"]) <= 32_000
+    assert len(row["text"]) <= 16_000
+    assert stored_json["_pdw_truncated"] is True
+    assert stored_json["type"] == "turn.failed"
+    assert row["text"].startswith("diagnostic-start ")
+    assert row["text"].endswith(" diagnostic-end")
+    assert "truncated" in row["text"]
+    assert row["run_id"] == "run-oversized"
+    assert row["event_index"] == 23
+    assert row["stream"] == "stdout"
+    assert row["event_type"] == "turn.failed"
+    assert row["created_at"] == now
+
+
 def test_agent_run_tool_call_rows_names_each_pdw_subcommand() -> None:
     now = datetime.now(tz=UTC)
     commands = [

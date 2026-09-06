@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 
+import pytest
+
 from personal_data_warehouse.agent_runner import AgentRunEvent, AgentRunResult
 from personal_data_warehouse.receipt_enrichment import (
     DECISION_FOUND,
@@ -381,3 +383,61 @@ def test_failed_receipt_run_persists_its_diagnostic_events_once() -> None:
     assert [row["event_index"] for row in warehouse.agent_run_event_batches[0]] == [0, 1]
     assert warehouse.agent_run_event_batches[0][0]["event_type"] == "turn.failed"
     assert warehouse.receipt_rows == []
+
+
+@pytest.mark.parametrize("storage_mode", ["missing", "failed"])
+def test_receipt_event_persistence_cannot_silently_succeed(storage_mode: str) -> None:
+    class Warehouse:
+        def __init__(self) -> None:
+            self.agent_runs = []
+
+        def ensure_agent_tables(self) -> None:
+            pass
+
+        def insert_agent_runs(self, rows) -> None:
+            self.agent_runs.extend(rows)
+
+    class FailingWarehouse(Warehouse):
+        def insert_agent_run_events(self, rows) -> None:
+            raise RuntimeError("event storage unavailable")
+
+    result = AgentRunResult(
+        run_id="run-failed",
+        provider="codex",
+        model="gpt-test",
+        task_type="receipt_transaction_match",
+        subject_id="ft_1",
+        prompt_version=PROMPT_VERSION,
+        input_sha256="sha",
+        status="error",
+        final_output_json={},
+        error="fatal",
+        exit_code=1,
+        started_at=NOW,
+        completed_at=NOW,
+        events=[
+            AgentRunEvent(
+                event_index=0,
+                stream="stderr",
+                event_type="text",
+                event_json={"text": "fatal diagnostic"},
+                text="fatal diagnostic",
+                created_at=NOW,
+            )
+        ],
+    )
+    warehouse = Warehouse() if storage_mode == "missing" else FailingWarehouse()
+    runner = ReceiptEnrichmentRunner(
+        warehouse=warehouse,
+        agent=None,
+        logger=None,
+        provider="codex",
+        model="gpt-test",
+        now=NOW,
+    )
+
+    expected_error = AttributeError if storage_mode == "missing" else RuntimeError
+    with pytest.raises(expected_error):
+        runner._record_agent_result(result)
+
+    assert [row["run_id"] for row in warehouse.agent_runs] == ["run-failed"]
