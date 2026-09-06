@@ -70,6 +70,31 @@ payloads to `/ingest/...`; the app owns the Drive credential, object keys, `kind
 `pdw_*` tags. Per-source `PDW_INGEST_<SOURCE>_FOLDER_ID` vars are optional and otherwise fall back
 to the shared object-store folder.
 
+## Plaid CLI: repair an existing Item
+
+Use `pdw ingest plaid items` to find the existing Item id, then
+`pdw ingest plaid update <item-id>` (an unambiguous prefix also works).
+This is the single repair path: it renews consent with account selection,
+keeps the existing Item and access token, and never exchanges a public token,
+deletes an Item, or triggers an all-institution sync. It reports the number of
+accounts available; a failed verification or zero accounts returns nonzero.
+Use `pdw ingest plaid link` only for genuinely new institutions, not repairs.
+
+Both flows accept `--no-browser`, `--host` (default `127.0.0.1`), and
+`--port` (default `0`, an available port). For execution on Porygon and a
+browser on Crobat, use `--no-browser --host 127.0.0.1 --port <port>` and tunnel
+Crobat's loopback port to Porygon's listener. Open that loopback URL on Crobat.
+OAuth needs a configured, Plaid-registered redirect URI matching the browser's
+callback address. Never share callback URLs or tokens in chat or logs.
+The CLI needs its existing Plaid configuration and warehouse access on the
+execution host; no credentials belong in command arguments.
+
+[Plaid update-mode documentation](https://plaid.com/docs/link/update-mode/)
+requires the existing access token, no new-product initialization, and
+`update.account_selection_enabled: true` for account selection. Account-selection
+update mode is not supported for UK/EU institutions; this repair path targets US/CA
+Items and must not be used to replace an unsupported Item.
+
 ## Run Locally
 
 ```bash

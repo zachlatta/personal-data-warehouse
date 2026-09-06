@@ -9,7 +9,7 @@ import logging
 import secrets
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 
@@ -39,7 +39,11 @@ class LinkResult:
 
 
 class LocalPlaidLinkServer:
-    def __init__(self, *, link_token: str, client_name: str, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(self, *, link_token: str, client_name: str, host: str = "127.0.0.1", port: int = 0,
+                 mode: Literal["link", "update"] = "link") -> None:
+        if mode not in {"link", "update"}:
+            raise ValueError("unknown Plaid Link mode")
+        self.mode = mode
         self.link_token = link_token
         self.client_name = client_name
         self.host = host
@@ -77,8 +81,15 @@ class LocalPlaidLinkServer:
                 length = int(self.headers.get("Content-Length") or "0")
                 data = json.loads(self.rfile.read(length) or b"{}")
                 public_token = str(data.get("public_token") or "")
-                if not public_token:
-                    outer.error = str(data.get("error") or "Plaid Link did not return a public token")
+                failed = bool(data.get("error")) or (
+                    data.get("success") is not True if outer.mode == "update" else not public_token
+                )
+                if failed:
+                    outer.error = (
+                        "Plaid update canceled or failed; existing Item was kept."
+                        if outer.mode == "update"
+                        else _redact(str(data.get("error") or "Plaid Link did not return a public token"), outer.link_token)
+                    )
                     self._write_json({"ok": False, "error": outer.error})
                     self._shutdown_server()
                     return
@@ -147,7 +158,7 @@ def _link_page(link_token: str, client_name: str, state_token: str) -> str:
 <head><meta charset=\"utf-8\"><title>{client_name_html} Plaid Link</title></head>
 <body>
   <h1>{client_name_html} Plaid Link</h1>
-  <p>Click the button below to open Plaid Link. Complete OAuth/MFA in the Plaid flow, then this local page will return a public token to the CLI.</p>
+  <p>Click the button below to open Plaid Link. Complete OAuth/MFA in the Plaid flow, then this local page will report completion to the CLI.</p>
   <button id=\"link\">Open Plaid Link</button>
   <pre id=\"status\"></pre>
   <script src=\"https://cdn.plaid.com/link/v2/stable/link-initialize.js\"></script>
@@ -156,11 +167,11 @@ def _link_page(link_token: str, client_name: str, state_token: str) -> str:
     const config = {{
       token: {link_token_json},
       onSuccess: async (public_token, metadata) => {{
-        status.textContent = 'Plaid Link completed; returning token to local CLI...';
+        status.textContent = 'Plaid Link completed; notifying local CLI...';
         const response = await fetch('/exchange?state=' + encodeURIComponent({state_json}), {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{public_token, metadata}}),
+          body: JSON.stringify({{success: true, public_token, metadata}}),
         }});
         const payload = await response.json();
         if (!payload.ok) {{ throw new Error(payload.error || 'exchange failed'); }}
@@ -198,8 +209,21 @@ def run_link(args: argparse.Namespace) -> int:
     warehouse = warehouse_from_settings(settings)
     try:
         warehouse.ensure_plaid_tables()
+        mode = "update" if args.command == "update" else "link"
+        item = None
+        if mode == "update":
+            try:
+                item = resolve_plaid_item(warehouse.load_plaid_item_tokens(), args.item_id)
+            except ValueError as exc:
+                print(f"pdw ingest plaid update: {exc}", file=sys.stderr)
+                print("Run `pdw ingest plaid items` to list linked items.", file=sys.stderr)
+                return 2
         client = PlaidClient(settings.plaid)
-        link_token_response = client.create_link_token(account=settings.plaid.account)
+        link_token_response = (
+            client.create_link_token(account=item.account, access_token=item.access_token)
+            if item is not None
+            else client.create_link_token(account=settings.plaid.account)
+        )
         link_token = str(link_token_response.get("link_token") or "")
         if not link_token:
             raise RuntimeError("Plaid did not return a link_token")
@@ -208,12 +232,25 @@ def run_link(args: argparse.Namespace) -> int:
             client_name=settings.plaid.client_name,
             host=args.host,
             port=args.port,
+            mode=mode,
         ) as server:
             print("Open this URL to authorize Plaid accounts:")
             print(server.url)
             if not args.no_browser:
                 webbrowser.open(server.url)
             result = server.wait_for_result()
+        if item is not None:
+            print(f"Existing Plaid Item {item.item_id} updated; identity and credential unchanged.")
+            try:
+                accounts = client.accounts_get(item.access_token).get("accounts")
+                if not isinstance(accounts, list):
+                    raise ValueError("missing accounts")
+            except Exception:
+                # Provider messages can echo credentials. Never print raw exceptions.
+                print("Account availability could not be verified; existing Item was kept.", file=sys.stderr)
+                return 1
+            print(f"accounts available: {len(accounts)}")
+            return 0 if accounts else 1
         exchange_response = client.exchange_public_token(result.public_token)
         access_token = str(exchange_response.get("access_token") or "")
         item_id = str(exchange_response.get("item_id") or "")
@@ -229,6 +266,10 @@ def run_link(args: argparse.Namespace) -> int:
         )
         print("Plaid institution linked successfully.")
         return 0
+    except Exception:
+        # Link tokens and credentials must not escape through exception tracebacks.
+        print("Plaid Link failed or was canceled; no Item was replaced or deleted.", file=sys.stderr)
+        return 1
     finally:
         warehouse.close()
 
@@ -414,10 +455,14 @@ def run_unlink(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Link Plaid items and sync Plaid-backed personal finance data.")
     subparsers = parser.add_subparsers(dest="command")
-    link = subparsers.add_parser("link", help="create a Plaid Link token, open local Link UI, and persist the exchanged access token")
-    link.add_argument("--host", default="127.0.0.1", help="local host for the Plaid Link callback server")
-    link.add_argument("--port", type=int, default=0, help="local port for the Plaid Link callback server (0 picks an open port)")
-    link.add_argument("--no-browser", action="store_true", help="print the local Link URL without opening a browser")
+    link = subparsers.add_parser("link", help="link a genuinely new institution (not an existing-Item repair)")
+    update = subparsers.add_parser("update", help="repair consent for an existing Item without replacing it")
+    update.add_argument("item_id", help="existing item id or unambiguous prefix (see `plaid items`)")
+    for flow in (link, update):
+        flow.add_argument("--host", default="127.0.0.1", help="local host for the Plaid Link callback server")
+        flow.add_argument("--port", type=int, default=0, help="local port for the Plaid Link callback server (0 picks an open port)")
+        flow.add_argument("--no-browser", action="store_true", help="print the local Link URL without opening a browser")
+        flow.set_defaults(func=run_link)
     sync = subparsers.add_parser("sync", help="sync all linked Plaid items")
     items = subparsers.add_parser("items", help="list linked Plaid items with their row counts")
     unlink = subparsers.add_parser(

@@ -326,3 +326,17 @@ func TestRunDispatchesIngestWithRootConfigFlags(t *testing.T) {
 		t.Fatalf("token flag not passed to uploader: %#v", cap.extraEnv)
 	}
 }
+
+func TestPlaidUpdateCanonicalCommandAndHelp(t *testing.T) {
+	cap := withStubIngestExec(t, 0)
+	var out, errOut bytes.Buffer
+	args := []string{"ingest", "plaid", "update", "item-existing", "--no-browser", "--host", "127.0.0.1", "--port", "8765"}
+	code := run(args, strings.NewReader(""), &out, &errOut, func(string) string { return "" })
+	want := append([]string{"run", "python", "-m", "personal_data_warehouse_plaid.cli"}, args[2:]...)
+	if code != 0 || !reflect.DeepEqual(cap.argv, want) {
+		t.Fatalf("update dispatch: code=%d argv=%v", code, cap.argv)
+	}
+	if !strings.Contains(ingestUsage, "pdw ingest plaid update <item-id>") {
+		t.Fatal("help must name the existing-Item repair command")
+	}
+}

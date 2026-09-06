@@ -120,7 +120,8 @@ EXAMPLES
   pdw ingest voice-memos --mode incremental
   pdw ingest apple-notes --mode full
   pdw ingest agent-sessions --limit 1000
-  pdw ingest plaid link
+  pdw ingest plaid link              # genuinely new institution only
+  pdw ingest plaid update <item-id>   # repair an existing Item, preserving its identity
   pdw ingest plaid sync
   pdw ingest plaid unlink <item-id>   # retire an item a re-link left behind
   pdw ingest manual-finance ~/Desktop/accounts

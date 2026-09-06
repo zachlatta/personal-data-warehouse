@@ -105,3 +105,29 @@ def test_plaid_client_removes_item_to_revoke_its_access_token() -> None:
     assert response == {"request_id": "req-1"}
     assert session.posts[0]["url"] == "https://sandbox.plaid.com/item/remove"
     assert session.posts[0]["json"]["access_token"] == "access-token"
+
+
+def test_update_link_payload_preserves_item_without_product_initialization() -> None:
+    from dataclasses import replace
+    import secrets
+
+    token = secrets.token_urlsafe(24)
+    config = replace(_config(), redirect_uri="http://127.0.0.1:8765/", webhook="https://example.com/webhook")
+    session = FakeSession([FakeResponse({})])
+    PlaidClient(config, session=session).create_link_token(account=config.account, access_token=token)
+    payload = session.posts[0]["json"]
+    assert payload["access_token"] == token
+    assert payload["update"] == {"account_selection_enabled": True}
+    assert not {"products", "additional_consented_products", "transactions"} & payload.keys()
+    assert payload["redirect_uri"] == config.redirect_uri
+    assert payload["webhook"] == config.webhook
+    assert payload["user"]["client_user_id"] == PlaidClient(config).client_user_id
+
+
+def test_explicit_empty_update_credential_cannot_fall_back_to_new_link() -> None:
+    import pytest
+
+    session = FakeSession([])
+    with pytest.raises(ValueError, match="access token"):
+        PlaidClient(_config(), session=session).create_link_token(access_token="")
+    assert session.posts == []

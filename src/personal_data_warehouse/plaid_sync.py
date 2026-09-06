@@ -90,23 +90,30 @@ class PlaidClient:
         digest = hashlib.sha256(self._config.account.encode("utf-8")).hexdigest()
         return f"pdw-{digest}"
 
-    def create_link_token(self, *, account: str | None = None) -> dict[str, Any]:
+    def create_link_token(self, *, account: str | None = None, access_token: str | None = None) -> dict[str, Any]:
         account_label = account or self._config.account
         digest = hashlib.sha256(account_label.encode("utf-8")).hexdigest()
-        configured_products = list(self._config.products)
-        required_products = ["transactions"] if "transactions" in configured_products else configured_products
         payload: dict[str, Any] = {
             "client_name": self._config.client_name,
             "user": {"client_user_id": f"pdw-{digest}"},
-            "products": required_products,
             "country_codes": list(self._config.country_codes),
             "language": self._config.language,
         }
-        additional_products = [product for product in configured_products if product not in required_products]
-        if additional_products:
-            payload["additional_consented_products"] = additional_products
-        if "transactions" in self._config.products:
-            payload["transactions"] = {"days_requested": self._config.transactions_lookback_days}
+        if access_token is not None:
+            if not access_token.strip():
+                raise ValueError("an existing Item access token is required for update mode")
+            # Repair consent on this Item, without initializing any new products.
+            payload["access_token"] = access_token
+            payload["update"] = {"account_selection_enabled": True}
+        else:
+            configured_products = list(self._config.products)
+            required_products = ["transactions"] if "transactions" in configured_products else configured_products
+            payload["products"] = required_products
+            additional_products = [product for product in configured_products if product not in required_products]
+            if additional_products:
+                payload["additional_consented_products"] = additional_products
+            if "transactions" in self._config.products:
+                payload["transactions"] = {"days_requested": self._config.transactions_lookback_days}
         if self._config.redirect_uri:
             payload["redirect_uri"] = self._config.redirect_uri
         if self._config.webhook:

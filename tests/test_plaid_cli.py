@@ -250,3 +250,178 @@ def test_unlink_can_skip_the_plaid_call_for_an_already_revoked_item() -> None:
     assert code == 0
     assert client.removed == []
     assert warehouse.deleted == [("zach@example.com", "item-old")]
+
+
+@pytest.mark.parametrize("payload,success", [
+    ({"success": True, "public_token": ""}, True),
+    ({"success": True, "public_token": None}, True),
+    ({"success": False}, False),
+    ({"error": "canceled"}, False),
+    ({"success": True, "error": "failed"}, False),
+    ({}, False),
+])
+def test_update_callback_requires_explicit_success_and_valid_state(payload, success) -> None:
+    import secrets
+
+    outcome = {}
+    with LocalPlaidLinkServer(
+        link_token=secrets.token_urlsafe(24), client_name="PDW", mode="update"
+    ) as server:
+        def wait():
+            try:
+                outcome["result"] = server.wait_for_result()
+            except RuntimeError as exc:
+                outcome["error"] = exc
+        thread = threading.Thread(target=wait, daemon=True)
+        thread.start()
+        bad = requests.post(f"{server.url}exchange?state=wrong", json=payload, timeout=5)
+        assert bad.status_code == 403
+        assert server.result is None
+        response = requests.post(
+            f"{server.url}exchange?state={server.state_token}", json=payload, timeout=5
+        )
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert response.json()["ok"] is success
+    assert ("result" in outcome) is success
+    assert ("error" in outcome) is not success
+
+
+def _update_dependencies(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import secrets
+    from personal_data_warehouse_plaid import cli
+
+    item = PlaidLinkedItem(
+        account="owner@example.com", item_id="item-existing",
+        access_token=secrets.token_urlsafe(24), institution_id="ins_1", institution_name="Example Bank",
+    )
+    config = SimpleNamespace(account=item.account, client_name="PDW", secret=secrets.token_urlsafe(24))
+    warehouse = MagicMock()
+    warehouse.load_plaid_item_tokens.return_value = [item]
+    client = MagicMock()
+    link_token = secrets.token_urlsafe(24)
+    client.create_link_token.return_value = {"link_token": link_token}
+    client.accounts_get.return_value = {"accounts": [{"account_id": "account-existing"}]}
+    server_factory = MagicMock()
+    server = server_factory.return_value.__enter__.return_value
+    server.url = "http://127.0.0.1:8765/"
+    server.wait_for_result.return_value = cli.LinkResult(public_token="")
+    monkeypatch.setattr(cli, "load_settings", lambda **kw: SimpleNamespace(plaid=config))
+    monkeypatch.setattr(cli, "warehouse_from_settings", lambda settings: warehouse)
+    monkeypatch.setattr(cli, "PlaidClient", lambda config: client)
+    monkeypatch.setattr(cli, "LocalPlaidLinkServer", server_factory)
+    browser = MagicMock()
+    monkeypatch.setattr(cli.webbrowser, "open", browser)
+    sync = MagicMock()
+    monkeypatch.setattr(cli, "PlaidSyncRunner", sync)
+    return cli, item, warehouse, client, server_factory, server, browser, sync, link_token
+
+
+@pytest.mark.parametrize("no_browser", [True, False])
+@pytest.mark.parametrize("accounts", [[], [{"account_id": "account-existing"}]])
+def test_update_preserves_identity_and_credential_without_sync(monkeypatch, capsys, no_browser, accounts):
+    cli, item, warehouse, client, factory, server, browser, sync, link_token = _update_dependencies(monkeypatch)
+    client.accounts_get.return_value = {"accounts": accounts}
+    argv = ["update", "item-ex", "--host", "127.0.0.1", "--port", "8765"]
+    if no_browser:
+        argv.append("--no-browser")
+    assert cli.main(argv) == (0 if accounts else 1)
+    client.create_link_token.assert_called_once_with(account=item.account, access_token=item.access_token)
+    assert factory.call_args.kwargs == {
+        "link_token": link_token, "client_name": "PDW", "host": "127.0.0.1", "port": 8765, "mode": "update",
+    }
+    client.accounts_get.assert_called_once_with(item.access_token)
+    client.exchange_public_token.assert_not_called()
+    client.item_remove.assert_not_called()
+    warehouse.upsert_plaid_item_token.assert_not_called()
+    warehouse.delete_plaid_item.assert_not_called()
+    warehouse.close.assert_called_once()
+    sync.assert_not_called()
+    assert browser.called is not no_browser
+    output = capsys.readouterr()
+    text = output.out + output.err
+    assert "Existing Plaid Item item-existing updated" in text
+    assert f"accounts available: {len(accounts)}" in text
+    assert item.access_token not in text
+    assert link_token not in text
+
+
+@pytest.mark.parametrize("needle", ["missing", "item-", ""])
+def test_update_refuses_unknown_or_ambiguous_item_before_link(monkeypatch, capsys, needle):
+    cli, item, warehouse, client, factory, *_ = _update_dependencies(monkeypatch)
+    from dataclasses import replace
+    warehouse.load_plaid_item_tokens.return_value.append(replace(item, item_id="item-other"))
+    assert cli.main(["update", needle]) == 2
+    client.create_link_token.assert_not_called()
+    factory.assert_not_called()
+    warehouse.close.assert_called_once()
+    assert "plaid items" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stage", ["create_link_token", "callback", "accounts_get"])
+def test_update_failure_never_replaces_or_deletes_item_or_leaks_tokens(monkeypatch, capsys, stage):
+    cli, item, warehouse, client, factory, server, browser, sync, link_token = _update_dependencies(monkeypatch)
+    error = RuntimeError(f"provider echoed {item.access_token} {link_token}")
+    if stage == "callback":
+        server.wait_for_result.side_effect = error
+    else:
+        getattr(client, stage).side_effect = error
+    assert cli.main(["update", item.item_id, "--no-browser"]) == 1
+    client.exchange_public_token.assert_not_called()
+    client.item_remove.assert_not_called()
+    warehouse.upsert_plaid_item_token.assert_not_called()
+    warehouse.delete_plaid_item.assert_not_called()
+    warehouse.close.assert_called_once()
+    sync.assert_not_called()
+    output = capsys.readouterr()
+    assert item.access_token not in output.out + output.err
+    assert link_token not in output.out + output.err
+
+
+def test_shared_link_page_explicitly_marks_success_and_keeps_oauth():
+    page = _link_page("placeholder", "PDW", "state")
+    assert "success: true" in page
+    assert "receivedRedirectUri = window.location.href" in page
+
+
+def test_update_requires_item_id():
+    from personal_data_warehouse_plaid.cli import build_parser
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["update"])
+
+
+def test_new_link_still_exchanges_and_persists_only_new_item(monkeypatch):
+    cli, item, warehouse, client, factory, server, browser, sync, link_token = _update_dependencies(monkeypatch)
+    import secrets
+    public_token = secrets.token_urlsafe(24)
+    server.wait_for_result.return_value = cli.LinkResult(public_token=public_token)
+    client.exchange_public_token.return_value = {"item_id": "item-new", "access_token": item.access_token}
+    assert cli.main(["link", "--no-browser"]) == 0
+    client.create_link_token.assert_called_once_with(account=item.account)
+    client.exchange_public_token.assert_called_once_with(public_token)
+    assert warehouse.upsert_plaid_item_token.call_args.kwargs["item_id"] == "item-new"
+    assert factory.call_args.kwargs["mode"] == "link"
+    client.accounts_get.assert_not_called()
+    sync.assert_not_called()
+
+
+def test_new_link_callback_rejects_empty_public_token():
+    outcome = {}
+    with LocalPlaidLinkServer(link_token="placeholder", client_name="PDW") as server:
+        def wait():
+            try:
+                server.wait_for_result()
+            except RuntimeError:
+                outcome["failed"] = True
+        thread = threading.Thread(target=wait, daemon=True)
+        thread.start()
+        response = requests.post(
+            f"{server.url}exchange?state={server.state_token}",
+            json={"success": True, "public_token": ""}, timeout=5,
+        )
+        thread.join(timeout=5)
+    assert response.json()["ok"] is False
+    assert outcome == {"failed": True}
+    assert server.result is None
