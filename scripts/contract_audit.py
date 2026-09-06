@@ -24,11 +24,18 @@ import re
 import statistics
 import subprocess
 import sys
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Sequence
 
-from personal_data_warehouse.search_benchmark_runner import LATENCY_P50_TARGET_MS
+from personal_data_warehouse.search_benchmark import (
+    ATTENTION_PRIORITIES,
+    run_search,
+)
+from personal_data_warehouse.search_benchmark_runner import (
+    LATENCY_P50_TARGET_MS,
+    MRR_FLOOR,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +44,7 @@ GREEN, YELLOW, RED = "green", "yellow", "red"
 #: The search latency the goal set for the tool, end to end through the CLI.
 SEARCH_P50_TARGET_SECONDS = LATENCY_P50_TARGET_MS / 1000
 SEARCH_P50_YELLOW_SECONDS = 5.0
+SEARCH_ATTENTION_PRIORITIES = tuple(ATTENTION_PRIORITIES)
 SEARCH_PROBE_QUERIES = (
     "runway burn rate months cash remaining",
     "trip planning flights hotel booking",
@@ -78,6 +86,46 @@ def worst(statuses: list[str]) -> str:
 
 def _unavailable(contract: str, title: str, what: str) -> Verdict:
     return Verdict(contract, title, YELLOW, f"could not read {what}; verdict withheld")
+
+
+def _latency_status(elapsed_seconds: float | None) -> str:
+    if elapsed_seconds is None:
+        return YELLOW
+    if elapsed_seconds < SEARCH_P50_TARGET_SECONDS:
+        return GREEN
+    if elapsed_seconds < SEARCH_P50_YELLOW_SECONDS:
+        return YELLOW
+    return RED
+
+
+def _validated_search_probe(
+    query: str, *, priorities: Sequence[str]
+) -> tuple[float | None, str]:
+    """Run one canonical search and return only valid hybrid latency.
+
+    ``run_search`` owns subprocess, JSON, payload-error, and priority-scope
+    validation. The audit adds the two properties specific to a hybrid latency
+    claim: the effective mode must still be hybrid and no keyword fallback may
+    have occurred. Error details are deliberately collapsed to categories so
+    audit evidence cannot expose returned rows, credentials, or private query
+    text.
+    """
+
+    result = run_search(
+        query,
+        "hybrid",
+        20,
+        priorities=tuple(priorities),
+        timeout=90.0,
+    )
+    if result.error:
+        issue = "scope_error" if "scope mismatch" in result.error else "search_error"
+        return None, issue
+    if result.mode != "hybrid":
+        return None, "mode_mismatch"
+    if result.fallback_reason:
+        return None, "fallback"
+    return result.elapsed_seconds, ""
 
 
 # --- contracts ----------------------------------------------------------------
@@ -147,21 +195,42 @@ def c5_layering() -> Verdict:
 
 def c6_performance() -> Verdict:
     title = "responds fast (search p50 < 2s)"
-    timings: list[float] = []
-    for query in SEARCH_PROBE_QUERIES:
-        started = time.time()
-        try:
-            subprocess.run(["pdw", "search", "--output", "json", "-n", "20", "--", query],
-                           capture_output=True, text=True, timeout=90)
-        except (OSError, subprocess.TimeoutExpired):
-            timings.append(90.0)
-            continue
-        timings.append(time.time() - started)
-    p50 = statistics.median(timings)
-    status = GREEN if p50 < SEARCH_P50_TARGET_SECONDS else (YELLOW if p50 < SEARCH_P50_YELLOW_SECONDS else RED)
-    # The benchmark row records whether the host was saturated while ITS
-    # probes ran (C6: confirm the machine is being used before optimizing).
-    # `idle` beside a slow p50 is the finding to act on first.
+    scopes: dict[str, tuple[str, ...]] = {
+        "all tiers": (),
+        "attention (self,direct,cc)": SEARCH_ATTENTION_PRIORITIES,
+    }
+    timings: dict[str, list[float]] = {name: [] for name in scopes}
+    errors = {name: 0 for name in scopes}
+
+    # Paired and serial: concurrent probes are a load test, not single-user
+    # latency. Alternate the first scope so cache warmth cannot consistently
+    # favour either path.
+    for index, query in enumerate(SEARCH_PROBE_QUERIES):
+        order = list(scopes.items())
+        if index % 2:
+            order.reverse()
+        for scope_name, priorities in order:
+            elapsed, issue = _validated_search_probe(query, priorities=priorities)
+            if issue:
+                errors[scope_name] += 1
+            else:
+                assert elapsed is not None
+                timings[scope_name].append(elapsed)
+
+    p50s = {
+        name: statistics.median(values) if values else None
+        for name, values in timings.items()
+    }
+    scope_statuses = []
+    for name in scopes:
+        # An invalid response is a search failure, not a very fast latency
+        # sample. Keep it in the grade even when other probes succeeded.
+        scope_statuses.append(RED if errors[name] else _latency_status(p50s[name]))
+    status = worst(scope_statuses)
+
+    # This row sampled host pressure while ITS older persisted probes ran. It
+    # is useful context, but cannot establish what the host was doing during
+    # the just-completed audit probes.
     bench = pdw_sql(
         "search benchmark saturation",
         "SELECT saturation, io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count, latency_p50_ms, collected_at"
@@ -169,13 +238,46 @@ def c6_performance() -> Verdict:
     )
     b = (bench or [None])[0]
     if b:
-        host = (f"benchmark host {b['saturation']} (io full {b['io_pressure_full_avg10']}%, cpu some {b['cpu_pressure_some_avg10']}%, "
-                f"load {b['load_1m']}/{b['cpu_count']}, p50 {b['latency_p50_ms']}ms, {str(b['collected_at'])[:16]})")
-        if b["saturation"] == "idle":
-            status = RED if status == RED else YELLOW
+        host = (
+            f"historical benchmark context at {str(b['collected_at'])[:16]}: "
+            f"host {b['saturation']} (io full {b['io_pressure_full_avg10']}%, "
+            f"cpu some {b['cpu_pressure_some_avg10']}%, load "
+            f"{b['load_1m']}/{b['cpu_count']}, p50 {b['latency_p50_ms']}ms)"
+        )
     else:
-        host = "no benchmark row yet"
-    return Verdict("C6", title, status, f"hybrid search p50 {p50:.2f}s over {len(timings)} novel queries ({', '.join(f'{t:.1f}' for t in timings)}); {host}")
+        host = "no historical benchmark host-pressure context available"
+
+    current_slow_or_invalid = any(
+        errors[name]
+        or p50s[name] is None
+        or p50s[name] >= SEARCH_P50_TARGET_SECONDS
+        for name in scopes
+    )
+    if current_slow_or_invalid:
+        pressure = (
+            "no contemporaneous host-pressure measurement for the current "
+            "slow/invalid probes; bottleneck saturation is not established"
+        )
+    else:
+        pressure = (
+            "current probes have no contemporaneous host-pressure measurement; "
+            "fast responses do not require a saturation claim"
+        )
+
+    scope_evidence = []
+    for name in scopes:
+        p50 = p50s[name]
+        p50_text = f"{p50:.2f}s" if p50 is not None else "unmeasured"
+        scope_evidence.append(
+            f"{name}: {len(timings[name])}/{len(SEARCH_PROBE_QUERIES)} valid, "
+            f"p50 {p50_text}, errors={errors[name]}"
+        )
+    return Verdict(
+        "C6",
+        title,
+        status,
+        f"paired serial hybrid probes; {'; '.join(scope_evidence)}; {pressure}; {host}",
+    )
 
 
 def c7_pipeline_health() -> Verdict:
@@ -196,16 +298,149 @@ def c8_search_quality() -> Verdict:
     if rows is None:
         return _unavailable("C8", title, "marts_ops.search_health")
     statuses = {r["component"]: r["status"] for r in rows}
-    bench = pdw_sql("search benchmark", "SELECT mode, status, labeled_cases, mrr, latency_p50_ms, collected_at FROM marts_ops.search_benchmark")
+    bench = pdw_sql(
+        "search benchmark",
+        "SELECT mode, status, probe_queries, latency_p50_ms, labeled_cases, mrr, errors, "
+        "attention_priorities_json, attention_probe_queries, "
+        "attention_latency_p50_ms, attention_labeled_cases, "
+        "attention_comparable_cases, attention_found, attention_mrr, "
+        "attention_errors, attention_recall_lost, attention_recall_gained, "
+        "attention_recall_retained, all_relevant_lower_tier, collected_at "
+        "FROM marts_ops.search_benchmark WHERE mode = 'hybrid'",
+    )
     b = (bench or [None])[0]
-    labels = bool(b and int(b.get("labeled_cases") or 0) > 0)
-    status = GREEN
-    if any(s in ("failing", "unknown") for s in statuses.values()):
-        status = RED
-    elif any(s in ("attention", "late", "backfilling") for s in statuses.values()) or not labels or (b and b["status"] in ("attention", "unknown")):
-        status = YELLOW
-    bench_ev = f"benchmark {b['status']}: MRR {b['mrr']} over {b['labeled_cases']} cases, p50 {b['latency_p50_ms']}ms ({str(b['collected_at'])[:16]})" if b else "no benchmark row yet"
-    return Verdict("C8", title, status, f"search_health {statuses}; {bench_ev}")
+    grades: list[str] = [GREEN]
+    if not statuses:
+        grades.append(YELLOW)
+    elif any(s in ("failing", "unknown") for s in statuses.values()):
+        grades.append(RED)
+    elif any(
+        s in ("attention", "late", "backfilling") for s in statuses.values()
+    ):
+        grades.append(YELLOW)
+
+    if not b:
+        grades.append(YELLOW)
+        return Verdict(
+            "C8",
+            title,
+            worst(grades),
+            f"search_health {statuses}; no hybrid benchmark row yet",
+        )
+
+    def integer(name: str) -> int | None:
+        value = b.get(name)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def number(name: str) -> float | None:
+        value = b.get(name)
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    benchmark_status = str(b.get("status") or "unknown")
+    if benchmark_status == "failing":
+        grades.append(RED)
+    elif benchmark_status in ("attention", "unknown", "no_data"):
+        grades.append(YELLOW)
+
+    all_probes = integer("probe_queries")
+    all_p50_ms = number("latency_p50_ms")
+    all_labels = integer("labeled_cases")
+    all_mrr = number("mrr")
+    all_errors = integer("errors")
+    attention_probes = integer("attention_probe_queries")
+    attention_p50_ms = number("attention_latency_p50_ms")
+    attention_labels = integer("attention_labeled_cases")
+    attention_comparable = integer("attention_comparable_cases")
+    attention_mrr = number("attention_mrr")
+    attention_errors = integer("attention_errors")
+
+    for probes, p50_ms, errors in (
+        (all_probes, all_p50_ms, all_errors),
+        (attention_probes, attention_p50_ms, attention_errors),
+    ):
+        if probes is None or probes <= 0 or p50_ms is None or errors is None:
+            grades.append(YELLOW)
+        else:
+            grades.append(_latency_status(p50_ms / 1000))
+        if errors is not None and errors > 0:
+            grades.append(RED)
+
+    if all_labels is None or all_labels <= 0 or all_mrr is None:
+        grades.append(YELLOW)
+    elif all_mrr < MRR_FLOOR:
+        grades.append(YELLOW)
+
+    # The paired attention score describes what happened, but the all-tier
+    # label set deliberately includes relevant noise/background rows that an
+    # attention filter must exclude. Do not apply the all-tier MRR floor to it.
+    if (
+        attention_labels is None
+        or attention_labels <= 0
+        or attention_comparable is None
+        or attention_comparable <= 0
+        or attention_mrr is None
+    ):
+        grades.append(YELLOW)
+
+    try:
+        measured_priorities = tuple(json.loads(str(b.get("attention_priorities_json"))))
+    except (TypeError, ValueError):
+        measured_priorities = ()
+    if measured_priorities != SEARCH_ATTENTION_PRIORITIES:
+        grades.append(YELLOW)
+
+    all_p50_text = f"{all_p50_ms:g}ms" if all_p50_ms is not None else "unmeasured"
+    all_mrr_text = f"{all_mrr:g}" if all_mrr is not None else "unmeasured"
+    attention_p50_text = (
+        f"{attention_p50_ms:g}ms" if attention_p50_ms is not None else "unmeasured"
+    )
+    attention_mrr_text = (
+        f"{attention_mrr:g}" if attention_mrr is not None else "unmeasured"
+    )
+    lower_tier = integer("all_relevant_lower_tier")
+    if lower_tier is None:
+        eligibility = "attention scoped relevance eligibility is not established by this schema"
+    elif lower_tier > 0:
+        eligibility = (
+            f"{lower_tier} all-tier relevant answers were lower-tier; exclusions are expected"
+        )
+    else:
+        eligibility = (
+            "no lower-tier answer was identified, but eligible-only relevance is not "
+            "independently labeled"
+        )
+    all_labels_text = str(all_labels) if all_labels is not None else "unmeasured"
+    all_errors_text = str(all_errors) if all_errors is not None else "unmeasured"
+    attention_probes_text = (
+        str(attention_probes) if attention_probes is not None else "unmeasured"
+    )
+    attention_errors_text = (
+        str(attention_errors) if attention_errors is not None else "unmeasured"
+    )
+    attention_labels_text = (
+        str(attention_labels) if attention_labels is not None else "unmeasured"
+    )
+    attention_comparable_text = (
+        str(attention_comparable)
+        if attention_comparable is not None
+        else "unmeasured"
+    )
+    evidence = (
+        f"search_health {statuses}; benchmark {benchmark_status} at "
+        f"{str(b.get('collected_at'))[:16]}: all-tier MRR {all_mrr_text} over "
+        f"{all_labels_text} labels, p50 {all_p50_text}, errors={all_errors_text}; "
+        f"attention p50 {attention_p50_text} over {attention_probes_text} probes, "
+        f"errors={attention_errors_text}; attention MRR {attention_mrr_text} is "
+        f"diagnostic, not graded against the all-tier floor; attention labels "
+        f"{attention_labels_text}, comparable {attention_comparable_text}; {eligibility}"
+    )
+    return Verdict("C8", title, worst(grades), evidence)
 
 
 def c9_one_way() -> Verdict:
