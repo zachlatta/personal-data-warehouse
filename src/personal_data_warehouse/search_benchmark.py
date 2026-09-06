@@ -754,40 +754,156 @@ def measure_serial_latency(
 ) -> dict[str, Any]:
     """Time searches one at a time, which is the only comparable latency number."""
 
-    scopes = {"all": (), "attention": tuple(ATTENTION_PRIORITIES)}
-    samples: dict[str, dict[str, list[float]]] = {
-        scope: {mode: [] for mode in modes} for scope in scopes
+    if not queries:
+        raise ValueError("serial latency measurement requires at least one query")
+    if not modes:
+        raise ValueError("serial latency measurement requires at least one mode")
+    if repeats < 1:
+        raise ValueError("serial latency repeats must be at least 1")
+
+    scopes = {
+        "all": (),
+        "self_direct": tuple(CATALOG.timeline_priorities.optimized_bm25_priorities),
+        "attention": tuple(ATTENTION_PRIORITIES),
     }
-    pair_index = 0
-    for _ in range(repeats):
-        for query in queries:
+    scope_orders = (
+        ("all", "self_direct", "attention"),
+        ("all", "attention", "self_direct"),
+        ("self_direct", "all", "attention"),
+        ("self_direct", "attention", "all"),
+        ("attention", "all", "self_direct"),
+        ("attention", "self_direct", "all"),
+    )
+    distinct_modes = tuple(dict.fromkeys(modes))
+    samples: dict[str, dict[str, list[float]]] = {
+        scope: {mode: [] for mode in distinct_modes} for scope in scopes
+    }
+    expected_by_mode = {
+        mode: len(queries) * repeats * sum(candidate == mode for candidate in modes)
+        for mode in distinct_modes
+    }
+    completeness: dict[str, dict[str, dict[str, Any]]] = {
+        scope: {
+            mode: {
+                "status": "incomplete",
+                "expected": expected_by_mode[mode],
+                "successful": 0,
+                "failed": 0,
+            }
+            for mode in distinct_modes
+        }
+        for scope in scopes
+    }
+    outcomes: list[dict[str, Any]] = []
+    scope_order_index = 0
+    for iteration in range(1, repeats + 1):
+        for query_index, query in enumerate(queries, start=1):
             for mode in modes:
-                order = list(scopes.items())
-                if pair_index % 2:
-                    order.reverse()
-                pair_index += 1
-                for scope_name, priorities in order:
-                    result = run_search(query, mode, depth, priorities=priorities)
-                    if not result.error:
+                order = scope_orders[scope_order_index % len(scope_orders)]
+                scope_order_index += 1
+                for order_index, scope_name in enumerate(order, start=1):
+                    priorities = scopes[scope_name]
+                    outcome: dict[str, Any] = {
+                        "scope": scope_name,
+                        "requested_priorities": list(priorities),
+                        "mode": mode,
+                        "effective_mode": "",
+                        "iteration": iteration,
+                        "query_index": query_index,
+                        "order": order_index,
+                        "outcome": "failed",
+                        "diagnostic_category": "exception",
+                    }
+                    try:
+                        result = run_search(query, mode, depth, priorities=priorities)
+                    except Exception:
+                        result = None
+                    if result is not None:
+                        outcome["effective_mode"] = result.mode
+                        outcome["elapsed_seconds"] = round(result.elapsed_seconds, 3)
+                        if result.error:
+                            lowered_error = result.error.lower()
+                            if "scope mismatch" in lowered_error:
+                                category = "scope_mismatch"
+                            elif "timed out" in lowered_error or "timeout" in lowered_error:
+                                category = "timeout"
+                            else:
+                                category = "search_error"
+                        elif priority_scope_error(result, priorities):
+                            category = "scope_mismatch"
+                        elif result.mode != mode:
+                            category = "mode_mismatch"
+                        elif result.fallback_reason:
+                            category = "fallback"
+                        else:
+                            category = "none"
+                    else:
+                        category = "exception"
+
+                    outcome["diagnostic_category"] = category
+                    if category == "none":
+                        outcome["outcome"] = "success"
                         samples[scope_name][mode].append(result.elapsed_seconds)
-                        print(
-                            f"  serial {mode:8s} {scope_name:9s} "
-                            f"{result.elapsed_seconds:6.1f}s  {query[:44]}",
-                            flush=True,
-                        )
-    out: dict[str, Any] = {"all": {}, "attention": {}, "p50_delta_seconds": {}}
+                        completeness[scope_name][mode]["successful"] += 1
+                    else:
+                        completeness[scope_name][mode]["failed"] += 1
+                    outcomes.append(outcome)
+                    elapsed = (
+                        f"{result.elapsed_seconds:6.1f}s" if result is not None else "   n/a"
+                    )
+                    print(
+                        f"  serial {mode:8s} {scope_name:11s} {elapsed} "
+                        f"iteration={iteration} query={query_index} order={order_index} "
+                        f"{outcome['outcome']}:{category}",
+                        flush=True,
+                    )
+
+    out: dict[str, Any] = {
+        "all": {},
+        "self_direct": {},
+        "attention": {},
+        "p50_delta_seconds": {},
+        "p50_delta_status": {},
+        "completeness": completeness,
+        "outcomes": outcomes,
+    }
     for scope_name in scopes:
         for mode, values in samples[scope_name].items():
             summary = _latency_summary(values)
             if summary:
                 out[scope_name][mode] = summary
-    for mode in modes:
+            else:
+                out[scope_name][mode] = {
+                    "n": 0,
+                    "measurement_status": "unmeasured",
+                }
+            cell = completeness[scope_name][mode]
+            if cell["successful"] == cell["expected"]:
+                cell["status"] = "complete"
+    for mode in distinct_modes:
         all_latency = out["all"].get(mode)
         attention_latency = out["attention"].get(mode)
-        if all_latency and attention_latency:
+        if "p50" in all_latency and "p50" in attention_latency:
             out["p50_delta_seconds"][mode] = round(
                 attention_latency["p50"] - all_latency["p50"], 2
             )
+            out["p50_delta_status"][mode] = (
+                "complete"
+                if completeness["all"][mode]["status"] == "complete"
+                and completeness["attention"][mode]["status"] == "complete"
+                else "incomplete"
+            )
+        else:
+            out["p50_delta_status"][mode] = "unmeasured"
+    out["status"] = (
+        "complete"
+        if all(
+            cell["status"] == "complete"
+            for scope in completeness.values()
+            for cell in scope.values()
+        )
+        else "incomplete"
+    )
     return out
 
 
@@ -1001,6 +1117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command in {"publish-labels", "pull-labels"}:
         return _labels_command(args)
+    if args.command == "latency":
+        if args.sample < 1:
+            parser.error("latency --sample must be at least 1")
+        if args.repeats < 1:
+            parser.error("latency --repeats must be at least 1")
     assert_private_path(args.output)
     modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
     # smoke takes no labels: it asks whether every source ANSWERS, which is a
@@ -1026,6 +1147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "latency":
         queries = [c.query for c in cases][: args.sample]
+        if not queries:
+            parser.error("latency requires at least one labeled query")
         report = {
             "environment": capture_environment(),
             "config": {"depth": args.depth, "modes": list(modes), "repeats": args.repeats,

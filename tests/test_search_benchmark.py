@@ -468,6 +468,278 @@ def test_run_search_rejects_a_response_that_did_not_apply_the_requested_scope(
     assert "scope" in result.error.lower()
 
 
+def _valid_serial_result(module, mode, priorities, elapsed):
+    return module.SearchResult(
+        mode=mode,
+        rows=(),
+        elapsed_seconds=elapsed,
+        priority_scope="selected" if priorities else "all",
+        selected_priorities=tuple(priorities),
+    )
+
+
+def test_serial_latency_measures_three_scopes_in_all_six_orders(monkeypatch) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    calls = []
+
+    def fake_run_search(query, mode, depth, *, priorities=(), **_kwargs):
+        calls.append((query, mode, depth, tuple(priorities)))
+        return _valid_serial_result(module, mode, priorities, elapsed=1.25)
+
+    monkeypatch.setattr(module, "run_search", fake_run_search)
+    report = module.measure_serial_latency(
+        ("private alpha", "private beta"),
+        modes=("hybrid",),
+        depth=7,
+        repeats=3,
+    )
+
+    all_scope = ()
+    self_direct = tuple(module.CATALOG.timeline_priorities.optimized_bm25_priorities)
+    attention = tuple(module.CATALOG.timeline_priorities.attention_priorities)
+    expected_orders = [
+        (all_scope, self_direct, attention),
+        (all_scope, attention, self_direct),
+        (self_direct, all_scope, attention),
+        (self_direct, attention, all_scope),
+        (attention, all_scope, self_direct),
+        (attention, self_direct, all_scope),
+    ]
+    actual_orders = [
+        tuple(call[3] for call in calls[offset : offset + 3])
+        for offset in range(0, len(calls), 3)
+    ]
+    assert actual_orders == expected_orders
+    assert report["status"] == "complete"
+    assert report["all"]["hybrid"]["n"] == 6
+    assert report["self_direct"]["hybrid"]["n"] == 6
+    assert report["attention"]["hybrid"]["n"] == 6
+    assert report["completeness"]["self_direct"]["hybrid"] == {
+        "status": "complete",
+        "expected": 6,
+        "successful": 6,
+        "failed": 0,
+    }
+    assert len(report["outcomes"]) == 18
+    assert report["outcomes"][0] == {
+        "scope": "all",
+        "requested_priorities": [],
+        "mode": "hybrid",
+        "effective_mode": "hybrid",
+        "iteration": 1,
+        "query_index": 1,
+        "order": 1,
+        "outcome": "success",
+        "diagnostic_category": "none",
+        "elapsed_seconds": 1.25,
+    }
+    # The per-request ledger identifies a private query by position, never by text.
+    assert "private alpha" not in json.dumps(report)
+    assert "private beta" not in json.dumps(report)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "diagnostic_category"),
+    [
+        ("exception", "exception"),
+        ("error", "search_error"),
+        ("timeout", "timeout"),
+        ("fallback", "fallback"),
+        ("wrong_mode", "mode_mismatch"),
+        ("missing_scope", "scope_mismatch"),
+        ("wrong_scope", "scope_mismatch"),
+    ],
+)
+def test_serial_latency_preserves_sanitized_failures(
+    monkeypatch, failure_kind, diagnostic_category
+) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    def fake_run_search(_query, mode, _depth, *, priorities=(), **_kwargs):
+        if priorities:
+            return _valid_serial_result(module, mode, priorities, elapsed=2.0)
+        if failure_kind == "exception":
+            raise RuntimeError("secret exception detail")
+        common = {
+            "mode": mode,
+            "elapsed_seconds": 0.01,
+            "priority_scope": "all",
+        }
+        if failure_kind == "error":
+            return module.SearchResult(error="secret backend error", **common)
+        if failure_kind == "timeout":
+            return module.SearchResult(error="timed out with secret token", **common)
+        if failure_kind == "fallback":
+            return module.SearchResult(fallback_reason="secret embedding failure", **common)
+        if failure_kind == "wrong_mode":
+            return module.SearchResult(**{**common, "mode": "keyword"})
+        if failure_kind == "missing_scope":
+            return module.SearchResult(mode=mode, elapsed_seconds=0.01)
+        return module.SearchResult(
+            **{**common, "priority_scope": "selected"},
+            selected_priorities=("self",),
+        )
+
+    monkeypatch.setattr(module, "run_search", fake_run_search)
+    report = module.measure_serial_latency(
+        ("private query",), modes=("hybrid",), depth=10, repeats=1
+    )
+
+    assert report["status"] == "incomplete"
+    assert report["all"]["hybrid"] == {
+        "n": 0,
+        "measurement_status": "unmeasured",
+    }
+    assert report["completeness"]["all"]["hybrid"] == {
+        "status": "incomplete",
+        "expected": 1,
+        "successful": 0,
+        "failed": 1,
+    }
+    failure = next(row for row in report["outcomes"] if row["scope"] == "all")
+    assert failure["outcome"] == "failed"
+    assert failure["diagnostic_category"] == diagnostic_category
+    assert report["p50_delta_seconds"] == {}
+    assert report["p50_delta_status"]["hybrid"] == "unmeasured"
+    serialized = json.dumps(report)
+    assert "secret" not in serialized
+    assert "private query" not in serialized
+    if failure_kind == "exception":
+        assert "elapsed_seconds" not in failure
+    else:
+        assert failure["elapsed_seconds"] == 0.01
+
+
+def test_serial_latency_rejects_incorrect_selected_priorities(monkeypatch) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    self_direct = tuple(module.CATALOG.timeline_priorities.optimized_bm25_priorities)
+
+    def fake_run_search(_query, mode, _depth, *, priorities=(), **_kwargs):
+        if tuple(priorities) == self_direct:
+            return module.SearchResult(
+                mode=mode,
+                elapsed_seconds=0.01,
+                priority_scope="selected",
+                selected_priorities=tuple(
+                    module.CATALOG.timeline_priorities.attention_priorities
+                ),
+            )
+        return _valid_serial_result(module, mode, priorities, elapsed=2.0)
+
+    monkeypatch.setattr(module, "run_search", fake_run_search)
+    report = module.measure_serial_latency(
+        ("private query",), modes=("hybrid",), depth=10, repeats=1
+    )
+
+    assert report["self_direct"]["hybrid"]["measurement_status"] == "unmeasured"
+    assert report["completeness"]["self_direct"]["hybrid"]["failed"] == 1
+    failure = next(row for row in report["outcomes"] if row["scope"] == "self_direct")
+    assert failure["diagnostic_category"] == "scope_mismatch"
+
+
+def test_serial_latency_marks_partial_percentiles_and_delta_incomplete(monkeypatch) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    calls_by_scope = {(): 0}
+
+    def fake_run_search(_query, mode, _depth, *, priorities=(), **_kwargs):
+        scope = tuple(priorities)
+        calls_by_scope[scope] = calls_by_scope.get(scope, 0) + 1
+        if not scope and calls_by_scope[scope] == 1:
+            return module.SearchResult(
+                mode=mode,
+                error="fast authentication failure",
+                elapsed_seconds=0.01,
+                priority_scope="all",
+            )
+        elapsed = 4.0 if not scope else 8.0
+        return _valid_serial_result(module, mode, priorities, elapsed=elapsed)
+
+    monkeypatch.setattr(module, "run_search", fake_run_search)
+    report = module.measure_serial_latency(
+        ("private query",), modes=("hybrid",), depth=10, repeats=2
+    )
+
+    assert report["all"]["hybrid"] == {
+        "n": 1,
+        "min": 4.0,
+        "p50": 4.0,
+        "p90": 4.0,
+        "max": 4.0,
+    }
+    assert report["completeness"]["all"]["hybrid"]["status"] == "incomplete"
+    assert report["completeness"]["attention"]["hybrid"]["status"] == "complete"
+    assert report["p50_delta_seconds"]["hybrid"] == 4.0
+    assert report["p50_delta_status"]["hybrid"] == "incomplete"
+
+
+@pytest.mark.parametrize("repeats", [0, -1])
+def test_serial_latency_rejects_invalid_repeats_before_search(monkeypatch, repeats) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    monkeypatch.setattr(
+        module,
+        "run_search",
+        lambda *_args, **_kwargs: pytest.fail("invalid repeats must make no search calls"),
+    )
+    with pytest.raises(ValueError, match="repeats"):
+        module.measure_serial_latency(
+            ("query",), modes=("hybrid",), depth=10, repeats=repeats
+        )
+
+
+def test_serial_latency_rejects_zero_queries_before_search(monkeypatch) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    monkeypatch.setattr(
+        module,
+        "run_search",
+        lambda *_args, **_kwargs: pytest.fail("zero queries must make no search calls"),
+    )
+    with pytest.raises(ValueError, match="query"):
+        module.measure_serial_latency((), modes=("hybrid",), depth=10, repeats=1)
+
+
+@pytest.mark.parametrize("flag", ["--sample", "--repeats"])
+def test_latency_subcommand_rejects_nonpositive_counts_before_loading_labels(
+    monkeypatch, tmp_path, flag
+) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    monkeypatch.setattr(
+        module,
+        "load_cases",
+        lambda *_args, **_kwargs: pytest.fail("invalid CLI counts must fail before labels"),
+    )
+    out = tmp_path / ".search-eval" / "latency.json"
+    with pytest.raises(SystemExit) as raised:
+        module.main(["latency", flag, "0", "--output", str(out)])
+    assert raised.value.code == 2
+
+
+def test_latency_subcommand_rejects_an_empty_label_set_before_environment_probe(
+    monkeypatch, tmp_path
+) -> None:
+    import personal_data_warehouse.search_benchmark as module
+
+    labels = tmp_path / ".search-eval" / "labels.json"
+    labels.parent.mkdir()
+    labels.write_text("[]")
+    monkeypatch.setattr(
+        module,
+        "capture_environment",
+        lambda *_args, **_kwargs: pytest.fail("empty labels must fail before environment probe"),
+    )
+    out = labels.parent / "latency.json"
+    with pytest.raises(SystemExit) as raised:
+        module.main(
+            ["latency", "--labels", str(labels), "--output", str(out)]
+        )
+    assert raised.value.code == 2
+
+
 class TestPartitionStaleCases:
     def _case(self, query, refs=(), predicate=None):
         return BenchmarkCase(

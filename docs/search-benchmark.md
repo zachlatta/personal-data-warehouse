@@ -44,8 +44,10 @@ uv run python scripts/search_benchmark.py run \
   --exclude-agent-sessions-since 2026-08-22 \
   --exclude-session <session-id>
 
-# Serial latency sample (the only comparable latency number).
-uv run python scripts/search_benchmark.py latency --sample 8
+# Serial latency sample (the only comparable latency number). This is 48 calls:
+# 8 queries x 2 modes x 3 priority scopes, with no concurrency or retries.
+uv run python scripts/search_benchmark.py latency \
+  --sample 8 --repeats 1 --modes hybrid,keyword
 
 # One call per source token: does every SCOPED search still answer?
 uv run python scripts/search_benchmark.py smoke
@@ -75,6 +77,43 @@ an order of magnitude.
 The cost of that: **timings collected under concurrency are not single-user latency**. The
 report labels them `latency_under_concurrency` and says so. When you need a latency number
 to compare against a budget, use the `latency` subcommand, which runs strictly serially.
+
+### Serial latency report
+
+The serial command measures every selected query/mode under three catalog-defined scopes:
+
+- `all` — no priority filter;
+- `self_direct` — `timeline_priorities.optimized_bm25_priorities` (`self,direct` today);
+- `attention` — `timeline_priorities.attention_priorities` (`self,direct,cc` today).
+
+The runner cycles deterministically through all six scope orders so no scope is always the
+cold or warm member of a trio. It makes exactly `sample x modes x repeats x 3` calls, one at
+a time, with no retry. The historical `all`, `attention`, and `p50_delta_seconds` keys remain
+available. `self_direct` adds the third distribution. Read those distributions together
+with the completeness fields:
+
+- top-level `status` is `complete` only when every expected scope/mode request succeeded;
+- `completeness.<scope>.<mode>` gives `expected`, `successful`, `failed`, and its own status;
+- `outcomes` records scope, requested priorities, requested/effective mode, iteration,
+  query position, order, elapsed time when known, and a bounded diagnostic category. It
+  deliberately contains neither query text nor raw exception/error/fallback detail;
+- a mode with no valid samples is explicit as `measurement_status: unmeasured` rather than
+  disappearing. A partial distribution still exposes its successful-sample percentiles but
+  remains `incomplete`; a reported all-to-attention p50 delta is qualified separately by
+  `p50_delta_status`.
+
+An errored or timed-out response, scope-echo mismatch, wrong effective mode, or fallback is
+not a latency success, however fast it returned. A correctly shaped and scoped empty result
+is a valid response and does count. Nonpositive `--sample`/`--repeats` values and an empty
+label set are rejected instead of producing a vacuously complete report.
+
+**Do not run the serial command against production by default.** It targets whichever PDW
+endpoint is configured, and even the example above makes 48 real search calls. Use a
+disposable or representative isolated environment for routine comparisons. A production
+canary needs a separately approved, bounded load window; this command does not grant one.
+The latency instrument alone also proves neither relevance eligibility nor ranking quality,
+and it does not establish a sub-two-second service claim. Use unchanged labeled quality
+cases and their scope eligibility as separate index-rollout gates.
 
 ## The label file
 
