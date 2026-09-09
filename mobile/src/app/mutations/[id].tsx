@@ -15,6 +15,7 @@ import { approveMutationRequest, getMutationRequest, rejectMutationRequest, remo
 import { formatWhen, pretty } from '@/lib/format';
 import {
   gmailBatchSummary,
+  hasGmailThreadMutations,
   gmailThreadDayGroups,
   gmailThreadReviews,
   isCalendarCreateMutation,
@@ -276,14 +277,14 @@ export default function MutationRequestScreen() {
     if (!request) return;
     const count = review.threadsInMutation;
     Alert.alert(
-      count > 1 ? `Keep ${count} threads in the inbox?` : 'Keep this thread in the inbox?',
+      review.action === 'Archive' ? (count > 1 ? `Keep ${count} threads in the inbox?` : 'Keep this thread in the inbox?') : `Skip this action on ${count} thread${count === 1 ? '' : 's'}?`,
       count > 1
         ? 'They are dropped from this request; everything else still runs.'
         : `“${review.subject}” is dropped from this request; everything else still runs.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Keep',
+          text: review.action === 'Archive' ? 'Keep' : 'Skip',
           style: 'destructive',
           onPress: async () => {
             setBusy(true);
@@ -330,7 +331,8 @@ export default function MutationRequestScreen() {
   const pending = request.status === 'pending_review';
   const requestMutations = request.mutations ?? [];
   const slackBatch = requestMutations.length > 1 && requestMutations.every((mutation) => isSlackMarkReadMutation(mutation));
-  const gmailBatch = requestMutations.length > 0 && requestMutations.every((mutation) => isGmailThreadMutation(mutation));
+  const gmailBatch = hasGmailThreadMutations(requestMutations);
+  const otherMutations = requestMutations.filter((mutation) => !isGmailThreadMutation(mutation));
   const query = filter.trim().toLowerCase();
   // A mutation kept out of the batch stays in the response as a rejected row,
   // so the button has to count what is still going to run, not the request's
@@ -391,8 +393,18 @@ export default function MutationRequestScreen() {
                 onScope={setScope}
                 scopeCounts={gmailScopeCounts}
                 visible={gmailVisible.length}
+                otherActionCount={otherMutations.length}
               />
             }
+            ListFooterComponent={otherMutations.length ? (
+              <View style={styles.content}>
+                <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
+                {otherMutations.map((mutation) => (
+                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} onRemove={() => remove(mutation)} requestReason={request.reason} />
+                ))}
+              </View>
+            ) : null}
             ListEmptyComponent={
               <ThemedText type="small" themeColor="textSecondary" style={styles.filterEmpty}>
                 No threads match that filter.
@@ -405,7 +417,7 @@ export default function MutationRequestScreen() {
               </View>
             )}
             renderItem={({ item }) => (
-              <GmailThreadRow review={item} pending={pending} onKeep={keepInInbox} defaultOpen={gmailReviews.length === 1} />
+              <GmailThreadRow review={item} pending={pending && !busy} onKeep={keepInInbox} defaultOpen={gmailReviews.length === 1} />
             )}
           />
         ) : slackBatch ? (
@@ -465,9 +477,9 @@ export default function MutationRequestScreen() {
               <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, styles.deny, busy && styles.disabled]}>
                 <ThemedText style={styles.buttonText}>Deny all</ThemedText>
               </Pressable>
-              <Pressable accessibilityRole="button" onPress={approve} disabled={busy} style={[styles.button, styles.approve, busy && styles.disabled]}>
+              <Pressable accessibilityRole="button" onPress={approve} disabled={busy || runningCount === 0} style={[styles.button, styles.approve, (busy || runningCount === 0) && styles.disabled]}>
                 <ThemedText style={styles.buttonText}>
-                  {gmailBatch ? `${gmailSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
+                  {gmailBatch && otherMutations.length === 0 && gmailSummary.verb !== 'Review' ? `${gmailSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
                 </ThemedText>
               </Pressable>
             </View>

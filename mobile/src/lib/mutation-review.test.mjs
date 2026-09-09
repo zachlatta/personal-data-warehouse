@@ -6,6 +6,7 @@ import {
   calendarMutationReview,
   formatGmailLabel,
   gmailBatchSummary,
+  hasGmailThreadMutations,
   gmailSenderName,
   gmailThreadDayGroups,
   gmailThreadReviews,
@@ -476,4 +477,47 @@ test('a thread row links to that thread in the mailbox it belongs to', () => {
   assert.equal(gmailThreadUrl('zach@example.test', 'thread-1'), 'https://mail.google.com/mail/u/?authuser=zach%40example.test#all/thread-1');
   assert.equal(gmailThreadUrl('', 'thread-1'), 'https://mail.google.com/mail/u/0#all/thread-1');
   assert.equal(gmailThreadUrl('zach@example.test', ''), '');
+});
+
+test('mixed Gmail and Slack requests keep the inbox review surface', () => {
+  const mail = archiveMutation('mail', { thread_id: 't', subject: 'Receipt' });
+  const mixed = [mail, { id: 'slack', operation: 'slack.mark_conversation_read' }];
+  assert.equal(hasGmailThreadMutations(mixed), true);
+  assert.equal(hasGmailThreadMutations([mixed[1]]), false);
+  assert.equal(hasGmailThreadMutations([]), false);
+  assert.equal(gmailThreadReviews(mixed).length, 1);
+});
+
+test('expanded Gmail messages use the entire body, not the inbox snippet', () => {
+  const body = 'Hello,\n\n' + 'Full message. '.repeat(200) + '\n\nOn Wed, someone wrote:\nOriginal message';
+  const [review] = gmailThreadReviews([archiveMutation('mail', {
+    thread_id: 't', messages: [{ message_id: 'm', body_text: body, preview_text: 'Short snippet' }],
+  })]);
+  assert.equal(review.messages[0].text, body);
+  assert.equal(review.messages[0].hasFullBody, true);
+  const [legacy] = gmailThreadReviews([archiveMutation('old', {
+    thread_id: 't', messages: [{ snippet: 'Only a preview' }],
+  })]);
+  assert.equal(legacy.messages[0].hasFullBody, false);
+});
+
+test('each thread states its own action, including mixed Gmail operations', () => {
+  const archive = archiveMutation('a', { thread_id: 'a' });
+  const restore = { ...archiveMutation('b', { thread_id: 'b' }), operation: 'gmail.unarchive_threads' };
+  const relabel = { ...archiveMutation('c', { thread_id: 'c' }), operation: 'gmail.modify_thread_labels', payload: { thread_ids: ['c'], remove_label_ids: ['INBOX'], add_labels: ['Receipts'] } };
+  const reviews = gmailThreadReviews([archive, restore, relabel]);
+  assert.equal(reviews[0].action, 'Archive');
+  assert.equal(reviews[1].action, 'Move to inbox');
+  assert.match(reviews[2].action, /Receipts/);
+  assert.match(reviews[2].action, /INBOX/);
+  assert.equal(gmailBatchSummary([archive, restore], reviews.slice(0, 2)).verb, 'Review');
+});
+
+test('partial thread previews never hide another thread affected by the same action', () => {
+  const mutation = archiveMutation('batch', { thread_id: 'known', subject: 'Known mail' });
+  mutation.payload.thread_ids = ['known', 'missing'];
+  const reviews = gmailThreadReviews([mutation]);
+  assert.deepEqual(reviews.map((review) => review.threadId), ['known', 'missing']);
+  assert.equal(reviews[1].messages.length, 0);
+  assert.equal(reviews[0].threadsInMutation, 2);
 });

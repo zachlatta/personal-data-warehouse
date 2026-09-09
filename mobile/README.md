@@ -30,12 +30,20 @@ payload. The pure part of that lives in `src/lib/mutation-review.ts` and has
 node tests (`npm test`, also run in CI before the OTA publish); the source-shaped
 components live in `src/components/*-review.tsx`.
 
-- **Gmail thread batches** (archive / unarchive / relabel) read as an inbox —
-  sender, subject, snippet, time — grouped by the day each thread last moved,
-  with chips for unread / automated / kept, a filter box past eight threads, an
-  ↗ to the thread in Gmail, and "Keep this in the inbox" to drop one thread from
-  the request without denying the rest. The approve button counts what will
-  still run.
+- **Gmail thread reviews** (archive / unarchive / relabel) read as an inbox:
+  sender, subject, snippet, time, and proposed action, grouped by the day each
+  thread last moved. This also applies to mixed Gmail/Slack requests; other
+  actions appear below the inbox and approval still covers the whole request.
+  Tap a thread to see its full subject and messages. The latest message opens
+  in full; earlier messages and sender/recipient details expand independently.
+  Bodies retain paragraphs and quoted replies, using the API's `body_text`
+  rather than its shortened `preview_text`. Missing bodies are explicitly
+  marked as previews, with an Open in Gmail link; remote email HTML is not run.
+  Filters cover unread / automated / skipped, with sender/subject search past
+  eight threads. Keep in inbox (or Skip action) removes the enclosing mutation;
+  if it affects multiple threads, the confirmation says how many. Missing
+  previews never hide affected thread IDs from the list. Approval counts only
+  mutations that will still run.
 - **Slack mark-read batches** show each speaker's profile picture and open that
   exact message in Slack on a tap, because the answer to "mark this read?" is
   often "let me reply first". Faces identify DM rows; channels keep their glyph.

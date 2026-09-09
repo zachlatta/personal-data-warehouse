@@ -625,7 +625,13 @@ export function isGmailThreadMutation(mutation: MutationLike): boolean {
   return GMAIL_THREAD_OPERATIONS.includes(text(mutation.operation));
 }
 
+// Gmail must stay reviewable even when another provider shares the request.
+export function hasGmailThreadMutations(mutations: MutationLike[]): boolean {
+  return mutations.some(isGmailThreadMutation);
+}
+
 export type GmailReviewMessage = {
+  hasFullBody: boolean;
   messageId: string;
   senderName: string;
   senderAddress: string;
@@ -637,6 +643,8 @@ export type GmailReviewMessage = {
 };
 
 export type GmailThreadReview = {
+  action: string;
+  error: string;
   key: string;
   mutationId: string;
   mutationStatus: string;
@@ -755,9 +763,19 @@ function gmailReviewMessage(raw: unknown): GmailReviewMessage {
     to: list(message.to_addresses),
     cc: list(message.cc_addresses),
     sentAt: text(message.internal_date),
-    text: text(message.preview_text) || text(message.snippet),
+    text: text(message.body_text) || text(message.preview_text) || text(message.snippet),
+    hasFullBody: Boolean(text(message.body_text)),
     unread: hasUnreadLabel(labels),
   };
+}
+
+function gmailThreadAction(mutation: MutationLike): string {
+  if (mutation.operation === 'gmail.archive_threads') return 'Archive';
+  if (mutation.operation === 'gmail.unarchive_threads') return 'Move to inbox';
+  const payload = asRecord(mutation.payload);
+  const add = [...list(payload.add_label_ids), ...list(payload.add_labels)];
+  const remove = [...list(payload.remove_label_ids), ...list(payload.remove_labels)];
+  return [add.length ? `Add labels: ${add.join(', ')}` : '', remove.length ? `Remove labels: ${remove.join(', ')}` : ''].filter(Boolean).join(' · ') || 'Change labels';
 }
 
 export function gmailThreadReviews(mutations: MutationLike[]): GmailThreadReview[] {
@@ -766,10 +784,12 @@ export function gmailThreadReviews(mutations: MutationLike[]): GmailThreadReview
     if (!isGmailThreadMutation(mutation)) continue;
     const preview = asRecord(mutation.preview);
     const payloadThreadIDs = list(asRecord(mutation.payload).thread_ids);
-    let threads = records(preview.threads);
-    // A request that predates thread previews, or a thread whose messages have
-    // left the warehouse, still has to render as a row rather than vanish.
-    if (threads.length === 0) threads = payloadThreadIDs.map((thread_id) => ({ thread_id }));
+    const previews = records(preview.threads);
+    // The payload is the action boundary. Missing previews must not hide any
+    // affected thread, or make a multi-thread skip look like a single-thread one.
+    const threads = payloadThreadIDs.length
+      ? [...new Set(payloadThreadIDs)].map((thread_id) => previews.find((thread) => text(thread.thread_id) === thread_id) ?? { thread_id })
+      : previews;
     for (const thread of threads) {
       const rawLabels = list(thread.labels);
       const labels = rawLabels.map(formatGmailLabel).filter(Boolean);
@@ -782,6 +802,8 @@ export function gmailThreadReviews(mutations: MutationLike[]): GmailThreadReview
       reviews.push({
         key: `${text(mutation.id)}:${threadId}`,
         mutationId: text(mutation.id),
+        action: gmailThreadAction(mutation),
+        error: text(asRecord(mutation).error),
         mutationStatus: text(mutation.status) || 'pending_review',
         threadsInMutation: Math.max(threads.length, 1),
         account: text(mutation.account),
@@ -815,6 +837,8 @@ export type GmailBatchSummary = {
 };
 
 export function gmailBatchSummary(mutations: MutationLike[], reviews: GmailThreadReview[]): GmailBatchSummary {
+  const operations = new Set((mutations ?? []).filter(isGmailThreadMutation).map((mutation) => mutation.operation));
+  const mixed = operations.size > 1;
   const operation = text((mutations ?? []).find(isGmailThreadMutation)?.operation);
   const live = reviews.filter((review) => !review.removed);
   const accounts: { account: string; count: number }[] = [];
@@ -824,11 +848,11 @@ export function gmailBatchSummary(mutations: MutationLike[], reviews: GmailThrea
     else accounts.push({ account: review.account, count: 1 });
   }
   const noun = live.length === 1 ? 'this thread' : 'these threads';
-  const verb = operation === 'gmail.unarchive_threads' ? 'Unarchive' : operation === 'gmail.modify_thread_labels' ? 'Relabel' : 'Archive';
-  const effect = operation === 'gmail.unarchive_threads'
+  const verb = mixed ? 'Review' : operation === 'gmail.unarchive_threads' ? 'Unarchive' : operation === 'gmail.modify_thread_labels' ? 'Relabel' : 'Archive';
+  const effect = mixed ? 'Applies the action shown on each thread.' : operation === 'gmail.unarchive_threads'
     ? `Puts ${noun} back in the Inbox.`
     : operation === 'gmail.modify_thread_labels'
-      ? `Changes the labels on ${noun}. Nothing leaves the Inbox.`
+      ? `Changes the labels on ${noun}. Review the additions and removals on each thread.`
       : `Takes ${noun} out of the Inbox. Nothing is deleted, and search still finds them.`;
   return {
     verb,

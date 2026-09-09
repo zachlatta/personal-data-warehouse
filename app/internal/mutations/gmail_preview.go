@@ -25,6 +25,7 @@ type gmailThreadPreviewRow struct {
 	InternalDate      time.Time
 	Snippet           string
 	PreviewText       string
+	BodyText          string
 	BodyHTML          string
 	MessageCount      int
 	InboxMessageCount int
@@ -174,6 +175,7 @@ func gmailThreadPreviewFromRows(threadID string, rows []gmailThreadPreviewRow) m
 			"internal_date": formatPreviewTime(row.InternalDate),
 			"snippet":       compactWhitespace(row.Snippet),
 			"preview_text":  bestGmailPreviewText(row),
+			"body_text":     row.BodyText,
 			"label_ids":     append([]string{}, row.LabelIDs...),
 		}
 		if bodyHTML := strings.TrimSpace(row.BodyHTML); bodyHTML != "" {

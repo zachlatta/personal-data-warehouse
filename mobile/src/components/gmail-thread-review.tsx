@@ -11,7 +11,7 @@ import type { MutationRequest } from '@/lib/api';
 import { cleanSnippet, formatWhen, truncate } from '@/lib/format';
 import type { GmailBatchSummary, GmailThreadReview } from '@/lib/mutation-review';
 
-const ACCENT = '#D97706';
+const ACCENT = '#2563EB';
 const DANGER = '#DC2626';
 
 function timeOfDay(iso: string): string {
@@ -29,35 +29,41 @@ function Chip({ label, tone = 'muted' }: { label: string; tone?: 'muted' | 'acce
   );
 }
 
-function ThreadMessage({ message, account }: { message: GmailThreadReview['messages'][number]; account: string }) {
+function ThreadMessage({ message, account, defaultOpen }: { message: GmailThreadReview['messages'][number]; account: string; defaultOpen: boolean }) {
   const theme = useTheme();
-  const [full, setFull] = useState(false);
-  const body = cleanSnippet(message.text ?? '').trim();
-  const long = body.length > 420;
-  const recipients = [
-    message.to.length ? `to ${message.to.join(', ')}` : '',
-    message.cc.length ? `cc ${message.cc.join(', ')}` : '',
-  ].filter(Boolean).join(' · ');
+  const [open, setOpen] = useState(defaultOpen);
+  const [details, setDetails] = useState(false);
+  const body = message.hasFullBody ? message.text : cleanSnippet(message.text ?? '').trim();
   return (
     <View style={[styles.message, { borderColor: theme.backgroundSelected }]}>
-      <View style={styles.messageHead}>
-        <ThemedText type="smallBold" numberOfLines={1} style={styles.messageSender}>{message.senderName}</ThemedText>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }}
+        accessibilityLabel={`${open ? 'Collapse' : 'Expand'} message from ${message.senderName}`}
+        onPress={() => setOpen((value) => !value)} style={styles.messageHead}>
+        <Avatar name={message.senderName} size={32} />
+        <View style={styles.rowCopy}>
+          <ThemedText type="smallBold">{message.senderName}</ThemedText>
+          <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
+            {open ? `to ${message.to.join(', ') || account}` : truncate(body, 100)}
+          </ThemedText>
+        </View>
         <ThemedText type="small" themeColor="textSecondary">{timeOfDay(message.sentAt)}</ThemedText>
-      </View>
-      {message.senderAddress ? (
-        <ThemedText type="small" themeColor="textSecondary" numberOfLines={1} selectable>{message.senderAddress}</ThemedText>
-      ) : null}
-      <ThemedText type="small" themeColor="textSecondary" numberOfLines={2}>{recipients || `to ${account}`}</ThemedText>
-      {body ? (
-        <ThemedText type="small" style={styles.messageBody}>{full || !long ? body : `${body.slice(0, 420)}…`}</ThemedText>
-      ) : (
-        <ThemedText type="small" themeColor="textSecondary">This message&rsquo;s text is not in the warehouse. Open it in Gmail before approving.</ThemedText>
-      )}
-      {long ? (
-        <Pressable accessibilityRole="button" onPress={() => setFull((value) => !value)} hitSlop={8}>
-          <ThemedText type="smallBold" style={styles.link}>{full ? 'Show less' : 'Show more'}</ThemedText>
+        <ThemedText themeColor="textSecondary">{open ? '⌃' : '⌄'}</ThemedText>
+      </Pressable>
+      {open ? <>
+        <Pressable accessibilityRole="button" accessibilityState={{ expanded: details }} onPress={() => setDetails((value) => !value)} style={styles.detailsButton}>
+          <ThemedText type="small" style={styles.link}>{details ? 'Hide details' : 'Show sender & recipients'}</ThemedText>
         </Pressable>
-      ) : null}
+        {details ? <View style={[styles.messageDetails, { backgroundColor: theme.backgroundElement }]}>
+          <ThemedText type="small" selectable>From: {message.senderAddress || message.senderName}</ThemedText>
+          <ThemedText type="small" selectable>To: {message.to.join(', ') || account}</ThemedText>
+          {message.cc.length ? <ThemedText type="small" selectable>Cc: {message.cc.join(', ')}</ThemedText> : null}
+          <ThemedText type="small" selectable>{formatWhen(message.sentAt)}</ThemedText>
+        </View> : null}
+        {body ? <ThemedText selectable style={styles.messageBody}>{body}</ThemedText> : null}
+        {!message.hasFullBody ? <ThemedText type="small" themeColor="textSecondary">
+          {body ? 'Only a preview is available.' : 'This message’s body is not in the warehouse.'} Open in Gmail to read the full message before approving.
+        </ThemedText> : null}
+      </> : null}
     </View>
   );
 }
@@ -90,7 +96,7 @@ export function GmailThreadRow({
         style={({ pressed }) => [styles.rowHead, pressed && { backgroundColor: theme.backgroundElement }]}>
         {/* Email has no profile picture, but the same circle keeps the row
             aligned with the Slack review's and marks an unread thread. */}
-        <Avatar name={review.senderName} size={34} highlight={review.unread} style={styles.avatar} />
+        <Avatar name={review.senderName} size={40} highlight={review.unread} style={styles.avatar} />
         <View style={styles.rowCopy}>
           <View style={styles.rowTop}>
             <ThemedText type={review.unread ? 'smallBold' : 'small'} numberOfLines={1} style={styles.rowSender}>
@@ -101,42 +107,46 @@ export function GmailThreadRow({
           </View>
           <ThemedText
             type={review.unread ? 'smallBold' : 'small'}
-            numberOfLines={2}
+            numberOfLines={open ? undefined : 1}
             style={[styles.rowSubject, review.removed && styles.struck]}>
             {review.subject}
           </ThemedText>
           {preview ? <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>{preview}</ThemedText> : null}
+          <ThemedText type="small" style={styles.link}>{review.action}</ThemedText>
           {review.removed || review.unread || review.labels.length ? (
             <View style={styles.rowChips}>
-              {review.removed ? <Chip label="KEPT IN INBOX" tone="danger" /> : null}
+              {review.removed ? <Chip label="SKIPPED" tone="danger" /> : null}
               {review.unread ? <Chip label="UNREAD" tone="accent" /> : null}
               {review.labels.map((label) => <Chip key={label} label={label} />)}
             </View>
           ) : null}
         </View>
-        {review.open ? <OpenInSourceButton link={review.open} compact /> : null}
         <ThemedText themeColor="textSecondary" style={[styles.chevron, open && styles.chevronOpen]}>›</ThemedText>
       </Pressable>
 
       {open ? (
         <View style={styles.expanded}>
           <ThemedText type="small" themeColor="textSecondary" selectable>
-            In {review.account} · thread {review.threadId || 'unknown'}
+            {review.account}
           </ThemedText>
           {review.messages.map((message, index) => (
-            <ThreadMessage key={message.messageId || index} message={message} account={review.account} />
+            <ThreadMessage key={message.messageId || index} message={message} account={review.account} defaultOpen={index === review.messages.length - 1} />
           ))}
+          {review.messageCount > review.messages.length && review.messages.length > 0 ? (
+            <ThemedText type="small" themeColor="textSecondary">Showing {review.messages.length} of {review.messageCount} messages. Open in Gmail for the rest.</ThemedText>
+          ) : null}
           {review.messages.length === 0 ? (
             <ThemedText type="small" themeColor="textSecondary">
               No messages for thread {review.threadId} are in the warehouse. Open it in Gmail before approving.
             </ThemedText>
           ) : null}
+          {review.error ? <ThemedText style={styles.error}>{review.error}</ThemedText> : null}
           <View style={styles.rowActions}>
             {review.open ? <OpenInSourceButton link={review.open} /> : null}
-            {pending && !review.removed ? (
+            {pending && review.mutationStatus === 'pending_review' && !review.removed ? (
               <Pressable accessibilityRole="button" onPress={() => onKeep(review)} style={styles.rowAction} hitSlop={6}>
                 <ThemedText type="smallBold" style={styles.danger}>
-                  {review.threadsInMutation > 1 ? `Keep these ${review.threadsInMutation} in the inbox` : 'Keep this in the inbox'}
+                  {review.action === 'Archive' ? (review.threadsInMutation > 1 ? `Keep ${review.threadsInMutation} threads in inbox` : 'Keep in inbox') : (review.threadsInMutation > 1 ? `Skip action on ${review.threadsInMutation} threads` : 'Skip this action')}
                 </ThemedText>
               </Pressable>
             ) : null}
@@ -152,7 +162,7 @@ const GMAIL_SCOPES = [
   { key: 'all', label: 'All' },
   { key: 'unread', label: 'Unread' },
   { key: 'automated', label: 'Automated' },
-  { key: 'kept', label: 'Kept' },
+  { key: 'kept', label: 'Skipped' },
 ] as const;
 
 export type GmailScope = (typeof GMAIL_SCOPES)[number]['key'];
@@ -172,6 +182,7 @@ export function GmailOverview({
   onScope,
   scopeCounts,
   visible,
+  otherActionCount = 0,
 }: {
   request: MutationRequest;
   summary: GmailBatchSummary;
@@ -182,6 +193,7 @@ export function GmailOverview({
   onScope: (value: GmailScope) => void;
   scopeCounts: Record<GmailScope, number>;
   visible: number;
+  otherActionCount?: number;
 }) {
   const theme = useTheme();
   const [showReason, setShowReason] = useState(false);
@@ -197,14 +209,14 @@ export function GmailOverview({
             {summary.verb} {summary.threadCount} thread{summary.threadCount === 1 ? '' : 's'}
           </ThemedText>
           <ThemedText type="small">{summary.effect}</ThemedText>
+          {otherActionCount ? <ThemedText type="smallBold">Also includes {otherActionCount} other actions below. Approve applies to the whole request.</ThemedText> : null}
           <ThemedText type="small" themeColor="textSecondary">
             {summary.accounts.map((entry) => `${entry.account} (${entry.count})`).join(' · ') || request.title}
           </ThemedText>
           {request.reason ? (
             <Pressable accessibilityRole="button" onPress={() => setShowReason((value) => !value)} hitSlop={6}>
-              <ThemedText type="small" themeColor="textSecondary" numberOfLines={showReason ? undefined : 2} style={styles.requestReason}>
-                {request.reason}
-              </ThemedText>
+              <ThemedText type="small" style={styles.link}>{showReason ? 'Hide request details' : 'Why these threads?'}</ThemedText>
+              {showReason ? <ThemedText type="small" themeColor="textSecondary" style={styles.requestReason}>{request.title}{'\n'}{request.reason}</ThemedText> : null}
             </Pressable>
           ) : null}
           <ThemedText type="small" themeColor="textSecondary">
@@ -256,7 +268,7 @@ export function GmailOverview({
       {visible !== summary.threadCount ? (
         <ThemedText type="small" themeColor="textSecondary">
           Showing {visible} of {summary.threadCount}
-          {summary.keptCount ? ` · ${summary.keptCount} kept in the inbox` : ''}
+          {summary.keptCount ? ` · ${summary.keptCount} skipped` : ''}
         </ThemedText>
       ) : null}
     </View>
@@ -266,7 +278,7 @@ export function GmailOverview({
 
 const styles = StyleSheet.create({
   overview: { padding: Spacing.three, gap: Spacing.two },
-  hero: { borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#D9770644' },
+  hero: { borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#2563EB33' },
   heroCopy: { flex: 1, minWidth: 0, gap: 4 },
   heroEyebrow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 7 },
   requestTitle: { fontSize: 24, lineHeight: 30 },
@@ -284,7 +296,7 @@ const styles = StyleSheet.create({
   rowCopy: { flex: 1, minWidth: 0, gap: 1 },
   rowTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
   rowSender: { flexShrink: 1 },
-  rowSubject: { fontWeight: '600' },
+  rowSubject: { fontSize: 15, lineHeight: 21 },
   struck: { textDecorationLine: 'line-through' },
   rowChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 3 },
   chip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 },
@@ -292,12 +304,13 @@ const styles = StyleSheet.create({
   chevron: { fontSize: 20, lineHeight: 22, marginTop: 8 },
   chevronOpen: { transform: [{ rotate: '90deg' }], color: ACCENT },
   expanded: { gap: Spacing.two, paddingHorizontal: Spacing.three, paddingBottom: Spacing.three },
-  message: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, padding: 10, gap: 3 },
+  message: { borderTopWidth: StyleSheet.hairlineWidth, paddingVertical: 12, gap: 6 },
   messageHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
-  messageSender: { flexShrink: 1 },
-  messageBody: { marginTop: 2 },
+  messageBody: { marginTop: 8, fontSize: 16, lineHeight: 24 },
+  detailsButton: { minHeight: 44, justifyContent: 'center', alignSelf: 'flex-start' },
+  messageDetails: { padding: 12, borderRadius: 8, gap: 6 },
   rowActions: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: Spacing.three, paddingTop: Spacing.one },
-  rowAction: { minHeight: 32, justifyContent: 'center' },
+  rowAction: { minHeight: 44, justifyContent: 'center' },
   link: { color: '#3c87f7' },
   danger: { color: DANGER },
 });

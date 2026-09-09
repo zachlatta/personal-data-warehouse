@@ -963,6 +963,9 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 				)
 				from 1 for 1600
 			) AS preview_text,
+			-- Expanded review must retain paragraphs and quoted replies, not the
+			-- cleaned/collapsed or 1600-character list preview above.
+			COALESCE(NULLIF(message.body_text, ''), NULLIF(message.body_markdown_full, ''), '') AS body_text,
 			substring(COALESCE(message.body_html, '') from 1 for 200000) AS body_html,
 			count(*) OVER (PARTITION BY message.account, message.thread_id)::bigint AS message_count,
 			count(*) FILTER (WHERE 'INBOX' = ANY(message.label_ids)) OVER (PARTITION BY message.account, message.thread_id)::bigint AS inbox_message_count
@@ -997,6 +1000,7 @@ func (s *PostgresStore) enrichGmailThreadPreviews(ctx context.Context, mutations
 			&row.InternalDate,
 			&row.Snippet,
 			&row.PreviewText,
+			&row.BodyText,
 			&row.BodyHTML,
 			&messageCount,
 			&inboxMessageCount,

@@ -258,3 +258,15 @@ func TestApplyGmailThreadPreviewRowsCarriesTheSenderDisplayName(t *testing.T) {
 		t.Fatalf("message from_name = %#v", message["from_name"])
 	}
 }
+
+func TestGmailReviewPreservesFullBodySeparatelyFromSnippet(t *testing.T) {
+	body := "Hello,\n\n" + strings.Repeat("Full message. ", 200) + "\nOn Wed, someone wrote:\nOriginal message"
+	thread := gmailThreadPreviewFromRows("t", []gmailThreadPreviewRow{{MessageID: "m", Snippet: "Short preview", BodyText: body}})
+	message := mapSliceFromAny(thread["messages"])[0]
+	if message["body_text"] != body {
+		t.Fatalf("full body was lost: %#v", message["body_text"])
+	}
+	if message["preview_text"] != "Short preview" {
+		t.Fatal("inbox snippet changed")
+	}
+}
