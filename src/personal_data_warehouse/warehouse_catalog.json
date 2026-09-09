@@ -2351,7 +2351,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "One row per linked Plaid Item, naming the institution and accounts that stop updating when it breaks. status = 'action_required' means re-run `pdw ingest plaid link` for that institution."
+      "comment": "One row per linked Plaid Item with institution and account health. `status = 'action_required'`: update the existing Item with `pdw ingest plaid update <item-id>`; never start a new Link."
     },
     {
       "id": "marts_ops_slack_conversation_health",

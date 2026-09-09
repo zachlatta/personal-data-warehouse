@@ -391,6 +391,29 @@ def test_plaid_docs_use_update_mode_for_existing_item_repairs(path: Path) -> Non
         )
 
 
+def test_plaid_item_health_catalog_repairs_the_existing_item_without_new_link() -> None:
+    """SQL discovery must not turn an Item repair into a duplicate Link."""
+
+    from personal_data_warehouse.warehouse_catalog import CATALOG
+
+    comment = CATALOG.object("marts_ops_plaid_item_health").comment
+    update_command = "`pdw ingest plaid update <item-id>`"
+    assert update_command in comment
+
+    update_at = comment.index(update_command)
+    update_window = comment[max(0, update_at - 100) : update_at + 100].lower()
+    assert "existing item" in update_window
+
+    lowered = comment.lower()
+    assert "new link" in lowered
+    new_link_at = lowered.index("new link")
+    new_link_window = lowered[max(0, new_link_at - 50) : new_link_at + 50]
+    assert "never" in new_link_window or "do not" in new_link_window
+    assert "`pdw ingest plaid link`" not in lowered
+    assert "institution" in lowered and "account health" in lowered
+    assert len(comment.encode("utf-8")) <= 187
+
+
 def test_plaid_desktop_oauth_does_not_require_a_redirect_uri() -> None:
     """Plaid's desktop popup works without the mobile redirect prerequisite."""
 
