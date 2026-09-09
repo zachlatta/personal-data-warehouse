@@ -2228,8 +2228,8 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     ) ex ON TRUE""",
     event_id="concat_ws('|', t.source, t.account, t.source_native_id)",
     event_ts=(
-        "COALESCE(ex.period_end::timestamp AT TIME ZONE 'UTC', "
-        "t.file_modified_at, t.ingested_at)"
+        "COALESCE(NULLIF(ex.period_end, '1970-01-01'::date)::timestamp AT TIME ZONE 'UTC', "
+        "NULLIF(t.file_modified_at, '1970-01-01 00:00:00+00'::timestamptz), t.ingested_at)"
     ),
     ingest_ts="GREATEST(t.ingested_at, COALESCE(ex.created_at, t.ingested_at))",
     actor="'me'",

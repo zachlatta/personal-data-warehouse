@@ -3377,3 +3377,19 @@ def test_a_live_adapter_is_never_retired_by_the_cleanup(warehouse):
     """
     live = {adapter.name for adapter in TIMELINE_ADAPTERS}
     assert set(RETIRED_TIMELINE_ADAPTERS).isdisjoint(live)
+
+
+@pytest.mark.parametrize('missing_file_timestamp', [False, True])
+def test_finance_evidence_missing_dates_never_uses_epoch(warehouse, missing_file_timestamp):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    warehouse._command("UPDATE @manual_finance_extractions SET period_end = '1970-01-01' WHERE content_sha256 = 'docsha'")
+    if missing_file_timestamp:
+        warehouse._command("UPDATE @manual_finance_documents SET file_modified_at = '1970-01-01' WHERE content_sha256 = 'docsha'")
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    expected = _NOW if missing_file_timestamp else _NOW - timedelta(hours=16)
+    assert warehouse._query("SELECT event_ts FROM @timeline_events WHERE adapter='manual_finance_document'") == [(expected,)]
