@@ -31,7 +31,8 @@ def test_load_settings_manual_finance_absent_without_env(monkeypatch):
     assert settings.manual_finance is None
 
 
-def test_cli_runs_uploader_with_parsed_args(monkeypatch, tmp_path):
+@pytest.mark.parametrize("evidence_only", [False, True])
+def test_cli_runs_uploader_with_parsed_args(monkeypatch, tmp_path, evidence_only):
     root = tmp_path / "accounts"
     (root / "acme-checking-0001").mkdir(parents=True)
     (root / "acme-checking-0001" / "statement.pdf").write_bytes(b"%PDF")
@@ -59,6 +60,7 @@ def test_cli_runs_uploader_with_parsed_args(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "ingest_client_from_env", lambda: object())
     cli.main(
         [
+            *(["--evidence-only"] if evidence_only else []),
             str(root),
             "--limit",
             "5",
@@ -68,6 +70,7 @@ def test_cli_runs_uploader_with_parsed_args(monkeypatch, tmp_path):
             str(tmp_path / "state.lock"),
         ]
     )
+    assert captured["evidence_only"] is evidence_only
     assert captured["account"] == "z@x.test"
     assert captured["paths"] == [root]
     assert captured["limit"] == 5

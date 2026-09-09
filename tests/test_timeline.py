@@ -1004,7 +1004,7 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         INSERT INTO @manual_finance_documents (source, account, source_native_id, filename,
                                               original_path, mime_type, content_sha256,
                                               file_modified_at, ingested_at, sync_version)
-        VALUES ('manual', 'z@x.test', 'docsha', 'statement.pdf', 'Bank/Checking',
+        VALUES ('manual_evidence', 'z@x.test', 'docsha', 'statement.pdf', 'Bank/Checking',
                 'application/pdf', 'docsha', %s, %s, %s)
         """,
         (_NOW - timedelta(hours=16), _NOW, sync_version),
@@ -1254,6 +1254,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert observation["snippet"] == "1234.56 USD"
 
     document = next(r for r in rows if r["adapter"] == "manual_finance_document")
+    assert document["metadata"]["evidence_only"] is True
     assert document["title"] == "statement.pdf"
     assert document["snippet"] == "Monthly checking statement"
 

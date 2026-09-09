@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> None:
             "object key's account segment."
         )
     )
+    parser.add_argument("--evidence-only", action="store_true", help="Archive and extract searchable evidence without booking it into the finance ledger; folders need not identify accounts")
     parser.add_argument("paths", nargs="+", type=Path, help="Files or directories to upload")
     parser.add_argument(
         "--root",
@@ -67,6 +68,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             summary = ManualFinanceUploadRunner(
                 account=settings.manual_finance.account,
+                evidence_only=args.evidence_only,
                 paths=args.paths,
                 root=args.root,
                 ingest_client=ingest_client_from_env(),

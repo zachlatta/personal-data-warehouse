@@ -315,6 +315,7 @@ class FinanceLedgerSummary:
     # small and stable; a jump means either a new institution is uploading to
     # the corpus root or an entity's books arrived where an investor's
     # statement used to.
+    documents_withheld_evidence: int = 0
     documents_withheld_entity: int = 0
     documents_withheld_unidentified: int = 0
     observation_conflicts: int = 0
@@ -467,9 +468,13 @@ class FinanceLedgerRunner:
         # untouched -- it simply never becomes one of the owner's stocks or
         # flows.
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        withheld_evidence: list[dict[str, Any]] = []
         withheld_entity: list[dict[str, Any]] = []
         withheld_unidentified: list[dict[str, Any]] = []
         for extraction in extractions:
+            if extraction.get("evidence_only", False):
+                withheld_evidence.append(extraction)
+                continue
             if document_reports_an_entity(extraction):
                 withheld_entity.append(extraction)
                 continue
@@ -706,6 +711,7 @@ class FinanceLedgerRunner:
             links_relinked=links_relinked,
             links_removed=links_removed,
             observations_removed=observations_removed,
+            documents_withheld_evidence=len(withheld_evidence),
             documents_withheld_entity=len(withheld_entity),
             documents_withheld_unidentified=len(withheld_unidentified),
             observation_conflicts=self._observation_conflicts,
@@ -1528,7 +1534,13 @@ class FinanceLedgerRunner:
                    e.reporting_scope, e.account_holder, e.value_basis,
                    e.transactions_json, e.balances_json, e.valuations_json,
                    e.positions_json, e.commitments_json, e.period_end,
-                   d.account, d.original_path, d.filename
+                   d.account, d.original_path, d.filename,
+                   EXISTS (
+                       SELECT 1 FROM @manual_finance_documents evidence
+                       WHERE evidence.content_sha256 = e.content_sha256
+                         AND evidence.source = 'manual_evidence'
+                         AND evidence.is_deleted = 0
+                   ) AS evidence_only
             FROM @manual_finance_extractions e
             JOIN @manual_finance_documents d
               ON d.content_sha256 = e.content_sha256 AND d.is_deleted = 0

@@ -225,3 +225,19 @@ def test_runner_limit_bounds_a_run(tmp_path):
         limit=1,
     ).sync()
     assert summary.files_uploaded == 1
+
+
+def test_evidence_upload_is_separate_provenance_and_incremental_state(tmp_path):
+    root = _corpus(tmp_path)
+    client = FakeIngestClient()
+    state = ManualFinanceUploadState.open(tmp_path / 'state.sqlite', account='z@x.test')
+    kwargs = dict(account='z@x.test', paths=[root], ingest_client=client,
+                  logger=Logger(), now=lambda: _TS, upload_state=state)
+    try:
+        assert ManualFinanceUploadRunner(**kwargs).sync().files_uploaded == 3
+        assert ManualFinanceUploadRunner(**kwargs, evidence_only=True).sync().files_uploaded == 3
+        assert ManualFinanceUploadRunner(**kwargs, evidence_only=True).sync().files_uploaded == 0
+        assert {m['payload']['source'] for m in client.metadata[3:]} == {'manual_evidence'}
+        assert client.metadata[0]['metadata_dedup_sha256'] != client.metadata[3]['metadata_dedup_sha256']
+    finally:
+        state.close()

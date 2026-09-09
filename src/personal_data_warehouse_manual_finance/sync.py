@@ -142,6 +142,7 @@ class ManualFinanceUploadRunner:
         limit: int | None = None,
         mode: str = "incremental",
         upload_state: ManualFinanceUploadState | None = None,
+        evidence_only: bool = False,
     ) -> None:
         if ingest_client is None:
             raise ValueError("ingest_client is required")
@@ -149,6 +150,7 @@ class ManualFinanceUploadRunner:
             raise ValueError("mode must be 'full' or 'incremental'")
         if not paths:
             raise ValueError("at least one file or directory is required")
+        self._source = "manual_evidence" if evidence_only else "manual"
         self._account = account
         self._paths = paths
         self._root = root
@@ -175,7 +177,7 @@ class ManualFinanceUploadRunner:
             if (
                 self._mode == "incremental"
                 and self._upload_state is not None
-                and self._upload_state.is_complete(content_sha256=content_sha256)
+                and self._upload_state.is_complete(content_sha256=self._state_key(content_sha256))
             ):
                 skipped += 1
                 continue
@@ -209,7 +211,7 @@ class ManualFinanceUploadRunner:
                 failures.append((candidate.original_path, exc))
                 if self._upload_state is not None:
                     self._upload_state.mark_failure(
-                        content_sha256=content_sha256,
+                        content_sha256=self._state_key(content_sha256),
                         original_path=candidate.original_path,
                         error=str(exc),
                         now=self._now(),
@@ -245,6 +247,11 @@ class ManualFinanceUploadRunner:
             raise failures[0][1]
         return summary
 
+    def _state_key(self, sha: str) -> str:
+        # Preserve existing statement state; evidence is a distinct provenance
+        # claim, so an earlier statement upload must not suppress its envelope.
+        return sha if self._source == "manual" else f"{self._source}:{sha}"
+
     def _upload_candidate(
         self,
         *,
@@ -267,6 +274,7 @@ class ManualFinanceUploadRunner:
             content_type=content_type,
         )
         envelope = build_document_metadata(
+            source=self._source,
             account=self._account,
             filename=candidate.path.name,
             original_path=candidate.original_path,
@@ -290,7 +298,7 @@ class ManualFinanceUploadRunner:
         )
         if self._upload_state is not None:
             self._upload_state.mark_success(
-                content_sha256=content_sha256,
+                content_sha256=self._state_key(content_sha256),
                 original_path=candidate.original_path,
                 now=self._now(),
             )

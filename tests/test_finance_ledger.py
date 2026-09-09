@@ -2867,3 +2867,17 @@ def test_calling_more_than_committed_owes_zero_not_a_negative(warehouse):
     assert warehouse._query(
         "SELECT unfunded, unfunded_basis FROM @marts_finance_commitments"
     ) == [(Decimal("0"), "derived")]
+
+
+@pytest.mark.parametrize('duplicate_manual_claim', [False, True])
+def test_evidence_document_never_books_even_with_confident_extraction(warehouse, duplicate_manual_claim):
+    warehouse.ensure_plaid_tables()
+    _seed_document(warehouse, document=_document_row(source='manual_evidence', original_path='2025 Taxes/return.pdf'),
+                   extraction=_extraction_row(transactions_json=[{'date': '2026-06-01', 'amount': '-100', 'description': 'Tax payment'}]))
+    if duplicate_manual_claim:
+        warehouse.insert_manual_finance_documents([_document_row()])
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+    assert summary.documents_withheld_evidence == 1
+    for relation in ('finance_accounts', 'finance_observations', 'finance_transactions', 'finance_tax_lots'):
+        assert warehouse._query(f'SELECT count(*) FROM @{relation}') == [(0,)]
+    assert warehouse._query('SELECT count(*) FROM @manual_finance_extractions') == [(1,)]

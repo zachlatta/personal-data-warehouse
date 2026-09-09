@@ -2242,6 +2242,7 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     ),
     metadata=(
         "jsonb_build_object("
+        "'evidence_only', t.source = 'manual_evidence', "
         "'document_type', ex.document_type, "
         "'institution', ex.institution, "
         "'account_name_hint', ex.account_name_hint, "

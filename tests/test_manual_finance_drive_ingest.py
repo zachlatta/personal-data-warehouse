@@ -189,3 +189,12 @@ def test_find_file_listing_falls_back_to_library():
 def test_has_metadata_payloads():
     assert has_metadata_payloads(object_store=FakeObjectStore(metadata_listings=[_metadata_listing()]))
     assert not has_metadata_payloads(object_store=FakeObjectStore())
+
+
+def test_evidence_provenance_survives_row_mapping():
+    payload = envelope()
+    payload['source'] = 'manual_evidence'
+    row = metadata_to_row(payload, ingested_at=datetime(2026, 9, 9, tzinfo=UTC))
+    assert row['source'] == 'manual_evidence'
+    assert row['raw_metadata_json']['source'] == 'manual_evidence'
+    assert row['content_sha256'] == 'filesha'

@@ -2945,6 +2945,17 @@ statements are the mortgage's only source.
   account-resolution hint) and as the object key's account segment:
   `manual-finance/inbox/<account-folder>/<date>-<sha><ext>`. Content-sha dedup + sha-keyed local
   state make re-runs cheap; `--limit`, `--mode full`, `--root` supported.
+- **Tax returns, payroll records, and supporting evidence:** use
+  `pdw ingest manual-finance --evidence-only <files-or-dir>`. This preserves arbitrary
+  year/document folders without interpreting them as accounts. Originals use the same
+  storage, extraction, health, and timeline/search pipeline, with provenance source
+  `manual_evidence` rather than `manual`. The ledger deterministically withholds any
+  content hash with a live evidence claim, even if an earlier ordinary manual claim or
+  a confident extraction exists. Re-running ordinary upload cannot undo that protection.
+  `documents_withheld_evidence` is reported by the finance ledger asset. Upload state and
+  metadata dedup distinguish the two claims, while file bytes still dedup by content hash.
+  This is searchable evidence, not verified tax calculations or a tax-filing engine.
+  Deploy the ledger guard before using the new uploader against production.
 - Transport: `/ingest/manual-finance/file` + `/metadata` (photos pattern, HMAC-signed,
   provenance-sha metadata dedup that excludes `original_path`, so moving a file does not
   duplicate the document — but note it does not update the hint either: an identical dedup

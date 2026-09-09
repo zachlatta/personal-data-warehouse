@@ -70,6 +70,9 @@ def finance_ledger(context) -> MaterializeResult:
             # stable. A jump means either a fund's books arrived where an
             # investor statement used to, or files are landing at the corpus
             # root instead of in an account folder.
+            "documents_withheld_evidence": MetadataValue.int(
+                summary.documents_withheld_evidence if summary else 0
+            ),
             "documents_withheld_entity": MetadataValue.int(
                 summary.documents_withheld_entity if summary else 0
             ),
