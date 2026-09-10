@@ -86,7 +86,7 @@ export default function TimelineScreen() {
 
   const chips = useMemo(
     () => (
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipsBar} contentContainerStyle={styles.chips}>
         {PRIORITIES.map((tier) => {
           const on = tiers.includes(tier);
           const color = PRIORITY_COLORS[tier];
@@ -153,13 +153,15 @@ export default function TimelineScreen() {
         onEndReachedThreshold={0.6}
         onEndReached={() => dispatch({ type: 'more' })}
         refreshControl={<RefreshControl refreshing={fetching === 'reset' && items.length > 0} onRefresh={() => dispatch({ type: 'reset' })} />}
-        ListFooterComponent={fetching !== 'none' ? <ActivityIndicator style={styles.footer} /> : null}
+        ListFooterComponent={fetching === 'more' ? <ActivityIndicator style={styles.footer} /> : null}
         ListEmptyComponent={
           fetching === 'none' ? (
             <ThemedText themeColor="textSecondary" style={styles.empty}>
               Nothing here for these tiers.
             </ThemedText>
-          ) : null
+          ) : (
+            <ActivityIndicator style={styles.footer} />
+          )
         }
       />
     </ThemedView>
@@ -168,7 +170,11 @@ export default function TimelineScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  chips: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.two },
+  // flexGrow: 0 keeps the chip bar at its content height: a pull-to-refresh
+  // empties the list, and without it the ScrollView fills the freed space and
+  // stretches every pill to the full screen height.
+  chipsBar: { flexGrow: 0, flexShrink: 0 },
+  chips: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.two, alignItems: 'center' },
   chip: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 5 },
   chipText: { fontSize: 13, fontWeight: '600' },
   row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
