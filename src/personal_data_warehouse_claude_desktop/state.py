@@ -11,7 +11,8 @@ messages by primary key, so re-uploading a whole conversation is cheap and safe.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import hashlib
 from pathlib import Path
 import sqlite3
 
@@ -137,4 +138,40 @@ def default_state_file() -> Path:
         / "Application Support"
         / "personal-data-warehouse"
         / "claude-desktop-upload-state.sqlite"
+    )
+
+
+#: How long the keepalive sensor sits out after claude.ai rejected the stored
+#: session, before probing again with the same key. One red run an hour keeps
+#: the failure visible in Dagster without the 288-a-day flood; a fresh push
+#: (different key hash) resumes immediately.
+CLAUDE_DESKTOP_REJECTED_REPROBE = timedelta(hours=1)
+
+
+def session_key_sha256(session_key: str) -> str:
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+
+
+def claude_desktop_credential_skip(
+    credential: dict | None, *, now: datetime | None = None, republish_hint: str
+) -> str | None:
+    """Return the sensor's skip message while the current key is known-rejected.
+
+    Skips only the exact key that failed (by sha256) and only within
+    ``CLAUDE_DESKTOP_REJECTED_REPROBE`` of the rejection, so the condition is
+    re-checked hourly and a new key is tried at once.
+    """
+    if not credential or str(credential.get("status") or "") != "action_required":
+        return None
+    rejected_sha = str(credential.get("rejected_session_sha256") or "")
+    if not rejected_sha or rejected_sha != session_key_sha256(str(credential.get("session_key") or "")):
+        return None
+    rejected_at = credential.get("rejected_at")
+    current = now or datetime.now(tz=UTC)
+    if rejected_at is None or current - rejected_at >= CLAUDE_DESKTOP_REJECTED_REPROBE:
+        return None
+    return (
+        "claude.ai rejected the stored Claude Desktop session "
+        f"({str(credential.get('error') or '')[:120]}); skipping polls until a new key is pushed "
+        f"or an hour passes. {republish_hint}"
     )

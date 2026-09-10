@@ -782,8 +782,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         data=7 * DAY,
         run=3 * HOUR,
         basis="measured: 111 gaps, p95 1.51d, max 16.71d; the 3h run heartbeat is the sharper signal",
-        state=StateSource(table="claude_desktop_credentials", updated_column="updated_at"),
-        note="the Mac re-pushes the session key hourly; a stale credential expires the poller",
+        state=StateSource(
+            table="claude_desktop_credentials",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "the Mac re-pushes the session key hourly and the poller stamps its own verdict"
+            " on the same row: action_required means claude.ai rejected the key and the"
+            " desktop app needs a sign-in"
+        ),
     ),
     _source(
         "chatgpt",

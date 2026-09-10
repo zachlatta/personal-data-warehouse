@@ -42,6 +42,21 @@ class ClaudeAiApiError(RuntimeError):
     """Raised when a claude.ai API call fails after retries."""
 
 
+class ClaudeAiAuthError(ClaudeAiApiError):
+    """claude.ai answered 401/403: the stored session is dead or blocked.
+
+    No retry clears this; only a fresh sign-in on the Mac does. The poller
+    records it on the credential row so /pipelines reads ``attention`` and the
+    keepalive sensor stops relaunching an identical red run every five minutes
+    -- 3,450 of them between 2026-08-29 and 2026-09-10 while
+    ``marts_ops.pipeline_health`` read ``ok``.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class ClaudeAiRateLimitError(ClaudeAiApiError):
     """The backend returned 429; stop this poll and continue on the next tick.
 
@@ -113,10 +128,11 @@ class ClaudeAiClient:
                 # 401/403 are auth/cloudflare and will not improve on retry, so
                 # fail fast with a clear message.
                 if response.status_code in (401, 403):
-                    raise ClaudeAiApiError(
+                    raise ClaudeAiAuthError(
                         f"claude.ai returned {response.status_code} for {path}; "
                         "the desktop login may have expired or Cloudflare is blocking - "
-                        "open the Claude Desktop app and sign in again"
+                        "open the Claude Desktop app and sign in again",
+                        status_code=response.status_code,
                     )
                 # 429 means throttled: don't retry inline (that only hammers an
                 # already-rate-limited endpoint); surface it so the poller stops

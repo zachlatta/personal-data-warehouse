@@ -2709,6 +2709,16 @@ _AI_EVENT_TABLE_BY_SOURCE = {
 }
 
 
+#: Columns the poller adds to private.claude_desktop_credentials beside the
+#: Go pusher's own DDL: its verdict on the key, so pipeline health can read it.
+CLAUDE_DESKTOP_CREDENTIAL_STATUS_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("status", "text NOT NULL DEFAULT 'ok'"),
+    ("error", "text NOT NULL DEFAULT ''"),
+    ("rejected_session_sha256", "text NOT NULL DEFAULT ''"),
+    ("rejected_at", "timestamptz NULL"),
+)
+
+
 class PostgresWarehouse:
     def __init__(self, postgres_database_url: str, *, schema: str = "public") -> None:
         normalized = normalize_postgres_url(postgres_database_url)
@@ -5924,18 +5934,74 @@ class PostgresWarehouse:
             )
             """
         )
+        # The poller's own verdict on the credential. The Go pusher creates the
+        # table without these (it only ever writes the key), so they are added
+        # here, checked first so a healthy deploy issues no DDL. Until 2026-09-10
+        # the row carried no status at all: the hourly push kept `updated_at`
+        # fresh, pipeline_health read that as a healthy run heartbeat, and the
+        # poller failed 3,450 times in twelve days behind an `ok`.
+        present = {
+            str(row[0])
+            for row in self._query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (self._object_schema("claude_desktop_credentials"), "claude_desktop_credentials"),
+            )
+        }
+        for column, ddl in CLAUDE_DESKTOP_CREDENTIAL_STATUS_COLUMNS:
+            if column not in present:
+                self._command(
+                    f"ALTER TABLE @claude_desktop_credentials ADD COLUMN IF NOT EXISTS {column} {ddl}"
+                )
 
     def read_claude_desktop_credential(self, *, account: str) -> dict[str, Any] | None:
         self.ensure_claude_desktop_tables()
         rows = self._query_dicts(
             """
-            SELECT account, session_key, org_id, expires_at, captured_at, updated_at
+            SELECT account, session_key, org_id, expires_at, captured_at, updated_at,
+                   status, error, rejected_session_sha256, rejected_at
             FROM @claude_desktop_credentials
             WHERE account = %s
             """,
             (account,),
         )
         return rows[0] if rows else None
+
+    def mark_claude_desktop_credential_rejected(
+        self, *, account: str, session_sha256: str, error: str, when: datetime | None = None
+    ) -> None:
+        """Record that claude.ai rejected the stored session (401/403).
+
+        Keyed on the sha256 of the session key so a concurrent push of a NEW key
+        is never marked with the old key's failure: the sensor compares this
+        against the current key and resumes on its own once it differs.
+        """
+        self.ensure_claude_desktop_tables()
+        when = when or datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE @claude_desktop_credentials
+            SET status = 'action_required',
+                error = %s,
+                rejected_session_sha256 = %s,
+                rejected_at = %s,
+                updated_at = %s
+            WHERE account = %s AND encode(sha256(convert_to(session_key, 'UTF8')), 'hex') = %s
+            """,
+            (error[:2000], session_sha256, when, when, account, session_sha256),
+        )
+
+    def mark_claude_desktop_credential_ok(self, *, account: str, when: datetime | None = None) -> None:
+        """A successful poll clears the verdict and stamps the run heartbeat."""
+        when = when or datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE @claude_desktop_credentials
+            SET status = 'ok', error = '', updated_at = %s
+            WHERE account = %s
+            """,
+            (when, account),
+        )
 
     def read_latest_claude_desktop_credential(self) -> dict[str, Any] | None:
         """Return the most recently pushed credential, regardless of its account label.
@@ -5950,7 +6016,8 @@ class PostgresWarehouse:
         self.ensure_claude_desktop_tables()
         rows = self._query_dicts(
             """
-            SELECT account, session_key, org_id, expires_at, captured_at, updated_at
+            SELECT account, session_key, org_id, expires_at, captured_at, updated_at,
+                   status, error, rejected_session_sha256, rejected_at
             FROM @claude_desktop_credentials
             ORDER BY updated_at DESC
             LIMIT 1

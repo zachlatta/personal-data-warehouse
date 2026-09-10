@@ -40,6 +40,10 @@ from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 CLAUDE_DESKTOP_POSTGRES_LOCK_ID = 8_407_112_444
+CLAUDE_DESKTOP_REPUBLISH_HINT = (
+    "Open the Claude Desktop app on the Mac, sign in again, then run "
+    "`pdw ingest claude-desktop` (or wait for the hourly claude-desktop-auth LaunchAgent)."
+)
 CLAUDE_DESKTOP_SENSOR_INTERVAL_SECONDS = 300
 
 
@@ -49,10 +53,11 @@ def claude_desktop_client(context) -> MaterializeResult:
 
     from personal_data_warehouse_claude_desktop.api import (
         ClaudeAiApiError,
+        ClaudeAiAuthError,
         ClaudeAiClient,
         resolve_sync_account,
     )
-    from personal_data_warehouse_claude_desktop.state import WarehouseSyncState
+    from personal_data_warehouse_claude_desktop.state import WarehouseSyncState, session_key_sha256
     from personal_data_warehouse_claude_desktop.sync import ClaudeDesktopUploadRunner
 
     settings = load_settings(require_gmail=False, require_claude_desktop=True)
@@ -138,7 +143,23 @@ def claude_desktop_client(context) -> MaterializeResult:
                         logger=context.log,
                         upload_state=WarehouseSyncState(warehouse=warehouse, account=sync_account),
                     )
-                    summary = runner.sync()
+                    try:
+                        summary = runner.sync()
+                    except ClaudeAiAuthError as exc:
+                        # Dead or blocked session: no retry clears it. Record it
+                        # on the credential row (pipeline_health reads `attention`
+                        # with this text) and let the sensor sit out an hour per
+                        # probe instead of one red run every five minutes.
+                        warehouse.mark_claude_desktop_credential_rejected(
+                            account=str(credential.get("account") or ""),
+                            session_sha256=session_key_sha256(str(credential.get("session_key") or "")),
+                            error=str(exc),
+                        )
+                        context.log.warning(
+                            "Claude Desktop session rejected (%s). %s", exc, CLAUDE_DESKTOP_REPUBLISH_HINT
+                        )
+                        raise
+                    warehouse.mark_claude_desktop_credential_ok(account=str(credential.get("account") or ""))
             finally:
                 warehouse.close()
 
@@ -190,6 +211,20 @@ def claude_desktop_client_keepalive_sensor(context):
         return SkipReason(
             f"Claude Desktop poller cannot upload - http_app ingest is not configured: {upload_problem}"
         )
+
+    # A key claude.ai has already rejected is not launched again every five
+    # minutes: the verdict is on the credential row for /pipelines, and the
+    # sensor re-probes hourly or as soon as a different key is pushed.
+    from personal_data_warehouse_claude_desktop.state import claude_desktop_credential_skip
+
+    warehouse = warehouse_from_settings(settings)
+    try:
+        credential = warehouse.read_latest_claude_desktop_credential()
+    finally:
+        warehouse.close()
+    rejected = claude_desktop_credential_skip(credential, republish_hint=CLAUDE_DESKTOP_REPUBLISH_HINT)
+    if rejected:
+        return SkipReason(rejected)
 
     return RunRequest(tags={"claude_desktop_trigger": "keepalive"})
 

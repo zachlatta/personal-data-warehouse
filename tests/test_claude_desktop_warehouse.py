@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import os
 
 import pytest
@@ -187,6 +187,58 @@ def test_read_latest_credential_ignores_account_and_picks_newest(warehouse) -> N
     assert latest is not None
     assert latest["session_key"] == "sk-new"
     assert latest["org_id"] == "org-new"
+
+
+def test_rejected_credential_is_marked_on_the_row_and_cleared_by_a_good_poll(warehouse) -> None:
+    """The poller's verdict lives on the credential row pipeline_health reads.
+
+    Between 2026-08-29 and 2026-09-10 the poller failed 3,450 times (claude.ai
+    403) while marts_ops.pipeline_health read `ok`, because the row's only
+    heartbeat was the hourly key push. The Go pusher creates the table without
+    verdict columns; ensure() adds them, and a rejection is keyed on the sha of
+    the exact key that failed so a fresh push is never mislabelled.
+    """
+    from personal_data_warehouse_claude_desktop.state import session_key_sha256
+
+    warehouse.ensure_claude_desktop_tables()
+    # Simulate the Go-shaped table (no verdict columns) and prove ensure repairs it.
+    for column in ("status", "error", "rejected_session_sha256", "rejected_at"):
+        warehouse._command(f"ALTER TABLE @claude_desktop_credentials DROP COLUMN {column}")
+    warehouse.ensure_claude_desktop_tables()
+    warehouse._command(
+        """
+        INSERT INTO @claude_desktop_credentials (account, session_key, org_id, captured_at)
+        VALUES (%s, %s, %s, %s)
+        """,
+        ("account@example.com", "sk-ant-sid-dead", "org-1", INGESTED),
+    )
+    cred = warehouse.read_latest_claude_desktop_credential()
+    assert cred["status"] == "ok" and cred["error"] == "" and cred["rejected_at"] is None
+
+    # A rejection of a DIFFERENT key (a concurrent push rotated it) marks nothing.
+    warehouse.mark_claude_desktop_credential_rejected(
+        account="account@example.com", session_sha256=session_key_sha256("sk-other"), error="403"
+    )
+    assert warehouse.read_latest_claude_desktop_credential()["status"] == "ok"
+
+    when = datetime(2026, 9, 10, 1, tzinfo=UTC)
+    warehouse.mark_claude_desktop_credential_rejected(
+        account="account@example.com",
+        session_sha256=session_key_sha256("sk-ant-sid-dead"),
+        error="claude.ai returned 403 for /api/organizations/x/chat_conversations",
+        when=when,
+    )
+    cred = warehouse.read_latest_claude_desktop_credential()
+    assert cred["status"] == "action_required"
+    assert "403" in cred["error"]
+    assert cred["rejected_session_sha256"] == session_key_sha256("sk-ant-sid-dead")
+    assert cred["rejected_at"] == when
+    assert cred["updated_at"] == when
+
+    warehouse.mark_claude_desktop_credential_ok(account="account@example.com", when=when + timedelta(hours=1))
+    cred = warehouse.read_latest_claude_desktop_credential()
+    assert cred["status"] == "ok" and cred["error"] == ""
+    assert cred["updated_at"] == when + timedelta(hours=1)
 
 
 def test_claude_desktop_persists_end_to_end(warehouse) -> None:
