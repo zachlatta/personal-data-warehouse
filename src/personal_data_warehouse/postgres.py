@@ -265,10 +265,15 @@ SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME = 3
 # multi-leg hybrid. The same pool taken from an index that contains only those
 # tiers is a shallow scan of a small corpus.
 #
-# Why these two tiers and no more: they are 7.9% of the corpus by document
-# bytes (1,451 MB of 18.4 GB), so the partial index is a fraction of the global
-# index rather than a second copy of it. Adding `cc` would pull in 6.9M more
-# rows and most of that argument.
+# Why these three tiers and no more: they are the attention scope every
+# surface recommends (`self,direct,cc`), and together 2.5M of 59M rows. The
+# pair originally held only `self` and `direct`, when `cc` was 6.9M rows; the
+# 2026-08-26 re-tiering shrank `cc` to 1.18M, and the recommended scope was
+# then the one shape the partial pair could NOT serve: a `self,direct,cc`
+# search fell back to the global index and walked ~500k score-ordered
+# documents with a heap visit each -- measured 2026-09-09 at p50 9-11s against
+# 1.4-1.9s unscoped and ~1s for `self,direct`. The index the advice points at
+# has to be the index the advice is fast on.
 SEARCH_TEXT_ATTENTION_PRIORITIES: tuple[str, ...] = (
     CATALOG.timeline_priorities.optimized_bm25_priorities
 )

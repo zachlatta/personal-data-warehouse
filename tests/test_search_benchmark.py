@@ -618,13 +618,14 @@ def test_serial_latency_rejects_incorrect_selected_priorities(monkeypatch) -> No
 
     def fake_run_search(_query, mode, _depth, *, priorities=(), **_kwargs):
         if tuple(priorities) == self_direct:
+            # The server answering with a DIFFERENT selection than asked for
+            # (here: a single wrong tier) is a scope mismatch, whatever the
+            # optimized set happens to be.
             return module.SearchResult(
                 mode=mode,
                 elapsed_seconds=0.01,
                 priority_scope="selected",
-                selected_priorities=tuple(
-                    module.CATALOG.timeline_priorities.attention_priorities
-                ),
+                selected_priorities=("noise",),
             )
         return _valid_serial_result(module, mode, priorities, elapsed=2.0)
 

@@ -34,6 +34,7 @@ var TimelinePriorities = TimelinePriorityContract{
 	OptimizedBM25Priorities: []string{
 		"self",
 		"direct",
+		"cc",
 	},
 	Tiers: []TimelinePriorityTier{
 		{Name: "self", Meaning: "Zach initiated it", TypicalRows: "his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments"},

@@ -9,7 +9,8 @@
     ],
     "optimized_bm25_priorities": [
       "self",
-      "direct"
+      "direct",
+      "cc"
     ],
     "tiers": [
       {
