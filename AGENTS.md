@@ -585,6 +585,16 @@ novel queries: unscoped hybrid p50 1.4–1.9s, `self,direct,cc` **9.2 / 10.2 / 1
 the weekly benchmark row read 11.2s for the same scope beside 5.3s unscoped. The
 optimized set is `optimized_bm25_priorities` in the catalog (2.5M of 59M rows) and the
 production pair was rebuilt in the same maintenance window as the plain REINDEX below.
+Measured 2026-09-10 02:23Z, novel queries, thirty minutes after the window and with the
+startup prewarm's I/O settled (`io some avg60` 2.7%): unscoped hybrid 1.29 / 1.27 / 1.57s,
+`self,direct,cc` **1.5 / 1.3 / 4.9 / 1.5 / 4.1s** (p50 1.5s, from 10s). The window itself:
+attention pair rebuilt with `cc` in 4m26s (944 MB + 17 MB), plain `REINDEX` of the global
+index in 13m51s (**12 GB → 6.2 GB**) and of the low-volume one in 1m29s (235 → 117 MB);
+`cache_residency` went from 9.5% to 38% of a working set that shrank from 23.8 to 17.6 GB.
+Two things to know before repeating it: a plain `REINDEX` of the global index blocks
+timeline writes and global searches for the whole fourteen minutes, and the deploy that
+follows (a changed index fingerprint) runs its own 26 GB prewarm at startup — the first
+searches after it read 16s / 45s, which is the prewarm's I/O, not the rebuild.
 
 The pair cost 14 MB + 533 MB against the global index's 10.2 GB and took 59s + 4m35s to
 build `CONCURRENTLY` on production (1,333,278 documents). Measured there the same day on
