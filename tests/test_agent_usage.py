@@ -408,5 +408,7 @@ def test_a_subcommand_the_cli_does_not_have_is_invented():
     # is any non-word character, not only whitespace.
     assert not _matches(CLI_INVENTED_RE, '{"command":"/bin/bash -lc \'pdw schema\'"}')
     assert not _matches(CLI_INVENTED_RE, '{"command":"pdw --help | head"}')
+    # `pdw readme` is the agent guide (since 2026-09-09), not an invention.
+    assert not _matches(CLI_INVENTED_RE, '{"command":"pdw readme search"}')
     # Prose capitalised after `pdw` is documentation, not a command attempt.
     assert not _matches(CLI_INVENTED_RE, '{"command":"cat <<EOF\\npdw CLI Full Disk Access\\nEOF"}')

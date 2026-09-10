@@ -69,7 +69,7 @@ SQL_ERROR_SESSION_CEILING = 0.1
 #: The pdw CLI's real subcommands, split by whether they are a question.
 #: Kept in the same order the dispatcher lists them so a new one is easy to add;
 #: app/cmd/pdw-cli/usage_test.go is what keeps that list honest on the Go side.
-PDW_READ_SUBCOMMANDS = ("search", "sql", "schema", "columns", "call", "list", "describe")
+PDW_READ_SUBCOMMANDS = ("search", "sql", "schema", "columns", "call", "list", "describe", "readme")
 PDW_ADMIN_SUBCOMMANDS = (
     # `readme` is the agent guide (bare `pdw` prints it too): reading the manual
     # is neither a question nor a wrong first move, so it is excluded from the
