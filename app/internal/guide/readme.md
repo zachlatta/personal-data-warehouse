@@ -52,7 +52,7 @@ sessions (< 10%).
 
 Commands agents invent that do not exist: `pdw query`, `pdw schema_overview`,
 `pdw describe_table`, `pdw call sql|query|search|schema_overview|describe_table` (each is
-refused with the real command), and `pdw --version` (it is `pdw version`). Always pass
+refused with the real command). `pdw --version` runs `pdw version` since 2026-09-10. Always pass
 `--output csv|json|nd-json` and a real `-q` intent in scripts; the SQL tool logs the
 intent server-side.
 {{- else -}}

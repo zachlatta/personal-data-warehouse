@@ -155,7 +155,7 @@ func TestGuideTeachesNoRefusedOrInventedCommand(t *testing.T) {
 	// The CLI refuses these with a redirect; the guide must not teach them
 	// except as the thing not to type.
 	text := mustRender(t, SurfaceCLI, "")
-	for _, forbidden := range []string{"pdw call search", "pdw call sql ", "pdw call query", "pdw call schema_overview", "pdw call describe_table", "pdw --version"} {
+	for _, forbidden := range []string{"pdw call search", "pdw call sql ", "pdw call query", "pdw call schema_overview", "pdw call describe_table"} {
 		idx := strings.Index(text, forbidden)
 		if idx < 0 {
 			continue
