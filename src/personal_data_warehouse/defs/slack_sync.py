@@ -97,15 +97,41 @@ class SlackChangePlan:
     reason: str = ""
 
 
-def fetch_client_counts(*, token: str, cookie: str) -> Mapping[str, object]:
+#: How the change feed names the workspace when Slack answers an org-scoped
+#: session with a sibling workspace's conversations. The plain call is first
+#: because it is what works every other day; the scoped variants are what the
+#: web client itself sends on an Enterprise Grid session (a `team_id` form
+#: field, then `slack_route=E:T` on the URL). Which variant recovers a bad
+#: answer is logged, because on 2026-09-08 the plain call described another
+#: workspace for fifteen hours with a token that the hourly republish had
+#: verified against 685 conversations that same afternoon -- the session was
+#: fine, Slack's routing of it was not, and nothing here could ask again.
+CLIENT_COUNTS_WORKSPACE_VARIANTS: tuple[str, ...] = ("plain", "team_id", "slack_route")
+
+
+def fetch_client_counts(
+    *,
+    token: str,
+    cookie: str,
+    team_id: str = "",
+    enterprise_id: str = "",
+    variant: str = "plain",
+) -> Mapping[str, object]:
     """One request that reports every conversation's newest message."""
     from personal_data_warehouse.slack_session import _slack_post
 
+    form = {"thread_counts_by_channel": "true", "org_wide_aware": "true"}
+    query: dict[str, str] = {}
+    if variant == "team_id" and team_id:
+        form["team_id"] = team_id
+    elif variant == "slack_route" and team_id:
+        query["slack_route"] = f"{enterprise_id}:{team_id}" if enterprise_id else team_id
     return _slack_post(
         "client.counts",
         token=token,
         cookie_header=f"d={cookie}",
-        form={"thread_counts_by_channel": "true", "org_wide_aware": "true"},
+        form=form,
+        query=query or None,
     )
 
 
@@ -129,14 +155,8 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
         # authenticates as nobody.
         return SlackChangePlan(usable=False, reason="no published Slack session (run `pdw slack publish-session`)")
 
-    payload = fetch_client_counts(token=token, cookie=cookie)
-    try:
-        feed = SlackChangeFeed.from_counts(payload)
-    except SlackChangeFeed.Error as exc:
-        logger.warning("Slack change feed unavailable, falling back to polling: %s", exc)
-        return SlackChangePlan(usable=False, reason=str(exc))
-
     team_id = str(session.get("team_id") or "")
+    enterprise_id = str(session.get("enterprise_id") or "")
 
     # An `ok: true` payload about SOMEONE ELSE'S conversations is not a change
     # feed. Hack Club is an Enterprise Grid org and a session's client.counts can
@@ -148,19 +168,44 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
     # never advance -- and synced ZERO messages for eleven hours while every
     # other Slack health number read `ok`. Only the DM landing-latency column
     # noticed. Degrading to the blanket poll costs throughput and never coverage,
-    # which is the trade this whole module is built on.
-    covered = sorted(feed.covered_conversation_ids)
-    if covered and hasattr(warehouse, "load_slack_known_conversation_ids"):
-        known = warehouse.load_slack_known_conversation_ids(
-            account=account, team_id=team_id, conversation_ids=covered
+    # which is the trade this whole module is built on -- but that poll burns
+    # its whole rate budget in two minutes and synced zero DMs per pass through
+    # the fifteen-hour episode of 2026-09-08, so before degrading, the plan asks
+    # again with the workspace named explicitly (CLIENT_COUNTS_WORKSPACE_VARIANTS).
+    feed = None
+    reason = ""
+    for variant in CLIENT_COUNTS_WORKSPACE_VARIANTS:
+        payload = fetch_client_counts(
+            token=token, cookie=cookie, team_id=team_id, enterprise_id=enterprise_id, variant=variant
         )
-        if len(known) < SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION * len(covered):
-            reason = (
-                f"client.counts named {len(covered)} conversations and we hold {len(known)} of them; "
-                "the feed is not describing this workspace"
+        try:
+            candidate = SlackChangeFeed.from_counts(payload)
+        except SlackChangeFeed.Error as exc:
+            logger.warning("Slack change feed unavailable, falling back to polling: %s", exc)
+            return SlackChangePlan(usable=False, reason=str(exc))
+        covered = sorted(candidate.covered_conversation_ids)
+        if covered and hasattr(warehouse, "load_slack_known_conversation_ids"):
+            known = warehouse.load_slack_known_conversation_ids(
+                account=account, team_id=team_id, conversation_ids=covered
             )
-            logger.warning("Slack change feed unusable, falling back to polling: %s", reason)
-            return SlackChangePlan(usable=False, reason=reason)
+            if len(known) < SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION * len(covered):
+                reason = (
+                    f"client.counts named {len(covered)} conversations and we hold {len(known)} of them; "
+                    "the feed is not describing this workspace"
+                )
+                logger.warning(
+                    "Slack change feed (%s) describes another workspace: %s", variant, reason
+                )
+                continue
+        if variant != "plain":
+            logger.warning(
+                "Slack change feed recovered by naming the workspace explicitly (variant=%s)", variant
+            )
+        feed = candidate
+        break
+    if feed is None:
+        logger.warning("Slack change feed unusable, falling back to polling: %s", reason)
+        return SlackChangePlan(usable=False, reason=reason)
 
     cursors = warehouse.load_slack_conversation_cursors(account=account, team_id=team_id)
     changed = feed.changed_since(cursors)

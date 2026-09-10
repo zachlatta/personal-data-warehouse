@@ -284,6 +284,99 @@ def test_a_feed_describing_another_workspace_is_not_usable(monkeypatch):
     assert "we hold 0" in plan.reason
 
 
+def test_a_feed_describing_another_workspace_is_retried_with_an_explicit_workspace(monkeypatch):
+    """The sibling-workspace answer is retried with the workspace named explicitly.
+
+    The third and fourth episodes: 2026-09-02 15:00-17:00 and 2026-09-08 12:00
+    through 2026-09-09 03:00 (fifteen hours), with the SAME token the hourly
+    republish had verified against 685 conversations. The session did not
+    change; Slack's answer to an org-scoped session did. The blanket poll the
+    guard degrades to burns its rate budget in two minutes and synced zero DMs
+    per pass, so DM landing p95 read 42 minutes. Before giving up, the plan asks
+    again with the workspace named (form team_id, then the web client's
+    slack_route), uses the first answer that names conversations we hold, and
+    logs which variant did -- so the next episode says what fixes it.
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    calls: list[dict] = []
+
+    def fake_counts(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("variant") == "team_id" and kwargs.get("team_id") == "T1":
+            return {
+                "ok": True,
+                "channels": [{"id": "C_OURS", "latest": "99.0"}],
+                "ims": [{"id": "D_OURS", "latest": "99.0"}],
+                "mpims": [],
+            }
+        return {
+            "ok": True,
+            "channels": [{"id": "C_OTHER_ORG", "latest": "99.0"}],
+            "ims": [{"id": "D_OTHER_ORG", "latest": "99.0"}],
+            "mpims": [],
+        }
+
+    monkeypatch.setattr(slack_defs, "fetch_client_counts", fake_counts)
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={
+                "session_token": "xoxc-t",
+                "session_cookie": "xoxd-c",
+                "team_id": "T1",
+                "enterprise_id": "E1",
+            },
+            cursors={},
+            known={"D_OURS", "C_OURS"},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+
+    assert plan.usable is True
+    assert set(plan.changed_conversation_ids) == {"D_OURS", "C_OURS"}
+    # The plain call first (it is what works every other day), then the scoped ones.
+    assert [call["variant"] for call in calls] == ["plain", "team_id"]
+    assert calls[1]["team_id"] == "T1" and calls[1]["enterprise_id"] == "E1"
+
+
+def test_every_workspace_variant_describing_another_workspace_still_degrades_to_polling(monkeypatch):
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    calls: list[dict] = []
+
+    def fake_counts(**kwargs):
+        calls.append(kwargs)
+        return {
+            "ok": True,
+            "channels": [{"id": "C_OTHER_ORG", "latest": "99.0"}],
+            "ims": [{"id": "D_OTHER_ORG", "latest": "99.0"}],
+            "mpims": [],
+        }
+
+    monkeypatch.setattr(slack_defs, "fetch_client_counts", fake_counts)
+    plan = slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={
+                "session_token": "xoxc-t",
+                "session_cookie": "xoxd-c",
+                "team_id": "T1",
+                "enterprise_id": "E1",
+            },
+            cursors={},
+            known={"D_OURS", "C_OURS"},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+
+    assert plan.usable is False
+    assert "we hold 0" in plan.reason
+    assert len(calls) == len(slack_defs.CLIENT_COUNTS_WORKSPACE_VARIANTS)
+
+
 def test_a_feed_naming_our_conversations_stays_usable_when_one_is_brand_new(monkeypatch):
     """The guard must not fire on the normal case it sits next to.
 

@@ -194,7 +194,14 @@ __all__ = [
 ]
 
 
-def _slack_post(method: str, *, token: str, cookie_header: str, form: Mapping[str, str] | None = None) -> dict[str, Any]:
+def _slack_post(
+    method: str,
+    *,
+    token: str,
+    cookie_header: str,
+    form: Mapping[str, str] | None = None,
+    query: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """POST to Slack with a *client* session (token + `d` cookie).
 
     Both parts are required together: the token alone returns `not_authed`, and
@@ -208,8 +215,13 @@ def _slack_post(method: str, *, token: str, cookie_header: str, form: Mapping[st
     import urllib.request
 
     body = urllib.parse.urlencode({"token": token, **(form or {})}).encode("utf-8")
+    url = f"https://slack.com/api/{method}"
+    if query:
+        # The web client scopes some calls on the URL (slack_route=E:T on an
+        # Enterprise Grid session); the form body is the token's.
+        url += "?" + urllib.parse.urlencode(dict(query))
     request = urllib.request.Request(
-        f"https://slack.com/api/{method}",
+        url,
         data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
