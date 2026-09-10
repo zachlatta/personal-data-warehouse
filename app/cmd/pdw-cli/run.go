@@ -186,12 +186,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			fmt.Fprint(stdout, usage)
 			return 0
 		}
-		// `pdw --version` is the recurring one: ten invocations in thirty days,
-		// each answered with a bare flag error plus the whole usage blob. One
-		// line naming the real command is the whole fix.
-		if redirect := rootFlagRedirect(args); redirect != "" {
-			fmt.Fprint(stderr, redirect)
-			return 2
+		// `pdw --version` is the flag every CLI has, and refusing it was the
+		// single largest "invented command" in agent sessions (302 of 623 in
+		// the fortnight to 2026-09-09). The flag spellings ARE `pdw version`.
+		if isVersionFlag(args) {
+			return runVersion(nil, stdout, stderr)
 		}
 		fmt.Fprintln(stderr, err)
 		fmt.Fprint(stderr, usage)
@@ -969,23 +968,24 @@ var callToolRedirects = map[string]string{
 	"describe_table":  "pdw columns <table>",
 }
 
-// rootFlagRedirect answers a root-level flag that does not exist with the
-// command that does. Returns "" when the flag is not one we recognize, so an
-// unknown flag still falls through to the ordinary usage error.
-func rootFlagRedirect(args []string) string {
+// isVersionFlag reports whether a root-level version flag (--version,
+// -version, -v) appears before a "--" terminator. The root FlagSet does not
+// declare it, so it surfaces as a parse error; this is what turns that error
+// into the version command instead of a refusal.
+func isVersionFlag(args []string) bool {
 	for _, arg := range args {
 		if arg == "--" {
-			return ""
+			return false
 		}
 		if !strings.HasPrefix(arg, "-") {
 			continue
 		}
 		switch strings.ToLower(strings.TrimLeft(arg, "-")) {
 		case "version", "v":
-			return "pdw: there is no --version flag; run `pdw version`.\n"
+			return true
 		}
 	}
-	return ""
+	return false
 }
 
 // hasHelpArg reports whether a help flag appears before a "--" terminator.

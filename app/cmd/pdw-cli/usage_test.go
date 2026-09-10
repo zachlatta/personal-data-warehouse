@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"flag"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -169,22 +170,23 @@ func TestSearchHelpPrintsTheSearchFlagSetNotTheGlobalUsage(t *testing.T) {
 	}
 }
 
-func TestVersionFlagRedirectsToTheVersionCommand(t *testing.T) {
-	// `pdw --version` was answered with a bare flag error plus the whole
-	// ~100-line usage blob, ten times in thirty days.
+func TestVersionFlagIsTheVersionCommand(t *testing.T) {
+	// `pdw --version` is the flag every CLI has. Refusing it with a redirect
+	// was the single largest "invented command" in agent sessions: 302 of 623
+	// in the fortnight to 2026-09-09. The flag spellings now run `pdw version`.
 	for _, args := range [][]string{{"--version"}, {"-version"}, {"-v"}, {"--base-url", "http://x", "--version"}} {
 		arg := strings.Join(args, " ")
 		var outBuf, errBuf bytes.Buffer
 		code := run(args, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
-		if code == 0 {
-			t.Fatalf("%s should not succeed", arg)
+		if code != 0 {
+			t.Fatalf("%s exit = %d (stderr=%s)", arg, code, errBuf.String())
 		}
-		errOut := errBuf.String()
-		if !strings.Contains(errOut, "pdw version") {
-			t.Fatalf("%s should name `pdw version`, got: %s", arg, errOut)
+		var want bytes.Buffer
+		if vcode := runVersion(nil, &want, io.Discard); vcode != 0 {
+			t.Fatalf("pdw version exit = %d", vcode)
 		}
-		if strings.Contains(errOut, "AUTO-UPDATE") {
-			t.Fatalf("%s dumped the full usage instead of a one-line redirect:\n%s", arg, errOut)
+		if outBuf.String() != want.String() {
+			t.Fatalf("%s printed %q, `pdw version` prints %q", arg, outBuf.String(), want.String())
 		}
 	}
 }

@@ -76,8 +76,10 @@ PDW_ADMIN_SUBCOMMANDS = (
     # denominator and the first-call decision like the other admin commands.
     "readme",
     "ingest", "login", "logout", "config", "chatgpt", "slack", "whoop", "version", "update",
-    # run() accepts all three spellings of help before it dispatches.
-    "--help", "-h", "help",
+    # run() accepts all three spellings of help before it dispatches, and since
+    # 2026-09-09 the version flag spellings run `pdw version` instead of a
+    # redirect -- they were 302 of the 623 "invented" calls in that fortnight.
+    "--help", "-h", "help", "--version", "-version", "-v",
 )
 
 #: `pdw` as the invoked binary rather than the three letters. A command position

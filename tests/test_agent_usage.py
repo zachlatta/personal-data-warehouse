@@ -395,7 +395,10 @@ def test_a_real_invocation_is_recognised_wherever_the_shell_puts_it():
 def test_a_subcommand_the_cli_does_not_have_is_invented():
     # These are the shapes the CLI answers with `unknown command` or a redirect.
     assert _matches(CLI_INVENTED_RE, '{"command":"pdw query \\"SELECT 1\\""}')
-    assert _matches(CLI_INVENTED_RE, '{"command":"pdw --version"}')
+    # `pdw --version` runs `pdw version` since 2026-09-09; it is an admin
+    # call, not an invented one -- it was 302 of 623 invented calls before.
+    assert not _matches(CLI_INVENTED_RE, '{"command":"pdw --version"}')
+    assert _matches(CLI_ADMIN_RE, '{"command":"pdw --version"}')
     # `pdw call <tool>` is fenced by runCall (C9: one obvious way per surface).
     # The old classifier only knew about `call sql`/`call query`, so the 81
     # `pdw call search` invocations in the fortnight to 2026-08-28 were counted
