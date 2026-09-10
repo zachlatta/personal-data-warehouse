@@ -71,6 +71,10 @@ SQL_ERROR_SESSION_CEILING = 0.1
 #: app/cmd/pdw-cli/usage_test.go is what keeps that list honest on the Go side.
 PDW_READ_SUBCOMMANDS = ("search", "sql", "schema", "columns", "call", "list", "describe")
 PDW_ADMIN_SUBCOMMANDS = (
+    # `readme` is the agent guide (bare `pdw` prints it too): reading the manual
+    # is neither a question nor a wrong first move, so it is excluded from the
+    # denominator and the first-call decision like the other admin commands.
+    "readme",
     "ingest", "login", "logout", "config", "chatgpt", "slack", "whoop", "version", "update",
     # run() accepts all three spellings of help before it dispatches.
     "--help", "-h", "help",

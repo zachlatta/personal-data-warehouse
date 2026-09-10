@@ -90,8 +90,11 @@ type sqlInput struct {
 // not exist, the search tool was called zero times, and 7 sessions total used
 // a priority tier. So it now says the three things that change what an agent
 // does first: start at the timeline, here are the attention tiers, and here is
-// the layer order to walk when SQL really is needed.
-var serverInstructions = "Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
+// the layer order to walk when SQL really is needed. Since 2026-09-09 the full
+// agent guide is the `readme` tool, so this paragraph opens by naming it: the
+// instructions are the one thing an MCP client shows before the first call.
+var serverInstructions = "Call the readme tool first: it is the agent guide to this warehouse (workflow, command map, priority tiers, SQL rules, where each domain lives), with topics for search, sql, sources, agent-sessions, finance, health, slack, mutations and ops. " +
+	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
 	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
 	"For an email, chat/channel, or agent-turn hit, read the conversation around it with timeline.context(ref, 5, 5) through the query tool — a Gmail hit returns its thread, a Slack hit its thread or channel, a message its chat; each hit's source_table/source_pk drill straight to the authoritative row. " +

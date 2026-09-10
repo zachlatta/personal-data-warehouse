@@ -13,6 +13,7 @@ import (
 
 func readOnlyTools(svc *query.Service) []tool.Tool {
 	return []tool.Tool{
+		readmeTool(),
 		queryTool(svc),
 		searchTool(svc),
 		schemaOverviewTool(svc),

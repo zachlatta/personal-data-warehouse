@@ -58,6 +58,7 @@ before the rename can still self-update.)
 After installing:
 
 ```bash
+pdw          # the agent guide (also `pdw readme`, `pdw readme <topic>`); no login needed
 pdw login    # interactive: stores API URL + token in ~/.config/pdw/config.json
 pdw list     # confirms the connection works
 pdw search 'offer letter signed start date'

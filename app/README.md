@@ -375,6 +375,16 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
   the full machine-readable response. SQL-native workflows can still call
   `timeline.search_text`, `timeline.search_text_exact`, and `timeline.context` through `pdw sql`.
 
+### `readme`
+
+The agent guide, MCP-only (the CLI renders the same guide locally as `pdw readme`).
+Takes no arguments for the main guide — the search-first workflow, the command map, the
+priority tiers, the SQL rules, where each domain lives, what a negative result means —
+or `{"topic": "<name>"}` for one deep-dive (`search`, `sql`, `sources`, `agent-sessions`,
+`finance`, `health`, `slack`, `mutations`, `ops`). Returns one plain-text block, not JSON.
+The server's MCP instructions open by naming it, so it is the first call an agent makes.
+Rendered from `internal/guide/`; its tests pin every relation it names to the catalog.
+
 ### `query`
 
 The single MCP SQL operation. It executes read-only Postgres SQL and returns every bounded result in full, including long text fields. Each statement must include `question`, a concise plain-English description of the intent; legacy bare SQL arrays are rejected.
@@ -495,17 +505,20 @@ go build -o /tmp/pdw ./cmd/pdw-cli
   --client laptop
 # or run without flags for an interactive prompt.
 
+/tmp/pdw                          # the agent guide (same as `pdw readme`); needs no login
+/tmp/pdw readme finance           # one guide topic in depth; `pdw readme --help` lists them
 /tmp/pdw list                     # name/title/description table
 /tmp/pdw list --json              # raw JSON tool list
 /tmp/pdw describe sql             # title + description + input JSON Schema
-/tmp/pdw call schema_overview     # zero-input NON-SQL tool
-/tmp/pdw columns gmail.messages   # describe_table: columns + types + indexes for one relation
+/tmp/pdw search --priority self,direct 'budget approval'   # hybrid search, scoped to attention tiers
+/tmp/pdw schema                   # schema_overview: every relation with its row estimate
+/tmp/pdw columns base_gmail.messages   # describe_table: columns + types + indexes for one relation
 /tmp/pdw sql -q 'Find offer letters' "SELECT * FROM timeline.search_text('offer letter', 50)"
 /tmp/pdw sql 'SELECT 1'                  # SQL is the only positional; defaults to CSV + an output-format note
 /tmp/pdw sql -q 'What is one?' 'SELECT 1'  # -q records the caller's intent in server logs
 /tmp/pdw sql --output json -q 'What time is it?' 'SELECT now()'
 /tmp/pdw sql --output nd-json -q 'Which recent Gmail messages exist?' 'SELECT * FROM gmail_messages LIMIT 3'
-/tmp/pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'  # opt out of the default 10-second timeout
+/tmp/pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'  # wait past the client's 75s cutoff
 /tmp/pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql  # SQL from a file
 /tmp/pdw sql -q 'Recent Slack messages' < query.sql                            # SQL from stdin
 /tmp/pdw config show              # prints config with the token redacted
@@ -515,9 +528,18 @@ go build -o /tmp/pdw ./cmd/pdw-cli
 Running SQL has exactly one path: the `sql` command. The read-only query tool
 is named `sql` over the CLI/HTTP API and `query` over MCP, so `pdw call sql`
 and `pdw call query` are both rejected with a pointer to `pdw sql`. This
-keeps SQL off the JSON-quoting `call` path. `call` is for non-SQL tools only.
-`pdw sql` cancels a query after 10 seconds by default; pass `--no-timeout` for
-a long-running query that should wait indefinitely on the client side.
+keeps SQL off the JSON-quoting `call` path. `call` is for non-SQL tools only;
+`schema_overview`, `describe_table`, `search` and `readme` are likewise refused
+there because each has a first-class command. The server stops a statement
+after its 60-second budget and `pdw sql` waits 75 seconds, so the server's
+error (with its rewrite hint) is what you see; pass `--no-timeout` to wait
+indefinitely on a large result download.
+
+The agent guide is part of the binary: bare `pdw` or `pdw readme` prints it
+with CLI spellings, `pdw readme <topic>` prints one deep-dive, and the MCP
+server exposes the same guide as the `readme` tool with MCP spellings. It is
+rendered from `internal/guide/`, whose tests pin every relation it names to
+the warehouse catalog and every tier to the priority contract.
 
 Values resolve in this order: **`--flag` > environment variable > config
 file > default**. Env vars (`PDW_API_URL`, `PDW_SECRET_TOKEN`,

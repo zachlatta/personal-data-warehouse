@@ -487,7 +487,7 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"query", "search", "schema_overview", "describe_table"} {
+	for _, name := range []string{"readme", "query", "search", "schema_overview", "describe_table"} {
 		if !found[name] {
 			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
 		}

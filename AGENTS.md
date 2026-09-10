@@ -49,6 +49,8 @@ quietly becoming untrue, and several of these have been.
   is a judgement no test can make for you. See [Timeline priority tiers](#timeline-priority-tiers).
 - **C3 — agents start at the timeline and can filter by priority.** The `search` tool or
   `timeline.events`/`timeline.search_text()` in SQL, then one hop out to the source row.
+  **The manual for this is `pdw readme` / the MCP `readme` tool**, rendered from
+  `app/internal/guide/` and pinned by its tests; see [The agent guide](#the-agent-guide).
   *Held up by* the catalog's `START HERE` guidance being published as real schema comments
   (`test_schema_comments_publish_the_start_here_guidance`) so discovery cannot disagree with
   the docs — and, since 2026-08-27, **measured**: `marts_ops.agent_usage` (daily
@@ -201,6 +203,23 @@ contract stated here has no check there. Grade from that, not from this prose.
 
 Adding a source touches all eleven. The step-by-step list, marked by which steps a test
 catches and which fail silently, is [Adding a warehouse source](#adding-a-warehouse-source).
+
+## The agent guide
+
+**The manual for using the warehouse lives in the binary, not in a skill.** `pdw readme
+[topic]` (and a bare `pdw`) on the CLI, the `readme` tool over MCP — both rendered from
+`app/internal/guide/` (`readme.md` plus `topics/*.md`, Go templates whose only branching
+is the surface's own spelling of each call). The fleet skill is one line that says to read
+it. Until 2026-09-09 the guide was a hand-transcribed skill outside this repository that
+drifted from the code on every reorg; now `app/internal/guide/guide_test.go` fails when
+the guide names a relation the catalog does not have, omits a priority tier or selection,
+teaches a command the CLI refuses, indexes a topic that does not exist, or outgrows one
+sitting (14 KB for the main page). So **editing the guide is how a warehouse change reaches
+agents**: a change that alters what an agent should do first, which relation a domain
+starts at, or a trap it must know is not done until the guide says so — a new source goes
+in `topics/sources.md`, a new command in the command map. Keep the main page to what every
+session needs and put depth in a topic. The repository is public: no incident amounts, no
+people's names, nothing that belongs in a private note.
 
 ## Warehouse Schema Layout
 
@@ -1180,10 +1199,13 @@ someone notices a gap in an answer).
     scoped with `sources => ARRAY[...]`, and it falls outside the low-volume BM25 partition,
     so a broad search reaches its rows only by walking past millions of gmail/slack documents.
 15. **Document it** — a section in `AGENTS.md` and/or `README.md` with the SQL starting
-    points. **SILENT in substance, ENFORCED in accuracy**: nothing requires you to write the
+    points, **and the agent guide** (`app/internal/guide/topics/sources.md`, plus the
+    domain topic if one exists), because the guide is what an agent actually reads.
+    **SILENT in substance, ENFORCED in accuracy**: nothing requires you to write the
     section, but if you do, every `schema.relation` you name must exist
-    (`test_docs_only_name_relations_that_exist`) and may not be a pre-reorg name
-    (`test_no_module_names_a_pre_reorg_physical_relation`).
+    (`test_docs_only_name_relations_that_exist` for the docs,
+    `TestEveryRelationTheGuideNamesExistsInTheCatalog` for the guide) and may not be a
+    pre-reorg name (`test_no_module_names_a_pre_reorg_physical_relation`).
 
 Photo sources have five *additional* registry edits on top of this list — see
 [Adding a photo source](#adding-a-photo-source-google_photos-takeout-import-manual-imports-).

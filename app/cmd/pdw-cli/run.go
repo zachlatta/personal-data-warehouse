@@ -23,11 +23,15 @@ var usage = `pdw — talk to the personal data warehouse /api/tools surface.
 USAGE
   pdw [--base-url URL] [--token TOKEN] [--client NAME] [<command> [args]]
 
-With no command, pdw runs schema_overview and prints the warehouse
-schema, so callers always see what tables and columns are available before
-writing SQL.
+With no command, pdw prints the agent guide (the same as "pdw readme"):
+how to use the warehouse well, starting at the timeline. Read it once per
+session; read a topic when a question enters that domain.
 
 COMMANDS
+  readme [topic]             Print the agent guide, or one of its topics
+                             (search, sql, sources, agent-sessions, finance,
+                             health, slack, mutations, ops, ingest). Needs no
+                             URL or token. Run "pdw readme --help" for the list.
   login                      Save warehouse URL + token to a per-user config file
                              so future runs need no env vars or flags.
                                --base-url URL  Warehouse URL (else prompted; defaults
@@ -81,8 +85,9 @@ COMMANDS
                              relations and keys but NOT columns, so this is the only
                              authoritative column list. Guessing column names is the
                              single largest source of failed queries.
-  schema                     Run schema_overview and print the warehouse schema
-                             (same as running pdw with no command).
+  schema                     Run schema_overview and print every relation with
+                             its row estimate. For finding a relation you do
+                             not know, not a first step: search needs none of it.
   ingest <source> [flags]    Run a local data-warehouse uploader through pdw.
                              Sources: voice-memos, apple-notes, apple-messages,
                              agent-sessions. Flags after <source> are forwarded
@@ -128,6 +133,8 @@ ENVIRONMENT
   XDG_CONFIG_HOME    Overrides the config directory root.
 
 EXAMPLES
+  pdw readme                         # the agent guide; bare "pdw" prints it too
+  pdw readme finance                 # one topic in depth
   pdw login                          # one-time setup; persists URL + token
   pdw list
   pdw describe sql
@@ -193,9 +200,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	rest := rootFlags.Args()
 	var cmd string
 	if len(rest) == 0 {
-		// No command: default to schema_overview so callers always see the
-		// schema first. Falls through to the auth/client setup below.
-		cmd = "schema"
+		// No command: print the agent guide. It used to run schema_overview,
+		// which taught every session to open with schema discovery -- the
+		// exact habit C3 measures against. The guide says search first.
+		cmd = "readme"
 	} else {
 		cmd, rest = rest[0], rest[1:]
 	}
@@ -212,6 +220,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usage)
 		return 0
+	}
+	// readme is rendered from the binary: no URL, no token, no network. It is
+	// dispatched before config resolution so the guide (which says to run
+	// `pdw login`) is readable on a machine that has not logged in yet.
+	if cmd == "readme" {
+		return runReadme(rest, stdout, stderr)
 	}
 	// ingest runs local uploaders and never talks to /api/tools, so dispatch
 	// it here: before the generic help check (so `pdw ingest <src> --help`
@@ -307,7 +321,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 }
 
 // schemaSearchFirstNudge is printed to stderr before every schema dump.
-var schemaSearchFirstNudge = "pdw schema: this is the relation list for writing SQL. For any text, topic, person or identifier question, start with `pdw search '<terms>'` (add --priority " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + " for attention questions) — it needs no schema."
+var schemaSearchFirstNudge = "pdw schema: this is the relation list for writing SQL. For any text, topic, person or identifier question, start with `pdw search '<terms>'` (add --priority " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + " for attention questions) — it needs no schema. `pdw readme` is the guide."
 
 // runSchema calls schema_overview and prints its CSV result blocks as plain
 // text so the no-args invocation is human-readable. Any extra args are
@@ -319,8 +333,10 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	}
 	// Schema discovery is step 2's prerequisite, not step 1: measured over
 	// 14 days to 2026-08-28, 31% of PDW sessions opened with this command and
-	// 21% with a search, against a 60% search-first target. The nudge goes to
-	// stderr so scripted consumers keep clean rows on stdout.
+	// 21% with a search, against a 60% search-first target -- and until
+	// 2026-09-09 a bare `pdw` ran it, so the first thing every session saw was
+	// the relation list. The nudge goes to stderr so scripted consumers keep
+	// clean rows on stdout.
 	fmt.Fprintln(stderr, schemaSearchFirstNudge)
 	out, err := client.CallTool(context.Background(), "schema_overview", nil)
 	if err != nil {
@@ -729,6 +745,10 @@ func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writ
 		fmt.Fprintln(stdout, "query is MCP-only; use `pdw sql [-q QUESTION] SQL` on the CLI.")
 		return 0
 	}
+	if name == "readme" {
+		fmt.Fprintln(stdout, "readme is MCP-only; the CLI renders the same guide with `pdw readme [topic]`.")
+		return 0
+	}
 	tools, err := client.ListTools(context.Background())
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw describe:", err)
@@ -931,6 +951,9 @@ func firstLine(s string) string {
 // as a command: `pdw query` and `pdw schema_overview` were both observed in
 // real sessions, and both got "unknown command" plus a ~100-line help dump.
 var commandRedirects = map[string]string{
+	"guide":           "read the agent guide with `pdw readme [topic]`",
+	"docs":            "read the agent guide with `pdw readme [topic]`",
+	"manual":          "read the agent guide with `pdw readme [topic]`",
 	"query":           "run SQL with `pdw sql -q '<question>' '<sql>'`",
 	"sql_query":       "run SQL with `pdw sql -q '<question>' '<sql>'`",
 	"schema_overview": "print the warehouse schema with `pdw schema`",
@@ -941,6 +964,7 @@ var commandRedirects = map[string]string{
 // callToolRedirects are the tools `call` refuses, because each already has a
 // first-class command whose output is readable rather than raw JSON.
 var callToolRedirects = map[string]string{
+	"readme":          "pdw readme [topic]",
 	"schema_overview": "pdw schema",
 	"describe_table":  "pdw columns <table>",
 }

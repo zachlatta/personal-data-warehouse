@@ -385,22 +385,6 @@ func TestHelpExitsZero(t *testing.T) {
 	}
 }
 
-func TestNoArgsRunsSchemaOverview(t *testing.T) {
-	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.slack.messages\nuser_id,conversation_id\nU09,C0\n"}]}}`)
-	})
-	out, errOut, code := runCLI(t, srv.URL, "")
-	if code != 0 {
-		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
-	}
-	if srv.lastPath != "/api/tools/schema_overview" || srv.lastMethod != http.MethodPost {
-		t.Fatalf("expected POST /api/tools/schema_overview, got %s %s", srv.lastMethod, srv.lastPath)
-	}
-	if !strings.Contains(out, "default.slack.messages") || !strings.Contains(out, "user_id,conversation_id") {
-		t.Fatalf("schema CSV not printed:\n%s", out)
-	}
-}
-
 func TestSchemaCommandRunsSchemaOverview(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"results":[{"sql":"SCHEMA","csv":"# default.gmail.messages\nsubject\nhello\n"}]}}`)
@@ -435,9 +419,11 @@ func TestSchemaCommandRejectsArguments(t *testing.T) {
 	}
 }
 
-func TestNoArgsWithoutConfigReportsMissingCredentials(t *testing.T) {
+func TestSchemaWithoutConfigReportsMissingCredentials(t *testing.T) {
+	// Bare `pdw` prints the guide without configuration (readme_test.go);
+	// a command that needs the server must still say what is missing.
 	var outBuf, errBuf bytes.Buffer
-	code := run(nil, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
+	code := run([]string{"schema"}, strings.NewReader(""), &outBuf, &errBuf, func(string) string { return "" })
 	if code == 0 {
 		t.Fatalf("expected non-zero exit when unconfigured")
 	}

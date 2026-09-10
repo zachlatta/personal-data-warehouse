@@ -25,6 +25,7 @@ var updateSchemaGoldens = flag.Bool("update", false, "regenerate input-schema go
 // from the HTTP API side via
 // apiSnapshotTools in mux_api_test.go.
 var mcpSnapshotTools = []string{
+	"readme",
 	"query",
 	"search",
 	"schema_overview",

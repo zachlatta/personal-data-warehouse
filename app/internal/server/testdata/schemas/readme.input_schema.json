@@ -1,0 +1,10 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "topic": {
+      "description": "optional topic name for a deep-dive section; omit for the main guide; an unknown name errors listing the valid topics",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
