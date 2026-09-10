@@ -7,7 +7,11 @@ run_coordinator:
   module: dagster._core.run_coordinator
   class: QueuedRunCoordinator
   config:
-    max_concurrent_runs: 8
+    # 12, not 8: the host has 28 cores at load ~2, and on 2026-09-09 seven hung
+    # jobs held 7 of 8 slots for 3.5 hours while the five-minute syncs queued
+    # for up to 46 minutes each. Per-job dagster/max_runtime tags are the other
+    # half of that fix; this is the headroom.
+    max_concurrent_runs: 12
     dequeue_interval_seconds: 5
     dequeue_use_threads: true
     dequeue_num_workers: 4

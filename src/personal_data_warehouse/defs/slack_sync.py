@@ -855,11 +855,21 @@ def _run_locked_slack_stage(
 slack_workspace_sync_job = define_asset_job(
     "slack_workspace_sync_job",
     selection=[slack_workspace_sync],
+    # A run-time cap below the global 4-hour run-monitoring one: on 2026-09-09
+    # seven short jobs hung in their step subprocess for 3.5 hours after a
+    # deploy and starved the five-minute syncs of run slots (see
+    # tests/test_dagster_job_runtime_caps.py).
+    tags={"dagster/max_runtime": "1800"},
 )
 
 slack_workspace_coverage_sync_job = define_asset_job(
     "slack_workspace_coverage_sync_job",
     selection=[slack_workspace_coverage_sync],
+    # A run-time cap below the global 4-hour run-monitoring one: on 2026-09-09
+    # seven short jobs hung in their step subprocess for 3.5 hours after a
+    # deploy and starved the five-minute syncs of run slots (see
+    # tests/test_dagster_job_runtime_caps.py).
+    tags={"dagster/max_runtime": "3600"},
 )
 
 slack_workspace_public_sweep_sync_job = define_asset_job(

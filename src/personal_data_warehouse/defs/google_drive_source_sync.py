@@ -79,6 +79,11 @@ def google_drive_source_sync(context) -> MaterializeResult:
 google_drive_source_sync_job = define_asset_job(
     "google_drive_source_sync_job",
     selection=[google_drive_source_sync],
+    # A run-time cap below the global 4-hour run-monitoring one: on 2026-09-09
+    # seven short jobs hung in their step subprocess for 3.5 hours after a
+    # deploy and starved the five-minute syncs of run slots (see
+    # tests/test_dagster_job_runtime_caps.py).
+    tags={"dagster/max_runtime": "7200"},
 )
 
 
