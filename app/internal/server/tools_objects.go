@@ -14,7 +14,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference, or a Slack attachment by its Slack file id. Pass the storage_file_id from a warehouse row's storage_* columns, or a slack_files.file_id (F...) to fetch the file live from the Slack API. Returns object metadata and a signed, time-limited download_url that fetches the raw file bytes without further authentication."
+const getObjectDescription = "Fetch a stored blob object (Gmail attachment, Apple Notes/Messages attachment, Voice Memo audio, ...) by its storage reference, or a Slack attachment by its Slack file id. Pass the storage_file_id from a warehouse row's storage_* columns, or a slack_files.file_id (F...) to fetch the file live from the Slack API. Returns object metadata and a signed, time-limited download_url that fetches the raw file bytes without further authentication. Fetch it with curl or Python requests, not urllib: the edge rejects urllib's default User-Agent with HTTP 403."
 
 type getObjectInput struct {
 	StorageFileID  string `json:"storage_file_id" jsonschema:"the storage_file_id from a warehouse row (storage_file_id / metadata_storage_file_id / html_storage_file_id), or a Slack file id from slack_files.file_id"`
@@ -35,8 +35,20 @@ type getObjectOutput struct {
 	StorageURL    string `json:"storage_url,omitempty"`
 	DownloadURL   string `json:"download_url,omitempty"`
 	ExpiresAt     string `json:"expires_at,omitempty"`
+	Hint          string `json:"hint,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
+
+// downloadURLHint travels with every download_url because the public app
+// hostname sits behind Cloudflare, whose bot rule rejects Python urllib's
+// default User-Agent (``Python-urllib/3.x``) with HTTP 403 before the request
+// reaches the app. Measured 2026-09-09 on a freshly minted link: urllib 403,
+// curl / requests / wget / Go all 200. The link itself is valid; the client
+// signature is what is refused. The caller is a model that will typically
+// reach for urllib, so the output says so rather than letting a valid link
+// read as a broken one.
+const downloadURLHint = "Fetch download_url with curl, wget, Python requests, or any client that sends a descriptive User-Agent. Python urllib's default User-Agent (Python-urllib/3.x) is rejected at the edge with HTTP 403 before the request reaches the app; the link is still valid."
+
 
 // driveSourceBackend marks rows whose bytes live in the user's own Google Drive
 // (Drive-as-a-source), served live via a per-account store rather than copied
@@ -202,6 +214,7 @@ func getObjectTool(store objectstore.ObjectStore, driveStores map[string]objects
 			exp := now().Add(ttl)
 			out.DownloadURL = signedObjectDownloadURL(signer, baseURL, in.StorageFileID, account, exp)
 			out.ExpiresAt = exp.UTC().Format(time.RFC3339)
+			out.Hint = downloadURLHint
 			return out, nil
 		},
 		IsError: func(o getObjectOutput) bool { return o.Error != "" },

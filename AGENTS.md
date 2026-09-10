@@ -3295,6 +3295,20 @@ pdw call get_object --data '{"storage_file_id":"F0EXAMPLE123"}'
 curl -L -o poster.png "<download_url from the response>"
 ```
 
+**A 403 on a fresh `download_url` is the client, not the link.** The public hostname sits
+behind Cloudflare, whose bot rule rejects Python urllib's default User-Agent
+(`Python-urllib/3.x`) with `browser_signature_banned` before the request reaches the app,
+so the app never sees it and its own logs stay silent. Measured 2026-09-09 on a link minted
+seconds earlier for a manual-finance statement: urllib **403**, curl / wget / `requests` /
+Go all **200**. A Codex session on porygon that day concluded the originals were unreachable
+"through that route" while their extracted text was fine; the link had been valid the whole
+time. `get_object` now carries a `hint` naming the client beside every `download_url`, and
+its description says so before the link is minted. Fetch with `curl`, `requests`, or any
+client that sends a descriptive User-Agent — a browser string is not needed, the rule
+targets the known-bot signature. The same rule is why every server-side Python caller of
+`PDW_API_URL` sets its own User-Agent (`agent_tool_proxy.py`, the benchmark runner, the
+Slack fingerprinter).
+
 **Do not build a second Slack fetch path.** A 2026-08-16 session concluded pdw could not fetch
 Slack file bytes and guessed an answer; it had tried the *public* `slack-files.com` permalink,
 which 404s unless the file was explicitly shared publicly. `url_private` needs the bearer token

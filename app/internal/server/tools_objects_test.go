@@ -145,6 +145,34 @@ func TestGetObjectToolReturnsSignedDownloadURL(t *testing.T) {
 	}
 }
 
+// The public hostname sits behind Cloudflare, which rejects Python urllib's
+// default User-Agent with HTTP 403 before the app sees the request. Measured
+// 2026-09-09 on a fresh link: urllib 403, curl/requests/wget/Go 200. A model
+// reading a 403 concludes the link is broken, so every download_url travels
+// with the hint that names the client, and the hint says the link is valid.
+func TestGetObjectToolAttachesUserAgentHintToDownloadURL(t *testing.T) {
+	store := &fakeObjectStore{
+		meta:    objectstore.ObjectMetadata{Backend: "google_drive", StorageFileID: "fid", ContentType: "application/pdf"},
+		content: []byte("%PDF"),
+	}
+	out := invokeGetObject(t, store, getObjectInput{StorageFileID: "fid"})
+	if out.DownloadURL == "" {
+		t.Fatalf("expected a download_url: %+v", out)
+	}
+	for _, want := range []string{"Python-urllib", "403", "curl", "still valid"} {
+		if !strings.Contains(out.Hint, want) {
+			t.Fatalf("hint must mention %q: %q", want, out.Hint)
+		}
+	}
+	if !strings.Contains(getObjectDescription, "urllib") {
+		t.Fatalf("tool description must warn about urllib before the link is minted: %q", getObjectDescription)
+	}
+	missing := invokeGetObject(t, &fakeObjectStore{notFound: true}, getObjectInput{StorageFileID: "gone"})
+	if missing.Hint != "" {
+		t.Fatalf("no download_url means no download hint: %+v", missing)
+	}
+}
+
 func TestGetObjectToolReportsGoogleNativeDocAsDocx(t *testing.T) {
 	store := &fakeObjectStore{
 		meta: objectstore.ObjectMetadata{
