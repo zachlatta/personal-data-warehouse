@@ -23,6 +23,7 @@ INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library"
 DEFAULT_AUDIO_EXTENSION = ".mp3"
 DEFAULT_AUDIO_CONTENT_TYPE = "audio/mpeg"
+AUDIO_KIND = "voice_recording_audio"
 METADATA_KIND = "voice_recording_metadata"
 PAGE_HTML_KIND = "voice_recording_page_html"
 
@@ -83,6 +84,12 @@ class AliceVoiceRecordingsImportRunner:
         self._stage = stage
         self._mode = mode
 
+    def _archived_completely(self, recording_id: str) -> bool:
+        """True when both the audio blob and the metadata sidecar exist."""
+        return _has_alice_object(
+            self._object_store, kind=METADATA_KIND, recording_id=recording_id
+        ) and _has_alice_object(self._object_store, kind=AUDIO_KIND, recording_id=recording_id)
+
     def sync(self) -> AliceVoiceRecordingsImportSummary:
         seen = 0
         uploaded = 0
@@ -97,13 +104,16 @@ class AliceVoiceRecordingsImportRunner:
                 seen += 1
                 recording_url = media_url_from_recording(upload_request)
                 recording_id = recording_id_from_upload_request(upload_request, recording_url=recording_url)
-                if self._mode == "incremental" and object_store_has_object(
-                    self._object_store,
-                    kind=METADATA_KIND,
-                    key="alice_upload_id",
-                    value=recording_id,
-                ):
-                    self._logger.info("skip Alice recording %s: metadata already archived", recording_id)
+                # Incremental short-circuit: skip a recording only when BOTH its
+                # sidecar and its audio already landed. The sidecar is written
+                # even when the media download fails (so the recording is at
+                # least known), and until 2026-09-09 that sidecar alone was the
+                # skip test -- so a recording whose download failed once was
+                # never asked for again: production held 8 of 53 recordings at
+                # size_bytes = 0 with no audio object while every daily poll
+                # reported green. Cheap: two metadata lookups per recording.
+                if self._mode == "incremental" and self._archived_completely(recording_id):
+                    self._logger.info("skip Alice recording %s: audio and metadata already archived", recording_id)
                     skipped += 1
                     continue
                 downloaded = download_recording(
@@ -187,6 +197,10 @@ class AliceVoiceRecordingsImportRunner:
             bytes_uploaded=bytes_uploaded,
             bytes_skipped=bytes_skipped,
         )
+
+
+def _has_alice_object(object_store: ObjectStore, *, kind: str, recording_id: str) -> bool:
+    return object_store_has_object(object_store, kind=kind, key="alice_upload_id", value=recording_id)
 
 
 def download_recording(

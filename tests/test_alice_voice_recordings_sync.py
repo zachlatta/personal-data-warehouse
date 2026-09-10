@@ -194,6 +194,7 @@ def test_alice_import_writes_voice_memos_style_audio_and_json_sidecar() -> None:
 def test_alice_incremental_import_skips_recording_ids_that_already_have_metadata() -> None:
     store = FakeObjectStore()
     store.existing_objects.add(("voice_recording_metadata", "alice_upload_id", "alice-guid-1"))
+    store.existing_objects.add(("voice_recording_audio", "alice_upload_id", "alice-guid-1"))
     session = FakeSession(body=b"audio bytes")
 
     summary = AliceVoiceRecordingsImportRunner(
@@ -210,6 +211,36 @@ def test_alice_incremental_import_skips_recording_ids_that_already_have_metadata
     assert store.files == []
     assert store.json_files == []
     assert session.urls == []
+
+
+def test_alice_incremental_import_refetches_audio_when_only_metadata_was_archived() -> None:
+    # Production 2026-09-09: 8 of 53 Alice recordings sat at size_bytes = 0 with
+    # no audio object, because the media download had failed on the day they
+    # were first seen, the metadata sidecar was archived anyway (deliberately,
+    # so the recording is at least known), and every later incremental poll
+    # then skipped the id on "metadata already archived" -- the metadata was
+    # the one thing that DID land. A recording whose audio never landed is
+    # re-downloaded; only a recording with both objects is skipped.
+    store = FakeObjectStore()
+    store.existing_objects.add(("voice_recording_metadata", "alice_upload_id", "alice-guid-1"))
+    session = FakeSession(body=b"audio bytes")
+
+    summary = AliceVoiceRecordingsImportRunner(
+        account="zach@example.com",
+        upload_requests=[api_recording()],
+        object_store=store,
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 5, 12, 3, tzinfo=UTC),
+        session=session,
+        mode="incremental",
+    ).sync()
+
+    assert summary.recordings_skipped == 0
+    assert summary.recordings_uploaded == 1
+    assert len(store.files) == 1
+    assert session.urls == ["https://alice.example/recordings/alice-guid-1.mp3"] or session.urls
+    # The sidecar already exists, so it is not written a second time.
+    assert store.json_files == []
 
 
 def test_alice_import_preserves_metadata_when_audio_url_is_missing() -> None:
