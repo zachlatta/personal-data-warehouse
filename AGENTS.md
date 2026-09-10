@@ -2349,6 +2349,22 @@ serverside**:
 The `sessionKey` rotates ~monthly; the desktop app refreshes it, and the clientside LaunchAgent
 re-pushes it hourly so the server's copy stays fresh.
 
+**The poller's verdict is on the credential row, and it is the only heartbeat that means
+anything.** Until 2026-09-10 the row's `updated_at` was `pipeline_health`'s run heartbeat,
+and the hourly push kept it fresh — so the poller failed **3,450 times** between 08-29 and
+09-10 (`claude.ai returned 403`, a dead desktop login) with one identical red Dagster run
+every five minutes while `marts_ops.pipeline_health` read `ok` and only
+`marts_ops.mart_view_health` noticed, eleven days later, that `marts_ai_conversations` had
+gone quiet. A 401/403 is now `ClaudeAiAuthError`; the poller records it on
+`private.claude_desktop_credentials` (`status = action_required`, `error`,
+`rejected_session_sha256`, `rejected_at` — columns `ensure_claude_desktop_tables` adds
+beside the Go pusher's DDL), `pipeline_health` reads that status, and the keepalive sensor
+sits out the exact rejected key for an hour per probe, resuming the moment a different key
+is pushed. The repair is a human one: open the Claude Desktop app on the Mac, sign in, and
+the hourly `claude-desktop-auth` LaunchAgent pushes the new key — a push that *succeeds*
+with the old cookie is not evidence the cookie works, which is exactly what the 12 days of
+green looked like.
+
 Env: `CLAUDE_DESKTOP_ACCOUNT` (keys the credential + cursor; falls back to
 `AGENT_SESSIONS_ACCOUNT`/`APPLE_MESSAGES_ACCOUNT`/`VOICE_MEMOS_ACCOUNT`/`GMAIL_ACCOUNTS[0]` - must
 match between the clientside push and the serverside poller), `CLAUDE_DESKTOP_ENABLED` (default on;
