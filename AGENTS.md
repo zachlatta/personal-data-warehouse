@@ -1328,6 +1328,22 @@ not in the `docker` group), and the Python env inside the app/Dagster containers
 every project dependency, so a `ModuleNotFoundError` there means you used the wrong
 interpreter, not a broken image.
 
+**A hung run holds a queue slot, and eight slots is one bad deploy away from starving the
+five-minute syncs.** At 14:00Z on 2026-09-09, right after a deploy, seven short jobs
+(gmail, contacts, plaid, drive, `pipeline_health`, slack coverage, whatsapp) started
+together and hung in their step subprocess without logging a line for 3.5 hours, until the
+next deploy cancelled them. `max_concurrent_runs` was 8, so the five-minute Slack freshness
+and timeline syncs were created on schedule and then sat `QUEUED` for up to 46 minutes each
+(create 14:20, start 14:58) — a DM landing-latency spike with every Slack health number
+green, and the second such spike that day after the change-feed episode above. Two things
+now hold it: the frequent jobs carry `dagster/max_runtime` tags well under the global
+four-hour run-monitoring cap (`tests/test_dagster_job_runtime_caps.py`; the cap itself
+stays for the WhatsApp windows and the multi-hour user sync), and the queue allows 12
+concurrent runs on a 28-core host at load 2. Diagnose this shape from the Dagster
+Postgres, not from `marts_ops.*`: `runs.create_timestamp` far behind `to_timestamp(start_time)`
+is a starved queue, and a run whose event log stops at `STEP_WORKER_STARTED` is a hung
+step, not a slow one.
+
 Coolify management tooling lives in the `sysadmin` repo at `~/dev/zachlatta/sysadmin`:
 
 - On `crobat` you can obtain a Coolify API key from that repo to drive the Coolify API. See its
@@ -1670,6 +1686,15 @@ existing code the day its raw table lands. They used to scan
 `base_apple_voice_memos.files` by name, and the mart hardcoded `NULL` transcript/summary
 for the other branch, which made the NULLs self-fulfilling: Alice sat at 53 recordings, 0
 transcripts and 0 summaries while every ENFORCED registry passed. See C5.
+
+**A recording whose audio never landed is asked for again, not skipped.** The Alice poller
+archives the metadata sidecar even when the media download fails (deliberately — the
+recording is at least known), and until 2026-09-09 that sidecar alone was the incremental
+skip test, so a recording that failed once was never downloaded again: production held 8
+of 53 Alice recordings at `size_bytes = 0` with no audio object while every daily poll read
+green and the contract audit graded them "untranscribable". The skip now requires BOTH the
+audio object and the sidecar; a `size_bytes = 0` row with a live source id is a fetch
+failure to investigate, never a quiet source.
 
 The three derived tables — `derived_voice_memos.transcription_runs`, `.transcript_segments`
 and `.enrichments` — are keyed by **`source` first**, because a `recording_id` is unique
@@ -3665,6 +3690,23 @@ Three behaviours are load-bearing and each failure would be silent:
 - **Any failure degrades to the old polling path** (`SlackChangePlan.usable = False`), so a
   revoked or missing session costs throughput and never coverage. `SLACK_ASSET_USE_CHANGE_FEED=0`
   forces that fallback.
+- **A sibling-workspace answer is retried with the workspace named before it degrades.**
+  The `ok: true`-about-another-workspace shape came back a third and fourth time — 2026-09-02
+  15:00–17:00 and **2026-09-08 12:00 → 2026-09-09 03:00, fifteen hours** — with the SAME
+  token the hourly republish on crobat had verified against 685 conversations that
+  afternoon. The session was fine; Slack's routing of an org-scoped session was not. The
+  guard degraded correctly, but the blanket poll it degrades to loads 3,660 IMs, hits
+  `Retry-After: 10` on its ~30th `conversations.history` call, exhausts its 120s sleep
+  budget two minutes in, and synced **zero** IM messages per pass — so the freshness job
+  took ~10 minutes, its schedule skipped two ticks in three, and DM landing p95 read 32
+  minutes (1:1) / 42 minutes (group) on `marts_ops.slack_conversation_health`. The plan now
+  asks again with the workspace named the way the web client does on Enterprise Grid — a
+  `team_id` form field, then `slack_route=E:T` on the URL (`CLIENT_COUNTS_WORKSPACE_VARIANTS`)
+  — uses the first answer that names conversations we hold, and logs
+  `recovered by naming the workspace explicitly (variant=…)`. Which variant it was is the
+  thing nobody could measure during the outage; read that log line next time before
+  theorising. A healthy feed is unchanged: the plain call is first, and all three variants
+  returned the same 686 rows on 2026-09-10.
 
 **`derived_slack.inbox_items` is refreshed incrementally, and the watermark is the reason.**
 Every Slack stage ends by refreshing that snapshot (`refresh_slack_account_state_items`).
