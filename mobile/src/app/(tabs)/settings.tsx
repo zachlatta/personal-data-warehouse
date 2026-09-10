@@ -119,7 +119,7 @@ export default function SettingsScreen() {
           </Pressable> : null}
           {experimentError ? <ThemedText type="small">{experimentError}</ThemedText> : null}
           <ThemedText type="small" themeColor="textSecondary">iOS keeps PDW’s header icon. Source artwork appears as a thumbnail. Some apps open a conversation instead of the exact message.</ThemedText>
-          {experiment?.events.slice(0, 3).map((event) => <ThemedText key={event.id} type="small">{event.source} · {event.preview?.title || event.actor || event.title || 'New item'} · {event.accepted} accepted · {event.opened} opened{event.failed ? ` · ${event.failed} failed/unknown` : ''}</ThemedText>)}
+          {experiment?.events.slice(0, 3).map((event) => <ThemedText key={event.id} type="small">{event.source} · {event.preview?.title || event.actor || event.title || 'New item'} · {event.accepted} accepted · {event.opened} opened{event.suppressed_read ? ` · ${event.suppressed_read} skipped: read` : ''}{event.suppressed_replied ? ` · ${event.suppressed_replied} skipped: replied` : ''}{event.failed ? ` · ${event.failed} failed/unknown` : ''}</ThemedText>)}
         </View>
         <View style={card}>
           <ThemedText type="smallBold" themeColor="textSecondary">

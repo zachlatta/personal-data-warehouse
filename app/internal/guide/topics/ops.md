@@ -67,3 +67,16 @@ cannot compensate for a source polling slowly. Calendar event time is a schedule
 meeting time, not creation time. Unsupported native group-message links fall back to
 the exact PDW event. iOS retains PDW's header identity and uses source artwork as a
 thumbnail. See repository `docs/notifications.md` for rollout, limits and cohort SQL.
+
+### Read/reply suppression
+
+Before each send/retry, the worker checks synced source state. In
+`marts_ops.notification_deliveries`, `status = 'suppressed'` is an intentional skip;
+`error` is `already_read` or `already_replied`, not a transport failure.
+Gmail uses message labels/sent thread messages, Slack uses conversation or explicit
+thread read cursors and same-thread replies, and Messages uses incoming read state
+and sent replies. Direct-chat later outgoing messages count as responses; unrelated
+group posts do not. WhatsApp supports response evidence but not verified local read
+state. Missing/unsynced evidence can still notify; a notification tap alone never
+proves a source read. Existing accepted pushes cannot be recalled. The full source
+rules and limits are in `docs/notifications.md`.

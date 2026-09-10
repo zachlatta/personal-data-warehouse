@@ -58,7 +58,11 @@ def test_go_worker_against_the_same_provisioned_schema(warehouse):
     from personal_data_warehouse.notifications import TABLES
     wh = warehouse
     wh.ensure_upstream_mutation_tables()
-    names = (*TABLES, "timeline_events", "push_devices", "marts_notification_health")
+    source_tables = ("gmail_messages", "slack_messages", "slack_conversations", "slack_account_identities",
+                     "apple_messages", "apple_message_chat_messages", "apple_message_chats",
+                     "whatsapp_messages", "whatsapp_chats")
+    wh._ensure_table_group(list(source_tables))
+    names = (*TABLES, "timeline_events", "push_devices", "marts_notification_health", *source_tables)
     env = dict(os.environ, PDW_NOTIFICATION_TEST_URL=os.environ["POSTGRES_DATABASE_URL"],
                PDW_NOTIFICATION_TEST_RELATIONS=json.dumps({name: wh.sql_relation(name) for name in names}))
     result = subprocess.run(["go", "test", "./internal/notifications", "-run", "TestPostgresNotifications", "-count=1"],

@@ -58,7 +58,9 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.accepted_at>'epoch'),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.opened_at>'epoch'),
- (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status IN ('failed','unknown'))
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status IN ('failed','unknown')),
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_read'),
+ (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_replied')
  FROM @notification_events n ORDER BY n.created_at DESC LIMIT 50`))
 	if err != nil {
 		unavailable(w)
@@ -68,9 +70,9 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 	events := []map[string]any{}
 	for rows.Next() {
 		var id, source, priority, created, actor, title, body, state string
-		var devices, accepted, opened, failed int
+		var devices, accepted, opened, failed, suppressedRead, suppressedReplied int
 		var payload []byte
-		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed) != nil {
+		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied) != nil {
 			unavailable(w)
 			return
 		}
@@ -79,7 +81,7 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(payload, &snapshot)
 		preview, _ := snapshot["presentation"].(map[string]any)
 
-		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created, "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed})
+		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created, "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied})
 	}
 	if rows.Err() != nil {
 		unavailable(w)

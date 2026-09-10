@@ -329,7 +329,7 @@ export function splitRef(ref: string): { adapter: string; eventId: string } | nu
 }
 
 // Timeline notification experiment: one global switch, separate from OS permission.
-export type NotificationExperiment = { enabled: boolean; status: string; error: string; events: { id: string; source: string; priority: string; title: string; actor: string; preview?: { title: string }; accepted: number; opened: number; failed: number }[] };
+export type NotificationExperiment = { enabled: boolean; status: string; error: string; events: { id: string; source: string; priority: string; title: string; actor: string; preview?: { title: string }; accepted: number; opened: number; failed: number; suppressed_read?: number; suppressed_replied?: number }[] };
 export function fetchNotificationExperiment(config: AppConfig): Promise<NotificationExperiment> { return request(config, '/api/notifications'); }
 export function setNotificationExperiment(config: AppConfig, enabled: boolean): Promise<{ enabled: boolean }> {
   return request(config, '/api/notifications/settings', { method: 'POST', body: JSON.stringify({ enabled }) });

@@ -148,7 +148,15 @@ func (s *Service) Tick(ctx context.Context) error {
 			}
 			result := Result{Status: "cancelled", Error: "device disabled or experiment paused"}
 			if active {
-				result = s.Sender.Send(ctx, d)
+				reason, err := s.suppressionReason(ctx, d)
+				if err != nil {
+					return err
+				}
+				if reason != "" {
+					result = Result{Status: "suppressed", Error: reason}
+				} else {
+					result = s.Sender.Send(ctx, d)
+				}
 			}
 			if err = s.settle(ctx, d, result, false); err != nil {
 				return err
@@ -292,7 +300,7 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 		r.Status = "accepted"
 	}
 	switch r.Status {
-	case "accepted", "provider_accepted", "failed", "retry", "unknown", "cancelled":
+	case "accepted", "provider_accepted", "failed", "retry", "unknown", "cancelled", "suppressed":
 	default:
 		return fmt.Errorf("invalid notification transport verdict %q", r.Status)
 	}

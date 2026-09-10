@@ -1,6 +1,6 @@
 # Timeline notification experiment
 
-PDW can deliver **every newly inserted direct or cc timeline event** to its
+PDW captures **every newly inserted direct or cc timeline event** and delivers eligible items to its
 registered iPhone and Web Push devices. /notifications (the **alerts** tab) is
 the control panel and recent delivery/open ledger; mobile Settings has the same
 global start/pause switch. /pipelines shows the live notification health verdict.
@@ -53,6 +53,36 @@ artwork appears as a rich-content thumbnail through the existing notification
 service extension. PDW cannot impersonate another app's notification identity.
 Browsers likewise retain their own OS attribution. Icons are served by PDW;
 source attribution/provenance is in the static notification-icons/README.txt.
+
+## Already read or replied to
+
+Immediately before **each device send and retry**, the worker checks current
+synced source rows, not the captured timeline snapshot. A confirmed read or response
+skips that delivery with status `suppressed` and `error = already_read` or
+`already_replied` in marts_ops.notification_deliveries. These are intentional
+skips, not failures. The web/mobile ledger shows separate read/reply skip counts.
+
+- **Gmail:** no UNREAD label on that message, or a later SENT message in the same
+  account/thread. Sending in another thread or account does not count.
+- **Slack:** the conversation's read cursor covers a top-level message; a thread
+  reply requires the parent thread's own explicit read cursor, never a channel
+  cursor. A later message by the authenticated user in that exact thread counts
+  as a response. In a one-to-one DM, a later top-level message also counts.
+  Unrelated channel/group posts and other threads do not.
+- **Messages:** an incoming message's is_read/date_read, or a later successfully
+  sent message in the same one-to-one chat. A group response must explicitly
+  quote the original message. Reactions and unsent messages do not count.
+- **WhatsApp:** a later outgoing message in the same direct chat, or an explicit
+  quoted response in a group. The synced data does not yet provide a verified
+  local per-message read watermark, so read-only suppression is not claimed.
+- Other sources and missing read/reply evidence still notify. Source query errors
+  stop an unchecked send and surface through worker health.
+
+A later direct-chat message is a conservative conversation-level response heuristic,
+not proof that it answered each earlier question. Group suppression is narrower.
+These checks use **synced evidence**: reading/replying in an app can still race its
+next sync or the final provider request. Already accepted pushes cannot be recalled.
+Notification taps alone are not proof that source content was read.
 
 ## Capture, retry and evidence semantics
 
