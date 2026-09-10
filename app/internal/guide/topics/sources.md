@@ -54,6 +54,9 @@ and state the window and freshness.
   iMessage, Apple Notes and Slack, with `content_sha256`, `is_stored` and the
   `storage_*` columns; enrichment text in `derived_enrichment.file_attachment_enrichments`.
   Bytes: {{if .CLI}}`pdw call get_object --data '{"storage_file_id": "<id>"}'`{{else}}`get_object` with the `storage_file_id`{{end}} (a Slack `F…` file id works directly).
+  Fetch the returned `download_url` with `curl`, `requests` or `wget`, not Python's
+  `urllib`: the public edge rejects urllib's default User-Agent with a 403 that looks
+  like an expired link. Verify the SHA-256 the response carries.
 
 ## Voice recordings and transcripts
 
