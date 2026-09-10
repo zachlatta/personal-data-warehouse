@@ -1208,3 +1208,14 @@ def test_auth_lock_mode_auto_shares_far_from_expiry(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(ar.ContainerAgentRunner, "_read_codex_auth_exp", lambda self: None)
     ar._AUTH_EXP_CACHE.clear()
     assert runner._auth_lock_must_be_exclusive("codex") is True
+
+
+def test_go_build_images_pin_the_module_toolchain_patch() -> None:
+    """A cached floating image must not be older than go.mod's minimum Go."""
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    version = re.search(r"^go (\d+\.\d+\.\d+)$", (root / "app/go.mod").read_text(), re.MULTILINE)
+    assert version is not None
+    for path in ("app/Dockerfile", "docker/agent.Dockerfile"):
+        assert f"FROM golang:{version.group(1)}-bookworm AS " in (root / path).read_text(), path

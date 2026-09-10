@@ -120,6 +120,7 @@ func TestPipelinesAPIReadsTheMartsViews(t *testing.T) {
 		warehouse.SQLRelation("marts_pipeline_table_freshness"),
 		warehouse.SQLRelation("marts_timeline_priority_mix"),
 		warehouse.SQLRelation("marts_agent_usage"),
+		warehouse.SQLRelation("marts_notification_health"),
 		warehouse.SQLRelation("marts_search_benchmark"),
 	} {
 		if !strings.Contains(joined, relation) {
@@ -560,6 +561,19 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 		if !strings.Contains(string(page), `"`+view.pageKey+`"`) &&
 			!strings.Contains(string(page), "state."+view.pageKey) {
 			t.Errorf("the /pipelines page does not render the %q level", view.pageKey)
+		}
+	}
+}
+
+func TestPipelinesPageTreatsPausedAsIntentional(t *testing.T) {
+	for _, fragment := range []string{
+		`"manual", "paused", "ok"`,
+		`paused: "var(--manual)"`,
+		`paused: "intentionally paused`,
+		`["ok", "manual", "paused", "unmonitored", "unmeasured"]`,
+	} {
+		if !strings.Contains(pipelinesPageHTML, fragment) {
+			t.Fatalf("paused must be explained, ranked and excluded from attention: missing %s", fragment)
 		}
 	}
 }

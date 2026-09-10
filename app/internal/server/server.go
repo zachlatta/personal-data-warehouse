@@ -17,6 +17,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/notifications"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
@@ -158,8 +159,15 @@ func toolShowsOnMCP(t tool.Tool) bool { return t.Surfaces().ShowsOnMCP() }
 func toolShowsOnCLI(t tool.Tool) bool { return t.Surfaces().ShowsOnCLI() }
 
 func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mutationSvcs ...*mutations.Service) http.Handler {
+	return NewMuxWithNotifications(cfg, authSvc, runner, nil, mutationSvcs...)
+}
+
+func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) http.Handler {
 	logger := slog.Default().With("component", "http")
 	mux := http.NewServeMux()
+	if notificationSvc != nil {
+		notificationSvc.Register(mux, authSvc.RequireStaticBearer())
+	}
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = "http://localhost" + cfg.Addr

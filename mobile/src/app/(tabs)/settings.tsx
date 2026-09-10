@@ -1,12 +1,13 @@
 import Constants from 'expo-constants';
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
+import { useFocusEffect } from 'expo-router';
 import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { sendTestPush } from '@/lib/api';
+import { sendTestPush, fetchNotificationExperiment, setNotificationExperiment, type NotificationExperiment } from '@/lib/api';
 import { useConfig, useSession } from '@/lib/session';
 import { applyUpdateNow, describeInstalledUpdate, type UpdateState } from '@/lib/updates';
 
@@ -29,6 +30,30 @@ export default function SettingsScreen() {
   const config = useConfig();
   const { push, refreshPush, signOut } = useSession();
   const [testing, setTesting] = useState(false);
+  const [experiment, setExperiment] = useState<NotificationExperiment | null>(null);
+  const [experimentError, setExperimentError] = useState('');
+  const [savingExperiment, setSavingExperiment] = useState(false);
+  useFocusEffect(useCallback(() => {
+    let cancelled = false;
+    const load = () => {
+      void fetchNotificationExperiment(config).then(
+        (value) => { if (!cancelled) { setExperiment(value); setExperimentError(''); } },
+        () => { if (!cancelled) setExperimentError('Notification status unavailable — check the connection or server.'); },
+      );
+    };
+    load();
+    const timer = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [config]));
+  const toggleExperiment = async () => {
+    if (!experiment) return;
+    setSavingExperiment(true);
+    try {
+      await setNotificationExperiment(config, !experiment.enabled);
+      setExperiment(await fetchNotificationExperiment(config)); setExperimentError('');
+    } catch (e) { setExperimentError(e instanceof Error ? e.message : String(e)); }
+    finally { setSavingExperiment(false); }
+  };
   const [update, setUpdate] = useState<UpdateState | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
 
@@ -84,6 +109,17 @@ export default function SettingsScreen() {
               {testResult}
             </ThemedText>
           ) : null}
+        </View>
+        <View style={card}>
+          <ThemedText type="smallBold">Timeline notifications</ThemedText>
+          <ThemedText type="small">Every new direct or CC event, with its source link. Existing app notifications are not changed.</ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">{experiment ? `${experiment.enabled ? 'On' : 'Paused'} · ${experiment.status}` : 'Not connected'}</ThemedText>
+          {experiment ? <Pressable onPress={() => void toggleExperiment()} disabled={savingExperiment} style={styles.secondary}>
+            <ThemedText type="smallBold">{experiment.enabled ? 'Pause on all devices' : 'Start experiment'}</ThemedText>
+          </Pressable> : null}
+          {experimentError ? <ThemedText type="small">{experimentError}</ThemedText> : null}
+          <ThemedText type="small" themeColor="textSecondary">iOS keeps PDW’s header icon. Source artwork appears as a thumbnail. Some apps open a conversation instead of the exact message.</ThemedText>
+          {experiment?.events.slice(0, 3).map((event) => <ThemedText key={event.id} type="small">{event.source} · {event.preview?.title || event.actor || event.title || 'New item'} · {event.accepted} accepted · {event.opened} opened{event.failed ? ` · ${event.failed} failed/unknown` : ''}</ThemedText>)}
         </View>
         <View style={card}>
           <ThemedText type="smallBold" themeColor="textSecondary">

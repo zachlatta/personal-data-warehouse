@@ -3220,6 +3220,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "upstream_mutation_request_events": _detail(
         "upstream_mutation_requests", "review/audit log under the mutation request"
     ),
+    "notification_state": _state("notification experiment switch and worker heartbeat"),
+    "notification_events": _state("notification outbox keyed to the original timeline event; not a second real-world event"),
+    "notification_deliveries": _state("per-device notification transport and open telemetry; keyed to the original event"),
+    "web_push_devices": _state("private browser push subscriptions"),
     "push_devices": _state("iOS app devices registered for push notifications"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
@@ -3254,6 +3258,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
 # schema test, which enumerates information_schema after running every
 # ensure_* method.
 RAW_DDL_TABLES: tuple[str, ...] = (
+    "notification_state", "notification_events", "notification_deliveries", "web_push_devices",
     "timeline_gmail_correspondents",
     "claude_desktop_credentials",
     "claude_desktop_conversation_state",

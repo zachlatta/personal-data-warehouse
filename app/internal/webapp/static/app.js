@@ -9,7 +9,10 @@ import * as searchView from "./search.js";
 import * as mutationsView from "./mutations.js";
 import { closeDrawer } from "./inspector.js";
 
+import * as notificationsView from "./notifications.js";
+
 const ROUTES = [
+  { pattern: /^\/notifications\/?$/, view: notificationsView, nav: "notifications", params: () => ({}) },
   { pattern: /^\/timeline(?:\/([^/]+)\/(.+))?\/?$/, view: timelineView, nav: "timeline", params: (m) => ({ adapter: m[1] ? decodeURIComponent(m[1]) : "", eventId: m[2] ? decodeURIComponent(m[2]) : "" }) },
   { pattern: /^\/search\/?$/, view: searchView, nav: "search", params: () => ({}) },
   { pattern: /^\/mutation-review(?:\/requests\/([^/]+))?\/?$/, view: mutationsView, nav: "mutation-review", params: (m) => ({ id: m[1] ? decodeURIComponent(m[1]) : "" }) },

@@ -179,7 +179,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # said so. It is deliberately not a
         # net-worth liability -- a commitment is contingent on the fund calling
         # it -- so it needed its own read interface.
-            "marts": 50,
+            "marts": 53,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -204,12 +204,12 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-            "ops": 34,
+            "ops": 36,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
-        "private": 9,
-        "internal": 2,
+        "private": 11,
+        "internal": 3,
     }
 
 

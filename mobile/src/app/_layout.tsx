@@ -1,10 +1,10 @@
 import { DarkTheme, DefaultTheme, ThemeProvider, useRouter, Stack } from 'expo-router';
 import * as Notifications from 'expo-notifications';
 import * as SplashScreen from 'expo-splash-screen';
-import { useEffect } from 'react';
-import { Alert, useColorScheme } from 'react-native';
+import { useEffect, useRef } from 'react';
+import { Alert, AppState, useColorScheme } from 'react-native';
 
-import { handleNotificationResponse, syncNotificationCategories } from '@/lib/push';
+import { handleNotificationResponse, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
 
@@ -13,6 +13,7 @@ SplashScreen.preventAutoHideAsync();
 function Root() {
   const { ready, config } = useSession();
   const router = useRouter();
+  const handled = useRef(new Set<string>());
 
   useEffect(() => {
     if (ready) SplashScreen.hideAsync();
@@ -27,6 +28,9 @@ function Root() {
   useEffect(() => {
     if (!ready || !config) return;
     void syncNotificationCategories(config);
+    void flushNotificationOpens().catch(error => console.warn('notification open will retry', error));
+    const sub = AppState.addEventListener('change', (state) => { if (state === 'active') void flushNotificationOpens().catch(error => console.warn('notification open will retry', error)); });
+    return () => sub.remove();
   }, [ready, config]);
 
   // Notification taps and action buttons: the one that launched the app,
@@ -36,12 +40,27 @@ function Root() {
     let cancelled = false;
     const act = async (response: Notifications.NotificationResponse | null | undefined) => {
       if (!response) return;
-      const outcome = await handleNotificationResponse(config, response);
-      if (cancelled) return;
-      if (outcome.message) Alert.alert('PDW', outcome.message);
-      if (outcome.route) router.push(outcome.route as never);
+      const key = `${response.notification.request.identifier}:${response.actionIdentifier}`;
+      if (handled.current.has(key)) return;
+      handled.current.add(key);
+      try {
+        const outcome = await handleNotificationResponse(config, response);
+        if (cancelled) return;
+        if (outcome.message) Alert.alert('PDW', outcome.message);
+        if (outcome.route) router.push(outcome.route as never);
+        if (outcome.recorded && !await outcome.recorded) throw new Error('notification open was not durably saved');
+        const last = await Notifications.getLastNotificationResponseAsync();
+        if (last?.notification.request.identifier === response.notification.request.identifier) await Notifications.clearLastNotificationResponseAsync();
+      } catch (error) {
+        // Keep the OS launch response available if durable enqueue failed.
+        handled.current.delete(key);
+        console.warn('notification response will retry on next launch', error);
+      } finally {
+        // Dedupe the cold-start/listener race, not a deliberate later tap.
+        setTimeout(() => handled.current.delete(key), 2000);
+      }
     };
-    Notifications.getLastNotificationResponseAsync().then(act);
+    void Notifications.getLastNotificationResponseAsync().then(act).catch(error => console.warn('notification launch response unavailable', error));
     const sub = Notifications.addNotificationResponseReceivedListener((response) => void act(response));
     return () => {
       cancelled = true;

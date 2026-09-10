@@ -19,7 +19,7 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 a { color: var(--amber); }
 
-#app { display: grid; grid-template-rows: 46px 1fr; height: 100%; }
+#app { display: grid; grid-template-rows: 46px 1fr; grid-template-columns: minmax(0, 1fr); height: 100%; }
 #view { min-height: 0; overflow: hidden; }
 
 /* ---- top bar ---- */
@@ -247,7 +247,7 @@ a.filelink:hover { text-decoration: underline; }
   #topbar { gap: 6px; padding: 0 8px; padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
   #wordmark { gap: 0; }
   #wordmark .name, #wordmark .sub, #topctl { display: none; }
-  #nav { flex: 1; min-width: 0; justify-content: space-evenly; }
+  #nav { flex: 1; min-width: 0; justify-content: space-evenly; overflow-x: auto; }
   #nav a { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 5px; font-size: 10px; letter-spacing: .035em; }
   #nav .count { margin-left: 3px; }
   #spacer { display: none; }
@@ -257,3 +257,24 @@ a.filelink:hover { text-decoration: underline; }
   #gate form { display: grid; }
   #gate input, #gate button { min-height: 44px; }
 }
+
+/* Notification experiment: restrained cards, readable on a phone or desktop. */
+.notification-panel { max-width: 850px; height: 100%; overflow-y: auto; margin: 0 auto; padding: 32px 20px; }
+.notification-panel h1 { font-size: clamp(24px, 4vw, 36px); line-height: 1.15; margin: 0 0 14px; }
+.notification-panel > p { max-width: 70ch; line-height: 1.6; }
+.notification-controls { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }
+.notification-controls button { min-height: 44px; padding: 10px 16px; }
+.notification-feedback { min-height: 24px; }
+.notification-note { opacity: .7; font-size: 12px; }
+.notification-history { display: grid; gap: 14px; margin-top: 28px; }
+.notification-card { border: 1px solid var(--line, #444); border-radius: 14px; padding: 20px; overflow-wrap: anywhere; }
+.notification-card h2 { margin: 14px 0 8px; font-size: 19px; }
+.notification-card p { line-height: 1.5; }
+.notification-card-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 11px; opacity: .7; }
+.notification-card small { opacity: .65; }
+
+.notification-card-content { display: flex; gap: 14px; margin: 12px 0; align-items: flex-start; }
+.notification-card-content img { flex: 0 0 44px; border-radius: 10px; object-fit: contain; }
+.notification-card-content > div { min-width: 0; overflow-wrap: anywhere; }
+.notification-card-content h2 { margin-top: 0; }
+.notification-card-content a { font-size: 0.85rem; }

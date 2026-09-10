@@ -3128,6 +3128,97 @@
       "query_access": "public",
       "secret": false,
       "comment": "Six-second heart rate scoped to one workout: marts_health.workouts joined to the one continuous series on the workout's own start/end bounds. elapsed_seconds is the offset into the workout, for plotting. Replaced the separate base_whoop_private.workout_heart_rate_samples table on 2026-08-26, when the continuous series moved to the same six-second grain and that table became a second copy of identical readings. Filter by workout_id or a time range; it is a range join over millions of samples."
+    },
+    {
+      "id": "notification_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "notification_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "notification_events",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "notification_events",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "notification_deliveries",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "notification_deliveries",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "web_push_devices",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "web_push_devices",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "capture_timeline_notification",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "capture_timeline_notification",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "marts_notifications",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "notifications",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Direct/cc. New arrivals captured while enabled; updates never replay. Join id to marts_ops.notification_deliveries.notification_id. Epoch timestamps become NULL."
+    },
+    {
+      "id": "marts_notification_deliveries",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "notification_deliveries",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Deliveries. accepted_at is service acceptance, receipt_at a provider verdict, opened_at an observed tap (not a read). Absent timestamps are NULL; credentials stay private."
+    },
+    {
+      "id": "marts_notification_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "notification_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Health. Paused, stale worker, or attention for failures, no devices and backlog."
     }
   ],
   "renamed_timeline_source_tables": {

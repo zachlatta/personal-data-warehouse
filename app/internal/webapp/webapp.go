@@ -26,7 +26,7 @@ const AssetPrefix = "/app/"
 
 // Routes are the browser paths the SPA owns; every one of them, and every
 // path beneath it, returns the same shell and the JS router takes over.
-var Routes = []string{"/timeline", "/mutation-review", "/search"}
+var Routes = []string{"/timeline", "/mutation-review", "/search", "/notifications"}
 
 // ReviewPath is the review UI's root, kept stable because approval URLs
 // returned to agents and pushed to the phone point under it.

@@ -1095,6 +1095,14 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     Pipeline(
+        id="timeline_notifications", label="Timeline notifications", kind="internal",
+        cadence="every 5 seconds", transport="transactional timeline outbox → app push worker",
+        expected_data_interval=None, expected_run_interval=MINUTE,
+        state=StateSource(table="notification_state", updated_column="last_run_at",
+                          status_column="status", error_column="error"),
+        note="optional experiment; marts_ops.notification_health distinguishes paused from stale",
+    ),
+    Pipeline(
         id="upstream_mutations",
         label="Upstream mutations",
         kind="internal",
@@ -1407,6 +1415,10 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "upstream_mutation_requests": _data("upstream_mutations", "updated_at", "created_at"),
     "upstream_mutation_events": _support("upstream_mutations", "created_at"),
     "upstream_mutation_request_events": _support("upstream_mutations", "created_at"),
+    "notification_state": _state("timeline_notifications", "last_run_at", "notification delivery instrumentation"),
+    "notification_events": _data("timeline_notifications", "created_at", "event_ts", "notification delivery instrumentation"),
+    "notification_deliveries": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
+    "web_push_devices": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "push_devices": _state("upstream_mutations", "updated_at", "iOS app devices registered for push notifications"),
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),

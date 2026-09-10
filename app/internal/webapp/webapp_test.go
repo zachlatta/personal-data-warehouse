@@ -216,12 +216,12 @@ func TestJavaScriptUnitTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("node --test failed: %v\n%s", err, out)
 	}
-	// Syntax-check every shipped module too: node parses ES modules on import.
+	// Syntax-check every script without executing browser/service-worker globals.
 	entries, _ := filepath.Glob(filepath.Join(dir, "static", "*.js"))
 	for _, entry := range entries {
-		check := exec.Command(node, "--input-type=module", "-e", "import("+jsString(entry)+").then(()=>process.exit(0), e=>{console.error(e);process.exit(1)})")
+		check := exec.Command(node, "--check", entry)
 		check.Dir = filepath.Join(dir, "static")
-		if out, err := check.CombinedOutput(); err != nil && !strings.Contains(string(out), "document is not defined") && !strings.Contains(string(out), "window is not defined") {
+		if out, err := check.CombinedOutput(); err != nil {
 			t.Fatalf("%s does not parse: %v\n%s", filepath.Base(entry), err, out)
 		}
 	}

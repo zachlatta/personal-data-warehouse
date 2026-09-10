@@ -2,7 +2,7 @@
 # the binary in the image always matches the checked-out app. It is never
 # self-updated at runtime (PDW_NO_AUTO_UPDATE=1): the container is read-only and
 # a background GitHub fetch would be both useless and unwanted here.
-FROM golang:1.26-bookworm AS pdw-cli
+FROM golang:1.26.8-bookworm AS pdw-cli
 
 WORKDIR /src
 COPY app/go.mod app/go.sum ./

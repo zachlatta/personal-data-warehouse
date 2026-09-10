@@ -2,6 +2,9 @@ import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+import { openDeepLink } from './deep-link';
+import { OpenQueue, notificationOpenLink, prepareNotificationOpen } from './notification-open-queue';
 
 import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest } from './api';
 import type { AppConfig } from './config';
@@ -85,7 +88,18 @@ export async function syncNotificationCategories(config: AppConfig): Promise<voi
   }
 }
 
-type NotificationData = { route?: unknown; request_id?: unknown; kind?: unknown };
+const openQueue = new OpenQueue({ get: SecureStore.getItemAsync, set: SecureStore.setItemAsync, remove: SecureStore.deleteItemAsync });
+export async function flushNotificationOpens(): Promise<void> {
+  await openQueue.flush(async ({ baseUrl, ...record }) => {
+    const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const response = await fetch(`${baseUrl}/api/notifications/opened`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record), signal: controller.signal });
+      return response.ok || response.status === 403 || response.status === 404;
+    } finally { clearTimeout(timer); }
+  });
+}
+
+type NotificationData = { route?: unknown; request_id?: unknown; kind?: unknown; open?: unknown; delivery_id?: unknown; open_proof?: unknown };
 
 function dataOf(response: Notifications.NotificationResponse | null | undefined): NotificationData {
   return (response?.notification.request.content.data as NotificationData | undefined) ?? {};
@@ -98,7 +112,7 @@ export function routeFromNotification(response: Notifications.NotificationRespon
   return typeof data.route === 'string' && data.route.startsWith('/') ? data.route : null;
 }
 
-export type NotificationOutcome = { route: string | null; message?: string };
+export type NotificationOutcome = { route: string | null; message?: string; recorded?: Promise<boolean> };
 
 // What to do with a tap or an action button. Approve/Deny on a mutation
 // alert call the review API directly (the button does not open the app);
@@ -112,6 +126,20 @@ export async function handleNotificationResponse(
   const data = dataOf(response);
   const route = routeFromNotification(response);
   const action = response.actionIdentifier;
+  if (data.kind === 'timeline_notification') {
+    // Open immediately; telemetry must never gate source navigation on a network.
+    const link = notificationOpenLink(data.open);
+    const flow = await prepareNotificationOpen(
+      () => link ? openDeepLink(link).then(() => true) : Promise.resolve(false),
+      () => typeof data.delivery_id === 'string' && typeof data.open_proof === 'string'
+        ? openQueue.add({ delivery_id: data.delivery_id, open_proof: data.open_proof, baseUrl: config.baseUrl })
+        : Promise.resolve(),
+    );
+    void flow.recorded.then((saved) => {
+      if (saved) void flushNotificationOpens().catch((error) => console.warn('notification open will retry', error));
+    });
+    return { route: flow.sourceOpened ? null : route, recorded: flow.recorded };
+  }
   const requestId = typeof data.request_id === 'string' ? data.request_id : null;
   if (requestId && (action === 'approve' || action === 'deny')) {
     try {

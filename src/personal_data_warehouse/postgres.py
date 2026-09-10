@@ -5705,6 +5705,9 @@ class PostgresWarehouse:
             )
             """
         )
+        from personal_data_warehouse.notifications import ensure_notification_tables
+
+        ensure_notification_tables(self)
         self._ensure_timeline_comments()
         self._ensure_search_views_if_possible()
 

@@ -176,6 +176,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="marts"></div>
   <div id="adapters"></div>
   <div id="backups"></div>
+  <div id="notifications"></div>
   <div id="search"></div>
   <div id="benchmark"></div>
   <div id="priority"></div>
@@ -207,12 +208,12 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   // both the tiles and the sort inside every group.
   var SEVERITY = [
     "failing", "stale", "attention", "late", "unknown",
-    "backfilling", "no_data", "unmeasured", "unmonitored", "manual", "ok"
+    "backfilling", "no_data", "unmeasured", "unmonitored", "manual", "paused", "ok"
   ];
   var COLORS = {
     ok: "var(--ok)", late: "var(--late)", stale: "var(--stale)", failing: "var(--failing)",
     attention: "var(--attention)", manual: "var(--manual)", no_data: "var(--nodata)",
-    unknown: "var(--unknown)", backfilling: "var(--manual)",
+    paused: "var(--manual)", unknown: "var(--unknown)", backfilling: "var(--manual)",
     unmeasured: "var(--nodata)", unmonitored: "var(--nodata)"
   };
   var KINDS = [
@@ -228,6 +229,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     failing: "its own sync state records an error",
     attention: "needs a manual step (a re-link, a re-login)",
     manual: "no cadence expected (manual uploads)",
+    paused: "intentionally paused — enable the experiment on the notifications page",
     no_data: "nothing has ever arrived",
     unknown: "the freshness snapshot itself is stale — check the pipeline_health asset",
     backfilling: "still working through its historical backlog",
@@ -264,7 +266,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    backups: [], priority: [], agents: [], benchmark: [],
+    backups: [], notifications: [], priority: [], agents: [], benchmark: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -378,7 +380,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   // pipelines-only count is how the page stops being the place you look.
   function everything() {
     return state.pipelines
-      .concat(state.backups)
+      .concat(state.backups).concat(state.notifications)
       .concat(state.marts)
       .concat(state.adapters)
       .concat(state.search)
@@ -389,7 +391,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 
   function matchesFilter(row) {
     if (state.attentionOnly &&
-        ["ok", "manual", "unmonitored", "unmeasured"].indexOf(row.status) !== -1) return false;
+        ["ok", "manual", "paused", "unmonitored", "unmeasured"].indexOf(row.status) !== -1) return false;
     if (state.filter && row.status !== state.filter) return false;
     return true;
   }
@@ -829,6 +831,12 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       b.note || (b.errors ? rows(b.errors) + " searches failed during the run" : ""));
   }
 
+  function notificationNode(n) {
+    return healthRow(n, "Timeline notifications", Number(n.enabled) === 1 ? "experiment on" : "experiment paused",
+      [["worker", n.last_run_at ? ago(ageOf(n.last_run_at)) + " ago" : "never", "new direct/CC arrivals only; no history replay", false]],
+      n.error || "Delivery/open ledger and controls: /notifications. Provider acceptance is not proof of device display.");
+  }
+
   function backupNode(b) {
     // Two independent facts, because reporting either alone is how this hid:
     // WAL shipped perfectly through the 2026-08-25 outage while no base backup
@@ -933,6 +941,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   }
 
   function renderLevels() {
+    renderSection("notifications", "notifications — are new direct/CC arrivals being delivered", state.notifications, notificationNode);
     renderSection("backups", LEVELS[0][1], state.backups, backupNode);
     renderSection("marts", LEVELS[1][1], state.marts, martNode);
     renderSection("adapters", LEVELS[2][1], state.adapters, adapterNode);
@@ -1027,7 +1036,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage, marts_ops.search_benchmark," +
+      " marts_ops.notification_health, marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage, marts_ops.search_benchmark," +
       " marts_ops.collation_health."));
   }
 
@@ -1055,6 +1064,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.marts = body.marts || [];
       state.adapters = body.adapters || [];
       state.backups = body.backups || [];
+      state.notifications = body.notifications || [];
       state.search = body.search || [];
       state.benchmark = body.benchmark || [];
       state.priority = body.priority || [];

@@ -11,6 +11,7 @@ app's `/pipelines` page.
 | marts | `marts_ops.mart_view_health` | is a read view built on anything current: `stalest_pipeline`, `stalest_pipeline_at` |
 | timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events`, and how far behind its source it is (`ingest_lag_seconds`) |
 | priority mix | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the tiers; an `unclassified` row is `failing` |
+| notifications | `marts_ops.notification_health` | is the direct/cc experiment paused, running, backlogged or failing |
 | agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier, per agent source |
 | search | `marts_ops.search_health`, `marts_ops.search_benchmark`, `marts_ops.search_benchmark_history` | chunk/embedding convergence, BM25 index integrity, cache residency; weekly latency and MRR |
 | per-source SLAs | `marts_ops.slack_conversation_health`, `marts_ops.plaid_item_health` | Slack per conversation type; each Plaid institution (a `duplicate` or dead Item is a named row) |
@@ -46,3 +47,23 @@ FROM marts_ops.mart_view_health WHERE status <> 'ok' ORDER BY status;
 Remote-device uploaders (the Apple sources, agent sessions) report a heartbeat per run,
 so a LaunchAgent that fires and fails reads `failing` rather than merely `late`; the
 `uploader_heartbeats` row says whether any device is reporting at all.
+
+## Notification experiment
+
+`marts_ops.notifications` records newly landed direct/cc events captured while enabled;
+`marts_ops.notification_deliveries` records each device's attempts and observed opens.
+Join notification `id` to delivery `notification_id`. Use `/notifications` or phone
+Settings to start/pause; read-only SQL cannot change the switch. Existing history and
+ordinary edits never replay. Device tokens and open capabilities are private.
+
+**Acceptance is not display, and a tap is not a read.** `accepted_at` means push-service
+acceptance; an Expo `provider_accepted` verdict means downstream handoff, not an OS
+screen observation. `opened_at` is when the server first observed a tap upload;
+offline uploads arrive later. Missing opens do not establish that a person ignored
+anything. All absent timestamps in these marts are NULL.
+
+Measure source sync delay separately from landing-to-push delay; a fast push worker
+cannot compensate for a source polling slowly. Calendar event time is a scheduled
+meeting time, not creation time. Unsupported native group-message links fall back to
+the exact PDW event. iOS retains PDW's header identity and uses source artwork as a
+thumbnail. See repository `docs/notifications.md` for rollout, limits and cohort SQL.

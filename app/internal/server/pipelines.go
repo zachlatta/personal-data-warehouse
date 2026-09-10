@@ -31,6 +31,8 @@ const (
 	pipelinesAgentsMaxRows    = 50
 )
 
+var pipelineNotificationHealthSQL = `SELECT enabled,last_run_at,error,status FROM ` + warehouse.SQLRelation("marts_notification_health")
+
 var pipelineHealthSQL = `
 SELECT pipeline, label, kind, cadence, transport, status, data_status, run_status,
        event_status, last_write_at, newest_event_at, last_run_at,
@@ -244,21 +246,23 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
+	notifications := s.optionalRows(r, "notification health", pipelineNotificationHealthSQL, 1)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
 	writeJSON(w, map[string]any{
-		"pipelines":  nonNilRows(pipelines.Rows),
-		"tables":     nonNilRows(tables.Rows),
-		"marts":      marts,
-		"adapters":   adapters,
-		"collation":  collation,
-		"search":     search,
-		"benchmark":  benchmark,
-		"priority":   priorityMix,
-		"agents":     agents,
-		"slack":      slack,
-		"plaid":      plaid,
-		"backups":    backups,
-		"server_now": s.now().UTC().Format(time.RFC3339Nano),
+		"pipelines":     nonNilRows(pipelines.Rows),
+		"tables":        nonNilRows(tables.Rows),
+		"marts":         marts,
+		"adapters":      adapters,
+		"collation":     collation,
+		"search":        search,
+		"benchmark":     benchmark,
+		"priority":      priorityMix,
+		"agents":        agents,
+		"slack":         slack,
+		"plaid":         plaid,
+		"backups":       backups,
+		"notifications": notifications,
+		"server_now":    s.now().UTC().Format(time.RFC3339Nano),
 	})
 }
 
