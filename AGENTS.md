@@ -574,6 +574,18 @@ two-partition pool is taken from them instead. Three things there are easy to ge
   of exclusive lock on the 45 GB timeline heap. The low-volume attention index must carry
   the list to be the low-volume partition at all, and at 90k documents it rebuilds in 59s.
 
+**The pair holds `cc` too since 2026-09-10, because the scope the advice recommends has
+to be the scope the index serves.** Every surface says "attention = `self,direct,cc`", and
+the pair held only `self` and `direct` — the original argument being that `cc` was 6.9M
+rows. The 2026-08-26 re-tiering shrank `cc` to 1.18M (self 524k, direct 830k, cc 1.18M,
+background 1.18M, noise 55.4M on 2026-09-10), and from then on the recommended scope was
+the one shape the subset test rejected: a `self,direct,cc` search fell through to the
+global pair and walked the corpus with a heap visit per document. Measured 2026-09-09 on
+novel queries: unscoped hybrid p50 1.4–1.9s, `self,direct,cc` **9.2 / 10.2 / 10.0s**, and
+the weekly benchmark row read 11.2s for the same scope beside 5.3s unscoped. The
+optimized set is `optimized_bm25_priorities` in the catalog (2.5M of 59M rows) and the
+production pair was rebuilt in the same maintenance window as the plain REINDEX below.
+
 The pair cost 14 MB + 533 MB against the global index's 10.2 GB and took 59s + 4m35s to
 build `CONCURRENTLY` on production (1,333,278 documents). Measured there the same day on
 twelve novel term-bag queries per tier, **alternating which implementation ran first** so
