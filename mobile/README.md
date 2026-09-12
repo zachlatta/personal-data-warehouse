@@ -14,6 +14,7 @@ Keychain (`expo-secure-store`).
 | Timeline (tiers default to `self`, `direct`, `cc`) | `GET /api/timeline`, `GET /api/timeline/item` |
 | Mutations (needs review / past) | `GET /api/mutations/requests[?status=…]` |
 | Review one request: approve, deny, skip an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove` |
+| Alerts: the global on/off switch for timeline notifications and the ledger of every one sent (delivered / opened / skipped / failed, paged by `next_cursor`) | `GET /api/notifications[?limit=&before=]`, `POST /api/notifications/settings` |
 | Settings: push registration, test push, disconnect | `POST /api/push/register`, `POST /api/push/test` |
 
 Push goes through the Expo push service: the app registers its

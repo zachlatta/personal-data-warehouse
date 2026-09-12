@@ -2,8 +2,8 @@
 
 PDW captures **every newly inserted direct or cc timeline event** and delivers eligible items to its
 registered iPhone and Web Push devices. /notifications (the **alerts** tab) is
-the control panel and recent delivery/open ledger; mobile Settings has the same
-global start/pause switch. /pipelines shows the live notification health verdict.
+the control panel and recent delivery/open ledger; the iPhone app's Alerts tab
+has the same global on/off switch and pages through the whole ledger. /pipelines shows the live notification health verdict.
 
 This is an experiment, not yet a lossless or instant replacement for native
 notifications. Leave original notifications available until you have tried the
@@ -200,8 +200,10 @@ Do not rotate VAPID keys casually: existing subscriptions are bound to them and
 must re-register. Missing keys disable web registration; partial or mismatched
 keys fail startup. Never put keys in git, a browser, or a test fixture.
 
-The authenticated API is /api/notifications, with POST /settings,
-/web/register, and /web/disable. Only /opened is capability-authenticated
+The authenticated API is /api/notifications (newest first, `limit` up to 500,
+`before=<next_cursor>` to page; the cursor is the `(created_at, id)` keyset so a
+burst created in one instant is neither skipped nor repeated), with POST
+/settings, /web/register, and /web/disable. Only /opened is capability-authenticated
 instead of bearer-authenticated. Request bodies are bounded and strict.
 Subscription destinations are allowlisted push services, with redirects refused.
 

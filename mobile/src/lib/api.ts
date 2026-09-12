@@ -328,9 +328,57 @@ export function splitRef(ref: string): { adapter: string; eventId: string } | nu
   return { adapter: ref.slice(0, idx), eventId: ref.slice(idx + 1) };
 }
 
-// Timeline notification experiment: one global switch, separate from OS permission.
-export type NotificationExperiment = { enabled: boolean; status: string; error: string; events: { id: string; source: string; priority: string; title: string; actor: string; preview?: { title: string }; accepted: number; opened: number; failed: number; suppressed_read?: number; suppressed_replied?: number }[] };
-export function fetchNotificationExperiment(config: AppConfig): Promise<NotificationExperiment> { return request(config, '/api/notifications'); }
-export function setNotificationExperiment(config: AppConfig, enabled: boolean): Promise<{ enabled: boolean }> {
+// --- timeline notifications ------------------------------------------------
+//
+// One global switch for the direct/cc timeline notifications, separate from
+// the OS permission, plus the ledger of everything sent and what became of it.
+
+export type NotificationEvent = {
+  id: string;
+  source: string;
+  priority: string;
+  created_at: string;
+  actor: string;
+  title: string;
+  body: string;
+  // pending → fanned_out | no_devices | cancelled
+  status: string;
+  preview?: { title?: string; subtitle?: string; body?: string; icon?: string; route?: string };
+  devices: number;
+  accepted: number;
+  opened: number;
+  failed: number;
+  suppressed_read: number;
+  suppressed_replied: number;
+};
+
+export type NotificationLedger = {
+  enabled: boolean;
+  status: string;
+  last_run_at: string;
+  error: string;
+  events: NotificationEvent[];
+  has_more: boolean;
+  next_cursor?: string;
+};
+
+export async function fetchNotificationLedger(config: AppConfig, params: { limit?: number; before?: string } = {}): Promise<NotificationLedger> {
+  const query = new URLSearchParams();
+  if (params.limit) query.set('limit', String(params.limit));
+  if (params.before) query.set('before', params.before);
+  const suffix = query.toString();
+  const body = await request<NotificationLedger>(config, `/api/notifications${suffix ? `?${suffix}` : ''}`);
+  return {
+    ...body,
+    events: (body.events ?? []).map((event) => ({
+      ...event,
+      suppressed_read: event.suppressed_read ?? 0,
+      suppressed_replied: event.suppressed_replied ?? 0,
+    })),
+    has_more: body.has_more ?? false,
+  };
+}
+
+export function setNotificationsEnabled(config: AppConfig, enabled: boolean): Promise<{ enabled: boolean }> {
   return request(config, '/api/notifications/settings', { method: 'POST', body: JSON.stringify({ enabled }) });
 }

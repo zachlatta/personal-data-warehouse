@@ -7,11 +7,62 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const APIPath = "/api/notifications"
+
+// The ledger is read newest-first in pages: the phone's Notifications tab and
+// the web alerts view both walk it with ?before=<created_at of the last row>.
+const (
+	defaultLedgerLimit = 50
+	maxLedgerLimit     = 500
+)
+
+type ledgerPage struct {
+	limit    int
+	before   time.Time // zero means "from the newest"
+	beforeID string
+}
+
+// A cursor is "<created_at RFC3339Nano>|<id>": the keyset the page is ordered
+// by, so rows created in the same instant are neither skipped nor repeated.
+func encodeCursor(created time.Time, id string) string {
+	return created.UTC().Format(time.RFC3339Nano) + "|" + id
+}
+
+func decodeCursor(raw string) (time.Time, string, bool) {
+	stamp, id, found := strings.Cut(raw, "|")
+	if !found || id == "" {
+		return time.Time{}, "", false
+	}
+	t, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return t, id, true
+}
+
+func ledgerPageParams(r *http.Request) (ledgerPage, bool) {
+	page := ledgerPage{limit: defaultLedgerLimit}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return ledgerPage{}, false
+		}
+		page.limit = min(n, maxLedgerLimit)
+	}
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		t, id, ok := decodeCursor(raw)
+		if !ok {
+			return ledgerPage{}, false
+		}
+		page.before, page.beforeID = t, id
+	}
+	return page, true
+}
 
 func (s *Service) Register(mux *http.ServeMux, auth func(http.Handler) http.Handler) {
 	mux.Handle("GET "+APIPath, auth(bounded(s.status)))
@@ -47,6 +98,11 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 func unavailable(w http.ResponseWriter) { http.Error(w, "notification storage unavailable", 503) }
 func (s *Service) status(w http.ResponseWriter, r *http.Request) {
+	page, ok := ledgerPageParams(r)
+	if !ok {
+		http.Error(w, "limit must be a positive integer and before a next_cursor from an earlier page", 400)
+		return
+	}
 	var enabled bool
 	var status, lastRun, reason string
 	err := s.DB.QueryRowContext(r.Context(), s.q(`SELECT enabled=1,status,COALESCE(last_run_at::text,''),error FROM @marts_notification_health`)).Scan(&enabled, &status, &lastRun, &reason)
@@ -54,6 +110,7 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
 		unavailable(w)
 		return
 	}
+	// One row past the page says whether there is more without a second count.
 	rows, err := s.DB.QueryContext(r.Context(), s.q(`SELECT n.id,n.source,n.priority,n.created_at,n.payload->>'actor',n.payload->>'title',n.payload->>'snippet',n.status,n.payload,
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.accepted_at>'epoch'),
@@ -61,33 +118,53 @@ func (s *Service) status(w http.ResponseWriter, r *http.Request) {
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status IN ('failed','unknown')),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_read'),
  (SELECT count(*) FROM @notification_deliveries d WHERE d.notification_id=n.id AND d.status='suppressed' AND d.error='already_replied')
- FROM @notification_events n ORDER BY n.created_at DESC LIMIT 50`))
+ FROM @notification_events n WHERE ($1::timestamptz IS NULL OR (n.created_at, n.id) < ($1, $2)) ORDER BY n.created_at DESC, n.id DESC LIMIT $3`), nullableTime(page.before), page.beforeID, page.limit+1)
 	if err != nil {
 		unavailable(w)
 		return
 	}
 	defer rows.Close()
 	events := []map[string]any{}
+	var lastCreated time.Time
+	var lastID string
+	hasMore := false
 	for rows.Next() {
-		var id, source, priority, created, actor, title, body, state string
+		var id, source, priority, actor, title, body, state string
+		var created time.Time
 		var devices, accepted, opened, failed, suppressedRead, suppressedReplied int
 		var payload []byte
 		if rows.Scan(&id, &source, &priority, &created, &actor, &title, &body, &state, &payload, &devices, &accepted, &opened, &failed, &suppressedRead, &suppressedReplied) != nil {
 			unavailable(w)
 			return
 		}
+		if len(events) == page.limit {
+			hasMore = true
+			break
+		}
+		lastCreated, lastID = created, id
 
 		var snapshot map[string]any
 		_ = json.Unmarshal(payload, &snapshot)
 		preview, _ := snapshot["presentation"].(map[string]any)
 
-		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created, "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied})
+		events = append(events, map[string]any{"preview": preview, "id": id, "source": source, "priority": priority, "created_at": created.UTC().Format(time.RFC3339Nano), "actor": actor, "title": title, "body": body, "status": state, "devices": devices, "accepted": accepted, "opened": opened, "failed": failed, "suppressed_read": suppressedRead, "suppressed_replied": suppressedReplied})
 	}
 	if rows.Err() != nil {
 		unavailable(w)
 		return
 	}
-	writeJSON(w, map[string]any{"enabled": enabled, "status": status, "last_run_at": lastRun, "error": reason, "web_public_key": s.PublicKey, "events": events})
+	out := map[string]any{"enabled": enabled, "status": status, "last_run_at": lastRun, "error": reason, "web_public_key": s.PublicKey, "events": events, "has_more": hasMore}
+	if hasMore {
+		out["next_cursor"] = encodeCursor(lastCreated, lastID)
+	}
+	writeJSON(w, out)
+}
+
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC()
 }
 func (s *Service) settings(w http.ResponseWriter, r *http.Request) {
 	var input struct {

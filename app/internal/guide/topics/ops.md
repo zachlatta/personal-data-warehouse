@@ -52,8 +52,8 @@ so a LaunchAgent that fires and fails reads `failing` rather than merely `late`;
 
 `marts_ops.notifications` records newly landed direct/cc events captured while enabled;
 `marts_ops.notification_deliveries` records each device's attempts and observed opens.
-Join notification `id` to delivery `notification_id`. Use `/notifications` or phone
-Settings to start/pause; read-only SQL cannot change the switch. Existing history and
+Join notification `id` to delivery `notification_id`. Use `/notifications` or the phone's
+Alerts tab to start/pause; read-only SQL cannot change the switch. Existing history and
 ordinary edits never replay. Device tokens and open capabilities are private.
 
 **Acceptance is not display, and a tap is not a read.** `accepted_at` means push-service

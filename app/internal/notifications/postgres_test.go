@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
 	"strings"
 	"testing"
@@ -200,5 +201,50 @@ func TestPostgresNotifications(t *testing.T) {
 	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, APIPath, nil))
 	if w.Code != 200 {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	// Walking the ledger one row at a time visits every event exactly once and
+	// ends on a page without a cursor.
+	total := count(`SELECT count(*) FROM @notification_events`)
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages <= total; pages++ {
+		path := APIPath + "?limit=1"
+		if cursor != "" {
+			path += "&before=" + neturl.QueryEscape(cursor)
+		}
+		w = httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != 200 {
+			t.Fatalf("page %d: %d %s", pages, w.Code, w.Body)
+		}
+		var page struct {
+			Events     []struct{ ID string }
+			HasMore    bool   `json:"has_more"`
+			NextCursor string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range page.Events {
+			if seen[e.ID] {
+				t.Fatalf("event %s repeated across pages", e.ID)
+			}
+			seen[e.ID] = true
+		}
+		if !page.HasMore {
+			if page.NextCursor != "" || len(seen) != total {
+				t.Fatalf("ledger walk ended with %d of %d events", len(seen), total)
+			}
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != total {
+		t.Fatalf("ledger walk never terminated: %d of %d", len(seen), total)
+	}
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, APIPath+"?before=garbage", nil))
+	if w.Code != 400 {
+		t.Fatalf("bad cursor accepted: %d", w.Code)
 	}
 }
