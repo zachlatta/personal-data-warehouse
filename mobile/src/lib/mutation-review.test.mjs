@@ -682,9 +682,9 @@ test('an apple merge reads as the kept card first, names the deletions, and warn
   assert.deepEqual(review.destructive, ['2 cards deleted after the merge']);
   assert.match(review.warning, /no longer in the synced address book/);
   assert.deepEqual(review.changes, [{ field: 'family_name', label: 'Last name', before: '', after: 'Lovelace', kind: 'changed' }]);
-  // the proposed work email is not on any card yet; the merged card's home email is
-  assert.equal(appleContactPointExists(review.points[0], review.cards), false);
-  assert.equal(appleContactPointExists({ kind: 'email', label: '', value: 'ada@EXAMPLE.test' }, review.cards), true);
+  // the proposed work email already sits on the merged card as a home email (case-insensitively), so the row says so
+  assert.equal(appleContactPointExists(review.points[0], review.cards), true);
+  assert.equal(appleContactPointExists({ kind: 'email', label: '', value: 'someone-else@example.test' }, review.cards), false);
   assert.equal(appleContactPointExists({ kind: 'phone', label: '', value: '+1 802-555-0100' }, review.cards), true);
 });
 
