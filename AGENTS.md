@@ -1977,6 +1977,23 @@ nothing and reports success. `GetRequest` hydrates every named card's current ro
 `preview.contact.cards` (kept card first for a merge, `missing: true` for a card the
 warehouse no longer holds) so the reviewer compares against what the card holds today.
 
+**Google Contacts (`zach@zachlatta.com`) is the canonical book and iCloud mirrors it.**
+Decided 2026-09-13, after both books were deduplicated and reconciled by hand. The daily
+`contacts_mirror` Dagster asset (`defs/contacts_mirror.py`, `contacts_mirror.py`) diffs
+`base_google_contacts.cards` against `base_apple_contacts.cards` and files the delta as
+ordinary reviewed requests through the app's `propose_mutation` (titles begin
+`Contacts mirror`), never writing a card itself. The rule is asymmetric on purpose:
+Google wins what a card *says* (name, organization, title — iCloud is changed to match),
+both books are additive for how to *reach* a person (an email or phone only one holds is
+added to the other; nothing is removed from a surviving card), and a person is one card
+per book (iCloud twins of one Google card are merged, Google duplicates folded). Identity
+is a shared email or phone, never a name alone, and cards whose names disagree on the
+first three letters are treated as a household sharing a number, not a duplicate. Cards
+with no email or phone cannot be matched and are left alone. The asset skips while a
+`Contacts mirror` request is still pending review, so a delta is proposed once, not daily.
+So an agent adding a contact proposes it to Google and lets the mirror carry it to the
+devices; `apple_contacts.*` is for iCloud-specific repairs.
+
 The Automation → Contacts TCC grant is separate from the Notes grant and from Full Disk
 Access, attributed to the same `launchd → /bin/zsh → uv (Cellar path) → python → osascript`
 chain, and drifts on every uv upgrade exactly as documented for Notes above. It was
