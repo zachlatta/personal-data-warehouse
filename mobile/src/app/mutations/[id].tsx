@@ -9,16 +9,19 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gmail-thread-review';
 import { CalendarMutationCard } from '@/components/calendar-mutation-review';
+import { ContactMutationCard } from '@/components/contact-mutation-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, rejectMutationRequest, removeMutation, type Mutation, type MutationRequest } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
+  contactBatchSummary,
   gmailBatchSummary,
   hasGmailThreadMutations,
   gmailThreadDayGroups,
   gmailThreadReviews,
   isCalendarCreateMutation,
+  isContactMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   mutationReviewContext,
@@ -58,6 +61,7 @@ function MutationCard({ mutation, pending, onRemove, requestReason, alone }: { m
   const theme = useTheme();
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
+  if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   const merged = flattenPayload(mutation.payload ?? {});
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
@@ -303,7 +307,8 @@ export default function MutationRequestScreen() {
   };
   const remove = (mutation: Mutation) => {
     if (!request) return;
-    Alert.alert('Skip this email?', 'It will not be sent when the request is approved.', [
+    const contact = isContactMutation(mutation);
+    Alert.alert(contact ? 'Skip this contact?' : 'Skip this email?', contact ? 'It is dropped from this request; every other contact still runs.' : 'It will not be sent when the request is approved.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Skip',
@@ -333,6 +338,10 @@ export default function MutationRequestScreen() {
   const slackBatch = requestMutations.length > 1 && requestMutations.every((mutation) => isSlackMarkReadMutation(mutation));
   const gmailBatch = hasGmailThreadMutations(requestMutations);
   const otherMutations = requestMutations.filter((mutation) => !isGmailThreadMutation(mutation));
+  // A contact batch says what approval does — "Create 12" — because a
+  // request of twelve address-book writes deserves a verb, not "Approve".
+  const contactBatch = requestMutations.length > 0 && requestMutations.every((mutation) => isContactMutation(mutation));
+  const contactSummary = contactBatch ? contactBatchSummary(requestMutations) : null;
   const query = filter.trim().toLowerCase();
   // A mutation kept out of the batch stays in the response as a rejected row,
   // so the button has to count what is still going to run, not the request's
@@ -479,7 +488,8 @@ export default function MutationRequestScreen() {
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy || runningCount === 0} style={[styles.button, styles.approve, (busy || runningCount === 0) && styles.disabled]}>
                 <ThemedText style={styles.buttonText}>
-                  {gmailBatch && otherMutations.length === 0 && gmailSummary.verb !== 'Review' ? `${gmailSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
+                  {gmailBatch && otherMutations.length === 0 && gmailSummary.verb !== 'Review' ? `${gmailSummary.verb} ${runningCount}`
+                    : contactSummary ? `${contactSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
                 </ThemedText>
               </Pressable>
             </View>

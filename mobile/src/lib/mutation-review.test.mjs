@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {
   calendarDayLayout,
   calendarMutationReview,
+  contactBatchSummary,
+  contactMutationReview,
   formatGmailLabel,
   gmailBatchSummary,
   hasGmailThreadMutations,
@@ -12,6 +14,7 @@ import {
   gmailThreadReviews,
   gmailThreadUrl,
   isCalendarCreateMutation,
+  isContactMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   looksAutomatedSender,
@@ -520,4 +523,125 @@ test('partial thread previews never hide another thread affected by the same act
   assert.deepEqual(reviews.map((review) => review.threadId), ['known', 'missing']);
   assert.equal(reviews[1].messages.length, 0);
   assert.equal(reviews[0].threadsInMutation, 2);
+});
+
+// --- contacts --------------------------------------------------------------
+
+function contactMutation(operation, preview = {}) {
+  return {
+    id: 'mut-contact',
+    provider: 'google_people',
+    operation: 'contacts.batch_mutation',
+    account: 'zach@example.test',
+    status: 'pending_review',
+    title: 'Create contact',
+    payload: { operations: [operation] },
+    preview: { operations: [{ ...operation, op_index: 0, ...preview }] },
+  };
+}
+
+test('a create_contact operation reads as a contact card, not a JSON dump', () => {
+  const mutation = contactMutation({
+    op: 'create_contact',
+    client_op_id: 'op-0',
+    person: {
+      names: [{ givenName: 'Nova', familyName: 'Example' }],
+      nicknames: [{ value: 'Nov' }],
+      emailAddresses: [{ type: 'work', value: 'nova@example.test' }, { value: 'nova@personal.test' }],
+      phoneNumbers: [{ type: 'mobile', value: '+18025550100' }],
+      organizations: [{ name: 'Hack Club', title: 'Deputy to the Founder' }],
+      urls: [{ type: 'work', value: 'https://example.test/nova' }],
+      addresses: [{ formattedValue: '1 Main St, Springfield' }],
+      biographies: [{ value: 'Met at the summit. Runs the events team.', contentType: 'TEXT_PLAIN' }],
+    },
+  });
+  assert.equal(isContactMutation(mutation), true);
+  const [review] = contactMutationReview(mutation);
+  assert.equal(review.op, 'create_contact');
+  assert.equal(review.verb, 'Create');
+  assert.equal(review.name, 'Nova Example');
+  assert.equal(review.nickname, 'Nov');
+  assert.equal(review.role, 'Deputy to the Founder · Hack Club');
+  assert.deepEqual(review.points.map((p) => [p.kind, p.label, p.value]), [
+    ['email', 'work', 'nova@example.test'],
+    ['email', '', 'nova@personal.test'],
+    ['phone', 'mobile', '+18025550100'],
+    ['url', 'work', 'https://example.test/nova'],
+    ['address', '', '1 Main St, Springfield'],
+  ]);
+  assert.equal(review.note, 'Met at the summit. Runs the events team.');
+  assert.equal(review.effect, 'Creates a new Google Contact.');
+  assert.equal(review.warning, '');
+  assert.deepEqual(review.changes, []);
+});
+
+test('an update_contact operation shows the before → after per masked field and names a cleared field as a wipe', () => {
+  const mutation = contactMutation(
+    {
+      op: 'update_contact',
+      client_op_id: 'op-1',
+      resource_name: 'people/c123',
+      expected_etag: 'etag-old',
+      update_person_fields: ['emailAddresses', 'organizations', 'phoneNumbers'],
+      clear_person_fields: ['phoneNumbers'],
+      person: {
+        resourceName: 'people/c123',
+        etag: 'etag-old',
+        emailAddresses: [{ value: 'new@example.test' }],
+        organizations: [{ name: 'Hack Club', title: 'Engineer' }],
+      },
+    },
+    {
+      after: { emailAddresses: [{ value: 'new@example.test' }], organizations: [{ name: 'Hack Club', title: 'Engineer' }] },
+      before: {
+        etag: 'etag-old',
+        names: [{ displayName: 'Sam Example' }],
+        emailAddresses: [{ value: 'old@example.test' }],
+        organizations: [{ name: 'Hack Club', title: 'Engineer' }],
+        phoneNumbers: [{ value: '+18025550199' }],
+      },
+      contact_found: true,
+      current_etag: 'etag-old',
+      etag_is_current: true,
+    },
+  );
+  const [review] = contactMutationReview(mutation);
+  assert.equal(review.verb, 'Update');
+  // The name comes from the synced card because the patch does not carry one.
+  assert.equal(review.name, 'Sam Example');
+  assert.equal(review.resourceName, 'people/c123');
+  assert.deepEqual(review.changes, [
+    { field: 'emailAddresses', label: 'Email', before: 'old@example.test', after: 'new@example.test', kind: 'changed' },
+    { field: 'organizations', label: 'Organization', before: 'Engineer, Hack Club', after: 'Engineer, Hack Club', kind: 'unchanged' },
+    { field: 'phoneNumbers', label: 'Phone', before: '+18025550199', after: '', kind: 'cleared' },
+  ]);
+  assert.match(review.effect, /Replaces Email, Organization/);
+  assert.match(review.effect, /Clears Phone/);
+  assert.equal(review.warning, '');
+});
+
+test('a stale etag or a missing synced card is a warning at review time, not a failed run later', () => {
+  const stale = contactMutation(
+    { op: 'update_contact', resource_name: 'people/c1', expected_etag: 'a', update_person_fields: ['names'], person: { names: [{ displayName: 'X' }] } },
+    { before: { etag: 'b', names: [{ displayName: 'Old' }] }, contact_found: true, current_etag: 'b', etag_is_current: false },
+  );
+  assert.match(contactMutationReview(stale)[0].warning, /changed since this was proposed/);
+  const missing = contactMutation(
+    { op: 'delete_contact', resource_name: 'people/c2', expected_etag: 'a' },
+    { contact_found: false },
+  );
+  const [review] = contactMutationReview(missing);
+  assert.equal(review.verb, 'Delete');
+  assert.equal(review.name, 'people/c2');
+  assert.match(review.warning, /not in the synced Google Contacts copy/);
+  assert.equal(review.effect, 'Deletes this contact from Google Contacts.');
+});
+
+test('a contact batch summary counts what will still run and picks the approve verb', () => {
+  const create = (id, status = 'pending_review') => ({ ...contactMutation({ op: 'create_contact', person: { names: [{ givenName: 'A' }] } }), id, status });
+  const update = { ...contactMutation({ op: 'update_contact', resource_name: 'people/x', expected_etag: 'e', update_person_fields: ['names'], person: { names: [{ givenName: 'B' }] } }), id: 'u' };
+  assert.deepEqual(contactBatchSummary([create('a'), create('b'), create('c', 'rejected')]), { create: 2, update: 0, delete: 0, running: 2, verb: 'Create' });
+  assert.deepEqual(contactBatchSummary([create('a'), update]), { create: 1, update: 1, delete: 0, running: 2, verb: 'Approve' });
+  assert.deepEqual(contactBatchSummary([{ ...update, payload: { operations: [{ op: 'delete_contact', resource_name: 'people/x', expected_etag: 'e' }] } }]), { create: 0, update: 0, delete: 1, running: 1, verb: 'Delete' });
+  assert.equal(isContactMutation({ operation: 'gmail.send_email', provider: 'gmail' }), false);
 });

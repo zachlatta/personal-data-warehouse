@@ -915,3 +915,278 @@ export function gmailThreadUrl(account: string, threadId: string): string {
   const prefix = mailbox ? `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(mailbox)}` : 'https://mail.google.com/mail/u/0';
   return `${prefix}#all/${encodeURIComponent(id)}`;
 }
+
+// --- contacts review -------------------------------------------------------
+//
+// A contact mutation is a Google People `Person` body. Rendered as JSON it
+// is forty lines per card, and a batch of twelve was approved by scrolling
+// past the first one. These helpers turn one operation into the card a
+// reviewer actually judges — the name, who they are, how to reach them, the
+// note that says why the agent thinks they belong in the address book — and,
+// for an update, the before → after of exactly the fields the mask touches.
+// A masked field with no incoming value is a WIPE, which is the one thing the
+// raw payload never says out loud.
+
+export const CONTACT_OPERATIONS = ['contacts.batch_mutation', 'google_people.contacts'];
+
+export function isContactMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'google_people' || CONTACT_OPERATIONS.includes(mutation.operation ?? '');
+}
+
+export type ContactOp = 'create_contact' | 'update_contact' | 'delete_contact';
+
+export type ContactReviewPoint = {
+  kind: 'email' | 'phone' | 'url' | 'address';
+  label: string;
+  value: string;
+};
+
+export type ContactFieldChange = {
+  field: string;
+  label: string;
+  before: string;
+  after: string;
+  kind: 'changed' | 'unchanged' | 'cleared';
+};
+
+export type ContactOperationReview = {
+  op: ContactOp;
+  verb: 'Create' | 'Update' | 'Delete';
+  name: string;
+  nickname: string;
+  role: string;
+  points: ContactReviewPoint[];
+  note: string;
+  resourceName: string;
+  effect: string;
+  warning: string;
+  changes: ContactFieldChange[];
+  raw: Record<string, unknown>;
+};
+
+const CONTACT_FIELD_LABELS: Record<string, string> = {
+  names: 'Name',
+  nicknames: 'Nickname',
+  emailAddresses: 'Email',
+  phoneNumbers: 'Phone',
+  organizations: 'Organization',
+  biographies: 'Note',
+  urls: 'Website',
+  addresses: 'Address',
+  birthdays: 'Birthday',
+  events: 'Event',
+  relations: 'Relation',
+  occupations: 'Occupation',
+  locations: 'Location',
+  interests: 'Interest',
+  memberships: 'Group',
+  userDefined: 'Custom field',
+  imClients: 'IM',
+  genders: 'Gender',
+  locales: 'Locale',
+  externalIds: 'External id',
+  clientData: 'Client data',
+  miscKeywords: 'Keyword',
+  calendarUrls: 'Calendar',
+  sipAddresses: 'SIP',
+};
+
+export function contactFieldLabel(field: string): string {
+  return CONTACT_FIELD_LABELS[field] ?? field;
+}
+
+function canonicalContactOp(value: string): ContactOp | '' {
+  switch (value) {
+    case 'create':
+    case 'create_contact':
+      return 'create_contact';
+    case 'update':
+    case 'update_contact':
+      return 'update_contact';
+    case 'delete':
+    case 'delete_contact':
+      return 'delete_contact';
+    default:
+      return '';
+  }
+}
+
+function recordList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.map(asRecord).filter((item) => Object.keys(item).length > 0) : [];
+}
+
+function personName(person: Record<string, unknown>): string {
+  for (const name of recordList(person.names)) {
+    const display = text(name.displayName) || text(name.unstructuredName);
+    if (display) return display;
+    const parts = [text(name.honorificPrefix), text(name.givenName), text(name.middleName), text(name.familyName), text(name.honorificSuffix)].filter(Boolean);
+    if (parts.length) return parts.join(' ');
+  }
+  return '';
+}
+
+function organizationSummary(org: Record<string, unknown>): string {
+  const title = text(org.title);
+  const name = text(org.name);
+  const department = text(org.department);
+  const where = [name, department].filter(Boolean).join(', ');
+  return [title, where].filter(Boolean).join(', ');
+}
+
+function personRole(person: Record<string, unknown>): string {
+  for (const org of recordList(person.organizations)) {
+    const title = text(org.title);
+    const name = text(org.name);
+    if (title || name) return [title, name].filter(Boolean).join(' · ');
+  }
+  return '';
+}
+
+function contactPoints(person: Record<string, unknown>): ContactReviewPoint[] {
+  const points: ContactReviewPoint[] = [];
+  const push = (kind: ContactReviewPoint['kind'], items: Record<string, unknown>[], ...valueKeys: string[]) => {
+    for (const item of items) {
+      let value = '';
+      for (const key of valueKeys) {
+        value = text(item[key]);
+        if (value) break;
+      }
+      if (!value) continue;
+      points.push({ kind, label: text(item.formattedType) || text(item.type), value });
+    }
+  };
+  push('email', recordList(person.emailAddresses), 'value');
+  push('phone', recordList(person.phoneNumbers), 'value', 'canonicalForm');
+  push('url', recordList(person.urls), 'value');
+  push('address', recordList(person.addresses), 'formattedValue', 'streetAddress', 'city');
+  return points;
+}
+
+// Summarise one Person field for a diff row. Every People field is a list of
+// typed entries, so the row reads as "a; b" when there is more than one.
+export function contactFieldSummary(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value).trim();
+  const items = Array.isArray(value) ? value : [value];
+  return items
+    .map((item) => {
+      if (typeof item !== 'object' || item === null) return text(item);
+      const record = asRecord(item);
+      if ('title' in record || 'department' in record || ('name' in record && !('value' in record))) {
+        const org = organizationSummary(record);
+        if (org) return org;
+      }
+      const name = personName({ names: [record] });
+      if (name) return name;
+      for (const key of ['value', 'canonicalForm', 'formattedValue', 'text', 'name', 'date']) {
+        const found = key === 'date' ? dateSummary(record[key]) : text(record[key]);
+        if (found) return found;
+      }
+      return JSON.stringify(record);
+    })
+    .filter(Boolean)
+    .join('; ');
+}
+
+function dateSummary(value: unknown): string {
+  const date = asRecord(value);
+  const parts = [date.year, date.month, date.day].map((part) => (typeof part === 'number' ? String(part).padStart(2, '0') : ''));
+  return parts.some(Boolean) ? parts.filter(Boolean).join('-') : '';
+}
+
+function contactWarning(op: ContactOp, preview: Record<string, unknown>): string {
+  if (op === 'create_contact') return '';
+  if (preview.contact_found === false) return 'This contact is not in the synced Google Contacts copy, so the change cannot be previewed.';
+  if (preview.etag_is_current === false) return 'This contact changed since this was proposed, so the change will be refused. Re-propose it against the current contact.';
+  return '';
+}
+
+function contactOperations(mutation: MutationLike): { operation: Record<string, unknown>; preview: Record<string, unknown> }[] {
+  const operations = recordList(asRecord(mutation.payload).operations);
+  const previews = recordList(asRecord(mutation.preview).operations);
+  if (operations.length === 0 && previews.length === 0) return [];
+  const source = operations.length ? operations : previews;
+  return source.map((operation, index) => {
+    const byIndex = previews.find((preview) => preview.op_index === index);
+    return { operation, preview: byIndex ?? previews[index] ?? {} };
+  });
+}
+
+export function contactMutationReview(mutation: MutationLike): ContactOperationReview[] {
+  return contactOperations(mutation).map(({ operation, preview }) => {
+    const op = canonicalContactOp(text(operation.op) || text(preview.op)) || 'create_contact';
+    const person = asRecord(operation.person ?? operation.after ?? preview.person ?? preview.after);
+    const before = asRecord(preview.before);
+    const resourceName = text(operation.resource_name) || text(preview.resource_name) || text(person.resourceName);
+    const subject = op === 'delete_contact' ? before : person;
+    const name = personName(subject) || personName(before);
+    const points = contactPoints(subject);
+    const note = recordList(subject.biographies).map((bio) => text(bio.value)).filter(Boolean).join('\n\n');
+    const nickname = recordList(subject.nicknames).map((nick) => text(nick.value)).filter(Boolean)[0] ?? '';
+
+    const changes: ContactFieldChange[] = [];
+    let effect = '';
+    if (op === 'update_contact') {
+      const cleared = new Set(stringList(operation.clear_person_fields ?? preview.clear_person_fields));
+      const after = asRecord(preview.after ?? operation.person);
+      const fields = stringList(operation.update_person_fields ?? preview.update_person_fields);
+      for (const field of fields) {
+        const beforeValue = contactFieldSummary(before[field]);
+        const afterValue = contactFieldSummary(after[field]);
+        const kind: ContactFieldChange['kind'] = cleared.has(field) ? 'cleared' : beforeValue === afterValue ? 'unchanged' : 'changed';
+        changes.push({ field, label: contactFieldLabel(field), before: beforeValue, after: kind === 'cleared' ? '' : afterValue, kind });
+      }
+      const replaced = changes.filter((change) => change.kind !== 'cleared').map((change) => change.label);
+      const wiped = changes.filter((change) => change.kind === 'cleared').map((change) => change.label);
+      const sentences = [];
+      if (replaced.length) sentences.push(`Replaces ${replaced.join(', ')}.`);
+      if (wiped.length) sentences.push(`Clears ${wiped.join(', ')} — the current value is deleted.`);
+      effect = sentences.join(' ') || 'Updates the selected fields.';
+    } else if (op === 'delete_contact') {
+      effect = 'Deletes this contact from Google Contacts.';
+    } else {
+      effect = 'Creates a new Google Contact.';
+    }
+
+    return {
+      op,
+      verb: op === 'create_contact' ? 'Create' : op === 'update_contact' ? 'Update' : 'Delete',
+      name: name || points[0]?.value || resourceName || 'Unnamed contact',
+      nickname,
+      role: personRole(subject) || (op !== 'create_contact' ? personRole(before) : ''),
+      points,
+      note,
+      resourceName,
+      effect,
+      warning: contactWarning(op, preview),
+      changes,
+      raw: operation,
+    };
+  });
+}
+
+export type ContactBatchSummary = {
+  create: number;
+  update: number;
+  delete: number;
+  running: number;
+  verb: 'Create' | 'Update' | 'Delete' | 'Approve';
+};
+
+// The approve button says what approving does. A batch that is all creates
+// reads "Create 12"; a mixed one falls back to "Approve".
+export function contactBatchSummary(mutations: MutationLike[]): ContactBatchSummary {
+  const summary: ContactBatchSummary = { create: 0, update: 0, delete: 0, running: 0, verb: 'Approve' };
+  for (const mutation of mutations) {
+    if (mutation.status !== 'pending_review') continue;
+    for (const review of contactMutationReview(mutation)) {
+      summary.running += 1;
+      if (review.op === 'create_contact') summary.create += 1;
+      else if (review.op === 'update_contact') summary.update += 1;
+      else summary.delete += 1;
+    }
+  }
+  const kinds = (['create', 'update', 'delete'] as const).filter((kind) => summary[kind] > 0);
+  if (kinds.length === 1) summary.verb = kinds[0] === 'create' ? 'Create' : kinds[0] === 'update' ? 'Update' : 'Delete';
+  return summary;
+}
