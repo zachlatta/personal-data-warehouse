@@ -6,7 +6,7 @@ WHOOP health, Plaid and statement-backed finances, meeting and voice-memo transc
 every prior AI agent session across all providers and machines. Any question about Zach's
 own life starts here — not from priors, not from a web search, and not from a single-source
 connector, which cannot join the half of the story that lived in another app. Reads are
-safe. Writes are proposals a human approves (topic `mutations`).
+safe. Built-in writes require human approval; connected MCP tools may write directly.
 
 This document is the contract for using it well. Read a topic when your question enters
 its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.
@@ -167,9 +167,15 @@ of history, so older spending lives in the statement corpus
 swept slowly and were frozen for months before 2026-08-27. State the window and the
 freshness of what you read.
 
+## Connected MCP servers
+
+Tools named `<connection>__<tool>` call a live upstream MCP server, not the warehouse.
+They may write directly without PDW mutation review. Configure and authenticate on the
+web app's `/connections` page; see topic `connections` for discovery, access and limits.
+
 ## Writes
 
-Nothing here writes upstream directly. {{if .CLI}}`pdw call propose_mutation_help` lists the supported
+Built-in warehouse mutation tools do not write upstream directly. {{if .CLI}}`pdw call propose_mutation_help` lists the supported
 types; `pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation_help` lists the supported
 types; `propose_mutation`{{end}} queues a request for human review and returns an
 `approval_url`. Gmail (send, archive, labels), Google Calendar, Google Contacts, Slack

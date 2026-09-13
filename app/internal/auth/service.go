@@ -548,7 +548,7 @@ var authorizePage = template.Must(template.New("authorize").Parse(`<!doctype htm
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Personal Data Warehouse</title>
 <style>body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:36rem;margin:12vh auto;padding:0 1rem;color:#172026}label,input,button{font-size:1rem}input{display:block;width:100%;box-sizing:border-box;margin:.5rem 0 1rem;padding:.7rem;border:1px solid #b8c1cc;border-radius:6px}button{padding:.7rem 1rem;border:0;border-radius:6px;background:#172026;color:white}</style></head>
-<body><h1>Authorize Personal Data Warehouse</h1><form method="post">
+<body><h1>Authorize Personal Data Warehouse</h1><p>This grants access to PDW and any connected MCP tools shared with this client name. Connected tools may execute writes using the upstream account, without PDW mutation review. Manage sharing on the Connections page.</p><form method="post">
 {{range $key, $values := .}}{{if and (ne $key "client_name") (ne $key "secret_token")}}{{range $values}}<input type="hidden" name="{{$key}}" value="{{.}}">{{end}}{{end}}{{end}}
 <label for="client_name">Client name</label><input id="client_name" name="client_name" type="text" autocomplete="off" autofocus required placeholder="e.g. claude, codex, hermes" maxlength="64">
 <label for="secret_token">Secret token</label><input id="secret_token" name="secret_token" type="password" required>

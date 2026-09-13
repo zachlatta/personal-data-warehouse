@@ -11,7 +11,10 @@ import { closeDrawer } from "./inspector.js";
 
 import * as notificationsView from "./notifications.js";
 
+import * as connectionsView from "./connections.js";
+
 const ROUTES = [
+  { pattern: /^\/connections\/?$/, view: connectionsView, nav: "connections", params: () => ({}) },
   { pattern: /^\/notifications\/?$/, view: notificationsView, nav: "notifications", params: () => ({}) },
   { pattern: /^\/timeline(?:\/([^/]+)\/(.+))?\/?$/, view: timelineView, nav: "timeline", params: (m) => ({ adapter: m[1] ? decodeURIComponent(m[1]) : "", eventId: m[2] ? decodeURIComponent(m[2]) : "" }) },
   { pattern: /^\/search\/?$/, view: searchView, nav: "search", params: () => ({}) },

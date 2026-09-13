@@ -29,7 +29,7 @@ session; read a topic when a question enters that domain.
 
 COMMANDS
   readme [topic]             Print the agent guide, or one of its topics
-                             (search, sql, sources, agent-sessions, finance,
+                             (connections, search, sql, sources, agent-sessions, finance,
                              health, slack, mutations, ops, ingest). Needs no
                              URL or token. Run "pdw readme --help" for the list.
   login                      Save warehouse URL + token to a per-user config file

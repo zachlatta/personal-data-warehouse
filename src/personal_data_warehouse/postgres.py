@@ -939,6 +939,8 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
         ("account", "collection"),
     ),
+    # Owner-managed gateway configuration, encrypted by the Go app.
+    "mcp_connections": TableSpec(("name", "payload", "updated_at"), ("name",), "updated_at"),
     # PK (account, session_key) is load-bearing: the app's publish endpoint
     # upserts this same table with ON CONFLICT (account, session_key). See
     # app/internal/slacksession/store.go.
@@ -4444,6 +4446,7 @@ class PostgresWarehouse:
         See personal_data_warehouse/pipeline_health.py: the tables hold measured
         facts, the views turn them into a live status.
         """
+        self._ensure_table_group(["mcp_connections"])
         # The weekly benchmark records how much of the HNSW + BM25 working set
         # is resident in Postgres shared buffers. pg_buffercache ships with the
         # official image's contrib modules, but is per-database like pg_trgm.

@@ -3219,6 +3219,17 @@
       "query_access": "public",
       "secret": false,
       "comment": "Health. Paused, stale worker, or attention for failures, no devices and backlog."
+    },
+    {
+      "id": "mcp_connections",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "mcp_connections",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
     }
   ],
   "renamed_timeline_source_tables": {

@@ -308,6 +308,7 @@ var Objects = []CatalogObject{
 	{ID: "marts_notifications", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "notifications", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "Direct/cc. New arrivals captured while enabled; updates never replay. Join id to marts_ops.notification_deliveries.notification_id. Epoch timestamps become NULL."},
 	{ID: "marts_notification_deliveries", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "notification_deliveries", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "Deliveries. accepted_at is service acceptance, receipt_at a provider verdict, opened_at an observed tap (not a read). Absent timestamps are NULL; credentials stay private."},
 	{ID: "marts_notification_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "notification_health", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "Health. Paused, stale worker, or attention for failures, no devices and backlog."},
+	{ID: "mcp_connections", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "mcp_connections", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 }
 
 // PreviousLocations maps each object's pre-reorganization physical

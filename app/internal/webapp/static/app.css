@@ -278,3 +278,20 @@ a.filelink:hover { text-decoration: underline; }
 .notification-card-content > div { min-width: 0; overflow-wrap: anywhere; }
 .notification-card-content h2 { margin-top: 0; }
 .notification-card-content a { font-size: 0.85rem; }
+
+/* Owner-managed remote MCP connections. */
+.connections { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; overflow: auto; height: 100%; }
+.connections h1 { font-size: 24px; margin: 0 0 12px; }
+.connections h2 { font-size: 17px; margin: 0 0 12px; }
+.connections p { line-height: 1.6; margin: 10px 0; }
+.connection-card { border: 1px solid var(--line, #ddd); border-radius: 8px; padding: 20px; margin: 18px 0; }
+.connection-field { display: flex; flex-direction: column; gap: 7px; margin: 14px 0; font-size: 13px; }
+.connection-field input:not([type=checkbox]) { width: 100%; padding: 9px 10px; box-sizing: border-box; }
+.connection-field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: flex-start; }
+.connection-field input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
+.connection-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+.connection-message:not(:empty) { border-left: 3px solid #90743a; background: #faf6e8; padding: 12px; margin-top: 18px; color: #4c402b; }
+.connection-warning { font-size: 12px; }
+.connection-url { overflow-wrap: anywhere; }
+.connections details { margin: 16px 0; }
+.connections summary { cursor: pointer; }

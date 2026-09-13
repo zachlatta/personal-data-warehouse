@@ -1103,6 +1103,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="optional experiment; marts_ops.notification_health distinguishes paused from stale",
     ),
     Pipeline(
+        id="mcp_proxy",
+        label="MCP connections",
+        kind="internal",
+        cadence="on demand",
+        transport="PDW web connections and upstream MCP calls",
+        expected_data_interval=None,
+        expected_run_interval=None,
+        note="Connection and authentication status is reported on /connections; this is not a source sync.",
+    ),
+    Pipeline(
         id="upstream_mutations",
         label="Upstream mutations",
         kind="internal",
@@ -1419,6 +1429,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "notification_events": _data("timeline_notifications", "created_at", "event_ts", "notification delivery instrumentation"),
     "notification_deliveries": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "web_push_devices": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
+    "mcp_connections": _data("mcp_proxy", "updated_at", note="encrypted owner-managed connection configuration; not an event source"),
     "push_devices": _state("upstream_mutations", "updated_at", "iOS app devices registered for push notifications"),
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),

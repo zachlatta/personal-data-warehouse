@@ -5,6 +5,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,10 +20,15 @@ import (
 // NewHandler returns the API mux serving /api/tools and /api/tools/{name}.
 // Pass nil for logger to use slog.Default().
 func NewHandler(registry *tool.Registry, logger *slog.Logger) http.Handler {
+	return NewDynamicHandler(func(context.Context) (*tool.Registry, error) { return registry, nil }, logger)
+}
+
+// NewDynamicHandler resolves a per-request tool snapshot after authentication.
+func NewDynamicHandler(provider func(context.Context) (*tool.Registry, error), logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &handler{registry: registry, logger: logger.With("component", "api")}
+	h := &handler{provider: provider, logger: logger.With("component", "api")}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/tools", h.handleTools)
 	mux.HandleFunc("/api/tools/", h.handleToolCall)
@@ -30,7 +36,7 @@ func NewHandler(registry *tool.Registry, logger *slog.Logger) http.Handler {
 }
 
 type handler struct {
-	registry *tool.Registry
+	provider func(context.Context) (*tool.Registry, error)
 	logger   *slog.Logger
 }
 
@@ -52,9 +58,14 @@ func (h *handler) handleTools(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	entries := make([]listEntry, 0, len(h.registry.All()))
-	for _, t := range h.registry.All() {
-		schema, err := t.InputSchema()
+	registry, err := h.provider(r.Context())
+	if err != nil {
+		writeError(w, 503, "tool_registry_unavailable", "tool registry unavailable")
+		return
+	}
+	entries := make([]listEntry, 0, len(registry.All()))
+	for _, t := range registry.All() {
+		schema, err := schemaFor(t)
 		if err != nil {
 			h.logger.ErrorContext(r.Context(), "input schema derivation failed", "tool", t.Name(), "error", err)
 			writeError(w, http.StatusInternalServerError, "schema_error", "failed to derive input schema for "+t.Name())
@@ -80,7 +91,12 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "tool_not_found", "no tool named "+name)
 		return
 	}
-	t := h.registry.ByName(name)
+	registry, err := h.provider(r.Context())
+	if err != nil {
+		writeError(w, 503, "tool_registry_unavailable", "tool registry unavailable")
+		return
+	}
+	t := registry.ByName(name)
 	if t == nil {
 		writeError(w, http.StatusNotFound, "tool_not_found", "no tool named "+name)
 		return
@@ -111,7 +127,7 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "tool_error", callErr.Error())
 		return
 	}
-	h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", isErr, "output", marshalAPIOutput(out))
+	h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", isErr, "output", loggedOutput(t, out))
 	// Soft IsError (per-statement errors etc.) returns 200 with data;
 	// callers inspect partial-success fields in the body. Matches MCP.
 	_ = isErr
@@ -164,4 +180,20 @@ func isJSONSpace(c byte) bool {
 		return true
 	}
 	return false
+}
+
+// Proxied content can contain credentials or sensitive upstream data.
+func loggedOutput(t tool.Tool, out any) string {
+	if policy, ok := t.(interface{ LogOutput() bool }); ok && !policy.LogOutput() {
+		return "<not logged>"
+	}
+	return marshalAPIOutput(out)
+}
+
+// Preserve JSON Schema extension keywords from remote MCP servers.
+func schemaFor(t tool.Tool) (any, error) {
+	if raw, ok := t.(interface{ RawInputSchema() any }); ok {
+		return raw.RawInputSchema(), nil
+	}
+	return t.InputSchema()
 }

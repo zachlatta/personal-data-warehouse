@@ -58,6 +58,7 @@ type Topic struct {
 // topics is the index, in the order the main guide lists them. Every entry
 // must have a template at topics/<name>.md; TestEveryTopicHasATemplate pins it.
 var topics = []Topic{
+	{Name: "connections", Summary: "remote MCP tools, web authentication, sharing, and upstream write permissions"},
 	{Name: "search", Summary: "query shape, modes, scoping, conversation context, and what a miss means"},
 	{Name: "sql", Summary: "columns-first SQL, the layers, type traps, the epoch sentinel, and the timeout budget"},
 	{Name: "sources", Summary: "where each domain lives: the starting relation for mail, chat, calendar, files, notes, photos, voice, health, finance"},

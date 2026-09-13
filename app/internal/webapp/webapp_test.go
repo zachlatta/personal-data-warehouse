@@ -41,7 +41,7 @@ func get(t *testing.T, url string) (*http.Response, string) {
 // phone or returned to an agent must open directly.
 func TestEveryRouteServesTheShellWithoutAuth(t *testing.T) {
 	srv := newServer(t)
-	for _, route := range []string{"/timeline", "/timeline/gmail_email/abc", "/mutation-review", "/mutation-review/requests/req-1", "/search"} {
+	for _, route := range []string{"/connections", "/timeline", "/timeline/gmail_email/abc", "/mutation-review", "/mutation-review/requests/req-1", "/search"} {
 		resp, body := get(t, srv.URL+route)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s: got %d, want 200", route, resp.StatusCode)

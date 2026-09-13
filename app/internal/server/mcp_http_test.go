@@ -163,3 +163,28 @@ func TestMCPServesToolsListForUnknownSessionID(t *testing.T) {
 		t.Fatalf("tools/list returned no tools: %s", raw)
 	}
 }
+
+func TestMCPConnectionsAdminAPIRejectsDownstreamOAuthTokens(t *testing.T) {
+	srv := newMCPTestServer(t)
+	token := oauthAccessToken(t, srv)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/connections", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	response, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("downstream token reached admin API: %d", response.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodGet, srv.URL+"/api/connections", nil)
+	req.Header.Set("Authorization", "Bearer web:"+muxAPITestSecret)
+	response, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("missing database should fail explicitly, not use volatile storage: %d", response.StatusCode)
+	}
+}

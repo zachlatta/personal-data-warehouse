@@ -16,6 +16,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/notifications"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
@@ -94,7 +95,7 @@ type sqlInput struct {
 // the layer order to walk when SQL really is needed. Since 2026-09-09 the full
 // agent guide is the `readme` tool, so this paragraph opens by naming it: the
 // instructions are the one thing an MCP client shows before the first call.
-var serverInstructions = "Call the readme tool first: it is the agent guide to this warehouse (workflow, command map, priority tiers, SQL rules, where each domain lives), with topics for search, sql, sources, agent-sessions, finance, health, slack, mutations and ops. " +
+var serverInstructions = "Call the readme tool first: it is the agent guide to this warehouse (workflow, command map, priority tiers, SQL rules, where each domain lives), with topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Tools named <connection>__<tool> are live upstream MCP tools, not warehouse queries; they may write directly using the connected account. " +
 	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
 	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
@@ -147,7 +148,7 @@ func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp
 		Name:    "personal-data-warehouse",
 		Version: "0.1.0",
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
-	serverLogger.Info("registering MCP tools")
+	serverLogger.Debug("registering MCP tools")
 	hooks := mcpToolHooks(serverLogger)
 	for _, t := range registry.Filter(toolShowsOnMCP).All() {
 		t.RegisterMCP(server, hooks)
@@ -359,12 +360,47 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	}
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
+	var proxy *mcpproxy.Service
+	if cfg.PostgresDatabaseURL != "" {
+		store, err := mcpproxy.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.SecretToken)
+		if err != nil {
+			logger.Error("MCP connection store could not initialize")
+		} else {
+			proxy = mcpproxy.New(store, baseURL, nil)
+			proxy.Register(mux, authSvc.RequireStaticBearer())
+		}
+	}
+	if proxy == nil {
+		unavailable := authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "MCP connections require the application database", http.StatusServiceUnavailable)
+		}))
+		mux.Handle("/api/connections", unavailable)
+		mux.Handle("/api/connections/", unavailable)
+	}
+	snapshot := func(ctx context.Context) (*tool.Registry, error) {
+		if proxy == nil {
+			return registry, nil
+		}
+		proxied, err := proxy.Tools(ctx)
+		if err != nil {
+			// Core warehouse tools remain usable during a connection-store outage.
+			logger.WarnContext(ctx, "MCP connections unavailable; serving warehouse tools only")
+			return registry, nil
+		}
+		return tool.NewRegistry(registry.All(), proxied), nil
+	}
 	// Stateless: every tool here is a self-contained request/response, and
 	// clients (notably the Claude connector) reuse their Mcp-Session-Id across
 	// redeploys and long idle gaps. A stateful handler answered those with
 	// "session not found" 404s, which the connector treated as the server
 	// being down, so its tools never loaded for that conversation.
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, &mcp.StreamableHTTPOptions{
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		if proxy == nil {
+			return mcpServer
+		}
+		current, _ := snapshot(r.Context())
+		return newMCPServerFromRegistry(current, slog.Default())
+	}, &mcp.StreamableHTTPOptions{
 		JSONResponse: true,
 		Stateless:    true,
 		Logger:       slog.Default().With("component", "mcp_streamable"),
@@ -372,7 +408,13 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
 	mux.Handle("/mcp", protected)
 
-	apiHandler := api.NewHandler(registry.Filter(toolShowsOnCLI), slog.Default())
+	apiHandler := api.NewDynamicHandler(func(ctx context.Context) (*tool.Registry, error) {
+		current, err := snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return current.Filter(toolShowsOnCLI), nil
+	}, slog.Default())
 	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
 	mux.Handle("/api/tools", apiProtected)
 	mux.Handle("/api/tools/", apiProtected)
