@@ -1190,3 +1190,206 @@ export function contactBatchSummary(mutations: MutationLike[]): ContactBatchSumm
   if (kinds.length === 1) summary.verb = kinds[0] === 'create' ? 'Create' : kinds[0] === 'update' ? 'Update' : 'Delete';
   return summary;
 }
+
+// --- apple contacts review -------------------------------------------------
+//
+// An Apple Contacts mutation names cards by id and carries only the fields it
+// touches; the app's read path adds every named card's current row under
+// preview.contact.cards. These helpers reuse the Google contact card's
+// vocabulary — points to reach the person, before → after rows per field —
+// so both address books review the same way, and they say the destructive
+// things out loud: a merge deletes cards, `remove` drops values, `note`
+// replaces the note.
+
+export const APPLE_CONTACT_OPERATIONS = ['apple_contacts.create_contact', 'apple_contacts.update_contact', 'apple_contacts.merge_contacts'];
+
+export function isAppleContactsMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'apple_contacts' || APPLE_CONTACT_OPERATIONS.includes(mutation.operation ?? '');
+}
+
+export type AppleContactOp = 'create' | 'update' | 'merge';
+
+export type AppleContactCard = {
+  cardId: string;
+  missing: boolean;
+  kept: boolean;
+  name: string;
+  role: string;
+  points: ContactReviewPoint[];
+  note: string;
+};
+
+export type AppleContactsReview = {
+  op: AppleContactOp;
+  verb: 'Create' | 'Update' | 'Merge';
+  name: string;
+  nickname: string;
+  role: string;
+  points: ContactReviewPoint[];
+  note: string;
+  appendNote: string;
+  removed: ContactReviewPoint[];
+  changes: ContactFieldChange[];
+  cards: AppleContactCard[];
+  deletedCount: number;
+  effect: string;
+  warning: string;
+  destructive: string[];
+  raw: Record<string, unknown>;
+};
+
+const APPLE_SCALAR_FIELDS: [string, string][] = [
+  ['given_name', 'First name'],
+  ['family_name', 'Last name'],
+  ['middle_name', 'Middle name'],
+  ['nickname', 'Nickname'],
+  ['organization', 'Organization'],
+  ['job_title', 'Title'],
+  ['department', 'Department'],
+];
+
+function appleEntryPoints(kind: ContactReviewPoint['kind'], value: unknown): ContactReviewPoint[] {
+  return recordList(value)
+    .map((entry) => ({ kind, label: text(entry.label), value: text(entry.value) || text(entry.canonicalForm) }))
+    .filter((point) => point.value);
+}
+
+function appleContactPoints(contact: Record<string, unknown>): ContactReviewPoint[] {
+  return [...appleEntryPoints('email', contact.emails), ...appleEntryPoints('phone', contact.phones), ...appleEntryPoints('url', contact.urls)];
+}
+
+function appleContactName(contact: Record<string, unknown>, allowOrganization: boolean): string {
+  const personal = [text(contact.given_name), text(contact.middle_name), text(contact.family_name)].filter(Boolean).join(' ');
+  // A company card has no personal name; only a CREATE may fall back to the
+  // organization, or an update that merely tags someone "Hack Club" would be
+  // titled Hack Club.
+  return personal || (allowOrganization ? text(contact.organization) : '');
+}
+
+function appleContactRole(contact: Record<string, unknown>): string {
+  return [text(contact.job_title), text(contact.organization)].filter(Boolean).join(' · ');
+}
+
+function appleCard(row: Record<string, unknown>, keepCardId: string): AppleContactCard {
+  const cardId = text(row.card_id);
+  return {
+    cardId,
+    missing: row.missing === true,
+    kept: Boolean(keepCardId) && cardId === keepCardId,
+    name: text(row.display_name),
+    role: appleContactRole(row),
+    points: appleContactPoints(row),
+    note: text(row.note),
+  };
+}
+
+function pointKey(point: ContactReviewPoint): string {
+  if (point.kind === 'phone') return point.value.replace(/\D/g, '').slice(-10);
+  return point.value.toLowerCase();
+}
+
+export function appleContactsReview(mutation: MutationLike): AppleContactsReview {
+  const preview = asRecord(asRecord(mutation.preview).contact);
+  const payload = asRecord(mutation.payload);
+  const contact = asRecord(preview.contact ?? payload.contact);
+  const opText = text(preview.action) || (mutation.operation ?? '').replace('apple_contacts.', '').replace('_contact', '').replace('_contacts', '');
+  const op: AppleContactOp = opText === 'create' ? 'create' : opText === 'merge' ? 'merge' : 'update';
+  const keepCardId = text(preview.keep_card_id ?? payload.keep_card_id);
+  const cardId = text(preview.card_id ?? payload.card_id);
+  const cards = recordList(preview.cards).map((row) => appleCard(row, keepCardId));
+  // A merge shows the kept card first whatever order the server sent.
+  cards.sort((a, b) => Number(b.kept) - Number(a.kept));
+  const current = op === 'create' ? undefined : cards.find((card) => (op === 'merge' ? card.kept : card.cardId === cardId)) ?? cards[0];
+  const currentRow = current && !current.missing ? recordList(preview.cards).find((row) => text(row.card_id) === current.cardId) ?? {} : {};
+
+  const points = appleContactPoints(contact);
+  const removeSpec = asRecord(preview.remove ?? payload.remove);
+  const removed: ContactReviewPoint[] = [
+    ...stringList(removeSpec.emails).map((value) => ({ kind: 'email' as const, label: '', value })),
+    ...stringList(removeSpec.phones).map((value) => ({ kind: 'phone' as const, label: '', value })),
+    ...stringList(removeSpec.urls).map((value) => ({ kind: 'url' as const, label: '', value })),
+  ];
+
+  const changes: ContactFieldChange[] = [];
+  if (op !== 'create') {
+    for (const [field, label] of APPLE_SCALAR_FIELDS) {
+      const after = text(contact[field]);
+      if (!after) continue;
+      const before = text(currentRow[field]) || (field === 'given_name' || field === 'family_name' ? '' : text(currentRow[field]));
+      changes.push({ field, label, before, after, kind: before === after ? 'unchanged' : 'changed' });
+    }
+    if (text(contact.note)) {
+      changes.push({ field: 'note', label: 'Note', before: text(currentRow.note), after: text(contact.note), kind: 'changed' });
+    }
+  }
+
+  const noteReplaced = op !== 'create' && Boolean(text(contact.note));
+  const destructive: string[] = [];
+  if (removed.length) destructive.push(`${removed.length} value${removed.length === 1 ? '' : 's'} removed from the card`);
+  if (noteReplaced) destructive.push('the note is replaced, not appended');
+  const deletedCount = op === 'merge' ? Math.max(stringList(preview.merge_card_ids ?? payload.merge_card_ids).length, cards.filter((card) => !card.kept).length) : 0;
+  if (deletedCount) destructive.push(`${deletedCount} card${deletedCount === 1 ? '' : 's'} deleted after the merge`);
+
+  let warning = '';
+  const missing = cards.filter((card) => card.missing);
+  if (missing.length) {
+    warning = op === 'merge'
+      ? `${missing.length} of the cards to merge ${missing.length === 1 ? 'is' : 'are'} no longer in the synced address book; the merge will fail on that card.`
+      : 'This card is not in the synced Apple Contacts copy, so the change cannot be previewed.';
+  }
+
+  const proposedName = appleContactName(contact, op === 'create');
+  const name = proposedName || current?.name || (op === 'create' ? points[0]?.value : '') || cardId || keepCardId || 'Unnamed contact';
+  const role = appleContactRole(contact) || current?.role || '';
+  const effect = op === 'create'
+    ? 'Creates a new card in Apple Contacts on the Mac; iCloud syncs it everywhere.'
+    : op === 'merge'
+      ? `Copies every email, phone and website onto the kept card, fills its empty fields, then deletes the other ${deletedCount === 1 ? 'card' : `${deletedCount} cards`}.`
+      : 'Sets the listed fields and adds the listed emails, phones and websites. Everything else on the card stays as it is.';
+
+  return {
+    op,
+    verb: op === 'create' ? 'Create' : op === 'merge' ? 'Merge' : 'Update',
+    name,
+    nickname: text(contact.nickname),
+    role,
+    points,
+    note: text(contact.note),
+    appendNote: text(contact.append_note),
+    removed,
+    changes,
+    cards,
+    deletedCount,
+    effect,
+    warning,
+    destructive,
+    raw: payload,
+  };
+}
+
+// Whether a proposed point is already on the card, so the row can say "already
+// there" instead of implying a duplicate will be added.
+export function appleContactPointExists(point: ContactReviewPoint, cards: AppleContactCard[]): boolean {
+  const key = pointKey(point);
+  return cards.some((card) => card.points.some((existing) => existing.kind === point.kind && pointKey(existing) === key));
+}
+
+export type AppleContactsBatchSummary = {
+  create: number;
+  update: number;
+  merge: number;
+  running: number;
+  verb: 'Create' | 'Update' | 'Merge' | 'Approve';
+};
+
+export function appleContactsBatchSummary(mutations: MutationLike[]): AppleContactsBatchSummary {
+  const summary: AppleContactsBatchSummary = { create: 0, update: 0, merge: 0, running: 0, verb: 'Approve' };
+  for (const mutation of mutations) {
+    if (mutation.status !== 'pending_review' || !isAppleContactsMutation(mutation)) continue;
+    summary.running += 1;
+    summary[appleContactsReview(mutation).op] += 1;
+  }
+  const kinds = (['create', 'update', 'merge'] as const).filter((kind) => summary[kind] > 0);
+  if (kinds.length === 1) summary.verb = kinds[0] === 'create' ? 'Create' : kinds[0] === 'update' ? 'Update' : 'Merge';
+  return summary;
+}

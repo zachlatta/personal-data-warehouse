@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  appleContactPointExists,
+  appleContactsBatchSummary,
+  appleContactsReview,
   calendarDayLayout,
   calendarMutationReview,
   contactBatchSummary,
@@ -13,6 +16,7 @@ import {
   gmailThreadDayGroups,
   gmailThreadReviews,
   gmailThreadUrl,
+  isAppleContactsMutation,
   isCalendarCreateMutation,
   isContactMutation,
   isGmailThreadMutation,
@@ -644,4 +648,82 @@ test('a contact batch summary counts what will still run and picks the approve v
   assert.deepEqual(contactBatchSummary([create('a'), update]), { create: 1, update: 1, delete: 0, running: 2, verb: 'Approve' });
   assert.deepEqual(contactBatchSummary([{ ...update, payload: { operations: [{ op: 'delete_contact', resource_name: 'people/x', expected_etag: 'e' }] } }]), { create: 0, update: 0, delete: 1, running: 1, verb: 'Delete' });
   assert.equal(isContactMutation({ operation: 'gmail.send_email', provider: 'gmail' }), false);
+});
+
+// --- apple contacts --------------------------------------------------------
+
+
+function appleMutation(operation, payload, preview) {
+  return { id: 'mut-apple', provider: 'apple_contacts', operation, account: 'zach@example.test', status: 'pending_review', payload, preview: { contact: preview } };
+}
+
+test('an apple merge reads as the kept card first, names the deletions, and warns about a vanished card', () => {
+  const mutation = appleMutation('apple_contacts.merge_contacts',
+    { keep_card_id: 'K:ABPerson', merge_card_ids: ['M:ABPerson', 'G:ABPerson'], contact: { family_name: 'Lovelace', emails: [{ label: 'work', value: 'ada@example.test' }] } },
+    {
+      action: 'merge', name: 'Lovelace', keep_card_id: 'K:ABPerson', merge_card_ids: ['M:ABPerson', 'G:ABPerson'],
+      contact: { family_name: 'Lovelace', emails: [{ label: 'work', value: 'ada@example.test' }] },
+      changes: ['family_name', 'emails (added)', '2 card(s) deleted after merge'],
+      cards: [
+        { card_id: 'M:ABPerson', display_name: 'Ada L', emails: [{ label: 'home', value: 'ADA@example.test' }], phones: [{ label: 'mobile', value: '(802) 555-0100', canonicalForm: '+18025550100' }] },
+        { card_id: 'K:ABPerson', display_name: 'Ada Lovelace', organization: 'Hack Club', job_title: 'Cofounder', emails: [], phones: [], urls: [], note: 'met at summit' },
+        { card_id: 'G:ABPerson', missing: true },
+      ],
+    });
+  assert.equal(isAppleContactsMutation(mutation), true);
+  const review = appleContactsReview(mutation);
+  assert.equal(review.op, 'merge');
+  assert.equal(review.verb, 'Merge');
+  assert.equal(review.name, 'Lovelace');
+  assert.equal(review.role, 'Cofounder · Hack Club');
+  assert.deepEqual(review.cards.map((c) => [c.cardId, c.kept, c.missing]), [['K:ABPerson', true, false], ['M:ABPerson', false, false], ['G:ABPerson', false, true]]);
+  assert.deepEqual(review.cards[1].points.map((p) => [p.kind, p.label, p.value]), [['email', 'home', 'ADA@example.test'], ['phone', 'mobile', '(802) 555-0100']]);
+  assert.equal(review.deletedCount, 2);
+  assert.deepEqual(review.destructive, ['2 cards deleted after the merge']);
+  assert.match(review.warning, /no longer in the synced address book/);
+  assert.deepEqual(review.changes, [{ field: 'family_name', label: 'Last name', before: '', after: 'Lovelace', kind: 'changed' }]);
+  // the proposed work email is not on any card yet; the merged card's home email is
+  assert.equal(appleContactPointExists(review.points[0], review.cards), false);
+  assert.equal(appleContactPointExists({ kind: 'email', label: '', value: 'ada@EXAMPLE.test' }, review.cards), true);
+  assert.equal(appleContactPointExists({ kind: 'phone', label: '', value: '+1 802-555-0100' }, review.cards), true);
+});
+
+test('an apple update shows before → after against the card today and says what is removed', () => {
+  const mutation = appleMutation('apple_contacts.update_contact',
+    { card_id: 'K:ABPerson', contact: { organization: 'Hack Club', job_title: 'Controller', append_note: 'seen 2026-09', phones: [{ label: 'mobile', value: '+18025550100' }] }, remove: { emails: ['old@example.test'] } },
+    {
+      action: 'update', card_id: 'K:ABPerson', name: '',
+      contact: { organization: 'Hack Club', job_title: 'Controller', append_note: 'seen 2026-09', phones: [{ label: 'mobile', value: '+18025550100' }] },
+      remove: { emails: ['old@example.test'] }, changes: ['note (appended)', 'job_title', 'organization', 'phones (added)', 'emails (removed)'],
+      cards: [{ card_id: 'K:ABPerson', display_name: 'Sierra Example', organization: 'Hack Club', job_title: '', emails: [{ label: 'work', value: 'old@example.test' }], phones: [], urls: [] }],
+    });
+  const review = appleContactsReview(mutation);
+  assert.equal(review.op, 'update');
+  assert.equal(review.name, 'Sierra Example');
+  assert.equal(review.role, 'Controller · Hack Club');
+  assert.deepEqual(review.changes, [
+    { field: 'organization', label: 'Organization', before: 'Hack Club', after: 'Hack Club', kind: 'unchanged' },
+    { field: 'job_title', label: 'Title', before: '', after: 'Controller', kind: 'changed' },
+  ]);
+  assert.equal(review.appendNote, 'seen 2026-09');
+  assert.deepEqual(review.removed, [{ kind: 'email', label: '', value: 'old@example.test' }]);
+  assert.deepEqual(review.destructive, ['1 value removed from the card']);
+  assert.equal(review.warning, '');
+  assert.equal(review.deletedCount, 0);
+});
+
+test('an apple create reads from the proposed contact alone and the batch verb follows the operations', () => {
+  const create = appleMutation('apple_contacts.create_contact',
+    { contact: { given_name: 'Ada', family_name: 'Lovelace', organization: 'Hack Club', emails: [{ label: 'work', value: 'ada@example.test' }], note: 'why she is here' } },
+    { action: 'create', name: 'Ada Lovelace', contact: { given_name: 'Ada', family_name: 'Lovelace', organization: 'Hack Club', emails: [{ label: 'work', value: 'ada@example.test' }], note: 'why she is here' }, changes: ['emails (added)', 'family_name', 'given_name', 'note (replaced)', 'organization'] });
+  const review = appleContactsReview(create);
+  assert.equal(review.op, 'create');
+  assert.equal(review.name, 'Ada Lovelace');
+  assert.equal(review.note, 'why she is here');
+  assert.deepEqual(review.destructive, []);
+  assert.deepEqual(review.changes, []);
+  assert.deepEqual(review.points, [{ kind: 'email', label: 'work', value: 'ada@example.test' }]);
+  assert.equal(appleContactsBatchSummary([create, { ...create, id: 'b' }]).verb, 'Create');
+  assert.equal(appleContactsBatchSummary([create, appleMutation('apple_contacts.merge_contacts', { keep_card_id: 'K', merge_card_ids: ['M'] }, { action: 'merge' })]).verb, 'Approve');
+  assert.equal(appleContactsBatchSummary([{ ...create, status: 'removed' }]).running, 0);
 });

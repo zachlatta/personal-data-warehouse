@@ -10,9 +10,12 @@ import type { Mutation } from '@/lib/api';
 import { pretty } from '@/lib/format';
 import { contactMutationReview, type ContactFieldChange, type ContactOperationReview, type ContactReviewPoint } from '@/lib/mutation-review';
 
-const CREATE = '#16A34A';
-const UPDATE = '#2563EB';
-const DELETE = '#DC2626';
+export const CONTACT_CREATE = '#16A34A';
+export const CONTACT_UPDATE = '#2563EB';
+export const CONTACT_DELETE = '#DC2626';
+const CREATE = CONTACT_CREATE;
+const UPDATE = CONTACT_UPDATE;
+const DELETE = CONTACT_DELETE;
 
 function opColor(op: ContactOperationReview['op']): string {
   return op === 'create_contact' ? CREATE : op === 'update_contact' ? UPDATE : DELETE;
@@ -30,13 +33,14 @@ const POINT_GLYPH: Record<ContactReviewPoint['kind'], string> = { email: '@', ph
 // One way to reach the person. Tapping it opens the mail app, dialer or
 // browser, because "is this the right email?" is often answered by looking
 // at who it belongs to, not by the string itself.
-function PointRow({ point }: { point: ContactReviewPoint }) {
+export function PointRow({ point, muted, tag }: { point: ContactReviewPoint; muted?: boolean; tag?: string }) {
   const theme = useTheme();
   const href = pointHref(point);
   const body = (
     <>
       <ThemedText type="smallBold" themeColor="textSecondary" style={styles.pointGlyph}>{POINT_GLYPH[point.kind]}</ThemedText>
-      <ThemedText selectable style={styles.pointValue} numberOfLines={2}>{point.value}</ThemedText>
+      <ThemedText selectable style={[styles.pointValue, muted && styles.pointMuted]} numberOfLines={2}>{point.value}</ThemedText>
+      {tag ? <ThemedText type="small" themeColor="textSecondary">{tag}</ThemedText> : null}
       {point.label ? <View style={[styles.typeChip, { borderColor: theme.backgroundSelected }]}><ThemedText style={styles.typeChipText}>{point.label.toUpperCase()}</ThemedText></View> : null}
     </>
   );
@@ -52,7 +56,7 @@ function PointRow({ point }: { point: ContactReviewPoint }) {
   );
 }
 
-function ChangeRow({ change }: { change: ContactFieldChange }) {
+export function ChangeRow({ change }: { change: ContactFieldChange }) {
   const theme = useTheme();
   return (
     <View style={[styles.change, { borderTopColor: theme.backgroundSelected }]}>
@@ -188,6 +192,7 @@ const styles = StyleSheet.create({
   pressed: { opacity: 0.6 },
   pointGlyph: { width: 16, textAlign: 'center' },
   pointValue: { flex: 1, minWidth: 0 },
+  pointMuted: { color: '#8B8F98', textDecorationLine: 'line-through' },
   typeChip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
   typeChipText: { color: '#8B8F98', fontSize: 9, fontWeight: '700', letterSpacing: 0.5 },
   note: { borderLeftWidth: 3, paddingLeft: 10, gap: 2 },
