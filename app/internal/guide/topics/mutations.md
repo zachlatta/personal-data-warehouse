@@ -48,7 +48,10 @@ authoritative when this list and it disagree.
   for cards that share an email or phone in `marts_contacts.contact_points`, never on a
   name match alone, and keep the card with the photo or hand-typed note. The review shows
   each card's current contents; the executor records the pre-edit cards in the result.
-  Like Notes these run on a Mac and iCloud syncs the change to every device.
+  An `update_contact` naming a card an earlier approved merge already deleted is applied
+  to the surviving card (`redirected_from` in the result), so batching merges and updates
+  from one snapshot is safe. Like Notes these run on a Mac and iCloud syncs the change to
+  every device.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

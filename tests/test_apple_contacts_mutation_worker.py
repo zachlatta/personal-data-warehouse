@@ -102,3 +102,18 @@ def test_apple_contacts_mutation_worker_is_a_resident_launch_agent():
     # binaries in it, and pdw replaces its own binary on every release.
     assert "pdw " not in wrapper.replace("pdw_export_app_credentials", "").replace("_pdw-upload-lib", "")
     assert "personal_data_warehouse_apple_contacts.mutation_worker" in wrapper
+
+
+def test_the_default_executor_resolves_merged_cards_through_the_warehouse(monkeypatch):
+    warehouse = _FakeWarehouse([])
+    warehouse.apple_contacts_merged_card_target = lambda card_id: "kept"
+    built = {}
+
+    class Spy:
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+
+    monkeypatch.setattr(mutation_worker, "AppleContactsMutationExecutor", Spy)
+    process_apple_contacts_mutations(warehouse=warehouse)
+
+    assert built["merged_into"]("anything") == "kept"

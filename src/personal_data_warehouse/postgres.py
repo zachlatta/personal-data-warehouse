@@ -7126,6 +7126,34 @@ class PostgresWarehouse:
             tuple(params),
         )
 
+    def apple_contacts_merged_card_target(self, card_id: str) -> str | None:
+        """The card a deleted Apple Contacts card was merged into, per the mutation ledger.
+
+        Only a SUCCEEDED ``apple_contacts.merge_contacts`` counts: a proposed or failed
+        merge says nothing about where the card went. The newest one wins.
+        """
+
+        card_id = str(card_id or "").strip()
+        if not card_id:
+            return None
+        rows = self._query_dicts(
+            """
+            SELECT payload_json ->> 'keep_card_id' AS keep_card_id
+            FROM @upstream_mutations
+            WHERE provider = 'apple_contacts'
+              AND operation = 'apple_contacts.merge_contacts'
+              AND status = 'succeeded'
+              AND payload_json -> 'merge_card_ids' ? %s
+            ORDER BY executed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (card_id,),
+        )
+        if not rows:
+            return None
+        target = str(rows[0]["keep_card_id"] or "").strip()
+        return target or None
+
     def _gmail_inbox_thread_ids_for_mutations(
         self, mutations: Sequence[Mapping[str, Any]]
     ) -> dict[str, set[str]]:

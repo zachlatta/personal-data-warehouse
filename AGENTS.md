@@ -1971,6 +1971,18 @@ resolve:
   holds all of them. Only `update_contact` is reclaimed from a stale `executing` claim — a
   replayed create duplicates and a replayed merge deletes cards that are already gone.
 
+**A card an earlier merge deleted is redirected, not failed.** Two requests proposed from
+one warehouse snapshot can name the same card — one `merge_contacts` folds it away, the
+other `update_contact` adds an email to it. The merge ran first on 2026-09-13 and
+Contacts.app answered `-1728` for the update one minute later, which read
+`failed_terminal` on a 168-mutation request whose other 167 rows succeeded. The executor
+now asks the mutation ledger (`apple_contacts_merged_card_target`: the newest SUCCEEDED
+`merge_contacts` whose `merge_card_ids` names the card, chains followed) and applies the
+update to the surviving card, recording `redirected_from` in `result_json`; a merge whose
+target is already folded into the same kept card skips it (`already_merged_card_ids`), and
+one folded into a *different* card stays terminal, because that is a real conflict. A card
+nobody merged is still simply missing.
+
 Unknown `contact` keys are rejected at proposal time rather than dropped, because a
 misspelled `email` for `emails` would otherwise become an approved mutation that changes
 nothing and reports success. `GetRequest` hydrates every named card's current row into

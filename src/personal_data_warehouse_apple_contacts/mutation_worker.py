@@ -69,7 +69,9 @@ def process_apple_contacts_mutations(
     reclaim_after: timedelta | None = None,
     ensure_tables: bool = True,
 ) -> AppleContactsMutationSummary:
-    executor = executor or AppleContactsMutationExecutor()
+    executor = executor or AppleContactsMutationExecutor(
+        merged_into=warehouse.apple_contacts_merged_card_target,
+    )
     claimed_by = claimed_by or f"mac:{socket.gethostname()}:apple_contacts_mutation_worker"
     reclaim_after = reclaim_after or timedelta(seconds=DEFAULT_RECLAIM_AFTER_SECONDS)
 

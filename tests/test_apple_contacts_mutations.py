@@ -241,3 +241,106 @@ def test_merge_refuses_to_delete_the_kept_card():
         APPLE_CONTACTS_MERGE_CONTACTS_OPERATION, {"keep_card_id": KEEP, "merge_card_ids": [KEEP]}
     ))
     assert result.status == "failed_terminal"
+
+
+# -- a card deleted by an earlier merge -------------------------------------------------
+#
+# Two requests proposed from one warehouse snapshot can name the same card: one merges it
+# away, the other updates it. The merge executes first, Contacts.app then answers -1728
+# for the update, and the update used to die failed_terminal even though the surviving
+# card is exactly where its values belong. The executor now asks the mutation ledger
+# which card the missing one was merged into and applies the update there.
+
+
+class _RaisingThen(_FakeRunner):
+    """Raise the entries that are exceptions, return the rest."""
+
+    def __call__(self, script):
+        self.scripts.append(script)
+        item = self.results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _missing(card_id):
+    return RuntimeError(f'199:256: execution error: Contacts got an error: Can’t get person id "{card_id}". (-1728)')
+
+
+def test_update_of_a_card_merged_away_is_redirected_to_the_surviving_card():
+    runner = _RaisingThen([
+        _missing(OTHER),
+        _dump(KEEP, "Sam", "Griffis", emails=[("_$!<Other>!$_", "sam@example.com")]),
+        f"{KEEP}{FIELD_SEPARATOR}Sam Griffis",
+    ])
+    executor = AppleContactsMutationExecutor(runner=runner, merged_into={OTHER: KEEP}.get)
+
+    result = executor.execute(_mutation(APPLE_CONTACTS_UPDATE_CONTACT_OPERATION, {
+        "card_id": OTHER, "contact": {"emails": [{"label": "work", "value": "sam@hackclub.example"}]},
+    }))
+
+    assert result.status == "succeeded"
+    assert result.result_json["card_id"] == KEEP
+    assert result.result_json["redirected_from"] == OTHER
+    assert result.result_json["added"]["emails"] == ["sam@hackclub.example"]
+    assert f'person id "{KEEP}"' in runner.scripts[2]
+
+
+def test_update_of_a_card_merged_away_follows_a_chain_of_merges():
+    middle = "11111111-0000-4468-9061-D2D41468E05A:ABPerson"
+    runner = _RaisingThen([_missing(OTHER), _dump(KEEP, "Sam", "Griffis"), f"{KEEP}{FIELD_SEPARATOR}Sam Griffis"])
+    executor = AppleContactsMutationExecutor(runner=runner, merged_into={OTHER: middle, middle: KEEP}.get)
+
+    result = executor.execute(_mutation(APPLE_CONTACTS_UPDATE_CONTACT_OPERATION, {
+        "card_id": OTHER, "contact": {"organization": "Hack Club"},
+    }))
+
+    assert result.status == "succeeded"
+    assert result.result_json["card_id"] == KEEP
+    assert result.result_json["redirected_from"] == OTHER
+
+
+def test_update_of_a_card_nobody_merged_stays_terminal():
+    runner = _RaisingThen([_missing(OTHER)])
+    executor = AppleContactsMutationExecutor(runner=runner, merged_into=lambda _card: None)
+
+    result = executor.execute(_mutation(APPLE_CONTACTS_UPDATE_CONTACT_OPERATION, {
+        "card_id": OTHER, "contact": {"organization": "Hack Club"},
+    }))
+
+    assert result.status == "failed_terminal"
+    assert "-1728" in result.error
+    assert len(runner.scripts) == 1
+
+
+def test_merge_skips_a_card_already_merged_into_the_kept_card():
+    runner = _RaisingThen([
+        _dump(KEEP, "Sam", "Griffis"),
+        _missing(OTHER),
+        f"{KEEP}{FIELD_SEPARATOR}Sam Griffis",
+    ])
+    executor = AppleContactsMutationExecutor(runner=runner, merged_into={OTHER: KEEP}.get)
+
+    result = executor.execute(_mutation(APPLE_CONTACTS_MERGE_CONTACTS_OPERATION, {
+        "keep_card_id": KEEP, "merge_card_ids": [OTHER], "contact": {"organization": "Hack Club"},
+    }))
+
+    assert result.status == "succeeded"
+    assert result.result_json["deleted_card_ids"] == []
+    assert result.result_json["already_merged_card_ids"] == [OTHER]
+    assert "delete person id" not in runner.scripts[2]
+    assert 'set organization of p to "Hack Club"' in runner.scripts[2]
+
+
+def test_merge_refuses_a_card_already_merged_somewhere_else():
+    elsewhere = "22222222-0000-4468-9061-D2D41468E05A:ABPerson"
+    runner = _RaisingThen([_dump(KEEP, "Sam", "Griffis"), _missing(OTHER)])
+    executor = AppleContactsMutationExecutor(runner=runner, merged_into={OTHER: elsewhere}.get)
+
+    result = executor.execute(_mutation(APPLE_CONTACTS_MERGE_CONTACTS_OPERATION, {
+        "keep_card_id": KEEP, "merge_card_ids": [OTHER],
+    }))
+
+    assert result.status == "failed_terminal"
+    assert elsewhere in result.error
+    assert len(runner.scripts) == 2

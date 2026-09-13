@@ -79,6 +79,16 @@ class AppleContactsCardNotFound(RuntimeError):
     pass
 
 
+# Contacts.app's "Can't get person id" -- the record is gone, and it will stay gone.
+CARD_NOT_FOUND_ERROR_CODE = "-1728"
+# Bound on following merge chains (A merged into B, B merged into C, ...).
+MAX_MERGE_CHAIN = 8
+
+
+def is_card_not_found(error: BaseException) -> bool:
+    return CARD_NOT_FOUND_ERROR_CODE in str(error)
+
+
 class AppleContactsInvalidMutation(RuntimeError):
     pass
 
@@ -181,8 +191,36 @@ def _read_script(card_id: str) -> str:
 class AppleContactsMutationExecutor:
     """Executes apple_contacts.* mutations claimed from ops.upstream_mutation_operations."""
 
-    def __init__(self, *, runner: Callable[[str], str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Callable[[str], str] | None = None,
+        merged_into: Callable[[str], str | None] | None = None,
+    ) -> None:
+        """``merged_into(card_id)`` names the card a deleted card was merged into.
+
+        Two requests proposed from one warehouse snapshot can name the same card: one
+        merges it away, the other updates it. The merge runs first and Contacts.app then
+        answers -1728 for the update, which used to die ``failed_terminal`` although the
+        surviving card is exactly where the values belong. The resolver is backed by the
+        mutation ledger's own succeeded ``merge_contacts`` rows; without one, a missing
+        card is simply missing.
+        """
         self._runner = runner or run_osascript
+        self._merged_into = merged_into or (lambda _card_id: None)
+
+    def _surviving_card(self, card_id: str) -> str | None:
+        """Follow succeeded merges from ``card_id`` to the card that still exists."""
+        seen = {card_id}
+        current = card_id
+        target: str | None = None
+        for _ in range(MAX_MERGE_CHAIN):
+            next_id = self._merged_into(current)
+            if not next_id or next_id in seen:
+                break
+            seen.add(next_id)
+            target = current = next_id
+        return target
 
     def execute(self, mutation: Mapping[str, Any]) -> AppleContactsMutationResult:
         provider = str(mutation.get("provider") or "")
@@ -264,14 +302,31 @@ class AppleContactsMutationExecutor:
             raise AppleContactsInvalidMutation("update_contact needs card_id")
         contact = _mapping(payload.get("contact"))
         remove = _mapping(payload.get("remove"))
-        current = self._read(card_id)
+        redirected_from = ""
+        try:
+            current = self._read(card_id)
+        except RuntimeError as error:
+            if not is_card_not_found(error):
+                raise
+            survivor = self._surviving_card(card_id)
+            if survivor is None:
+                raise
+            redirected_from, card_id = card_id, survivor
+            current = self._read(card_id)
 
+        provenance = {"redirected_from": redirected_from} if redirected_from else {}
         lines, added, removed, note_changed = _apply_changes("p", current, contact, remove)
         changed = bool(lines)
         if not changed:
             return AppleContactsMutationResult(
                 status="succeeded",
-                result_json={"card_id": card_id, "action": "update", "changed": False, "previous_card": current},
+                result_json={
+                    "card_id": card_id,
+                    "action": "update",
+                    "changed": False,
+                    "previous_card": current,
+                    **provenance,
+                },
             )
         card_id_out, name = self._write(card_id, lines)
         return AppleContactsMutationResult(
@@ -285,6 +340,7 @@ class AppleContactsMutationExecutor:
                 "removed": removed,
                 "note_changed": note_changed,
                 "previous_card": current,
+                **provenance,
             },
         )
 
@@ -300,7 +356,28 @@ class AppleContactsMutationExecutor:
         overrides = _mapping(payload.get("contact"))
 
         keep = self._read(keep_id)
-        others = [self._read(other) for other in merge_ids]
+        # A card an earlier merge already folded into keep_id is done, not an error; one
+        # folded into some OTHER card is a conflict a human has to look at.
+        others: list[dict[str, Any]] = []
+        to_delete: list[str] = []
+        already_merged: list[str] = []
+        for other in merge_ids:
+            try:
+                others.append(self._read(other))
+            except RuntimeError as error:
+                if not is_card_not_found(error):
+                    raise
+                survivor = self._surviving_card(other)
+                if survivor == keep_id:
+                    already_merged.append(other)
+                    continue
+                if survivor:
+                    raise AppleContactsInvalidMutation(
+                        f"card {other} was already merged into {survivor}, not into {keep_id}; "
+                        f"Contacts.app said: {error}"
+                    )
+                raise
+            to_delete.append(other)
 
         # The union: every list value the kept card lacks, every scalar it has empty.
         union: dict[str, Any] = {key: [] for key, _e in LIST_FIELDS}
@@ -323,7 +400,7 @@ class AppleContactsMutationExecutor:
         keep_clean = {k: v for k, v in keep.items() if not k.endswith("__filled")}
 
         lines, added, removed, note_changed = _apply_changes("p", keep_clean, union, {})
-        for other in merge_ids:
+        for other in to_delete:
             lines.append(f"delete person id {applescript_string(other)}")
         card_id_out, name = self._write(keep_id, lines)
         return AppleContactsMutationResult(
@@ -334,7 +411,8 @@ class AppleContactsMutationExecutor:
                 "action": "merge",
                 "added": added,
                 "note_changed": note_changed,
-                "deleted_card_ids": merge_ids,
+                "deleted_card_ids": to_delete,
+                "already_merged_card_ids": already_merged,
                 "previous_cards": [keep_clean, *others],
             },
         )
