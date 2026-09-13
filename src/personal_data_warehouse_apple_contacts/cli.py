@@ -13,6 +13,10 @@ from personal_data_warehouse_voice_memos.network import (
     NetworkPolicy,
     preflight_app_ingest,
 )
+from personal_data_warehouse_apple_contacts.mutation_worker import (
+    apple_contacts_mutations_enabled,
+    process_apple_contacts_mutations,
+)
 from personal_data_warehouse_apple_contacts.state import AppleContactsUploadState, default_state_file
 from personal_data_warehouse_apple_contacts.sync import AppleContactsUploadRunner
 
@@ -31,6 +35,8 @@ def main() -> None:
     parser.add_argument("--state-file", type=Path, default=default_state_file())
     parser.add_argument("--lock-file", type=Path, default=default_state_file().with_suffix(".lock"))
     parser.add_argument("--limit", type=int, default=None, help="Maximum changed contacts to upload; 0 means unlimited")
+    parser.add_argument("--no-mutations", action="store_true", help="Skip applying approved Apple Contacts mutations in this run")
+    parser.add_argument("--mutations-only", action="store_true", help="Apply approved Apple Contacts mutations and skip the upload stage")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 0:
         parser.error("--limit must be greater than or equal to 0")
@@ -47,6 +53,13 @@ def main() -> None:
         with exclusive_lock(args.lock_file) as acquired:
             if not acquired:
                 print("Apple Contacts upload skipped: another uploader run is active")
+                return
+            # Mutations run BEFORE the upload stage on purpose: a card this run writes is
+            # then picked up by the same run's scan, so an approved edit reaches the
+            # warehouse in one cycle instead of waiting five minutes for the next one.
+            if not args.no_mutations and apple_contacts_mutations_enabled():
+                print(run_apple_contacts_mutations())
+            if args.mutations_only:
                 return
             summary = AppleContactsUploadRunner(
                 account=settings.apple_contacts.account,
@@ -67,6 +80,30 @@ def main() -> None:
         f"skipped={summary.contacts_skipped} deleted={summary.contacts_deleted} "
         f"deferred={summary.contacts_deferred} batches={summary.batches_uploaded}"
     )
+
+
+def run_apple_contacts_mutations() -> str:
+    """Apply approved Apple Contacts mutations, never failing the upload run.
+
+    The uploader is the source of truth for card *data*; mutations are a rider on it. A
+    warehouse that is unreachable, or a Contacts.app that refuses one edit, must not stop
+    the address book from syncing -- so every failure here is reported and swallowed.
+    """
+
+    try:
+        from personal_data_warehouse.config import load_settings as _load_settings
+        from personal_data_warehouse.warehouse import warehouse_from_settings
+
+        settings = _load_settings(require_postgres=True, require_gmail=False)
+        warehouse = warehouse_from_settings(settings)
+    except Exception as error:  # noqa: BLE001 - reported, never fatal to the upload
+        return f"Apple Contacts mutations skipped: warehouse unavailable ({error})"
+    try:
+        return process_apple_contacts_mutations(warehouse=warehouse).describe()
+    except Exception as error:  # noqa: BLE001 - reported, never fatal to the upload
+        return f"Apple Contacts mutations failed: {error}"
+    finally:
+        warehouse.close()
 
 
 def build_before_upload_check():

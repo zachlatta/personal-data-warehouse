@@ -294,6 +294,72 @@ func MutationHelp() MutationHelpDocument {
 					"it records the pre-edit body in the result JSON so an unwanted replacement is recoverable, but that is a repair, not a guard.",
 			},
 			{
+				Type:        AppleContactsCreateContactOperation,
+				Summary:     "Create a card in Apple (iCloud) Contacts. Executed on Zach's Mac through Contacts.app, not in the cloud.",
+				RequiresEnv: "APPLE_CONTACTS_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleContactsCreateContactOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Contacts account label"},
+					{Name: "contact", JSONType: "object", Required: true, Description: "given_name, family_name, middle_name, nickname, organization, job_title, department, note (strings) and emails, phones, urls (arrays of {label, value}; labels such as work, home, mobile, other). At least one of given_name, family_name, organization."},
+				},
+				Example: map[string]any{
+					"type":    AppleContactsCreateContactOperation,
+					"account": "you@example.com",
+					"contact": map[string]any{
+						"given_name": "Ada", "family_name": "Lovelace", "organization": "Hack Club", "job_title": "Deputy to the Founder",
+						"emails": []map[string]any{{"label": "work", "value": "ada@example.com"}},
+						"phones": []map[string]any{{"label": "mobile", "value": "+1 802 555 0100"}},
+					},
+				},
+				ExtraNotes: "Check marts_contacts.contacts first: a person who already has a card should get update_contact, and two cards for one person should get merge_contacts. " +
+					"Executed by the local apple-contacts worker on a Mac signed in to iCloud, so it completes on that Mac rather than within seconds of approval; iCloud then syncs the card to every device. " +
+					"The result JSON carries the new card_id, which is also what base_apple_contacts.cards.card_id will hold once the uploader syncs it.",
+			},
+			{
+				Type:        AppleContactsUpdateContactOperation,
+				Summary:     "Set fields on, add values to, or remove values from an existing Apple Contacts card.",
+				RequiresEnv: "APPLE_CONTACTS_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleContactsUpdateContactOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Contacts account label"},
+					{Name: "card_id", JSONType: "string", Required: true, Description: "base_apple_contacts.cards.card_id (<UUID>:ABPerson); it is also Contacts' own id for the card"},
+					{Name: "contact", JSONType: "object", Required: false, Description: "same shape as create_contact. Scalars are SET; emails/phones/urls are ADDED when the card lacks the value (never replaced); note REPLACES the note; append_note adds to it."},
+					{Name: "remove", JSONType: "object", Required: false, Description: "emails, phones, urls: arrays of exact values to delete from the card"},
+				},
+				Example: map[string]any{
+					"type":    AppleContactsUpdateContactOperation,
+					"account": "you@example.com",
+					"card_id": "8537DF38-BF0D-4468-9061-D2D41468E05A:ABPerson",
+					"contact": map[string]any{
+						"organization": "Hack Club", "job_title": "Director of Operations",
+						"emails": []map[string]any{{"label": "work", "value": "ada@example.com"}},
+					},
+				},
+				ExtraNotes: "Additive by default: nothing on the card is dropped unless it is named in remove, and the executor records the pre-edit card in the result JSON (previous_card). " +
+					"Prefer append_note over note. The review shows the card's current contents beside the proposed change.",
+			},
+			{
+				Type:        AppleContactsMergeContactsOperation,
+				Summary:     "Fold duplicate Apple Contacts cards into one: union every email/phone/url, fill the kept card's empty fields, delete the rest.",
+				RequiresEnv: "APPLE_CONTACTS_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleContactsMergeContactsOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Contacts account label"},
+					{Name: "keep_card_id", JSONType: "string", Required: true, Description: "the card that survives (base_apple_contacts.cards.card_id)"},
+					{Name: "merge_card_ids", JSONType: "array<string>", Required: true, Description: "the cards folded into keep_card_id and then DELETED"},
+					{Name: "contact", JSONType: "object", Required: false, Description: "overrides applied on top of the union, same shape as create_contact (e.g. the correct family_name when the cards disagree)"},
+				},
+				Example: map[string]any{
+					"type":           AppleContactsMergeContactsOperation,
+					"account":        "you@example.com",
+					"keep_card_id":   "8537DF38-BF0D-4468-9061-D2D41468E05A:ABPerson",
+					"merge_card_ids": []string{"44C1F82A-1F0E-4C2B-9E1B-2A5E4F7B8C9D:ABPerson"},
+					"contact":        map[string]any{"family_name": "Lovelace"},
+				},
+				ExtraNotes: "Destructive: the merged cards are deleted after their values are copied. Only propose it for cards you have confirmed are the same person through a shared email or phone in marts_contacts.contact_points, never on a name match alone. " +
+					"Every pre-merge card is recorded in the result JSON (previous_cards). Keep the card with the photo or the hand-typed note as keep_card_id.",
+			},
+			{
 				Type:        SlackMarkConversationReadOperation,
 				Summary:     "Mark a Slack conversation read through one exact, already-synced message.",
 				RequiresEnv: "SLACK_ACCOUNTS",

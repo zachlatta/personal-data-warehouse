@@ -77,6 +77,7 @@ export const GMAIL_SEND_EMAIL = "gmail.send_email";
 export const SLACK_MARK_CONVERSATION_READ = "slack.mark_conversation_read";
 const CALENDAR_OPS = ["calendar.create_event", "calendar.update_event", "calendar.delete_event"];
 const APPLE_NOTES_OPS = ["apple_notes.create_note", "apple_notes.update_note"];
+const APPLE_CONTACTS_OPS = ["apple_contacts.create_contact", "apple_contacts.update_contact", "apple_contacts.merge_contacts"];
 
 export function isGmailThreadMutation(m) {
   return m.provider === "gmail" && (
@@ -89,6 +90,7 @@ export function isContactMutation(m) {
 }
 export function isCalendarMutation(m) { return m.provider === "google_calendar" || CALENDAR_OPS.includes(m.operation); }
 export function isAppleNotesMutation(m) { return m.provider === "apple_notes" || APPLE_NOTES_OPS.includes(m.operation); }
+export function isAppleContactsMutation(m) { return m.provider === "apple_contacts" || APPLE_CONTACTS_OPS.includes(m.operation); }
 export function isSlackMarkReadMutation(m) {
   return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
 }
@@ -979,6 +981,42 @@ export function appleNotesView(mutation) {
     heading: str(note.action) === "create" ? "Create Apple Note" : "Update Apple Note",
     name: str(note.name), folder: str(note.folder), noteId: str(note.note_id),
     changes: stringSlice(note.changes), bodyPreview: str(note.body_preview),
+  };
+}
+
+// --- apple contacts ------------------------------------------------------------
+
+function contactEntries(value) {
+  return mapSlice(value).map((e) => ({ label: trimStr(e.label), value: trimStr(e.value) })).filter((e) => e.value);
+}
+
+// One view per proposal: the proposed fields, what is destructive, and the current
+// state of every card it names (hydrated on read; `missing` when the warehouse no
+// longer holds the card). A merge lists the kept card first.
+export function appleContactsView(mutation) {
+  const preview = asMap(asMap(mutation.preview).contact);
+  const contact = asMap(preview.contact);
+  const action = str(preview.action) || "update";
+  const heading = action === "create" ? "Create Apple Contact" : action === "merge" ? "Merge Apple Contacts" : "Update Apple Contact";
+  const scalars = [];
+  for (const key of ["given_name", "family_name", "middle_name", "nickname", "organization", "job_title", "department"]) {
+    if (trimStr(contact[key])) scalars.push([key.replace("_", " "), trimStr(contact[key])]);
+  }
+  const remove = asMap(preview.remove);
+  const cards = mapSlice(preview.cards).map((card) => ({
+    cardId: trimStr(card.card_id), missing: card.missing === true,
+    displayName: trimStr(card.display_name), organization: trimStr(card.organization), jobTitle: trimStr(card.job_title),
+    emails: contactEntries(card.emails), phones: contactEntries(card.phones), urls: contactEntries(card.urls), note: str(card.note),
+    kept: action === "merge" && trimStr(card.card_id) === trimStr(preview.keep_card_id),
+  }));
+  const changes = stringSlice(preview.changes);
+  return {
+    heading, action, name: str(preview.name), cardId: trimStr(preview.card_id), keepCardId: trimStr(preview.keep_card_id),
+    mergeCardIds: stringSlice(preview.merge_card_ids), scalars, note: str(contact.note), appendNote: str(contact.append_note),
+    emails: contactEntries(contact.emails), phones: contactEntries(contact.phones), urls: contactEntries(contact.urls),
+    remove: { emails: stringSlice(remove.emails), phones: stringSlice(remove.phones), urls: stringSlice(remove.urls) },
+    changes, destructive: changes.some((c) => c.includes("removed") || c.includes("replaced") || c.includes("deleted")),
+    cards,
   };
 }
 

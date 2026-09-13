@@ -23,6 +23,7 @@ from personal_data_warehouse.calendar_mutations import (
     CalendarMutationResult,
     CalendarMutationExecutor,
 )
+from personal_data_warehouse.apple_contacts_mutations import APPLE_CONTACTS_PROVIDER
 from personal_data_warehouse.apple_notes_mutations import APPLE_NOTES_PROVIDER
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.contact_mutations import (
@@ -73,8 +74,9 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
 # one of Zach's Macs. The cloud worker must not claim these: it cannot execute them, and a
 # claim it then fails as unknown-provider both bumps attempt_count and hides the row from
 # the Mac worker that could have applied it. Each entry needs a local worker (see
-# personal_data_warehouse_apple_notes.mutation_worker) or its rows sit approved forever.
-LOCAL_ONLY_MUTATION_PROVIDERS: tuple[str, ...] = (APPLE_NOTES_PROVIDER,)
+# personal_data_warehouse_apple_notes.mutation_worker,
+# personal_data_warehouse_apple_contacts.mutation_worker) or its rows sit approved forever.
+LOCAL_ONLY_MUTATION_PROVIDERS: tuple[str, ...] = (APPLE_NOTES_PROVIDER, APPLE_CONTACTS_PROVIDER)
 
 # Bootstrap guard for the sensor's table-ensure. The sensor evaluates every
 # UPSTREAM_MUTATION_SENSOR_INTERVAL_SECONDS in the long-lived user-code server,

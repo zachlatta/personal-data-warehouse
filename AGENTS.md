@@ -1940,6 +1940,51 @@ hard way on porygon, 2026-08-24:
 SQL starting points: `base_apple_notes.notes` for the resulting note, and
 `ops.upstream_mutation_operations` for the mutation's own status, result and error.
 
+## Writing to Apple Contacts (apple_contacts mutations)
+
+Apple (iCloud) Contacts is the second write-back source, in exactly the Apple Notes shape:
+iCloud publishes no write API, so the proposal and review halves live with every other
+mutation type (`app/internal/mutations/apple_contacts.go`) and the executor is local —
+`personal_data_warehouse.apple_contacts_mutations` driven by Contacts.app over AppleScript,
+claimed by `personal_data_warehouse_apple_contacts.mutation_worker` (a resident LaunchAgent,
+`com.zachlatta.personal-data-warehouse.apple-contacts-mutation-worker`, plus the five-minute
+uploader as fallback, which applies approved rows **before** it scans so the changed card
+reaches `base_apple_contacts.cards` in the same cycle). `apple_contacts` sits in
+`LOCAL_ONLY_MUTATION_PROVIDERS` so the cloud worker never claims it. The AppleScript
+plumbing both executors share (`applescript_string`, `run_osascript`, the `-1743` →
+`blocked_missing_credentials` classification) lives in `apple_automation.py`.
+
+Three operations, all keyed by `base_apple_contacts.cards.card_id` — which is also Contacts'
+own AppleScript `id` (`<UUID>:ABPerson`), so unlike Notes there is no second identifier to
+resolve:
+
+- `apple_contacts.create_contact` — `contact` with `given_name`/`family_name`/`organization`
+  (at least one), `middle_name`, `nickname`, `job_title`, `department`, `note`, and
+  `emails`/`phones`/`urls` as `[{label, value}]`.
+- `apple_contacts.update_contact` — `card_id` + `contact` (scalars SET, list values ADDED
+  when the card lacks them, `note` replaces, `append_note` appends) + `remove`
+  (`emails`/`phones`/`urls` values to delete). Additive by default: nothing leaves the card
+  unless named in `remove`, and `result_json.previous_card` records the pre-edit card.
+- `apple_contacts.merge_contacts` — `keep_card_id` + `merge_card_ids` + optional `contact`
+  overrides. Unions every list field, fills the kept card's empty scalars from the merged
+  ones, applies the overrides, then **deletes the merged cards**; `result_json.previous_cards`
+  holds all of them. Only `update_contact` is reclaimed from a stale `executing` claim — a
+  replayed create duplicates and a replayed merge deletes cards that are already gone.
+
+Unknown `contact` keys are rejected at proposal time rather than dropped, because a
+misspelled `email` for `emails` would otherwise become an approved mutation that changes
+nothing and reports success. `GetRequest` hydrates every named card's current row into
+`preview.contact.cards` (kept card first for a merge, `missing: true` for a card the
+warehouse no longer holds) so the reviewer compares against what the card holds today.
+
+The Automation → Contacts TCC grant is separate from the Notes grant and from Full Disk
+Access, attributed to the same `launchd → /bin/zsh → uv (Cellar path) → python → osascript`
+chain, and drifts on every uv upgrade exactly as documented for Notes above. It was
+already present on porygon when this shipped (2026-09-12). `APPLE_CONTACTS_MUTATIONS_ENABLED=0`
+pauses the local worker; `pdw ingest apple-contacts --mutations-only` / `--no-mutations`
+split the two stages. The app needs `APPLE_CONTACTS_ACCOUNTS` (falls back to
+`GMAIL_ACCOUNTS`) to accept proposals for the account.
+
 ## Local Apple Messages Upload Scheduler
 
 This Mac is intended to run the local Apple Messages uploader through a user LaunchAgent:

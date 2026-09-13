@@ -2,8 +2,8 @@
 
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
-Prefer this path for any change to Zach's Gmail, Calendar, Contacts, Slack read state or
-Apple Notes; use a direct connector only for something PDW has no mutation type for, and
+Prefer this path for any change to Zach's Gmail, Calendar, Google or Apple Contacts, Slack
+read state or Apple Notes; use a direct connector only for something PDW has no mutation type for, and
 say why.
 
 ## The two calls
@@ -17,8 +17,9 @@ say why.
 Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_threads`,
 `gmail.modify_thread_labels`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
-`apple_notes.create_note`, `apple_notes.update_note`. The help call is authoritative when
-this list and it disagree.
+`apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
+`apple_contacts.update_contact`, `apple_contacts.merge_contacts`. The help call is
+authoritative when this list and it disagree.
 
 ## Rules
 
@@ -35,6 +36,17 @@ this list and it disagree.
   note is addressed by the bare UUID `base_apple_notes.notes.note_id`; a title is the
   note's first line, not a separate property. These run on a Mac, not in the cloud, so
   they wait for that Mac's next uploader cycle after approval.
+- **Apple Contacts is the address book on Zach's devices; Google Contacts is a separate
+  book.** `marts_contacts.contacts` unions both (`source` says which); a card with
+  `source = 'apple_contacts'` is changed with `apple_contacts.*`, addressed by its
+  `card_id` (`<UUID>:ABPerson`), and a `google_people` card with `google_people.contacts`.
+  `update_contact` is additive — scalars are set, emails/phones/urls are added, nothing is
+  dropped unless named in `remove`, and `append_note` is preferred over `note`.
+  `merge_contacts` deletes the merged cards after copying their values: propose it only
+  for cards that share an email or phone in `marts_contacts.contact_points`, never on a
+  name match alone, and keep the card with the photo or hand-typed note. The review shows
+  each card's current contents; the executor records the pre-edit cards in the result.
+  Like Notes these run on a Mac and iCloud syncs the change to every device.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

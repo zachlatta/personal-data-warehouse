@@ -8,7 +8,7 @@ import {
   calendarPatchValue, calendarInitials, autolinkSegments, calendarTitle, calendarOperation,
   contactOperationSummary, contactFieldDisplayValue, canonicalContactOp, contactUpdateFields, contactEffect,
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
-  groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView,
+  groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView, appleContactsView,
   isSlackMarkReadMutation, slackMarkReadView, slackMarkReadGroups, mutationReviewContext,
   gmailMutationGroupActionText, gmailMutationGroupVerb, gmailMutationLabelChanges,
 } from "../mutation_view.js";
@@ -424,6 +424,25 @@ test("request context splits known keys from the leftover JSON", () => {
   assert.equal(identificationView({}).name, "Unidentified");
   assert.equal(splitRequestContext({}).empty, true);
   assert.equal(splitRequestContext(null).empty, true);
+});
+
+test("appleContactsView reads the contact preview, flags destructive changes, and lists cards kept-first", () => {
+  const v = appleContactsView({ preview: { contact: {
+    action: "merge", name: "Ada Lovelace", keep_card_id: "K:ABPerson", merge_card_ids: ["M:ABPerson"],
+    contact: { family_name: "Lovelace", emails: [{ label: "work", value: "ada@example.com" }] },
+    changes: ["family_name", "emails (added)", "1 card(s) deleted after merge"],
+    cards: [{ card_id: "K:ABPerson", display_name: "Ada", emails: [{ label: "home", value: "a@x.com" }] }, { card_id: "M:ABPerson", missing: true }],
+  } } });
+  assert.equal(v.heading, "Merge Apple Contacts");
+  assert.equal(v.destructive, true);
+  assert.deepEqual(v.emails, [{ label: "work", value: "ada@example.com" }]);
+  assert.equal(v.cards[0].kept, true);
+  assert.equal(v.cards[1].missing, true);
+  const u = appleContactsView({ preview: { contact: { action: "update", card_id: "K:ABPerson", contact: { organization: "Hack Club" }, changes: ["organization"] } } });
+  assert.equal(u.heading, "Update Apple Contact");
+  assert.equal(u.destructive, false);
+  assert.deepEqual(u.scalars, [["organization", "Hack Club"]]);
+  assert.equal(appleContactsView({ preview: {} }).heading, "Update Apple Contact");
 });
 
 test("appleNotesView reads the note preview", () => {

@@ -9,21 +9,25 @@ import (
 const (
 	ReviewPath = "/mutation-review"
 
-	GmailArchiveOperation              = "gmail.archive_threads"
-	GmailUnarchiveOperation            = "gmail.unarchive_threads"
-	GmailModifyThreadLabelsOperation   = "gmail.modify_thread_labels"
-	GmailSendEmailOperation            = "gmail.send_email"
-	GooglePeopleContactsOperation      = "google_people.contacts"
-	ContactsBatchMutationOperation     = "contacts.batch_mutation"
-	CalendarProvider                   = "google_calendar"
-	CalendarCreateEventOperation       = "calendar.create_event"
-	CalendarUpdateEventOperation       = "calendar.update_event"
-	CalendarDeleteEventOperation       = "calendar.delete_event"
-	AppleNotesProvider                 = "apple_notes"
-	AppleNotesCreateNoteOperation      = "apple_notes.create_note"
-	AppleNotesUpdateNoteOperation      = "apple_notes.update_note"
-	SlackProvider                      = "slack"
-	SlackMarkConversationReadOperation = "slack.mark_conversation_read"
+	GmailArchiveOperation               = "gmail.archive_threads"
+	GmailUnarchiveOperation             = "gmail.unarchive_threads"
+	GmailModifyThreadLabelsOperation    = "gmail.modify_thread_labels"
+	GmailSendEmailOperation             = "gmail.send_email"
+	GooglePeopleContactsOperation       = "google_people.contacts"
+	ContactsBatchMutationOperation      = "contacts.batch_mutation"
+	CalendarProvider                    = "google_calendar"
+	CalendarCreateEventOperation        = "calendar.create_event"
+	CalendarUpdateEventOperation        = "calendar.update_event"
+	CalendarDeleteEventOperation        = "calendar.delete_event"
+	AppleNotesProvider                  = "apple_notes"
+	AppleNotesCreateNoteOperation       = "apple_notes.create_note"
+	AppleNotesUpdateNoteOperation       = "apple_notes.update_note"
+	AppleContactsProvider               = "apple_contacts"
+	AppleContactsCreateContactOperation = "apple_contacts.create_contact"
+	AppleContactsUpdateContactOperation = "apple_contacts.update_contact"
+	AppleContactsMergeContactsOperation = "apple_contacts.merge_contacts"
+	SlackProvider                       = "slack"
+	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
 
 	defaultRequestedBy = "mcp"
 	// reviewerActorID is the actor recorded when a reviewer surface passes
@@ -39,6 +43,7 @@ type Config struct {
 	ContactGoogleAccounts []string
 	CalendarAccounts      []string
 	AppleNotesAccounts    []string
+	AppleContactsAccounts []string
 	SlackAccounts         []string
 	Now                   func() time.Time
 	// RequestCreated is called after a request lands in pending_review — the
@@ -101,6 +106,11 @@ type MutationInput struct {
 	Name               string
 	Body               string
 	AppendBody         string
+	CardID             string
+	KeepCardID         string
+	MergeCardIDs       []string
+	Contact            map[string]any
+	Remove             map[string]any
 	ConversationID     string
 	MessageTS          string
 }

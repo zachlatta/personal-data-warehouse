@@ -624,6 +624,60 @@ function renderAppleNotes(mutation) {
   return article;
 }
 
+function contactEntryList(entries) {
+  const list = h("ul", "contact-entries");
+  for (const entry of entries) {
+    const item = h("li", "");
+    if (entry.label) item.appendChild(h("span", "m", entry.label + " "));
+    item.appendChild(document.createTextNode(entry.value));
+    list.appendChild(item);
+  }
+  return list;
+}
+
+function renderContactCard(card) {
+  const box = h("section", "contact-card" + (card.kept ? " kept" : ""));
+  const head = h("div", "contact-card-head");
+  head.appendChild(h("strong", "", card.missing ? "Card not in warehouse" : (card.displayName || "(no name)")));
+  if (card.kept) head.appendChild(h("span", "mpill", "kept"));
+  else if (!card.missing && card.mergeTarget) head.appendChild(h("span", "mpill s-failed", "deleted after merge"));
+  box.appendChild(head);
+  box.appendChild(h("p", "m", card.cardId));
+  if (card.missing) return box;
+  box.appendChild(dl([["Organization", card.organization], ["Title", card.jobTitle]]));
+  if (card.emails.length) box.appendChild(contactEntryList(card.emails));
+  if (card.phones.length) box.appendChild(contactEntryList(card.phones));
+  if (card.urls.length) box.appendChild(contactEntryList(card.urls));
+  if (card.note) box.appendChild(pre(card.note));
+  return box;
+}
+
+function renderAppleContacts(mutation) {
+  const view = V.appleContactsView(mutation);
+  const article = h("article", "mut contacts");
+  article.appendChild(mutationHead("Apple Contacts", view.heading, mutation.status));
+  article.appendChild(h("p", "mmeta m", mutation.operation + " for " + mutation.account));
+  if (view.destructive) article.appendChild(h("p", "bad", "Destructive: " + view.changes.filter((c) => c.includes("removed") || c.includes("replaced") || c.includes("deleted")).join("; ")));
+  const proposed = h("section", "contact-proposed");
+  proposed.appendChild(h("h4", "", view.action === "merge" ? "Overrides applied after the merge" : "Proposed"));
+  proposed.appendChild(dl([["Name", view.name], ...view.scalars, ["Changes", view.changes.join(", ")]]));
+  if (view.emails.length) proposed.appendChild(contactEntryList(view.emails));
+  if (view.phones.length) proposed.appendChild(contactEntryList(view.phones));
+  if (view.urls.length) proposed.appendChild(contactEntryList(view.urls));
+  if (view.note) proposed.appendChild(pre(view.note));
+  if (view.appendNote) proposed.appendChild(pre("+ " + view.appendNote));
+  const removed = [...view.remove.emails, ...view.remove.phones, ...view.remove.urls];
+  if (removed.length) proposed.appendChild(h("p", "bad", "Remove: " + removed.join(", ")));
+  article.appendChild(proposed);
+  if (view.cards.length) {
+    const current = h("section", "contact-current");
+    current.appendChild(h("h4", "", view.action === "merge" ? "Cards being merged" : "Card today"));
+    for (const card of view.cards) current.appendChild(renderContactCard({ ...card, mergeTarget: view.action === "merge" && !card.kept }));
+    article.appendChild(current);
+  }
+  return article;
+}
+
 function renderSlackMarkReadBody(mutation, view, requestReason) {
   const body = h("div", "slack-review-body");
   const action = h("div", "slack-action");
@@ -772,6 +826,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
+  if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);
   if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
   return renderGeneric(mutation);
 }

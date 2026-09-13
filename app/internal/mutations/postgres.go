@@ -307,6 +307,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	}
 	mutations = s.hydrateCalendarDayPreviews(ctx, mutations)
 	mutations = s.hydrateSlackMarkReadPreviewLinks(ctx, mutations)
+	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
 	request.Mutations = mutations
 	if request.MutationCount == 0 {
 		request.MutationCount = len(mutations)
@@ -1813,6 +1814,22 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					"context": input.Context,
 				},
 			})
+		case AppleContactsCreateContactOperation, AppleContactsUpdateContactOperation, AppleContactsMergeContactsOperation:
+			if err := validateAppleContactsMutation(mutation); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  AppleContactsProvider,
+				Operation: mutation.Type,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, appleContactsTitle(mutation)),
+				Reason:    reason,
+				Payload:   appleContactsPayload(mutation),
+				Preview: map[string]any{
+					"contact": appleContactsPreview(mutation),
+					"context": input.Context,
+				},
+			})
 		case SlackMarkConversationReadOperation:
 			conversationID := strings.TrimSpace(mutation.ConversationID)
 			messageTS := strings.TrimSpace(mutation.MessageTS)
@@ -2912,4 +2929,72 @@ func (s *PostgresStore) querySlackMarkReadPreviewRows(
 		return nil, err
 	}
 	return out, nil
+}
+
+// hydrateAppleContactsCardPreviews places the current base_apple_contacts.cards row
+// beside every card an Apple Contacts proposal names. It belongs on the read path:
+// a card changes after a request is proposed (the uploader re-syncs it every five
+// minutes), and a merge reviewed as bare ids is a merge approved unread. Failure is
+// non-fatal; the client then shows the ids without their current contents.
+func (s *PostgresStore) hydrateAppleContactsCardPreviews(ctx context.Context, mutations []Mutation) []Mutation {
+	if s == nil || s.db == nil {
+		return mutations
+	}
+	ids := appleContactsCardIDsForMutations(mutations)
+	if len(ids) == 0 {
+		return mutations
+	}
+	args := make([]any, 0, len(ids))
+	values := make([]string, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+		values = append(values, fmt.Sprintf("($%d)", len(args)))
+	}
+	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
+		WITH wanted(card_id) AS (VALUES %s)
+		SELECT card.card_id, COALESCE(card.display_name, ''), COALESCE(card.organization, ''), COALESCE(card.job_title, ''),
+		       COALESCE(card.emails::text, '[]'), COALESCE(card.phones::text, '[]'), COALESCE(card.urls::text, '[]'),
+		       COALESCE(card.notes, ''), card.source_updated_at
+		FROM @apple_contact_cards AS card
+		JOIN wanted ON wanted.card_id = card.card_id
+		WHERE card.is_deleted = 0
+	`, strings.Join(values, ", ")), args...)
+	if err != nil {
+		return mutations
+	}
+	defer rows.Close()
+	cards := map[string]map[string]any{}
+	for rows.Next() {
+		var cardID, displayName, organization, jobTitle, emails, phones, urls, notes string
+		var updatedAt sql.NullTime
+		if err := rows.Scan(&cardID, &displayName, &organization, &jobTitle, &emails, &phones, &urls, &notes, &updatedAt); err != nil {
+			return mutations
+		}
+		card := map[string]any{
+			"card_id":      cardID,
+			"display_name": displayName,
+			"organization": organization,
+			"job_title":    jobTitle,
+			"emails":       decodeJSONSlice([]byte(emails)),
+			"phones":       decodeJSONSlice([]byte(phones)),
+			"urls":         decodeJSONSlice([]byte(urls)),
+			"note":         notes,
+		}
+		if updatedAt.Valid {
+			card["source_updated_at"] = updatedAt.Time.UTC().Format(time.RFC3339)
+		}
+		cards[cardID] = card
+	}
+	if err := rows.Err(); err != nil {
+		return mutations
+	}
+	return applyAppleContactsCardRows(mutations, cards)
+}
+
+func decodeJSONSlice(data []byte) []any {
+	var out []any
+	if len(data) == 0 || json.Unmarshal(data, &out) != nil {
+		return []any{}
+	}
+	return out
 }

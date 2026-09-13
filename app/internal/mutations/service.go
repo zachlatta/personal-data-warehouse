@@ -59,6 +59,7 @@ func NewService(store Store, cfg Config) *Service {
 	cfg.ContactGoogleAccounts = normalizeAccountList(cfg.ContactGoogleAccounts)
 	cfg.CalendarAccounts = normalizeAccountList(cfg.CalendarAccounts)
 	cfg.AppleNotesAccounts = normalizeAccountList(cfg.AppleNotesAccounts)
+	cfg.AppleContactsAccounts = normalizeAccountList(cfg.AppleContactsAccounts)
 	cfg.SlackAccounts = normalizeAccountList(cfg.SlackAccounts)
 	return &Service{store: store, cfg: cfg}
 }
@@ -229,6 +230,13 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if err := validateAppleNotesMutation(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
+	case AppleContactsCreateContactOperation, AppleContactsUpdateContactOperation, AppleContactsMergeContactsOperation:
+		if err := validateConfiguredAccount(account, s.cfg.AppleContactsAccounts, "APPLE_CONTACTS_ACCOUNTS"); err != nil {
+			return err
+		}
+		if err := validateAppleContactsMutation(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	case SlackMarkConversationReadOperation:
 		if err := validateConfiguredAccount(account, s.cfg.SlackAccounts, "SLACK_ACCOUNTS"); err != nil {
 			return err
@@ -241,7 +249,7 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d message_ts must be an exact Slack timestamp such as 1593473566.000200", index)
 		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, or slack.mark_conversation_read", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, or slack.mark_conversation_read", index, mutationType)
 	}
 	return nil
 }
@@ -311,6 +319,11 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		Name:               strings.TrimSpace(stringFromAny(raw["name"])),
 		Body:               stringFromAny(raw["body"]),
 		AppendBody:         stringFromAny(raw["append_body"]),
+		CardID:             strings.TrimSpace(stringFromAny(raw["card_id"])),
+		KeepCardID:         strings.TrimSpace(stringFromAny(raw["keep_card_id"])),
+		MergeCardIDs:       stringSliceFromAny(raw["merge_card_ids"]),
+		Contact:            mapFromAny(raw["contact"]),
+		Remove:             mapFromAny(raw["remove"]),
 		ConversationID:     strings.TrimSpace(stringFromAny(raw["conversation_id"])),
 		MessageTS:          strings.TrimSpace(stringFromAny(raw["message_ts"])),
 	}, nil
