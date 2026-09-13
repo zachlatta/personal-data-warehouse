@@ -35,6 +35,12 @@ Search scope `finance` covers transactions; a receipt's link to its transaction 
   (`reporting_scope`, `measure`, and a refusal when two different documents claim one
   account-day), which means a line can be *missing* for a day rather than wrong; the
   `finance_ledger` asset's `observation_conflicts` counter says so.
+- **A multi-position report books only the folder's own line.** A fund administrator's
+  positions export lists every vehicle plus a total, uploaded into one vehicle's folder;
+  the line whose description names that folder (`pwv-fund-i-lp` ↔ "PWV Fund I LP") is the
+  account's value and lines naming other ledger accounts are theirs, never the total. A
+  report that names other accounts but not its own folder's books nothing for that day
+  and increments `valuations_withheld_unattributed`.
 - **Check `position_coverage.coverage_status` before quoting a return.** `complete`,
   `partial`, `none`, `lots_exceed_holding`, `basis_mismatch`, `no_holding`. The last three
   mean open lots the provider's own holdings do not back; a lot-derived gain for that

@@ -932,6 +932,148 @@ def test_multi_entity_valuation_doc_prefers_total_else_first(warehouse):
     ]
 
 
+def test_multi_account_positions_report_books_only_the_folders_own_line(warehouse):
+    """The live incident (2026-04-11): a fund administrator's positions report
+    lists the owner's interest in three vehicles plus a totals row, uploaded
+    into one vehicle's folder. Totals-wins booked the whole $16,797 portfolio
+    as a $6,562 fund interest. The folder's own key picks its line; the other
+    vehicles' lines belong to their own folders and book nothing here.
+    """
+    warehouse.ensure_plaid_tables()
+    for folder, sha in (("pwv-astranis-spv-i-llc", "sha-astranis"), ("pwv-zoo-spv-i-llc", "sha-zoo")):
+        _seed_document(
+            warehouse,
+            document=_document_row(content_sha256=sha, source_native_id=sha,
+                                   filename="subscription.pdf",
+                                   original_path=f"{folder}/subscription.pdf"),
+            extraction=_extraction_row(
+                content_sha256=sha, document_type="subscription_agreement",
+                institution="Fundadmin Co", account_name_hint=folder, account_mask="",
+                commitments_json=[{"date": "2026-01-30", "committed": "5000", "called": "",
+                                   "unfunded": "", "description": folder}],
+            ),
+        )
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-positions", source_native_id="sha-positions",
+                               filename="positions.rtf",
+                               original_path="pwv-fund-i-lp/positions.rtf"),
+        extraction=_extraction_row(
+            content_sha256="sha-positions",
+            document_type="fund_positions",
+            institution="Fundadmin Co",
+            account_name_hint="PWV Fund I LP",
+            account_mask="",
+            valuations_json=[
+                {"date": "2026-04-11", "value": "5241.59", "measure": "position_value",
+                 "description": "PWV Astranis SPV I LLC — Net Asset Value"},
+                {"date": "2026-04-11", "value": "6561.81", "measure": "position_value",
+                 "description": "PWV Fund I LP — Net Asset Value"},
+                {"date": "2026-04-11", "value": "4993.98", "measure": "position_value",
+                 "description": "PWV Zoo SPV I LLC — Net Asset Value"},
+                {"date": "2026-04-11", "value": "16797.38", "measure": "position_value",
+                 "description": "Totals — Net Asset Value"},
+            ],
+            commitments_json=[
+                {"date": "2026-04-11", "committed": "5000.00", "called": "5275.00",
+                 "unfunded": "", "description": "PWV Astranis SPV I LLC"},
+                {"date": "2026-04-11", "committed": "25000.00", "called": "7500.00",
+                 "unfunded": "", "description": "PWV Fund I LP"},
+                {"date": "2026-04-11", "committed": "5000.00", "called": "5150.00",
+                 "unfunded": "", "description": "PWV Zoo SPV I LLC"},
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.observation_conflicts == 0
+    assert summary.valuations_withheld_unattributed == 0
+    fund = warehouse._query(
+        """
+        SELECT o.kind, o.value FROM @finance_observations o
+        JOIN @finance_account_links l ON l.account_id = o.account_id
+        WHERE l.source_account_key = 'pwv-fund-i-lp' AND o.as_of = %s ORDER BY o.kind
+        """,
+        (date(2026, 4, 11),),
+    )
+    assert fund == [
+        ("called_capital", Decimal("7500.00")),
+        ("commitment", Decimal("25000.00")),
+        ("valuation", Decimal("6561.81")),
+    ]
+    # The SPV folders are untouched by the Fund I folder's document.
+    assert warehouse._query(
+        """
+        SELECT count(*) FROM @finance_observations o
+        JOIN @finance_account_links l ON l.account_id = o.account_id
+        WHERE l.source_account_key <> 'pwv-fund-i-lp' AND o.as_of = %s
+        """,
+        (date(2026, 4, 11),),
+    ) == [(0,)]
+
+
+def test_positions_report_naming_only_other_accounts_books_no_valuation(warehouse):
+    """A portfolio-wide report uploaded into a folder whose account it never
+    names: its lines are other ledger accounts' and its total is the whole
+    portfolio, so the day is refused and counted, not booked."""
+    warehouse.ensure_plaid_tables()
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-zoo", source_native_id="sha-zoo",
+                               filename="subscription.pdf",
+                               original_path="pwv-zoo-spv-i-llc/subscription.pdf"),
+        extraction=_extraction_row(
+            content_sha256="sha-zoo", document_type="subscription_agreement",
+            institution="Fundadmin Co", account_name_hint="PWV Zoo SPV I LLC", account_mask="",
+            commitments_json=[{"date": "2026-02-12", "committed": "5000", "called": "",
+                               "unfunded": "", "description": "PWV Zoo SPV I LLC"}],
+        ),
+    )
+    _seed_document(
+        warehouse,
+        document=_document_row(content_sha256="sha-portfolio", source_native_id="sha-portfolio",
+                               filename="positions.rtf",
+                               original_path="fundadmin-portfolio/positions.rtf"),
+        extraction=_extraction_row(
+            content_sha256="sha-portfolio",
+            document_type="fund_positions",
+            institution="Fundadmin Co",
+            account_name_hint="Portfolio",
+            account_mask="",
+            valuations_json=[
+                {"date": "2026-04-11", "value": "4993.98", "measure": "position_value",
+                 "description": "PWV Zoo SPV I LLC — Net Asset Value"},
+                {"date": "2026-04-11", "value": "6561.81", "measure": "position_value",
+                 "description": "Some Other Fund — Net Asset Value"},
+                {"date": "2026-04-11", "value": "11555.79", "measure": "position_value",
+                 "description": "Totals — Net Asset Value"},
+            ],
+        ),
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS).sync()
+
+    assert summary.valuations_withheld_unattributed == 1
+    assert warehouse._query(
+        "SELECT count(*) FROM @finance_observations WHERE kind = 'valuation'"
+    ) == [(0,)]
+
+
+@pytest.mark.parametrize(
+    ("description", "key", "expected"),
+    [
+        ("PWV Fund I LP — Net Asset Value", "pwv-fund-i-lp", True),
+        ("PWV Fund I GP LLC", "pwv-fund-i-lp", False),
+        ("Totals — Net Asset Value", "pwv-fund-i-lp", False),
+        ("Fidelity Brokerage 9513", "fidelity|9513", False),
+        ("anything", "", False),
+    ],
+)
+def test_description_names_account_key(description, key, expected):
+    from personal_data_warehouse.finance_ledger import _description_names_account_key
+
+    assert _description_names_account_key(description, key) is expected
+
+
 def test_folder_spanning_account_number_change_resolves_by_any_mask(warehouse):
     # One folder holds statements across a clearing migration: the OLDEST
     # document carries a retired mask, later ones carry the mask plaid knows.
@@ -2328,6 +2470,11 @@ def test_every_non_value_observation_kind_is_excluded_from_net_worth(warehouse):
 # --- a contractual figure is not the holder's position value ----------------------
 
 
+def _values(entries):
+    values, _unattributed = _daily_valuations(entries)
+    return values
+
+
 def test_a_valuation_cap_is_never_the_holders_position_value():
     """A SAFE's post-money valuation cap is a ceiling on the ISSUER.
 
@@ -2336,12 +2483,12 @@ def test_a_valuation_cap_is_never_the_holders_position_value():
     unambiguously the investor's own, so `reporting_scope` cannot help. Only
     the entry's own `measure` can.
     """
-    assert _daily_valuations(
+    assert _values(
         [{"date": "2026-08-27", "value": "40000000", "description": "Post-Money Valuation Cap",
           "measure": "reference"}]
     ) == []
     # A carrying value beats a cost basis on the same day...
-    assert _daily_valuations(
+    assert _values(
         [
             {"date": "2026-08-27", "value": "5000", "description": "Cost basis", "measure": "cost_basis"},
             {"date": "2026-08-27", "value": "5400", "description": "Carrying value",
@@ -2352,12 +2499,12 @@ def test_a_valuation_cap_is_never_the_holders_position_value():
     ) == [(date(2026, 8, 27), Decimal("5400"))]
     # ...but a document stating ONLY a cost basis still produces a value: an
     # angel SAFE really is carried at cost.
-    assert _daily_valuations(
+    assert _values(
         [{"date": "2026-08-27", "value": "5000", "description": "Cost basis", "measure": "cost_basis"}]
     ) == [(date(2026, 8, 27), Decimal("5000"))]
     # Pre-v3 entries carry no measure and behave exactly as they always did,
     # so re-extraction is what improves the corpus, never a silent regression.
-    assert _daily_valuations(
+    assert _values(
         [{"date": "2026-08-27", "value": "525000", "description": "Estimate"}]
     ) == [(date(2026, 8, 27), Decimal("525000"))]
 

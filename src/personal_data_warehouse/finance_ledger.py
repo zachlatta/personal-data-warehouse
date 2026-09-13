@@ -38,7 +38,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -319,6 +319,10 @@ class FinanceLedgerSummary:
     documents_withheld_entity: int = 0
     documents_withheld_unidentified: int = 0
     observation_conflicts: int = 0
+    # Valuation account-days a multi-account document could not attribute:
+    # its lines named OTHER ledger accounts but never this folder's own, so
+    # its total is somebody's portfolio, not this account's value.
+    valuations_withheld_unattributed: int = 0
     security_trades_upserted: int = 0
     security_trades_merged: int = 0
     security_trades_removed: int = 0
@@ -339,9 +343,11 @@ class FinanceLedgerRunner:
         # Account-days two documents disagreed about, so the ledger booked
         # neither. Nonzero means a source document needs a human.
         self._observation_conflicts = 0
+        self._valuations_withheld_unattributed = 0
 
     def sync(self) -> FinanceLedgerSummary:
         self._observation_conflicts = 0
+        self._valuations_withheld_unattributed = 0
         self._warehouse.ensure_finance_tables()
         # The ledger consumes manual_finance extractions; ensure that source's
         # tables so a fresh schema (or a deploy where the extraction asset has
@@ -457,6 +463,7 @@ class FinanceLedgerRunner:
         doc_link_rows: list[dict[str, Any]] = []
         doc_accounts: dict[str, str] = {}  # extraction sha -> ledger account id
         doc_account_kinds: dict[str, str] = {}
+        doc_account_keys: dict[str, str] = {}  # extraction sha -> the group's account key
         # Group extractions per logical account key first: one folder can span
         # an account-number change (Robinhood's Apex-era statements carry a
         # different mask than its later ones), so resolution must consider
@@ -618,6 +625,7 @@ class FinanceLedgerRunner:
             for extraction in group:
                 doc_accounts[str(extraction["content_sha256"])] = account_id
                 doc_account_kinds[str(extraction["content_sha256"])] = account_kind
+                doc_account_keys[str(extraction["content_sha256"])] = key
 
         self._warehouse.insert_finance_accounts(doc_account_rows)
         self._warehouse.insert_finance_account_links(doc_link_rows)
@@ -641,6 +649,7 @@ class FinanceLedgerRunner:
             extractions,
             doc_accounts=doc_accounts,
             doc_account_kinds=doc_account_kinds,
+            doc_account_keys=doc_account_keys,
             now=now,
             sync_version=sync_version,
         )
@@ -715,6 +724,7 @@ class FinanceLedgerRunner:
             documents_withheld_entity=len(withheld_entity),
             documents_withheld_unidentified=len(withheld_unidentified),
             observation_conflicts=self._observation_conflicts,
+            valuations_withheld_unattributed=self._valuations_withheld_unattributed,
             security_trades_upserted=securities["upserted"],
             security_trades_merged=securities["merged"],
             security_trades_removed=securities["removed"],
@@ -1325,9 +1335,14 @@ class FinanceLedgerRunner:
         *,
         doc_accounts: dict[str, str],
         doc_account_kinds: dict[str, str],
+        doc_account_keys: dict[str, str] | None = None,
         now: datetime,
         sync_version: int,
     ) -> list[dict[str, Any]]:
+        doc_account_keys = doc_account_keys or {}
+        # Every account key the corpus knows, so a document's lines can be
+        # recognised as naming a DIFFERENT account rather than restating this one.
+        known_account_keys = set(doc_account_keys.values())
         rows: dict[tuple[str, date, str], dict[str, Any]] = {}
         sources: dict[tuple[str, date, str], str] = {}
         conflicted: set[tuple[str, date, str]] = set()
@@ -1415,14 +1430,34 @@ class FinanceLedgerRunner:
                 if as_of is None or value is None:
                     continue
                 put(account_id, as_of, balance_kind, value, currency, sha)
-            # A valuation document may report several positions for one day
-            # (e.g. a fund export listing every entity plus a totals row, all
-            # attributed to the folder's account): the account's value for the
-            # day is the explicit total when one exists, else the sum of the
-            # parts.
+            # A valuation document may report several positions for one day.
+            # A brokerage statement's holdings plus a totals row are one
+            # account, and the total is its value. A fund administrator's
+            # positions report lists several VEHICLES plus a total, and the
+            # total is the owner's whole portfolio: booked to the folder's
+            # account it published $16,797 as a $6,562 fund interest
+            # (2026-04-11). The folder's own key decides which line is this
+            # account's; lines naming other ledger accounts are theirs.
             valuation_kind = OBSERVATION_KIND_TAX_BASIS if tax_basis else OBSERVATION_KIND_VALUATION
-            for (as_of, value) in _daily_valuations(extraction["valuations_json"] or []):
+            own_key = doc_account_keys.get(sha, "")
+            other_keys = known_account_keys - {own_key}
+            daily, unattributed = _daily_valuations(
+                extraction["valuations_json"] or [],
+                account_key=own_key,
+                other_account_keys=other_keys,
+            )
+            for (as_of, value) in daily:
                 put(account_id, as_of, valuation_kind, value, currency, sha)
+            for as_of in unattributed:
+                self._valuations_withheld_unattributed += 1
+                self._logger.warning(
+                    "Withholding the %s valuation for %s: document %s lists positions "
+                    "in other ledger accounts but no line for this one, so its total "
+                    "is a portfolio, not this account's value.",
+                    as_of,
+                    account_id,
+                    sha,
+                )
             # Capital commitments are stocks too — "this obligation was $X on
             # this day" — but they are not what the account is WORTH, so they
             # get their own kinds and stay out of net worth. Unfunded capital
@@ -1431,6 +1466,15 @@ class FinanceLedgerRunner:
             for entry in extraction["commitments_json"] or []:
                 as_of = _parse_iso_date(str(entry.get("date", "")))
                 if as_of is None:
+                    continue
+                # `commitments[]` is one entry per vehicle. An entry that names
+                # ANOTHER ledger account is that account's obligation, and
+                # booking it here is exactly the cross-vehicle collision the
+                # in-document conflict guard below exists to refuse.
+                description = str(entry.get("description", ""))
+                if not _description_names_account_key(description, own_key) and any(
+                    _description_names_account_key(description, other) for other in other_keys
+                ):
                     continue
                 for field, kind in (
                     ("committed", OBSERVATION_KIND_COMMITMENT),
@@ -1827,8 +1871,34 @@ def _group_primary_mask(
     return ""
 
 
-def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
+def _description_names_account_key(description: str, account_key: str) -> bool:
+    """Whether a document line names the account an upload folder identifies.
+
+    Only a FOLDER key is a human-given name (`pwv-fund-i-lp`); an
+    `institution|mask` key and a filename stem are not names anything on a
+    page would spell out, so they never match. Every folder token must appear
+    as a whole word: `pwv-fund-i-lp` names "PWV Fund I LP — Net Asset Value"
+    and not "PWV Fund I GP LLC".
+    """
+    if not account_key or "|" in account_key:
+        return False
+    tokens = [token for token in account_key.split("-") if token]
+    if not tokens:
+        return False
+    words = set(re.sub(r"[^a-z0-9]+", " ", description.lower()).split())
+    return all(token in words for token in tokens)
+
+
+def _daily_valuations(
+    entries: list[Any],
+    *,
+    account_key: str = "",
+    other_account_keys: Iterable[str] = (),
+) -> tuple[list[tuple[date, Decimal]], list[date]]:
     """Collapse a document's valuation entries to one value per day.
+
+    Returns ``(values, unattributed_days)``: the account's value for each day it
+    could decide, and the days it refused.
 
     **A `reference` entry is never a value.** A SAFE prints a post-money
     valuation CAP — a contractual ceiling on the ISSUER's valuation — and it is
@@ -1839,21 +1909,28 @@ def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
     `position_value` is preferred, `cost_basis` is the fallback (an angel SAFE
     IS carried at cost), and `reference` is dropped outright.
 
-    Within the surviving entries, an entry described as a total wins (a fund
-    export listing every entity plus a totals row). Otherwise the FIRST entry
-    of the day wins: valuation documents usually restate the same asset several
+    **A line naming this account wins over any total.** A fund administrator's
+    positions report lists every vehicle the owner holds plus a totals row,
+    and it is uploaded into ONE vehicle's folder. Its total is the owner's
+    whole portfolio: booked as the folder's value it published a $16,797 fund
+    interest that was really $6,562 (2026-04-11). So the entry whose
+    description names the folder's account is that account's value, and when
+    the entries name OTHER ledger accounts but never this one the day is
+    refused rather than guessed.
+
+    Otherwise an entry described as a total wins (a brokerage statement's
+    holdings plus a totals row are one account). Otherwise the FIRST entry of
+    the day wins: valuation documents usually restate the same asset several
     ways (point estimate, low/high bounds, rental estimates, assessed-value
     variants) with the primary figure listed first, and summing alternative
-    measures of one asset inflates it catastrophically. A parts-only
-    multi-entity document without a totals row undercounts to its first
-    position — a visible, benign failure the extraction's totals coverage makes
-    rare.
+    measures of one asset inflates it catastrophically.
 
     Pre-v3 entries carry no `measure` and are treated as `unknown`, which keeps
     the whole existing corpus behaving exactly as before: the ONLY entries this
     drops are ones an agent explicitly labelled `reference`.
     """
     entries = _preferred_measure_entries(entries)
+    other_keys = [key for key in other_account_keys if key]
     by_day: dict[date, dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1867,14 +1944,29 @@ def _daily_valuations(entries: list[Any]) -> list[tuple[date, Decimal]]:
         # negative AND matched the totals heuristic). Assets are worth >= 0.
         if value < 0:
             continue
-        day = by_day.setdefault(as_of, {"first": value, "total": None})
-        is_total = "total" in str(entry.get("description", "")).lower()
+        day = by_day.setdefault(
+            as_of, {"first": value, "total": None, "own": None, "names_other": False}
+        )
+        description = str(entry.get("description", ""))
+        if day["own"] is None and _description_names_account_key(description, account_key):
+            day["own"] = value
+        elif any(_description_names_account_key(description, other) for other in other_keys):
+            day["names_other"] = True
+        is_total = "total" in description.lower()
         if is_total and day["total"] is None:
             day["total"] = value
-    return [
-        (as_of, day["total"] if day["total"] is not None else day["first"])
-        for as_of, day in sorted(by_day.items())
-    ]
+    values: list[tuple[date, Decimal]] = []
+    unattributed: list[date] = []
+    for as_of, day in sorted(by_day.items()):
+        if day["own"] is not None:
+            values.append((as_of, day["own"]))
+        elif day["names_other"]:
+            unattributed.append(as_of)
+        elif day["total"] is not None:
+            values.append((as_of, day["total"]))
+        else:
+            values.append((as_of, day["first"]))
+    return values, unattributed
 
 
 def _preferred_measure_entries(entries: list[Any]) -> list[Any]:
