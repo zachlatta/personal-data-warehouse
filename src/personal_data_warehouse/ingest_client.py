@@ -326,6 +326,33 @@ class IngestClient:
             params={},
         )
 
+    def publish_hacker_news_session(
+        self,
+        *,
+        account: str,
+        session_token: str,
+        session_key: str = "default",
+        source_browser: str = "",
+    ) -> Mapping[str, Any]:
+        """Publish the captured news.ycombinator.com cookie to the app (Postgres-backed).
+
+        ``account`` is the HN username. The acknowledgement carries the token's
+        sha256, never the token.
+        """
+        payload = {
+            "account": account,
+            "session_key": session_key,
+            "session_token": session_token,
+            "source_browser": source_browser,
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return self._signed_post(
+            "/ingest/hacker-news/session",
+            body=body,
+            content_type="application/json",
+            params={},
+        )
+
     def publish_whoop_private_session(
         self,
         *,

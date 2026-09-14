@@ -83,6 +83,18 @@ Read topic `health` before quoting a number — the unit traps are 1000x errors.
 `base_manual_finance.documents` with agent extractions in `derived_finance.document_extractions`.
 Read topic `finance` before quoting a total: several guards deliberately withhold a number.
 
+## Hacker News
+
+`base_hacker_news.items` is one row per archived item (story, comment, job, poll), keyed by
+HN's `item_id`; `account` is the HN username. It holds Zach's own stories and comments,
+everything he upvoted, favorited or hidden, and the **complete discussion** under every
+one of those stories — not a mirror of all of HN, so absence here says nothing about HN.
+`base_hacker_news.user_items` says WHY an item is archived (`relation` in `submitted`,
+`favorited`, `upvoted`, `hidden`; `removed_at` is 1970 while live). `root_story_id` groups
+a whole thread; `body_text` is the decoded body, `text` the raw HTML. Timeline source
+`hacker_news`, search scope `hacker_news`: his items and anything he acted on are `self`,
+replies to him `direct`, the rest of a thread `cc`; `timeline.context()` returns the thread.
+
 ## Prior agent sessions
 
 `marts_ai_conversations.sessions` (one row per session across Claude Code, Codex, Claude

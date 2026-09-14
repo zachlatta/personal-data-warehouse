@@ -2735,6 +2735,61 @@ starting points: `base_chatgpt.events` plus `marts_ai_conversations.events` /
 `marts_ai_conversations.sessions` filtered to `source = 'chatgpt'`, and `private.chatgpt_sessions`
 (credential) / `ops.chatgpt_conversation_sync` (per-conversation watermark).
 
+## Hacker News (his items, his lists, and every discussion under them)
+
+**Start at `base_hacker_news.items`**, or at the timeline with `sources => ARRAY['hacker_news']`.
+The archive is deliberately NOT a mirror of Hacker News (the public corpus is ~50M items and
+grows ~4M a year); it is every item Zach touched plus the **complete comment tree** of every
+story he touched:
+
+| relation | where it comes from | credential |
+| --- | --- | --- |
+| `submitted` (his stories AND comments) | `/v0/user/<account>` on the Firebase API — the whole list in one request, so it is a full walk every run | none |
+| `favorited` | `news.ycombinator.com/favorites?id=<account>` (+ `&comments=t`) | none |
+| `upvoted`, `hidden` | `/upvoted`, `/hidden` — shown only to the logged-in user | the browser's `user` cookie, published by `pdw hn publish-session` |
+
+`base_hacker_news.user_items` is one row per `(item_id, relation)`; `removed_at` is the epoch
+while the relation is live and a weekly full walk of each list stamps it when an upvote or
+favorite is taken back. Every item named by a list is fetched from the API, then its parent
+chain up to the story, then the **frontier** — every `kids` id of an archived item that is not
+itself archived — until the budget (`HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN`, 3,000) runs out.
+**The table is the walk state**: a run cut short resumes by asking the same set-difference
+question, so there is no cursor to repair. Items in discussions whose story is younger than
+`HACKER_NEWS_LIVE_WINDOW_DAYS` (3) are re-read every `HACKER_NEWS_REFRESH_MIN_AGE_HOURS` (6),
+because a comment's `kids` list is the only way to learn about a new reply; older threads are
+settled and left alone.
+
+`account` is the **HN username**, not an email — it keys every row and it is what the timeline
+compares an item's `author` to. One adapter (`hacker_news_item`, source `hacker_news`, kind
+`hn_item`) covers the source: an item Zach wrote or acted on (upvote, favorite, hide — an action
+he took, the same rule that keeps a card purchase at `self`) is `self`, a reply to one of his
+items is `direct`, the rest of an archived thread is `cc`. `context` is the root story id, so
+`timeline.context()` on any HN hit returns the discussion. `body_text` is the API's HTML body
+decoded at ingest; `text` is the raw HTML, kept faithful.
+
+**A login page on a private list is a credential verdict, not an empty list.** The poller marks
+that exact cookie rejected (`private.hacker_news_sessions.expired_token_sha256`), records
+`action_required` on the `upvoted`/`hidden` rows of `ops.hacker_news_sync_state`, and keeps
+running the public lists and the item walk — so a dead cookie degrades to "public only", never to
+silence, and `marts_ops.pipeline_health` reads `attention` for the `hacker_news` pipeline. The
+repair is `pdw hn publish-session` on the Mac whose Chrome is signed in to news.ycombinator.com
+(it refuses to publish one user's cookie under another username, and checks the cookie against a
+login-only page before publishing). HN's login cookie is long-lived, so this is setup, not a chore.
+
+Config (Dagster deployment): `HACKER_NEWS_ACCOUNT` (the username; required to enable the
+source), `HACKER_NEWS_ENABLED=0` to pause, and the budgets above. The sensor polls every
+`HACKER_NEWS_POLL_INTERVAL_SECONDS` (30 min).
+
+```sql
+SELECT i.posted_at, i.item_type, i.author, coalesce(nullif(i.title, ''), left(i.body_text, 80)) AS what,
+       array_agg(u.relation) FILTER (WHERE u.relation IS NOT NULL) AS relations
+FROM base_hacker_news.items i
+LEFT JOIN base_hacker_news.user_items u
+  ON u.account = i.account AND u.item_id = i.item_id AND u.removed_at <= '1970-01-01'
+WHERE i.author = i.account
+GROUP BY 1, 2, 3, 4 ORDER BY i.posted_at DESC LIMIT 20;
+```
+
 ## Health (two WHOOP sources, one read interface)
 
 **Start at `marts_health`, not at either `base_whoop*` schema.** WHOOP arrives twice — the

@@ -132,8 +132,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// (C3) and marts_ops.pgbackrest_health (C10) landed in the same window.
 	// Those are contract surfaces, so the budget moves; 8800 leaves room for
 	// one more and not for prose.
-	if guidance > 8800 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 8800)", guidance)
+	//
+	// 8800 held until 2026-09-13, when the hacker_news source landed with its
+	// own START HERE relation (base_hacker_news.items). HEAD sat at 8788, so
+	// any new entry point crossed it; the source's other comments were cut to
+	// one trap line first. 9000 leaves room for one more entry point, not prose.
+	if guidance > 9000 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9000)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

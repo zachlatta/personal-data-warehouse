@@ -858,6 +858,33 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "hacker_news",
+        "Hacker News",
+        cadence="every 30 min",
+        transport=(
+            "Dagster hacker_news_sync → Firebase HN API for items, news.ycombinator.com"
+            " list pages for favorites (public) and upvoted/hidden (published session)"
+        ),
+        data=2 * DAY,
+        run=3 * HOUR,
+        basis=(
+            "every run re-lists the newest page of each list and re-reads live threads,"
+            " so a healthy poller writes on every run; the 2-day data SLA is the run"
+            " cadence with room for HN being unreachable, not a measured posting gap"
+        ),
+        state=StateSource(
+            table="hacker_news_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "action_required on the upvoted/hidden rows means the published"
+            " news.ycombinator.com session answered a login page — re-publish it with"
+            " `pdw hn publish-session`; the public lists and item walk keep running"
+        ),
+    ),
+    _source(
         "plaid",
         "Plaid finance",
         cadence="every 30 min",
@@ -1340,6 +1367,14 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # public ones at higher resolution, so they are still `data` — this
     # pipeline going quiet is a real outage even though base_whoop keeps
     # filling.
+    # Hacker News
+    "hacker_news_items": _data("hacker_news", "synced_at", "posted_at"),
+    "hacker_news_user_items": _data("hacker_news", "synced_at"),
+    "hacker_news_profile": _support("hacker_news", "synced_at", note="profile snapshot"),
+    "hacker_news_sync_state": _state("hacker_news", "updated_at"),
+    "hacker_news_sessions": _state(
+        "hacker_news", "updated_at", "published news.ycombinator.com session cookie"
+    ),
     "whoop_private_cycles": _data("whoop_private", "synced_at", "start_at"),
     "whoop_private_sleeps": _data("whoop_private", "synced_at", "start_at"),
     "whoop_private_recoveries": _data(

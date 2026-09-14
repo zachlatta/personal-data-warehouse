@@ -34,6 +34,7 @@ Item that double-counts net worth. Retire a confirmed duplicate with
 | `pdw slack publish-session` | captures the Slack desktop app's client session so the sync can ask Slack what changed in one request instead of polling ~950 conversations |
 | `pdw chatgpt publish-session` | captures the chatgpt.com browser session for the server-side ChatGPT poller; the token lives ~10 days and only a running, signed-in browser renews it |
 | `pdw whoop publish-session` | captures the app.whoop.com browser session for the private WHOOP source; self-renews while sync runs |
+| `pdw hn publish-session` | captures the news.ycombinator.com login cookie so the Hacker News sync can read the upvoted and hidden lists; long-lived, re-run when `/pipelines` says `action_required` |
 | `pdw ingest claude-desktop` | pushes the Claude Desktop session credential |
 
 Each reads a browser or app keychain item, so it must run from a **GUI terminal** on the

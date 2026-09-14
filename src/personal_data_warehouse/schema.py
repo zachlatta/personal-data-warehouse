@@ -2597,3 +2597,109 @@ RECEIPT_TRANSACTION_RECEIPT_COLUMNS = (
     "updated_at",
     "sync_version",
 )
+
+
+# --- Hacker News ----------------------------------------------------------
+#
+# `account` is the HN username (not an email): every relation here is
+# about what THAT user did, and the timeline's self/direct tiers are decided
+# by comparing an item's author to it.
+HACKER_NEWS_ITEM_COLUMNS = (
+    "account",
+    # HN's numeric id, stored as text like every other provider id here.
+    "item_id",
+    # story / comment / job / poll / pollopt, as the API reports it.
+    "item_type",
+    "author",
+    "posted_at",
+    "title",
+    "url",
+    # The body exactly as the API returns it (HTML fragments and entities).
+    "text",
+    # The same body decoded to plain text at ingest, for search and snippets.
+    "body_text",
+    "parent_id",
+    # The story this item ultimately hangs from (itself for a story). Keys the
+    # timeline's context stream, so the whole discussion is one conversation.
+    "root_story_id",
+    "score",
+    "descendants",
+    "is_dead",
+    "is_deleted",
+    # The API's `kids` list, kept so the walk can find children it has not
+    # fetched yet without a second request for the parent.
+    "kids_json",
+    "raw_json",
+    # When this row's fields were last read from the API (a refresh re-stamps
+    # it); first_seen_at is the first time.
+    "fetched_at",
+    "first_seen_at",
+    "synced_at",
+    "sync_version",
+)
+
+#: Why an item is in the archive. One row per (item, relation); `removed_at`
+#: is the epoch while the relation is live (an upvote can be taken back, a
+#: favorite removed) and the full list walk stamps it when the item is gone.
+HACKER_NEWS_USER_ITEM_COLUMNS = (
+    "account",
+    "item_id",
+    # submitted / favorited / upvoted / hidden
+    "relation",
+    "discovered_at",
+    "removed_at",
+    "synced_at",
+    "sync_version",
+)
+
+HACKER_NEWS_PROFILE_COLUMNS = (
+    "account",
+    "user_id",
+    "karma",
+    "about",
+    "submitted_count",
+    "created_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+#: Per-list run state: one row per (account, list_name). `list_name` is one
+#: of the HTML lists (submitted is read from the API instead), the item
+#: walk, or the refresh pass, so a dead cookie on the private lists reads
+#: `action_required` on its own rows while the public work keeps its `ok`.
+HACKER_NEWS_SYNC_STATE_COLUMNS = (
+    "account",
+    "list_name",
+    "status",
+    "error",
+    "last_success_at",
+    # When the list was last walked to its end (removals are only detectable
+    # by a full walk, so this is what bounds how stale a removal can be).
+    "full_walk_completed_at",
+    "pages_seen",
+    "items_seen",
+    # Fingerprint of the exact session rejected with a login page, so the
+    # sensor sits out only while that same dead credential is installed.
+    "credential_sha256",
+    "updated_at",
+    "sync_version",
+)
+
+#: The news.ycombinator.com `user` cookie, published by
+#: ``pdw hn publish-session``. PK (account, session_key) is load-bearing:
+#: the app upserts this same table (app/internal/hackernewssession/store.go).
+HACKER_NEWS_SESSION_COLUMNS = (
+    "account",
+    "session_key",
+    "session_token",
+    "source_browser",
+    "token_sha256",
+    "published_at",
+    "updated_at",
+    "sync_version",
+    "expired_at",
+    "expired_token_sha256",
+    "status",
+    "error",
+)

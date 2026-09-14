@@ -16,6 +16,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/hackernewssession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/notifications"
@@ -299,6 +300,16 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		} else {
 			mux.Handle(chatgptsession.Endpoint, chatgptsession.NewService(sessionStore, authSvc, time.Now, logger).Handler())
 			logger.Info("chatgpt session publishing enabled", "endpoint", chatgptsession.Endpoint)
+		}
+
+		// Hacker News: the login-only lists (upvoted, hidden) need the
+		// browser's `user` cookie. Same signed-publish shape.
+		hnStore, herr := hackernewssession.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if herr != nil {
+			logger.Error("hacker news session store failed to initialize; session publishing disabled", "error", herr.Error())
+		} else {
+			mux.Handle(hackernewssession.Endpoint, hackernewssession.NewService(hnStore, authSvc, time.Now, logger).Handler())
+			logger.Info("hacker news session publishing enabled", "endpoint", hackernewssession.Endpoint)
 		}
 
 		// WHOOP's private API enforces MFA, so the credential is a captured

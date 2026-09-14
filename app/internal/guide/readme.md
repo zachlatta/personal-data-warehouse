@@ -47,7 +47,7 @@ sessions (< 10%).
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates | `pdw schema` |
 | The other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
-| A local uploader or credential publisher | `pdw ingest <source>`, `pdw slack\|chatgpt\|whoop publish-session` (topic `ingest`) |
+| A local uploader or credential publisher | `pdw ingest <source>`, `pdw slack\|chatgpt\|whoop\|hn publish-session` (topic `ingest`) |
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
 
 Commands agents invent that do not exist: `pdw query`, `pdw schema_overview`,

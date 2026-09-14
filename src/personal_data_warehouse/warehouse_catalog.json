@@ -271,6 +271,14 @@
       "comment": "Faithful whoop private source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_hacker_news",
+      "layer": "base",
+      "domain": "hacker_news",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful hacker news source data: Zach's items and lists plus the full discussion under every story he touched; not a mirror of HN."
+    },
+    {
       "name": "derived_documents",
       "layer": "derived",
       "domain": "documents",
@@ -3035,6 +3043,63 @@
       "domain": "private",
       "schema": "private",
       "name": "whoop_private_sessions",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "hacker_news_items",
+      "kind": "table",
+      "layer": "base",
+      "domain": "hacker_news",
+      "schema": "base_hacker_news",
+      "name": "items",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for Hacker News. One row per archived item keyed by item_id; account is the HN username; root_story_id groups a discussion; body_text is the decoded body. user_items says why an item is here."
+    },
+    {
+      "id": "hacker_news_user_items",
+      "kind": "table",
+      "layer": "base",
+      "domain": "hacker_news",
+      "schema": "base_hacker_news",
+      "name": "user_items",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Why an item is archived (submitted/favorited/upvoted/hidden); removed_at is 1970 while live."
+    },
+    {
+      "id": "hacker_news_profile",
+      "kind": "table",
+      "layer": "base",
+      "domain": "hacker_news",
+      "schema": "base_hacker_news",
+      "name": "profile",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "hacker_news_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "hacker_news_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "hacker_news_sessions",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "hacker_news_sessions",
       "discoverable": false,
       "query_access": "denied",
       "secret": true

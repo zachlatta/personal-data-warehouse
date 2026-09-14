@@ -103,6 +103,9 @@ COMMANDS
   whoop publish-session      Publish this Mac's app.whoop.com browser session so
                              the private-API WHOOP sync (heart rate, hypnogram,
                              journal) keeps running. See "pdw whoop --help".
+  hn publish-session         Publish this Mac's news.ycombinator.com login so
+                             the Hacker News sync can read your upvoted and
+                             hidden lists. See "pdw hn --help".
   version                    Print the build version.
   update                     Replace this binary with the latest GitHub release.
                                --check  Only report whether an update is available.
@@ -241,6 +244,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	// whoop publish-session is the same shape: a local browser-cookie capture
 	// posted to the app's signed endpoint, with no /api/tools client needed.
+	if cmd == "hn" {
+		return runHackerNews(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
+	}
+	// hn publish-session: same shape as whoop.
 	if cmd == "whoop" {
 		return runWhoop(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}

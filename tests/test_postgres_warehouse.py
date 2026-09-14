@@ -2059,6 +2059,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_google_drive_source_tables()
     warehouse.ensure_whoop_tables()
     warehouse.ensure_whoop_private_tables()
+    warehouse.ensure_hacker_news_tables()
     warehouse.ensure_plaid_tables()
     warehouse.ensure_manual_finance_tables()
     warehouse.ensure_finance_tables()

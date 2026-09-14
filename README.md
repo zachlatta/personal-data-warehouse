@@ -440,6 +440,23 @@ retried in place (bounded by `WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS`, default 120) 
 first backfill can progress without restarting from page one; long/daily limits fail the run for
 operator visibility instead of sleeping a Dagster worker for hours.
 
+## Hacker News Sync
+
+Archives Zach's Hacker News activity — his stories and comments, everything he upvoted,
+favorited or hidden, and the complete comment tree of every one of those stories — into
+`base_hacker_news.items` / `base_hacker_news.user_items` / `base_hacker_news.profile`, with one
+timeline adapter (`hacker_news_item`) and the search scope `hacker_news`. Items come from the
+public Firebase API; the `submitted` list from the user endpoint and `favorites` from the public
+list page; `upvoted` and `hidden` from the login-only pages using a browser cookie published with
+`pdw hn publish-session` (stored in `private.hacker_news_sessions`).
+
+Configure `HACKER_NEWS_ACCOUNT` (the HN username) on the Dagster deployment. Optional:
+`HACKER_NEWS_ENABLED`, `HACKER_NEWS_POLL_INTERVAL_SECONDS` (1800),
+`HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN` (3000), `HACKER_NEWS_MAX_LIST_PAGES_PER_RUN` (40),
+`HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS` (7 days), `HACKER_NEWS_LIVE_WINDOW_DAYS` (3),
+`HACKER_NEWS_REFRESH_MIN_AGE_HOURS` (6). Health: `marts_ops.pipeline_health` row `hacker_news`;
+per-list state in `ops.hacker_news_sync_state`.
+
 ## Google Drive Source Sync
 
 Mirrors your Google Drive *files* (metadata + extracted text) into the warehouse so they

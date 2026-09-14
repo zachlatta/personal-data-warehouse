@@ -1230,6 +1230,7 @@ def test_live_public_schema_holds_no_warehouse_objects() -> None:
 def _seed_health(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
+    wh.ensure_hacker_news_tables()
 
     wh.insert_whoop_cycles(
         [

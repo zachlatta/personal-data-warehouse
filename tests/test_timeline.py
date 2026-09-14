@@ -80,6 +80,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_google_drive_source_tables()
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
+    wh.ensure_hacker_news_tables()
     wh.ensure_plaid_tables()
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
@@ -1078,6 +1079,43 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         # assertions treat as the oldest seeded row.
         (_NOW.date(), _NOW, sync_version),
     )
+    # Hacker News: a story Zach upvoted, his comment under it, a reply to that
+    # comment and a stranger's sibling comment — one row per classification
+    # branch (self / self / direct / cc).
+    wh.insert_hacker_news_items(
+        [
+            {
+                "account": "zachlatta", "item_id": "100", "item_type": "story", "author": "someone",
+                "posted_at": _NOW - timedelta(hours=8), "title": "Show HN: a thing", "url": "https://example.test",
+                "text": "", "body_text": "", "parent_id": "", "root_story_id": "100", "score": 42,
+                "descendants": 3, "is_dead": 0, "is_deleted": 0, "kids_json": ["101", "103"],
+                "raw_json": {"id": 100}, "fetched_at": _NOW, "first_seen_at": _NOW, "synced_at": _NOW,
+            },
+            {
+                "account": "zachlatta", "item_id": "101", "item_type": "comment", "author": "zachlatta",
+                "posted_at": _NOW - timedelta(hours=7), "title": "", "url": "",
+                "text": "<p>nice &amp; useful</p>", "body_text": "nice & useful", "parent_id": "100",
+                "root_story_id": "100", "score": 0, "descendants": 0, "is_dead": 0, "is_deleted": 0,
+                "kids_json": ["102"], "raw_json": {"id": 101}, "fetched_at": _NOW, "first_seen_at": _NOW,
+                "synced_at": _NOW,
+            },
+            {
+                "account": "zachlatta", "item_id": "102", "item_type": "comment", "author": "replier",
+                "posted_at": _NOW - timedelta(hours=6), "title": "", "url": "", "text": "thanks",
+                "body_text": "thanks", "parent_id": "101", "root_story_id": "100", "score": 0,
+                "descendants": 0, "is_dead": 0, "is_deleted": 0, "kids_json": [], "raw_json": {"id": 102},
+                "fetched_at": _NOW, "first_seen_at": _NOW, "synced_at": _NOW,
+            },
+            {
+                "account": "zachlatta", "item_id": "103", "item_type": "comment", "author": "stranger",
+                "posted_at": _NOW - timedelta(hours=5), "title": "", "url": "", "text": "meh",
+                "body_text": "meh", "parent_id": "100", "root_story_id": "100", "score": 0,
+                "descendants": 0, "is_dead": 0, "is_deleted": 0, "kids_json": [], "raw_json": {"id": 103},
+                "fetched_at": _NOW, "first_seen_at": _NOW, "synced_at": _NOW,
+            },
+        ]
+    )
+    wh.upsert_hacker_news_user_items(account="zachlatta", relation="upvoted", item_ids=["100"], now=_NOW)
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -1110,6 +1148,10 @@ EXPECTED_SEEDED_PRIORITIES = {
     "whoop_sleep": "noise",
     "whoop_workout": "self",
     "whoop_private_journal": "self",
+    # Four seeded rows, one per branch, asserted individually in
+    # test_backfill_normalizes_every_source; this dict is built newest-first
+    # and keeps the LAST row per adapter, which is the upvoted story (self).
+    "hacker_news_item": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
@@ -1139,6 +1181,7 @@ EXPECTED_SEEDED_EVENTS = {
     "whoop_sleep": 1,
     "whoop_workout": 1,
     "whoop_private_journal": 1,
+    "hacker_news_item": 4,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -1276,6 +1319,23 @@ def test_backfill_normalizes_every_source(warehouse):
 
     priorities = {row["adapter"]: row["priority"] for row in rows}
     assert priorities == EXPECTED_SEEDED_PRIORITIES
+
+    # Hacker News: one row per classification branch, and the discussion is
+    # one context so timeline.context() returns the thread.
+    hn = {r["source_pk"]["item_id"]: r for r in rows if r["adapter"] == "hacker_news_item"}
+    assert {k: v["priority"] for k, v in hn.items()} == {
+        "100": "self",  # upvoted story by someone else
+        "101": "self",  # Zach's own comment
+        "102": "direct",  # a reply to Zach's comment
+        "103": "cc",  # a stranger's comment elsewhere in the thread
+    }
+    assert {v["context"] for v in hn.values()} == {"100"}
+    assert hn["100"]["title"] == "HN: Show HN: a thing"
+    assert hn["101"]["title"] == "Re: Show HN: a thing"
+    assert hn["101"]["snippet"] == "nice & useful"
+    assert hn["100"]["metadata"]["relations"] == ["upvoted"]
+    assert hn["100"]["source_table"] == "hacker_news_items"
+    assert hn["102"]["actor"] == "replier"
 
     # Second run is a no-op: nothing new, no seq churn. Keyed on the real
     # primary key: event_id alone is only unique within an adapter, and the

@@ -74,6 +74,11 @@ from personal_data_warehouse.schema import (
     PlaidLinkedItem,
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
+    HACKER_NEWS_ITEM_COLUMNS,
+    HACKER_NEWS_PROFILE_COLUMNS,
+    HACKER_NEWS_SESSION_COLUMNS,
+    HACKER_NEWS_SYNC_STATE_COLUMNS,
+    HACKER_NEWS_USER_ITEM_COLUMNS,
     GOOGLE_DRIVE_SYNC_STATE_COLUMNS,
     MEDIA_FINGERPRINT_COLUMNS,
     MESSAGE_COLUMNS,
@@ -330,6 +335,9 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     # public API already puts on the timeline, so re-emitting them would double
     # every health event.
     ("whoop_private", ("whoop_private_journal",), "t.kind"),
+    # Stories and comments share one adapter; the subsource is the item type
+    # (story / comment / job / poll) from metadata.
+    ("hacker_news", ("hacker_news_item",), "COALESCE(t.metadata->>'item_type', t.kind)"),
 )
 # The adapters the broad-search pool scans through the low-volume partial BM25
 # index, derived from the source map so a new source cannot be forgotten.
@@ -938,6 +946,15 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "whoop_private_sync_state": TableSpec(
         WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
         ("account", "collection"),
+    ),
+    # Hacker News. `account` is the HN username.
+    "hacker_news_items": TableSpec(HACKER_NEWS_ITEM_COLUMNS, ("account", "item_id")),
+    "hacker_news_user_items": TableSpec(
+        HACKER_NEWS_USER_ITEM_COLUMNS, ("account", "item_id", "relation")
+    ),
+    "hacker_news_profile": TableSpec(HACKER_NEWS_PROFILE_COLUMNS, ("account", "user_id")),
+    "hacker_news_sync_state": TableSpec(
+        HACKER_NEWS_SYNC_STATE_COLUMNS, ("account", "list_name"), "updated_at"
     ),
     # Owner-managed gateway configuration, encrypted by the Go app.
     "mcp_connections": TableSpec(("name", "payload", "updated_at"), ("name",), "updated_at"),
@@ -1560,6 +1577,38 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     # max(): it refuses to run that over a large unindexed heap, so a table
     # without this index reports no freshness at all rather than reporting it
     # late (pipeline_health.PROBE_SKIPPED_UNINDEXED).
+    # Hacker News. synced_at leads for the freshness probe; the walk
+    # frontier and the refresh pass read by root story and by posting time.
+    IndexSpec(
+        "hacker_news_items_synced_idx",
+        "hacker_news_items",
+        "CREATE INDEX IF NOT EXISTS hacker_news_items_synced_idx ON @hacker_news_items (synced_at)",
+    ),
+    IndexSpec(
+        "hacker_news_items_root_idx",
+        "hacker_news_items",
+        "CREATE INDEX IF NOT EXISTS hacker_news_items_root_idx ON @hacker_news_items (account, root_story_id, posted_at)",
+    ),
+    IndexSpec(
+        "hacker_news_items_posted_idx",
+        "hacker_news_items",
+        "CREATE INDEX IF NOT EXISTS hacker_news_items_posted_idx ON @hacker_news_items (account, posted_at DESC)",
+    ),
+    IndexSpec(
+        "hacker_news_items_author_idx",
+        "hacker_news_items",
+        "CREATE INDEX IF NOT EXISTS hacker_news_items_author_idx ON @hacker_news_items (account, author, posted_at DESC)",
+    ),
+    IndexSpec(
+        "hacker_news_user_items_synced_idx",
+        "hacker_news_user_items",
+        "CREATE INDEX IF NOT EXISTS hacker_news_user_items_synced_idx ON @hacker_news_user_items (synced_at)",
+    ),
+    IndexSpec(
+        "hacker_news_profile_synced_idx",
+        "hacker_news_profile",
+        "CREATE INDEX IF NOT EXISTS hacker_news_profile_synced_idx ON @hacker_news_profile (synced_at)",
+    ),
     IndexSpec(
         "whoop_private_cycles_synced_idx",
         "whoop_private_cycles",
@@ -2002,7 +2051,33 @@ POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
 
 
 
+EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _default_python_value(column: str, *, table: str | None = None) -> Any:
+    """The Python-side twin of ``_default_sql``: what an absent field stores."""
+    if _is_jsonb_column(table, column):
+        return [] if column in JSONB_ARRAY_COLUMNS_BY_TABLE.get(table or "", set()) else {}
+    if column in ARRAY_COLUMNS:
+        return []
+    if _is_text_column(table, column):
+        return ""
+    if _is_numeric_column(table, column) or column in FLOAT_COLUMNS or column in INTEGER_COLUMNS:
+        return 0
+    if column in DATE_COLUMNS:
+        return date(1970, 1, 1)
+    if column in TIMESTAMP_COLUMNS:
+        return EPOCH_UTC
+    return ""
+
+
+HACKER_NEWS_SESSION_REJECTED_ERROR = (
+    "Hacker News answered a login page for the stored session; run "
+    "`pdw hn publish-session` on the Mac signed in to news.ycombinator.com."
+)
+
 POSTGRES_INSERT_PAGE_SIZES = {
+    "hacker_news_items": 500,
     "apple_notes": 50,
     "apple_note_revisions": 50,
     "apple_note_attachments": 250,
@@ -2094,6 +2169,8 @@ JSONB_COLUMNS_BY_TABLE = {
     "whoop_private_sleep_events": {"raw_json"},
     "whoop_private_heart_rate_samples": {"raw_json"},
     "whoop_private_journal_entries": {"raw_json"},
+    "hacker_news_items": {"raw_json", "kids_json"},
+    "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
     # a typed column over a UI payload goes quietly null when WHOOP restyles.
@@ -2120,6 +2197,7 @@ JSONB_COLUMNS_BY_TABLE = {
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
+    "hacker_news_items": {"kids_json"},
     "contact_cards": {
         "emails",
         "phones",
@@ -2228,6 +2306,11 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # hacker_news
+    "fetched_at",
+    "discovered_at",
+    "removed_at",
+    "full_walk_completed_at",
     "newest_session_at",
     "ran_at",
     "amcheck_at",
@@ -2336,6 +2419,13 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # hacker_news
+    "descendants",
+    "is_dead",
+    "karma",
+    "submitted_count",
+    "pages_seen",
+    "items_seen",
     "recordings_seen",
     "probe_queries",
     "latency_p50_ms",
@@ -2682,6 +2772,13 @@ _WHOOP_PRIVATE_TABLES = (
     "whoop_private_documents",
     "whoop_private_sync_state",
     "whoop_private_sessions",
+)
+
+_HACKER_NEWS_TABLES = (
+    "hacker_news_items",
+    "hacker_news_user_items",
+    "hacker_news_profile",
+    "hacker_news_sync_state",
 )
 
 _WHATSAPP_TABLES = (
@@ -8644,6 +8741,407 @@ class PostgresWarehouse:
                 )
             ],
             WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
+        )
+
+
+    # --- Hacker News -------------------------------------------------------
+
+    def ensure_hacker_news_tables(self) -> None:
+        """Provision the Hacker News source: items, why-rows, profile, state, session."""
+        self._ensure_table_group(list(_HACKER_NEWS_TABLES))
+        self.ensure_hacker_news_session_table()
+
+    def ensure_hacker_news_session_table(self) -> None:
+        """Server-side store for the news.ycombinator.com ``user`` cookie.
+
+        ``pdw hn publish-session`` captures it from a browser and POSTs it to
+        the app, which upserts it here (app/internal/hackernewssession); the
+        Dagster poller reads it to fetch the login-only lists (upvoted,
+        hidden). Same shape as ``chatgpt_sessions``: raw DDL because
+        ``expired_at`` is genuinely nullable -- NULL means "never rejected",
+        which the epoch sentinel cannot say without a second column.
+        """
+        self._command(
+            """
+            CREATE TABLE IF NOT EXISTS @hacker_news_sessions (
+                account text NOT NULL,
+                session_key text NOT NULL DEFAULT 'default',
+                session_token text NOT NULL DEFAULT '',
+                source_browser text NOT NULL DEFAULT '',
+                token_sha256 text NOT NULL DEFAULT '',
+                published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                sync_version bigint NOT NULL DEFAULT 1,
+                expired_at timestamptz,
+                expired_token_sha256 text NOT NULL DEFAULT '',
+                status text NOT NULL DEFAULT 'ok',
+                error text NOT NULL DEFAULT '',
+                PRIMARY KEY (account, session_key)
+            )
+            """
+        )
+        self._apply_catalog_grant("hacker_news_sessions")
+
+    def get_hacker_news_session(self, *, account: str, session_key: str = "default") -> dict[str, Any] | None:
+        self.ensure_hacker_news_session_table()
+        rows = self._query_dicts(
+            f"SELECT {', '.join(_identifier(c) for c in HACKER_NEWS_SESSION_COLUMNS)} "
+            "FROM @hacker_news_sessions WHERE account = %s AND session_key = %s",
+            (account, session_key),
+        )
+        return rows[0] if rows else None
+
+    def upsert_hacker_news_session(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        session_token: str,
+        source_browser: str = "",
+        published_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """The Python twin of the app's publish upsert (tests and in-process publishers).
+
+        A publish is a human repair action, so it always wins and clears any
+        action_required state, exactly as the Go store does.
+        """
+        self.ensure_hacker_news_session_table()
+        now = updated_at or datetime.now(tz=UTC)
+        published = published_at or now
+        token_sha256 = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        self._command(
+            """
+            INSERT INTO @hacker_news_sessions (
+                account, session_key, session_token, source_browser, token_sha256,
+                published_at, updated_at, sync_version, status, error
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ok', '')
+            ON CONFLICT (account, session_key) DO UPDATE SET
+                session_token = EXCLUDED.session_token,
+                source_browser = EXCLUDED.source_browser,
+                token_sha256 = EXCLUDED.token_sha256,
+                published_at = EXCLUDED.published_at,
+                updated_at = EXCLUDED.updated_at,
+                sync_version = EXCLUDED.sync_version,
+                status = 'ok',
+                error = ''
+            """,
+            (
+                account,
+                session_key,
+                session_token,
+                source_browser,
+                token_sha256,
+                published,
+                now,
+                int(now.astimezone(UTC).timestamp() * 1_000_000),
+            ),
+        )
+        return {"account": account, "session_key": session_key, "token_sha256": token_sha256}
+
+    def mark_hacker_news_session_expired(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        token_sha256: str,
+        when: datetime | None = None,
+    ) -> None:
+        """Record that HN answered a login page for this exact token.
+
+        Guarded on ``token_sha256`` so a concurrent re-publish (which rotates
+        the hash) is never clobbered by a poll that started on the old cookie.
+        """
+        if not token_sha256:
+            return
+        self.ensure_hacker_news_session_table()
+        when = when or datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE @hacker_news_sessions
+            SET expired_at = %s,
+                expired_token_sha256 = %s,
+                status = 'action_required',
+                error = %s,
+                updated_at = %s
+            WHERE account = %s AND session_key = %s AND token_sha256 = %s
+            """,
+            (
+                when,
+                token_sha256,
+                HACKER_NEWS_SESSION_REJECTED_ERROR,
+                when,
+                account,
+                session_key,
+                token_sha256,
+            ),
+        )
+
+    def record_hacker_news_session_success(
+        self, *, account: str, session_key: str, token_sha256: str, now: datetime | None = None
+    ) -> None:
+        if not token_sha256:
+            return
+        self.ensure_hacker_news_session_table()
+        now = now or datetime.now(tz=UTC)
+        self._command(
+            """
+            UPDATE @hacker_news_sessions
+            SET expired_at = NULL, expired_token_sha256 = '', status = 'ok', error = '', updated_at = %s
+            WHERE account = %s AND session_key = %s AND token_sha256 = %s
+            """,
+            (now, account, session_key, token_sha256),
+        )
+
+    def insert_hacker_news_items(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert items by (account, item_id).
+
+        A refresh carries a fresh ``first_seen_at`` it cannot know; the upsert
+        keeps the stored one (it is the landing stamp the timeline reads for
+        latency), while every other column takes the newer read.
+        """
+        if not rows:
+            return
+        columns = HACKER_NEWS_ITEM_COLUMNS
+        values = [
+            tuple(
+                _normalize_insert_value(
+                    row.get(column, _default_python_value(column, table="hacker_news_items")),
+                    table="hacker_news_items",
+                    column=column,
+                )
+                for column in columns
+            )
+            for row in rows
+        ]
+        column_sql = ", ".join(_identifier(column) for column in columns)
+        updates = ", ".join(
+            f"{_identifier(c)} = EXCLUDED.{_identifier(c)}"
+            for c in columns
+            if c not in {"account", "item_id", "first_seen_at"}
+        )
+        sql = f"""
+            INSERT INTO @hacker_news_items ({column_sql})
+            VALUES %s
+            ON CONFLICT (account, item_id) DO UPDATE SET
+                {updates},
+                first_seen_at = LEAST(@hacker_news_items.first_seen_at, EXCLUDED.first_seen_at)
+        """
+        # LEAST() is wrong when the stored value is the epoch sentinel, which
+        # a row never legitimately carries here (every insert stamps it), so
+        # the sentinel is treated as absent.
+        sql = sql.replace(
+            "LEAST(@hacker_news_items.first_seen_at, EXCLUDED.first_seen_at)",
+            "CASE WHEN @hacker_news_items.first_seen_at <= '1970-01-01 00:00:00+00'::timestamptz "
+            "THEN EXCLUDED.first_seen_at ELSE LEAST(@hacker_news_items.first_seen_at, EXCLUDED.first_seen_at) END",
+        )
+        template = "(" + ", ".join(["%s"] * len(columns)) + ")"
+        with self._connection.cursor() as cursor:
+            execute_values(
+                cursor,
+                self._expand_relations(sql),
+                values,
+                template=template,
+                page_size=POSTGRES_INSERT_PAGE_SIZES.get("hacker_news_items", 500),
+            )
+
+    def insert_hacker_news_profile(self, row: Mapping[str, Any]) -> None:
+        self._insert_rows("hacker_news_profile", [dict(row)], HACKER_NEWS_PROFILE_COLUMNS)
+
+    def hacker_news_known_item_ids(self, *, account: str, item_ids: Sequence[str]) -> set[str]:
+        ids = [str(i) for i in item_ids]
+        if not ids:
+            return set()
+        rows = self._query(
+            "SELECT item_id FROM @hacker_news_items WHERE account = %s AND item_id = ANY(%s)",
+            (account, ids),
+        )
+        return {str(r[0]) for r in rows}
+
+    def hacker_news_item_roots(self, *, account: str, item_ids: Sequence[str]) -> dict[str, str]:
+        """item_id -> root_story_id for the ids the archive already holds."""
+        ids = [str(i) for i in item_ids]
+        if not ids:
+            return {}
+        rows = self._query(
+            "SELECT item_id, root_story_id FROM @hacker_news_items WHERE account = %s AND item_id = ANY(%s)",
+            (account, ids),
+        )
+        return {str(r[0]): str(r[1]) for r in rows}
+
+    def hacker_news_user_item_ids(self, *, account: str, relation: str, live_only: bool = True) -> set[str]:
+        """Every item id carrying ``relation`` (live ones only by default)."""
+        sql = "SELECT item_id FROM @hacker_news_user_items WHERE account = %s AND relation = %s"
+        if live_only:
+            sql += " AND removed_at <= '1970-01-01 00:00:00+00'::timestamptz"
+        rows = self._query(sql, (account, relation))
+        return {str(r[0]) for r in rows}
+
+    def hacker_news_walk_frontier(self, *, account: str, limit: int) -> list[tuple[str, str]]:
+        """Children the archive knows about but has not fetched.
+
+        Every fetched item carries its ``kids`` list, so "the next things to
+        fetch" is a set difference the table itself answers: no walk state to
+        repair, and a run cut short by its budget resumes by asking again.
+        Returns ``(item_id, root_story_id)`` pairs, newest stories first so a
+        budget-bounded run finishes recent discussions before old ones.
+        """
+        rows = self._query(
+            """
+            SELECT DISTINCT ON (kid.id) kid.id, p.root_story_id, p.posted_at
+            FROM @hacker_news_items p
+            CROSS JOIN LATERAL jsonb_array_elements_text(p.kids_json) AS kid(id)
+            WHERE p.account = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM @hacker_news_items c
+                  WHERE c.account = p.account AND c.item_id = kid.id
+              )
+            ORDER BY kid.id, p.posted_at DESC
+            LIMIT %s
+            """,
+            (account, int(limit)),
+        )
+        ordered = sorted(rows, key=lambda r: (r[2], r[0]), reverse=True)
+        return [(str(r[0]), str(r[1])) for r in ordered]
+
+    def hacker_news_items_due_for_refresh(
+        self,
+        *,
+        account: str,
+        now: datetime,
+        live_window: timedelta,
+        min_age: timedelta,
+        limit: int,
+    ) -> list[str]:
+        """Items in still-live discussions whose last read is older than ``min_age``.
+
+        A story's score and comment count move for a day or two and then
+        settle, and a comment's ``kids`` list is the only way to learn about
+        a reply, so every item of a story posted within ``live_window`` is
+        re-read on that cadence. Older threads are settled and left alone.
+        """
+        rows = self._query(
+            """
+            SELECT i.item_id
+            FROM @hacker_news_items i
+            JOIN @hacker_news_items s
+              ON s.account = i.account AND s.item_id = i.root_story_id
+            WHERE i.account = %s
+              AND s.posted_at >= %s
+              AND i.fetched_at <= %s
+            ORDER BY i.fetched_at ASC
+            LIMIT %s
+            """,
+            (account, now - live_window, now - min_age, int(limit)),
+        )
+        return [str(r[0]) for r in rows]
+
+    def upsert_hacker_news_user_items(
+        self, *, account: str, relation: str, item_ids: Sequence[str], now: datetime
+    ) -> None:
+        """Record that these items carry ``relation`` for the account, reviving retired rows."""
+        ids = [str(i) for i in item_ids]
+        if not ids:
+            return
+        version = int(now.astimezone(UTC).timestamp() * 1_000_000)
+        with self._connection.cursor() as cursor:
+            execute_values(
+                cursor,
+                self._expand_relations(
+                    """
+                    INSERT INTO @hacker_news_user_items
+                        (account, item_id, relation, discovered_at, removed_at, synced_at, sync_version)
+                    VALUES %s
+                    ON CONFLICT (account, item_id, relation) DO UPDATE SET
+                        removed_at = '1970-01-01 00:00:00+00'::timestamptz,
+                        synced_at = EXCLUDED.synced_at,
+                        sync_version = EXCLUDED.sync_version
+                    """
+                ),
+                [(account, i, relation, now, EPOCH_UTC, now, version) for i in ids],
+                template="(%s, %s, %s, %s, %s, %s, %s)",
+            )
+
+    def retire_hacker_news_user_items(
+        self, *, account: str, relation: str, live_item_ids: Sequence[str], now: datetime
+    ) -> int:
+        """After a FULL walk of a list, stamp removed_at on rows the list no longer names."""
+        ids = [str(i) for i in live_item_ids]
+        version = int(now.astimezone(UTC).timestamp() * 1_000_000)
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                self._expand_relations(
+                    """
+                    UPDATE @hacker_news_user_items
+                    SET removed_at = %s, synced_at = %s, sync_version = %s
+                    WHERE account = %s AND relation = %s
+                      AND removed_at <= '1970-01-01 00:00:00+00'::timestamptz
+                      AND NOT (item_id = ANY(%s))
+                    """
+                ),
+                (now, now, version, account, relation, ids),
+            )
+            return int(cursor.rowcount or 0)
+
+    def load_hacker_news_sync_state(self, *, account: str) -> dict[str, dict[str, Any]]:
+        columns = HACKER_NEWS_SYNC_STATE_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(c) for c in columns)} FROM @hacker_news_sync_state WHERE account = %s",
+            (account,),
+        )
+        return {str(row[1]): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def record_hacker_news_sync_state(
+        self,
+        *,
+        account: str,
+        list_name: str,
+        status: str,
+        error: str,
+        now: datetime,
+        success: bool,
+        full_walk_completed_at: datetime | None = None,
+        pages_seen: int | None = None,
+        items_seen: int | None = None,
+        credential_sha256: str = "",
+    ) -> None:
+        """One upserted row per list: a failure keeps the last success time and
+        the last full-walk time, a success re-stamps them."""
+        version = int(now.astimezone(UTC).timestamp() * 1_000_000)
+        self._command(
+            """
+            INSERT INTO @hacker_news_sync_state
+                (account, list_name, status, error, last_success_at, full_walk_completed_at,
+                 pages_seen, items_seen, credential_sha256, updated_at, sync_version)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (account, list_name) DO UPDATE SET
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                last_success_at = GREATEST(@hacker_news_sync_state.last_success_at, EXCLUDED.last_success_at),
+                full_walk_completed_at = GREATEST(
+                    @hacker_news_sync_state.full_walk_completed_at, EXCLUDED.full_walk_completed_at),
+                pages_seen = COALESCE(%s, @hacker_news_sync_state.pages_seen),
+                items_seen = COALESCE(%s, @hacker_news_sync_state.items_seen),
+                credential_sha256 = EXCLUDED.credential_sha256,
+                updated_at = EXCLUDED.updated_at,
+                sync_version = EXCLUDED.sync_version
+            """,
+            (
+                account,
+                list_name,
+                status,
+                error,
+                now if success else EPOCH_UTC,
+                full_walk_completed_at or EPOCH_UTC,
+                int(pages_seen or 0),
+                int(items_seen or 0),
+                credential_sha256,
+                now,
+                version,
+                pages_seen,
+                items_seen,
+            ),
         )
 
     def load_slack_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:

@@ -73,6 +73,15 @@ DEFAULT_CHATGPT_PAGE_SIZE = 28
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
 DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_CHATGPT_CLIENT_ENABLED = True
+DEFAULT_HACKER_NEWS_API_BASE_URL = "https://hacker-news.firebaseio.com/v0"
+DEFAULT_HACKER_NEWS_SITE_BASE_URL = "https://news.ycombinator.com"
+DEFAULT_HACKER_NEWS_POLL_INTERVAL_SECONDS = 1800
+DEFAULT_HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN = 3000
+DEFAULT_HACKER_NEWS_MAX_LIST_PAGES_PER_RUN = 40
+DEFAULT_HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS = 7 * 24 * 3600
+DEFAULT_HACKER_NEWS_LIVE_WINDOW_DAYS = 3
+DEFAULT_HACKER_NEWS_REFRESH_MIN_AGE_HOURS = 6
+DEFAULT_HACKER_NEWS_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_WHOOP_BASE_URL = "https://api.prod.whoop.com/developer"
 DEFAULT_WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 DEFAULT_WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
@@ -416,6 +425,29 @@ class WhoopConfig:
 
 
 @dataclass(frozen=True)
+class HackerNewsConfig:
+    """The Hacker News source: public API items plus the account's lists.
+
+    ``account`` is the HN USERNAME (it keys every row and the self/direct
+    tiers), not an email. The login-only lists read the cookie published by
+    ``pdw hn publish-session`` into ``private.hacker_news_sessions``.
+    """
+
+    account: str
+    session_key: str = "default"
+    api_base_url: str = DEFAULT_HACKER_NEWS_API_BASE_URL
+    site_base_url: str = DEFAULT_HACKER_NEWS_SITE_BASE_URL
+    poll_interval_seconds: int = DEFAULT_HACKER_NEWS_POLL_INTERVAL_SECONDS
+    max_item_fetches_per_run: int = DEFAULT_HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN
+    max_list_pages_per_run: int = DEFAULT_HACKER_NEWS_MAX_LIST_PAGES_PER_RUN
+    full_walk_interval_seconds: int = DEFAULT_HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS
+    live_window_days: int = DEFAULT_HACKER_NEWS_LIVE_WINDOW_DAYS
+    refresh_min_age_hours: int = DEFAULT_HACKER_NEWS_REFRESH_MIN_AGE_HOURS
+    request_timeout_seconds: int = DEFAULT_HACKER_NEWS_REQUEST_TIMEOUT_SECONDS
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class WhoopPrivateConfig:
     """The WHOOP private (app) API sync.
 
@@ -556,6 +588,7 @@ class Settings:
     alice_voice_recordings: AliceVoiceRecordingsConfig | None = None
     whoop: WhoopConfig | None = None
     whoop_private: WhoopPrivateConfig | None = None
+    hacker_news: HackerNewsConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
@@ -667,6 +700,7 @@ def load_settings(
     require_whoop: bool = False,
     require_whoop_client_secrets: bool = False,
     require_whoop_private: bool = False,
+    require_hacker_news: bool = False,
     require_google_drive_source: bool = False,
     require_plaid: bool = False,
     require_assemblyai: bool = False,
@@ -1546,6 +1580,49 @@ def load_settings(
     # The private (app) API rides on the same account label as the public one
     # and needs no client credentials at all: its credential is the published
     # browser session. It is therefore configured whenever WHOOP is.
+    hacker_news_account = (os.getenv("HACKER_NEWS_ACCOUNT") or "").strip()
+    hacker_news: HackerNewsConfig | None = None
+    if require_hacker_news or hacker_news_account or os.getenv("HACKER_NEWS_ENABLED"):
+        if not hacker_news_account:
+            raise ValueError("HACKER_NEWS_ACCOUNT (the HN username) must be set for Hacker News sync")
+        hn_ints = {
+            "poll_interval_seconds": (
+                "HACKER_NEWS_POLL_INTERVAL_SECONDS", DEFAULT_HACKER_NEWS_POLL_INTERVAL_SECONDS, 60
+            ),
+            "max_item_fetches_per_run": (
+                "HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN", DEFAULT_HACKER_NEWS_MAX_ITEM_FETCHES_PER_RUN, 1
+            ),
+            "max_list_pages_per_run": (
+                "HACKER_NEWS_MAX_LIST_PAGES_PER_RUN", DEFAULT_HACKER_NEWS_MAX_LIST_PAGES_PER_RUN, 1
+            ),
+            "full_walk_interval_seconds": (
+                "HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS", DEFAULT_HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS, 3600
+            ),
+            "live_window_days": ("HACKER_NEWS_LIVE_WINDOW_DAYS", DEFAULT_HACKER_NEWS_LIVE_WINDOW_DAYS, 0),
+            "refresh_min_age_hours": (
+                "HACKER_NEWS_REFRESH_MIN_AGE_HOURS", DEFAULT_HACKER_NEWS_REFRESH_MIN_AGE_HOURS, 1
+            ),
+            "request_timeout_seconds": (
+                "HACKER_NEWS_REQUEST_TIMEOUT_SECONDS", DEFAULT_HACKER_NEWS_REQUEST_TIMEOUT_SECONDS, 1
+            ),
+        }
+        hn_values: dict[str, int] = {}
+        for field_name, (env_name, default, minimum) in hn_ints.items():
+            value = int(os.getenv(env_name, str(default)))
+            if value < minimum:
+                raise ValueError(f"{env_name} must be at least {minimum}")
+            hn_values[field_name] = value
+        hacker_news = HackerNewsConfig(
+            account=hacker_news_account,
+            session_key=os.getenv("HACKER_NEWS_SESSION_KEY", "default").strip() or "default",
+            api_base_url=os.getenv("HACKER_NEWS_API_BASE_URL", DEFAULT_HACKER_NEWS_API_BASE_URL).strip()
+            or DEFAULT_HACKER_NEWS_API_BASE_URL,
+            site_base_url=os.getenv("HACKER_NEWS_SITE_BASE_URL", DEFAULT_HACKER_NEWS_SITE_BASE_URL).strip()
+            or DEFAULT_HACKER_NEWS_SITE_BASE_URL,
+            enabled=os.getenv("HACKER_NEWS_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+            **hn_values,
+        )
+
     whoop_private_account = (
         os.getenv("WHOOP_PRIVATE_ACCOUNT") or whoop_account or default_voice_memos_account
     ).strip()
@@ -1945,6 +2022,7 @@ def load_settings(
         alice_voice_recordings=alice_voice_recordings,
         whoop=whoop,
         whoop_private=whoop_private,
+        hacker_news=hacker_news,
         google_drive_source=google_drive_source,
         plaid=plaid,
         assemblyai=assemblyai,

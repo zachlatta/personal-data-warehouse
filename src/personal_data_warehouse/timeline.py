@@ -2049,6 +2049,65 @@ _WHOOP_PRIVATE_JOURNAL = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+_HACKER_NEWS_ITEM = _simple_adapter(
+    name="hacker_news_item",
+    source_table="hacker_news_items",
+    source="hacker_news",
+    kind="hn_item",
+    # The root story rides along so a comment can be titled by the discussion
+    # it belongs to; `account` is the HN username, which is what makes the
+    # self/direct decision below a plain column comparison.
+    from_sql=(
+        "@hacker_news_items t "
+        "LEFT JOIN @hacker_news_items r "
+        "ON r.account = t.account AND r.item_id = t.root_story_id"
+    ),
+    event_id="concat_ws('|', t.account, t.item_id)",
+    event_ts=_real_ts("t.posted_at", "t.first_seen_at", "t.synced_at"),
+    ingest_ts="t.synced_at",
+    actor="t.author",
+    title=(
+        "CASE WHEN t.item_type = 'comment' "
+        "THEN concat('Re: ', COALESCE(NULLIF(r.title, ''), 'HN discussion')) "
+        "ELSE concat('HN: ', COALESCE(NULLIF(t.title, ''), t.item_type)) END"
+    ),
+    snippet=_snippet("CASE WHEN t.body_text <> '' THEN t.body_text ELSE t.url END"),
+    # The whole discussion is one conversation: keying context by the root
+    # story makes the generic (source, context) walk return the thread.
+    context="t.root_story_id",
+    source_pk="jsonb_build_object('account', t.account, 'item_id', t.item_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'item_type', t.item_type, "
+        "'score', t.score, "
+        "'descendants', t.descendants, "
+        "'url', t.url, "
+        "'parent_id', t.parent_id, "
+        "'root_story_id', t.root_story_id, "
+        "'is_dead', t.is_dead <> 0, "
+        "'is_deleted', t.is_deleted <> 0, "
+        "'relations', COALESCE((SELECT array_agg(u.relation ORDER BY u.relation) "
+        "FROM @hacker_news_user_items u WHERE u.account = t.account AND u.item_id = t.item_id "
+        f"AND u.removed_at <= {_EPOCH}), ARRAY[]::text[]))"
+    ),
+    search_text=_search_concat("t.title", "t.body_text", "t.url", "t.author"),
+    # self: Zach wrote it, or acted on it (upvote, favorite, hide -- an action
+    # he took, the same rule that keeps a card purchase at self). direct: a
+    # reply to one of his items, which is a real person answering him. cc:
+    # everything else in a discussion he is part of.
+    priority=(
+        "CASE "
+        "WHEN t.author = t.account THEN 'self' "
+        "WHEN EXISTS (SELECT 1 FROM @hacker_news_user_items u "
+        "WHERE u.account = t.account AND u.item_id = t.item_id "
+        f"AND u.removed_at <= {_EPOCH}) THEN 'self' "
+        "WHEN EXISTS (SELECT 1 FROM @hacker_news_items p "
+        "WHERE p.account = t.account AND p.item_id = t.parent_id "
+        "AND p.author = t.account) THEN 'direct' "
+        "ELSE 'cc' END"
+    ),
+)
+
 _MUTATION = _simple_adapter(
     name="mutation",
     source_table="upstream_mutations",
@@ -2602,6 +2661,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_SLEEP,
     _WHOOP_WORKOUT,
     _WHOOP_PRIVATE_JOURNAL,
+    _HACKER_NEWS_ITEM,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
@@ -2820,6 +2880,7 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "whoop_sleep",
         "whoop_workout",
         "whoop_private_journal",
+        "hacker_news_item",
         "finance_transaction",
         "finance_observation",
         "manual_finance_document",
@@ -3148,6 +3209,14 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # base_whoop adapters, and emitting them a second time would double every
     # health event Zach has. Only the journal — which the public API does not
     # expose at all — is an events table here.
+    # Hacker News: one events table; the why-rows and profile hang off it.
+    "hacker_news_items": _events(),
+    "hacker_news_user_items": _detail(
+        "hacker_news_items", "why an item is archived (submitted / favorited / upvoted / hidden)"
+    ),
+    "hacker_news_profile": _entity("the HN account's current karma and about text"),
+    "hacker_news_sync_state": _state("per-list Hacker News walk state"),
+    "hacker_news_sessions": _state("published news.ycombinator.com session cookie"),
     "whoop_private_cycles": _detail(
         "whoop_cycles", "high-resolution copy of the public cycle (strain components, sleep need)"
     ),
@@ -3266,6 +3335,7 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "whatsapp_client_sessions",
     "chatgpt_sessions",
     "chatgpt_conversation_sync",
+    "hacker_news_sessions",
     "upstream_mutation_requests",
     "upstream_mutations",
     "upstream_mutation_events",

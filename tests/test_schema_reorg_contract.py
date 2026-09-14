@@ -82,6 +82,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_photos_tables()
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
+    wh.ensure_hacker_news_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
     wh.ensure_finance_tables()
@@ -143,7 +144,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # six-second grain the workout-scoped table held and that table became a
         # second copy of identical readings; the workout view of the one series
         # is marts_health.workout_heart_rate_samples.
-        "base": 61,
+        # +3 base: the hacker_news source (base_hacker_news.items/user_items/
+        # profile), with +1 ops (hacker_news_sync_state) and +1 private
+        # (hacker_news_sessions, the published news.ycombinator.com cookie).
+        "base": 64,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -204,11 +208,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-            "ops": 36,
+            "ops": 37,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
-        "private": 12,  # encrypted MCP connections
+        "private": 13,  # encrypted MCP connections, HN session
         "internal": 3,
     }
 
