@@ -9,14 +9,29 @@ be connected without duplicating their implementation or copying their databases
 Tools are named `<connection>__<upstream_tool>`. The prefix prevents collisions with
 PDW's own tools and with other connected servers.
 {{if .CLI}}
-Use `pdw list`, `pdw describe <tool>`, then `pdw call <tool> --data '<json>'`.
+Use `pdw list` to find a tool, then `pdw describe <tool>` **before the first call**.
+Use the exact argument names and types from that schema, not guesses. Describe every
+unfamiliar tool before launching parallel calls. Invoke with `pdw call <tool> --data '<json>'`.
+For input from a file, use `pdw call <tool> < input.json`; for a pipe, omit `--data`.
+`--data` accepts inline JSON only, not `@file` or `@-`.
+
+The default `--output json` preserves the full result, including `content`,
+`structuredContent`, and `isError`. `--output text` prints text content blocks in order,
+without parsing JSON inside them, and warns when it omits non-text blocks.
+`--output structured` prints only `structuredContent`; it fails clearly if that field is
+absent rather than guessing from text. Formatting happens after execution: do not repeat a write
+just to change output format. Formatting failures preserve the raw result on stderr.
+An upstream `isError: true` exits nonzero and preserves the full error result on stdout
+in JSON mode, or stderr in the projection modes. Read its diagnostic and check
+`pdw describe <tool>` before correcting arguments; do not blindly retry.
 {{else}}
-Use the tool definitions in this MCP connection. Some clients cache definitions; reconnect
-PDW in that client if newly connected tools have not appeared.
+Read the tool's input definition **before the first call**. Use its exact argument names
+and types, and check every unfamiliar definition before launching parallel calls.
+Some clients cache definitions; reconnect PDW in that client if newly connected tools
+have not appeared.
 {{end}}
 The upstream input schema, result content, structured result and error flag are retained.
-The CLI wraps the MCP result in its ordinary data envelope; inspect `content`,
-`structuredContent`, and `isError`. A tool error is not an empty successful result.
+A tool error is not an empty successful result.
 
 **Writes execute with the owner's upstream account.** They do not go through PDW's
 mutation review unless the upstream tool implements its own review. Follow the upstream

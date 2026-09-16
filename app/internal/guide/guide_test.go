@@ -208,3 +208,23 @@ func TestRenderedGuideHasNoTemplateResidue(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectionsGuideTeachesSchemaFirstAndOutput(t *testing.T) {
+	for _, surface := range []Surface{SurfaceCLI, SurfaceMCP} {
+		text := mustRender(t, surface, "connections")
+		for _, want := range []string{"before the first call", "parallel", "not automatically retried"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("%s missing %q", surface, want)
+			}
+		}
+		if surface == SurfaceCLI {
+			for _, want := range []string{"pdw describe <tool>", "--output text", "--output structured", "< input.json", "nonzero", "do not repeat a write"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("CLI missing %q", want)
+				}
+			}
+		} else if strings.Contains(text, "--output") {
+			t.Error("CLI flags leaked into MCP guide")
+		}
+	}
+}

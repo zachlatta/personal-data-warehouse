@@ -47,6 +47,7 @@ COMMANDS
                              as the request body. Without --data, read JSON from
                              stdin. To run SQL, use the "sql" command below, not
                              "call sql" / "call query".
+                               --output FORMAT  json (default), text, or structured.
                                --data JSON   Inline JSON input
                                              (aliases: --args, --input, --json).
   search [flags] QUERY...    Hybrid search across every synced source. This is
@@ -817,6 +818,7 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	fs := flag.NewFlagSet("call", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	data := fs.String("data", "", "inline JSON request body")
+	output := fs.String("output", "json", "json, text, or structured")
 	// Accept the flag names agents commonly reach for as aliases instead of
 	// failing hard at parse time.
 	dataArgs := fs.String("args", "", "alias for --data")
@@ -839,7 +841,16 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return 2
 	}
 
-	input, err := loadCallInput(firstNonEmpty(*data, *dataArgs, *dataInput, *dataJSON), stdin)
+	if *output != "json" && *output != "text" && *output != "structured" {
+		fmt.Fprintln(stderr, "pdw call: --output must be json, text, or structured")
+		return 2
+	}
+	inline := firstNonEmpty(*data, *dataArgs, *dataInput, *dataJSON)
+	if strings.HasPrefix(strings.TrimSpace(inline), "@") {
+		fmt.Fprintf(stderr, "pdw call: --data accepts inline JSON, not @file or @-. Read JSON from stdin instead: pdw call %s < input.json (or pipe JSON to pdw call %s without --data)\n", name, name)
+		return 2
+	}
+	input, err := loadCallInput(inline, stdin)
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
@@ -855,9 +866,27 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 				}
 			}
 			fmt.Fprintf(stderr, "pdw call: %s (http %d): %s\n", apiErr.Code, apiErr.Status, apiErr.Message)
+			if apiErr.Code == "invalid_input" {
+				fmt.Fprintf(stderr, "Check the exact input schema with: pdw describe %s\n", name)
+			}
 			return 1
 		}
 		fmt.Fprintln(stderr, "pdw call:", err)
+		return 1
+	}
+	var result struct {
+		IsError bool `json:"isError"`
+	}
+	_ = json.Unmarshal(out, &result)
+	if result.IsError {
+		// Keep the complete error envelope even when a projection was requested.
+		// Upstream errors can carry non-text content and structured diagnostics.
+		destination := stderr
+		if *output == "json" {
+			destination = stdout
+		}
+		printCallJSON(destination, out)
+		fmt.Fprintf(stderr, "pdw call: upstream tool reported isError=true. For argument errors, check the exact input schema with: pdw describe %s\n", name)
 		return 1
 	}
 	// The HTTP tool API returns domain-level errors as 200 with data so it can
@@ -869,13 +898,59 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "pdw call:", message)
 		return 1
 	}
-	pretty, perr := prettyJSON(out)
-	if perr != nil {
-		fmt.Fprintln(stdout, string(out))
-		return 0
+	if err := renderCallOutput(out, *output, stdout, stderr); err != nil {
+		fmt.Fprintf(stderr, "pdw call: %s. The upstream call already executed; do not repeat a write just to change output format. Raw result follows:\n", err)
+		printCallJSON(stderr, out)
+		return 1
 	}
-	fmt.Fprintln(stdout, pretty)
 	return 0
+}
+
+func printCallJSON(w io.Writer, raw json.RawMessage) {
+	pretty, err := prettyJSON(raw)
+	if err != nil {
+		pretty = string(raw)
+	}
+	fmt.Fprintln(w, pretty)
+}
+
+func renderCallOutput(raw json.RawMessage, format string, stdout, stderr io.Writer) error {
+	if format == "json" {
+		printCallJSON(stdout, raw)
+		return nil
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("--output %s requires an MCP result object", format)
+	}
+	if format == "structured" {
+		value, ok := result["structuredContent"]
+		if !ok || string(value) == "null" {
+			return fmt.Errorf("result has no structuredContent; use --output json")
+		}
+		printCallJSON(stdout, value)
+		return nil
+	}
+	var content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	value, ok := result["content"]
+	if !ok || string(value) == "null" || json.Unmarshal(value, &content) != nil {
+		return fmt.Errorf("result has no valid MCP content array; use --output json")
+	}
+	skipped := 0
+	for _, block := range content {
+		if block.Type == "text" {
+			fmt.Fprintln(stdout, block.Text)
+		} else {
+			skipped++
+		}
+	}
+	if skipped > 0 {
+		fmt.Fprintf(stderr, "pdw call: --output text omitted %d non-text content block(s); use --output json to retain all content. Do not repeat a write just to change output format.\n", skipped)
+	}
+	return nil
 }
 
 func topLevelToolError(raw json.RawMessage) string {
