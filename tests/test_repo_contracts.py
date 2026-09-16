@@ -807,3 +807,18 @@ def test_sql_sentence_detector_uses_the_same_function_words_as_the_app() -> None
     block = go.split("var searchSentenceWords = map[string]bool{", 1)[1].split("}", 1)[0]
     go_words = set(re.findall(r'"([a-z]+)": true', block))
     assert go_words == set(postgres_module.SEARCH_SENTENCE_WORDS)
+
+
+def test_only_the_dagster_image_owns_index_definitions() -> None:
+    """The deployment rebuilds drifted indexes; a Mac uploader never does.
+
+    A Mac checkout one deploy behind production rebuilt the low-volume BM25
+    indexes to its older adapter list on every five-minute uploader run, and
+    Dagster rebuilt them back: ~16 exclusive-lock rebuilds an hour, each, for
+    two days. Ownership is an explicit environment flag baked into the Dagster
+    image, so no client-side process can ever claim it by accident.
+    """
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "PDW_INDEX_DEFINITION_OWNER=1" in dockerfile
+    for launchd in (REPO_ROOT / "ops" / "launchd").glob("*.plist"):
+        assert "PDW_INDEX_DEFINITION_OWNER" not in launchd.read_text(encoding="utf-8"), launchd

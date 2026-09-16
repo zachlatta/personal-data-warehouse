@@ -2840,6 +2840,17 @@ class PostgresWarehouse:
         self._connection.autocommit = True
         self._ensured_index_names: set[str] = set()
         self._pg_trgm_ensured = False
+        # Only the deployment may REBUILD an index whose declared definition
+        # moved. Every client that opens the warehouse runs ensure_* too (the
+        # Mac uploaders and resident mutation workers carry the production
+        # URL), and a checkout one deploy behind reads the current index as
+        # drifted: from 2026-09-14 to 09-16 porygon and Dagster rebuilt the two
+        # low-volume BM25 indexes to each other's definition ~16 times an hour,
+        # 30-45s of exclusive lock on timeline.events per rebuild. Creating a
+        # MISSING index stays open to everyone; that path is idempotent.
+        self.owns_index_definitions = os.getenv("PDW_INDEX_DEFINITION_OWNER", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         self._pg_textsearch_ensured = False
         self._pgvector_ensured = False
         self._ensure_canonical_schemas()
@@ -8013,6 +8024,15 @@ class PostgresWarehouse:
             try:
                 if self._index_exists(index.name):
                     if not self._index_definition_drifted(index):
+                        self._ensured_index_names.add(index.name)
+                        continue
+                    if not self.owns_index_definitions:
+                        logger.warning(
+                            "Index %s was built from a different definition than this "
+                            "process declares; leaving it for the deployment "
+                            "(PDW_INDEX_DEFINITION_OWNER) to rebuild",
+                            index.name,
+                        )
                         self._ensured_index_names.add(index.name)
                         continue
                     # Rebuild atomically: DROP and CREATE go to the server as one

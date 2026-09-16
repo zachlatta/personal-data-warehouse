@@ -571,7 +571,16 @@ two-partition pool is taken from them instead. Three things there are easy to ge
   tier alone and the high-volume partition adds `adapter NOT IN (...)` as an ordinary
   filter, because a predicate derived from the adapter registry needs
   `rebuild_on_definition_change`, and that rebuild is a non-concurrent DROP+CREATE — minutes
-  of exclusive lock on the 45 GB timeline heap. The low-volume attention index must carry
+  of exclusive lock on the 45 GB timeline heap.
+  **Only the Dagster image performs that rebuild** (`PDW_INDEX_DEFINITION_OWNER=1`, set in
+  the `Dockerfile`; every other process logs the drift and leaves the index alone). Every
+  client that opens the warehouse runs `ensure_*` — the Mac uploaders and resident mutation
+  workers carry the production URL — and a checkout one deploy behind reads the CURRENT
+  index as drifted: from 2026-09-14 to 09-16 porygon (on the pre-Hacker-News commit) and
+  Dagster rebuilt both low-volume BM25 indexes to each other's definition ~16 times an
+  hour each, 30-45s of exclusive lock on `timeline.events` per rebuild, and every Slack
+  freshness pass sat minutes behind that lock (DM landing p95 ~30 min). `git pull` on the
+  Mac is the immediate repair; the ownership flag is what keeps it from recurring. The low-volume attention index must carry
   the list to be the low-volume partition at all, and at 90k documents it rebuilds in 59s.
 
 **The pair holds `cc` too since 2026-09-10, because the scope the advice recommends has

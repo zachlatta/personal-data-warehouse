@@ -964,3 +964,60 @@ def test_indexes_not_opted_in_are_never_rebuilt(warehouse):
     plain = IndexSpec(name="x_idx", table="whoop_private_sports", sql="CREATE INDEX x_idx ON @whoop_private_sports (name)")
 
     assert warehouse._index_definition_drifted(plain) is False
+
+
+def test_only_the_index_definition_owner_rebuilds_a_drifted_index(warehouse, monkeypatch):
+    """A drifted definition is rebuilt by the deployment, never by a client.
+
+    Every process that opens the warehouse runs ensure_* on the way in — the
+    Dagster steps, but also the Mac uploaders and resident mutation workers
+    that carry the production URL in their .env. A Mac one deploy behind sees
+    the CURRENT index as "drifted" and rebuilds it to its older definition, the
+    next Dagster step rebuilds it back, and the two low-volume BM25 indexes
+    were dropped and recreated ~16 times an hour each for two days (2026-09-14
+    to 09-16), holding an exclusive lock on timeline.events for 30-45s a time.
+    Only the process that owns the definition (PDW_INDEX_DEFINITION_OWNER=1,
+    set in the Dagster image) may rebuild; everyone else leaves the index alone.
+    """
+    from personal_data_warehouse import postgres as postgres_module
+    from personal_data_warehouse.postgres import IndexSpec
+
+    warehouse.ensure_whoop_private_tables()
+    spec = IndexSpec(
+        name="pdw_owner_probe_idx",
+        table="whoop_private_journal_entries",
+        sql="CREATE INDEX IF NOT EXISTS pdw_owner_probe_idx ON @whoop_private_journal_entries (day)",
+        rebuild_on_definition_change=True,
+    )
+    monkeypatch.setattr(postgres_module, "POSTGRES_INDEXES", (spec,))
+    warehouse._command(warehouse._expanded_index_sql(spec))
+    warehouse._command("COMMENT ON INDEX pdw_owner_probe_idx IS 'pdw-index-def:stale'")
+    assert warehouse._index_definition_drifted(spec)
+
+    def comment() -> str:
+        rows = warehouse._query(
+            "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+            "INNER JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = %s AND n.nspname = ANY(%s) AND c.relkind = 'i'",
+            (spec.name, warehouse.physical_schema_names(include_hidden=True)),
+        )
+        return rows[0][0]
+
+    warehouse.owns_index_definitions = False
+    warehouse._ensure_indexes([spec.table])
+    assert comment() == "pdw-index-def:stale", "a non-owner must not rebuild a drifted index"
+    assert spec.name in warehouse._ensured_index_names, "and must not re-check it on every ensure"
+
+    warehouse._ensured_index_names.discard(spec.name)
+    warehouse.owns_index_definitions = True
+    warehouse._ensure_indexes([spec.table])
+    assert comment() == f"pdw-index-def:{warehouse.index_definition_fingerprint(spec)}"
+
+
+def test_index_definition_ownership_comes_from_the_deployment_env(monkeypatch):
+    from personal_data_warehouse.postgres import PostgresWarehouse
+
+    monkeypatch.delenv("PDW_INDEX_DEFINITION_OWNER", raising=False)
+    assert PostgresWarehouse(_postgres_url()).owns_index_definitions is False
+    monkeypatch.setenv("PDW_INDEX_DEFINITION_OWNER", "1")
+    assert PostgresWarehouse(_postgres_url()).owns_index_definitions is True
