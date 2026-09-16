@@ -207,6 +207,8 @@ class SlackSyncRunner:
         thread_missing_replies_only: bool = False,
         max_rate_limit_sleep_seconds: int | None = None,
         max_transient_attempts: int = 8,
+        freshness_window_by_type: Mapping[str, timedelta] | None = None,
+        freshness_limit_by_type: Mapping[str, int] | None = None,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
@@ -253,6 +255,14 @@ class SlackSyncRunner:
         self._max_rate_limit_sleep_seconds = max_rate_limit_sleep_seconds
         self._rate_limit_sleep_seconds = 0
         self._max_transient_attempts = max_transient_attempts
+        # The freshness pass serves every conversation type from ONE runner so
+        # the fixed per-runner cost (ensure_slack_tables, the full sync-state
+        # read, auth.test, the inbox_items refresh) is paid once, not four
+        # times; these maps carry the window and candidate cap each priority
+        # group used to get from its own runner. A type absent from a map falls
+        # back to history_window / conversation_limit.
+        self._freshness_window_by_type = dict(freshness_window_by_type or {})
+        self._freshness_limit_by_type = dict(freshness_limit_by_type or {})
 
     def sync_all(self) -> list[SlackSyncSummary]:
         self._warehouse.ensure_slack_tables()
@@ -753,7 +763,6 @@ class SlackSyncRunner:
         sync_version: int,
         state_by_key: Mapping[tuple[str, str, str, str], Any],
     ) -> SlackSyncSummary:
-        oldest_ts = self._freshness_oldest_ts()
         if self._use_existing_conversations:
             conversations = self._warehouse.load_slack_conversation_payloads(
                 account=account.account,
@@ -832,6 +841,8 @@ class SlackSyncRunner:
         files_written = 0
         conversations_seen = 0
         for group in priority_groups:
+            oldest_ts = self._freshness_oldest_ts(group[0])
+            group_limit = self._freshness_limit_by_type.get(group[0], self._conversation_limit)
             group_conversations = [
                 conversation
                 for conversation in conversations
@@ -844,8 +855,8 @@ class SlackSyncRunner:
                 ),
                 reverse=True,
             )
-            if self._conversation_limit is not None:
-                group_conversations = group_conversations[: self._conversation_limit]
+            if group_limit is not None:
+                group_conversations = group_conversations[:group_limit]
             group_written = 0
             for conversation in group_conversations:
                 if not conversation.get("id"):
@@ -1088,8 +1099,10 @@ class SlackSyncRunner:
             return ""
         return str(state.get("cursor_ts") or "")
 
-    def _freshness_oldest_ts(self) -> float:
-        window = self._history_window or timedelta(minutes=30)
+    def _freshness_oldest_ts(self, conversation_type: str | None = None) -> float:
+        window = (
+            self._freshness_window_by_type.get(conversation_type) if conversation_type else None
+        ) or self._history_window or timedelta(minutes=30)
         return self._now().timestamp() - window.total_seconds()
 
     def _sync_account_thread_replies(

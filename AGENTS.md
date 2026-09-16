@@ -3787,6 +3787,18 @@ landing stamp**: that same 18:13 message read `synced_at = 19:15:16`, the re-fet
 is why the view reads the timeline's `first_seen_at` instead (95ms warm, ~39k buffers,
 bounded by `timeline_events_source_time_idx`).
 
+**The freshness stage is ONE runner over all four conversation types, and that is a
+latency decision.** Until 2026-09-16 it built four `SlackSyncRunner`s, one per type, so
+each type could carry its own history window and candidate cap — and each runner paid the
+same fixed preamble (`ensure_slack_tables`, the full `ops.slack_sync_state` read,
+`auth.test`) plus a `derived_slack.inbox_items` refresh on the way out. Measured that day
+the preamble was ~4 minutes per type (most of it queued behind the index-refresh lock
+described under [Timeline search](#timeline-search-and-hybrid-retrieval)), so a 5-minute
+cron ran 8–23 minutes, skipped every other tick, and DM landing p95 read ~30 minutes
+while every other Slack number was `ok`. The per-type windows and caps survive as
+`freshness_window_by_type` / `freshness_limit_by_type`, applied per priority group inside
+the one pass; `test_slack_freshness_sync_runs_priority_cycle` pins the single runner.
+
 **The tail was a conversation we had never heard of, not a slow fetch.** The freshness
 pass takes its candidates from the *cached* `base_slack.conversations` rows, so an id
 `client.counts` names that has no row is loaded as nothing and silently dropped. Discovery

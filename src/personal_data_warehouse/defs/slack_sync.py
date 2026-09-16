@@ -246,58 +246,64 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
     else:
         logger.info("Slack change feed unusable (%s); polling as before", plan.reason)
 
-    for conversation_types, window_minutes, conversation_limit in [
-        (("im",), _int_env("SLACK_ASSET_DM_WINDOW_MINUTES", 240), _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 500)),
-        (("mpim",), _int_env("SLACK_ASSET_MPIM_WINDOW_MINUTES", 240), _int_env("SLACK_ASSET_MPIM_FRESHNESS_LIMIT", 250)),
-        (
-            ("private_channel",),
-            _int_env("SLACK_ASSET_PRIVATE_WINDOW_MINUTES", 180),
-            _int_env("SLACK_ASSET_PRIVATE_FRESHNESS_LIMIT", 100),
-        ),
-        (
-            ("public_channel",),
-            _int_env("SLACK_ASSET_PUBLIC_WINDOW_MINUTES", 120),
-            _int_env("SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT", 100),
-        ),
-    ]:
-        summaries.extend(
-            SlackSyncRunner(
-                settings=settings,
-                warehouse=warehouse,
-                logger=logger,
-                history_window=timedelta(minutes=window_minutes),
-                sync_users=False,
-                sync_members=False,
-                freshness_priority=True,
-                use_existing_conversations=True,
-                conversation_types=conversation_types,
-                # A change-feed pass is bounded by what actually moved (~51 on a
-                # normal day), so the per-type caps that exist to ration a
-                # blanket poll would only get in the way.
-                conversation_limit=(
-                    _int_env("SLACK_ASSET_CHANGED_LIMIT", 500) if changed_ids is not None else conversation_limit
-                ),
-                conversation_ids=changed_ids,
-                # A conversation the feed names but we have never cached is fetched
-                # with conversations.info there and then, instead of waiting for the
-                # paged discovery walk to reach it -- which cost a new group DM 13.6
-                # hours of landing latency on 2026-08-27.
-                new_conversation_limit=_int_env("SLACK_ASSET_NEW_CONVERSATION_LIMIT", 25),
-                # Stop gracefully when the rate-limit budget is exhausted instead of
-                # failing the run. The history cursor is persisted per conversation as
-                # the pass proceeds, so the next freshness run resumes from there. (This
-                # mirrors coverage and thread syncs, which already pass this flag; the
-                # freshness stage was the only Slack job that hard-failed on a budget hit.)
-                skip_known_errors=True,
-                # Fetch replies inline for thread parents that land in the recent
-                # window so brand-new threads are captured complete on first pass.
-                # Bounded to parents within the freshness window and still capped by
-                # the rate-limit budget below. Coverage (which walks multi-year
-                # history) stays decoupled and leaves old replies to the backfill job.
-                sync_thread_replies=True,
-                max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
-            ).sync_all()
-        )
+    # Per-type windows and candidate caps, applied by the ONE runner below per
+    # priority group. This used to be four runners, one per type, and each paid
+    # the same fixed preamble (ensure_slack_tables, the full sync-state read,
+    # auth.test) plus a derived_slack.inbox_items refresh on the way out --
+    # measured 2026-09-16 at ~4 minutes per type, so the 5-minute cron ran
+    # 8-23 minutes, skipped every other tick, and DM landing p95 sat at ~30
+    # minutes while every other Slack health number read ok.
+    window_by_type = {
+        "im": timedelta(minutes=_int_env("SLACK_ASSET_DM_WINDOW_MINUTES", 240)),
+        "mpim": timedelta(minutes=_int_env("SLACK_ASSET_MPIM_WINDOW_MINUTES", 240)),
+        "private_channel": timedelta(minutes=_int_env("SLACK_ASSET_PRIVATE_WINDOW_MINUTES", 180)),
+        "public_channel": timedelta(minutes=_int_env("SLACK_ASSET_PUBLIC_WINDOW_MINUTES", 120)),
+    }
+    limit_by_type = {
+        "im": _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 500),
+        "mpim": _int_env("SLACK_ASSET_MPIM_FRESHNESS_LIMIT", 250),
+        "private_channel": _int_env("SLACK_ASSET_PRIVATE_FRESHNESS_LIMIT", 100),
+        "public_channel": _int_env("SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT", 100),
+    }
+    if changed_ids is not None:
+        # A change-feed pass is bounded by what actually moved (~51 on a
+        # normal day), so the per-type caps that exist to ration a blanket
+        # poll would only get in the way.
+        changed_limit = _int_env("SLACK_ASSET_CHANGED_LIMIT", 500)
+        limit_by_type = {conversation_type: changed_limit for conversation_type in limit_by_type}
+    summaries.extend(
+        SlackSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=logger,
+            history_window=max(window_by_type.values()),
+            freshness_window_by_type=window_by_type,
+            freshness_limit_by_type=limit_by_type,
+            sync_users=False,
+            sync_members=False,
+            freshness_priority=True,
+            use_existing_conversations=True,
+            conversation_types=("im", "mpim", "private_channel", "public_channel"),
+            conversation_limit=None,
+            conversation_ids=changed_ids,
+            # A conversation the feed names but we have never cached is fetched
+            # with conversations.info there and then, instead of waiting for the
+            # paged discovery walk to reach it -- which cost a new group DM 13.6
+            # hours of landing latency on 2026-08-27.
+            new_conversation_limit=_int_env("SLACK_ASSET_NEW_CONVERSATION_LIMIT", 25),
+            # Stop gracefully when the rate-limit budget is exhausted instead of
+            # failing the run. The history cursor is persisted per conversation as
+            # the pass proceeds, so the next freshness run resumes from there.
+            skip_known_errors=True,
+            # Fetch replies inline for thread parents that land in the recent
+            # window so brand-new threads are captured complete on first pass.
+            # Bounded to parents within the freshness window and still capped by
+            # the rate-limit budget below. Coverage (which walks multi-year
+            # history) stays decoupled and leaves old replies to the backfill job.
+            sync_thread_replies=True,
+            max_rate_limit_sleep_seconds=_rate_limit_budget_seconds(),
+        ).sync_all()
+    )
 
     if _bool_env("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", True):
         summaries.extend(run_slack_read_state_sync(settings=settings, warehouse=warehouse, logger=logger))

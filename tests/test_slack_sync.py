@@ -3635,3 +3635,58 @@ def test_runner_freshness_priority_bounds_how_many_new_conversations_one_pass_di
     ).sync_all()
 
     assert [params["channel"] for method, params in client.calls if method == "conversations.info"] == ["D_1", "D_2"]
+
+
+def test_runner_freshness_applies_window_and_limit_per_conversation_type(monkeypatch):
+    """One runner serves every type, with each type's own window and cap.
+
+    The freshness stage used to build four runners so each type could carry
+    its own history window and candidate limit, and every runner paid the same
+    fixed preamble and inbox refresh. With the maps below one runner keeps the
+    per-type behaviour: an im is fetched inside a 10-minute window, a public
+    channel only inside a 1-minute one, and the im group is capped at one.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "D_OLD", "user": "U0", "is_im": True, "latest": {"ts": "1450.000000"}},
+        {"id": "D_NEW", "user": "U1", "is_im": True, "latest": {"ts": "1500.000000"}},
+        {"id": "C_STALE", "name": "stale", "is_channel": True, "latest": {"ts": "1500.000000"}},
+        {"id": "C_LIVE", "name": "live", "is_channel": True, "latest": {"ts": "1990.000000"}},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1500.000000", "user": "U1", "text": "dm"}], "response_metadata": {}},
+                {"ok": True, "messages": [{"ts": "1990.000000", "user": "U4", "text": "public"}], "response_metadata": {}},
+            ],
+        }
+    )
+
+    summary = SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        freshness_window_by_type={"im": timedelta(minutes=10), "public_channel": timedelta(minutes=1)},
+        freshness_limit_by_type={"im": 1},
+        conversation_types=("im", "public_channel"),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()[0]
+
+    history_calls = [params for method, params in client.calls if method == "conversations.history"]
+    assert [params["channel"] for params in history_calls] == ["D_NEW", "C_LIVE"]
+    assert history_calls[0]["oldest"] == 1400.0
+    assert history_calls[1]["oldest"] == 1940.0
+    assert summary.messages_written == 2

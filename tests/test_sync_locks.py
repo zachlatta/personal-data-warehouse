@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -156,22 +156,35 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
         logger=_NullLogger(),
     )
 
-    assert len(summaries) == 5
-    assert [call["conversation_types"] for call in calls[:4]] == [
-        ("im",),
-        ("mpim",),
-        ("private_channel",),
-        ("public_channel",),
-    ]
-    assert all(call["freshness_priority"] for call in calls[:4])
-    assert all(call["use_existing_conversations"] is True for call in calls[:4])
-    assert [call["conversation_limit"] for call in calls[:4]] == [500, 250, 100, 100]
+    # ONE freshness runner over all four types, not four. Each runner pays a
+    # fixed preamble (ensure_slack_tables, the full sync-state read, auth.test,
+    # and a derived_slack.inbox_items refresh on the way out); measured
+    # 2026-09-16 that was ~4 minutes per type, so a 5-minute cron ran 8-23
+    # minutes and DM landing p95 sat at ~30 minutes. The per-type windows and
+    # limits survive as maps the runner applies per priority group.
+    assert len(summaries) == 2
+    freshness = calls[0]
+    assert freshness["conversation_types"] == ("im", "mpim", "private_channel", "public_channel")
+    assert freshness["freshness_priority"]
+    assert freshness["use_existing_conversations"] is True
+    assert freshness["freshness_window_by_type"] == {
+        "im": timedelta(minutes=240),
+        "mpim": timedelta(minutes=240),
+        "private_channel": timedelta(minutes=180),
+        "public_channel": timedelta(minutes=120),
+    }
+    assert freshness["freshness_limit_by_type"] == {
+        "im": 500,
+        "mpim": 250,
+        "private_channel": 100,
+        "public_channel": 100,
+    }
     assert all(call["sync_users"] is False for call in calls)
     assert all(call["sync_members"] is False for call in calls)
     # Freshness fetches replies inline so brand-new threads are captured complete.
-    assert all(call["sync_thread_replies"] is True for call in calls[:4])
+    assert freshness["sync_thread_replies"] is True
     # A rate-limit budget hit stops the pass gracefully instead of failing the run.
-    assert all(call["skip_known_errors"] is True for call in calls[:4])
+    assert freshness["skip_known_errors"] is True
 
 
 def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
@@ -219,7 +232,7 @@ def test_slack_freshness_sync_piggybacks_read_state(monkeypatch) -> None:
         logger=_NullLogger(),
     )
 
-    assert len(summaries) == 5
+    assert len(summaries) == 2
     assert calls[-1]["sync_conversation_info_only"] is True
     assert calls[-1]["conversation_limit"] == 25
 
@@ -886,8 +899,8 @@ def test_slack_intelligent_sync_keeps_legacy_combined_behavior(monkeypatch) -> N
     )
 
     # freshness (4 types) + read_state + coverage + public sweep.
-    assert len(summaries) == 7
-    assert len(calls) == 7
+    assert len(summaries) == 4
+    assert len(calls) == 4
 
 
 def test_exclusive_process_lock_is_non_blocking(tmp_path) -> None:
