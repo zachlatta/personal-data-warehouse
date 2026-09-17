@@ -125,17 +125,19 @@ gmail_mailbox_sync_job = define_asset_job(
 )
 
 
-# A full mailbox sync takes ~9 minutes, so an every-minute cadence ran it
-# effectively back-to-back and continuously. The skip_if_job_in_progress guard
-# already prevents overlapping runs, but spacing the cron to every 15 minutes
-# guarantees a real idle gap between runs, draining sustained CPU/memory pressure
-# on the host (which was thrashing swap and starving the Dagster gRPC heartbeat).
+# A full mailbox sync takes ~9 minutes, so an every-minute cadence once ran it
+# back-to-back and continuously; the cron was spaced to every 15 minutes to
+# guarantee an idle gap (the host was thrashing swap and starving the Dagster
+# gRPC heartbeat). Incremental history-id runs average ~160s (measured
+# 2026-09-16 over 284 runs), so every five minutes keeps that gap while
+# landing mail in ~3 minutes instead of ~10. The skip_if_job_in_progress guard
+# still prevents a slow full sync from overlapping itself.
 @schedule(
-    cron_schedule="*/15 * * * *",
+    cron_schedule="*/5 * * * *",
     job=gmail_mailbox_sync_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )
-def gmail_mailbox_sync_every_fifteen_minutes(context):
+def gmail_mailbox_sync_every_five_minutes(context):
     return skip_if_job_in_progress(context, job_name="gmail_mailbox_sync_job")
 
 
@@ -144,5 +146,5 @@ def defs() -> Definitions:
     return Definitions(
         assets=[gmail_mailbox_sync],
         jobs=[gmail_mailbox_sync_job],
-        schedules=[gmail_mailbox_sync_every_fifteen_minutes],
+        schedules=[gmail_mailbox_sync_every_five_minutes],
     )

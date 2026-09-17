@@ -22,7 +22,7 @@ from PIL import Image
 import pytest
 from personal_data_warehouse.config import GOOGLE_DRIVE_SCOPE, load_settings
 from personal_data_warehouse.defs.gmail_sync import (
-    gmail_mailbox_sync_every_fifteen_minutes,
+    gmail_mailbox_sync_every_five_minutes,
 )
 from personal_data_warehouse.gmail_auth import update_env_file
 from personal_data_warehouse.gmail_sync import (
@@ -424,9 +424,12 @@ def test_gmail_token_json_from_env_accepts_base64(monkeypatch) -> None:
     assert gmail_token_json_from_env("zach@hackclub.com") == token_json
 
 
-def test_gmail_sync_schedule_runs_every_fifteen_minutes_by_default() -> None:
-    assert gmail_mailbox_sync_every_fifteen_minutes.cron_schedule == "*/15 * * * *"
-    assert gmail_mailbox_sync_every_fifteen_minutes.default_status.value == "RUNNING"
+def test_gmail_sync_schedule_runs_every_five_minutes_by_default() -> None:
+    """Gmail is the second most-read attention source; 15 minutes was a 2026-07
+    host-pressure fix for a ~9-minute full sync, and incremental runs now average
+    ~160s (measured 2026-09-16), so the idle gap survives at every five."""
+    assert gmail_mailbox_sync_every_five_minutes.cron_schedule == "*/5 * * * *"
+    assert gmail_mailbox_sync_every_five_minutes.default_status.value == "RUNNING"
 
 
 def test_google_auth_update_env_file_replaces_and_appends_values(tmp_path) -> None:

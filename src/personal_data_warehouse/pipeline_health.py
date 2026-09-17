@@ -541,10 +541,10 @@ PIPELINES: tuple[Pipeline, ...] = (
     _source(
         "gmail",
         "Gmail",
-        cadence="every 15 min",
+        cadence="every 5 min",
         transport="Dagster gmail_sync → Gmail API (history-id incremental)",
         data=6 * HOUR,
-        run=45 * MINUTE,
+        run=15 * MINUTE,
         state=StateSource(
             table="gmail_sync_state",
             updated_column="updated_at",
