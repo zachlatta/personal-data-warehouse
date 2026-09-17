@@ -647,6 +647,7 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         # the raw sources is the identity/normalization step itself, not an
         # enrichment candidate scan bypassing an existing mart.
         "manual_finance_documents": "derived-ledger builder: authoritative manual source rows",
+        "gmail_messages": "derived-ledger builder: normalize bank alert evidence into provisional flows",
         "plaid_accounts": "derived-ledger builder: normalize provider accounts",
         "plaid_investment_securities": "derived-ledger builder: normalize security identities",
         "plaid_investment_transactions": "derived-ledger builder: normalize investment activity",

@@ -53,6 +53,8 @@ def finance_ledger(context) -> MaterializeResult:
 
     return MaterializeResult(
         metadata={
+            "alerts_withheld": MetadataValue.int(summary.alerts_withheld if summary else 0),
+            "alerts_needing_review": MetadataValue.int(summary.alerts_needing_review if summary else 0),
             "accounts_seen": MetadataValue.int(summary.accounts_seen if summary else 0),
             "accounts_created": MetadataValue.int(summary.accounts_created if summary else 0),
             "links_created": MetadataValue.int(summary.links_created if summary else 0),
@@ -109,9 +111,9 @@ finance_ledger_job = define_asset_job(
 
 
 @schedule(
-    # Shortly after each */30 plaid sync window, so every day gets its balance
-    # observations even if the backlog sensor never fires.
-    cron_schedule="7,37 * * * *",
+    # Pick up email alerts and completed Plaid/statement syncs on the same
+    # path. Gmail polling latency is additional; this is not push delivery.
+    cron_schedule="*/5 * * * *",
     job=finance_ledger_job,
     default_status=DefaultScheduleStatus.RUNNING,
 )

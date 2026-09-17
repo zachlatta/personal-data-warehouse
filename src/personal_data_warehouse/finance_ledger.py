@@ -44,6 +44,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from personal_data_warehouse.capital_one_alerts import reconcile_alerts
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.securities_ledger import (
     SecurityIdentity,
@@ -305,6 +306,8 @@ class FinanceLedgerSummary:
     transactions_merged: int = 0
     transactions_skipped: int = 0
     transactions_removed: int = 0
+    alerts_withheld: int = 0
+    alerts_needing_review: int = 0
     accounts_merged: int = 0
     accounts_pruned: int = 0
     masks_cleared: int = 0
@@ -714,6 +717,8 @@ class FinanceLedgerRunner:
             transactions_merged=transactions["merged"],
             transactions_skipped=transactions["skipped"],
             transactions_removed=transactions["removed"],
+            alerts_withheld=transactions["alerts_withheld"],
+            alerts_needing_review=transactions["alerts_needing_review"],
             accounts_merged=accounts_merged,
             accounts_pruned=accounts_pruned,
             masks_cleared=masks_cleared,
@@ -997,7 +1002,8 @@ class FinanceLedgerRunner:
         # Plaid flows first (they win field precedence and found the pool the
         # fuzzy dedup matches against). Deterministic order so replay
         # reproduces founding ids.
-        plaid_rows = self._load_plaid_transactions()
+        all_plaid_rows = self._load_plaid_transactions()
+        plaid_rows = [row for row in all_plaid_rows if not row["is_removed"]]
         posted_by_pending_id = {
             str(row["pending_transaction_id"]): row
             for row in plaid_rows
@@ -1214,6 +1220,26 @@ class FinanceLedgerRunner:
                     )
                 )
 
+        # Alerts are provisional witnesses, after BOTH authoritative sources
+        # have deduped. Replaying drops their old provisional row as soon as a
+        # unique bank/statement match arrives and retains the Gmail drill-down.
+        alert_emails = self._load_capital_one_alerts()
+        alert_rows, alert_links = reconcile_alerts(
+            alert_emails, self._load_account_index(),
+            list(transaction_rows.values()), now, sync_version,
+            authorizations=self._alert_authorizations(all_plaid_rows, plaid_account_map),
+        )
+        transaction_rows.update({row["transaction_id"]: row for row in alert_rows})
+        link_rows.extend(alert_links)
+        merged += len(alert_links) - len(alert_rows)
+        alerts_withheld = len(alert_emails) - len(alert_links)
+        alerts_needing_review = sum(link["match_method"] in {"needs_review", "expired_unconfirmed"} for link in alert_links)
+        if alerts_withheld or alerts_needing_review:
+            self._logger.warning(
+                "Capital One alerts: %s withheld (template/authentication/account identity); "
+                "%s require reconciliation review", alerts_withheld, alerts_needing_review,
+            )
+
         # The ledger is replayed from all source rows, but a replay is not a
         # new write. Filter against the current derived facts before the
         # upsert so 17k unchanged transactions and 18k resolution links do not
@@ -1252,6 +1278,8 @@ class FinanceLedgerRunner:
             "merged": merged,
             "skipped": skipped,
             "removed": removed,
+            "alerts_withheld": alerts_withheld,
+            "alerts_needing_review": alerts_needing_review,
         }
 
     def _best_pool_match(
@@ -1541,9 +1569,8 @@ class FinanceLedgerRunner:
             """
             SELECT account, account_id, transaction_id, posted_at, name,
                    merchant_name, amount, iso_currency_code, pending,
-                   pending_transaction_id
+                   pending_transaction_id, is_removed
             FROM @plaid_transactions
-            WHERE is_removed = 0
             ORDER BY posted_at, transaction_id
             """
         )
@@ -1621,6 +1648,45 @@ class FinanceLedgerRunner:
             if not _row_matches(existing.get(key), row, _OBSERVATION_SEMANTIC_COLUMNS):
                 changed.append(row)
         return changed
+
+    @staticmethod
+    def _alert_authorizations(
+        rows: list[dict[str, Any]], account_map: dict[tuple[str, str], str],
+    ) -> list[dict[str, Any]]:
+        successor_candidates: dict[tuple[str, str, str], set[str]] = {}
+        for row in rows:
+            if not row["is_removed"] and not row["pending"] and row["pending_transaction_id"]:
+                key = (row["account"], row["account_id"], row["pending_transaction_id"])
+                successor_candidates.setdefault(key, set()).add(stable_finance_transaction_id(
+                    LEDGER_SOURCE_PLAID, f"{row['account']}|{row['transaction_id']}"))
+        successors = {key: next(iter(ids)) for key, ids in successor_candidates.items() if len(ids) == 1}
+        return [
+            dict(
+                transaction_id=stable_finance_transaction_id(
+                    LEDGER_SOURCE_PLAID, f"{row['account']}|{row['transaction_id']}"),
+                account_id=account_map[(row["account"], row["account_id"])],
+                posted_at=row["posted_at"], amount=-_as_decimal(row["amount"]),
+                currency=row["iso_currency_code"], description=row["name"], merchant=row["merchant_name"],
+                removed=bool(row["is_removed"]),
+                successor_transaction_id=successors.get((row["account"], row["account_id"], row["transaction_id"]), ""),
+            )
+            for row in rows if row["pending"] and (row["account"], row["account_id"]) in account_map
+        ]
+
+    def _load_capital_one_alerts(self) -> list[dict[str, Any]]:
+        # Gmail is optional on a fresh finance-only warehouse. Do not provision
+        # its entire source pipeline from the finance runner.
+        if not self._warehouse._relation_exists("gmail_messages"):
+            return []
+        return self._warehouse._query_dicts(
+            """
+            SELECT account, message_id, from_address, subject, body_text, payload_json
+            FROM @gmail_messages
+            WHERE from_address ILIKE '%capitalone@notification.capitalone.com%'
+              AND subject = 'A new transaction was charged to your account'
+            ORDER BY account, message_id
+            """
+        )
 
     def _load_existing_transactions(self) -> dict[str, dict[str, Any]]:
         rows = self._warehouse._query_dicts(

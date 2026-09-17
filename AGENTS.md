@@ -3119,12 +3119,19 @@ enrichment layer.
   retire the dead Item and the survivor adopts the older account on the next run, leaving residue
   with no links, which is pruned with its observations.
 - `derived_finance.observations` — append-only per-day values (PK account_id/as_of/kind/source; NUMERIC
-  money, DATE days). The `finance_ledger` asset (schedule `7,37 * * * *`, after each `*/30` Plaid
-  sync) snapshots every live Plaid account's balance daily — Plaid itself only keeps
+  money, DATE days). The `finance_ledger` asset (schedule `*/5 * * * *`, picking up Gmail, Plaid and statement
+  updates) snapshots every live Plaid account's balance daily — Plaid itself only keeps
   current-state, so this table IS the balance history.
 - `derived_finance.transactions` — the unified deduped flow ledger (+
   `derived_finance.transaction_links` audit): one row per real-world money movement across Plaid and
-  uploaded statements. Amounts are signed NUMERIC, **positive = inflow to the account** (Plaid's
+  uploaded statements, plus authenticated Capital One purchase alerts (`pending = 1`). Alerts
+  reconcile only against a unique account/currency/merchant/exact-amount match within seven
+  days; unresolved holds stay provisional, and changed amounts or ambiguous matches need
+  review. `marts_finance.transactions.reconciliation_status` distinguishes these from posted
+  spending; sum `settled_amount` and `active_pending_amount` separately. Removed authorizations
+  retire; 30-day unmatched alerts expire as unconfirmed, never asserted cancelled. Refunds are
+  separate posted credits. Bank-native pending links permit changed final amounts. Alerts never alter balance
+  observations. Amounts are signed NUMERIC, **positive = inflow to the account** (Plaid's
   positive-out is negated at ingest; document rows carry explicit in/out). Cross-source dedup at
   the Plaid/statement overlap seam: same account + exact amount + dates within ±3 days merge
   (Plaid wins field precedence; `match_method` records source_id/pending_id/fuzzy_amount_date).

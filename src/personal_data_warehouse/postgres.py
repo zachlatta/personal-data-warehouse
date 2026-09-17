@@ -3718,9 +3718,24 @@ class PostgresWarehouse:
                 t.description,
                 t.merchant,
                 t.pending,
-                t.source
+                t.source,
+                CASE WHEN t.source = 'capital_one_alert' THEN
+                    COALESCE(alert.match_method, 'needs_review')
+                    WHEN t.pending = 1 THEN 'pending'
+                    ELSE 'posted' END AS reconciliation_status,
+                CASE WHEN t.pending = 0 THEN t.amount ELSE 0::numeric END AS settled_amount,
+                -- Retired/unconfirmed/review-needed email evidence is retained
+                -- for audit but is neither settled nor active pending spending.
+                CASE WHEN t.pending = 1 AND (
+                    t.source <> 'capital_one_alert' OR alert.match_method = 'provisional'
+                ) THEN t.amount ELSE 0::numeric END AS active_pending_amount
             FROM @finance_transactions AS t
             JOIN @finance_accounts AS a ON a.account_id = t.account_id
+            LEFT JOIN LATERAL (
+                SELECT l.match_method FROM @finance_transaction_links l
+                WHERE t.source = 'capital_one_alert' AND l.source = 'capital_one_alert'
+                  AND l.transaction_id = t.transaction_id LIMIT 1
+            ) AS alert ON TRUE
             """,
         )
         # Cross-source security trades. The plaid-only passthrough at

@@ -149,7 +149,7 @@ receipt_enrichment_job = define_asset_job(
 
 
 @schedule(
-    # Off the hour, after the finance ledger snapshot at :07/:37 has landed the
+    # Off the hour, after the five-minute finance ledger has landed the
     # newest transactions a receipt might match against.
     cron_schedule="17 * * * *",
     job=receipt_enrichment_job,

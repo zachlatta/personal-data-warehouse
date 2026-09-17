@@ -1076,8 +1076,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         id="finance_ledger",
         label="Finance ledger",
         kind="derived",
-        cadence=":07 and :37 hourly",
-        transport="Dagster finance_ledger over Plaid + manual_finance",
+        cadence="every 5 minutes",
+        transport="Dagster finance_ledger over Plaid + manual_finance + Capital One email alerts",
         expected_data_interval=3 * HOUR,
         expected_run_interval=None,
         # The one pipeline where event time legitimately trails write time, and

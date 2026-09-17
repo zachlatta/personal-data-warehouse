@@ -1965,6 +1965,7 @@
     },
     {
       "id": "marts_finance_transactions",
+      "comment": "Signed flows: positive=inflow. Sum settled_amount and active_pending_amount separately; reconciliation_status distinguishes retired/review-needed alerts.",
       "kind": "view",
       "layer": "marts",
       "domain": "finance",

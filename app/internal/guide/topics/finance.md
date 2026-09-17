@@ -89,3 +89,38 @@ Search scope `finance` covers transactions; a receipt's link to its transaction 
 - `derived_finance.document_extractions` — the agent's strict-schema reading of each
   document (`reporting_scope`, `account_holder`, `value_basis`, per-entry `measure`),
   keyed by prompt version so a re-extraction never clobbers the last one.
+
+## Capital One purchase alerts
+
+Authenticated Capital One purchase-alert emails feed the same ledger as provisional
+flows (`source = 'capital_one_alert'`, `pending = 1`). The finance job checks every five
+minutes, in addition to Gmail's own polling delay; this is near-real-time, not push.
+Alerts do not change balances or net worth. `posted_at` is the purchase date in the
+email, not a claim about the exact authorization time.
+
+A unique match by owner/account, currency, merchant, exact amount and a posting date
+within seven days replaces the provisional row with the Plaid or statement row.
+`derived_finance.transaction_links` retains the email's `account|message_id` as
+`source_row_key` for drill-down. Replays do not add another purchase.
+
+In `marts_finance.transactions`, sum `settled_amount` for actual net flows and
+`active_pending_amount` separately for provisional spending (both signed positive-in).
+Do not sum raw `amount` across all statuses. `reconciliation_status` distinguishes
+`posted`, `pending`, `provisional`, `needs_review`, `authorization_removed`, and
+`expired_unconfirmed`.
+
+An explicit Plaid pending-row removal retires an unambiguously matched alert from
+active pending totals; merely missing from a sync does not prove cancellation.
+Unmatched alerts older than 30 days become `expired_unconfirmed`: retained for audit
+and review, but excluded from both totals, never asserted to be bank cancellations.
+A later posted match can still settle either retired state. A provider's explicit
+`pending_transaction_id` can reconcile changed tip/hold amounts; without that proof,
+changed amounts and ambiguous matches need review and are excluded from active totals.
+
+Refunds remain separate positive posted flows, offsetting the original purchase in
+`settled_amount`, including partial refunds. They never replace the purchase or match
+its email alert. Refund and payment emails are not purchase alerts; those credits
+still arrive through Plaid or statements. Alerts never modify balance observations.
+Unknown templates, failed authentication and ambiguous account identities are withheld,
+counted as `alerts_withheld`; unresolved/stale cases are `alerts_needing_review` in job
+metadata. Replays retain evidence without reviving a removed authorization as spending.

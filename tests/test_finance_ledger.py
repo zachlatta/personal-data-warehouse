@@ -3028,3 +3028,120 @@ def test_evidence_document_never_books_even_with_confident_extraction(warehouse,
     for relation in ('finance_accounts', 'finance_observations', 'finance_transactions', 'finance_tax_lots'):
         assert warehouse._query(f'SELECT count(*) FROM @{relation}') == [(0,)]
     assert warehouse._query('SELECT count(*) FROM @manual_finance_extractions') == [(1,)]
+
+
+@pytest.mark.parametrize("settled_source", ["plaid", "manual_finance"])
+def test_capital_one_alert_replays_then_reconciles_without_double_counting(warehouse, settled_source):
+    from tests.test_capital_one_alerts import email
+
+    warehouse.ensure_plaid_tables()
+    warehouse.insert_plaid_items([_plaid_item_row(institution_name='Capital One')])
+    warehouse.insert_plaid_accounts([_plaid_account_row(type='credit', subtype='credit card', mask='1234')])
+    # Real Gmail table and loader; fixture amounts/identities are synthetic.
+    warehouse.ensure_tables()
+    alert = email(account='z@x.test')
+    import json
+    warehouse._command(
+        """INSERT INTO @gmail_messages (account, message_id, from_address, subject, body_text, payload_json)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (alert['account'], alert['message_id'], alert['from_address'], alert['subject'],
+         alert['body_text'], json.dumps(alert['payload_json'])),
+    )
+    now = datetime(2026, 9, 16, 18, tzinfo=UTC)
+    runner = FinanceLedgerRunner(warehouse=warehouse, now=now)
+    runner.sync()
+    rows = warehouse._query('SELECT amount, pending, source, reconciliation_status FROM @marts_finance_transactions')
+    assert rows == [(Decimal('-5.97'), 1, 'capital_one_alert', 'provisional')]
+    assert runner.sync().transactions_upserted == 0
+    before_balances = warehouse._query('SELECT value FROM @finance_observations ORDER BY as_of')
+
+    if settled_source == "plaid":
+        warehouse.insert_plaid_transactions([_plaid_transaction_row(
+            amount=5.97, name='TEST COFFEE', merchant_name='Test Coffee', posted_at=now,
+        )])
+    else:
+        _seed_document(
+            warehouse,
+            document=_document_row(original_path="capital-one-1234/statement.pdf"),
+            extraction=_extraction_row(
+                institution="Capital One", account_mask="1234",
+                transactions_json=[{"date": "2026-09-16", "description": "TEST COFFEE",
+                                    "amount": "5.97", "direction": "out"}],
+                balances_json=[],
+            ),
+        )
+    runner.sync()
+    assert warehouse._query('SELECT amount, pending, source, reconciliation_status FROM @marts_finance_transactions') == [
+        (Decimal('-5.97'), 0, settled_source, 'posted'),
+    ]
+    assert warehouse._query('SELECT count(DISTINCT transaction_id), count(*) FROM @finance_transaction_links') == [(1, 2)]
+    assert warehouse._query('SELECT value FROM @finance_observations ORDER BY as_of') == before_balances
+    assert runner.sync().transactions_upserted == 0
+
+
+def test_alert_authorization_removal_settlement_and_refund_lifecycle(warehouse):
+    import json
+    from datetime import timedelta
+    from tests.test_capital_one_alerts import email
+
+    warehouse.ensure_plaid_tables()
+    warehouse.insert_plaid_items([_plaid_item_row(institution_name='Capital One')])
+    warehouse.insert_plaid_accounts([_plaid_account_row(type='credit', subtype='credit card', mask='1234')])
+    warehouse.ensure_tables()
+    alert = email(account='z@x.test')
+    warehouse._command(
+        """INSERT INTO @gmail_messages (account, message_id, from_address, subject, body_text, payload_json)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (alert['account'], alert['message_id'], alert['from_address'], alert['subject'],
+         alert['body_text'], json.dumps(alert['payload_json'])),
+    )
+    now = datetime(2026, 9, 16, 18, tzinfo=UTC)
+    runner = FinanceLedgerRunner(warehouse=warehouse, now=now)
+    totals = 'SELECT sum(settled_amount), sum(active_pending_amount) FROM @marts_finance_transactions'
+    runner.sync()
+    assert warehouse._query(totals) == [(Decimal('0'), Decimal('-5.97'))]
+    # An outage/missing record alone does not prove the bank cancelled a hold.
+    FinanceLedgerRunner(warehouse=warehouse, now=now + timedelta(days=31)).sync()
+    assert warehouse._query('SELECT reconciliation_status FROM @marts_finance_transactions') == [('expired_unconfirmed',)]
+    assert warehouse._query(totals) == [(0, 0)]
+    runner = FinanceLedgerRunner(warehouse=warehouse, now=now + timedelta(days=32))
+
+    pending = _plaid_transaction_row(transaction_id='authorization', amount=5.97,
+        name='TEST COFFEE', merchant_name='Test Coffee', posted_at=now, pending=1)
+    warehouse.insert_plaid_transactions([pending])
+    runner.sync()
+    assert warehouse._query(totals) == [(0, Decimal('-5.97'))]
+    warehouse.insert_plaid_transactions([{**pending, 'is_removed': 1}])
+    runner.sync()
+    assert warehouse._query('SELECT reconciliation_status FROM @marts_finance_transactions') == [('authorization_removed',)]
+    assert warehouse._query(totals) == [(0, 0)]
+    assert runner.sync().transactions_upserted == 0
+
+    # A removed pending row may be the first half of a later posted conversion,
+    # not necessarily a cancelled purchase. The bank's explicit link wins.
+    warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id='settled',
+        pending_transaction_id='authorization', amount=7.00, name='TEST COFFEE WITH TIP',
+        merchant_name='Test Coffee', posted_at=now)])
+    runner.sync()
+    assert warehouse._query(totals) == [(Decimal('-7'), 0)]
+    assert warehouse._query('SELECT count(*) FROM @finance_transactions') == [(1,)]
+    for refund in ('2', '7'):
+        warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id='refund',
+            amount=-Decimal(refund), name='TEST COFFEE REFUND', merchant_name='Test Coffee',
+            posted_at=now + timedelta(days=2))])
+        runner.sync()
+        assert warehouse._query(totals) == [(Decimal('-7') + Decimal(refund), 0)]
+        assert warehouse._query('SELECT count(*) FROM @finance_transactions') == [(2,)]
+        assert runner.sync().transactions_upserted == 0
+
+
+def test_alert_authorization_successor_is_account_scoped_and_unambiguous():
+    pending = _plaid_transaction_row(transaction_id='pending', pending=1, is_removed=1)
+    first = _plaid_transaction_row(transaction_id='posted-a', pending_transaction_id='pending')
+    second = _plaid_transaction_row(transaction_id='posted-b', pending_transaction_id='pending')
+    owner_map = {('z@x.test', 'acc-1'): 'canonical'}
+    witnesses = FinanceLedgerRunner._alert_authorizations([pending, first, second], owner_map)
+    assert witnesses[0]['successor_transaction_id'] == ''
+    foreign = {**second, 'account': 'other@example.test'}
+    witnesses = FinanceLedgerRunner._alert_authorizations([pending, first, foreign], owner_map)
+    assert witnesses[0]['successor_transaction_id'] == stable_finance_transaction_id('plaid', 'z@x.test|posted-a')

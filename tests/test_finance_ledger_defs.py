@@ -8,9 +8,9 @@ from personal_data_warehouse.defs.finance_ledger import (
 )
 
 
-def test_finance_ledger_schedule_follows_each_plaid_sync() -> None:
-    # Plaid syncs on */30; the ledger snapshots shortly after each sync window.
-    assert finance_ledger_schedule.cron_schedule == "7,37 * * * *"
+def test_finance_ledger_schedule_picks_up_email_and_plaid_updates() -> None:
+    # The unified ledger picks up new alerts and each completed bank sync.
+    assert finance_ledger_schedule.cron_schedule == "*/5 * * * *"
     assert finance_ledger_schedule.default_status.value == "RUNNING"
 
 
