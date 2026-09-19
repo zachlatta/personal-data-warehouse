@@ -732,8 +732,11 @@ will always sometimes pass a user's question through — and are not fixed by gu
   tokens rank an earlier chunk occurrence ahead of a late mention, while opaque ids containing
   digits preserve recency. Conversation windows retain full-document exact matching because a
   window's `event_id` is its last member, not necessarily the member containing the literal;
-  the full path runs only when the chunk index first confirms a matching chat window. Ordinary
-  alphabetic names also retain full-document exact matching. Hybrid falls
+  the full path runs only when the chunk index first confirms a matching chat window. Since
+  2026-09-19 ordinary alphabetic names take the chunk path too: keeping them on the
+  full-document recheck cost ~1 GB of heap read and ~2s per two-word search (6.4 GB across
+  six probes, the host's largest search-cache evictor) for one labeled proper name at rank 1
+  instead of 2. Hybrid falls
   back to keyword with an explicit `fallback_reason` when embeddings or pgvector are
   unavailable. Agent sessions are indexed per turn (`kind = 'agent_turn'`); the session
   roll-up row carries headline fields only.
@@ -907,6 +910,18 @@ leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that s
 `hnsw.ef_search` 1000 -> 300 at the same 1,000-candidate pool kept a 9.2/10 top-10
 overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
 the index is resident.
+
+**`pg_prewarm` in `prefetch` mode is a hint, not a warm, and it lied once.** On
+2026-09-19 a forced warm reported 3.46M blocks in 26 seconds and `fincore` on the index
+files found **1% of HNSW and 10% of the global BM25 index** resident afterwards:
+`prefetch` is an asynchronous `posix_fadvise(WILLNEED)` that the kernel dropped under
+memory pressure, and the state row recorded a success. The warm modes are now `read`
+(synchronous, 10 GB of HNSW in 9.6s and 6.7 GB of BM25 in 4.4s on the same host) then
+`buffer` for HNSW. Verify a warm with `fincore` inside the Postgres container
+(`docker exec <pg> fincore -b <relfilepath>*`), never with the log line — and subtract
+`Shmem` (the 8 GB of shared buffers) from `/proc/meminfo`'s `Cached` before reading it
+as file cache: the host's real page cache is ~10 GB, which is why a 10 GB HNSW graph
+cannot stay resident there while the sync workload runs beside it.
 
 **A cold cache with no index-identity change is re-warmed by the five-minute search
 health pass, at most once a day.** `prewarm_search_indexes_if_needed` fires on a schema

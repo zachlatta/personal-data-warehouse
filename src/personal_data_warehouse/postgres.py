@@ -12625,13 +12625,22 @@ class PostgresWarehouse:
     def _search_index_prewarm_targets(self) -> list[tuple[str, str]]:
         """Search index regclass names and their measured-best warm modes.
 
-        HNSW is larger than ``shared_buffers`` and random-walked, so prefetch it
+        HNSW is larger than ``shared_buffers`` and random-walked, so read it
         through the kernel cache before filling the scarce Postgres buffers.
         ``buffer`` alone left only about 9% of the graph resident in the OS
-        cache after a production REINDEX on 2026-09-02; adding the prefetch
-        took contract-audit hybrid p50 from 2.44s to 0.21s.  BM25 is prefetched
-        last rather than buffered so it does not evict the ANN graph from
-        Postgres's 8 GiB pool.
+        cache after a production REINDEX on 2026-09-02; warming the kernel
+        cache first took contract-audit hybrid p50 from 2.44s to 0.21s.  BM25
+        is read last rather than buffered so it does not evict the ANN graph
+        from Postgres's 8 GiB pool.
+
+        The kernel-cache mode is ``read``, not ``prefetch``.  ``prefetch`` is
+        an asynchronous ``posix_fadvise(WILLNEED)`` hint: on 2026-09-19 a
+        forced warm reported 3.46M blocks in 26 seconds and ``fincore`` then
+        found 1% of HNSW and 10% of BM25 resident -- the hint had been
+        dropped under memory pressure and the warm was a fiction with a
+        success log line.  ``read`` pulls the pages synchronously (10 GB of
+        HNSW in 9.6s, 6.7 GB of BM25 in 4.4s on the same host) and the
+        residency it reports is real.
         """
 
         hnsw = [
@@ -12647,10 +12656,10 @@ class PostgresWarehouse:
         hnsw_names = [
             f"{self._object_schema(spec.table)}.{spec.name}" for spec in hnsw
         ]
-        return [(name, "prefetch") for name in hnsw_names] + [
+        return [(name, "read") for name in hnsw_names] + [
             (name, "buffer") for name in hnsw_names
         ] + [
-            (f"{self._object_schema(spec.table)}.{spec.name}", "prefetch")
+            (f"{self._object_schema(spec.table)}.{spec.name}", "read")
             for spec in bm25
         ]
 
@@ -13994,13 +14003,18 @@ class PostgresWarehouse:
                         -- short hybrid query. Keep exact mode itself unchanged.
                         -- Match the exact function's deterministic amount and
                         -- phone variants so moving the leg does not narrow it.
-                        -- Keep ordinary alphabetic names on the full-document
-                        -- path. Chunk-window anchoring moved one labeled proper
-                        -- name from rank 1 to rank 2; machine tokens (digits or
-                        -- identifier punctuation) were quality-identical and
-                        -- are the calls whose old recheck has the worst tail.
-                        IF exact_needle ~ '[0-9_./@-]'
-                           AND EXISTS (
+                        -- Every short needle takes the bounded chunk path,
+                        -- alphabetic names included. Until 2026-09-19 names
+                        -- kept the full-document path because chunk anchoring
+                        -- had moved one labeled proper name from rank 1 to 2;
+                        -- the price, measured that day, was ~1 GB of heap read
+                        -- and ~2s per two-word search -- the single largest
+                        -- evictor of the search working set on the host
+                        -- (6.4 GB across six probes) and the difference between
+                        -- keyword at 0.9s and hybrid at 3.7-5.2s. The chat-
+                        -- window recovery below still runs the full path for
+                        -- conversations, where the chunk cannot name the member.
+                        IF EXISTS (
                                SELECT 1
                                FROM pg_catalog.pg_index i
                                WHERE i.indexrelid = pg_catalog.to_regclass('"""

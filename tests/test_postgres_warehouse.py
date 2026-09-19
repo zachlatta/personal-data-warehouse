@@ -272,17 +272,22 @@ def test_search_cache_residency_query_executes_with_no_indexes_yet(
     assert measured["resident_fraction"] == 0.0
 
 
-def test_search_index_prewarm_prefetches_then_buffers_hnsw_before_every_bm25_index(
+def test_search_index_prewarm_reads_then_buffers_hnsw_before_every_bm25_index(
     monkeypatch,
 ) -> None:
     """A new deploy/reindex warms the ANN graph through both cache layers.
 
-    Prefetching HNSW first is not redundant with ``buffer``: measured after a
-    production REINDEX, buffer-only left the HNSW relation ~9% resident in the
-    OS cache and contract-audit p50 at 2.44s; one prefetch made its first 6 GiB
-    resident and p50 0.21s.  Buffer HNSW second, then prefetch BM25 into the
-    kernel cache so it does not evict the graph from Postgres's 8 GiB pool. A
-    second call for the same postmaster/index fingerprint is free.
+    Reading HNSW into the kernel cache first is not redundant with ``buffer``:
+    measured after a production REINDEX, buffer-only left the HNSW relation
+    ~9% resident in the OS cache and contract-audit p50 at 2.44s; warming the
+    kernel cache made its first 6 GiB resident and p50 0.21s.  Buffer HNSW
+    second, then read BM25 into the kernel cache so it does not evict the
+    graph from Postgres's 8 GiB pool. A second call for the same
+    postmaster/index fingerprint is free.
+
+    The kernel-cache mode must be the synchronous ``read``: ``prefetch`` is an
+    async hint the kernel dropped under pressure on 2026-09-19, leaving 1% of
+    HNSW resident behind a "warmed" log line.
     """
 
     warehouse = object.__new__(PostgresWarehouse)
@@ -329,13 +334,14 @@ def test_search_index_prewarm_prefetches_then_buffers_hnsw_before_every_bm25_ind
 
     assert result["warmed"] is True
     assert prewarm_calls[:2] == [
-        ("derived_search.search_chunk_embeddings_hnsw_idx", "prefetch"),
+        ("derived_search.search_chunk_embeddings_hnsw_idx", "read"),
         ("derived_search.search_chunk_embeddings_hnsw_idx", "buffer"),
     ]
     assert prewarm_calls[2:] == [
-        (f"timeline.{name}", "prefetch")
+        (f"timeline.{name}", "read")
         for name in warehouse.bm25_timeline_index_names()
     ]
+    assert "prefetch" not in {mode for _name, mode in prewarm_calls}
     assert "prewarmed_signature" in state_updates[-1][0]
     assert state_updates[-1][1] == (
         "new-signature",
@@ -408,7 +414,7 @@ def test_search_prewarm_fingerprint_tracks_relfilenodes_not_normal_growth() -> N
 
     warehouse._query = query
     fingerprint = warehouse._search_index_fingerprint(
-        [("timeline.idx", "prefetch")]
+        [("timeline.idx", "read")]
     )
 
     assert fingerprint
@@ -6732,7 +6738,12 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     sql = _search_text_function_sql()
     exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact("):]
     literal = exact[exact.index("exact_refs"):exact.index("RETURN QUERY")]
-    assert "exact_needle ~ '[0-9_./@-]'" in literal
+    # Every short needle takes the chunk path. The machine-token gate that
+    # kept alphabetic names on the full-document recheck cost ~1 GB of heap
+    # read and ~2s per two-word search (2026-09-19) and was the host's largest
+    # search-cache evictor; the chat-window recovery keeps the full path where
+    # the chunk cannot name the member event.
+    assert "exact_needle ~ '[0-9_./@-]'" not in literal
     assert "pg_catalog.to_regclass" in literal
     assert "i.indisvalid" in literal and "i.indisready" in literal
     assert "FROM @search_chunks" in literal
@@ -6752,8 +6763,8 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     )
     assert "split_part(h.ref, ':', 1) = ANY (sem_adapters)" in literal
     assert "@search_text_exact(" in literal, (
-        "ordinary names and chat-window identifiers must keep full-document "
-        "matching so hybrid returns the event that actually contains the literal"
+        "chat-window identifiers must keep full-document matching so hybrid "
+        "returns the member event that actually contains the literal"
     )
     assert "GROUP BY" in literal, (
         "several chunks from one event must produce one literal rank"
