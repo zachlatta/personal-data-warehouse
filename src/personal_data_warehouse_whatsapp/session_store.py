@@ -66,6 +66,20 @@ class PostgresWhatsAppSessionStore:
             self.snapshot_from_path(path, client_id=client_id)
         return client_id
 
+    def record_status(self, status: str, error: str) -> None:
+        """Record the credential verdict (ok / action_required) on the session row.
+
+        The session row is the pipeline's StateSource, so this is what makes a
+        removed linked device read `attention` on /pipelines instead of `late`.
+        """
+        self._warehouse.record_whatsapp_client_session_status(
+            account=self._account,
+            session_key=self._session_key,
+            status=status,
+            error=error,
+            updated_at=datetime.now(tz=UTC),
+        )
+
     def snapshot_from_path(self, path: Path, *, client_id: str) -> SessionSnapshot | None:
         path = path.expanduser()
         if not path.exists():

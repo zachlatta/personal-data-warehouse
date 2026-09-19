@@ -283,6 +283,47 @@ def test_plaid_action_required_is_surfaced_as_attention():
     assert "action_required" in state.attention_statuses
 
 
+def test_whatsapp_pairing_required_is_surfaced_as_attention():
+    """A removed linked device is a credential verdict, not a late pipeline.
+
+    Between 2026-09-09 and 09-19 the client failed fifteen run windows with
+    "pairing required" while /pipelines read only `late`, because the
+    session table carried no status column for the health view to read.
+    """
+    state = pipeline("whatsapp").state
+    assert state is not None
+    assert state.table == "whatsapp_client_sessions"
+    assert state.status_column == "status"
+    assert state.error_column == "error"
+    assert "action_required" in state.attention_statuses
+    assert "re-pair" in pipeline("whatsapp").note
+
+
+def test_whatsapp_session_status_colours_the_pipeline_row(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse.record_whatsapp_client_session_status(
+        account="z@x.test", session_key="default", status="action_required",
+        error="WhatsApp pairing required", updated_at=now,
+    )
+
+    def collect() -> dict:
+        PipelineHealthCollector(warehouse).run_all()
+        return warehouse._query_dicts(
+            "SELECT status, last_error FROM @marts_pipeline_health WHERE pipeline = 'whatsapp'"
+        )[0]
+
+    row = collect()
+    assert row["status"] == "attention"
+    assert "pairing required" in row["last_error"]
+
+    warehouse.record_whatsapp_client_session_status(
+        account="z@x.test", session_key="default", status="ok", error="", updated_at=now,
+    )
+    assert collect()["status"] in ("ok", "no_data", "late")  # no data rows seeded; the state itself is clear
+    assert collect()["status"] != "attention"
+
+
 def test_whoop_action_required_remains_an_operator_visible_attention_state():
     """Skipped retry ticks must not make a rejected WHOOP credential look healthy."""
     state = pipeline("whoop").state

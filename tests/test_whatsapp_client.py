@@ -113,6 +113,10 @@ class FailOnceBatchObjectStore(FakeObjectStore):
 class FakeSessionWarehouse:
     def __init__(self) -> None:
         self.row: dict[str, object] | None = None
+        self.statuses: list[tuple[str, str, str, str]] = []
+
+    def record_whatsapp_client_session_status(self, *, account: str, session_key: str, status: str, error: str, updated_at=None):
+        self.statuses.append((account, session_key, status, error))
 
     def get_whatsapp_client_session(self, *, account: str, session_key: str):
         if self.row is None:
@@ -336,6 +340,93 @@ def test_run_fails_loud_when_client_never_connects(tmp_path, monkeypatch) -> Non
 
     with pytest.raises(RuntimeError, match="never connected"):
         runner.run()
+
+
+def test_run_records_action_required_on_the_session_row_when_pairing_is_needed(tmp_path, monkeypatch) -> None:
+    # Fifteen "never connected" failures over ten days (2026-09-09..19) read
+    # only `late` on /pipelines, because the run window still re-stamped the
+    # session snapshot. Pairing required is a credential verdict, the same
+    # shape as a dead WHOOP/Plaid/ChatGPT credential, and it has to be
+    # recorded as action_required on the state row the pipeline reads.
+    import neonize.client as neonize_client
+
+    fake = FakeClient()
+    fake.connect = lambda *args, **kwargs: None
+    monkeypatch.setattr(neonize_client, "NewClient", lambda *args, **kwargs: fake)
+    statuses: list[tuple[str, str]] = []
+
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        flush_interval_seconds=1,
+        session_status_callback=lambda status, error: statuses.append((status, error)),
+    )
+    with pytest.raises(RuntimeError, match="never connected"):
+        runner.run()
+
+    assert statuses, "the run window ended without recording a session status"
+    status, error = statuses[-1]
+    assert status == "action_required"
+    assert "never connected" in error
+    assert "re-pair" in error
+    assert "pairing code" in error
+
+
+def test_pairing_prompt_and_logout_record_action_required_and_connect_clears_it(tmp_path) -> None:
+    statuses: list[tuple[str, str]] = []
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        session_status_callback=lambda status, error: statuses.append((status, error)),
+    )
+
+    runner._on_qr(None, b"2@pairing-payload")
+    assert statuses[-1][0] == "action_required"
+    assert "Linked Devices" in statuses[-1][1]
+
+    runner._on_connected(None, None)
+    assert statuses[-1] == ("ok", "")
+
+    class LoggedOut:
+        Reason = "REMOVED"
+
+    runner._on_logged_out(FakeClient(), LoggedOut())
+    assert statuses[-1][0] == "action_required"
+    assert "REMOVED" in statuses[-1][1]
+
+
+def test_session_status_callback_failure_never_kills_the_client(tmp_path) -> None:
+    def boom(status: str, error: str) -> None:
+        raise RuntimeError("postgres away")
+
+    runner = WhatsAppClientRunner(
+        account="zach@example.com",
+        session_path=tmp_path / "session.sqlite",
+        object_store=FakeObjectStore(),
+        upload_state=None,
+        logger=FakeLogger(),
+        session_status_callback=boom,
+    )
+    runner._on_connected(None, None)  # must not raise
+
+
+def test_postgres_session_store_records_status_on_the_session_row() -> None:
+    warehouse = FakeSessionWarehouse()
+    store = PostgresWhatsAppSessionStore(warehouse=warehouse, account="zach@example.com", session_key="default")
+
+    store.record_status("action_required", "pairing required")
+    store.record_status("ok", "")
+
+    assert warehouse.statuses == [
+        ("zach@example.com", "default", "action_required", "pairing required"),
+        ("zach@example.com", "default", "ok", ""),
+    ]
 
 
 def test_write_qr_artifacts_creates_refreshing_pairing_page(tmp_path) -> None:

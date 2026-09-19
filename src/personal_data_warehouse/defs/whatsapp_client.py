@@ -154,6 +154,7 @@ def whatsapp_client(context) -> MaterializeResult:
                     pair_phone=settings.whatsapp.pair_phone,
                     client_id=client_id,
                     session_snapshot_callback=lambda: session_store.snapshot_from_path(session_path, client_id=client_id),
+                    session_status_callback=session_store.record_status,
                     download_history_media=settings.whatsapp.download_history_media,
                 ).run()
             finally:

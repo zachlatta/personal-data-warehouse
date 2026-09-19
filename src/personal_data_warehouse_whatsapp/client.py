@@ -29,6 +29,22 @@ from personal_data_warehouse_whatsapp.events import (
 from personal_data_warehouse_whatsapp.state import WhatsAppUploadState
 
 
+#: The repair text for a removed linked device. It is what /pipelines shows,
+#: so it names the exact steps rather than "check the logs".
+PAIRING_REQUIRED_MESSAGE = (
+    "WhatsApp pairing required: the linked device was removed. On the phone open WhatsApp > "
+    "Settings > Linked Devices > Link a Device (\"Link with phone number instead\" when "
+    "WHATSAPP_PAIR_PHONE is set) and enter the pairing code from the newest "
+    "whatsapp_client_job run log within two minutes of it being printed; cancel the stalled "
+    "run first so a fresh code is issued."
+)
+NEVER_CONNECTED_MESSAGE = (
+    "WhatsApp client never connected during its run window. 'Client outdated (405)' in the "
+    "logs means the pinned neonize/whatsmeow version needs a bump; otherwise the linked device "
+    "was removed and needs a re-pair. " + PAIRING_REQUIRED_MESSAGE
+)
+
+
 class WhatsAppClientRunner:
     def __init__(
         self,
@@ -46,6 +62,7 @@ class WhatsAppClientRunner:
         pair_phone: str = "",
         client_id: str = "",
         session_snapshot_callback: Callable[[], Any] | None = None,
+        session_status_callback: Callable[[str, str], Any] | None = None,
         qr_output_dir: Path | str | None = None,
         download_history_media: bool = False,
         now: Callable[[], datetime] | None = None,
@@ -58,6 +75,7 @@ class WhatsAppClientRunner:
         self._pair_phone = pair_phone
         self._client_id = client_id
         self._session_snapshot_callback = session_snapshot_callback
+        self._session_status_callback = session_status_callback
         self._qr_output_dir = Path(qr_output_dir).expanduser() if qr_output_dir is not None else None
         self._download_history_media = download_history_media
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -133,12 +151,11 @@ class WhatsAppClientRunner:
             # version, removed linked device) completes every window as a
             # hollow SUCCESS with zero activity — a silent freeze. Fail the
             # run so monitoring sees it; the keepalive's crash cooldown keeps
-            # the retries sparse.
-            raise RuntimeError(
-                "WhatsApp client never connected during its run window. Check the logs above: "
-                "'Client outdated (405)' means the pinned neonize/whatsmeow version needs a bump; "
-                "a removed linked device needs a QR re-pair."
-            )
+            # the retries sparse. The same verdict is recorded on the session
+            # row as action_required: a red Dagster run is not a health
+            # surface, and fifteen of them (2026-09-09..19) read only `late`.
+            self._record_status("action_required", NEVER_CONNECTED_MESSAGE)
+            raise RuntimeError(NEVER_CONNECTED_MESSAGE)
         self._logger.info("WhatsApp client summary: %s", self._totals)
         return dict(self._totals)
 
@@ -163,18 +180,22 @@ class WhatsAppClientRunner:
             rendered,
             qr_data.decode("utf-8", errors="replace"),
         )
+        self._record_status("action_required", PAIRING_REQUIRED_MESSAGE)
 
     def _on_connected(self, _client, _event) -> None:
         self._connected_event.set()
         self._logger.info("WhatsApp client connected")
         self._snapshot_session("connected")
+        self._record_status("ok", "")
 
     def _on_pair_status(self, _client, event) -> None:
         self._logger.info("WhatsApp pair status: %s", event)
         self._snapshot_session("pair status")
 
     def _on_logged_out(self, client, event) -> None:
-        self._logger.warning("WhatsApp client logged out (reason: %s); stopping", getattr(event, "Reason", ""))
+        reason = getattr(event, "Reason", "")
+        self._logger.warning("WhatsApp client logged out (reason: %s); stopping", reason)
+        self._record_status("action_required", f"WhatsApp logged out (reason: {reason}); {PAIRING_REQUIRED_MESSAGE}")
         self._shutdown(client, "logged out")
 
     def _on_offline_sync_completed(self, _client, event) -> None:
@@ -348,6 +369,15 @@ class WhatsAppClientRunner:
             size = getattr(snapshot, "database_bytes_size", 0)
             sha = getattr(snapshot, "database_sha256", "")
             self._logger.info("Saved WhatsApp session snapshot after %s (%s bytes, sha256=%s)", reason, size, sha)
+
+    def _record_status(self, status: str, error: str) -> None:
+        """Write the credential verdict to the session row; never raise."""
+        if self._session_status_callback is None:
+            return
+        try:
+            self._session_status_callback(status, error)
+        except Exception as exc:  # noqa: BLE001 - a status write must never kill the client
+            self._logger.warning("WhatsApp session status write (%s) failed: %s", status, exc)
 
     def _shutdown(self, client, reason: str) -> None:
         if self._stop_event.is_set():

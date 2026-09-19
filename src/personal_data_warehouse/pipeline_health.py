@@ -650,8 +650,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="in-Dagster linked-device client → Drive inbox → Dagster",
         data=2 * DAY,
         run=4 * HOUR,
-        state=StateSource(table="whatsapp_client_sessions", updated_column="updated_at"),
-        note="the session snapshot advances every run window; a frozen one means the device unpaired",
+        state=StateSource(
+            table="whatsapp_client_sessions",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "the session snapshot advances every run window; action_required means the linked"
+            " device was removed and needs a re-pair (WhatsApp > Settings > Linked Devices,"
+            " pairing code from the newest whatsapp_client_job run log)"
+        ),
     ),
     _source(
         "apple_notes",

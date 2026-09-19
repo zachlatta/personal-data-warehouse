@@ -2686,6 +2686,17 @@ For local pairing/debugging there is a CLI: `uv run personal-data-warehouse-what
 (requires `brew install libmagic` on macOS). It requires `POSTGRES_DATABASE_URL` because
 Postgres is the session source of truth. `--session-file` only selects the runtime cache file.
 
+**A removed linked device is `action_required`, not `late`.** Between 2026-09-09 and
+09-19 the client failed fifteen run windows with "pairing required" while `/pipelines`
+read only `late`, because every window still re-stamped the session snapshot and the
+session row carried no status for the health view to read. The client now records
+`status`/`error` on `private.whatsapp_client_sessions` (the pipeline's `StateSource`):
+`action_required` on a pairing prompt, a logout, or a window that never connected, and
+`ok` the moment it connects. The repair is on the phone: cancel the stalled
+`whatsapp_client_job` run so a fresh code is issued, then WhatsApp > Settings > Linked
+Devices > Link a Device > "Link with phone number instead" and enter the pairing code from
+the new run log within about two minutes. History sync then backfills the gap by itself.
+
 Caveats: unofficial clients violate WhatsApp ToS and carry a small account-ban risk. neonize is
 pinned exactly (0.4.3.post0) and **must be bumped when WhatsApp rejects the bundled whatsmeow
 version** — the failure looks like `Client outdated (405) connect failure` in the run logs. In

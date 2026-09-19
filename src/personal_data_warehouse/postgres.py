@@ -6210,13 +6210,42 @@ class PostgresWarehouse:
         )
         self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()")
         self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS sync_version bigint NOT NULL DEFAULT 1")
+        # The credential verdict the pipeline health view reads: 'ok' while the
+        # client connects, 'action_required' once the linked device is removed
+        # (pairing required / logged out / never connected in a window).
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ok'")
+        self._command("ALTER TABLE @whatsapp_client_sessions ADD COLUMN IF NOT EXISTS error text NOT NULL DEFAULT ''")
+
+    def record_whatsapp_client_session_status(
+        self,
+        *,
+        account: str,
+        session_key: str,
+        status: str,
+        error: str,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """Upsert the session row's status/error without touching the snapshot bytes."""
+        self.ensure_whatsapp_client_session_table()
+        now = updated_at or datetime.now(tz=UTC)
+        self._command(
+            """
+            INSERT INTO @whatsapp_client_sessions (account, session_key, status, error, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (account, session_key) DO UPDATE SET
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (account, session_key, status, error, now),
+        )
 
     def get_whatsapp_client_session(self, *, account: str, session_key: str) -> dict[str, Any] | None:
         self.ensure_whatsapp_client_session_table()
         rows = self._query_dicts(
             """
             SELECT account, session_key, client_id, database_bytes, database_sha256,
-                   database_bytes_size, restored_at, updated_at, sync_version
+                   database_bytes_size, restored_at, updated_at, sync_version, status, error
             FROM @whatsapp_client_sessions
             WHERE account = %s AND session_key = %s
             """,
