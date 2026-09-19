@@ -34,6 +34,7 @@ from personal_data_warehouse.search_index import (
     SearchChunkBuilder,
     SearchEmbeddingRunner,
     record_search_cache_residency,
+    rewarm_search_indexes_if_cold,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 
@@ -128,7 +129,7 @@ def search_chunks(context) -> MaterializeResult:
                 # left C6 pointing at a stale cause, so refresh the inexpensive
                 # pg_buffercache gauge on this five-minute health cadence.
                 try:
-                    record_search_cache_residency(warehouse)
+                    residency = record_search_cache_residency(warehouse)
                 except Exception as error:  # health fact, not a chunk failure
                     context.log.error(
                         "Could not measure search cache residency: %s", error
@@ -136,6 +137,16 @@ def search_chunks(context) -> MaterializeResult:
                     warehouse.write_search_health(
                         "cache_residency", last_error=str(error)[:500]
                     )
+                else:
+                    # A cold cache with no index-identity change is re-warmed
+                    # here, at most once a day: the identity-keyed prewarm
+                    # cannot see an eviction, and 2026-09-16..19 sat at 10%.
+                    try:
+                        warm = rewarm_search_indexes_if_cold(warehouse, residency)
+                        if warm.get("warmed"):
+                            context.log.info("Re-warmed cold search cache: %s", warm)
+                    except Exception as error:  # cache repair must not fail the builder
+                        context.log.error("Could not re-warm search cache: %s", error)
             except Exception as error:
                 warehouse.write_search_health("chunks", last_error=str(error)[:500])
                 raise

@@ -53,6 +53,10 @@ SLACK_CONVERSATION_GONE_CODES = frozenset(
     {"channel_not_found", "is_archived", "channel_is_archived", "not_in_channel"}
 )
 
+# Slack's generic failure code. Observed only where a history page is too
+# large to serve; iter_cursor_pages_with_cursor retries such a page smaller.
+SLACK_PAGE_TOO_LARGE_CODE = "fatal_error"
+
 # conversations.replies error codes that are terminal for one thread without
 # implying anything about its channel: the parent message was deleted.
 SLACK_THREAD_GONE_CODES = frozenset({"thread_not_found"})
@@ -2168,7 +2172,19 @@ def iter_cursor_pages_with_cursor(
     cursor = start_cursor
     call_fn = call or (lambda current_client, current_method, **current_params: current_client.call(current_method, **current_params))
     while True:
-        response = call_fn(client, method, limit=limit, cursor=cursor, **params)
+        try:
+            response = call_fn(client, method, limit=limit, cursor=cursor, **params)
+        except SlackApiCallError as exc:
+            # Slack's generic `fatal_error` is, for conversations.history, a
+            # page that is too large to serve: one public channel of
+            # dictionary-dump messages (2026-09-19) failed at any limit of 50
+            # or more and answered fine at 1. The same cursor is retried with
+            # half the page rather than recorded as a permanent error, which
+            # is what left that channel unreadable and its state row red.
+            if exc.code != SLACK_PAGE_TOO_LARGE_CODE or limit <= 1:
+                raise
+            limit = max(1, limit // 2)
+            continue
         metadata = response.get("response_metadata") or {}
         cursor = str(metadata.get("next_cursor") or "")
         yield list(response.get(item_key, []) or []), cursor

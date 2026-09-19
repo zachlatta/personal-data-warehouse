@@ -22,6 +22,8 @@ from personal_data_warehouse.search_index import (
     SearchEmbeddingRunner,
     _EmbedBudget,
     record_search_cache_residency,
+    rewarm_search_indexes_if_cold,
+    should_rewarm_search_indexes,
     split_text,
     vector_literal,
     window_start,
@@ -676,6 +678,66 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
     assert facts["caught_up"] == 1
     assert facts["last_error"] == ""
     assert facts["last_success_at"].tzinfo is UTC
+
+
+def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:
+    # After the 2026-09-14..16 index-definition flap thrashed ~57 TB through
+    # the page cache, residency sat at 10% for three days with nothing to
+    # restore it: prewarm fires only on a signature / restart / relfilenode
+    # change, and none of those had happened. A cold cache with no identity
+    # change is exactly the case this guard exists for.
+    now = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    long_ago = now - timedelta(days=3)
+    assert should_rewarm_search_indexes(resident_fraction=0.10, last_prewarmed_at=long_ago, now=now)
+    # Warm enough: leave it alone.
+    assert not should_rewarm_search_indexes(resident_fraction=0.40, last_prewarmed_at=long_ago, now=now)
+    # Cold but warmed recently: a forced warm that did not stick is not
+    # repeated every five minutes -- the cache is being evicted by
+    # something else, and re-reading 20 GB on each tick would be that thing.
+    assert not should_rewarm_search_indexes(
+        resident_fraction=0.10, last_prewarmed_at=now - timedelta(hours=2), now=now
+    )
+    # Unmeasured residency (no pg_buffercache) never triggers a warm.
+    assert not should_rewarm_search_indexes(resident_fraction=-1, last_prewarmed_at=long_ago, now=now)
+
+
+def test_rewarm_forces_a_prewarm_when_cold_and_records_why() -> None:
+    class Warehouse:
+        def __init__(self, prewarmed_at):
+            self.prewarmed_at = prewarmed_at
+            self.forced = []
+
+        def search_prewarmed_at(self):
+            return self.prewarmed_at
+
+        def prewarm_search_indexes_if_needed(self, *, force=False):
+            self.forced.append(force)
+            return {"warmed": True, "reason": "forced", "blocks": 123}
+
+    now = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    cold = Warehouse(now - timedelta(days=3))
+    result = rewarm_search_indexes_if_cold(cold, {"resident_fraction": 0.10}, now=now)
+    assert cold.forced == [True]
+    assert result["warmed"] is True and result["blocks"] == 123
+
+    warm = Warehouse(now - timedelta(days=3))
+    result = rewarm_search_indexes_if_cold(warm, {"resident_fraction": 0.5}, now=now)
+    assert warm.forced == []
+    assert result["warmed"] is False and "resident" in result["reason"]
+
+    recent = Warehouse(now - timedelta(hours=1))
+    result = rewarm_search_indexes_if_cold(recent, {"resident_fraction": 0.10}, now=now)
+    assert recent.forced == []
+    assert "recently" in result["reason"]
+
+
+def test_search_prewarmed_at_is_the_epoch_until_a_warm_is_recorded(warehouse: PostgresWarehouse) -> None:
+    _provision(warehouse)
+    first = warehouse.search_prewarmed_at()
+    assert first.tzinfo is not None
+    assert first.year == 1970
+    warehouse._command("UPDATE @search_schema_state SET prewarmed_at = now() WHERE id = 1")
+    assert warehouse.search_prewarmed_at().year >= 2026
 
 
 def test_embedding_runner_resumes_a_bounded_backfill_across_runs(

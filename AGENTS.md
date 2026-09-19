@@ -605,6 +605,15 @@ timeline writes and global searches for the whole fourteen minutes, and the depl
 follows (a changed index fingerprint) runs its own 26 GB prewarm at startup — the first
 searches after it read 16s / 45s, which is the prewarm's I/O, not the rebuild.
 
+Repeated 2026-09-19 14:27–14:49Z after the 09-14..16 index-definition flap had doubled
+every BM25 index again: plain `REINDEX` of the global index in 15m50s (**12 GB → 6.36 GB**),
+the attention index in 4m41s (1.9 GB → 968 MB), the low-volume pair in 47s + 30s
+(298 → 148 MB, 41 → 39 MB), each with `lock_timeout = 90s` and a retry loop so the
+rebuild queues behind readers instead of wedging them; no lock waiters were seen. All
+four passed the cold probe after `pg_buffercache_evict_relation` + `drop_caches`, the
+Dagster prewarm fired by itself on the relfilenode change, and `cache_residency` read
+**35.9%** of an 18.1 GB working set (from 10.3% of 25.7 GB) within ten minutes.
+
 The pair cost 14 MB + 533 MB against the global index's 10.2 GB and took 59s + 4m35s to
 build `CONCURRENTLY` on production (1,333,278 documents). Measured there the same day on
 twelve novel term-bag queries per tier, **alternating which implementation ran first** so
@@ -899,6 +908,19 @@ leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that s
 overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
 the index is resident.
 
+**A cold cache with no index-identity change is re-warmed by the five-minute search
+health pass, at most once a day.** `prewarm_search_indexes_if_needed` fires on a schema
+signature, a database restart, or a REINDEX (the relfilenode fingerprint) — and none of
+those happened between 2026-09-16 and 09-19, while the 09-14..16 index-definition flap
+(`bm25_attention_lowvol_idx` rebuilt 1,705 times, ~57 TB through the page cache in nine
+days) had left residency at 10% for three days with unscoped hybrid at 3-4s. The
+`search_chunks` asset now calls `rewarm_search_indexes_if_cold` after it records
+`cache_residency`: below `SEARCH_RESIDENCY_REWARM_FLOOR` (20%) and more than
+`SEARCH_RESIDENCY_REWARM_MIN_INTERVAL` (24h) since the last warm, it forces one. The
+interval is the point: a forced warm that did not stick means something else is evicting
+the cache, and the answer to that is `pg_stat_statements ORDER BY shared_blks_read DESC`,
+not another 20 GB read every five minutes.
+
 The second coordinate on the fresh keyset is non-negotiable: one chunk-builder batch
 stamps thousands of rows with the same `built_at`. A timestamp-only cursor once stopped in
 the middle of such a group and permanently skipped 2,525 chunks while every scheduled run
@@ -1119,6 +1141,13 @@ production rather than by argument:
   table inside a healthy pipeline. Ranking by SLA-relative age matters for the same reason:
   `marts_ai_conversations.events` unions six agent sources whose expectations differ tenfold,
   and raw age would permanently nominate whichever is legitimately the quietest.
+
+**Slack's generic `fatal_error` on `conversations.history` is a page too large to
+serve, and the page is retried smaller.** The channel behind the 2026-09-19 red row held
+dictionary-dump messages: Slack answered `fatal_error` at any page size of 50 or more and
+served the same page at `limit=1`. `iter_cursor_pages_with_cursor` halves the page size
+from the same cursor down to 1 before giving up, so a channel with one oversized message
+is read past it instead of re-erroring on every sweep forever.
 
 **An errored scope is `failing` only when it is at least 1% of the state table's
 scopes; otherwise `attention`.** On a one-row state table (gmail, a transcription run) or

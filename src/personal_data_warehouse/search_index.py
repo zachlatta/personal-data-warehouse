@@ -90,6 +90,53 @@ EMBED_FRESH_SCAN_ROWS = 500_000
 EMBED_ORPHAN_RECHECK_INTERVAL = timedelta(hours=24)
 
 
+#: Shared-buffer residency below which the search working set is treated as
+#: cold and re-warmed. 38% was the reading right after the 2026-09-10 rebuild
+#: and prewarm; 10% was three days of 3-4s unscoped hybrid searches.
+SEARCH_RESIDENCY_REWARM_FLOOR = 0.20
+#: A forced warm is never repeated within this window: if one did not stick,
+#: something else is evicting the cache, and re-reading ~20 GB every five
+#: minutes would be that something. Find the evictor in pg_stat_statements
+#: (ORDER BY shared_blks_read DESC) rather than fighting it.
+SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=24)
+
+
+def should_rewarm_search_indexes(
+    *, resident_fraction: float, last_prewarmed_at: datetime, now: datetime
+) -> bool:
+    """Whether a cold search cache with no index-identity change should be re-warmed.
+
+    ``prewarm_search_indexes_if_needed`` fires on a schema signature, database
+    restart, or REINDEX. None of those happened between 2026-09-16 and 09-19,
+    yet the 09-14..16 index-definition flap had pushed ~57 TB through the page
+    cache and left residency at 10% for three days. This is the guard for that
+    shape; it is deliberately rate-limited rather than reactive.
+    """
+
+    if resident_fraction < 0:
+        return False  # unmeasured, never evidence of cold
+    if resident_fraction >= SEARCH_RESIDENCY_REWARM_FLOOR:
+        return False
+    return now - last_prewarmed_at >= SEARCH_RESIDENCY_REWARM_MIN_INTERVAL
+
+
+def rewarm_search_indexes_if_cold(
+    warehouse: Any, measured: dict[str, Any], *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Force a prewarm when the measured residency says the cache is cold."""
+
+    now = now or datetime.now(tz=UTC)
+    fraction = float(measured.get("resident_fraction", -1))
+    last = warehouse.search_prewarmed_at()
+    if fraction < 0 or fraction >= SEARCH_RESIDENCY_REWARM_FLOOR:
+        return {"warmed": False, "reason": f"resident fraction {fraction:.2f} is not cold", "blocks": 0}
+    if now - last < SEARCH_RESIDENCY_REWARM_MIN_INTERVAL:
+        return {"warmed": False, "reason": f"cold ({fraction:.2f}) but warmed recently at {last.isoformat()}", "blocks": 0}
+    result = warehouse.prewarm_search_indexes_if_needed(force=True)
+    result["reason"] = f"cold ({fraction:.2f}) and last warmed {last.isoformat()}"
+    return result
+
+
 def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
     """Measure and publish current search-index shared-buffer residency.
 

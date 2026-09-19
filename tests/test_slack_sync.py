@@ -7,6 +7,7 @@ import pytest
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import (
+    iter_cursor_pages,
     SlackRateLimitedError,
     SlackApiCallError,
     SlackWebApiClient,
@@ -507,6 +508,54 @@ def test_iter_cursor_items_pages_until_next_cursor_is_empty():
 
     assert list(iter_cursor_items(client, "users.list", "members", limit=2)) == [{"id": "U1"}, {"id": "U2"}]
     assert client.calls[1][1]["cursor"] == "next"
+
+
+def test_cursor_pages_halve_the_page_size_when_slack_answers_fatal_error():
+    # One public channel (2026-09-19) held dictionary-dump messages so large
+    # that conversations.history answered Slack's generic `fatal_error` at any
+    # page size of 50 or more while `limit=1` worked. Every sweep re-erred on
+    # the same page, so the channel could never be read past it and the row
+    # sat in slack_sync_state as a permanent error. The page is retried with
+    # a smaller limit from the SAME cursor rather than given up on.
+    client = FakeSlackClient(
+        {
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: fatal_error", code="fatal_error"),
+                SlackApiCallError("conversations.history failed: fatal_error", code="fatal_error"),
+                {"ok": True, "messages": [{"ts": "1.0"}], "response_metadata": {"next_cursor": "c2"}},
+                {"ok": True, "messages": [{"ts": "2.0"}], "response_metadata": {}},
+            ]
+        }
+    )
+
+    pages = list(iter_cursor_pages(client, "conversations.history", "messages", limit=200, channel="C1"))
+
+    assert pages == [[{"ts": "1.0"}], [{"ts": "2.0"}]]
+    assert [c[1]["limit"] for c in client.calls] == [200, 100, 50, 50]
+    assert [c[1]["cursor"] for c in client.calls] == ["", "", "", "c2"]
+
+
+def test_cursor_pages_give_up_on_fatal_error_at_the_smallest_page():
+    client = FakeSlackClient(
+        {
+            "conversations.history": [
+                SlackApiCallError("conversations.history failed: fatal_error", code="fatal_error")
+                for _ in range(9)
+            ]
+        }
+    )
+    with pytest.raises(SlackApiCallError, match="fatal_error"):
+        list(iter_cursor_pages(client, "conversations.history", "messages", limit=200, channel="C1"))
+    assert [c[1]["limit"] for c in client.calls] == [200, 100, 50, 25, 12, 6, 3, 1]
+
+
+def test_cursor_pages_do_not_shrink_for_other_api_errors():
+    client = FakeSlackClient(
+        {"conversations.history": [SlackApiCallError("conversations.history failed: channel_not_found", code="channel_not_found")]}
+    )
+    with pytest.raises(SlackApiCallError, match="channel_not_found"):
+        list(iter_cursor_pages(client, "conversations.history", "messages", limit=200, channel="C1"))
+    assert len(client.calls) == 1
 
 
 def test_conversation_recency_uses_latest_or_cursor_state():

@@ -12695,6 +12695,14 @@ class PostgresWarehouse:
             return str(rows[0][0]), rows[0][1], str(rows[0][2])
         return "", datetime.fromtimestamp(0, tz=UTC), ""
 
+    def search_prewarmed_at(self) -> datetime:
+        """When the search indexes were last warmed (the epoch if never)."""
+        self._ensure_search_schema_state_table()
+        rows = self._query("SELECT prewarmed_at FROM @search_schema_state WHERE id = 1")
+        if rows and rows[0][0] is not None:
+            return rows[0][0]
+        return datetime.fromtimestamp(0, tz=UTC)
+
     def prewarm_search_indexes_if_needed(
         self, *, schema_signature: str | None = None, force: bool = False
     ) -> dict[str, int | bool | str]:
