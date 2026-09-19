@@ -6950,10 +6950,16 @@ def test_search_text_pushes_priorities_into_every_scan() -> None:
     assert "query, per_branch_limit, since, priorities" in sql, (
         "each branch's EXECUTE must pass `priorities` as the fourth format argument"
     )
-    # Both pooled partitions (global index + low-volume partial index).
-    assert sql.count("AND (priorities IS NULL OR t.priority::text = ANY (priorities))") >= 3, (
-        "the broad pooled scan's BOTH partitions and search_text_exact's scan "
-        "must filter on priority in the WHERE, not after the top-k"
+    # Both pooled partitions of both pools (global + low-volume, attention +
+    # attention low-volume) run as one-shot dynamic SQL, so the tier filter
+    # is the USING parameter $1 there; search_text_exact's scan keeps the
+    # static form.
+    assert sql.count("AND ($1 IS NULL OR t.priority::text = ANY ($1))") >= 4, (
+        "the pooled scan's partitions must filter on priority in the WHERE, "
+        "not after the top-k"
+    )
+    assert sql.count("AND (priorities IS NULL OR t.priority::text = ANY (priorities))") >= 1, (
+        "search_text_exact's scan must filter on priority in the WHERE"
     )
 
 
@@ -7119,10 +7125,39 @@ def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() 
         "the broad pool must choose the attention index only when the requested "
         "tiers are a SUBSET of the ones it contains"
     )
-    assert "to_bm25query(query, 'timeline_events_search_text_bm25_attention_idx')" in pool
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_idx')" in pool
     assert (
-        "to_bm25query(query, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in pool
+        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in pool
     )
+
+
+def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> None:
+    """The pooled scan must not run as a cached plan with the query as a parameter.
+
+    Measured 2026-09-19 on production, same words, same session: the pool as
+    a static plpgsql statement took 14-28s on queries whose matches include a
+    few multi-megabyte `self`-tier documents (pg_textsearch re-scores every
+    returned row on that path), while the identical statement with the query
+    inlined as a literal took 4-190ms. A PREPAREd statement was slow under
+    force_custom_plan too, so it is the cached-plan path itself. Only the
+    query needs to be a literal; priorities and since travel through USING.
+    """
+    sql = _search_text_function_sql()
+    pool = sql[
+        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+    assert "to_bm25query(query," not in pool, (
+        "the pool must inline the query as a literal (%1$L), never reference "
+        "the plpgsql variable, which makes it a cached parameterized plan"
+    )
+    assert pool.count("EXECUTE format($pool$") == 2, "both the attention and the broad pool run as one-shot dynamic SQL"
+    assert pool.count("USING priorities, since;") == 2
+    assert "($1 IS NULL OR t.priority::text = ANY ($1))" in pool
+    assert "($2 IS NULL OR t.event_ts >= $2)" in pool
+    assert "(priorities IS NULL OR" not in pool and "(since IS NULL OR" not in pool
+    assert "%" not in pool.replace("%1$L", ""), "format() would misread any other percent sign in the template"
 
 
 def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
@@ -7184,8 +7219,8 @@ def test_a_non_subset_priority_call_keeps_the_general_indexes() -> None:
         "the fallback pool must not name an attention index: it cannot answer "
         "a call for noise/cc/background at all"
     )
-    assert "to_bm25query(query, 'timeline_events_search_text_bm25_idx')" in general
-    assert "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx')" in general
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')" in general
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_lowvol_idx')" in general
 
 
 def test_search_schema_signature_covers_the_attention_tiers() -> None:

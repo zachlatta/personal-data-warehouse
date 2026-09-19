@@ -12967,6 +12967,26 @@ class PostgresWarehouse:
             SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
             SEARCH_TEXT_POOL_PART_LOW_VOLUME,
         )
+        # The pool is issued as ONE-SHOT dynamic SQL with the query text
+        # inlined as a literal, never as a cached plan with the query as a
+        # parameter. Measured 2026-09-19 on production, same words, same
+        # session: the pool as a static plpgsql statement (an SPI cached plan)
+        # took 14-28s on queries whose matches include a few multi-megabyte
+        # `self`-tier documents, while the identical statement issued with the
+        # query as a literal took 4-190ms -- and a PREPAREd statement was slow
+        # under force_custom_plan too, so it is the cached-plan path itself,
+        # not generic-vs-custom. Only the query needs to be a literal;
+        # `priorities` and `since` are ordinary parameters passed with USING.
+        def one_shot_pool(pool_sql: str) -> str:
+            return (
+                pool_sql.replace("to_bm25query(query,", "to_bm25query(%1$L,")
+                .replace("(since IS NULL OR t.event_ts >= since)", "($2 IS NULL OR t.event_ts >= $2)")
+                .replace(
+                    "(priorities IS NULL OR t.priority::text = ANY (priorities))",
+                    "($1 IS NULL OR t.priority::text = ANY ($1))",
+                )
+            )
+
         # The ATTENTION pool: the identical two-partition shape, taken from the
         # partial indexes that contain only `self` and `direct`. Used only when
         # the requested tiers are a SUBSET of those -- a call for `noise` or an
@@ -13302,21 +13322,29 @@ class PostgresWarehouse:
                     -- read the general indexes or it returns silently empty.
                     -- `priorities` is NULL-normalized to "all tiers" above, so
                     -- an unscoped call correctly fails this test.
+                    -- EXECUTE format(...), not a static statement: a cached
+                    -- plan for this scan re-scores every returned document
+                    -- (14-28s when a few are multi-megabyte); the query text
+                    -- must reach the planner as a literal. See one_shot_pool.
                     IF priorities IS NOT NULL
                        AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""] THEN
+                        EXECUTE format($pool$
                         SELECT array_agg(p.adapter), array_agg(p.event_id),
                                array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
                           FROM (
-                            """ + attention_pool_sql + r"""
-                          ) p;
+                            """ + one_shot_pool(attention_pool_sql) + r"""
+                          ) p$pool$, query)
+                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                          USING priorities, since;
                     ELSE
+                        EXECUTE format($pool$
                         SELECT array_agg(p.adapter), array_agg(p.event_id),
                                array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
                           FROM (
-                            """ + broad_pool_sql + r"""
-                          ) p;
+                            """ + one_shot_pool(broad_pool_sql) + r"""
+                          ) p$pool$, query)
+                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                          USING priorities, since;
                     END IF;
                     PERFORM set_config('enable_sort', 'on', true);
                     RETURN QUERY

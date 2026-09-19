@@ -548,6 +548,25 @@ index walks past millions of gmail/slack documents and took 15-16s on an unlucky
 And the pool depth is a measured trade (`SEARCH_TEXT_BROAD_POOL`): deeper gives the
 per-source floor more to promote, up to a point where latency grows and scores do not.
 
+**The pooled scan is one-shot dynamic SQL with the query text inlined, and that is
+the difference between 190ms and 28 seconds.** Measured 2026-09-19 on production, same
+words, same session: the pool as a static plpgsql statement — an SPI cached plan with
+`query` as a parameter to `to_bm25query()` — took 14–28s on queries whose matches
+include a few multi-megabyte `self`-tier documents (77 Drive files for one two-word
+probe), while the identical statement with the query as a literal took 4–190ms, and a
+`PREPARE`d statement was just as slow under `force_custom_plan`, so it is the
+cached-plan path itself that makes pg_textsearch re-score every returned document
+rather than trust the index order. The scoped branches always inlined the query
+(`%1$L`); the two pools now do too, with `priorities` and `since` passed through
+`USING`, and `test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined`
+refuses a static `to_bm25query(query, …)` inside the pool. The symptom to recognise:
+`auto_explain` shows the index scan returning a few hundred rows with ~20k buffers and
+~130ms of I/O, and the statement still takes 25 seconds — the time is in the per-row
+re-scoring, which no node attributes. A related trap found the same day: a plain
+`REINDEX` of a BM25 index wrote `pg_class.reltuples = 212,042` for the 61M-row
+timeline heap (a 280x under-estimate); `ANALYZE timeline.events` repaired it in 19s.
+Check `reltuples` after any index rebuild on that table.
+
 **An attention-scoped broad call reads its own pair of indexes, and the literal tier
 predicate beside them is load-bearing.** `priorities => ARRAY['self']` is the query C3
 exists for, and it was the slowest thing in the layer: `self` is 1.01% of 49M rows and
