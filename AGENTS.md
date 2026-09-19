@@ -1120,6 +1120,15 @@ production rather than by argument:
   `marts_ai_conversations.events` unions six agent sources whose expectations differ tenfold,
   and raw age would permanently nominate whichever is legitimately the quietest.
 
+**An errored scope is `failing` only when it is at least 1% of the state table's
+scopes; otherwise `attention`.** On a one-row state table (gmail, a transcription run) or
+a four-row one (whoop) that is still the very first error, so nothing there changed. On
+Slack's ~24k conversation rows, one public channel answering `conversations.history` with
+Slack's generic `fatal_error` on every sweep read the whole pipeline `failing` on
+2026-09-19 — messages ten minutes fresh, 288/288 runs green — and eleven marts red behind
+it. The row is still counted in `state_error_rows` and named in `last_error`; it is the
+colour that is proportionate now.
+
 **`newest_event_at` is judged, and `unmeasured` is not `no_data`.** Event lateness escalates
 the pipeline's status exactly like write lateness. Two failure modes are deliberately kept
 apart from it: `unmonitored` (no data table declares an event column) and `unmeasured` (the

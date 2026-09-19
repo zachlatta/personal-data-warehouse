@@ -622,6 +622,53 @@ def test_terminal_gone_state_rows_do_not_surface_as_failures(warehouse):
     assert row["last_error_at"] is None
 
 
+def test_one_errored_scope_among_thousands_reads_attention_not_failing(warehouse):
+    # On 2026-09-19 one public channel of 24,234 answered conversations.history
+    # with Slack's generic `fatal_error` on every sweep, and the whole slack
+    # pipeline read `failing` -- with messages ten minutes fresh and 288/288
+    # runs green -- while eleven marts turned red behind it. A single scope of a
+    # many-scope state table is `attention`; `failing` is reserved for an error
+    # share of at least one percent, which on a one-row table (gmail, voice
+    # transcription) or a four-row one (whoop) is still the very first error.
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    ok_rows = ",\n".join(
+        f"('zrl', 'T1', 'conversation', 'C{i}', '', 'partial', 'ok', '', %s, 1)" for i in range(150)
+    )
+    warehouse._command(
+        f"""
+        INSERT INTO @slack_sync_state
+            (account, team_id, object_type, object_id, cursor_ts, last_sync_type,
+             status, error, updated_at, sync_version)
+        VALUES {ok_rows},
+            ('zrl', 'T1', 'conversation', 'CBAD', '', 'backfill',
+             'error', 'conversations.history failed: fatal_error', %s, 1)
+        """,
+        tuple([now] * 151),
+    )
+
+    def collect() -> dict:
+        PipelineHealthCollector(warehouse).run()
+        return warehouse._query_dicts(
+            "SELECT status, state_rows, state_error_rows, last_error"
+            " FROM @marts_pipeline_health WHERE pipeline = 'slack'"
+        )[0]
+
+    row = collect()
+    assert row["state_rows"] == 151
+    assert row["state_error_rows"] == 1
+    assert row["status"] == "attention"
+    assert "fatal_error" in row["last_error"]  # still named, still visible
+
+    warehouse._command(
+        "UPDATE @slack_sync_state SET status = 'error', error = 'ratelimited'"
+        " WHERE object_id IN ('C0', 'C1')"
+    )
+    row = collect()
+    assert row["state_error_rows"] == 3  # ~2% of scopes: a real outage
+    assert row["status"] == "failing"
+
+
 def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(warehouse):
     """A Mac uploader that fires and fails must read `failing`, not `late`.
 

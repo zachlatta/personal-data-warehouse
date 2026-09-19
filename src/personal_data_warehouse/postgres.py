@@ -4697,8 +4697,16 @@ class PostgresWarehouse:
                     WHEN collected_at IS NULL
                       OR now() - collected_at > make_interval(
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
-                    WHEN state_error_rows > 0 THEN 'failing'
-                    WHEN state_attention_rows > 0 THEN 'attention'
+                    -- An errored scope is `failing` only when it is at least
+                    -- one percent of the state table's scopes. On a one-row
+                    -- table (gmail, a transcription run) or a four-row one
+                    -- (whoop) that is still the very first error; on Slack's
+                    -- ~24k conversation rows one channel answering
+                    -- `fatal_error` forever is `attention`, not a red
+                    -- pipeline with eleven red marts behind it (2026-09-19).
+                    WHEN state_error_rows > 0
+                     AND state_error_rows * 100 >= state_rows THEN 'failing'
+                    WHEN state_error_rows > 0 OR state_attention_rows > 0 THEN 'attention'
                     -- Event lateness escalates exactly like write lateness.
                     -- Only 'late'/'stale' escalate: 'unmonitored', 'unmeasured'
                     -- and 'no_data' are statements about the measurement, and
