@@ -951,6 +951,9 @@ func TestLoadCachedModelDataInflatesTheRawDeflateArchive(t *testing.T) {
 }
 
 func TestBuildWritebackHelperRebuildsOnlyWhenTheSourceChanges(t *testing.T) {
+	prev := hostOS
+	hostOS = "darwin"
+	t.Cleanup(func() { hostOS = prev })
 	root := filepath.Join(t.TempDir(), "helper")
 	builds := 0
 	compile := func(source, output string) error {

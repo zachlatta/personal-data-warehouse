@@ -21,6 +21,10 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
 )
 
+// hostOS is runtime.GOOS; a package var so the macOS-only paths are testable
+// on the Linux CI runner.
+var hostOS = runtime.GOOS
+
 // Renames must be real Core Data saves, not raw SQL: CloudRecordings.db
 // belongs to NSPersistentCloudKitContainer (mirrored by voicememod), and only
 // a save that records persistent history is exported to CloudKit and synced
@@ -122,7 +126,7 @@ func HelperIsCurrent(root string) bool {
 // the swiftc invocation (nil for the real one); the build lock serialises
 // concurrent uploader runs.
 func BuildWritebackHelper(root string, compile func(source, output string) error) (string, error) {
-	if runtime.GOOS != "darwin" {
+	if hostOS != "darwin" {
 		return "", errors.New("Voice Memos write-back is only available on macOS")
 	}
 	if compile == nil {

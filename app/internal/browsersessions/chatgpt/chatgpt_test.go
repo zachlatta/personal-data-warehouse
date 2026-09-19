@@ -199,6 +199,7 @@ func fakeSetup(installed map[string]bool, discover func(string) (chatgpt.Capture
 }
 
 func TestEnsureBrowser(t *testing.T) {
+	chatgpt.SetHostOS(t, "darwin")
 	s, log := fakeSetup(map[string]bool{"/Applications/Google Chrome.app": true}, nil)
 	if p, err := s.EnsureBrowser("", false); err != nil || p.Key != "chrome" {
 		t.Fatalf("p = %v err = %v", p, err)

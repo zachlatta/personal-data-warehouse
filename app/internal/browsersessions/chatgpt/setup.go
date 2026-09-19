@@ -11,6 +11,10 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium"
 )
 
+// hostOS is runtime.GOOS; a package var so the macOS-only paths are testable
+// on the Linux CI runner.
+var hostOS = runtime.GOOS
+
 // Setup is the browser-bootstrap flow: every side effect (install, open a
 // URL, prompt) is injected so it is testable and so non-interactive callers
 // can opt out.
@@ -101,7 +105,7 @@ func (s Setup) installed(profile chromium.Profile) bool {
 }
 
 func (s Setup) install(profile chromium.Profile) error {
-	if runtime.GOOS != "darwin" {
+	if hostOS != "darwin" {
 		return cookieErrorf("cannot auto-install %s on this platform; install it manually", profile.DisplayName)
 	}
 	if profile.HomebrewCask == "" || s.BrewAvailable == nil || !s.BrewAvailable() {
