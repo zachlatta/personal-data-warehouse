@@ -1048,20 +1048,23 @@ The five-minute uploaders must report within `UPLOADER_RUN_INTERVAL` (30 min: la
 stale at 3h); the heartbeat is best-effort and never changes the uploader's own exit code.
 The `uploader_heartbeats` pipeline row says whether ANY device is reporting at all.
 
-**The heartbeat post runs OUTSIDE the pdw CLI, so it needs credentials of its own.**
-`pdw_post_heartbeat` shells out to `uv run python -m personal_data_warehouse.uploader_heartbeat`
-directly, which inherits none of the URL/token `pdw ingest` resolves for the uploader beside
-it. The five Apple wrappers each happened to export `PDW_API_URL`/`PDW_SECRET_TOKEN` from
-`~/.config/pdw/config.json` for their own uploaders (they keep `pdw` out of the exec chain to
-protect their TCC grants); the two agent-sessions wrappers run *through* `pdw` and so never
-did — and their heartbeat therefore failed on **every** run from the day it shipped, ~288
-times a day per Mac, into a launchd error log nobody reads. `claude_code`, `codex`, `pi` and
-`openclaw` all sat at `last_run_at` NULL, so for those four "the uploader died" and "Zach is
-not using this tool" were indistinguishable — the exact gap the heartbeat exists to close,
-open on the four pipelines with no other signal. Credential resolution now lives once in
-`pdw_export_app_credentials` in `bin/_pdw-upload-lib.sh` and every wrapper inherits it by
-sourcing the lib; `tests/test_upload_heartbeat_lib.py` fails if a wrapper hand-rolls the
-config read again, or posts a heartbeat without sourcing the lib.
+**The heartbeat post is `pdw heartbeat`, and it resolves credentials the way every other
+pdw command does.** `pdw_post_heartbeat` in `bin/_pdw-upload-lib.sh` runs
+`pdw heartbeat --pipeline a,b --exit-code N --duration-seconds F --ran-at ISO` (native Go,
+`app/cmd/pdw-cli/heartbeat.go`), which reads `pdw login`'s config like `pdw ingest` does.
+The history that shaped it: when the post was a `uv run python -m …` DIRECTLY outside the
+CLI, it inherited none of the URL/token `pdw ingest` resolved for the uploader beside it. The
+five Apple wrappers each happened to export `PDW_API_URL`/`PDW_SECRET_TOKEN` from
+`~/.config/pdw/config.json` for their own uploaders; the two agent-sessions wrappers ran
+*through* `pdw` and so never did — and their heartbeat therefore failed on **every** run from
+the day it shipped, ~288 times a day per Mac, into a launchd error log nobody reads.
+`claude_code`, `codex`, `pi` and `openclaw` all sat at `last_run_at` NULL, so for those four
+"the uploader died" and "Zach is not using this tool" were indistinguishable — the exact gap
+the heartbeat exists to close, open on the four pipelines with no other signal. Credential
+resolution lives once in `pdw_export_app_credentials` in the lib and every wrapper inherits it
+by sourcing the lib; `tests/test_upload_heartbeat_lib.py` fails if a wrapper hand-rolls the
+config read again, or posts a heartbeat without sourcing the lib, and
+`tests/test_device_wrappers.py` fails if any wrapper runs anything but `pdw`.
 
 - Collector: the `pipeline_health` Dagster asset (`*/10 * * * *`) probes `max(<column>)` per
   table and writes `ops.pipeline_health` + `ops.pipeline_table_freshness`. It only probes a
@@ -1483,10 +1486,18 @@ release binaries with a stable identity **in the release workflow**:
   porygon. If the key is ever lost, generate a new one (openssl self-signed cert with the
   `codeSigning` EKU), update both secrets, and expect one re-toggle per Mac.
 
-This covers pdw's own grant (needed by `pdw ingest claude-desktop`). The uploader
-LaunchAgents dodge the problem differently — they exec `uv run python` directly without pdw
-in the chain — and their `/bin/zsh`/`uv`/venv-python grants (including the uv python
-path-drift gotcha described below) are unchanged.
+This covers every grant now, because every device-side job runs through the one signed
+binary: the uploaders (`pdw ingest <source>`), the Notes/Contacts mutation workers
+(`pdw mutations <provider>`), the browser-session publishers (`pdw slack|chatgpt|whoop|hn
+publish-session`) and the run heartbeat (`pdw heartbeat`). The LaunchAgents used to keep
+pdw OUT of their exec chain and run `uv run python` directly, precisely because an unsigned
+self-update revoked the grant; with the stable signing identity that reason is gone, and so
+are uv and Python from the chain (`tests/test_device_wrappers.py` pins it). The one-time cost
+per Mac is re-issuing each grant to `~/.local/bin/pdw`: Full Disk Access (the uploaders),
+Automation → Notes and Automation → Contacts (the mutation workers), Photos (the photos
+uploader, alongside the separate PDW Photos Exporter helper grant), and the "Safe Storage"
+keychain ACLs (the session publishers, Always Allow). The uv-python path-drift gotcha that
+used to break these grants on every `uv` patch bump no longer applies.
 
 ## iOS app and push notifications
 
@@ -1747,7 +1758,7 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist`
 - Wrapper script: `bin/voice-memos-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `pdw ingest voice-memos --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_voice_memos.cli`)
+- Command: `pdw ingest voice-memos --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`
 - Status helper: `bin/voice-memos-upload-status`
@@ -1758,8 +1769,10 @@ app-assigned name ("New Recording N" / geocoded location names — detected by t
 pre-flag-era rows) are renamed in the Voice Memos app to the newest completed
 `derived_voice_memos.enrichments` title. Hand-typed titles are never overwritten (the
 gate is enforced at plan time and re-checked inside the write transaction). The rename
-is a proper Core Data save against `CloudRecordings.db` via PyObjC
-(`writeback.py` + `store_writer.py`): the model comes from the store's own
+is a proper Core Data save against `CloudRecordings.db` by a small Swift helper
+(`app/internal/uploaders/voicememos/macos/VoiceMemosWriteback.swift`, embedded in the pdw
+binary and compiled on demand with `swiftc`, the same arrangement as the photos exporter;
+driven by `writeback.go` + `storewriter.go`): the model comes from the store's own
 `Z_MODELCACHE`, migration is disabled (incompatible future stores fail loudly), and the
 save records persistent history under the author
 `com.zachlatta.pdw.voice-memo-writeback`, which `voicememod` exports to CloudKit so the
@@ -1793,14 +1806,13 @@ behave better for user-session jobs and are easier to inspect with `launchctl`.
 If the run log shows `PermissionError: [Errno 1] Operation not permitted` for
 `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings`, the LaunchAgent is
 loaded correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk
-Access to the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
-versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
-`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
-hardcode it — derive the current target with
-`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
-kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
-uploader starts failing with a permission error after working fine before.
+Access to the executable chain used by the job: `/bin/zsh` and the `pdw` binary
+(`~/.local/bin/pdw`). Nothing else is in the chain any more — no `uv`, no venv python, and
+therefore no uv-python path drift to re-check. The grant survives `pdw update` because release
+binaries are signed with a stable identity; if it breaks anyway, `codesign -d --verbose=2
+~/.local/bin/pdw` must show `Identifier=com.zachlatta.pdw` (a local `go build` is ad-hoc signed
+and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
+the LaunchAgent again.
 
 ## Local Apple Notes Upload Scheduler
 
@@ -1811,7 +1823,7 @@ This Mac is intended to run the local Apple Notes uploader through a user Launch
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-notes-upload.plist`
 - Wrapper script: `bin/apple-notes-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `pdw ingest apple-notes --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_apple_notes.cli`)
+- Command: `pdw ingest apple-notes --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat`
 - Status helper: `bin/apple-notes-upload-status`
@@ -1839,21 +1851,20 @@ The uploader only sees this Mac's local NoteStore, and macOS only pulls Notes iC
 while Notes.app is running — with the app quit, the store silently freezes and the uploader
 reports healthy `selected=0` runs while edits made on other devices never arrive. Each run
 therefore ensures Notes.app is running (launched hidden via `open -g -j -a Notes`; see
-`notes_app.py`). Set `APPLE_NOTES_OPEN_NOTES_APP=0` to disable. If apple_notes data looks
+`app/internal/uploaders/applenotes`). Set `APPLE_NOTES_OPEN_NOTES_APP=0` to disable. If apple_notes data looks
 stale despite healthy runs, check the `NoteStore.sqlite-wal` mtime — days old means iCloud
 delivery is stalled, not the uploader.
 
 If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, the LaunchAgent is loaded
-correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk Access to
-the executable chain used by the job, especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
-versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
-`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
-hardcode it — derive the current target with
-`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
-kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
-uploader starts failing with a permission error after working fine before.
+correctly but macOS Full Disk Access is blocking the background process. Grant Full Disk
+Access to the executable chain used by the job: `/bin/zsh` and the `pdw` binary
+(`~/.local/bin/pdw`). Nothing else is in the chain any more — no `uv`, no venv python, and
+therefore no uv-python path drift to re-check. The grant survives `pdw update` because release
+binaries are signed with a stable identity; if it breaks anyway, `codesign -d --verbose=2
+~/.local/bin/pdw` must show `Identifier=com.zachlatta.pdw` (a local `go build` is ad-hoc signed
+and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
+the LaunchAgent again.
 
 ## Writing to Apple Notes (apple_notes mutations)
 
@@ -1934,14 +1945,19 @@ hard way on porygon, 2026-08-24:
   `auth_value = 2, auth_reason = 3, flags = NULL`. The user TCC database is readable and
   writable only from a chain that already holds Full Disk Access — in practice a LaunchAgent,
   not an SSH shell — and `tccd` caches, so a change needs `kill -9 $(pgrep -f 'tccd$')`.
-- **TCC attributes the event to `uv`, at its versioned Cellar path.** The chain is
-  launchd → `/bin/zsh` → `uv` → python → `osascript`, and the grant lands on
-  `/opt/homebrew/Cellar/uv/<version>/bin/uv`. That path **drifts on every uv upgrade**,
-  exactly like the Full Disk Access python-path drift documented above, so a working
-  executor will start returning `blocked_missing_credentials` after a `brew upgrade` with no
-  code change. The executor classifies `-1743` as `blocked_missing_credentials` rather than
-  a failure precisely so this reads as "a human must re-grant on that Mac".
+- **TCC attributes the event to the `pdw` binary.** The chain is
+  launchd → `/bin/zsh` → `pdw` → `osascript`, so the Automation → Notes grant lands on
+  `~/.local/bin/pdw`. It used to land on `uv` at its versioned Cellar path
+  (`/opt/homebrew/Cellar/uv/<version>/bin/uv`), which **drifted on every uv upgrade** and made
+  a working executor start returning `blocked_missing_credentials` after a `brew upgrade` with
+  no code change; release binaries are signed with a stable identity now, so the grant
+  survives `pdw update`, and the move to the Go worker needs the grant re-issued ONCE per
+  Mac. The executor classifies `-1743` as `blocked_missing_credentials` rather than a failure
+  precisely so this reads as "a human must re-grant on that Mac".
 
+The resident worker is `pdw mutations apple-notes` (`app/internal/mutationworkers/applenotes`,
+run by the `apple-notes-mutation-worker` LaunchAgent through `bin/apple-notes-mutation-worker-launchd`);
+`--once` applies one batch and exits, which is what the uploader's pre-scan pass does.
 `APPLE_NOTES_MUTATIONS_ENABLED=0` pauses the local worker without touching the uploader.
 `pdw ingest apple-notes --mutations-only` applies approved mutations and skips the upload;
 `--no-mutations` does the reverse.
@@ -1954,14 +1970,16 @@ SQL starting points: `base_apple_notes.notes` for the resulting note, and
 Apple (iCloud) Contacts is the second write-back source, in exactly the Apple Notes shape:
 iCloud publishes no write API, so the proposal and review halves live with every other
 mutation type (`app/internal/mutations/apple_contacts.go`) and the executor is local —
-`personal_data_warehouse.apple_contacts_mutations` driven by Contacts.app over AppleScript,
-claimed by `personal_data_warehouse_apple_contacts.mutation_worker` (a resident LaunchAgent,
-`com.zachlatta.personal-data-warehouse.apple-contacts-mutation-worker`, plus the five-minute
-uploader as fallback, which applies approved rows **before** it scans so the changed card
-reaches `base_apple_contacts.cards` in the same cycle). `apple_contacts` sits in
-`LOCAL_ONLY_MUTATION_PROVIDERS` so the cloud worker never claims it. The AppleScript
-plumbing both executors share (`applescript_string`, `run_osascript`, the `-1743` →
-`blocked_missing_credentials` classification) lives in `apple_automation.py`.
+`app/internal/mutationworkers/applecontacts` (native Go in the pdw binary) driven by
+Contacts.app over AppleScript, claimed by `pdw mutations apple-contacts` (a resident
+LaunchAgent, `com.zachlatta.personal-data-warehouse.apple-contacts-mutation-worker`, through
+`bin/apple-contacts-mutation-worker-launchd`, plus the five-minute uploader as fallback, which
+applies approved rows **before** it scans so the changed card reaches
+`base_apple_contacts.cards` in the same cycle). `apple_contacts` sits in
+`LOCAL_ONLY_MUTATION_PROVIDERS` (`defs/upstream_mutations.py`) so the cloud worker never
+claims it. The AppleScript plumbing both executors share (string quoting, `osascript`
+execution, the `-1743` → `blocked_missing_credentials` classification) lives in
+`app/internal/mutationworkers/applescript`.
 
 Three operations, all keyed by `base_apple_contacts.cards.card_id` — which is also Contacts'
 own AppleScript `id` (`<UUID>:ABPerson`), so unlike Notes there is no second identifier to
@@ -1985,7 +2003,7 @@ one warehouse snapshot can name the same card — one `merge_contacts` folds it 
 other `update_contact` adds an email to it. The merge ran first on 2026-09-13 and
 Contacts.app answered `-1728` for the update one minute later, which read
 `failed_terminal` on a 168-mutation request whose other 167 rows succeeded. The executor
-now asks the mutation ledger (`apple_contacts_merged_card_target`: the newest SUCCEEDED
+now asks the mutation ledger (`queue.PostgresStore.AppleContactsMergedCardTarget`: the newest SUCCEEDED
 `merge_contacts` whose `merge_card_ids` names the card, chains followed) and applies the
 update to the surviving card, recording `redirected_from` in `result_json`; a merge whose
 target is already folded into the same kept card skips it (`already_merged_card_ids`), and
@@ -2016,9 +2034,10 @@ So an agent adding a contact proposes it to Google and lets the mirror carry it 
 devices; `apple_contacts.*` is for iCloud-specific repairs.
 
 The Automation → Contacts TCC grant is separate from the Notes grant and from Full Disk
-Access, attributed to the same `launchd → /bin/zsh → uv (Cellar path) → python → osascript`
-chain, and drifts on every uv upgrade exactly as documented for Notes above. It was
-already present on porygon when this shipped (2026-09-12). `APPLE_CONTACTS_MUTATIONS_ENABLED=0`
+Access, attributed to the same `launchd → /bin/zsh → pdw → osascript` chain, and needs the
+same one-time re-grant to the signed `pdw` binary documented for Notes above (it was granted
+to uv's Cellar path when this shipped on porygon, 2026-09-12, and drifted on every uv upgrade
+until the worker moved into pdw). `APPLE_CONTACTS_MUTATIONS_ENABLED=0`
 pauses the local worker; `pdw ingest apple-contacts --mutations-only` / `--no-mutations`
 split the two stages. The app needs `APPLE_CONTACTS_ACCOUNTS` (falls back to
 `GMAIL_ACCOUNTS`) to accept proposals for the account.
@@ -2032,7 +2051,7 @@ This Mac is intended to run the local Apple Messages uploader through a user Lau
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-messages-upload.plist`
 - Wrapper script: `bin/apple-messages-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `pdw ingest apple-messages --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_apple_messages.cli`)
+- Command: `pdw ingest apple-messages --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat`
 - Status helper: `bin/apple-messages-upload-status`
@@ -2058,15 +2077,14 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-messag
 
 If the run log shows `PermissionError` or SQLite `authorization denied` for
 `~/Library/Messages/chat.db`, the LaunchAgent is loaded correctly but macOS Full Disk Access is
-blocking the background process. Grant Full Disk Access to the executable chain used by the job,
-especially `/bin/zsh`, the `pdw` binary (`~/.local/bin/pdw`), `/opt/homebrew/bin/uv`, and
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`. The python lives under a
-versioned uv directory, so its real path **drifts on every uv python patch bump** (e.g.
-`cpython-3.12.12-…` → `cpython-3.12.13-…`), silently breaking the previously-granted FDA. Don't
-hardcode it — derive the current target with
-`uv run python -c 'import sys,os;print(os.path.realpath(sys.executable))'`, grant FDA to that, then
-kickstart the LaunchAgent again. Because the path changes under you, re-check it whenever an
-uploader starts failing with a permission error after working fine before.
+blocking the background process. Grant Full Disk
+Access to the executable chain used by the job: `/bin/zsh` and the `pdw` binary
+(`~/.local/bin/pdw`). Nothing else is in the chain any more — no `uv`, no venv python, and
+therefore no uv-python path drift to re-check. The grant survives `pdw update` because release
+binaries are signed with a stable identity; if it breaks anyway, `codesign -d --verbose=2
+~/.local/bin/pdw` must show `Identifier=com.zachlatta.pdw` (a local `go build` is ad-hoc signed
+and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
+the LaunchAgent again.
 
 Apple Messages SQL starting points are `base_apple_messages.messages`, `base_apple_messages.chats`,
 `base_apple_messages.handles`, `base_apple_messages.chat_handles`,
@@ -2082,7 +2100,7 @@ This Mac is intended to run the local Apple Contacts uploader through a user Lau
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.apple-contacts-upload.plist`
 - Wrapper script: `bin/apple-contacts-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `uv run python -m personal_data_warehouse_apple_contacts.cli --mode incremental`
+- Command: `pdw ingest apple-contacts --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/apple-contacts-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/apple-contacts-upload.heartbeat`
 - Status helper: `bin/apple-contacts-upload-status`
@@ -2114,8 +2132,8 @@ unions active Apple and Google cards and `marts_contacts.contact_points` provide
 for identity joins. `marts_messages.apple_messages` uses those points to resolve Messages senders.
 
 If the run log shows `PermissionError` or SQLite `authorization denied` for an Address Book
-store, grant Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`, the repo venv Python, and the
-current real uv Python path, then kickstart the LaunchAgent.
+store, grant Full Disk Access to `/bin/zsh` and the signed `pdw` binary (`~/.local/bin/pdw`),
+then kickstart the LaunchAgent.
 
 ## Local Apple Photos Upload Scheduler
 
@@ -2126,7 +2144,7 @@ This Mac is intended to run the local Apple Photos uploader through a user Launc
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.photos-upload.plist`
 - Wrapper script: `bin/photos-upload-launchd`
 - Run cadence: every 1800 seconds with `RunAtLoad`
-- Command: `uv run python -m personal_data_warehouse_photos.cli --mode incremental --limit 100` (override the bounded-run default with `PHOTOS_UPLOAD_LIMIT`; the wrapper runs uv DIRECTLY — pdw self-updates invalidate TCC grants attributed to it, so it must stay out of every uploader exec chain; credentials are read from `~/.config/pdw/config.json`)
+- Command: `pdw ingest apple-photos --mode incremental --limit 100` (override the bounded-run default with `PHOTOS_UPLOAD_LIMIT`; native Go in the signed pdw binary. The wrapper used to run uv DIRECTLY because unsigned pdw self-updates invalidated the TCC grants attributed to it; release binaries are signed with a stable identity now, so pdw is the whole chain and the Full Disk Access grant for the `Photos.sqlite` snapshot moves to `~/.local/bin/pdw`, once)
 - Main run log: `~/Library/Logs/personal-data-warehouse/photos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/photos-upload.heartbeat`
 - Status helper: `bin/photos-upload-status`
@@ -2160,8 +2178,8 @@ Exporter.app`; every helper call goes through LaunchServices so TCC consistently
 grant to `com.zachlatta.pdw.photos-exporter`. Do not replace this with a loose executable: macOS
 attributes a command-line PhotoKit request to its responsible parent (Ghostty interactively,
 launchd when scheduled), producing a grant that works in only one context. The first scheduled
-export requests access automatically, or request it ahead of time with `uv run python -m
-personal_data_warehouse_photos.cli --authorize`; either path must show **PDW Photos Exporter** as
+export requests access automatically, or request it ahead of time with
+`pdw ingest apple-photos --authorize`; either path must show **PDW Photos Exporter** as
 the requester. Grant **Full Access** (Selected Photos is insufficient), then kickstart the
 LaunchAgent. The helper is rebuilt only when its checked-in Swift source or privacy plist changes;
 because it is ad-hoc signed, such a change requires authorization again. If a run reports that
@@ -2228,10 +2246,10 @@ To add a source:
    table to `_PHOTO_TABLES` and `TIMELINE_TABLE_COVERAGE` (a `detail` of `photo_assets`).
 2. **Registry**: one entry in `PHOTO_SOURCE_RELATIONS` (`"<source>": "<source>_files"`). Unknown
    sources fail loud at ingest — register before uploading.
-3. **Uploader**: post the shared envelope (`personal_data_warehouse_photos/envelope.py`,
+3. **Uploader**: post the shared envelope (`app/internal/uploaders/photos/envelope.go`,
    `source="<source>"`, native id + role per file, raw record under a source-named key like
    `takeout_sidecar`) to `/ingest/photos/file/resumable` + `/ingest/photos/metadata` via
-   `IngestClient.upload_photo_file_path`/`upload_photo_metadata`. Live/motion
+   `ingestclient.Client.UploadPhotoFile`/`UploadPhotoMetadata`. Live/motion
    components upload under the same native id with `role=live_video`; edited outputs use
    `role=edited`.
 4. **Precedence**: slot the source into `PHOTO_SOURCE_PRECEDENCE`
@@ -2255,7 +2273,7 @@ line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Wrapper script: `bin/agent-sessions-upload-launchd`
 - Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `pdw ingest agent-sessions --mode incremental` (the wrapper runs the pdw CLI, which execs `uv run python -m personal_data_warehouse_agent_sessions.cli`)
+- Command: `pdw ingest agent-sessions --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat`
 - Status helper: `bin/agent-sessions-upload-status`
@@ -2337,7 +2355,9 @@ app, whose own cap is `PDW_INGEST_MAX_OBJECT_BYTES`, default 512 MiB). Voice mem
 routinely exceed 100 MiB, so a client posting to the Cloudflare URL silently fails on big files —
 and because a per-file failure used to re-raise, a single oversized memo wedged the whole run.
 
-The upload client (`ingest_client.py`, shared by every uploader) handles this two ways:
+The upload client (`app/internal/ingestclient`, shared by every `pdw ingest` uploader; the
+Python `ingest_client.py` is now only the server-side sliver the Claude Desktop poller uses to
+post agent-session batches from Dagster) handles this two ways:
 
 - **Prefer a Tailscale-direct origin.** When `PDW_INGEST_TAILSCALE_HOST` names a tailnet node
   (e.g. `mew-coolify`, the host the app runs on) — or `PDW_INGEST_DIRECT_URL` gives an explicit base — the client
@@ -2348,7 +2368,7 @@ The upload client (`ingest_client.py`, shared by every uploader) handles this tw
   transparently falls back to the public `PDW_API_URL`. These are set in the gitignored repo `.env`
   on the tailnet machines, so the committed repo stays generic. `PDW_TAILSCALE_BIN` overrides the
   CLI path.
-- **Defer what the route still can't carry.** `IngestClient.effective_max_upload_bytes` reports the
+- **Defer what the route still can't carry.** `Client.EffectiveMaxUploadBytes` reports the
   real ceiling for the chosen route (512 MiB direct, else min(app cap, 100 MiB)). The voice-memos
   runner defers any recording above it (like its partial/age deferrals) instead of 413-ing and
   wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
@@ -2375,8 +2395,10 @@ time out, a known rotom-side issue). It writes one JSONL transcript per session 
 a **systemd user timer** (zrl has `Linger=yes`, so user units run without an active login).
 
 - Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main` via a read-only GitHub
-  deploy key; `core.sshCommand` points at `~/.ssh/pdw_deploy_key`); runs via `uv`
-  (`~/.local/bin/uv`).
+  deploy key; `core.sshCommand` points at `~/.ssh/pdw_deploy_key`). The checkout supplies only
+  the wrapper, the shared lib and `.env`; the uploader itself is the native Go
+  `pdw ingest agent-sessions`, so the VM needs a Linux release of the pdw binary at
+  `~/.local/bin/pdw` (or `PDW_BIN`) and no `uv`/Python at all.
 - Env: `~/dev/zachlatta/personal-data-warehouse/.env` holds the **app-ingest** config (the VM has
   no Drive credential): `PDW_API_URL` (the app, `https://data-warehouse-mcp.zachlatta.com`),
   `PDW_SECRET_TOKEN` (= the app's `PDW_SECRET_TOKEN`/`MCP_SECRET_TOKEN`),
@@ -2412,7 +2434,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now personal-data-warehouse-agent-sessions-upload.timer
 ```
 
-To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull && uv sync`. Because
+To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull` for the wrapper and
+`pdw update` for the uploader (there is no Python environment to sync any more). Because
 uploads go through the app, end-to-end also depends on the **app** (`/ingest/agent-sessions/batch`)
 and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
@@ -2712,7 +2735,8 @@ Two pieces:
 - **Client-side setup (manual, interactive): `pdw chatgpt publish-session`.** Reads the
   chatgpt.com session cookie from a local Chrome-family browser (Chrome/Brave/Edge/Arc; auto-detected
   or `--browser`), decrypting it with the browser's *legacy*, consent-readable "<Browser> Safe
-  Storage" keychain item (a one-time "allow" prompt); see `chatgpt_cookies.py`. It validates the
+  Storage" keychain item (a one-time "allow" prompt); see `app/internal/browsersessions/chatgpt`
+  (native Go — the Python `chatgpt_cookies.py` is gone). It validates the
   session against `/api/auth/session`, then POSTs the full cookie header (HMAC-signed, like every
   other ingest) to the app endpoint `POST /ingest/chatgpt/session`, which upserts it into Postgres
   `private.chatgpt_sessions` (`app/internal/chatgptsession`). The cookie never goes to Drive. Re-run
@@ -2783,7 +2807,7 @@ running the public lists and the item walk — so a dead cookie degrades to "pub
 silence, and `marts_ops.pipeline_health` reads `attention` for the `hacker_news` pipeline. The
 repair is `pdw hn publish-session` on the Mac whose Chrome is signed in to news.ycombinator.com
 (it refuses to publish one user's cookie under another username, and checks the cookie against a
-login-only page before publishing). HN's login cookie is long-lived, so this is setup, not a chore.
+login-only page before publishing; native Go, `app/internal/browsersessions/hackernews`). HN's login cookie is long-lived, so this is setup, not a chore.
 
 Config (Dagster deployment): `HACKER_NEWS_ACCOUNT` (the username; required to enable the
 source), `HACKER_NEWS_ENABLED=0` to pause, and the budgets above. The sensor polls every
@@ -3004,7 +3028,8 @@ drill into `base_whoop_private.*` for the resolution the public row does not car
 
 MFA is mandatory on this account, so there is no unattended password grant and no login to
 implement. The web app's session is captured from ordinary Chrome cookies on `.whoop.com`
-(the same Safe Storage keychain machinery `chatgpt_cookies.py` uses) and published to the
+(the same Safe Storage keychain machinery the ChatGPT capture uses,
+`app/internal/browsersessions/chromium`) and published to the
 warehouse, exactly like the ChatGPT session:
 
 - `whoop-auth-token` — the bearer, an AWS Cognito JWT, **24 hours**.
@@ -3169,8 +3194,10 @@ valuation screenshots, private-fund position docs, CSV/OFX/QFX exports — land 
 `derived_finance.document_extractions`. The mortgage servicer is not Plaid-supported, so mortgage
 statements are the mortgage's only source.
 
-- Upload: `pdw ingest manual-finance <files-or-dir>` (uploader package
-  `src/personal_data_warehouse_manual_finance/`). The folder-per-account organization
+- Upload: `pdw ingest manual-finance <files-or-dir>` (native Go,
+  `app/internal/uploaders/manualfinance`; the envelope's provenance dedup sha is mirrored
+  server-side in `personal_data_warehouse.manual_finance_envelope` for the re-file script).
+  The folder-per-account organization
   (`<institution>-<name>-<mask>/statement.pdf`) is preserved as `original_path` (the primary
   account-resolution hint) and as the object key's account segment:
   `manual-finance/inbox/<account-folder>/<date>-<sha><ext>`. Content-sha dedup + sha-keyed local
@@ -3939,12 +3966,14 @@ agent to succeed. Repair by unlocking the Mac and running it once from a GUI ter
 choosing **Always Allow**.
 
 It runs on the Mac signed in to the Slack desktop app (**crobat**), not on porygon, because
-that is where the session lives. **The wrapper execs `uv run python -m
-personal_data_warehouse.slack_setup` directly and deliberately keeps `pdw` out of the exec
-chain**: macOS attributes the "Slack Safe Storage" keychain grant to the binaries in that
-chain, and pdw replaces its own binary on every release, so routing through `pdw slack`
-would let a routine update silently revoke the grant. The photos uploader avoids Full Disk
-Access loss the same way. Credentials still come from `pdw login`'s config file.
+that is where the session lives. **The wrapper runs `pdw slack publish-session` (native Go,
+`app/internal/browsersessions/slack`) and nothing else.** It used to exec the Python capture
+directly and keep `pdw` OUT of the exec chain, because macOS attributes the "Slack Safe
+Storage" keychain grant to the binaries in that chain and an unsigned pdw replaced its own
+binary on every release; release binaries are signed with a stable identity now, so the
+grant follows pdw across updates. The move needs the keychain ACL re-issued once to
+`~/.local/bin/pdw` (run it from a GUI terminal, choose Always Allow). Credentials still come
+from `pdw login`'s config file.
 
 **Enterprise Grid is a live trap here.** Hack Club is an Enterprise Grid org, so a client
 session's `auth.test` returns the **org** id `E09V59WQY1E` where the app token returns the

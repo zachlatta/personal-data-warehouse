@@ -2,17 +2,23 @@
 set -u
 
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
-UV="/opt/homebrew/bin/uv"
-# Run the Python uploader module DIRECTLY (not through `pdw ingest`): pdw
-# self-updates on every release, and each binary replacement makes macOS
-# revoke its Full Disk Access, which killed this uploader until a manual
-# re-toggle. With pdw out of the exec chain, TCC only sees the stable
-# binaries (zsh, uv, the venv python). Credentials still come from pdw's own
-# config file, so `pdw login` remains the single setup step.
+# The uploader is native Go inside the signed pdw binary: `pdw ingest ...` reads
+# the source on this Mac and posts it to the app's ingest endpoints itself. No uv
+# and no Python anywhere in the exec chain (launchd -> zsh -> pdw). That chain
+# used to keep pdw OUT on purpose, because every pdw self-update replaced the
+# binary and macOS revoked the Full Disk Access keyed to it; release binaries
+# are now signed with a stable identity, so the grant survives updates. Grant
+# Full Disk Access to ~/.local/bin/pdw once per Mac (AGENTS.md "pdw CLI Full
+# Disk Access vs self-updates").
 # Sourced up here, not just before the heartbeat: pdw_export_app_credentials
-# has to run BEFORE the uploader so the uploader gets the URL/token too.
+# has to run BEFORE the uploader so an operator-less environment still carries
+# the URL/token pdw would otherwise read from its config file.
 . "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+# `.env` for the uploader's own settings (accounts, Tailscale-direct origin)
+# is read from PDW_INGEST_PROJECT_DIR; pin it so launchd's cwd does not matter.
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/voice-memos-upload.run.log"
 HEARTBEAT_FILE="$LOG_DIR/voice-memos-upload.heartbeat"
@@ -24,11 +30,14 @@ started_at_iso="$(date -Iseconds)"
 
 echo "[$started_at_iso] starting Voice Memos upload" >> "$LOG_FILE"
 
-if ! cd "$REPO_DIR"; then
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$UV" run python -m personal_data_warehouse_voice_memos.cli --mode incremental >> "$LOG_FILE" 2>&1
+    "$PDW" ingest voice-memos --mode incremental >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 
@@ -37,7 +46,7 @@ finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
-PDW_REPO_DIR="$REPO_DIR" PDW_UV="${UV:-uv}" pdw_post_heartbeat "apple_voice_memos" "$finished_at_iso" "$exit_code" "$duration_seconds"
+pdw_post_heartbeat "apple_voice_memos" "$finished_at_iso" "$exit_code" "$duration_seconds"
 echo "[$finished_at_iso] finished Voice Memos upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

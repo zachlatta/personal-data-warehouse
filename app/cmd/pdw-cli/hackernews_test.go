@@ -2,61 +2,70 @@ package main
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestHackerNewsForwardsToModule(t *testing.T) {
-	cap := withStubIngestExec(t, 0)
+func withFakeHackerNews(t *testing.T, code int) *capturedLocal {
+	t.Helper()
+	prev := hackerNewsRun
+	cap := &capturedLocal{}
+	hackerNewsRun = fakeLocal(cap, code)
+	t.Cleanup(func() { hackerNewsRun = prev })
+	return cap
+}
+
+func TestHackerNewsForwardsVerbAndFlagsToTheNativePublisher(t *testing.T) {
+	cap := withFakeHackerNews(t, 0)
 	var out, errBuf bytes.Buffer
-	code := runHackerNews(
-		[]string{"publish-session", "--browser", "chrome", "--dry-run"},
-		strings.NewReader(""), &out, &errBuf,
-		func(string) string { return "" },
-		"", "",
-	)
+	code := runHackerNews([]string{"publish-session", "--browser", "chrome", "--dry-run"}, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, map[string]string{"PDW_API_URL": "https://w.example", "PDW_SECRET_TOKEN": "t"}), "", "")
 	if code != 0 {
 		t.Fatalf("exit code = %d", code)
 	}
-	if !cap.called {
-		t.Fatal("expected uv exec to be invoked")
+	want := []string{"publish-session", "--browser", "chrome", "--dry-run"}
+	if !cap.called || !reflect.DeepEqual(cap.args, want) {
+		t.Fatalf("args = %v, want %v", cap.args, want)
 	}
-	want := []string{"run", "python", "-m", hackerNewsModule, "publish-session", "--browser", "chrome", "--dry-run"}
-	if strings.Join(cap.argv, " ") != strings.Join(want, " ") {
-		t.Fatalf("argv = %v, want %v", cap.argv, want)
+	if cap.cfg.BaseURL != "https://w.example" || cap.cfg.Token != "t" {
+		t.Fatalf("cfg = %+v", cap.cfg)
 	}
 }
 
-func TestHackerNewsPassesWarehouseConfig(t *testing.T) {
-	cap := withStubIngestExec(t, 0)
+func TestHackerNewsFlagsOverrideTheEnvironmentConfig(t *testing.T) {
+	cap := withFakeHackerNews(t, 0)
 	var out, errBuf bytes.Buffer
 	runHackerNews([]string{"publish-session"}, strings.NewReader(""), &out, &errBuf,
-		func(string) string { return "" }, "https://warehouse.example", "secret-token")
-	if v, ok := envValue(cap.extraEnv, "PDW_API_URL"); !ok || v != "https://warehouse.example" {
-		t.Fatalf("PDW_API_URL = %q ok=%v", v, ok)
-	}
-	if v, ok := envValue(cap.extraEnv, "PDW_SECRET_TOKEN"); !ok || v != "secret-token" {
-		t.Fatalf("PDW_SECRET_TOKEN = %q ok=%v", v, ok)
+		isolatedEnv(t, nil), "https://warehouse.example", "secret-token")
+	if cap.cfg.BaseURL != "https://warehouse.example" || cap.cfg.Token != "secret-token" {
+		t.Fatalf("cfg = %+v", cap.cfg)
 	}
 }
 
-func TestHackerNewsRequiresSubcommand(t *testing.T) {
-	withStubIngestExec(t, 0)
+func TestHackerNewsWithoutASubcommandExplainsItself(t *testing.T) {
+	cap := withFakeHackerNews(t, 0)
 	var out, errBuf bytes.Buffer
-	code := runHackerNews(nil, strings.NewReader(""), &out, &errBuf, func(string) string { return "" }, "", "")
-	if code != 2 {
-		t.Fatalf("exit code = %d, want 2", code)
+	code := runHackerNews(nil, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, nil), "", "")
+	if code != 2 || cap.called {
+		t.Fatalf("exit code = %d called=%v, want 2 and no dispatch", code, cap.called)
+	}
+	if !strings.Contains(errBuf.String(), "publish-session") {
+		t.Fatalf("stderr did not name the subcommand: %s", errBuf.String())
 	}
 }
 
-func TestHackerNewsHelp(t *testing.T) {
-	withStubIngestExec(t, 0)
+func TestHackerNewsHelpNamesNoPythonLauncher(t *testing.T) {
+	cap := withFakeHackerNews(t, 0)
 	var out, errBuf bytes.Buffer
-	code := runHackerNews([]string{"--help"}, strings.NewReader(""), &out, &errBuf, func(string) string { return "" }, "", "")
-	if code != 0 {
-		t.Fatalf("exit code = %d", code)
+	code := runHackerNews([]string{"--help"}, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, nil), "", "")
+	if code != 0 || cap.called {
+		t.Fatalf("exit code = %d called=%v", code, cap.called)
 	}
-	if !strings.Contains(out.String(), "publish-session") {
+	help := out.String()
+	if !strings.Contains(help, "publish-session") {
 		t.Fatal("help should mention publish-session")
+	}
+	if strings.Contains(help, "PDW_UV_BIN") || strings.Contains(help, "PDW_INGEST_PROJECT_DIR") {
+		t.Fatal("usage still documents the uv launcher")
 	}
 }

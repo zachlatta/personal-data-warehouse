@@ -89,11 +89,27 @@ COMMANDS
   schema                     Run schema_overview and print every relation with
                              its row estimate. For finding a relation you do
                              not know, not a first step: search needs none of it.
-  ingest <source> [flags]    Run a local data-warehouse uploader through pdw.
-                             Sources: voice-memos, apple-notes, apple-messages,
-                             agent-sessions. Flags after <source> are forwarded
-                             to the uploader (e.g. --mode incremental|full,
-                             --limit N). See "pdw ingest --help".
+  ingest <source> [flags]    Run a local data-warehouse uploader (built into
+                             this binary). Sources: agent-sessions,
+                             apple-contacts, apple-messages, apple-notes,
+                             apple-photos, claude-desktop, manual-finance,
+                             plaid, voice-memos. Flags after <source> are
+                             forwarded to the uploader (e.g. --mode
+                             incremental|full, --limit N). See "pdw ingest --help".
+  heartbeat [flags]          Record one uploader run's verdict in
+                             ops.uploader_heartbeats (what the uploader wrappers
+                             post after every run). See "pdw heartbeat --help".
+                               --pipeline NAMES      comma-separated pipeline ids (required)
+                               --exit-code N         the run's exit status (required)
+                               --duration-seconds F  run duration (default 0)
+                               --device HOST         default: short hostname
+                               --ran-at ISO          default: now
+                               --error TEXT          failure summary, if any
+  mutations <provider> [--once]
+                             Apply approved Apple Notes / Apple Contacts
+                             mutations through this Mac's apps: resident worker
+                             by default, one batch with --once. Providers:
+                             apple-notes, apple-contacts. See "pdw mutations --help".
   slack publish-session      Publish this Mac's Slack client session to the
                              warehouse, so the sync can ask Slack what changed
                              in one request instead of polling every
@@ -256,6 +272,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	// posts it to the app's signed endpoint -- same shape again.
 	if cmd == "slack" {
 		return runSlack(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
+	}
+	// heartbeat is what the uploader wrappers run after every uploader run; it
+	// posts to the app's signed ingest endpoint with the same resolved config.
+	if cmd == "heartbeat" {
+		return runHeartbeat(rest, stdout, stderr, getenv, *baseURL, *token)
+	}
+	// mutations runs the local Apple Notes / Contacts mutation workers, which
+	// talk to Postgres and need no /api/tools client.
+	if cmd == "mutations" {
+		return runMutations(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
 	// `pdw search --help` must print the search FlagSet's own help, not the
 	// global usage: the flags this command accepts (notably --priority) are

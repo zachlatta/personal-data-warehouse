@@ -2,19 +2,21 @@
 set -u
 
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
-UV="/opt/homebrew/bin/uv"
-# Run the Python module DIRECTLY, not through `pdw slack publish-session`.
-# This job reads the Slack desktop app's "Slack Safe Storage" keychain item, and
-# macOS attributes that grant to the binaries in the exec chain -- while pdw
-# replaces its own binary on every release. Keeping pdw out of the chain is what
-# stops a routine pdw update from silently revoking the grant and turning this
-# into an hourly failure, the same reasoning the photos uploader documents.
-# Credentials still come from pdw's own config, so `pdw login` remains the one
-# credential setup step.
-# Sourced up here, not just before the heartbeat: pdw_export_app_credentials
-# has to run BEFORE the uploader so the uploader gets the URL/token too.
+# `pdw slack publish-session` (native Go) captures the Slack desktop app's
+# session -- the xoxc token from its localStorage plus the `d` cookie, decrypted
+# with the "Slack Safe Storage" keychain item -- validates it against auth.test
+# and publishes it to the warehouse for the change-feed sync. It runs hourly so
+# the server's copy never lags the app's; the `d` cookie is good for ~13 months.
+# No uv or Python in the exec chain (launchd -> zsh -> pdw). That chain used to
+# keep pdw OUT on purpose, because macOS attributes the keychain grant to the
+# binaries in it and pdw replaced its own binary on every release; release
+# binaries are now signed with a stable identity, so the grant follows pdw
+# across updates. Grant it once by running `pdw slack publish-session` from a
+# GUI terminal on this Mac and choosing Always Allow.
 . "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/slack-auth.run.log"
 HEARTBEAT_FILE="$LOG_DIR/slack-auth.heartbeat"
@@ -31,11 +33,14 @@ started_at_epoch="$(date +%s)"
 started_at_iso="$(date -Iseconds)"
 echo "[$started_at_iso] starting slack session publish" >> "$LOG_FILE"
 
-if ! cd "$REPO_DIR"; then
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$UV" run python -m personal_data_warehouse.slack_setup >> "$LOG_FILE" 2>&1
+  "$PDW" slack publish-session >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

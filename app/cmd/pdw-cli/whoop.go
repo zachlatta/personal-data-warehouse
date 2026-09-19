@@ -3,12 +3,14 @@ package main
 import (
 	"fmt"
 	"io"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/whoop"
 )
 
-// whoopModule is the Python module implementing `pdw whoop`. Like the ingest
-// uploaders it runs via `uv run python -m <module>` and parses its own flags,
-// so pdw forwards everything after the verb verbatim.
-const whoopModule = "personal_data_warehouse.whoop_private_setup"
+// whoopRun is the native publisher (app/internal/browsersessions/whoop). It
+// parses its own flags, so pdw forwards everything after "whoop" verbatim,
+// verb included. A package var so tests can capture the dispatch.
+var whoopRun localCommand = whoop.Run
 
 const whoopUsage = `pdw whoop - manage the WHOOP browser session used for high-resolution sync.
 
@@ -30,21 +32,19 @@ and slides its 30-day window forward, so a healthy sync keeps itself alive
 indefinitely. Re-run this only after the session is revoked, the password
 changes, or sync has been down for more than 30 days -- /pipelines will say so.
 
-FLAGS (forwarded; see "pdw whoop publish-session --help")
+FLAGS (see "pdw whoop publish-session --help")
   --browser NAME     Force a browser (chrome|brave|edge|arc|chromium|vivaldi).
   --account EMAIL    Account label/key for the session (default: configured account).
   --session-key KEY  Session key for multiple accounts (default "default").
   --dry-run          Capture and report without publishing (verifies decryption).
 
 ENVIRONMENT
-  PDW_UV_BIN              uv launcher path (default: uv on PATH).
-  PDW_INGEST_PROJECT_DIR  Repo checkout uv runs in (default: current directory).
   PDW_API_URL             Warehouse URL the session is published to (else "pdw login").
   PDW_SECRET_TOKEN        App secret token used to sign the upload (else "pdw login").
 `
 
-// runWhoop dispatches `pdw whoop <subcommand>` to the Python module, reusing the
-// same uv launcher and warehouse-config plumbing as `pdw ingest` and `pdw chatgpt`.
+// runWhoop dispatches `pdw whoop <subcommand>` to the native publisher with
+// the same warehouse-config plumbing as `pdw ingest` and `pdw chatgpt`.
 func runWhoop(
 	args []string,
 	stdin io.Reader,
@@ -61,14 +61,5 @@ func runWhoop(
 		fmt.Fprint(stdout, whoopUsage)
 		return 0
 	}
-	argv := ingestArgv(whoopModule, args)
-	return ingestExec(
-		ingestUvBin(getenv),
-		argv,
-		ingestProjectDir(getenv),
-		ingestEnvAdditions(getenv, flagBaseURL, flagToken),
-		stdin,
-		stdout,
-		stderr,
-	)
+	return whoopRun(args, stdin, stdout, stderr, getenv, resolveLocalConfig(getenv, flagBaseURL, flagToken))
 }

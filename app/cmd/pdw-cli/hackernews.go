@@ -3,12 +3,14 @@ package main
 import (
 	"fmt"
 	"io"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/hackernews"
 )
 
-// hackerNewsModule is the Python module implementing `pdw hn`. Like the ingest
-// uploaders it runs via `uv run python -m <module>` and parses its own flags,
-// so pdw forwards everything after the verb verbatim.
-const hackerNewsModule = "personal_data_warehouse.hacker_news_setup"
+// hackerNewsRun is the native publisher (app/internal/browsersessions/hackernews).
+// It parses its own flags, so pdw forwards everything after "hn" verbatim, verb
+// included. A package var so tests can capture the dispatch.
+var hackerNewsRun localCommand = hackernews.Run
 
 const hackerNewsUsage = `pdw hn - manage the Hacker News login used for the login-only lists.
 
@@ -26,21 +28,19 @@ The cookie is long-lived, so this is setup rather than a chore. Re-run it when
 /pipelines shows the hacker_news pipeline in action_required: that means HN
 answered a login page for the stored cookie.
 
-FLAGS (forwarded; see "pdw hn publish-session --help")
+FLAGS (see "pdw hn publish-session --help")
   --browser NAME     Force a browser (chrome|brave|edge|arc|chromium|vivaldi).
   --account NAME     HN username the session belongs to (default: configured).
   --session-key KEY  Session key for multiple accounts (default "default").
   --dry-run          Capture and validate without publishing.
 
 ENVIRONMENT
-  PDW_UV_BIN              uv launcher path (default: uv on PATH).
-  PDW_INGEST_PROJECT_DIR  Repo checkout uv runs in (default: current directory).
   PDW_API_URL             Warehouse URL the session is published to (else "pdw login").
   PDW_SECRET_TOKEN        App secret token used to sign the upload (else "pdw login").
 `
 
-// runHackerNews dispatches `pdw hn <subcommand>` to the Python module, reusing
-// the same uv launcher and warehouse-config plumbing as `pdw ingest`.
+// runHackerNews dispatches `pdw hn <subcommand>` to the native publisher with
+// the same warehouse-config plumbing as `pdw ingest` and `pdw whoop`.
 func runHackerNews(
 	args []string,
 	stdin io.Reader,
@@ -57,14 +57,5 @@ func runHackerNews(
 		fmt.Fprint(stdout, hackerNewsUsage)
 		return 0
 	}
-	argv := ingestArgv(hackerNewsModule, args)
-	return ingestExec(
-		ingestUvBin(getenv),
-		argv,
-		ingestProjectDir(getenv),
-		ingestEnvAdditions(getenv, flagBaseURL, flagToken),
-		stdin,
-		stdout,
-		stderr,
-	)
+	return hackerNewsRun(args, stdin, stdout, stderr, getenv, resolveLocalConfig(getenv, flagBaseURL, flagToken))
 }

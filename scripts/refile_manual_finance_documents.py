@@ -57,7 +57,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from personal_data_warehouse_manual_finance.envelope import (
+from personal_data_warehouse.manual_finance_envelope import (
     build_document_metadata,
     provenance_dedup_sha256,
 )

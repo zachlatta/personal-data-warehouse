@@ -23,8 +23,6 @@ from personal_data_warehouse.calendar_mutations import (
     CalendarMutationResult,
     CalendarMutationExecutor,
 )
-from personal_data_warehouse.apple_contacts_mutations import APPLE_CONTACTS_PROVIDER
-from personal_data_warehouse.apple_notes_mutations import APPLE_NOTES_PROVIDER
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.contact_mutations import (
     GOOGLE_CONTACTS_BATCH_MUTATION_OPERATION,
@@ -73,9 +71,14 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
 # Providers whose upstream has no server API, so the only write path is an app running on
 # one of Zach's Macs. The cloud worker must not claim these: it cannot execute them, and a
 # claim it then fails as unknown-provider both bumps attempt_count and hides the row from
-# the Mac worker that could have applied it. Each entry needs a local worker (see
-# personal_data_warehouse_apple_notes.mutation_worker,
-# personal_data_warehouse_apple_contacts.mutation_worker) or its rows sit approved forever.
+# the Mac worker that could have applied it. Each entry needs a local worker -- the Go
+# `pdw mutations apple-notes` / `pdw mutations apple-contacts` resident workers
+# (app/internal/mutationworkers, run by the *-mutation-worker LaunchAgents) -- or its rows
+# sit approved forever. The provider names are mirrored from the Go executors
+# (app/internal/mutations/apple_notes.go, apple_contacts.go); they are the `provider`
+# column value the proposal API writes.
+APPLE_NOTES_PROVIDER = "apple_notes"
+APPLE_CONTACTS_PROVIDER = "apple_contacts"
 LOCAL_ONLY_MUTATION_PROVIDERS: tuple[str, ...] = (APPLE_NOTES_PROVIDER, APPLE_CONTACTS_PROVIDER)
 
 # Bootstrap guard for the sensor's table-ensure. The sensor evaluates every

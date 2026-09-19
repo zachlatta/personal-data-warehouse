@@ -5,19 +5,17 @@
 # personal-data-warehouse-agent-sessions-upload.service systemd user unit on
 # Linux hosts (e.g. the openclaw VM, which syncs ~/.openclaw agent sessions).
 # Self-locating: it derives the repo root from its own path, so the same script
-# works regardless of where the checkout lives.
+# works regardless of where the checkout lives. The checkout is only needed for
+# this lib and for `.env` (PDW_INGEST_PROJECT_DIR); the uploader itself is the
+# native Go `pdw ingest agent-sessions`, so no uv or Python is required on the
+# host. Install a release binary at ~/.local/bin/pdw (or set PDW_BIN).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-UV="${UV_BIN:-$HOME/.local/bin/uv}"
-[ -x "$UV" ] || UV="$(command -v uv || echo uv)"
-# The uploader now runs through the pdw CLI: `pdw ingest agent-sessions` execs
-# `uv run python -m <module>`. Resolve pdw (override with PDW_BIN) and pin uv +
-# the repo so pdw finds them under the minimal systemd environment.
-PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
-[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
-export PDW_UV_BIN="$UV"
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
 export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 
 LOG_DIR="${PDW_LOG_DIR:-$HOME/.local/state/personal-data-warehouse}"
@@ -31,7 +29,10 @@ started_at_iso="$(date -Iseconds)"
 
 echo "[$started_at_iso] starting agent sessions upload" >> "$LOG_FILE"
 
-if ! cd "$REPO_DIR"; then
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
@@ -43,9 +44,8 @@ finished_at_epoch="$(date +%s)"
 finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
-. "$SCRIPT_DIR/_pdw-upload-lib.sh"
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
-PDW_REPO_DIR="$REPO_DIR" PDW_UV="${UV:-uv}" pdw_post_heartbeat "openclaw" "$finished_at_iso" "$exit_code" "$duration_seconds"
+pdw_post_heartbeat "openclaw" "$finished_at_iso" "$exit_code" "$duration_seconds"
 echo "[$finished_at_iso] finished agent sessions upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

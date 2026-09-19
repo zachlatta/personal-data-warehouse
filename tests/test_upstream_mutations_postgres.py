@@ -1148,32 +1148,3 @@ def test_ensure_upstream_mutation_tables_declares_the_supersede_column(warehouse
         (warehouse._object_schema("upstream_mutation_requests"), target.name),
     )
     assert "superseded_by_request_id" in {str(row["column_name"]) for row in rows}
-
-
-def test_apple_contacts_merged_card_target_reads_the_newest_succeeded_merge(warehouse):
-    gone = "AF0D7001-E8F8-4772-AE89-A7DC5D907E91:ABPerson"
-    kept = "AACADB21-739D-4B5F-A14E-4E4B3DB7916E:ABPerson"
-    _seed_mutation_request(
-        warehouse,
-        request_id="req_merge",
-        title="merge",
-        mutations=[
-            {
-                "provider": "apple_contacts",
-                "operation": "apple_contacts.merge_contacts",
-                "status": "succeeded",
-                "payload": {"keep_card_id": kept, "merge_card_ids": [gone], "contact": {}},
-            },
-            {
-                # A merge that never ran says nothing about where the card went.
-                "provider": "apple_contacts",
-                "operation": "apple_contacts.merge_contacts",
-                "status": "failed_terminal",
-                "payload": {"keep_card_id": "nope:ABPerson", "merge_card_ids": [gone], "contact": {}},
-            },
-        ],
-    )
-
-    assert warehouse.apple_contacts_merged_card_target(gone) == kept
-    assert warehouse.apple_contacts_merged_card_target(kept) is None
-    assert warehouse.apple_contacts_merged_card_target("") is None

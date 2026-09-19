@@ -7,7 +7,7 @@
 # Why this exists: the wrappers used to stamp a bare ISO timestamp into the
 # heartbeat file on *every* run, regardless of exit code. A job that fired every
 # interval but failed every time (e.g. an Apple Messages/Notes/Voice Memos
-# uploader after macOS silently revoked Full Disk Access on a uv python bump)
+# uploader after macOS silently revoked Full Disk Access on a binary change)
 # therefore looked perfectly healthy: the heartbeat kept advancing while no new
 # data reached the warehouse for days. The status helpers, which just `cat` the
 # heartbeat, could not tell the difference.
@@ -46,38 +46,71 @@ pdw_record_run() {
 }
 
 # _pdw_config_value FILE KEY -> prints the JSON string at FILE[KEY], or nothing.
-# Uses the system python3 (macOS ships one; Linux hosts have one on PATH) so
-# credential resolution never depends on the repo venv being built.
+# The file is the flat object the Go CLI writes with encoding/json (one string
+# per key, no nesting), so a sed extraction is exact for it and keeps Python
+# out of the wrappers entirely. A JSON escape inside the value (\" or \\) is
+# not decoded; neither a URL nor a token pdw issues contains one.
 _pdw_config_value() {
-  _py="/usr/bin/python3"
-  [ -x "$_py" ] || _py="$(command -v python3 2>/dev/null)"
-  [ -n "$_py" ] || return 0
-  "$_py" -c 'import json,sys
-try:
-    print(json.load(open(sys.argv[1])).get(sys.argv[2], "") or "")
-except Exception:
-    pass' "$1" "$2" 2>/dev/null
+  [ -r "$1" ] || return 0
+  { tr -d '\n' < "$1"; echo; } | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p"
+}
+
+# pdw_resolve_bin -> prints the pdw binary every wrapper should exec.
+# PDW_BIN wins (tests and operators), then the release install location
+# (~/.local/bin/pdw, where `pdw update` writes), then whatever is on PATH.
+# Prints nothing when none exists, so callers can decide whether that is fatal
+# (an uploader) or a quiet skip (the heartbeat post).
+#
+# Every device-side job runs THROUGH this one binary now -- uploaders, the
+# mutation workers, the browser-session publishers and the heartbeat post --
+# with no uv or Python anywhere in the exec chain. That used to be avoided on
+# purpose: pdw self-updates replaced its binary and macOS TCC keyed each Full
+# Disk Access / Automation / Photos grant to that exact build, so an update
+# silently revoked the grant. Release binaries are now signed with the stable
+# `com.zachlatta.pdw` identity (see AGENTS.md "pdw CLI Full Disk Access vs
+# self-updates"), so the grant follows the binary across updates and there is
+# nothing left to protect by keeping pdw out of the chain. Each Mac needs the
+# grants (Full Disk Access for the uploaders, Automation -> Notes/Contacts for
+# the mutation workers, Photos for the photos uploader) re-issued ONCE to the
+# signed pdw binary; after that they survive every `pdw update`.
+pdw_resolve_bin() {
+  _pdw="${PDW_BIN:-}"
+  if [ -n "$_pdw" ] && [ -x "$_pdw" ]; then
+    printf '%s\n' "$_pdw"
+    return 0
+  fi
+  _pdw="$HOME/.local/bin/pdw"
+  if [ -x "$_pdw" ]; then
+    printf '%s\n' "$_pdw"
+    return 0
+  fi
+  _pdw="$(command -v pdw 2>/dev/null || true)"
+  if [ -n "$_pdw" ]; then
+    printf '%s\n' "$_pdw"
+    return 0
+  fi
+  return 0
 }
 
 # pdw_export_app_credentials
 # Export PDW_API_URL / PDW_SECRET_TOKEN from pdw's own config file (whatever
-# `pdw login` wrote), so a caller that is NOT inside the pdw CLI can still reach
-# the app.
+# `pdw login` wrote), so a caller that is NOT the pdw CLI can still reach the
+# app -- today that is only the wrappers' own `.env`-free environment and any
+# operator tooling sourcing this lib; the CLI resolves the same file itself.
 #
-# Why this lives here rather than in each wrapper: the heartbeat post runs
-# `uv run python -m personal_data_warehouse.uploader_heartbeat` DIRECTLY, so it
-# inherits none of the URL/token that `pdw ingest` resolves for the uploader it
-# sits next to. The five Apple wrappers had each hand-rolled this same config
-# read for their own uploaders (they keep pdw out of the exec chain to protect
-# their TCC grants), which incidentally made their heartbeats work. The two
-# agent-sessions wrappers run their uploader THROUGH pdw and so never needed to
-# -- and their heartbeat consequently failed on every run from the day it
-# shipped, ~288 times a day per Mac, straight into a launchd error log nobody
-# reads. The visible damage was on /pipelines: claude_code, codex, pi and
-# openclaw all sat at last_run_at NULL, so for those four sources "the uploader
-# died" and "Zach is not using this tool" were indistinguishable -- the exact
-# gap the heartbeat exists to close, open on the four pipelines that had no
-# other signal.
+# Why this lives here rather than in each wrapper: when the heartbeat post was
+# a `uv run python -m ...` DIRECTLY outside pdw, it inherited none of the
+# URL/token `pdw ingest` resolved for the uploader beside it. The five Apple
+# wrappers had each hand-rolled this same config read for their own uploaders,
+# which incidentally made their heartbeats work; the two agent-sessions
+# wrappers ran their uploader THROUGH pdw and so never needed to -- and their
+# heartbeat consequently failed on every run from the day it shipped, ~288
+# times a day per Mac, straight into a launchd error log nobody reads. The
+# visible damage was on /pipelines: claude_code, codex, pi and openclaw all sat
+# at last_run_at NULL, so for those four sources "the uploader died" and "Zach
+# is not using this tool" were indistinguishable. The heartbeat is `pdw
+# heartbeat` now and resolves the config itself, but one implementation of the
+# read stays here so no wrapper ever grows its own copy again.
 #
 # Idempotent and non-destructive: an already-set value always wins, so an
 # operator or a wrapper pointing at a different origin is never overridden, and
@@ -123,18 +156,20 @@ pdw_export_app_credentials() {
 # Post the run's verdict to the warehouse (ops.uploader_heartbeats) so
 # marts_ops.pipeline_health can tell a failing uploader from a quiet source.
 # PIPELINES is comma-separated (the agent-sessions uploader covers several).
-# Needs PDW_REPO_DIR and PDW_UV from the wrapper; best effort — never changes
-# the uploader's own exit code, and a missing config just skips.
+# Runs `pdw heartbeat` (native Go; resolves the URL/token the way every other
+# pdw command does). Best effort: never changes the uploader's own exit code,
+# and a host with no pdw binary just skips.
 pdw_post_heartbeat() {
   _pipelines="$1"
   _iso="$2"
   _code="$3"
   _duration="${4:-0}"
-  if [ -z "${PDW_REPO_DIR:-}" ] || [ -z "${PDW_UV:-}" ]; then
+  _pdw="$(pdw_resolve_bin)"
+  if [ -z "$_pdw" ]; then
     return 0
   fi
   pdw_export_app_credentials
-  "$PDW_UV" run --directory "$PDW_REPO_DIR" python -m personal_data_warehouse.uploader_heartbeat \
+  "$_pdw" heartbeat \
     --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
     >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
   return 0

@@ -3,12 +3,14 @@ package main
 import (
 	"fmt"
 	"io"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chatgpt"
 )
 
-// chatgptModule is the Python module implementing `pdw chatgpt`. Like the
-// ingest uploaders it runs via `uv run python -m <module>` and parses its own
-// flags, so pdw forwards everything after the verb verbatim.
-const chatgptModule = "personal_data_warehouse_chatgpt.cli"
+// chatgptRun is the native publisher (app/internal/browsersessions/chatgpt).
+// It parses its own flags, so pdw forwards everything after "chatgpt"
+// verbatim, verb included. A package var so tests can capture the dispatch.
+var chatgptRun localCommand = chatgpt.Run
 
 const chatgptUsage = `pdw chatgpt - manage the ChatGPT web session used for server-side ingestion.
 
@@ -28,7 +30,7 @@ re-publishes hourly to keep the server's copy as fresh as the browser's. When th
 browser's own session is what has lapsed, publish-session says so and you sign
 into chatgpt.com again.
 
-FLAGS (forwarded to the uploader; see "pdw chatgpt publish-session --help")
+FLAGS (see "pdw chatgpt publish-session --help")
   --browser NAME     Force a browser (chrome|brave|edge|arc|chromium|vivaldi).
   --account EMAIL    Account label/key for the session (default $CHATGPT_ACCOUNT/fallback).
   --session-key KEY  Session key for multiple accounts (default "default").
@@ -40,14 +42,12 @@ The session is posted to the warehouse over the same URL + token pdw uses for
 everything else: run "pdw login" once (or set PDW_API_URL + PDW_SECRET_TOKEN).
 
 ENVIRONMENT
-  PDW_UV_BIN              uv launcher path (default: uv on PATH).
-  PDW_INGEST_PROJECT_DIR  Repo checkout uv runs in (default: current directory).
   PDW_API_URL            Warehouse URL the session is published to (else "pdw login").
   PDW_SECRET_TOKEN       App secret token used to sign the upload (else "pdw login").
 `
 
-// runChatGPT dispatches `pdw chatgpt <subcommand>` to the Python module, reusing
-// the same uv launcher and warehouse-config plumbing as `pdw ingest`.
+// runChatGPT dispatches `pdw chatgpt <subcommand>` to the native publisher
+// with the same warehouse-config plumbing as `pdw ingest`.
 func runChatGPT(
 	args []string,
 	stdin io.Reader,
@@ -64,14 +64,5 @@ func runChatGPT(
 		fmt.Fprint(stdout, chatgptUsage)
 		return 0
 	}
-	argv := ingestArgv(chatgptModule, args)
-	return ingestExec(
-		ingestUvBin(getenv),
-		argv,
-		ingestProjectDir(getenv),
-		ingestEnvAdditions(getenv, flagBaseURL, flagToken),
-		stdin,
-		stdout,
-		stderr,
-	)
+	return chatgptRun(args, stdin, stdout, stderr, getenv, resolveLocalConfig(getenv, flagBaseURL, flagToken))
 }

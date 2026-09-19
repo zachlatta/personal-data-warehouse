@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-import gzip
 import hashlib
-import json
-from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -16,8 +12,6 @@ from personal_data_warehouse.ingest_client import (
     resolve_direct_ingest_origin,
     sign_object_upload,
 )
-from personal_data_warehouse_agent_sessions.state import AgentSessionsUploadState
-from personal_data_warehouse_agent_sessions.sync import AgentSessionsUploadRunner
 
 
 # --- signing contract -------------------------------------------------------
@@ -108,28 +102,6 @@ def test_post_signs_body_and_sends_expected_query() -> None:
     assert q["sig"] == expected_sig
 
 
-def test_apple_contacts_batch_uses_semantic_ingest_endpoint() -> None:
-    session = _FakeSession()
-    client = IngestClient(
-        base_url="https://app.example.test/",
-        signing_key=b"0123456789abcdef0123456789abcdef",
-        session=session,
-        now=lambda: 1700000000.0,
-    )
-
-    client.upload_apple_contacts_batch(
-        b"contacts-gzip",
-        exported_at="2026-07-23T12:00:00+00:00",
-    )
-
-    call = session.calls[0]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/apple-contacts/batch"
-    query = {key: value[0] for key, value in parse_qs(parts.query).items()}
-    assert query["exported_at"] == "2026-07-23T12:00:00+00:00"
-    assert call["headers"]["Content-Type"] == "application/gzip"
-
-
 class _PhotoResumableSession(_FakeSession):
     def __init__(self, *, content_sha256: str) -> None:
         super().__init__()
@@ -167,219 +139,6 @@ class _PhotoResumableSession(_FakeSession):
         )
 
 
-def test_upload_photo_file_uses_resumable_chunks_and_metadata_stays_signed(tmp_path: Path) -> None:
-    body = b"heic-byte!"
-    content_sha256 = hashlib.sha256(body).hexdigest()
-    path = tmp_path / "photo.heic"
-    path.write_bytes(body)
-    session = _PhotoResumableSession(content_sha256=content_sha256)
-    client = IngestClient(
-        base_url="https://app.example.test/",
-        signing_key=b"0123456789abcdef0123456789abcdef",
-        session=session,
-        now=lambda: 1700000000.0,
-        link_ttl_seconds=900,
-    )
-    stored = client.upload_photo_file_path(
-        path,
-        captured_at="2026-06-01T14:30:00",
-        extension=".heic",
-        content_type="image/heic",
-        content_sha256=content_sha256,
-    )
-    assert stored["storage_file_id"] == "fid-photo"
-
-    call = session.calls[0]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/photos/file/resumable"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    assert q["content_sha256"] == hashlib.sha256(call["data"]).hexdigest()
-    assert call["headers"]["Content-Type"] == "application/json"
-    assert json.loads(call["data"]) == {
-        "captured_at": "2026-06-01T14:30:00",
-        "content_sha256": content_sha256,
-        "content_type": "image/heic",
-        "extension": ".heic",
-        "size_bytes": len(body),
-    }
-    assert [put["data"] for put in session.put_calls] == [body[:4], body[4:8], body[8:]]
-    assert [put["headers"]["Content-Range"] for put in session.put_calls] == [
-        "bytes 0-3/10",
-        "bytes 4-7/10",
-        "bytes 8-9/10",
-    ]
-
-    client.upload_photo_metadata(
-        {"schema_version": 1, "source": "apple_photos"},
-        captured_at="2026-06-01T14:30:00",
-        file_content_sha256="filesha",
-        metadata_dedup_sha256="dedupsha",
-    )
-    call = session.calls[1]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/photos/metadata"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    assert q["file_content_sha256"] == "filesha"
-    assert q["metadata_dedup_sha256"] == "dedupsha"
-    assert call["headers"]["Content-Type"] == "application/json"
-
-
-def test_resumable_photo_upload_queries_drive_after_a_dropped_chunk(tmp_path: Path) -> None:
-    import requests
-
-    body = b"abcdefgh"
-    content_sha256 = hashlib.sha256(body).hexdigest()
-    path = tmp_path / "movie.mov"
-    path.write_bytes(body)
-
-    class InterruptedSession(_PhotoResumableSession):
-        def __init__(self) -> None:
-            super().__init__(content_sha256=content_sha256)
-            self.outcomes = [
-                requests.Timeout("response lost"),
-                _FakeResponse({}, status_code=308, headers={"Range": "bytes=0-3"}),
-                _FakeResponse(
-                    {
-                        "id": "fid-movie",
-                        "webViewLink": "https://drive/movie",
-                        "sha256Checksum": content_sha256,
-                        "size": "8",
-                    }
-                ),
-            ]
-
-        def put(self, url, *, data, headers, timeout):
-            self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
-            outcome = self.outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-    session = InterruptedSession()
-    stored = IngestClient(
-        base_url="https://app.example.test",
-        signing_key=b"k" * 32,
-        session=session,
-    ).upload_photo_file_path(
-        path,
-        captured_at="2026-06-01T14:30:00",
-        extension=".mov",
-        content_type="video/quicktime",
-        content_sha256=content_sha256,
-    )
-
-    assert stored["storage_file_id"] == "fid-movie"
-    assert session.put_calls[0]["headers"]["Content-Range"] == "bytes 0-3/8"
-    assert session.put_calls[1]["data"] == b""
-    assert session.put_calls[1]["headers"]["Content-Range"] == "bytes */8"
-    assert session.put_calls[2]["headers"]["Content-Range"] == "bytes 4-7/8"
-
-
-def test_resumable_photo_upload_rejects_drive_checksum_mismatch(tmp_path: Path) -> None:
-    body = b"full-original"
-    content_sha256 = hashlib.sha256(body).hexdigest()
-    path = tmp_path / "photo.heic"
-    path.write_bytes(body)
-
-    class WrongChecksumSession(_PhotoResumableSession):
-        def put(self, url, *, data, headers, timeout):
-            self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
-            return _FakeResponse(
-                {
-                    "id": "fid-corrupt",
-                    "webViewLink": "https://drive/corrupt",
-                    "sha256Checksum": "0" * 64,
-                    "size": str(len(body)),
-                }
-            )
-
-    with pytest.raises(ValueError, match="checksum"):
-        IngestClient(
-            base_url="https://app.example.test",
-            signing_key=b"k" * 32,
-            session=WrongChecksumSession(content_sha256=content_sha256),
-        ).upload_photo_file_path(
-            path,
-            captured_at="2026-06-01T14:30:00",
-            extension=".heic",
-            content_type="image/heic",
-            content_sha256=content_sha256,
-        )
-
-
-def test_resumable_photo_upload_never_exposes_the_session_capability_in_errors(
-    tmp_path: Path,
-) -> None:
-    import requests
-
-    body = b"full-original"
-    content_sha256 = hashlib.sha256(body).hexdigest()
-    path = tmp_path / "photo.heic"
-    path.write_bytes(body)
-
-    class FailingSession(_PhotoResumableSession):
-        def put(self, url, *, data, headers, timeout):
-            raise requests.RequestException(f"failed while using {url}")
-
-    with pytest.raises(RuntimeError) as raised:
-        IngestClient(
-            base_url="https://app.example.test",
-            signing_key=b"k" * 32,
-            session=FailingSession(content_sha256=content_sha256),
-        ).upload_photo_file_path(
-            path,
-            captured_at="2026-06-01T14:30:00",
-            extension=".heic",
-            content_type="image/heic",
-            content_sha256=content_sha256,
-        )
-    assert "session-secret" not in str(raised.value)
-
-
-def test_upload_manual_finance_document_and_metadata_send_expected_queries() -> None:
-    session = _FakeSession()
-    client = IngestClient(
-        base_url="https://app.example.test/",
-        signing_key=b"0123456789abcdef0123456789abcdef",
-        session=session,
-        now=lambda: 1700000000.0,
-        link_ttl_seconds=900,
-    )
-    body = b"%PDF-statement"
-    client.upload_manual_finance_document(
-        body,
-        modified_at="2026-06-30T10:00:00",
-        account_folder="acme-checking-0001",
-        extension=".pdf",
-        content_type="application/pdf",
-    )
-    call = session.calls[0]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/manual-finance/file"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    assert q["modified_at"] == "2026-06-30T10:00:00"
-    assert q["account_folder"] == "acme-checking-0001"
-    assert q["extension"] == ".pdf"
-    assert q["content_sha256"] == hashlib.sha256(body).hexdigest()
-    assert call["headers"]["Content-Type"] == "application/pdf"
-
-    client.upload_manual_finance_metadata(
-        {"schema_version": 1, "source": "manual"},
-        modified_at="2026-06-30T10:00:00",
-        account_folder="acme-checking-0001",
-        file_content_sha256="filesha",
-        metadata_dedup_sha256="dedupsha",
-    )
-    call = session.calls[1]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/manual-finance/metadata"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    assert q["account_folder"] == "acme-checking-0001"
-    assert q["file_content_sha256"] == "filesha"
-    assert q["metadata_dedup_sha256"] == "dedupsha"
-    assert call["headers"]["Content-Type"] == "application/json"
-
-
 class _FakeJSONSession:
     def __init__(self, payload: dict) -> None:
         self.calls: list[dict] = []
@@ -388,74 +147,6 @@ class _FakeJSONSession:
     def post(self, url, *, data, headers, timeout):
         self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
         return _FakeResponse(self._payload)
-
-
-def test_publish_chatgpt_session_signs_json_body() -> None:
-    session = _FakeJSONSession({"account": "user@example.com", "session_key": "default", "token_sha256": "abc"})
-    client = IngestClient(
-        base_url="https://app.example.test/",
-        signing_key=b"0123456789abcdef0123456789abcdef",
-        session=session,
-        now=lambda: 1700000000.0,
-        link_ttl_seconds=900,
-    )
-    ack = client.publish_chatgpt_session(
-        account="user@example.com",
-        session_token="__Secure-next-auth.session-token=tok; cf_clearance=cf",
-        source_browser="Google Chrome",
-    )
-    assert ack["token_sha256"] == "abc"
-    call = session.calls[0]
-    assert call["headers"]["Content-Type"] == "application/json"
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/chatgpt/session"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    expected_sha = hashlib.sha256(call["data"]).hexdigest()
-    assert q["content_sha256"] == expected_sha
-    assert q["sig"] == sign_object_upload(
-        b"0123456789abcdef0123456789abcdef", "/ingest/chatgpt/session", expected_sha, 1700000000 + 900
-    )
-    # The body is canonical JSON carrying the credential.
-    assert b'"account":"user@example.com"' in call["data"]
-    assert b"__Secure-next-auth.session-token=tok" in call["data"]
-
-
-def test_post_heartbeat_signs_the_run_verdict() -> None:
-    session = _FakeJSONSession({"ok": True})
-    client = IngestClient(
-        base_url="https://app.example.test/",
-        signing_key=b"0123456789abcdef0123456789abcdef",
-        session=session,
-        now=lambda: 1700000000.0,
-        link_ttl_seconds=900,
-    )
-    client.post_heartbeat(
-        pipeline="apple_notes",
-        device="porygon",
-        ran_at="2026-08-27T03:00:00+00:00",
-        exit_code=1,
-        duration_seconds=12,
-        error="x" * 700,
-    )
-    call = session.calls[0]
-    parts = urlsplit(call["url"])
-    assert parts.path == "/ingest/heartbeat"
-    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    expected_sha = hashlib.sha256(call["data"]).hexdigest()
-    assert q["content_sha256"] == expected_sha
-    assert q["sig"] == sign_object_upload(
-        b"0123456789abcdef0123456789abcdef", "/ingest/heartbeat", expected_sha, 1700000000 + 900
-    )
-    body = json.loads(call["data"])
-    assert body["pipeline"] == "apple_notes"
-    assert body["device"] == "porygon"
-    assert body["exit_code"] == 1
-    assert body["duration_seconds"] == 12
-    assert len(body["error"]) == 500
-
-
-# Object keys are now built only by the app (Go); see
-# app/internal/server/ingest_test.go for the key/tag assertions.
 
 
 # --- runner uses the http_app batch uploader --------------------------------
@@ -467,64 +158,6 @@ class _FakeLogger:
 
     def warning(self, *args, **kwargs) -> None:
         pass
-
-
-def test_runner_uploads_via_batch_uploader(tmp_path: Path) -> None:
-    proj = tmp_path / "claude" / "-proj"
-    proj.mkdir(parents=True)
-    path = proj / "sess-1.jsonl"
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"type": "user", "uuid": "u1"}) + "\n")
-        handle.write(json.dumps({"type": "user", "uuid": "u2"}) + "\n")
-
-    uploads: list[tuple[bytes, datetime]] = []
-
-    def uploader(encoded: bytes, exported_at: datetime) -> dict:
-        uploads.append((encoded, exported_at))
-        return {"storage_backend": "google_drive", "storage_key": "k", "storage_file_id": "fid", "storage_url": ""}
-
-    state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
-    now = datetime(2026, 6, 14, 18, tzinfo=UTC)
-    summary = AgentSessionsUploadRunner(
-        account="zach@example.com",
-        device="porygon",
-        claude_projects_dir=tmp_path / "claude",
-        codex_sessions_dir=None,
-        batch_uploader=uploader,
-        logger=_FakeLogger(),
-        upload_state=state,
-        now=lambda: now,
-    ).sync()
-    state.close()
-
-    assert summary.batches_uploaded == 1
-    assert len(uploads) == 1
-    encoded, exported_at = uploads[0]
-    assert exported_at == now
-    # The uploader receives ready-to-store gzipped JSONL envelopes.
-    records = [json.loads(line) for line in gzip.decompress(encoded).decode("utf-8").splitlines() if line.strip()]
-    assert [r["record"]["line"]["uuid"] for r in records] == ["u1", "u2"]
-
-
-def test_runner_requires_batch_uploader(tmp_path: Path) -> None:
-    state = AgentSessionsUploadState.open(tmp_path / "state.sqlite", account="zach@example.com")
-    try:
-        raised = False
-        try:
-            AgentSessionsUploadRunner(
-                account="z@example.com",
-                device="d",
-                claude_projects_dir=tmp_path,
-                codex_sessions_dir=None,
-                batch_uploader=None,
-                logger=_FakeLogger(),
-                upload_state=state,
-            )
-        except ValueError:
-            raised = True
-        assert raised
-    finally:
-        state.close()
 
 
 # --- ingest_client_from_env: warehouse URL/token resolution -----------------

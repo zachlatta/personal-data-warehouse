@@ -122,20 +122,24 @@ def test_health_reports_never_when_no_success_yet(tmp_path: Path):
     assert "last success: never" in out
 
 
-def test_post_heartbeat_invokes_the_python_module_with_the_run_verdict(tmp_path: Path):
-    """The wrapper ships the exit code it observed; the fake uv records the argv."""
-    fake_uv = tmp_path / "uv"
-    fake_uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_UV_LOG"\n')
-    fake_uv.chmod(0o755)
-    log = tmp_path / "uv.log"
+def _fake_pdw(tmp_path: Path, body: str) -> Path:
+    fake = tmp_path / "pdw"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(0o755)
+    return fake
+
+
+def test_post_heartbeat_invokes_pdw_heartbeat_with_the_run_verdict(tmp_path: Path):
+    """The wrapper ships the exit code it observed; the fake pdw records the argv."""
+    fake_pdw = _fake_pdw(tmp_path, 'printf "%s\\n" "$@" > "$FAKE_PDW_LOG"\n')
+    log = tmp_path / "pdw.log"
     out = _run(
         'pdw_post_heartbeat "claude_code,codex" "2026-08-27T03:00:00-04:00" 1 42; echo "rc=$?"',
-        env={"PDW_UV": str(fake_uv), "PDW_REPO_DIR": str(tmp_path), "FAKE_UV_LOG": str(log)},
+        env={"PDW_BIN": str(fake_pdw), "FAKE_PDW_LOG": str(log)},
     )
     assert out.strip().endswith("rc=0")
     argv = log.read_text().split("\n")
-    assert argv[:4] == ["run", "--directory", str(tmp_path), "python"]
-    assert "personal_data_warehouse.uploader_heartbeat" in argv
+    assert argv[0] == "heartbeat"
     assert argv[argv.index("--pipeline") + 1] == "claude_code,codex"
     assert argv[argv.index("--exit-code") + 1] == "1"
     assert argv[argv.index("--duration-seconds") + 1] == "42"
@@ -143,32 +147,60 @@ def test_post_heartbeat_invokes_the_python_module_with_the_run_verdict(tmp_path:
 
 
 def test_post_heartbeat_never_changes_the_wrappers_exit_code(tmp_path: Path):
-    fake_uv = tmp_path / "uv"
-    fake_uv.write_text("#!/bin/sh\nexit 7\n")
-    fake_uv.chmod(0o755)
+    fake_pdw = _fake_pdw(tmp_path, "exit 7\n")
     out = _run(
         'pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1 2>/dev/null; echo "rc=$?"',
-        env={"PDW_UV": str(fake_uv), "PDW_REPO_DIR": str(tmp_path)},
+        env={"PDW_BIN": str(fake_pdw)},
     )
     assert out.strip() == "rc=0"
 
 
-def test_post_heartbeat_is_a_noop_without_a_repo_and_uv():
-    out = _run('pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1; echo "rc=$?"')
+def test_post_heartbeat_is_a_noop_without_a_pdw_binary(tmp_path: Path):
+    """No binary anywhere (PDW_BIN unset, ~/.local/bin empty, nothing on PATH): skip quietly."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    out = _run(
+        'pdw_post_heartbeat "apple_notes" "2026-08-27T03:00:00-04:00" 0 1; echo "rc=$?"',
+        env={"PDW_BIN": "", "PATH": str(empty)},
+    )
     assert out.strip() == "rc=0"
+
+
+def test_resolve_bin_prefers_the_override_then_the_release_install_then_path(tmp_path: Path):
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    release = home / ".local" / "bin" / "pdw"
+    release.write_text("#!/bin/sh\n")
+    release.chmod(0o755)
+    on_path = tmp_path / "path" / "pdw"
+    on_path.parent.mkdir()
+    on_path.write_text("#!/bin/sh\n")
+    on_path.chmod(0o755)
+    override = _fake_pdw(tmp_path, "")
+
+    base = {"HOME": str(home), "PATH": str(on_path.parent)}
+    assert _run("pdw_resolve_bin", env={**base, "PDW_BIN": str(override)}).strip() == str(override)
+    assert _run("pdw_resolve_bin", env={**base, "PDW_BIN": ""}).strip() == str(release)
+    release.unlink()
+    assert _run("pdw_resolve_bin", env={**base, "PDW_BIN": ""}).strip() == str(on_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _run("pdw_resolve_bin", env={**base, "PDW_BIN": "", "PATH": str(empty)}).strip() == ""
 
 
 # --- credential resolution ----------------------------------------------------
 #
-# The heartbeat post runs `uv run python -m ...` DIRECTLY, outside the pdw CLI,
-# so it inherits none of the URL/token pdw resolves for `pdw ingest`. The two
-# agent-sessions wrappers run their uploader THROUGH pdw and so never exported
+# When the heartbeat post ran `uv run python -m ...` DIRECTLY, outside the pdw
+# CLI, it inherited none of the URL/token pdw resolves for `pdw ingest`. The two
+# agent-sessions wrappers ran their uploader THROUGH pdw and so never exported
 # those variables themselves -- and their heartbeat therefore failed on every
 # run from the day it shipped, leaving claude_code, codex, pi and openclaw with
 # last_run_at NULL on /pipelines while the uploads themselves worked fine. The
 # five Apple wrappers only escaped because each had hand-rolled the same config
-# read for its own uploader. Resolving credentials here, once, is what makes the
-# heartbeat independent of how a given wrapper chose to invoke its uploader.
+# read for its own uploader. The poster is `pdw heartbeat` now and resolves the
+# config itself, but the lib still exports the credentials once, so no wrapper
+# ever grows its own copy of the read again and an operator sourcing the lib
+# gets the same answer pdw does.
 
 
 def _pdw_config(tmp_path: Path, url: str = "https://warehouse.example", token: str = "s3cret") -> Path:
@@ -177,24 +209,23 @@ def _pdw_config(tmp_path: Path, url: str = "https://warehouse.example", token: s
     return config
 
 
-def _argv_env(tmp_path: Path, name: str = "uv") -> tuple[Path, Path]:
-    """A fake uv that records the PDW_API_URL/PDW_SECRET_TOKEN it was handed."""
-    fake_uv = tmp_path / name
-    fake_uv.write_text('#!/bin/sh\nprintf "%s|%s\\n" "${PDW_API_URL-unset}" "${PDW_SECRET_TOKEN-unset}" > "$FAKE_UV_LOG"\n')
-    fake_uv.chmod(0o755)
-    return fake_uv, tmp_path / "uv.log"
+def _argv_env(tmp_path: Path, name: str = "pdw") -> tuple[Path, Path]:
+    """A fake pdw that records the PDW_API_URL/PDW_SECRET_TOKEN it was handed."""
+    fake_pdw = tmp_path / name
+    fake_pdw.write_text('#!/bin/sh\nprintf "%s|%s\\n" "${PDW_API_URL-unset}" "${PDW_SECRET_TOKEN-unset}" > "$FAKE_PDW_LOG"\n')
+    fake_pdw.chmod(0o755)
+    return fake_pdw, tmp_path / "pdw.log"
 
 
 def test_post_heartbeat_reaches_the_app_when_only_pdw_login_is_configured(tmp_path: Path):
     """The regression: `pdw login` alone must be enough, as it is for the uploader."""
     config = _pdw_config(tmp_path)
-    fake_uv, log = _argv_env(tmp_path)
+    fake_pdw, log = _argv_env(tmp_path)
     _run(
         'pdw_post_heartbeat "claude_code,codex,pi" "2026-08-27T03:00:00-04:00" 0 1',
         env={
-            "PDW_UV": str(fake_uv),
-            "PDW_REPO_DIR": str(tmp_path),
-            "FAKE_UV_LOG": str(log),
+            "PDW_BIN": str(fake_pdw),
+            "FAKE_PDW_LOG": str(log),
             "PDW_CONFIG": str(config),
             "PDW_API_URL": "",
             "PDW_SECRET_TOKEN": "",
@@ -271,7 +302,7 @@ def test_no_upload_wrapper_hand_rolls_the_pdw_config_read():
     offenders = sorted(
         path.name
         for path in bin_dir.iterdir()
-        if path.is_file() and path.name != LIB.name and "json.load(open(sys.argv[1]))" in path.read_text(errors="ignore")
+        if path.is_file() and path.name != LIB.name and "config.json" in path.read_text(errors="ignore")
     )
     assert offenders == [], f"these wrappers duplicate pdw_export_app_credentials: {offenders}"
 

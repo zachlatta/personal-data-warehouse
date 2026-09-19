@@ -3,7 +3,6 @@ name = "personal_data_warehouse"
 requires-python = ">=3.10,<3.15"
 version = "0.1.0"
 dependencies = [
-    "cryptography>=42.0.0",
     "dagster==1.12.22",
     "dagster-postgres>=0.28.22",
     "google-api-python-client>=2.169.0",
@@ -12,17 +11,15 @@ dependencies = [
     "pillow>=12.2.0",
     "psycopg2-binary>=2.9.10",
     "pypdf>=6.10.2",
-    "pytypedstream>=0.1.0",
     "python-dotenv>=1.1.0",
     "requests>=2.32.0",
     "slack-sdk>=3.41.0",
     "neonize==0.4.3.post0",
     "qrcode>=8.2",
     "pillow-heif>=1.4.0",
+    # curl_cffi impersonates a browser for the server-side claude.ai / chatgpt.com
+    # / WHOOP pollers, which sit behind Cloudflare managed challenges.
     "curl-cffi>=0.13",
-    # Voice Memos write-back drives Core Data on the client Mac; never
-    # installed on the Linux prod deployment.
-    "pyobjc-framework-CoreData>=10.3; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -34,12 +31,13 @@ personal-data-warehouse-slack-sync = "personal_data_warehouse.slack_sync:main"
 personal-data-warehouse-whoop-auth = "personal_data_warehouse.whoop_auth:main"
 personal-data-warehouse-whoop-sync = "personal_data_warehouse.whoop_sync:main"
 personal-data-warehouse-whoop-private-sync = "personal_data_warehouse.whoop_private_sync:main"
-# The four scheduled client uploaders are no longer standalone console scripts:
-# they run through the pdw CLI as `pdw ingest <source>` (voice-memos,
-# apple-notes, apple-messages, agent-sessions), which execs `uv run python -m
-# <module>`. whatsapp-client stays a console script because it is a local
-# pairing/debug tool, not a scheduled uploader (WhatsApp ingests in-process in
-# the production Dagster deployment).
+# Every device-side client (the uploaders, the mutation workers, the
+# browser-session publishers, the run heartbeat) is native Go in the pdw CLI
+# (`pdw ingest <source>`, `pdw mutations <provider>`, `pdw <service>
+# publish-session`, `pdw heartbeat`); nothing in this package runs on a Mac.
+# whatsapp-client stays a console script because it is a local pairing/debug
+# tool, not a scheduled uploader (WhatsApp ingests in-process in the production
+# Dagster deployment).
 personal-data-warehouse-whatsapp-client = "personal_data_warehouse_whatsapp.cli:main"
 personal-data-warehouse-agent-auth = "personal_data_warehouse.agent_runner:auth_main"
 
@@ -63,18 +61,9 @@ markers = [
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/personal_data_warehouse",
-    "src/personal_data_warehouse_agent_sessions",
-    "src/personal_data_warehouse_chatgpt",
     "src/personal_data_warehouse_claude_desktop",
     "src/personal_data_warehouse_alice_voice_recordings",
-    "src/personal_data_warehouse_apple_messages",
-    "src/personal_data_warehouse_apple_contacts",
-    "src/personal_data_warehouse_apple_notes",
-    "src/personal_data_warehouse_photos",
-    "src/personal_data_warehouse_voice_memos",
     "src/personal_data_warehouse_whatsapp",
-    "src/personal_data_warehouse_plaid",
-    "src/personal_data_warehouse_manual_finance",
 ]
 force-include = { "pyproject.toml" = "pyproject.toml" }
 

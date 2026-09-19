@@ -4,11 +4,12 @@ set -u
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 # The Claude Desktop auth pusher is native to the pdw CLI (Go): it decrypts the
 # claude.ai sessionKey from the local desktop app and pushes it to the warehouse
-# app, which stores it for the serverside poller. Unlike the Python uploaders it
-# does NOT load .env itself, so source it here for CLAUDE_DESKTOP_ACCOUNT /
-# GMAIL_ACCOUNTS (the warehouse URL + token come from `pdw login`).
-PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
-[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+# app, which stores it for the serverside poller. Unlike `pdw ingest <source>`
+# it does NOT load the project .env itself, so source it here for
+# CLAUDE_DESKTOP_ACCOUNT / GMAIL_ACCOUNTS (the warehouse URL + token come from
+# `pdw login`).
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+PDW="$(pdw_resolve_bin)"
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/claude-desktop-auth.run.log"
 HEARTBEAT_FILE="$LOG_DIR/claude-desktop-auth.heartbeat"
@@ -24,7 +25,10 @@ fi
 started_at_iso="$(date -Iseconds)"
 echo "[$started_at_iso] starting claude desktop auth push" >> "$LOG_FILE"
 
-if ! cd "$REPO_DIR"; then
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
@@ -33,7 +37,6 @@ else
 fi
 
 finished_at_iso="$(date -Iseconds)"
-. "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 echo "[$finished_at_iso] finished claude desktop auth push exit_code=$exit_code" >> "$LOG_FILE"
 

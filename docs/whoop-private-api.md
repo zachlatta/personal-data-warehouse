@@ -24,8 +24,9 @@ app stores its session in ordinary Chrome cookies on `.whoop.com`:
 | `whoop-auth-refresh-token` | opaque, **30 days** |
 | `whoop-auth-expiry` | expiry hint, non-numeric |
 
-They decrypt with the same Safe Storage keychain machinery `chatgpt_cookies.py`
-already uses, so capture is a solved problem.
+They decrypt with the same Safe Storage keychain machinery the ChatGPT capture
+already uses (`app/internal/browsersessions/chromium`, native Go in the pdw CLI;
+`pdw whoop publish-session`), so capture is a solved problem.
 
 **Refresh — the load-bearing detail:**
 

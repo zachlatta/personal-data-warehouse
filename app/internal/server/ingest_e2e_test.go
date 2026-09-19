@@ -12,7 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +20,9 @@ import (
 	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/manualfinance"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/photos"
 )
 
 // fakeDrive is an httptest backend that simulates the slice of the Drive REST
@@ -436,12 +439,16 @@ func TestIngestEndToEndEveryEndpoint(t *testing.T) {
 	}
 }
 
-// TestIngestEndToEndPythonClient is the cross-runtime manual test: the real
-// Python IngestClient posts through every endpoint to the live handler, which
-// writes to the fake Drive. Opt-in (needs uv + the repo) via PDW_E2E=1.
-func TestIngestEndToEndPythonClient(t *testing.T) {
+// TestIngestEndToEndGoClient is the cross-package e2e: the real Go ingest
+// client (app/internal/ingestclient, the one every `pdw ingest <source>`
+// uploader uses) posts through every endpoint to the live handler over HTTP,
+// which writes to the fake Drive. It proves what the retired Python driver
+// proved: the client's signing, query shape and dedup shas produce exactly the
+// Drive objects the handler-level cases above expect, byte for byte, for every
+// source. Opt-in via PDW_E2E=1, as the Python-driven version was.
+func TestIngestEndToEndGoClient(t *testing.T) {
 	if os.Getenv("PDW_E2E") != "1" {
-		t.Skip("set PDW_E2E=1 to run the Python<->Go cross-boundary e2e (needs uv)")
+		t.Skip("set PDW_E2E=1 to run the Go client<->server e2e")
 	}
 	drive := &fakeDrive{}
 	driveSrv := httptest.NewServer(drive)
@@ -450,23 +457,132 @@ func TestIngestEndToEndPythonClient(t *testing.T) {
 	ingestSrv := httptest.NewServer(svc.handler())
 	defer ingestSrv.Close()
 
-	cmd := exec.Command("uv", "run", "python", "scripts/ingest_e2e_driver.py", ingestSrv.URL, objectsTestSecret)
-	cmd.Dir = repoRootForE2E(t)
-	out, err := cmd.CombinedOutput()
-	t.Logf("python driver output:\n%s", out)
-	if err != nil {
-		t.Fatalf("python driver failed: %v", err)
-	}
-	if got := len(drive.uploads); got != len(ingestArtifacts())+1 {
-		t.Fatalf("expected %d uploads from python client, got %d", len(ingestArtifacts())+1, got)
-	}
-}
-
-func repoRootForE2E(t *testing.T) string {
-	t.Helper()
-	wd, err := os.Getwd() // .../app/internal/server
+	client, err := ingestclient.New(
+		ingestSrv.URL,
+		objectsTestSecret,
+		ingestclient.WithNow(func() time.Time { return objectsTestNow }),
+		ingestclient.WithSleep(func(time.Duration) {}),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.TrimSuffix(wd, "/app/internal/server")
+
+	photo := []byte("heic-bytes")
+	photoSHA := sha256Hex(photo)
+	photoDedupSHA := photos.ProvenanceDedupSHA256("apple_photos", "z@x.test", "UUID-1", "original", photoSHA)
+	statement := []byte("%PDF-statement-bytes")
+	statementSHA := sha256Hex(statement)
+	statementDedupSHA := manualfinance.ProvenanceDedupSHA256("manual", "z@x.test", statementSHA, statementSHA)
+	audio := []byte("audio-bytes")
+	audioSHA := sha256Hex(audio)
+	photoPath := filepath.Join(t.TempDir(), "photo.heic")
+	if err := os.WriteFile(photoPath, photo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type step struct {
+		name string
+		run  func() (ingestclient.StoredObject, error)
+	}
+	steps := []step{
+		{"agent-sessions/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadAgentSessionsBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"apple-contacts/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleContactsBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"apple-messages/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleMessagesBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"apple-messages/attachment", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleMessagesAttachment([]byte("attachment-bytes"), ingestclient.AppleMessagesAttachment{
+				AttachmentGUID: "A1", MessageGUID: "M1", ContentType: "image/jpeg",
+				CreatedAt: "2025-03-04T00:00:00+00:00", Filename: "p.jpg",
+			})
+		}},
+		{"photos/file", func() (ingestclient.StoredObject, error) {
+			return client.UploadPhotoFile(photoPath, "2026-06-01T14:30:00", ".heic", "image/heic", photoSHA)
+		}},
+		{"photos/metadata", func() (ingestclient.StoredObject, error) {
+			return client.UploadPhotoMetadata(map[string]any{"schema_version": 1, "source": "apple_photos"},
+				"2026-06-01T14:30:00", photoSHA, photoDedupSHA)
+		}},
+		{"voice-memos/audio", func() (ingestclient.StoredObject, error) {
+			return client.UploadVoiceMemoAudio(audio, "2025-07-15T09:00:00", ".m4a", "audio/m4a")
+		}},
+		{"voice-memos/metadata", func() (ingestclient.StoredObject, error) {
+			return client.UploadVoiceMemoMetadata(map[string]any{"schema_version": 1}, "2025-07-15T09:00:00", audioSHA)
+		}},
+		{"apple-notes/body", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleNotesBody([]byte("<html>x</html>"), "N1", "R1", "2026-01-02T03:04:05+00:00")
+		}},
+		{"apple-notes/attachment", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleNotesAttachment([]byte("note-attachment"), ingestclient.AppleNotesAttachment{
+				NoteID: "N1", RevisionID: "R1", ModifiedAt: "2026-01-02T03:04:05+00:00",
+				AttachmentID: "AT1", Filename: "d.pdf", ContentType: "application/pdf",
+			})
+		}},
+		{"apple-notes/revision", func() (ingestclient.StoredObject, error) {
+			return client.UploadAppleNotesRevision(map[string]any{"schema_version": 1, "source": "apple_notes"},
+				"N1", "R1", "2026-01-02T03:04:05+00:00", "FP1")
+		}},
+		{"manual-finance/file", func() (ingestclient.StoredObject, error) {
+			return client.UploadManualFinanceDocument(statement, "2026-06-30T10:00:00", "Acme-Checking-0001", ".pdf", "application/pdf")
+		}},
+		{"manual-finance/metadata", func() (ingestclient.StoredObject, error) {
+			return client.UploadManualFinanceMetadata(map[string]any{"schema_version": 1, "source": "manual"},
+				"2026-06-30T10:00:00", "Acme-Checking-0001", statementSHA, statementDedupSHA)
+		}},
+	}
+	if len(steps) != len(ingestArtifacts())+1 {
+		t.Fatalf("e2e client drives %d endpoints but %d artifacts (+1 photo file) are registered", len(steps), len(ingestArtifacts()))
+	}
+
+	// The handler-level cases are the byte-for-byte contract; the client must
+	// land on exactly those objects when it drives the same endpoints.
+	want := map[string]e2eCase{}
+	for _, tc := range e2eCases() {
+		want[tc.name] = tc
+	}
+	for _, st := range steps {
+		before := len(drive.uploads)
+		stored, err := st.run()
+		if err != nil {
+			t.Fatalf("%s: %v", st.name, err)
+		}
+		if stored.StorageFileID == "" || stored.StorageKey == "" {
+			t.Fatalf("%s: incomplete stored object %+v", st.name, stored)
+		}
+		if len(drive.uploads) != before+1 {
+			t.Fatalf("%s: expected exactly one Drive upload, got %d new", st.name, len(drive.uploads)-before)
+		}
+		up := drive.lastUpload()
+		if st.name == "photos/file" {
+			if up.Name != "2026-06-01-"+photoSHA+".heic" || string(up.Media) != string(photo) || up.AppProps["pdw_kind"] != "photo_file" {
+				t.Fatalf("photos/file uploaded = %+v", up)
+			}
+			continue
+		}
+		tc, ok := want[st.name]
+		if !ok {
+			t.Fatalf("%s has no handler-level case to compare against", st.name)
+		}
+		if up.Name != tc.wantName {
+			t.Errorf("%s: drive name = %q, want %q", st.name, up.Name, tc.wantName)
+		}
+		if tc.wantMime != "" && up.MimeType != tc.wantMime {
+			t.Errorf("%s: drive mimeType = %q, want %q", st.name, up.MimeType, tc.wantMime)
+		}
+		if up.AppProps["content_sha256"] != sha256Hex(up.Media) {
+			t.Errorf("%s: content_sha256 = %q does not match the stored bytes", st.name, up.AppProps["content_sha256"])
+		}
+		for k, v := range tc.wantProps {
+			if up.AppProps[k] != v {
+				t.Errorf("%s: appProperty %q = %q, want %q", st.name, k, up.AppProps[k], v)
+			}
+		}
+	}
+	if got := len(drive.uploads); got != len(ingestArtifacts())+1 {
+		t.Fatalf("expected %d uploads from the Go client, got %d", len(ingestArtifacts())+1, got)
+	}
 }

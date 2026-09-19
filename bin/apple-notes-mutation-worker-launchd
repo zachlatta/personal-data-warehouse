@@ -2,11 +2,23 @@
 set -eu
 
 REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
-UV="/opt/homebrew/bin/uv"
+# Resident local mutation worker for approved Notes mutations: native Go in the
+# signed pdw binary (`pdw mutations apple-notes`), which drives Notes.app over
+# AppleScript. No uv or Python in the exec chain (launchd -> zsh -> pdw). macOS
+# attributes the Automation -> Notes grant to the binaries in that chain; pdw
+# release binaries are signed with a stable identity, so one grant to
+# ~/.local/bin/pdw per Mac survives every self-update (it used to be keyed to
+# uv's Cellar path and broke on every brew upgrade).
 
 . "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
 mkdir -p "$HOME/Library/Logs/personal-data-warehouse"
 
+if [ -z "$PDW" ]; then
+  echo "no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >&2
+  exit 1
+fi
 cd "$REPO_DIR"
-exec "$UV" run python -m personal_data_warehouse_apple_notes.mutation_worker
+exec "$PDW" mutations apple-notes

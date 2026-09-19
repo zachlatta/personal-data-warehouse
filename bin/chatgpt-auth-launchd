@@ -10,8 +10,8 @@ REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
 # It reads the browser's "Safe Storage" keychain item, so the login keychain
 # must be auto-unlocked by loginwindow and the item's ACL must say Always Allow
 # (see the macos-keychain-launchd-vs-session runbook when it starts failing).
-PDW="${PDW_BIN:-$HOME/.local/bin/pdw}"
-[ -x "$PDW" ] || PDW="$(command -v pdw 2>/dev/null || echo "$PDW")"
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+PDW="$(pdw_resolve_bin)"
 LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
 LOG_FILE="$LOG_DIR/chatgpt-auth.run.log"
 HEARTBEAT_FILE="$LOG_DIR/chatgpt-auth.heartbeat"
@@ -27,7 +27,10 @@ fi
 started_at_iso="$(date -Iseconds)"
 echo "[$started_at_iso] starting chatgpt session publish" >> "$LOG_FILE"
 
-if ! cd "$REPO_DIR"; then
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
@@ -38,7 +41,6 @@ else
 fi
 
 finished_at_iso="$(date -Iseconds)"
-. "$REPO_DIR/bin/_pdw-upload-lib.sh"
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 echo "[$finished_at_iso] finished chatgpt session publish exit_code=$exit_code" >> "$LOG_FILE"
 

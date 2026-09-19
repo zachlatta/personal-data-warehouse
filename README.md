@@ -621,8 +621,6 @@ institution, never to repair an existing Item:
 
 ```bash
 pdw ingest plaid link
-# If running directly from a checkout before updating the pdw binary:
-uv run python -m personal_data_warehouse_plaid.cli link
 ```
 
 The command creates a short-lived Link token, opens a localhost page, and prompts through Plaid
@@ -646,8 +644,6 @@ again. The institution may return less than the requested maximum.
 
 ```bash
 pdw ingest plaid sync
-# Direct checkout equivalent:
-uv run python -m personal_data_warehouse_plaid.cli sync
 ```
 
 The `plaid_finance_sync` Dagster asset performs the same sync. Its enabled
@@ -886,7 +882,8 @@ pdw ingest voice-memos --writeback-limit 20     # bound renames per run
 
 On the app/warehouse side no new surface is involved; the client needs the usual
 `PDW_API_URL` + `PDW_SECRET_TOKEN`. The write requires the same Full Disk Access grant
-the uploader already has (it runs in the same python process).
+the uploader already has (it runs in the same `pdw` process; the Core Data save itself is a
+small Swift helper the binary compiles on demand).
 
 On Zach's MacBook Pro, the local uploader is managed by a per-user macOS LaunchAgent
 instead of cron. The checked-in plist template lives at
@@ -921,9 +918,10 @@ cat ~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat
 If LaunchAgent runs fail with `PermissionError: [Errno 1] Operation not permitted` for
 `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings`, macOS Full Disk Access
 is blocking the background process. Grant Full Disk Access in System Settings > Privacy & Security
-> Full Disk Access to the executable chain used by the job, especially `/bin/zsh`,
-`/opt/homebrew/bin/uv`, `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and
-its current real path `/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`.
+> Full Disk Access to the executable chain used by the job: `/bin/zsh` and the signed `pdw`
+binary (`~/.local/bin/pdw`). The uploader is native Go, so there is no uv or Python in the
+chain any more, and the grant survives `pdw update` because releases are signed with a
+stable identity (see AGENTS.md "pdw CLI Full Disk Access vs self-updates").
 After changing privacy permissions, rerun:
 
 ```bash
@@ -1061,9 +1059,7 @@ cat ~/Library/Logs/personal-data-warehouse/apple-notes-upload.heartbeat
 If LaunchAgent runs fail with `PermissionError` or SQLite `authorization denied` for
 `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, macOS Full Disk Access is
 blocking the background process. Grant Full Disk Access in System Settings > Privacy & Security
-> Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`,
-`/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and its current real path
-`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`, then
+> Full Disk Access to `/bin/zsh` and the signed `pdw` binary (`~/.local/bin/pdw`), then
 kickstart the LaunchAgent again.
 
 The Apple Notes uploader uses the same network guard as Voice Memos. Apple Notes-specific
@@ -1154,11 +1150,8 @@ cat ~/Library/Logs/personal-data-warehouse/apple-messages-upload.heartbeat
 
 If LaunchAgent runs fail with `PermissionError` or SQLite `authorization denied` for
 `~/Library/Messages/chat.db`, macOS Full Disk Access is blocking the background process. Grant Full
-Disk Access in System Settings > Privacy & Security > Full Disk Access to `/bin/zsh`,
-`/opt/homebrew/bin/uv`, `/Users/zrl/dev/zachlatta/personal-data-warehouse/.venv/bin/python3`, and
-its current real path
-`/Users/zrl/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/bin/python3.12`, then
-kickstart the LaunchAgent again.
+Disk Access in System Settings > Privacy & Security > Full Disk Access to `/bin/zsh` and the
+signed `pdw` binary (`~/.local/bin/pdw`), then kickstart the LaunchAgent again.
 
 ## Apple Contacts Sync
 
@@ -1210,8 +1203,8 @@ launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.apple-
 ```
 
 Monitor it with `bin/apple-contacts-upload-status`. If the run cannot read an
-`AddressBook-v22.abcddb` store, grant Full Disk Access to `/bin/zsh`, `/opt/homebrew/bin/uv`, the
-repo venv Python, and that Python executable's current resolved uv-managed path.
+`AddressBook-v22.abcddb` store, grant Full Disk Access to `/bin/zsh` and the signed `pdw`
+binary (`~/.local/bin/pdw`).
 
 ### Alice App Voice Recordings
 
