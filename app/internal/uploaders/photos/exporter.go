@@ -49,6 +49,28 @@ type ExportError struct{ Message string }
 
 func (e *ExportError) Error() string { return e.Message }
 
+// PhotosAccessError means the helper does not hold Full Photos library access,
+// so no export can succeed until a person re-grants it. It is a run-level
+// verdict, not a per-file failure: the runner stops the batch on the first
+// one instead of backing off every file and hiding the outage behind
+// "failed=N".
+//
+// The scheduled export never raises the consent prompt itself. It used to,
+// and a helper rebuild (a new ad-hoc cdhash resets the TCC grant) on a
+// headless Mac then parked every export on a dialog nobody could click until
+// the 3600s timeout: 26 timeouts over 2026-09-19..20, six-hour runs, and a
+// `failing` row that took a day to read. Only `--authorize` prompts.
+type PhotosAccessError struct {
+	Status  int64
+	Message string
+}
+
+func (e *PhotosAccessError) Error() string { return e.Message }
+
+// photosAccessErrorPrefix is how the helper reports a missing grant on
+// stderr; the Go side turns it into a PhotosAccessError.
+const photosAccessErrorPrefix = "Photos library access is "
+
 func exportErrorf(format string, args ...any) error {
 	return &ExportError{Message: fmt.Sprintf(format, args...)}
 }
@@ -250,10 +272,17 @@ func (e *PhotoKitExporter) runHelper(arguments ...string) (map[string]any, error
 	defer os.RemoveAll(invocationDir)
 	stdoutPath := filepath.Join(invocationDir, "stdout.json")
 	stderrPath := filepath.Join(invocationDir, "stderr.txt")
+	pidPath := filepath.Join(invocationDir, "helper.pid")
+	// `open` returns as soon as LaunchServices has started the app, so the
+	// helper outlives the launch command. It writes its own pid first thing
+	// so a timed-out export can kill it instead of orphaning a process that
+	// keeps waiting on PhotoKit (or on a consent dialog) for another hour.
+	arguments = append(append([]string{}, arguments...), "--pid-path", pidPath)
 	command := append([]string{openCommand, "-n", "-j", "--stdout", stdoutPath, "--stderr", stderrPath, helper, "--args"}, arguments...)
 	result, err := runner(command, timeout)
 	if err != nil {
 		if errors.Is(err, ErrCommandTimeout) {
+			killHelper(pidPath)
 			return nil, exportErrorf("Timed out after %ss waiting for Apple Photos/iCloud", timeoutText)
 		}
 		return nil, err
@@ -272,7 +301,19 @@ func (e *PhotoKitExporter) runHelper(arguments ...string) (map[string]any, error
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			killHelper(pidPath)
 			return nil, exportErrorf("Timed out after %ss waiting for Apple Photos/iCloud", timeoutText)
+		}
+		if pid, ok := helperPID(pidPath); ok && !processAlive(pid) {
+			// The helper started, then died without writing either channel
+			// (a crash, a kill): waiting for the deadline would attribute a
+			// process that no longer exists to iCloud.
+			helperStdout = readFileIfExists(stdoutPath)
+			helperStderr = readFileIfExists(stderrPath)
+			if strings.TrimSpace(helperStdout) == "" && strings.TrimSpace(helperStderr) == "" {
+				return nil, exportErrorf("The native PhotoKit helper (pid %d) exited without reporting a result", pid)
+			}
+			break
 		}
 		if remaining > 50*time.Millisecond {
 			remaining = 50 * time.Millisecond
@@ -284,6 +325,9 @@ func (e *PhotoKitExporter) runHelper(arguments ...string) (map[string]any, error
 		if detail == "" {
 			detail = "unknown PhotoKit error"
 		}
+		if strings.HasPrefix(detail, photosAccessErrorPrefix) {
+			return nil, &PhotosAccessError{Status: accessStatusOf(detail), Message: strings.TrimSpace(detail)}
+		}
 		return nil, &ExportError{Message: detail}
 	}
 	var payload map[string]any
@@ -291,6 +335,56 @@ func (e *PhotoKitExporter) runHelper(arguments ...string) (map[string]any, error
 		return nil, exportErrorf("The native PhotoKit helper returned invalid output")
 	}
 	return payload, nil
+}
+
+// helperPID reads the pid the helper wrote for this invocation.
+func helperPID(pidPath string) (int, bool) {
+	text := strings.TrimSpace(readFileIfExists(pidPath))
+	if text == "" {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(text)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// processAlive reports whether pid still exists (signal 0 probes without
+// sending anything).
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// killHelper terminates a helper that outlived its export deadline. Best
+// effort: the pid may never have been written, or the process may already
+// be gone.
+func killHelper(pidPath string) {
+	pid, ok := helperPID(pidPath)
+	if !ok {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
+// accessStatusOf pulls the "(status N)" the helper appends to an access
+// error; -1 when absent.
+func accessStatusOf(detail string) int64 {
+	start := strings.LastIndex(detail, "(status ")
+	if start < 0 {
+		return -1
+	}
+	rest := detail[start+len("(status "):]
+	end := strings.Index(rest, ")")
+	if end < 0 {
+		return -1
+	}
+	value, err := strconv.ParseInt(rest[:end], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return value
 }
 
 func readFileIfExists(path string) string {

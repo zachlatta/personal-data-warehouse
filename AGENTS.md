@@ -2249,12 +2249,20 @@ hidden native app `~/Library/Application Support/personal-data-warehouse/photos-
 Exporter.app`; every helper call goes through LaunchServices so TCC consistently attributes the
 grant to `com.zachlatta.pdw.photos-exporter`. Do not replace this with a loose executable: macOS
 attributes a command-line PhotoKit request to its responsible parent (Ghostty interactively,
-launchd when scheduled), producing a grant that works in only one context. The first scheduled
-export requests access automatically, or request it ahead of time with
-`pdw ingest apple-photos --authorize`; either path must show **PDW Photos Exporter** as
-the requester. Grant **Full Access** (Selected Photos is insufficient), then kickstart the
-LaunchAgent. The helper is rebuilt only when its checked-in Swift source or privacy plist changes;
-because it is ad-hoc signed, such a change requires authorization again. If a run reports that
+launchd when scheduled), producing a grant that works in only one context. **A scheduled export
+never raises the consent prompt**: request access with `pdw ingest apple-photos --authorize`
+from a GUI session on that Mac, which must show **PDW Photos Exporter** as the requester. Grant
+**Full Access** (Selected Photos is insufficient), then kickstart the LaunchAgent. The helper is
+rebuilt only when its checked-in Swift source or privacy plist changes; because it is ad-hoc
+signed, such a change resets the grant (the designated requirement is the build's cdhash) and
+needs `--authorize` again. Until 2026-09-20 the scheduled export prompted by itself, and on a
+headless Mac the rebuild from the Go port parked every export on a dialog nobody could click
+until the 3600s per-file timeout — 26 timeouts, six-hour runs, and a `failing` row that took a
+day to read — while `sample tccd` sat in `CFUserNotificationReceiveResponse`. Now the export
+checks the status and exits with `Photos library access is not determined …`, the runner stops
+the batch on that error (a `PhotosAccessError`, never backed off per file) so the run is red
+within seconds, and a helper that outlives the export deadline is killed through the pid it
+writes to `--pid-path` instead of being orphaned. If a run reports that
 Photos access was denied or limited, repair PDW Photos Exporter in System Settings → Privacy &
 Security → Photos. LaunchServices invocation is asynchronous and the uploader waits on the app's
 redirected result files; do not use `open -W`, which races short-lived helper instances and can

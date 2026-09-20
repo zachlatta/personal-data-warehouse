@@ -105,13 +105,26 @@ private func authorize() -> Never {
     emit(["status": requestAuthorization().rawValue])
 }
 
+private func accessStatusName(_ status: PHAuthorizationStatus) -> String {
+    switch status {
+    case .notDetermined: return "not determined"
+    case .restricted: return "restricted"
+    case .denied: return "denied"
+    case .authorized: return "authorized"
+    case .limited: return "limited"
+    @unknown default: return "unknown"
+    }
+}
+
 private func exportResource() -> Never {
-    // The first scheduled run is allowed to raise the consent prompt itself.
-    // This process is an LSUIElement app launched in the user's Aqua session,
-    // so the prompt and resulting grant belong to PDW Photos Exporter rather
-    // than to Ghostty or launchd.
-    guard requestAuthorization().rawValue == authorizedStatus else {
-        fail("The uploader does not have Full Photos library access. Run `pdw ingest apple-photos --authorize` interactively, then allow Full Access in System Settings → Privacy & Security → Photos.")
+    // A scheduled export NEVER raises the consent prompt. It used to, and a
+    // helper rebuild (a new ad-hoc cdhash resets the grant) on a headless Mac
+    // then parked every export on a dialog nobody could click until the
+    // uploader's timeout. Only `authorize` prompts; the export reports the
+    // status it found and exits so the run reads failing within seconds.
+    let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    guard status.rawValue == authorizedStatus else {
+        fail("Photos library access is \(accessStatusName(status)) (status \(status.rawValue)): the uploader does not have Full Photos library access. Run `pdw ingest apple-photos --authorize` from a GUI session on this Mac, then allow Full Access in System Settings → Privacy & Security → Photos.")
     }
     let values = arguments()
     guard
@@ -173,6 +186,11 @@ private func exportResource() -> Never {
 
 guard CommandLine.arguments.count >= 2 else {
     fail("Expected a command: status, authorize, or export")
+}
+
+// The launcher reads this pid to kill a helper that outlives its deadline.
+if let pidPath = arguments()["--pid-path"] {
+    try? "\(getpid())\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
 }
 
 switch CommandLine.arguments[1] {

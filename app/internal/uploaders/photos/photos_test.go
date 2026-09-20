@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -248,11 +249,15 @@ type fakeExporter struct {
 	failIDs        map[string]bool
 	calls          []string
 	maxStagedFiles int
+	accessErr      *PhotosAccessError
 }
 
 func (f *fakeExporter) Export(candidate Candidate, destinationDir string) (ExportedFile, error) {
 	key := candidate.StateID()
 	f.calls = append(f.calls, key)
+	if f.accessErr != nil {
+		return ExportedFile{}, f.accessErr
+	}
 	if f.failIDs[key] {
 		return ExportedFile{}, &ExportError{Message: "iCloud failed for " + candidate.Filename}
 	}
@@ -447,6 +452,29 @@ func TestBeforeUploadCheckBlocksTheBatch(t *testing.T) {
 	summary, err := runner.Sync()
 	if err != nil || summary.FilesUploaded != 0 || summary.FilesSelected != 4 || len(client.files) != 0 || len(exporter.calls) != 0 {
 		t.Fatalf("summary = %+v err = %v calls = %v", summary, err, exporter.calls)
+	}
+}
+
+func TestSyncStopsTheBatchOnAMissingPhotosGrant(t *testing.T) {
+	// A lost grant fails every file the same way; backing each one off would
+	// burn a helper launch per file and read as "failed=N" instead of the
+	// one repair a person has to make.
+	dir := t.TempDir()
+	library := copyFixtureLibrary(t, dir)
+	state := openTestState(t, dir, library)
+	defer state.Close()
+	client := &fakeClient{}
+	exporter := &fakeExporter{accessErr: &PhotosAccessError{Status: 0, Message: "Photos library access is not determined (status 0): run `pdw ingest apple-photos --authorize`"}}
+	summary, err := newRunner(library, client, state, exporter, fixtureNow).Sync()
+	var access *PhotosAccessError
+	if !errors.As(err, &access) || len(exporter.calls) != 1 || len(client.files) != 0 {
+		t.Fatalf("err = %v calls = %v files = %d", err, exporter.calls, len(client.files))
+	}
+	if summary.FilesFailed != 1 || summary.FilesUploaded != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if entry, ok, _ := state.EntryFor(SourceTypeAssetFile, exporter.calls[0]); ok && entry.FailureCount != 0 {
+		t.Fatalf("a missing grant must not back off the file: %+v", entry)
 	}
 }
 
@@ -829,6 +857,84 @@ func TestExportTimesOutWaitingForTheHelper(t *testing.T) {
 	}
 }
 
+// spawnSleeper starts a process that would outlive any test deadline and
+// returns its pid; the caller decides whether the exporter kills it.
+func spawnSleeper(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sleep", "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	return cmd
+}
+
+func TestExportKillsAHelperThatOutlivesItsDeadline(t *testing.T) {
+	// `open -j` returns at once, so a helper stuck on iCloud (or on a consent
+	// dialog nobody can click) used to outlive the export's deadline and pile
+	// up as orphans: two were still alive from earlier runs on 2026-09-20.
+	dir := t.TempDir()
+	sleeper := spawnSleeper(t)
+	runner := func(command []string, timeout time.Duration) (CommandResult, error) {
+		if err := os.WriteFile(argAfter(command, "--pid-path"), []byte(fmt.Sprintf("%d\n", sleeper.Process.Pid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return CommandResult{}, nil
+	}
+	exporter := &PhotoKitExporter{HelperPath: filepath.Join(dir, HelperAppName), CommandRunner: runner, Timeout: 150 * time.Millisecond,
+		LookPath: func(string) (string, error) { return "/usr/bin/open", nil }}
+	_, err := exporter.Export(exporterCandidate("original"), dir)
+	if err == nil || !strings.Contains(err.Error(), "Timed out after 0.15s waiting for Apple Photos/iCloud") {
+		t.Fatalf("err = %v", err)
+	}
+	// A killed child is a zombie until it is reaped, and kill(pid, 0) still
+	// succeeds on a zombie, so wait for the exit rather than probing.
+	exited := make(chan error, 1)
+	go func() { exited <- sleeper.Wait() }()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("helper pid %d survived the export deadline", sleeper.Process.Pid)
+	}
+}
+
+func TestExportFailsFastWhenTheHelperDiesWithoutOutput(t *testing.T) {
+	dir := t.TempDir()
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	runner := func(command []string, timeout time.Duration) (CommandResult, error) {
+		if err := os.WriteFile(argAfter(command, "--pid-path"), []byte(fmt.Sprintf("%d\n", gone.Process.Pid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return CommandResult{}, nil
+	}
+	exporter := &PhotoKitExporter{HelperPath: filepath.Join(dir, HelperAppName), CommandRunner: runner, Timeout: 10 * time.Second,
+		LookPath: func(string) (string, error) { return "/usr/bin/open", nil }}
+	started := time.Now()
+	_, err := exporter.Export(exporterCandidate("original"), dir)
+	if err == nil || !strings.Contains(err.Error(), "exited without reporting a result") {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(started) > 3*time.Second {
+		t.Fatalf("waited %s for a helper that had already exited", time.Since(started))
+	}
+}
+
+func TestExportReportsAMissingGrantAsAnAccessError(t *testing.T) {
+	dir := t.TempDir()
+	runner := &helperRunner{errText: "Photos library access is not determined (status 0): the uploader does not have Full Photos library access. Run `pdw ingest apple-photos --authorize` from a GUI session on this Mac.\n"}
+	_, err := newExporterForTest(runner, dir).Export(exporterCandidate("original"), dir)
+	var access *PhotosAccessError
+	if !errors.As(err, &access) || access.Status != 0 || !strings.Contains(access.Message, "pdw ingest apple-photos --authorize") {
+		t.Fatalf("err = %#v", err)
+	}
+	if !strings.Contains(strings.Join(runner.calls[0], " "), "--pid-path") {
+		t.Fatalf("export did not hand the helper a pid path: %v", runner.calls[0])
+	}
+}
+
 func TestRequestAuthorizationWaitsForTheHelperWithoutOpenWait(t *testing.T) {
 	dir := t.TempDir()
 	runner := &helperRunner{status: 3, delay: 50 * time.Millisecond}
@@ -838,10 +944,10 @@ func TestRequestAuthorizationWaitsForTheHelperWithoutOpenWait(t *testing.T) {
 		t.Fatalf("status = %d err = %v", status, err)
 	}
 	command := runner.calls[0]
-	if command[len(command)-1] != "authorize" || command[len(command)-2] != "--args" || !strings.Contains(strings.Join(command, " "), filepath.Join(dir, HelperAppName)) {
+	if argAfter(command, "--args") != "authorize" || !strings.Contains(strings.Join(command, " "), filepath.Join(dir, HelperAppName)) {
 		t.Fatalf("command = %v", command)
 	}
-	if status, err := exporter.AuthorizationStatus(); err != nil || status != 3 || runner.calls[1][len(runner.calls[1])-1] != "status" {
+	if status, err := exporter.AuthorizationStatus(); err != nil || status != 3 || argAfter(runner.calls[1], "--args") != "status" {
 		t.Fatalf("status = %d err = %v", status, err)
 	}
 }
@@ -852,7 +958,8 @@ func TestNativeHelperSourcesAreEmbeddedAndPinTheContract(t *testing.T) {
 	for _, needle := range []string{
 		"options.isNetworkAccessAllowed = true", "wantedType = .photo", "wantedType = .video", "wantedType = .pairedVideo",
 		"PHAsset.fetchAssets(with: libraryFetchOptions())", "options.includeAllBurstAssets = true", "options.includeHiddenAssets = true",
-		"guard requestAuthorization().rawValue == authorizedStatus",
+		"let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)", "guard status.rawValue == authorizedStatus",
+		photosAccessErrorPrefix, "--pid-path",
 	} {
 		if !strings.Contains(source, needle) {
 			t.Errorf("helper source lost %q", needle)
@@ -1058,7 +1165,7 @@ func TestRunAuthorizeUsesTheHelperAndReportsTheGrant(t *testing.T) {
 	}
 	t.Cleanup(func() { newExporter = old })
 	code, stdout, _ := runCLI(t, []string{"--authorize"}, map[string]string{}, ingestclient.Config{})
-	if code != 0 || !strings.Contains(stdout, "Photos library access granted") || granted.calls[0][len(granted.calls[0])-1] != "authorize" {
+	if code != 0 || !strings.Contains(stdout, "Photos library access granted") || argAfter(granted.calls[0], "--args") != "authorize" {
 		t.Fatalf("exit %d stdout = %s", code, stdout)
 	}
 	denied := &helperRunner{status: 2}

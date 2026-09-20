@@ -213,6 +213,19 @@ func (r *Runner) syncCandidates(candidates []Candidate, exportDir string) (Summa
 	for index, candidate := range selected {
 		r.Logger.Infof("[%d/%d] Exporting full original %s (%s) through PhotoKit", index+1, len(selected), candidate.Filename, candidate.Role)
 		exported, err := r.Exporter.Export(candidate, exportDir)
+		var access *PhotosAccessError
+		if errors.As(err, &access) {
+			// No file can succeed without the grant, and each attempt would
+			// only launch the helper again: stop the batch, keep the file out
+			// of the retry backoff (it did nothing wrong), and fail the run
+			// with the repair in its message.
+			r.Logger.Warningf("Stopping the photo upload at %s: %s", candidate.Filename, err)
+			if _, recordErr := r.recordFailures(failures); recordErr != nil {
+				return summary, recordErr
+			}
+			summary.FilesFailed = len(failures) + 1
+			return summary, err
+		}
 		if err != nil {
 			r.Logger.Warningf("Failed to upload %s: %s", candidate.Filename, err)
 			failures = append(failures, failedCandidate{candidate, err})
