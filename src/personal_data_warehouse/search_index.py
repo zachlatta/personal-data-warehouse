@@ -137,6 +137,45 @@ def rewarm_search_indexes_if_cold(
     return result
 
 
+def restore_search_cache_after_reconcile(
+    warehouse: Any, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Repair the search cache after a cache-evicting timeline reconcile.
+
+    This used to be an unconditional ``force=True`` warm, and the warm was
+    the evictor: gmail, slack_message and slack_file each reconcile hourly on
+    their own clock, so production issued 63 full BM25 warms (13.4 GB each)
+    and 17 HNSW loads in 24 hours on 2026-09-20 -- ~1.5 TB through an 18 GB
+    cache, pg_prewarm the largest block reader on the host, residency 19.6%.
+    Now the reconcile measures residency, publishes it, and warms only under
+    the same floor and daily interval the cold-cache guard uses.
+    """
+    try:
+        measured = record_search_cache_residency(warehouse)
+    except Exception as error:  # noqa: BLE001 - unmeasured is never evidence of cold
+        return {"warmed": False, "reason": f"residency unmeasured: {error}"[:300], "blocks": 0}
+    return rewarm_search_indexes_if_cold(warehouse, measured, now=now)
+
+
+def record_bm25_index_bloat(warehouse: Any) -> dict[str, int | float]:
+    """Publish on-disk versus live bytes of the timeline BM25 indexes."""
+    measured = warehouse.measure_bm25_index_bloat()
+    warehouse.write_search_health(
+        "bm25_index_bloat",
+        configured=1,
+        pgvector_available=1,
+        caught_up=1,
+        processed_rows=measured["index_count"],
+        pending_count=0,
+        resident_bytes=measured["live_bytes"],
+        total_bytes=measured["on_disk_bytes"],
+        resident_fraction=measured["live_fraction"],
+        last_success_at=datetime.now(tz=UTC),
+        last_error="",
+    )
+    return measured
+
+
 def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
     """Measure and publish current search-index shared-buffer residency.
 

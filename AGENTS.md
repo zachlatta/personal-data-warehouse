@@ -942,6 +942,26 @@ leg that is 90% I/O wait needs its pages kept, not a better plan. The A/B that s
 overlap and changed warm latency by 4ms, so shrinking the scan buys almost nothing once
 the index is resident.
 
+**The warmer was the evictor, and a forced warm is never free.** Measured 2026-09-20 on
+production: `timeline_sync` forced a full search-index warm after every hourly reconcile of
+`gmail_email`, `slack_message` and `slack_file` — three independent hourly clocks, so 63
+BM25 warms and 17 HNSW loads in 24 hours, ~1.5 TB pushed through an 18 GB cache, with
+`pg_prewarm` the largest block reader in `pg_stat_statements` (31 TB since 09-02) and
+residency at 19.6% while cold novel searches took 5–8 s. Two things made it worse than
+the sum: the HNSW `buffer` pass loaded a 10.3 GB graph into 8 GB of `shared_buffers`, so
+every warm evicted every other page Postgres held; and the global BM25 index was
+**13.4 GB on disk with 6.4 GB of live segments** — pg_textsearch spills and merges park
+displaced pages for deferred reclaim and never truncate the file, so a day after a plain
+REINDEX to 6.36 GB the warm was reading 7 GB of dead pages every time. Now the
+post-reconcile repair measures residency and goes through the same floor and 24-hour
+interval as the cold-cache guard (`restore_search_cache_after_reconcile`), the warm has
+no `buffer` pass, and `marts_ops.search_health` carries a `bm25_index_bloat` row
+(`resident_bytes` = live segment bytes, `total_bytes` = file bytes, `attention` below
+60% live) so the 2x file is a number. The repair for the file is a plain `REINDEX` in a
+maintenance window; pg_textsearch 1.4.0 adds `bm25_compact()` for keeping it there.
+The RAM question this answered: mew has 2×16 GB DDR4 in A2/B2 with A1/B1 free (128 GB
+max) — but do not buy sticks to hold a cache the warmer is flushing.
+
 **`pg_prewarm` in `prefetch` mode is a hint, not a warm, and it lied once.** On
 2026-09-19 a forced warm reported 3.46M blocks in 26 seconds and `fincore` on the index
 files found **1% of HNSW and 10% of the global BM25 index** resident afterwards:

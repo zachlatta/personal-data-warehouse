@@ -33,6 +33,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.search_index import (
     SearchChunkBuilder,
     SearchEmbeddingRunner,
+    record_bm25_index_bloat,
     record_search_cache_residency,
     rewarm_search_indexes_if_cold,
 )
@@ -124,6 +125,13 @@ def search_chunks(context) -> MaterializeResult:
                 )
                 if broken:
                     context.log.error("BM25 index probe failed: %s", broken)
+                # And how much of each BM25 file is live: pg_textsearch never
+                # truncates displaced pages, and a 2x file is 2x per warm.
+                try:
+                    record_bm25_index_bloat(warehouse)
+                except Exception as error:  # health fact, not a chunk failure
+                    context.log.error("Could not measure BM25 index bloat: %s", error)
+                    warehouse.write_search_health("bm25_index_bloat", last_error=str(error)[:500])
                 # Cache warmth can change within minutes under the raw-source
                 # sync workload.  Publishing it only in the weekly benchmark
                 # left C6 pointing at a stale cause, so refresh the inexpensive

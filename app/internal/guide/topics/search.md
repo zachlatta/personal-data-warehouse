@@ -87,6 +87,9 @@ with 42883). Hybrid retrieval from SQL does not exist; use {{if .CLI}}`pdw searc
 - `ERROR: invalid page index at block N (SQLSTATE XX001)` means a BM25 index was left
   corrupt by a Postgres crash. It is not a query problem: report it and check
   `marts_ops.search_health` component `bm25_indexes`.
+- Slow cold searches on a quiet host are usually a cache question, not a query one:
+  `marts_ops.search_health` rows `cache_residency` (share of the working set in shared
+  buffers) and `bm25_index_bloat` (live bytes vs file bytes of the BM25 indexes) say so.
 - **The search document is not the whole row.** For agent sessions it is the title, the
   first prompt, the working directory and the user/assistant turns — tool calls and tool
   results are not in it. For Slack, WhatsApp and iMessage it is the message plus any

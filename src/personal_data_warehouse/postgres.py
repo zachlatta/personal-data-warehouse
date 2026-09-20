@@ -414,6 +414,40 @@ SEARCH_HYBRID_LEXICAL_HEAD_WEIGHT = 3.0
 # The BM25 health probe's query: common, mixed-frequency terms so the scan
 # touches many posting lists across the index rather than one.
 BM25_PROBE_QUERY = "meeting order email update warehouse magazine budget photo call plan"
+
+#: Live-segment share of a BM25 index file below which `marts_ops.search_health`
+#: reads `attention`. pg_textsearch spills and merges park displaced pages
+#: for deferred reclaim and never truncate: a day after the 2026-09-19 plain
+#: REINDEX (6.36 GB) the global index was 13.4 GB on disk with 6.4 GB live,
+#: and every prewarm read all 13.4 GB. A plain REINDEX is the repair; a
+#: 2x file is the shape to catch.
+BM25_INDEX_BLOAT_LIVE_FLOOR = 0.6
+
+_BM25_SUMMARY_TOTAL = re.compile(
+    r"Total:\s*(?P<segments>\d+)\s+segments?,\s*(?P<pages>\d+)\s+pages"
+)
+
+
+def parse_bm25_index_summary(summary: str) -> dict[str, int | None] | None:
+    """Read live segment pages out of ``bm25_summarize_index()`` text.
+
+    Returns ``None`` when the text is not a summary at all. A summary with no
+    ``Total:`` line is an index whose documents are all still in the memtable
+    (a fresh or tiny index): ``live_bytes`` is ``None`` there, meaning
+    "nothing displaced yet", not zero.
+    """
+    text = summary or ""
+    if not text.lstrip().startswith("Index:"):
+        return None
+    match = _BM25_SUMMARY_TOTAL.search(text)
+    if not match:
+        return {"segments": 0, "live_pages": None, "live_bytes": None}
+    pages = int(match.group("pages"))
+    return {
+        "segments": int(match.group("segments")),
+        "live_pages": pages,
+        "live_bytes": pages * 8192,
+    }
 # The function words the app's sentence detector counts (searchSentenceWords in
 # app/internal/query/search.go); the fuse repeats the test in SQL so the
 # direct-SQL wrapper and the app agree on which queries get the head bonus.
@@ -5190,6 +5224,11 @@ class PostgresWarehouse:
                      WHEN configured = 0 OR pgvector_available = 0 THEN 'failing'
                      WHEN last_error IS NOT NULL THEN 'failing'
                      WHEN component = 'cache_residency' AND resident_fraction <= 0 THEN 'attention'
+                     -- bm25_index_bloat: resident_bytes is the LIVE segment size and
+                     -- total_bytes the on-disk file; below the floor the file is mostly
+                     -- displaced pages every warm still reads (13.4 GB for 6.4 GB live, 2026-09-20).
+                     WHEN component = 'bm25_index_bloat'
+                      AND resident_fraction < {BM25_INDEX_BLOAT_LIVE_FLOOR} THEN 'attention'
                      WHEN caught_up = 0
                       AND oldest_pending_at < now() - interval '{SEARCH_HEALTH_LATE_AFTER_MINUTES} minutes'
                        THEN 'late'
@@ -5684,6 +5723,38 @@ class PostgresWarehouse:
                 errors[name] = str(error).strip()[:300]
         return errors
 
+    def measure_bm25_index_bloat(self) -> dict[str, int | float]:
+        """On-disk versus live bytes across the timeline BM25 indexes.
+
+        ``pg_relation_size`` cannot see this: the file keeps the pages a
+        spill or merge displaced, so it only ever grows until a REINDEX. The
+        live figure comes from ``bm25_summarize_index``'s segment total.
+        """
+        schema = self._object_schema("timeline_events")
+        on_disk = 0
+        live = 0
+        count = 0
+        for name in self.bm25_timeline_index_names():
+            if not self._index_exists(name):
+                continue
+            qualified = f"{schema}.{name}"
+            size = self._query("SELECT pg_relation_size(%s::regclass)", (qualified,))
+            summary = self._query("SELECT public.bm25_summarize_index(%s)", (qualified,))
+            parsed = parse_bm25_index_summary(str(summary[0][0]) if summary else "")
+            if parsed is None:
+                continue
+            count += 1
+            file_bytes = int(size[0][0] or 0)
+            on_disk += file_bytes
+            live_bytes = parsed["live_bytes"]
+            live += file_bytes if live_bytes is None else min(int(live_bytes), file_bytes)
+        return {
+            "index_count": count,
+            "on_disk_bytes": on_disk,
+            "live_bytes": live,
+            "live_fraction": (live / on_disk) if on_disk else 1.0,
+        }
+
     def write_search_benchmark_runs(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
         """Publish the current row and retain the append-only measurement."""
         materialized = [
@@ -5771,6 +5842,7 @@ class PostgresWarehouse:
             "embeddings",
             "orphaned_chunks",
             "bm25_indexes",
+            "bm25_index_bloat",
             "cache_residency",
         }:
             raise ValueError(f"unknown search health component: {component}")
@@ -12649,6 +12721,13 @@ class PostgresWarehouse:
         is read last rather than buffered so it does not evict the ANN graph
         from Postgres's 8 GiB pool.
 
+        There is deliberately no ``buffer`` pass any more.  HNSW is 10.3 GB
+        against an 8 GB ``shared_buffers``, so loading it through pg_prewarm's
+        buffer mode evicted every other page the search path held -- and on
+        2026-09-20 that load ran 17 times a day behind the timeline's
+        post-reconcile warm.  Postgres fills its own pool from the warmed
+        kernel cache on first use; the kernel cache is what a warm restores.
+
         The kernel-cache mode is ``read``, not ``prefetch``.  ``prefetch`` is
         an asynchronous ``posix_fadvise(WILLNEED)`` hint: on 2026-09-19 a
         forced warm reported 3.46M blocks in 26 seconds and ``fincore`` then
@@ -12673,8 +12752,6 @@ class PostgresWarehouse:
             f"{self._object_schema(spec.table)}.{spec.name}" for spec in hnsw
         ]
         return [(name, "read") for name in hnsw_names] + [
-            (name, "buffer") for name in hnsw_names
-        ] + [
             (f"{self._object_schema(spec.table)}.{spec.name}", "read")
             for spec in bm25
         ]

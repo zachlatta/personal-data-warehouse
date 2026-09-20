@@ -288,18 +288,17 @@ def test_search_cache_residency_query_executes_with_no_indexes_yet(
     assert measured["resident_fraction"] == 0.0
 
 
-def test_search_index_prewarm_reads_then_buffers_hnsw_before_every_bm25_index(
+def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers(
     monkeypatch,
 ) -> None:
     """A new deploy/reindex warms the ANN graph through both cache layers.
 
-    Reading HNSW into the kernel cache first is not redundant with ``buffer``:
-    measured after a production REINDEX, buffer-only left the HNSW relation
-    ~9% resident in the OS cache and contract-audit p50 at 2.44s; warming the
-    kernel cache made its first 6 GiB resident and p50 0.21s.  Buffer HNSW
-    second, then read BM25 into the kernel cache so it does not evict the
-    graph from Postgres's 8 GiB pool. A second call for the same
-    postmaster/index fingerprint is free.
+    HNSW is read into the kernel cache, then every BM25 index. There is no
+    ``buffer`` pass: the graph is 10.3 GB and ``shared_buffers`` is 8 GB, so
+    loading it through pg_prewarm's buffer mode evicted every other page the
+    search path had (measured 2026-09-20, 17 such loads a day). Postgres
+    fills its own pool from the warmed kernel cache on first use. A second
+    call for the same postmaster/index fingerprint is free.
 
     The kernel-cache mode must be the synchronous ``read``: ``prefetch`` is an
     async hint the kernel dropped under pressure on 2026-09-19, leaving 1% of
@@ -349,15 +348,14 @@ def test_search_index_prewarm_reads_then_buffers_hnsw_before_every_bm25_index(
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
 
     assert result["warmed"] is True
-    assert prewarm_calls[:2] == [
+    assert prewarm_calls[:1] == [
         ("derived_search.search_chunk_embeddings_hnsw_idx", "read"),
-        ("derived_search.search_chunk_embeddings_hnsw_idx", "buffer"),
     ]
-    assert prewarm_calls[2:] == [
+    assert prewarm_calls[1:] == [
         (f"timeline.{name}", "read")
         for name in warehouse.bm25_timeline_index_names()
     ]
-    assert "prefetch" not in {mode for _name, mode in prewarm_calls}
+    assert {mode for _name, mode in prewarm_calls} == {"read"}
     assert "prewarmed_signature" in state_updates[-1][0]
     assert state_updates[-1][1] == (
         "new-signature",

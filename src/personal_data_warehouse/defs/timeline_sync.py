@@ -17,6 +17,7 @@ from dagster import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.search_index import restore_search_cache_after_reconcile
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.timeline import TimelineSyncEngine, TimelineSyncError
 
@@ -37,10 +38,11 @@ TIMELINE_SYNC_RUN_BUDGET_SECONDS = 240
 TIMELINE_SYNC_BACKFILL_BUDGET_ENV = "TIMELINE_SYNC_BACKFILL_BUDGET_SECONDS"
 
 # Their independent coverage proof necessarily walks a large recent source
-# window even when it finds only a handful of gaps.  Restore the HNSW/BM25
-# working set after those hourly scans, once at the end of the timeline run;
-# otherwise a correctness pass makes interactive search cold until organic
-# traffic happens to repopulate it.
+# window even when it finds only a handful of gaps.  After one of those hourly
+# scans the timeline run measures search-cache residency and re-warms only if
+# it is actually cold and has not been warmed today.  It used to force a warm
+# every time, and with three adapters on independent hourly clocks that was
+# 63 full 13 GB BM25 reads a day (2026-09-20) -- the warm was the evictor.
 CACHE_EVICTING_RECONCILE_ADAPTERS = frozenset(
     {"gmail_email", "slack_message", "slack_file"}
 )
@@ -91,9 +93,9 @@ def timeline_sync(context) -> MaterializeResult:
             ):
                 warehouse = PostgresWarehouse(settings.postgres_database_url or "")
                 try:
-                    warm = warehouse.prewarm_search_indexes_if_needed(force=True)
+                    warm = restore_search_cache_after_reconcile(warehouse)
                     context.log.info(
-                        "Restored search cache after high-volume timeline reconcile: %s",
+                        "Search cache after high-volume timeline reconcile: %s",
                         warm,
                     )
                 except Exception as error:  # cache repair must not fail ingestion

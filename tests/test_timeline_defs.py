@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -90,45 +91,81 @@ def test_timeline_sync_asset_passes_the_backfill_throttle_from_the_environment(m
     assert engine.backfill_budget == 45.0
 
 
-def test_timeline_sync_rewarms_search_after_a_high_volume_reconcile(monkeypatch):
+def _reconcile_stats(self, **_kwargs):
+    return [AdapterSyncStats(adapter="slack_message", backfill_done=True, reconcile_ran=True)]
+
+
+class _FakeCacheWarehouse:
+    """Enough of PostgresWarehouse for the post-reconcile cache repair."""
+
+    instances: list["_FakeCacheWarehouse"] = []
+
+    def __init__(self, url, *, resident_fraction=0.10, prewarmed_at=None):
+        self.url = url
+        self.resident_fraction = resident_fraction
+        self.prewarmed_at = prewarmed_at or datetime(2020, 1, 1, tzinfo=UTC)
+        self.force_calls = []
+        self.closed = False
+        _FakeCacheWarehouse.instances.append(self)
+
+    def measure_search_cache_residency(self):
+        return {"resident_fraction": self.resident_fraction, "resident_bytes": 1, "total_bytes": 10, "target_count": 2}
+
+    def write_search_health(self, component, **facts):
+        self.health = (component, facts)
+
+    def search_prewarmed_at(self):
+        return self.prewarmed_at
+
+    def prewarm_search_indexes_if_needed(self, *, force=False):
+        self.force_calls.append(force)
+        return {"warmed": True, "reason": "forced", "blocks": 10}
+
+    def close(self):
+        self.closed = True
+
+
+def test_timeline_sync_rewarms_search_after_a_high_volume_reconcile_only_when_cold(monkeypatch):
+    """The post-reconcile warm is gated by residency and the daily floor.
+
+    Until 2026-09-20 it was ``force=True``: three adapters reconcile on
+    independent hourly clocks, so production issued 63 full BM25 warms and a
+    10 GB HNSW ``buffer`` load in 24 hours -- ~1.5 TB through an 18 GB cache,
+    the single largest block reader on the host, and the reason residency sat
+    at 19.6% with cold searches at 5-8s. The warmer was the evictor.
+    """
     _patch_common(monkeypatch)
     monkeypatch.setattr(timeline_defs, "exclusive_sync_lock", _acquired_lock)
-
-    def run_with_reconcile(self, **_kwargs):
-        return [
-            AdapterSyncStats(
-                adapter="slack_message",
-                backfill_done=True,
-                reconcile_ran=True,
-            )
-        ]
-
-    monkeypatch.setattr(_FakeEngine, "run", run_with_reconcile)
-
-    class FakeWarehouse:
-        instances = []
-
-        def __init__(self, url):
-            self.url = url
-            self.force_calls = []
-            self.closed = False
-            self.instances.append(self)
-
-        def prewarm_search_indexes_if_needed(self, *, force=False):
-            self.force_calls.append(force)
-            return {"warmed": True, "reason": "forced", "blocks": 10}
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(timeline_defs, "PostgresWarehouse", FakeWarehouse)
+    monkeypatch.setattr(_FakeEngine, "run", _reconcile_stats)
+    _FakeCacheWarehouse.instances.clear()
+    monkeypatch.setattr(timeline_defs, "PostgresWarehouse", _FakeCacheWarehouse)
 
     timeline_defs.timeline_sync(build_asset_context())
 
-    [warehouse] = FakeWarehouse.instances
+    [warehouse] = _FakeCacheWarehouse.instances
     assert warehouse.url == "postgresql://example/warehouse"
-    assert warehouse.force_calls == [True]
+    assert warehouse.force_calls == [True]  # cold and never warmed: repair it
+    assert warehouse.health[0] == "cache_residency"  # and the measurement is published
     assert warehouse.closed
+
+
+def test_timeline_sync_leaves_a_warm_or_recently_warmed_cache_alone(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(timeline_defs, "exclusive_sync_lock", _acquired_lock)
+    monkeypatch.setattr(_FakeEngine, "run", _reconcile_stats)
+
+    for kwargs in (
+        {"resident_fraction": 0.45},  # still warm after the reconcile
+        {"resident_fraction": 0.10, "prewarmed_at": datetime.now(tz=UTC) - timedelta(hours=1)},  # cold, warmed an hour ago
+    ):
+        _FakeCacheWarehouse.instances.clear()
+        monkeypatch.setattr(
+            timeline_defs, "PostgresWarehouse", lambda url, _k=kwargs: _FakeCacheWarehouse(url, **_k)
+        )
+        timeline_defs.timeline_sync(build_asset_context())
+        [warehouse] = _FakeCacheWarehouse.instances
+        assert warehouse.force_calls == [], kwargs
+        assert warehouse.closed
 
 
 def test_timeline_sync_asset_skips_when_lock_busy(monkeypatch):

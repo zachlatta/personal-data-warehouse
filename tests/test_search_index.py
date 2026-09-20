@@ -807,3 +807,68 @@ def test_bm25_index_probe_covers_every_timeline_bm25_index(warehouse: PostgresWa
     warehouse.write_search_health("bm25_indexes", caught_up=1, processed_rows=len(probe))
     rows = warehouse._query("SELECT status FROM @marts_search_health WHERE component = 'bm25_indexes'")
     assert rows and rows[0][0] == "ok"
+
+
+def test_parse_bm25_index_summary_reads_live_pages_and_segments() -> None:
+    """The live bytes of a pg_textsearch index are in its segment summary.
+
+    ``pg_relation_size`` is not: on 2026-09-20 the global BM25 index was
+    13.4 GB on disk with 6.4 GB of live segments, a day after a plain REINDEX
+    had left it at 6.36 GB -- spill and merge park displaced pages for
+    deferred reclaim and never truncate the file, and every prewarm read all
+    13.4 GB. The summary is the only place the live size is stated.
+    """
+    from personal_data_warehouse.postgres import parse_bm25_index_summary
+
+    summary = (
+        "Index: timeline.timeline_events_search_text_bm25_idx\n\n"
+        "Segments:\n"
+        "  L0 Segment 1: block=1488, pages=54, size=0.4MB, terms=5824, docs=1284\n"
+        "  L2 Segment 3: block=957, pages=816577, size=6379.5MB, terms=20586157, docs=61465415\n"
+        "  Total: 12 segments, 820723 pages (6411.9MB), 20850186 terms, 61519180 docs\n\n"
+        "Index Size:\n  on-disk: 13429399552 bytes\n"
+    )
+    parsed = parse_bm25_index_summary(summary)
+    assert parsed == {"segments": 12, "live_pages": 820723, "live_bytes": 820723 * 8192}
+    assert parse_bm25_index_summary("garbage") is None
+    # Everything still in the memtable: a summary, but nothing displaced yet.
+    assert parse_bm25_index_summary("Index: x\n\nSegments:\n") == {
+        "segments": 0, "live_pages": None, "live_bytes": None,
+    }
+
+
+def test_bm25_index_bloat_is_a_search_health_row(warehouse: PostgresWarehouse) -> None:
+    from personal_data_warehouse.search_index import record_bm25_index_bloat
+
+    _provision(warehouse)
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["alpha bravo charlie"])
+    _sync_timeline(warehouse)
+
+    measured = record_bm25_index_bloat(warehouse)
+    assert measured["index_count"] >= 4
+    assert measured["on_disk_bytes"] > 0
+    assert 0 < measured["live_fraction"] <= 1.0
+    rows = warehouse._query(
+        "SELECT status, total_bytes, resident_bytes, resident_fraction "
+        "FROM @marts_search_health WHERE component = 'bm25_index_bloat'"
+    )
+    assert rows and rows[0][0] == "ok"
+    assert rows[0][1] == measured["on_disk_bytes"]
+    assert rows[0][2] == measured["live_bytes"]
+
+    # More than a third of the file dead is the 2026-09-20 shape and reads attention.
+    warehouse.write_search_health(
+        "bm25_index_bloat",
+        caught_up=1,
+        processed_rows=4,
+        resident_bytes=6_400_000_000,
+        total_bytes=13_400_000_000,
+        resident_fraction=6.4 / 13.4,
+        last_success_at=datetime.now(tz=UTC),
+    )
+    rows = warehouse._query("SELECT status FROM @marts_search_health WHERE component = 'bm25_index_bloat'")
+    assert rows[0][0] == "attention"
+
+
