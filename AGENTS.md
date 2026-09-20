@@ -13,6 +13,11 @@ Development practices:
   `uv run pytest --unit-only` only as an explicit faster iteration, not final verification;
   missing environment variables never opt tests out. No production database URL is necessary or
   recommended for tests.
+  The disposable Postgres runs with `fsync`, `synchronous_commit` and `full_page_writes` off —
+  it is thrown away per run, and on Docker-for-Mac each fsync is a virtual block device round
+  trip — and the image is published for arm64 as well as amd64 so an Apple-silicon Mac runs it
+  natively. Measured 2026-09-20 on porygon (OrbStack, image on the external NVMe) over the same
+  167 DB-heavy tests: emulated amd64 with fsync on 352s, native arm64 with fsync off 88s.
 * **`uv run pytest` does not run `go test ./...`, and CI does.** Anything under `app/` — and
   anything that *generates* into it, which in practice means
   `src/personal_data_warehouse/warehouse_catalog.json` — is verified locally only by the Python

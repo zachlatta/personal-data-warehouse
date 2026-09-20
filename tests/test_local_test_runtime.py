@@ -110,6 +110,16 @@ def test_default_start_launches_extension_complete_postgres_on_a_dynamic_port() 
         "postgres",
         "-c",
         "shared_preload_libraries=pg_textsearch",
+        # The database is created and destroyed per run, so durability buys
+        # nothing; on Docker-for-Mac each fsync is a virtual block device round
+        # trip (~1.4 ms measured 2026-09-20), and these three flags took the same
+        # 167 DB-heavy tests from 352s to 190s.
+        "-c",
+        "fsync=off",
+        "-c",
+        "synchronous_commit=off",
+        "-c",
+        "full_page_writes=off",
     ]
     assert ["docker", "port", "pdw-tests-owned-123", "5432/tcp"] in docker.calls
     assert docker.ready_calls == 2

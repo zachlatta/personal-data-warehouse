@@ -204,6 +204,16 @@ class PostgresTestRuntime:
                 "postgres",
                 "-c",
                 "shared_preload_libraries=pg_textsearch",
+                # Disposable database: durability buys nothing, and on
+                # Docker-for-Mac every fsync is a virtual block device round
+                # trip (~1.4 ms measured 2026-09-20). Measured on the same 167
+                # DB-heavy tests: 352s with fsync on, 190s with these off.
+                "-c",
+                "fsync=off",
+                "-c",
+                "synchronous_commit=off",
+                "-c",
+                "full_page_writes=off",
             ],
             timeout=300,
             failure=f"could not start the warehouse Postgres image {image}",

@@ -355,3 +355,16 @@ def test_restore_drill_columns_are_migrated_and_never_written_by_the_loop() -> N
             f"{column} is not in the spec the ensure path reconciles"
         )
         assert column not in loop, f"the backup loop must never write {column}"
+
+
+def test_the_postgres_image_is_published_for_both_amd64_and_arm64() -> None:
+    # The Dockerfile has resolved pg_textsearch per TARGETARCH for a while, but
+    # the workflow pinned linux/amd64 only, so every Apple-silicon dev Mac ran the
+    # disposable test Postgres under emulation: 352s vs 225s for the same 167
+    # tests on 2026-09-20. Production is amd64 and keeps pulling that manifest.
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "postgres-pgbackrest-image.yml"
+    ).read_text(encoding="utf-8")
+    platforms_lines = [line.strip() for line in workflow.splitlines() if line.strip().startswith("platforms:")]
+    assert platforms_lines == ["platforms: linux/amd64,linux/arm64"]
+    assert "docker/setup-qemu-action" in workflow, "a multi-arch build on the amd64 builder needs QEMU binfmt"

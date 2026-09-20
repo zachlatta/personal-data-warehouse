@@ -33,6 +33,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      # arm64 is for the Apple-silicon dev Macs, whose test suites otherwise run
+      # Postgres under emulation (measured 2026-09-20: 352s vs 225s for the same
+      # 167 tests). Production on mew-coolify keeps pulling the amd64 manifest.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -62,7 +68,7 @@ jobs:
         with:
           context: docker/postgres-pgbackrest
           file: docker/postgres-pgbackrest/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
