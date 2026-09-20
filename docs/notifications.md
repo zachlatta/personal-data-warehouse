@@ -1,7 +1,12 @@
 # Timeline notification experiment
 
-PDW captures **every newly inserted direct or cc timeline event** and delivers eligible items to its
-registered iPhone and Web Push devices. /notifications (the **alerts** tab) is
+PDW captures **every newly inserted `direct` timeline event** and delivers eligible items to its
+registered iPhone and Web Push devices. It captured `cc` as well until 2026-09-20: in the week
+the experiment was on, Hacker News thread chatter (then `cc`) produced 17,908 pushes, Slack `cc`
+1,136 at a 2% open rate with 651 of them over an hour old when sent, against 171 Slack `direct`
+at 7% and 100 iMessages at 18%. `cc` is for reading, not paging. A recurring calendar invite
+pages once per series, not once per expanded instance (one weekly team sync produced 53 pushes).
+/notifications (the **alerts** tab) is
 the control panel and recent delivery/open ledger; the iPhone app's Alerts tab
 has the same global on/off switch and pages through the whole ledger. /pipelines shows the live notification health verdict.
 
@@ -87,7 +92,7 @@ Notification taps alone are not proof that source content was read.
 ## Capture, retry and evidence semantics
 
 - An AFTER INSERT trigger captures the bounded source snapshot in the source
-  transaction. A rollback produces no alert. Only direct/cc inserts qualify:
+  transaction. A rollback produces no alert. Only `direct` inserts qualify:
   edits, enrichment, reclassification and update-only backfills never notify again.
   A genuinely new historical insertion **does** qualify while enabled.
 - Installation starts paused. The state lock serializes capture/fanout with pause.

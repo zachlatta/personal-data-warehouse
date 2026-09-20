@@ -106,7 +106,7 @@ func TestPostgresNotifications(t *testing.T) {
 	}
 	// A failed transport is retried durably, with a stable id and bounded attempts.
 	sender.result = Result{Status: "retry", Error: "temporary failure"}
-	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','retry','test','cc')`)
+	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','retry','test','direct')`)
 	if err = s.Tick(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestPostgresNotifications(t *testing.T) {
 		t.Fatal("resume failed")
 	}
 	sender.result = Result{Status: "failed", Error: "DeviceNotRegistered", Disable: true}
-	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','retire-one','test','direct'),('test','retire-two','test','cc')`)
+	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','retire-one','test','direct'),('test','retire-two','test','direct')`)
 	before = len(sender.sent)
 	if err = s.Tick(ctx); err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestPostgresNotifications(t *testing.T) {
 	if count(`SELECT count(*) FROM @push_devices WHERE status='active'`) != 0 {
 		t.Fatal("dead endpoints not retired")
 	}
-	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','no-device','test','cc')`)
+	exec(`INSERT INTO @timeline_events (adapter,event_id,source,priority) VALUES ('test','no-device','test','direct')`)
 	if err = s.Tick(ctx); err != nil {
 		t.Fatal(err)
 	}

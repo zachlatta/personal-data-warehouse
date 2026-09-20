@@ -1642,7 +1642,12 @@ _CALENDAR_EVENT = _simple_adapter(
         "'status', t.status, "
         "'event_type', t.event_type, "
         "'all_day', t.is_all_day <> 0, "
-        "'deleted', t.is_deleted <> 0)"
+        "'deleted', t.is_deleted <> 0, "
+        # One invite to a weekly meeting expands to every instance in the
+        # sync window, and each instance is its own timeline row; the
+        # notification outbox uses this to page once per series, not once
+        # per occurrence (53 pushes for one team sync on 2026-09-11).
+        "'recurring_event_id', t.recurring_event_id)"
     ),
     search_text=_search_concat("t.summary", "t.description", "t.location", "t.organizer_email", "t.attendees_json"),
     # Who set the meeting up, not when it starts. The rule used to short-circuit

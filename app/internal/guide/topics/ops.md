@@ -11,7 +11,7 @@ app's `/pipelines` page.
 | marts | `marts_ops.mart_view_health` | is a read view built on anything current: `stalest_pipeline`, `stalest_pipeline_at` |
 | timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events`, and how far behind its source it is (`ingest_lag_seconds`) |
 | priority mix | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the tiers; an `unclassified` row is `failing` |
-| notifications | `marts_ops.notification_health` | is the direct/cc experiment paused, running, backlogged or failing |
+| notifications | `marts_ops.notification_health` | is the direct-only push experiment paused, running, backlogged or failing |
 | agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier, per agent source |
 | search | `marts_ops.search_health`, `marts_ops.search_benchmark`, `marts_ops.search_benchmark_history` | chunk/embedding convergence, BM25 index integrity, cache residency; weekly latency and MRR |
 | per-source SLAs | `marts_ops.slack_conversation_health`, `marts_ops.plaid_item_health` | Slack per conversation type; each Plaid institution (a `duplicate` or dead Item is a named row) |
@@ -50,7 +50,7 @@ so a LaunchAgent that fires and fails reads `failing` rather than merely `late`;
 
 ## Notification experiment
 
-`marts_ops.notifications` records newly landed direct/cc events captured while enabled;
+`marts_ops.notifications` records newly landed `direct` events captured while enabled (one per recurring calendar series);
 `marts_ops.notification_deliveries` records each device's attempts and observed opens.
 Join notification `id` to delivery `notification_id`. Use `/notifications` or the phone's
 Alerts tab to start/pause; read-only SQL cannot change the switch. Existing history and

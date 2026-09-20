@@ -37,12 +37,42 @@ def test_capture_starts_only_on_enable_and_only_for_new_attention_events(warehou
         insert(wh, priority, priority)
     wh._command("UPDATE @timeline_events SET title = 'Edited' WHERE event_id = 'direct'")
     wh._command("UPDATE @timeline_events SET priority = 'direct' WHERE event_id = 'noise'")
-    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("cc",), ("direct",)]
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("direct",)]
     wh.ensure_timeline_tables()
-    assert wh._query("SELECT count(*) FROM @notification_events") == [(2,)]
+    assert wh._query("SELECT count(*) FROM @notification_events") == [(1,)]
     wh._command("UPDATE @notification_state SET enabled = 0 WHERE id = 'timeline'")
     insert(wh, "paused", "direct")
-    assert wh._query("SELECT count(*) FROM @notification_events") == [(2,)]
+    assert wh._query("SELECT count(*) FROM @notification_events") == [(1,)]
+
+
+def test_a_recurring_invite_pages_once_per_series_not_once_per_instance(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    for n in range(1, 4):
+        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, metadata) "
+                    "VALUES ('calendar_event', %s, 'direct'::" + wh.sql_relation("timeline_priority")
+                    + ", 'calendar', 'Team Sync', %s::jsonb)",
+                    (f"a|cal|series_{n}", '{"recurring_event_id": "series"}'))
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, metadata) "
+                "VALUES ('calendar_event', 'a|cal|single', 'direct'::" + wh.sql_relation("timeline_priority")
+                + ", 'calendar', 'One-off', %s::jsonb)", ('{"recurring_event_id": ""}',))
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [
+        ("a|cal|series_1",), ("a|cal|single",)]
+
+
+def test_an_old_direct_plus_cc_trigger_is_replaced_by_ensure(warehouse):
+    wh = warehouse
+    wh._command("DROP TRIGGER timeline_notification_insert ON @timeline_events")
+    wh._command("CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events "
+                "FOR EACH ROW WHEN (NEW.priority IN ('direct','cc')) "
+                "EXECUTE FUNCTION @capture_timeline_notification()")
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    insert(wh, "old-cc", "cc")
+    assert wh._query("SELECT count(*) FROM @notification_events") == [(1,)]
+    wh.ensure_timeline_tables()
+    insert(wh, "new-cc", "cc")
+    insert(wh, "new-direct", "direct")
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("new-direct",), ("old-cc",)]
 
 
 def test_capture_rolls_back_with_source_insert(warehouse):

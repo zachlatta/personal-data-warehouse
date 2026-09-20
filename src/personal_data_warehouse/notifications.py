@@ -12,22 +12,30 @@ def ensure_notification_tables(warehouse):
         warehouse._command(statement)
     for logical in (*TABLES, "capture_timeline_notification", "marts_notifications", "marts_notification_deliveries", "marts_notification_health"):
         warehouse._apply_catalog_grant(logical)
-    # Do not take a table-wide DDL lock on the large timeline at every sync.
-    if not warehouse._query("SELECT 1 FROM pg_trigger WHERE tgrelid = %s::regclass "
-                            "AND tgname = 'timeline_notification_insert'", (warehouse.sql_relation("timeline_events"),)):
+    # Do not take a table-wide DDL lock on the large timeline at every sync:
+    # only when the trigger is missing or its WHEN clause is not the current one.
+    # Only `direct` pages (since 2026-09-20): a week of direct + cc was 1,136
+    # Slack cc pushes at a 2% open rate, 651 of them over an hour old when
+    # sent, against 171 direct at 7%. cc is for reading, not for paging.
+    current = warehouse._query(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = %s::regclass "
+        "AND tgname = 'timeline_notification_insert'", (warehouse.sql_relation("timeline_events"),))
+    if not current or NOTIFICATION_TRIGGER_WHEN not in current[0][0]:
         warehouse._command("""
             DO $$ BEGIN
                 PERFORM set_config('lock_timeout', '3s', true);
                 PERFORM pg_advisory_xact_lock(hashtext(%s || ':notification-trigger'));
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger
-                               WHERE tgrelid = %s::regclass
-                                 AND tgname = 'timeline_notification_insert') THEN
-                    CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events
-                    FOR EACH ROW WHEN (NEW.priority IN ('direct','cc'))
-                    EXECUTE FUNCTION @capture_timeline_notification();
-                END IF;
+                DROP TRIGGER IF EXISTS timeline_notification_insert ON @timeline_events;
+                CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events
+                FOR EACH ROW WHEN (NEW.priority = 'direct')
+                EXECUTE FUNCTION @capture_timeline_notification();
             END $$
-        """, (warehouse.sql_relation("timeline_events"), warehouse.sql_relation("timeline_events")))
+        """, (warehouse.sql_relation("timeline_events"),))
+
+
+# What pg_get_triggerdef prints for the WHEN clause above; the ensure path
+# compares against it so an old `IN ('direct','cc')` trigger is replaced.
+NOTIFICATION_TRIGGER_WHEN = "WHEN ((new.priority = 'direct'::"
 
 
 STATEMENTS = (
@@ -49,6 +57,7 @@ STATEMENTS = (
     )""",
     "CREATE INDEX IF NOT EXISTS notification_events_pending_idx ON @notification_events (created_at, id) WHERE status = 'pending'",
     "CREATE INDEX IF NOT EXISTS notification_events_created_idx ON @notification_events (created_at)",
+    "CREATE INDEX IF NOT EXISTS notification_events_series_idx ON @notification_events (adapter, source, (payload->>'recurring_event_id'))",
     """CREATE TABLE IF NOT EXISTS @notification_deliveries (
         id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
         notification_id text NOT NULL, device_id text NOT NULL,
@@ -77,12 +86,21 @@ STATEMENTS = (
     """CREATE OR REPLACE FUNCTION @capture_timeline_notification() RETURNS trigger
     LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled = 1 FROM @notification_state WHERE id = 'timeline' FOR SHARE) THEN
+            -- A recurring invite lands as one row per expanded instance; page
+            -- for the first instance seen and let the rest ride along.
+            IF COALESCE(NEW.metadata->>'recurring_event_id', '') <> '' AND EXISTS (
+                SELECT 1 FROM @notification_events
+                WHERE adapter = NEW.adapter AND source = NEW.source
+                  AND payload->>'recurring_event_id' = NEW.metadata->>'recurring_event_id') THEN
+                RETURN NEW;
+            END IF;
             INSERT INTO @notification_events (adapter, event_id, source, priority, event_ts, landed_at, payload)
             VALUES (NEW.adapter, NEW.event_id, NEW.source, NEW.priority::text, NEW.event_ts, NEW.first_seen_at,
                 jsonb_build_object('adapter',NEW.adapter,'event_id',NEW.event_id,'source',NEW.source,
                     'source_table',NEW.source_table,'source_pk',NEW.source_pk,
                     'actor',left(NEW.actor,200),'title',left(NEW.title,300),
                     'snippet',left(NEW.snippet,800),'context',left(NEW.context,200),
+                    'recurring_event_id',COALESCE(NEW.metadata->>'recurring_event_id',''),
                     'metadata',jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
                                                   'chat_id',NEW.metadata->>'chat_id')))
             ON CONFLICT (adapter, event_id) DO NOTHING;
