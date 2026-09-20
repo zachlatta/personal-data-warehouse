@@ -2093,8 +2093,12 @@ _HACKER_NEWS_ITEM = _simple_adapter(
     search_text=_search_concat("t.title", "t.body_text", "t.url", "t.author"),
     # self: Zach wrote it, or acted on it (upvote, favorite, hide -- an action
     # he took, the same rule that keeps a card purchase at self). direct: a
-    # reply to one of his items, which is a real person answering him. cc:
-    # everything else in a discussion he is part of.
+    # reply to one of his items, which is a real person answering him. noise:
+    # everything else in the thread. It was `cc` until 2026-09-20, and because
+    # the push trigger fires on direct + cc, a thread Zach upvoted once paged
+    # him for every comment under it: 17,908 HN pushes in one week against 62
+    # from every other source. Nobody in the rest of a thread is talking to
+    # him; cc is for real people he is actually peripheral to.
     priority=(
         "CASE "
         "WHEN t.author = t.account THEN 'self' "
@@ -2104,7 +2108,7 @@ _HACKER_NEWS_ITEM = _simple_adapter(
         "WHEN EXISTS (SELECT 1 FROM @hacker_news_items p "
         "WHERE p.account = t.account AND p.item_id = t.parent_id "
         "AND p.author = t.account) THEN 'direct' "
-        "ELSE 'cc' END"
+        "ELSE 'noise' END"
     ),
 )
 

@@ -2937,7 +2937,9 @@ settled and left alone.
 compares an item's `author` to. One adapter (`hacker_news_item`, source `hacker_news`, kind
 `hn_item`) covers the source: an item Zach wrote or acted on (upvote, favorite, hide — an action
 he took, the same rule that keeps a card purchase at `self`) is `self`, a reply to one of his
-items is `direct`, the rest of an archived thread is `cc`. `context` is the root story id, so
+items is `direct`, the rest of an archived thread is `noise` (it was `cc` until 2026-09-20, when
+it was found paging Zach for every comment under a story he had upvoted: 17,908 pushes in a week
+against 62 from every other source). `context` is the root story id, so
 `timeline.context()` on any HN hit returns the discussion. `body_text` is the API's HTML body
 decoded at ingest; `text` is the raw HTML, kept faithful.
 

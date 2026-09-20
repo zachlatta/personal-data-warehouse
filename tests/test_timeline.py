@@ -1327,7 +1327,7 @@ def test_backfill_normalizes_every_source(warehouse):
         "100": "self",  # upvoted story by someone else
         "101": "self",  # Zach's own comment
         "102": "direct",  # a reply to Zach's comment
-        "103": "cc",  # a stranger's comment elsewhere in the thread
+        "103": "noise",  # a stranger's comment elsewhere in the thread: nobody is talking to Zach
     }
     assert {v["context"] for v in hn.values()} == {"100"}
     assert hn["100"]["title"] == "HN: Show HN: a thing"

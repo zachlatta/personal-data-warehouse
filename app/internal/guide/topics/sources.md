@@ -93,7 +93,7 @@ one of those stories — not a mirror of all of HN, so absence here says nothing
 `favorited`, `upvoted`, `hidden`; `removed_at` is 1970 while live). `root_story_id` groups
 a whole thread; `body_text` is the decoded body, `text` the raw HTML. Timeline source
 `hacker_news`, search scope `hacker_news`: his items and anything he acted on are `self`,
-replies to him `direct`, the rest of a thread `cc`; `timeline.context()` returns the thread.
+replies to him `direct`, the rest of a thread `noise`; `timeline.context()` returns the thread.
 
 ## Prior agent sessions
 
