@@ -3336,16 +3336,16 @@ def test_prune_clamps_a_large_backlog_instead_of_declining_it(warehouse):
     """
     _ensure_all_source_tables(warehouse)
     _seed_sources(warehouse)
-    for i in range(200):
-        warehouse._command(
-            """
-            INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
-                                              currency, description, merchant, pending, source,
-                                              created_at, sync_version)
-            VALUES (%s, 'fa1', %s, -1.00, 'USD', 'Bulk', 'Bulk', 0, 'plaid', %s, %s)
-            """,
-            (f"ft-mass-{i}", _NOW - timedelta(hours=20), _NOW, 1),
-        )
+    warehouse._command(
+        """
+        INSERT INTO @finance_transactions (transaction_id, account_id, posted_at, amount,
+                                          currency, description, merchant, pending, source,
+                                          created_at, sync_version)
+        SELECT 'ft-mass-' || i, 'fa1', %s, -1.00, 'USD', 'Bulk', 'Bulk', 0, 'plaid', %s, 1
+        FROM generate_series(0, 199) AS i
+        """,
+        (_NOW - timedelta(hours=20), _NOW),
+    )
     _engine(warehouse).run()
 
     def _count() -> int:

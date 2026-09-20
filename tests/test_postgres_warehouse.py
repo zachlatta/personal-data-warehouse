@@ -43,6 +43,7 @@ from personal_data_warehouse.postgres import (
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     INDEX_SCHEMA_REFRESH_LOCK_ID,
+    index_refresh_lock_key,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
@@ -161,8 +162,22 @@ def test_index_refresh_takes_nonblocking_advisory_lock(monkeypatch) -> None:
     ]
 
 
+def test_index_refresh_lock_is_keyed_per_namespace_and_unchanged_for_production() -> None:
+    # Production is the one `public` namespace and keeps the historical key.
+    # Each pdw_test_* namespace gets its own, so parallel test workers building
+    # separate schemas no longer contend for one cluster-wide try-lock and
+    # silently skip their own index pass (the 2026-09-20 xdist failures).
+    assert index_refresh_lock_key("public") == INDEX_SCHEMA_REFRESH_LOCK_ID
+    a = index_refresh_lock_key("pdw_test_20260920_a")
+    b = index_refresh_lock_key("pdw_test_20260920_b")
+    assert a != b != INDEX_SCHEMA_REFRESH_LOCK_ID and a != INDEX_SCHEMA_REFRESH_LOCK_ID
+    assert index_refresh_lock_key("pdw_test_20260920_a") == a
+    assert all(-(2**63) <= key < 2**63 for key in (a, b))
+
+
 def test_index_refresh_skips_when_another_builder_holds_the_lock(monkeypatch) -> None:
     warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "pdw_test_x"
     commands: list[tuple[str, tuple | None]] = []
 
     monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(False,)])
@@ -180,6 +195,7 @@ def test_index_refresh_skips_when_another_builder_holds_the_lock(monkeypatch) ->
 
 def test_index_refresh_releases_advisory_lock_on_error(monkeypatch) -> None:
     warehouse = object.__new__(PostgresWarehouse)
+    warehouse._schema = "public"
     commands: list[tuple[str, tuple | None]] = []
 
     monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(True,)])

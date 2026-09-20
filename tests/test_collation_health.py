@@ -137,7 +137,12 @@ def test_the_database_row_counts_the_indexes_that_ride_the_default_collation(war
     """The finding has to say how much is at stake, in indexes."""
     CollationHealthCollector(warehouse).run()
     row = _findings(warehouse)["database"]
-    live = warehouse._query(
+    # The collector's number is deliberately whole-database (the finding is
+    # about the cluster's collation, not one schema). Under parallel test
+    # workers other pdw_test_* schemas come and go between the collector's
+    # count and this one, so compare against what this warehouse itself owns:
+    # every one of its collatable indexes must be inside the collector's count.
+    own = warehouse._query(
         """
         SELECT count(DISTINCT indexrelid)
         FROM (
@@ -145,14 +150,15 @@ def test_the_database_row_counts_the_indexes_that_ride_the_default_collation(war
             FROM pg_index AS i
             INNER JOIN pg_class AS c ON c.oid = i.indexrelid
             INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+            WHERE n.nspname = ANY(%s)
         ) AS used
         INNER JOIN pg_collation AS cl ON cl.oid = used.collid
         WHERE cl.collprovider = 'd'
-        """
+        """,
+        (warehouse.physical_schema_names(include_hidden=True),),
     )[0][0]
-    assert row["dependent_indexes"] == live
-    assert live > 0, "the warehouse always has collatable indexes on the default collation"
+    assert own > 0, "the warehouse always has collatable indexes on the default collation"
+    assert row["dependent_indexes"] >= own
 
 
 def test_only_collations_with_a_dependent_index_are_reported(warehouse):

@@ -617,12 +617,20 @@ def test_no_module_names_a_pre_reorg_physical_relation() -> None:
     for path in _markdown_documents():
         sources.append((path, list(enumerate(path.read_text().splitlines(), 1))))
 
+    # One compiled alternation and one search per chunk: 115 names x every
+    # string literal in the repo as separate re.search calls was 9.7s of the
+    # suite, and every stale name contains a dot, so a chunk without one is
+    # skipped before the regex runs at all.
+    stale_pattern = re.compile(
+        r"(?<![\w.@])(" + "|".join(re.escape(name) for name in sorted(stale, key=len, reverse=True)) + r")(?![\w])"
+    )
     offenders: list[str] = []
     for path, chunks in sources:
         for lineno, text in chunks:
-            for name in stale:
-                if re.search(rf"(?<![\w.@]){re.escape(name)}(?![\w])", text):
-                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {name}")
+            if "." not in text:
+                continue
+            for match in stale_pattern.finditer(text):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {match.group(1)}")
     assert not offenders, "pre-reorg physical names still in source: " + "; ".join(
         sorted(set(offenders))[:20]
     )

@@ -507,6 +507,23 @@ SEARCH_SCHEMA_REFRESH_LOCK_ID = 8_407_112_465
 # process's in-progress concurrent index for an abandoned invalid index and
 # drop it underneath the builder.
 INDEX_SCHEMA_REFRESH_LOCK_ID = 8_407_112_484
+
+
+def index_refresh_lock_key(namespace: str) -> int:
+    """The advisory-lock key `_ensure_indexes` takes, per warehouse namespace.
+
+    Production has one namespace (``public``) and keeps the historical key
+    unchanged. A test warehouse lives in its own ``pdw_test_*`` namespace, and
+    until 2026-09-20 every namespace shared the one cluster-wide key: under
+    parallel test workers whoever lost the try-lock silently skipped building
+    its own schema's indexes, and a different index test failed on every run.
+    Locks are per namespace because that is the unit whose indexes they guard.
+    """
+    if namespace == "public":
+        return INDEX_SCHEMA_REFRESH_LOCK_ID
+    digest = hashlib.sha256(namespace.encode("utf-8")).digest()
+    # Keep the derived key inside bigint range and away from the base key.
+    return INDEX_SCHEMA_REFRESH_LOCK_ID ^ int.from_bytes(digest[:7], "big")
 # Serializes _ensure_query_role's shared GRANT/REVOKEs across processes.
 # Distinct from TIMELINE_SYNC_POSTGRES_LOCK_ID, which held the same id: the two
 # happen to live in different databases today (this one on the warehouse, that
@@ -8015,15 +8032,14 @@ class PostgresWarehouse:
         # pg_advisory_lock is itself such a transaction, producing a deadlock
         # with the builder it is waiting for. A later ensure_* call retries any
         # skipped work after the current builder releases the session lock.
-        acquired = self._query(
-            "SELECT pg_try_advisory_lock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,)
-        )
+        lock_key = index_refresh_lock_key(self._schema)
+        acquired = self._query("SELECT pg_try_advisory_lock(%s)", (lock_key,))
         if not acquired or not bool(acquired[0][0]):
             return
         try:
             self._ensure_indexes_locked(tables)
         finally:
-            self._command("SELECT pg_advisory_unlock(%s)", (INDEX_SCHEMA_REFRESH_LOCK_ID,))
+            self._command("SELECT pg_advisory_unlock(%s)", (lock_key,))
 
     def _ensure_indexes_locked(self, tables: Sequence[str]) -> None:
         table_names = set(tables)

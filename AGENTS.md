@@ -18,6 +18,13 @@ Development practices:
   trip — and the image is published for arm64 as well as amd64 so an Apple-silicon Mac runs it
   natively. Measured 2026-09-20 on porygon (OrbStack, image on the external NVMe) over the same
   167 DB-heavy tests: emulated amd64 with fsync on 352s, native arm64 with fsync off 88s.
+  The suite runs under `pytest-xdist` by default (`-n auto` in `pyproject.toml`; `-n 0` for a
+  serial run or `--pdb`): each test warehouse is its own `pdw_test_*` namespace and the
+  index-refresh advisory lock is keyed per namespace (`index_refresh_lock_key`), which is what
+  makes parallel workers safe — with one cluster-wide try-lock, whichever worker lost it
+  silently skipped its own schema's index pass and a different index test failed every run.
+  Full suite on porygon 2026-09-20: 1,228s → 483s (fsync off) → 261s (native arm64) → ~125s
+  (4 workers).
 * **`uv run pytest` does not run `go test ./...`, and CI does.** Anything under `app/` — and
   anything that *generates* into it, which in practice means
   `src/personal_data_warehouse/warehouse_catalog.json` — is verified locally only by the Python

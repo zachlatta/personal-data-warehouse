@@ -174,7 +174,10 @@ def test_object_exists_propagates_non_404() -> None:
         store.object_exists({"storage_file_id": "boom"})
 
 
-def test_delete_object_calls_delete_and_is_idempotent() -> None:
+def test_delete_object_calls_delete_and_is_idempotent(monkeypatch) -> None:
+    # The 500 path below walks the retry loop, whose backoff is real
+    # time.sleep(1 + 2 + 3 + 4): ten seconds of the suite doing nothing.
+    monkeypatch.setattr(gd.time, "sleep", lambda _seconds: None)
     files = FakeFiles()
     store = make_store(files)
     store.delete_object({"storage_file_id": "fid"})
