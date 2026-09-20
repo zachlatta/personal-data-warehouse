@@ -133,6 +133,11 @@ func (r *Runner) Sync() (Summary, error) {
 			break
 		}
 	}
+	if !summary.LimitReached {
+		if err := r.readOpenClawStore(batch, &remaining, &summary); err != nil {
+			return summary, err
+		}
+	}
 	if err := r.flush(batch); err != nil {
 		return summary, err
 	}

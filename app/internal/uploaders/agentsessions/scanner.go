@@ -1,7 +1,8 @@
 // Package agentsessions uploads local AI agent CLI session transcripts
 // (Claude Code, Codex, OpenClaw, pi) through the app's ingest API. The
 // transcripts are append-only JSONL files, one per session, so the uploader
-// remembers a byte offset per file and ships only what is new.
+// remembers a byte offset per file and ships only what is new. Newer OpenClaw
+// keeps its transcript in a SQLite store instead; see openclawstore.go.
 package agentsessions
 
 import (
@@ -42,7 +43,9 @@ type Dirs struct {
 	ClaudeProjects   string
 	CodexSessions    string
 	OpenClawSessions string
-	PiSessions       string
+	// OpenClawStore is the SQLite store newer OpenClaw keeps transcripts in.
+	OpenClawStore string
+	PiSessions    string
 }
 
 // DirsFromEnv reads AGENT_SESSIONS_*_DIR with the documented defaults; a
@@ -58,10 +61,12 @@ func DirsFromEnv(getenv common.Getenv) Dirs {
 		}
 		return common.ExpandUser(value)
 	}
+	openClawSessions := resolve("AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR", "~/.openclaw/agents/main/sessions")
 	return Dirs{
+		OpenClawStore:    resolve("AGENT_SESSIONS_OPENCLAW_STORE_PATH", defaultOpenClawStore(openClawSessions)),
 		ClaudeProjects:   resolve("AGENT_SESSIONS_CLAUDE_PROJECTS_DIR", "~/.claude/projects"),
 		CodexSessions:    resolve("AGENT_SESSIONS_CODEX_SESSIONS_DIR", "~/.codex/sessions"),
-		OpenClawSessions: resolve("AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR", "~/.openclaw/agents/main/sessions"),
+		OpenClawSessions: openClawSessions,
 		PiSessions:       resolve("AGENT_SESSIONS_PI_SESSIONS_DIR", "~/.pi/agent/sessions"),
 	}
 }

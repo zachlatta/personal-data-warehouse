@@ -2384,7 +2384,24 @@ The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollou
 `AGENT_SESSIONS_PI_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
 tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
 binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
-trace and the `.json` sidecars next to each transcript. It tracks a byte offset per file,
+trace and the `.json` sidecars next to each transcript.
+
+**OpenClaw 2026.9 stopped writing `<sessionId>.jsonl` at all.** It imported every transcript
+into the agent's SQLite store (`~/.openclaw/agents/main/agent/openclaw-agent.sqlite`, table
+`transcript_events`: one row per event, `event_json` byte-for-byte the old JSONL line) and
+left only `.deleted`/`.reset`/`.migrated` archives in the sessions directory. From 2026-09-09
+to 09-20 the uploader therefore ran green every five minutes reporting `Discovered 0 agent
+session transcript file(s)`, its heartbeat read `ok`, and no OpenClaw session reached the
+warehouse -- a healthy uploader over a source that had moved is exactly what the run
+heartbeat cannot see. The uploader now also reads that store (read-only, live, no snapshot:
+it is >100 MB), with a per-session `seq` cursor kept in the same state file. The store path
+defaults to `../agent/openclaw-agent.sqlite` beside the sessions dir, so blanking
+`AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR` disables both; `AGENT_SESSIONS_OPENCLAW_STORE_PATH`
+overrides it. **The rewrite generation is part of the cursor**
+(`transcript_rewrite_watermarks.generation`): a compaction or rewind reuses `seq` numbers for
+different events, so a bare `seq` cursor would skip them; a new generation re-ships the
+session and ingest dedupes by the event's own `id`. A host still on the JSONL layout has no
+store file and is unaffected. The uploader tracks a byte offset per file,
 coalesces new lines across files into full-size gzipped JSONL batches, and posts them through the
 app's ingest endpoint (see below), which writes them into the `agent-sessions/inbox/` Drive
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
@@ -2471,7 +2488,8 @@ warehouse's own internal enrichment agent.)
 OpenClaw runs on the `openclaw` Ubuntu VM (libvirt/KVM guest on `rotom`; reach it with
 `ssh openclaw`, or `ssh -J rotom openclaw` when direct TCP is wedged — pings work but SSH can
 time out, a known rotom-side issue). It writes one JSONL transcript per session under
-`~/.openclaw/agents/main/sessions/`. Because the VM is Linux (no launchd), the uploader runs as
+`~/.openclaw/agents/main/sessions/` (through 2026.8; since 2026.9 in the agent's SQLite
+store, which the same uploader reads -- see above). Because the VM is Linux (no launchd), the uploader runs as
 a **systemd user timer** (zrl has `Linger=yes`, so user units run without an active login).
 
 - Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main` via a read-only GitHub
