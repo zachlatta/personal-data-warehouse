@@ -1631,7 +1631,10 @@ back it, all behind the static bearer the CLI uses:
   (`…/supersede`, offered when `can_supersede`). Every `gmail.send_email` mutation
   carries an `email` view-model (delivery mode, variants with the selected one marked,
   each body split into editable part / signature / quoted thread, the reply thread) so
-  no client re-derives it. The actor is `app:<client_name>`. It executes nothing.
+  no client re-derives it. Each part is carried as HTML for the web's contenteditable
+  and as plain text (`editor_text`, `signature_text`, `quoted_text`) for the phone's
+  TextInput; both clients reassemble editor + signature + quote in that order, which
+  is the seam the server splits on next time. The actor is `app:<client_name>`. It executes nothing.
   **The browser UI is a client of this same API**: `/mutation-review`, `/timeline` and
   `/search` are one static single-page app (`app/internal/webapp`, ES modules embedded in
   the binary, no build step, no CDN) that renders nothing server-side and authenticates

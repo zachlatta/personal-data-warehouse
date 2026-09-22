@@ -155,6 +155,10 @@ export type Mutation = {
   created_at: string | null;
   approved_at: string | null;
   executed_at: string | null;
+  // The server's reviewer model of a gmail.send_email mutation: delivery
+  // mode, variants, each body split into editable part / signature / quote,
+  // and the reply thread (app/internal/mutations/email_view.go).
+  email?: Record<string, unknown>;
 };
 
 export type MutationRequest = {
@@ -214,6 +218,23 @@ export async function removeMutation(config: AppConfig, requestId: string, mutat
     config,
     `/api/mutations/requests/${encodeURIComponent(requestId)}/mutations/${encodeURIComponent(mutationId)}/remove`,
     { method: 'POST' },
+  );
+  return body.mutation;
+}
+
+// The edited email replaces the mutation's message (and, with variants, marks
+// the chosen one) before approval; the server normalizes and validates it.
+export type UpdateEmailMutationInput = {
+  delivery_mode: 'send' | 'draft';
+  selected_variant_id: string;
+  message: Record<string, unknown>;
+};
+
+export async function updateEmailMutation(config: AppConfig, requestId: string, mutationId: string, input: UpdateEmailMutationInput): Promise<Mutation> {
+  const body = await request<{ mutation: Mutation }>(
+    config,
+    `/api/mutations/requests/${encodeURIComponent(requestId)}/mutations/${encodeURIComponent(mutationId)}/update-email`,
+    { method: 'POST', body: JSON.stringify(input) },
   );
   return body.mutation;
 }

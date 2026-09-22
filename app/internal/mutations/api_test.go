@@ -484,6 +484,19 @@ func TestGmailEmailViewSplitsSignatureAndQuoteFromTheBody(t *testing.T) {
 	if !strings.HasPrefix(read["quoted_html"].(string), `<div class="gmail_quote">`) {
 		t.Fatalf("quoted_html = %q", read["quoted_html"])
 	}
+	// The phone edits plain text (a native TextInput has no contenteditable),
+	// so the view also carries each part as text and the client never has to
+	// strip HTML itself.
+	if read["editor_text"] != "Sounds good." {
+		t.Fatalf("editor_text = %q", read["editor_text"])
+	}
+	if read["signature_text"] != "Zach" {
+		t.Fatalf("signature_text = %q", read["signature_text"])
+	}
+	second := view["variants"].([]map[string]any)[1]
+	if second["editor_text"] != "Maybe." || second["signature_text"] != "" {
+		t.Fatalf("plain-text variant text parts = %q / %q", second["editor_text"], second["signature_text"])
+	}
 }
 
 func TestAPIListHonorsALimit(t *testing.T) {

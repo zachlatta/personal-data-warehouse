@@ -5,12 +5,15 @@ import {
   appleContactPointExists,
   appleContactsBatchSummary,
   appleContactsReview,
+  assembleEmailBody,
   calendarDayLayout,
   calendarMutationReview,
   contactBatchSummary,
   contactMutationReview,
   formatGmailLabel,
   gmailBatchSummary,
+  gmailEmailReview,
+  gmailEmailUpdateInput,
   hasGmailThreadMutations,
   gmailSenderName,
   gmailThreadDayGroups,
@@ -19,6 +22,7 @@ import {
   isAppleContactsMutation,
   isCalendarCreateMutation,
   isContactMutation,
+  isGmailSendEmailMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   looksAutomatedSender,
@@ -726,4 +730,104 @@ test('an apple create reads from the proposed contact alone and the batch verb f
   assert.equal(appleContactsBatchSummary([create, { ...create, id: 'b' }]).verb, 'Create');
   assert.equal(appleContactsBatchSummary([create, appleMutation('apple_contacts.merge_contacts', { keep_card_id: 'K', merge_card_ids: ['M'] }, { action: 'merge' })]).verb, 'Approve');
   assert.equal(appleContactsBatchSummary([{ ...create, status: 'removed' }]).running, 0);
+});
+
+// --- gmail.send_email editing ------------------------------------------------
+
+function sendEmailMutation(overrides = {}) {
+  return {
+    id: 'mut-email',
+    provider: 'gmail',
+    operation: 'gmail.send_email',
+    account: 'zach@example.test',
+    status: 'pending_review',
+    payload: { delivery_mode: 'send', message: { to: ['vendor@example.test'], subject: 'Re: quote', body_text: 'Sounds good.' } },
+    preview: {},
+    email: {
+      delivery_mode: 'send',
+      has_variants: true,
+      message: { to: ['vendor@example.test'], cc: [], bcc: [], subject: 'Re: quote', editor_text: 'Sounds good.', editor_html: '<div>Sounds good.</div>', signature_html: '<div class="gmail_signature"><b>Zach</b></div>', signature_text: 'Zach', quoted_html: '<div class="gmail_quote">On Mon, they wrote:<br>hi</div>', quoted_text: 'On Mon, they wrote:\nhi', reply_to_thread_id: 't-9', in_reply_to: '<m1@example.test>', references: ['<m0@example.test>', '<m1@example.test>'] },
+      variants: [
+        { id: 'variant-1', title: 'Direct', selected: false, to: ['vendor@example.test'], cc: [], bcc: [], subject: 'Re: quote', editor_text: 'Sounds good.', editor_html: '<div>Sounds good.</div>', signature_html: '', signature_text: '', quoted_html: '', quoted_text: '', reply_to_thread_id: 't-9', in_reply_to: '', references: [] },
+        { id: 'variant-2', title: 'Softer', selected: true, to: ['vendor@example.test'], cc: ['boss@example.test'], bcc: [], subject: 'Re: quote', editor_text: 'Maybe.', editor_html: '<div>Maybe.</div>', signature_html: '<div class="gmail_signature"><b>Zach</b></div>', signature_text: 'Zach', quoted_html: '<div class="gmail_quote">older</div>', quoted_text: 'older', reply_to_thread_id: 't-9', in_reply_to: '<m1@example.test>', references: ['<m1@example.test>'] },
+      ],
+      reply_threads: [
+        { thread_id: 't-9', subject: 'quote', messages: [{ message_id: 'm1', from_address: 'vendor@example.test', from_name: 'Vendor', to_addresses: ['zach@example.test'], internal_date: '2026-08-30T15:00:00Z', body_text: 'hi there' }] },
+      ],
+    },
+    ...overrides,
+  };
+}
+
+test('a send_email mutation becomes an editable composer: variants, the selected one marked, parts as text', () => {
+  const mutation = sendEmailMutation();
+  assert.equal(isGmailSendEmailMutation(mutation), true);
+  assert.equal(isGmailSendEmailMutation({ provider: 'gmail', operation: 'gmail.archive_threads' }), false);
+  const review = gmailEmailReview(mutation);
+  assert.equal(review.deliveryMode, 'send');
+  assert.equal(review.hasVariants, true);
+  assert.deepEqual(review.variants.map((variant) => variant.id), ['variant-1', 'variant-2']);
+  assert.equal(review.selectedVariantId, 'variant-2');
+  const softer = review.variants[1];
+  assert.equal(softer.title, 'Softer');
+  assert.equal(softer.editorText, 'Maybe.');
+  assert.equal(softer.signatureText, 'Zach');
+  assert.equal(softer.quotedText, 'older');
+  assert.deepEqual(softer.cc, ['boss@example.test']);
+  assert.equal(softer.replyToThreadId, 't-9');
+  assert.deepEqual(softer.references, ['<m1@example.test>']);
+  assert.equal(review.replyThreads.length, 1);
+  assert.equal(review.replyThreads[0].subject, 'quote');
+  assert.equal(review.replyThreads[0].messages[0].senderName, 'Vendor');
+  assert.equal(review.replyThreads[0].messages[0].text, 'hi there');
+});
+
+test('a send_email mutation without variants offers its one message as the only variant', () => {
+  const mutation = sendEmailMutation();
+  mutation.email = { ...mutation.email, has_variants: false, variants: [] };
+  const review = gmailEmailReview(mutation);
+  assert.equal(review.hasVariants, false);
+  assert.equal(review.variants.length, 1);
+  assert.equal(review.variants[0].id, '');
+  assert.equal(review.variants[0].editorText, 'Sounds good.');
+  assert.equal(review.selectedVariantId, '');
+});
+
+test('a send_email mutation with no server view falls back to the payload message', () => {
+  const mutation = sendEmailMutation({ email: undefined });
+  const review = gmailEmailReview(mutation);
+  assert.equal(review.variants.length, 1);
+  assert.equal(review.variants[0].editorText, 'Sounds good.');
+  assert.deepEqual(review.variants[0].to, ['vendor@example.test']);
+});
+
+test('the edited plain text is assembled into the body the server splits again: editor, signature, quote', () => {
+  const body = assembleEmailBody({
+    editorText: 'Hi there,\n\nSee <you> Monday.\nThanks  \n\n',
+    signatureHTML: '<div class="gmail_signature"><b>Zach</b></div>',
+    signatureText: 'Zach',
+    quotedHTML: '<div class="gmail_quote">older</div>',
+    quotedText: 'older',
+  });
+  assert.equal(body.body_html, '<div>Hi there,</div><div><br></div><div>See &lt;you&gt; Monday.<br>Thanks</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
+  assert.equal(body.body_text, 'Hi there,\n\nSee <you> Monday.\nThanks\n\nZach\n\nolder\n');
+  const bare = assembleEmailBody({ editorText: 'Just this.', signatureHTML: '', signatureText: '', quotedHTML: '', quotedText: '' });
+  assert.equal(bare.body_html, '<div>Just this.</div>');
+  assert.equal(bare.body_text, 'Just this.\n');
+});
+
+test('the update input carries the recipients split, the assembled body and the reply headers', () => {
+  const review = gmailEmailReview(sendEmailMutation());
+  const input = gmailEmailUpdateInput(review.variants[1], { to: 'a@example.test, b@example.test\nc@example.test', cc: '', bcc: ' d@example.test ', subject: '  Re: quote  ', editorText: 'Maybe not.' }, 'draft');
+  assert.equal(input.delivery_mode, 'draft');
+  assert.equal(input.selected_variant_id, 'variant-2');
+  assert.deepEqual(input.message.to, ['a@example.test', 'b@example.test', 'c@example.test']);
+  assert.deepEqual(input.message.cc, []);
+  assert.deepEqual(input.message.bcc, ['d@example.test']);
+  assert.equal(input.message.subject, 'Re: quote');
+  assert.equal(input.message.body_html, '<div>Maybe not.</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
+  assert.equal(input.message.body_text, 'Maybe not.\n\nZach\n\nolder\n');
+  assert.equal(input.message.reply_to_thread_id, 't-9');
+  assert.equal(input.message.in_reply_to, '<m1@example.test>');
+  assert.deepEqual(input.message.references, ['<m1@example.test>']);
 });

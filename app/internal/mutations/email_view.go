@@ -48,7 +48,9 @@ func gmailEmailView(mutation Mutation) map[string]any {
 // gmailEmailMessageView splits one email body the way the editor needs it:
 // editor_html is what the reviewer types in, signature_html is shown below it
 // read-only, quoted_html is the collapsed quoted thread, body_html is the
-// whole thing as it will be sent.
+// whole thing as it will be sent. Each part is also carried as plain text
+// (editor_text, signature_text, quoted_text) for a client whose editor is a
+// plain text field — the iOS app — so no client strips HTML on its own.
 func gmailEmailMessageView(email map[string]any) map[string]any {
 	bodyHTML := strings.TrimSpace(stringFromAny(email["body_html"]))
 	bodyText := stringFromAny(email["body_text"])
@@ -66,7 +68,9 @@ func gmailEmailMessageView(email map[string]any) map[string]any {
 		"body_text":          bodyText,
 		"body_html":          fullBodyHTML,
 		"editor_html":        editorHTML,
+		"editor_text":        htmlFragmentText(editorHTML),
 		"signature_html":     sanitizeGmailSignaturePreviewHTML(signatureHTML),
+		"signature_text":     htmlFragmentText(signatureHTML),
 		"quoted_html":        quotedHTML,
 		"quoted_text":        strings.TrimSpace(htmlFragmentText(quotedHTML)),
 		"reply_to_thread_id": stringFromAny(email["reply_to_thread_id"]),

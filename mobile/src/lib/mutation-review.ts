@@ -9,6 +9,8 @@ type MutationLike = {
   payload?: Record<string, unknown>;
   preview?: Record<string, unknown>;
   result?: Record<string, unknown>;
+  // The server's reviewer model of a gmail.send_email mutation (email_view.go).
+  email?: unknown;
 };
 
 export type SlackReviewMessage = {
@@ -1392,4 +1394,195 @@ export function appleContactsBatchSummary(mutations: MutationLike[]): AppleConta
   const kinds = (['create', 'update', 'merge'] as const).filter((kind) => summary[kind] > 0);
   if (kinds.length === 1) summary.verb = kinds[0] === 'create' ? 'Create' : kinds[0] === 'update' ? 'Update' : 'Merge';
   return summary;
+}
+
+// --- gmail.send_email: the composer -----------------------------------------
+//
+// The server computes the reviewer's model of an email once (api "email":
+// delivery mode, every variant with the selected one marked, each body split
+// into editable part / signature / quoted thread, the thread replied to). The
+// phone edits the editable part as plain text, so it reads the *_text halves
+// and assembles the body back the same way the web editor does.
+
+export function isGmailSendEmailMutation(mutation: MutationLike): boolean {
+  return text(mutation.provider) === 'gmail' && text(mutation.operation) === 'gmail.send_email';
+}
+
+export type GmailEmailVariant = {
+  id: string;
+  title: string;
+  selected: boolean;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  subject: string;
+  editorText: string;
+  signatureHTML: string;
+  signatureText: string;
+  quotedHTML: string;
+  quotedText: string;
+  replyToThreadId: string;
+  inReplyTo: string;
+  references: string[];
+};
+
+export type GmailEmailReplyThread = { threadId: string; subject: string; messages: GmailReviewMessage[] };
+
+export type GmailEmailReview = {
+  deliveryMode: 'send' | 'draft';
+  hasVariants: boolean;
+  selectedVariantId: string;
+  variants: GmailEmailVariant[];
+  replyThreads: GmailEmailReplyThread[];
+};
+
+// A plain-text rendering of an HTML fragment, the same reduction the server's
+// htmlFragmentText makes: block and line-break tags become newlines, every
+// other tag is dropped, entities are decoded, blank lines are removed.
+function htmlFragmentText(value: string): string {
+  const withBreaks = value.replace(/\r\n/g, '\n').replace(/<(br\b[^>]*|\/div\s*|\/p\s*)>/gi, '\n').replace(/<[^>]*>/g, '');
+  return decodeHTMLEntities(withBreaks).split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+}
+
+function decodeHTMLEntities(value: string): string {
+  const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, code: string) => {
+    if (code[0] === '#') {
+      const point = code[1] === 'x' || code[1] === 'X' ? Number.parseInt(code.slice(2), 16) : Number.parseInt(code.slice(1), 10);
+      return Number.isFinite(point) ? String.fromCodePoint(point) : match;
+    }
+    return named[code.toLowerCase()] ?? match;
+  });
+}
+
+function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string; title: string; selected: boolean }): GmailEmailVariant {
+  const editorHTML = text(raw.editor_html);
+  const editorText = typeof raw.editor_text === 'string' ? raw.editor_text.replace(/\s+$/, '') : editorHTML ? htmlFragmentText(editorHTML) : text(raw.body_text);
+  const signatureHTML = text(raw.signature_html);
+  return {
+    id: text(raw.id) || fallback.id,
+    title: text(raw.title) || fallback.title,
+    selected: typeof raw.selected === 'boolean' ? raw.selected : fallback.selected,
+    to: list(raw.to),
+    cc: list(raw.cc),
+    bcc: list(raw.bcc),
+    subject: text(raw.subject),
+    editorText,
+    signatureHTML,
+    signatureText: typeof raw.signature_text === 'string' ? raw.signature_text.trim() : htmlFragmentText(signatureHTML),
+    quotedHTML: text(raw.quoted_html),
+    quotedText: text(raw.quoted_text),
+    replyToThreadId: text(raw.reply_to_thread_id),
+    inReplyTo: text(raw.in_reply_to),
+    references: list(raw.references),
+  };
+}
+
+export function gmailEmailReview(mutation: MutationLike): GmailEmailReview {
+  const email = asRecord(mutation.email);
+  const payload = asRecord(mutation.payload);
+  // A row that arrived without the server view (an older server, a list
+  // page) still has its stored message; the split parts are simply empty.
+  const message = Object.keys(email).length ? asRecord(email.message) : { ...asRecord(payload.message), editor_html: '' };
+  const rawVariants = records(email.variants);
+  const hasVariants = email.has_variants === true && rawVariants.length > 1;
+  const variants = hasVariants
+    ? rawVariants.map((variant, index) => gmailEmailVariant(variant, { id: `variant_${index + 1}`, title: `Version ${index + 1}`, selected: false }))
+    : [gmailEmailVariant(message, { id: '', title: '', selected: true })];
+  const mode = text(email.delivery_mode) || text(payload.delivery_mode);
+  return {
+    deliveryMode: mode === 'draft' ? 'draft' : 'send',
+    hasVariants,
+    selectedVariantId: hasVariants ? (variants.find((variant) => variant.selected) ?? variants[0]).id : '',
+    variants,
+    replyThreads: records(email.reply_threads).map((thread) => ({
+      threadId: text(thread.thread_id),
+      subject: text(thread.subject),
+      messages: records(thread.messages).map(gmailReviewMessage),
+    })),
+  };
+}
+
+function escapeHTML(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&#34;').replace(/'/g, '&#39;');
+}
+
+// The server's emailPlainTextToHTML, so text typed on the phone is stored in
+// the same shape the server would have produced from body_text: paragraphs
+// as <div>s separated by an empty <div>, lines within one joined by <br>.
+export function emailPlainTextToHTML(value: string): string {
+  const trimmed = value.replace(/\r\n/g, '\n').trim();
+  if (!trimmed) return '<div><br></div>';
+  const paragraphs = trimmed.split('\n\n').map((paragraph) => paragraph.split('\n').map((line) => line.trim()).filter(Boolean)).filter((lines) => lines.length);
+  if (!paragraphs.length) return '<div><br></div>';
+  return paragraphs.map((lines) => `<div>${lines.map(escapeHTML).join('<br>')}</div>`).join('<div><br></div>');
+}
+
+function normalizeEmailText(value: string): string {
+  const lines = value.replace(/\r\n/g, '\n').split('\n').map((line) => line.replace(/\s+$/, ''));
+  return lines.filter((line, index) => line.trim() !== '' || (index > 0 && index < lines.length - 1)).join('\n').trim();
+}
+
+// assembleEmailBody is the web editor's assembly (mutation_view.js): editor,
+// then signature, then the quoted thread, separated by an empty div (HTML) or
+// a blank line (text). The server splits the stored body on exactly those
+// seams the next time it builds the view, so the order is load-bearing.
+export function assembleEmailBody(parts: { editorText: string; signatureHTML: string; signatureText: string; quotedHTML: string; quotedText: string }): { body_html: string; body_text: string } {
+  const editorText = parts.editorText.replace(/\s+$/, '');
+  const body_html = [editorText.trim() ? emailPlainTextToHTML(editorText) : '', parts.signatureHTML.trim(), parts.quotedHTML.trim()].filter(Boolean).join('<div><br></div>');
+  const body_text = `${[editorText, normalizeEmailText(parts.signatureText), normalizeEmailText(parts.quotedText)].filter(Boolean).join('\n\n')}\n`;
+  return { body_html, body_text };
+}
+
+export function splitEmailAddressList(value: string): string[] {
+  return value.split(/[,\n\r]/).map((entry) => entry.trim()).filter(Boolean);
+}
+
+export type GmailEmailEdits = { to: string; cc: string; bcc: string; subject: string; editorText: string };
+
+export type GmailEmailUpdateInput = {
+  delivery_mode: 'send' | 'draft';
+  selected_variant_id: string;
+  message: {
+    to: string[];
+    cc: string[];
+    bcc: string[];
+    subject: string;
+    body_text: string;
+    body_html: string;
+    reply_to_thread_id: string;
+    in_reply_to: string;
+    references: string[];
+  };
+};
+
+// The body of POST …/mutations/<id>/update-email: the edited fields over the
+// variant's own reply headers, which the phone never shows and must not drop.
+export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEmailEdits, deliveryMode: 'send' | 'draft'): GmailEmailUpdateInput {
+  const body = assembleEmailBody({
+    editorText: edits.editorText,
+    signatureHTML: variant.signatureHTML,
+    signatureText: variant.signatureText,
+    quotedHTML: variant.quotedHTML,
+    quotedText: variant.quotedText,
+  });
+  return {
+    delivery_mode: deliveryMode,
+    selected_variant_id: variant.id,
+    message: {
+      to: splitEmailAddressList(edits.to),
+      cc: splitEmailAddressList(edits.cc),
+      bcc: splitEmailAddressList(edits.bcc),
+      subject: edits.subject.trim(),
+      body_text: body.body_text,
+      body_html: body.body_html,
+      reply_to_thread_id: variant.replyToThreadId,
+      in_reply_to: variant.inReplyTo,
+      references: variant.references,
+    },
+  };
+}
+
+export function gmailEmailEditsFor(variant: GmailEmailVariant): GmailEmailEdits {
+  return { to: variant.to.join(', '), cc: variant.cc.join(', '), bcc: variant.bcc.join(', '), subject: variant.subject, editorText: variant.editorText };
 }

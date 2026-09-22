@@ -13,7 +13,7 @@ Keychain (`expo-secure-store`).
 | --- | --- |
 | Timeline (tiers default to `self`, `direct`, `cc`) | `GET /api/timeline`, `GET /api/timeline/item` |
 | Mutations (needs review / past) | `GET /api/mutations/requests[?status=…]` |
-| Review one request: approve, deny, skip an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove` |
+| Review one request: approve, deny, skip an email, edit an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove`, `POST …/mutations/{mid}/update-email` |
 | Alerts: the global on/off switch for timeline notifications and the ledger of every one sent (delivered / opened / skipped / failed, paged by `next_cursor`) | `GET /api/notifications[?limit=&before=]`, `POST /api/notifications/settings` |
 | Settings: push registration, test push, disconnect | `POST /api/push/register`, `POST /api/push/test` |
 
@@ -45,6 +45,16 @@ components live in `src/components/*-review.tsx`.
   if it affects multiple threads, the confirmation says how many. Missing
   previews never hide affected thread IDs from the list. Approval counts only
   mutations that will still run.
+- **Email proposals** (`gmail.send_email`) read as the composer they are: To,
+  Cc, Bcc, Subject and the body are editable, the signature and quoted thread
+  sit below read-only exactly as they will be sent, a proposal with several
+  versions is chosen from chips, and Send-on-approval / Save-as-draft is a
+  toggle. The body is edited as plain text — the server's `email` view carries
+  each part as text (`editor_text`, `signature_text`, `quoted_text`) beside the
+  HTML the web editor uses — and `assembleEmailBody` reassembles the stored
+  body in the order the server splits it again (editor, signature, quote).
+  Save posts to `update-email` and reloads: approval sends what is stored,
+  never what is on screen, so an unsaved edit is visibly unsaved.
 - **Slack mark-read batches** show each speaker's profile picture and open that
   exact message in Slack on a tap, because the answer to "mark this read?" is
   often "let me reply first". Faces identify DM rows; channels keep their glyph.
