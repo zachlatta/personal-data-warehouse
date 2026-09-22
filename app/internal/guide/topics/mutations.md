@@ -36,12 +36,10 @@ authoritative when this list and it disagree.
   note is addressed by the bare UUID `base_apple_notes.notes.note_id`; a title is the
   note's first line, not a separate property. These run on a Mac, not in the cloud, so
   they wait for that Mac's next uploader cycle after approval.
-- **Google Contacts (`zach@zachlatta.com`) is the canonical address book; iCloud mirrors
-  it.** `marts_contacts.contacts` unions both (`source` says which). Write a new or changed
-  contact to Google with `google_people.contacts`; the daily `contacts_mirror` asset then
-  proposes the iCloud side (and copies any email/phone that only iCloud held back to
-  Google), so one proposal is enough. Use `apple_contacts.*` (a card's `card_id`,
-  `<UUID>:ABPerson`) only for something iCloud-specific such as merging iCloud duplicates.
+- **Apple Contacts:** `marts_contacts.contacts` unions the Google and iCloud books
+  (`source` says which). Write to Google with `google_people.contacts`; write to iCloud
+  with `apple_contacts.*` (a card's `card_id`, `<UUID>:ABPerson`). Nothing copies one
+  book to the other, so a contact that must exist in both needs a proposal for each.
   `update_contact` is additive — scalars are set, emails/phones/urls are added, nothing is
   dropped unless named in `remove`, and `append_note` is preferred over `note`.
   `merge_contacts` deletes the merged cards after copying their values: propose it only
