@@ -312,6 +312,19 @@ def claude_code_event_row(
                 row["subtype"] = "tool_result"
                 row["text"] = _join_text_blocks(content, text_types=("tool_result",))
                 row["tool_result_json"] = raw_json({"content": content})
+                # The tool_use id the result answers, so a consumer can pair
+                # call and result by id rather than by adjacency: Claude Code
+                # issues parallel tool calls, and measured on 2026-09-22 a
+                # lead()-by-seq pairing missed the result of 26% of pdw
+                # search calls and nearly every proxied MCP call.
+                row["turn_id"] = next(
+                    (
+                        str(block.get("tool_use_id") or "")
+                        for block in content
+                        if isinstance(block, Mapping) and block.get("type") == "tool_result"
+                    ),
+                    "",
+                )
             else:
                 row["subtype"] = "message"
                 row["text"] = _join_text_blocks(content)

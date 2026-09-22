@@ -3877,6 +3877,33 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     assert rows == [("slack_message:dp1",)]
 
 
+def test_search_text_preview_strips_tracking_urls_and_table_scaffolding(warehouse: PostgresWarehouse) -> None:
+    # Measured 2026-09-22: a newsletter hit's whole 800-char preview was
+    # squarespace-mail.com redirect URLs and `| | --- |` markdown-table debris,
+    # and bulk mail pads its preheader with zero-width joiners. The preview is
+    # for reading; strip what nobody reads, AFTER windowing so the regexes run
+    # over the preview and never over a multi-megabyte document.
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    doc = (
+        "| | | | --- | --- | | | [Mt Foolery](https://mgcp01.engage.squarespace-mail.com/r?m=65789e4c&u=https%3A%2F%2Fwww.mtfoolery.com)"
+        " Mt Foolery, Charlotte, VT \u200b\u200c\u034f see https://example.com/tickets?id=1 tonight | | --- |"
+    )
+    preview = warehouse._query("SELECT @search_text_preview(%s, %s)", (doc, "Mt Foolery"))[0][0]
+    assert "squarespace" not in preview and "https://" not in preview
+    assert "\u200b" not in preview and "\u034f" not in preview
+    assert "---" not in preview and "| |" not in preview
+    assert "Mt Foolery, Charlotte, VT" in preview and "tonight" in preview
+
+    # A short document with nothing to strip is returned as-is; an all-noise
+    # one becomes NULL rather than an empty string.
+    assert warehouse._query("SELECT @search_text_preview(%s, %s)", ("plain words", "plain"))[0][0] == "plain words"
+    assert warehouse._query("SELECT @search_text_preview(%s, %s)", ("https://a.b/c | | --- |", "c"))[0][0] is None
+
+
 def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> None:
     # A search hit's `text` is a relevance PREVIEW, not the full document. Some
     # branches read multi-megabyte columns (Google Drive doc text, large email /

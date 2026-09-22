@@ -1,4 +1,10 @@
 {
   "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "description": "optional schema name or prefix to list (marts_finance, marts, base_); omit for every schema plus the conventions preamble",
+      "type": "string"
+    }
+  },
   "type": "object"
 }

@@ -407,6 +407,24 @@ func (s *Service) truncateRowsForOutput(rows []map[string]any) ([]map[string]any
 }
 
 func (s *Service) SchemaOverview(ctx context.Context) Response {
+	return s.SchemaOverviewFiltered(ctx, "")
+}
+
+// schemaFilterRe accepts a schema name or prefix: a layer (`marts`, `base_`)
+// or one schema (`marts_finance`).
+var schemaFilterRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// SchemaOverviewFiltered lists only the schemas matching filter -- an exact
+// schema name or a prefix such as a layer (`marts`, `base_`). The full
+// overview is 36 KB on MCP; a caller that already knows the domain it is in
+// pays for one schema instead, and the conventions preamble is omitted since
+// a filtered call has already read it.
+func (s *Service) SchemaOverviewFiltered(ctx context.Context, filter string) Response {
+	filter = strings.ToLower(strings.TrimSpace(filter))
+	if filter != "" && !schemaFilterRe.MatchString(filter) {
+		failure := fmt.Sprintf("schema filter %q must be a schema name or prefix such as marts, marts_finance or base_", filter)
+		return Response{Results: []Result{{SQL: "schema_overview", Error: failure, CSV: errorCSV(failure)}}}
+	}
 	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
 	const currentDatabaseSQL = "SELECT current_database() AS database"
 	started := time.Now()
@@ -433,7 +451,22 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 		return Response{Results: []Result{schemaResult}}
 	}
 	tables := schemaTableRefs(tablesResult)
-	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables))
+	if filter != "" {
+		kept := tables[:0]
+		for _, table := range tables {
+			if table.Schema == filter || strings.HasPrefix(table.Schema, filter) {
+				kept = append(kept, table)
+			}
+		}
+		tables = kept
+		if len(tables) == 0 {
+			failure := fmt.Sprintf("no queryable schema matches %q; run schema_overview with no filter for the list", filter)
+			schemaResult.Error = failure
+			schemaResult.CSV = errorCSV(failure)
+			return Response{Results: []Result{schemaResult}}
+		}
+	}
+	s.logger.InfoContext(ctx, "schema overview tables listed", "tables", len(tables), "filter", filter)
 
 	facts := s.overviewCatalog(ctx, tables)
 
@@ -449,7 +482,7 @@ func (s *Service) SchemaOverview(ctx context.Context) Response {
 		}
 	}
 
-	schemaResult.CSV = s.renderOverview(database, tables, facts, timelineColumns)
+	schemaResult.CSV = s.renderOverview(database, tables, facts, timelineColumns, filter == "")
 	s.logger.InfoContext(ctx, "schema overview completed", "database", database, "tables", len(tables), "bytes", len(schemaResult.CSV), "duration", time.Since(started))
 	return Response{Results: []Result{schemaResult}}
 }
@@ -727,9 +760,25 @@ func timelinePriorityHint(sql string) string {
 	return "(hint: this reads timeline.events without a priority predicate. For attention or correspondence add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the filter only when broad recall or an unknown tier is intentional.)"
 }
 
+// gmailBodyTextRef matches a statement that reads body_text (or body_html)
+// from base_gmail.messages. Measured 2026-09-22: a `left(body_text, 3000)`
+// on a ticket email was 3 KB of seetickets.us redirect URLs and nothing
+// else; body_markdown_clean holds the same message without the tracking.
+var gmailBodyTextRef = regexp.MustCompile(`(?is)\bbody_(?:text|html)\b.*\bbase_gmail\.messages\b|\bbase_gmail\.messages\b.*\bbody_(?:text|html)\b`)
+
+func gmailBodyHint(sql string) string {
+	if !gmailBodyTextRef.MatchString(sql) || strings.Contains(strings.ToLower(sql), "body_markdown_clean") {
+		return ""
+	}
+	return "(hint: base_gmail.messages.body_text and body_html are the raw MIME parts and are mostly tracking URLs and HTML on bulk mail; read body_markdown_clean for the message as written.)"
+}
+
 func sqlUsageHint(sql string) string {
-	hints := make([]string, 0, 2)
+	hints := make([]string, 0, 3)
 	if hint := rawTextScanHint(sql); hint != "" {
+		hints = append(hints, hint)
+	}
+	if hint := gmailBodyHint(sql); hint != "" {
 		hints = append(hints, hint)
 	}
 	if hint := timelinePriorityHint(sql); hint != "" {

@@ -412,3 +412,32 @@ def test_a_subcommand_the_cli_does_not_have_is_invented():
     assert not _matches(CLI_INVENTED_RE, '{"command":"pdw readme search"}')
     # Prose capitalised after `pdw` is documentation, not a command attempt.
     assert not _matches(CLI_INVENTED_RE, '{"command":"cat <<EOF\\npdw CLI Full Disk Access\\nEOF"}')
+
+
+def test_a_piped_cli_search_without_its_header_is_unknown_not_failed() -> None:
+    # Agents pipe `pdw search` through grep/head/cut, which strips the
+    # `Search:` header; and a parallel tool call's result may not be the row
+    # this collector paired. Neither is a failed priority filter. Measured
+    # 2026-09-22, treating them as failed put 29% of a fortnight's searches in
+    # search_invalid_or_failed_priority.
+    piped = parse_search_call(
+        _search_row(
+            '{"command":"pdw search --priority self,direct budget 2>&1 | grep -A3 2026-09"}',
+            "2026-09-10 10:29 · self · me — budget approval\n   ref: gmail_email:a|b",
+        )
+    )
+    assert piped.explicit_filter and piped.success
+    assert not piped.invalid_or_failed_filter
+
+    unknown_flag = parse_search_call(
+        _search_row(
+            '{"command":"pdw search --priority self budget --bogus"}',
+            "pdw search: unknown flag --bogus (run `pdw search --help`)",
+        )
+    )
+    assert unknown_flag.invalid_or_failed_filter
+
+    unscoped_piped = parse_search_call(
+        _search_row('{"command":"pdw search budget | head -5"}', "1. gmail · noise · 2026-09-10 · x — y")
+    )
+    assert not unscoped_piped.explicit_filter and unscoped_piped.success

@@ -237,7 +237,20 @@ is an error rather than query text), and on MCP `connections` + `connection_call
 place of a flat listing of every connected upstream tool: that list was 196 tools /
 153 KB (~38k tokens) of definitions in every MCP session, 142 KB of it proxied, and the
 sessions paying it almost never called one (`PDW_MCP_LIST_CONNECTION_TOOLS=1` restores
-the flat list; `pdw list` / `pdw call` are unchanged). The fleet skill is one line that says to read
+the flat list; `pdw list` / `pdw call` are unchanged). The follow-up the same day: search
+previews are cleaned after windowing (tracking URLs, markdown-table scaffolding, zero-width
+padding — a newsletter hit's whole 800-char preview had been squarespace-mail.com redirect
+links); a textless Slack hit (a file, image or canvas post, ~5,000 a week) is labelled at
+**read time** in the search service rather than in the adapter's snippet, because the
+adapter edit would change its signature and re-walk 46.8M Slack rows for a label; the SQL
+tool hints at `body_markdown_clean` when a statement reads `body_text`/`body_html` from
+`base_gmail.messages`; `schema_overview` / `pdw schema` take a schema name or layer prefix
+so one domain costs one schema instead of the 36 KB whole; and `marts_ops.agent_usage`
+pairs a tool result with its call by `turn_id` (Claude Code's `tool_use_id`, now stamped on
+result rows too) before falling back to adjacency, and reads a piped CLI search with no
+`Search:` header as unknown rather than failed — adjacency alone had lost the result of
+26% of pdw search calls and nearly every proxied MCP call, and the header rule had put 29%
+of a fortnight's searches in `search_invalid_or_failed_priority`. The fleet skill is one line that says to read
 it. Until 2026-09-09 the guide was a hand-transcribed skill outside this repository that
 drifted from the code on every reorg; now `app/internal/guide/guide_test.go` fails when
 the guide names a relation the catalog does not have, omits a priority tier or selection,

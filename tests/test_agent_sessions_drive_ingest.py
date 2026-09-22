@@ -218,6 +218,9 @@ def test_claude_user_tool_result_row() -> None:
     assert row["role"] == "tool"
     assert row["subtype"] == "tool_result"
     assert "file1.txt" in row["text"]
+    # The tool_use id the result answers: parallel tool calls make the next
+    # row the wrong pairing, so consumers pair by id (agent_usage does).
+    assert row["turn_id"] == "tu-1"
 
 
 def test_claude_meta_line_without_uuid_gets_synthetic_id_and_title() -> None:

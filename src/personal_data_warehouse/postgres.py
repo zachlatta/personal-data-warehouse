@@ -13292,7 +13292,15 @@ class PostgresWarehouse:
             IMMUTABLE
             PARALLEL SAFE
             AS $preview$
-                SELECT CASE
+                -- The windowed text is cleaned AFTER windowing, so the regexes
+                -- only ever run over SEARCH_TEXT_PREVIEW_CHARS: tracking URLs
+                -- (a newsletter hit's whole preview was squarespace-mail.com
+                -- redirect links), markdown-table scaffolding (`| | --- |`)
+                -- and the zero-width/format characters bulk mail pads its
+                -- preheader with. Windowing runs on the raw text so a URL-
+                -- shaped query term still finds its match.
+                SELECT nullif(btrim(regexp_replace(regexp_replace(regexp_replace(regexp_replace(
+                    (SELECT CASE
                     WHEN doc IS NULL OR length(doc) <= """
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r""" THEN doc
@@ -13321,7 +13329,11 @@ class PostgresWarehouse:
             + str(SEARCH_TEXT_PREVIEW_CHARS)
             + r""")
                     )
-                END
+                END),
+                    'https?://[^[:space:]<>)\]"'']+', '', 'g'),
+                    '[\u200B\u200C\u200D\u2060\u034F\uFEFF]+', '', 'g'),
+                    '(\|[[:space:]]*|-{3,}[[:space:]]*)+(\||$)', ' ', 'g'),
+                    '[[:space:]]{2,}', ' ', 'g')), '')
             $preview$;
             CREATE OR REPLACE FUNCTION @search_text(
                 query text,

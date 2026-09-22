@@ -434,12 +434,26 @@ func TestSchemaCommandRejectsArguments(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Fatal("server should not be called")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "schema", "extra")
-	if code == 0 {
-		t.Fatalf("expected non-zero exit")
+	if _, errOut, code := runCLI(t, srv.URL, "", "schema", "marts", "base"); code != 2 || !strings.Contains(errOut, "at most one") {
+		t.Fatalf("two filters: code=%d stderr=%s", code, errOut)
 	}
-	if !strings.Contains(errOut, "unexpected arguments") {
-		t.Fatalf("stderr missing argument error: %s", errOut)
+	if _, errOut, code := runCLI(t, srv.URL, "", "schema", "marts; drop"); code != 2 || !strings.Contains(errOut, "schema name or prefix") {
+		t.Fatalf("malformed filter: code=%d stderr=%s", code, errOut)
+	}
+}
+
+func TestSchemaCommandForwardsAFilterAndSkipsTheNudge(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"results":[{"csv":"# marts_finance (1 relation)\n  marts_finance.net_worth\n"}]}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "schema", "marts_finance")
+	if code != 0 || errOut != "" {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	var input map[string]string
+	_ = json.Unmarshal(srv.lastBody, &input)
+	if input["schema"] != "marts_finance" || !strings.Contains(out, "marts_finance.net_worth") {
+		t.Fatalf("input=%#v out=%q", input, out)
 	}
 }
 

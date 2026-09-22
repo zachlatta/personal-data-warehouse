@@ -239,6 +239,31 @@ func TestSchemaOverviewFlagsAmbiguousTimeColumnsInsteadOfGuessing(t *testing.T) 
 }
 
 // The overview is the required first call, so its size is part of the contract.
+func TestSchemaOverviewFilterListsOneSchemaWithoutThePreamble(t *testing.T) {
+	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+	full := svc.SchemaOverview(context.Background()).Results[0].CSV
+	one := svc.SchemaOverviewFiltered(context.Background(), "marts_inbox").Results[0]
+	if one.Error != "" {
+		t.Fatal(one.Error)
+	}
+	if !strings.Contains(one.CSV, "marts_inbox.gmail_threads") || strings.Contains(one.CSV, "base_gmail.messages") {
+		t.Fatalf("filtered overview should list only marts_inbox:\n%s", one.CSV)
+	}
+	if len(one.CSV) >= len(full)/2 || strings.Contains(one.CSV, "START HERE") {
+		t.Fatalf("a filtered overview omits the conventions preamble (%d vs %d bytes)", len(one.CSV), len(full))
+	}
+	layer := svc.SchemaOverviewFiltered(context.Background(), "marts").Results[0].CSV
+	if !strings.Contains(layer, "marts_inbox.gmail_threads") || strings.Contains(layer, "gmail.messages  ") {
+		t.Fatalf("a layer prefix lists every schema in the layer and nothing else:\n%s", layer)
+	}
+	if none := svc.SchemaOverviewFiltered(context.Background(), "nope"); none.Results[0].Error == "" || !strings.Contains(none.Results[0].Error, "no queryable schema") {
+		t.Fatalf("an unmatched filter is an error, not an empty list: %#v", none.Results[0])
+	}
+	if bad := svc.SchemaOverviewFiltered(context.Background(), "marts; drop"); bad.Results[0].Error == "" {
+		t.Fatal("a malformed filter is rejected")
+	}
+}
+
 func TestSchemaOverviewStaysCompact(t *testing.T) {
 	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
 
@@ -833,6 +858,24 @@ func TestRawTextScanHintFiresOnlyForRawPatternScansOutsideTheTimeline(t *testing
 	}
 	if hint := rawTextScanHint("SELECT * FROM base_slack.messages WHERE text ILIKE '%x%'"); !strings.Contains(hint, "timeline.search_text") {
 		t.Fatalf("the hint must say what to use instead; got %q", hint)
+	}
+}
+
+func TestGmailBodyHintPointsAtTheCleanColumn(t *testing.T) {
+	cases := map[string]bool{
+		"SELECT subject, left(body_text, 3000) FROM base_gmail.messages WHERE message_id = 'x'": true,
+		"SELECT body_html FROM base_gmail.messages m WHERE m.thread_id = 't'":                   true,
+		"SELECT subject, body_markdown_clean FROM base_gmail.messages WHERE message_id = 'x'":   false,
+		"SELECT body_text FROM base_apple_notes.notes LIMIT 1":                                  false,
+		"SELECT subject FROM base_gmail.messages LIMIT 1":                                       false,
+	}
+	for sql, want := range cases {
+		if got := gmailBodyHint(sql) != ""; got != want {
+			t.Fatalf("gmailBodyHint(%q) fired=%v, want %v", sql, got, want)
+		}
+	}
+	if !strings.Contains(sqlUsageHint("SELECT body_text FROM base_gmail.messages LIMIT 1"), "body_markdown_clean") {
+		t.Fatal("the usage hint must carry the gmail body hint")
 	}
 }
 

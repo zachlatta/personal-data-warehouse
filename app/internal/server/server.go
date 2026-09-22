@@ -63,7 +63,9 @@ type queryStatementInput struct {
 	SQL      string `json:"sql" jsonschema:"read-only Postgres SQL string to run"`
 }
 
-type schemaOverviewInput struct{}
+type schemaOverviewInput struct {
+	Schema string `json:"schema,omitempty" jsonschema:"optional schema name or prefix to list (marts_finance, marts, base_); omit for every schema plus the conventions preamble"`
+}
 
 type describeTableInput struct {
 	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. base_gmail.messages; a bare table name resolves when only one schema has it"`
@@ -115,7 +117,7 @@ var searchDescription = "FIRST tool for any text, topic, person, phrase, or iden
 
 const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
 
-const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL." + timelinePrioritySQLReminder + " It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
+const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL; pass schema (a name or prefix such as marts_finance or marts) to list one domain instead of the ~36 KB whole." + timelinePrioritySQLReminder + " It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
 const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (base_gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
 

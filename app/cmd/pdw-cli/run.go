@@ -96,9 +96,11 @@ COMMANDS
                              relations and keys but NOT columns, so this is the only
                              authoritative column list. Guessing column names is the
                              single largest source of failed queries.
-  schema                     Run schema_overview and print every relation with
-                             its row estimate. For finding a relation you do
-                             not know, not a first step: search needs none of it.
+  schema [SCHEMA|PREFIX]     Run schema_overview and print every relation with
+                             its row estimate, or only one schema / layer
+                             (marts_finance, marts, base_). For finding a
+                             relation you do not know, not a first step:
+                             search needs none of it.
   ingest <source> [flags]    Run a local data-warehouse uploader (built into
                              this binary). Sources: agent-sessions,
                              apple-contacts, apple-messages, apple-notes,
@@ -374,9 +376,18 @@ var schemaSearchFirstNudge = "pdw schema: this is the relation list for writing 
 // text so the no-args invocation is human-readable. Any extra args are
 // rejected to keep the command's contract narrow.
 func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer) int {
-	if len(args) > 0 {
-		fmt.Fprintln(stderr, "pdw schema: unexpected arguments")
+	if len(args) > 1 {
+		fmt.Fprintln(stderr, "pdw schema: pass at most one schema name or prefix (e.g. marts_finance, marts, base_)")
 		return 2
+	}
+	var input json.RawMessage
+	if len(args) == 1 {
+		filter := strings.TrimSpace(args[0])
+		if !validIdentifier(filter) {
+			fmt.Fprintln(stderr, "pdw schema: the filter must be a schema name or prefix such as marts_finance, marts or base_")
+			return 2
+		}
+		input, _ = json.Marshal(map[string]string{"schema": filter})
 	}
 	// Schema discovery is step 2's prerequisite, not step 1: measured over
 	// 14 days to 2026-08-28, 31% of PDW sessions opened with this command and
@@ -384,8 +395,10 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	// 2026-09-09 a bare `pdw` ran it, so the first thing every session saw was
 	// the relation list. The nudge goes to stderr so scripted consumers keep
 	// clean rows on stdout.
-	fmt.Fprintln(stderr, schemaSearchFirstNudge)
-	out, err := client.CallTool(context.Background(), "schema_overview", nil)
+	if input == nil {
+		fmt.Fprintln(stderr, schemaSearchFirstNudge)
+	}
+	out, err := client.CallTool(context.Background(), "schema_overview", input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {

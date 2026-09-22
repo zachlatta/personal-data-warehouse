@@ -31,8 +31,8 @@ discovery calls below are what is current.
 {{if .CLI}}   `pdw columns <schema.relation>` — and `pdw schema` only to find a relation you do not know.{{else}}   `describe_table` with `{"relation": "<schema.relation>"}` — and `schema_overview` only to find a relation you do not know.{{end}}
 
 Do not open with schema discovery because SQL may be useful later; do not `ILIKE` a raw
-`base_*` body column (it times out, and the SQL tool warns on that shape); do not guess a
-second name after a 42703/42P01 — re-check the columns and read the server's hint. `marts_ops.agent_usage` measures whether this order is followed.
+`base_*` body column (it times out; the SQL tool warns); after a 42703/42P01 read the
+server's hint rather than guessing a second name. `marts_ops.agent_usage` measures whether this is followed.
 
 ## Command map
 
@@ -44,7 +44,7 @@ second name after a 42703/42P01 — re-check the columns and read the server's h
 | The conversation around a hit | `pdw context '<ref>' [--before N] [--after N]` |
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL: `--file q.sql` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
-| Every relation with row estimates | `pdw schema` |
+| Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
 | The other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
 | A local uploader or credential publisher | `pdw ingest <source>`, `pdw slack\|chatgpt\|whoop\|hn publish-session` (topic `ingest`) |
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
@@ -61,7 +61,7 @@ default CSV output, so `--output json` stays parseable through `2>&1`.
 | Search every source | `search` `{"query": "...", "priorities": [...], "sources": [...], "since": "YYYY-MM-DD", "mode": "hybrid|keyword|exact", "max_results": N}` |
 | Read-only SQL | `query` `{"queries": [{"question": "<why>", "sql": "<SQL>"}], "format": "csv|json|ndjson"}` |
 | One relation's exact columns | `describe_table` `{"relation": "<schema.relation>"}` |
-| Every relation with row estimates | `schema_overview` `{}` |
+| Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |
 | Bytes of a stored attachment, photo, recording or Slack file | `get_object` `{"storage_file_id": "<id>"}` |
 | A reviewed write | `propose_mutation_help` `{}`, then `propose_mutation` (topic `mutations`) |
 | A push notification to Zach's phone | `notify` |

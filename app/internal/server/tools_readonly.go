@@ -104,8 +104,8 @@ func schemaOverviewTool(svc *query.Service) tool.Tool {
 		NameStr:        "schema_overview",
 		TitleStr:       "Schema Overview",
 		DescriptionStr: schemaOverviewDescription,
-		Handle: func(ctx context.Context, _ schemaOverviewInput) (schemaOverviewOutput, error) {
-			return schemaOverviewOutput{Response: svc.SchemaOverview(ctx)}, nil
+		Handle: func(ctx context.Context, in schemaOverviewInput) (schemaOverviewOutput, error) {
+			return schemaOverviewOutput{Response: svc.SchemaOverviewFiltered(ctx, in.Schema)}, nil
 		},
 		IsError: func(o schemaOverviewOutput) bool { return o.hasError() },
 	}

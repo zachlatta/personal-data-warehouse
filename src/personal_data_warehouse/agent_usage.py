@@ -395,7 +395,19 @@ def parse_search_call(row: dict[str, Any]) -> SearchCallObservation:
     else:
         # Older CLI results predate the explicit Scope line but the Search
         # header was already emitted only after a successful API response.
-        success = bool(re.search(r"^Search:", text, re.MULTILINE))
+        # A result with no header AND no failure signal is one the agent
+        # piped through grep/head/cut (or one this collector could not pair
+        # with its call at all): it is unknown, not a failed filter. Counting
+        # it as failed put 29% of a fortnight's searches in
+        # search_invalid_or_failed_priority.
+        header = bool(re.search(r"^Search:", text, re.MULTILINE))
+        failed_cli = bool(re.search(r"^pdw search: |unknown flag|unknown priority|SQLSTATE|statement timeout", text, re.MULTILINE))
+        success = header or (not failed_cli and not failed_envelope and bool(text.strip()) and not explicit)
+        if not header and not failed_cli and not failed_envelope and explicit:
+            # Scoped call whose echo we cannot read: credit the filter as
+            # applied rather than as failed; the scope line was stripped, not
+            # rejected.
+            success = True
         query_match = _CLI_SEARCH_QUERY_RE.search(text)
         query = query_match.group(1).strip() if query_match else ""
         bulk_hint = False
@@ -456,7 +468,7 @@ def analyze_search_calls(rows: list[dict[str, Any]]) -> SearchUsageMetrics:
 
 _AGENT_USAGE_CALLS_CTE = """
 WITH ev AS (
-  SELECT source, session_id, seq, occurred_at, subtype, tool_name,
+  SELECT source, session_id, seq, occurred_at, subtype, tool_name, turn_id,
          CASE WHEN source = 'codex' AND subtype IN ('custom_tool_call', 'item_completed')
               THEN raw_json ELSE tool_input_json END AS inp0,
          CASE WHEN source = 'codex' THEN raw_json ELSE tool_result_json END AS res0
@@ -466,16 +478,31 @@ WITH ev AS (
 sessions AS (
   SELECT source, session_id, max(occurred_at) AS newest FROM ev GROUP BY source, session_id
 ),
-ev2 AS (
-  SELECT *,
-         lead(res0) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_res,
-         lead(subtype) OVER (PARTITION BY source, session_id ORDER BY seq) AS next_subtype
+-- A result answers a call by id when the transcript carries one (Claude
+-- Code's tool_use id is on both rows since 2026-09-22). Adjacency is the
+-- fallback: with parallel tool calls the result of call N is not the next
+-- row, and pairing by lead() alone lost the result of a quarter of pdw search
+-- calls and nearly every proxied MCP call in the fortnight measured.
+results_by_id AS (
+  SELECT source, session_id, turn_id, min(res0) AS res
   FROM ev
+  WHERE subtype = 'tool_result' AND turn_id <> '' AND res0 <> ''
+  GROUP BY source, session_id, turn_id
+),
+ev2 AS (
+  SELECT e.*,
+         r.res AS id_res,
+         lead(e.res0) OVER (PARTITION BY e.source, e.session_id ORDER BY e.seq) AS next_res,
+         lead(e.subtype) OVER (PARTITION BY e.source, e.session_id ORDER BY e.seq) AS next_subtype
+  FROM ev e
+  LEFT JOIN results_by_id r
+    ON r.source = e.source AND r.session_id = e.session_id
+   AND e.turn_id <> '' AND r.turn_id = e.turn_id AND e.subtype <> 'tool_result'
 ),
 calls AS (
   SELECT source, session_id, seq, occurred_at, tool_name, inp0 AS inp,
          CASE WHEN source = 'codex' AND subtype = 'item_completed' THEN res0
-              ELSE coalesce(NULLIF(next_res, ''), res0) END AS result,
+              ELSE coalesce(NULLIF(id_res, ''), NULLIF(next_res, ''), res0) END AS result,
          (tool_name ILIKE '%%personal_data_warehouse%%') AS is_mcp
   FROM ev2
   WHERE (

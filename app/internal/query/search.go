@@ -468,6 +468,14 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 // 1,200 keeps the matched window and a paragraph either side.
 const searchPreviewMaxRunes = 1200
 
+// searchEmptyMessageNote is the preview of a chat hit that has no text of
+// its own. On Slack, ~5,000 messages a week carry an empty `text` -- a file,
+// image or canvas post whose file is a separate slack_file event -- and the
+// hit rendered as bare "actor #channel", which reads as a broken row. The
+// note is set at read time on purpose: writing it into the adapter's snippet
+// would change the adapter signature and re-walk 46.8M Slack rows for a label.
+const searchEmptyMessageNote = "(no message text: a file, image or canvas post; the file is a separate slack_file event in the same channel, and timeline.context(ref) shows the messages around it)"
+
 func capSearchPreviews(rows []map[string]any) {
 	for _, row := range rows {
 		text, ok := row["text"].(string)
@@ -477,7 +485,31 @@ func capSearchPreviews(rows []map[string]any) {
 		if runes := []rune(text); len(runes) > searchPreviewMaxRunes {
 			row["text"] = string(runes[:searchPreviewMaxRunes]) + "…"
 		}
+		if fmt.Sprint(row["source"]) == "slack" && strings.TrimSpace(fmt.Sprint(row["title"])) == "" && isBareActorContext(text, row) {
+			row["text"] = searchEmptyMessageNote
+		}
 	}
+}
+
+// isBareActorContext reports whether a chat hit's search document is only
+// its actor and context labels -- the shape a message with no text produces.
+func isBareActorContext(text string, row map[string]any) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return true
+	}
+	labels := map[string]bool{}
+	for _, key := range []string{"who", "actor", "context"} {
+		for _, f := range strings.Fields(fmt.Sprint(row[key])) {
+			labels[f] = true
+		}
+	}
+	for _, f := range fields {
+		if !labels[f] {
+			return false
+		}
+	}
+	return true
 }
 
 // runHybridSearch fans BM25, one ANN call, and the

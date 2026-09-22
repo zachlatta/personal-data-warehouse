@@ -26,7 +26,7 @@ func renderTestOverview(t *testing.T) string {
 		t.Fatal("catalog exposes no discoverable relations")
 	}
 	svc := &Service{}
-	return svc.renderOverview("pdw", tables, map[string]*relationFacts{}, "")
+	return svc.renderOverview("pdw", tables, map[string]*relationFacts{}, "", true)
 }
 
 func TestOverviewMarksTheEntryPointAndNotItsDrillDowns(t *testing.T) {

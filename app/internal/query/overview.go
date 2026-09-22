@@ -404,11 +404,13 @@ func timeColumnFor(display string, facts *relationFacts) string {
 	return strings.Join(candidates, "|") + "  (ambiguous — confirm with describe_table)"
 }
 
-func (s *Service) renderOverview(database string, tables []tableRef, facts map[string]*relationFacts, timelineColumns string) string {
+func (s *Service) renderOverview(database string, tables []tableRef, facts map[string]*relationFacts, timelineColumns string, withPreamble bool) string {
 	var out strings.Builder
-	out.WriteString(startHereBlock())
-	out.WriteString(fmt.Sprintf(overviewPreamble, database))
-	out.WriteString("\n")
+	if withPreamble {
+		out.WriteString(startHereBlock())
+		out.WriteString(fmt.Sprintf(overviewPreamble, database))
+		out.WriteString("\n")
+	}
 
 	bySchema := map[string][]tableRef{}
 	schemas := make([]string, 0, 8)

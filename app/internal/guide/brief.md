@@ -31,7 +31,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | Conversation around a hit | `pdw context '<ref>' [--before N] [--after N]` |
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL via `--file` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
-| Every relation with row estimates | `pdw schema` |
+| Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
 | Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 
@@ -45,7 +45,7 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 | Search | `search` `{"query", "priorities", "sources", "since", "mode", "max_results"}` |
 | Read-only SQL | `query` `{"queries": [{"question", "sql"}], "format": "csv|json|ndjson"}` (CSV by default) |
 | One relation's exact columns | `describe_table` `{"relation"}` |
-| Every relation with row estimates | `schema_overview` `{}` |
+| Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |
 | Bytes of a stored attachment, photo, recording or Slack file | `get_object` `{"storage_file_id"}` |
 | A reviewed write | `propose_mutation_help`, then `propose_mutation` (topic `mutations`) |
 | Connected upstream MCP servers (skills, tasks, other warehouses) | `connections` to list, `connection_call` to invoke (topic `connections`) |

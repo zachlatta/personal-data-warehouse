@@ -469,6 +469,25 @@ func TestSearchCapsEachPreviewBelowTheGeneralFieldLimit(t *testing.T) {
 	}
 }
 
+func TestSearchLabelsATextlessSlackHitInsteadOfEchoingItsActor(t *testing.T) {
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: {
+		Columns: []string{"source", "who", "context", "title", "text"},
+		Rows: []map[string]any{
+			{"source": "slack", "who": "Birbuh", "context": "#stardance", "title": "", "text": "Birbuh\n#stardance"},
+			{"source": "slack", "who": "Birbuh", "context": "#stardance", "title": "", "text": "Birbuh #stardance here is the deck"},
+			{"source": "gmail", "who": "a@b.c", "context": "a@b.c", "title": "", "text": "a@b.c"},
+		},
+	}}}
+	svc := NewService(runner, Options{MaxFieldChars: 4000})
+	rows := svc.Search(context.Background(), SearchRequest{Query: "stardance", Mode: "keyword"}).Rows.([]map[string]any)
+	if rows[0]["text"] != searchEmptyMessageNote {
+		t.Fatalf("a bare actor+channel document must be labelled, got %q", rows[0]["text"])
+	}
+	if rows[1]["text"] == searchEmptyMessageNote || rows[2]["text"] == searchEmptyMessageNote {
+		t.Fatal("a hit with words of its own, or from another source, is left alone")
+	}
+}
+
 func TestSearchResponseGuidesTheNextStep(t *testing.T) {
 	withHit := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
 	resp := NewService(withHit, Options{}).Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
