@@ -91,6 +91,24 @@ func TestDescribeTableReturnsColumnsIndexesAndRowEstimate(t *testing.T) {
 	}
 }
 
+func TestDescribeTablePutsColumnsBeforeIndexesAndElidesLongPredicates(t *testing.T) {
+	svc := NewService(gmailMessagesRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+	csv := svc.DescribeTable(context.Background(), "gmail.messages").Results[0].CSV
+	columns := strings.Index(csv, "account (text),internal_date")
+	indexes := strings.Index(csv, "# indexes:")
+	if columns < 0 || indexes < 0 || columns > indexes {
+		t.Fatalf("columns must come before the index block (a `head -40` reader cut them off):\n%s", csv)
+	}
+	long := "btree (account, internal_date DESC) WHERE ((is_deleted = 0) AND ((POSITION(('\"attachmentId\"'::text) IN (payload_json)) > 0) OR (payload_json ~ '\"filename\"'::text))) [unique]"
+	got := compactIndexLine(long)
+	if len(got) >= len(long) || !strings.HasSuffix(got, "… [unique]") || !strings.HasPrefix(got, "btree (account, internal_date DESC) WHERE ((is_deleted = 0)") {
+		t.Fatalf("compactIndexLine = %q", got)
+	}
+	if compactIndexLine("btree (a, b) [primary key]") != "btree (a, b) [primary key]" {
+		t.Fatal("a line without a predicate must be untouched")
+	}
+}
+
 func TestDescribeTableResolvesUnqualifiedName(t *testing.T) {
 	svc := NewService(gmailMessagesRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
 

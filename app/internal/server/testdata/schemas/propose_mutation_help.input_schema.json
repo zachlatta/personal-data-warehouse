@@ -1,4 +1,14 @@
 {
   "additionalProperties": false,
+  "properties": {
+    "list_only": {
+      "description": "return only each type's name and summary, without fields or examples",
+      "type": "boolean"
+    },
+    "type": {
+      "description": "one mutation type to document in full, e.g. gmail.send_email; omit for every type",
+      "type": "string"
+    }
+  },
   "type": "object"
 }

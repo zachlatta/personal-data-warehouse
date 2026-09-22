@@ -58,10 +58,11 @@ before the rename can still self-update.)
 After installing:
 
 ```bash
-pdw          # the agent guide (also `pdw readme`, `pdw readme <topic>`); no login needed
+pdw          # the brief agent guide (also `pdw readme`, `pdw readme full|<topic>`); no login needed
 pdw login    # interactive: stores API URL + token in ~/.config/pdw/config.json
 pdw list     # confirms the connection works
 pdw search 'offer letter signed start date'
+pdw context '<ref from a hit>'      # the thread / chat / channel around it
 pdw sql -q 'Find offer letters' "SELECT * FROM timeline.search_text('offer letter', 50)"
 pdw update   # later: self-updates to the newest release
 ```

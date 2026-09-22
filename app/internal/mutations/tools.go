@@ -3,13 +3,14 @@ package mutations
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
 const proposeMutationDescription = "Create a pending upstream mutation request for human review in the Personal Data Warehouse. Does not execute the mutation; returns a request_id and approval_url for the web review UI. Mutations is an array — each entry specifies a type (e.g. gmail.send_email) plus that type's payload fields. Call propose_mutation_help first to see the supported types and the exact payload schema for each."
 
-const proposeMutationHelpDescription = "Return the catalog of mutation types supported by propose_mutation, with field-by-field descriptions and a worked example for each. Takes no arguments. Call this before propose_mutation to see how to shape each mutation entry."
+const proposeMutationHelpDescription = "Return the catalog of mutation types supported by propose_mutation, with field-by-field descriptions and a worked example for each. With no arguments it returns every type (~27 KB); pass type (e.g. gmail.send_email) to get one type's fields and example, or list_only: true for just the type names and summaries. Call this before propose_mutation to see how to shape each mutation entry."
 
 // Tools returns the propose_mutation MCP tools backed by the given service.
 // Returns nil when service is nil so callers can pass the result straight into
@@ -36,14 +37,43 @@ func Tools(service *Service) []tool.Tool {
 			NameStr:        "propose_mutation_help",
 			TitleStr:       "Propose Mutation Help",
 			DescriptionStr: proposeMutationHelpDescription,
-			Handle: func(_ context.Context, _ ProposeMutationHelpInput) (MutationHelpDocument, error) {
-				return MutationHelp(), nil
+			Handle: func(_ context.Context, in ProposeMutationHelpInput) (MutationHelpDocument, error) {
+				return MutationHelpFor(in)
 			},
 		},
 	}
 }
 
-type ProposeMutationHelpInput struct{}
+type ProposeMutationHelpInput struct {
+	Type     string `json:"type,omitempty" jsonschema:"one mutation type to document in full, e.g. gmail.send_email; omit for every type"`
+	ListOnly bool   `json:"list_only,omitempty" jsonschema:"return only each type's name and summary, without fields or examples"`
+}
+
+// MutationHelpFor narrows the catalog. Agents were grepping the 27 KB full
+// document for one type (and once for a type name that does not exist, twice,
+// getting nothing back either time); an unknown type is answered with the
+// list of real ones.
+func MutationHelpFor(in ProposeMutationHelpInput) (MutationHelpDocument, error) {
+	doc := MutationHelp()
+	want := strings.TrimSpace(in.Type)
+	if want != "" {
+		var names []string
+		for _, entry := range doc.Mutations {
+			if entry.Type == want {
+				doc.Mutations = []MutationHelpType{entry}
+				return doc, nil
+			}
+			names = append(names, entry.Type)
+		}
+		return MutationHelpDocument{}, &tool.InvalidInputError{Message: "no mutation type " + want + "; supported types: " + strings.Join(names, ", ")}
+	}
+	if in.ListOnly {
+		for i := range doc.Mutations {
+			doc.Mutations[i] = MutationHelpType{Type: doc.Mutations[i].Type, Summary: doc.Mutations[i].Summary, RequiresEnv: doc.Mutations[i].RequiresEnv}
+		}
+	}
+	return doc, nil
+}
 
 type MutationHelpDocument struct {
 	Overview  string             `json:"overview"`

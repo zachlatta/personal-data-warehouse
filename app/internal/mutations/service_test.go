@@ -131,6 +131,25 @@ func TestProposeMutationRejectsEmptyGmailThreadIDsBeforeStore(t *testing.T) {
 	}
 }
 
+func TestProposeMutationReportsEveryMissingTopLevelFieldAtOnce(t *testing.T) {
+	store := &recordingStore{}
+	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})
+	_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
+		Mutations: []map[string]any{{"type": GmailArchiveOperation, "account": "zach@example.test", "thread_ids": []any{"t1"}}},
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"title must not be blank", "reason must not be blank", "required top-level fields"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error should name every missing field in one reply, got: %v", err)
+		}
+	}
+	if len(store.createCalls) != 0 {
+		t.Fatal("store must not be reached")
+	}
+}
+
 func TestProposeMutationGmailModifyThreadLabels(t *testing.T) {
 	store := &recordingStore{request: Request{ID: "req-labels", Status: "pending_review"}}
 	service := NewService(store, Config{BaseURL: "https://mcp.example.test"})

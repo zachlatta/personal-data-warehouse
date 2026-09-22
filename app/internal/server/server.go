@@ -96,7 +96,7 @@ type sqlInput struct {
 // the layer order to walk when SQL really is needed. Since 2026-09-09 the full
 // agent guide is the `readme` tool, so this paragraph opens by naming it: the
 // instructions are the one thing an MCP client shows before the first call.
-var serverInstructions = "Call the readme tool first: it is the agent guide to this warehouse (workflow, command map, priority tiers, SQL rules, where each domain lives), with topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Tools named <connection>__<tool> are live upstream MCP tools, not warehouse queries; they may write directly using the connected account. " +
+var serverInstructions = "Call the readme tool first: it is the brief agent guide to this warehouse (workflow, tool map, priority tiers, SQL traps, where each domain lives), with topic full for the long form and topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Connected upstream MCP servers (skills, tasks, other warehouses) are reached through the connections tool (list, then a tool's schema) and connection_call; they are live upstream calls with the connected account, not warehouse queries, and they may write. " +
 	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
 	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
@@ -108,10 +108,10 @@ const schemaFirstReminder = "Call schema_overview first, then describe_table for
 const queryDescription = "The single MCP SQL entry point. Run read-only Postgres SQL and return each bounded result in full, without cursor helper tools or field truncation. " + schemaFirstReminder + timelinePrioritySQLReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
 var searchDescription = "FIRST tool for any text, topic, person, phrase, or identifier lookup across all synced sources; it searches the cross-source timeline and needs no schema discovery. " +
-	"Phrase query as words the ANSWERING RECORD would contain: use \"runway burn rate months cash remaining\", not \"how long our money lasts\". Add likely record-language synonyms. " +
-	"hybrid (default) fuses semantic, keyword, and short literal retrieval; exact is strongest when every hit must contain an identifier/path/filename/literal phrase; keyword is BM25-only. " +
-	"Scope with priorities when the question is about attention rather than content — " + warehouse.TimelinePriorityParentheticalDefinitions() + ". The default is every tier; for attention or correspondence use " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + ". Scope with sources/since only when known. " +
-	"Every hit carries priority plus ref, source_table and source_pk: use ref with timeline.context(ref, 5, 5) for surrounding messages, source_table/source_pk to reach the raw row (timeline -> marts_* -> base_*). The response tells you how to recover from zero results."
+	"Query with the FEWEST distinctive words the answering record would contain (\"runway burn rate months cash remaining\", not \"how long our money lasts\"); on a miss drop words. " +
+	"hybrid (default) fuses semantic, keyword and literal retrieval; exact when every hit must contain an identifier, path, amount or literal phrase; keyword is BM25-only. " +
+	"Scope with priorities for attention questions — " + warehouse.TimelinePriorityParentheticalDefinitions() + "; attention or correspondence is " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + ". Default max_results 10. " +
+	"Every hit carries priority, ref, source_table and source_pk: timeline.context(ref, 5, 5) through query reads the conversation around it; source_table/source_pk reach the raw row."
 
 const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
 
@@ -151,8 +151,18 @@ func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp
 	}, &mcp.ServerOptions{Instructions: serverInstructions})
 	serverLogger.Debug("registering MCP tools")
 	hooks := mcpToolHooks(serverLogger)
+	var proxied []tool.Tool
 	for _, t := range registry.Filter(toolShowsOnMCP).All() {
+		if isConnectionTool(t) && !listConnectionToolsFlat() {
+			proxied = append(proxied, t)
+			continue
+		}
 		t.RegisterMCP(server, hooks)
+	}
+	if len(proxied) > 0 {
+		for _, t := range connectionTools(proxied) {
+			t.RegisterMCP(server, hooks)
+		}
 	}
 	return server
 }

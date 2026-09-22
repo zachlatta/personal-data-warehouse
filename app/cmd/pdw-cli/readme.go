@@ -12,12 +12,12 @@ import (
 var readmeUsage = `pdw readme - the agent guide to the warehouse.
 
 USAGE
-  pdw readme [topic]
+  pdw readme [full|topic]
 
-With no topic, prints the main guide: the search-first workflow, the command
-map, the priority tiers, the SQL rules, where each domain lives, and what a
-negative result means. Bare "pdw" prints the same thing. With a topic, prints
-that deep-dive section.
+With no topic, prints the brief guide: the search-first workflow, the command
+map, the priority tiers, the SQL traps, where each domain lives. Bare "pdw"
+prints the same thing. "full" prints the complete guide; a topic prints that
+deep-dive section.
 
 TOPICS
 ` + readmeTopicLines() + `

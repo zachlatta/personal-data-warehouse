@@ -71,7 +71,7 @@ var topics = []Topic{
 	{Name: "ingest", Summary: "local uploaders and credential publishers (`pdw ingest`, `pdw slack|chatgpt|whoop publish-session`)", CLIOnly: true},
 }
 
-//go:embed readme.md topics/*.md
+//go:embed brief.md readme.md topics/*.md
 var files embed.FS
 
 // Topics returns the index visible on a surface, in listing order.
@@ -107,13 +107,20 @@ func (e *UnknownTopicError) Error() string {
 	return fmt.Sprintf("no readme topic %q; topics are: %s", e.Topic, strings.Join(TopicNames(e.Surface), ", "))
 }
 
-// Render returns the main guide when topic is empty, or one topic's section.
+// Render returns the brief guide when topic is empty, the full guide for
+// "full", or one topic's section.
 func Render(surface Surface, topic string) (string, error) {
 	topic = strings.ToLower(strings.TrimSpace(topic))
 	// Accept the spellings agents reach for: `agent_sessions`, `AgentSessions`.
 	topic = strings.ReplaceAll(topic, "_", "-")
 	topic = strings.ReplaceAll(topic, " ", "-")
-	if topic == "" || topic == "readme" || topic == "index" {
+	// The brief is what every session reads; the full guide is a topic of
+	// its own, because measured across real sessions the 14 KB main page was
+	// re-read at the top of every session whatever the question was.
+	if topic == "" || topic == "brief" || topic == "index" {
+		return render(surface, "brief.md")
+	}
+	if topic == "full" || topic == "readme" || topic == "long" {
 		return render(surface, "readme.md")
 	}
 	for _, t := range Topics(surface) {

@@ -105,14 +105,21 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 }
 
 func (s *Service) validateCreateInput(input CreateRequestInput) error {
+	// Every missing top-level field in ONE error: a real session paid a
+	// round trip for "title must not be blank", fixed it, and paid another
+	// for "reason must not be blank".
+	var missing []string
 	if input.Title == "" {
-		return errors.New("title must not be blank")
+		missing = append(missing, "title must not be blank")
 	}
 	if input.Reason == "" {
-		return errors.New("reason must not be blank")
+		missing = append(missing, "reason must not be blank")
 	}
 	if len(input.Mutations) == 0 {
-		return errors.New("mutations must include at least one mutation")
+		missing = append(missing, "mutations must include at least one mutation")
+	}
+	if len(missing) > 0 {
+		return errors.New(strings.Join(missing, "; ") + " (required top-level fields: title, reason, mutations)")
 	}
 	for index, mutation := range input.Mutations {
 		if err := s.validateMutation(index, mutation); err != nil {

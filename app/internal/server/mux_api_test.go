@@ -410,8 +410,8 @@ func TestAPIProposeMutationValidationReturnsActionable400(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d error = %#v, want 400", resp.StatusCode, envelope.Error)
 	}
-	if envelope.Error.Code != "invalid_input" || envelope.Error.Message != "title must not be blank" {
-		t.Fatalf("error = %#v", envelope.Error)
+	if envelope.Error.Code != "invalid_input" || !strings.HasPrefix(envelope.Error.Message, "title must not be blank") || !strings.Contains(envelope.Error.Message, "reason must not be blank") {
+		t.Fatalf("every missing top-level field should be named in one reply: %#v", envelope.Error)
 	}
 }
 

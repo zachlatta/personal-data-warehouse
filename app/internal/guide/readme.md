@@ -5,13 +5,12 @@ Google Contacts, iMessage and SMS, WhatsApp, Apple Notes, Apple Photos, Apple Vo
 WHOOP health, Plaid and statement-backed finances, meeting and voice-memo transcripts, and
 every prior AI agent session across all providers and machines. Any question about Zach's
 own life starts here — not from priors, not from a web search, and not from a single-source
-connector, which cannot join the half of the story that lived in another app. Reads are
-safe. Built-in writes require human approval; connected MCP tools may write directly.
+connector. Reads are safe. Built-in writes require human approval; connected MCP tools may write directly.
 
 This document is the contract for using it well. Read a topic when your question enters
 its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.
-Never trust a relation or column name from memory, including one you read here: the
-warehouse is re-layered often, and the discovery calls below are what is current.
+Never trust a relation or column name from memory, including one you read here; the
+discovery calls below are what is current.
 
 ## The workflow: search first, SQL second
 
@@ -21,7 +20,9 @@ warehouse is re-layered often, and the discovery calls below are what is current
 2. **Read the conversation** around a useful hit — a Gmail hit returns its thread, a Slack
    hit its thread or channel, a chat hit the rest of that chat, an agent turn its
    neighbouring turns:
-{{if .CLI}}   `pdw sql -q 'context around a hit' "SELECT * FROM timeline.context('<ref>', 5, 5)"`{{else}}   `query` with `{"queries": [{"question": "context around a hit", "sql": "SELECT * FROM timeline.context('<ref>', 5, 5)"}]}`{{end}}
+{{if .CLI}}   `pdw context '<ref>'` (or `pdw sql -q 'context around a hit' "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"`){{else}}   `query` with `{"queries": [{"question": "context around a hit", "sql": "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"}]}`{{end}}
+   Name the columns: `SELECT *` on `timeline.context()` returns `metadata` and the full
+   `search_text` of every row, seven times the size of the three columns you read.
 3. **Structured questions** (aggregates, joins, predicates, drill-down) are SQL, walked
    in layer order: bounded `timeline.events` filtered by priority → `marts_*` (stable
    per-domain read views) → `base_*` (raw provider rows, reached from a hit's
@@ -31,19 +32,17 @@ warehouse is re-layered often, and the discovery calls below are what is current
 
 Do not open with schema discovery because SQL may be useful later; do not `ILIKE` a raw
 `base_*` body column (it times out, and the SQL tool warns on that shape); do not guess a
-second name after a 42703/42P01 — re-check the columns and read the server's hint. This
-order is measured: `marts_ops.agent_usage` grades every agent source on search-first
-sessions (target ≥ 60%), searches carrying a priority filter (≥ 40%), and SQL-error
-sessions (< 10%).
+second name after a 42703/42P01 — re-check the columns and read the server's hint. `marts_ops.agent_usage` measures whether this order is followed.
 
 ## Command map
 
 {{if .CLI -}}
 | You want | Run |
 | --- | --- |
-| This guide, or one topic | `pdw readme [topic]` (bare `pdw` prints the guide) |
-| Search every source | `pdw search [--priority TIERS] [--source NAMES] [--since DATE] [--mode hybrid\|keyword\|exact] [-n N] '<terms>'` |
-| Read-only SQL | `pdw sql --output json -q '<why>' '<SQL>'` (multi-line SQL: `--file q.sql` or stdin) |
+| The brief, this full guide, or one topic | `pdw readme [full\|topic]` (bare `pdw` prints the brief) |
+| Search every source | `pdw search [--priority TIERS] [--source NAMES] [--since DATE] [--mode hybrid\|keyword\|exact] [-n N] [--full] '<terms>'` (one line per hit; `--full` for long previews) |
+| The conversation around a hit | `pdw context '<ref>' [--before N] [--after N]` |
+| Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL: `--file q.sql` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates | `pdw schema` |
 | The other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
@@ -51,14 +50,14 @@ sessions (< 10%).
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
 
 Commands agents invent that do not exist: `pdw query`, `pdw schema_overview`,
-`pdw describe_table`, `pdw call sql|query|search|schema_overview|describe_table` (each is
-refused with the real command). `pdw --version` runs `pdw version` since 2026-09-10. Always pass
-`--output csv|json|nd-json` and a real `-q` intent in scripts; the SQL tool logs the
-intent server-side.
+`pdw describe_table`, `pdw call sql|query|search|schema_overview|describe_table` (refused
+with the real command). Pass a
+real `-q` intent; the SQL tool logs it server-side. Shape hints go to stderr only for the
+default CSV output, so `--output json` stays parseable through `2>&1`.
 {{- else -}}
 | You want | Call |
 | --- | --- |
-| This guide, or one topic | `readme` (`{}` or `{"topic": "<name>"}`) |
+| The brief, this full guide, or one topic | `readme` (`{}`, `{"topic": "full"}` or `{"topic": "<name>"}`) |
 | Search every source | `search` `{"query": "...", "priorities": [...], "sources": [...], "since": "YYYY-MM-DD", "mode": "hybrid|keyword|exact", "max_results": N}` |
 | Read-only SQL | `query` `{"queries": [{"question": "<why>", "sql": "<SQL>"}], "format": "csv|json|ndjson"}` |
 | One relation's exact columns | `describe_table` `{"relation": "<schema.relation>"}` |
@@ -76,17 +75,15 @@ credential publishers exist only there.
 ## Search well
 
 Search with the **fewest, most distinctive words the answering record would contain** — a
-name, an id, a product, an amount, a subject-line phrase — not the question, and not a
-long bag of generic terms. Measured on the labeled benchmark: a bare identifier scores
-MRR 0.68, a term bag 0.42, a sentence-shaped question 0.29, and **adding generic words to
+name, an id, a product, an amount, a subject-line phrase — not the question. Measured on the labeled benchmark, a bare identifier
+scores MRR 0.68, a term bag 0.42, a question 0.29, and **adding generic words to
 a distinctive anchor hurts** ("Mt Foolery" ranks first; the same anchor inside
 "Mt Foolery cancelled postponed weather" is not in the top 50). Search an identifier alone. Prefer several short
 searches over one long one. On a miss, drop words rather than add them; when the tool
 attaches a `hint`, act on it.
 
 - `hybrid` (default) fuses semantic, BM25 and a gated literal leg by rank; `exact` for a
-  literal phrase, email address, phone, amount, URL, path or id (number-format variants
-  match: `1441.52` finds `1,441.52`); `keyword` for BM25 only.
+  literal phrase, email address, phone, amount, URL, path or id; `keyword` for BM25 only.
 - Scope by `sources` (`gmail`, `slack`, `apple_messages`, `whatsapp`, `calendar`, `drive`,
   `contacts`, `notes`, `photos`, `voice_memos`/`transcripts`, `agent_session`, `finance`,
   `whoop`, ...; an unknown token errors with the valid list) and `since` when the request
@@ -143,7 +140,7 @@ More in topic `sql`.
 | domain | start at |
 | --- | --- |
 | everything, cross-source | `timeline.events`, `timeline.search_text()`, `timeline.search_text_exact()`, `timeline.context()` |
-| mail | `base_gmail.messages`, `base_gmail.attachments`, `marts_inbox.gmail_threads` |
+| mail | `base_gmail.messages` (read `body_markdown_clean`, not `body_text`, which is tracking URLs), `base_gmail.attachments`, `marts_inbox.gmail_threads` |
 | chat | `marts_messages.messages` (iMessage + WhatsApp, sender-resolved), `base_slack.messages`, `marts_inbox.slack_items`, `marts_slack.huddles` |
 | calendar and contacts | `base_google_calendar.events`, `marts_contacts.contacts`, `marts_contacts.contact_points` |
 | files, notes, photos | `base_google_drive.files`, `derived_documents.google_drive_file_texts`, `base_apple_notes.notes`, `marts_photos.photos`, `marts_files.attachments` |
@@ -164,14 +161,17 @@ reporting a negative, check the source's freshness (`marts_ops.pipeline_health`,
 reaches PDW (metadata only, `marts_slack.huddles`); a bank may hand Plaid only ~90 days
 of history, so older spending lives in the statement corpus
 (`base_manual_finance.documents`); Slack public channels Zach is not a member of are
-swept slowly and were frozen for months before 2026-08-27. State the window and the
+swept slowly. State the window and the
 freshness of what you read.
 
 ## Connected MCP servers
 
 Tools named `<connection>__<tool>` call a live upstream MCP server, not the warehouse.
-They may write directly without PDW mutation review. Configure and authenticate on the
-web app's `/connections` page; see topic `connections` for discovery, access and limits.
+They may write directly without PDW mutation review. {{if .CLI}}`pdw list` names them and `pdw call`
+invokes them.{{else}}They are not in the tool list: `connections` lists a connection's tools with their
+schemas and `connection_call` invokes one, so ~190 upstream definitions do not sit in every
+session's context.{{end}} Configure and authenticate on the web app's `/connections` page; see topic
+`connections` for discovery, access and limits.
 
 ## Writes
 

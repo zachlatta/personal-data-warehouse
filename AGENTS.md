@@ -152,7 +152,8 @@ quietly becoming untrue, and several of these have been.
   54), unscoped hybrid **p50 2.09s / p90 3.54s / max 3.59s** — `attention` by 90ms against
   the 2s goal, which is the honest distance left.
 - **C9 — one obvious way to do a thing, on both surfaces.** There is exactly one hybrid
-  search, one SQL entry point per surface, one schema-discovery call. *Held up by*
+  search, one SQL entry point per surface, one schema-discovery call, one way to read the
+  conversation around a hit (`pdw context <ref>`; see [The agent guide](#the-agent-guide)). *Held up by*
   `tool.Surface` splitting MCP-only and CLI-only tools, the `runCall` fence that refuses
   `pdw call sql|query|search|schema_overview|describe_table` with a redirect, and the usage
   drift tests in `app/cmd/pdw-cli/usage_test.go`, which derive the command list from the
@@ -219,15 +220,30 @@ catches and which fail silently, is [Adding a warehouse source](#adding-a-wareho
 ## The agent guide
 
 **The manual for using the warehouse lives in the binary, not in a skill.** `pdw readme
-[topic]` (and a bare `pdw`) on the CLI, the `readme` tool over MCP — both rendered from
-`app/internal/guide/` (`readme.md` plus `topics/*.md`, Go templates whose only branching
-is the surface's own spelling of each call). The fleet skill is one line that says to read
+[full|topic]` (and a bare `pdw`) on the CLI, the `readme` tool over MCP — both rendered from
+`app/internal/guide/` (`brief.md`, `readme.md` plus `topics/*.md`, Go templates whose only
+branching is the surface's own spelling of each call). **The brief is what a session reads
+by default** (~6 KB, capped at 8 KB by `guide_test.go`); `pdw readme full` / `{"topic":
+"full"}` is the long form (capped at 14 KB). Measured over twelve real sessions on
+2026-09-22, the skill plus the full guide cost 25–45 KB before the first data call
+whatever the question was — a one-line phone-number lookup paid eight times its own
+answer in preamble — which is why the default is the brief. The same audit added
+`pdw context <ref>` (the first-class spelling of `timeline.context()`, naming its columns:
+`SELECT *` there returned `metadata` and the full `search_text` of every row, 3.8 KB
+against 0.5 KB for the three columns anyone reads, and it was used a quarter as often as
+search because the ref had to be quoted inside a quoted statement), a one-line-per-hit
+search output (`--full` for the old previews, `-n 10` default, an unknown flag anywhere
+is an error rather than query text), and on MCP `connections` + `connection_call` in
+place of a flat listing of every connected upstream tool: that list was 196 tools /
+153 KB (~38k tokens) of definitions in every MCP session, 142 KB of it proxied, and the
+sessions paying it almost never called one (`PDW_MCP_LIST_CONNECTION_TOOLS=1` restores
+the flat list; `pdw list` / `pdw call` are unchanged). The fleet skill is one line that says to read
 it. Until 2026-09-09 the guide was a hand-transcribed skill outside this repository that
 drifted from the code on every reorg; now `app/internal/guide/guide_test.go` fails when
 the guide names a relation the catalog does not have, omits a priority tier or selection,
 teaches a command the CLI refuses, indexes a topic that does not exist, or outgrows one
-sitting (14 KB for the main page). So **editing the guide is how a warehouse change reaches
-agents**: a change that alters what an agent should do first, which relation a domain
+sitting (14 KB for the full page, 8 KB for the brief). So **editing the guide is how a warehouse
+change reaches agents**: a change that alters what an agent should do first, which relation a domain
 starts at, or a trap it must know is not done until the guide says so — a new source goes
 in `topics/sources.md`, a new command in the command map. Keep the main page to what every
 session needs and put depth in a topic. The repository is public: no incident amounts, no

@@ -14,16 +14,20 @@ func TestCallMCPErrorPreservesEnvelopeAndFails(t *testing.T) {
 			srv := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				if r.Method != "POST" {
-					t.Error("unexpected schema discovery")
+					// An argument error is answered with the schema inline,
+					// which needs one listing call; a real session guessed
+					// schema/table/schema_name across seven round trips.
+					fmt.Fprint(w, `{"data":[{"name":"remote__list","title":"","description":"","input_schema":{"type":"object","properties":{"schema_name":{"type":"string"}},"required":["schema_name"]}}]}`)
+					return
 				}
 				fmt.Fprint(w, `{"data":{"isError":true,"error":"also a top-level error","structuredContent":{"detail":"failure-detail"},"content":[{"type":"text","text":"Invalid arguments"},{"type":"image","data":"image-data"}]}}`)
 			})
 			out, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__list", "--output", format)
-			if code != 1 || calls != 1 {
+			if code != 1 || calls != 2 {
 				t.Fatalf("code=%d calls=%d stderr=%s", code, calls, diagnostics)
 			}
-			if !strings.Contains(diagnostics, "pdw describe remote__list") {
-				t.Fatal(diagnostics)
+			if !strings.Contains(diagnostics, "Input schema for remote__list") || !strings.Contains(diagnostics, `"required":["schema_name"]`) {
+				t.Fatalf("argument error should carry the input schema inline: %s", diagnostics)
 			}
 			preserved := out
 			if format != "json" {
@@ -33,6 +37,21 @@ func TestCallMCPErrorPreservesEnvelopeAndFails(t *testing.T) {
 				t.Fatalf("lost envelope: %s", preserved)
 			}
 		})
+	}
+}
+
+func TestCallMCPErrorWithoutArgumentWordingDoesNotDiscover(t *testing.T) {
+	calls := 0
+	srv := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != "POST" {
+			t.Error("unexpected schema discovery")
+		}
+		fmt.Fprint(w, `{"data":{"isError":true,"content":[{"type":"text","text":"upstream exploded"}]}}`)
+	})
+	_, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__list")
+	if code != 1 || calls != 1 || !strings.Contains(diagnostics, "pdw describe remote__list") {
+		t.Fatalf("code=%d calls=%d stderr=%s", code, calls, diagnostics)
 	}
 }
 
@@ -49,7 +68,7 @@ func TestCallOutputFormats(t *testing.T) {
 		{"no guess", `{"content":[{"type":"text","text":"{\"x\":1}"}]}`, "structured", "", "already executed", 1},
 		{"legacy", `{"ok":true}`, "json", "{\n  \"ok\": true\n}\n", "", 0},
 		{"false", `{"isError":false,"content":[]}`, "text", "", "", 0},
-		{"missing content", `{"ok":true}`, "text", "", "already executed", 1},
+		{"missing content", `{"ok":true}`, "text", "{\"ok\":true}\n", "", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0

@@ -170,9 +170,9 @@ func TestSQLCommandDefaultOutputsNoteAndCSV(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected zero exit, got %d (stderr=%s)", code, errOut)
 	}
-	wantOut := sqlOutputHint + "\n" + "n\n1\n2\n"
+	wantOut := "n\n1\n2\n"
 	if out != wantOut {
-		t.Fatalf("sql CLI output = %q, want %q", out, wantOut)
+		t.Fatalf("sql CLI output = %q, want %q (no note line: it cost a line on every call)", out, wantOut)
 	}
 	if strings.Contains(out, `"rows"`) || strings.Contains(out, `"total_rows"`) {
 		t.Fatalf("sql CLI should print row output, not response metadata:\n%s", out)
@@ -196,9 +196,6 @@ func TestSQLCommandExplicitJSONOmitsDefaultNote(t *testing.T) {
 	}
 	if input["sql"] != "SELECT 1 AS n" || input["format"] != "json" || input["question"] != "What is one?" {
 		t.Fatalf("request input = %#v", input)
-	}
-	if strings.Contains(out, sqlOutputHint) {
-		t.Fatalf("explicit output should not print default note:\n%s", out)
 	}
 	if !strings.Contains(out, "[\n  {\n    \"n\": 1\n  }\n]") {
 		t.Fatalf("json rows were not pretty-printed:\n%s", out)
@@ -305,13 +302,40 @@ func TestSQLCommandQuestionFlagReachesServer(t *testing.T) {
 // TestSQLCommandTooManyArgsErrorIsOneLineWithExample covers the old
 // two-positional footgun: passing question + SQL positionally now fails with a
 // single actionable line that points at -q, never the full usage blob.
+func TestSQLCommandAcceptsTheOldPositionalQuestionWithAWarning(t *testing.T) {
+	// `pdw sql "<question>" "<sql>"` was the command's shape until 2026-09
+	// and agents still type it (14 dead calls in one fortnight). It runs, and
+	// the one-line stderr note names -q.
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"sql":"SELECT 1","format":"csv","rows":"n\n1","total_rows":1}}`)
+	})
+	out, errOut, code := runCLI(t, srv.URL, "", "sql", "What is one?", "SELECT 1")
+	if code != 0 {
+		t.Fatalf("old positional form should be accepted, exit %d: %s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["question"] != "What is one?" || input["sql"] != "SELECT 1" {
+		t.Fatalf("request input = %#v", input)
+	}
+	if out != "n\n1\n" {
+		t.Fatalf("stdout = %q", out)
+	}
+	assertSQLErrorErgonomic(t, errOut)
+	if !strings.Contains(errOut, "-q") || !strings.Contains(errOut, sqlExample) {
+		t.Fatalf("the note should point at -q with an example: %s", errOut)
+	}
+}
+
 func TestSQLCommandTooManyArgsErrorIsOneLineWithExample(t *testing.T) {
 	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
 		t.Fatal("server should not be hit")
 	})
-	_, errOut, code := runCLI(t, srv.URL, "", "sql", "What is one?", "SELECT 1")
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "SELECT 1", "SELECT 2")
 	if code == 0 {
-		t.Fatalf("expected non-zero exit for two positional args")
+		t.Fatalf("expected non-zero exit for two SQL positional args")
 	}
 	assertSQLErrorErgonomic(t, errOut)
 	if !strings.Contains(errOut, "-q") {

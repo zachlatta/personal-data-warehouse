@@ -74,3 +74,22 @@ func TestMutationHelpDocumentsGmailThreadLabelChanges(t *testing.T) {
 		t.Fatalf("Gmail label notes do not explain names and IDs: %q", labels.ExtraNotes)
 	}
 }
+
+func TestMutationHelpForNarrowsToOneTypeOrTheList(t *testing.T) {
+	one, err := MutationHelpFor(ProposeMutationHelpInput{Type: GmailSendEmailOperation})
+	if err != nil || len(one.Mutations) != 1 || one.Mutations[0].Type != GmailSendEmailOperation || len(one.Mutations[0].Fields) == 0 {
+		t.Fatalf("one type: %#v err=%v", one.Mutations, err)
+	}
+	if _, err := MutationHelpFor(ProposeMutationHelpInput{Type: "contacts.batch_mutation"}); err == nil || !strings.Contains(err.Error(), GmailSendEmailOperation) {
+		t.Fatalf("an unknown type must name the real ones: %v", err)
+	}
+	list, err := MutationHelpFor(ProposeMutationHelpInput{ListOnly: true})
+	if err != nil || len(list.Mutations) != len(MutationHelp().Mutations) {
+		t.Fatalf("list: %d types err=%v", len(list.Mutations), err)
+	}
+	for _, entry := range list.Mutations {
+		if len(entry.Fields) != 0 || entry.Example != nil || entry.Type == "" || entry.Summary == "" {
+			t.Fatalf("list_only entry should carry only type and summary: %#v", entry)
+		}
+	}
+}

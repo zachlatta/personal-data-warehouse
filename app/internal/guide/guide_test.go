@@ -15,7 +15,7 @@ import (
 
 func renderAll(t *testing.T, surface Surface) map[string]string {
 	t.Helper()
-	out := map[string]string{"": mustRender(t, surface, "")}
+	out := map[string]string{"": mustRender(t, surface, ""), "full": mustRender(t, surface, "full")}
 	for _, topic := range Topics(surface) {
 		out[topic.Name] = mustRender(t, surface, topic.Name)
 	}
@@ -168,17 +168,34 @@ func TestGuideTeachesNoRefusedOrInventedCommand(t *testing.T) {
 }
 
 func TestMainGuideStaysReadableInOneSitting(t *testing.T) {
-	// The main guide is read by every session; the depth belongs in topics.
-	// The cap is generous but real -- a guide that grows into the old skill
-	// stops being read.
+	// The brief is read by every session, so its size is a per-session tax:
+	// measured over twelve real sessions the old 14 KB main page plus the
+	// fleet skill cost 25-45 KB before the first data call, whatever the
+	// question was. The full guide is still capped so it stays one sitting.
 	for _, surface := range []Surface{SurfaceCLI, SurfaceMCP} {
-		text := mustRender(t, surface, "")
-		if n := len(text); n > 14_000 {
-			t.Fatalf("%s main guide is %d bytes; move detail into a topic (cap 14000)", surface, n)
+		brief := mustRender(t, surface, "")
+		if n := len(brief); n > 8_000 {
+			t.Fatalf("%s brief guide is %d bytes; move detail into the full guide or a topic (cap 8000)", surface, n)
 		}
-		if n := len(text); n < 6_000 {
-			t.Fatalf("%s main guide is only %d bytes; it lost content", surface, n)
+		if n := len(brief); n < 3_000 {
+			t.Fatalf("%s brief guide is only %d bytes; it lost content", surface, n)
 		}
+		full := mustRender(t, surface, "full")
+		if n := len(full); n > 14_000 {
+			t.Fatalf("%s full guide is %d bytes; move detail into a topic (cap 14000)", surface, n)
+		}
+		if n := len(full); n < 6_000 {
+			t.Fatalf("%s full guide is only %d bytes; it lost content", surface, n)
+		}
+	}
+}
+
+func TestBriefNamesTheFullGuide(t *testing.T) {
+	if !strings.Contains(mustRender(t, SurfaceCLI, ""), "pdw readme full") {
+		t.Fatal("CLI brief does not say how to reach the full guide")
+	}
+	if !strings.Contains(mustRender(t, SurfaceMCP, ""), `{"topic": "full"}`) {
+		t.Fatal("MCP brief does not say how to reach the full guide")
 	}
 }
 

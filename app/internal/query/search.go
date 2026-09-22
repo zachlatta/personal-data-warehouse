@@ -27,7 +27,9 @@ const (
 // The earlier default of 50 routinely produced tens of thousands of output
 // tokens, so agents piped the response through ad-hoc Python or `head` and lost
 // the metadata and lower-ranked hits anyway.
-const searchDefaultMaxResults = 20
+// 10 since 2026-09-22: on MCP a 20-hit page ran 14-63 KB and one real
+// search was refused by the client at 79,804 characters.
+const searchDefaultMaxResults = 10
 
 const (
 	searchHitGuidance = "For an email, chat/channel, or agent-turn hit, read the conversation " +
@@ -448,6 +450,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	} else {
 		resp.Guidance = searchHitGuidance
 	}
+	capSearchPreviews(raw.Rows)
 	resp.Rows, resp.Truncations, err = s.formatRows(raw.Columns, raw.Rows, 0, len(raw.Rows), "json")
 	if err != nil {
 		resp.Error = err.Error()
@@ -456,6 +459,25 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	s.logger.InfoContext(ctx, "search completed", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "rows", resp.TotalRows, "duration", time.Since(started))
 	return resp
+}
+
+// searchPreviewMaxRunes bounds each hit's text preview. The SQL layer windows
+// a preview to 8,000 characters and the general field cap is 4,000; on MCP a
+// default 20-hit page therefore ran to 63 KB, and one real session's search
+// came back at 79,804 characters and was refused by the client outright.
+// 1,200 keeps the matched window and a paragraph either side.
+const searchPreviewMaxRunes = 1200
+
+func capSearchPreviews(rows []map[string]any) {
+	for _, row := range rows {
+		text, ok := row["text"].(string)
+		if !ok {
+			continue
+		}
+		if runes := []rune(text); len(runes) > searchPreviewMaxRunes {
+			row["text"] = string(runes[:searchPreviewMaxRunes]) + "…"
+		}
+	}
 }
 
 // runHybridSearch fans BM25, one ANN call, and the

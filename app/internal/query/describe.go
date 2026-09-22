@@ -67,17 +67,22 @@ func (s *Service) DescribeTable(ctx context.Context, relation string) Response {
 			out.WriteString("# " + line + "\n")
 		}
 	}
-	if lines := s.tableIndexList(ctx, ref); len(lines) > 0 {
-		out.WriteString("# indexes:\n")
-		for _, line := range lines {
-			out.WriteString("#   ")
-			out.WriteString(line)
-			out.WriteString("\n")
-		}
-	}
+	// Columns first: they are the answer, and a caller piping through
+	// `head -40` (as real sessions do) must never cut them off behind the
+	// index block. Partial-index predicates are elided past a short prefix --
+	// on base_gmail.messages they were half the whole reply and nobody
+	// writes SQL from them.
 	out.WriteString("\n")
 	out.WriteString(described.CSV)
 	out.WriteString("\n")
+	if lines := s.tableIndexList(ctx, ref); len(lines) > 0 {
+		out.WriteString("\n# indexes:\n")
+		for _, line := range lines {
+			out.WriteString("#   ")
+			out.WriteString(compactIndexLine(line))
+			out.WriteString("\n")
+		}
+	}
 
 	result.CSV = out.String()
 	s.logger.InfoContext(ctx, "describe table completed", "relation", ref.DisplayName(), "duration", time.Since(started))
@@ -237,6 +242,30 @@ func (s *Service) tableRowEstimate(ctx context.Context, ref tableRef) (int64, bo
 	}
 	estimate, ok := int64Value(result.Rows[0]["row_estimate"])
 	return estimate, ok
+}
+
+// indexPredicateKeepChars is how much of a partial-index WHERE clause the
+// listing keeps before an ellipsis.
+const indexPredicateKeepChars = 48
+
+func compactIndexLine(line string) string {
+	idx := strings.Index(line, " WHERE ")
+	if idx < 0 {
+		return line
+	}
+	flag := ""
+	for _, suffix := range []string{" [primary key]", " [unique]"} {
+		if strings.HasSuffix(line, suffix) {
+			flag = suffix
+			line = strings.TrimSuffix(line, suffix)
+			break
+		}
+	}
+	predicate := line[idx+len(" WHERE "):]
+	if len(predicate) > indexPredicateKeepChars {
+		predicate = predicate[:indexPredicateKeepChars] + "…"
+	}
+	return line[:idx] + " WHERE " + predicate + flag
 }
 
 // tableIndexList reads one relation's indexes in the same rendering the schema

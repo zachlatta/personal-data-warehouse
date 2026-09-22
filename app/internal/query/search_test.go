@@ -142,8 +142,8 @@ func TestSearchKeywordModeRunsSearchText(t *testing.T) {
 }
 
 func TestSearchDefaultResultCountBoundsLLMOutput(t *testing.T) {
-	if searchDefaultMaxResults != 20 {
-		t.Fatalf("default max_results = %d, want 20", searchDefaultMaxResults)
+	if searchDefaultMaxResults != 10 {
+		t.Fatalf("default max_results = %d, want 10", searchDefaultMaxResults)
 	}
 }
 
@@ -449,6 +449,23 @@ func TestSearchTruncatesLongFieldsLikeQueryResults(t *testing.T) {
 	}
 	if len(resp.Truncations) != 1 || resp.Truncations[0].Total != 50 || resp.Truncations[0].Returned != 10 {
 		t.Fatalf("truncations = %#v", resp.Truncations)
+	}
+}
+
+func TestSearchCapsEachPreviewBelowTheGeneralFieldLimit(t *testing.T) {
+	long := strings.Repeat("y", 3000)
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: {
+		Columns: []string{"text", "title"},
+		Rows:    []map[string]any{{"text": long, "title": long}},
+	}}}
+	svc := NewService(runner, Options{MaxFieldChars: 4000})
+	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	rows := resp.Rows.([]map[string]any)
+	if got := rows[0]["text"].(string); len([]rune(got)) != searchPreviewMaxRunes+1 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("text preview should be capped at %d runes, got %d", searchPreviewMaxRunes, len([]rune(got)))
+	}
+	if rows[0]["title"] != long {
+		t.Fatal("only the preview column is capped")
 	}
 }
 

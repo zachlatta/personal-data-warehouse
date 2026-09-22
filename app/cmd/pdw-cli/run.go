@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -28,10 +29,10 @@ how to use the warehouse well, starting at the timeline. Read it once per
 session; read a topic when a question enters that domain.
 
 COMMANDS
-  readme [topic]             Print the agent guide, or one of its topics
-                             (connections, search, sql, sources, agent-sessions, finance,
-                             health, slack, mutations, ops, ingest). Needs no
-                             URL or token. Run "pdw readme --help" for the list.
+  readme [full|topic]        Print the brief agent guide (bare "pdw" too), the
+                             full guide ("full"), or one topic (connections, search,
+                             sql, sources, agent-sessions, finance, health, slack,
+                             mutations, ops, ingest). Needs no URL or token.
   login                      Save warehouse URL + token to a per-user config file
                              so future runs need no env vars or flags.
                                --base-url URL  Warehouse URL (else prompted; defaults
@@ -54,7 +55,8 @@ COMMANDS
                              the normal CLI search path; no JSON or SQL required.
                              Run "pdw search --help" for the full flag list.
                                --mode MODE       hybrid (default), keyword, or exact
-                               -n, --max-results N  Maximum hits (default 20)
+                               -n, --max-results N  Maximum hits (default 10; alias --limit)
+                               --full            Long previews instead of one line per hit
                                --source NAMES    Source aliases, comma-separated; repeatable
                                --priority TIERS  Timeline priority tiers, comma-separated.
 ` + warehouse.TimelinePriorityHelpLines("                                                 ") + `
@@ -62,6 +64,12 @@ COMMANDS
                                                  scope-selection guide.
                                --since TIME      Lower event-time bound (e.g. 2026-08-01)
                                --output FMT      text (default) or json
+  context REF [--before N] [--after N]
+                             The conversation around a search hit's ref: a Gmail
+                             hit's thread, a Slack hit's thread or channel, a chat
+                             hit's chat, an agent turn's neighbours (5 each way by
+                             default). One line per event; --refs adds each event's
+                             own ref; --output json for the rows.
   sql [--output FMT] [-q QUESTION] [--file PATH] [--no-timeout] [SQL]
                              The one way to run read-only SQL. The SQL is the
                              single positional argument; it may instead be read
@@ -75,8 +83,10 @@ COMMANDS
                                              intent. Optional; when omitted a
                                              generic "no intent given" marker is
                                              logged instead.
-                               --output FMT  csv, json, or nd-json. If omitted,
-                                             defaults to csv and prints a note.
+                               --output FMT  csv (default; "text" is an alias),
+                                             json, or nd-json. Shape hints go to
+                                             stderr only for csv, so json stays
+                                             parseable through 2>&1.
                                --file PATH   Read the SQL statement from a file.
                                --no-timeout  Wait indefinitely for the response (the server still bounds statement execution).
   columns <table>            Describe one relation: every column with its exact
@@ -160,6 +170,7 @@ EXAMPLES
   pdw describe sql
   pdw search 'runway burn rate months cash remaining'
   pdw search --priority self,direct 'budget approval'
+  pdw context 'gmail_email:zach@example.com|18c5f2a67f2cc844'   # the thread around a hit
   pdw search --source gmail,slack --since 2026-08-01 'budget approval'
   pdw search --mode exact --output json 'admin/api-keys'
   pdw columns base_gmail.messages         # every column + type, before writing SQL
@@ -170,6 +181,7 @@ EXAMPLES
   pdw sql 'SELECT 1'
   pdw sql -q 'How many rows?' 'SELECT count(*) FROM base_gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
+  pdw sql -q 'Read a Gmail thread' "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"
   pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'
   pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
   pdw sql -q 'Recent Slack messages in a channel' < query.sql
@@ -344,6 +356,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runSQL(client, rest, stdin, stdout, stderr)
 	case "columns":
 		return runColumns(client, rest, stdout, stderr)
+	case "context":
+		return runContext(client, rest, stdout, stderr)
 	case "schema":
 		return runSchema(client, rest, stdout, stderr)
 	default:
@@ -405,8 +419,6 @@ func runSchema(client *cliclient.Client, args []string, stdout, stderr io.Writer
 	return 0
 }
 
-const sqlOutputHint = "note: use --output [csv|json|nd-json] to specify output format"
-
 // Slightly above the server's 60s statement budget (config.QueryTimeout), so a
 // slow query surfaces the server's SQL timeout error — which carries a rewrite
 // hint — instead of a client-side abort that leaves the statement burning
@@ -451,6 +463,7 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	if code != 0 {
 		return code
 	}
+	code = 0
 	input, err := json.Marshal(sqlCommandInput{Question: question, SQL: sql, Format: format})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw sql:", err)
@@ -486,15 +499,16 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 		fmt.Fprintln(stderr, "pdw sql:", payload.Error)
 		return 1
 	}
-	if payload.Hint != "" {
-		// Advice about the statement's shape, on stderr so scripted --output
-		// consumers still get clean rows on stdout.
+	_ = formatSpecified
+	code = printSQLRows(payload.Rows, format, stdout)
+	if payload.Hint != "" && format == "csv" {
+		// Advice about the statement's shape. Only for CSV, and only after the
+		// rows: agents run `--output json ... 2>&1 | python3 -c json.load`,
+		// and a hint on stderr before the rows crashed exactly that parser in
+		// a real session (the query was then re-run at full cost).
 		fmt.Fprintln(stderr, "pdw sql:", payload.Hint)
 	}
-	if !formatSpecified {
-		fmt.Fprintln(stdout, sqlOutputHint)
-	}
-	return printSQLRows(payload.Rows, format, stdout)
+	return code
 }
 
 // Copy-pasteable examples embedded in sql error messages so a failed call
@@ -533,6 +547,15 @@ func resolveSQLInput(positional []string, questionFlag, file string, stdin io.Re
 			return "", "", 2
 		}
 		sql = strings.TrimSpace(string(b))
+	case len(positional) == 2 && looksLikeSQL(positional[1]) && !looksLikeSQL(positional[0]):
+		// The pre-2026-09 form, `pdw sql "<question>" "<sql>"`, is still in
+		// agents' habits (14 dead calls in one fortnight, three in one
+		// session). Accept it and say so, rather than charging a round trip.
+		if questionFlag == "" {
+			question = strings.TrimSpace(positional[0])
+		}
+		sql = strings.TrimSpace(positional[1])
+		fmt.Fprintf(stderr, "pdw sql: the question is -q now (accepted this time): %s\n", sqlExample)
 	case len(positional) > 1:
 		fmt.Fprintf(stderr, "pdw sql: too many arguments; SQL is the single positional arg now and the question moved to -q. Example: %s\n", sqlExample)
 		return "", "", 2
@@ -552,6 +575,11 @@ func resolveSQLInput(positional []string, questionFlag, file string, stdin io.Re
 	}
 	return question, sql, 0
 }
+
+// sqlLeadingKeyword matches the start of a read-only statement.
+var sqlLeadingKeyword = regexp.MustCompile(`(?is)^\s*(select|with|explain|show|values|table)\b`)
+
+func looksLikeSQL(s string) bool { return sqlLeadingKeyword.MatchString(s) }
 
 // runColumns describes one relation so callers can confirm exact column names
 // before writing SQL instead of guessing them. It calls the server's
@@ -652,7 +680,7 @@ func validIdentifier(s string) bool {
 
 func normalizeSQLOutputFormat(output string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(output)) {
-	case "", "csv":
+	case "", "csv", "text":
 		return "csv", nil
 	case "json":
 		return "json", nil
@@ -912,7 +940,18 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 			destination = stdout
 		}
 		printCallJSON(destination, out)
-		fmt.Fprintf(stderr, "pdw call: upstream tool reported isError=true. For argument errors, check the exact input schema with: pdw describe %s\n", name)
+		fmt.Fprintf(stderr, "pdw call: upstream tool reported isError=true.\n")
+		// An argument error is answered with the schema here and now: in two
+		// real sessions `'schema_name' is a required property` came back
+		// seven times while the agent guessed `schema`, then `table`, then
+		// `schema_name` with `table`, each guess a round trip.
+		if looksLikeArgumentError(string(out)) {
+			if schema := toolInputSchema(client, name); schema != "" {
+				fmt.Fprintf(stderr, "Input schema for %s:\n%s\n", name, schema)
+				return 1
+			}
+		}
+		fmt.Fprintf(stderr, "For argument errors, check the exact input schema with: pdw describe %s\n", name)
 		return 1
 	}
 	// The HTTP tool API returns domain-level errors as 200 with data so it can
@@ -930,6 +969,30 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return 1
 	}
 	return 0
+}
+
+// argumentErrorRe recognises the validation wording MCP servers use.
+var argumentErrorRe = regexp.MustCompile(`(?i)required property|validation error|invalid (argument|input|param)|unknown (argument|field|param)|missing (argument|field|param)|must be (a|an) `)
+
+func looksLikeArgumentError(envelope string) bool { return argumentErrorRe.MatchString(envelope) }
+
+// toolInputSchema returns a tool's input schema, compact, or "" when the
+// listing is unavailable.
+func toolInputSchema(client *cliclient.Client, name string) string {
+	tools, err := client.ListTools(context.Background())
+	if err != nil {
+		return ""
+	}
+	for _, t := range tools {
+		if t.Name == name {
+			var buf bytes.Buffer
+			if json.Compact(&buf, t.InputSchema) != nil {
+				return string(t.InputSchema)
+			}
+			return buf.String()
+		}
+	}
+	return ""
 }
 
 func printCallJSON(w io.Writer, raw json.RawMessage) {
@@ -963,7 +1026,15 @@ func renderCallOutput(raw json.RawMessage, format string, stdout, stderr io.Writ
 	}
 	value, ok := result["content"]
 	if !ok || string(value) == "null" || json.Unmarshal(value, &content) != nil {
-		return fmt.Errorf("result has no valid MCP content array; use --output json")
+		// A built-in tool answers with a plain object, not an MCP content
+		// array. The text projection of that is the object itself, compact;
+		// erroring here used to print an error AND the raw pretty JSON.
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, raw); err != nil {
+			return fmt.Errorf("result has no valid MCP content array; use --output json")
+		}
+		fmt.Fprintln(stdout, buf.String())
+		return nil
 	}
 	skipped := 0
 	for _, block := range content {
