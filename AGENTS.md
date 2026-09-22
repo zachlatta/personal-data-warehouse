@@ -1689,6 +1689,23 @@ back it, all behind the static bearer the CLI uses:
   the server wires to the push notifier. Delivery is asynchronous and bounded; a
   `DeviceNotRegistered` ticket flips that row to `disabled` with the reason, so an
   unreachable phone is a fact in the table rather than a quietly shrinking fan-out.
+  **The alert carries the request** (`data.request`, the same JSON `GET
+  …/requests/<id>` returns), so the phone renders the review the moment the alert
+  is tapped and on no network at all; the phone's `mutation-cache.ts` is seeded from
+  the alert and every API read, and the screens paint from it before they fetch.
+  APNs caps a payload at 4 KB (`push.MaxMessageBytes`, budgeted with
+  `push.MessageSize`), so a request that does not fit ships its header with
+  `partial: true` and the phone loads the mutations; one whose header alone does
+  not fit ships only `request_id`, as before.
+- **The request list carries no `context` or `result`.** Both are review detail —
+  an agent's whole proposal snapshot, a status per mutation — and neither client's
+  list rendered them, yet on 2026-09-22 they were 95% of a 1.3 MB / 1.5 s
+  `GET /api/mutations/requests?limit=200` (the same 1.3 MB at `limit=50`, because
+  a handful of observed requests carried the bulk). The list query does not read
+  the columns at all; `GET …/requests/<id>` still returns both. The web review
+  keeps an in-tab `RequestCache` so the list and a request already read paint from
+  memory while the fetch confirms them, and the shell `modulepreload`s the module
+  graph so the SPA's imports are one round trip rather than one per depth.
 
 **Every timeline row carries its deep link, and the detail carries the conversation.**
 `GET /api/timeline`, `/api/timeline/item` and `/api/timeline/item/context` attach

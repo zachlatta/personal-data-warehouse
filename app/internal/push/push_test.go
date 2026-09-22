@@ -288,6 +288,20 @@ func TestNotificationMapsEveryRichFieldOntoTheExpoMessage(t *testing.T) {
 	}
 }
 
+func TestMessageSizeMeasuresTheWireJSON(t *testing.T) {
+	small, err := MessageSize(Notification{Title: "t"})
+	if err != nil || small <= 0 || small > 200 {
+		t.Fatalf("size %d err %v", small, err)
+	}
+	padded, err := MessageSize(Notification{Title: "t", Data: map[string]any{"blob": strings.Repeat("x", MaxMessageBytes)}})
+	if err != nil || padded <= MaxMessageBytes {
+		t.Fatalf("a data blob past the APNs limit must measure past it: %d err %v", padded, err)
+	}
+	if _, err := MessageSize(Notification{}); err == nil {
+		t.Fatal("an invalid notification has no size")
+	}
+}
+
 func TestNotificationDefaultsAreTheOldPlainAlert(t *testing.T) {
 	m, err := Notification{Title: "t", Body: "b"}.message("ExponentPushToken[abc]")
 	if err != nil {

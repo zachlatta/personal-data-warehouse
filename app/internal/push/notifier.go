@@ -2,6 +2,7 @@ package push
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,6 +47,28 @@ type Notification struct {
 	// Data is arbitrary payload delivered to the app beside route; the app
 	// also reads data.request_id for mutation actions.
 	Data map[string]any `json:"data,omitempty"`
+}
+
+// MaxMessageBytes is the ceiling APNs enforces on one notification payload
+// (4 KB); Expo relays the message inside that envelope, so a message whose
+// own JSON approaches it is dropped by the provider rather than delivered.
+// Callers that attach data (a mutation request's body, so the phone can
+// render it before it has network) budget against this with MessageSize.
+const MaxMessageBytes = 4096
+
+// MessageSize is the byte length of the Expo wire message this notification
+// becomes, measured with a placeholder token so it can be judged before any
+// device is looked up.
+func MessageSize(n Notification) (int, error) {
+	m, err := n.message("ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]")
+	if err != nil {
+		return 0, err
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return 0, err
+	}
+	return len(raw), nil
 }
 
 // Interruption levels, per UNNotificationInterruptionLevel.

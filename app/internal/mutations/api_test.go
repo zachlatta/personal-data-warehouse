@@ -156,6 +156,13 @@ func TestAPIListFiltersByStatusAndRejectsUnknownStatus(t *testing.T) {
 	if _, has := first["mutations"]; has {
 		t.Fatal("list rows must not carry full mutation bodies")
 	}
+	// Context and result were 95% of the production list's 1.3 MB and no
+	// list renders either; they belong to the detail read.
+	for _, key := range []string{"context", "result"} {
+		if _, has := first[key]; has {
+			t.Fatalf("list rows must not carry %s", key)
+		}
+	}
 
 	// Production writes statuses the API was not told about (succeeded); the
 	// filter must pass them through and refuse only malformed tokens.
@@ -181,6 +188,9 @@ func TestAPIGetReturnsMutationsAndNotFound(t *testing.T) {
 	m := mutations[0].(map[string]any)
 	if m["operation"] != GmailArchiveOperation || m["approved_at"] != nil {
 		t.Fatalf("mutation JSON wrong: %v", m)
+	}
+	if request["context"] == nil || request["result"] == nil {
+		t.Fatalf("the detail read must carry context and result: %v", request)
 	}
 	missing, _ := http.Get(srv.URL + APIPath + "/requests/nope")
 	if missing.StatusCode != http.StatusNotFound {

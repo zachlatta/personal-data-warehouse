@@ -216,7 +216,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		push.NewHandler(pushStore, notifier, time.Now, logger).Register(mux, authSvc.RequireStaticBearer())
 		if mutationSvc != nil {
 			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
-				notifier.NotifyAsync(mutationNotification(request))
+				notifier.NotifyAsync(mutationNotification(request, mutationSvc.RequestJSON))
 			})
 		}
 		logger.Info("push notification endpoints enabled", "register", push.RegisterPath, "expo_access_token", cfg.ExpoAccessToken != "")
@@ -479,7 +479,18 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 
 // mutationNotification is the alert sent when a request lands in
 // pending_review. data.route is what the app navigates to on tap.
-func mutationNotification(request mutations.Request) push.Notification {
+// mutationNotificationDataBudget leaves room under push.MaxMessageBytes for
+// the envelope Expo wraps around the message before APNs sees it.
+const mutationNotificationDataBudget = push.MaxMessageBytes - 512
+
+// mutationNotification is the alert a request landing in review sends. It
+// carries the request itself under data.request — the same JSON the review
+// API returns — so the phone can render the review the moment the alert is
+// tapped, before it has a network round trip, and on a bad connection at
+// all. APNs caps a payload at 4 KB, so a request that does not fit ships
+// without its mutations (data.request.partial = true) and the phone loads
+// those; the header still renders instantly. encode is Service.RequestJSON.
+func mutationNotification(request mutations.Request, encode func(mutations.Request, bool) map[string]any) push.Notification {
 	body := request.Reason
 	if body == "" {
 		body = "Open the app to review it."
@@ -496,7 +507,7 @@ func mutationNotification(request mutations.Request) push.Notification {
 	if count > 1 {
 		title = fmt.Sprintf("%d mutations to review: %s", count, request.Title)
 	}
-	return push.Notification{
+	n := push.Notification{
 		Title:    title,
 		Body:     body,
 		Category: push.CategoryMutationReview,
@@ -511,6 +522,29 @@ func mutationNotification(request mutations.Request) push.Notification {
 			"kind":       "mutation_request",
 		},
 	}
+	if encode == nil {
+		return n
+	}
+	for _, candidate := range []map[string]any{encode(request, true), partialRequestJSON(encode(request, false))} {
+		n.Data["request"] = candidate
+		if size, err := push.MessageSize(n); err == nil && size <= mutationNotificationDataBudget {
+			return n
+		}
+	}
+	delete(n.Data, "request")
+	return n
+}
+
+// partialRequestJSON marks a list-shaped request as one whose mutations the
+// phone still has to fetch, so it renders a loading row rather than "no
+// mutations".
+func partialRequestJSON(item map[string]any) map[string]any {
+	out := make(map[string]any, len(item)+1)
+	for k, v := range item {
+		out[k] = v
+	}
+	out["partial"] = true
+	return out
 }
 
 func queryResponseHasError(resp query.FullQueryBatchResponse) bool {

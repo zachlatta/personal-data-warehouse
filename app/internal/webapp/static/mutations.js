@@ -6,11 +6,15 @@
 import { mutations } from "./api.js";
 import { h, clear, frag, button, link, confirmDialog, formatWhen, fmtFull } from "./ui.js";
 import * as V from "./mutation_view.js";
+import { RequestCache } from "./request_cache.js";
 
 const LIST_PATH = "/mutation-review";
 function requestPath(id) { return LIST_PATH + "/requests/" + encodeURIComponent(id); }
 
-function mutationsChanged() { document.dispatchEvent(new CustomEvent("pdw:mutations-changed")); }
+// What the API last said, so a page paints before it fetches; a decision
+// invalidates it because the next read must show the request's new status.
+const cache = new RequestCache();
+function mutationsChanged() { cache.invalidate(); document.dispatchEvent(new CustomEvent("pdw:mutations-changed")); }
 
 // An "unauthorized" error is handled globally (the token gate opens); showing
 // it inline would only duplicate the gate.
@@ -952,19 +956,25 @@ async function renderList(root, ctx, alive) {
   ctx.setStats("");
   const refresh = button("refresh", "", () => renderList(root, ctx, alive));
   ctx.setControls(refresh);
-  clear(root).appendChild(h("p", "m", "loading…"));
+  function paint(requests, refreshing) {
+    const { pending, past } = V.splitRequestsForList(requests);
+    ctx.setStats(pending.length + " pending · " + past.length + " past" + (refreshing ? " · refreshing…" : ""));
+    clear(root);
+    root.appendChild(renderRequestTable("Pending review", pending, "No requests are waiting for review."));
+    root.appendChild(renderRequestTable("Past requests", past, "No approved or denied requests yet."));
+  }
+  // The last answer paints at once; the fetch below replaces it.
+  const cached = cache.peekList();
+  if (cached) paint(cached, true); else clear(root).appendChild(h("p", "m", "loading…"));
   let requests;
   try { requests = await mutations.list({ limit: 200 }); } catch (err) {
     if (!alive()) return;
+    if (cached) { ctx.setStats(errorText(err) || "could not refresh"); return; }
     clear(root).appendChild(h("p", "bad", errorText(err) || "could not load requests"));
     return;
   }
   if (!alive()) return;
-  const { pending, past } = V.splitRequestsForList(requests);
-  ctx.setStats(pending.length + " pending · " + past.length + " past");
-  clear(root);
-  root.appendChild(renderRequestTable("Pending review", pending, "No requests are waiting for review."));
-  root.appendChild(renderRequestTable("Past requests", past, "No approved or denied requests yet."));
+  paint(cache.rememberList(requests), false);
 }
 
 function renderRequestHeader(request) {
@@ -1103,19 +1113,27 @@ function renderSlackBatch(request, list) {
 async function renderDetail(root, ctx, id, alive) {
   ctx.setSubtitle("mutation review");
   ctx.setControls(link(LIST_PATH, "← all requests"));
-  clear(root).appendChild(h("p", "m", "loading…"));
+  const actions = { reload() { if (alive()) renderDetail(root, ctx, id, alive); } };
+  // A request already read this session paints from memory while the API
+  // confirms it (a back-navigation from a review must not spin).
+  const cached = cache.peek(id);
+  if (cached) paintDetail(root, ctx, cached, actions, true); else clear(root).appendChild(h("p", "m", "loading…"));
   let request;
   try { request = await mutations.get(id); } catch (err) {
     if (!alive()) return;
+    if (cached) { ctx.setStats(errorText(err) || "could not refresh"); return; }
     clear(root);
     root.appendChild(link(LIST_PATH, "← all requests", "back"));
     root.appendChild(h("p", "bad", errorText(err) || "could not load request"));
     return;
   }
   if (!alive()) return;
-  const actions = { reload() { if (alive()) renderDetail(root, ctx, id, alive); } };
+  paintDetail(root, ctx, cache.remember(request), actions, false);
+}
+
+function paintDetail(root, ctx, request, actions, refreshing) {
   const list = Array.isArray(request.mutations) ? request.mutations : [];
-  ctx.setStats(list.length + " mutation" + V.plural(list.length) + " · " + V.requestListStatus(request));
+  ctx.setStats(list.length + " mutation" + V.plural(list.length) + " · " + V.requestListStatus(request) + (refreshing ? " · refreshing…" : ""));
   clear(root);
   root.appendChild(link(LIST_PATH, "← all requests", "back"));
   root.appendChild(renderRequestHeader(request));

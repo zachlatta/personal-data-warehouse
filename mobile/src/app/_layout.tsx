@@ -4,7 +4,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useEffect, useRef } from 'react';
 import { Alert, AppState, useColorScheme } from 'react-native';
 
-import { handleNotificationResponse, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
+import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
 
@@ -62,9 +62,13 @@ function Root() {
     };
     void Notifications.getLastNotificationResponseAsync().then(act).catch(error => console.warn('notification launch response unavailable', error));
     const sub = Notifications.addNotificationResponseReceivedListener((response) => void act(response));
+    // An alert that arrives while the app is open seeds the review it carries,
+    // so opening it from the list is instant too.
+    const received = Notifications.addNotificationReceivedListener((notification) => seedFromNotification(notification));
     return () => {
       cancelled = true;
       sub.remove();
+      received.remove();
     };
   }, [ready, config, router]);
 

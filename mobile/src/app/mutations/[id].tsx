@@ -31,6 +31,7 @@ import {
   slackMarkReadGroups,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
+import { peekMutationRequest, rememberMutationRequest } from '@/lib/mutation-cache';
 import { useConfig } from '@/lib/session';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
@@ -210,7 +211,9 @@ export default function MutationRequestScreen() {
   const config = useConfig();
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const [request, setRequest] = useState<MutationRequest | null>(null);
+  // The alert that opened this screen carried the request, or the list read
+  // it moments ago: paint that at once and let the read below confirm it.
+  const [request, setRequest] = useState<MutationRequest | null>(() => (id ? peekMutationRequest(id) : null));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState('');
@@ -219,7 +222,7 @@ export default function MutationRequestScreen() {
   const load = useCallback(async () => {
     if (!id) return;
     try {
-      setRequest(await getMutationRequest(config, id));
+      setRequest(rememberMutationRequest(await getMutationRequest(config, id)));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -231,6 +234,7 @@ export default function MutationRequestScreen() {
     let cancelled = false;
     getMutationRequest(config, id)
       .then((loaded) => {
+        rememberMutationRequest(loaded);
         if (!cancelled) setRequest(loaded);
       })
       .catch((e) => {
@@ -244,7 +248,7 @@ export default function MutationRequestScreen() {
   const act = async (fn: () => Promise<MutationRequest>) => {
     setBusy(true);
     try {
-      setRequest(await fn());
+      setRequest(rememberMutationRequest(await fn()));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -462,6 +466,12 @@ export default function MutationRequestScreen() {
         ) : (
           <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
             {overview}
+            {request.partial && requestMutations.length === 0 ? (
+              <View style={styles.partialRow}>
+                <ActivityIndicator />
+                <ThemedText type="small" themeColor="textSecondary">Loading {request.mutation_count} mutation{request.mutation_count === 1 ? '' : 's'}…</ThemedText>
+              </View>
+            ) : null}
             {requestMutations.map((mutation) => (
               <MutationCard
                 key={mutation.id}
@@ -507,6 +517,7 @@ export default function MutationRequestScreen() {
 }
 
 const styles = StyleSheet.create({
+  partialRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingVertical: Spacing.two },
   container: { flex: 1 },
   reviewBody: { flex: 1 },
   scroll: { flex: 1 },

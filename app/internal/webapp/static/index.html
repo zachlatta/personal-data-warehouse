@@ -6,6 +6,20 @@
 <title>pdw</title>
 <link rel="stylesheet" href="/app/app.css?v=__ASSET_VERSION__">
 <link rel="stylesheet" href="/app/mutations.css?v=__ASSET_VERSION__">
+<!-- The router imports every view; preloading the graph fetches it in one
+     round trip instead of one per import depth. -->
+<link rel="modulepreload" href="/app/api.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/ui.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/format.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/inspector.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/timeline.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/search.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/search_state.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/mutations.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/mutation_view.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/request_cache.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/notifications.js?v=__ASSET_VERSION__">
+<link rel="modulepreload" href="/app/connections.js?v=__ASSET_VERSION__">
 </head>
 <body>
 <div id="app">

@@ -211,14 +211,19 @@ func nullableTime(value time.Time) any {
 	return value.UTC().Format(time.RFC3339)
 }
 
+// RequestJSON is the wire shape of one request: the row a list shows, or —
+// withMutations — the whole review, which is also what a push notification
+// carries so the phone can render a request before it has network.
+func (s *Service) RequestJSON(request Request, withMutations bool) map[string]any {
+	return s.requestJSON(request, withMutations)
+}
+
 func (s *Service) requestJSON(request Request, withMutations bool) map[string]any {
 	item := map[string]any{
 		"id":             request.ID,
 		"status":         request.Status,
 		"title":          request.Title,
 		"reason":         request.Reason,
-		"context":        emptyMap(request.Context),
-		"result":         emptyMap(request.Result),
 		"error":          request.Error,
 		"superseded_by":  request.SupersededBy,
 		"revision":       request.Revision,
@@ -235,7 +240,14 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		// its replacement; the status list lives here, not in each client.
 		"can_supersede": strings.TrimSpace(request.SupersededBy) == "" && requestIsSupersedable(request.Status),
 	}
+	// context and result are review detail, not list columns: a request's
+	// context is the agent's whole proposal snapshot and result carries a
+	// status per mutation, so on production the list of 200 requests was
+	// 1.3 MB with them and both clients rendered neither. They ride with
+	// the mutations.
 	if withMutations {
+		item["context"] = emptyMap(request.Context)
+		item["result"] = emptyMap(request.Result)
 		mutations := make([]map[string]any, 0, len(request.Mutations))
 		for _, mutation := range request.Mutations {
 			mutations = append(mutations, mutationJSON(mutation))

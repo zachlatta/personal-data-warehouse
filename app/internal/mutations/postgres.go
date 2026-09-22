@@ -256,8 +256,12 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 	}
 	args = append(args, limit)
 	rows, err := queryContext(ctx, s.db, fmt.Sprintf(`
-		SELECT request.id, request.status, request.title, request.reason, request.context_json,
-		       request.result_json, request.error, request.idempotency_key,
+		SELECT request.id, request.status, request.title, request.reason,
+		       -- A list row never renders context or result, and the two were
+		       -- most of the bytes read, decoded and re-encoded for each page;
+		       -- GetRequest reads them for the one request being reviewed.
+		       NULL::jsonb AS context_json, NULL::jsonb AS result_json,
+		       request.error, request.idempotency_key,
 		       request.superseded_by_request_id, request.revision,
 		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at,

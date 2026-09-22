@@ -5,6 +5,7 @@ import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { openDeepLink } from './deep-link';
 import { OpenQueue, notificationOpenLink, prepareNotificationOpen } from './notification-open-queue';
+import { rememberMutationRequest, seedMutationRequestFromNotification } from './mutation-cache';
 
 import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest } from './api';
 import type { AppConfig } from './config';
@@ -99,7 +100,14 @@ export async function flushNotificationOpens(): Promise<void> {
   });
 }
 
-type NotificationData = { route?: unknown; request_id?: unknown; kind?: unknown; open?: unknown; delivery_id?: unknown; open_proof?: unknown };
+type NotificationData = { route?: unknown; request_id?: unknown; kind?: unknown; open?: unknown; delivery_id?: unknown; open_proof?: unknown; request?: unknown };
+
+// A mutation alert carries the request it is about; remembering it here is
+// what lets the review screen render the moment the alert is tapped, with
+// no network. Called for alerts received while running and for the one tapped.
+export function seedFromNotification(notification: Notifications.Notification | null | undefined): void {
+  seedMutationRequestFromNotification(notification?.request.content.data);
+}
 
 function dataOf(response: Notifications.NotificationResponse | null | undefined): NotificationData {
   return (response?.notification.request.content.data as NotificationData | undefined) ?? {};
@@ -126,6 +134,7 @@ export async function handleNotificationResponse(
   const data = dataOf(response);
   const route = routeFromNotification(response);
   const action = response.actionIdentifier;
+  seedFromNotification(response.notification);
   if (data.kind === 'timeline_notification') {
     // Open immediately; telemetry must never gate source navigation on a network.
     const link = notificationOpenLink(data.open);
@@ -144,10 +153,10 @@ export async function handleNotificationResponse(
   if (requestId && (action === 'approve' || action === 'deny')) {
     try {
       if (action === 'approve') {
-        await approveMutationRequest(config, requestId);
+        rememberMutationRequest(await approveMutationRequest(config, requestId));
         return { route: null, message: 'Approved from the notification.' };
       }
-      await rejectMutationRequest(config, requestId, 'Denied from the notification.');
+      rememberMutationRequest(await rejectMutationRequest(config, requestId, 'Denied from the notification.'));
       return { route: null, message: 'Denied from the notification.' };
     } catch (error) {
       // The decision did not land; open the review screen so it can be made there.

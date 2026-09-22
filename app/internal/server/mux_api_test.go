@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -555,21 +556,21 @@ func TestPushAndMutationAPIRoutesRequireBearer(t *testing.T) {
 }
 
 func TestMutationNotificationShape(t *testing.T) {
-	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2})
+	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2}, nil)
 	if n.Title != "2 mutations to review: Send reply" || n.Body != "asked for it" {
 		t.Fatalf("unexpected notification %+v", n)
 	}
 	if n.Route != "/mutations/r1" || n.Data["request_id"] != "r1" {
 		t.Fatalf("route or request id missing: %+v", n)
 	}
-	single := mutationNotification(mutations.Request{ID: "r2", Title: "Archive", Mutations: []mutations.Mutation{{}}})
+	single := mutationNotification(mutations.Request{ID: "r2", Title: "Archive", Mutations: []mutations.Mutation{{}}}, nil)
 	if single.Title != "Mutation to review: Archive" || single.Body == "" {
 		t.Fatalf("single-mutation shape wrong: %+v", single)
 	}
 }
 
 func TestMutationNotificationIsActionableFromTheLockScreen(t *testing.T) {
-	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2})
+	n := mutationNotification(mutations.Request{ID: "r1", Title: "Send reply", Reason: "asked for it", MutationCount: 2}, nil)
 	if n.Category != push.CategoryMutationReview {
 		t.Fatalf("a review alert must carry the mutation_review category so Approve/Deny buttons appear: %+v", n)
 	}
@@ -578,6 +579,54 @@ func TestMutationNotificationIsActionableFromTheLockScreen(t *testing.T) {
 	}
 	if err := n.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The alert carries the request body so the phone renders the review from the
+// notification alone; a request too big for APNs' 4 KB payload ships its
+// header marked partial, and one too big even for that ships none of it.
+func TestMutationNotificationCarriesTheRequestWithinTheAPNsBudget(t *testing.T) {
+	svc := mutations.NewService(nil, mutations.Config{BaseURL: "https://pdw.example"})
+	small := mutations.Request{ID: "r1", Status: "pending_review", Title: "Send reply", Reason: "asked", MutationCount: 1,
+		Mutations: []mutations.Mutation{{ID: "m1", RequestID: "r1", Provider: "gmail", Operation: mutations.GmailArchiveOperation, Status: "pending_review", Payload: map[string]any{"thread_ids": []any{"t1"}}}}}
+	n := mutationNotification(small, svc.RequestJSON)
+	got, ok := n.Data["request"].(map[string]any)
+	if !ok || got["id"] != "r1" || got["partial"] != nil {
+		t.Fatalf("a small request must ride whole in data.request: %+v", n.Data)
+	}
+	if muts, _ := got["mutations"].([]map[string]any); len(muts) != 1 || muts[0]["operation"] != mutations.GmailArchiveOperation {
+		t.Fatalf("mutations missing from the carried request: %+v", got["mutations"])
+	}
+	if size, err := push.MessageSize(n); err != nil || size > push.MaxMessageBytes {
+		t.Fatalf("message size %d err %v", size, err)
+	}
+
+	big := small
+	big.Mutations = nil
+	for i := 0; i < 60; i++ {
+		big.Mutations = append(big.Mutations, mutations.Mutation{ID: fmt.Sprintf("m%d", i), Provider: "gmail", Operation: mutations.GmailArchiveOperation, Payload: map[string]any{"thread_ids": []any{strings.Repeat("t", 40)}}})
+	}
+	big.MutationCount = 60
+	n = mutationNotification(big, svc.RequestJSON)
+	got, ok = n.Data["request"].(map[string]any)
+	if !ok || got["partial"] != true || got["mutation_count"] != 60 {
+		t.Fatalf("an oversized request must ship its header marked partial: %+v", n.Data["request"])
+	}
+	if _, has := got["mutations"]; has {
+		t.Fatal("the partial shape must omit mutations, not truncate them")
+	}
+	if size, err := push.MessageSize(n); err != nil || size > push.MaxMessageBytes {
+		t.Fatalf("partial message size %d err %v", size, err)
+	}
+
+	huge := big
+	huge.Reason = strings.Repeat("r", 5000)
+	n = mutationNotification(huge, svc.RequestJSON)
+	if _, has := n.Data["request"]; has {
+		t.Fatalf("a header that itself exceeds the budget must not be attached: %d bytes", len(fmt.Sprint(n.Data["request"])))
+	}
+	if n.Data["request_id"] != "r1" || n.Route != "/mutations/r1" {
+		t.Fatalf("the route and id must survive the fallback: %+v", n)
 	}
 }
 

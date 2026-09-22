@@ -8,6 +8,7 @@ import { StatusPill } from '@/components/status-pill';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { listMutationRequests, type MutationRequest } from '@/lib/api';
+import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
 import { formatWhen } from '@/lib/format';
 import { useConfig } from '@/lib/session';
 
@@ -15,7 +16,8 @@ export default function MutationsScreen() {
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
-  const [requests, setRequests] = useState<MutationRequest[]>([]);
+  // The last list paints at once; the focus effect below refreshes it.
+  const [requests, setRequests] = useState<MutationRequest[]>(() => peekMutationRequests() ?? []);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -23,7 +25,7 @@ export default function MutationsScreen() {
     setRefreshing(true);
     setError(null);
     try {
-      setRequests(await listMutationRequests(config));
+      setRequests(rememberMutationRequests(await listMutationRequests(config)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

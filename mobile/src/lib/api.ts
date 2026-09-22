@@ -162,8 +162,10 @@ export type MutationRequest = {
   status: MutationRequestStatus;
   title: string;
   reason: string;
-  context: Record<string, unknown>;
-  result: Record<string, unknown>;
+  // context and result ride only with the detail read (and the alert's copy
+  // of it); list rows omit them.
+  context?: Record<string, unknown>;
+  result?: Record<string, unknown>;
   error: string;
   superseded_by: string;
   requested_by: string;
@@ -176,6 +178,9 @@ export type MutationRequest = {
   mutation_count: number;
   review_url: string;
   mutations?: Mutation[];
+  // true on the copy a push alert carries when the request was too big for
+  // the 4 KB notification: the header is real, the mutations still need a read.
+  partial?: boolean;
 };
 
 export async function listMutationRequests(config: AppConfig, statuses?: MutationRequestStatus[]): Promise<MutationRequest[]> {
