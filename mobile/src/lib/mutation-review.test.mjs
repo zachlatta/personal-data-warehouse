@@ -25,12 +25,14 @@ import {
   isGmailSendEmailMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
+  isSlackSendMessageMutation,
   looksAutomatedSender,
   mutationReviewContext,
   requestLifecycle,
   requestLifecycleNote,
   slackMarkReadGroups,
   slackMarkReadReview,
+  slackSendMessageReview,
 } from './mutation-review.ts';
 
 test('a calendar create mutation becomes a complete day view with real conflicts and guests', () => {
@@ -842,4 +844,56 @@ test('requestLifecycle reports an agent withdrawal with its reason and replaceme
   assert.equal(requestLifecycleNote({ status: 'withdrawn', withdrawn_by: 'codex', error: 'sent by hand' }), 'Withdrawn by codex: sent by hand');
   assert.equal(requestLifecycleNote({ status: 'withdrawn' }), 'Withdrawn by an agent.');
   assert.equal(requestLifecycleNote({ status: 'rejected', error: 'no' }), '');
+});
+
+test('a Slack send is reviewed as a message to a named recipient, with its thread and warnings', () => {
+  const mutation = {
+    id: 'mut-send', provider: 'slack', operation: 'slack.send_message', account: 'zrl', status: 'pending_review',
+    payload: { conversation_id: 'C1', user_id: '', text: 'Deploy is fixed.', thread_ts: '1593473600.000300', reply_broadcast: true },
+    preview: { slack_message: {
+      conversation_id: 'C1', thread_ts: '1593473600.000300', delivery: 'thread_reply', reply_broadcast: true, text: 'Draft.',
+      team_id: 'T1', conversation_type: 'public_channel', conversation_name: 'ops', recipient_label: '#ops',
+      conversation_found: true, thread_found: true, is_member: false,
+      warnings: ['You are not a member of this channel; Slack will reject the post (not_in_channel).'],
+      messages: [
+        { message_ts: '1593473600.000300', user_id: 'UMARCUS', actor_name: 'Marcus', text: 'Can someone look?', is_thread_parent: true, open: { url: 'https://example.slack.com/archives/C1/p1593473600000300', app_url: 'slack://channel?team=T1&id=C1' } },
+        { message_ts: '1593473660.000400', user_id: 'UME', actor_name: 'Zach', is_from_me: true, text: 'Looking.' },
+      ],
+      open: { url: 'https://example.slack.com/archives/C1/p1593473600000300' },
+    } },
+  };
+  assert.equal(isSlackSendMessageMutation(mutation), true);
+  assert.equal(isSlackMarkReadMutation(mutation), false);
+  const review = slackSendMessageReview(mutation);
+  assert.equal(review.heading, 'Reply in Slack thread');
+  assert.equal(review.deliveryLabel, 'Thread reply');
+  assert.equal(review.recipientLabel, '#ops');
+  assert.equal(review.text, 'Deploy is fixed.');
+  assert.equal(review.replyBroadcast, true);
+  assert.equal(review.verified, true);
+  assert.equal(review.warnings.length, 1);
+  assert.equal(review.contextLabel, 'The thread');
+  assert.equal(review.messages[0].isThreadParent, true);
+  assert.equal(review.messages[0].open.app_url, 'slack://channel?team=T1&id=C1');
+  assert.equal(review.messages[1].actorName, 'You');
+  assert.equal(review.sent, null);
+});
+
+test('a Slack DM names the person, and an unresolved send warns instead of looking verified', () => {
+  const dm = slackSendMessageReview({
+    provider: 'slack', operation: 'slack.send_message', account: 'zrl',
+    payload: { conversation_id: '', user_id: 'UMARCUS', text: 'Hi.' },
+    preview: { slack_message: { user_id: 'UMARCUS', delivery: 'dm', team_id: 'T1', conversation_type: 'im', recipient_label: 'Marcus', recipient_found: true, resolved_conversation_id: 'D1', avatar_url: 'https://avatars.example.test/m.png', warnings: [] } },
+    result: { message_ts: '1700000000.000100', already_sent: true },
+  });
+  assert.equal(dm.heading, 'Send Slack DM');
+  assert.equal(dm.recipientLabel, 'Marcus');
+  assert.equal(dm.conversationId, 'D1');
+  assert.equal(dm.avatarUrl, 'https://avatars.example.test/m.png');
+  assert.deepEqual(dm.sent, { messageTs: '1700000000.000100', alreadySent: true });
+  const unresolved = slackSendMessageReview({ provider: 'slack', operation: 'slack.send_message', account: 'zrl', payload: { conversation_id: 'C9', text: 'hi' }, preview: {} });
+  assert.equal(unresolved.resolved, false);
+  assert.equal(unresolved.verified, false);
+  assert.equal(unresolved.recipientLabel, 'C9');
+  assert.match(unresolved.warnings[0], /not checked against the warehouse/);
 });

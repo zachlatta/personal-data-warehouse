@@ -10,6 +10,7 @@ import {
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
   groupMutations, requestListStatus, requestLifecycle, splitRequestsForList, splitRequestContext, identificationView, appleNotesView, appleContactsView,
   isSlackMarkReadMutation, slackMarkReadView, slackMarkReadGroups, mutationReviewContext,
+  isSlackSendMessageMutation, slackSendMessageView, slackPermalink,
   gmailMutationGroupActionText, gmailMutationGroupVerb, gmailMutationLabelChanges,
 } from "../mutation_view.js";
 
@@ -473,4 +474,93 @@ test("splitRequestsForList keeps a withdrawn request out of the pending list", (
   const { pending, past } = splitRequestsForList([{ id: "a", status: "withdrawn" }, { id: "b", status: "pending_review" }]);
   assert.deepEqual(pending.map((r) => r.id), ["b"]);
   assert.deepEqual(past.map((r) => r.id), ["a"]);
+});
+
+// --- slack send -----------------------------------------------------------------
+
+test("a Slack send reads as the message it is: recipient, words, thread, warnings", () => {
+  const mutation = {
+    provider: "slack", operation: "slack.send_message", account: "zrl", status: "pending_review",
+    payload: { conversation_id: "C1", user_id: "", text: "Deploy is fixed.", thread_ts: "1593473600.000300", reply_broadcast: true },
+    preview: { slack_message: {
+      conversation_id: "C1", thread_ts: "1593473600.000300", delivery: "thread_reply", reply_broadcast: true,
+      text: "Deploy is fixed.", team_id: "T1", team_domain: "example", conversation_type: "public_channel",
+      conversation_name: "ops", recipient_label: "#ops", conversation_found: true, thread_found: true,
+      is_member: false, warnings: ["You are not a member of this channel; Slack will reject the post (not_in_channel)."],
+      messages: [
+        { message_ts: "1593473600.000300", user_id: "U-MARCUS", actor_name: "Marcus", text: "Can someone look?", is_thread_parent: true, open: { url: "https://example.slack.com/archives/C1/p1593473600000300" } },
+        { message_ts: "1593473660.000400", user_id: "U-ME", actor_name: "Zach", is_from_me: true, text: "Looking." },
+      ],
+      open: { url: "https://example.slack.com/archives/C1/p1593473600000300" },
+    } },
+  };
+  assert.equal(isSlackSendMessageMutation(mutation), true);
+  assert.equal(isSlackMarkReadMutation(mutation), false);
+  const view = slackSendMessageView(mutation);
+  assert.equal(view.heading, "Reply in Slack thread");
+  assert.equal(view.delivery, "thread_reply");
+  assert.equal(view.deliveryLabel, "Thread reply");
+  assert.equal(view.recipientLabel, "#ops");
+  assert.equal(view.text, "Deploy is fixed.");
+  assert.equal(view.threadTs, "1593473600.000300");
+  assert.equal(view.replyBroadcast, true);
+  assert.equal(view.resolved, true);
+  assert.equal(view.verified, true);
+  assert.deepEqual(view.warnings, ["You are not a member of this channel; Slack will reject the post (not_in_channel)."]);
+  assert.equal(view.contextLabel, "The thread");
+  assert.equal(view.messages.length, 2);
+  assert.equal(view.messages[0].isThreadParent, true);
+  assert.equal(view.messages[1].actorName, "You");
+  assert.equal(view.open.url, "https://example.slack.com/archives/C1/p1593473600000300");
+  assert.equal(view.sent, null);
+});
+
+test("a Slack DM resolves to the person, and an edit's payload text wins over the preview", () => {
+  const view = slackSendMessageView({
+    provider: "slack", operation: "slack.send_message", account: "zrl",
+    payload: { conversation_id: "", user_id: "U-MARCUS", text: "Final words.", thread_ts: "", reply_broadcast: false },
+    preview: { slack_message: {
+      user_id: "U-MARCUS", delivery: "dm", text: "Draft words.", team_id: "T1", conversation_type: "im",
+      recipient_user_id: "U-MARCUS", recipient_name: "Marcus", recipient_label: "Marcus", recipient_found: true,
+      resolved_conversation_id: "D1", avatar_url: "https://avatars.example.test/marcus.png", warnings: [], edited: true,
+    } },
+  });
+  assert.equal(view.heading, "Send Slack DM");
+  assert.equal(view.recipientLabel, "Marcus");
+  assert.equal(view.conversationId, "D1");
+  assert.equal(view.userId, "U-MARCUS");
+  assert.equal(view.text, "Final words.");
+  assert.equal(view.edited, true);
+  assert.equal(view.verified, true);
+  assert.equal(view.avatarUrl, "https://avatars.example.test/marcus.png");
+  assert.deepEqual(view.warnings, []);
+});
+
+test("an unresolved Slack send says so instead of looking verified", () => {
+  const view = slackSendMessageView({
+    provider: "slack", operation: "slack.send_message", account: "zrl",
+    payload: { conversation_id: "C9", text: "hi" },
+    preview: { slack_message: { conversation_id: "C9", text: "hi", delivery: "conversation" } },
+  });
+  assert.equal(view.heading, "Send Slack message");
+  assert.equal(view.recipientLabel, "C9");
+  assert.equal(view.resolved, false);
+  assert.equal(view.verified, false);
+  assert.equal(view.warnings.length, 1);
+  assert.match(view.warnings[0], /not checked against the warehouse/);
+  assert.match(view.effect, /cannot be unsent/);
+});
+
+test("a sent Slack message links to the message it created", () => {
+  const view = slackSendMessageView({
+    provider: "slack", operation: "slack.send_message", account: "zrl", status: "succeeded",
+    payload: { conversation_id: "C1", text: "hi", thread_ts: "1593473600.000300" },
+    preview: { slack_message: { conversation_id: "C1", team_id: "T1", team_domain: "example", conversation_found: true, thread_ts: "1593473600.000300" } },
+    result: { team_id: "T1", conversation_id: "C1", message_ts: "1593473700.000500", thread_ts: "1593473600.000300", already_sent: true },
+  });
+  assert.equal(view.sent.messageTs, "1593473700.000500");
+  assert.equal(view.sent.alreadySent, true);
+  assert.equal(view.sent.open.url, "https://example.slack.com/archives/C1/p1593473700000500?thread_ts=1593473600.000300&cid=C1");
+  assert.equal(slackPermalink("T1", "C1", "1.2", "", "").url, "https://app.slack.com/client/T1/C1/p12");
+  assert.equal(slackPermalink("", "C1", "1.2", "", "example"), null);
 });

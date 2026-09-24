@@ -3,8 +3,8 @@
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
 Prefer this path for any change to Zach's Gmail, Calendar, Google or Apple Contacts, Slack
-read state or Apple Notes; use a direct connector only for something PDW has no mutation type for, and
-say why.
+(a message sent as him, or his read state) or Apple Notes; use a direct connector only for
+something PDW has no mutation type for, and say why.
 
 ## The two calls
 
@@ -17,7 +17,7 @@ say why.
 Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_threads`,
 `gmail.modify_thread_labels`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
-`apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
+`slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`. The help call is
 authoritative when this list and it disagree.
 
@@ -44,6 +44,15 @@ authoritative when this list and it disagree.
   (`replaces_revision` / `expected_revision`) or the call is refused: never take back a
   version a human is still changing. Withdrawing removes work from the queue and never
   runs anything; approval and execution stay with the human and the workers.
+- **Slack as Zach:** `slack.send_message` posts through his own Slack session (never a
+  bot) to a `conversation_id` from `base_slack.conversations`, to one person by `user_id`
+  from `base_slack.users` (the executor reuses or opens the DM), or under `thread_ts` (a
+  synced `base_slack.messages.message_ts`; needs `conversation_id`). Write Slack mrkdwn
+  and `<@U…>` mentions, at most 4,000 characters, and reply where the conversation is —
+  read it with `timeline.context()` first. The reviewer sees the recipient by name, the
+  thread, and the warnings (not synced, archived, not a member), and can edit the words
+  before approving; recipient and thread are not editable. One approval sends one
+  message: a retry after a lost response finds its own `client_msg_id` before posting.
 - **Apple Notes:** `body` replaces the whole note; `append_body` adds to it. Prefer
   `append_body` — the executor cannot tell an intentional rewrite from a stale read. A
   note is addressed by the bare UUID `base_apple_notes.notes.note_id`; a title is the

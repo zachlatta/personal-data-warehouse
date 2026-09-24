@@ -66,6 +66,9 @@ func (s fakeMutationStore) GetRequest(context.Context, string) (mutations.Reques
 func (s fakeMutationStore) UpdateGmailEmailMutation(context.Context, string, string, mutations.UpdateGmailEmailMutationInput, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
 }
+func (s fakeMutationStore) UpdateSlackMessageMutation(context.Context, string, string, mutations.UpdateSlackMessageMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
 
 func (s fakeMutationStore) RemoveMutation(context.Context, string, string, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
@@ -106,6 +109,9 @@ func (s *recordingMutationStore) GetRequest(context.Context, string) (mutations.
 }
 
 func (s *recordingMutationStore) UpdateGmailEmailMutation(context.Context, string, string, mutations.UpdateGmailEmailMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
+func (s *recordingMutationStore) UpdateSlackMessageMutation(context.Context, string, string, mutations.UpdateSlackMessageMutationInput, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
 }
 

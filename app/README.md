@@ -235,8 +235,8 @@ When mutation review is enabled, the server also exposes:
 
 - `propose_mutation` — single entry point that takes `title`, `reason`, `mutations: [...]`,
   and optional `context`. Each entry in `mutations` carries a `type` (e.g. `gmail.send_email`,
-  `gmail.archive_threads`, `gmail.modify_thread_labels`, `calendar.update_event`, or
-  `slack.mark_conversation_read`) plus that type's payload fields.
+  `gmail.archive_threads`, `gmail.modify_thread_labels`, `calendar.update_event`,
+  `slack.mark_conversation_read`, or `slack.send_message`) plus that type's payload fields.
   `gmail.modify_thread_labels` accepts exact label display names or Gmail label IDs in
   `add_labels` / `remove_labels`; `create_and_add_labels` explicitly creates missing user labels
   by display name and applies them, while reusing same-name labels on retry. Batching multiple
@@ -248,8 +248,12 @@ When mutation review is enabled, the server also exposes:
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
 They return an approval URL under `/mutation-review` (the web app, which reviews through
 `/api/mutations/*`); the actual Gmail, Calendar, Contacts, or Slack write is still performed later
-by the existing approved-mutation worker. Slack mark-read uses the private xoxc + `d`-cookie pair
-published by `pdw slack publish-session`; credentials never enter the proposal payload.
+by the existing approved-mutation worker. Slack mark-read and send-message use the private
+xoxc + `d`-cookie pair published by `pdw slack publish-session` (a message is posted as Zach,
+never as a bot); credentials never enter the proposal payload. A send carries a `client_msg_id`
+derived from its mutation id and is looked for in the warehouse and in Slack before every
+attempt, so a retry after a lost response cannot post twice; the reviewer can edit its text
+through `POST /api/mutations/requests/<id>/mutations/<mutation_id>/update-slack-message`.
 
 SQL starting points:
 

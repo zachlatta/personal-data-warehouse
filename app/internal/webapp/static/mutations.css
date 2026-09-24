@@ -293,6 +293,21 @@ table.cal-patch tbody th { width: 130px; color: var(--dim); text-transform: none
 .slack-stays-unread { color: var(--dim); }
 .slack-context-missing { padding: 9px 10px; border: 1px solid rgba(224,108,95,.5); color: var(--red); border-radius: 3px; font-size: 12px; }
 
+/* Slack sends: the recipient on the action block, the words in a composer
+   while the request is pending, the thread or conversation they land in. */
+.slack-send .slack-recipient { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; margin-top: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.slack-send .slack-recipient .avatar { width: 26px; height: 26px; }
+.slack-context-chip.ok { color: var(--green, #4caf7d); border-color: color-mix(in srgb, var(--green, #4caf7d) 45%, transparent); }
+.slack-warning { margin: 6px 0; padding: 8px 10px; border: 1px solid rgba(224,108,95,.5); border-radius: 3px; font-size: 12px; }
+.slack-compose { margin: 12px 0; }
+.slack-compose-form { display: grid; gap: 6px; }
+.slack-compose-text { width: 100%; min-height: 96px; padding: 9px 10px; border: 1px solid var(--line2); border-radius: 4px; background: var(--bg2); color: var(--text); font: inherit; font-size: 13px; line-height: 1.5; resize: vertical; box-sizing: border-box; }
+.slack-compose-text:focus { outline: none; border-color: var(--amber); }
+.slack-compose-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 10.5px; }
+.slack-compose-readonly { margin: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg2); color: var(--text); font: inherit; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.slack-sent { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; }
+@media (pointer: coarse) { .slack-compose-text { font-size: 16px; min-height: 120px; } }
+
 /* Slack batches: one compact, searchable row per reviewed boundary. The full
    transcript is created only after the row opens, keeping 198-item requests
    fast and comprehensible. */

@@ -17,6 +17,7 @@ from personal_data_warehouse.gmail_mutations import (
 )
 from personal_data_warehouse.slack_mutations import (
     SLACK_MARK_CONVERSATION_READ_OPERATION,
+    SLACK_SEND_MESSAGE_OPERATION,
     SlackMutationResult,
 )
 
@@ -104,6 +105,10 @@ class FakeWarehouse:
 
     def observe_succeeded_slack_mark_conversation_read_mutations(self, **_kwargs) -> int:
         self.calls.append("observe_slack")
+        return 0
+
+    def observe_succeeded_slack_send_message_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_slack_send")
         return 0
 
     def succeeded_upstream_mutation_count(self, *, ensure_tables=True, exclude_providers=None) -> int:
@@ -321,6 +326,9 @@ def test_upstream_mutation_sensor_emits_run_when_stale_reclaimable_work_exists(m
     assert ("gmail", GMAIL_UNARCHIVE_OPERATION) in idempotent_operations
     assert ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION) in idempotent_operations
     assert ("slack", SLACK_MARK_CONVERSATION_READ_OPERATION) in idempotent_operations
+    # A send is retried only through failed_retryable, never reclaimed mid-flight.
+    assert ("slack", SLACK_SEND_MESSAGE_OPERATION) not in idempotent_operations
+    assert ("gmail", "gmail.send_email") not in idempotent_operations
     assert warehouse.closed is True
 
 
@@ -437,6 +445,7 @@ def test_observation_batch_is_separate_from_execution() -> None:
         "observe_contacts",
         "observe_calendar",
         "observe_slack",
+        "observe_slack_send",
     ]
 
 
@@ -864,3 +873,44 @@ def test_process_upstream_mutation_batch_routes_slack_mark_read_to_slack_executo
         )
     ]
     assert summary.succeeded == 1
+
+
+def test_sends_are_never_in_the_reclaimable_set() -> None:
+    for operation in upstream_mutation_defs.NON_RECLAIMABLE_SEND_OPERATIONS:
+        assert operation not in upstream_mutation_defs.RECLAIMABLE_IDEMPOTENT_OPERATIONS
+    assert ("slack", SLACK_SEND_MESSAGE_OPERATION) in upstream_mutation_defs.NON_RECLAIMABLE_SEND_OPERATIONS
+
+
+def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -> None:
+    mutation = {
+        "id": "mut-slack-send",
+        "provider": "slack",
+        "operation": SLACK_SEND_MESSAGE_OPERATION,
+    }
+    warehouse = FakeWarehouse(claimed=[mutation])
+    slack_executor = FakeExecutor(
+        [
+            SlackMutationResult(
+                status="failed_retryable",
+                result_json={"conversation_id": "C1", "client_msg_id": "abc"},
+                error="Slack chat.postMessage request failed: TimeoutError",
+            )
+        ]
+    )
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=FakeExecutor([]),
+        contact_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        slack_executor=slack_executor,
+        limit=5,
+        claimed_by="worker-1",
+    )
+
+    assert slack_executor.seen == [mutation]
+    assert warehouse.completed == []
+    assert warehouse.failed == [
+        ("mut-slack-send", "failed_retryable", "Slack chat.postMessage request failed: TimeoutError", {"conversation_id": "C1", "client_msg_id": "abc"}, "worker-1")
+    ]
+    assert summary.failed_retryable == 1

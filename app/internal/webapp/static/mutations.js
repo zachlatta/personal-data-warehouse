@@ -815,6 +815,131 @@ function renderSlackMarkRead(request, mutation, suppliedView) {
   return node;
 }
 
+// A Slack send is reviewed as the message it is: who receives it, the words,
+// and the conversation or thread they land in -- with the words editable while
+// the request is still pending, because a review that can only approve or deny
+// a near-miss reply is a review that denies it.
+function renderSlackSendMessage(request, mutation, actions) {
+  const view = V.slackSendMessageView(mutation);
+  const pending = request && request.status === "pending_review" && mutation.status === "pending_review";
+  const article = h("article", "mut slack-send");
+  article.appendChild(mutationHead("slack", mutation.title || view.heading, mutation.status));
+
+  const action = h("div", "slack-action");
+  action.appendChild(h("strong", "", "What will happen"));
+  action.appendChild(h("p", "", view.effect));
+  const recipient = h("div", "slack-recipient");
+  recipient.appendChild(view.avatarUrl && (view.conversationType === "im" || view.delivery === "dm")
+    ? slackAvatar(view.avatarUrl, view.recipientLabel)
+    : h("span", "slack-kind-icon", view.conversationType === "public_channel" ? "#" : view.conversationType === "private_channel" ? "◈" : view.conversationType === "mpim" ? "◎" : "@"));
+  const recipientCopy = h("span", "slack-row-copy");
+  const headline = h("span", "slack-row-headline");
+  headline.appendChild(h("strong", "", view.recipientLabel || "Unknown recipient"));
+  headline.appendChild(h("span", "slack-context-chip", view.deliveryLabel));
+  if (view.verified) headline.appendChild(h("span", "slack-context-chip ok", "in warehouse"));
+  recipientCopy.appendChild(headline);
+  recipientCopy.appendChild(h("span", "slack-row-preview", ["as " + mutation.account, view.replyBroadcast ? "also posted to the conversation" : ""].filter(Boolean).join(" · ")));
+  recipient.appendChild(recipientCopy);
+  if (view.open) recipient.appendChild(slackOpenLink(view.open, view.recipientLabel));
+  action.appendChild(recipient);
+  article.appendChild(action);
+  for (const warning of view.warnings) article.appendChild(h("p", "bad slack-warning", warning));
+
+  if (view.messages.length) {
+    const context = h("section", "slack-context");
+    const contextHead = h("div", "slack-context-head");
+    contextHead.appendChild(h("h4", "", view.contextLabel));
+    contextHead.appendChild(h("span", "m", view.messages.length + " message" + V.plural(view.messages.length)));
+    context.appendChild(contextHead);
+    const transcript = h("div", "slack-transcript");
+    for (const message of view.messages) {
+      const row = h("article", "slack-msg" + (message.isThreadParent ? " target" : ""));
+      row.appendChild(slackAvatar(message.avatarUrl, message.actorName));
+      const copy = h("div", "slack-msg-copy");
+      const head = h("div", "slack-msg-head");
+      head.appendChild(h("strong", "", message.actorName));
+      if (message.sentAt) {
+        const when = h("time", "", formatWhen(message.sentAt));
+        when.title = fmtFull(message.sentAt);
+        head.appendChild(when);
+      }
+      copy.appendChild(head);
+      copy.appendChild(h("p", "slack-msg-text", message.text || "(no text)"));
+      if (message.isThreadParent) {
+        const tags = h("div", "slack-msg-tags");
+        tags.appendChild(h("span", "slack-read-through", "replying to this"));
+        copy.appendChild(tags);
+      }
+      row.appendChild(copy);
+      if (message.open) row.appendChild(slackOpenLink(message.open, message.actorName));
+      transcript.appendChild(row);
+    }
+    context.appendChild(transcript);
+    article.appendChild(context);
+  }
+
+  const compose = h("section", "slack-compose");
+  const composeHead = h("div", "slack-context-head");
+  composeHead.appendChild(h("h4", "", view.sent ? "Message sent" : "Your message"));
+  if (view.edited) composeHead.appendChild(h("span", "m", "edited in review"));
+  compose.appendChild(composeHead);
+  if (pending) {
+    const form = h("form", "slack-compose-form");
+    const editor = h("textarea", "slack-compose-text");
+    editor.value = view.text;
+    editor.rows = Math.min(14, Math.max(4, view.text.split("\n").length + 1));
+    editor.spellcheck = true;
+    editor.maxLength = 4000;
+    form.appendChild(editor);
+    const meta = h("div", "slack-compose-meta");
+    const counter = h("span", "m", editor.value.length + " / 4000");
+    editor.addEventListener("input", () => { counter.textContent = editor.value.length + " / 4000"; });
+    meta.appendChild(h("span", "m", "Slack formatting: *bold*, _italic_, <@U…> mentions."));
+    meta.appendChild(counter);
+    form.appendChild(meta);
+    const errorNode = h("div", "bad");
+    form.appendChild(errorNode);
+    async function submit() {
+      errorNode.textContent = "";
+      const text = editor.value.trim();
+      if (!text) { errorNode.textContent = "The message cannot be empty."; return; }
+      try {
+        await mutations.updateSlackMessage(request.id, mutation.id, { text });
+        mutationsChanged();
+        actions.reload();
+      } catch (err) { errorNode.textContent = errorText(err); }
+    }
+    const buttons = h("div", "cactions");
+    buttons.appendChild(button("Save message changes", "primary", submit));
+    form.appendChild(buttons);
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); submit(); });
+    compose.appendChild(form);
+  } else {
+    compose.appendChild(h("pre", "slack-compose-readonly", view.text || "(no text)"));
+  }
+  if (view.sent) {
+    const sent = h("p", "m slack-sent");
+    sent.appendChild(document.createTextNode(view.sent.alreadySent ? "Already in Slack from an earlier attempt: " : "Posted as message ") );
+    sent.appendChild(h("code", "", view.sent.messageTs));
+    if (view.sent.open) sent.appendChild(slackOpenLink(view.sent.open, view.recipientLabel));
+    compose.appendChild(sent);
+  }
+  article.appendChild(compose);
+
+  const technical = details("Exact Slack target", "raw");
+  technical.appendChild(dl([
+    ["Conversation ID", view.conversationId],
+    ["User ID", view.userId],
+    ["Thread timestamp", view.threadTs],
+    ["Account", mutation.account],
+    ["Checked against the warehouse", view.resolved ? (view.verified ? "yes, found" : "yes, not found") : "no"],
+  ]));
+  article.appendChild(technical);
+  if (mutation.reason && mutation.reason !== (request && request.reason)) article.appendChild(h("p", "mreason", mutation.reason));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  return article;
+}
+
 function renderGeneric(mutation) {
   const article = h("article", "mut generic");
   article.appendChild(mutationHead(mutation.provider || "mutation", mutation.title || mutation.operation || "mutation", mutation.status));
@@ -832,6 +957,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
   if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);
   if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
+  if (V.isSlackSendMessageMutation(mutation)) return renderSlackSendMessage(request, mutation, actions);
   return renderGeneric(mutation);
 }
 

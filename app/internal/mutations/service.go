@@ -14,6 +14,7 @@ import (
 var (
 	slackConversationIDPattern = regexp.MustCompile(`^[CDG][A-Z0-9]+$`)
 	slackMessageTSPattern      = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
+	slackUserIDPattern         = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
 )
 
 type Service struct {
@@ -367,8 +368,15 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if !slackMessageTSPattern.MatchString(strings.TrimSpace(mutation.MessageTS)) {
 			return fmt.Errorf("mutation %d message_ts must be an exact Slack timestamp such as 1593473566.000200", index)
 		}
+	case SlackSendMessageOperation:
+		if err := validateConfiguredAccount(account, s.cfg.SlackAccounts, "SLACK_ACCOUNTS"); err != nil {
+			return err
+		}
+		if err := validateSlackSendMessage(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, or slack.mark_conversation_read", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, slack.mark_conversation_read, or slack.send_message", index, mutationType)
 	}
 	return nil
 }
@@ -454,7 +462,30 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		Remove:             mapFromAny(raw["remove"]),
 		ConversationID:     strings.TrimSpace(stringFromAny(raw["conversation_id"])),
 		MessageTS:          strings.TrimSpace(stringFromAny(raw["message_ts"])),
+		UserID:             strings.TrimSpace(stringFromAny(raw["user_id"])),
+		Text:               stringFromAny(raw["text"]),
+		ThreadTS:           strings.TrimSpace(stringFromAny(raw["thread_ts"])),
+		ReplyBroadcast:     boolFromAny(raw["reply_broadcast"]),
 	}, nil
+}
+
+// boolFromAny reads a JSON boolean, tolerating the string spellings an agent
+// pastes from a shell ("true") without treating every non-empty value as yes.
+func boolFromAny(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1", "yes":
+			return true
+		}
+	case float64:
+		return typed != 0
+	case int:
+		return typed != 0
+	}
+	return false
 }
 
 func validateGmailLabelChanges(addLabels []string, createAndAddLabels []string, removeLabels []string) error {

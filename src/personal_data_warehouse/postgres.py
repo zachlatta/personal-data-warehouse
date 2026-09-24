@@ -526,6 +526,7 @@ GMAIL_MODIFY_THREAD_LABELS_OPERATION = "gmail.modify_thread_labels"
 GMAIL_SEND_EMAIL_OPERATION = "gmail.send_email"
 SLACK_PROVIDER = "slack"
 SLACK_MARK_CONVERSATION_READ_OPERATION = "slack.mark_conversation_read"
+SLACK_SEND_MESSAGE_OPERATION = "slack.send_message"
 CALENDAR_PROVIDER = "google_calendar"
 CALENDAR_CREATE_EVENT_OPERATION = "calendar.create_event"
 CALENDAR_UPDATE_EVENT_OPERATION = "calendar.update_event"
@@ -7619,6 +7620,51 @@ class PostgresWarehouse:
             ensure_tables=False,
         )
 
+    def observe_succeeded_slack_send_message_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        """Mark a Slack send observed once the posted message has been synced back."""
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        mutations = self._succeeded_upstream_mutations(
+            provider=SLACK_PROVIDER,
+            operation=SLACK_SEND_MESSAGE_OPERATION,
+            limit=limit,
+        )
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for mutation in mutations:
+            result = _as_json_dict(mutation["result_json"])
+            team_id = str(result.get("team_id") or "").strip()
+            conversation_id = str(result.get("conversation_id") or "").strip()
+            message_ts = str(result.get("message_ts") or "").strip()
+            if not team_id or not conversation_id or not re.fullmatch(r"[0-9]+\.[0-9]+", message_ts):
+                continue
+            rows = self._query(
+                """
+                SELECT 1
+                FROM @slack_messages
+                WHERE account = %s
+                  AND team_id = %s
+                  AND conversation_id = %s
+                  AND message_ts = %s
+                  AND is_deleted = 0
+                LIMIT 1
+                """,
+                (mutation["account"], team_id, conversation_id, message_ts),
+            )
+            if rows:
+                observations.append(
+                    (
+                        str(mutation["id"]),
+                        {"conversation_id": conversation_id, "message_ts": message_ts},
+                    )
+                )
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
     def observe_succeeded_contact_mutations(
         self, *, limit: int | None = None, ensure_tables: bool = True
     ) -> int:
@@ -9309,7 +9355,122 @@ class PostgresWarehouse:
         conversation_id: str,
         message_ts: str,
     ) -> dict[str, Any]:
-        """Return the exact live Slack message/conversation a reviewed read targets.
+        """Return the exact live Slack message/conversation a reviewed read targets."""
+        return self.load_slack_message_target(
+            account=account, team_id=team_id, conversation_id=conversation_id, message_ts=message_ts
+        )
+
+    def load_slack_conversation_target(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        """Return the exact synced Slack conversation a reviewed send posts into, or {}.
+
+        Keyed by the session's workspace for the same reason as the message
+        target: an Enterprise Grid session must not post into a sibling workspace.
+        """
+        rows = self._query_dicts(
+            """
+            SELECT
+                account,
+                team_id,
+                conversation_id,
+                conversation_type,
+                name,
+                is_member,
+                is_im,
+                is_mpim,
+                is_archived
+            FROM @slack_conversations
+            WHERE account = %s
+              AND team_id = %s
+              AND conversation_id = %s
+            LIMIT 1
+            """,
+            (account, team_id, conversation_id),
+        )
+        return rows[0] if rows else {}
+
+    def load_slack_user_target(self, *, account: str, team_id: str, user_id: str) -> dict[str, Any]:
+        """Return the synced Slack user a reviewed DM is addressed to, or {}."""
+        rows = self._query_dicts(
+            """
+            SELECT account, team_id, user_id, name, real_name, display_name, is_bot, is_deleted
+            FROM @slack_users
+            WHERE account = %s
+              AND team_id = %s
+              AND user_id = %s
+            LIMIT 1
+            """,
+            (account, team_id, user_id),
+        )
+        return rows[0] if rows else {}
+
+    def load_slack_dm_conversation(self, *, account: str, team_id: str, user_id: str) -> dict[str, Any]:
+        """The synced 1:1 DM with `user_id`, or {} when the warehouse holds none.
+
+        A DM's row names the other person only inside raw_json (`user`); its
+        `name` column is that same id. Read the payload, not the name.
+        """
+        rows = self._query_dicts(
+            """
+            SELECT account, team_id, conversation_id, is_archived
+            FROM @slack_conversations
+            WHERE account = %s
+              AND team_id = %s
+              AND conversation_type = 'im'
+              AND COALESCE(raw_json::jsonb->>'user', '') = %s
+            ORDER BY is_archived ASC, conversation_id ASC
+            LIMIT 1
+            """,
+            (account, team_id, user_id),
+        )
+        return rows[0] if rows else {}
+
+    def find_slack_message_by_client_msg_id(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        client_msg_id: str,
+    ) -> dict[str, Any]:
+        """The synced message carrying this client_msg_id in the conversation, or {}.
+
+        This is the free half of the send pre-check: a message posted by an
+        earlier attempt whose response was lost has usually been synced back by
+        the time the retry runs.
+        """
+        if not client_msg_id:
+            return {}
+        rows = self._query_dicts(
+            """
+            SELECT account, team_id, conversation_id, message_ts, thread_ts, user_id
+            FROM @slack_messages
+            WHERE account = %s
+              AND team_id = %s
+              AND conversation_id = %s
+              AND client_msg_id = %s
+              AND is_deleted = 0
+            ORDER BY message_ts ASC
+            LIMIT 1
+            """,
+            (account, team_id, conversation_id, client_msg_id),
+        )
+        return rows[0] if rows else {}
+
+    def load_slack_message_target(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        message_ts: str,
+    ) -> dict[str, Any]:
+        """Return the exact live Slack message/conversation a reviewed write targets.
 
         The team id comes from the private session, not from proposal input. That
         keeps an Enterprise Grid client session pinned to the warehouse workspace
@@ -9328,6 +9489,8 @@ class PostgresWarehouse:
                 conversation.is_archived,
                 message.message_ts,
                 message.message_datetime,
+                message.thread_ts,
+                message.parent_message_ts,
                 message.text
             FROM @slack_conversations AS conversation
             JOIN @slack_messages AS message

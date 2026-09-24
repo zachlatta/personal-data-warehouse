@@ -57,6 +57,9 @@ func (s *apiFakeStore) GetRequest(_ context.Context, id string) (Request, error)
 func (s *apiFakeStore) UpdateGmailEmailMutation(context.Context, string, string, UpdateGmailEmailMutationInput, string) (Mutation, error) {
 	return Mutation{}, errors.New("not used")
 }
+func (s *apiFakeStore) UpdateSlackMessageMutation(context.Context, string, string, UpdateSlackMessageMutationInput, string) (Mutation, error) {
+	return Mutation{}, errors.New("not used")
+}
 func (s *apiFakeStore) RemoveMutation(_ context.Context, requestID, mutationID, actor string) (Mutation, error) {
 	if _, ok := s.requests[requestID]; !ok {
 		return Mutation{}, ErrNotFound

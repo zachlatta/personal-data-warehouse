@@ -34,6 +34,7 @@ from personal_data_warehouse.postgres import (
     INTEGER_COLUMNS,
     SLACK_MARK_CONVERSATION_READ_OPERATION,
     SLACK_PROVIDER,
+    SLACK_SEND_MESSAGE_OPERATION,
     TIMESTAMP_COLUMNS,
     PostgresWarehouse,
     _jsonb_param,
@@ -951,8 +952,83 @@ def test_slack_mark_read_target_and_observation_are_pinned_to_exact_message(
     assert _request_status(warehouse, request["id"]) == "observed"
 
 
+def test_slack_send_targets_and_observation_are_pinned_to_synced_rows(
+    warehouse: PostgresWarehouse,
+) -> None:
+    from personal_data_warehouse.schema import SLACK_USER_COLUMNS
+
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            _slack_conversation_row(conversation_id="D1", last_read="1.0", user="U-MARCUS"),
+            _slack_conversation_row(conversation_id="C1", last_read="1.0", conversation_type="public_channel", is_im=0),
+        ]
+    )
+    warehouse.insert_slack_users(
+        [
+            _default_row(SLACK_USER_COLUMNS, account="zrl", team_id="T1", user_id="U-MARCUS", name="marcus", raw_json="{}", synced_at=datetime(2026, 5, 22, 12, tzinfo=UTC), sync_version=1),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [_slack_message_row(conversation_id="C1", message_ts="1593473600.000300", client_msg_id="cmid-earlier")]
+    )
+
+    conversation = warehouse.load_slack_conversation_target(account="zrl", team_id="T1", conversation_id="C1")
+    assert conversation["conversation_type"] == "public_channel" and conversation["is_member"] == 1
+    assert warehouse.load_slack_conversation_target(account="zrl", team_id="T2", conversation_id="C1") == {}
+    person = warehouse.load_slack_user_target(account="zrl", team_id="T1", user_id="U-MARCUS")
+    assert person["name"] == "marcus" and person["is_bot"] == 0 and person["is_deleted"] == 0
+    assert warehouse.load_slack_user_target(account="zrl", team_id="T1", user_id="U-NOBODY") == {}
+    assert warehouse.load_slack_dm_conversation(account="zrl", team_id="T1", user_id="U-MARCUS")["conversation_id"] == "D1"
+    assert warehouse.load_slack_dm_conversation(account="zrl", team_id="T1", user_id="U-NOBODY") == {}
+    parent = warehouse.load_slack_message_target(account="zrl", team_id="T1", conversation_id="C1", message_ts="1593473600.000300")
+    assert parent["thread_ts"] == "1593473600.000300"
+    found = warehouse.find_slack_message_by_client_msg_id(account="zrl", team_id="T1", conversation_id="C1", client_msg_id="cmid-earlier")
+    assert found["message_ts"] == "1593473600.000300"
+    assert warehouse.find_slack_message_by_client_msg_id(account="zrl", team_id="T1", conversation_id="C1", client_msg_id="cmid-never") == {}
+    assert warehouse.find_slack_message_by_client_msg_id(account="zrl", team_id="T1", conversation_id="C1", client_msg_id="") == {}
+
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_slack_send",
+        title="Reply in #ops",
+        account="zrl",
+        mutations=[
+            {
+                "provider": SLACK_PROVIDER,
+                "operation": SLACK_SEND_MESSAGE_OPERATION,
+                "payload": {"conversation_id": "C1", "user_id": "", "text": "On it.", "thread_ts": "", "reply_broadcast": False},
+            }
+        ],
+    )
+    child = request["mutations"][0]
+    claimed = warehouse.claim_approved_upstream_mutations(limit=1, claimed_by="worker")
+    assert [row["id"] for row in claimed] == [child["id"]]
+    # The claimed row carries the approval time the executor's pre-check reads from.
+    assert claimed[0]["approved_at"] > EPOCH
+    warehouse.complete_upstream_mutation(
+        child["id"],
+        result_json={"conversation_id": "C1", "team_id": "T1", "message_ts": "1593473700.000500", "client_msg_id": "cmid-sent", "already_sent": False},
+        actor_id="worker",
+    )
+    assert warehouse.observe_succeeded_slack_send_message_mutations() == 0
+    assert _request_status(warehouse, request["id"]) == "succeeded"
+
+    warehouse.insert_slack_messages(
+        [_slack_message_row(conversation_id="C1", message_ts="1593473700.000500", client_msg_id="cmid-sent")]
+    )
+    assert warehouse.observe_succeeded_slack_send_message_mutations() == 1
+    assert _request_status(warehouse, request["id"]) == "observed"
+
+
 def _slack_conversation_row(
-    *, conversation_id: str, last_read: str, sync_version: int = 1
+    *,
+    conversation_id: str,
+    last_read: str,
+    sync_version: int = 1,
+    conversation_type: str = "im",
+    is_im: int = 1,
+    user: str = "",
 ) -> dict[str, Any]:
     now = datetime(2026, 5, 22, 12, tzinfo=UTC)
     return _default_row(
@@ -960,9 +1036,9 @@ def _slack_conversation_row(
         account="zrl",
         team_id="T1",
         conversation_id=conversation_id,
-        conversation_type="im",
-        name="Direct message",
-        is_im=1,
+        conversation_type=conversation_type,
+        name="Direct message" if conversation_type == "im" else conversation_id,
+        is_im=is_im,
         is_member=1,
         raw_json=json.dumps(
             {
@@ -971,6 +1047,7 @@ def _slack_conversation_row(
                 "unread_count": 0,
                 "unread_count_display": 0,
                 "is_open": True,
+                **({"user": user} if user else {}),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -980,7 +1057,7 @@ def _slack_conversation_row(
     )
 
 
-def _slack_message_row(*, conversation_id: str, message_ts: str) -> dict[str, Any]:
+def _slack_message_row(*, conversation_id: str, message_ts: str, client_msg_id: str = "") -> dict[str, Any]:
     now = datetime(2026, 5, 22, 12, tzinfo=UTC)
     return _default_row(
         SLACK_MESSAGE_COLUMNS,
@@ -991,6 +1068,7 @@ def _slack_message_row(*, conversation_id: str, message_ts: str) -> dict[str, An
         message_datetime=now,
         thread_ts=message_ts,
         text="please review",
+        client_msg_id=client_msg_id,
         raw_json="{}",
         synced_at=now,
         sync_version=1,

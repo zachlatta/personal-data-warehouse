@@ -33,6 +33,10 @@ func (s *recordingStore) UpdateGmailEmailMutation(context.Context, string, strin
 	return Mutation{}, nil
 }
 
+func (s *recordingStore) UpdateSlackMessageMutation(context.Context, string, string, UpdateSlackMessageMutationInput, string) (Mutation, error) {
+	return Mutation{}, nil
+}
+
 func (s *recordingStore) RemoveMutation(context.Context, string, string, string) (Mutation, error) {
 	return Mutation{}, nil
 }
@@ -437,6 +441,7 @@ func TestMutationHelpDocumentsSupportedMutationTypes(t *testing.T) {
 		CalendarUpdateEventOperation,
 		CalendarDeleteEventOperation,
 		SlackMarkConversationReadOperation,
+		SlackSendMessageOperation,
 	} {
 		if !types[expected] {
 			t.Fatalf("help missing mutation type %s", expected)

@@ -113,6 +113,9 @@ export const mutations = {
   async updateEmail(requestId, mutationId, input) {
     return (await request(requestPath(requestId, "mutations", mutationId, "update-email"), { method: "POST", body: input })).mutation;
   },
+  async updateSlackMessage(requestId, mutationId, input) {
+    return (await request(requestPath(requestId, "mutations", mutationId, "update-slack-message"), { method: "POST", body: input })).mutation;
+  },
 };
 
 // --- search (the app's hybrid search tool, POST /api/tools/search) ----------

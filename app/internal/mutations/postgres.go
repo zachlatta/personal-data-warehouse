@@ -158,6 +158,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
+	s.enrichSlackSendMessagePreviews(ctx, normalized)
 	idempotencyKey, err := requestIdempotencyKey(input, normalized)
 	if err != nil {
 		return Request{}, err
@@ -328,7 +329,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 		return Request{}, err
 	}
 	mutations = s.hydrateCalendarDayPreviews(ctx, mutations)
-	mutations = s.hydrateSlackMarkReadPreviewLinks(ctx, mutations)
+	mutations = s.hydrateSlackPreviewLinks(ctx, mutations)
 	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
 	request.Mutations = mutations
 	if request.MutationCount == 0 {
@@ -469,17 +470,17 @@ func (s *PostgresStore) loadCalendarDayPreviewRows(ctx context.Context, targets 
 	return previewRows, nil
 }
 
-// hydrateSlackMarkReadPreviewLinks resolves the workspace domain and the
-// speakers' avatars for every Slack mark-read mutation in one pair of
+// hydrateSlackPreviewLinks resolves the workspace domain and the speakers'
+// avatars for every Slack mark-read AND send-message mutation in one pair of
 // lookups, whatever the size of the batch, and hands them to
 // applySlackMarkReadPreviewLinks. Like the other preview enrichments it is
 // non-fatal: a review without faces is worse than one with them, and worth
 // far less than no review at all.
-func (s *PostgresStore) hydrateSlackMarkReadPreviewLinks(ctx context.Context, mutations []Mutation) []Mutation {
+func (s *PostgresStore) hydrateSlackPreviewLinks(ctx context.Context, mutations []Mutation) []Mutation {
 	if s == nil || s.db == nil {
 		return mutations
 	}
-	teams, users := slackMarkReadPreviewLinkTargets(mutations)
+	teams, users := slackPreviewLinkTargets(mutations)
 	if len(teams) == 0 {
 		return mutations
 	}
@@ -539,14 +540,14 @@ func (s *PostgresStore) hydrateSlackMarkReadPreviewLinks(ctx context.Context, mu
 			  ON wanted.account = actor.account AND wanted.team_id = actor.team_id AND wanted.user_id = actor.user_id
 		`, strings.Join(userValues, ", ")), userArgs...)
 		if err != nil {
-			return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+			return applySlackPreviewLinks(mutations, domains, avatars)
 		}
 		for userRows.Next() {
 			var key slackUserKey
 			var avatar string
 			if err := userRows.Scan(&key.Account, &key.TeamID, &key.UserID, &avatar); err != nil {
 				userRows.Close()
-				return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+				return applySlackPreviewLinks(mutations, domains, avatars)
 			}
 			if avatar != "" {
 				avatars[slackUserKey{Account: normalizeAccount(key.Account), TeamID: key.TeamID, UserID: key.UserID}] = avatar
@@ -555,7 +556,7 @@ func (s *PostgresStore) hydrateSlackMarkReadPreviewLinks(ctx context.Context, mu
 		_ = userRows.Err()
 		userRows.Close()
 	}
-	return applySlackMarkReadPreviewLinks(mutations, domains, avatars)
+	return applySlackPreviewLinks(mutations, domains, avatars)
 }
 
 // slackPreviewAvatarLimit bounds one read's avatar lookup.
@@ -1878,6 +1879,23 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					"context": input.Context,
 				},
 			})
+		case SlackSendMessageOperation:
+			if err := validateSlackSendMessage(mutation); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			payload := slackSendMessagePayload(mutation)
+			out = append(out, storedMutation{
+				Provider:  SlackProvider,
+				Operation: SlackSendMessageOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, slackSendMessageTitle(payload)),
+				Reason:    reason,
+				Payload:   payload,
+				Preview: map[string]any{
+					"slack_message": slackSendMessagePreview(payload),
+					"context":       input.Context,
+				},
+			})
 		default:
 			return nil, fmt.Errorf("mutation %d has unsupported type %q", index, mutation.Type)
 		}
@@ -2800,12 +2818,10 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 	return detail, true
 }
 
-func (s *PostgresStore) loadSlackMarkReadPreviewRows(
-	ctx context.Context,
-	detail slackMarkReadPreviewDetail,
-) ([]slackMarkReadPreviewRow, error) {
-	if detail.ContextKind == "thread" {
-		return s.querySlackMarkReadPreviewRows(ctx, `
+// slackThreadPreviewRowsSQL is one thread — its parent and the replies
+// nearest the anchor ($4 is the thread ts, $5 the anchor ts) — as both the
+// mark-read and the send-message previews show it.
+const slackThreadPreviewRowsSQL = `
 			WITH selected AS (
 			SELECT
 				message.account,
@@ -2840,7 +2856,14 @@ func (s *PostgresStore) loadSlackMarkReadPreviewRows(
 			SELECT account, conversation_id, message_ts, message_datetime, user_id, actor_name, text, thread_ts, avatar_url
 			FROM selected
 			ORDER BY sort_at ASC, sort_ts ASC
-		`, detail, detail.ThreadTS, detail.MessageTS)
+`
+
+func (s *PostgresStore) loadSlackMarkReadPreviewRows(
+	ctx context.Context,
+	detail slackMarkReadPreviewDetail,
+) ([]slackMarkReadPreviewRow, error) {
+	if detail.ContextKind == "thread" {
+		return s.querySlackMarkReadPreviewRows(ctx, slackThreadPreviewRowsSQL, detail, detail.ThreadTS, detail.MessageTS)
 	}
 	before, err := s.querySlackMarkReadPreviewRows(ctx, `
 		SELECT
@@ -3028,4 +3051,352 @@ func decodeJSONSlice(data []byte) []any {
 		return []any{}
 	}
 	return out
+}
+
+// UpdateSlackMessageMutation applies a reviewer's edit of a pending Slack
+// send. Like the Gmail edit it bumps the revision so a stale client sees the
+// change, and records the edit on both the mutation and the request.
+func (s *PostgresStore) UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	if err := s.EnsureTables(ctx); err != nil {
+		return Mutation{}, err
+	}
+	if actor == "" {
+		actor = reviewerActorID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Mutation{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	requestStatus, err := requestStatusForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if requestStatus != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot edit mutation for request with status %s", requestStatus)
+	}
+	mutation, err := mutationForUpdate(ctx, tx, requestID, mutationID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if mutation.Status != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot edit mutation with status %s", mutation.Status)
+	}
+	if !isSlackSendMessageMutation(mutation) {
+		return Mutation{}, fmt.Errorf("cannot edit mutation with operation %s", mutation.Operation)
+	}
+	payload, preview, title, err := updatedSlackMessagePayload(mutation, input)
+	if err != nil {
+		return Mutation{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutations
+		   SET title = $1,
+		       payload_json = $2::jsonb,
+		       preview_json = $3::jsonb,
+		       revision = revision + 1,
+		       updated_at = $4
+		 WHERE id = $5
+	`, title, jsonString(payload), jsonString(preview), now, mutationID); err != nil {
+		return Mutation{}, err
+	}
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutation_requests
+		   SET revision = revision + 1,
+		       updated_at = $1
+		 WHERE id = $2
+	`, now, requestID); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendMutationEvent(ctx, tx, mutationID, "edited", "human", actor, map[string]any{
+		"request_id": requestID,
+		"text":       payload["text"],
+	}); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendRequestEvent(ctx, tx, requestID, "mutation_edited", "human", actor, map[string]any{
+		"mutation_id": mutationID,
+	}); err != nil {
+		return Mutation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Mutation{}, err
+	}
+	committed = true
+	mutation.Title = title
+	mutation.Payload = payload
+	mutation.Preview = preview
+	mutation.Revision++
+	mutation.UpdatedAt = now
+	return mutation, nil
+}
+
+// enrichSlackSendMessagePreviews resolves the recipient of every Slack send
+// against the warehouse at proposal time: the workspace, the person or the
+// channel by name, whether Zach can post there, and the conversation or
+// thread the message lands in. Non-fatal, like every other preview
+// enrichment: the executor independently re-checks all of it against the
+// live API before posting, and a missing preview reads as a warning rather
+// than as silence.
+func (s *PostgresStore) enrichSlackSendMessagePreviews(ctx context.Context, mutations []storedMutation) {
+	if s == nil || s.db == nil {
+		return
+	}
+	targets := slackSendMessagePreviewTargets(mutations)
+	if len(targets) == 0 {
+		return
+	}
+	contexts := make([]slackSendPreviewContext, 0, len(targets))
+	for _, target := range targets {
+		detail, ok := s.loadSlackSendPreviewDetail(ctx, target)
+		if !ok {
+			continue
+		}
+		rows, err := s.loadSlackSendPreviewRows(ctx, detail)
+		if err != nil {
+			rows = nil
+		}
+		contexts = append(contexts, slackSendPreviewContext{Key: target, Detail: detail, Rows: rows})
+	}
+	applySlackSendMessagePreviewDetails(mutations, contexts)
+}
+
+func (s *PostgresStore) loadSlackSendPreviewDetail(ctx context.Context, target slackSendPreviewKey) (slackSendPreviewDetail, bool) {
+	detail := slackSendPreviewDetail{
+		Account:         target.Account,
+		ConversationID:  target.ConversationID,
+		RecipientUserID: target.UserID,
+		ThreadTS:        target.ThreadTS,
+	}
+	if target.UserID != "" {
+		if !s.loadSlackSendRecipient(ctx, &detail) {
+			// An unknown user still needs the workspace, so the warning can
+			// say which account it was checked against.
+			s.loadSlackSendIdentity(ctx, &detail)
+		}
+	}
+	if detail.ConversationID != "" {
+		if !s.loadSlackSendConversation(ctx, &detail) && detail.TeamID == "" {
+			s.loadSlackSendIdentity(ctx, &detail)
+		}
+	}
+	if detail.TeamID == "" {
+		return detail, false
+	}
+	if detail.ThreadTS != "" && detail.ConversationFound {
+		row := queryRowContext(ctx, s.db, `
+			SELECT 1
+			FROM @slack_messages AS message
+			WHERE message.account = $1 AND message.team_id = $2
+			  AND message.conversation_id = $3 AND message.message_ts = $4
+			  AND message.is_deleted = 0
+		`, detail.Account, detail.TeamID, detail.ConversationID, detail.ThreadTS)
+		var one int
+		detail.ThreadFound = row.Scan(&one) == nil
+	}
+	return detail, true
+}
+
+// loadSlackSendIdentity fills the workspace from the account's own identity
+// row when neither the recipient nor the conversation resolved.
+func (s *PostgresStore) loadSlackSendIdentity(ctx context.Context, detail *slackSendPreviewDetail) {
+	row := queryRowContext(ctx, s.db, `
+		SELECT identity.team_id, COALESCE(identity.user_id, ''), COALESCE(team.domain, '')
+		FROM @slack_account_identities AS identity
+		LEFT JOIN @slack_teams AS team
+		  ON team.account = identity.account AND team.team_id = identity.team_id
+		WHERE identity.account = $1
+		ORDER BY identity.team_id ASC
+		LIMIT 1
+	`, detail.Account)
+	var teamID, selfUserID, domain string
+	if err := row.Scan(&teamID, &selfUserID, &domain); err != nil {
+		return
+	}
+	if detail.TeamID == "" {
+		detail.TeamID = teamID
+	}
+	if detail.SelfUserID == "" {
+		detail.SelfUserID = selfUserID
+	}
+	if detail.TeamDomain == "" {
+		detail.TeamDomain = domain
+	}
+}
+
+// loadSlackSendRecipient resolves a DM recipient: the person, and the DM
+// conversation the warehouse already holds with them, if any.
+func (s *PostgresStore) loadSlackSendRecipient(ctx context.Context, detail *slackSendPreviewDetail) bool {
+	row := queryRowContext(ctx, s.db, `
+		SELECT
+			person.team_id,
+			COALESCE(NULLIF(person.display_name, ''), NULLIF(person.real_name, ''), NULLIF(person.name, ''), person.user_id),
+			COALESCE(person.raw_json, '{}'),
+			COALESCE(identity.user_id, ''),
+			COALESCE(team.domain, ''),
+			COALESCE((
+				SELECT dm.conversation_id
+				FROM @slack_conversations AS dm
+				WHERE dm.account = person.account AND dm.team_id = person.team_id
+				  AND dm.conversation_type = 'im'
+				  AND COALESCE(dm.raw_json::jsonb->>'user', '') = person.user_id
+				ORDER BY dm.conversation_id ASC
+				LIMIT 1
+			), '')
+		FROM @slack_users AS person
+		LEFT JOIN @slack_account_identities AS identity
+		  ON identity.account = person.account AND identity.team_id = person.team_id
+		LEFT JOIN @slack_teams AS team
+		  ON team.account = person.account AND team.team_id = person.team_id
+		WHERE person.account = $1 AND person.user_id = $2
+		ORDER BY person.team_id ASC
+		LIMIT 1
+	`, detail.Account, detail.RecipientUserID)
+	var rawJSON, dmConversationID string
+	if err := row.Scan(&detail.TeamID, &detail.RecipientName, &rawJSON, &detail.SelfUserID, &detail.TeamDomain, &dmConversationID); err != nil {
+		return false
+	}
+	person := decodeJSONMap([]byte(rawJSON))
+	profile := mapFromAny(person["profile"])
+	detail.RecipientFound = true
+	detail.RecipientDeleted = person["deleted"] == true
+	detail.RecipientIsBot = person["is_bot"] == true
+	detail.RecipientAvatar = strings.TrimSpace(stringFromAny(profile["image_192"]))
+	if detail.RecipientAvatar == "" {
+		detail.RecipientAvatar = strings.TrimSpace(stringFromAny(profile["image_72"]))
+	}
+	if dmConversationID != "" {
+		detail.ConversationID = dmConversationID
+	}
+	return true
+}
+
+func (s *PostgresStore) loadSlackSendConversation(ctx context.Context, detail *slackSendPreviewDetail) bool {
+	row := queryRowContext(ctx, s.db, `
+		SELECT
+			conversation.team_id,
+			COALESCE(conversation.conversation_type, ''),
+			COALESCE(
+				NULLIF(conversation.name, ''),
+				NULLIF(peer.display_name, ''),
+				NULLIF(peer.real_name, ''),
+				NULLIF(peer.name, ''),
+				''
+			),
+			COALESCE(conversation.raw_json, '{}'),
+			COALESCE(peer.user_id, ''),
+			COALESCE(peer.raw_json, '{}'),
+			COALESCE(identity.user_id, ''),
+			COALESCE(team.domain, '')
+		FROM @slack_conversations AS conversation
+		LEFT JOIN @slack_users AS peer
+		  ON peer.account = conversation.account
+		 AND peer.team_id = conversation.team_id
+		 AND peer.user_id = COALESCE(conversation.raw_json::jsonb->>'user', '')
+		LEFT JOIN @slack_account_identities AS identity
+		  ON identity.account = conversation.account AND identity.team_id = conversation.team_id
+		LEFT JOIN @slack_teams AS team
+		  ON team.account = conversation.account AND team.team_id = conversation.team_id
+		WHERE conversation.account = $1 AND conversation.conversation_id = $2
+		ORDER BY conversation.team_id ASC
+		LIMIT 1
+	`, detail.Account, detail.ConversationID)
+	var rawJSON, peerUserID, peerJSON, selfUserID, domain, teamID string
+	if err := row.Scan(&teamID, &detail.ConversationType, &detail.ConversationName, &rawJSON, &peerUserID, &peerJSON, &selfUserID, &domain); err != nil {
+		return false
+	}
+	if detail.TeamID != "" && teamID != detail.TeamID {
+		// A DM resolved from the person lives in one workspace; a conversation
+		// row from another is not it.
+		return false
+	}
+	detail.TeamID = teamID
+	if detail.SelfUserID == "" {
+		detail.SelfUserID = selfUserID
+	}
+	if detail.TeamDomain == "" {
+		detail.TeamDomain = domain
+	}
+	state := decodeJSONMap([]byte(rawJSON))
+	detail.ConversationFound = true
+	detail.IsArchived = state["is_archived"] == true
+	detail.IsMember = state["is_member"] == true || detail.ConversationType == "im" || detail.ConversationType == "mpim"
+	if detail.ConversationType == "im" && peerUserID != "" {
+		if detail.RecipientUserID == "" {
+			detail.RecipientUserID = peerUserID
+			detail.RecipientFound = true
+			detail.RecipientName = detail.ConversationName
+		}
+		if detail.RecipientAvatar == "" {
+			profile := mapFromAny(mapFromAny(decodeJSONMap([]byte(peerJSON)))["profile"])
+			detail.RecipientAvatar = strings.TrimSpace(stringFromAny(profile["image_192"]))
+			if detail.RecipientAvatar == "" {
+				detail.RecipientAvatar = strings.TrimSpace(stringFromAny(profile["image_72"]))
+			}
+		}
+	}
+	return true
+}
+
+// loadSlackSendPreviewRows is the context a reviewer reads the proposed
+// message against: the thread it replies to, or the newest messages of the
+// conversation it lands in.
+func (s *PostgresStore) loadSlackSendPreviewRows(ctx context.Context, detail slackSendPreviewDetail) ([]slackMarkReadPreviewRow, error) {
+	if !detail.ConversationFound || detail.ConversationID == "" {
+		return nil, nil
+	}
+	if detail.ThreadTS != "" {
+		return s.querySlackMarkReadPreviewRows(ctx, slackThreadPreviewRowsSQL, slackMarkReadPreviewDetail{
+			Account: detail.Account, TeamID: detail.TeamID, ConversationID: detail.ConversationID,
+			MessageTS: detail.ThreadTS, SelfUserID: detail.SelfUserID,
+		}, detail.ThreadTS, detail.ThreadTS)
+	}
+	rows, err := queryContext(ctx, s.db, `
+		SELECT
+			message.account,
+			message.conversation_id,
+			message.message_ts,
+			message.message_datetime,
+			message.user_id,
+			COALESCE(NULLIF(actor.display_name, ''), NULLIF(actor.real_name, ''), NULLIF(actor.name, ''), NULLIF(message.username, ''), NULLIF(message.user_id, ''), NULLIF(message.bot_id, ''), 'Unknown'),
+			substring(COALESCE(message.text, '') from 1 for 4000),
+			COALESCE(NULLIF(message.thread_ts, ''), message.parent_message_ts, ''),
+			COALESCE(NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_192', NULLIF(actor.raw_json, '')::jsonb->'profile'->>'image_72', '')
+		FROM @slack_messages AS message
+		LEFT JOIN @slack_users AS actor
+		  ON actor.account = message.account
+		 AND actor.team_id = message.team_id
+		 AND actor.user_id = message.user_id
+		WHERE message.account = $1
+		  AND message.team_id = $2
+		  AND message.conversation_id = $3
+		  AND message.is_deleted = 0
+		ORDER BY message.message_datetime DESC, message.message_ts DESC
+		LIMIT $4
+	`, detail.Account, detail.TeamID, detail.ConversationID, slackSendPreviewContextLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []slackMarkReadPreviewRow{}
+	for rows.Next() {
+		var row slackMarkReadPreviewRow
+		if err := rows.Scan(&row.Account, &row.ConversationID, &row.MessageTS, &row.SentAt, &row.UserID, &row.ActorName, &row.Text, &row.ThreadTS, &row.AvatarURL); err != nil {
+			return nil, err
+		}
+		row.IsFromMe = detail.SelfUserID != "" && row.UserID == detail.SelfUserID
+		if row.IsFromMe {
+			row.ActorName = "You"
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }

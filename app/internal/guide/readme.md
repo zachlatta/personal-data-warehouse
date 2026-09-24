@@ -179,7 +179,7 @@ Built-in warehouse mutation tools do not write upstream directly. {{if .CLI}}`pd
 types; `pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation_help` lists the supported
 types; `propose_mutation`{{end}} queues a request for human review and returns an
 `approval_url`. Gmail (send, archive, labels), Google Calendar, Google Contacts, Slack
-mark-read and Apple Notes are supported. Topic `mutations`.
+(send, mark read) and Apple Notes are supported. Topic `mutations`.
 
 {{if .CLI -}}
 ## Setup

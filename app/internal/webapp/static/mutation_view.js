@@ -93,6 +93,7 @@ export const GMAIL_UNARCHIVE = "gmail.unarchive_threads";
 export const GMAIL_MODIFY_THREAD_LABELS = "gmail.modify_thread_labels";
 export const GMAIL_SEND_EMAIL = "gmail.send_email";
 export const SLACK_MARK_CONVERSATION_READ = "slack.mark_conversation_read";
+export const SLACK_SEND_MESSAGE = "slack.send_message";
 const CALENDAR_OPS = ["calendar.create_event", "calendar.update_event", "calendar.delete_event"];
 const APPLE_NOTES_OPS = ["apple_notes.create_note", "apple_notes.update_note"];
 const APPLE_CONTACTS_OPS = ["apple_contacts.create_contact", "apple_contacts.update_contact", "apple_contacts.merge_contacts"];
@@ -111,6 +112,9 @@ export function isAppleNotesMutation(m) { return m.provider === "apple_notes" ||
 export function isAppleContactsMutation(m) { return m.provider === "apple_contacts" || APPLE_CONTACTS_OPS.includes(m.operation); }
 export function isSlackMarkReadMutation(m) {
   return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
+}
+export function isSlackSendMessageMutation(m) {
+  return m.provider === "slack" && m.operation === SLACK_SEND_MESSAGE;
 }
 
 // groupMutations mirrors renderMutationList: Gmail thread mutations group by
@@ -1095,6 +1099,82 @@ export function slackMarkReadView(mutation) {
     messages,
     targetMessage,
   };
+}
+
+// A Slack send, as the reviewer reads it: who it goes to, where it lands, the
+// words (the payload is authoritative -- an edit rewrites both, but an old
+// preview could lag), the context it replies into, and every warning the
+// proposer found. `resolved` is false when the recipient was never checked
+// against the warehouse at all, which is its own warning.
+export function slackSendMessageView(mutation) {
+  const payload = asMap(mutation.payload);
+  const preview = asMap(asMap(mutation.preview).slack_message);
+  const result = asMap(mutation.result);
+  const proposedConversationId = trimStr(preview.conversation_id) || trimStr(payload.conversation_id);
+  const conversationId = trimStr(preview.resolved_conversation_id) || proposedConversationId;
+  const userId = trimStr(preview.user_id) || trimStr(payload.user_id);
+  const threadTs = trimStr(preview.thread_ts) || trimStr(payload.thread_ts);
+  const delivery = trimStr(preview.delivery) || (threadTs ? "thread_reply" : (userId && !proposedConversationId) ? "dm" : "conversation");
+  const conversationType = trimStr(preview.conversation_type) || (delivery === "dm" ? "im" : "");
+  const text = str(payload.text) || str(preview.text);
+  const resolved = "team_id" in preview;
+  let recipientLabel = trimStr(preview.recipient_label) || trimStr(preview.recipient_name) || trimStr(preview.conversation_name) || (delivery === "dm" ? userId : conversationId);
+  if ((conversationType === "public_channel" || conversationType === "private_channel") && recipientLabel && !recipientLabel.startsWith("#")) {
+    recipientLabel = "#" + recipientLabel;
+  }
+  const messages = mapSlice(preview.messages).map((message) => ({
+    messageTs: trimStr(message.message_ts),
+    sentAt: trimStr(message.sent_at),
+    userId: trimStr(message.user_id),
+    actorName: message.is_from_me === true ? "You" : (trimStr(message.actor_name) || "Unknown"),
+    text: str(message.text),
+    isFromMe: message.is_from_me === true,
+    isThreadParent: message.is_thread_parent === true,
+    avatarUrl: trimStr(message.avatar_url),
+    open: deepLink(message.open),
+  }));
+  const warnings = stringSlice(preview.warnings);
+  if (!resolved) warnings.push("The recipient was not checked against the warehouse when this was proposed. Verify the exact ids below before approving.");
+  const verified = resolved && (delivery === "dm" ? preview.recipient_found === true : preview.conversation_found === true);
+  const deliveryLabel = delivery === "dm" ? "Direct message" : delivery === "thread_reply" ? "Thread reply" : "Message";
+  const heading = delivery === "dm" ? "Send Slack DM" : delivery === "thread_reply" ? "Reply in Slack thread" : "Send Slack message";
+  const sentMessageTs = trimStr(result.message_ts);
+  const sentOpen = sentMessageTs
+    ? slackPermalink(trimStr(result.team_id) || trimStr(preview.team_id), trimStr(result.conversation_id) || conversationId, sentMessageTs, trimStr(result.thread_ts), trimStr(preview.team_domain))
+    : null;
+  return {
+    heading,
+    delivery,
+    deliveryLabel,
+    recipientLabel,
+    conversationId,
+    userId,
+    threadTs,
+    replyBroadcast: preview.reply_broadcast === true || payload.reply_broadcast === true,
+    conversationType,
+    text,
+    effect: trimStr(preview.effect) || "Posts this message as you. Once approved it is posted and cannot be unsent by the warehouse.",
+    resolved,
+    verified,
+    warnings,
+    edited: preview.edited === true,
+    contextLabel: delivery === "thread_reply" ? "The thread" : "Recent messages",
+    messages,
+    avatarUrl: trimStr(preview.avatar_url),
+    open: deepLink(preview.open),
+    sent: sentMessageTs ? { messageTs: sentMessageTs, alreadySent: result.already_sent === true, open: sentOpen } : null,
+  };
+}
+
+// The permalink shape the server builds (app/internal/deeplink), repeated here
+// for the one link the server cannot precompute: the message a send created.
+export function slackPermalink(teamId, conversationId, messageTs, threadTs, domain) {
+  if (!teamId || !conversationId || !messageTs) return null;
+  const p = "p" + messageTs.replaceAll(".", "");
+  if (!domain) return { url: "https://app.slack.com/client/" + encodeURIComponent(teamId) + "/" + encodeURIComponent(conversationId) + "/" + p, label: "Slack" };
+  let url = "https://" + domain + ".slack.com/archives/" + encodeURIComponent(conversationId) + "/" + p;
+  if (threadTs && threadTs !== messageTs) url += "?thread_ts=" + encodeURIComponent(threadTs) + "&cid=" + encodeURIComponent(conversationId);
+  return { url, label: "Slack" };
 }
 
 // The link that opens a record in the app it came from, as both surfaces

@@ -62,3 +62,11 @@ messages a day keep it `ok` through a total group-DM outage, so the per-type che
 that means something; ok ≥ 95%), `history_polled_fraction` (judged for public channels),
 the DM landing latency columns, and `status` as the worst of them. The status is about
 the sync attempt, not message volume: group DMs have legitimate zero-message days.
+
+## Writing
+
+Sending as Zach is a reviewed mutation, never a direct call: propose `slack.send_message`
+(topic `mutations`) with the `conversation_id` you found on the timeline — or a `user_id`
+from `base_slack.users` for a DM, or `thread_ts` to reply in a thread — and the message
+posts through his own session only after he approves it in the review UI, where he can
+still edit the words. Marking a conversation read is `slack.mark_conversation_read`.

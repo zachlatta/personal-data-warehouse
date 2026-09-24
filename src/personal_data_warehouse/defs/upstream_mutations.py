@@ -38,6 +38,7 @@ from personal_data_warehouse.gmail_mutations import (
 from personal_data_warehouse.slack_mutations import (
     SLACK_MARK_CONVERSATION_READ_OPERATION,
     SLACK_PROVIDER,
+    SLACK_SEND_MESSAGE_OPERATION,
     SlackMutationExecutor,
 )
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
@@ -61,11 +62,19 @@ GMAIL_THREAD_LABEL_OPERATIONS = {
 # risking duplicate user-visible side effects. Gmail's batchModify is idempotent for label
 # add/remove, and explicit label creation re-lists/reuses same-name labels (including a 409
 # race) before modifying messages. Other creates and sends (calendar, email, contacts) are not.
+# A Slack send (SLACK_SEND_MESSAGE_OPERATION) is deliberately absent too: its executor
+# looks for its own client_msg_id before posting, which makes a `failed_retryable` retry
+# safe, but a reclaim races a worker that may still be mid-post, and the pre-check cannot
+# see a message that has not landed yet.
 RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_ARCHIVE_OPERATION),
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
     ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION),
     (SLACK_PROVIDER, SLACK_MARK_CONVERSATION_READ_OPERATION),
+)
+NON_RECLAIMABLE_SEND_OPERATIONS: tuple[tuple[str, str], ...] = (
+    ("gmail", "gmail.send_email"),
+    (SLACK_PROVIDER, SLACK_SEND_MESSAGE_OPERATION),
 )
 
 # Providers whose upstream has no server API, so the only write path is an app running on
@@ -385,6 +394,7 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) ->
     observed += warehouse.observe_succeeded_contact_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_calendar_event_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_slack_mark_conversation_read_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_slack_send_message_mutations(ensure_tables=False)
     return UpstreamMutationObservationSummary(observed=observed)
 
 

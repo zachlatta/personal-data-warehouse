@@ -13,6 +13,7 @@ import { AppleContactMutationCard } from '@/components/apple-contact-mutation-re
 import { ContactMutationCard } from '@/components/contact-mutation-review';
 import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
+import { SlackSendMessageCard } from '@/components/slack-send-review';
 import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, rejectMutationRequest, removeMutation, updateEmailMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
@@ -29,6 +30,7 @@ import {
   isGmailSendEmailMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
+  isSlackSendMessageMutation,
   mutationReviewContext,
   requestLifecycle,
   requestLifecycleNote,
@@ -69,6 +71,7 @@ function MutationCard({ mutation, pending, busy, onRemove, onSaveEmail, requestR
   const theme = useTheme();
   if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveEmail} onRemove={onRemove} requestReason={requestReason} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
+  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} requestReason={requestReason} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   if (isAppleContactsMutation(mutation)) return <AppleContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;

@@ -48,6 +48,12 @@ type apiUpdateEmailBody struct {
 	Message           map[string]any `json:"message"`
 }
 
+// apiUpdateSlackMessageBody is the reviewer's edit of a Slack send: the text
+// only. Recipient and thread are fixed at proposal time.
+type apiUpdateSlackMessageBody struct {
+	Text string `json:"text"`
+}
+
 func (s *Service) apiListRequests(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		apiError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -154,6 +160,18 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		mutation, err := s.store.UpdateGmailEmailMutation(r.Context(), requestID, parts[2], gmailEmailUpdateInputFromJSON(body), actor)
+		if err != nil {
+			apiStoreError(w, err)
+			return
+		}
+		apiJSON(w, http.StatusOK, map[string]any{"mutation": mutationJSON(mutation)})
+	case len(parts) == 4 && parts[1] == "mutations" && parts[3] == "update-slack-message" && r.Method == http.MethodPost:
+		var body apiUpdateSlackMessageBody
+		if err := decodeOptionalJSON(r, &body); err != nil {
+			apiError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		mutation, err := s.store.UpdateSlackMessageMutation(r.Context(), requestID, parts[2], UpdateSlackMessageMutationInput{Text: body.Text}, actor)
 		if err != nil {
 			apiStoreError(w, err)
 			return

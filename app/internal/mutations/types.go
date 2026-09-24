@@ -28,6 +28,7 @@ const (
 	AppleContactsMergeContactsOperation = "apple_contacts.merge_contacts"
 	SlackProvider                       = "slack"
 	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
+	SlackSendMessageOperation           = "slack.send_message"
 
 	defaultRequestedBy = "mcp"
 	// reviewerActorID is the actor recorded when a reviewer surface passes
@@ -62,6 +63,7 @@ type Store interface {
 	ListRequests(ctx context.Context, filter RequestFilter) ([]Request, error)
 	GetRequest(ctx context.Context, id string) (Request, error)
 	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
+	UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error)
 	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
@@ -113,6 +115,14 @@ type UpdateGmailEmailMutationInput struct {
 	SelectedVariantID string
 }
 
+// UpdateSlackMessageMutationInput is what a reviewer may change on a Slack
+// send before approving it: the words. The recipient and the thread are not
+// editable, because they were validated at proposal time against the
+// warehouse; a wrong recipient is a request to deny, not to redirect.
+type UpdateSlackMessageMutationInput struct {
+	Text string
+}
+
 type MutationInput struct {
 	Type               string
 	Account            string
@@ -144,6 +154,10 @@ type MutationInput struct {
 	Remove             map[string]any
 	ConversationID     string
 	MessageTS          string
+	UserID             string
+	Text               string
+	ThreadTS           string
+	ReplyBroadcast     bool
 }
 
 type GmailEmailVariantInput struct {

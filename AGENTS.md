@@ -4214,3 +4214,56 @@ who was there at any one moment.
 **What was said in a huddle is not in PDW and cannot be made to be.** Zach makes real
 decisions in huddles, so absence of a decision in the warehouse is never evidence that the
 decision was not made. Say so rather than reporting a confident negative.
+
+## Sending Slack messages as Zach (`slack.send_message`)
+
+The second reviewed Slack write beside `slack.mark_conversation_read`, and the first that
+says something in his name — so every rule here is about the message going exactly where
+the reviewer saw it going, once. Nothing is posted before a human approves the request.
+
+- **The proposal names the recipient exactly.** `conversation_id` (`C…`/`D…`/`G…`) or
+  `user_id` (`U…`/`W…`) for a DM, never both; `thread_ts` needs `conversation_id` (a
+  thread lives in one conversation); `reply_broadcast` needs `thread_ts`; `text` is
+  mrkdwn, at most 4,000 characters, because Slack truncates a longer message with a warning
+  the executor could only see after approval. `app/internal/mutations/slack_send.go`
+  refuses all of that at proposal time, and the same checks run again at storage.
+- **The review resolves it against the warehouse and warns before approval.**
+  `enrichSlackSendMessagePreviews` fills the `slack_message` preview at proposal time —
+  the workspace, the recipient by name (and the DM the warehouse already holds with a
+  person), the thread's parent and nearest replies or the conversation's newest six
+  messages, and `warnings` for what the executor will refuse: not synced for this
+  account, archived, not a member of the channel, a deactivated or bot user, a thread
+  parent the warehouse does not hold. Faces and permalinks are hydrated on read, like
+  mark-read. **Only the words are editable** in the web review
+  (`POST …/mutations/<id>/update-slack-message`); the recipient and the thread were
+  validated at proposal time and a wrong recipient is a deny, not a redirect. The phone
+  renders the card read-only and says where to edit.
+- **The executor re-checks everything live** (`slack_mutations.py`), through the client
+  session `pdw slack publish-session` publishes — it posts as Zach, never as a bot: the
+  session's identity (`auth.test`), the conversation in `base_slack.conversations` **for
+  the session's team** (an Enterprise Grid session must not post into a sibling
+  workspace), `conversations.info` (same id, not archived, and for a DM that
+  `channel.user` is the proposed person), the thread parent in `base_slack.messages` (a
+  reply's ts is re-pointed at its parent, recorded as `thread_ts_requested`), and for a
+  `user_id` the person in `base_slack.users` (live, not a bot) then the synced DM or
+  `conversations.open`, which is idempotent and posts nothing.
+- **One approval sends one message.** Every attempt carries
+  `client_msg_id = uuid5(fixed namespace, mutation id)` and, before posting, looks for it
+  in `base_slack.messages` and then in `conversations.history` / `conversations.replies`
+  from five minutes before the approval (falling back to a same-author, same-text match,
+  because Slack rewrites entities and links in what it stores); a hit is `succeeded` with
+  `already_sent: true` and `matched_by`. A pre-check that cannot run is
+  `failed_retryable`, never a send. A `failed_retryable` send IS retried by the next
+  worker run, which is safe only because of that check; a send is deliberately **not** in
+  `RECLAIMABLE_IDEMPOTENT_OPERATIONS`, because a reclaim races a worker that may still be
+  mid-post and the pre-check cannot see a message that has not landed. A stale
+  `executing` send therefore waits for a human, exactly like `gmail.send_email`. The
+  namespace constant must never change: a message sent under the old one would be
+  invisible to the retry that follows.
+- **Observation closes the loop** when the posted `message_ts` lands in
+  `base_slack.messages` (`observe_succeeded_slack_send_message_mutations`), the same
+  way a Gmail send is observed through its message id.
+- Deployment needs nothing new: `SLACK_ACCOUNTS` already gates Slack proposals in the
+  app, the Dagster worker already runs `SlackMutationExecutor` with the published
+  session, and both deploy from `main`. There is no way to test a send without sending —
+  the first real use should be a one-line DM to Zach himself.

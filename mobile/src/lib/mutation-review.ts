@@ -84,6 +84,112 @@ export function isSlackMarkReadMutation(mutation: MutationLike): boolean {
   return mutation.provider === 'slack' && mutation.operation === 'slack.mark_conversation_read';
 }
 
+export function isSlackSendMessageMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'slack' && mutation.operation === 'slack.send_message';
+}
+
+export type SlackSendContextMessage = {
+  messageTs: string;
+  sentAt: string;
+  actorName: string;
+  text: string;
+  isFromMe: boolean;
+  isThreadParent: boolean;
+  avatarUrl: string;
+  open: TimelineDeepLink | null;
+};
+
+export type SlackSendMessageReview = {
+  heading: string;
+  delivery: 'dm' | 'conversation' | 'thread_reply';
+  deliveryLabel: string;
+  recipientLabel: string;
+  conversationId: string;
+  userId: string;
+  threadTs: string;
+  replyBroadcast: boolean;
+  conversationType: string;
+  account: string;
+  text: string;
+  effect: string;
+  // resolved: the proposer checked the recipient against the warehouse at all;
+  // verified: it found them. An unresolved send is its own warning.
+  resolved: boolean;
+  verified: boolean;
+  warnings: string[];
+  edited: boolean;
+  contextLabel: string;
+  messages: SlackSendContextMessage[];
+  avatarUrl: string;
+  open: TimelineDeepLink | null;
+  sent: { messageTs: string; alreadySent: boolean } | null;
+};
+
+// A Slack send as the reviewer reads it. The payload's text is authoritative:
+// a web edit rewrites both, but the preview is the snapshot and the payload is
+// what the executor posts.
+export function slackSendMessageReview(mutation: MutationLike): SlackSendMessageReview {
+  const payload = asRecord(mutation.payload);
+  const preview = asRecord(asRecord(mutation.preview).slack_message);
+  const result = asRecord(mutation.result);
+  const proposedConversationId = text(preview.conversation_id) || text(payload.conversation_id);
+  const conversationId = text(preview.resolved_conversation_id) || proposedConversationId;
+  const userId = text(preview.user_id) || text(payload.user_id);
+  const threadTs = text(preview.thread_ts) || text(payload.thread_ts);
+  const rawDelivery = text(preview.delivery);
+  const delivery: SlackSendMessageReview['delivery'] = rawDelivery === 'dm' || rawDelivery === 'thread_reply' || rawDelivery === 'conversation'
+    ? rawDelivery
+    : threadTs ? 'thread_reply' : userId && !proposedConversationId ? 'dm' : 'conversation';
+  const conversationType = text(preview.conversation_type) || (delivery === 'dm' ? 'im' : '');
+  const resolved = 'team_id' in preview;
+  let recipientLabel = text(preview.recipient_label) || text(preview.recipient_name) || text(preview.conversation_name) || (delivery === 'dm' ? userId : conversationId);
+  if ((conversationType === 'public_channel' || conversationType === 'private_channel') && recipientLabel && !recipientLabel.startsWith('#')) {
+    recipientLabel = `#${recipientLabel}`;
+  }
+  const messages: SlackSendContextMessage[] = Array.isArray(preview.messages)
+    ? preview.messages.map((raw) => {
+        const message = asRecord(raw);
+        return {
+          messageTs: text(message.message_ts),
+          sentAt: text(message.sent_at),
+          actorName: message.is_from_me === true ? 'You' : text(message.actor_name) || 'Unknown',
+          text: text(message.text) || '(no text)',
+          isFromMe: message.is_from_me === true,
+          isThreadParent: message.is_thread_parent === true,
+          avatarUrl: text(message.avatar_url),
+          open: deepLink(message.open),
+        };
+      })
+    : [];
+  const warnings = stringList(preview.warnings);
+  if (!resolved) warnings.push('The recipient was not checked against the warehouse when this was proposed. Verify the exact ids below before approving.');
+  const verified = resolved && (delivery === 'dm' ? preview.recipient_found === true : preview.conversation_found === true);
+  const sentMessageTs = text(result.message_ts);
+  return {
+    heading: delivery === 'dm' ? 'Send Slack DM' : delivery === 'thread_reply' ? 'Reply in Slack thread' : 'Send Slack message',
+    delivery,
+    deliveryLabel: delivery === 'dm' ? 'Direct message' : delivery === 'thread_reply' ? 'Thread reply' : 'Message',
+    recipientLabel,
+    conversationId,
+    userId,
+    threadTs,
+    replyBroadcast: preview.reply_broadcast === true || payload.reply_broadcast === true,
+    conversationType,
+    account: text(mutation.account),
+    text: typeof payload.text === 'string' && payload.text.trim() ? payload.text : text(preview.text),
+    effect: text(preview.effect) || 'Posts this message as you. Once approved it is posted and cannot be unsent by the warehouse.',
+    resolved,
+    verified,
+    warnings,
+    edited: preview.edited === true,
+    contextLabel: delivery === 'thread_reply' ? 'The thread' : 'Recent messages',
+    messages,
+    avatarUrl: text(preview.avatar_url),
+    open: deepLink(preview.open),
+    sent: sentMessageTs ? { messageTs: sentMessageTs, alreadySent: result.already_sent === true } : null,
+  };
+}
+
 export function slackMarkReadReview(mutation: MutationLike): SlackMarkReadReview {
   const payload = asRecord(mutation.payload);
   const preview = asRecord(asRecord(mutation.preview).slack_read);

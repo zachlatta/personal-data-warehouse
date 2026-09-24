@@ -442,6 +442,31 @@ func MutationHelp() MutationHelpDocument {
 					"The executor requires an xoxc token and d cookie published with `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
 			},
 			{
+				Type:        SlackSendMessageOperation,
+				Summary:     "Send a Slack message as Zach: to a channel or group, as a DM to one person, or as a reply in a thread.",
+				RequiresEnv: "SLACK_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + SlackSendMessageOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Slack account label"},
+					{Name: "conversation_id", JSONType: "string", Required: false, Description: "Slack C, D, or G conversation ID to post in (base_slack.conversations.conversation_id). Exactly one of conversation_id or user_id."},
+					{Name: "user_id", JSONType: "string", Required: false, Description: "Slack U or W user ID to message directly (base_slack.users.user_id); the executor opens or reuses the DM. Exactly one of conversation_id or user_id."},
+					{Name: "text", JSONType: "string", Required: true, Description: "the message, in Slack mrkdwn (write a mention as <@U…>); at most 4000 characters"},
+					{Name: "thread_ts", JSONType: "string", Required: false, Description: "exact Slack timestamp of the thread's parent message to reply under (base_slack.messages.message_ts); needs conversation_id"},
+					{Name: "reply_broadcast", JSONType: "boolean", Required: false, Description: "with thread_ts: also post the reply to the conversation; defaults to false"},
+				},
+				Example: map[string]any{
+					"type":            SlackSendMessageOperation,
+					"account":         "zrl",
+					"conversation_id": "C012ABCDEF",
+					"thread_ts":       "1593473566.000200",
+					"text":            "Thanks — I'll take a look this afternoon.",
+				},
+				ExtraNotes: "Nothing is sent until a human approves the request; the reviewer can edit the text before approving, so propose the message you would actually send rather than a draft to be fixed. " +
+					"Sent as Zach through the client session published with `pdw slack publish-session` (never a bot). The executor re-checks the account, the workspace (auth.test against the stored session) and the recipient: a conversation must be synced in base_slack.conversations for that workspace, not archived, and one Zach can post in; a user_id must be a live, non-bot base_slack.users row; a thread_ts must be a synced message in that conversation. " +
+					"One approval sends one message: every attempt carries a client_msg_id derived from the mutation id and looks for it in the warehouse and in Slack before posting, so a retry after a timeout cannot post twice. " +
+					"Prefer conversation_id when you found the conversation on the timeline; use user_id only for a person you have no DM with yet.",
+			},
+			{
 				Type:        CalendarDeleteEventOperation,
 				Summary:     "Delete a Google Calendar event. Use an instance event_id to cancel a single occurrence of a recurring series.",
 				RequiresEnv: "CALENDAR_ACCOUNTS",
