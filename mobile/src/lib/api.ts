@@ -136,7 +136,8 @@ export type MutationRequestStatus =
   | 'executing'
   | 'executed'
   | 'failed'
-  | 'superseded';
+  | 'superseded'
+  | 'withdrawn';
 
 export type Mutation = {
   id: string;
@@ -172,8 +173,14 @@ export type MutationRequest = {
   result?: Record<string, unknown>;
   error: string;
   superseded_by: string;
+  // The earlier request this one was proposed to replace (the agent withdrew
+  // that one for this); empty when it replaces nothing.
+  replaces: string;
   requested_by: string;
   approved_by: string;
+  // Set when an agent withdrew the request; the reason is in error.
+  withdrawn_by: string;
+  withdrawn_at: string | null;
   created_at: string | null;
   updated_at: string | null;
   approved_at: string | null;

@@ -12,6 +12,7 @@ export const STATUS_COLORS: Record<string, string> = {
   rejected: '#6B7280',
   failed: '#DC2626',
   superseded: '#6B7280',
+  withdrawn: '#6B7280',
 };
 
 export function StatusPill({ status }: { status: string }) {

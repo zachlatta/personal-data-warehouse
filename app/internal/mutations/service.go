@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 var (
@@ -24,6 +26,14 @@ type ProposalResponse struct {
 	MutationIDs []string `json:"mutation_ids"`
 	ApprovalURL string   `json:"approval_url"`
 	Status      string   `json:"status"`
+	// Revision is the version to pass back as expected_revision if this
+	// request is later withdrawn or replaced after a reviewer has edited it.
+	Revision int64 `json:"revision"`
+	// ReplacedRequestID and ReplacedRequestStatus report what happened to the
+	// request named in replaces_request_id: withdrawn (it was still pending)
+	// or its unchanged terminal status with the link added.
+	ReplacedRequestID     string `json:"replaced_request_id,omitempty"`
+	ReplacedRequestStatus string `json:"replaced_request_status,omitempty"`
 }
 
 type ProposeMutationInput struct {
@@ -31,6 +41,29 @@ type ProposeMutationInput struct {
 	Reason    string           `json:"reason" jsonschema:"why these mutations should be reviewed and approved"`
 	Mutations []map[string]any `json:"mutations" jsonschema:"one or more mutation objects; call propose_mutation_help to see the supported types and their payload schemas"`
 	Context   map[string]any   `json:"context,omitempty" jsonschema:"optional source context for human review"`
+	// The replacement fields are how a corrected proposal retires the one it
+	// corrects in the same call, so a reviewer can never approve both.
+	ReplacesRequestID string `json:"replaces_request_id,omitempty" jsonschema:"id of an earlier request this proposal replaces: if it is still pending review it is withdrawn in the same transaction; if it failed or was denied it is linked as superseded; if it was approved or has run the proposal is refused so the change is not made twice"`
+	ReplacesReason    string `json:"replaces_reason,omitempty" jsonschema:"required with replaces_request_id: why the earlier request is being replaced, recorded on it as the withdrawal reason"`
+	ReplacesRevision  int64  `json:"replaces_revision,omitempty" jsonschema:"the earlier request's revision as last read (ops.upstream_mutation_requests.revision or the revision returned when it was proposed); required once a reviewer has edited that request, so a version the reviewer is still changing is never replaced blind"`
+}
+
+// WithdrawMutationInput is the withdraw_mutation tool's input: an agent taking
+// back a request it (or another agent) proposed, before a human decides on it.
+type WithdrawMutationInput struct {
+	RequestID           string `json:"request_id" jsonschema:"the request to withdraw; it must still be pending review"`
+	Reason              string `json:"reason" jsonschema:"required: why the request no longer stands (already done by hand, wrong recipient, overtaken by events, replaced by another request); shown to the reviewer and kept in the audit log"`
+	ReplacedByRequestID string `json:"replaced_by_request_id,omitempty" jsonschema:"optional id of the request that stands in for this one; prefer proposing the replacement with replaces_request_id, which withdraws the old request atomically"`
+	ExpectedRevision    int64  `json:"expected_revision,omitempty" jsonschema:"the request's revision as last read; required once a reviewer has edited the request, and must match its current revision"`
+}
+
+// WithdrawResponse reports the withdrawn request's final state.
+type WithdrawResponse struct {
+	RequestID           string `json:"request_id"`
+	Status              string `json:"status"`
+	ReplacedByRequestID string `json:"replaced_by_request_id,omitempty"`
+	Revision            int64  `json:"revision"`
+	ReviewURL           string `json:"review_url"`
 }
 
 // proposalInputError separates a caller's rejected proposal from a storage or
@@ -73,13 +106,33 @@ func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInpu
 		}
 		mutations = append(mutations, mutation)
 	}
-	return s.createRequest(ctx, CreateRequestInput{
+	create := CreateRequestInput{
 		Title:       strings.TrimSpace(input.Title),
 		Reason:      strings.TrimSpace(input.Reason),
 		Context:     cloneMap(input.Context),
 		Mutations:   mutations,
-		RequestedBy: defaultRequestedBy,
-	})
+		RequestedBy: requestActor(ctx),
+	}
+	if replaces := strings.TrimSpace(input.ReplacesRequestID); replaces != "" {
+		create.Replaces = &RequestReplacement{
+			RequestID:        replaces,
+			ExpectedRevision: input.ReplacesRevision,
+			Reason:           strings.TrimSpace(input.ReplacesReason),
+		}
+	} else if strings.TrimSpace(input.ReplacesReason) != "" || input.ReplacesRevision != 0 {
+		return ProposalResponse{}, invalidProposalInput(errors.New("replaces_reason and replaces_revision only mean something with replaces_request_id"))
+	}
+	return s.createRequest(ctx, create)
+}
+
+// requestActor is the identity recorded as the proposer or withdrawer: the
+// client name the bearer or OAuth session carries (the `pdw login` client,
+// the connector's client_name), or the historical "mcp" when none is known.
+func requestActor(ctx context.Context) string {
+	if name := strings.TrimSpace(auth.ClientNameFromContext(ctx)); name != "" {
+		return name
+	}
+	return defaultRequestedBy
 }
 
 func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (ProposalResponse, error) {
@@ -101,7 +154,55 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 	if s.cfg.RequestCreated != nil {
 		s.cfg.RequestCreated(ctx, request)
 	}
-	return s.responseForRequest(request), nil
+	response := s.responseForRequest(request)
+	if input.Replaces != nil && request.ReplacesRequestID != "" {
+		// The old request's fate is part of the answer: withdrawn, or linked
+		// under its unchanged terminal status. One read, only on this path.
+		if replaced, err := s.store.GetRequest(ctx, request.ReplacesRequestID); err == nil {
+			response.ReplacedRequestID = replaced.ID
+			response.ReplacedRequestStatus = replaced.Status
+			if replaced.Status == StatusWithdrawn && s.cfg.RequestWithdrawn != nil {
+				s.cfg.RequestWithdrawn(ctx, replaced)
+			}
+		}
+	}
+	return response, nil
+}
+
+// WithdrawMutation takes a pending request back. It is the one thing an agent
+// may do to a request after proposing it; it never touches an approved,
+// executing, finished, or denied request, and it can never make anything run.
+func (s *Service) WithdrawMutation(ctx context.Context, input WithdrawMutationInput) (WithdrawResponse, error) {
+	if s == nil || s.store == nil {
+		return WithdrawResponse{}, errors.New("mutation store is not configured")
+	}
+	id := strings.TrimSpace(input.RequestID)
+	withdraw := WithdrawInput{
+		Reason:           strings.TrimSpace(input.Reason),
+		ReplacedBy:       strings.TrimSpace(input.ReplacedByRequestID),
+		ExpectedRevision: input.ExpectedRevision,
+		Actor:            requestActor(ctx),
+	}
+	if err := validateWithdrawInput(id, withdraw); err != nil {
+		return WithdrawResponse{}, invalidProposalInput(err)
+	}
+	request, err := s.store.WithdrawRequest(ctx, id, withdraw)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return WithdrawResponse{}, invalidProposalInput(fmt.Errorf("no mutation request %s", id))
+		}
+		return WithdrawResponse{}, err
+	}
+	if s.cfg.RequestWithdrawn != nil {
+		s.cfg.RequestWithdrawn(ctx, request)
+	}
+	return WithdrawResponse{
+		RequestID:           request.ID,
+		Status:              request.Status,
+		ReplacedByRequestID: request.SupersededBy,
+		Revision:            request.Revision,
+		ReviewURL:           s.requestURL(request.ID),
+	}, nil
 }
 
 func (s *Service) validateCreateInput(input CreateRequestInput) error {
@@ -120,6 +221,17 @@ func (s *Service) validateCreateInput(input CreateRequestInput) error {
 	}
 	if len(missing) > 0 {
 		return errors.New(strings.Join(missing, "; ") + " (required top-level fields: title, reason, mutations)")
+	}
+	if input.Replaces != nil {
+		if strings.TrimSpace(input.Replaces.RequestID) == "" {
+			return errors.New("replaces_request_id must not be blank")
+		}
+		if strings.TrimSpace(input.Replaces.Reason) == "" {
+			return errors.New("replaces_reason is required with replaces_request_id: say why the earlier request is being replaced")
+		}
+		if input.Replaces.ExpectedRevision < 0 {
+			return errors.New("replaces_revision must be a positive revision number")
+		}
 	}
 	for index, mutation := range input.Mutations {
 		if err := s.validateMutation(index, mutation); err != nil {
@@ -270,6 +382,14 @@ func (s *Service) SetRequestCreated(hook func(context.Context, Request)) {
 	s.cfg.RequestCreated = hook
 }
 
+// SetRequestWithdrawn installs (or replaces) the Config.RequestWithdrawn hook.
+func (s *Service) SetRequestWithdrawn(hook func(context.Context, Request)) {
+	if s == nil {
+		return
+	}
+	s.cfg.RequestWithdrawn = hook
+}
+
 func (s *Service) responseForRequest(request Request) ProposalResponse {
 	mutationIDs := make([]string, 0, len(request.Mutations))
 	for _, mutation := range request.Mutations {
@@ -280,6 +400,7 @@ func (s *Service) responseForRequest(request Request) ProposalResponse {
 		MutationIDs: mutationIDs,
 		ApprovalURL: s.requestURL(request.ID),
 		Status:      request.Status,
+		Revision:    request.Revision,
 	}
 }
 

@@ -8,7 +8,9 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const proposeMutationDescription = "Create a pending upstream mutation request for human review in the Personal Data Warehouse. Does not execute the mutation; returns a request_id and approval_url for the web review UI. Mutations is an array — each entry specifies a type (e.g. gmail.send_email) plus that type's payload fields. Call propose_mutation_help first to see the supported types and the exact payload schema for each."
+const proposeMutationDescription = "Create a pending upstream mutation request for human review in the Personal Data Warehouse. Does not execute the mutation; returns a request_id and approval_url for the web review UI. Mutations is an array — each entry specifies a type (e.g. gmail.send_email) plus that type's payload fields. Call propose_mutation_help first to see the supported types and the exact payload schema for each. To correct an earlier proposal, pass replaces_request_id (with replaces_reason): the old request is withdrawn in the same transaction if still pending, so a reviewer can never approve both; if it was already approved or has run, the proposal is refused rather than repeating the change."
+
+const withdrawMutationDescription = "Withdraw a pending mutation request you no longer stand behind — the change was made by hand, the recipient or account was wrong, events overtook it, or another request replaces it. Requires a reason; optionally names the request that replaces it. Only a request still pending review can be withdrawn: an approved, executing, finished, or denied request is refused with its status, and if a reviewer has edited the request you must pass the revision you read (expected_revision). Withdrawing never runs anything; it only removes work from the review queue and is recorded in the audit log with your client identity."
 
 const proposeMutationHelpDescription = "Return the catalog of mutation types supported by propose_mutation, with field-by-field descriptions and a worked example for each. With no arguments it returns every type (~27 KB); pass type (e.g. gmail.send_email) to get one type's fields and example, or list_only: true for just the type names and summaries. Call this before propose_mutation to see how to shape each mutation entry."
 
@@ -26,11 +28,16 @@ func Tools(service *Service) []tool.Tool {
 			DescriptionStr: proposeMutationDescription,
 			Handle: func(ctx context.Context, in ProposeMutationInput) (ProposalResponse, error) {
 				response, err := service.ProposeMutation(ctx, in)
-				var inputErr *proposalInputError
-				if errors.As(err, &inputErr) {
-					return response, &tool.InvalidInputError{Message: inputErr.Error()}
-				}
-				return response, err
+				return response, agentFacingError(err)
+			},
+		},
+		&tool.Typed[WithdrawMutationInput, WithdrawResponse]{
+			NameStr:        "withdraw_mutation",
+			TitleStr:       "Withdraw Mutation",
+			DescriptionStr: withdrawMutationDescription,
+			Handle: func(ctx context.Context, in WithdrawMutationInput) (WithdrawResponse, error) {
+				response, err := service.WithdrawMutation(ctx, in)
+				return response, agentFacingError(err)
 			},
 		},
 		&tool.Typed[ProposeMutationHelpInput, MutationHelpDocument]{
@@ -42,6 +49,27 @@ func Tools(service *Service) []tool.Tool {
 			},
 		},
 	}
+}
+
+// agentFacingError turns the two outcomes a caller can act on — a rejected
+// input and a request whose state refuses the action — into the tool layer's
+// invalid-input error (HTTP 400, an MCP error result with the message), and
+// leaves storage failures as what they are. Without this a "request X was
+// already approved" answer would surface as an origin 502 that an edge proxy
+// may replace with a generic body the agent cannot read.
+func agentFacingError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var inputErr *proposalInputError
+	if errors.As(err, &inputErr) {
+		return &tool.InvalidInputError{Message: inputErr.Error()}
+	}
+	var stateErr *RequestStateError
+	if errors.As(err, &stateErr) {
+		return &tool.InvalidInputError{Message: stateErr.Error()}
+	}
+	return err
 }
 
 type ProposeMutationHelpInput struct {
@@ -101,12 +129,17 @@ func MutationHelp() MutationHelpDocument {
 	return MutationHelpDocument{
 		Overview: "propose_mutation creates a pending mutation request for human review. " +
 			"The top-level fields (title, reason, mutations, context) wrap one or more mutations. " +
-			"Each entry in mutations is an object whose `type` selects one of the supported operations below; the remaining fields are the payload for that type.",
+			"Each entry in mutations is an object whose `type` selects one of the supported operations below; the remaining fields are the payload for that type. " +
+			"A request is never edited by an agent after it is proposed: to correct one, propose the corrected request with replaces_request_id and replaces_reason (the old request is withdrawn in the same transaction while it is still pending, linked as superseded if it failed or was denied, and the proposal is refused if it was approved or has run), " +
+			"or call withdraw_mutation with a reason to take a pending request back without a replacement. Reviewers edit, trim, approve, and deny; agents propose and withdraw.",
 		Common: []MutationHelpArg{
 			{Name: "title", JSONType: "string", Required: true, Description: "short human-readable title for the reviewed request"},
 			{Name: "reason", JSONType: "string", Required: true, Description: "why these mutations should be reviewed and approved"},
 			{Name: "mutations", JSONType: "array<object>", Required: true, Description: "one or more mutation entries; each must include type plus that type's fields"},
 			{Name: "context", JSONType: "object", Required: false, Description: "optional source context for the human reviewer"},
+			{Name: "replaces_request_id", JSONType: "string", Required: false, Description: "id of an earlier request this proposal replaces; withdrawn atomically while pending, linked when failed or denied, refused when approved or already run"},
+			{Name: "replaces_reason", JSONType: "string", Required: false, Description: "required with replaces_request_id: why the earlier request is being replaced"},
+			{Name: "replaces_revision", JSONType: "integer", Required: false, Description: "the earlier request's revision as last read; required once a reviewer has edited it"},
 		},
 		Mutations: []MutationHelpType{
 			{

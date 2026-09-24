@@ -1,4 +1,4 @@
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -30,6 +30,8 @@ import {
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   mutationReviewContext,
+  requestLifecycle,
+  requestLifecycleNote,
   slackMarkReadGroups,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
@@ -120,6 +122,7 @@ function RequestOverview({
 }) {
   const theme = useTheme();
   const context = mutationReviewContext(request.context);
+  const lifecycle = requestLifecycle(request);
   return (
     <View style={styles.overview}>
       <View style={[styles.hero, { backgroundColor: theme.backgroundElement }]}>
@@ -179,7 +182,19 @@ function RequestOverview({
           {request.approved_at ? ` · ${formatWhen(request.approved_at)}` : ''}
         </ThemedText>
       ) : null}
-      {request.error ? <ThemedText style={styles.error}>{request.error}</ThemedText> : null}
+      {lifecycle.withdrawn ? (
+        <ThemedText type="small" themeColor="textSecondary">{requestLifecycleNote(request)}</ThemedText>
+      ) : request.error ? <ThemedText style={styles.error}>{request.error}</ThemedText> : null}
+      {lifecycle.supersededBy ? (
+        <Pressable accessibilityRole="link" onPress={() => router.push({ pathname: '/mutations/[id]', params: { id: lifecycle.supersededBy } })}>
+          <ThemedText type="small" style={styles.link}>{lifecycle.withdrawn ? 'Replaced by' : 'Superseded by'} {lifecycle.supersededBy} →</ThemedText>
+        </Pressable>
+      ) : null}
+      {lifecycle.replaces ? (
+        <Pressable accessibilityRole="link" onPress={() => router.push({ pathname: '/mutations/[id]', params: { id: lifecycle.replaces } })}>
+          <ThemedText type="small" style={styles.link}>Replaces {lifecycle.replaces} (withdrawn for this one) →</ThemedText>
+        </Pressable>
+      ) : null}
       {error ? <ThemedText style={styles.error}>{error}</ThemedText> : null}
       {onFilter ? (
         <View style={styles.filterBlock}>
@@ -581,5 +596,6 @@ const styles = StyleSheet.create({
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   input: { borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 12, fontSize: 16 },
   error: { color: '#D0342C' },
+  link: { color: '#2563EB' },
   slackAccent: { color: '#D97706', letterSpacing: 0.8 },
 });

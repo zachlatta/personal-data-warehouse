@@ -32,6 +32,7 @@ var mcpSnapshotTools = []string{
 	"describe_table",
 	"propose_mutation",
 	"propose_mutation_help",
+	"withdraw_mutation",
 }
 
 func TestMCPToolInputSchemasMatchGolden(t *testing.T) {

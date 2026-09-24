@@ -1648,6 +1648,33 @@ back it, all behind the static bearer the CLI uses:
   and as plain text (`editor_text`, `signature_text`, `quoted_text`) for the phone's
   TextInput; both clients reassemble editor + signature + quote in that order, which
   is the seam the server splits on next time. The actor is `app:<client_name>`. It executes nothing.
+  **Agents get one control over a request after proposing it, and it is not editing.** Since
+  2026-09-24 `withdraw_mutation` (reason required) moves a *pending* request to `withdrawn`, and
+  `propose_mutation` with `replaces_request_id` + `replaces_reason` withdraws the request it
+  corrects in the same transaction as the corrected proposal, linking the two both ways
+  (`superseded_by` / `replaces`). The design was chosen over agent-editable proposals on the
+  production record: every agent-side correction in 255 requests was a whole-request
+  replacement or a proposal gone moot (eleven inbox-cleanup v1 requests hand-denied with a typed
+  "superseded by v2", six 5,000-thread batches denied "outdated" after nine days, "already
+  sent", "did it manually", "too late"), while the one same-request tweak that recurs — a
+  footer, a recipient — is what the reviewer's own edit-before-approve already does (42
+  `mutation_edited` events). An in-place agent edit would also put a payload under the feet of
+  a reviewer reading it; a replacement is a new row the reviewer reads fresh, and the old row is
+  never rewritten, so what a human approves is exactly what the agent proposed. The
+  duplicate-send hazard it closes is the 2026-08-14 calendar batch: the agent proposed a
+  replacement and wrote "do not approve the earlier proposal", the earlier one had already been
+  approved, both ran, and a third request deleted the duplicates. Now a replacement of an
+  approved, executing, or finished request is refused with its status and nothing is created;
+  the race between an approval and a withdrawal is the same `FOR UPDATE` row lock, so exactly
+  one wins; and once a reviewer has edited a request its `revision` moves and the agent must
+  pass the revision it read (`replaces_revision` / `expected_revision`) or be refused, so a
+  version a human is still changing is never taken back blind. `withdrawn` is terminal and
+  distinct from `rejected` (a reviewer's decision, kept as that record); the actor is the
+  bearer's client name (`requested_by` / `withdrawn_by`, the `pdw login` client or the
+  connector's `client_name`, "mcp" when unknown), the reason lives in `error` beside a denial's,
+  and the request event ledger carries `withdrawn` / `replaces` / `superseded` with actor and
+  revision. The three columns (`replaces_request_id`, `withdrawn_by`, `withdrawn_at`) are declared
+  in both ensure paths and pinned by tests on each side; the worker never claims a withdrawn row.
   **The browser UI is a client of this same API**: `/mutation-review`, `/timeline` and
   `/search` are one static single-page app (`app/internal/webapp`, ES modules embedded in
   the binary, no build step, no CDN) that renders nothing server-side and authenticates

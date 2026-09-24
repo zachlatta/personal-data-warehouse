@@ -90,6 +90,9 @@ func (s *apiFakeStore) RejectRequest(_ context.Context, id, actor, reason string
 	s.actors = append(s.actors, actor)
 	return r, nil
 }
+func (s *apiFakeStore) WithdrawRequest(context.Context, string, WithdrawInput) (Request, error) {
+	return Request{}, errors.New("not used")
+}
 func (s *apiFakeStore) SupersedeRequest(context.Context, string, string, string) (Request, error) {
 	return Request{}, errors.New("not used")
 }
@@ -289,6 +292,9 @@ type supersedingStore struct {
 	emailEdits []UpdateGmailEmailMutationInput
 }
 
+func (s *supersedingStore) WithdrawRequest(context.Context, string, WithdrawInput) (Request, error) {
+	return Request{}, errors.New("not used")
+}
 func (s *supersedingStore) SupersedeRequest(_ context.Context, id, by, actor string) (Request, error) {
 	return s.recordSupersede(id, by, actor)
 }

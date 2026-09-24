@@ -261,6 +261,17 @@ is the link showing it was dealt with. Only `failed_terminal`, `failed_retryable
 `blocked_missing_credentials` requests can be superseded (`can_supersede` on the API), so live work
 cannot be closed out by mistake, and the replacement must already exist.
 
+An agent can take a **pending** request back, and only that. `withdraw_mutation` (with a required
+reason) moves it to `withdrawn` — a terminal, agent-written status kept apart from `rejected`, which
+is the reviewer's decision — and `propose_mutation` with `replaces_request_id` + `replaces_reason`
+withdraws the earlier request in the same transaction as the corrected proposal, so a reviewer can
+never approve both and send the same thing twice. A request that was already approved, is executing,
+or has run refuses both calls (and a replacement that names it is not created at all); a request a
+reviewer has edited refuses them until the agent passes the revision it read. The web and phone
+review show who withdrew a request, why, and what replaced it, and a withdrawn request's review alert
+is replaced on the phone by a passive one. Agents never approve, deny, or edit: those remain the
+reviewer's controls.
+
 ## Gmail Auth
 
 Authorize each mailbox once before running the sync:

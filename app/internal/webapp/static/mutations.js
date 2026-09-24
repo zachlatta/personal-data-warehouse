@@ -1003,12 +1003,31 @@ function renderRequestHeader(request) {
     meta.appendChild(item);
   }
   main.appendChild(meta);
-  if (request.error) main.appendChild(h("p", "bad", request.error));
-  const supersededBy = V.trimStr(request.superseded_by);
-  if (supersededBy) {
-    const p = h("p", "superseded", "Superseded by ");
-    p.appendChild(link(requestPath(supersededBy), supersededBy, "code"));
-    p.appendChild(document.createTextNode(". This request is kept as the record of what failed."));
+  const life = V.requestLifecycle(request);
+  if (life.withdrawn) {
+    // The reason lives in request.error; it is printed here, once, with who
+    // withdrew it and what replaced it, instead of as a bare red line.
+    const p = h("p", "superseded", "Withdrawn by " + life.withdrawn.by + (life.withdrawn.reason ? ": " + life.withdrawn.reason : "."));
+    if (life.withdrawn.at) p.title = fmtFull(life.withdrawn.at);
+    if (life.supersededBy) {
+      p.appendChild(document.createTextNode(" Replaced by "));
+      p.appendChild(link(requestPath(life.supersededBy), life.supersededBy, "code"));
+      p.appendChild(document.createTextNode("."));
+    }
+    main.appendChild(p);
+  } else {
+    if (request.error) main.appendChild(h("p", "bad", request.error));
+    if (life.supersededBy) {
+      const p = h("p", "superseded", "Superseded by ");
+      p.appendChild(link(requestPath(life.supersededBy), life.supersededBy, "code"));
+      p.appendChild(document.createTextNode(". This request is kept as the record of what failed."));
+      main.appendChild(p);
+    }
+  }
+  if (life.replaces) {
+    const p = h("p", "superseded", "Replaces ");
+    p.appendChild(link(requestPath(life.replaces), life.replaces, "code"));
+    p.appendChild(document.createTextNode(", which the agent withdrew for this one."));
     main.appendChild(p);
   }
   sect.appendChild(main);

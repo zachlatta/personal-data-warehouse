@@ -21,6 +21,18 @@
       "description": "why these mutations should be reviewed and approved",
       "type": "string"
     },
+    "replaces_reason": {
+      "description": "required with replaces_request_id: why the earlier request is being replaced, recorded on it as the withdrawal reason",
+      "type": "string"
+    },
+    "replaces_request_id": {
+      "description": "id of an earlier request this proposal replaces: if it is still pending review it is withdrawn in the same transaction; if it failed or was denied it is linked as superseded; if it was approved or has run the proposal is refused so the change is not made twice",
+      "type": "string"
+    },
+    "replaces_revision": {
+      "description": "the earlier request's revision as last read (ops.upstream_mutation_requests.revision or the revision returned when it was proposed); required once a reviewer has edited that request, so a version the reviewer is still changing is never replaced blind",
+      "type": "integer"
+    },
     "title": {
       "description": "short human-readable title for the reviewed request",
       "type": "string"

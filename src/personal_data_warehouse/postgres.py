@@ -6822,6 +6822,11 @@ class PostgresWarehouse:
             # column; both ensure paths must agree, or whichever bootstraps a
             # database first decides its shape.
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS superseded_by_request_id text NOT NULL DEFAULT ''",
+            # Agent withdrawal and replacement (app/internal/mutations/withdraw.go
+            # writes these; the Go ensure path declares the same three).
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''",
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''",
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
@@ -7735,9 +7740,12 @@ class PostgresWarehouse:
         if not mutations:
             return
         statuses = [str(mutation["status"]) for mutation in mutations]
-        active_statuses = [status for status in statuses if status != "rejected"]
+        # A withdrawn row is the agent's retraction, a rejected one the
+        # reviewer's decision; neither is live work, and a request whose every
+        # row was withdrawn is withdrawn, not denied.
+        active_statuses = [status for status in statuses if status not in {"rejected", "withdrawn"}]
         if not active_statuses:
-            status = "rejected"
+            status = "withdrawn" if all(status == "withdrawn" for status in statuses) else "rejected"
         elif any(status == "pending_review" for status in active_statuses):
             status = "pending_review"
         elif any(status == "executing" for status in active_statuses):

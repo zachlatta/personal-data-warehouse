@@ -230,6 +230,9 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
 				notifier.NotifyAsync(mutationNotification(request, mutationSvc.RequestJSON))
 			})
+			mutationSvc.SetRequestWithdrawn(func(_ context.Context, request mutations.Request) {
+				notifier.NotifyAsync(mutationWithdrawnNotification(request))
+			})
 		}
 		logger.Info("push notification endpoints enabled", "register", push.RegisterPath, "expo_access_token", cfg.ExpoAccessToken != "")
 	}
@@ -525,6 +528,10 @@ func mutationNotification(request mutations.Request, encode func(mutations.Reque
 		Category: push.CategoryMutationReview,
 		Route:    "/mutations/" + request.ID,
 		ThreadID: "mutations",
+		// One alert per request: a withdrawal later replaces this alert in
+		// place instead of leaving an Approve button on a request that no
+		// longer exists to approve.
+		CollapseID: mutationCollapseID(request.ID),
 		// A request waits on a human, so it may break through a Focus
 		// that allows time-sensitive alerts; it is not critical (which
 		// would bypass silent mode).
@@ -626,4 +633,36 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 		}
 		logger.InfoContext(r.Context(), "HTTP request completed", "method", r.Method, "path", r.URL.Path, "status", status, "bytes", rec.bytes, "duration", time.Since(started), "client", pdwauth.ClientNameFromContext(r.Context()))
 	})
+}
+
+func mutationCollapseID(requestID string) string { return "mutation-request:" + requestID }
+
+// mutationWithdrawnNotification replaces the review alert for a request an
+// agent withdrew. It is passive — nothing is waiting on the reader — and it
+// carries no action category, so a stale Approve cannot be tapped; the
+// server refuses that anyway, but the phone should not offer it.
+func mutationWithdrawnNotification(request mutations.Request) push.Notification {
+	body := strings.TrimSpace(request.Error)
+	if body == "" {
+		body = "The agent withdrew this request."
+	}
+	if request.SupersededBy != "" {
+		body += " Replaced by " + request.SupersededBy + "."
+	}
+	const maxBody = 180
+	if len(body) > maxBody {
+		body = body[:maxBody-1] + "…"
+	}
+	return push.Notification{
+		Title:             "Withdrawn: " + request.Title,
+		Body:              body,
+		Route:             "/mutations/" + request.ID,
+		ThreadID:          "mutations",
+		CollapseID:        mutationCollapseID(request.ID),
+		InterruptionLevel: push.InterruptionPassive,
+		Data: map[string]any{
+			"request_id": request.ID,
+			"kind":       "mutation_request_withdrawn",
+		},
+	}
 }

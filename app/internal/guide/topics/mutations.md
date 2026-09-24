@@ -31,6 +31,19 @@ authoritative when this list and it disagree.
 - **Email as Zach:** preserve CC lists on replies, reply in the thread you found, and
   never send from a guessed account. The reviewer can edit an email before approving it,
   drop one item from a batch without denying the rest, or mark a dead request superseded.
+- **A proposal is never edited after it is proposed; it is replaced or withdrawn.** To
+  correct one, propose the corrected request with `replaces_request_id` and
+  `replaces_reason`: while the old request is still pending it is withdrawn in the same
+  transaction, so the reviewer can never approve both and send the same thing twice; if it
+  failed or was denied it is linked as superseded; if it was approved or has already run
+  the proposal is refused with its status — do not re-propose it, say what is wrong. To
+  take a pending request back with no replacement (done by hand, wrong account, overtaken
+  by events), {{if .CLI}}`pdw call withdraw_mutation --data '{"request_id": "...", "reason": "..."}'`{{else}}`withdraw_mutation` with `request_id` and `reason`{{end}}.
+  A reason is required on both paths and is shown to the reviewer. Once a reviewer has
+  edited a request its `revision` moves, and you must pass the revision you read
+  (`replaces_revision` / `expected_revision`) or the call is refused: never take back a
+  version a human is still changing. Withdrawing removes work from the queue and never
+  runs anything; approval and execution stay with the human and the workers.
 - **Apple Notes:** `body` replaces the whole note; `append_body` adds to it. Prefer
   `append_body` — the executor cannot tell an intentional rewrite from a stale read. A
   note is addressed by the bare UUID `base_apple_notes.notes.note_id`; a title is the

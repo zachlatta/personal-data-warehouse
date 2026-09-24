@@ -27,6 +27,8 @@ import {
   isSlackMarkReadMutation,
   looksAutomatedSender,
   mutationReviewContext,
+  requestLifecycle,
+  requestLifecycleNote,
   slackMarkReadGroups,
   slackMarkReadReview,
 } from './mutation-review.ts';
@@ -830,4 +832,14 @@ test('the update input carries the recipients split, the assembled body and the 
   assert.equal(input.message.reply_to_thread_id, 't-9');
   assert.equal(input.message.in_reply_to, '<m1@example.test>');
   assert.deepEqual(input.message.references, ['<m1@example.test>']);
+});
+
+test('requestLifecycle reports an agent withdrawal with its reason and replacement', () => {
+  const life = requestLifecycle({ status: 'withdrawn', withdrawn_by: 'codex', error: 'sent by hand', superseded_by: 'req_2', replaces: '', withdrawn_at: '2026-09-24T10:00:00Z' });
+  assert.deepEqual(life, { withdrawn: { by: 'codex', reason: 'sent by hand', at: '2026-09-24T10:00:00Z' }, supersededBy: 'req_2', replaces: '' });
+  assert.equal(requestLifecycle({ status: 'pending_review', error: 'x' }).withdrawn, null);
+  assert.equal(requestLifecycle({ status: 'withdrawn' }).withdrawn.by, 'an agent');
+  assert.equal(requestLifecycleNote({ status: 'withdrawn', withdrawn_by: 'codex', error: 'sent by hand' }), 'Withdrawn by codex: sent by hand');
+  assert.equal(requestLifecycleNote({ status: 'withdrawn' }), 'Withdrawn by an agent.');
+  assert.equal(requestLifecycleNote({ status: 'rejected', error: 'no' }), '');
 });

@@ -165,6 +165,15 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if existing, err := s.getRequestByIdempotencyKey(ctx, idempotencyKey); err != nil {
 		return Request{}, err
 	} else if existing.ID != "" {
+		// The same proposal is already stored (a retry, or an agent proposing
+		// twice). The replacement it names still has to be closed out, and
+		// applyReplacement is a no-op when that already happened.
+		if input.Replaces != nil {
+			if err := s.applyReplacementStandalone(ctx, existing.ID, *input.Replaces, input.RequestedBy); err != nil {
+				return Request{}, err
+			}
+			return s.GetRequest(ctx, existing.ID)
+		}
 		return existing, nil
 	}
 
@@ -227,6 +236,14 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			return Request{}, err
 		}
 	}
+	// Closing out the replaced request rides in this transaction on purpose:
+	// the new proposal and the old one's withdrawal are one fact. If the old
+	// request turns out to have been approved, nothing is created.
+	if input.Replaces != nil {
+		if err := applyReplacement(ctx, tx, requestID, *input.Replaces, input.RequestedBy, now); err != nil {
+			return Request{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Request{}, err
 	}
@@ -262,9 +279,10 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       -- GetRequest reads them for the one request being reviewed.
 		       NULL::jsonb AS context_json, NULL::jsonb AS result_json,
 		       request.error, request.idempotency_key,
-		       request.superseded_by_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
-		       request.approved_at, request.executed_at, request.observed_at,
+		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
+		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.created_at, request.updated_at,
+		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
@@ -880,9 +898,10 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 	row := queryRowContext(ctx, s.db, `
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
 		       request.result_json, request.error, request.idempotency_key,
-		       request.superseded_by_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.created_at, request.updated_at,
-		       request.approved_at, request.executed_at, request.observed_at,
+		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
+		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.created_at, request.updated_at,
+		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
@@ -1540,14 +1559,17 @@ func scanRequest(row scanner) (Request, error) {
 		&request.Error,
 		&request.IdempotencyKey,
 		&request.SupersededBy,
+		&request.ReplacesRequestID,
 		&request.Revision,
 		&request.RequestedBy,
 		&request.ApprovedBy,
+		&request.WithdrawnBy,
 		&request.CreatedAt,
 		&request.UpdatedAt,
 		&request.ApprovedAt,
 		&request.ExecutedAt,
 		&request.ObservedAt,
+		&request.WithdrawnAt,
 		&mutationCount,
 	)
 	if err != nil {
@@ -2566,6 +2588,11 @@ var upstreamMutationSchemaStatements = []string{
 	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS request_index bigint NOT NULL DEFAULT 0`,
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS superseded_by_request_id text NOT NULL DEFAULT ''`,
+	// Agent withdrawal and replacement (2026-09-24). The Python ensure path
+	// declares the same three columns; both must agree.
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''`,
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''`,
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
 	`CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
 		mutation_id text NOT NULL,
 		event_index bigint NOT NULL,

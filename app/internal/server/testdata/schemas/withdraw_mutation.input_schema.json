@@ -1,0 +1,26 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "expected_revision": {
+      "description": "the request's revision as last read; required once a reviewer has edited the request, and must match its current revision",
+      "type": "integer"
+    },
+    "reason": {
+      "description": "required: why the request no longer stands (already done by hand, wrong recipient, overtaken by events, replaced by another request); shown to the reviewer and kept in the audit log",
+      "type": "string"
+    },
+    "replaced_by_request_id": {
+      "description": "optional id of the request that stands in for this one; prefer proposing the replacement with replaces_request_id, which withdraws the old request atomically",
+      "type": "string"
+    },
+    "request_id": {
+      "description": "the request to withdraw; it must still be pending review",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "reason"
+  ],
+  "type": "object"
+}

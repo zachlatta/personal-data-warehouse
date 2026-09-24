@@ -50,6 +50,11 @@ type Config struct {
 	// hook the push notifier hangs off. It must not block: the proposal has
 	// already been stored, and a slow provider must not slow the proposer.
 	RequestCreated func(context.Context, Request)
+	// RequestWithdrawn is called after an agent withdraws a pending request,
+	// directly or by proposing its replacement, so the alert that asked for a
+	// review of it can be replaced on the phone. Same contract as
+	// RequestCreated: already stored, must not block.
+	RequestWithdrawn func(context.Context, Request)
 }
 
 type Store interface {
@@ -61,6 +66,7 @@ type Store interface {
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
 	SupersedeRequest(ctx context.Context, id string, supersededBy string, actor string) (Request, error)
+	WithdrawRequest(ctx context.Context, id string, input WithdrawInput) (Request, error)
 }
 
 type RequestFilter struct {
@@ -74,6 +80,31 @@ type CreateRequestInput struct {
 	Context     map[string]any
 	Mutations   []MutationInput
 	RequestedBy string
+	// Replaces names the earlier request this proposal stands in for. The
+	// store closes that request out in the same transaction — withdrawing it
+	// if it is still pending, linking it if it is dead — or refuses the whole
+	// proposal when it has already been approved or has run.
+	Replaces *RequestReplacement
+}
+
+// RequestReplacement is the agent's statement about the request a proposal
+// replaces: which one, why, and (when a reviewer has edited it) the revision
+// the agent read.
+type RequestReplacement struct {
+	RequestID        string
+	ExpectedRevision int64
+	Reason           string
+}
+
+// WithdrawInput is an agent taking a pending request back. Reason is
+// required; ReplacedBy optionally links the request that stands in for it;
+// ExpectedRevision (0 = not stated) is required once a reviewer has changed
+// the request, and must match.
+type WithdrawInput struct {
+	Reason           string
+	ReplacedBy       string
+	ExpectedRevision int64
+	Actor            string
 }
 
 type UpdateGmailEmailMutationInput struct {
@@ -139,16 +170,23 @@ type Request struct {
 	Error          string
 	IdempotencyKey string
 	SupersededBy   string
-	Revision       int64
-	RequestedBy    string
-	ApprovedBy     string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	ApprovedAt     time.Time
-	ExecutedAt     time.Time
-	ObservedAt     time.Time
-	MutationCount  int
-	Mutations      []Mutation
+	// ReplacesRequestID is the earlier request this one was proposed to
+	// replace (the reverse of SupersededBy on that request).
+	ReplacesRequestID string
+	Revision          int64
+	RequestedBy       string
+	ApprovedBy        string
+	// WithdrawnBy is the agent identity that withdrew the request; the
+	// reason is in Error, exactly where a reviewer's denial reason lives.
+	WithdrawnBy   string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	ApprovedAt    time.Time
+	ExecutedAt    time.Time
+	ObservedAt    time.Time
+	WithdrawnAt   time.Time
+	MutationCount int
+	Mutations     []Mutation
 }
 
 type Mutation struct {

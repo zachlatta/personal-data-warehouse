@@ -49,6 +49,10 @@ func (s *recordingStore) SupersedeRequest(context.Context, string, string, strin
 	return Request{}, nil
 }
 
+func (s *recordingStore) WithdrawRequest(context.Context, string, WithdrawInput) (Request, error) {
+	return Request{}, nil
+}
+
 func TestProposeMutationGmailArchiveThreads(t *testing.T) {
 	store := &recordingStore{request: Request{
 		ID:     "req-123",

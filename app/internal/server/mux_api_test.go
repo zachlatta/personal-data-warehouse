@@ -35,6 +35,7 @@ var apiSnapshotTools = []string{
 	"sql",
 	"propose_mutation",
 	"propose_mutation_help",
+	"withdraw_mutation",
 }
 
 // mcpOnlyToolNames are exposed on MCP but must NOT appear on the HTTP API.

@@ -51,10 +51,28 @@ export function plural(n) { return n === 1 ? "" : "s"; }
 export function displayRequestStatus(status) { return status === "rejected" ? "denied" : (status || ""); }
 
 // A resolved failure must not read as an open one in the list, which is where
-// a stale red row is actually noticed.
+// a stale red row is actually noticed. A withdrawn request with a replacement
+// reads "replaced" rather than "superseded": the agent took it back for the
+// other one, nothing failed.
 export function requestListStatus(request) {
   const status = displayRequestStatus(request.status);
-  return trimStr(request.superseded_by) ? status + " (superseded)" : status;
+  if (!trimStr(request.superseded_by)) return status;
+  return status + (request.status === "withdrawn" ? " (replaced)" : " (superseded)");
+}
+
+// requestLifecycle is what happened to a request after it was proposed, for
+// the header: an agent withdrawal (who, why, and the request that stands in
+// for it), a human's supersede link on a dead request, and the request this
+// one replaces. `withdrawn` is null unless the status is withdrawn; its reason
+// is the row's error, exactly where a reviewer's denial reason lives, so the
+// header must not print that line twice.
+export function requestLifecycle(request) {
+  const supersededBy = trimStr(request.superseded_by);
+  const replaces = trimStr(request.replaces);
+  const withdrawn = request.status === "withdrawn"
+    ? { by: trimStr(request.withdrawn_by) || "an agent", reason: trimStr(request.error), at: trimStr(request.withdrawn_at) }
+    : null;
+  return { withdrawn, supersededBy, replaces };
 }
 
 export function splitRequestsForList(requests) {

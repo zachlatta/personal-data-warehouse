@@ -8,7 +8,7 @@ import {
   calendarPatchValue, calendarInitials, autolinkSegments, calendarTitle, calendarOperation,
   contactOperationSummary, contactFieldDisplayValue, canonicalContactOp, contactUpdateFields, contactEffect,
   contactEtagWarning, personFromFlatOperation, contactSummaryFromPerson,
-  groupMutations, requestListStatus, splitRequestsForList, splitRequestContext, identificationView, appleNotesView, appleContactsView,
+  groupMutations, requestListStatus, requestLifecycle, splitRequestsForList, splitRequestContext, identificationView, appleNotesView, appleContactsView,
   isSlackMarkReadMutation, slackMarkReadView, slackMarkReadGroups, mutationReviewContext,
   gmailMutationGroupActionText, gmailMutationGroupVerb, gmailMutationLabelChanges,
 } from "../mutation_view.js";
@@ -450,4 +450,27 @@ test("appleNotesView reads the note preview", () => {
   assert.equal(v.heading, "Create Apple Note");
   assert.deepEqual(v.changes, ["body"]);
   assert.equal(appleNotesView({ preview: {} }).heading, "Update Apple Note");
+});
+
+// --- agent withdrawal ---------------------------------------------------------
+
+test("requestListStatus reads a withdrawn-and-replaced request as replaced, not superseded", () => {
+  assert.equal(requestListStatus({ status: "withdrawn" }), "withdrawn");
+  assert.equal(requestListStatus({ status: "withdrawn", superseded_by: "req_2" }), "withdrawn (replaced)");
+  assert.equal(requestListStatus({ status: "failed_terminal", superseded_by: "req_2" }), "failed_terminal (superseded)");
+  assert.equal(requestListStatus({ status: "rejected" }), "denied");
+});
+
+test("requestLifecycle names who withdrew a request, why, and what replaced it", () => {
+  const life = requestLifecycle({ status: "withdrawn", withdrawn_by: "claude-code", error: "already done by hand", superseded_by: "req_2", replaces: "", withdrawn_at: "2026-09-24T10:00:00Z" });
+  assert.deepEqual(life, { withdrawn: { by: "claude-code", reason: "already done by hand", at: "2026-09-24T10:00:00Z" }, supersededBy: "req_2", replaces: "" });
+  assert.equal(requestLifecycle({ status: "withdrawn" }).withdrawn.by, "an agent");
+  assert.equal(requestLifecycle({ status: "pending_review", error: "x" }).withdrawn, null, "only a withdrawn request has a withdrawal");
+  assert.equal(requestLifecycle({ status: "pending_review", replaces: " req_1 " }).replaces, "req_1");
+});
+
+test("splitRequestsForList keeps a withdrawn request out of the pending list", () => {
+  const { pending, past } = splitRequestsForList([{ id: "a", status: "withdrawn" }, { id: "b", status: "pending_review" }]);
+  assert.deepEqual(pending.map((r) => r.id), ["b"]);
+  assert.deepEqual(past.map((r) => r.id), ["a"]);
 });

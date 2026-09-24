@@ -1586,3 +1586,41 @@ export function gmailEmailUpdateInput(variant: GmailEmailVariant, edits: GmailEm
 export function gmailEmailEditsFor(variant: GmailEmailVariant): GmailEmailEdits {
   return { to: variant.to.join(', '), cc: variant.cc.join(', '), bcc: variant.bcc.join(', '), subject: variant.subject, editorText: variant.editorText };
 }
+
+// --- request lifecycle ------------------------------------------------------
+
+export type RequestLifecycle = {
+  // Present only when an agent withdrew the request: who, why (the row's
+  // error, where a reviewer's denial reason also lives), and when.
+  withdrawn: { by: string; reason: string; at: string | null } | null;
+  // The request that stands in for this one (agent withdrawal or a human's
+  // supersede link), and the request this one replaces.
+  supersededBy: string;
+  replaces: string;
+};
+
+type RequestLifecycleLike = {
+  status?: string;
+  error?: string;
+  superseded_by?: string;
+  replaces?: string;
+  withdrawn_by?: string;
+  withdrawn_at?: string | null;
+};
+
+export function requestLifecycle(request: RequestLifecycleLike): RequestLifecycle {
+  const supersededBy = (request.superseded_by ?? '').trim();
+  const replaces = (request.replaces ?? '').trim();
+  const withdrawn = request.status === 'withdrawn'
+    ? { by: (request.withdrawn_by ?? '').trim() || 'an agent', reason: (request.error ?? '').trim(), at: request.withdrawn_at ?? null }
+    : null;
+  return { withdrawn, supersededBy, replaces };
+}
+
+// The one-line status note under a request header. A withdrawn request says
+// who took it back and why; a denial says denied; nothing else gets a line.
+export function requestLifecycleNote(request: RequestLifecycleLike): string {
+  const life = requestLifecycle(request);
+  if (!life.withdrawn) return '';
+  return `Withdrawn by ${life.withdrawn.by}${life.withdrawn.reason ? `: ${life.withdrawn.reason}` : '.'}`;
+}

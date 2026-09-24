@@ -1147,4 +1147,44 @@ def test_ensure_upstream_mutation_tables_declares_the_supersede_column(warehouse
         """,
         (warehouse._object_schema("upstream_mutation_requests"), target.name),
     )
-    assert "superseded_by_request_id" in {str(row["column_name"]) for row in rows}
+    columns = {str(row["column_name"]) for row in rows}
+    assert "superseded_by_request_id" in columns
+    # Agent withdrawal and replacement (app/internal/mutations/withdraw.go).
+    assert {"replaces_request_id", "withdrawn_by", "withdrawn_at"} <= columns
+
+
+# The Go store writes `withdrawn` on a request an agent took back. The worker
+# must never claim its rows, and the request-status roll-up the worker runs
+# after a claim must read a wholly withdrawn request as withdrawn, not denied.
+def test_withdrawn_mutations_are_never_claimed_and_roll_up_as_withdrawn(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_upstream_mutation_tables()
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @upstream_mutation_requests (id, status, title, reason, error, requested_by, created_at, updated_at)
+        VALUES ('req_withdrawn', 'withdrawn', 'moot', 'test', 'done by hand', 'codex', %s, %s)
+        """,
+        (now, now),
+    )
+    for index, status in enumerate(("withdrawn", "withdrawn")):
+        warehouse._command(
+            """
+            INSERT INTO @upstream_mutations (
+                id, request_id, request_index, provider, operation, account, status, title, reason,
+                payload_json, preview_json, result_json, error, idempotency_key, requested_by, created_at, updated_at
+            )
+            VALUES (%s, 'req_withdrawn', %s, 'gmail', %s, %s, %s, 'archive', 'test',
+                    %s, '{}'::jsonb, '{}'::jsonb, 'done by hand', '', 'codex', %s, %s)
+            """,
+            (f"mut_withdrawn_{index}", index, GMAIL_ARCHIVE_OPERATION, ACCOUNT, status, _jsonb_param({"thread_ids": ["t1"]}), now, now),
+        )
+    claimed = warehouse.claim_approved_upstream_mutations(limit=10, claimed_by="worker", ensure_tables=False)
+    assert claimed == []
+    warehouse._refresh_upstream_mutation_request_status("req_withdrawn")
+    rows = warehouse._query_dicts("SELECT status FROM @upstream_mutation_requests WHERE id = 'req_withdrawn'")
+    assert rows[0]["status"] == "withdrawn"
+    # A reviewer dropped one row, the agent withdrew the rest: still withdrawn, not denied.
+    warehouse._command("UPDATE @upstream_mutations SET status = 'rejected' WHERE id = 'mut_withdrawn_0'")
+    warehouse._refresh_upstream_mutation_request_status("req_withdrawn")
+    rows = warehouse._query_dicts("SELECT status FROM @upstream_mutation_requests WHERE id = 'req_withdrawn'")
+    assert rows[0]["status"] == "rejected"

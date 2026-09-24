@@ -28,6 +28,7 @@
 .mpill.s-succeeded, .mpill.s-observed, .mpill.cal-succeeded { color: var(--green); border-color: rgba(111,207,151,.45); }
 .mpill.s-rejected, .mpill.s-denied, .mpill.s-failed_terminal, .mpill.s-blocked_missing_credentials, .mpill.cal-failed { color: var(--red); border-color: rgba(224,108,95,.5); }
 .mpill.s-failed_retryable, .mpill.cal-retry { color: var(--amber); border-color: var(--amber-dim); }
+.mpill.s-withdrawn { color: var(--dim); border-color: var(--line2); }
 
 /* the request list */
 table.rtable { width: 100%; border-collapse: collapse; font-size: 12px; }
