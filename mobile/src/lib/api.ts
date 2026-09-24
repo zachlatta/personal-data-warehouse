@@ -246,6 +246,19 @@ export async function updateEmailMutation(config: AppConfig, requestId: string, 
   return body.mutation;
 }
 
+// The reviewer's edit of a Slack send: the words only. The recipient and the
+// thread were validated at proposal time and stay fixed; the server checks the text.
+export type UpdateSlackMessageMutationInput = { text: string };
+
+export async function updateSlackMessageMutation(config: AppConfig, requestId: string, mutationId: string, input: UpdateSlackMessageMutationInput): Promise<Mutation> {
+  const body = await request<{ mutation: Mutation }>(
+    config,
+    `/api/mutations/requests/${encodeURIComponent(requestId)}/mutations/${encodeURIComponent(mutationId)}/update-slack-message`,
+    { method: 'POST', body: JSON.stringify(input) },
+  );
+  return body.mutation;
+}
+
 // --- push -------------------------------------------------------------------
 
 export type PushDevice = {

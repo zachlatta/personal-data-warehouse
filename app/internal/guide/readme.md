@@ -175,11 +175,11 @@ session's context.{{end}} Configure and authenticate on the web app's `/connecti
 
 ## Writes
 
-Built-in warehouse mutation tools do not write upstream directly. {{if .CLI}}`pdw call propose_mutation_help` lists the supported
+Built-in mutation tools do not write upstream directly. {{if .CLI}}`pdw call propose_mutation_help` lists the supported
 types; `pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation_help` lists the supported
 types; `propose_mutation`{{end}} queues a request for human review and returns an
-`approval_url`. Gmail (send, archive, labels), Google Calendar, Google Contacts, Slack
-(send, mark read) and Apple Notes are supported. Topic `mutations`.
+`approval_url`. Gmail (send, archive, labels), Google Calendar and Contacts, Slack (send,
+mark read) and Apple Notes are supported. Topic `mutations`.
 
 {{if .CLI -}}
 ## Setup

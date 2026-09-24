@@ -1,11 +1,12 @@
-import { Alert, Pressable, StyleSheet, View } from 'react-native';
+import { useEffect, useMemo, useState } from 'react';
+import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
 import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import type { Mutation } from '@/lib/api';
+import type { Mutation, UpdateSlackMessageMutationInput } from '@/lib/api';
 import { openDeepLink } from '@/lib/deep-link';
 import { formatWhen } from '@/lib/format';
 import { slackSendMessageReview, type SlackSendContextMessage } from '@/lib/mutation-review';
@@ -47,13 +48,50 @@ function ContextRow({ message }: { message: SlackSendContextMessage }) {
   );
 }
 
+const SLACK_TEXT_MAX = 4000;
+
 // A Slack send, reviewed as the message it is: who receives it, the words,
-// and the thread or conversation they land in. The phone reads and decides;
-// the words are edited on the web review page, like an email's.
-export function SlackSendMessageCard({ mutation, requestReason }: { mutation: Mutation; requestReason?: string }) {
+// and the thread or conversation they land in. The words are editable while
+// the request is pending and save through update-slack-message, so the edit
+// is on the server before approval — approval sends what is stored, never
+// what is on screen. The recipient and the thread are not editable here or
+// on the web: a wrong recipient is a deny.
+export function SlackSendMessageCard({
+  mutation,
+  pending: requestPending = mutation.status === 'pending_review',
+  busy = false,
+  onSave,
+  requestReason,
+}: {
+  mutation: Mutation;
+  pending?: boolean;
+  busy?: boolean;
+  onSave?: (input: UpdateSlackMessageMutationInput) => Promise<void>;
+  requestReason?: string;
+}) {
   const theme = useTheme();
-  const review = slackSendMessageReview(mutation);
-  const pending = mutation.status === 'pending_review';
+  const review = useMemo(() => slackSendMessageReview(mutation), [mutation]);
+  const pending = requestPending && mutation.status === 'pending_review';
+  const editable = pending && !!onSave;
+  const [text, setText] = useState(review.text);
+  const [error, setError] = useState('');
+  const [saved, setSaved] = useState(false);
+  // A reload after a save (or someone else's edit) is the new baseline.
+  useEffect(() => { setText(review.text); setSaved(false); }, [review.text]);
+  const dirty = text.trim() !== review.text.trim();
+  const save = async () => {
+    if (!onSave) return;
+    const trimmed = text.trim();
+    if (!trimmed) { setError('The message cannot be empty.'); return; }
+    if (trimmed.length > SLACK_TEXT_MAX) { setError(`Slack messages are at most ${SLACK_TEXT_MAX} characters.`); return; }
+    setError('');
+    try {
+      await onSave({ text: trimmed });
+      setSaved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const icon = review.conversationType === 'public_channel' ? '#'
     : review.conversationType === 'private_channel' ? '◈'
       : review.conversationType === 'mpim' ? '◎' : '@';
@@ -102,12 +140,41 @@ export function SlackSendMessageCard({ mutation, requestReason }: { mutation: Mu
         <ThemedText type="smallBold" themeColor="textSecondary">
           {review.sent ? 'MESSAGE SENT' : 'YOUR MESSAGE'}{review.edited ? ' · EDITED IN REVIEW' : ''}
         </ThemedText>
-        <View style={[styles.bubble, { backgroundColor: theme.background }]}>
-          <ThemedText selectable>{review.text || '(no text)'}</ThemedText>
-        </View>
-        {pending ? (
-          <ThemedText type="small" themeColor="textSecondary">To change the words, edit this request on the web review page before approving.</ThemedText>
-        ) : null}
+        {editable ? (
+          <>
+            <TextInput
+              accessibilityLabel="Message text"
+              value={text}
+              onChangeText={(value) => { setText(value); setSaved(false); }}
+              editable={!busy}
+              multiline
+              autoCapitalize="sentences"
+              autoCorrect
+              maxLength={SLACK_TEXT_MAX}
+              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#D97706' : '#6B728044' }]}
+            />
+            <View style={styles.composeMeta}>
+              <ThemedText type="small" themeColor="textSecondary">Slack formatting: *bold*, _italic_, {'<@U…>'} mentions.</ThemedText>
+              <ThemedText type="small" themeColor="textSecondary">{text.length} / {SLACK_TEXT_MAX}</ThemedText>
+            </View>
+            {error ? <ThemedText type="small" style={styles.error}>{error}</ThemedText> : null}
+            <View style={styles.composeActions}>
+              {saved && !dirty ? <ThemedText type="small" themeColor="textSecondary">Saved — approval sends this text.</ThemedText> : <View />}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ disabled: busy || !dirty }}
+                disabled={busy || !dirty}
+                onPress={() => { void save(); }}
+                style={({ pressed }) => [styles.saveButton, (busy || !dirty) && styles.saveButtonDisabled, pressed && styles.messagePressed]}>
+                <ThemedText type="smallBold" style={styles.saveButtonText}>{busy ? 'Saving…' : 'Save message changes'}</ThemedText>
+              </Pressable>
+            </View>
+          </>
+        ) : (
+          <View style={[styles.bubble, { backgroundColor: theme.background }]}>
+            <ThemedText selectable>{review.text || '(no text)'}</ThemedText>
+          </View>
+        )}
         {review.sent ? (
           <ThemedText type="small" themeColor="textSecondary">
             {review.sent.alreadySent ? 'Already in Slack from an earlier attempt: ' : 'Posted as message '}{review.sent.messageTs}
@@ -150,6 +217,12 @@ const styles = StyleSheet.create({
   parentTag: { alignSelf: 'flex-start', marginTop: 3, color: '#D97706', fontSize: 11, letterSpacing: 0.8 },
   compose: { gap: Spacing.one },
   bubble: { borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728044' },
+  input: { minHeight: 110, borderRadius: 10, padding: 12, borderWidth: 1, fontSize: 16, lineHeight: 22, textAlignVertical: 'top' },
+  composeMeta: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
+  composeActions: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: Spacing.two },
+  saveButton: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, backgroundColor: '#D97706' },
+  saveButtonDisabled: { opacity: 0.45 },
+  saveButtonText: { color: '#fff' },
   target: { gap: 2 },
   error: { color: '#D0342C' },
 });
