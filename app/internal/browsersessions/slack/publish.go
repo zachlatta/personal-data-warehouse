@@ -69,6 +69,38 @@ func WorkspaceIDsForEnterprise(cfg ingestclient.Config, clientName string) Works
 	}
 }
 
+// KnownWorkspaceLookup answers whether the warehouse has ever synced a
+// workspace under this id, for any account.
+type KnownWorkspaceLookup func(teamID string) (bool, error)
+
+// WorkspaceIsKnown is the guard against publishing somebody else's workspace
+// under Zach's account label. On 2026-09-23 the Hack Club token in the Slack
+// desktop app had been signed out, a second workspace's token still answered
+// auth.test, and the capture published THAT session as `zrl`: every Slack
+// write keys its target by the session's workspace, so mark-read and send
+// were refused for a day while the row read `ok`. The same SQL-tool shape as
+// WorkspaceIDsForEnterprise, for the same laptop-without-a-database reason.
+func WorkspaceIsKnown(cfg ingestclient.Config, clientName string) KnownWorkspaceLookup {
+	return func(teamID string) (bool, error) {
+		if strings.TrimSpace(cfg.BaseURL) == "" || strings.TrimSpace(cfg.Token) == "" {
+			return false, captureErrorf("PDW_API_URL/PDW_SECRET_TOKEN are not set; run `pdw login` first")
+		}
+		statement := "SELECT team_id FROM " + warehouse.SQLRelation("slack_teams") +
+			" WHERE team_id = " + common.SQLLiteral(teamID) + " LIMIT 1"
+		rows, err := common.SQLToolQuery(cfg.BaseURL, clientName, cfg.Token,
+			"Does the warehouse sync this Slack workspace?", statement, 60*time.Second)
+		if err != nil {
+			return false, err
+		}
+		for _, row := range rows {
+			if stringOf(row["team_id"]) == teamID {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+}
+
 // ResolveAccount is the label the credential is stored under. SLACK_ACCOUNTS
 // comes first and the generic personal-email fallbacks last, because the SYNC
 // looks this credential up by its own Slack account label; publishing under a
@@ -99,19 +131,21 @@ type Publisher func(ingestclient.SlackSession) (map[string]any, error)
 
 // Deps are the seams Run wires to the real machine; tests inject fakes.
 type Deps struct {
-	Discover   func(source string) (Session, error)
-	Probe      func(Session) map[string]any
-	Workspaces WorkspaceLookup
-	Publisher  func() (Publisher, error)
+	Discover       func(source string) (Session, error)
+	Probe          func(Session) map[string]any
+	Workspaces     WorkspaceLookup
+	KnownWorkspace KnownWorkspaceLookup
+	Publisher      func() (Publisher, error)
 }
 
 func defaultDeps(getenv func(string) string, cfg ingestclient.Config, stderr io.Writer) Deps {
 	host := chromium.DefaultHost()
 	client := NewClient()
 	return Deps{
-		Discover:   func(source string) (Session, error) { return Discover(host, source, client.AuthTest) },
-		Probe:      client.ProbeClientCounts,
-		Workspaces: WorkspaceIDsForEnterprise(cfg, getenv("PDW_CLIENT_NAME")),
+		Discover:       func(source string) (Session, error) { return Discover(host, source, client.AuthTest) },
+		Probe:          client.ProbeClientCounts,
+		Workspaces:     WorkspaceIDsForEnterprise(cfg, getenv("PDW_CLIENT_NAME")),
+		KnownWorkspace: WorkspaceIsKnown(cfg, getenv("PDW_CLIENT_NAME")),
 		Publisher: func() (Publisher, error) {
 			ic, err := ingestclient.FromEnv(getenv, cfg, common.NewWriterLogger(stderr))
 			if err != nil {
@@ -200,6 +234,29 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 			report["error"] = err.Error()
 			emit()
 			return 3
+		}
+		// A workspace the warehouse has never synced is the wrong workspace:
+		// the desktop app is signed into something else, and a session for it
+		// stored under this account would make every Slack write refuse its
+		// target while the credential row reads healthy. --team-id is the
+		// deliberate override.
+		if deps.KnownWorkspace != nil {
+			known, err := deps.KnownWorkspace(resolvedTeam)
+			if err != nil {
+				report["error"] = err.Error()
+				emit()
+				return 3
+			}
+			report["known_workspace"] = known
+			if !known {
+				report["error"] = fmt.Sprintf(
+					"the captured session belongs to workspace %s (%s), which the warehouse has never synced under any account; "+
+						"the Slack desktop app is signed into the wrong workspace -- sign in to the workspace the warehouse syncs and rerun, "+
+						"or pass --team-id %s to publish it anyway",
+					resolvedTeam, session.TeamURL, resolvedTeam)
+				emit()
+				return 3
+			}
 		}
 	}
 	resolvedAccount := ResolveAccount(*account, getenv)

@@ -78,6 +78,14 @@ func newDeps(session slack.Session, discoverErr error, probe map[string]any, wor
 		Workspaces: func(string) ([]string, error) {
 			return workspaces, nil
 		},
+		KnownWorkspace: func(teamID string) (bool, error) {
+			for _, known := range workspaces {
+				if known == teamID {
+					return true, nil
+				}
+			}
+			return false, nil
+		},
 		Publisher: func() (slack.Publisher, error) {
 			return func(s ingestclient.SlackSession) (map[string]any, error) {
 				f.published = &s
@@ -177,13 +185,40 @@ func TestRunExitCodes(t *testing.T) {
 		}
 	})
 	t.Run("unconfigured publisher is 1", func(t *testing.T) {
-		f := newDeps(slack.Session{TeamID: "T1"}, nil, okProbe, nil)
+		f := newDeps(slack.Session{TeamID: "T1"}, nil, okProbe, []string{"T1"})
 		f.deps.Publisher = func() (slack.Publisher, error) { return nil, errors.New("PDW_API_URL must be set") }
 		code, report, _ := run(t, f.deps, nil, "publish-session")
 		if code != 1 || !strings.Contains(report["error"].(string), "PDW_API_URL") {
 			t.Fatalf("code = %d report = %v", code, report)
 		}
 	})
+}
+
+// The 2026-09-23 shape: the Hack Club token was signed out, another
+// workspace's token still answered, and that workspace got published as zrl.
+func TestRunRefusesAWorkspaceTheWarehouseHasNeverSynced(t *testing.T) {
+	stranger := slack.Session{Source: "slack-app", Token: "xoxc-supersecrettoken", CookieD: "xoxd-supersecretcookie",
+		TeamID: "T0A4T3P6VUG", UserID: "U0A9TGMBR70", TeamURL: "https://example-other.slack.com/"}
+	f := newDeps(stranger, nil, okProbe, []string{"T0266FRGM"})
+	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, "publish-session")
+	if code != 3 || f.published != nil || report["known_workspace"] != false {
+		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
+	}
+	msg := report["error"].(string)
+	for _, want := range []string{"T0A4T3P6VUG", "example-other.slack.com", "never synced", "--team-id"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error does not mention %q: %s", want, msg)
+		}
+	}
+	// The explicit flag is the deliberate override, and a known workspace passes.
+	f = newDeps(stranger, nil, okProbe, []string{"T0266FRGM"})
+	if code, _, _ := run(t, f.deps, nil, "publish-session", "--team-id", "T0A4T3P6VUG"); code != 0 || f.published == nil {
+		t.Fatalf("explicit --team-id was refused: code = %d", code)
+	}
+	f = newDeps(slack.Session{TeamID: "T0266FRGM", TeamURL: "https://hackclub.slack.com/"}, nil, okProbe, []string{"T0266FRGM"})
+	if code, report, _ := run(t, f.deps, nil, "publish-session"); code != 0 || report["known_workspace"] != true {
+		t.Fatalf("known workspace refused: code = %d report = %v", code, report)
+	}
 }
 
 func TestRunVerbDispatch(t *testing.T) {
