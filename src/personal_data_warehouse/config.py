@@ -57,7 +57,7 @@ DEFAULT_WHATSAPP_SESSION_KEY = "default"
 DEFAULT_WHATSAPP_STORAGE_BACKEND = "google_drive"
 DEFAULT_WHATSAPP_MEDIA_BYTES_PER_FLUSH = 512 * 1024 * 1024
 DEFAULT_WHATSAPP_MEDIA_COUNT_PER_FLUSH = 200
-DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS = 60
+DEFAULT_WHATSAPP_FLUSH_INTERVAL_SECONDS = 20
 # Bounded client run window; must stay below Dagster run_monitoring
 # max_runtime_seconds (14400 in docker/dagster.yaml) so runs end cleanly and
 # the keepalive sensor relaunches them.

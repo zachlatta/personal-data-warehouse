@@ -14,6 +14,18 @@
     <key>StartInterval</key>
     <integer>300</integer>
 
+    <!-- Fire on change too: the SQLite WAL is what the app writes on every
+         new message, so a message is uploaded seconds after it arrives instead
+         of at the next five-minute tick. ThrottleInterval bounds a chatty WAL
+         to one run a minute; StartInterval stays as the floor. -->
+    <key>WatchPaths</key>
+    <array>
+      <string>/Users/zrl/Library/Messages/chat.db-wal</string>
+    </array>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
     <key>RunAtLoad</key>
     <true/>
 

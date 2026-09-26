@@ -25,6 +25,7 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 WHATSAPP_DRIVE_INGEST_POSTGRES_LOCK_ID = 8_407_112_441
@@ -71,8 +72,19 @@ def whatsapp_drive_ingest(context) -> MaterializeResult:
                 logger=context.log,
             ).sync()
 
+    # Land this source's timeline rows in the same run instead of waiting
+    # for the five-minute timeline_sync tick on top of the inbox sensor.
+    fast_lane = {"enabled": False, "rows": 0}
+    if summary is not None and summary.messages_written:
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["whatsapp"],
+            logger=context.log,
+        )
+
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "batches_seen": MetadataValue.int(summary.batches_seen if summary else 0),
             "chats_written": MetadataValue.int(summary.chats_written if summary else 0),
             "chat_participants_written": MetadataValue.int(summary.chat_participants_written if summary else 0),

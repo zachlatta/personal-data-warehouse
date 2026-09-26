@@ -24,6 +24,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 AGENT_SESSIONS_SENSOR_INTERVAL_SECONDS = 60
@@ -63,8 +64,19 @@ def agent_sessions_drive_ingest(context) -> MaterializeResult:
     finally:
         warehouse.close()
 
+    # Land this source's timeline rows in the same run instead of waiting
+    # for the five-minute timeline_sync tick on top of the inbox sensor.
+    fast_lane = {"enabled": False, "rows": 0}
+    if summary is not None and summary.events_written:
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["agent_sessions"],
+            logger=context.log,
+        )
+
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "batches_seen": MetadataValue.int(summary.batches_seen if summary else 0),
             "events_written": MetadataValue.int(summary.events_written if summary else 0),
             "files_promoted": MetadataValue.int(summary.files_promoted if summary else 0),

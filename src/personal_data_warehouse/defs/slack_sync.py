@@ -29,6 +29,7 @@ from personal_data_warehouse.slack_sync import (
     SlackSyncSummary,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
@@ -747,6 +748,7 @@ def slack_workspace_sync(context) -> MaterializeResult:
         run_fn=run_slack_freshness_sync,
         lock_name="slack-freshness",
         postgres_lock_id=SLACK_FRESHNESS_POSTGRES_LOCK_ID,
+        land_on_timeline=True,
     )
 
 
@@ -859,6 +861,7 @@ def _run_locked_slack_stage(
     lock_wait_seconds: float | None = None,
     lock_name: str = "slack",
     postgres_lock_id: int = SLACK_SYNC_POSTGRES_LOCK_ID,
+    land_on_timeline: bool = False,
 ) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=True)
     warehouse = warehouse_from_settings(settings)
@@ -875,9 +878,23 @@ def _run_locked_slack_stage(
         else:
             summaries = run_fn(settings=settings, warehouse=warehouse, logger=context.log)
 
+    # The freshness stage is the one that lands DMs; land its timeline rows
+    # in the same run instead of waiting for the five-minute timeline_sync
+    # tick on top of this five-minute one.
+    fast_lane = {"enabled": False, "rows": 0}
+    if land_on_timeline and any(
+        summary.messages_written or summary.files_written for summary in summaries
+    ):
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["slack"],
+            logger=context.log,
+        )
+
     deployment = build_metadata()
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "sync_stage": stage_name,
             "lock_acquired": acquired,
             "skipped_due_to_lock": not acquired,

@@ -3582,7 +3582,7 @@ class TimelineSyncEngine:
             cursor.execute(
                 self._dest_sql(
                     """
-                    INSERT INTO @timeline_sync_state (
+                    INSERT INTO @timeline_sync_state AS tss (
                         adapter, backfill_cursor_event_ts, backfill_cursor_event_id, backfill_done,
                         watermark_ingest_ts, watermark_event_id, last_run_at, last_error, updated_at,
                         adapter_signature, last_reconcile_at
@@ -3592,8 +3592,23 @@ class TimelineSyncEngine:
                         backfill_cursor_event_ts = EXCLUDED.backfill_cursor_event_ts,
                         backfill_cursor_event_id = EXCLUDED.backfill_cursor_event_id,
                         backfill_done = EXCLUDED.backfill_done,
-                        watermark_ingest_ts = EXCLUDED.watermark_ingest_ts,
-                        watermark_event_id = EXCLUDED.watermark_event_id,
+                        -- The stored watermark only ever moves forward. The
+                        -- fast lane (run_incremental, called from a source's
+                        -- own ingest run) can advance it while a scheduled
+                        -- full pass still holds an older copy in memory; the
+                        -- full pass's later saves must not rewind it, or the
+                        -- next incremental re-reads rows the fast lane
+                        -- already landed.
+                        watermark_ingest_ts = CASE
+                            WHEN (EXCLUDED.watermark_ingest_ts, EXCLUDED.watermark_event_id)
+                                 > (tss.watermark_ingest_ts, tss.watermark_event_id)
+                            THEN EXCLUDED.watermark_ingest_ts
+                            ELSE tss.watermark_ingest_ts END,
+                        watermark_event_id = CASE
+                            WHEN (EXCLUDED.watermark_ingest_ts, EXCLUDED.watermark_event_id)
+                                 > (tss.watermark_ingest_ts, tss.watermark_event_id)
+                            THEN EXCLUDED.watermark_event_id
+                            ELSE tss.watermark_event_id END,
                         last_run_at = now(),
                         last_error = EXCLUDED.last_error,
                         updated_at = now(),
@@ -4076,6 +4091,95 @@ class TimelineSyncEngine:
                     cursor.execute(f"DELETE FROM {state} WHERE adapter = %s", (name,))
         return deleted
 
+    # -- fast lane -----------------------------------------------------------
+
+    def _adapter_incremental_lock_key(self, adapter: TimelineAdapter) -> str:
+        # Namespaced by destination schema so parallel test warehouses (one
+        # schema per xdist worker) never contend with each other or production.
+        return f"{self._dest_schema}|timeline_incremental|{adapter.name}"
+
+    def _try_adapter_incremental_lock(self, adapter: TimelineAdapter) -> bool:
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(hashtext(%s))",
+                (self._adapter_incremental_lock_key(adapter),),
+            )
+            return bool(cursor.fetchone()[0])
+
+    def _release_adapter_incremental_lock(self, adapter: TimelineAdapter) -> None:
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(hashtext(%s))",
+                (self._adapter_incremental_lock_key(adapter),),
+            )
+
+    def _fast_lane_ready(self, adapter: TimelineAdapter) -> bool:
+        """Only an adapter the scheduled pass has fully initialized may take the fast lane.
+
+        First contact (choosing the initial watermark) and a definition change
+        (resetting the backfill) are the scheduled pass's decisions; the fast
+        lane never makes them, so it cannot race the reset or land rows under
+        a signature the next full pass would immediately re-walk.
+        """
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(
+                self._dest_sql(
+                    "SELECT backfill_done, adapter_signature FROM @timeline_sync_state WHERE adapter = %s"
+                ),
+                (adapter.name,),
+            )
+            row = cursor.fetchone()
+        return (
+            row is not None
+            and bool(row[0])
+            and row[1] == adapter_definition_signature(adapter)
+        )
+
+    def run_incremental(
+        self,
+        *,
+        adapter_names: Sequence[str],
+        max_seconds: float | None = None,
+    ) -> list[AdapterSyncStats]:
+        """The fast lane: incremental sync only, for the named adapters only.
+
+        Called from a source's own ingest run the moment its rows land, so a
+        message does not wait for the five-minute scheduled pass on top of
+        the source's own poll. It does nothing the scheduled pass would not
+        do next tick anyway -- no backfill, refresh, prune, reconcile, retire
+        or correspondent refresh -- and it skips rather than waits when the
+        scheduled pass holds an adapter's incremental lock. Every adapter's
+        outcome is reported; an adapter that was skipped carries no error.
+        """
+        self._connect()
+        deadline = time.monotonic() + max_seconds if max_seconds else None
+        stats: list[AdapterSyncStats] = []
+        for name in adapter_names:
+            adapter = next((a for a in self._adapters if a.name == name), None)
+            if adapter is None:
+                raise ValueError(f"unknown timeline adapter {name!r}")
+            stat = AdapterSyncStats(adapter=adapter.name)
+            stats.append(stat)
+            if _past(deadline):
+                break
+            if not self._fast_lane_ready(adapter):
+                logger.info("timeline fast lane skipped %s: not yet initialized by the scheduled pass", adapter.name)
+                continue
+            if not self._try_adapter_incremental_lock(adapter):
+                logger.info("timeline fast lane skipped %s: the scheduled pass holds its incremental lock", adapter.name)
+                continue
+            try:
+                state = self._load_state(adapter)
+                stat.backfill_done = state.backfill_done
+                stat.incremental_rows = self._run_incremental(adapter, state, deadline)
+                self._save_state(adapter, state)
+            except Exception as exc:  # noqa: BLE001 - the fast lane never fails ingestion
+                logger.exception("timeline fast lane failed for %s", adapter.name)
+                stat.error = str(exc)
+            finally:
+                self._release_adapter_incremental_lock(adapter)
+        return stats
+
     def run(
         self,
         *,
@@ -4115,10 +4219,20 @@ class TimelineSyncEngine:
         # behind it. C1 requires every source's new rows to get a turn before
         # any already-present history is reconsidered.
         for adapter in self._adapters:
+            # The fast lane (run_incremental) holds this while it lands a
+            # source's rows from that source's own ingest run; waiting here
+            # would stall every adapter behind it, and it lasts seconds, so
+            # the scheduled pass skips the adapter's incremental this tick.
+            # The state row is still loaded so refresh/backfill/reconcile
+            # below keep their turn.
+            locked = self._try_adapter_incremental_lock(adapter)
             try:
                 state = self._load_state(adapter)
                 states[adapter.name] = state
-                stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
+                if locked:
+                    stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
+                else:
+                    logger.info("timeline incremental for %s skipped: fast lane holds its lock", adapter.name)
                 stats[adapter.name].backfill_done = state.backfill_done
                 # Heartbeat. `_save_state` stamps last_run_at, but every other
                 # caller only reaches it when rows were WRITTEN, so a healthy
@@ -4132,6 +4246,9 @@ class TimelineSyncEngine:
                 if state is not None:
                     self._save_state(adapter, state, error=str(exc))
                 failed.append(adapter.name)
+            finally:
+                if locked:
+                    self._release_adapter_incremental_lock(adapter)
             if _past(deadline):
                 break
 

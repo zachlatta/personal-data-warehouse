@@ -1096,6 +1096,73 @@ cold and 0.66s warm while returning the full 1,000-row pool, so it is both faste
 exact than filtered ANN. Fetch chunk text only *after* the top-k: doing it below the sort
 detoasts every Drive document. Broad and mixed-source searches still use the global HNSW.
 
+## Landing latency: how long a source takes to reach the timeline
+
+**Measure it from `timeline.events.first_seen_at - event_ts`, never from a `base_*`
+table's `ingested_at`/`synced_at`.** Those columns are re-stamped by every rescan and
+upsert: `base_apple_messages.messages.ingested_at` read 5-20 *hours* behind on 2026-09-25
+for messages the timeline had held within five minutes, because the nightly full rescan
+rewrote the column. `first_seen_at` is the first time the row existed in PDW.
+
+```sql
+SELECT source, count(*) AS n,
+  round(percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - event_ts))/60) AS p50_min,
+  round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - event_ts))/60) AS p95_min
+FROM timeline.events
+WHERE first_seen_at >= now() - interval '24 hours' AND event_ts >= now() - interval '3 days'
+  AND first_seen_at >= event_ts
+GROUP BY 1 ORDER BY p50_min;
+```
+
+Measured 2026-09-25 before the fast lane below: WhatsApp p50 4 min / p95 6, Slack DMs
+4 / 9, iMessage 5 / 9, Gmail 3 / 6, agent sessions 6-7 / 9, Apple Notes 8 / 11, Drive
+17 / 30 (its 30-minute cron), Contacts 47 (hourly), Slack public channels ~3 h / ~6 h
+(the non-member sweep rotation, by design), voice memos ~4 h (transcription), WHOOP ~8 h
+(the cycle's own clock), Hacker News ~7 days (a comment's `event_ts` is when it was
+posted; the frontier walk finds it later). **The chat sources were fast at the source and
+slow on the schedule**: every one was two serial five-minute clocks -- the source's own
+poll or upload, then the `timeline_sync` tick -- and two uniform 0-5 minute waits is ~5 min
+expected, ~10 min worst, which is exactly what the tiers read. Two things in the 7-day
+window were outages, not cadence: WhatsApp read ~7 days for 09-11..09-18 (the device was
+unpaired until 09-19 and the backlog landed at once) and OpenClaw the same shape until the
+SQLite-store fix on 09-20.
+
+**The fast lane removes the second clock.** An ingest asset that just wrote rows --
+`whatsapp_drive_ingest`, `apple_messages_drive_ingest`, `agent_sessions_drive_ingest`,
+`gmail_mailbox_sync` and the Slack *freshness* stage (`slack_workspace_sync`; coverage,
+sweeps and metadata are history and stay on the scheduled pass) -- calls
+`land_sources_on_timeline` (`timeline_fast_lane.py`) before it returns, which runs
+`TimelineSyncEngine.run_incremental` for that source's adapters only, in the same run: no
+queue slot, no subprocess start, no wait for `*/5`. It is **incremental only** and never a
+correctness dependency: backfill, refresh, prune, reconcile, retire and first contact stay
+with the five-minute `timeline_sync`, which is unchanged and is still what makes the
+timeline converge (C1). Three rules keep the two from fighting:
+
+- **Each adapter's incremental pass holds a per-adapter advisory lock**
+  (`hashtext('<schema>|timeline_incremental|<adapter>')`), taken by both the fast lane and
+  the scheduled pass, and both *skip* rather than wait -- the scheduled pass still loads the
+  state row so refresh/backfill/reconcile keep their turn.
+- **The stored watermark only ever moves forward**, enforced in `_save_state` itself
+  (row-comparison `CASE` in the upsert), so a scheduled pass that saves a stale in-memory
+  copy after the fast lane advanced the watermark cannot rewind it.
+- **The fast lane only touches an adapter the scheduled pass has initialized**
+  (`backfill_done` with a matching `adapter_signature`); first contact and a definition
+  reset are the scheduled pass's decisions.
+
+It never raises into the ingest run (a failure is a warning plus an `errors` entry in the
+asset's `timeline_fast_lane` metadata), it runs only when the ingest wrote rows, and
+`TIMELINE_FAST_LANE_ENABLED=0` on the Dagster deployment turns it off with no other effect.
+
+The client side moved too: the iMessage and Apple Notes LaunchAgents carry `WatchPaths`
+on the store's SQLite WAL (`chat.db-wal`, `NoteStore.sqlite-wal`) with a 60-second
+`ThrottleInterval`, so an upload fires seconds after the app writes rather than at the next
+five-minute tick (the tick stays as the floor); and the WhatsApp client flushes every 20 s
+instead of 60 (`WHATSAPP_FLUSH_INTERVAL_SECONDS`), snapshotting its session only when a
+flush actually shipped something. The remaining floor for WhatsApp and iMessage is the
+Drive inbox sensor's 60-second minimum interval plus one Dagster run start; for Slack DMs it
+is the freshness cron itself. Expected after all of it: WhatsApp and iMessage ~1-2 min,
+Slack DMs ~3 min, Gmail ~3 min. Re-measure with the query above rather than quoting these.
+
 ## Pipeline Freshness and Health
 
 Every warehouse table also has to declare **which pipeline feeds it and how freshness is

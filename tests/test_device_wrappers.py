@@ -138,3 +138,23 @@ def test_systemd_unit_runs_the_self_locating_wrapper() -> None:
     assert "ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd" in service
     assert "OnUnitActiveSec=300s" in timer
     assert not _INTERPRETER_INVOCATION.search(service)
+
+
+def test_message_and_note_uploaders_also_fire_when_the_store_changes() -> None:
+    """The five-minute tick is a floor; a new message should not wait for it.
+
+    Measured 2026-09-25, iMessage landed p50 5 min / p95 9 min and the whole
+    of it was two serial five-minute clocks. launchd WatchPaths on the store's
+    WAL fires the upload seconds after Messages.app writes; ThrottleInterval
+    keeps a chatty WAL to one run a minute.
+    """
+    expected = {
+        "apple-messages-upload": "/Users/zrl/Library/Messages/chat.db-wal",
+        "apple-notes-upload": "/Users/zrl/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite-wal",
+    }
+    for label, path in expected.items():
+        with (LAUNCHD / f"com.zachlatta.personal-data-warehouse.{label}.plist").open("rb") as handle:
+            plist = plistlib.load(handle)
+        assert plist["WatchPaths"] == [path], label
+        assert plist["ThrottleInterval"] == 60, label
+        assert plist["StartInterval"] == 300, label

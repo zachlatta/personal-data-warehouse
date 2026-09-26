@@ -26,6 +26,7 @@ from personal_data_warehouse.gmail_sync import (
 )
 from personal_data_warehouse.objectstore import ObjectStore, build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 
 
 def build_attachment_object_store_factory(*, settings: Settings, logger):
@@ -78,8 +79,19 @@ def gmail_mailbox_sync(context) -> MaterializeResult:
         attachment_object_store_factory=attachment_object_store_factory,
     ).sync_all()
 
+    # Land this source's timeline rows in the same run instead of waiting
+    # for the five-minute timeline_sync tick on top of this five-minute one.
+    fast_lane = {"enabled": False, "rows": 0}
+    if any(summary.messages_written for summary in summaries):
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["gmail"],
+            logger=context.log,
+        )
+
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "mailboxes": MetadataValue.json(
                 [
                     {

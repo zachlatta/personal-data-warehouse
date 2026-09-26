@@ -56,7 +56,7 @@ class WhatsAppClientRunner:
         upload_state: WhatsAppUploadState | None,
         logger,
         run_seconds: int = 10800,
-        flush_interval_seconds: int = 60,
+        flush_interval_seconds: int = 20,
         media_bytes_per_flush: int = 512 * 1024 * 1024,
         media_count_per_flush: int = 200,
         pair_phone: str = "",
@@ -307,7 +307,11 @@ class WhatsAppClientRunner:
             self._totals["batches_uploaded"] += summary.batches_uploaded
             self._totals["media_uploaded"] += summary.media_uploaded
             self._totals["media_bytes_uploaded"] += summary.media_bytes_uploaded
-        self._snapshot_session("flush")
+        # The session snapshot is a whole-SQLite bytea write to Postgres; at
+        # a 20-second flush cadence it is only worth taking when the flush
+        # actually shipped something.
+        if summary.batches_uploaded or summary.media_uploaded:
+            self._snapshot_session("flush")
 
     def _dump_contacts(self, client) -> None:
         self._contacts_dumped = True
