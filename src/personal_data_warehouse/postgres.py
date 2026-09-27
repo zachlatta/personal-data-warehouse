@@ -3658,6 +3658,16 @@ class PostgresWarehouse:
         # ties resolve by kind: balance (institution-authoritative) beats
         # principal beats valuation.
         kind_rank = "CASE o.kind WHEN 'balance' THEN 0 WHEN 'principal' THEN 1 ELSE 2 END"
+        # Same day, same kind, two providers: the one whose stamp is the
+        # INSTITUTION's beats the one whose stamp is a poll. A SimpleFIN
+        # balance carries the bridge's `balance-date`; a Plaid balance carries
+        # only the moment Plaid was asked, and Plaid polls every 30 minutes,
+        # so on observed_at alone Plaid would win every same-day tie while
+        # its number lagged. Measured 2026-09-27 on Capital One: Plaid 4.11
+        # at 13:30, the bridge 32.55 at 12:56 -- and 32.55 is 4.11 plus the
+        # two purchases Plaid had not posted yet. A newer DAY still wins
+        # outright; this only breaks the same-day tie.
+        source_rank = "CASE o.source WHEN 'simplefin' THEN 0 ELSE 1 END"
         # Observation kinds that are facts about an account but NOT what it is
         # worth today. They are stored in the same table on purpose — the
         # ledger holds facts, and status is derived at read time — so every
@@ -3733,7 +3743,7 @@ class PostgresWarehouse:
                 SELECT o.kind, o.as_of, o.value, o.source, o.observed_at
                 FROM @finance_observations AS o
                 WHERE o.account_id = a.account_id AND {value_kinds}
-                ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                ORDER BY o.as_of DESC, {kind_rank}, {source_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
             """,
@@ -3757,7 +3767,7 @@ class PostgresWarehouse:
                     SELECT o.value
                     FROM @finance_observations AS o
                     WHERE o.account_id = a.account_id AND o.as_of <= d.day AND {value_kinds}
-                    ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                    ORDER BY o.as_of DESC, {kind_rank}, {source_rank}, o.observed_at DESC
                     LIMIT 1
                 ) AS o ON TRUE
             )
@@ -3798,7 +3808,7 @@ class PostgresWarehouse:
                 SELECT o.kind, o.as_of, o.value, o.source
                 FROM @finance_observations AS o
                 WHERE o.account_id = a.account_id AND {value_kinds}
-                ORDER BY o.as_of DESC, {kind_rank}, o.observed_at DESC
+                ORDER BY o.as_of DESC, {kind_rank}, {source_rank}, o.observed_at DESC
                 LIMIT 1
             ) AS o ON TRUE
             """,

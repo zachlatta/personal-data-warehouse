@@ -3277,9 +3277,8 @@ def test_simplefin_account_lands_on_the_plaid_founded_account_and_dedups_its_flo
     )
     assert [(o["source"], o["value"]) for o in observations] == [("plaid", Decimal("123.45")), ("simplefin", Decimal("130.00"))]
     assert observations[1]["observed_at"] == _TS + timedelta(hours=1)
-    # Both observations are for the same day; the bridge's stamp (_TS + 1h) is
-    # newer than Plaid's own sync stamp (_TS), so net worth reads SimpleFIN --
-    # and would read Plaid if Plaid had synced later, whatever the run time.
+    # Both observations are for the same day: the bridge's institution stamp
+    # beats Plaid's poll stamp, so net worth reads SimpleFIN.
     net_worth = warehouse._query_dicts("SELECT value, source, observed_at FROM @marts_finance_net_worth")
     assert net_worth == [{"value": Decimal("130.00"), "source": "simplefin", "observed_at": _TS + timedelta(hours=1)}]
     assert observations[0]["observed_at"] == _TS  # Plaid's synced_at, not the run time
@@ -3397,3 +3396,18 @@ def test_simplefin_replay_rebuilds_identically(warehouse):
         warehouse._command(f"DELETE FROM @{table}")
     runner.sync()
     assert snapshot() == before
+
+
+def test_same_day_bridge_balance_outranks_plaid_poll_but_a_newer_day_wins(warehouse):
+    """Plaid polls every 30 minutes, so its stamp is almost always newer; the
+    bridge's is the institution's own. Same day: bridge. Newer day: whoever."""
+    _seed_plaid(warehouse, [_plaid_account_row(synced_at=_TS + timedelta(hours=3))])
+    _seed_simplefin(warehouse, [_simplefin_account_row(balance=130.00, balance_at=_TS)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    picked = warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth")
+    assert picked == [{"value": Decimal("130.00"), "source": "simplefin"}]
+    # A day later Plaid has re-synced and the bridge has not: Plaid's day is newer.
+    warehouse.insert_plaid_accounts([_plaid_account_row(current_balance=99.0, synced_at=_TS + timedelta(days=1), sync_version=2)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(days=1, hours=1)).sync()
+    picked = warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth")
+    assert picked == [{"value": Decimal("99.0"), "source": "plaid"}]

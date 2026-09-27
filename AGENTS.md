@@ -3438,8 +3438,13 @@ weaker founds its own account, because under-merging reads as two lines while ov
 silently halves a balance. Two live SimpleFIN accounts never share a ledger account.
 
 Once landed: the bridge balance is a second `balance` observation with `source =
-'simplefin'`, stamped with the bridge's own `balance-date` (not the run time), so
-`marts_finance.net_worth` takes it only when it is genuinely fresher than Plaid's; and
+'simplefin'`, stamped with the bridge's own `balance-date` (not the run time), and a Plaid
+balance observation now carries `base_plaid.accounts.synced_at` rather than the run time
+(it used to be re-stamped `now()` by every five-minute ledger run). `marts_finance.net_worth`
+takes the newer DAY outright and, on the same day, ranks the bridge's institution-stamped
+balance ahead of Plaid's poll-stamped one (`source_rank` in the view): measured
+2026-09-27, Plaid's Capital One balance read 4.11 at 13:30 while the bridge read 32.55 at
+12:56, and 32.55 was 4.11 plus the two purchases Plaid had not posted yet; and
 each SimpleFIN transaction merges into the Plaid row for the same movement by exact
 amount within ±3 days (`fuzzy_amount_date`), founding its own row only when Plaid has
 none. Plaid goes first and keeps field precedence. **Signs are opposite and stored
