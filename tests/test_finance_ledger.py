@@ -3277,8 +3277,12 @@ def test_simplefin_account_lands_on_the_plaid_founded_account_and_dedups_its_flo
     )
     assert [(o["source"], o["value"]) for o in observations] == [("plaid", Decimal("123.45")), ("simplefin", Decimal("130.00"))]
     assert observations[1]["observed_at"] == _TS + timedelta(hours=1)
-    net_worth = warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth")
-    assert net_worth == [{"value": Decimal("130.00"), "source": "plaid"}] or net_worth[0]["value"] in (Decimal("123.45"), Decimal("130.00"))
+    # Both observations are for the same day; the bridge's stamp (_TS + 1h) is
+    # newer than Plaid's own sync stamp (_TS), so net worth reads SimpleFIN --
+    # and would read Plaid if Plaid had synced later, whatever the run time.
+    net_worth = warehouse._query_dicts("SELECT value, source, observed_at FROM @marts_finance_net_worth")
+    assert net_worth == [{"value": Decimal("130.00"), "source": "simplefin", "observed_at": _TS + timedelta(hours=1)}]
+    assert observations[0]["observed_at"] == _TS  # Plaid's synced_at, not the run time
     # Three real-world movements, not five: the two both providers saw merged
     # into Plaid's rows; the one only SimpleFIN saw founded its own.
     transactions = warehouse._query_dicts(

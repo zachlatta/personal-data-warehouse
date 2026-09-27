@@ -508,7 +508,14 @@ class FinanceLedgerRunner:
                     "value": row["current_balance"],
                     "currency": row["iso_currency_code"],
                     "source": LEDGER_SOURCE_PLAID,
-                    "observed_at": now,
+                    # Plaid's own sync stamp, not this run's. Net worth breaks
+                    # a same-day tie between providers on observed_at, and a
+                    # ledger run every five minutes would otherwise re-stamp
+                    # a balance Plaid last refreshed hours ago as the freshest
+                    # reading there is: measured 2026-09-27, Plaid's Capital
+                    # One balance was still missing the previous day's
+                    # purchases while the SimpleFIN Bridge had them.
+                    "observed_at": _ensure_utc_datetime(row["synced_at"], fallback=now),
                     "sync_version": sync_version,
                 }
             )
@@ -1943,6 +1950,7 @@ class FinanceLedgerRunner:
             """
             SELECT a.account, a.item_id, a.account_id, a.name, a.official_name,
                    a.mask, a.type, a.subtype, a.current_balance, a.iso_currency_code,
+                   a.synced_at,
                    COALESCE(i.institution_name, '') AS institution_name
             FROM @plaid_accounts a
             LEFT JOIN @plaid_items i
@@ -2210,6 +2218,15 @@ class FinanceLedgerRunner:
             "created_at": now,
             "sync_version": sync_version,
         }
+
+
+def _ensure_utc_datetime(value: Any, *, fallback: datetime) -> datetime:
+    """A provider's own timestamp, or the run time when it has none."""
+    if not isinstance(value, datetime) or value.timestamp() <= 0:
+        return fallback
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _institution_matches(left: str, right: str) -> bool:
