@@ -124,7 +124,7 @@ func (s *LinkServer) Handler() http.Handler {
 			case "/":
 				writeHTML(w, LinkPage(s.LinkToken, s.ClientName, s.StateToken))
 			case "/done":
-				writeHTML(w, "<html><body><h1>Plaid Link complete</h1><p>You can close this tab.</p></body></html>")
+				writeHTML(w, DonePage())
 			default:
 				http.Error(w, "404 Not Found", http.StatusNotFound)
 			}
@@ -240,14 +240,20 @@ func writeJSON(w http.ResponseWriter, payload map[string]any) {
 	_, _ = w.Write(data)
 }
 
-// LinkPage renders the local Plaid Link page (the _link_page HTML in cli.py).
+// DonePage is the page shown after Plaid Link reported completion to the CLI.
+func DonePage() string {
+	return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Plaid Link complete</title></head><body><h1>Plaid Link complete</h1><p>You can close this tab.</p></body></html>`
+}
+
+// LinkPage renders the local Plaid Link page. Both pages carry a mobile viewport tag:
+// without it iOS renders the page at desktop width and it cannot be zoomed or panned.
 func LinkPage(linkToken, clientName, stateToken string) string {
 	linkTokenJSON, _ := json.Marshal(linkToken)
 	stateJSON, _ := json.Marshal(stateToken)
 	clientNameHTML := html.EscapeString(clientName)
 	return `<!doctype html>
 <html>
-<head><meta charset="utf-8"><title>` + clientNameHTML + ` Plaid Link</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>` + clientNameHTML + ` Plaid Link</title></head>
 <body>
   <h1>` + clientNameHTML + ` Plaid Link</h1>
   <p>Click the button below to open Plaid Link. Complete OAuth/MFA in the Plaid flow, then this local page will report completion to the CLI.</p>

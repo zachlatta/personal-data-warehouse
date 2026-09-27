@@ -437,6 +437,16 @@ func TestLinkServerPagesAndUnknownPaths(t *testing.T) {
 	}
 }
 
+func TestLinkPageIsUsableOnAPhone(t *testing.T) {
+	const viewport = `<meta name="viewport" content="width=device-width, initial-scale=1">`
+	if !strings.Contains(LinkPage("link-token", "PDW", "state-token"), viewport) {
+		t.Fatalf("link page lacks a mobile viewport meta tag; the page cannot be zoomed or panned on a phone")
+	}
+	if !strings.Contains(DonePage(), viewport) {
+		t.Fatalf("done page lacks a mobile viewport meta tag")
+	}
+}
+
 func TestLinkPageResumesOAuthRedirectAndMarksSuccess(t *testing.T) {
 	page := LinkPage("link-token", "PDW <x>", "state-token")
 	for _, want := range []string{
