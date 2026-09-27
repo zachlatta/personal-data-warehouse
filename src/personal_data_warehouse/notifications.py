@@ -101,8 +101,11 @@ STATEMENTS = (
                     'actor',left(NEW.actor,200),'title',left(NEW.title,300),
                     'snippet',left(NEW.snippet,800),'context',left(NEW.context,200),
                     'recurring_event_id',COALESCE(NEW.metadata->>'recurring_event_id',''),
+                    -- The keys the phone groups alerts under: a Slack thread, an
+                    -- iMessage chat, a Gmail thread.
                     'metadata',jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
-                                                  'chat_id',NEW.metadata->>'chat_id')))
+                                                  'chat_id',NEW.metadata->>'chat_id',
+                                                  'thread_id',NEW.metadata->>'thread_id')))
             ON CONFLICT (adapter, event_id) DO NOTHING;
         END IF;
         RETURN NEW;

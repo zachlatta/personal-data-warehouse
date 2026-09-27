@@ -1811,6 +1811,16 @@ back it, all behind the static bearer the CLI uses:
 - `POST /api/push/register` stores the device's Expo push token in
   `private.push_devices` (`app/internal/push`); `POST /api/push/test` sends to every
   active device and returns the fan-out report.
+- **A timeline alert is stacked on the phone by the conversation, not by the source.**
+  iOS groups notifications by `thread_id`, and until 2026-09-26 every timeline alert
+  carried `timeline:<source>`, so every Slack channel, DM and group DM piled into one
+  unreviewable stack. `notificationThreadID` (`timeline_notifications.go`) now keys a
+  Slack alert by `team_id:conversation_id`, Gmail by the thread (the sender when there is
+  none), iMessage and WhatsApp by the chat, Drive by the file, and everything else by the
+  row's `context` stream, falling back to the bare source only when there is nothing
+  finer. The Gmail thread reaches the outbox because the capture trigger
+  (`notifications.py`) copies `thread_id` beside `thread_ts` and `chat_id` into the
+  payload's `metadata`; a key the trigger does not copy cannot group anything.
 - A request landing in `pending_review` fires `mutations.Config.RequestCreated`, which
   the server wires to the push notifier. Delivery is asynchronous and bounded; a
   `DeviceNotRegistered` ticket flips that row to `disabled` with the reason, so an

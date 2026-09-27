@@ -60,6 +60,17 @@ def test_a_recurring_invite_pages_once_per_series_not_once_per_instance(warehous
         ("a|cal|series_1",), ("a|cal|single",)]
 
 
+def test_capture_carries_the_conversation_keys_the_phone_groups_by(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, metadata) "
+                "VALUES ('gmail_email', 'me|m1', 'direct'::" + wh.sql_relation("timeline_priority")
+                + ", 'gmail', 'Re: hello', %s::jsonb)",
+                ('{"thread_id": "th1", "thread_ts": "9.9", "chat_id": "c1", "labels": ["INBOX"]}',))
+    [(payload,)] = wh._query("SELECT payload->'metadata' FROM @notification_events WHERE event_id = 'me|m1'")
+    assert payload == {"thread_id": "th1", "thread_ts": "9.9", "chat_id": "c1"}
+
+
 def test_an_old_direct_plus_cc_trigger_is_replaced_by_ensure(warehouse):
     wh = warehouse
     wh._command("DROP TRIGGER timeline_notification_insert ON @timeline_events")

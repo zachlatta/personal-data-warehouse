@@ -45,3 +45,38 @@ func TestNotificationSampleRegressions(t *testing.T) {
 		t.Fatalf("unknown preview: %+v", unknown)
 	}
 }
+
+// iOS stacks alerts by thread id. One thread per source put every Slack
+// message, from every channel and DM, in one pile; the pile is now the
+// conversation, the person, or the thing — never the source.
+func TestNotificationsGroupByConversationNotBySource(t *testing.T) {
+	cases := []struct {
+		name string
+		row  map[string]any
+		want string
+	}{
+		{"slack conversation", map[string]any{"source": "slack", "source_pk": map[string]any{"team_id": "T1", "conversation_id": "C1", "message_ts": "1.0"}, "metadata": map[string]any{"thread_ts": "0.9"}}, "timeline:slack:T1:C1"},
+		{"slack reply stays with its channel", map[string]any{"source": "slack", "source_pk": map[string]any{"team_id": "T1", "conversation_id": "C1", "message_ts": "2.0"}}, "timeline:slack:T1:C1"},
+		{"gmail thread", map[string]any{"source": "gmail", "actor": "a@example.test", "source_pk": map[string]any{"account": "me", "message_id": "m2"}, "metadata": map[string]any{"thread_id": "th1"}}, "timeline:gmail:me:th1"},
+		{"gmail without thread falls back to the sender", map[string]any{"source": "gmail", "actor": "a@example.test", "source_pk": map[string]any{"account": "me", "message_id": "m3"}}, "timeline:gmail:me:from:a@example.test"},
+		{"imessage chat", map[string]any{"source": "apple_messages", "context": "Group", "source_pk": map[string]any{"account": "me", "message_id": "9"}, "metadata": map[string]any{"chat_id": "iMessage;+;chat123"}}, "timeline:apple_messages:me:iMessage;+;chat123"},
+		{"whatsapp chat", map[string]any{"source": "whatsapp", "source_pk": map[string]any{"account": "me", "chat_id": "123@g.us", "message_id": "9"}}, "timeline:whatsapp:me:123@g.us"},
+		{"drive file", map[string]any{"source": "google_drive", "source_pk": map[string]any{"account": "me", "file_id": "F1"}}, "timeline:google_drive:me:F1"},
+		{"calendar by calendar", map[string]any{"source": "calendar", "context": "primary"}, "timeline:calendar:primary"},
+		{"unknown source with a context", map[string]any{"source": "other", "context": "stream"}, "timeline:other:stream"},
+		{"nothing to group by", map[string]any{"source": "other"}, "timeline:other"},
+	}
+	for _, tc := range cases {
+		got := renderTimelineNotification(tc.row, "https://pdw.example", timelineLinkEnv{}).ThreadID
+		if got != tc.want {
+			t.Errorf("%s: thread %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{"source_pk": map[string]any{"team_id": "T1", "conversation_id": "C1"}})
+	var row map[string]any
+	_ = json.Unmarshal(raw, &row)
+	row["source"] = "slack"
+	if got := renderTimelineNotification(row, "", timelineLinkEnv{}).ThreadID; got != "timeline:slack:T1:C1" {
+		t.Fatalf("source_pk arriving as JSON text is not decoded: %q", got)
+	}
+}
