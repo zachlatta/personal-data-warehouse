@@ -175,6 +175,10 @@ DEFAULT_PLAID_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_PLAID_TRANSACTIONS_LOOKBACK_DAYS = 730
 MAX_PLAID_TRANSACTIONS_LOOKBACK_DAYS = 730
 PLAID_ENVIRONMENTS = ("sandbox", "development", "production")
+DEFAULT_SIMPLEFIN_LOOKBACK_DAYS = 365
+DEFAULT_SIMPLEFIN_WINDOW_DAYS = 60
+DEFAULT_SIMPLEFIN_OVERLAP_DAYS = 7
+DEFAULT_SIMPLEFIN_REQUEST_TIMEOUT_SECONDS = 60
 PLAID_SUPPORTED_PRODUCTS = ("transactions", "investments", "liabilities")
 DEFAULT_ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
 DEFAULT_ASSEMBLYAI_POLL_INTERVAL_SECONDS = 5
@@ -509,6 +513,27 @@ class PlaidConfig:
 
 
 @dataclass(frozen=True)
+class SimpleFINConfig:
+    """The SimpleFIN Bridge access URL and how far back to walk it.
+
+    ``access_url`` is the claimed ``https://user:pass@host/simplefin`` URL — the
+    one-time setup token is exchanged for it with
+    ``uv run python -m personal_data_warehouse.simplefin_sync claim``; a setup
+    token can only be claimed once, so the access URL is what gets configured.
+    ``account`` is the OWNER label the rows are keyed by; it must equal the
+    Plaid owner label so the finance ledger can resolve both providers'
+    accounts onto one logical account.
+    """
+
+    account: str
+    access_url: str
+    lookback_days: int = DEFAULT_SIMPLEFIN_LOOKBACK_DAYS
+    window_days: int = DEFAULT_SIMPLEFIN_WINDOW_DAYS
+    overlap_days: int = DEFAULT_SIMPLEFIN_OVERLAP_DAYS
+    request_timeout_seconds: int = DEFAULT_SIMPLEFIN_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class AssemblyAIConfig:
     api_key: str
     base_url: str = DEFAULT_ASSEMBLYAI_BASE_URL
@@ -591,6 +616,7 @@ class Settings:
     hacker_news: HackerNewsConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
+    simplefin: SimpleFINConfig | None = None
     assemblyai: AssemblyAIConfig | None = None
     agent: AgentConfig | None = None
     postgres_database_url: str | None = None
@@ -703,6 +729,7 @@ def load_settings(
     require_hacker_news: bool = False,
     require_google_drive_source: bool = False,
     require_plaid: bool = False,
+    require_simplefin: bool = False,
     require_assemblyai: bool = False,
     require_agent: bool = False,
 ) -> Settings:
@@ -1871,6 +1898,46 @@ def load_settings(
             transactions_lookback_days=plaid_transactions_lookback_days,
         )
 
+    simplefin_access_url = os.getenv("SIMPLEFIN_ACCESS_URL", "").strip().rstrip("/")
+    simplefin: SimpleFINConfig | None = None
+    if require_simplefin or simplefin_access_url:
+        if not simplefin_access_url:
+            raise ValueError("SIMPLEFIN_ACCESS_URL must be set for SimpleFIN finance sync")
+        if not simplefin_access_url.startswith("https://"):
+            raise ValueError("SIMPLEFIN_ACCESS_URL must be the claimed https access URL")
+        # Same owner label as Plaid by default: the ledger resolves provider
+        # accounts by owner + institution + mask, so a different label here
+        # would fork every account SimpleFIN and Plaid both report.
+        simplefin_account = (os.getenv("SIMPLEFIN_ACCOUNT") or plaid_account).strip()
+        if not simplefin_account:
+            raise ValueError("SIMPLEFIN_ACCOUNT (or PLAID_ACCOUNT) must be set for SimpleFIN finance sync")
+        simplefin_lookback_days = int(
+            os.getenv("SIMPLEFIN_LOOKBACK_DAYS", str(DEFAULT_SIMPLEFIN_LOOKBACK_DAYS))
+        )
+        simplefin_window_days = int(os.getenv("SIMPLEFIN_WINDOW_DAYS", str(DEFAULT_SIMPLEFIN_WINDOW_DAYS)))
+        simplefin_overlap_days = int(
+            os.getenv("SIMPLEFIN_OVERLAP_DAYS", str(DEFAULT_SIMPLEFIN_OVERLAP_DAYS))
+        )
+        simplefin_request_timeout_seconds = int(
+            os.getenv("SIMPLEFIN_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_SIMPLEFIN_REQUEST_TIMEOUT_SECONDS))
+        )
+        if simplefin_lookback_days < 1:
+            raise ValueError("SIMPLEFIN_LOOKBACK_DAYS must be at least 1")
+        if not 1 <= simplefin_window_days <= 90:
+            raise ValueError("SIMPLEFIN_WINDOW_DAYS must be between 1 and 90 (the bridge caps a request at 90 days)")
+        if simplefin_overlap_days < 0:
+            raise ValueError("SIMPLEFIN_OVERLAP_DAYS must not be negative")
+        if simplefin_request_timeout_seconds < 1:
+            raise ValueError("SIMPLEFIN_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        simplefin = SimpleFINConfig(
+            account=simplefin_account,
+            access_url=simplefin_access_url,
+            lookback_days=simplefin_lookback_days,
+            window_days=simplefin_window_days,
+            overlap_days=simplefin_overlap_days,
+            request_timeout_seconds=simplefin_request_timeout_seconds,
+        )
+
     assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     assemblyai: AssemblyAIConfig | None = None
     if require_assemblyai or assemblyai_api_key:
@@ -2025,6 +2092,7 @@ def load_settings(
         hacker_news=hacker_news,
         google_drive_source=google_drive_source,
         plaid=plaid,
+        simplefin=simplefin,
         assemblyai=assemblyai,
         agent=agent,
         postgres_database_url=postgres_database_url,

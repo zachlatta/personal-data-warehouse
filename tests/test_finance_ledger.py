@@ -9,7 +9,7 @@ Deleting the finance.* rows and re-running replays every decision.
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -3145,3 +3145,251 @@ def test_alert_authorization_successor_is_account_scoped_and_unambiguous():
     foreign = {**second, 'account': 'other@example.test'}
     witnesses = FinanceLedgerRunner._alert_authorizations([pending, first, foreign], owner_map)
     assert witnesses[0]['successor_transaction_id'] == stable_finance_transaction_id('plaid', 'z@x.test|posted-a')
+
+
+# --- simplefin: the second provider over the same accounts ---------------------
+
+
+def _simplefin_account_row(**overrides) -> dict:
+    row = {
+        "account": "z@x.test",
+        "account_id": "ACT-1",
+        "org_id": "www.acme.example",
+        "org_name": "Acme Bank",
+        "org_domain": "www.acme.example",
+        "org_url": "https://www.acme.example",
+        "name": "Checking (0001)",
+        "currency": "USD",
+        "balance": 123.45,
+        "available_balance": 100.0,
+        "balance_at": _TS - timedelta(hours=2),
+        "is_removed": 0,
+        "extra_json": {},
+        "raw_json": {},
+        "synced_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _simplefin_transaction_row(**overrides) -> dict:
+    row = {
+        "account": "z@x.test",
+        "account_id": "ACT-1",
+        "transaction_id": "sf-1",
+        "posted_at": _TS,
+        "transacted_at": _TS,
+        "amount": -4.5,  # simplefin: positive = money in, so a purchase is negative
+        "description": "Coffee Shop",
+        "payee": "Coffee Shop",
+        "memo": "COFFEE SHOP",
+        "mcc": "5812",
+        "pending": 0,
+        "is_removed": 0,
+        "extra_json": {},
+        "raw_json": {},
+        "synced_at": _TS,
+        "sync_version": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def _seed_simplefin(warehouse, accounts, transactions=()) -> None:
+    warehouse.ensure_simplefin_tables()
+    warehouse.insert_simplefin_accounts(accounts)
+    warehouse.insert_simplefin_transactions(list(transactions))
+    for account in accounts:
+        warehouse.insert_simplefin_sync_state(
+            account=account["account"], account_id=account["account_id"], cursor="1", status="ok",
+            last_synced_at=_TS, updated_at=_TS,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "extra", "expected"),
+    [
+        ("Venture X (5520)", {}, "5520"),
+        ("Checking ...4871", {}, "4871"),
+        ("Fidelity Rewards Visa Signature Card 3728", {}, "3728"),
+        ("360 Checking x1234", {}, "1234"),
+        ("Savings", {}, ""),
+        ("Savings", {"last4": "9999"}, "9999"),
+        ("Plan 401k", {}, ""),  # a bare number in the name that is not four digits at the end
+    ],
+)
+def test_simplefin_account_mask_is_read_from_the_name(name, extra, expected):
+    from personal_data_warehouse.finance_ledger import simplefin_account_mask
+
+    assert simplefin_account_mask(name, extra) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "balance", "holdings", "expected"),
+    [
+        ("Venture X (5520)", -32.55, False, ("credit", "liability")),
+        ("Checking (4871)", 10.0, False, ("checking", "asset")),
+        ("Brokerage 9513", 10.0, True, ("brokerage", "asset")),
+        ("Roth IRA", 10.0, False, ("ira", "asset")),
+        ("Mystery", -5.0, False, ("credit", "liability")),
+        ("Mystery", 5.0, False, ("other", "asset")),
+    ],
+)
+def test_simplefin_account_kind_side(name, balance, holdings, expected):
+    from personal_data_warehouse.finance_ledger import simplefin_account_kind_side
+
+    assert simplefin_account_kind_side(name, balance=balance, has_holdings=holdings) == expected
+
+
+def test_simplefin_account_lands_on_the_plaid_founded_account_and_dedups_its_flows(warehouse):
+    """The whole point: both providers report one card; net worth and the
+    transaction ledger count it once."""
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    warehouse.insert_plaid_transactions([
+        _plaid_transaction_row(transaction_id="tx-1", amount=4.5, posted_at=_TS),
+        _plaid_transaction_row(transaction_id="tx-2", amount=-1960.0, name="PAYROLL", posted_at=_TS - timedelta(days=3)),
+    ])
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(name="Checking (0001)", balance=130.00, balance_at=_TS + timedelta(hours=1))],
+        [
+            _simplefin_transaction_row(transaction_id="sf-1", amount=-4.5, posted_at=_TS + timedelta(days=1)),
+            _simplefin_transaction_row(transaction_id="sf-2", amount=1960.0, description="Pay day", posted_at=_TS - timedelta(days=2)),
+            _simplefin_transaction_row(transaction_id="sf-3", amount=-7.25, description="Bait", posted_at=_TS),
+        ],
+    )
+    summary = FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    accounts = warehouse._query_dicts("SELECT account_id, name, kind, mask FROM @finance_accounts")
+    assert len(accounts) == 1, accounts
+    plaid_id = stable_finance_account_id("plaid", "z@x.test", "acc-1")
+    assert accounts[0]["account_id"] == plaid_id and accounts[0]["name"] == "Checking"
+    links = warehouse._query_dicts(
+        "SELECT source, source_account_key, account_id, match_method FROM @finance_account_links ORDER BY source"
+    )
+    assert links == [
+        {"source": "plaid", "source_account_key": "acc-1", "account_id": plaid_id, "match_method": "source_id"},
+        {"source": "simplefin", "source_account_key": "ACT-1", "account_id": plaid_id, "match_method": "institution_mask"},
+    ]
+    # Both providers observe the balance; net worth takes the freshest one.
+    observations = warehouse._query_dicts(
+        "SELECT source, value, observed_at FROM @finance_observations WHERE account_id = %s ORDER BY source", (plaid_id,)
+    )
+    assert [(o["source"], o["value"]) for o in observations] == [("plaid", Decimal("123.45")), ("simplefin", Decimal("130.00"))]
+    assert observations[1]["observed_at"] == _TS + timedelta(hours=1)
+    net_worth = warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth")
+    assert net_worth == [{"value": Decimal("130.00"), "source": "plaid"}] or net_worth[0]["value"] in (Decimal("123.45"), Decimal("130.00"))
+    # Three real-world movements, not five: the two both providers saw merged
+    # into Plaid's rows; the one only SimpleFIN saw founded its own.
+    transactions = warehouse._query_dicts(
+        "SELECT source, amount, description FROM @finance_transactions ORDER BY amount"
+    )
+    assert [(t["source"], t["amount"]) for t in transactions] == [
+        ("simplefin", Decimal("-7.25")), ("plaid", Decimal("-4.5")), ("plaid", Decimal("1960.0")),
+    ]
+    tx_links = warehouse._query_dicts(
+        "SELECT source, match_method, count(*) AS n FROM @finance_transaction_links GROUP BY 1, 2 ORDER BY 1, 2"
+    )
+    assert tx_links == [
+        {"source": "plaid", "match_method": "source_id", "n": 2},
+        {"source": "simplefin", "match_method": "fuzzy_amount_date", "n": 2},
+        {"source": "simplefin", "match_method": "source_id", "n": 1},
+    ]
+    assert summary.transactions_merged == 2
+    health = warehouse._query_dicts(
+        "SELECT status, ledger_account_id, match_method, shared_with_plaid FROM @marts_ops_simplefin_account_health"
+    )
+    assert health == [{"status": "ok", "ledger_account_id": plaid_id, "match_method": "institution_mask", "shared_with_plaid": 1}]
+
+
+def test_simplefin_account_without_a_mask_is_matched_by_shared_transactions(warehouse):
+    _seed_plaid(warehouse, [_plaid_account_row(mask="0001")])
+    plaid_rows = [
+        _plaid_transaction_row(transaction_id=f"tx-{i}", amount=float(10 + i), posted_at=_TS - timedelta(days=i))
+        for i in range(4)
+    ]
+    warehouse.insert_plaid_transactions(plaid_rows)
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(name="Everyday Checking", balance=5.0)],
+        [
+            _simplefin_transaction_row(transaction_id=f"sf-{i}", amount=-float(10 + i), posted_at=_TS - timedelta(days=i) + timedelta(days=1))
+            for i in range(4)
+        ],
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    links = warehouse._query_dicts(
+        "SELECT account_id, match_method FROM @finance_account_links WHERE source = 'simplefin'"
+    )
+    assert links == [{"account_id": stable_finance_account_id("plaid", "z@x.test", "acc-1"), "match_method": "transaction_overlap"}]
+    assert len(warehouse._query_dicts("SELECT 1 FROM @finance_accounts")) == 1
+    assert len(warehouse._query_dicts("SELECT 1 FROM @finance_transactions")) == 4
+
+
+def test_simplefin_account_with_too_little_evidence_founds_its_own_account(warehouse):
+    """Under-merging is the recoverable direction: two lines, never a halved balance."""
+    _seed_plaid(warehouse, [_plaid_account_row(mask="0001")])
+    warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id="tx-1", amount=4.5)])
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(name="Everyday Checking", balance=5.0)],
+        [_simplefin_transaction_row(transaction_id="sf-1", amount=-4.5)],
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    accounts = warehouse._query_dicts("SELECT account_id FROM @finance_accounts ORDER BY account_id")
+    assert len(accounts) == 2
+    health = warehouse._query_dicts("SELECT match_method, shared_with_plaid FROM @marts_ops_simplefin_account_health")
+    assert health == [{"match_method": "source_id", "shared_with_plaid": 0}]
+
+
+def test_simplefin_only_institution_books_a_liability_as_the_amount_owed(warehouse):
+    warehouse.ensure_plaid_tables()
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(account_id="ACT-9", org_name="Card Co", name="Venture X (5520)", balance=-32.55)],
+        [_simplefin_transaction_row(account_id="ACT-9", transaction_id="sf-9", amount=-32.55, description="Grocery", payee="Grocery")],
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    account = warehouse._query_dicts("SELECT account_id, kind, side, mask, institution FROM @finance_accounts")[0]
+    assert account["account_id"] == stable_finance_account_id("simplefin", "z@x.test", "ACT-9")
+    assert (account["kind"], account["side"], account["mask"], account["institution"]) == ("credit", "liability", "5520", "Card Co")
+    net_worth = warehouse._query_dicts("SELECT value, signed_value, source FROM @marts_finance_net_worth")
+    assert net_worth == [{"value": Decimal("32.55"), "signed_value": Decimal("-32.55"), "source": "simplefin"}]
+    transactions = warehouse._query_dicts("SELECT source, amount, merchant FROM @finance_transactions")
+    assert transactions == [{"source": "simplefin", "amount": Decimal("-32.55"), "merchant": "Grocery"}]
+
+
+def test_simplefin_balance_is_frozen_while_the_access_url_is_action_required(warehouse):
+    warehouse.ensure_plaid_tables()
+    _seed_simplefin(warehouse, [_simplefin_account_row(account_id="ACT-9", org_name="Card Co", name="Checking (1111)")])
+    warehouse.insert_simplefin_sync_state(
+        account="z@x.test", account_id="", cursor="", status="action_required", error="403", last_synced_at=_TS, updated_at=_TS,
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    assert warehouse._query_dicts("SELECT 1 FROM @finance_observations") == []
+    assert warehouse._query_dicts("SELECT status FROM @marts_ops_simplefin_account_health") == [{"status": "action_required"}]
+    # The link was still made, so the backlog sensor stops asking for it.
+    assert has_pending_finance_observations(warehouse) is False
+
+
+def test_simplefin_replay_rebuilds_identically(warehouse):
+    _seed_plaid(warehouse, [_plaid_account_row()])
+    warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id="tx-1", amount=4.5)])
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(), _simplefin_account_row(account_id="ACT-2", name="Savings (0002)", balance=9.0)],
+        [_simplefin_transaction_row(transaction_id="sf-1", amount=-4.5), _simplefin_transaction_row(transaction_id="sf-2", amount=-9.0)],
+    )
+    runner = FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2))
+    runner.sync()
+    snapshot = lambda: (  # noqa: E731
+        warehouse._query_dicts("SELECT account_id, kind, side, mask FROM @finance_accounts ORDER BY account_id"),
+        warehouse._query_dicts("SELECT source, source_account_key, account_id, match_method FROM @finance_account_links ORDER BY 1, 2"),
+        warehouse._query_dicts("SELECT transaction_id, account_id, amount, source FROM @finance_transactions ORDER BY 1"),
+        warehouse._query_dicts("SELECT source_row_key, transaction_id, match_method FROM @finance_transaction_links ORDER BY 1"),
+    )
+    before = snapshot()
+    for table in ("finance_transaction_links", "finance_transactions", "finance_observations", "finance_account_links", "finance_accounts"):
+        warehouse._command(f"DELETE FROM @{table}")
+    runner.sync()
+    assert snapshot() == before

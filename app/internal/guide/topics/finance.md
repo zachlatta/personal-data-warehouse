@@ -1,8 +1,9 @@
 # Finance
 
-Two sources — Plaid (linked institutions, synced every 30 minutes) and manually uploaded
-documents (statements, valuations, fund positions, tax records) — feed one cross-source
-ledger in `derived_finance.*`, read through `marts_finance.*`. The ledger stores **facts**
+Three sources — Plaid (linked institutions, synced every 30 minutes), SimpleFIN (the same
+institutions through the SimpleFIN Bridge, hourly) and manually uploaded documents
+(statements, valuations, fund positions, tax records) — feed one cross-source ledger in
+`derived_finance.*`, read through `marts_finance.*`. The ledger stores **facts**
 only: a *flow* (money moved) or a *stock* (something was worth X on day T). No categories.
 
 ## Start here
@@ -16,8 +17,9 @@ only: a *flow* (money moved) or a *stock* (something was worth X on day T). No c
 | holdings, trades, cost basis | `marts_finance.investment_holdings`, `marts_finance.security_transactions`, `marts_finance.tax_lots`, `marts_finance.position_coverage` |
 | debts | `marts_finance.liabilities` |
 | raw provider rows | `base_plaid.accounts`, `.transactions`, `.investment_holdings`, `.investment_transactions`, `.liabilities`, `.items` |
+| raw SimpleFIN rows | `base_simplefin.accounts`, `.transactions`, `.holdings` — **opposite signs to Plaid**: `amount` positive = money in, a card's `balance` negative = owed |
 | uploaded documents and what the agent extracted from them | `base_manual_finance.documents`, `derived_finance.document_extractions` |
-| is each institution alive | `marts_ops.plaid_item_health` |
+| is each institution alive | `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health` (which ledger account each SimpleFIN row landed on, and `shared_with_plaid`) |
 
 Search scope `finance` covers transactions; a receipt's link to its transaction is
 `marts_receipts.transaction_receipts`.
@@ -64,6 +66,15 @@ Search scope `finance` covers transactions; a receipt's link to its transaction 
 - **A re-link can mint a second live Plaid Item** and double-count an institution while
   everything reads `ok`. `marts_ops.plaid_item_health` reads `duplicate` for it; the
   retirement is deliberate ({{if .CLI}}`pdw ingest plaid unlink <item-id> --dry-run` first{{else}}an operator's `pdw ingest plaid unlink`{{end}}).
+- **Plaid and SimpleFIN report the same accounts, and the ledger counts each once.** A
+  SimpleFIN account resolves onto the Plaid-founded ledger account by institution + the
+  last four digits in its name (or by the transactions the two feeds share when the name
+  has none), its balance is a second observation net worth takes only when fresher, and
+  its transactions merge into Plaid's by exact amount within ±3 days
+  (`match_method = 'fuzzy_amount_date'`). A row in `marts_ops.simplefin_account_health`
+  with `shared_with_plaid = 0` at a Plaid-linked institution is a possible double count;
+  `ledger_account_id` NULL means it is not in net worth yet. Ask `marts_finance.*`, never
+  `base_plaid.*` plus `base_simplefin.*` summed.
 - Uploaded documents: the **upload folder is the account**
   (`<institution>-<name>-<mask>/statement.pdf` is preserved as `original_path`). A
   document at the corpus root with no account mask books nothing, on purpose; if a

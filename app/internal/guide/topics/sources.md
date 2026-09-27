@@ -79,7 +79,8 @@ Read topic `health` before quoting a number — the unit traps are 1000x errors.
 `marts_finance.net_worth` (with `staleness` per line), `net_worth_history`, `accounts`,
 `transactions` (signed: positive = inflow), `commitments`, `security_transactions`,
 `tax_lots`, `position_coverage`, `investment_holdings`, `liabilities`; the ledger facts in
-`derived_finance.*`; raw Plaid in `base_plaid.*` and uploaded statements in
+`derived_finance.*`; raw Plaid in `base_plaid.*`, raw SimpleFIN in `base_simplefin.*` (the
+same institutions, opposite sign conventions, reconciled by the ledger) and uploaded statements in
 `base_manual_finance.documents` with agent extractions in `derived_finance.document_extractions`.
 Read topic `finance` before quoting a total: several guards deliberately withhold a number.
 

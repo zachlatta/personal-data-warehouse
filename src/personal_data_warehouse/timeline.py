@@ -3268,6 +3268,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "plaid_liabilities": _entity("current liability state"),
     "plaid_sync_state": _state("per-item/product sync cursor"),
     "plaid_item_tokens": _state("private Plaid access tokens"),
+    # SimpleFIN is the second provider feed for the same accounts; like Plaid
+    # its rows are finance query state, and the ledger emits the events.
+    "simplefin_accounts": _entity("account and current balance state from the SimpleFIN Bridge"),
+    "simplefin_transactions": _entity("finance query surface; deduped into derived_finance.transactions"),
+    "simplefin_holdings": _entity("current brokerage position snapshot"),
+    "simplefin_sync_state": _state("per-account window cursor, status and error; the '' row is the connection"),
     # Finance ledger. Raw Plaid rows remain source state; their deduplicated
     # ledger transactions and point-in-time observations are timeline events.
     "finance_accounts": _entity("logical account/asset/liability dimension"),

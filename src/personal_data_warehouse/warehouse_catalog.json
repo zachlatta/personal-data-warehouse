@@ -239,6 +239,14 @@
       "comment": "Faithful plaid source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_simplefin",
+      "layer": "base",
+      "domain": "simplefin",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful simplefin source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
+    },
+    {
       "name": "base_slack",
       "layer": "base",
       "domain": "slack",
@@ -659,6 +667,41 @@
         "schema": "plaid",
         "name": "liabilities"
       }
+    },
+    {
+      "id": "simplefin_accounts",
+      "kind": "table",
+      "layer": "base",
+      "domain": "simplefin",
+      "schema": "base_simplefin",
+      "name": "accounts",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "SimpleFIN accounts. `balance` is NEGATIVE when a card is owed (unlike base_plaid); no type/mask column. Read via marts_finance.net_worth."
+    },
+    {
+      "id": "simplefin_transactions",
+      "kind": "table",
+      "layer": "base",
+      "domain": "simplefin",
+      "schema": "base_simplefin",
+      "name": "transactions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "SimpleFIN transactions; `amount` positive = money IN (Plaid's sign is the opposite). Read via marts_finance.transactions, which dedups them against Plaid."
+    },
+    {
+      "id": "simplefin_holdings",
+      "kind": "table",
+      "layer": "base",
+      "domain": "simplefin",
+      "schema": "base_simplefin",
+      "name": "holdings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
     },
     {
       "id": "slack_teams",
@@ -2364,6 +2407,18 @@
       "comment": "One row per linked Plaid Item with institution and account health. `status = 'action_required'`: update the existing Item with `pdw ingest plaid update <item-id>`; never start a new Link."
     },
     {
+      "id": "marts_ops_simplefin_account_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "simplefin_account_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Per SimpleFIN account: bridge balance age, sync verdict (`action_required` = claim a new setup token), and which ledger account it reconciled onto (`shared_with_plaid = 0` at a Plaid institution = possible double count)."
+    },
+    {
       "id": "marts_ops_slack_conversation_health",
       "kind": "view",
       "layer": "marts",
@@ -2711,6 +2766,17 @@
         "schema": "plaid",
         "name": "sync_state"
       }
+    },
+    {
+      "id": "simplefin_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "simplefin_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
     },
     {
       "id": "slack_sync_state",

@@ -909,6 +909,31 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="action_required means an Item needs `pdw ingest plaid link` again",
     ),
     _source(
+        "simplefin",
+        "SimpleFIN finance",
+        cadence="hourly",
+        transport="Dagster simplefin_finance_sync → SimpleFIN Bridge /accounts (every connected institution in one call)",
+        # The bridge refreshes each institution about once a day, so a balance
+        # legitimately sits a day old; the hourly run heartbeat is what says
+        # the poll itself is alive.
+        data=2 * DAY,
+        run=3 * HOUR,
+        state=StateSource(
+            table="simplefin_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+            # `attention` is the bridge's own "connection needs attention"
+            # message: data still flows for every other institution, and
+            # the repair is a re-login inside the SimpleFIN Bridge.
+            attention_statuses=("action_required", "attention"),
+        ),
+        note=(
+            "action_required means the access URL was refused: claim a new setup token"
+            " (`python -m personal_data_warehouse.simplefin_sync claim`) and set SIMPLEFIN_ACCESS_URL"
+        ),
+    ),
+    _source(
         "manual_finance",
         "Manual finance documents",
         cadence="manual upload",
@@ -1424,6 +1449,11 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "plaid_investment_securities": _support("plaid", "synced_at"),
     "plaid_sync_state": _state("plaid", "updated_at", "per-item/product cursor, status, and error"),
     "plaid_item_tokens": _state("plaid", "updated_at", "private access tokens"),
+    # SimpleFIN
+    "simplefin_transactions": _data("simplefin", "synced_at", "posted_at"),
+    "simplefin_accounts": _data("simplefin", "synced_at", note="balance snapshot; balance_at is the bridge's own stamp"),
+    "simplefin_holdings": _data("simplefin", "synced_at"),
+    "simplefin_sync_state": _state("simplefin", "updated_at", "per-account window cursor, status, and error"),
     # Manual finance documents
     "manual_finance_documents": _data("manual_finance", "ingested_at", "file_modified_at"),
     "manual_finance_extractions": _data("manual_finance_extraction", "created_at", "ai_processed_at"),

@@ -475,9 +475,12 @@ def c11_source_slas() -> Verdict:
     plaid = pdw_sql("plaid health", "SELECT institution_name, status FROM marts_ops.plaid_item_health")
     if slack is None or plaid is None:
         return _unavailable("C11", title, "slack_conversation_health / plaid_item_health")
+    simplefin = pdw_sql("simplefin health", "SELECT org_name, name, status, shared_with_plaid FROM marts_ops.simplefin_account_health") or []
+    bad_simplefin = [f"simplefin:{r['org_name']}/{r['name']}={r['status']}" for r in simplefin if r["status"] != "ok"]
     bad = [f"slack:{r['conversation_type']}={r['status']}" for r in slack if r["status"] != "ok"]
     bad += [f"plaid:{r['institution_name']}={r['status']}" for r in plaid if r["status"] not in ("ok",)]
-    return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}; not ok: {bad or 'none'}")
+    bad += bad_simplefin
+    return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}, simplefin accounts {len(simplefin)} ({sum(int(r['shared_with_plaid'] or 0) for r in simplefin)} shared with plaid); not ok: {bad or 'none'}")
 
 
 def s1_slack() -> Verdict:

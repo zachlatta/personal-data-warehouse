@@ -60,7 +60,14 @@ from personal_data_warehouse.securities_ledger import (
 
 
 LEDGER_SOURCE_PLAID = "plaid"
+LEDGER_SOURCE_SIMPLEFIN = "simplefin"
 LEDGER_SOURCE_MANUAL = "manual_finance"
+
+# SimpleFIN prints no account mask; when its account name carries none, the
+# account is matched to a Plaid-linked ledger account at the same institution
+# by the transactions the two feeds share: this many exact (amount, day ±3)
+# pairs, and a unique candidate, or nothing merges.
+SIMPLEFIN_OVERLAP_MIN_MATCHES = 3
 
 OBSERVATION_KIND_BALANCE = "balance"
 OBSERVATION_KIND_VALUATION = "valuation"
@@ -187,6 +194,64 @@ def plaid_account_kind_side(type_: str, subtype: str) -> tuple[str, str]:
         if s in _IRA_SUBTYPES:
             return ("ira", ACCOUNT_SIDE_ASSET)
         return ("brokerage", ACCOUNT_SIDE_ASSET)
+    return ("other", ACCOUNT_SIDE_ASSET)
+
+
+_SIMPLEFIN_MASK_PATTERNS = (
+    re.compile(r"\((\d{4})\)\s*$"),
+    re.compile(r"(?:[x*•·#…]|\.\.\.|ending(?: in)?|-)\s*(\d{4})\s*$", re.IGNORECASE),
+    re.compile(r"\b(\d{4})\s*$"),
+)
+
+
+def simplefin_account_mask(name: str, extra: Mapping[str, Any] | None = None) -> str:
+    """The last four digits SimpleFIN's account name (or ``extra``) reveals.
+
+    The bridge reports no mask column, but nearly every institution names an
+    account by its last four digits ("Venture X (5520)", "Checking ...4871").
+    That is the only identity evidence that can land a SimpleFIN account on
+    the ledger account Plaid founded, so it is read here rather than trusted
+    to a human map. ``extra`` keys are tried first because a bridge that does
+    report a number is more reliable than a name.
+    """
+
+    for key in ("mask", "last4", "last-4", "account-number-last4", "account_number_last4"):
+        value = str((extra or {}).get(key) or "").strip()
+        if value and value[-4:].isdigit():
+            return value[-4:]
+    text = (name or "").strip()
+    for pattern in _SIMPLEFIN_MASK_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def simplefin_account_kind_side(name: str, *, balance: float = 0.0, has_holdings: bool = False) -> tuple[str, str]:
+    """Kind/side for a SimpleFIN account, which reports neither.
+
+    The name is the evidence, the balance sign the tiebreak: the bridge signs
+    balances from the customer's side, so a negative balance on an account
+    whose name says nothing is money owed, not an overdrawn asset.
+    """
+
+    lowered = (name or "").lower()
+    if any(word in lowered for word in ("mortgage",)):
+        return ("mortgage", ACCOUNT_SIDE_LIABILITY)
+    if any(word in lowered for word in ("credit", "card", "visa", "mastercard", "amex", "discover", "savor", "venture")):
+        return ("credit", ACCOUNT_SIDE_LIABILITY)
+    if any(word in lowered for word in ("loan", "line of credit", "heloc")):
+        return ("other", ACCOUNT_SIDE_LIABILITY)
+    if any(word in lowered for word in ("ira", "roth", "401", "403", "pension", "sep ", "simple ira")):
+        return ("ira", ACCOUNT_SIDE_ASSET)
+    if has_holdings or any(word in lowered for word in ("brokerage", "investment", "individual", "trading", "crypto")):
+        return ("brokerage", ACCOUNT_SIDE_ASSET)
+    if "checking" in lowered:
+        return ("checking", ACCOUNT_SIDE_ASSET)
+    if any(word in lowered for word in ("savings", "money market", "cash management", "hsa", " cd")):
+        return ("savings", ACCOUNT_SIDE_ASSET)
+    if balance < 0:
+        return ("credit", ACCOUNT_SIDE_LIABILITY)
     return ("other", ACCOUNT_SIDE_ASSET)
 
 
@@ -451,13 +516,115 @@ class FinanceLedgerRunner:
         self._warehouse.insert_finance_accounts(account_rows)
         self._warehouse.insert_finance_account_links(link_rows)
 
+        # --- simplefin accounts: the second provider, onto the SAME accounts --
+        # SimpleFIN and Plaid describe the same real accounts. A SimpleFIN
+        # row resolves the way a Plaid row does -- owner + institution + mask +
+        # side -- against an index that now holds the Plaid-founded accounts,
+        # and founds its own only when nothing matches. Where the bridge
+        # prints no mask, the transactions the two feeds share are the
+        # evidence (see _resolve_simplefin_accounts).
+        simplefin_accounts = self._load_simplefin_accounts()
+        simplefin_frozen = self._simplefin_connection_is_action_required()
+        simplefin_links = self._load_links(LEDGER_SOURCE_SIMPLEFIN)
+        provider_index = self._load_account_index()
+        simplefin_resolutions = self._resolve_simplefin_accounts(
+            simplefin_accounts,
+            links=simplefin_links,
+            index=provider_index,
+            plaid_account_map=plaid_account_map,
+        )
+        simplefin_account_rows: list[dict[str, Any]] = []
+        simplefin_link_rows: list[dict[str, Any]] = []
+        simplefin_account_map: dict[tuple[str, str], str] = {}
+        existing_created_at = self._load_account_created_at()
+        for row in simplefin_accounts:
+            link_key = (row["account"], row["account_id"])
+            account_id, match_method = simplefin_resolutions[link_key]
+            if match_method:
+                simplefin_link_rows.append(
+                    self._link_row(
+                        source=LEDGER_SOURCE_SIMPLEFIN,
+                        account=row["account"],
+                        source_account_key=row["account_id"],
+                        account_id=account_id,
+                        match_method=match_method,
+                        match_score=1.0,
+                        now=now,
+                        sync_version=sync_version,
+                    )
+                )
+                if link_key in simplefin_links:
+                    accounts_merged += 1
+                else:
+                    links_created += 1
+            simplefin_account_map[link_key] = account_id
+            kind, side = simplefin_account_kind_side(
+                row["name"], balance=float(row["balance"]), has_holdings=bool(row["has_holdings"])
+            )
+            created_at = existing_created_at.get(account_id)
+            if created_at is None:
+                # Only a SimpleFIN-founded account is described by SimpleFIN;
+                # an account Plaid founded keeps Plaid's name, kind and mask.
+                accounts_created += 1
+                simplefin_account_rows.append(
+                    {
+                        "account_id": account_id,
+                        "account": row["account"],
+                        "name": row["name"],
+                        "kind": kind,
+                        "side": side,
+                        "currency": row["currency"],
+                        "institution": row["org_name"],
+                        "mask": row["mask"],
+                        "created_at": now,
+                        "updated_at": now,
+                        "sync_version": sync_version,
+                    }
+                )
+                existing_created_at[account_id] = now
+            else:
+                side = self._account_side(account_id, index=provider_index, fallback=side)
+            if simplefin_frozen:
+                self._logger.warning(
+                    "Skipping SimpleFIN balance for %s (%s): the access URL is action_required, "
+                    "so the bridge balance is frozen at its last pre-failure value",
+                    account_id,
+                    row["org_name"],
+                )
+                continue
+            balance_at = row["balance_at"]
+            if not isinstance(balance_at, datetime) or balance_at.timestamp() <= 0:
+                continue
+            value = _as_decimal(row["balance"])
+            # The bridge signs from the customer's side (owed = negative); the
+            # ledger stores a liability's value as the amount owed.
+            if side == ACCOUNT_SIDE_LIABILITY:
+                value = -value
+            observation_rows.append(
+                {
+                    "account_id": account_id,
+                    "as_of": balance_at.date(),
+                    "kind": OBSERVATION_KIND_BALANCE,
+                    "value": value,
+                    "currency": row["currency"],
+                    "source": LEDGER_SOURCE_SIMPLEFIN,
+                    # The bridge's own stamp, not this run's: net worth picks
+                    # the freshest observation and a re-read of an unchanged
+                    # balance must not out-rank a newer Plaid reading.
+                    "observed_at": balance_at,
+                    "sync_version": sync_version,
+                }
+            )
+        self._warehouse.insert_finance_accounts(simplefin_account_rows)
+        self._warehouse.insert_finance_account_links(simplefin_link_rows)
+
         # --- document accounts, observations, and the unified transactions -----
         # Masks a PROVIDER vouches for. A document-extracted mask is only
         # identity when this set or the upload folder corroborates it; see
         # `mask_is_corroborated`.
         provider_masks = {
             str(row["mask"]).strip() for row in plaid_accounts if str(row["mask"]).strip()
-        }
+        } | {str(row["mask"]).strip() for row in simplefin_accounts if str(row["mask"]).strip()}
         extractions = self._load_latest_extractions()
         manual_links = self._load_links(LEDGER_SOURCE_MANUAL)
         account_index = self._load_account_index()
@@ -678,6 +845,7 @@ class FinanceLedgerRunner:
 
         transactions = self._build_transactions(
             plaid_account_map=plaid_account_map,
+            simplefin_account_map=simplefin_account_map,
             extractions=extractions,
             doc_accounts=doc_accounts,
             now=now,
@@ -709,7 +877,7 @@ class FinanceLedgerRunner:
         )
 
         summary = FinanceLedgerSummary(
-            accounts_seen=len(plaid_accounts) + extractions_seen,
+            accounts_seen=len(plaid_accounts) + len(simplefin_accounts) + extractions_seen,
             accounts_created=accounts_created,
             links_created=links_created,
             observations_upserted=len(observation_rows),
@@ -983,6 +1151,152 @@ class FinanceLedgerRunner:
                 claimed.add(candidate)
         return resolved
 
+    # --- simplefin account identity ---------------------------------------------
+
+    def _resolve_simplefin_accounts(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        links: dict[tuple[str, str], str],
+        index: list[dict[str, Any]],
+        plaid_account_map: dict[tuple[str, str], str],
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Resolve each live SimpleFIN account to a logical account.
+
+        Same evidence as Plaid -- owner + institution + mask + side, against
+        an index that already holds the Plaid-founded accounts -- so a card
+        both providers report lands on ONE ledger account, and the daily
+        balance and every transaction are counted once. A SimpleFIN account
+        whose name prints no mask is matched by the transactions the two feeds
+        share instead (``transaction_overlap``): at least
+        SIMPLEFIN_OVERLAP_MIN_MATCHES exact (amount, day ±3) pairs with a
+        Plaid-linked account at the same institution and side, and no second
+        candidate as good. Anything less founds its own account, which is the
+        recoverable direction: an under-merged account reads as two lines,
+        an over-merged one silently halves a balance.
+
+        Two live SimpleFIN accounts never share a ledger account; a SimpleFIN
+        account and a Plaid account are expected to.
+        """
+
+        by_id = {str(entry["account_id"]): entry for entry in index}
+        ordered = sorted(rows, key=lambda row: (str(row["account"]), str(row["account_id"])))
+        resolved: dict[tuple[str, str], tuple[str, str]] = {}
+        claimed: set[str] = set()
+        for row in ordered:
+            key = (str(row["account"]), str(row["account_id"]))
+            linked = links.get(key)
+            if linked is not None:
+                resolved[key] = (linked, "")
+                claimed.add(linked)
+
+        overlap_index: dict[tuple[str, str], set[tuple[Decimal, date]]] | None = None
+        for row in ordered:
+            key = (str(row["account"]), str(row["account_id"]))
+            owner = str(row["account"])
+            _, side = simplefin_account_kind_side(
+                str(row["name"]), balance=float(row["balance"]), has_holdings=bool(row["has_holdings"])
+            )
+            candidate = _best_identity_match(
+                index,
+                owner=owner,
+                institution=str(row["org_name"]),
+                mask=str(row["mask"]),
+                side=side,
+                exclude=claimed,
+            )
+            method = "institution_mask"
+            if candidate is None and not str(row["mask"]).strip():
+                if overlap_index is None:
+                    overlap_index = self._plaid_transaction_fingerprints()
+                candidate = self._overlap_candidate(
+                    row, side=side, index=index, plaid_account_map=plaid_account_map,
+                    fingerprints=overlap_index, exclude=claimed,
+                )
+                method = "transaction_overlap"
+            current = resolved.get(key, (None, ""))[0]
+            if current is None:
+                account_id = candidate or stable_finance_account_id(
+                    LEDGER_SOURCE_SIMPLEFIN, owner, str(row["account_id"])
+                )
+                resolved[key] = (account_id, method if candidate else "source_id")
+                claimed.add(account_id)
+                continue
+            if candidate is not None and candidate != current and _created_before(by_id.get(candidate), by_id.get(current)):
+                # The link was made before the Plaid account existed (or from
+                # thinner evidence) and now points at a SimpleFIN-founded twin
+                # of an older account: re-point it, the same rule Plaid's
+                # re-link repair follows.
+                resolved[key] = (candidate, method)
+                claimed.discard(current)
+                claimed.add(candidate)
+        return resolved
+
+    def _plaid_transaction_fingerprints(self) -> dict[tuple[str, str], set[tuple[Decimal, date]]]:
+        """(owner, plaid account_id) -> the (ledger-signed amount, day) pairs it holds."""
+        out: dict[tuple[str, str], set[tuple[Decimal, date]]] = {}
+        for row in self._load_plaid_transactions():
+            if row["is_removed"] or int(row["pending"]) == 1:
+                continue
+            out.setdefault((str(row["account"]), str(row["account_id"])), set()).add(
+                (-_as_decimal(row["amount"]), _as_date(row["posted_at"]))
+            )
+        return out
+
+    def _overlap_candidate(
+        self,
+        row: dict[str, Any],
+        *,
+        side: str,
+        index: list[dict[str, Any]],
+        plaid_account_map: dict[tuple[str, str], str],
+        fingerprints: dict[tuple[str, str], set[tuple[Decimal, date]]],
+        exclude: set[str],
+    ) -> str | None:
+        owner = str(row["account"])
+        mine = [
+            (_as_decimal(t["amount"]), _as_date(t["posted_at"]))
+            for t in self._load_simplefin_transactions(account_id=str(row["account_id"]))
+            if not t["is_removed"] and int(t["pending"]) == 0
+        ]
+        if len(mine) < SIMPLEFIN_OVERLAP_MIN_MATCHES:
+            return None
+        by_id = {str(entry["account_id"]): entry for entry in index}
+        scores: dict[str, int] = {}
+        for (plaid_owner, plaid_account_id), theirs in fingerprints.items():
+            if plaid_owner != owner:
+                continue
+            ledger_id = plaid_account_map.get((plaid_owner, plaid_account_id))
+            entry = by_id.get(ledger_id or "")
+            if ledger_id is None or entry is None or ledger_id in exclude:
+                continue
+            if str(entry.get("side", "")) != side:
+                continue
+            if not _institution_matches(str(row["org_name"]), str(entry.get("institution", ""))):
+                continue
+            their_by_amount: dict[Decimal, list[date]] = {}
+            for amount, day in theirs:
+                their_by_amount.setdefault(amount, []).append(day)
+            matches = 0
+            for amount, day in mine:
+                if any(abs((other - day).days) <= FUZZY_MATCH_MAX_DAYS for other in their_by_amount.get(amount, [])):
+                    matches += 1
+            if matches >= SIMPLEFIN_OVERLAP_MIN_MATCHES:
+                scores[ledger_id] = max(scores.get(ledger_id, 0), matches)
+        if not scores:
+            return None
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            return None
+        return ranked[0][0]
+
+    @staticmethod
+    def _account_side(account_id: str, *, index: list[dict[str, Any]], fallback: str) -> str:
+        for entry in index:
+            if str(entry.get("account_id", "")) == account_id:
+                return str(entry.get("side") or fallback)
+        return fallback
+
     # --- transactions ---------------------------------------------------------
 
     def _build_transactions(
@@ -990,6 +1304,7 @@ class FinanceLedgerRunner:
         *,
         plaid_account_map: dict[tuple[str, str], str],
         extractions: list[dict[str, Any]],
+        simplefin_account_map: dict[tuple[str, str], str] | None = None,
         doc_accounts: dict[str, str],
         now: datetime,
         sync_version: int,
@@ -1135,6 +1450,89 @@ class FinanceLedgerRunner:
                     "transaction_id": transaction_id,
                     "posted_on": _as_date(row["transaction_at"]),
                     "description": str(row["name"]),
+                    "used": False,
+                }
+            )
+
+        # SimpleFIN flows: the second provider over the SAME accounts. Where
+        # the ledger account already carries the Plaid row for a movement,
+        # the SimpleFIN row is a second witness and merges into it (exact
+        # amount, posting day within ±3 -- the two feeds stamp a card
+        # purchase one to two days apart); otherwise it founds the row, so an
+        # institution only SimpleFIN reaches is covered by exactly the same
+        # code. Plaid goes first and wins field precedence because its rows
+        # are the ones the alert reconciliation and receipts already cite.
+        for row in self._load_simplefin_transactions() if simplefin_account_map else []:
+            owner = str(row["account"])
+            source_row_key = f"{owner}|{row['account_id']}|{row['transaction_id']}"
+            account_id = simplefin_account_map.get((owner, str(row["account_id"])))
+            if account_id is None:
+                skipped += 1
+                continue
+            # SimpleFIN is already positive-in.
+            amount = _as_decimal(row["amount"])
+            posted_on = _as_date(row["posted_at"])
+            description = str(row["payee"] or row["description"] or row["memo"])
+            match = self._best_pool_match(
+                pool,
+                account_id=account_id,
+                amount=amount,
+                posted_on=posted_on,
+                description=description,
+            )
+            if match is not None:
+                match["used"] = True
+                link_rows.append(
+                    self._link_row(
+                        source=LEDGER_SOURCE_SIMPLEFIN,
+                        account="",
+                        source_account_key="",
+                        account_id="",
+                        match_method="fuzzy_amount_date",
+                        match_score=match["score"],
+                        now=now,
+                        sync_version=sync_version,
+                        as_transaction=True,
+                        source_row_key=source_row_key,
+                        transaction_id=match["transaction_id"],
+                    )
+                )
+                merged += 1
+                continue
+            transaction_id = stable_finance_transaction_id(LEDGER_SOURCE_SIMPLEFIN, source_row_key)
+            transaction_rows[transaction_id] = {
+                "transaction_id": transaction_id,
+                "account_id": account_id,
+                "posted_at": row["posted_at"],
+                "amount": amount,
+                "currency": str(row["currency"]),
+                "description": str(row["description"] or row["memo"] or row["payee"]),
+                "merchant": str(row["payee"]),
+                "pending": int(row["pending"]),
+                "source": LEDGER_SOURCE_SIMPLEFIN,
+                "created_at": now,
+                "sync_version": sync_version,
+            }
+            link_rows.append(
+                self._link_row(
+                    source=LEDGER_SOURCE_SIMPLEFIN,
+                    account="",
+                    source_account_key="",
+                    account_id="",
+                    match_method="source_id",
+                    match_score=1.0,
+                    now=now,
+                    sync_version=sync_version,
+                    as_transaction=True,
+                    source_row_key=source_row_key,
+                    transaction_id=transaction_id,
+                )
+            )
+            pool.setdefault((account_id, amount), []).append(
+                {
+                    "transaction_id": transaction_id,
+                    "posted_on": posted_on,
+                    "description": description,
                     "used": False,
                 }
             )
@@ -1564,6 +1962,52 @@ class FinanceLedgerRunner:
         )
         return {(str(row[0]), str(row[1])) for row in rows}
 
+    def _load_simplefin_accounts(self) -> list[dict[str, Any]]:
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT a.account, a.account_id, a.org_name, a.name, a.currency, a.balance,
+                   a.balance_at, a.extra_json,
+                   EXISTS (
+                       SELECT 1 FROM @simplefin_holdings h
+                       WHERE h.account = a.account AND h.account_id = a.account_id
+                   ) AS has_holdings
+            FROM @simplefin_accounts a
+            WHERE a.is_removed = 0
+            ORDER BY a.account, a.account_id
+            """
+        )
+        for row in rows:
+            extra = row.get("extra_json") if isinstance(row.get("extra_json"), Mapping) else {}
+            row["mask"] = simplefin_account_mask(str(row["name"]), extra)
+        return rows
+
+    def _simplefin_connection_is_action_required(self) -> bool:
+        rows = self._warehouse._query(
+            "SELECT 1 FROM @simplefin_sync_state WHERE account_id = '' AND status = 'action_required' LIMIT 1"
+        )
+        return bool(rows)
+
+    def _load_simplefin_transactions(self, *, account_id: str | None = None) -> list[dict[str, Any]]:
+        where = "WHERE is_removed = 0"
+        params: tuple[Any, ...] = ()
+        if account_id is not None:
+            where = "WHERE account_id = %s"
+            params = (account_id,)
+        return self._warehouse._query_dicts(
+            f"""
+            SELECT account, account_id, transaction_id, posted_at, amount, currency_of_row.currency,
+                   description, payee, memo, pending, is_removed
+            FROM @simplefin_transactions t
+            JOIN LATERAL (
+                SELECT a.currency FROM @simplefin_accounts a
+                WHERE a.account = t.account AND a.account_id = t.account_id
+            ) AS currency_of_row ON TRUE
+            {where}
+            ORDER BY posted_at, account_id, transaction_id
+            """,
+            params,
+        )
+
     def _load_plaid_transactions(self) -> list[dict[str, Any]]:
         return self._warehouse._query_dicts(
             """
@@ -1629,14 +2073,16 @@ class FinanceLedgerRunner:
                 """
                 SELECT account_id, as_of, kind, value, currency, source
                 FROM @finance_observations
-                WHERE source = %s
+                WHERE source = ANY(%s)
                 """,
-                (LEDGER_SOURCE_MANUAL,),
+                ([LEDGER_SOURCE_MANUAL, LEDGER_SOURCE_SIMPLEFIN],),
             )
         }
         changed: list[dict[str, Any]] = []
         for row in rows:
-            if str(row["source"]) != LEDGER_SOURCE_MANUAL:
+            # A SimpleFIN balance carries the bridge's own stamp, so an
+            # unchanged re-read is not a new observation either.
+            if str(row["source"]) not in (LEDGER_SOURCE_MANUAL, LEDGER_SOURCE_SIMPLEFIN):
                 changed.append(row)
                 continue
             key = (
@@ -1842,6 +2288,24 @@ def has_pending_finance_observations(warehouse: PostgresWarehouse) -> bool:
         LIMIT 1
         """,
         (LEDGER_SOURCE_PLAID, LEDGER_SOURCE_PLAID, OBSERVATION_KIND_BALANCE),
+    )
+    if rows:
+        return True
+    if not warehouse._relation_exists("simplefin_accounts"):
+        return False
+    # A SimpleFIN account nothing has resolved yet is a balance net worth is
+    # missing; once linked, the bridge's own stamp decides whether there is a
+    # new observation, so a link is the only backlog signal here.
+    rows = warehouse._query(
+        """
+        SELECT 1
+        FROM @simplefin_accounts a
+        LEFT JOIN @finance_account_links l
+          ON l.source = %s AND l.account = a.account AND l.source_account_key = a.account_id
+        WHERE a.is_removed = 0 AND l.account_id IS NULL
+        LIMIT 1
+        """,
+        (LEDGER_SOURCE_SIMPLEFIN,),
     )
     return bool(rows)
 

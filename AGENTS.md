@@ -187,7 +187,8 @@ quietly becoming untrue, and several of these have been.
   public channels Zach is not in sat frozen at their backfill behind a 99.2% discovery
   number while PDW held 40% of the month's public-channel messages; `marts_ops.plaid_item_health` does the same per institution, because a
   re-link that mints a second live Item double-counts net worth while the pipeline stays
-  green; `marts_finance.net_worth.staleness` judges each manual valuation against its own
+  green, and `marts_ops.simplefin_account_health` does it per SimpleFIN account, naming the
+  ledger account each one reconciled onto and whether Plaid shares it (since 2026-09-27); `marts_finance.net_worth.staleness` judges each manual valuation against its own
   kind's refresh. *Gap:* every other source rides aggregate freshness. Latency, as opposed
   to freshness, is still unmeasured almost everywhere.
 
@@ -3413,6 +3414,54 @@ Run `uv run python scripts/plaid_linking_report.py` after linking/live verificat
 mode-0600, gitignored `reports/plaid-linking-report.private.md` artifact with every institution and
 anonymous account status plus last-pull evidence. See the README's **Plaid Finance Sync** section
 for all settings and safe aggregate verification queries.
+
+## SimpleFIN Finance (a second provider over the same accounts)
+
+SimpleFIN is the second provider feed beside Plaid, added 2026-09-27 because Plaid's
+Capital One Item kept going quiet (it was 5–20 hours stale on the day this landed) while
+the SimpleFIN Bridge served the same cards with a same-day balance. It is read-only, one
+claimed access URL for every institution connected in the bridge, and it lands in
+`base_simplefin.accounts` / `.transactions` / `.holdings` with `ops.simplefin_sync_state`
+as its state (`simplefin_sync.py`, Dagster asset `simplefin_finance_sync`, hourly at `:07`).
+
+**The whole point is that both providers describe the SAME accounts, so the ledger has to
+land them on one logical account each — or net worth doubles.** The bridge reports no
+account type and no mask, so `finance_ledger.py` infers both: the last four digits in the
+account name (`simplefin_account_mask`: "Venture X (5520)", "Checking ...4871") and a
+kind/side from name keywords with the balance sign as tiebreak
+(`simplefin_account_kind_side`). Resolution then runs exactly as Plaid's does — owner +
+institution + mask + side against the ledger index, which already holds the Plaid-founded
+accounts — and a SimpleFIN account whose name prints no mask is matched by the
+transactions the two feeds share (`transaction_overlap`: ≥ 3 exact amount/±3-day pairs
+with one Plaid-linked account at that institution, and no runner-up as good). Anything
+weaker founds its own account, because under-merging reads as two lines while over-merging
+silently halves a balance. Two live SimpleFIN accounts never share a ledger account.
+
+Once landed: the bridge balance is a second `balance` observation with `source =
+'simplefin'`, stamped with the bridge's own `balance-date` (not the run time), so
+`marts_finance.net_worth` takes it only when it is genuinely fresher than Plaid's; and
+each SimpleFIN transaction merges into the Plaid row for the same movement by exact
+amount within ±3 days (`fuzzy_amount_date`), founding its own row only when Plaid has
+none. Plaid goes first and keeps field precedence. **Signs are opposite and stored
+faithfully**: SimpleFIN `amount` is positive-in (the ledger's convention, no negation),
+Plaid's is positive-out; a SimpleFIN credit-card `balance` is negative when owed, so a
+liability-side observation is booked as `-balance`. `marts_ops.simplefin_account_health`
+is the reconciliation surface — `ledger_account_id`, `match_method`, `shared_with_plaid`
+— and a row at a Plaid-linked institution with `shared_with_plaid = 0` is the thing to
+investigate. SimpleFIN holdings are stored raw and are not yet in the securities ledger.
+
+Credential and failure modes: the bridge's setup token is base64 of a claim URL that can
+be POSTed once; `uv run python -m personal_data_warehouse.simplefin_sync claim <token>`
+prints the access URL, which is `SIMPLEFIN_ACCESS_URL` on the Dagster deployment
+(`SIMPLEFIN_ACCOUNT` defaults to `PLAID_ACCOUNT`, and must, or every shared account
+forks). A 401/402/403 is `action_required` on the connection row (`account_id = ''`) —
+claim a new token; the run stays green and the ledger stops re-observing the frozen
+balances. The bridge's own "connection may need attention" messages are `attention` on
+the row they name and are repaired by a re-login inside the bridge. Each run reads one
+bounded window (the oldest account cursor minus a 7-day overlap; the full
+`SIMPLEFIN_LOOKBACK_DAYS` when an account has never been read), paged in ≤ 90-day
+requests because the bridge caps a range at 90 days; pending rows the window no longer
+carries are tombstoned, posted rows are never removed by absence.
 
 ## Finance Ledger (stocks and flows)
 

@@ -17,7 +17,7 @@ import pytest
 
 from personal_data_warehouse.defs import contacts_sync, gmail_sync, google_drive_source_sync
 from personal_data_warehouse.defs import pipeline_health as pipeline_health_defs
-from personal_data_warehouse.defs import plaid_sync, slack_sync, timeline_sync
+from personal_data_warehouse.defs import plaid_sync, simplefin_sync, slack_sync, timeline_sync
 
 MAX_RUNTIME_TAG = "dagster/max_runtime"
 
@@ -32,6 +32,7 @@ MAX_RUNTIME_TAG = "dagster/max_runtime"
         (gmail_sync.gmail_mailbox_sync_job, 3600),
         (contacts_sync.contacts_sync_job, 3600),
         (plaid_sync.plaid_finance_sync_job, 3600),
+        (simplefin_sync.simplefin_finance_sync_job, 1800),
         (google_drive_source_sync.google_drive_source_sync_job, 7200),
     ],
 )

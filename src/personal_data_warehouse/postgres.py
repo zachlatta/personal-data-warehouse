@@ -72,6 +72,10 @@ from personal_data_warehouse.schema import (
     PLAID_SYNC_STATE_COLUMNS,
     PLAID_TRANSACTION_COLUMNS,
     PlaidLinkedItem,
+    SIMPLEFIN_ACCOUNT_COLUMNS,
+    SIMPLEFIN_HOLDING_COLUMNS,
+    SIMPLEFIN_SYNC_STATE_COLUMNS,
+    SIMPLEFIN_TRANSACTION_COLUMNS,
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
@@ -757,6 +761,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "plaid_liabilities": TableSpec(PLAID_LIABILITY_COLUMNS, ("account", "account_id", "liability_type")),
     "plaid_sync_state": TableSpec(PLAID_SYNC_STATE_COLUMNS, ("account", "item_id", "product"), "updated_at"),
+    "simplefin_accounts": TableSpec(SIMPLEFIN_ACCOUNT_COLUMNS, ("account", "account_id")),
+    "simplefin_transactions": TableSpec(
+        SIMPLEFIN_TRANSACTION_COLUMNS, ("account", "account_id", "transaction_id")
+    ),
+    "simplefin_holdings": TableSpec(SIMPLEFIN_HOLDING_COLUMNS, ("account", "account_id", "holding_id")),
+    "simplefin_sync_state": TableSpec(SIMPLEFIN_SYNC_STATE_COLUMNS, ("account", "account_id"), "updated_at"),
     # Finance ledger: derived stocks-and-flows layer (see finance_ledger.py).
     # Accounts are logical cross-source identities; observations are
     # append-only per-day values (the PK makes re-syncs upsert in place while
@@ -2149,6 +2159,9 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "plaid_investment_holdings": 500,
     "plaid_investment_transactions": 500,
     "plaid_liabilities": 500,
+    "simplefin_accounts": 500,
+    "simplefin_transactions": 500,
+    "simplefin_holdings": 500,
 }
 
 
@@ -2234,6 +2247,9 @@ JSONB_COLUMNS_BY_TABLE = {
     "plaid_investment_holdings": {"raw_json"},
     "plaid_investment_transactions": {"raw_json"},
     "plaid_liabilities": {"raw_json"},
+    "simplefin_accounts": {"extra_json", "raw_json"},
+    "simplefin_transactions": {"extra_json", "raw_json"},
+    "simplefin_holdings": {"raw_json"},
     "manual_finance_documents": {"raw_metadata_json"},
     "manual_finance_extractions": {
         "transactions_json",
@@ -2358,6 +2374,11 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # SimpleFIN: the bridge's own balance stamp, the day a transaction
+    # happened, and a holding's acquisition date.
+    "balance_at",
+    "transacted_at",
+    "acquired_at",
     # hacker_news
     "fetched_at",
     "discovered_at",
@@ -2727,6 +2748,11 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    # SimpleFIN balances and holdings (provider floats, like Plaid's).
+    "balance",
+    "shares",
+    "market_value",
+    "purchase_price",
     # search_benchmark_runs: host saturation sampled beside the latency probes
     "io_pressure_full_avg10",
     "cpu_pressure_some_avg10",
@@ -3075,6 +3101,16 @@ class PostgresWarehouse:
             ]
         )
         self._ensure_plaid_finance_mart_views()
+
+    def ensure_simplefin_tables(self) -> None:
+        self._ensure_table_group(
+            [
+                "simplefin_accounts",
+                "simplefin_transactions",
+                "simplefin_holdings",
+                "simplefin_sync_state",
+            ]
+        )
 
     def _ensure_query_role(self) -> None:
         # The sweep in _ensure_query_role_locked rewrites the ACL of every
@@ -3545,9 +3581,77 @@ class PostgresWarehouse:
                 "plaid_accounts",
                 "plaid_investment_securities",
                 "plaid_investment_holdings",
+                # The second provider the ledger reads; declared here for the
+                # same reason as the Plaid tables above.
+                "simplefin_accounts",
+                "simplefin_transactions",
+                "simplefin_holdings",
+                "simplefin_sync_state",
             ]
         )
         self._ensure_finance_ledger_mart_views()
+        self._ensure_simplefin_health_view()
+
+    def _ensure_simplefin_health_view(self) -> None:
+        # The reconciliation surface for the second provider. Plaid and
+        # SimpleFIN both report the SAME real accounts, and the ledger's whole
+        # job is to land them on one logical account each; this is where that
+        # is a row rather than a hunch. It lives with the finance views (not
+        # with the SimpleFIN tables) because it reads the ledger's links.
+        self._ensure_view(
+            "marts_ops_simplefin_account_health",
+            """
+            CREATE OR REPLACE VIEW @marts_ops_simplefin_account_health AS
+            SELECT
+                a.account,
+                a.account_id,
+                a.org_name,
+                a.name,
+                a.currency,
+                a.balance,
+                NULLIF(a.balance_at, '1970-01-01 00:00:00+00'::timestamptz) AS balance_at,
+                (EXTRACT(EPOCH FROM now() - a.balance_at))::bigint AS balance_age_seconds,
+                a.synced_at,
+                CASE
+                    WHEN conn.status = 'action_required' THEN 'action_required'
+                    WHEN conn.status = 'failed' THEN 'failing'
+                    WHEN COALESCE(s.status, '') IN ('attention', 'action_required', 'failed') THEN 'attention'
+                    WHEN conn.status = 'attention' THEN 'attention'
+                    WHEN s.status IS NULL THEN 'unknown'
+                    ELSE 'ok'
+                END AS status,
+                COALESCE(NULLIF(s.error, ''), conn.error, '') AS error,
+                NULLIF(s.last_synced_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_synced_at,
+                tx.newest_transaction_at,
+                tx.transactions_30d,
+                l.account_id AS ledger_account_id,
+                l.match_method,
+                CASE WHEN plaid_link.account_id IS NOT NULL THEN 1 ELSE 0 END::bigint AS shared_with_plaid
+            FROM @simplefin_accounts AS a
+            LEFT JOIN @simplefin_sync_state AS s
+              ON s.account = a.account AND s.account_id = a.account_id
+            LEFT JOIN @simplefin_sync_state AS conn
+              ON conn.account = a.account AND conn.account_id = ''
+            LEFT JOIN LATERAL (
+                SELECT
+                    NULLIF(max(t.posted_at), '1970-01-01 00:00:00+00'::timestamptz) AS newest_transaction_at,
+                    count(*) FILTER (WHERE t.posted_at >= now() - interval '30 days')::bigint AS transactions_30d
+                FROM @simplefin_transactions AS t
+                WHERE t.account = a.account AND t.account_id = a.account_id AND t.is_removed = 0
+            ) AS tx ON TRUE
+            LEFT JOIN @finance_account_links AS l
+              ON l.source = 'simplefin' AND l.account = a.account AND l.source_account_key = a.account_id
+            LEFT JOIN LATERAL (
+                SELECT p.account_id
+                FROM @finance_account_links AS p
+                JOIN @plaid_accounts AS pa
+                  ON pa.account = p.account AND pa.account_id = p.source_account_key AND pa.is_removed = 0
+                WHERE p.source = 'plaid' AND p.account_id = l.account_id
+                LIMIT 1
+            ) AS plaid_link ON TRUE
+            WHERE a.is_removed = 0
+            """,
+        )
 
     def _ensure_finance_ledger_mart_views(self) -> None:
         # Each account contributes its single latest observation. Same-day
@@ -10193,6 +10297,147 @@ class PostgresWarehouse:
                 }
             ],
             PLAID_SYNC_STATE_COLUMNS,
+        )
+
+    # --- SimpleFIN ---------------------------------------------------------------
+
+    def load_simplefin_sync_state(self, *, account: str) -> dict[str, dict[str, Any]]:
+        columns = SIMPLEFIN_SYNC_STATE_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(column) for column in columns)} FROM @simplefin_sync_state WHERE account = %s",
+            (account,),
+        )
+        return {str(row[1]): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def simplefin_has_accounts_without_state(self, *, account: str) -> bool:
+        """A live account no successful run has stamped yet (new institution)."""
+        rows = self._query(
+            """
+            SELECT 1
+            FROM @simplefin_accounts a
+            LEFT JOIN @simplefin_sync_state s
+              ON s.account = a.account AND s.account_id = a.account_id
+            WHERE a.account = %s AND a.is_removed = 0
+              AND (s.account_id IS NULL OR s.cursor = '' OR s.status <> 'ok')
+            LIMIT 1
+            """,
+            (account,),
+        )
+        return bool(rows)
+
+    def insert_simplefin_accounts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("simplefin_accounts", rows, SIMPLEFIN_ACCOUNT_COLUMNS)
+
+    def mark_missing_simplefin_accounts_removed(
+        self, *, account: str, active_account_ids: set[str], synced_at: datetime
+    ) -> int:
+        params: list[Any] = [account]
+        active_filter = ""
+        if active_account_ids:
+            active_filter = "AND NOT (account_id = ANY(%s))"
+            params.append(sorted(active_account_ids))
+        rows = self._query(
+            f"""
+            SELECT {", ".join(_identifier(column) for column in SIMPLEFIN_ACCOUNT_COLUMNS)}
+            FROM @simplefin_accounts
+            WHERE account = %s AND is_removed = 0 {active_filter}
+            """,
+            tuple(params),
+        )
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        tombstones: list[dict[str, Any]] = []
+        for row in rows:
+            tombstone = dict(zip(SIMPLEFIN_ACCOUNT_COLUMNS, row, strict=True))
+            tombstone["is_removed"] = 1
+            tombstone["synced_at"] = synced_at
+            tombstone["sync_version"] = sync_version
+            tombstones.append(tombstone)
+        self.insert_simplefin_accounts(tombstones)
+        return len(tombstones)
+
+    def insert_simplefin_transactions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("simplefin_transactions", rows, SIMPLEFIN_TRANSACTION_COLUMNS)
+
+    def mark_missing_pending_simplefin_transactions_removed(
+        self,
+        *,
+        account: str,
+        active_keys: set[tuple[str, str]],
+        window_start: datetime,
+        synced_at: datetime,
+    ) -> int:
+        """Tombstone pending rows inside the read window the bridge no longer serves.
+
+        Only PENDING rows, and only inside the window that was actually read:
+        a posted row that fell out of a bounded window is not a removal.
+        """
+        rows = self._query(
+            f"""
+            SELECT {", ".join(_identifier(column) for column in SIMPLEFIN_TRANSACTION_COLUMNS)}
+            FROM @simplefin_transactions
+            WHERE account = %s AND pending = 1 AND is_removed = 0
+              AND GREATEST(posted_at, transacted_at) >= %s
+            """,
+            (account, window_start),
+        )
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        tombstones: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(zip(SIMPLEFIN_TRANSACTION_COLUMNS, row, strict=True))
+            if (str(record["account_id"]), str(record["transaction_id"])) in active_keys:
+                continue
+            record["is_removed"] = 1
+            record["synced_at"] = synced_at
+            record["sync_version"] = sync_version
+            tombstones.append(record)
+        self.insert_simplefin_transactions(tombstones)
+        return len(tombstones)
+
+    def insert_simplefin_holdings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("simplefin_holdings", rows, SIMPLEFIN_HOLDING_COLUMNS)
+
+    def delete_missing_simplefin_holdings(
+        self, *, account: str, account_id: str, active_holding_ids: set[str]
+    ) -> int:
+        rows = self._query(
+            "SELECT holding_id FROM @simplefin_holdings WHERE account = %s AND account_id = %s",
+            (account, account_id),
+        )
+        stale = sorted(str(row[0]) for row in rows if str(row[0]) not in active_holding_ids)
+        if not stale:
+            return 0
+        self._command(
+            "DELETE FROM @simplefin_holdings WHERE account = %s AND account_id = %s AND holding_id = ANY(%s)",
+            (account, account_id, stale),
+        )
+        return len(stale)
+
+    def insert_simplefin_sync_state(
+        self,
+        *,
+        account: str,
+        account_id: str,
+        cursor: str = "",
+        status: str,
+        error: str = "",
+        last_synced_at: datetime,
+        updated_at: datetime,
+    ) -> None:
+        self._insert_rows(
+            "simplefin_sync_state",
+            [
+                {
+                    "account": account,
+                    "account_id": account_id,
+                    "cursor": cursor,
+                    "status": status,
+                    "error": error,
+                    "last_synced_at": last_synced_at,
+                    "updated_at": updated_at,
+                    "sync_version": int(_ensure_utc(updated_at).timestamp() * 1_000_000),
+                }
+            ],
+            SIMPLEFIN_SYNC_STATE_COLUMNS,
         )
 
     def insert_finance_accounts(self, rows: list[dict[str, Any]]) -> None:

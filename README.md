@@ -596,6 +596,32 @@ sync stage is still running. The hourly Slack user sync is stricter: lock conten
 lets Dagster retry because a skipped user refresh is otherwise easy to miss.
 Calendar sync runs through `calendar_event_sync_every_five_minutes` with its own nonblocking lock.
 
+## SimpleFIN Finance Sync
+
+SimpleFIN (https://www.simplefin.org) is the second provider feed beside Plaid: one access URL
+covers every institution connected in the SimpleFIN Bridge, and the `simplefin_finance_sync`
+Dagster asset (hourly) lands accounts, transactions and holdings in `base_simplefin.*`. The
+finance ledger resolves each SimpleFIN account onto the logical account Plaid founded
+(institution + the last four digits in the account name, or the transactions both feeds share)
+and dedups the flows, so `marts_finance.*` counts an account once however many providers
+report it; `marts_ops.simplefin_account_health` shows the reconciliation per account.
+
+The bridge hands out a one-time **setup token**; claim it once for the access URL and configure
+that:
+
+```bash
+uv run python -m personal_data_warehouse.simplefin_sync claim <setup-token>   # prints the access URL
+SIMPLEFIN_ACCESS_URL=https://...@beta-bridge.simplefin.org/simplefin        # on the Dagster deployment
+SIMPLEFIN_ACCOUNT=you@example.com     # optional; defaults to PLAID_ACCOUNT so both providers share an owner
+SIMPLEFIN_LOOKBACK_DAYS=365           # first read; later runs re-read only the overlap
+```
+
+Sign conventions differ from Plaid's and are stored faithfully: a SimpleFIN transaction
+`amount` is positive when money enters the account, and a credit card's `balance` is negative
+when it is owed. `action_required` on the pipeline means the access URL was refused (claim a
+new token); `attention` is the bridge's own "connection needs attention", repaired by a
+re-login inside the bridge.
+
 ## Plaid Finance Sync
 
 Plaid raw data is source-owned: physical relations live under `plaid.*`, not a generic

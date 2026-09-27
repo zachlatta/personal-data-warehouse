@@ -900,6 +900,81 @@ PLAID_SYNC_STATE_COLUMNS = (
     "sync_version",
 )
 
+# SimpleFIN (https://www.simplefin.org/protocol.html): a second finance
+# provider beside Plaid. One access URL covers every institution connected in
+# the SimpleFIN Bridge, and every response carries all of them at once, so
+# there is no per-Item scoping; rows are keyed by the bridge's own account id.
+# Balances are numeric strings signed from the customer's side (a credit card
+# owing money reads negative), transaction amounts are positive when money
+# enters the account, and `posted` / `balance-date` are UNIX epochs.
+SIMPLEFIN_ACCOUNT_COLUMNS = (
+    "account",
+    "account_id",
+    "org_id",
+    "org_name",
+    "org_domain",
+    "org_url",
+    "name",
+    "currency",
+    "balance",
+    "available_balance",
+    "balance_at",
+    "is_removed",
+    "extra_json",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+SIMPLEFIN_TRANSACTION_COLUMNS = (
+    "account",
+    "account_id",
+    "transaction_id",
+    "posted_at",
+    "transacted_at",
+    "amount",
+    "description",
+    "payee",
+    "memo",
+    "mcc",
+    "pending",
+    "is_removed",
+    "extra_json",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+SIMPLEFIN_HOLDING_COLUMNS = (
+    "account",
+    "account_id",
+    "holding_id",
+    "symbol",
+    "description",
+    "currency",
+    "shares",
+    "cost_basis",
+    "market_value",
+    "purchase_price",
+    "acquired_at",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+# One row per SimpleFIN account (`account_id`), plus one connection row with
+# `account_id = ''` carrying the access URL's own verdict (auth, bridge errors).
+SIMPLEFIN_SYNC_STATE_COLUMNS = (
+    "account",
+    "account_id",
+    "cursor",
+    "status",
+    "error",
+    "last_synced_at",
+    "updated_at",
+    "sync_version",
+)
+
 
 @dataclass(frozen=True)
 class PlaidLinkedItem:

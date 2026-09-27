@@ -653,6 +653,9 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         "plaid_investment_transactions": "derived-ledger builder: normalize investment activity",
         "plaid_items": "derived-ledger builder: retain institution provenance",
         "plaid_transactions": "derived-ledger builder: normalize transaction facts",
+        "simplefin_accounts": "derived-ledger builder: normalize the second provider's accounts onto Plaid's",
+        "simplefin_transactions": "derived-ledger builder: dedup the second provider's flows against Plaid's",
+        "simplefin_holdings": "derived-ledger builder: a position snapshot marks an account a brokerage",
     },
     "photo_context.py": {
         # Context for the photo caption agent ("what was on the calendar when

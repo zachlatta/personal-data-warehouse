@@ -397,6 +397,7 @@ def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
     wh.ensure_plaid_tables()
+    wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()
     wh.ensure_manual_finance_tables()
     wh.ensure_receipt_tables()
