@@ -488,9 +488,9 @@ test('gmail labels hide what every row carries and name what Gmail names', () =>
   assert.equal(formatGmailLabel('Unread'), '');
 });
 
-test('a thread row links to that thread in the mailbox it belongs to', () => {
-  assert.equal(gmailThreadUrl('zach@example.test', 'thread-1'), 'https://mail.google.com/mail/u/?authuser=zach%40example.test#all/thread-1');
-  assert.equal(gmailThreadUrl('', 'thread-1'), 'https://mail.google.com/mail/u/0#all/thread-1');
+test('a thread row links to that thread in Superhuman, in the mailbox it belongs to', () => {
+  assert.equal(gmailThreadUrl('zach@example.test', 'thread-1'), 'https://mail.superhuman.com/zach@example.test/thread/thread-1');
+  assert.equal(gmailThreadUrl('', 'thread-1'), 'https://mail.superhuman.com/thread/thread-1');
   assert.equal(gmailThreadUrl('zach@example.test', ''), '');
 });
 

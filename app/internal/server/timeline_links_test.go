@@ -62,13 +62,34 @@ func TestTimelineDeepLinkSlackUnknownTeamFallsBackToAppRedirect(t *testing.T) {
 	}
 }
 
-func TestTimelineDeepLinkGmailOpensTheMessageInThatAccount(t *testing.T) {
-	link := linkFor(t, "gmail_email", "gmail_messages", `{"account":"z@x.test","message_id":"18f1abc"}`, `{}`)
-	if link == nil || link.URL != "https://mail.google.com/mail/?authuser=z%40x.test#all/18f1abc" {
+func TestTimelineDeepLinkGmailOpensTheThreadInSuperhumanForThatAccount(t *testing.T) {
+	// Superhuman addresses a conversation by Gmail's thread id, not the
+	// message id, so a reply deep in a thread still opens that thread.
+	link := linkFor(t, "gmail_email", "gmail_messages",
+		`{"account":"z@x.test","message_id":"18f1abc"}`, `{"thread_id":"18f0fff"}`)
+	if link == nil || link.URL != "https://mail.superhuman.com/z@x.test/thread/18f0fff" {
 		t.Fatalf("link = %#v", link)
 	}
-	if link.Label != "Gmail" {
+	if link.Label != "Superhuman" {
 		t.Fatalf("label = %q", link.Label)
+	}
+	if link.AppURL != "" {
+		t.Fatalf("app url = %q", link.AppURL)
+	}
+}
+
+func TestTimelineDeepLinkGmailWithoutAnAccountUsesSuperhumansDefaultMailbox(t *testing.T) {
+	link := linkFor(t, "gmail_email", "gmail_messages", `{"message_id":"18f1abc"}`, `{"thread_id":"18f0fff"}`)
+	if link == nil || link.URL != "https://mail.superhuman.com/thread/18f0fff" {
+		t.Fatalf("link = %#v", link)
+	}
+}
+
+func TestTimelineDeepLinkGmailWithoutAThreadIDHasNoLink(t *testing.T) {
+	// A message id is not a thread id except on a thread's first message, so
+	// guessing would open the wrong conversation.
+	if link := linkFor(t, "gmail_email", "gmail_messages", `{"account":"z@x.test","message_id":"18f1abc"}`, `{}`); link != nil {
+		t.Fatalf("expected no link, got %#v", link)
 	}
 }
 
@@ -187,7 +208,7 @@ func TestTimelineListAndItemCarryDeepLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	link, _ := page.Items[0]["open"].(map[string]any)
-	if link["url"] != "https://mail.google.com/mail/?authuser=z%40x.test#all/m1" || link["label"] != "Gmail" {
+	if link["url"] != "https://mail.superhuman.com/z@x.test/thread/th1" || link["label"] != "Superhuman" {
 		t.Fatalf("list item open = %#v", page.Items[0]["open"])
 	}
 

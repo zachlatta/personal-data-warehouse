@@ -926,7 +926,7 @@ export function gmailThreadReviews(mutations: MutationLike[]): GmailThreadReview
         unread: hasUnreadLabel(rawLabels) || hasUnreadLabel(messageLabels),
         automated: looksAutomatedSender(address, senderName, labels),
         removed: text(mutation.status) === 'rejected' || text(mutation.status) === 'removed' || text(mutation.status) === 'skipped',
-        open: url ? { url, label: 'Gmail' } : null,
+        open: url ? { url, label: 'Superhuman' } : null,
         messages: messages.map(gmailReviewMessage),
       });
     }
@@ -1012,16 +1012,16 @@ function localDayKey(iso: string): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
-// The Gmail thread the row is about, in the account it belongs to. Gmail's own
-// /u/?authuser= form addresses the mailbox by address rather than by the
-// profile index, which is what makes a link correct on a phone signed in to
-// several accounts.
+// The Gmail thread the row is about, opened in Superhuman (where Zach reads
+// mail) in the account it belongs to. Superhuman's /<account>/thread/<id>
+// form addresses the mailbox by address, which is what makes a link correct
+// when several accounts are signed in; its thread id is Gmail's.
 export function gmailThreadUrl(account: string, threadId: string): string {
   const id = text(threadId);
   if (!id) return '';
   const mailbox = text(account);
-  const prefix = mailbox ? `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(mailbox)}` : 'https://mail.google.com/mail/u/0';
-  return `${prefix}#all/${encodeURIComponent(id)}`;
+  const prefix = mailbox ? `https://mail.superhuman.com/${encodeURIComponent(mailbox).replace(/%40/g, '@')}` : 'https://mail.superhuman.com';
+  return `${prefix}/thread/${encodeURIComponent(id)}`;
 }
 
 // --- contacts review -------------------------------------------------------

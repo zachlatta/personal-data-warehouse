@@ -61,7 +61,7 @@ function ThreadMessage({ message, account, defaultOpen }: { message: GmailThread
         </View> : null}
         {body ? <ThemedText selectable style={styles.messageBody}>{body}</ThemedText> : null}
         {!message.hasFullBody ? <ThemedText type="small" themeColor="textSecondary">
-          {body ? 'Only a preview is available.' : 'This message’s body is not in the warehouse.'} Open in Gmail to read the full message before approving.
+          {body ? 'Only a preview is available.' : 'This message’s body is not in the warehouse.'} Open in Superhuman to read the full message before approving.
         </ThemedText> : null}
       </> : null}
     </View>
@@ -133,11 +133,11 @@ export function GmailThreadRow({
             <ThreadMessage key={message.messageId || index} message={message} account={review.account} defaultOpen={index === review.messages.length - 1} />
           ))}
           {review.messageCount > review.messages.length && review.messages.length > 0 ? (
-            <ThemedText type="small" themeColor="textSecondary">Showing {review.messages.length} of {review.messageCount} messages. Open in Gmail for the rest.</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">Showing {review.messages.length} of {review.messageCount} messages. Open in Superhuman for the rest.</ThemedText>
           ) : null}
           {review.messages.length === 0 ? (
             <ThemedText type="small" themeColor="textSecondary">
-              No messages for thread {review.threadId} are in the warehouse. Open it in Gmail before approving.
+              No messages for thread {review.threadId} are in the warehouse. Open it in Superhuman before approving.
             </ThemedText>
           ) : null}
           {review.error ? <ThemedText style={styles.error}>{review.error}</ThemedText> : null}

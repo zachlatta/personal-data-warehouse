@@ -87,14 +87,7 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 	case sourceTable == "slack_messages" || sourceTable == "slack_files":
 		return slackDeepLink(pk, meta, env)
 	case sourceTable == "gmail_messages":
-		account, messageID := linkString(pk, "account"), linkString(pk, "message_id")
-		if messageID == "" {
-			return nil
-		}
-		return &timelineDeepLink{
-			URL:   "https://mail.google.com/mail/?authuser=" + url.QueryEscape(account) + "#all/" + url.PathEscape(messageID),
-			Label: "Gmail",
-		}
+		return superhumanDeepLink(linkString(pk, "account"), linkString(meta, "thread_id"))
 	case sourceTable == "calendar_events":
 		return calendarDeepLink(pk)
 	case sourceTable == "google_drive_files":
@@ -164,6 +157,21 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 		return &timelineDeepLink{URL: target, Label: "Mutation review"}
 	}
 	return nil
+}
+
+// superhumanDeepLink opens a Gmail message's conversation in Superhuman,
+// which is where Zach reads mail. Superhuman addresses a conversation as
+// /<account>/thread/<Gmail thread id>; a message id only equals the thread id
+// on a thread's first message, so a row without a thread id gets no link.
+func superhumanDeepLink(account, threadID string) *timelineDeepLink {
+	if threadID == "" {
+		return nil
+	}
+	target := "https://mail.superhuman.com/"
+	if account != "" {
+		target += url.PathEscape(account) + "/"
+	}
+	return &timelineDeepLink{URL: target + "thread/" + url.PathEscape(threadID), Label: "Superhuman"}
 }
 
 func slackDeepLink(pk, meta map[string]any, env timelineLinkEnv) *timelineDeepLink {

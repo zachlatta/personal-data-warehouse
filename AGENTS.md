@@ -1849,7 +1849,7 @@ back it, all behind the static bearer the CLI uses:
 `open: {url, label, app_url?}` to each row (`app/internal/server/timeline_links.go`),
 computed from `adapter` + `source_pk` + `metadata` alone so the list pays no extra query:
 a Slack permalink (`<domain>.slack.com/archives/<conv>/p<ts>`, with `thread_ts`/`cid` for
-a reply, domain from `base_slack.teams`), Gmail `#all/<message_id>` in that account,
+a reply, domain from `base_slack.teams`), Gmail as Superhuman's `/<account>/thread/<thread_id>`,
 Calendar's base64 `eid`, Drive `open?id=`, Google Contacts, ChatGPT/claude.ai conversations,
 `wa.me` for a 1:1 WhatsApp chat, `imessage:`/`sms:` for a 1:1 iMessage chat, and the
 Notes `showNote?identifier=` scheme. `app_url` is the native scheme a phone tries first
