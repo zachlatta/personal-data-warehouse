@@ -61,6 +61,7 @@ func gmailEmailMessageView(email map[string]any) map[string]any {
 	bodyHTML, quotedHTML := splitGmailQuotedHTML(bodyHTML)
 	editorHTML, signatureHTML := splitEmailBodyAndSignatureHTML(bodyHTML)
 	return map[string]any{
+		"attachments":        email["attachments"],
 		"to":                 stringSliceFromAny(email["to"]),
 		"cc":                 stringSliceFromAny(email["cc"]),
 		"bcc":                stringSliceFromAny(email["bcc"]),
@@ -260,6 +261,9 @@ func gmailEmailUpdateInputFromJSON(body apiUpdateEmailBody) UpdateGmailEmailMuta
 		"subject":   strings.TrimSpace(stringFromAny(source["subject"])),
 		"body_text": stringFromAny(source["body_text"]),
 		"body_html": stringFromAny(source["body_html"]),
+	}
+	if attachments, ok := source["attachments"]; ok {
+		message["attachments"] = attachments
 	}
 	if replyToThreadID := strings.TrimSpace(stringFromAny(source["reply_to_thread_id"])); replyToThreadID != "" {
 		message["reply_to_thread_id"] = replyToThreadID

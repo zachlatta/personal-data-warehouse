@@ -201,6 +201,17 @@ export function GmailEmailComposeCard({
           placeholderTextColor={theme.textSecondary}
           style={[styles.body, { color: theme.text }]}
         />
+        {variant.attachments.length > 0 ? (
+          <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
+            <ThemedText type="smallBold">Attachments ({variant.attachments.length})</ThemedText>
+            {variant.attachments.map((attachment, index) => (
+              <ThemedText key={index} type="small" selectable>
+                {attachment.filename} · {attachment.content_type}
+              </ThemedText>
+            ))}
+            <ThemedText type="small" themeColor="textSecondary">Use the web review to download or change attachments. Email edits here keep these files.</ThemedText>
+          </View>
+        ) : null}
         {variant.signatureText ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
             <ThemedText type="small" themeColor="textSecondary" selectable>{variant.signatureText}</ThemedText>

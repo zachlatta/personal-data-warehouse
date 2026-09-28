@@ -1,4 +1,5 @@
 import test from "node:test";
+import * as V from "../mutation_view.js";
 import assert from "node:assert/strict";
 import {
   gmailSenderDisplayName, splitGmailQuotedHTML, gmailBodyFrameHeight, htmlFragmentText, gmailThreadSummary, gmailMessageSender,
@@ -563,4 +564,15 @@ test("a sent Slack message links to the message it created", () => {
   assert.equal(view.sent.open.url, "https://example.slack.com/archives/C1/p1593473700000500?thread_ts=1593473600.000300&cid=C1");
   assert.equal(slackPermalink("T1", "C1", "1.2", "", "").url, "https://app.slack.com/client/T1/C1/p12");
   assert.equal(slackPermalink("", "C1", "1.2", "", "example"), null);
+});
+
+test("attachment review preserves bytes and enforces aggregate limits", () => {
+  const attachment = { filename: "hello.txt", content_type: "text/plain", data_base64: "aGVsbG8=" };
+  assert.deepEqual(V.emailAttachments({ attachments: [attachment] }), [attachment]);
+  assert.deepEqual(V.emailAttachments({}), []);
+  assert.equal(V.attachmentSize(attachment), 5);
+  assert.equal(V.attachmentSize({ data_base64: "" }), 0);
+  assert.equal(V.attachmentSize({ data_base64: "YQ==" }), 1);
+  assert.doesNotThrow(() => V.checkAttachmentLimits([attachment]));
+  assert.throws(() => V.checkAttachmentLimits(Array(101).fill(attachment)), /100 files/);
 });

@@ -287,6 +287,9 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			}
 		}
 		for messageIndex, message := range messages {
+			if err := validateEmailAttachments(message["attachments"]); err != nil {
+				return fmt.Errorf("mutation %d: %w", index, err)
+			}
 			if !hasAnyRecipient(message) {
 				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include at least one recipient", index, messageIndex+1)
 			}

@@ -256,6 +256,51 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   }
   form.appendChild(fields);
 
+  let attachments = [...V.emailAttachments(variant)];
+  const attachmentWrap = h("div", "attachments");
+  const attachmentError = h("div", "bad");
+  const picker = h("input"); picker.type = "file"; picker.multiple = true;
+  picker.setAttribute("aria-label", "Add attachments");
+  let readingAttachments = false;
+  function paintAttachments() {
+    clear(attachmentWrap);
+    attachmentWrap.appendChild(h("strong", "", "Attachments"));
+    attachmentWrap.appendChild(attachmentList(attachments, index => {
+      attachments.splice(index, 1); paintAttachments();
+    }));
+    attachmentWrap.appendChild(picker);
+    attachmentWrap.appendChild(attachmentError);
+  }
+  picker.addEventListener("change", async () => {
+    attachmentError.textContent = "";
+    readingAttachments = true;
+    picker.disabled = true;
+    try {
+      const files = [...picker.files];
+      if (attachments.length + files.length > 100 ||
+          files.reduce((n, f) => n + f.size, 0) + attachments.reduce((n, a) => n + V.attachmentSize(a), 0) > 20 * 1024 * 1024) {
+        throw new Error("Attachments may contain at most 100 files and total at most 20 MiB.");
+      }
+      const added = [];
+      for (const file of files) {
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(",")[1]);
+          reader.onerror = () => reject(new Error("Could not read " + file.name));
+          reader.onabort = () => reject(new Error("File read cancelled"));
+          reader.readAsDataURL(file);
+        });
+        added.push({ filename: file.name, content_type: file.type || "application/octet-stream", data_base64: data });
+      }
+      V.checkAttachmentLimits([...attachments, ...added]);
+      attachments.push(...added);
+      paintAttachments();
+    } catch (err) { attachmentError.textContent = errorText(err); }
+    finally { readingAttachments = false; picker.disabled = false; picker.value = ""; }
+  });
+  paintAttachments();
+  form.appendChild(attachmentWrap);
+
   const editorWrap = h("div", "editor-wrap");
   const toolbar = h("div", "toolbar");
   const editor = h("div", "editor");
@@ -291,6 +336,7 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   form.appendChild(errorNode);
 
   async function submit(deliveryOverride) {
+    if (readingAttachments) { errorNode.textContent = "Wait for attachments to finish reading."; return; }
     const body = V.assembleEmailBody({
       editorHTML: stripTrailingEmptyBlocks(editor),
       editorText: editor.innerText,
@@ -309,6 +355,7 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
         subject: inputs.subject.value.trim(),
         body_text: body.body_text,
         body_html: body.body_html,
+        attachments,
         reply_to_thread_id: V.str(variant.reply_to_thread_id),
         in_reply_to: V.str(variant.in_reply_to),
         references: V.stringSlice(variant.references),
@@ -398,10 +445,30 @@ function renderGmailEmail(request, mutation, actions) {
       ["Delivery", deliveryMode], ["To", V.stringSlice(message.to).join(", ")], ["Cc", V.stringSlice(message.cc).join(", ")],
       ["Bcc", V.stringSlice(message.bcc).join(", ")], ["Subject", V.str(message.subject)],
     ]));
+    ro.appendChild(attachmentList(V.emailAttachments(message)));
     ro.appendChild(bodyFrame(V.trimStr(message.body_html), false));
     article.appendChild(ro);
   }
   return article;
+}
+
+// Download as opaque bytes: never render an attachment as active HTML in our origin.
+function attachmentList(attachments, onRemove) {
+  const list = h("div", "attachment-list");
+  for (const [index, attachment] of attachments.entries()) {
+    const row = h("div", "attachment-row");
+    row.appendChild(button(attachment.filename + " (" + V.attachmentSize(attachment).toLocaleString() + " bytes)", "subtle", () => {
+      const bytes = Uint8Array.from(atob(attachment.data_base64), c => c.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = attachment.filename; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }));
+    row.appendChild(h("span", "muted", attachment.content_type));
+    if (onRemove) row.appendChild(button("Remove", "danger", () => onRemove(index)));
+    list.appendChild(row);
+  }
+  return list;
 }
 
 // --- contacts -------------------------------------------------------------------

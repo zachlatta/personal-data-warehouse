@@ -155,7 +155,7 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 		apiJSON(w, http.StatusOK, map[string]any{"request": s.requestJSON(request, true)})
 	case len(parts) == 4 && parts[1] == "mutations" && parts[3] == "update-email" && r.Method == http.MethodPost:
 		var body apiUpdateEmailBody
-		if err := decodeOptionalJSON(r, &body); err != nil {
+		if err := decodeOptionalJSONLimit(r, &body, 32<<20); err != nil {
 			apiError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -190,7 +190,14 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeOptionalJSON(r *http.Request, into any) error {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	return decodeOptionalJSONLimit(r, into, 64<<10)
+}
+
+func decodeOptionalJSONLimit(r *http.Request, into any, limit int64) error {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if int64(len(raw)) > limit {
+		return errors.New("JSON body too large")
+	}
 	if err != nil {
 		return err
 	}

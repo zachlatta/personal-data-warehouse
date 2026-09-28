@@ -641,3 +641,73 @@ def test_gmail_mutation_failure_status_treats_refresh_error_as_blocked() -> None
 def _decode_raw_message(raw: str):
     padded = raw + ("=" * (-len(raw) % 4))
     return BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(padded.encode("ascii")))
+
+
+def test_email_attachments_survive_send_and_reply_draft() -> None:
+    for mode in ("send", "draft"):
+        service = FakeGmailService()
+        data = bytes(range(256))
+        result = GmailMutationExecutor(
+            settings=object(), service_factory=lambda account: service
+        ).execute({
+            "provider": "gmail", "operation": GMAIL_SEND_EMAIL_OPERATION,
+            "account": "sender@example.test",
+            "payload_json": {"delivery_mode": mode, "message": {
+                "to": ["recipient@example.test"], "subject": "Attachments",
+                "body_text": "Plain", "body_html": "<p>HTML</p>",
+                "reply_to_thread_id": "thread-1", "in_reply_to": "<id@example.test>",
+                "attachments": [
+                    {"filename": "résumé.bin", "content_type": "application/octet-stream",
+                     "data_base64": base64.b64encode(data).decode()},
+                    {"filename": "empty.txt", "content_type": "text/plain", "data_base64": ""},
+                ],
+            }},
+        })
+        assert result.status == "succeeded"
+        body = (service.send_calls[0]["body"] if mode == "send"
+                else service.draft_create_calls[0]["body"]["message"])
+        assert body["threadId"] == "thread-1"
+        email = _decode_raw_message(body["raw"])
+        assert email.get_content_type() == "multipart/mixed"
+        assert email.get_body(preferencelist=("plain",)).get_content().strip() == "Plain"
+        assert email.get_body(preferencelist=("html",)).get_content().strip() == "<p>HTML</p>"
+        parts = list(email.iter_attachments())
+        assert [p.get_filename() for p in parts] == ["résumé.bin", "empty.txt"]
+        assert [p.get_payload(decode=True) for p in parts] == [data, b""]
+        assert all(p.get_content_disposition() == "attachment" for p in parts)
+
+
+def test_invalid_attachments_fail_before_contacting_gmail() -> None:
+    for attachments in (
+        "bad", [{}], [{"filename": "../secret", "content_type": "text/plain", "data_base64": ""}],
+        [{"filename": "ok", "content_type": "text/plain\r\nX: injected", "data_base64": ""}],
+        [{"filename": "ok", "content_type": "text/plain", "data_base64": "!!"}],
+        [{"filename": "ok", "content_type": "text/plain"}],
+    ):
+        service = FakeGmailService()
+        result = GmailMutationExecutor(settings=object(), service_factory=lambda _: service).execute({
+            "provider": "gmail", "operation": GMAIL_SEND_EMAIL_OPERATION,
+            "account": "sender@example.test",
+            "payload_json": {"message": {"to": ["a@example.test"], "subject": "Test",
+                                         "body_text": "Test", "attachments": attachments}},
+        })
+        assert result.status == "failed_terminal"
+        assert not service.send_calls and not service.draft_create_calls
+
+
+def test_attachment_limits_and_canonical_base64() -> None:
+    import pytest
+
+    attachment = {"filename": "file.bin", "content_type": "application/octet-stream", "data_base64": ""}
+    assert len(gmail_mutations._email_attachments([attachment] * 100)) == 100
+    with pytest.raises(ValueError):
+        gmail_mutations._email_attachments([attachment] * 101)
+    with pytest.raises(ValueError):
+        gmail_mutations._email_attachments([{**attachment, "content_type": "multipart/mixed"}])
+    for encoded in ("YQ", "YR==", "YQ==\n", "_w=="):
+        with pytest.raises(ValueError):
+            gmail_mutations._email_attachments([{**attachment, "data_base64": encoded}])
+    large = {**attachment, "data_base64": base64.b64encode(bytes(20 * 1024 * 1024)).decode()}
+    assert len(gmail_mutations._email_attachments([large])[0][1]) == 20 * 1024 * 1024
+    with pytest.raises(ValueError):
+        gmail_mutations._email_attachments([large, {**attachment, "data_base64": "AA=="}])

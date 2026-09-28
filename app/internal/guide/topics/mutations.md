@@ -31,6 +31,13 @@ authoritative when this list and it disagree.
 - **Email as Zach:** preserve CC lists on replies, reply in the thread you found, and
   never send from a guessed account. The reviewer can edit an email before approving it,
   drop one item from a batch without denying the rest, or mark a dead request superseded.
+- **Email attachments:** set `message.attachments` to an array of
+  `{filename, content_type, data_base64}` (standard base64 bytes, not a path or URL).
+  Maximum 100 files / 20 MiB decoded total per message. The proposal snapshots the
+  files for review and sends the approved bytes with either a send or draft.
+  {{if .CLI}}For large payloads, use `pdw call propose_mutation < proposal.json` rather than a shell argument.{{end}} Variants
+  inherit the base attachments; set a variant's `message.attachments` to override, or
+  `[]` to remove. Reviewers can download, add or remove files in the web editor.
 - **A proposal is never edited after it is proposed; it is replaced or withdrawn.** To
   correct one, propose the corrected request with `replaces_request_id` and
   `replaces_reason`: while the old request is still pending it is withdrawn in the same

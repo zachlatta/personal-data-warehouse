@@ -1245,3 +1245,19 @@ export function mutationReviewContext(value) {
     leftover,
   };
 }
+
+// Attachment data stays with the reviewed message, never a mutable URL.
+export function emailAttachments(message) {
+  return Array.isArray(message?.attachments) ? message.attachments : [];
+}
+
+export function attachmentSize(attachment) {
+  const data = str(attachment.data_base64);
+  return Math.max(0, data.length / 4 * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0));
+}
+
+export function checkAttachmentLimits(attachments) {
+  if (attachments.length > 100 || attachments.reduce((sum, a) => sum + attachmentSize(a), 0) > 20 * 1024 * 1024) {
+    throw new Error("Attachments may contain at most 100 files and total at most 20 MiB.");
+  }
+}

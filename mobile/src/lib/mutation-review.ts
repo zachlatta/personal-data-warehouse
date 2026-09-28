@@ -1514,7 +1514,10 @@ export function isGmailSendEmailMutation(mutation: MutationLike): boolean {
   return text(mutation.provider) === 'gmail' && text(mutation.operation) === 'gmail.send_email';
 }
 
+export type GmailEmailAttachment = { filename: string; content_type: string; data_base64: string };
+
 export type GmailEmailVariant = {
+  attachments: GmailEmailAttachment[];
   id: string;
   title: string;
   selected: boolean;
@@ -1569,6 +1572,7 @@ function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string;
     id: text(raw.id) || fallback.id,
     title: text(raw.title) || fallback.title,
     selected: typeof raw.selected === 'boolean' ? raw.selected : fallback.selected,
+    attachments: records(raw.attachments).map((a) => ({ filename: text(a.filename), content_type: text(a.content_type), data_base64: text(a.data_base64) })),
     to: list(raw.to),
     cc: list(raw.cc),
     bcc: list(raw.bcc),

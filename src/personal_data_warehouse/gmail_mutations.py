@@ -4,6 +4,7 @@ import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.message import EmailMessage
+import re
 import ssl
 from typing import Any
 
@@ -592,7 +593,13 @@ def build_email_raw(*, account: str, message: Mapping[str, Any]) -> str:
         email.set_content(body_html, subtype="html")
     else:
         email.set_content(body_text)
-    return base64.urlsafe_b64encode(email.as_bytes()).decode("ascii")
+    for attachment, data in _email_attachments(message.get("attachments")):
+        maintype, subtype = attachment["content_type"].split("/")
+        email.add_attachment(data, maintype=maintype, subtype=subtype, filename=attachment["filename"])
+    raw = email.as_bytes()
+    if len(raw) > 35_000_000:
+        raise ValueError("email MIME message exceeds 35 MB")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
 def _delivery_mode(value: Any) -> str:
@@ -624,3 +631,37 @@ def _string_list(value: Any) -> list[str]:
     else:
         return []
     return [str(item).strip() for item in raw_values if str(item).strip()]
+
+
+def _email_attachments(value: Any) -> list[tuple[dict[str, Any], bytes]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 100:
+        raise ValueError("attachments must be an array of at most 100 files")
+    out = []
+    total = 0
+    for attachment in value:
+        if not isinstance(attachment, dict) or set(attachment) != {"filename", "content_type", "data_base64"}:
+            raise ValueError("attachments require filename, content_type and data_base64 only")
+        name = attachment["filename"]
+        if (not isinstance(name, str) or not name.strip() or len(name.encode("utf-8")) > 255
+                or name in {".", ".."} or any(c in name for c in "/\\")
+                or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+            raise ValueError("invalid attachment filename")
+        content_type = attachment["content_type"]
+        if (not isinstance(content_type, str)
+                or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", content_type)
+                or content_type.lower().startswith("multipart/")):
+            raise ValueError("invalid attachment content_type")
+        encoded = attachment["data_base64"]
+        remaining = 20 * 1024 * 1024 - total
+        if not isinstance(encoded, str) or len(encoded) > 4 * ((remaining + 2) // 3):
+            raise ValueError("attachments may total at most 20 MiB")
+        data = base64.b64decode(encoded, validate=True)
+        if base64.b64encode(data).decode("ascii") != encoded:
+            raise ValueError("attachment data must be canonical standard base64")
+        total += len(data)
+        if total > 20 * 1024 * 1024:
+            raise ValueError("attachments may total at most 20 MiB")
+        out.append((attachment, data))
+    return out

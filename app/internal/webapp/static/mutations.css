@@ -430,3 +430,9 @@ summary.slack-group-summary::-webkit-details-marker, summary.slack-review-summar
   .slack-review-body .slack-action { display: block; }
   .slack-review-body .slack-action dl { margin-top: 7px; }
 }
+
+/* Attachment names are untrusted, potentially long, and never active previews. */
+.mv .attachments { padding: 12px 0; }
+.mv .attachment-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+.mv .attachment-row button { overflow-wrap: anywhere; max-width: 100%; }
+.mv .attachments input[type="file"] { max-width: 100%; margin-top: 8px; }

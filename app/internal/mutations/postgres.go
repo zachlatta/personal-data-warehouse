@@ -1687,6 +1687,9 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := validateEmailAttachments(mutation.Message["attachments"]); err != nil {
+				return nil, err
+			}
 			message := normalizeMessageForStorage(mutation.Message)
 			variants, err := normalizeEmailVariantInputs(message, mutation.EmailVariants)
 			if err != nil {
@@ -1912,6 +1915,9 @@ func normalizeMessageForStorage(message map[string]any) map[string]any {
 		"body_text": stringFromAny(message["body_text"]),
 		"body_html": stringFromAny(message["body_html"]),
 	}
+	if attachments, ok := message["attachments"]; ok {
+		out["attachments"] = attachments
+	}
 	if replyToThreadID := strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])); replyToThreadID != "" {
 		out["reply_to_thread_id"] = replyToThreadID
 	}
@@ -1933,6 +1939,9 @@ func normalizeEmailVariantInputs(baseMessage map[string]any, variants []GmailEma
 			return nil, err
 		}
 		message := emailVariantMessage(baseMessage, variant)
+		if err := validateEmailAttachments(message["attachments"]); err != nil {
+			return nil, err
+		}
 		normalizedMessage := normalizeMessageForStorage(message)
 		id := emailVariantID(index)
 		if seenIDs[id] {
@@ -2046,6 +2055,9 @@ func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationI
 	}
 	for key, value := range input.Message {
 		mergedMessage[key] = value
+	}
+	if err := validateEmailAttachments(mergedMessage["attachments"]); err != nil {
+		return nil, nil, "", err
 	}
 	message := normalizeMessageForStorage(mergedMessage)
 	if !hasAnyRecipient(message) {

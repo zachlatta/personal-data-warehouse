@@ -897,3 +897,13 @@ test('a Slack DM names the person, and an unresolved send warns instead of looki
   assert.equal(unresolved.recipientLabel, 'C9');
   assert.match(unresolved.warnings[0], /not checked against the warehouse/);
 });
+
+test('email review exposes attachments without losing them on a body edit', () => {
+  const attachment = { filename: 'hello.txt', content_type: 'text/plain', data_base64: 'aGVsbG8=' };
+  const review = gmailEmailReview({ provider: 'gmail', operation: 'gmail.send_email',
+    email: { message: { to: ['a@example.test'], subject: 'Files', body_text: 'Attached', attachments: [attachment] } } });
+  assert.deepEqual(review.variants[0].attachments, [attachment]);
+  const input = gmailEmailUpdateInput(review.variants[0], { to: 'a@example.test', cc: '', bcc: '', subject: 'Edited', editorText: 'Edited' }, 'draft');
+  // Omit attachment edits on mobile: the server preserves the selected variant's bytes.
+  assert.equal(Object.hasOwn(input.message, 'attachments'), false);
+});
