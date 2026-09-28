@@ -356,6 +356,20 @@ func (c *Client) UploadAgentSessionsBatch(gzipBytes []byte, exportedAt string) (
 	return c.post("/ingest/agent-sessions/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
 }
 
+// --- muse -------------------------------------------------------------------
+
+// UploadMuseFile posts the bytes of one Muse workspace file too large or too
+// binary to ride inline in a batch. The app stores it content-addressed.
+func (c *Client) UploadMuseFile(content []byte, extension, contentType string) (StoredObject, error) {
+	ct := contentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	return c.post("/ingest/muse/file", content, ct, map[string]string{
+		"extension": extension, "content_type": contentType,
+	})
+}
+
 // --- apple messages ---------------------------------------------------------
 
 // UploadAppleMessagesBatch posts a gzipped JSONL batch of message records.

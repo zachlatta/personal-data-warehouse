@@ -60,6 +60,7 @@ from personal_data_warehouse.schema import (
     FINANCE_TRANSACTION_COLUMNS,
     FINANCE_TRANSACTION_LINK_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
+    MUSE_FILE_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
     RECEIPT_TRANSACTION_RECEIPT_COLUMNS,
     PLAID_ACCOUNT_COLUMNS,
@@ -315,6 +316,8 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("gmail", ("gmail_email",), "t.kind"),
     ("google_drive", ("drive_file",), "t.kind"),
     ("imessage", ("apple_message",), "t.kind"),
+    # The Muse agent's workspace files; its transcripts are agent sessions.
+    ("muse_file", ("muse_file",), "t.kind"),
     (
         "finance",
         ("finance_transaction", "finance_observation", "manual_finance_document"),
@@ -905,6 +908,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "codex_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "openclaw_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "pi_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "muse_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    # The Muse agent's persistent workspace as it currently stands.
+    "muse_files": TableSpec(MUSE_FILE_COLUMNS, ("account", "path")),
     "agent_runs": TableSpec(AGENT_RUN_COLUMNS, ("run_id",)),
     "agent_run_events": TableSpec(AGENT_RUN_EVENT_COLUMNS, ("run_id", "event_index")),
     "agent_run_tool_calls": TableSpec(AGENT_RUN_TOOL_CALL_COLUMNS, ("run_id", "event_index", "tool_name")),
@@ -1136,6 +1142,7 @@ _AI_CONVERSATION_EVENT_TABLES = (
     "codex_events",
     "openclaw_events",
     "pi_events",
+    "muse_events",
 )
 
 
@@ -1641,6 +1648,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     # late (pipeline_health.PROBE_SKIPPED_UNINDEXED).
     # Hacker News. synced_at leads for the freshness probe; the walk
     # frontier and the refresh pass read by root story and by posting time.
+    IndexSpec(
+        "muse_files_ingested_idx",
+        "muse_files",
+        "CREATE INDEX IF NOT EXISTS muse_files_ingested_idx ON @muse_files (ingested_at)",
+    ),
+    IndexSpec(
+        "muse_files_modified_idx",
+        "muse_files",
+        "CREATE INDEX IF NOT EXISTS muse_files_modified_idx ON @muse_files (modified_at DESC)",
+    ),
     IndexSpec(
         "hacker_news_items_synced_idx",
         "hacker_news_items",
@@ -2153,6 +2170,9 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "codex_events": 500,
     "openclaw_events": 500,
     "pi_events": 500,
+    "muse_events": 500,
+    # Text files ride inline, up to the uploader's inline cap each.
+    "muse_files": 50,
     "plaid_accounts": 500,
     "plaid_transactions": 500,
     "plaid_investment_securities": 500,
@@ -2374,6 +2394,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # Muse workspace files: when a path stopped existing (epoch while it does).
+    "deleted_at",
     # SimpleFIN: the bridge's own balance stamp, the day a transaction
     # happened, and a holding's acquisition date.
     "balance_at",
@@ -2492,6 +2514,8 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # Muse workspace files: 1 when the content is inline text.
+    "is_text",
     # hacker_news
     "descendants",
     "is_dead",
@@ -2888,6 +2912,7 @@ _AI_EVENT_TABLE_BY_SOURCE = {
     "codex": "codex_events",
     "openclaw": "openclaw_events",
     "pi": "pi_events",
+    "muse": "muse_events",
 }
 
 
@@ -4723,6 +4748,7 @@ class PostgresWarehouse:
 
     def ensure_agent_sessions_tables(self) -> None:
         self._ensure_table_group(_AI_CONVERSATION_EVENT_TABLES)
+        self._ensure_table_group(["muse_files"])
         self.ensure_chatgpt_tables()
         self.ensure_claude_desktop_tables()
         self._ensure_ai_conversation_events_view()
@@ -10916,6 +10942,9 @@ class PostgresWarehouse:
             rows_by_table.setdefault(table, []).append(row)
         for table, table_rows in rows_by_table.items():
             self._insert_rows(table, table_rows, AGENT_SESSION_EVENT_COLUMNS)
+
+    def insert_muse_files(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("muse_files", rows, MUSE_FILE_COLUMNS)
 
     def chatgpt_conversation_sync_map(self, *, account: str) -> dict[str, float]:
         """Return ``{session_id: update_time}`` already synced for ``account``.

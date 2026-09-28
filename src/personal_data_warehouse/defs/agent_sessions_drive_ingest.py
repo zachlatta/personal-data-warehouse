@@ -67,10 +67,17 @@ def agent_sessions_drive_ingest(context) -> MaterializeResult:
     # Land this source's timeline rows in the same run instead of waiting
     # for the five-minute timeline_sync tick on top of the inbox sensor.
     fast_lane = {"enabled": False, "rows": 0}
+    files_written = int(getattr(summary, "files_written", 0) or 0) if summary is not None else 0
+    sources = []
     if summary is not None and summary.events_written:
+        sources.append("agent_sessions")
+    if files_written:
+        # Muse workspace files ride these batches but have their own adapter.
+        sources.append("muse")
+    if sources:
         fast_lane = land_sources_on_timeline(
             postgres_url=settings.postgres_database_url or "",
-            sources=["agent_sessions"],
+            sources=sources,
             logger=context.log,
         )
 
@@ -80,6 +87,7 @@ def agent_sessions_drive_ingest(context) -> MaterializeResult:
             "batches_seen": MetadataValue.int(summary.batches_seen if summary else 0),
             "events_written": MetadataValue.int(summary.events_written if summary else 0),
             "files_promoted": MetadataValue.int(summary.files_promoted if summary else 0),
+            "muse_files_written": MetadataValue.int(files_written),
         }
     )
 

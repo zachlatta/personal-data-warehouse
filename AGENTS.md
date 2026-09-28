@@ -2708,6 +2708,48 @@ and the **prod Dagster** reader both running `main` (the app writes the object t
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
 relying on the timer.
 
+## Muse (Meta's hosted personal agent)
+
+Muse is Meta's hosted personal agent; each user gets an agent on its own VM. Everything
+it keeps on that VM's disk lands in PDW: **its chat transcripts** as the seventh
+agent-session source (`base_muse.events`, source `muse`, read through
+`marts_ai_conversations.events` like every other provider) and **its persistent
+workspace** as `base_muse.files` — `MEMORY.md` and `memory/` (what it believes about Zach
+and the people around him), goal pages, feed research, podcasts, deliverables and what
+Zach attached in a chat — one row per path at its latest content (`content_text` inline
+for text, `storage_file_id` for a binary's bytes through `get_object`, `is_deleted = 1`
+for a path that is gone). Timeline adapter `muse_file`, search scope `muse_file`.
+
+**The VM shapes the transport.** It accepts no inbound connection, loses every process
+(and everything outside `/home/hatch`, including apt packages and `/usr/local`) on
+restart, and reaches the internet only through Meta's egress proxy. So the uploader runs
+**on** the VM — `pdw ingest muse` (native Go, `app/internal/uploaders/muse`), with its
+state in `/home/hatch/.local/state/pdw` because that is what survives — and it is
+scheduled by a **Muse hook**, not cron: a hook is a Bash script the runtime itself polls,
+and one that ends with `silent` never wakes the model. A Muse cron job would have been a
+model turn every five minutes, each writing a new transcript for the next run to ingest.
+The script is `ops/muse/pdw-ingest-hook.sh`; `ops/muse/README.md` has the install steps.
+It posts `pdw heartbeat --pipeline muse`, which is the `muse` row's run signal.
+
+**Muse writes its own loops on the user channel, so `role` is rebuilt, not copied.**
+Of 485 transcripts in its first two days, 313 were self-improvement runs, 54 hourly
+feed runs and ~70 subagents — every one opened by a `role: user` message Zach never
+typed. Each transcript line carries the Muse `source` that wrote it; only
+`source = 'runtime'` in a non-subagent session is Zach typing, and everything else is
+`role = 'system'` with the loop in `subtype`. Which session is a subagent is only said
+by its opening message (`[Subagent Context] … Requester agent id: <id>`), so the
+uploader reads that once per transcript (plus the model from `sessions.json`) and ships
+it on every line; the warehouse sets `is_sidechain = 1` and `parent_uuid` from it. With
+that, the existing agent-session rules classify Muse with no Muse-specific timeline SQL:
+chats are `self`, loops and subagents `background`. Reasoning items stay in `raw_json`
+only, as for every provider; Meta's own `muse.db` tool withholds them, but they are in
+the transcript files on Zach's VM.
+
+What PDW does **not** get: Muse's Postgres (feed, goals, ideas, device and health tables)
+is reachable only through the agent's own read-only `muse.db` tool, not from a shell, and
+its phone data (contacts, calendar, health, media library) was empty for this account on
+2026-09-28. Its connectors read other systems PDW already syncs.
+
 ## Claude Desktop Sessions (claude.ai)
 
 Captures normal Claude conversations from the Claude Desktop app so they're queryable in

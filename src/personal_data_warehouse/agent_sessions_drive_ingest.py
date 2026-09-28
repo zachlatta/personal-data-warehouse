@@ -13,6 +13,11 @@ Three transports feed the same row schema:
   from the local desktop app. It ships ``claude_desktop_event`` envelopes through
   the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
   ``base_claude_desktop.events`` rows.
+* Muse (Meta's hosted personal agent) runs on its own VM; ``pdw ingest muse``
+  runs there, tails ``~/agents/*/sessions/*.jsonl`` into ``muse_event``
+  envelopes (``base_muse.events``) and snapshots the agent's persistent
+  workspace (memory, goals, feed, generated files) into ``muse_file``
+  envelopes (``base_muse.files``) through this same inbox.
 * ChatGPT (the consumer product) is polled server-side from its backend API,
   which returns each conversation as a node-tree. ``chatgpt_conversation_to_event_rows``
   linearizes that tree into ``base_chatgpt.events`` rows; see
@@ -53,6 +58,7 @@ class AgentSessionsDriveIngestSummary:
     batches_seen: int
     events_written: int
     files_promoted: int
+    files_written: int = 0
 
 
 class AgentSessionsDriveIngestRunner:
@@ -86,11 +92,20 @@ class AgentSessionsDriveIngestRunner:
             [record for batch in batches for record in batch_records(batch)],
             key=record_exported_at,
         )
+        file_records = [record for record in records if record.get("record_type") == MUSE_FILE_RECORD_TYPE]
+        event_records = [record for record in records if record.get("record_type") != MUSE_FILE_RECORD_TYPE]
         event_rows = dedupe_rows(
-            [record_to_event_row(record, ingested_at=ingested_at) for record in records],
+            [record_to_event_row(record, ingested_at=ingested_at) for record in event_records],
             ("source", "session_id", "event_uuid"),
         )
-        self._warehouse.insert_agent_session_events(event_rows)
+        if event_rows:
+            self._warehouse.insert_agent_session_events(event_rows)
+        file_rows = dedupe_rows(
+            [muse_file_row(record, ingested_at=ingested_at) for record in file_records],
+            ("account", "path"),
+        )
+        if file_rows:
+            self._warehouse.insert_muse_files(file_rows)
 
         promoted = 0
         promote = self._object_store is not None or self._object_store_factory is not None
@@ -103,14 +118,16 @@ class AgentSessionsDriveIngestRunner:
                     promoted = sum(future.result() for future in as_completed(futures))
 
         self._logger.info(
-            "Ingested %s agent-session batches, %s events",
+            "Ingested %s agent-session batches, %s events, %s Muse workspace files",
             len(batches),
             len(event_rows),
+            len(file_rows),
         )
         return AgentSessionsDriveIngestSummary(
             batches_seen=len(batches),
             events_written=len(event_rows),
             files_promoted=promoted,
+            files_written=len(file_rows),
         )
 
     def _promote_batch(self, batch: Mapping[str, Any]) -> int:
@@ -205,6 +222,17 @@ def record_to_event_row(record: Mapping[str, Any], *, ingested_at: datetime) -> 
     line = line if isinstance(line, Mapping) else {}
     account = str(record.get("account", ""))
     device = str(record.get("device", ""))
+    if tool == "muse":
+        session = payload.get("session")
+        return muse_event_row(
+            line,
+            session_id=session_id,
+            account=account,
+            device=device,
+            seq=seq,
+            ingested_at=ingested_at,
+            session=session if isinstance(session, Mapping) else {},
+        )
     builder = _EVENT_ROW_BUILDERS.get(tool, claude_code_event_row)
     return builder(
         line,
@@ -633,6 +661,184 @@ def openclaw_event_row(
         row["subtype"] = role
 
     return row
+
+
+# --- Muse (Meta's hosted personal agent) -------------------------------------
+
+MUSE_FILE_RECORD_TYPE = "muse_file"
+
+# The one item source that carries words Zach typed into a Muse chat. Muse
+# writes its own background loops -- self-improvement runs, the hourly feed,
+# cron workers, verification workers, onboarding scripts -- on the SAME user
+# channel, each tagged with its own ``source``; counting those as user turns
+# would file hundreds of machine prompts a day as 'self' on the timeline.
+_MUSE_TYPED_SOURCE = "runtime"
+
+
+def muse_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+    session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize one line of a Muse ``~/agents/<agent>/sessions/<id>.jsonl``.
+
+    A transcript is a ``session_header``, then ``item`` lines -- each an
+    OpenAI-Responses-shaped ``item`` (``message``/``message_parts`` with a
+    role, ``thinking``, ``commentary_text``, ``function_call``,
+    ``function_call_output``) tagged with the Muse ``source`` that produced it
+    -- plus ``compaction_checkpoint`` lines carrying a written summary of the
+    conversation so far. ``session`` is what the uploader read from the file's
+    opening item and ``sessions.json``: whether this is a subagent (and whose),
+    which loop opened it, and the model serving it; no single line says so.
+    """
+    line_type = str(line.get("type", ""))
+    kind = str(session.get("kind", ""))
+    subagent = kind == "subagent"
+    if line_type == "item":
+        uuid = f"{session_id}#{_int(line.get('seq'))}"
+    elif line_type == "compaction_checkpoint":
+        uuid = f"{session_id}#compaction-{_int(line.get('compaction_id'))}"
+    elif line_type == "session_header":
+        uuid = f"{session_id}#header"
+    else:
+        uuid = f"{session_id}#line-{seq}"
+    row = _base_row(
+        source="muse",
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=uuid,
+        occurred_at=parse_datetime(str(line.get("created_at", ""))),
+        ingested_at=ingested_at,
+    )
+    row["entrypoint"] = str(session.get("opening_source", ""))
+    row["is_sidechain"] = 1 if subagent else 0
+    row["parent_uuid"] = str(session.get("requester_agent_id", "")) if subagent else ""
+    model = str(session.get("model", ""))
+
+    if line_type == "session_header":
+        row["subtype"] = "session_header"
+        return row
+    if line_type == "compaction_checkpoint":
+        row["subtype"] = "compaction"
+        row["text"] = str(line.get("summary", ""))
+        return row
+    if line_type != "item":
+        return row
+
+    item_source = str(line.get("source", ""))
+    body = line.get("item") if isinstance(line.get("item"), Mapping) else {}
+    item_type = str(body.get("type", ""))
+    row["event_type"] = item_type
+    if item_type in ("message", "message_parts"):
+        role = str(body.get("role", ""))
+        text = str(body.get("text", "")) if item_type == "message" else _muse_parts_text(body.get("parts"))
+        row["text"] = text
+        row["subtype"] = "message"
+        if role == "assistant":
+            row["role"] = "assistant"
+            row["model"] = model
+        elif role == "user":
+            typed = (
+                item_source == _MUSE_TYPED_SOURCE
+                and not subagent
+                and not text.lstrip().startswith("[Subagent Context]")
+            )
+            if typed:
+                row["role"] = "user"
+            else:
+                row["role"] = "system"
+                row["subtype"] = item_source or "injected"
+        else:
+            row["role"] = "system"
+            row["subtype"] = role or "message"
+    elif item_type == "commentary_text":
+        row["role"] = "assistant"
+        row["subtype"] = "commentary"
+        row["text"] = str(body.get("text", ""))
+        row["model"] = model
+    elif item_type == "thinking":
+        # Reasoning stays in raw_json only, as for every other agent source:
+        # it is not what the agent said, so it is not search text.
+        row["role"] = "assistant"
+        row["subtype"] = "thinking"
+        row["model"] = model
+    elif item_type == "function_call":
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = str(body.get("name", ""))
+        row["tool_input_json"] = _as_json_text(body.get("arguments"))
+        row["turn_id"] = str(body.get("call_id", ""))
+        row["model"] = model
+    elif item_type == "function_call_output":
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["text"] = _stringify(body.get("output"))
+        row["tool_result_json"] = raw_json(
+            {key: body.get(key) for key in ("output", "success", "metadata") if key in body}
+        )
+        row["turn_id"] = str(body.get("call_id", ""))
+    else:
+        row["subtype"] = item_type
+    return row
+
+
+def _muse_parts_text(parts: Any) -> str:
+    if not isinstance(parts, list):
+        return ""
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, Mapping):
+            continue
+        if part.get("type") == "text":
+            chunks.append(str(part.get("text", "")))
+        elif part.get("type") == "file_ref":
+            name = part.get("path") or part.get("name") or part.get("file_id") or ""
+            chunks.append(f"[file: {name}]")
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def muse_file_row(record: Mapping[str, Any], *, ingested_at: datetime) -> dict[str, Any]:
+    """One Muse workspace file's current state (``base_muse.files``).
+
+    Keyed by (account, path): the table is the workspace as it stands, a path
+    the uploader no longer finds is a tombstone (``is_deleted = 1``) rather
+    than a missing row. Text files carry their content inline; everything else
+    carries the object-store pointer the uploader got back for its bytes.
+    """
+    payload = nested_mapping(record, "record")
+    path = str(payload.get("path", ""))
+    directory, _, filename = path.rpartition("/")
+    deleted = bool(payload.get("deleted"))
+    return {
+        "account": str(record.get("account", "")),
+        "path": path,
+        "directory": directory,
+        "filename": filename,
+        "device": str(record.get("device", "")),
+        "content_sha256": str(payload.get("content_sha256", "")),
+        "size_bytes": _int(payload.get("size_bytes")),
+        "modified_at": parse_datetime(str(payload.get("modified_at", ""))),
+        "mime_type": str(payload.get("mime_type", "")),
+        "is_text": 1 if payload.get("is_text") else 0,
+        "content_text": str(payload.get("content_text", "")) if not deleted else "",
+        "storage_backend": str(payload.get("storage_backend", "")),
+        "storage_key": str(payload.get("storage_key", "")),
+        "storage_file_id": str(payload.get("storage_file_id", "")),
+        "storage_url": str(payload.get("storage_url", "")),
+        "is_deleted": 1 if deleted else 0,
+        "deleted_at": ingested_at if deleted else parse_datetime(""),
+        "exported_at": record_exported_at(record),
+        "ingested_at": ingested_at,
+        "sync_version": sync_version(ingested_at),
+    }
 
 
 def pi_event_row(

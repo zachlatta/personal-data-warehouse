@@ -279,18 +279,21 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "finance", kind: "transaction"},
 	{source: "finance", kind: "balance_observation"},
 	{source: "finance", kind: "document"},
+	{source: "muse", kind: "muse_file"},
 	{source: "chatgpt", kind: "agent_session"},
 	{source: "claude_code", kind: "agent_session"},
 	{source: "claude_desktop", kind: "agent_session"},
 	{source: "codex", kind: "agent_session"},
 	{source: "openclaw", kind: "agent_session"},
 	{source: "pi", kind: "agent_session"},
+	{source: "muse", kind: "agent_session"},
 	{source: "chatgpt", kind: "agent_turn"},
 	{source: "claude_code", kind: "agent_turn"},
 	{source: "claude_desktop", kind: "agent_turn"},
 	{source: "codex", kind: "agent_turn"},
 	{source: "openclaw", kind: "agent_turn"},
 	{source: "pi", kind: "agent_turn"},
+	{source: "muse", kind: "agent_turn"},
 }
 
 // Timeline priority tiers (the timeline_priority enum labels), highest

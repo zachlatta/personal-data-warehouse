@@ -316,13 +316,21 @@ func (r *Runner) envelope(file SessionFile, seq int64, line map[string]any) map[
 		"device":         r.Device,
 		"exported_at":    common.ISOFormat(r.Now()),
 		"record_type":    file.Tool + "_event",
-		"record": map[string]any{
-			"tool":       file.Tool,
-			"session_id": file.SessionID,
-			"seq":        seq,
-			"line":       line,
-		},
+		"record":         r.record(file, seq, line),
 	}
+}
+
+func (r *Runner) record(file SessionFile, seq int64, line map[string]any) map[string]any {
+	record := map[string]any{
+		"tool":       file.Tool,
+		"session_id": file.SessionID,
+		"seq":        seq,
+		"line":       line,
+	}
+	if file.Session != nil {
+		record["session"] = file.Session
+	}
+	return record
 }
 
 // completeLines returns only newline-terminated lines (each including its
