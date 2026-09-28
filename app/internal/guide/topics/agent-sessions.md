@@ -1,7 +1,7 @@
 # Prior agent sessions
 
-PDW indexes every past AI agent session across six providers — Claude Code, Codex, Claude
-Desktop, ChatGPT, OpenClaw and pi — from every machine, unified in
+PDW indexes every past AI agent session across seven providers — Claude Code, Codex, Claude
+Desktop, ChatGPT, OpenClaw, pi and Muse — from every machine, unified in
 `marts_ai_conversations`. It is the fleet's own transcript archive and the single most
 underused thing in the warehouse. Before re-deriving anything, ask it: *have we solved
 this before, and how? what did that agent conclude? how does the fleet really call tool
@@ -46,13 +46,23 @@ ORDER BY seq DESC LIMIT 5;
   `role`, `event_type`, `subtype`, `text`, `tool_name`, `tool_input_json`,
   `tool_result_json`, `is_sidechain`, `raw_json`, per-event token counts.
 - `base_claude_code.events`, `base_codex.events`, `base_claude_desktop.events`,
-  `base_chatgpt.events`, `base_openclaw.events`, `base_pi.events` — the raw per-provider
-  streams the mart unions.
+  `base_chatgpt.events`, `base_openclaw.events`, `base_pi.events`, `base_muse.events` —
+  the raw per-provider streams the mart unions.
 
 `entrypoint` separates interactive from automated work: `cli` and `codex-tui` are Zach at
 a keyboard; `sdk-cli`, `codex_exec` and OpenClaw's entrypoints are scheduled or
 fleet-driven runs. `chatgpt` sessions have no entrypoint and `claude_desktop` `device`
 values are opaque; read nothing into either.
+
+**Muse** (Meta's hosted personal agent) writes its own background loops — self-improvement,
+the hourly feed, cron and verification workers — on the same user channel Zach types
+into, so its rows are normalized differently: `role = 'user'` only for words Zach typed,
+every loop prompt is `role = 'system'` with the loop's name in `subtype`
+(`runtime.self_improvement`, `runtime.feed`, `scheduler.cron`, ...), and `entrypoint` is
+the loop that opened the session. Subagents are `is_sidechain = 1` with the parent's
+session id in `parent_uuid`. `subtype = 'compaction'` rows carry Muse's own running
+summary of a long chat. Its reasoning is kept in `raw_json` only. The agent's memory,
+goal pages and generated files are `base_muse.files` (topic `sources`).
 
 ## Pairing tool calls with results
 

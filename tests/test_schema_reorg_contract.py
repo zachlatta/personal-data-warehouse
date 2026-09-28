@@ -153,7 +153,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # with +1 ops (simplefin_sync_state) and +1 marts
         # (marts_ops.simplefin_account_health, where its reconciliation onto
         # the Plaid-founded ledger accounts is a row per account).
-        "base": 67,
+        # +2 base: the muse source (base_muse.events, the agent's transcripts,
+        # and base_muse.files, its persistent workspace).
+        "base": 69,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,

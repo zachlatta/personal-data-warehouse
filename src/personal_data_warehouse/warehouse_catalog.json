@@ -215,6 +215,14 @@
       "comment": "Faithful manual finance source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_muse",
+      "layer": "base",
+      "domain": "muse",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful muse source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
+    },
+    {
       "name": "base_openclaw",
       "layer": "base",
       "domain": "openclaw",
@@ -1393,6 +1401,28 @@
         "schema": "pi",
         "name": "events"
       }
+    },
+    {
+      "id": "muse_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "muse",
+      "schema": "base_muse",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "muse_files",
+      "kind": "table",
+      "layer": "base",
+      "domain": "muse",
+      "schema": "base_muse",
+      "name": "files",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
     },
     {
       "id": "manual_finance_documents",

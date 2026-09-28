@@ -105,7 +105,7 @@ COMMANDS
                              this binary). Sources: agent-sessions,
                              apple-contacts, apple-messages, apple-notes,
                              apple-photos, claude-desktop, manual-finance,
-                             plaid, voice-memos. Flags after <source> are
+                             muse, plaid, voice-memos. Flags after <source> are
                              forwarded to the uploader (e.g. --mode
                              incremental|full, --limit N). See "pdw ingest --help".
   heartbeat [flags]          Record one uploader run's verdict in

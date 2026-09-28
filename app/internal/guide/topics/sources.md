@@ -96,10 +96,21 @@ a whole thread; `body_text` is the decoded body, `text` the raw HTML. Timeline s
 `hacker_news`, search scope `hacker_news`: his items and anything he acted on are `self`,
 replies to him `direct`, the rest of a thread `noise`; `timeline.context()` returns the thread.
 
+## Muse
+
+Muse is Meta's hosted personal agent, running on its own VM. Its chats are agent sessions
+(source `muse`, topic `agent-sessions`). `base_muse.files` is its persistent workspace as
+it stands, one row per `path`: `MEMORY.md` and `memory/` (what it believes about Zach and
+the people around him), `workspace/goals/`, feed research, podcasts, deliverables in
+`workspace/your_files/`, and what Zach attached in a chat (`workspace/user/`, the only
+`self` files). Text is in `content_text`; a binary's bytes are one `get_object` on
+`storage_file_id`; `is_deleted = 1` marks a path that is gone. Search scope `muse_file`.
+Muse's connectors, phone data and database are not in PDW — only what is on its disk.
+
 ## Prior agent sessions
 
 `marts_ai_conversations.sessions` (one row per session across Claude Code, Codex, Claude
-Desktop, ChatGPT, OpenClaw and pi) and `marts_ai_conversations.events` (one row per turn
+Desktop, ChatGPT, OpenClaw, pi and Muse) and `marts_ai_conversations.events` (one row per turn
 or tool call). Search scope `agent_session` with priorities `self,background`. Topic
 `agent-sessions`.
 

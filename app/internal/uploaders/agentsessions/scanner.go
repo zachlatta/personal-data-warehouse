@@ -21,6 +21,9 @@ const (
 	CodexTool      = "codex"
 	OpenClawTool   = "openclaw"
 	PiTool         = "pi"
+	// MuseTool is Meta's hosted personal agent. Only `pdw ingest muse`, run on
+	// the Muse VM, sets Dirs.MuseAgents; see muse.go.
+	MuseTool = "muse"
 )
 
 // OpenClaw writes several sidecar files next to each "<sessionId>.jsonl"
@@ -36,6 +39,10 @@ type SessionFile struct {
 	Tool      string
 	SessionID string
 	Path      string
+	// Session is per-transcript metadata no single line carries, shipped on
+	// every line's record (Muse only: what kind of session it is, which loop
+	// opened it, and the model serving it).
+	Session map[string]any
 }
 
 // Dirs names each tool's transcript root; an empty root disables that tool.
@@ -46,6 +53,9 @@ type Dirs struct {
 	// OpenClawStore is the SQLite store newer OpenClaw keeps transcripts in.
 	OpenClawStore string
 	PiSessions    string
+	// MuseAgents is a Muse VM's ~/agents directory. Never read from the
+	// environment: only `pdw ingest muse` sets it.
+	MuseAgents string
 }
 
 // DirsFromEnv reads AGENT_SESSIONS_*_DIR with the documented defaults; a
@@ -93,6 +103,7 @@ func Discover(dirs Dirs) []SessionFile {
 	files = append(files, discoverCodex(dirs.CodexSessions)...)
 	files = append(files, discoverOpenClaw(dirs.OpenClawSessions)...)
 	files = append(files, discoverPi(dirs.PiSessions)...)
+	files = append(files, discoverMuse(dirs.MuseAgents)...)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Tool != files[j].Tool {
 			return files[i].Tool < files[j].Tool

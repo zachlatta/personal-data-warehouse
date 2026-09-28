@@ -2330,6 +2330,48 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+# The Muse agent's persistent workspace (base_muse.files): its memory files,
+# goal pages, feed research, podcasts and deliverables, plus what Zach uploaded
+# into a chat. One timeline row per path at its latest content, so a search
+# lands on what the agent currently believes rather than every autosave of it;
+# the table is current state, so a path that disappeared is pruned.
+_MUSE_FILE = _simple_adapter(
+    name="muse_file",
+    source_table="muse_files",
+    source="muse",
+    kind="muse_file",
+    from_sql="@muse_files t",
+    where="t.is_deleted = 0",
+    event_id="concat_ws('|', t.account, t.path)",
+    event_ts=_real_ts("t.modified_at", "t.ingested_at"),
+    ingest_ts="t.ingested_at",
+    actor="'muse'",
+    title="t.path",
+    snippet=_snippet("t.content_text"),
+    context="t.directory",
+    source_pk="jsonb_build_object('account', t.account, 'path', t.path)",
+    metadata=(
+        "jsonb_build_object("
+        "'mime_type', t.mime_type, "
+        "'size_bytes', t.size_bytes, "
+        "'content_sha256', t.content_sha256, "
+        "'is_text', t.is_text <> 0, "
+        "'storage_file_id', t.storage_file_id, "
+        "'device', t.device)"
+    ),
+    search_text=_search_concat("t.path", "t.content_text"),
+    prune_sql=(
+        "SELECT concat_ws('|', t.account, t.path) FROM @muse_files t WHERE t.is_deleted = 0"
+    ),
+    # workspace/user/ is where Muse puts what Zach attached in a chat, so those
+    # files are his. Everything else here the agent wrote -- its memory, its
+    # goal pages, its feed, what it made for him -- which is model output,
+    # the same tier as an agent session's replies.
+    priority=(
+        "CASE WHEN t.path LIKE 'workspace/user/%%' THEN 'self' ELSE 'background' END"
+    ),
+)
+
 
 # An opening prompt another program wrote. Every orchestrator (paseo
 # subagents, runbook fan-outs, the daily run-sheet job, /command invocations)
@@ -2674,6 +2716,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
+    _MUSE_FILE,
     _MUTATION,
     _MUTATION_REQUEST,
     _ENRICHMENT_RUN,
@@ -2893,6 +2936,9 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "finance_transaction",
         "finance_observation",
         "manual_finance_document",
+        # context is the file's directory, which IS the grouping: the
+        # neighbours of a memory note are the other notes beside it.
+        "muse_file",
         "mutation",
         "mutation_request",
         "enrichment_run",
@@ -3167,6 +3213,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "codex_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "openclaw_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "pi_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "muse_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "muse_files": _events("one row per Muse workspace file at its latest content"),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),

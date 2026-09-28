@@ -252,7 +252,15 @@ func e2eCases() []e2eCase {
 	statementSHA := sha(statement)
 	financeMeta := []byte(`{"schema_version":1,"source":"manual"}`)
 	financeDedupSHA := sha([]byte("manual|z@x.test|" + statementSHA + "|" + statementSHA))
+	museBlob := []byte("muse-podcast-bytes")
+	museSHA := sha(museBlob)
 	return []e2eCase{
+		{
+			name: "muse/file", endpoint: "/ingest/muse/file", body: museBlob,
+			extra:    url.Values{"extension": {".mp3"}, "content_type": {"audio/mpeg"}},
+			wantName: museSHA + ".mp3", wantMime: "audio/mpeg",
+			wantProps: map[string]string{"pdw_kind": "muse_file_blob", "pdw_source": "agent_sessions"},
+		},
 		{
 			name: "agent-sessions/batch", endpoint: "/ingest/agent-sessions/batch", body: batchBody,
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
@@ -525,6 +533,9 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		{"apple-notes/revision", func() (ingestclient.StoredObject, error) {
 			return client.UploadAppleNotesRevision(map[string]any{"schema_version": 1, "source": "apple_notes"},
 				"N1", "R1", "2026-01-02T03:04:05+00:00", "FP1")
+		}},
+		{"muse/file", func() (ingestclient.StoredObject, error) {
+			return client.UploadMuseFile([]byte("muse-podcast-bytes"), ".mp3", "audio/mpeg")
 		}},
 		{"manual-finance/file", func() (ingestclient.StoredObject, error) {
 			return client.UploadManualFinanceDocument(statement, "2026-06-30T10:00:00", "Acme-Checking-0001", ".pdf", "application/pdf")

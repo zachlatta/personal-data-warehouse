@@ -1399,6 +1399,33 @@ AGENT_RUN_TOOL_CALL_COLUMNS = (
 # One row per raw transcript/conversation event; source-owned physical tables
 # share this row shape, and marts_ai_conversations.sessions provides the
 # session-level roll-up so cross-batch counts and token sums stay correct.
+# One row per file in the Muse agent's persistent workspace (base_muse.files):
+# the workspace as it currently stands, keyed by (account, path). Text files
+# carry their content inline; binaries carry the object-store pointer for their
+# bytes. A path the uploader no longer finds is kept as a tombstone.
+MUSE_FILE_COLUMNS = (
+    "account",
+    "path",
+    "directory",
+    "filename",
+    "device",
+    "content_sha256",
+    "size_bytes",
+    "modified_at",
+    "mime_type",
+    "is_text",
+    "content_text",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "is_deleted",
+    "deleted_at",
+    "exported_at",
+    "ingested_at",
+    "sync_version",
+)
+
 AGENT_SESSION_EVENT_COLUMNS = (
     "source",
     "session_id",

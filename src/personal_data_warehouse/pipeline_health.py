@@ -784,6 +784,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "muse",
+        "Muse agent",
+        cadence="hook every 5 min",
+        transport=(
+            "Muse VM hook runs pdw ingest muse → /ingest/agent-sessions/batch"
+            " (transcripts + workspace text) and /ingest/muse/file (binaries)"
+        ),
+        data=2 * DAY,
+        basis=(
+            "measured 2026-09-28 over Muse's first two days: 485 transcripts, of"
+            " which 313 self-improvement runs and 54 feed runs are Muse's own"
+            " background loops, writing every hour whether or not Zach opens the"
+            " app. Two quiet days is therefore the loops or the uploader stopping,"
+            " not Zach being away; the run heartbeat is the sharper signal"
+        ),
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("muse"),
+    ),
+    _source(
         "claude_desktop",
         "Claude Desktop",
         cadence="poller every 5 min",
@@ -1379,6 +1398,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "codex_events": _data("codex", "ingested_at", "occurred_at"),
     "openclaw_events": _data("openclaw", "ingested_at", "occurred_at"),
     "pi_events": _data("pi", "ingested_at", "occurred_at"),
+    "muse_events": _data("muse", "ingested_at", "occurred_at"),
+    "muse_files": _data("muse", "ingested_at", "modified_at"),
     "claude_desktop_events": _data("claude_desktop", "ingested_at", "occurred_at"),
     "claude_desktop_credentials": _state("claude_desktop", "updated_at", "pushed claude.ai session key"),
     "claude_desktop_conversation_state": _state("claude_desktop", "last_synced_at"),

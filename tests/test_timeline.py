@@ -1013,6 +1013,16 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO @muse_files (account, path, directory, filename, device, content_sha256,
+                                 size_bytes, modified_at, mime_type, is_text, content_text,
+                                 ingested_at, sync_version)
+        VALUES ('z@x.test', 'memory/people/INDEX.md', 'memory/people', 'INDEX.md', 'muse', 'musesha',
+                24, %s, 'text/markdown', 1, 'People the agent knows about', %s, %s)
+        """,
+        (_NOW - timedelta(hours=2), _NOW, sync_version),
+    )
+    wh._command(
+        """
         INSERT INTO @manual_finance_extractions (content_sha256, ai_provider, ai_model,
                                                 ai_prompt_version, status, institution,
                                                 period_end, summary, created_at, sync_version)
@@ -1156,6 +1166,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
+    "muse_file": "background",
     "mutation": "background",
     "mutation_request": "background",
     "enrichment_run": "background",
@@ -1186,6 +1197,7 @@ EXPECTED_SEEDED_EVENTS = {
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
+    "muse_file": 1,
     "mutation": 1,
     "mutation_request": 1,
     "enrichment_run": 1,
@@ -3454,3 +3466,77 @@ def test_finance_evidence_missing_dates_never_uses_epoch(warehouse, missing_file
         engine.close()
     expected = _NOW if missing_file_timestamp else _NOW - timedelta(hours=16)
     assert warehouse._query("SELECT event_ts FROM @timeline_events WHERE adapter='manual_finance_document'") == [(expected,)]
+
+
+def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehouse):
+    """Muse writes its own loops on the user channel; only a chat Zach typed is his.
+
+    The uploader marks every Muse loop prompt (self-improvement, feed, cron)
+    role = 'system' and every subagent is_sidechain = 1, so the existing
+    agent-session rules classify them with no Muse-specific SQL. A file Zach
+    attached lands in workspace/user/ and is his; the agent's memory is not.
+    """
+    _ensure_all_source_tables(warehouse)
+
+    def muse_line(session: str, seq: int, role: str, text: str, *, sidechain: int = 0) -> None:
+        warehouse._command(
+            """
+            INSERT INTO @muse_events (source, session_id, event_uuid, seq, occurred_at,
+                                      role, text, is_sidechain, ingested_at)
+            VALUES ('muse', %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (session, f"{session}#{seq}", seq, _NOW, role, text, sidechain, _NOW),
+        )
+
+    muse_line("chat", 0, "system", "The user has just completed app setup.")
+    muse_line("chat", 1, "user", "Find me flights to SF next Thursday")
+    muse_line("chat", 2, "assistant", "Here are three options.")
+    muse_line("loop", 0, "system", "## Step instructions A window of recent activity was selected")
+    muse_line("loop", 1, "assistant", "claims delivered")
+    muse_line("sub", 0, "system", "[Subagent Context] You are running as a subagent", sidechain=1)
+    muse_line("sub", 1, "assistant", "listing drafted", sidechain=1)
+    for path, directory in (("workspace/user/receipt.pdf", "workspace/user"), ("MEMORY.md", "")):
+        warehouse._command(
+            """
+            INSERT INTO @muse_files (account, path, directory, filename, content_sha256,
+                                     modified_at, ingested_at)
+            VALUES ('z@x.test', %s, %s, %s, 'sha', %s, %s)
+            """,
+            (path, directory, path.rsplit("/", 1)[-1], _NOW, _NOW),
+        )
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def priority_of(adapter: str, event_id: str) -> str:
+        rows = warehouse._query(
+            "SELECT priority FROM @timeline_events WHERE adapter = %s AND event_id = %s",
+            (adapter, event_id),
+        )
+        assert rows, (adapter, event_id)
+        return rows[0][0]
+
+    assert priority_of("agent_session", "muse|chat") == "self"
+    assert priority_of("agent_session_turn", "muse|chat|1") == "self"
+    assert priority_of("agent_session_turn", "muse|chat|2") == "background"
+    assert priority_of("agent_session", "muse|loop") == "background"
+    assert priority_of("agent_session", "muse|sub") == "background"
+    assert priority_of("muse_file", "z@x.test|workspace/user/receipt.pdf") == "self"
+    assert priority_of("muse_file", "z@x.test|MEMORY.md") == "background"
+
+    # A path the uploader tombstoned leaves the timeline.
+    warehouse._command(
+        "UPDATE @muse_files SET is_deleted = 1, ingested_at = %s WHERE path = 'MEMORY.md'",
+        (_NOW + timedelta(minutes=5),),
+    )
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    assert not warehouse._query(
+        "SELECT 1 FROM @timeline_events WHERE adapter = 'muse_file' AND event_id = 'z@x.test|MEMORY.md'"
+    )

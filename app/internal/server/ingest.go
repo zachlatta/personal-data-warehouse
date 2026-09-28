@@ -438,6 +438,9 @@ func required(q url.Values, key string) (string, error) {
 	return "", fmt.Errorf("missing required field %q", key)
 }
 
+// museFileExtensionRe is the only extension shape allowed into a Muse blob key.
+var museFileExtensionRe = regexp.MustCompile(`^\.[A-Za-z0-9]{1,12}$`)
+
 // ingestArtifacts is the registry of single-object semantic endpoints.
 func ingestArtifacts() []ingestArtifact {
 	batch := func(endpoint, slug, prefix, kind string) ingestArtifact {
@@ -466,6 +469,28 @@ func ingestArtifacts() []ingestArtifact {
 		batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"),
 		batch("/ingest/apple-contacts/batch", "apple_contacts", "apple-contacts/inbox", "apple_contact_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
+		// --- muse: a workspace file whose bytes do not ride inline in a batch
+		{
+			endpoint: "/ingest/muse/file",
+			// The Muse uploader's transcripts and text files travel as
+			// agent-sessions batches, so its binaries share that store (and
+			// Drive folder) rather than needing a folder of their own. Nothing
+			// reads these by kind: base_muse.files carries the pointer.
+			sourceSlug: "agent_sessions",
+			kind:       "muse_file_blob",
+			// Content-addressed: an unchanged file re-sent is the same object.
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				extension := q.Get("extension")
+				if !museFileExtensionRe.MatchString(extension) {
+					extension = ""
+				}
+				return ingestBuildResult{
+					objectKey:     fmt.Sprintf("muse/files/%s/%s%s", sha[:2], sha, strings.ToLower(extension)),
+					contentType:   q.Get("content_type"),
+					appProperties: map[string]string{},
+				}, nil
+			},
+		},
 		{
 			endpoint:   "/ingest/apple-messages/attachment",
 			sourceSlug: "apple_messages",

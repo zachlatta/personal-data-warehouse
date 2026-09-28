@@ -161,3 +161,23 @@ def test_only_the_slack_freshness_stage_lands_slack_on_the_timeline(monkeypatch)
     monkeypatch.setattr(slack_defs, "run_slack_coverage_sync", lambda **_k: [workspace(4)])
     slack_defs.slack_workspace_coverage_sync(build_asset_context())
     assert len(calls) == 1
+
+
+def test_agent_sessions_ingest_lands_muse_files_when_only_workspace_files_changed(monkeypatch) -> None:
+    module = agent_defs
+    monkeypatch.setattr(module, "load_settings", lambda **_k: _Settings(agent_sessions=object()))
+    monkeypatch.setattr(module, "warehouse_from_settings", lambda _s: _FakeWarehouse())
+    monkeypatch.setattr(module, "iter_batch_payloads", lambda **_k: iter(()))
+    monkeypatch.setattr(module, "_agent_sessions_object_store", lambda _s: object())
+    calls = _capture(monkeypatch, module)
+
+    summary = SimpleNamespace(batches_seen=1, events_written=0, files_promoted=1, files_written=2)
+    monkeypatch.setattr(module, "AgentSessionsDriveIngestRunner", _runner_returning(summary))
+    result = module.agent_sessions_drive_ingest(build_asset_context())
+    assert calls == [{"postgres_url": URL, "sources": ["muse"]}]
+    assert result.metadata["muse_files_written"].value == 2
+
+    summary = SimpleNamespace(batches_seen=1, events_written=4, files_promoted=1, files_written=1)
+    monkeypatch.setattr(module, "AgentSessionsDriveIngestRunner", _runner_returning(summary))
+    module.agent_sessions_drive_ingest(build_asset_context())
+    assert calls[-1] == {"postgres_url": URL, "sources": ["agent_sessions", "muse"]}

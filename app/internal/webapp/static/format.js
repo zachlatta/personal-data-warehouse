@@ -62,7 +62,7 @@ const HUES = {
   mutations: "#c46be0", warehouse: "#8b94a1",
   alice_voice_recordings: "#de7eb6", finance: "#6fcf97",
   photos: "#e8a06b",
-  claude_code: "#b78ae8", codex: "#9a8ae8", openclaw: "#8aa6e8", pi: "#7b93df", claude_desktop: "#cf8ae8", chatgpt: "#8ae8c9",
+  claude_code: "#b78ae8", codex: "#9a8ae8", openclaw: "#8aa6e8", pi: "#7b93df", claude_desktop: "#cf8ae8", chatgpt: "#8ae8c9", muse: "#e88ab4",
   agent_sessions: "#b78ae8", agent_session: "#b78ae8",
 };
 export function hue(src) { return HUES[src] || "#8b94a1"; }

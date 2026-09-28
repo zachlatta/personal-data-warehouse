@@ -39,7 +39,7 @@ than paging deeper.
 - `sources` — aliases are accepted: `gmail`/`email`, `slack`, `apple_messages`/`imessages`,
   `whatsapp`, `calendar`, `drive`/`gdrive`, `contacts`, `notes`, `photos`,
   `voice_memos`/`transcripts`, `agent_session`/`agent_sessions`, `finance`, `whoop`,
-  `slack_files`, `mutations`. An unknown token errors with the valid set.
+  `slack_files`, `mutations`, `muse_file`. An unknown token errors with the valid set.
 - `since` — a lower bound on event time (`2026-03-01`). It is also the lever that makes
   a scoped Google Drive search cheap: Drive documents are multi-megabyte and scoring 50
   of them costs seconds.

@@ -644,3 +644,32 @@ func TestIngestAppleNotesBodyAttachmentRevisionKeys(t *testing.T) {
 		t.Fatalf("revision props = %v", r.AppProperties)
 	}
 }
+
+func TestIngestMuseFileIsContentAddressedInTheAgentSessionsStore(t *testing.T) {
+	svc, stores := ingestTestService()
+	blob := []byte("ID3 generated podcast bytes")
+	blobSHA := sha256Hex(blob)
+	target := signedIngestTarget("/ingest/muse/file", blob, url.Values{
+		"extension":    {".mp3"},
+		"content_type": {"audio/mpeg"},
+	})
+	if rec := postIngest(t, svc, target, blob); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["agent_sessions"].lastFile
+	if want := "muse/files/" + blobSHA[:2] + "/" + blobSHA + ".mp3"; put.ObjectKey != want {
+		t.Fatalf("key = %q, want %q", put.ObjectKey, want)
+	}
+	if put.Kind != "muse_file_blob" || put.ContentType != "audio/mpeg" || put.SkipExistingCheck {
+		t.Fatalf("put = %+v", put)
+	}
+
+	// An extension that is not a plain suffix never reaches the object key.
+	target = signedIngestTarget("/ingest/muse/file", blob, url.Values{"extension": {"/../x"}})
+	if rec := postIngest(t, svc, target, blob); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if got := stores["agent_sessions"].lastFile.ObjectKey; got != "muse/files/"+blobSHA[:2]+"/"+blobSHA {
+		t.Fatalf("unsafe extension key = %q", got)
+	}
+}
