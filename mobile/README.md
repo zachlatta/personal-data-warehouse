@@ -55,6 +55,13 @@ components live in `src/components/*-review.tsx`.
   body in the order the server splits it again (editor, signature, quote).
   Save posts to `update-email` and reloads: approval sends what is stored,
   never what is on screen, so an unsaved edit is visibly unsaved.
+  Tap an outgoing attachment to review it without leaving the proposal: images
+  and text display natively, PDFs preview on iOS, and Share / Save opens other
+  formats in an installed app or saves them to Files. Previewing never changes
+  attachment bytes or approves the email. Each viewer uses an isolated temporary
+  directory, deleted when it closes. HTML/SVG attachments are not rendered.
+  This viewer adds native modules and needs a new preview build, not only an OTA
+  update; the mobile workflow detects the fingerprint change and queues it.
 - **Slack mark-read batches** show each speaker's profile picture and open that
   exact message in Slack on a tap, because the answer to "mark this read?" is
   often "let me reply first". Faces identify DM rows; channels keep their glyph.

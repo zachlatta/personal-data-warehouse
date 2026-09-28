@@ -49,7 +49,8 @@
           "color": "#208AEF"
         }
       ],
-      "@bacons/apple-targets"
+      "@bacons/apple-targets",
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": true,
@@ -63,7 +64,7 @@
     },
     "owner": "zlatta",
     "runtimeVersion": {
-      "policy": "appVersion"
+      "policy": "fingerprint"
     },
     "updates": {
       "url": "https://u.expo.dev/c5085048-1a90-4340-a13d-6624522b6589"

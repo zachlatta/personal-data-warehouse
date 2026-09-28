@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
+import { EmailAttachments } from '@/components/email-attachment-preview';
 import { Avatar } from '@/components/avatar';
 import { StatusPill } from '@/components/status-pill';
 import { ThemedText } from '@/components/themed-text';
@@ -203,13 +204,7 @@ export function GmailEmailComposeCard({
         />
         {variant.attachments.length > 0 ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
-            <ThemedText type="smallBold">Attachments ({variant.attachments.length})</ThemedText>
-            {variant.attachments.map((attachment, index) => (
-              <ThemedText key={index} type="small" selectable>
-                {attachment.filename} · {attachment.content_type}
-              </ThemedText>
-            ))}
-            <ThemedText type="small" themeColor="textSecondary">Use the web review to download or change attachments. Email edits here keep these files.</ThemedText>
+            <EmailAttachments key={variant.id} attachments={variant.attachments} />
           </View>
         ) : null}
         {variant.signatureText ? (
