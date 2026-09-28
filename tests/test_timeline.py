@@ -3495,7 +3495,11 @@ def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehous
     muse_line("loop", 1, "assistant", "claims delivered")
     muse_line("sub", 0, "system", "[Subagent Context] You are running as a subagent", sidechain=1)
     muse_line("sub", 1, "assistant", "listing drafted", sidechain=1)
-    for path, directory in (("workspace/user/receipt.pdf", "workspace/user"), ("MEMORY.md", "")):
+    # A realistic workspace: the prune guard refuses to leave fewer than
+    # PRUNE_MIN_KEEP rows standing, so two files alone would never prune.
+    files = [("workspace/user/receipt.pdf", "workspace/user"), ("MEMORY.md", "")]
+    files += [(f"memory/people/p{i}.md", "memory/people") for i in range(60)]
+    for path, directory in files:
         warehouse._command(
             """
             INSERT INTO @muse_files (account, path, directory, filename, content_sha256,
