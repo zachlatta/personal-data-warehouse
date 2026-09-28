@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
@@ -76,8 +76,14 @@ export function SlackSendMessageCard({
   const [text, setText] = useState(review.text);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
-  // A reload after a save (or someone else's edit) is the new baseline.
-  useEffect(() => { setText(review.text); setSaved(false); }, [review.text]);
+  // Reset before painting a new server baseline, rather than rendering stale
+  // text and synchronously setting state from an effect (which blocks OTA lint).
+  const [baseline, setBaseline] = useState(review.text);
+  if (baseline !== review.text) {
+    setBaseline(review.text);
+    setText(review.text);
+    setSaved(false);
+  }
   const dirty = text.trim() !== review.text.trim();
   const save = async () => {
     if (!onSave) return;
