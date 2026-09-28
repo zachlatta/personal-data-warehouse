@@ -49,6 +49,10 @@ finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+# The warehouse-side heartbeat: the Slack change-feed verdict quotes it, so a
+# publisher failing hourly (as it did for eight days from 2026-09-20) is named
+# on /pipelines the moment the feed it keeps alive goes down.
+pdw_post_heartbeat "slack_session_publish" "$finished_at_iso" "$exit_code" "$duration_seconds"
 echo "[$finished_at_iso] finished slack session publish exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

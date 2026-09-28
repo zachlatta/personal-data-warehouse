@@ -213,6 +213,7 @@ class SlackSyncRunner:
         max_transient_attempts: int = 8,
         freshness_window_by_type: Mapping[str, timedelta] | None = None,
         freshness_limit_by_type: Mapping[str, int] | None = None,
+        freshness_warm_window: timedelta | None = None,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
@@ -267,6 +268,10 @@ class SlackSyncRunner:
         # back to history_window / conversation_limit.
         self._freshness_window_by_type = dict(freshness_window_by_type or {})
         self._freshness_limit_by_type = dict(freshness_limit_by_type or {})
+        # The blanket poll's middle tier: conversations whose cursor sits inside
+        # this window are taken after the ones active inside the freshness
+        # window and before everything older. None collapses it into the rest.
+        self._freshness_warm_window = freshness_warm_window
 
     def sync_all(self) -> list[SlackSyncSummary]:
         self._warehouse.ensure_slack_tables()
@@ -844,6 +849,8 @@ class SlackSyncRunner:
         messages_written = 0
         files_written = 0
         conversations_seen = 0
+        # One plan entry per candidate: (conversation, group, window oldest_ts).
+        planned: list[tuple[Mapping[str, object], tuple[str, ...], float]] = []
         for group in priority_groups:
             oldest_ts = self._freshness_oldest_ts(group[0])
             group_limit = self._freshness_limit_by_type.get(group[0], self._conversation_limit)
@@ -861,11 +868,9 @@ class SlackSyncRunner:
             )
             if group_limit is not None:
                 group_conversations = group_conversations[:group_limit]
-            group_written = 0
             for conversation in group_conversations:
                 if not conversation.get("id"):
                     continue
-                cursor_ts = _conversation_cursor_ts(conversation)
                 is_new = str(conversation["id"]) in newly_discovered_ids
                 # A conversation we have only just learned about is exempt from the
                 # activity gate: the gate falls back to the cached `latest.ts` when there
@@ -874,79 +879,154 @@ class SlackSyncRunner:
                 if not is_new and not conversation_may_have_activity_since(
                     conversation,
                     oldest_ts,
-                    cursor_ts=cursor_ts,
+                    cursor_ts=_conversation_cursor_ts(conversation),
                 ):
                     continue
-                # Resume from our own cursor when it predates the freshness window so a
-                # conversation that fell behind (e.g. was skipped while its cached
-                # latest.ts was stale) is caught up in full, not just over the last
-                # window. For healthy conversations the cursor sits inside the window, so
-                # this is the normal window fetch.
-                conversation_oldest_ts = oldest_ts
-                if cursor_ts is not None and 0 < cursor_ts < oldest_ts:
-                    conversation_oldest_ts = cursor_ts
-                elif is_new:
-                    # We hold nothing for it, so the window is not a top-up, it is a
-                    # truncation: one production DM's first message sat eight
-                    # minutes outside the window and waited eight hours for the coverage
-                    # floor walk. Streaming in full is cheap for something this new.
-                    conversation_oldest_ts = None
-                conversations_seen += 1
-                try:
-                    result = self._sync_conversation_messages(
-                        account=account.account,
-                        team_id=team_id,
-                        conversation_id=str(conversation["id"]),
-                        client=client,
-                        synced_at=synced_at,
-                        sync_version=sync_version,
-                        oldest_ts=conversation_oldest_ts,
-                    )
-                except SlackRateLimitBudgetExceeded as exc:
-                    if not self._skip_known_errors:
-                        raise
-                    # The per-runner rate-limit budget is shared, so once it is
-                    # exhausted every remaining conversation in this pass would
-                    # also trip it. Stop gracefully instead of failing the run:
-                    # each conversation persists its history cursor as it goes
-                    # (see _sync_conversation_messages), so the next freshness
-                    # pass resumes from where this one left off.
-                    self._logger.warning(
-                        "Stopping Slack freshness sync for %s after rate limit budget was exhausted at %s: %s",
-                        account.account,
-                        conversation["id"],
-                        exc,
-                    )
-                    return SlackSyncSummary(
-                        account=account.account,
-                        team_id=team_id,
-                        sync_type="freshness_priority",
-                        conversations_seen=conversations_seen,
-                        messages_written=messages_written,
-                        users_written=0,
-                        files_written=files_written,
-                    )
-                except SlackApiCallError as exc:
-                    # A single unreachable channel (deleted/archived/left) must not
-                    # abort the whole freshness window: record it, mark it inactive
-                    # if it is gone for good, and move on to the next conversation.
-                    self._handle_conversation_sync_error(
-                        account=account.account,
-                        team_id=team_id,
-                        conversation_id=str(conversation["id"]),
-                        sync_type="partial",
-                        exc=exc,
-                        synced_at=synced_at,
-                        sync_version=sync_version,
-                    )
-                    continue
-                messages_written += result["messages_written"]
-                files_written += result["files_written"]
-                group_written += result["messages_written"]
+                planned.append((conversation, group, oldest_ts))
+
+        # The blanket poll (no change feed) cannot fetch everything: the shared
+        # rate budget ends it after roughly thirty conversations.history calls.
+        # Walking the types in priority order, each sorted by activity, spent
+        # that budget on the same ~30 most recently active DMs every pass and
+        # never reached a group DM -- from 2026-09-21, while the change feed was
+        # down, 164 of 219 group-DM messages in a week never landed. So a
+        # blanket pass takes candidates in activity tiers (inside the freshness
+        # window, inside the warm window, the rest) and inside a tier by when
+        # we last polled them, across types; every poll is stamped below, so
+        # the next pass starts where this one's budget ran out. A change-feed
+        # pass is already bounded by what moved and keeps the type priority.
+        blanket = self._conversation_ids is None
+        if blanket:
+            now_ts = synced_at.timestamp()
+            warm_floor = (
+                now_ts - self._freshness_warm_window.total_seconds()
+                if self._freshness_warm_window is not None
+                else None
+            )
+            type_rank = {group: index for index, group in enumerate(priority_groups)}
+            epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+            def _tier(conversation: Mapping[str, object], oldest_ts: float) -> int:
+                if str(conversation["id"]) in newly_discovered_ids:
+                    return 0
+                activity = conversation_activity_ts(
+                    conversation, cursor_ts=_conversation_cursor_ts(conversation)
+                )
+                if activity >= oldest_ts:
+                    return 0
+                if warm_floor is not None and activity >= warm_floor:
+                    return 1
+                return 2
+
+            def _last_polled(conversation: Mapping[str, object]) -> float:
+                state = state_by_key.get((account.account, team_id, "conversation", str(conversation["id"])))
+                updated = state.get("updated_at") if isinstance(state, Mapping) else None
+                if not isinstance(updated, datetime) or updated <= epoch:
+                    return float("-inf")
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=UTC)
+                return updated.timestamp()
+
+            planned.sort(
+                key=lambda entry: (
+                    _tier(entry[0], entry[2]),
+                    _last_polled(entry[0]),
+                    type_rank[entry[1]],
+                )
+            )
+
+        written_by_type: dict[str, int] = {}
+        planned_by_type: dict[str, int] = {}
+        for _conversation, group, _oldest in planned:
+            planned_by_type[group[0]] = planned_by_type.get(group[0], 0) + 1
+        for conversation, group, oldest_ts in planned:
+            cursor_ts = _conversation_cursor_ts(conversation)
+            is_new = str(conversation["id"]) in newly_discovered_ids
+            # Resume from our own cursor when it predates the freshness window so a
+            # conversation that fell behind (e.g. was skipped while its cached
+            # latest.ts was stale) is caught up in full, not just over the last
+            # window. For healthy conversations the cursor sits inside the window, so
+            # this is the normal window fetch.
+            conversation_oldest_ts: float | None = oldest_ts
+            if cursor_ts is not None and 0 < cursor_ts < oldest_ts:
+                conversation_oldest_ts = cursor_ts
+            elif is_new:
+                # We hold nothing for it, so the window is not a top-up, it is a
+                # truncation: one production DM's first message sat eight
+                # minutes outside the window and waited eight hours for the coverage
+                # floor walk. Streaming in full is cheap for something this new.
+                conversation_oldest_ts = None
+            conversations_seen += 1
+            try:
+                result = self._sync_conversation_messages(
+                    account=account.account,
+                    team_id=team_id,
+                    conversation_id=str(conversation["id"]),
+                    client=client,
+                    synced_at=synced_at,
+                    sync_version=sync_version,
+                    oldest_ts=conversation_oldest_ts,
+                )
+            except SlackRateLimitBudgetExceeded as exc:
+                if not self._skip_known_errors:
+                    raise
+                # The per-runner rate-limit budget is shared, so once it is
+                # exhausted every remaining conversation in this pass would
+                # also trip it. Stop gracefully instead of failing the run:
+                # each conversation persists its history cursor as it goes
+                # (see _sync_conversation_messages), so the next freshness
+                # pass resumes from where this one left off.
+                self._logger.warning(
+                    "Stopping Slack freshness sync for %s after rate limit budget was exhausted at %s "
+                    "(%s of %s candidates polled): %s",
+                    account.account,
+                    conversation["id"],
+                    conversations_seen - 1,
+                    len(planned),
+                    exc,
+                )
+                return SlackSyncSummary(
+                    account=account.account,
+                    team_id=team_id,
+                    sync_type="freshness_priority",
+                    conversations_seen=conversations_seen,
+                    messages_written=messages_written,
+                    users_written=0,
+                    files_written=files_written,
+                )
+            except SlackApiCallError as exc:
+                # A single unreachable channel (deleted/archived/left) must not
+                # abort the whole freshness window: record it, mark it inactive
+                # if it is gone for good, and move on to the next conversation.
+                self._handle_conversation_sync_error(
+                    account=account.account,
+                    team_id=team_id,
+                    conversation_id=str(conversation["id"]),
+                    sync_type="partial",
+                    exc=exc,
+                    synced_at=synced_at,
+                    sync_version=sync_version,
+                )
+                continue
+            if blanket:
+                # A poll that found nothing writes no cursor, and the rotation
+                # above orders by the last poll: without this stamp a quiet
+                # conversation would be first in line on every pass.
+                self._warehouse.touch_slack_conversation_sync_state(
+                    account=account.account,
+                    team_id=team_id,
+                    conversation_id=str(conversation["id"]),
+                    updated_at=synced_at,
+                    sync_version=sync_version,
+                )
+            messages_written += result["messages_written"]
+            files_written += result["files_written"]
+            written_by_type[group[0]] = written_by_type.get(group[0], 0) + result["messages_written"]
+        for group in priority_groups:
             self._logger.info(
                 "Freshness synced %s Slack messages from %s %s conversations for %s",
-                group_written,
-                len(group_conversations),
+                written_by_type.get(group[0], 0),
+                planned_by_type.get(group[0], 0),
                 ",".join(group),
                 account.account,
             )

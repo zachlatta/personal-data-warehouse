@@ -434,3 +434,128 @@ def test_a_warehouse_with_no_conversations_yet_polls_rather_than_trusting_the_fe
     )
 
     assert plan.usable is False
+
+
+class _VerdictWarehouse(_Warehouse):
+    """Holds ops.slack_sync_state rows the way the verdict recorder uses them."""
+
+    def __init__(self, session=None):
+        super().__init__(session=session)
+        self.rows: dict[tuple[str, str, str, str], dict] = {}
+
+    def load_slack_sync_state_by_type(self, object_type):
+        return {key: dict(row) for key, row in self.rows.items() if key[2] == object_type}
+
+    def insert_slack_sync_state(self, **row):
+        self.rows[(row["account"], row["team_id"], row["object_type"], row["object_id"])] = row
+
+    def verdict(self):
+        return self.rows[("zrl", "", "change_feed", "client.counts")]
+
+    heartbeats: list = []
+
+    def load_uploader_heartbeats(self, *, pipeline):
+        return [row for row in self.heartbeats if row["pipeline"] == pipeline]
+
+
+def test_an_unusable_change_feed_becomes_a_credential_verdict_after_an_hour():
+    """A week of fallback polling must not be invisible again.
+
+    From 2026-09-21 every freshness pass logged "change feed unusable" -- the
+    published session belonged to another workspace -- and fell back to the
+    blanket poll, which never reached a group DM. The session row still read
+    `ok`, the Slack pipeline read `ok`, and 164 of 219 group-DM messages in a
+    week never landed. The verdict now lives in ops.slack_sync_state, whose
+    `action_required` rows the Slack pipeline row reads as `attention` with the
+    reason. One bad pass is not an incident (the 2026-09-02 sibling-workspace
+    blips cleared on their own), so it takes an hour of continuous failure.
+    """
+    from datetime import timedelta
+
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    warehouse = _VerdictWarehouse(
+        session={
+            "team_url": "https://example-other.slack.com/",
+            "published_at": datetime(2026, 9, 23, 19, 31, tzinfo=UTC),
+        }
+    )
+    # The Mac's hourly publisher posts a heartbeat; its failure is the cause,
+    # so the verdict quotes it where the alert is read.
+    warehouse.heartbeats = [
+        {
+            "pipeline": slack_defs.SLACK_SESSION_PUBLISHER_PIPELINE,
+            "device": "crobat",
+            "ran_at": datetime(2026, 9, 21, 11, 52, tzinfo=UTC),
+            "status": "error",
+            "exit_code": 1,
+            "error": "exit code 1",
+        }
+    ]
+    start = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+    bad = slack_defs.SlackChangePlan(
+        usable=False,
+        reason="client.counts named 17 conversations and we hold 0 of them; the feed is not describing this workspace",
+    )
+
+    slack_defs.record_slack_change_feed_verdict(warehouse=warehouse, account="zrl", plan=bad, now=start)
+    first = warehouse.verdict()
+    assert first["status"] == "degraded"  # neither error nor attention yet
+    assert float(first["cursor_ts"]) == pytest.approx(start.timestamp())
+
+    later = start + timedelta(minutes=65)
+    slack_defs.record_slack_change_feed_verdict(warehouse=warehouse, account="zrl", plan=bad, now=later)
+    row = warehouse.verdict()
+    assert row["status"] == "action_required"
+    assert float(row["cursor_ts"]) == pytest.approx(start.timestamp())  # since stays put
+    assert row["updated_at"] == later
+    for needle in (
+        "2026-09-21T12:00", "we hold 0", "example-other.slack.com", "pdw slack publish-session",
+        "crobat", "exit 1",
+    ):
+        assert needle in row["error"], needle
+
+    slack_defs.record_slack_change_feed_verdict(
+        warehouse=warehouse,
+        account="zrl",
+        plan=slack_defs.SlackChangePlan(usable=True, changed_conversation_ids=()),
+        now=later + timedelta(minutes=5),
+    )
+    healed = warehouse.verdict()
+    assert (healed["status"], healed["error"], healed["cursor_ts"]) == ("ok", "", "")
+
+
+def test_a_disabled_change_feed_records_no_verdict():
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    warehouse = _VerdictWarehouse()
+    slack_defs.record_slack_change_feed_verdict(
+        warehouse=warehouse,
+        account="zrl",
+        plan=slack_defs.SlackChangePlan(usable=False, reason="change feed disabled"),
+        now=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+    assert warehouse.rows == {}
+
+
+def test_the_freshness_pass_records_the_feed_verdict(monkeypatch):
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            pass
+
+        def sync_all(self):
+            return []
+
+    monkeypatch.setattr(
+        slack_defs,
+        "slack_change_plan",
+        lambda **_: slack_defs.SlackChangePlan(usable=False, reason="invalid_auth"),
+    )
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", _Runner)
+    monkeypatch.setenv("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", "0")
+    warehouse = _VerdictWarehouse()
+    slack_defs.run_slack_freshness_sync(settings=_settings(monkeypatch), warehouse=warehouse, logger=NullLog())
+    assert warehouse.verdict()["status"] == "degraded"
+    assert "invalid_auth" in warehouse.verdict()["error"]

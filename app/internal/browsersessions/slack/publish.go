@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -131,7 +132,7 @@ type Publisher func(ingestclient.SlackSession) (map[string]any, error)
 
 // Deps are the seams Run wires to the real machine; tests inject fakes.
 type Deps struct {
-	Discover       func(source string) (Session, error)
+	Discover       func(source string) ([]Session, error)
 	Probe          func(Session) map[string]any
 	Workspaces     WorkspaceLookup
 	KnownWorkspace KnownWorkspaceLookup
@@ -142,7 +143,7 @@ func defaultDeps(getenv func(string) string, cfg ingestclient.Config, stderr io.
 	host := chromium.DefaultHost()
 	client := NewClient()
 	return Deps{
-		Discover:       func(source string) (Session, error) { return Discover(host, source, client.AuthTest) },
+		Discover:       func(source string) ([]Session, error) { return Discover(host, source, client.AuthTest) },
 		Probe:          client.ProbeClientCounts,
 		Workspaces:     WorkspaceIDsForEnterprise(cfg, getenv("PDW_CLIENT_NAME")),
 		KnownWorkspace: WorkspaceIsKnown(cfg, getenv("PDW_CLIENT_NAME")),
@@ -200,7 +201,7 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 	report := map[string]any{"published": false}
 	emit := func() { printJSON(stdout, report) }
 
-	session, err := deps.Discover(*source)
+	sessions, err := deps.Discover(*source)
 	if err != nil {
 		report = map[string]any{"error": err.Error()}
 		if strings.Contains(err.Error(), "timed out") {
@@ -212,52 +213,32 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 		emit()
 		return 1
 	}
-	report["session"] = session.Redacted()
 
-	probe := deps.Probe(session)
-	report["client_counts"] = probe
-	if ok, _ := probe["ok"].(bool); !ok {
-		// A session that cannot answer "what changed" is useless for the sync.
-		report["error"] = "client.counts failed; not publishing"
+	chosen, resolvedTeam, candidates, code, reason := selectSession(sessions, *teamID, deps)
+	report["candidates"] = candidates
+	if code != 0 {
+		// Keep the single-session report shape the status helper reads.
+		if len(candidates) == 1 {
+			for k, v := range candidates[0] {
+				if k != "skipped" {
+					report[k] = v
+				}
+			}
+		}
+		report["error"] = reason
 		emit()
-		return 2
+		return code
 	}
+	report["session"] = chosen.session.Redacted()
+	report["client_counts"] = chosen.probe
+	if chosen.known != nil {
+		report["known_workspace"] = *chosen.known
+	}
+	report["team_id"] = resolvedTeam
+	session := chosen.session
 	if *dryRun {
 		emit()
 		return 0
-	}
-
-	resolvedTeam := *teamID
-	if resolvedTeam == "" {
-		resolvedTeam, err = ResolveTeamID(session.TeamID, session.EnterpriseID, deps.Workspaces)
-		if err != nil {
-			report["error"] = err.Error()
-			emit()
-			return 3
-		}
-		// A workspace the warehouse has never synced is the wrong workspace:
-		// the desktop app is signed into something else, and a session for it
-		// stored under this account would make every Slack write refuse its
-		// target while the credential row reads healthy. --team-id is the
-		// deliberate override.
-		if deps.KnownWorkspace != nil {
-			known, err := deps.KnownWorkspace(resolvedTeam)
-			if err != nil {
-				report["error"] = err.Error()
-				emit()
-				return 3
-			}
-			report["known_workspace"] = known
-			if !known {
-				report["error"] = fmt.Sprintf(
-					"the captured session belongs to workspace %s (%s), which the warehouse has never synced under any account; "+
-						"the Slack desktop app is signed into the wrong workspace -- sign in to the workspace the warehouse syncs and rerun, "+
-						"or pass --team-id %s to publish it anyway",
-					resolvedTeam, session.TeamURL, resolvedTeam)
-				emit()
-				return 3
-			}
-		}
 	}
 	resolvedAccount := ResolveAccount(*account, getenv)
 	publish, err := deps.Publisher()
@@ -289,10 +270,115 @@ func RunWith(args []string, stdout, stderr io.Writer, getenv func(string) string
 	}
 	report["published"] = true
 	report["account"] = resolvedAccount
-	report["team_id"] = resolvedTeam
 	report["acknowledgement"] = ack
 	emit()
 	return 0
+}
+
+type candidate struct {
+	session Session
+	probe   map[string]any
+	known   *bool
+}
+
+// selectSession picks the session to publish from everything the desktop app
+// holds. Workspace-scoped sessions are tried before org (Enterprise Grid)
+// ones: an org session's client.counts can answer about a sibling workspace,
+// which is the shape that took the change feed down on 2026-08-28 and again
+// in September. Each candidate must answer client.counts, resolve to one
+// workspace, and be a workspace the warehouse syncs (unless --team-id names
+// it). The report lists every candidate and why it was passed over.
+func selectSession(sessions []Session, explicitTeam string, deps Deps) (candidate, string, []map[string]any, int, string) {
+	ordered := make([]Session, 0, len(sessions))
+	for _, s := range sessions {
+		if s.TeamID != "" {
+			ordered = append(ordered, s)
+		}
+	}
+	for _, s := range sessions {
+		if s.TeamID == "" {
+			ordered = append(ordered, s)
+		}
+	}
+	if explicitTeam != "" {
+		// The deliberate override: the session for that workspace first, then
+		// an org session (which resolves to it), then anything else.
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return ordered[i].TeamID == explicitTeam && ordered[j].TeamID != explicitTeam
+		})
+	}
+	var reports []map[string]any
+	var reasons []string
+	worst := 0
+	skip := func(entry map[string]any, code int, reason string) {
+		entry["skipped"] = reason
+		reasons = append(reasons, reason)
+		if code > worst {
+			worst = code
+		}
+	}
+	notTried := func(from int) {
+		for _, rest := range ordered[from:] {
+			reports = append(reports, map[string]any{"session": rest.Redacted(), "not_tried": true})
+		}
+	}
+	for i, s := range ordered {
+		entry := map[string]any{"session": s.Redacted()}
+		reports = append(reports, entry)
+		probe := deps.Probe(s)
+		entry["client_counts"] = probe
+		if ok, _ := probe["ok"].(bool); !ok {
+			// A session that cannot answer "what changed" is useless for the sync.
+			skip(entry, 2, "client.counts failed; not publishing")
+			continue
+		}
+		c := candidate{session: s, probe: probe}
+		if explicitTeam != "" {
+			if s.TeamID != "" && s.TeamID != explicitTeam && len(ordered) > 1 {
+				skip(entry, 3, fmt.Sprintf("session is for workspace %s, not --team-id %s", s.TeamID, explicitTeam))
+				continue
+			}
+			entry["team_id"] = explicitTeam
+			entry["chosen"] = true
+			notTried(i + 1)
+			return c, explicitTeam, reports, 0, ""
+		}
+		resolved, err := ResolveTeamID(s.TeamID, s.EnterpriseID, deps.Workspaces)
+		if err != nil {
+			skip(entry, 3, err.Error())
+			continue
+		}
+		entry["team_id"] = resolved
+		if deps.KnownWorkspace != nil {
+			known, err := deps.KnownWorkspace(resolved)
+			if err != nil {
+				skip(entry, 3, err.Error())
+				continue
+			}
+			entry["known_workspace"] = known
+			c.known = &known
+			if !known {
+				// A workspace the warehouse has never synced is the wrong
+				// workspace: a session for it stored under this account would
+				// make every Slack write refuse its target while the credential
+				// row reads healthy.
+				skip(entry, 3, fmt.Sprintf(
+					"the captured session belongs to workspace %s (%s), which the warehouse has never synced under any account; "+
+						"the Slack desktop app is signed into the wrong workspace -- sign in to the workspace the warehouse syncs and rerun, "+
+						"or pass --team-id %s to publish it anyway",
+					resolved, s.TeamURL, resolved))
+				continue
+			}
+		}
+		entry["chosen"] = true
+		notTried(i + 1)
+		return c, resolved, reports, 0, ""
+	}
+	if worst == 0 {
+		worst = 1
+		reasons = append(reasons, "no Slack session found")
+	}
+	return candidate{}, "", reports, worst, strings.Join(reasons, "; ")
 }
 
 func printJSON(w io.Writer, v any) {

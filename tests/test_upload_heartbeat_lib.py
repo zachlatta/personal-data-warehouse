@@ -320,3 +320,13 @@ def test_every_heartbeat_posting_wrapper_can_resolve_credentials():
         if "_pdw-upload-lib.sh" not in text:
             missing.append(path.name)
     assert missing == [], f"these wrappers post a heartbeat without sourcing the lib: {missing}"
+
+
+def test_the_slack_session_publisher_posts_a_heartbeat():
+    """The hourly `pdw slack publish-session` agent failed ~every hour for eight
+    days from 2026-09-20 into a log nobody read. Its heartbeat is what the
+    Slack change-feed verdict quotes as the cause when the feed goes down."""
+    from personal_data_warehouse.defs.slack_sync import SLACK_SESSION_PUBLISHER_PIPELINE
+
+    text = (LIB.parent / "slack-auth-launchd").read_text()
+    assert f'pdw_post_heartbeat "{SLACK_SESSION_PUBLISHER_PIPELINE}"' in text

@@ -3739,3 +3739,145 @@ def test_runner_freshness_applies_window_and_limit_per_conversation_type(monkeyp
     assert history_calls[0]["oldest"] == 1400.0
     assert history_calls[1]["oldest"] == 1940.0
     assert summary.messages_written == 2
+
+
+def test_blanket_freshness_rotates_types_by_last_poll_and_reaches_quiet_group_dms(monkeypatch):
+    """Without the change feed, every conversation type must get a turn.
+
+    From 2026-09-21 the change feed was unusable (a session for the wrong
+    workspace) and every five-minute pass fell back to the blanket poll. That
+    poll walked im, then mpim, then channels, each sorted by activity, and the
+    shared rate budget ran out ~30 IMs in -- the same 30 every run. Measured
+    2026-09-28 against Slack: 164 of 219 group-DM messages from the previous
+    week were not in the warehouse, several group DMs untouched since 09-17.
+
+    So the blanket poll takes candidates in tiers -- active inside the
+    freshness window, then inside the warm window, then the rest -- and inside
+    each tier by when we last polled them, across types, and stamps every poll
+    so the rotation advances even when nothing new arrived.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+
+    def state(conversation_id, cursor, polled_minutes_ago):
+        return {
+            "account": "zrl",
+            "team_id": "T1",
+            "object_type": "conversation",
+            "object_id": conversation_id,
+            "cursor_ts": f"{cursor:.6f}",
+            "last_sync_type": "partial",
+            "status": "ok",
+            "error": "",
+            "updated_at": now - timedelta(minutes=polled_minutes_ago),
+        }
+
+    hot = 1_790_000_000 - 60  # a minute ago: inside the four-hour window
+    warm = 1_790_000_000 - 3 * 86_400  # three days ago: outside the window, inside the warm one
+    cold = 1_790_000_000 - 60 * 86_400
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "D_RECENT"): state("D_RECENT", hot, 1),
+            ("zrl", "T1", "conversation", "D_WAITING"): state("D_WAITING", hot, 10),
+            ("zrl", "T1", "conversation", "G_QUIET"): state("G_QUIET", warm, 3 * 1440),
+            ("zrl", "T1", "conversation", "D_COLD"): state("D_COLD", cold, 50 * 1440),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "D_RECENT", "user": "U1", "is_im": True},
+        {"id": "D_WAITING", "user": "U2", "is_im": True},
+        {"id": "G_HOT", "name": "mpdm-a--b-1", "is_mpim": True, "latest": {"ts": f"{hot:.6f}"}},
+        {"id": "G_QUIET", "name": "mpdm-c--d-1", "is_mpim": True},
+        {"id": "D_COLD", "user": "U3", "is_im": True},
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [
+                empty,
+                empty,
+                empty,
+                {"ok": True, "messages": [{"ts": f"{warm + 60:.6f}", "user": "U9", "text": "hi"}], "response_metadata": {}},
+                empty,
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: now,
+        history_window=timedelta(hours=4),
+        freshness_warm_window=timedelta(days=14),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    history = [params for method, params in client.calls if method == "conversations.history"]
+    # Never polled first, then the longest-waiting; types interleave; then
+    # warm, then cold.
+    assert [params["channel"] for params in history] == ["G_HOT", "D_WAITING", "D_RECENT", "G_QUIET", "D_COLD"]
+    # The quiet group DM is read from its own cursor, not from the window.
+    assert float(history[3]["oldest"]) == pytest.approx(warm)
+    assert [m["conversation_id"] for m in warehouse.messages] == ["G_QUIET"]
+    # Every poll is stamped, so the next pass starts somewhere else.
+    assert {touch["conversation_id"] for touch in warehouse.conversation_touches} == {
+        "G_HOT", "D_WAITING", "D_RECENT", "G_QUIET", "D_COLD"
+    }
+
+
+def test_change_feed_freshness_keeps_type_priority(monkeypatch):
+    # With a usable feed the runner is handed exactly what moved and fetches
+    # all of it; the last-polled rotation is a blanket-poll repair and must not
+    # reorder that pass (DMs stay first).
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "G_QUIET"): {
+                "account": "zrl", "team_id": "T1", "object_type": "conversation", "object_id": "G_QUIET",
+                "cursor_ts": f"{1_790_000_000 - 3 * 86_400:.6f}", "last_sync_type": "partial", "status": "ok",
+                "error": "", "updated_at": now - timedelta(days=3),
+            },
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "D_MOVED", "user": "U1", "is_im": True, "latest": {"ts": f"{1_790_000_000 - 30:.6f}"}},
+        {"id": "G_QUIET", "name": "mpdm-c--d-1", "is_mpim": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [{"ok": True, "messages": [], "response_metadata": {}}] * 2,
+        }
+    )
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: now,
+        history_window=timedelta(hours=4),
+        freshness_warm_window=timedelta(days=14),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        sync_thread_replies=False,
+        conversation_ids=("D_MOVED", "G_QUIET"),
+        sleep=lambda seconds: None,
+    ).sync_all()
+    assert [p["channel"] for m, p in client.calls if m == "conversations.history"] == ["D_MOVED", "G_QUIET"]

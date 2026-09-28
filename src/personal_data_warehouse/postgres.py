@@ -9487,6 +9487,14 @@ class PostgresWarehouse:
             return {}
         return dict(zip(columns, rows[0], strict=True))
 
+    def load_uploader_heartbeats(self, *, pipeline: str) -> list[dict[str, Any]]:
+        """Every device's latest heartbeat for one pipeline, newest first."""
+        return self._query_dicts(
+            "SELECT pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at "
+            "FROM @uploader_heartbeats WHERE pipeline = %s ORDER BY ran_at DESC",
+            (pipeline,),
+        )
+
     def load_slack_mark_read_target(
         self,
         *,
@@ -11993,6 +12001,15 @@ class PostgresWarehouse:
                   AND e.event_ts >= now() - interval '24 hours'
                 GROUP BY c.account, c.team_id, c.conversation_type
             ),
+            feed AS (
+                -- The change feed's own verdict (defs/slack_sync.py,
+                -- record_slack_change_feed_verdict): one row per account.
+                SELECT DISTINCT ON (f.account)
+                    f.account, f.status, f.error, f.updated_at
+                FROM @slack_sync_state AS f
+                WHERE f.object_type = 'change_feed' AND f.object_id = 'client.counts'
+                ORDER BY f.account, f.updated_at DESC
+            ),
             judged AS (
                 SELECT
                     p.*,
@@ -12078,6 +12095,13 @@ class PostgresWarehouse:
                       OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.75)
                       OR p.landing_status = 'stale'
+                      -- The three types history_cycle_seconds leaves unjudged
+                      -- are unjudged BECAUSE the change feed says what moved.
+                      -- With the feed down for an hour that premise is false:
+                      -- from 2026-09-21 these rows read ok for a week while
+                      -- 164 of 219 group-DM messages never landed.
+                      OR (p.history_cycle_seconds IS NULL
+                          AND fv.status = 'action_required')
                         THEN 'stale'
                     WHEN p.refreshed_count::numeric / p.live_count < 0.95
                       OR (p.history_cycle_seconds IS NOT NULL
@@ -12085,8 +12109,12 @@ class PostgresWarehouse:
                       OR p.landing_status = 'late'
                         THEN 'late'
                     ELSE 'ok'
-                END AS status
+                END AS status,
+                COALESCE(fv.status, 'unknown') AS change_feed_status,
+                COALESCE(fv.error, '') AS change_feed_error,
+                fv.updated_at AS change_feed_checked_at
             FROM judged AS p
+            LEFT JOIN feed AS fv ON fv.account = p.account
             LEFT JOIN @slack_sync_state AS st
                    ON st.account = p.account
                   AND st.team_id = p.team_id

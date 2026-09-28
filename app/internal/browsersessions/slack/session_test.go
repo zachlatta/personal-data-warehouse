@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/util"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium/chromiumtest"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/slack"
@@ -85,10 +87,14 @@ func TestCapturePicksTheTokenSlackAccepts(t *testing.T) {
 		return map[string]any{"ok": false, "error": "invalid_auth"}
 	}
 	expires := time.Date(2027, 9, 28, 0, 0, 0, 0, time.UTC)
-	s, err := slack.Capture(root, map[string]string{"d": "xoxd-cookievalue"}, expires, "slack-app", authTest)
+	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd-cookievalue"}, expires, "slack-app", authTest)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %+v", sessions)
+	}
+	s := sessions[0]
 	if s.Token != "xoxc-livetoken2222" || s.TeamID != "T0266FRGM" || s.UserID != "U09UE480JHH" || s.EnterpriseID != "" {
 		t.Fatalf("session = %+v", s)
 	}
@@ -103,17 +109,17 @@ func TestCapturePicksTheTokenSlackAccepts(t *testing.T) {
 func TestCaptureFailures(t *testing.T) {
 	root := t.TempDir()
 	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-deadtoken1111")})
-	_, err := slack.Capture(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
+	_, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
 		func(string, string) map[string]any { return map[string]any{"ok": false, "error": "invalid_auth"} })
 	if err == nil || !strings.Contains(err.Error(), "no working") || !strings.Contains(err.Error(), "invalid_auth") {
 		t.Fatalf("err = %v", err)
 	}
-	_, err = slack.Capture(root, map[string]string{"b": "not-the-session"}, time.Time{}, "slack-app",
+	_, err = slack.CaptureAll(root, map[string]string{"b": "not-the-session"}, time.Time{}, "slack-app",
 		func(string, string) map[string]any { return map[string]any{"ok": true} })
 	if err == nil || !strings.Contains(err.Error(), "`d` session cookie") {
 		t.Fatalf("err = %v", err)
 	}
-	_, err = slack.Capture(t.TempDir(), map[string]string{"d": "x"}, time.Time{}, "slack-app",
+	_, err = slack.CaptureAll(t.TempDir(), map[string]string{"d": "x"}, time.Time{}, "slack-app",
 		func(string, string) map[string]any { return map[string]any{"ok": true} })
 	if err == nil || !strings.Contains(err.Error(), "no xoxc- token") {
 		t.Fatalf("err = %v", err)
@@ -123,13 +129,14 @@ func TestCaptureFailures(t *testing.T) {
 func TestCaptureDoesNotPassOffAnEnterpriseIDAsATeamID(t *testing.T) {
 	root := t.TempDir()
 	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-enterprisetok1")})
-	s, err := slack.Capture(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
+	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
 		func(string, string) map[string]any {
 			return map[string]any{"ok": true, "team_id": "E09V59WQY1E", "user_id": "U1", "url": "https://hackclub.enterprise.slack.com/"}
 		})
 	if err != nil {
 		t.Fatal(err)
 	}
+	s := sessions[0]
 	if s.EnterpriseID != "E09V59WQY1E" || s.TeamID != "" {
 		t.Fatalf("an enterprise id must never be stored as a team id: %+v", s)
 	}
@@ -206,7 +213,7 @@ func TestDiscoverReadsTheSlackAppStore(t *testing.T) {
 		}
 		return "slack-pw", nil
 	}}
-	s, err := slack.Discover(host, "", func(token, cookie string) map[string]any {
+	sessions, err := slack.Discover(host, "", func(token, cookie string) map[string]any {
 		if token != "xoxc-apptoken1234" || cookie != "d=xoxd-live" {
 			t.Fatalf("token=%q cookie=%q", token, cookie)
 		}
@@ -215,7 +222,8 @@ func TestDiscoverReadsTheSlackAppStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Source != "slack-app" || s.CookieExpiresAt.IsZero() || s.CookieD != "xoxd-live" {
+	s := sessions[0]
+	if len(sessions) != 1 || s.Source != "slack-app" || s.CookieExpiresAt.IsZero() || s.CookieD != "xoxd-live" {
 		t.Fatalf("session = %+v", s)
 	}
 	if _, err := slack.Discover(host, "netscape", nil); err == nil || !strings.Contains(err.Error(), "unknown Slack session source") {
@@ -224,5 +232,82 @@ func TestDiscoverReadsTheSlackAppStore(t *testing.T) {
 	host.ApplicationSupport = t.TempDir()
 	if _, err := slack.Discover(host, "", nil); err == nil || !strings.Contains(err.Error(), "no slack.com `d` cookie") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// writeRealLevelDB writes a real (Snappy-compressed) LevelDB the way Chromium
+// keeps localStorage, and compacts it so the values live in .ldb tables.
+func writeRealLevelDB(t *testing.T, root string, key string, value []byte) {
+	t.Helper()
+	store := filepath.Join(root, "Local Storage", "leveldb")
+	db, err := leveldb.OpenFile(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte(key), value, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CompactRange(util.Range{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The 2026-09-20 shape: Slack kept three signed-in workspaces in one
+// localConfig_v2 value; after compaction Snappy encoded the second and third
+// tokens as back-references into the first (they share the user/team prefix),
+// so a raw byte scan found one token while the database held three.
+func TestScanReadsTokensSnappyHidFromARawByteScan(t *testing.T) {
+	root := t.TempDir()
+	shared := "2210535565-1234567890123-"
+	first := "xoxc-" + shared + "1111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	second := "xoxc-" + shared + "1111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+	value := append([]byte{0}, utf16le(`{"teams":{"T1":{"token":"`+first+`"},"T2":{"token":"`+second+`"}}}`)...)
+	writeRealLevelDB(t, root, "_https://app.slack.com\x00\x01localConfig_v2", value)
+
+	store := filepath.Join(root, "Local Storage", "leveldb")
+	raw := ""
+	entries, _ := os.ReadDir(store)
+	for _, e := range entries {
+		b, _ := os.ReadFile(filepath.Join(store, e.Name()))
+		raw += string(b)
+	}
+	if strings.Contains(raw, string(utf16le(second))) {
+		t.Fatal("test precondition: the second token should not survive compression verbatim")
+	}
+	got := slack.ScanLocalStorageForTokens(root)
+	have := map[string]bool{}
+	for _, tok := range got {
+		have[tok] = true
+	}
+	if !have[first] || !have[second] {
+		t.Fatalf("tokens the database holds were missed: got %v", got)
+	}
+}
+
+func TestCaptureAllReturnsEveryAcceptedSession(t *testing.T) {
+	root := t.TempDir()
+	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-otherworkspace1 xoxc-hackclubtoken22 xoxc-deadtoken333")})
+	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
+		func(token, _ string) map[string]any {
+			switch token {
+			case "xoxc-otherworkspace1":
+				return map[string]any{"ok": true, "team_id": "T0A4T3P6VUG", "user_id": "U2", "url": "https://other.slack.com/"}
+			case "xoxc-hackclubtoken22":
+				return map[string]any{"ok": true, "team_id": "T0266FRGM", "user_id": "U1", "url": "https://hackclub.slack.com/"}
+			}
+			return map[string]any{"ok": false, "error": "invalid_auth"}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	teams := []string{}
+	for _, s := range sessions {
+		teams = append(teams, s.TeamID)
+	}
+	if strings.Join(teams, ",") != "T0266FRGM,T0A4T3P6VUG" {
+		t.Fatalf("teams = %v", teams)
 	}
 }

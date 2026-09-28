@@ -25,6 +25,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium"
 )
 
@@ -137,15 +139,45 @@ func decodeUTF16LE(data []byte) string {
 }
 
 // ScanLocalStorageForTokens returns every xoxc- token in a Chromium
-// localStorage tree, newest file first. Slack rewrites localConfig_v2 on each
-// sign-in, so stale tokens from previous logins stay behind in older .ldb
-// files; this only ORDERS candidates by mtime, and the caller decides by
-// asking Slack.
+// localStorage tree: the live database's values first, then anything a raw
+// byte scan of the files turns up, newest file first.
+//
+// The database read is the one that matters. LevelDB compresses its tables
+// with Snappy, and Slack keeps every signed-in workspace's token in ONE
+// localConfig_v2 value, so after a compaction the second and later tokens --
+// which share the user/team prefix with the first -- are stored as
+// back-references and never appear verbatim on disk. From 2026-09-20 a raw
+// scan on crobat found two of the three tokens the database held, both
+// useless (one signed out, one another workspace's), while the two working
+// Hack Club tokens sat unread; the change feed was down for a week behind it.
+// The raw scan is kept because stale tokens from previous logins stay behind
+// in older files the live database no longer points at. This only ORDERS
+// candidates; the caller decides by asking Slack.
 func ScanLocalStorageForTokens(storeRoot string) []string {
-	leveldb := filepath.Join(storeRoot, "Local Storage", "leveldb")
-	entries, err := os.ReadDir(leveldb)
+	leveldbDir := filepath.Join(storeRoot, "Local Storage", "leveldb")
+	var ordered []string
+	seen := map[string]bool{}
+	add := func(found map[string]bool) {
+		tokens := make([]string, 0, len(found))
+		for tok := range found {
+			tokens = append(tokens, tok)
+		}
+		sort.Strings(tokens)
+		for _, tok := range tokens {
+			if !seen[tok] {
+				seen[tok] = true
+				ordered = append(ordered, tok)
+			}
+		}
+	}
+	add(scanLevelDBValues(leveldbDir))
+
+	entries, err := os.ReadDir(leveldbDir)
 	if err != nil {
-		return nil
+		if len(ordered) == 0 {
+			return nil
+		}
+		return ordered
 	}
 	type file struct {
 		path  string
@@ -160,11 +192,9 @@ func ScanLocalStorageForTokens(storeRoot string) []string {
 		if err != nil {
 			continue
 		}
-		files = append(files, file{filepath.Join(leveldb, e.Name()), info.ModTime()})
+		files = append(files, file{filepath.Join(leveldbDir, e.Name()), info.ModTime()})
 	}
 	sort.SliceStable(files, func(i, j int) bool { return files[i].mtime.After(files[j].mtime) })
-	var ordered []string
-	seen := map[string]bool{}
 	for _, f := range files {
 		data, err := os.ReadFile(f.path)
 		if err != nil {
@@ -172,37 +202,75 @@ func ScanLocalStorageForTokens(storeRoot string) []string {
 		}
 		found := map[string]bool{}
 		scanBytes(data, found)
-		tokens := make([]string, 0, len(found))
-		for tok := range found {
-			tokens = append(tokens, tok)
-		}
-		sort.Strings(tokens)
-		for _, tok := range tokens {
-			if !seen[tok] {
-				seen[tok] = true
-				ordered = append(ordered, tok)
-			}
-		}
+		add(found)
+	}
+	if len(ordered) == 0 {
+		return nil
 	}
 	return ordered
+}
+
+// scanLevelDBValues opens a COPY of the database read-only (the running Slack
+// app holds the LOCK on the original, and nothing here may ever write to it)
+// and scans every current value. A database that cannot be opened yields
+// nothing and the raw scan still runs.
+func scanLevelDBValues(leveldbDir string) map[string]bool {
+	found := map[string]bool{}
+	entries, err := os.ReadDir(leveldbDir)
+	if err != nil || len(entries) == 0 {
+		return found
+	}
+	tmp, err := os.MkdirTemp("", "pdw-slack-leveldb-")
+	if err != nil {
+		return found
+	}
+	defer os.RemoveAll(tmp)
+	for _, e := range entries {
+		if !e.Type().IsRegular() || e.Name() == "LOCK" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(leveldbDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(tmp, e.Name()), data, 0o600); err != nil {
+			return found
+		}
+	}
+	db, err := leveldb.OpenFile(tmp, &opt.Options{ReadOnly: true, ErrorIfMissing: true})
+	if err != nil {
+		return found
+	}
+	defer db.Close()
+	it := db.NewIterator(nil, nil)
+	defer it.Release()
+	for it.Next() {
+		scanBytes(it.Value(), found)
+	}
+	return found
 }
 
 // AuthTest is Slack's auth.test with a client session; it returns the raw
 // payload (never raises for an API-level failure).
 type AuthTest func(token, cookieHeader string) map[string]any
 
-// Capture picks the token Slack accepts, given a store and its cookies.
-func Capture(storeRoot string, cookies map[string]string, cookieExpiresAt time.Time, source string, authTest AuthTest) (Session, error) {
+// CaptureAll returns every session Slack accepts, in candidate order. The
+// desktop app is routinely signed in to several workspaces, and which one is
+// the right one is the warehouse's question, not the first answer's: taking
+// the first accepted token is how another workspace's session was published
+// as zrl on 2026-09-23.
+func CaptureAll(storeRoot string, cookies map[string]string, cookieExpiresAt time.Time, source string, authTest AuthTest) ([]Session, error) {
 	cookieD := cookies[SessionCookie]
 	if cookieD == "" {
-		return Session{}, captureErrorf("found no `d` session cookie for slack.com; the xoxc token alone is not a session (sign in to Slack on this machine, then retry)")
+		return nil, captureErrorf("found no `d` session cookie for slack.com; the xoxc token alone is not a session (sign in to Slack on this machine, then retry)")
 	}
 	candidates := ScanLocalStorageForTokens(storeRoot)
 	if len(candidates) == 0 {
-		return Session{}, captureErrorf("found no xoxc- token in %s/Local Storage", storeRoot)
+		return nil, captureErrorf("found no xoxc- token in %s/Local Storage", storeRoot)
 	}
 	header := SessionCookie + "=" + cookieD
 	lastError := ""
+	var sessions []Session
 	for _, token := range candidates {
 		payload := authTest(token, header)
 		if ok, _ := payload["ok"].(bool); ok {
@@ -212,7 +280,6 @@ func Capture(storeRoot string, cookies map[string]string, cookieExpiresAt time.T
 			// org id as team_id would fork the whole dataset, so the two are kept
 			// apart and the caller resolves the workspace from base_slack.teams.
 			reported := stringOf(payload["team_id"])
-			isEnterprise := strings.HasPrefix(reported, "E")
 			s := Session{
 				Source:          source,
 				Token:           token,
@@ -221,19 +288,23 @@ func Capture(storeRoot string, cookies map[string]string, cookieExpiresAt time.T
 				TeamURL:         stringOf(payload["url"]),
 				CookieExpiresAt: cookieExpiresAt,
 			}
-			if isEnterprise {
+			if strings.HasPrefix(reported, "E") {
 				s.EnterpriseID = reported
 			} else {
 				s.TeamID = reported
 			}
-			return s, nil
+			sessions = append(sessions, s)
+			continue
 		}
 		lastError = stringOf(payload["error"])
 		if lastError == "" {
 			lastError = "unknown_error"
 		}
 	}
-	return Session{}, captureErrorf("found %d xoxc- token(s) but no working one (last error: %s); the stored session has probably been signed out", len(candidates), lastError)
+	if len(sessions) == 0 {
+		return nil, captureErrorf("found %d xoxc- token(s) but no working one (last error: %s); the stored session has probably been signed out", len(candidates), lastError)
+	}
+	return sessions, nil
 }
 
 func stringOf(v any) string {
@@ -347,9 +418,10 @@ func truthy(v any) bool {
 	}
 }
 
-// Discover captures a Slack session from the Slack desktop app (the only
-// source today). An explicit source that is not known is an error.
-func Discover(host chromium.Host, source string, authTest AuthTest) (Session, error) {
+// Discover captures every Slack session the desktop app holds that Slack
+// accepts (the app is the only source today). An explicit source that is not
+// known is an error.
+func Discover(host chromium.Host, source string, authTest AuthTest) ([]Session, error) {
 	profiles := []chromium.Profile{AppProfile}
 	if source != "" {
 		var kept []chromium.Profile
@@ -359,7 +431,7 @@ func Discover(host chromium.Host, source string, authTest AuthTest) (Session, er
 			}
 		}
 		if len(kept) == 0 {
-			return Session{}, captureErrorf("unknown Slack session source %q", source)
+			return nil, captureErrorf("unknown Slack session source %q", source)
 		}
 		profiles = kept
 	}
@@ -387,12 +459,12 @@ func Discover(host chromium.Host, source string, authTest AuthTest) (Session, er
 			if _, ok := byName[SessionCookie]; !ok {
 				continue
 			}
-			return Capture(filepath.Dir(db), byName, expires, profile.Key, authTest)
+			return CaptureAll(filepath.Dir(db), byName, expires, profile.Key, authTest)
 		}
 		errs = append(errs, fmt.Sprintf("%s: no slack.com `d` cookie in any cookie store", profile.Key))
 	}
 	if len(errs) == 0 {
-		return Session{}, captureErrorf("no Slack session found")
+		return nil, captureErrorf("no Slack session found")
 	}
-	return Session{}, captureErrorf("%s", strings.Join(errs, "; "))
+	return nil, captureErrorf("%s", strings.Join(errs, "; "))
 }

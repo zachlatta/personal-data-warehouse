@@ -222,6 +222,96 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
     )
 
 
+#: How long the change feed may stay unusable before its verdict reads
+#: ``action_required`` (the Slack pipeline row's ``attention``). One bad pass is
+#: not an incident: the 2026-09-02 sibling-workspace blips cleared themselves.
+SLACK_CHANGE_FEED_ATTENTION_AFTER = timedelta(hours=1)
+#: The one ops.slack_sync_state row that carries the feed's verdict. team_id is
+#: empty on purpose: the published session may belong to the WRONG workspace,
+#: which is exactly when this row matters.
+SLACK_CHANGE_FEED_STATE_KEY = ("", "change_feed", "client.counts")
+#: The ops.uploader_heartbeats pipeline the Mac's hourly `pdw slack
+#: publish-session` agent (bin/slack-auth-launchd) reports under. It has no
+#: Pipeline of its own -- a pipeline needs a payload table -- so the change-feed
+#: verdict is where it is read: a dead feed plus a failing publisher names the
+#: cause in one line.
+SLACK_SESSION_PUBLISHER_PIPELINE = "slack_session_publish"
+
+
+def record_slack_change_feed_verdict(*, warehouse, account: str, plan: SlackChangePlan, now: datetime) -> None:
+    """Stamp whether the change feed worked, where /pipelines can see it.
+
+    From 2026-09-21 to 09-28 every freshness pass logged "change feed
+    unusable" -- the published session belonged to another workspace -- and
+    fell back to the blanket poll, which never reached a group DM: 164 of 219
+    group-DM messages in a week never landed. The session row still read
+    ``ok`` and so did the Slack pipeline, because nothing recorded the verdict
+    anywhere a health surface reads. It now lives in ``ops.slack_sync_state``,
+    the Slack pipeline's own StateSource, whose ``action_required`` rows read as
+    ``attention`` with this error. ``cursor_ts`` holds when the failure began
+    (epoch seconds), so the hour of grace survives across passes; a healthy
+    pass clears it. A deliberately disabled feed records nothing.
+    """
+    if plan.usable is False and plan.reason == "change feed disabled":
+        return
+    team_id, object_type, object_id = SLACK_CHANGE_FEED_STATE_KEY
+    now = now.astimezone(UTC)
+    row = {
+        "account": account,
+        "team_id": team_id,
+        "object_type": object_type,
+        "object_id": object_id,
+        "last_sync_type": "change_feed",
+        "updated_at": now,
+        "sync_version": int(now.timestamp() * 1_000_000),
+    }
+    if plan.usable:
+        warehouse.insert_slack_sync_state(**row, cursor_ts="", status="ok", error="")
+        return
+    previous = warehouse.load_slack_sync_state_by_type(object_type).get((account, *SLACK_CHANGE_FEED_STATE_KEY)) or {}
+    try:
+        since = float(previous.get("cursor_ts") or "")
+    except ValueError:
+        since = now.timestamp()
+    failing_for = timedelta(seconds=max(0.0, now.timestamp() - since))
+    status = "action_required" if failing_for >= SLACK_CHANGE_FEED_ATTENTION_AFTER else "degraded"
+    session_note = ""
+    try:
+        session = warehouse.load_slack_session(account=account) or {}
+    except Exception:  # pragma: no cover - the verdict must never break the sync
+        session = {}
+    if session:
+        published = session.get("published_at")
+        published_text = published.astimezone(UTC).isoformat(timespec="minutes") if isinstance(published, datetime) else "?"
+        session_note = (
+            f" The published session is for {session.get('team_url') or session.get('team_id') or 'an unknown workspace'},"
+            f" published {published_text}."
+        )
+    publisher_note = ""
+    try:
+        heartbeats = (
+            warehouse.load_uploader_heartbeats(pipeline=SLACK_SESSION_PUBLISHER_PIPELINE)
+            if hasattr(warehouse, "load_uploader_heartbeats")
+            else []
+        )
+    except Exception:  # pragma: no cover - the verdict must never break the sync
+        heartbeats = []
+    for beat in heartbeats:
+        ran_at = beat.get("ran_at")
+        ran_text = ran_at.astimezone(UTC).isoformat(timespec="minutes") if isinstance(ran_at, datetime) else "?"
+        publisher_note += (
+            f" The hourly publisher on {beat.get('device') or '?'} last ran {ran_text}:"
+            f" {'ok' if beat.get('status') == 'ok' else 'failed'}, exit {beat.get('exit_code')}."
+        )
+    error = (
+        f"Slack change feed unusable since {datetime.fromtimestamp(since, tz=UTC).isoformat(timespec='minutes')}"
+        f" ({plan.reason}); freshness is falling back to polling conversations one by one, which cannot keep"
+        f" DMs and group DMs current.{session_note}{publisher_note} Repair: sign in to the synced workspace in the Slack"
+        " desktop app on the Mac, then run `pdw slack publish-session` there."
+    )
+    warehouse.insert_slack_sync_state(**row, cursor_ts=f"{since:.6f}", status=status, error=error)
+
+
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     summaries: list[SlackSyncSummary] = []
 
@@ -235,6 +325,12 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             plan = slack_change_plan(
                 settings=settings, warehouse=warehouse, account=account.account, logger=logger
             )
+            try:
+                record_slack_change_feed_verdict(
+                    warehouse=warehouse, account=account.account, plan=plan, now=datetime.now(tz=UTC)
+                )
+            except Exception as exc:  # pragma: no cover - the verdict must never break the sync
+                logger.warning("Could not record the Slack change feed verdict: %s", exc)
             break
     changed_ids: Sequence[str] | None = None
     if plan.usable:
@@ -280,6 +376,9 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             history_window=max(window_by_type.values()),
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,
+            # A blanket poll (no usable change feed) rotates candidates by when
+            # they were last polled, tier by tier; this is the middle tier.
+            freshness_warm_window=timedelta(days=_int_env("SLACK_ASSET_FRESHNESS_WARM_DAYS", 14)),
             sync_users=False,
             sync_members=False,
             freshness_priority=True,

@@ -14,7 +14,7 @@ somebody else. Confirm any id you build a who-said-what query on from `base_slac
   `subtype` carries Slack's own message kinds. A permalink is
   `https://<team_domain>.slack.com/archives/<conversation_id>/p<ts without the dot>`
   (with `?thread_ts=…&cid=…` for a reply); the team domain is in `base_slack.teams`.
-- `base_slack.conversations` — `conversation_kind` says im / mpim / private_channel /
+- `base_slack.conversations` — `conversation_type` says im / mpim / private_channel /
   public_channel. **Render by kind, never by name**: a DM's `name` is the other user's
   id and a group DM's is `mpdm-a--b--c-1`.
 - `base_slack.users`, `base_slack.conversation_members`, `base_slack.message_reactions`,
@@ -62,6 +62,10 @@ messages a day keep it `ok` through a total group-DM outage, so the per-type che
 that means something; ok ≥ 95%), `history_polled_fraction` (judged for public channels),
 the DM landing latency columns, and `status` as the worst of them. The status is about
 the sync attempt, not message volume: group DMs have legitimate zero-message days.
+DMs, group DMs and private channels stay current only through the change feed (a
+Slack client session published from the Mac). `change_feed_status` on the same view
+says whether it works; when it reads `action_required`, those three types read
+`stale` and a missing recent DM or group-DM message is a sync gap, not evidence.
 
 ## Writing
 

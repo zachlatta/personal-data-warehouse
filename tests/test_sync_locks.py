@@ -179,6 +179,9 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
         "private_channel": 100,
         "public_channel": 100,
     }
+    # The blanket poll's warm tier: conversations active in the last two weeks
+    # are rotated in after the ones active inside the freshness window.
+    assert freshness["freshness_warm_window"] == timedelta(days=14)
     assert all(call["sync_users"] is False for call in calls)
     assert all(call["sync_members"] is False for call in calls)
     # Freshness fetches replies inline so brand-new threads are captured complete.

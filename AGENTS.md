@@ -4342,7 +4342,8 @@ choosing **Always Allow**.
 
 It runs on the Mac signed in to the Slack desktop app (**crobat**), not on porygon, because
 that is where the session lives. **The wrapper runs `pdw slack publish-session` (native Go,
-`app/internal/browsersessions/slack`) and nothing else.** It used to exec the Python capture
+`app/internal/browsersessions/slack`) and nothing else** but its own `pdw heartbeat`, posted
+under `slack_session_publish`. It used to exec the Python capture
 directly and keep `pdw` OUT of the exec chain, because macOS attributes the "Slack Safe
 Storage" keychain grant to the binaries in that chain and an unsigned pdw replaced its own
 binary on every release; release binaries are signed with a stable identity now, so the
@@ -4357,6 +4358,51 @@ one as the other would not error; it would write a second parallel copy of Slack
 refuses to put an `E` id in `team_id`, the publish endpoint rejects it, and
 `pdw slack publish-session` resolves the workspace through `base_slack.teams.enterprise_id`
 rather than guessing (an org covering several workspaces raises instead).
+
+### When the change feed goes down: the week of 2026-09-21
+
+**Seven days of "change feed unusable" read `ok` everywhere, and group DMs stopped landing.**
+Three failures lined up, and each is now closed:
+
+- **The capture could not see the working tokens.** Slack keeps every signed-in workspace's
+  `xoxc-` token in ONE `localConfig_v2` localStorage value. After a LevelDB compaction that
+  value sits in a Snappy-compressed table, and the second and later tokens -- which share
+  the user/team prefix with the first -- are stored as back-references, so they never
+  appear verbatim on disk. The raw byte scan found two of the three tokens the database
+  held (one signed out, one for an unrelated workspace) and missed both working Hack Club
+  ones; `slack-auth` failed hourly from 2026-09-20 12:06. `ScanLocalStorageForTokens`
+  now opens a **copy** of the database read-only with goleveldb and scans its current
+  values first, keeping the raw scan for stale leftovers in older files.
+- **The publisher took the first token Slack accepted.** On 2026-09-23 that was another
+  workspace's session, and it became production's. `CaptureAll` returns every accepted
+  session and `publish-session` picks: workspace-scoped (`T…`) sessions before org
+  (`E…`) ones, each required to answer `client.counts`, resolve to one workspace, and be a
+  workspace the warehouse syncs. The report lists every candidate and why it was passed over.
+- **The blanket poll never reached a group DM.** With no usable feed the freshness pass
+  polls cached conversations one by one, and the shared rate budget ends it after ~30
+  `conversations.history` calls. It walked `im`, then `mpim`, then channels, each by
+  recency, so it spent every pass on the same ~30 DMs. Measured 2026-09-28 against Slack's
+  own history for 150 active conversations: 1:1 DMs p50 3 min with 5 of 600 messages
+  missing, **group DMs 164 of 219 missing**, some untouched since 09-17. A blanket pass now
+  takes candidates in tiers (active inside the freshness window, inside
+  `SLACK_ASSET_FRESHNESS_WARM_DAYS` = 14, the rest) and inside a tier by **last poll**
+  across types, stamping every poll (`touch_slack_conversation_sync_state`) so the next
+  pass starts where the budget ran out. A change-feed pass is unchanged.
+
+**The verdict is a row, not a log line.** Every freshness pass writes the feed's verdict to
+`ops.slack_sync_state` (`team_id = ''`, `object_type = 'change_feed'`, `object_id =
+'client.counts'`, `cursor_ts` = when the failure began). An unusable feed is `degraded`
+for its first hour and `action_required` after, which the Slack row of
+`marts_ops.pipeline_health` reads as `attention` with the reason, the published session's
+workspace and age, and the `slack_session_publish` heartbeat of the Mac that should be
+replacing it. `marts_ops.slack_conversation_health` carries it as `change_feed_status` and
+reads `im` / `mpim` / `private_channel` **stale** while it is `action_required`: those
+types are unjudged on history polls only because the feed says what moved.
+
+**To verify a Slack claim against Slack itself**, the user token (`SLACK_<ACCOUNT>_TOKEN`
+in the gitignored `.env`) reads `conversations.history` for any DM or group DM; its
+`search.messages` is `missing_scope`. It shares the production sync's rate budget, so keep a
+sample to a few minutes of calls.
 
 ## Slack huddles: metadata yes, content no
 

@@ -2638,3 +2638,43 @@ def test_ensure_restores_any_missing_column_on_every_health_snapshot_table(wareh
     for view in ("marts_pipeline_health", "marts_agent_usage", "marts_search_benchmark"):
         marts = relation(view).with_namespace(warehouse.schema_namespace)
         warehouse._query(f'SELECT count(*) FROM "{marts.schema}"."{marts.name}"')
+
+
+def test_an_unusable_slack_change_feed_reads_attention_on_the_slack_row(warehouse):
+    """The change feed's verdict is one ops.slack_sync_state row.
+
+    From 2026-09-21 to 09-28 the published Slack session belonged to another
+    workspace, every freshness pass fell back to the blanket poll, and the
+    Slack row read `ok` while group DMs stopped landing. The verdict row the
+    freshness pass now writes is `action_required` after an hour, and that must
+    colour the Slack pipeline without anyone having to know the row exists.
+    """
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @slack_sync_state
+            (account, team_id, object_type, object_id, cursor_ts, last_sync_type,
+             status, error, updated_at, sync_version)
+        VALUES
+            ('zrl', 'T1', 'conversation', 'D1', '', 'partial', 'ok', '', %s, 1),
+            ('zrl', '', 'change_feed', 'client.counts', '1790000000.000000', 'change_feed',
+             'action_required', 'Slack change feed unusable since 2026-09-21T12:00+00:00', %s, 1)
+        """,
+        (now, now),
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, last_error FROM @marts_pipeline_health WHERE pipeline = 'slack'"
+    )[0]
+    assert row["status"] == "attention"
+    assert "change feed unusable" in row["last_error"]
+
+    warehouse._command(
+        "UPDATE @slack_sync_state SET status = 'degraded' WHERE object_type = 'change_feed'"
+    )
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status FROM @marts_pipeline_health WHERE pipeline = 'slack'"
+    )[0]
+    assert row["status"] != "attention", "the hour of grace must not colour the row"

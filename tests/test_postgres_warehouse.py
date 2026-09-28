@@ -8238,3 +8238,61 @@ def test_postgres_slack_account_state_refresh_is_debounced(warehouse: PostgresWa
     _seed_slack_dm(warehouse, conversation_id="D2", now=now, synced_at=now)
     assert warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now).mode == "incremental"
     assert _inbox_rows(warehouse)["D2"][0] == 0
+
+
+def test_slack_conversation_health_reads_the_change_feed_types_stale_when_the_feed_is_down(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The three feed-covered types are only 'ok' while the feed works.
+
+    history_cycle_seconds is NULL for im / mpim / private_channel because the
+    change feed says what moved -- so "not polled" is no evidence there. From
+    2026-09-21 the feed was unusable for a week and those rows kept reading
+    `ok` while 164 of 219 group-DM messages never landed: a type with nothing
+    landed has no latency to judge (`unknown`), and the premise that justified
+    not judging polls was false. The feed's own verdict row settles it.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    warehouse.insert_slack_conversations(
+        [
+            _health_conversation_row("D1", "im", synced_at=now - timedelta(minutes=5)),
+            _health_conversation_row("G1", "mpim", synced_at=now - timedelta(minutes=5)),
+            _health_conversation_row("C1", "public_channel", synced_at=now - timedelta(minutes=5)),
+        ]
+    )
+
+    def statuses() -> dict:
+        return {
+            row[0]: (row[1], row[2])
+            for row in warehouse._query(
+                """
+                SELECT conversation_type, status, change_feed_status
+                FROM @marts_ops_slack_conversation_health WHERE account = 'zrl'
+                """
+            )
+        }
+
+    before = statuses()
+    assert before["mpim"] == ("ok", "unknown")
+
+    def verdict(status: str) -> None:
+        warehouse.insert_slack_sync_state(
+            account="zrl", team_id="", object_type="change_feed", object_id="client.counts",
+            cursor_ts=f"{(now - timedelta(hours=2)).timestamp():.6f}", last_sync_type="change_feed",
+            status=status, error="Slack change feed unusable since ...", updated_at=now,
+            sync_version=int(now.timestamp() * 1_000_000),
+        )
+
+    verdict("degraded")  # inside the hour of grace: not yet a verdict
+    assert statuses()["mpim"] == ("ok", "degraded")
+
+    verdict("action_required")
+    rows = statuses()
+    assert rows["im"] == ("stale", "action_required")
+    assert rows["mpim"] == ("stale", "action_required")
+    # Public channels never relied on the feed; their sweep is judged directly.
+    assert rows["public_channel"][0] == before["public_channel"][0]
+
+    verdict("ok")
+    assert statuses()["mpim"] == ("ok", "ok")
