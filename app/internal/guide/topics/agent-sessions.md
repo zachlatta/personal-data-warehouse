@@ -59,7 +59,8 @@ the hourly feed, cron and verification workers — on the same user channel Zach
 into, so its rows are normalized differently: `role = 'user'` only for words Zach typed,
 every loop prompt is `role = 'system'` with the loop's name in `subtype`
 (`runtime.self_improvement`, `runtime.feed`, `scheduler.cron`, ...), and `entrypoint` is
-the loop that opened the session. Subagents are `is_sidechain = 1` with the parent's
+the loop that opened the session — a loop session has no typed prompt, so its timeline
+row is titled for the loop (`Muse self-improvement run`, `Muse subagent`, ...). Subagents are `is_sidechain = 1` with the parent's
 session id in `parent_uuid`. `subtype = 'compaction'` rows carry Muse's own running
 summary of a long chat. Its reasoning is kept in `raw_json` only. The agent's memory,
 goal pages and generated files are `base_muse.files` (topic `sources`).

@@ -2740,8 +2740,14 @@ typed. Each transcript line carries the Muse `source` that wrote it; only
 by its opening message (`[Subagent Context] … Requester agent id: <id>`), so the
 uploader reads that once per transcript (plus the model from `sessions.json`) and ships
 it on every line; the warehouse sets `is_sidechain = 1` and `parent_uuid` from it. With
-that, the existing agent-session rules classify Muse with no Muse-specific timeline SQL:
-chats are `self`, loops and subagents `background`. Reasoning items stay in `raw_json`
+that, the existing agent-session rules classify Muse with no Muse-specific priority SQL:
+chats are `self`, loops and subagents `background`. The one Muse-specific piece is the
+session row's **title**: a loop has no typed prompt and Muse writes no session title, so on
+2026-09-29 730 of 745 Muse session rows on the timeline were blank. The `agent_session`
+adapter now names a Muse session with neither for its loop (`MUSE_LOOP_SESSION_TITLES`,
+keyed by `entrypoint`: `Muse self-improvement run`, `Muse hourly feed run`,
+`Muse subagent`, ...); it never feeds the priority rules. Muse transcripts carry no token
+usage at all, so `input_tokens`/`output_tokens` are 0 by fact, not by a mapping gap. Reasoning items stay in `raw_json`
 only, as for every provider; Meta's own `muse.db` tool withholds them, but they are in
 the transcript files on Zach's VM.
 

@@ -5587,7 +5587,7 @@ class PostgresWarehouse:
                 source_pipeline_id = coverage.pipeline
                 expected = pipeline(source_pipeline_id).expected_data_interval
             elif adapter.source_table == "ai_conversation_events":
-                # A virtual UNION over six providers with radically different
+                # A virtual UNION over every agent provider with radically different
                 # human-use cadences. Their uploader/poller heartbeats are the
                 # real SLA; one aggregate last-data timestamp is not.
                 source_pipeline_id = "agent_sources"

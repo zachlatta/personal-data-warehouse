@@ -2412,11 +2412,48 @@ _AGENT_INJECTED_PREAMBLE = (
 )
 
 
+# A Muse loop session has neither title source the roll-up reads: Muse writes
+# no session title, and a loop has no prompt Zach typed (the uploader files its
+# opener as role = 'system'). Measured 2026-09-29, that left 730 of 745 Muse
+# session rows with an empty title and snippet. The loop that opened the session
+# is on every line as ``entrypoint``, so the row is named for it. A label only:
+# the priority rules never read it, so it cannot promote a loop.
+MUSE_LOOP_SESSION_TITLES = {
+    "runtime.self_improvement": "Muse self-improvement run",
+    "runtime.feed": "Muse hourly feed run",
+    "runtime.execute_resolve_worker": "Muse execute/resolve worker",
+    "runtime.proactivity": "Muse proactivity run",
+    "runtime.skill_invalidation": "Muse skill invalidation run",
+    "scheduler.cron": "Muse scheduled task",
+}
+
+
+def _muse_loop_session_title_sql() -> str:
+    """NULL for every non-Muse session, so other providers keep their titles."""
+
+    def literal(value: str) -> str:
+        # The adapter SQL runs with bound parameters, so a '%' would need doubling.
+        assert "%" not in value, value
+        return "'" + value.replace("'", "''") + "'"
+
+    known = " ".join(
+        f"WHEN {literal(entrypoint)} THEN {literal(title)}"
+        for entrypoint, title in sorted(MUSE_LOOP_SESSION_TITLES.items())
+    )
+    return (
+        "CASE WHEN s.source <> 'muse' THEN NULL "
+        "WHEN s.non_sidechain_count = 0 THEN 'Muse subagent' "
+        f"ELSE CASE s.entrypoint {known} "
+        "WHEN '' THEN 'Muse background session' "
+        "ELSE 'Muse background session (' || s.entrypoint || ')' END END"
+    )
+
+
 def _agent_session_adapter() -> TimelineAdapter:
     """Session-level roll-up over marts_ai_conversations.events.
 
     One timeline row per session/conversation (Claude Code, Codex, OpenClaw,
-    Claude Desktop, ChatGPT — the row's ``source`` is the per-session source
+    Claude Desktop, ChatGPT, pi, Muse — the row's ``source`` is the per-session source
     value), matching the marts_ai_conversations.sessions roll-up. Individual transcript
     lines are surfaced through the session's detail view, not as separate
     timeline entries.
@@ -2436,7 +2473,7 @@ def _agent_session_adapter() -> TimelineAdapter:
             s.end_ts AS end_ts,
             COALESCE(s.device, '') AS actor,
             COALESCE(NULLIF(st.session_title, ''),
-                     left(fp.text, {TIMELINE_TITLE_CHARS}), '') AS title,
+                     left(fp.text, {TIMELINE_TITLE_CHARS}), {_muse_loop_session_title_sql()}, '') AS title,
             COALESCE(left(fp.text, {TIMELINE_SNIPPET_CHARS}), '') AS snippet,
             COALESCE(NULLIF(cw.cwd, ''), s.account, '') AS context,
             (jsonb_build_object('source', s.source, 'session_id', s.session_id))::text AS source_pk,
@@ -2457,6 +2494,8 @@ def _agent_session_adapter() -> TimelineAdapter:
             -- relevance is not diluted across a whole session and the search
             -- preview lands on the matched turn instead of the transcript head.
             concat_ws(E'\n', NULLIF(st.session_title, ''), NULLIF(fp.text, ''),
+                      CASE WHEN COALESCE(NULLIF(st.session_title, ''), fp.text) IS NULL
+                           THEN {_muse_loop_session_title_sql()} END,
                       NULLIF(cw.cwd, ''), NULLIF(gb.git_branch, ''), NULLIF(ru.repo_url, '')) AS search_text,
             s.ingest_ts AS ingest_ts,
             -- Interactive vs background (benchmark-tuned, sampling/ 2026-07,

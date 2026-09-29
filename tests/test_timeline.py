@@ -3544,3 +3544,60 @@ def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehous
     assert not warehouse._query(
         "SELECT 1 FROM @timeline_events WHERE adapter = 'muse_file' AND event_id = 'z@x.test|MEMORY.md'"
     )
+
+
+def test_a_muse_loop_session_is_titled_by_its_loop_not_left_blank(warehouse):
+    """A Muse loop session has no typed prompt and no title, so it read as a blank row.
+
+    Measured 2026-09-29: 730 of 745 Muse session rows on the timeline had an
+    empty title and snippet, because the only title sources are the agent's
+    own session title (Muse writes none) and the first prompt Zach typed (a
+    loop has none, by construction). The loop that opened the session is on
+    every row as ``entrypoint``, so the row names it. A chat keeps its first
+    prompt, and a blank session from another provider is not relabelled.
+    """
+    _ensure_all_source_tables(warehouse)
+
+    def line(source: str, session: str, seq: int, role: str, text: str, entrypoint: str, sidechain: int = 0) -> None:
+        table = "@muse_events" if source == "muse" else "@claude_code_events"
+        warehouse._command(
+            f"""
+            INSERT INTO {table} (source, session_id, event_uuid, seq, occurred_at,
+                                 role, text, entrypoint, is_sidechain, ingested_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (source, session, f"{session}#{seq}", seq, _NOW, role, text, entrypoint, sidechain, _NOW),
+        )
+
+    line("muse", "improve", 0, "meta", "", "runtime.self_improvement")
+    line("muse", "improve", 1, "system", "## Classification context {}", "runtime.self_improvement")
+    line("muse", "feed", 1, "system", "Work this hour's beat.", "runtime.feed")
+    line("muse", "novel", 1, "system", "something new", "runtime.brand_new_loop")
+    line("muse", "sub", 1, "system", "[Subagent Context] You are running as a subagent", "runtime", sidechain=1)
+    line("muse", "chat", 1, "user", "Find me flights to SF next Thursday", "runtime")
+    line("claude_code", "blank", 1, "assistant", "hello", "sdk-cli")
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def session(source: str, session_id: str) -> tuple[str, str, str]:
+        rows = warehouse._query(
+            "SELECT title, search_text, priority::text FROM @timeline_events "
+            "WHERE adapter = 'agent_session' AND event_id = %s",
+            (f"{source}|{session_id}",),
+        )
+        assert rows, session_id
+        return rows[0]
+
+    assert session("muse", "improve")[:1] == ("Muse self-improvement run",)
+    assert "self-improvement" in session("muse", "improve")[1]
+    assert session("muse", "feed")[0] == "Muse hourly feed run"
+    assert session("muse", "novel")[0] == "Muse background session (runtime.brand_new_loop)"
+    assert session("muse", "sub")[0] == "Muse subagent"
+    assert session("muse", "chat")[0] == "Find me flights to SF next Thursday"
+    assert session("claude_code", "blank")[0] == ""
+    # The label is a title, never a reason to promote a loop.
+    assert {session("muse", s)[2] for s in ("improve", "feed", "novel", "sub")} == {"background"}

@@ -1899,7 +1899,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Start here for past AI sessions. One row per session across all six providers, with title, first prompt, repo/branch, device, model and token totals. Drill into marts_ai_conversations.events for the turns.",
+      "comment": "Start here for past AI sessions. One row per session across every provider, with title, first prompt, repo/branch, device, model and token totals. Drill into marts_ai_conversations.events for the turns.",
       "previous": {
         "schema": "marts",
         "name": "ai_conversation_sessions"
