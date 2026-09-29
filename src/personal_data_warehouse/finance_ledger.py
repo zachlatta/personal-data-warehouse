@@ -227,6 +227,22 @@ def simplefin_account_mask(name: str, extra: Mapping[str, Any] | None = None) ->
     return ""
 
 
+def simplefin_liability_value(bridge_balance: Decimal, *, plaid_balance: Decimal | None) -> Decimal:
+    """The amount owed on a liability, from the bridge's balance.
+
+    The bridge signs from the customer's side (owed = negative), so the owed
+    amount is ``-balance`` -- except that it reports a card IN CREDIT as
+    negative too: Capital One Savor carried an 11.54 cash-back credit that
+    Plaid reported as -11.54 while the bridge also said -11.54, and booking
+    it as owed turned an asset into a debt. The bridge's magnitude is right
+    and its direction is not evidence, so where Plaid reports the same
+    account (Plaid: positive = owed, negative = credit) Plaid's sign decides.
+    """
+    if plaid_balance is not None and plaid_balance != 0 and bridge_balance != 0:
+        return abs(bridge_balance) if plaid_balance > 0 else -abs(bridge_balance)
+    return -bridge_balance
+
+
 def simplefin_account_kind_side(name: str, *, balance: float = 0.0, has_holdings: bool = False) -> tuple[str, str]:
     """Kind/side for a SimpleFIN account, which reports neither.
 
@@ -447,6 +463,9 @@ class FinanceLedgerRunner:
         )
         accounts_merged = 0
         plaid_account_map: dict[tuple[str, str], str] = {}
+        # Plaid's own signed balance per ledger account, for the direction
+        # of a SimpleFIN card balance (see below).
+        plaid_balance_by_account: dict[str, Decimal] = {}
         for row in plaid_accounts:
             link_key = (row["account"], row["account_id"])
             account_id, match_method = resolutions[link_key]
@@ -500,6 +519,7 @@ class FinanceLedgerRunner:
                     row["mask"],
                 )
                 continue
+            plaid_balance_by_account[account_id] = _as_decimal(row["current_balance"])
             observation_rows.append(
                 {
                     "account_id": account_id,
@@ -603,10 +623,8 @@ class FinanceLedgerRunner:
             if not isinstance(balance_at, datetime) or balance_at.timestamp() <= 0:
                 continue
             value = _as_decimal(row["balance"])
-            # The bridge signs from the customer's side (owed = negative); the
-            # ledger stores a liability's value as the amount owed.
             if side == ACCOUNT_SIDE_LIABILITY:
-                value = -value
+                value = simplefin_liability_value(value, plaid_balance=plaid_balance_by_account.get(account_id))
             observation_rows.append(
                 {
                     "account_id": account_id,

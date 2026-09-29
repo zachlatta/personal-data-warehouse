@@ -3492,15 +3492,27 @@ balance observation now carries `base_plaid.accounts.synced_at` rather than the 
 takes the newer DAY outright and, on the same day, ranks the bridge's institution-stamped
 balance ahead of Plaid's poll-stamped one (`source_rank` in the view): measured
 2026-09-27, Plaid's Capital One balance read 4.11 at 13:30 while the bridge read 32.55 at
-12:56, and 32.55 was 4.11 plus the two purchases Plaid had not posted yet; and
+12:56, and 32.55 was 4.11 plus the two purchases Plaid had not posted yet. **That
+preference is conditional on the flows**, because the bridge refreshes about once a day
+(around 01:00Z) while Plaid posts through the day: measured 2026-09-29, the bridge's
+01:00 balance read 32.55 with nothing posted after 09-26 while Plaid had posted nine
+purchases dated 09-28 and read 172.53, and net worth quoted 32.55 all day. A bridge
+balance whose newest POSTED movement for the account (read from each provider's own
+rows through the account links, UTC days) is older than Plaid's by that day now ranks
+behind Plaid's; with no such evidence the bridge still wins the day. And
 each SimpleFIN transaction merges into the Plaid row for the same movement by exact
 amount within ±3 days (`fuzzy_amount_date`), founding its own row only when Plaid has
 none. Plaid goes first and keeps field precedence. **Signs are opposite and stored
 faithfully**: SimpleFIN `amount` is positive-in (the ledger's convention, no negation),
 Plaid's is positive-out; a SimpleFIN credit-card `balance` is negative when owed, so a
-liability-side observation is booked as `-balance`. `marts_ops.simplefin_account_health`
-is the reconciliation surface — `ledger_account_id`, `match_method`, `shared_with_plaid`
-— and a row at a Plaid-linked institution with `shared_with_plaid = 0` is the thing to
+liability-side observation is booked as `-balance` — **except that the bridge also
+reports a card in CREDIT as negative**: Capital One Savor carried an 11.54 cash-back
+credit that Plaid reported as -11.54 and the bridge as -11.54 too, which booked an asset
+as a debt. The bridge's magnitude is right and its sign is not evidence, so where Plaid
+reports the same account Plaid's sign decides (`simplefin_liability_value`).
+`marts_ops.simplefin_account_health` is the reconciliation surface — `ledger_account_id`,
+`match_method`, `shared_with_plaid`, and `net_worth_value` / `net_worth_source` /
+`plaid_newest_transaction_at` for which provider net worth is quoting and why — and a row at a Plaid-linked institution with `shared_with_plaid = 0` is the thing to
 investigate. SimpleFIN holdings are stored raw and are not yet in the securities ledger.
 
 Credential and failure modes: the bridge's setup token is base64 of a claim URL that can

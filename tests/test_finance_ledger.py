@@ -3411,3 +3411,123 @@ def test_same_day_bridge_balance_outranks_plaid_poll_but_a_newer_day_wins(wareho
     FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(days=1, hours=1)).sync()
     picked = warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth")
     assert picked == [{"value": Decimal("99.0"), "source": "plaid"}]
+
+
+def _card(**overrides) -> dict:
+    return _plaid_account_row(
+        name="Venture X", official_name="Venture X", mask="5520", type="credit", subtype="credit card", **overrides
+    )
+
+
+def test_a_bridge_balance_that_misses_movements_plaid_already_posted_yields_to_plaid(warehouse):
+    """The same-day bridge preference is a claim that the bridge is fresher,
+    and the transactions say whether it is. Measured 2026-09-29 on Capital One:
+    the bridge refreshed at 01:00 with 32.55 and nothing posted after 09-26;
+    Plaid posted nine purchases dated 09-28 during the day and read 172.53, and
+    net worth kept quoting the bridge's 32.55 all day."""
+    _seed_plaid(warehouse, [_card(current_balance=172.53, synced_at=_TS + timedelta(hours=3))])
+    warehouse.insert_plaid_transactions([
+        _plaid_transaction_row(transaction_id="old", amount=17.15, posted_at=_TS - timedelta(days=3)),
+        _plaid_transaction_row(transaction_id="new", amount=139.98, posted_at=_TS - timedelta(days=1)),
+    ])
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(name="Venture X (5520)", org_name="Acme Bank", balance=-32.55, balance_at=_TS - timedelta(hours=11))],
+        [_simplefin_transaction_row(transaction_id="sf-old", amount=-17.15, posted_at=_TS - timedelta(days=3) + timedelta(hours=12))],
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    assert warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth") == [
+        {"value": Decimal("172.53"), "source": "plaid"}
+    ]
+    assert warehouse._query_dicts("SELECT latest_value, latest_observation_source FROM @marts_finance_accounts") == [
+        {"latest_value": Decimal("172.53"), "latest_observation_source": "plaid"}
+    ]
+    history = warehouse._query_dicts(
+        "SELECT liabilities FROM @marts_finance_net_worth_history WHERE day = %s", (_TS.date(),)
+    )
+    assert history == [{"liabilities": Decimal("172.53")}]
+    health = warehouse._query_dicts(
+        "SELECT net_worth_value, net_worth_source, plaid_newest_transaction_at FROM @marts_ops_simplefin_account_health"
+    )
+    assert health == [
+        {"net_worth_value": Decimal("172.53"), "net_worth_source": "plaid", "plaid_newest_transaction_at": _TS - timedelta(days=1)}
+    ]
+
+
+def test_a_bridge_balance_that_has_seen_the_newest_movement_still_wins_the_day(warehouse):
+    """The case the preference was built for, 2026-09-27: the bridge had two
+    purchases Plaid had not posted, so its same-day balance is the fresher one."""
+    _seed_plaid(warehouse, [_card(current_balance=4.11, synced_at=_TS + timedelta(hours=3))])
+    warehouse.insert_plaid_transactions([
+        _plaid_transaction_row(transaction_id="old", amount=10.0, posted_at=_TS - timedelta(days=2)),
+    ])
+    _seed_simplefin(
+        warehouse,
+        [_simplefin_account_row(name="Venture X (5520)", balance=-32.55, balance_at=_TS)],
+        [
+            _simplefin_transaction_row(transaction_id="sf-old", amount=-10.0, posted_at=_TS - timedelta(days=2)),
+            _simplefin_transaction_row(transaction_id="sf-new", amount=-28.44, posted_at=_TS - timedelta(days=1)),
+        ],
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    assert warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth") == [
+        {"value": Decimal("32.55"), "source": "simplefin"}
+    ]
+
+
+def test_a_card_in_credit_takes_its_direction_from_plaid_not_the_bridge(warehouse):
+    """The bridge reports a card's balance as negative whether it is owed or
+    in credit: Capital One Savor carried an 11.54 cash-back credit (Plaid
+    -11.54) and the bridge also said -11.54, which the ledger booked as 11.54
+    OWED -- a 23.08 swing with the wrong sign. The bridge's magnitude is
+    right; where Plaid reports the same account, Plaid says which way."""
+    _seed_plaid(warehouse, [
+        _plaid_account_row(name="Savor", official_name="Savor", mask="5718", type="credit", subtype="credit card", current_balance=-11.54)
+    ])
+    _seed_simplefin(warehouse, [_simplefin_account_row(name="Savor (5718)", balance=-11.54, balance_at=_TS)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    observations = warehouse._query_dicts("SELECT source, value FROM @finance_observations ORDER BY source")
+    assert observations == [
+        {"source": "plaid", "value": Decimal("-11.54")},
+        {"source": "simplefin", "value": Decimal("-11.54")},
+    ]
+    assert warehouse._query_dicts("SELECT signed_value FROM @marts_finance_net_worth") == [
+        {"signed_value": Decimal("11.54")}
+    ]
+
+
+def test_a_card_owed_on_both_feeds_is_still_booked_as_owed(warehouse):
+    _seed_plaid(warehouse, [_card(current_balance=40.00)])
+    _seed_simplefin(warehouse, [_simplefin_account_row(name="Venture X (5520)", balance=-32.55, balance_at=_TS)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    assert warehouse._query_dicts("SELECT value FROM @finance_observations WHERE source = 'simplefin'") == [
+        {"value": Decimal("32.55")}
+    ]
+
+
+def test_a_quiet_account_the_bridge_has_no_flows_for_is_not_evidence_the_bridge_is_behind(warehouse):
+    """The bridge reads ~90 days of transactions; Savor's last movement was a
+    cash-back credit just outside that window, so the bridge holds no flows
+    for it at all while Plaid holds that one. Silence on a quiet card is not
+    a missed movement."""
+    _seed_plaid(warehouse, [_card(current_balance=40.00, synced_at=_TS + timedelta(hours=3))])
+    warehouse.insert_plaid_transactions([
+        _plaid_transaction_row(transaction_id="old", amount=40.0, posted_at=_TS - timedelta(days=91)),
+    ])
+    _seed_simplefin(warehouse, [_simplefin_account_row(name="Venture X (5520)", balance=-41.00, balance_at=_TS)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    assert warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth") == [
+        {"value": Decimal("41.00"), "source": "simplefin"}
+    ]
+
+
+def test_a_bridge_with_no_flows_is_behind_a_recent_plaid_posting(warehouse):
+    _seed_plaid(warehouse, [_card(current_balance=40.00, synced_at=_TS + timedelta(hours=3))])
+    warehouse.insert_plaid_transactions([
+        _plaid_transaction_row(transaction_id="new", amount=40.0, posted_at=_TS - timedelta(days=1)),
+    ])
+    _seed_simplefin(warehouse, [_simplefin_account_row(name="Venture X (5520)", balance=-0.00, balance_at=_TS)])
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=4)).sync()
+    assert warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth") == [
+        {"value": Decimal("40.0"), "source": "plaid"}
+    ]

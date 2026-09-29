@@ -2926,6 +2926,45 @@ CLAUDE_DESKTOP_CREDENTIAL_STATUS_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+
+def _newest_posted_day_sql(source: str, account_id_expr: str, day_expr: str) -> str:
+    """The newest day ``source`` has POSTED a movement on for a ledger account.
+
+    Read from the provider's own rows through the ledger's account links, so
+    it is what that provider has seen -- a merged ledger row carries only the
+    precedence source's date. Days are UTC: Plaid stamps a posted date at
+    midnight UTC and the bridge at noon, and a session-local cast would put
+    the Plaid one on the previous day west of UTC.
+    """
+    table = {"plaid": "@plaid_transactions", "simplefin": "@simplefin_transactions"}[source]
+    return f"""(
+        SELECT max((t.posted_at AT TIME ZONE 'UTC')::date)
+        FROM @finance_account_links AS fl
+        JOIN {table} AS t
+          ON t.account = fl.account AND t.account_id = fl.source_account_key
+        WHERE fl.source = '{source}' AND fl.account_id = {account_id_expr}
+          AND t.pending = 0 AND t.is_removed = 0
+          AND t.posted_at > '1970-01-01 00:00:00+00'::timestamptz
+          AND (t.posted_at AT TIME ZONE 'UTC')::date <= {day_expr}
+    )"""
+
+
+# A bridge that holds NO flows for an account is behind Plaid only for a
+# posting this recent. The bridge reads ~90 days, so a quiet card whose last
+# movement fell just outside that window (Capital One Savor: one cash-back
+# credit on 06-30, read 2026-09-27) has no bridge flows at all while Plaid
+# keeps the old one -- silence there is not a missed movement.
+BRIDGE_SILENT_ACCOUNT_RECENT_DAYS = 30
+
+
+def _bridge_balance_is_behind_plaid_sql(account_id_expr: str, day_expr: str) -> str:
+    """True when Plaid has posted a movement for the account on a later day
+    than anything the SimpleFIN Bridge has, as of ``day_expr``."""
+    plaid = _newest_posted_day_sql("plaid", account_id_expr, day_expr)
+    bridge = _newest_posted_day_sql("simplefin", account_id_expr, day_expr)
+    floor = f"({day_expr} - {BRIDGE_SILENT_ACCOUNT_RECENT_DAYS})"
+    return f"COALESCE({plaid} > COALESCE({bridge}, {floor}), FALSE)"
+
 class PostgresWarehouse:
     def __init__(self, postgres_database_url: str, *, schema: str = "public") -> None:
         normalized = normalize_postgres_url(postgres_database_url)
@@ -3604,6 +3643,8 @@ class PostgresWarehouse:
         self._ensure_table_group(
             [
                 "plaid_accounts",
+                # net worth's same-day provider choice reads posted flows
+                "plaid_transactions",
                 "plaid_investment_securities",
                 "plaid_investment_holdings",
                 # The second provider the ledger reads; declared here for the
@@ -3651,7 +3692,15 @@ class PostgresWarehouse:
                 tx.transactions_30d,
                 l.account_id AS ledger_account_id,
                 l.match_method,
-                CASE WHEN plaid_link.account_id IS NOT NULL THEN 1 ELSE 0 END::bigint AS shared_with_plaid
+                CASE WHEN plaid_link.account_id IS NOT NULL THEN 1 ELSE 0 END::bigint AS shared_with_plaid,
+                -- Appended: what net worth actually quotes for the ledger
+                -- account, and from which provider, beside the newest movement
+                -- Plaid has posted. A bridge balance that lost the day to
+                -- Plaid shows here as net_worth_source = 'plaid' with a
+                -- plaid_newest_transaction_at later than newest_transaction_at.
+                nw.value AS net_worth_value,
+                nw.source AS net_worth_source,
+                plaid_tx.newest_transaction_at AS plaid_newest_transaction_at
             FROM @simplefin_accounts AS a
             LEFT JOIN @simplefin_sync_state AS s
               ON s.account = a.account AND s.account_id = a.account_id
@@ -3674,6 +3723,16 @@ class PostgresWarehouse:
                 WHERE p.source = 'plaid' AND p.account_id = l.account_id
                 LIMIT 1
             ) AS plaid_link ON TRUE
+            LEFT JOIN @marts_finance_net_worth AS nw
+              ON nw.account_id = l.account_id
+            LEFT JOIN LATERAL (
+                SELECT NULLIF(max(pt.posted_at), '1970-01-01 00:00:00+00'::timestamptz) AS newest_transaction_at
+                FROM @finance_account_links AS p
+                JOIN @plaid_transactions AS pt
+                  ON pt.account = p.account AND pt.account_id = p.source_account_key
+                WHERE p.source = 'plaid' AND p.account_id = l.account_id
+                  AND pt.pending = 0 AND pt.is_removed = 0
+            ) AS plaid_tx ON TRUE
             WHERE a.is_removed = 0
             """,
         )
@@ -3692,7 +3751,20 @@ class PostgresWarehouse:
         # at 13:30, the bridge 32.55 at 12:56 -- and 32.55 is 4.11 plus the
         # two purchases Plaid had not posted yet. A newer DAY still wins
         # outright; this only breaks the same-day tie.
-        source_rank = "CASE o.source WHEN 'simplefin' THEN 0 ELSE 1 END"
+        #
+        # The preference is a claim that the bridge is fresher, and the flows
+        # say whether it is: the bridge refreshes about once a day, Plaid
+        # through the day. Measured 2026-09-29: the bridge's 01:00 balance
+        # read 32.55 with nothing posted after 09-26 while Plaid had posted
+        # nine purchases dated 09-28 and read 172.53, and net worth quoted
+        # 32.55 all day. So a bridge balance that has not seen the newest
+        # movement Plaid has POSTED for the account by that day ranks behind
+        # Plaid's; with no such evidence the bridge still wins the day.
+        source_rank = (
+            "CASE WHEN o.source <> 'simplefin' THEN 1 "
+            f"WHEN {_bridge_balance_is_behind_plaid_sql('o.account_id', 'o.as_of')} THEN 2 "
+            "ELSE 0 END"
+        )
         # Observation kinds that are facts about an account but NOT what it is
         # worth today. They are stored in the same table on purpose — the
         # ledger holds facts, and status is derived at read time — so every

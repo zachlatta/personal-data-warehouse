@@ -69,7 +69,9 @@ Search scope `finance` covers transactions; a receipt's link to its transaction 
 - **Plaid and SimpleFIN report the same accounts, and the ledger counts each once.** A
   SimpleFIN account resolves onto the Plaid-founded ledger account by institution + the
   last four digits in its name (or by the transactions the two feeds share when the name
-  has none), its balance is a second observation net worth takes only when fresher, and
+  has none), its balance is a second observation net worth takes only when it has seen
+  the newest posted movement (the bridge refreshes about once a day, Plaid through the
+  day; `net_worth_source` on the health row says which one is quoted), and
   its transactions merge into Plaid's by exact amount within ±3 days
   (`match_method = 'fuzzy_amount_date'`). A row in `marts_ops.simplefin_account_health`
   with `shared_with_plaid = 0` at a Plaid-linked institution is a possible double count;
