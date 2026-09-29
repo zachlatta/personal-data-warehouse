@@ -2068,6 +2068,9 @@ SLACK_SESSION_COLUMNS = (
     "user_id",
     "team_url",
     "source_app",
+    # The browser the session was pasted from; every request spends it with
+    # this User-Agent (slack_session._slack_post).
+    "user_agent",
     "cookie_expires_at",
     "published_at",
     "updated_at",

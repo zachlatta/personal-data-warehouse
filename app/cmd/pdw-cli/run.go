@@ -122,10 +122,11 @@ COMMANDS
                              mutations through this Mac's apps: resident worker
                              by default, one batch with --once. Providers:
                              apple-notes, apple-contacts. See "pdw mutations --help".
-  slack publish-session      Publish this Mac's Slack client session to the
-                             warehouse, so the sync can ask Slack what changed
-                             in one request instead of polling every
-                             conversation. See "pdw slack --help".
+  slack publish-session      Publish a Slack web session pasted from a browser,
+                             so the sync can ask Slack what changed in one
+                             request instead of polling every conversation.
+                             Talks to nothing but the warehouse. See
+                             "pdw slack --help".
   chatgpt publish-session    Publish this Mac's chatgpt.com browser session so
                              the server-side poller can keep syncing ChatGPT
                              conversations. See "pdw chatgpt --help".
@@ -282,7 +283,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "whoop" {
 		return runWhoop(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
-	// slack publish-session captures the Slack desktop app's client session and
+	// slack publish-session reads a Slack web session pasted from a browser and
 	// posts it to the app's signed endpoint -- same shape again.
 	if cmd == "slack" {
 		return runSlack(rest, stdin, stdout, stderr, getenv, *baseURL, *token)

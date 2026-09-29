@@ -60,7 +60,7 @@ func TestPublishStoresBothHalvesOfTheSession(t *testing.T) {
 	store := &fakeStore{}
 	rec := post(t, store, `{"account":"zrl","session_token":"xoxc-tok","session_cookie":"xoxd-ck",
 		"team_id":"T0266FRGM","enterprise_id":"E09V59WQY1E","user_id":"U1",
-		"source_app":"slack-app","cookie_expires_at":"2027-09-28T03:42:00Z"}`)
+		"source_app":"slack-web","user_agent":"Mozilla/5.0 Chrome/140"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -73,6 +73,10 @@ func TestPublishStoresBothHalvesOfTheSession(t *testing.T) {
 	}
 	if got.TeamID != "T0266FRGM" || got.EnterpriseID != "E09V59WQY1E" {
 		t.Fatalf("workspace and org ids must stay separate, got %+v", got)
+	}
+	// The sync sends the minting browser's User-Agent with the session.
+	if got.UserAgent != "Mozilla/5.0 Chrome/140" || got.SourceApp != "slack-web" {
+		t.Fatalf("user agent and source must be persisted, got %+v", got)
 	}
 	var ack Ack
 	if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {

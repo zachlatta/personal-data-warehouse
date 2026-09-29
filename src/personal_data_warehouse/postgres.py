@@ -6848,11 +6848,14 @@ class PostgresWarehouse:
                 "media_fingerprints",
                 "slack_sync_state",
                 "slack_account_state_item_rows",
-                # The captured client session that lets the sync ask Slack what
+                # The pasted web session that lets the sync ask Slack what
                 # changed in one request instead of polling every conversation.
                 "slack_sessions",
             ]
         )
+        # A one-row credential table; user_agent arrived after production's
+        # copy was provisioned (the app's publish path adds it too).
+        self._reconcile_table_columns("slack_sessions")
         self._ensure_slack_conversation_stats_backfilled()
         self._ensure_slack_sync_state_gone_reclassified()
         self._ensure_clean_slack_inbox_view()
@@ -9486,14 +9489,6 @@ class PostgresWarehouse:
         if not rows:
             return {}
         return dict(zip(columns, rows[0], strict=True))
-
-    def load_uploader_heartbeats(self, *, pipeline: str) -> list[dict[str, Any]]:
-        """Every device's latest heartbeat for one pipeline, newest first."""
-        return self._query_dicts(
-            "SELECT pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at "
-            "FROM @uploader_heartbeats WHERE pipeline = %s ORDER BY ran_at DESC",
-            (pipeline,),
-        )
 
     def load_slack_mark_read_target(
         self,

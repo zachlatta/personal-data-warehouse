@@ -70,18 +70,9 @@ type fakeDeps struct {
 	published *ingestclient.SlackSession
 }
 
-func newDeps(session slack.Session, discoverErr error, probe map[string]any, workspaces []string) *fakeDeps {
-	return newMultiDeps([]slack.Session{session}, discoverErr, probe, workspaces)
-}
-
-func newMultiDeps(sessions []slack.Session, discoverErr error, probe map[string]any, workspaces []string) *fakeDeps {
+func newDeps(workspaces []string) *fakeDeps {
 	f := &fakeDeps{}
-	if discoverErr != nil {
-		sessions = nil
-	}
 	f.deps = slack.Deps{
-		Discover: func(source string) ([]slack.Session, error) { return sessions, discoverErr },
-		Probe:    func(slack.Session) map[string]any { return probe },
 		Workspaces: func(string) ([]string, error) {
 			return workspaces, nil
 		},
@@ -103,15 +94,12 @@ func newMultiDeps(sessions []slack.Session, discoverErr error, probe map[string]
 	return f
 }
 
-var liveSession = slack.Session{Source: "slack-app", Token: "xoxc-supersecrettoken", CookieD: "xoxd-supersecretcookie",
-	EnterpriseID: "E09V59WQY1E", UserID: "U09UE480JHH", TeamURL: "https://hackclub.slack.com/"}
+const cookieLine = "xoxd-supersecretcookie%2Fx%3D"
 
-var okProbe = map[string]any{"ok": true, "channels": 812, "ims": 3627, "mpims": 2788, "total_conversations": 7227, "with_latest_marker": 7227}
-
-func run(t *testing.T, deps slack.Deps, env map[string]string, args ...string) (int, map[string]any, string) {
+func run(t *testing.T, deps slack.Deps, env map[string]string, stdin string, args ...string) (int, map[string]any, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := slack.RunWith(args, &stdout, &stderr, envOf(env), deps)
+	code := slack.RunWith(args, strings.NewReader(stdin), &stdout, &stderr, envOf(env), deps)
 	var report map[string]any
 	if stdout.Len() > 0 {
 		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
@@ -124,92 +112,122 @@ func run(t *testing.T, deps slack.Deps, env map[string]string, args ...string) (
 	return code, report, stderr.String()
 }
 
-func TestRunPublishesResolvingTheWorkspaceFromTheEnterprise(t *testing.T) {
-	f := newDeps(liveSession, nil, okProbe, []string{"T0266FRGM"})
-	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, "publish-session")
+// The point of the manual flow: on 2026-09-29 every hourly run of the old
+// desktop-app capture called auth.test and client.counts with Zach's own
+// desktop session from a Go TLS stack, and Slack signed him out of every
+// device each time (`unexpected_scraping`, "Go-based tool"). Deps has no Slack
+// client at all now, so nothing here can talk to Slack; this pins the report
+// saying so and the credential reaching the warehouse untouched.
+func TestRunPublishesThePastedWorkspaceSessionWithoutCallingSlack(t *testing.T) {
+	f := newDeps([]string{"T0266FRGM"})
+	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, snippetOutput+"\n"+cookieLine+"\n", "publish-session")
 	if code != 0 {
 		t.Fatalf("code = %d report = %v", code, report)
 	}
 	if report["published"] != true || report["team_id"] != "T0266FRGM" || report["account"] != "zrl" {
 		t.Fatalf("report = %v", report)
 	}
-	if f.published == nil || f.published.TeamID != "T0266FRGM" || f.published.EnterpriseID != "E09V59WQY1E" ||
-		f.published.SessionToken != "xoxc-supersecrettoken" || f.published.SessionCookie != "xoxd-supersecretcookie" ||
-		f.published.SessionKey != "default" || f.published.SourceApp != "slack-app" || f.published.CookieExpiresAt != "" {
-		t.Fatalf("published = %+v", f.published)
+	p := f.published
+	if p == nil || p.TeamID != "T0266FRGM" || p.EnterpriseID != "E09V59WQY1E" || p.UserID != "U09UE480JHH" ||
+		p.SessionToken != "xoxc-workspacesupersecret" || p.SessionCookie != cookieLine ||
+		p.SessionKey != "default" || p.SourceApp != slack.SourceWeb || !strings.Contains(p.UserAgent, "Chrome/140") ||
+		p.TeamURL != "https://hackclub.slack.com/" {
+		t.Fatalf("published = %+v", p)
 	}
-	session := report["session"].(map[string]any)
-	if session["enterprise_id"] != "E09V59WQY1E" || session["token_sha256"] != liveSession.Fingerprint() {
-		t.Fatalf("session = %v", session)
+	if !strings.Contains(report["next"].(string), "change_feed_status") {
+		t.Fatalf("report does not say how to confirm the session works: %v", report)
+	}
+}
+
+func TestRunPrintsInstructionsOnlyToATerminal(t *testing.T) {
+	f := newDeps([]string{"T0266FRGM"})
+	_, _, stderr := run(t, f.deps, nil, snippetOutput+"\n"+cookieLine+"\n", "publish-session")
+	if strings.Contains(stderr, "localConfig_v2") {
+		t.Fatalf("piped input still printed the instructions: %s", stderr)
+	}
+	f.deps.Interactive = func() bool { return true }
+	_, _, stderr = run(t, f.deps, nil, snippetOutput+"\n"+cookieLine+"\n", "publish-session")
+	for _, want := range []string{"app.slack.com", slack.ConsoleSnippet, `"d"`, "xoxd-"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("instructions lack %q: %s", want, stderr)
+		}
+	}
+}
+
+func TestRunResolvesAnOrgOnlyPasteToItsWorkspace(t *testing.T) {
+	org := `{"user_agent":"UA","teams":[{"id":"E09V59WQY1E","url":"https://hackclub.enterprise.slack.com/","user_id":"U09UE480JHH","token":"xoxc-orgsupersecret"}]}`
+	f := newDeps([]string{"T0266FRGM"})
+	code, report, _ := run(t, f.deps, nil, org+"\n"+cookieLine, "publish-session")
+	if code != 0 || f.published.TeamID != "T0266FRGM" || f.published.EnterpriseID != "E09V59WQY1E" || report["team_id"] != "T0266FRGM" {
+		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
 	}
 }
 
 func TestRunDryRunValidatesWithoutPublishing(t *testing.T) {
-	f := newDeps(liveSession, nil, okProbe, []string{"T0266FRGM"})
+	f := newDeps([]string{"T0266FRGM"})
 	f.deps.Publisher = func() (slack.Publisher, error) { t.Fatal("must not publish"); return nil, nil }
-	code, report, _ := run(t, f.deps, nil, "publish-session", "--dry-run")
-	if code != 0 || report["published"] != false || report["team_id"] != "T0266FRGM" ||
-		report["client_counts"].(map[string]any)["total_conversations"] != float64(7227) {
+	code, report, _ := run(t, f.deps, nil, snippetOutput+"\n"+cookieLine, "publish-session", "--dry-run")
+	if code != 0 || report["published"] != false || report["team_id"] != "T0266FRGM" {
 		t.Fatalf("code = %d report = %v", code, report)
 	}
 }
 
 func TestRunExplicitFlagsWin(t *testing.T) {
-	f := newDeps(liveSession, nil, okProbe, []string{"T1", "T2"})
-	code, report, _ := run(t, f.deps, nil, "publish-session", "--team-id", "T2", "--account", "chosen", "--session-key", "alt")
-	if code != 0 || report["team_id"] != "T2" || f.published.Account != "chosen" || f.published.SessionKey != "alt" {
+	f := newDeps([]string{"T0266FRGM"})
+	code, report, _ := run(t, f.deps, nil, snippetOutput+"\n"+cookieLine, "publish-session", "--team-id", "T0A4T3P6VUG", "--account", "chosen", "--session-key", "alt")
+	if code != 0 || report["team_id"] != "T0A4T3P6VUG" || f.published.Account != "chosen" || f.published.SessionKey != "alt" ||
+		f.published.SessionToken != "xoxc-strangersupersecret" {
+		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
+	}
+}
+
+// When Slack changes localConfig_v2 and the snippet stops working, a token
+// found some other way can still be published by naming who it belongs to.
+func TestRunPublishesABareTokenOnlyWithItsIdentity(t *testing.T) {
+	bare := "xoxc-baresupersecret-1234567890\n" + cookieLine + "\n"
+	f := newDeps([]string{"T0266FRGM"})
+	if code, report, _ := run(t, f.deps, nil, bare, "publish-session"); code != 1 || !strings.Contains(report["error"].(string), "--user-id") || f.published != nil {
+		t.Fatalf("code = %d report = %v", code, report)
+	}
+	code, report, _ := run(t, f.deps, nil, bare, "publish-session", "--team-id", "T0266FRGM", "--user-id", "U09UE480JHH")
+	if code != 0 || f.published.SessionToken != "xoxc-baresupersecret-1234567890" || f.published.UserID != "U09UE480JHH" || f.published.TeamID != "T0266FRGM" {
 		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
 	}
 }
 
 func TestRunExitCodes(t *testing.T) {
-	t.Run("capture failure is 1 with the error", func(t *testing.T) {
-		f := newDeps(slack.Session{}, &slack.CaptureError{Msg: "found no xoxc- token"}, nil, nil)
-		code, report, _ := run(t, f.deps, nil, "publish-session")
-		if code != 1 || report["error"] != "found no xoxc- token" || report["likely_cause"] != nil {
-			t.Fatalf("code = %d report = %v", code, report)
-		}
-	})
-	t.Run("a keychain prompt timeout explains itself", func(t *testing.T) {
-		f := newDeps(slack.Session{}, errors.New("could not run `security` to read Slack Safe Storage: timed out after 60 seconds"), nil, nil)
-		code, report, _ := run(t, f.deps, nil, "publish-session")
-		blob := strings.ToLower(report["likely_cause"].(string) + report["fix"].(string))
-		if code != 1 || !strings.Contains(blob, "keychain") || !strings.Contains(blob, "always allow") || !strings.Contains(blob, "locked") {
-			t.Fatalf("code = %d report = %v", code, report)
-		}
-	})
-	t.Run("client.counts failure is 2", func(t *testing.T) {
-		f := newDeps(liveSession, nil, map[string]any{"ok": false, "error": "not_allowed_token_type"}, nil)
-		code, report, _ := run(t, f.deps, nil, "publish-session")
-		if code != 2 || report["client_counts"].(map[string]any)["error"] != "not_allowed_token_type" || report["published"] != false {
+	t.Run("a paste missing the cookie is 1 and says so", func(t *testing.T) {
+		f := newDeps([]string{"T0266FRGM"})
+		code, report, _ := run(t, f.deps, nil, snippetOutput+"\n", "publish-session")
+		if code != 1 || !strings.Contains(report["error"].(string), `"d" cookie`) || f.published != nil {
 			t.Fatalf("code = %d report = %v", code, report)
 		}
 	})
 	t.Run("ambiguous enterprise is 3", func(t *testing.T) {
-		f := newDeps(liveSession, nil, okProbe, []string{"T1", "T2"})
-		code, report, _ := run(t, f.deps, nil, "publish-session")
+		org := `{"teams":[{"id":"E1","user_id":"U1","token":"xoxc-orgsupersecret"}]}`
+		f := newDeps([]string{"T1", "T2"})
+		code, report, _ := run(t, f.deps, nil, org+"\n"+cookieLine, "publish-session")
 		if code != 3 || !strings.Contains(report["error"].(string), "more than one workspace") || f.published != nil {
 			t.Fatalf("code = %d report = %v", code, report)
 		}
 	})
 	t.Run("unconfigured publisher is 1", func(t *testing.T) {
-		f := newDeps(slack.Session{TeamID: "T1"}, nil, okProbe, []string{"T1"})
+		f := newDeps([]string{"T0266FRGM"})
 		f.deps.Publisher = func() (slack.Publisher, error) { return nil, errors.New("PDW_API_URL must be set") }
-		code, report, _ := run(t, f.deps, nil, "publish-session")
+		code, report, _ := run(t, f.deps, nil, snippetOutput+"\n"+cookieLine, "publish-session")
 		if code != 1 || !strings.Contains(report["error"].(string), "PDW_API_URL") {
 			t.Fatalf("code = %d report = %v", code, report)
 		}
 	})
 }
 
-// The 2026-09-23 shape: the Hack Club token was signed out, another
-// workspace's token still answered, and that workspace got published as zrl.
+// The 2026-09-23 shape: another workspace's session got published as zrl.
+// A paste of only a stranger workspace is refused unless --team-id names it.
 func TestRunRefusesAWorkspaceTheWarehouseHasNeverSynced(t *testing.T) {
-	stranger := slack.Session{Source: "slack-app", Token: "xoxc-supersecrettoken", CookieD: "xoxd-supersecretcookie",
-		TeamID: "T0A4T3P6VUG", UserID: "U0A9TGMBR70", TeamURL: "https://example-other.slack.com/"}
-	f := newDeps(stranger, nil, okProbe, []string{"T0266FRGM"})
-	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, "publish-session")
-	if code != 3 || f.published != nil || report["known_workspace"] != false {
+	stranger := `{"teams":[{"id":"T0A4T3P6VUG","url":"https://example-other.slack.com/","user_id":"U0A9TGMBR70","token":"xoxc-strangersupersecret"}]}`
+	f := newDeps([]string{"T0266FRGM"})
+	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, stranger+"\n"+cookieLine, "publish-session")
+	if code != 3 || f.published != nil {
 		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
 	}
 	msg := report["error"].(string)
@@ -218,81 +236,31 @@ func TestRunRefusesAWorkspaceTheWarehouseHasNeverSynced(t *testing.T) {
 			t.Fatalf("error does not mention %q: %s", want, msg)
 		}
 	}
-	// The explicit flag is the deliberate override, and a known workspace passes.
-	f = newDeps(stranger, nil, okProbe, []string{"T0266FRGM"})
-	if code, _, _ := run(t, f.deps, nil, "publish-session", "--team-id", "T0A4T3P6VUG"); code != 0 || f.published == nil {
+	if code, _, _ := run(t, f.deps, nil, stranger+"\n"+cookieLine, "publish-session", "--team-id", "T0A4T3P6VUG"); code != 0 || f.published == nil {
 		t.Fatalf("explicit --team-id was refused: code = %d", code)
-	}
-	f = newDeps(slack.Session{TeamID: "T0266FRGM", TeamURL: "https://hackclub.slack.com/"}, nil, okProbe, []string{"T0266FRGM"})
-	if code, report, _ := run(t, f.deps, nil, "publish-session"); code != 0 || report["known_workspace"] != true {
-		t.Fatalf("known workspace refused: code = %d report = %v", code, report)
 	}
 }
 
 func TestRunVerbDispatch(t *testing.T) {
-	f := newDeps(liveSession, nil, okProbe, nil)
-	if code, _, err := run(t, f.deps, nil); code != 2 || !strings.Contains(err, "usage: pdw slack publish-session") {
+	f := newDeps(nil)
+	if code, _, err := run(t, f.deps, nil, ""); code != 2 || !strings.Contains(err, "usage: pdw slack publish-session") {
 		t.Fatalf("code = %d stderr = %q", code, err)
 	}
 	var helpOut, helpErr bytes.Buffer
-	if code := slack.RunWith([]string{"--help"}, &helpOut, &helpErr, envOf(nil), f.deps); code != 0 || !strings.Contains(helpOut.String(), "usage:") || helpErr.Len() != 0 {
+	if code := slack.RunWith([]string{"--help"}, strings.NewReader(""), &helpOut, &helpErr, envOf(nil), f.deps); code != 0 ||
+		!strings.Contains(helpOut.String(), "usage:") || !strings.Contains(helpOut.String(), slack.ConsoleSnippet) || helpErr.Len() != 0 {
 		t.Fatalf("code = %d stdout = %q stderr = %q", code, helpOut.String(), helpErr.String())
 	}
-	if code, _, err := run(t, f.deps, nil, "frobnicate"); code != 2 || !strings.Contains(err, "unknown command") {
+	if code, _, err := run(t, f.deps, nil, "", "frobnicate"); code != 2 || !strings.Contains(err, "unknown command") {
 		t.Fatalf("code = %d stderr = %q", code, err)
 	}
-	if code, _, err := run(t, f.deps, nil, "publish-session", "--bogus"); code != 2 || !strings.Contains(err, "bogus") {
+	if code, _, err := run(t, f.deps, nil, "", "publish-session", "--bogus"); code != 2 || !strings.Contains(err, "bogus") {
 		t.Fatalf("code = %d stderr = %q", code, err)
 	}
-	helpOut.Reset()
-	helpErr.Reset()
-	if code := slack.RunWith([]string{"publish-session", "--help"}, &helpOut, &helpErr, envOf(nil), f.deps); code != 0 || !strings.Contains(helpOut.String(), "usage:") || helpErr.Len() != 0 {
-		t.Fatalf("code = %d stdout = %q stderr = %q", code, helpOut.String(), helpErr.String())
+	if code, _, err := run(t, f.deps, nil, "", "publish-session", "--source", "slack-app"); code != 2 || !strings.Contains(err, "source") {
+		t.Fatalf("the desktop-app --source flag must be gone: code = %d stderr = %q", code, err)
 	}
-	if code, _, err := run(t, f.deps, nil, "publish-session", "extra"); code != 2 || !strings.Contains(err, "unexpected argument") {
+	if code, _, err := run(t, f.deps, nil, "", "publish-session", "extra"); code != 2 || !strings.Contains(err, "unexpected argument") {
 		t.Fatalf("code = %d stderr = %q", code, err)
-	}
-}
-
-// The 2026-09-28 shape on crobat: the desktop app held three working sessions
-// -- another workspace's, the Hack Club org's, and the Hack Club workspace's --
-// and the first one Slack accepted was the stranger. The publisher must pick
-// the workspace the warehouse syncs, and prefer the workspace-scoped token
-// over the org one because an org session's client.counts can describe a
-// sibling workspace.
-func TestRunPublishesTheWorkspaceTheWarehouseSyncsAmongSeveralSessions(t *testing.T) {
-	stranger := slack.Session{Source: "slack-app", Token: "xoxc-strangersupersecret", CookieD: "xoxd-supersecretcookie",
-		TeamID: "T0A4T3P6VUG", UserID: "U0A9TGMBR70", TeamURL: "https://example-other.slack.com/"}
-	org := slack.Session{Source: "slack-app", Token: "xoxc-orgsupersecret", CookieD: "xoxd-supersecretcookie",
-		EnterpriseID: "E09V59WQY1E", UserID: "U09UE480JHH", TeamURL: "https://hackclub.enterprise.slack.com/"}
-	workspace := slack.Session{Source: "slack-app", Token: "xoxc-workspacesupersecret", CookieD: "xoxd-supersecretcookie",
-		TeamID: "T0266FRGM", UserID: "U09UE480JHH", TeamURL: "https://hackclub.slack.com/"}
-	f := newMultiDeps([]slack.Session{stranger, org, workspace}, nil, okProbe, []string{"T0266FRGM"})
-	code, report, _ := run(t, f.deps, map[string]string{"SLACK_ACCOUNTS": "zrl"}, "publish-session")
-	if code != 0 || f.published == nil {
-		t.Fatalf("code = %d report = %v", code, report)
-	}
-	if f.published.SessionToken != workspace.Token || f.published.TeamID != "T0266FRGM" {
-		t.Fatalf("published the wrong session: %+v", f.published)
-	}
-	candidates := report["candidates"].([]any)
-	if len(candidates) != 3 {
-		t.Fatalf("candidates = %v", candidates)
-	}
-	// The org session alone is still publishable, resolved to its workspace.
-	f = newMultiDeps([]slack.Session{stranger, org}, nil, okProbe, []string{"T0266FRGM"})
-	if code, report, _ := run(t, f.deps, nil, "publish-session"); code != 0 || f.published.SessionToken != org.Token || report["team_id"] != "T0266FRGM" {
-		t.Fatalf("code = %d report = %v published = %+v", code, report, f.published)
-	}
-	// A session whose client.counts fails is passed over for one that works.
-	f = newMultiDeps([]slack.Session{workspace, org}, nil, okProbe, []string{"T0266FRGM"})
-	f.deps.Probe = func(s slack.Session) map[string]any {
-		if s.Token == workspace.Token {
-			return map[string]any{"ok": false, "error": "not_allowed_token_type"}
-		}
-		return okProbe
-	}
-	if code, report, _ := run(t, f.deps, nil, "publish-session"); code != 0 || f.published.SessionToken != org.Token {
-		t.Fatalf("code = %d report = %v", code, report)
 	}
 }

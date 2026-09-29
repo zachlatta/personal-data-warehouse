@@ -1,63 +1,61 @@
-// Package slack captures the Slack desktop app's client session and publishes
-// it to the warehouse (`pdw slack publish-session`).
+// Package slack publishes a Slack web session that Zach copies by hand from a
+// browser (`pdw slack publish-session`).
 //
 // Slack's public Web API cannot say which conversations changed; the client's
 // own `client.counts` can, but only for a signed-in session. That session is
-// two pieces that are useless apart: an `xoxc-` token kept in the app's
-// localStorage (LevelDB) and the `d` cookie in its Chromium cookie store.
-// This is the port of personal_data_warehouse.slack_session + slack_setup.
-// Nothing here logs or prints a secret; reports carry a fingerprint instead.
+// two pieces that are useless apart: an `xoxc-` token kept in the web client's
+// localStorage and the HttpOnly `d` cookie.
+//
+// Until 2026-09-29 this package read both out of the Slack DESKTOP app on
+// crobat every hour and called auth.test + client.counts with them to pick the
+// right workspace. Slack's anomaly detection flagged every one of those runs as
+// `unexpected_scraping` ("Go-based tool": a Slack desktop User-Agent over Go's
+// TLS fingerprint, from the desktop's own IP, on the desktop's own session) and
+// reset every session Zach had -- four sign-outs on 09-29 alone, each to the
+// second of an hourly run. So the session is now pasted from a browser once,
+// and nothing in this package talks to Slack: identity comes from the same
+// localStorage the token does. Nothing here logs or prints a secret; reports
+// carry a fingerprint instead.
 package slack
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"time"
-	"unicode/utf16"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium"
 )
 
 const (
-	// CookieHostSuffix selects slack.com cookies.
-	CookieHostSuffix = "slack.com"
 	// SessionCookie is the cookie that turns an xoxc token into a session.
 	SessionCookie = "d"
-	// DefaultAPIBaseURL is Slack's API origin.
-	DefaultAPIBaseURL = "https://slack.com"
-	userAgent         = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Slack_SSB/4.36.140"
+	// SourceWeb marks a session pasted from the Slack web client.
+	SourceWeb = "slack-web"
 )
 
-// AppProfile is the Slack desktop app: an Electron Chromium profile, so the
-// cookie store and the Safe Storage keychain entry have the browser shape.
-var AppProfile = chromium.Profile{
-	Key:                "slack-app",
-	DisplayName:        "Slack",
-	SupportSubdir:      "Slack",
-	SafeStorageService: "Slack Safe Storage",
-	SafeStorageAccount: "Slack",
-	AppBundle:          "/Applications/Slack.app",
-	HomebrewCask:       "slack",
-}
+// ConsoleSnippet is pasted into the browser's DevTools console on
+// app.slack.com. It copies one JSON line to the clipboard: every signed-in
+// team's token and identity from localConfig_v2 (the key the Slack client
+// keeps them under; verified against crobat's client on 2026-09-29), plus the
+// browser's own User-Agent, which the warehouse then sends with the session so
+// the requests at least name the browser that minted it.
+const ConsoleSnippet = `copy(JSON.stringify({user_agent:navigator.userAgent,teams:Object.values(JSON.parse(localStorage.localConfig_v2).teams).map(t=>({id:t.id,name:t.name,url:t.url,user_id:t.user_id,enterprise_id:t.enterprise_id||"",token:t.token}))}))`
 
 // Deliberately narrow: `xoxc-` only (a user client token); `xoxb-`/`xoxp-`
 // do not work with the client endpoints, and the length floor keeps
-// truncated fragments out of the candidate list.
+// truncated fragments out.
 var tokenRE = regexp.MustCompile(`xoxc-[0-9a-zA-Z-]{10,}`)
 
-// CaptureError means no usable logged-in Slack session was found.
+// The `d` cookie value. DevTools shows it URL-encoded by default and decoded
+// ('/', '+', '=') when "Show URL-decoded" is ticked; both are accepted.
+var cookieRE = regexp.MustCompile(`xoxd-[0-9A-Za-z%/+=_.-]+`)
+
+// CaptureError means the paste did not hold a usable session.
 type CaptureError struct{ Msg string }
 
 func (e *CaptureError) Error() string { return e.Msg }
@@ -66,16 +64,17 @@ func captureErrorf(format string, args ...any) error {
 	return &CaptureError{Msg: fmt.Sprintf(format, args...)}
 }
 
-// Session is a captured Slack client session.
+// Session is one team's Slack client session from the paste.
 type Session struct {
-	Source          string
-	Token           string
-	CookieD         string
-	TeamID          string
-	EnterpriseID    string
-	UserID          string
-	TeamURL         string
-	CookieExpiresAt time.Time // zero when unknown
+	Source       string
+	Token        string
+	CookieD      string
+	TeamID       string
+	EnterpriseID string
+	UserID       string
+	TeamURL      string
+	TeamName     string
+	UserAgent    string
 }
 
 // Fingerprint is a stable, non-secret identity for the credential.
@@ -84,227 +83,190 @@ func (s Session) Fingerprint() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CookieHeader is the Cookie header value the client endpoints need.
-func (s Session) CookieHeader() string { return SessionCookie + "=" + s.CookieD }
-
 // Redacted is the report-safe view: identity plus a token sha, no secret.
 func (s Session) Redacted() map[string]any {
-	var expires any
-	if !s.CookieExpiresAt.IsZero() {
-		expires = isoformat(s.CookieExpiresAt)
-	}
 	return map[string]any{
-		"source":            s.Source,
-		"team_id":           s.TeamID,
-		"enterprise_id":     s.EnterpriseID,
-		"user_id":           s.UserID,
-		"team_url":          s.TeamURL,
-		"cookie_expires_at": expires,
-		"token_sha256":      s.Fingerprint(),
+		"source":        s.Source,
+		"team_id":       s.TeamID,
+		"enterprise_id": s.EnterpriseID,
+		"user_id":       s.UserID,
+		"team_url":      s.TeamURL,
+		"team_name":     s.TeamName,
+		"token_sha256":  s.Fingerprint(),
 	}
 }
 
-// isoformat renders a UTC time the way Python's datetime.isoformat() does.
-func isoformat(t time.Time) string {
-	t = t.UTC()
-	if t.Nanosecond() == 0 {
-		return t.Format("2006-01-02T15:04:05+00:00")
-	}
-	return t.Format("2006-01-02T15:04:05.000000+00:00")
+// Paste is everything recognised in what Zach pasted.
+type Paste struct {
+	Teams      []Session
+	BareTokens []string // xoxc tokens found outside the snippet's JSON
+	CookieD    string
+	UserAgent  string
 }
 
-func scanBytes(data []byte, found map[string]bool) {
-	for _, m := range tokenRE.FindAll(data, -1) {
-		found[string(m)] = true
-	}
-	// Chromium stores some localStorage values as UTF-16LE, where a byte-level
-	// search for "xoxc-" finds nothing because every character is NUL-separated.
-	// Both alignments are tried: LevelDB records carry a one-byte type prefix.
-	for _, offset := range []int{0, 1} {
-		if len(data) <= offset {
+func (p Paste) hasToken() bool { return len(p.Teams) > 0 || len(p.BareTokens) > 0 }
+
+// Complete reports whether both halves of a session are present.
+func (p Paste) Complete() bool { return p.hasToken() && p.CookieD != "" }
+
+type pastedTeam struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	URL          string `json:"url"`
+	UserID       string `json:"user_id"`
+	EnterpriseID string `json:"enterprise_id"`
+	Token        string `json:"token"`
+}
+
+type pastedConfig struct {
+	UserAgent string          `json:"user_agent"`
+	Teams     json.RawMessage `json:"teams"`
+}
+
+// ParsePaste reads the snippet's JSON (or a whole localConfig_v2 value, whose
+// teams are keyed by id), any bare xoxc token, and the `d` cookie, in any
+// order.
+func ParsePaste(text string) (Paste, error) {
+	var paste Paste
+	seenTokens := map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		for _, m := range tokenRE.FindAllString(decodeUTF16LE(data[offset:]), -1) {
-			found[m] = true
-		}
-	}
-}
-
-func decodeUTF16LE(data []byte) string {
-	units := make([]uint16, 0, len(data)/2)
-	for i := 0; i+1 < len(data); i += 2 {
-		units = append(units, uint16(data[i])|uint16(data[i+1])<<8)
-	}
-	return string(utf16.Decode(units))
-}
-
-// ScanLocalStorageForTokens returns every xoxc- token in a Chromium
-// localStorage tree: the live database's values first, then anything a raw
-// byte scan of the files turns up, newest file first.
-//
-// The database read is the one that matters. LevelDB compresses its tables
-// with Snappy, and Slack keeps every signed-in workspace's token in ONE
-// localConfig_v2 value, so after a compaction the second and later tokens --
-// which share the user/team prefix with the first -- are stored as
-// back-references and never appear verbatim on disk. From 2026-09-20 a raw
-// scan on crobat found two of the three tokens the database held, both
-// useless (one signed out, one another workspace's), while the two working
-// Hack Club tokens sat unread; the change feed was down for a week behind it.
-// The raw scan is kept because stale tokens from previous logins stay behind
-// in older files the live database no longer points at. This only ORDERS
-// candidates; the caller decides by asking Slack.
-func ScanLocalStorageForTokens(storeRoot string) []string {
-	leveldbDir := filepath.Join(storeRoot, "Local Storage", "leveldb")
-	var ordered []string
-	seen := map[string]bool{}
-	add := func(found map[string]bool) {
-		tokens := make([]string, 0, len(found))
-		for tok := range found {
-			tokens = append(tokens, tok)
-		}
-		sort.Strings(tokens)
-		for _, tok := range tokens {
-			if !seen[tok] {
-				seen[tok] = true
-				ordered = append(ordered, tok)
+		if strings.HasPrefix(line, "{") {
+			var cfg pastedConfig
+			if err := json.Unmarshal([]byte(line), &cfg); err == nil && len(cfg.Teams) > 0 {
+				teams, err := decodeTeams(cfg.Teams)
+				if err != nil {
+					return Paste{}, captureErrorf("could not read the teams in the pasted JSON: %v", err)
+				}
+				if cfg.UserAgent != "" {
+					paste.UserAgent = cfg.UserAgent
+				}
+				for _, t := range teams {
+					if t.Token == "" || seenTokens[t.Token] {
+						continue
+					}
+					seenTokens[t.Token] = true
+					paste.Teams = append(paste.Teams, sessionFromTeam(t))
+				}
+				continue
 			}
 		}
-	}
-	add(scanLevelDBValues(leveldbDir))
-
-	entries, err := os.ReadDir(leveldbDir)
-	if err != nil {
-		if len(ordered) == 0 {
-			return nil
+		for _, tok := range tokenRE.FindAllString(line, -1) {
+			if !seenTokens[tok] {
+				seenTokens[tok] = true
+				paste.BareTokens = append(paste.BareTokens, tok)
+			}
 		}
-		return ordered
-	}
-	type file struct {
-		path  string
-		mtime time.Time
-	}
-	var files []file
-	for _, e := range entries {
-		if !e.Type().IsRegular() {
-			continue
+		if m := cookieRE.FindString(line); m != "" {
+			paste.CookieD = NormalizeCookie(m)
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, file{filepath.Join(leveldbDir, e.Name()), info.ModTime()})
 	}
-	sort.SliceStable(files, func(i, j int) bool { return files[i].mtime.After(files[j].mtime) })
-	for _, f := range files {
-		data, err := os.ReadFile(f.path)
-		if err != nil {
-			continue
-		}
-		found := map[string]bool{}
-		scanBytes(data, found)
-		add(found)
+	for i := range paste.Teams {
+		paste.Teams[i].CookieD = paste.CookieD
+		paste.Teams[i].UserAgent = paste.UserAgent
 	}
-	if len(ordered) == 0 {
-		return nil
-	}
-	return ordered
+	return paste, nil
 }
 
-// scanLevelDBValues opens a COPY of the database read-only (the running Slack
-// app holds the LOCK on the original, and nothing here may ever write to it)
-// and scans every current value. A database that cannot be opened yields
-// nothing and the raw scan still runs.
-func scanLevelDBValues(leveldbDir string) map[string]bool {
-	found := map[string]bool{}
-	entries, err := os.ReadDir(leveldbDir)
-	if err != nil || len(entries) == 0 {
-		return found
+func decodeTeams(raw json.RawMessage) ([]pastedTeam, error) {
+	var list []pastedTeam
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
 	}
-	tmp, err := os.MkdirTemp("", "pdw-slack-leveldb-")
-	if err != nil {
-		return found
+	var byID map[string]pastedTeam
+	if err := json.Unmarshal(raw, &byID); err != nil {
+		return nil, err
 	}
-	defer os.RemoveAll(tmp)
-	for _, e := range entries {
-		if !e.Type().IsRegular() || e.Name() == "LOCK" {
-			continue
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]pastedTeam, 0, len(ids))
+	for _, id := range ids {
+		t := byID[id]
+		if t.ID == "" {
+			t.ID = id
 		}
-		data, err := os.ReadFile(filepath.Join(leveldbDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(tmp, e.Name()), data, 0o600); err != nil {
-			return found
-		}
+		out = append(out, t)
 	}
-	db, err := leveldb.OpenFile(tmp, &opt.Options{ReadOnly: true, ErrorIfMissing: true})
-	if err != nil {
-		return found
-	}
-	defer db.Close()
-	it := db.NewIterator(nil, nil)
-	defer it.Release()
-	for it.Next() {
-		scanBytes(it.Value(), found)
-	}
-	return found
+	return out, nil
 }
 
-// AuthTest is Slack's auth.test with a client session; it returns the raw
-// payload (never raises for an API-level failure).
-type AuthTest func(token, cookieHeader string) map[string]any
+// sessionFromTeam keeps an org entry's id out of team_id. On Enterprise Grid
+// the client keeps one entry per workspace (a T id, with enterprise_id set) and
+// one for the org itself (an E id); every warehouse row is keyed by the
+// workspace, so storing an E id as team_id would fork the dataset silently.
+func sessionFromTeam(t pastedTeam) Session {
+	s := Session{
+		Source:   SourceWeb,
+		Token:    t.Token,
+		UserID:   t.UserID,
+		TeamURL:  t.URL,
+		TeamName: t.Name,
+	}
+	if strings.HasPrefix(t.ID, "E") {
+		s.EnterpriseID = t.ID
+	} else {
+		s.TeamID = t.ID
+		s.EnterpriseID = t.EnterpriseID
+	}
+	return s
+}
 
-// CaptureAll returns every session Slack accepts, in candidate order. The
-// desktop app is routinely signed in to several workspaces, and which one is
-// the right one is the warehouse's question, not the first answer's: taking
-// the first accepted token is how another workspace's session was published
-// as zrl on 2026-09-23.
-func CaptureAll(storeRoot string, cookies map[string]string, cookieExpiresAt time.Time, source string, authTest AuthTest) ([]Session, error) {
-	cookieD := cookies[SessionCookie]
-	if cookieD == "" {
-		return nil, captureErrorf("found no `d` session cookie for slack.com; the xoxc token alone is not a session (sign in to Slack on this machine, then retry)")
+// NormalizeCookie returns the `d` value as the browser sends it: URL-encoded,
+// without a `d=` prefix or a trailing separator.
+func NormalizeCookie(raw string) string {
+	v := strings.TrimSpace(raw)
+	v = strings.TrimPrefix(v, SessionCookie+"=")
+	v = strings.Trim(v, `"';`)
+	if strings.ContainsAny(v, "/+=") {
+		v = url.QueryEscape(v)
 	}
-	candidates := ScanLocalStorageForTokens(storeRoot)
-	if len(candidates) == 0 {
-		return nil, captureErrorf("found no xoxc- token in %s/Local Storage", storeRoot)
-	}
-	header := SessionCookie + "=" + cookieD
-	lastError := ""
-	var sessions []Session
-	for _, token := range candidates {
-		payload := authTest(token, header)
-		if ok, _ := payload["ok"].(bool); ok {
-			// On Enterprise Grid the client session authenticates against the
-			// ORG, so auth.test returns an `E...` id where the app token returns
-			// the workspace `T...` id every warehouse row is keyed by. Storing the
-			// org id as team_id would fork the whole dataset, so the two are kept
-			// apart and the caller resolves the workspace from base_slack.teams.
-			reported := stringOf(payload["team_id"])
-			s := Session{
-				Source:          source,
-				Token:           token,
-				CookieD:         cookieD,
-				UserID:          stringOf(payload["user_id"]),
-				TeamURL:         stringOf(payload["url"]),
-				CookieExpiresAt: cookieExpiresAt,
+	return v
+}
+
+// ReadPaste reads lines until both halves of a session have arrived, so a
+// terminal user never has to know to press Ctrl-D, and returns an error naming
+// whatever is still missing at EOF.
+func ReadPaste(r io.Reader) (Paste, error) {
+	reader := bufio.NewReaderSize(r, 1<<20)
+	var text strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		text.WriteString(line)
+		if line != "" {
+			paste, perr := ParsePaste(text.String())
+			if perr != nil {
+				return Paste{}, perr
 			}
-			if strings.HasPrefix(reported, "E") {
-				s.EnterpriseID = reported
-			} else {
-				s.TeamID = reported
+			if paste.Complete() {
+				return paste, nil
 			}
-			sessions = append(sessions, s)
-			continue
 		}
-		lastError = stringOf(payload["error"])
-		if lastError == "" {
-			lastError = "unknown_error"
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Paste{}, captureErrorf("could not read the paste: %v", err)
 		}
 	}
-	if len(sessions) == 0 {
-		return nil, captureErrorf("found %d xoxc- token(s) but no working one (last error: %s); the stored session has probably been signed out", len(candidates), lastError)
+	paste, err := ParsePaste(text.String())
+	if err != nil {
+		return Paste{}, err
 	}
-	return sessions, nil
+	switch {
+	case !paste.hasToken() && paste.CookieD == "":
+		return Paste{}, captureErrorf("nothing was pasted: expected the console snippet's JSON and the \"d\" cookie (xoxd-...)")
+	case !paste.hasToken():
+		return Paste{}, captureErrorf("found the \"d\" cookie but no xoxc token: paste the JSON the console snippet copied")
+	case paste.CookieD == "":
+		return Paste{}, captureErrorf("found the token but no \"d\" cookie: copy the value of the cookie named d (it starts with xoxd-) from DevTools > Application > Cookies > https://app.slack.com")
+	}
+	return paste, nil
 }
 
 func stringOf(v any) string {
@@ -316,155 +278,4 @@ func stringOf(v any) string {
 	default:
 		return fmt.Sprint(t)
 	}
-}
-
-// Client talks to Slack's client endpoints with a token + `d` cookie.
-type Client struct {
-	BaseURL string
-	HTTP    *http.Client
-}
-
-// NewClient returns a Slack client against the real API.
-func NewClient() *Client {
-	return &Client{BaseURL: DefaultAPIBaseURL, HTTP: &http.Client{Timeout: 30 * time.Second}}
-}
-
-// post POSTs to Slack with a client session. Both parts are required: the
-// token alone returns `not_authed`, the cookie alone has nothing to
-// authorise. The browser-shaped headers are not decoration.
-func (c *Client) post(method, token, cookieHeader string, form map[string]string) map[string]any {
-	values := url.Values{"token": {token}}
-	for k, v := range form {
-		values.Set(k, v)
-	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/api/"+method, strings.NewReader(values.Encode()))
-	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-	req.Header.Set("Cookie", cookieHeader)
-	req.Header.Set("User-Agent", userAgent)
-	httpClient := c.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return map[string]any{"ok": false, "error": fmt.Sprintf("http_%d", resp.StatusCode)}
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}
-	}
-	return payload
-}
-
-// AuthTest calls auth.test.
-func (c *Client) AuthTest(token, cookieHeader string) map[string]any {
-	return c.post("auth.test", token, cookieHeader, nil)
-}
-
-// ProbeClientCounts asks Slack, in ONE request, what has changed across every
-// conversation, and returns a non-secret summary of what came back.
-func (c *Client) ProbeClientCounts(s Session) map[string]any {
-	payload := c.post("client.counts", s.Token, s.CookieHeader(), map[string]string{
-		"thread_counts_by_channel": "true",
-		"org_wide_aware":           "true",
-	})
-	if ok, _ := payload["ok"].(bool); !ok {
-		errText := stringOf(payload["error"])
-		if errText == "" {
-			errText = "unknown_error"
-		}
-		return map[string]any{"ok": false, "error": errText}
-	}
-	summary := map[string]any{"ok": true}
-	total, withLatest := 0, 0
-	for _, bucket := range []string{"channels", "ims", "mpims"} {
-		entries, _ := payload[bucket].([]any)
-		summary[bucket] = len(entries)
-		total += len(entries)
-		for _, entry := range entries {
-			if m, ok := entry.(map[string]any); ok && truthy(m["latest"]) {
-				withLatest++
-			}
-		}
-	}
-	summary["total_conversations"] = total
-	summary["with_latest_marker"] = withLatest
-	return summary
-}
-
-func truthy(v any) bool {
-	switch t := v.(type) {
-	case nil:
-		return false
-	case string:
-		return t != ""
-	case bool:
-		return t
-	case float64:
-		return t != 0
-	default:
-		return true
-	}
-}
-
-// Discover captures every Slack session the desktop app holds that Slack
-// accepts (the app is the only source today). An explicit source that is not
-// known is an error.
-func Discover(host chromium.Host, source string, authTest AuthTest) ([]Session, error) {
-	profiles := []chromium.Profile{AppProfile}
-	if source != "" {
-		var kept []chromium.Profile
-		for _, p := range profiles {
-			if p.Key == source {
-				kept = append(kept, p)
-			}
-		}
-		if len(kept) == 0 {
-			return nil, captureErrorf("unknown Slack session source %q", source)
-		}
-		profiles = kept
-	}
-	var errs []string
-	for _, profile := range profiles {
-		key, err := host.SafeStorageKey(profile)
-		if err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		for _, db := range host.CookieDBs(profile) {
-			cookies, err := chromium.ReadCookies(db, key, CookieHostSuffix)
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", profile.Key, err))
-				continue
-			}
-			byName := map[string]string{}
-			var expires time.Time
-			for _, c := range cookies {
-				byName[c.Name] = c.Value
-				if c.Name == SessionCookie && expires.IsZero() {
-					expires = c.Expires()
-				}
-			}
-			if _, ok := byName[SessionCookie]; !ok {
-				continue
-			}
-			return CaptureAll(filepath.Dir(db), byName, expires, profile.Key, authTest)
-		}
-		errs = append(errs, fmt.Sprintf("%s: no slack.com `d` cookie in any cookie store", profile.Key))
-	}
-	if len(errs) == 0 {
-		return nil, captureErrorf("no Slack session found")
-	}
-	return nil, captureErrorf("%s", strings.Join(errs, "; "))
 }

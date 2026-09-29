@@ -1,313 +1,139 @@
 package slack_test
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/util"
-	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium"
-	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/chromium/chromiumtest"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/browsersessions/slack"
 )
 
-func writeLevelDB(t *testing.T, root string, files map[string][]byte) string {
-	t.Helper()
-	store := filepath.Join(root, "Local Storage", "leveldb")
-	if err := os.MkdirAll(store, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, payload := range files {
-		if err := os.WriteFile(filepath.Join(store, name), payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return store
-}
+// snippetOutput is what ConsoleSnippet copies from app.slack.com: the shape of
+// localConfig_v2 on crobat's Slack client, 2026-09-29 (one stranger
+// workspace, the Hack Club org, and the Hack Club workspace).
+const snippetOutput = `{"user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36","teams":[` +
+	`{"id":"T0A4T3P6VUG","name":"Other","url":"https://example-other.slack.com/","user_id":"U0A9TGMBR70","enterprise_id":"","token":"xoxc-strangersupersecret"},` +
+	`{"id":"E09V59WQY1E","name":"Hack Club","url":"https://hackclub.enterprise.slack.com/","user_id":"U09UE480JHH","enterprise_id":"","token":"xoxc-orgsupersecret"},` +
+	`{"id":"T0266FRGM","name":"Hack Club","url":"https://hackclub.slack.com/","user_id":"U09UE480JHH","enterprise_id":"E09V59WQY1E","token":"xoxc-workspacesupersecret"}]}`
 
-func utf16le(s string) []byte {
-	out := make([]byte, 0, 2*len(s))
-	for _, r := range s {
-		out = append(out, byte(r), byte(r>>8))
-	}
-	return out
-}
-
-func TestScanFindsTokensInAsciiAndUTF16(t *testing.T) {
-	root := t.TempDir()
-	writeLevelDB(t, root, map[string][]byte{"000005.ldb": []byte(`{"teams":{"T1":{"token":"xoxc-aaaa1111bbbb"}}}`)})
-	if got := slack.ScanLocalStorageForTokens(root); len(got) != 1 || got[0] != "xoxc-aaaa1111bbbb" {
-		t.Fatalf("got %v", got)
-	}
-	root2 := t.TempDir()
-	writeLevelDB(t, root2, map[string][]byte{"026136.ldb": append([]byte{0}, utf16le(`{"token":"xoxc-utf16token99"}`)...)})
-	if got := slack.ScanLocalStorageForTokens(root2); len(got) != 1 || got[0] != "xoxc-utf16token99" {
-		t.Fatalf("got %v", got)
-	}
-	if got := slack.ScanLocalStorageForTokens(t.TempDir()); got != nil {
-		t.Fatalf("missing store should be empty, got %v", got)
-	}
-}
-
-func TestScanOrdersNewestFileFirstAndDedups(t *testing.T) {
-	root := t.TempDir()
-	store := writeLevelDB(t, root, map[string][]byte{
-		"000005.ldb": []byte(`{"token":"xoxc-oldoldold11"}`),
-		"026136.ldb": []byte(`{"token":"xoxc-newnewnew22"} xoxc-newnewnew22 xoxb-notauser99 xoxc-sh`),
-	})
-	os.Chtimes(filepath.Join(store, "000005.ldb"), time.Unix(1_000_000, 0), time.Unix(1_000_000, 0))
-	os.Chtimes(filepath.Join(store, "026136.ldb"), time.Unix(2_000_000, 0), time.Unix(2_000_000, 0))
-	got := slack.ScanLocalStorageForTokens(root)
-	if strings.Join(got, ",") != "xoxc-newnewnew22,xoxc-oldoldold11" {
-		t.Fatalf("got %v", got)
-	}
-}
-
-func TestCapturePicksTheTokenSlackAccepts(t *testing.T) {
-	root := t.TempDir()
-	store := writeLevelDB(t, root, map[string][]byte{"old.ldb": []byte("xoxc-staletoken111"), "new.ldb": []byte("xoxc-livetoken2222")})
-	// The stale token's file is NEWER so it is tried first; only Slack's answer saves us.
-	os.Chtimes(filepath.Join(store, "old.ldb"), time.Unix(2_000_000, 0), time.Unix(2_000_000, 0))
-	os.Chtimes(filepath.Join(store, "new.ldb"), time.Unix(1_000_000, 0), time.Unix(1_000_000, 0))
-	var seen []string
-	authTest := func(token, cookieHeader string) map[string]any {
-		seen = append(seen, token)
-		if cookieHeader != "d=xoxd-cookievalue" {
-			t.Fatalf("cookie header %q", cookieHeader)
-		}
-		if token == "xoxc-livetoken2222" {
-			return map[string]any{"ok": true, "team_id": "T0266FRGM", "user_id": "U09UE480JHH", "url": "https://hackclub.slack.com/"}
-		}
-		return map[string]any{"ok": false, "error": "invalid_auth"}
-	}
-	expires := time.Date(2027, 9, 28, 0, 0, 0, 0, time.UTC)
-	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd-cookievalue"}, expires, "slack-app", authTest)
+func TestParsePasteReadsTheSnippetAndTheCookie(t *testing.T) {
+	paste, err := slack.ParsePaste(snippetOutput + "\nxoxd-supersecretcookie%2Fabc%3D\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sessions) != 1 {
-		t.Fatalf("sessions = %+v", sessions)
+	if paste.CookieD != "xoxd-supersecretcookie%2Fabc%3D" || !strings.Contains(paste.UserAgent, "Chrome/140") {
+		t.Fatalf("paste = %+v", paste)
 	}
-	s := sessions[0]
-	if s.Token != "xoxc-livetoken2222" || s.TeamID != "T0266FRGM" || s.UserID != "U09UE480JHH" || s.EnterpriseID != "" {
-		t.Fatalf("session = %+v", s)
+	if len(paste.Teams) != 3 {
+		t.Fatalf("teams = %+v", paste.Teams)
 	}
-	if strings.Join(seen, ",") != "xoxc-staletoken111,xoxc-livetoken2222" {
-		t.Fatalf("seen = %v", seen)
+	org, workspace := paste.Teams[1], paste.Teams[2]
+	// An org entry's id is the ENTERPRISE id; storing it as team_id would fork
+	// every warehouse row keyed by the workspace.
+	if org.TeamID != "" || org.EnterpriseID != "E09V59WQY1E" || org.Token != "xoxc-orgsupersecret" {
+		t.Fatalf("org = %+v", org)
 	}
-	if s.Redacted()["cookie_expires_at"] != "2027-09-28T00:00:00+00:00" {
-		t.Fatalf("redacted = %v", s.Redacted())
-	}
-}
-
-func TestCaptureFailures(t *testing.T) {
-	root := t.TempDir()
-	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-deadtoken1111")})
-	_, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
-		func(string, string) map[string]any { return map[string]any{"ok": false, "error": "invalid_auth"} })
-	if err == nil || !strings.Contains(err.Error(), "no working") || !strings.Contains(err.Error(), "invalid_auth") {
-		t.Fatalf("err = %v", err)
-	}
-	_, err = slack.CaptureAll(root, map[string]string{"b": "not-the-session"}, time.Time{}, "slack-app",
-		func(string, string) map[string]any { return map[string]any{"ok": true} })
-	if err == nil || !strings.Contains(err.Error(), "`d` session cookie") {
-		t.Fatalf("err = %v", err)
-	}
-	_, err = slack.CaptureAll(t.TempDir(), map[string]string{"d": "x"}, time.Time{}, "slack-app",
-		func(string, string) map[string]any { return map[string]any{"ok": true} })
-	if err == nil || !strings.Contains(err.Error(), "no xoxc- token") {
-		t.Fatalf("err = %v", err)
+	if workspace.TeamID != "T0266FRGM" || workspace.EnterpriseID != "E09V59WQY1E" || workspace.UserID != "U09UE480JHH" ||
+		workspace.TeamURL != "https://hackclub.slack.com/" || workspace.UserAgent != paste.UserAgent ||
+		workspace.CookieD != paste.CookieD || workspace.Source != slack.SourceWeb {
+		t.Fatalf("workspace = %+v", workspace)
 	}
 }
 
-func TestCaptureDoesNotPassOffAnEnterpriseIDAsATeamID(t *testing.T) {
-	root := t.TempDir()
-	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-enterprisetok1")})
-	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
-		func(string, string) map[string]any {
-			return map[string]any{"ok": true, "team_id": "E09V59WQY1E", "user_id": "U1", "url": "https://hackclub.enterprise.slack.com/"}
-		})
-	if err != nil {
-		t.Fatal(err)
+func TestParsePasteAcceptsTheCookieInAnyShapeDevToolsShowsIt(t *testing.T) {
+	for raw, want := range map[string]string{
+		"xoxd-abc%2Fdef%2Bg%3D%3D":      "xoxd-abc%2Fdef%2Bg%3D%3D",
+		"d=xoxd-abc%2Fdef;":             "xoxd-abc%2Fdef",
+		`"xoxd-abc%2Fdef"`:              "xoxd-abc%2Fdef",
+		"xoxd-abc/def+g==":              "xoxd-abc%2Fdef%2Bg%3D%3D", // "Show URL-decoded" ticked
+		"  xoxd-abc%2Fdef \t":           "xoxd-abc%2Fdef",
+		"d\txoxd-abc%2Fdef\t.slack.com": "xoxd-abc%2Fdef", // a copied table row
+	} {
+		paste, err := slack.ParsePaste(snippetOutput + "\n" + raw)
+		if err != nil || paste.CookieD != want {
+			t.Fatalf("%q -> %q, %v; want %q", raw, paste.CookieD, err, want)
+		}
 	}
-	s := sessions[0]
-	if s.EnterpriseID != "E09V59WQY1E" || s.TeamID != "" {
-		t.Fatalf("an enterprise id must never be stored as a team id: %+v", s)
+}
+
+func TestParsePasteTakesTheWholeLocalConfig(t *testing.T) {
+	// The whole localConfig_v2 value, teams keyed by id, is also accepted: it
+	// is what someone copies from the Application panel instead.
+	raw := `{"lastActiveTeamId":"T0266FRGM","teams":{"T0266FRGM":{"id":"T0266FRGM","user_id":"U09UE480JHH","enterprise_id":"E09V59WQY1E","url":"https://hackclub.slack.com/","token":"xoxc-workspacesupersecret"}}}`
+	paste, err := slack.ParsePaste(raw + "\nxoxd-supersecretcookie")
+	if err != nil || len(paste.Teams) != 1 || paste.Teams[0].TeamID != "T0266FRGM" || paste.Teams[0].Token != "xoxc-workspacesupersecret" {
+		t.Fatalf("paste = %+v, %v", paste, err)
 	}
-	if s.Redacted()["enterprise_id"] != "E09V59WQY1E" || s.Redacted()["cookie_expires_at"] != nil {
-		t.Fatalf("redacted = %v", s.Redacted())
+}
+
+func TestParsePasteKeepsABareTokenForTheFlags(t *testing.T) {
+	paste, err := slack.ParsePaste("xoxc-baresupersecret-1234567890\nxoxd-supersecretcookie\n")
+	if err != nil || len(paste.Teams) != 0 || len(paste.BareTokens) != 1 || paste.BareTokens[0] != "xoxc-baresupersecret-1234567890" {
+		t.Fatalf("paste = %+v, %v", paste, err)
+	}
+}
+
+func TestReadPasteStopsAsSoonAsBothHalvesArrive(t *testing.T) {
+	// Interactive use: the reader must not wait for EOF once it has a team and
+	// a cookie, or a terminal user has to know to press Ctrl-D.
+	r := &countingReader{lines: []string{snippetOutput, "xoxd-supersecretcookie", "never read"}}
+	paste, err := slack.ReadPaste(r)
+	if err != nil || paste.CookieD != "xoxd-supersecretcookie" || len(paste.Teams) != 3 {
+		t.Fatalf("paste = %+v, %v", paste, err)
+	}
+	if r.served != 2 {
+		t.Fatalf("read %d lines, want 2", r.served)
+	}
+}
+
+func TestReadPasteNamesWhatIsMissing(t *testing.T) {
+	if _, err := slack.ReadPaste(strings.NewReader(snippetOutput + "\n")); err == nil || !strings.Contains(err.Error(), `"d" cookie`) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := slack.ReadPaste(strings.NewReader("xoxd-supersecretcookie\n")); err == nil || !strings.Contains(err.Error(), "xoxc") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := slack.ReadPaste(strings.NewReader("")); err == nil {
+		t.Fatal("empty input accepted")
 	}
 }
 
 func TestRedactedCarriesNoSecret(t *testing.T) {
-	s := slack.Session{Source: "slack-app", Token: "xoxc-secrettoken1", CookieD: "xoxd-secretcookie", TeamID: "T1", UserID: "U1"}
-	blob, _ := json.Marshal(s.Redacted())
-	if strings.Contains(string(blob), "xoxc-secrettoken1") || strings.Contains(string(blob), "xoxd-secretcookie") {
-		t.Fatalf("secret leaked: %s", blob)
-	}
-	if !strings.Contains(string(blob), s.Fingerprint()) || !strings.Contains(string(blob), `"team_id":"T1"`) {
-		t.Fatalf("blob = %s", blob)
-	}
-}
-
-func TestClientPostsTokenAndCookieAndSummarisesCounts(t *testing.T) {
-	var gotCookie, gotToken, gotUA string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.ParseForm()
-		gotCookie, gotToken, gotUA = r.Header.Get("Cookie"), r.PostForm.Get("token"), r.Header.Get("User-Agent")
-		switch r.URL.Path {
-		case "/api/auth.test":
-			json.NewEncoder(w).Encode(map[string]any{"ok": true, "team_id": "T1", "user_id": "U1", "url": "https://x.slack.com/"})
-		case "/api/client.counts":
-			if r.PostForm.Get("org_wide_aware") != "true" || r.PostForm.Get("thread_counts_by_channel") != "true" {
-				t.Errorf("form = %v", r.PostForm)
-			}
-			json.NewEncoder(w).Encode(map[string]any{"ok": true,
-				"channels": []any{map[string]any{"latest": "1.2"}, map[string]any{}},
-				"ims":      []any{map[string]any{"latest": "3.4"}},
-				"mpims":    []any{}})
-		case "/api/boom":
-			w.WriteHeader(500)
-		default:
-			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "unknown_method"})
+	paste, _ := slack.ParsePaste(snippetOutput + "\nxoxd-supersecretcookie")
+	blob := strings.Join(func() []string {
+		var out []string
+		for k, v := range paste.Teams[2].Redacted() {
+			out = append(out, k, strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(toString(v), "\n", ""), " ", "")))
 		}
-	}))
-	defer srv.Close()
-	c := &slack.Client{BaseURL: srv.URL, HTTP: srv.Client()}
-	if p := c.AuthTest("xoxc-tok", "d=cookie"); p["team_id"] != "T1" {
-		t.Fatalf("auth.test = %v", p)
-	}
-	if gotCookie != "d=cookie" || gotToken != "xoxc-tok" || !strings.Contains(gotUA, "Slack_SSB") {
-		t.Fatalf("cookie=%q token=%q ua=%q", gotCookie, gotToken, gotUA)
-	}
-	summary := c.ProbeClientCounts(slack.Session{Token: "xoxc-tok", CookieD: "cookie"})
-	if summary["ok"] != true || summary["channels"] != 2 || summary["ims"] != 1 || summary["mpims"] != 0 ||
-		summary["total_conversations"] != 3 || summary["with_latest_marker"] != 2 {
-		t.Fatalf("summary = %v", summary)
-	}
-	bad := &slack.Client{BaseURL: srv.URL + "/nope", HTTP: srv.Client()}
-	if p := bad.ProbeClientCounts(slack.Session{}); p["ok"] != false || p["error"] != "unknown_method" {
-		t.Fatalf("bad = %v", p)
+		return out
+	}(), " ")
+	if strings.Contains(blob, "supersecret") || !strings.Contains(blob, paste.Teams[2].Fingerprint()) {
+		t.Fatalf("redacted = %s", blob)
 	}
 }
 
-func TestDiscoverReadsTheSlackAppStore(t *testing.T) {
-	key := chromiumtest.Key("slack-pw")
-	support := t.TempDir()
-	appRoot := filepath.Join(support, "Slack")
-	os.MkdirAll(appRoot, 0o755)
-	chromiumtest.WriteCookieDB(t, filepath.Join(appRoot, "Cookies"), key, []chromiumtest.Row{
-		{HostKey: ".slack.com", Name: "d", Value: "xoxd-live", ExpiresUTC: 13400000000000000},
-		{HostKey: ".slack.com", Name: "b", Value: "other"},
-	})
-	writeLevelDB(t, appRoot, map[string][]byte{"1.ldb": []byte("xoxc-apptoken1234")})
-	host := chromium.Host{ApplicationSupport: support, KeychainPassword: func(service, account string) (string, error) {
-		if service != "Slack Safe Storage" || account != "Slack" {
-			t.Fatalf("keychain item %q/%q", service, account)
+func TestTheSnippetReadsLocalConfigAndCopiesTheUserAgent(t *testing.T) {
+	for _, want := range []string{"localStorage.localConfig_v2", "navigator.userAgent", "copy(", "user_id", "enterprise_id", "token"} {
+		if !strings.Contains(slack.ConsoleSnippet, want) {
+			t.Fatalf("snippet lacks %q: %s", want, slack.ConsoleSnippet)
 		}
-		return "slack-pw", nil
-	}}
-	sessions, err := slack.Discover(host, "", func(token, cookie string) map[string]any {
-		if token != "xoxc-apptoken1234" || cookie != "d=xoxd-live" {
-			t.Fatalf("token=%q cookie=%q", token, cookie)
+	}
+}
+
+type countingReader struct {
+	lines  []string
+	served int
+	buf    []byte
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if len(r.buf) == 0 {
+		if r.served >= len(r.lines) {
+			return 0, ioEOF
 		}
-		return map[string]any{"ok": true, "team_id": "T1"}
-	})
-	if err != nil {
-		t.Fatal(err)
+		r.buf = []byte(r.lines[r.served] + "\n")
+		r.served++
 	}
-	s := sessions[0]
-	if len(sessions) != 1 || s.Source != "slack-app" || s.CookieExpiresAt.IsZero() || s.CookieD != "xoxd-live" {
-		t.Fatalf("session = %+v", s)
-	}
-	if _, err := slack.Discover(host, "netscape", nil); err == nil || !strings.Contains(err.Error(), "unknown Slack session source") {
-		t.Fatalf("err = %v", err)
-	}
-	host.ApplicationSupport = t.TempDir()
-	if _, err := slack.Discover(host, "", nil); err == nil || !strings.Contains(err.Error(), "no slack.com `d` cookie") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-// writeRealLevelDB writes a real (Snappy-compressed) LevelDB the way Chromium
-// keeps localStorage, and compacts it so the values live in .ldb tables.
-func writeRealLevelDB(t *testing.T, root string, key string, value []byte) {
-	t.Helper()
-	store := filepath.Join(root, "Local Storage", "leveldb")
-	db, err := leveldb.OpenFile(store, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Put([]byte(key), value, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CompactRange(util.Range{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// The 2026-09-20 shape: Slack kept three signed-in workspaces in one
-// localConfig_v2 value; after compaction Snappy encoded the second and third
-// tokens as back-references into the first (they share the user/team prefix),
-// so a raw byte scan found one token while the database held three.
-func TestScanReadsTokensSnappyHidFromARawByteScan(t *testing.T) {
-	root := t.TempDir()
-	shared := "2210535565-1234567890123-"
-	first := "xoxc-" + shared + "1111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	second := "xoxc-" + shared + "1111111111111-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
-	value := append([]byte{0}, utf16le(`{"teams":{"T1":{"token":"`+first+`"},"T2":{"token":"`+second+`"}}}`)...)
-	writeRealLevelDB(t, root, "_https://app.slack.com\x00\x01localConfig_v2", value)
-
-	store := filepath.Join(root, "Local Storage", "leveldb")
-	raw := ""
-	entries, _ := os.ReadDir(store)
-	for _, e := range entries {
-		b, _ := os.ReadFile(filepath.Join(store, e.Name()))
-		raw += string(b)
-	}
-	if strings.Contains(raw, string(utf16le(second))) {
-		t.Fatal("test precondition: the second token should not survive compression verbatim")
-	}
-	got := slack.ScanLocalStorageForTokens(root)
-	have := map[string]bool{}
-	for _, tok := range got {
-		have[tok] = true
-	}
-	if !have[first] || !have[second] {
-		t.Fatalf("tokens the database holds were missed: got %v", got)
-	}
-}
-
-func TestCaptureAllReturnsEveryAcceptedSession(t *testing.T) {
-	root := t.TempDir()
-	writeLevelDB(t, root, map[string][]byte{"a.ldb": []byte("xoxc-otherworkspace1 xoxc-hackclubtoken22 xoxc-deadtoken333")})
-	sessions, err := slack.CaptureAll(root, map[string]string{"d": "xoxd"}, time.Time{}, "slack-app",
-		func(token, _ string) map[string]any {
-			switch token {
-			case "xoxc-otherworkspace1":
-				return map[string]any{"ok": true, "team_id": "T0A4T3P6VUG", "user_id": "U2", "url": "https://other.slack.com/"}
-			case "xoxc-hackclubtoken22":
-				return map[string]any{"ok": true, "team_id": "T0266FRGM", "user_id": "U1", "url": "https://hackclub.slack.com/"}
-			}
-			return map[string]any{"ok": false, "error": "invalid_auth"}
-		})
-	if err != nil {
-		t.Fatal(err)
-	}
-	teams := []string{}
-	for _, s := range sessions {
-		teams = append(teams, s.TeamID)
-	}
-	if strings.Join(teams, ",") != "T0266FRGM,T0A4T3P6VUG" {
-		t.Fatalf("teams = %v", teams)
-	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
 }

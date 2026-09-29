@@ -29,6 +29,7 @@ type publishRequest struct {
 	UserID          string `json:"user_id"`
 	TeamURL         string `json:"team_url"`
 	SourceApp       string `json:"source_app"`
+	UserAgent       string `json:"user_agent"`
 	CookieExpiresAt string `json:"cookie_expires_at"`
 }
 
@@ -128,6 +129,7 @@ func (s *Service) Handler() http.Handler {
 			UserID:          req.UserID,
 			TeamURL:         req.TeamURL,
 			SourceApp:       req.SourceApp,
+			UserAgent:       req.UserAgent,
 			CookieExpiresAt: parseTime(req.CookieExpiresAt),
 		}, s.now())
 		if err != nil {

@@ -388,11 +388,13 @@ func TestHeartbeatAndSessionsSignJSONBodies(t *testing.T) {
 	if ack["token_sha256"] != "abc" || app.last().Path != "/ingest/chatgpt/session" {
 		t.Fatalf("chatgpt publish = %v %+v", ack, app.last())
 	}
-	if _, err := client.PublishSlackSession(SlackSession{Account: "zrl", SessionKey: "default", SessionToken: "xoxc-1", SessionCookie: "d", TeamID: "T1"}); err != nil {
+	if _, err := client.PublishSlackSession(SlackSession{Account: "zrl", SessionKey: "default", SessionToken: "xoxc-1", SessionCookie: "d", TeamID: "T1", UserAgent: "UA"}); err != nil {
 		t.Fatal(err)
 	}
-	if app.last().Path != "/ingest/slack/session" {
-		t.Fatalf("slack path = %s", app.last().Path)
+	var slackBody map[string]any
+	json.Unmarshal(app.last().Body, &slackBody)
+	if app.last().Path != "/ingest/slack/session" || slackBody["user_agent"] != "UA" {
+		t.Fatalf("slack publish = %s %v", app.last().Path, slackBody)
 	}
 	if _, err := client.PublishWhoopPrivateSession(WhoopSession{Account: "z", SessionKey: "default", AccessToken: "a", RefreshToken: "r"}); err != nil {
 		t.Fatal(err)

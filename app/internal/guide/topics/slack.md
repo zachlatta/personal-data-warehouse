@@ -63,9 +63,11 @@ that means something; ok ≥ 95%), `history_polled_fraction` (judged for public 
 the DM landing latency columns, and `status` as the worst of them. The status is about
 the sync attempt, not message volume: group DMs have legitimate zero-message days.
 DMs, group DMs and private channels stay current only through the change feed (a
-Slack client session published from the Mac). `change_feed_status` on the same view
-says whether it works; when it reads `action_required`, those three types read
-`stale` and a missing recent DM or group-DM message is a sync gap, not evidence.
+Slack web session Zach pastes with `pdw slack publish-session`). `change_feed_status`
+on the same view says whether it works; when it reads `action_required`, those three
+types read `stale` and a missing recent DM or group-DM message is a sync gap, not
+evidence. Never capture or replay his Slack login from a script to repair it: that is
+what got him signed out of every device on 2026-09-29. Ask him to paste a new session.
 
 ## Writing
 

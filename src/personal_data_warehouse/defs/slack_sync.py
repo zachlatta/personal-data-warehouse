@@ -114,6 +114,7 @@ def fetch_client_counts(
     *,
     token: str,
     cookie: str,
+    user_agent: str,
     team_id: str = "",
     enterprise_id: str = "",
     variant: str = "plain",
@@ -131,6 +132,7 @@ def fetch_client_counts(
         "client.counts",
         token=token,
         cookie_header=f"d={cookie}",
+        user_agent=user_agent,
         form=form,
         query=query or None,
     )
@@ -154,10 +156,13 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
     if not token or not cookie:
         # Both halves or nothing: an xoxc token without the `d` cookie
         # authenticates as nobody.
-        return SlackChangePlan(usable=False, reason="no published Slack session (run `pdw slack publish-session`)")
+        return SlackChangePlan(
+            usable=False, reason="no published Slack session (Zach pastes one into `pdw slack publish-session`)"
+        )
 
     team_id = str(session.get("team_id") or "")
     enterprise_id = str(session.get("enterprise_id") or "")
+    user_agent = str(session.get("user_agent") or "")
 
     # An `ok: true` payload about SOMEONE ELSE'S conversations is not a change
     # feed. Hack Club is an Enterprise Grid org and a session's client.counts can
@@ -177,7 +182,12 @@ def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChan
     reason = ""
     for variant in CLIENT_COUNTS_WORKSPACE_VARIANTS:
         payload = fetch_client_counts(
-            token=token, cookie=cookie, team_id=team_id, enterprise_id=enterprise_id, variant=variant
+            token=token,
+            cookie=cookie,
+            user_agent=user_agent,
+            team_id=team_id,
+            enterprise_id=enterprise_id,
+            variant=variant,
         )
         try:
             candidate = SlackChangeFeed.from_counts(payload)
@@ -230,12 +240,6 @@ SLACK_CHANGE_FEED_ATTENTION_AFTER = timedelta(hours=1)
 #: empty on purpose: the published session may belong to the WRONG workspace,
 #: which is exactly when this row matters.
 SLACK_CHANGE_FEED_STATE_KEY = ("", "change_feed", "client.counts")
-#: The ops.uploader_heartbeats pipeline the Mac's hourly `pdw slack
-#: publish-session` agent (bin/slack-auth-launchd) reports under. It has no
-#: Pipeline of its own -- a pipeline needs a payload table -- so the change-feed
-#: verdict is where it is read: a dead feed plus a failing publisher names the
-#: cause in one line.
-SLACK_SESSION_PUBLISHER_PIPELINE = "slack_session_publish"
 
 
 def record_slack_change_feed_verdict(*, warehouse, account: str, plan: SlackChangePlan, now: datetime) -> None:
@@ -287,27 +291,13 @@ def record_slack_change_feed_verdict(*, warehouse, account: str, plan: SlackChan
             f" The published session is for {session.get('team_url') or session.get('team_id') or 'an unknown workspace'},"
             f" published {published_text}."
         )
-    publisher_note = ""
-    try:
-        heartbeats = (
-            warehouse.load_uploader_heartbeats(pipeline=SLACK_SESSION_PUBLISHER_PIPELINE)
-            if hasattr(warehouse, "load_uploader_heartbeats")
-            else []
-        )
-    except Exception:  # pragma: no cover - the verdict must never break the sync
-        heartbeats = []
-    for beat in heartbeats:
-        ran_at = beat.get("ran_at")
-        ran_text = ran_at.astimezone(UTC).isoformat(timespec="minutes") if isinstance(ran_at, datetime) else "?"
-        publisher_note += (
-            f" The hourly publisher on {beat.get('device') or '?'} last ran {ran_text}:"
-            f" {'ok' if beat.get('status') == 'ok' else 'failed'}, exit {beat.get('exit_code')}."
-        )
     error = (
         f"Slack change feed unusable since {datetime.fromtimestamp(since, tz=UTC).isoformat(timespec='minutes')}"
         f" ({plan.reason}); freshness is falling back to polling conversations one by one, which cannot keep"
-        f" DMs and group DMs current.{session_note}{publisher_note} Repair: sign in to the synced workspace in the Slack"
-        " desktop app on the Mac, then run `pdw slack publish-session` there."
+        f" DMs and group DMs current.{session_note} Repair (Zach, by hand): sign in to Hack Club at"
+        " https://app.slack.com in a browser and paste the session into `pdw slack publish-session`, which"
+        " prints the steps. Never capture or replay his Slack login from a script: that signed him out of"
+        " every device on 2026-09-29."
     )
     warehouse.insert_slack_sync_state(**row, cursor_ts=f"{since:.6f}", status=status, error=error)
 

@@ -249,7 +249,7 @@ These tools only create rows in the `upstream_mutation_requests` and `upstream_m
 They return an approval URL under `/mutation-review` (the web app, which reviews through
 `/api/mutations/*`); the actual Gmail, Calendar, Contacts, or Slack write is still performed later
 by the existing approved-mutation worker. Slack mark-read and send-message use the private
-xoxc + `d`-cookie pair published by `pdw slack publish-session` (a message is posted as Zach,
+xoxc + `d`-cookie web session Zach pastes into `pdw slack publish-session` (a message is posted as Zach,
 never as a bot); credentials never enter the proposal payload. A send carries a `client_msg_id`
 derived from its mutation id and is looked for in the warehouse and in Slack before every
 attempt, so a retry after a lost response cannot post twice; the reviewer can edit its text

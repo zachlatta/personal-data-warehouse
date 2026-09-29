@@ -45,7 +45,7 @@ func TestSlackRequiresSubcommandAndPrintsHelp(t *testing.T) {
 	if code := runSlack([]string{"--help"}, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, nil), "", ""); code != 0 || cap.called {
 		t.Fatalf("--help exit=%d called=%v", code, cap.called)
 	}
-	if !strings.Contains(out.String(), "Always Allow") || strings.Contains(out.String(), "PDW_UV_BIN") {
+	if !strings.Contains(out.String(), "sends nothing to Slack") || strings.Contains(out.String(), "Always Allow") {
 		t.Fatalf("help: %s", out.String())
 	}
 }

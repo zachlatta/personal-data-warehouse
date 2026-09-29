@@ -4266,17 +4266,9 @@ runs were lock-skipped no-ops, and why backfills never drained.
 
 **`client.counts` answers the same question in one request** — but only for a real
 signed-in session, which is why `private.slack_sessions` exists. The credential is two
-pieces that are useless apart: an `xoxc-` token from the Slack desktop app's localStorage
-and the `d` cookie. Capture and publish both with:
-
-```bash
-pdw slack publish-session            # add --dry-run to check without publishing
-```
-
-Run it from a **GUI terminal** on the Mac signed in to Slack (SSH cannot reach the
-keychain) and choose **Always Allow** — a one-shot "Allow" makes every later run fail. The
-`d` cookie is good for ~13 months and rolls forward with use, so this is setup, not a
-chore.
+pieces that are useless apart: an `xoxc-` token from the Slack web client's localStorage
+and the HttpOnly `d` cookie. Zach pastes both by hand; see
+[Publishing the Slack session](#publishing-the-slack-session-a-paste-never-a-capture).
 
 **What the feed does and does not cover.** Measured on the real workspace: 316 channels
 (exactly the 317 the account belongs to), 237 open DMs, 137 open group DMs — 690 total. It
@@ -4329,61 +4321,72 @@ overlap misses is wrong for at most a day. Concurrent refreshes take
 to eleven minutes on each other for an identical result. Delete the two state rows to
 force a full rebuild.
 
-### Local Slack Auth Scheduler
+### Publishing the Slack session: a paste, never a capture
 
-- LaunchAgent label: `com.zachlatta.personal-data-warehouse.slack-auth`
-- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.slack-auth.plist`
-- Wrapper script: `bin/slack-auth-launchd`; status helper: `bin/slack-auth-status`
-- Run cadence: every 3600 seconds with `RunAtLoad`
-- Run log: `~/Library/Logs/personal-data-warehouse/slack-auth.run.log`
+**Nothing may capture or replay Zach's Slack login on a schedule; it signs him out of
+everything.** Until 2026-09-29 an hourly LaunchAgent on crobat read the Slack DESKTOP app's
+token and `d` cookie and called `auth.test` + `client.counts` with them, from Go, to pick the
+right workspace. Slack's audit log (the Hack Club warehouse syncs it as `slack.audit_logs`)
+recorded every successful run as an `anomaly`, reason `unexpected_scraping`,
+`scraping_tool: "Go-based tool"` — a Slack desktop User-Agent over Go's TLS fingerprint, on
+the desktop's own session, from the desktop's own IP — followed by
+`user_sessions_reset_by_anomaly_event_response`: every device signed out. Four resets on
+09-29 matched runs to the second. It had been quiet for weeks before (Slack's detector
+changed around 09-20, the first reset), and it was quiet 09-20..09-28 only because the
+capture was broken and never reached Slack. A manual Go test on 09-28 with a
+`Go-http-client` User-Agent drew `unexpected_user_agent` as well.
 
-**When it fails, `security` timing out after 60 seconds is the usual reason and it is not
-a hung binary.** It means the keychain put up a prompt no LaunchAgent can answer: either the
-login keychain is locked (Mac asleep or at the login screen) or the ACL on "Slack Safe
-Storage" is a one-shot "Allow" rather than "Always Allow". The command says so in its own
-output. This is benign in itself — the `d` cookie is valid for ~13 months, so an hour (or a
-week) of missed re-publishes changes nothing; only a genuinely rotated session needs the
-agent to succeed. Repair by unlocking the Mac and running it once from a GUI terminal,
-choosing **Always Allow**.
+So the session comes from a browser, once, by hand, and `pdw slack publish-session` talks to
+nothing but the warehouse:
 
-It runs on the Mac signed in to the Slack desktop app (**crobat**), not on porygon, because
-that is where the session lives. **The wrapper runs `pdw slack publish-session` (native Go,
-`app/internal/browsersessions/slack`) and nothing else** but its own `pdw heartbeat`, posted
-under `slack_session_publish`. It used to exec the Python capture
-directly and keep `pdw` OUT of the exec chain, because macOS attributes the "Slack Safe
-Storage" keychain grant to the binaries in that chain and an unsigned pdw replaced its own
-binary on every release; release binaries are signed with a stable identity now, so the
-grant follows pdw across updates. The move needs the keychain ACL re-issued once to
-`~/.local/bin/pdw` (run it from a GUI terminal, choose Always Allow). Credentials still come
-from `pdw login`'s config file.
+```bash
+pdw slack publish-session            # prints the steps when run from a terminal
+```
+
+It asks for two pastes: the line a DevTools console snippet copies on app.slack.com
+(`ConsoleSnippet`: every signed-in team's token, `id`, `user_id`, `enterprise_id` and `url`
+from `localStorage.localConfig_v2`, plus `navigator.userAgent`), then the `d` cookie
+(`xoxd-…`, DevTools → Application → Cookies). Identity comes from the same localStorage the
+token does, so no call to Slack is needed to know whose session it is; the workspace guard
+(the warehouse must already sync it, unless `--team-id` names it) runs against the
+warehouse through the SQL tool. The browser's User-Agent is stored in
+`private.slack_sessions.user_agent` and every server-side request spends the session with
+it (`slack_session._slack_post`), rather than the Slack desktop User-Agent the helper used to
+hard-code, which a browser-minted session has never presented.
+
+**The server still spends the session every five minutes, and that is a known risk, not a
+solved one.** The change feed (`client.counts`) and the Slack writes run from Python on
+mew-coolify with Python's TLS fingerprint. Slack has not flagged that shape, but it had
+barely been exercised: the session died with each reset. If `slack.audit_logs` ever shows
+`unexpected_scraping` without a manual publish beside it, the server is the cause, and the
+fix is to stop spending a login at all (official user-token scopes for sends and mark-read,
+the Events API for "what changed"), not to disguise the requests better. Keep the browser
+profile the session came from signed in: signing out there ends the session, and the
+change-feed verdict goes `action_required` within the hour.
 
 **Enterprise Grid is a live trap here.** Hack Club is an Enterprise Grid org, so a client
 session's `auth.test` returns the **org** id `E09V59WQY1E` where the app token returns the
 **workspace** id `T0266FRGM` — and all ~45M warehouse rows are keyed by the workspace. Storing
-one as the other would not error; it would write a second parallel copy of Slack. The capture
-refuses to put an `E` id in `team_id`, the publish endpoint rejects it, and
-`pdw slack publish-session` resolves the workspace through `base_slack.teams.enterprise_id`
-rather than guessing (an org covering several workspaces raises instead).
+one as the other would not error; it would write a second parallel copy of Slack. The web
+client's `localConfig_v2` holds one entry per workspace (`T…`, with `enterprise_id`) and one
+for the org itself (`E…`); the paste parser never puts an `E` id in `team_id`, the publish
+endpoint rejects it, `publish-session` prefers the workspace entry, and an org-only paste is
+resolved through `base_slack.teams.enterprise_id` rather than guessed (an org covering
+several workspaces raises instead).
 
 ### When the change feed goes down: the week of 2026-09-21
 
 **Seven days of "change feed unusable" read `ok` everywhere, and group DMs stopped landing.**
 Three failures lined up, and each is now closed:
 
-- **The capture could not see the working tokens.** Slack keeps every signed-in workspace's
-  `xoxc-` token in ONE `localConfig_v2` localStorage value. After a LevelDB compaction that
-  value sits in a Snappy-compressed table, and the second and later tokens -- which share
-  the user/team prefix with the first -- are stored as back-references, so they never
-  appear verbatim on disk. The raw byte scan found two of the three tokens the database
-  held (one signed out, one for an unrelated workspace) and missed both working Hack Club
-  ones; `slack-auth` failed hourly from 2026-09-20 12:06. `ScanLocalStorageForTokens`
-  now opens a **copy** of the database read-only with goleveldb and scans its current
-  values first, keeping the raw scan for stale leftovers in older files.
-- **The publisher took the first token Slack accepted.** On 2026-09-23 that was another
-  workspace's session, and it became production's. `CaptureAll` returns every accepted
-  session and `publish-session` picks: workspace-scoped (`T…`) sessions before org
-  (`E…`) ones, each required to answer `client.counts`, resolve to one workspace, and be a
-  workspace the warehouse syncs. The report lists every candidate and why it was passed over.
+- **The desktop-app capture could not see the working tokens, and then took the wrong
+  one.** It byte-scanned the app's LevelDB, where Snappy compression hid the working Hack
+  Club tokens, and on 2026-09-23 it published another workspace's session as production's.
+  The capture is gone (see
+  [Publishing the Slack session](#publishing-the-slack-session-a-paste-never-a-capture));
+  what survives is the choice: the paste names every signed-in team, and `publish-session`
+  takes workspace-scoped (`T…`) entries before org (`E…`) ones and only a workspace the
+  warehouse syncs, listing every candidate and why it was passed over.
 - **The blanket poll never reached a group DM.** With no usable feed the freshness pass
   polls cached conversations one by one, and the shared rate budget ends it after ~30
   `conversations.history` calls. It walked `im`, then `mpim`, then channels, each by
@@ -4400,8 +4403,7 @@ Three failures lined up, and each is now closed:
 'client.counts'`, `cursor_ts` = when the failure began). An unusable feed is `degraded`
 for its first hour and `action_required` after, which the Slack row of
 `marts_ops.pipeline_health` reads as `attention` with the reason, the published session's
-workspace and age, and the `slack_session_publish` heartbeat of the Mac that should be
-replacing it. `marts_ops.slack_conversation_health` carries it as `change_feed_status` and
+workspace and age, and the repair: Zach pastes a new session. `marts_ops.slack_conversation_health` carries it as `change_feed_status` and
 reads `im` / `mpim` / `private_channel` **stale** while it is `action_required`: those
 types are unjudged on history polls only because the feed says what moved.
 

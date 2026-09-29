@@ -440,7 +440,7 @@ func MutationHelp() MutationHelpDocument {
 					"message_ts":      "1593473566.000200",
 				},
 				ExtraNotes: "This moves the whole conversation read cursor through message_ts; it does not mark only one message or only one thread. " +
-					"The executor requires an xoxc token and d cookie published with `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
+					"The executor requires the Slack web session Zach pastes into `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
 			},
 			{
 				Type:        SlackSendMessageOperation,
@@ -463,7 +463,7 @@ func MutationHelp() MutationHelpDocument {
 					"text":            "Thanks — I'll take a look this afternoon.",
 				},
 				ExtraNotes: "Nothing is sent until a human approves the request; the reviewer can edit the text before approving, so propose the message you would actually send rather than a draft to be fixed. " +
-					"Sent as Zach through the client session published with `pdw slack publish-session` (never a bot). The executor re-checks the account, the workspace (auth.test against the stored session) and the recipient: a conversation must be synced in base_slack.conversations for that workspace, not archived, and one Zach can post in; a user_id must be a live, non-bot base_slack.users row; a thread_ts must be a synced message in that conversation. " +
+					"Sent as Zach through the Slack web session Zach pastes into `pdw slack publish-session` (never a bot). The executor re-checks the account, the workspace (auth.test against the stored session) and the recipient: a conversation must be synced in base_slack.conversations for that workspace, not archived, and one Zach can post in; a user_id must be a live, non-bot base_slack.users row; a thread_ts must be a synced message in that conversation. " +
 					"One approval sends one message: every attempt carries a client_msg_id derived from the mutation id and looks for it in the warehouse and in Slack before posting, so a retry after a timeout cannot post twice. " +
 					"Prefer conversation_id when you found the conversation on the timeline; use user_id only for a person you have no DM with yet.",
 			},

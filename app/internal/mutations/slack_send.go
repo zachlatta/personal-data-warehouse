@@ -10,8 +10,8 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/deeplink"
 )
 
-// A Slack message is sent AS ZACH, through the client session that
-// `pdw slack publish-session` publishes (the same xoxc + d-cookie pair the
+// A Slack message is sent AS ZACH, through the web session Zach pastes into
+// `pdw slack publish-session` (the same xoxc + d-cookie pair the
 // mark-read mutation spends), and only after a human approves it in the review
 // UI. The proposal names the recipient exactly — a conversation id, or a user
 // id for a direct message — and the executor (slack_mutations.py) re-resolves

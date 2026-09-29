@@ -39,7 +39,6 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
-    "slack-auth-launchd": ('"$PDW" slack publish-session', None),
     "chatgpt-auth-launchd": ('"$PDW" chatgpt publish-session --non-interactive', None),
     "claude-desktop-auth-launchd": ('"$PDW" ingest claude-desktop', None),
 }
@@ -54,7 +53,6 @@ LAUNCH_AGENTS: dict[str, tuple[str, bool]] = {
     "photos-upload": ("photos-upload-launchd", False),
     "apple-notes-mutation-worker": ("apple-notes-mutation-worker-launchd", True),
     "apple-contacts-mutation-worker": ("apple-contacts-mutation-worker-launchd", True),
-    "slack-auth": ("slack-auth-launchd", False),
     "chatgpt-auth": ("chatgpt-auth-launchd", False),
     "claude-desktop-auth": ("claude-desktop-auth-launchd", False),
 }
@@ -128,8 +126,26 @@ def test_uploaders_run_every_five_minutes_and_photos_every_thirty() -> None:
     for label in ("agent-sessions-upload", "apple-contacts-upload", "apple-messages-upload", "apple-notes-upload", "voice-memos-upload"):
         assert interval(label) == 300, label
     assert interval("photos-upload") == 1800
-    for label in ("slack-auth", "chatgpt-auth", "claude-desktop-auth"):
+    for label in ("chatgpt-auth", "claude-desktop-auth"):
         assert interval(label) == 3600, label
+
+
+def test_nothing_schedules_the_slack_session_publisher() -> None:
+    """The Slack session is pasted by hand, never captured on a schedule.
+
+    Until 2026-09-29 an hourly LaunchAgent on crobat read the Slack desktop
+    app's own login and called auth.test + client.counts with it from Go.
+    Slack flagged every run as `unexpected_scraping` ("Go-based tool") and
+    signed Zach out of every device -- four times on 09-29, each to the second
+    of a run. Re-adding a scheduled capture brings that back.
+    """
+    offenders = [
+        p.name
+        for directory in (BIN, LAUNCHD, SYSTEMD)
+        for p in directory.iterdir()
+        if p.is_file() and ("slack publish-session" in p.read_text(errors="ignore") or "slack-auth" in p.name)
+    ]
+    assert offenders == [], offenders
 
 
 def test_systemd_unit_runs_the_self_locating_wrapper() -> None:

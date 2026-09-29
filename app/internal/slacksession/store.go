@@ -50,15 +50,18 @@ type Store interface {
 
 // Credential is one captured Slack client session.
 type Credential struct {
-	Account         string
-	SessionKey      string
-	SessionToken    string
-	SessionCookie   string
-	TeamID          string
-	EnterpriseID    string
-	UserID          string
-	TeamURL         string
-	SourceApp       string
+	Account       string
+	SessionKey    string
+	SessionToken  string
+	SessionCookie string
+	TeamID        string
+	EnterpriseID  string
+	UserID        string
+	TeamURL       string
+	SourceApp     string
+	// UserAgent is the browser that minted the session; the sync sends it with
+	// every request so Slack sees the session's own browser, not a stand-in.
+	UserAgent       string
 	CookieExpiresAt time.Time
 }
 
@@ -97,6 +100,7 @@ CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("slack_sessions") + ` (
     user_id text NOT NULL DEFAULT '',
     team_url text NOT NULL DEFAULT '',
     source_app text NOT NULL DEFAULT '',
+    user_agent text NOT NULL DEFAULT '',
     cookie_expires_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
     published_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
     updated_at timestamptz NOT NULL DEFAULT now(),
@@ -106,14 +110,19 @@ CREATE TABLE IF NOT EXISTS ` + warehouse.SQLRelation("slack_sessions") + ` (
     PRIMARY KEY (account, session_key)
 )`
 
+// CREATE TABLE IF NOT EXISTS never revisits a table provisioned before a
+// column existed; the Python ensure path reconciles the same column.
+var addUserAgentSQL = "ALTER TABLE " + warehouse.SQLRelation("slack_sessions") +
+	" ADD COLUMN IF NOT EXISTS user_agent text NOT NULL DEFAULT ''"
+
 // A publish is an explicit human repair action, so it always wins over whatever
 // the sync last recorded, and it clears any action_required state.
 var upsertSQL = `
 INSERT INTO ` + warehouse.SQLRelation("slack_sessions") + ` (
     account, session_key, session_token, session_cookie, token_sha256,
-    team_id, enterprise_id, user_id, team_url, source_app,
+    team_id, enterprise_id, user_id, team_url, source_app, user_agent,
     cookie_expires_at, published_at, updated_at, sync_version, status, error
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, 'ok', '')
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $14, $11, $12, $12, $13, 'ok', '')
 ON CONFLICT (account, session_key) DO UPDATE SET
     session_token = EXCLUDED.session_token,
     session_cookie = EXCLUDED.session_cookie,
@@ -123,6 +132,7 @@ ON CONFLICT (account, session_key) DO UPDATE SET
     user_id = EXCLUDED.user_id,
     team_url = EXCLUDED.team_url,
     source_app = EXCLUDED.source_app,
+    user_agent = EXCLUDED.user_agent,
     cookie_expires_at = EXCLUDED.cookie_expires_at,
     published_at = EXCLUDED.published_at,
     updated_at = EXCLUDED.updated_at,
@@ -139,13 +149,16 @@ func (s *PostgresStore) Upsert(ctx context.Context, cred Credential, now time.Ti
 	if _, err := s.db.ExecContext(ctx, createTableSQL); err != nil {
 		return Ack{}, fmt.Errorf("ensure slack_sessions: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, addUserAgentSQL); err != nil {
+		return Ack{}, fmt.Errorf("ensure slack_sessions.user_agent: %w", err)
+	}
 	sum := sha256.Sum256([]byte(cred.SessionToken))
 	tokenSHA := hex.EncodeToString(sum[:])
 	now = now.UTC()
 	if _, err := s.db.ExecContext(ctx, upsertSQL,
 		cred.Account, cred.SessionKey, cred.SessionToken, cred.SessionCookie, tokenSHA,
 		cred.TeamID, cred.EnterpriseID, cred.UserID, cred.TeamURL, cred.SourceApp,
-		cred.CookieExpiresAt.UTC(), now, now.UnixMicro(),
+		cred.CookieExpiresAt.UTC(), now, now.UnixMicro(), cred.UserAgent,
 	); err != nil {
 		return Ack{}, fmt.Errorf("upsert slack_sessions: %w", err)
 	}

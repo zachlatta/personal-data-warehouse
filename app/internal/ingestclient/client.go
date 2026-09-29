@@ -576,34 +576,35 @@ func (c *Client) PublishHackerNewsSession(s HackerNewsSession) (map[string]any, 
 	return c.SignedPost("/ingest/hacker-news/session", body, "application/json", nil)
 }
 
-// SlackSession is a captured Slack client session: both halves go together on
-// purpose, because an xoxc token without the d cookie authenticates as nobody.
+// SlackSession is a Slack web session pasted from a browser: both halves go
+// together on purpose, because an xoxc token without the d cookie
+// authenticates as nobody. UserAgent is the browser that minted it.
 type SlackSession struct {
-	Account         string
-	SessionKey      string
-	SessionToken    string
-	SessionCookie   string
-	TeamID          string
-	EnterpriseID    string
-	UserID          string
-	TeamURL         string
-	CookieExpiresAt string
-	SourceApp       string
+	Account       string
+	SessionKey    string
+	SessionToken  string
+	SessionCookie string
+	TeamID        string
+	EnterpriseID  string
+	UserID        string
+	TeamURL       string
+	SourceApp     string
+	UserAgent     string
 }
 
-// PublishSlackSession publishes a captured Slack client session.
+// PublishSlackSession publishes a Slack web session.
 func (c *Client) PublishSlackSession(s SlackSession) (map[string]any, error) {
 	body, err := common.CanonicalJSON(map[string]any{
-		"account":           s.Account,
-		"session_key":       s.SessionKey,
-		"session_token":     s.SessionToken,
-		"session_cookie":    s.SessionCookie,
-		"team_id":           s.TeamID,
-		"enterprise_id":     s.EnterpriseID,
-		"user_id":           s.UserID,
-		"team_url":          s.TeamURL,
-		"source_app":        s.SourceApp,
-		"cookie_expires_at": s.CookieExpiresAt,
+		"account":        s.Account,
+		"session_key":    s.SessionKey,
+		"session_token":  s.SessionToken,
+		"session_cookie": s.SessionCookie,
+		"team_id":        s.TeamID,
+		"enterprise_id":  s.EnterpriseID,
+		"user_id":        s.UserID,
+		"team_url":       s.TeamURL,
+		"source_app":     s.SourceApp,
+		"user_agent":     s.UserAgent,
 	})
 	if err != nil {
 		return nil, err

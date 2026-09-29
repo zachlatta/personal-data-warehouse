@@ -28,6 +28,7 @@ def _session(**overrides):
         "team_id": "T1",
         "enterprise_id": "E1",
         "user_id": "U1",
+        "user_agent": "Mozilla/5.0 Chrome/140",
     }
     session.update(overrides)
     return session
@@ -62,8 +63,8 @@ def _mutation(**payload_overrides):
 def test_marks_exact_synced_message_read_with_xoxc_session() -> None:
     calls = []
 
-    def call(method, *, token, cookie_header, form=None):
-        calls.append((method, token, cookie_header, dict(form or {})))
+    def call(method, *, token, cookie_header, user_agent, form=None):
+        calls.append((method, token, cookie_header, dict(form or {}), user_agent))
         return {
             "auth.test": {"ok": True, "user_id": "U1", "team_id": "E1"},
             "conversations.info": {"ok": True, "channel": {"id": "D1", "last_read": "1593473500.000100"}},
@@ -82,6 +83,8 @@ def test_marks_exact_synced_message_read_with_xoxc_session() -> None:
     }
     assert [item[0] for item in calls] == ["auth.test", "conversations.info", "conversations.mark"]
     assert all(item[2] == "d=secret-cookie" for item in calls)
+    # Every call names the browser the pasted session came from.
+    assert all(item[4] == "Mozilla/5.0 Chrome/140" for item in calls)
     assert calls[-1][3] == {"channel": "D1", "ts": "1593473566.000200"}
     assert warehouse.target_calls == [
         {"account": "zrl", "team_id": "T1", "conversation_id": "D1", "message_ts": "1593473566.000200"}
@@ -253,7 +256,7 @@ class _SlackAPI:
         self.raise_on = set(raise_on)
         self.calls = []
 
-    def __call__(self, method, *, token, cookie_header, form=None):
+    def __call__(self, method, *, token, cookie_header, user_agent, form=None):
         self.calls.append((method, token, cookie_header, dict(form or {})))
         if method in self.raise_on:
             raise TimeoutError("boom")

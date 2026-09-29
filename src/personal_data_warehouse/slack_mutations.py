@@ -69,6 +69,7 @@ class _SlackSession:
     cookie_header: str
     team_id: str
     user_id: str
+    user_agent: str
 
 
 class _PrecheckUnavailable(Exception):
@@ -134,6 +135,7 @@ class SlackMutationExecutor:
         team_id = str(session.get("team_id") or "").strip()
         enterprise_id = str(session.get("enterprise_id") or "").strip()
         user_id = str(session.get("user_id") or "").strip()
+        user_agent = str(session.get("user_agent") or "")
         safe_result["team_id"] = team_id
         if not token or not cookie or not team_id or not user_id:
             return SlackMutationResult(
@@ -141,14 +143,16 @@ class SlackMutationExecutor:
                 result_json=safe_result,
                 error=(
                     f"Slack client session for account {account!r} is incomplete; "
-                    "run `pdw slack publish-session` to publish xoxc + d-cookie credentials"
+                    "Zach must paste a Slack web session into `pdw slack publish-session`"
                 ),
             )
 
         cookie_header = cookie if cookie.startswith("d=") else f"d={cookie}"
 
         try:
-            auth = dict(self._slack_post("auth.test", token=token, cookie_header=cookie_header))
+            auth = dict(
+                self._slack_post("auth.test", token=token, cookie_header=cookie_header, user_agent=user_agent)
+            )
         except Exception as exc:
             return _retryable(safe_result, f"Slack auth.test request failed: {type(exc).__name__}")
         if not auth.get("ok"):
@@ -164,17 +168,18 @@ class SlackMutationExecutor:
                 result_json=safe_result,
                 error=(
                     "stored Slack client session identity does not match its published user/workspace; "
-                    "publish a fresh session before retrying"
+                    "Zach must paste a fresh session into `pdw slack publish-session` before retrying"
                 ),
             )
-        return _SlackSession(token=token, cookie_header=cookie_header, team_id=team_id, user_id=user_id)
+        return _SlackSession(
+            token=token, cookie_header=cookie_header, team_id=team_id, user_id=user_id, user_agent=user_agent
+        )
 
     def _call(self, session: _SlackSession, method: str, form: Mapping[str, str] | None = None) -> dict[str, Any]:
+        auth = {"token": session.token, "cookie_header": session.cookie_header, "user_agent": session.user_agent}
         if form is None:
-            return dict(self._slack_post(method, token=session.token, cookie_header=session.cookie_header))
-        return dict(
-            self._slack_post(method, token=session.token, cookie_header=session.cookie_header, form=dict(form))
-        )
+            return dict(self._slack_post(method, **auth))
+        return dict(self._slack_post(method, **auth, form=dict(form)))
 
     # --- mark read -------------------------------------------------------------
 

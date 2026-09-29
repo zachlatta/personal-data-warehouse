@@ -150,6 +150,69 @@ def test_freshness_limits_shrink_to_the_changed_set(monkeypatch):
     assert plan.changed_conversation_ids == ("D1",)
 
 
+def test_the_change_feed_sends_the_browser_user_agent_the_session_was_pasted_with(monkeypatch):
+    """The session now comes from a browser, so its requests name that browser.
+
+    The helper used to hard-code the Slack desktop app's User-Agent. For a
+    session minted by Chrome that is a User-Agent the session has never
+    presented, which Slack's anomaly detection reports as
+    `unexpected_user_agent` (seen 2026-09-28 19:48 beside a sign-out).
+    """
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    seen = []
+
+    def fake_counts(**kwargs):
+        seen.append(kwargs)
+        return {"ok": True, "ims": [{"id": "D1", "latest": "99.0"}], "channels": [], "mpims": []}
+
+    monkeypatch.setattr(slack_defs, "fetch_client_counts", fake_counts)
+    slack_defs.slack_change_plan(
+        settings=_settings(monkeypatch),
+        warehouse=_Warehouse(
+            session={
+                "session_token": "xoxc-t",
+                "session_cookie": "xoxd-c",
+                "team_id": "T1",
+                "user_agent": "Mozilla/5.0 Chrome/140",
+            },
+            cursors={"D1": 1.0},
+        ),
+        account="zrl",
+        logger=NullLog(),
+    )
+    assert seen and all(call["user_agent"] == "Mozilla/5.0 Chrome/140" for call in seen)
+
+
+def test_the_session_helper_puts_the_given_user_agent_on_the_wire(monkeypatch):
+    import urllib.request
+
+    from personal_data_warehouse import slack_session
+
+    sent = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(request, timeout):
+        sent["ua"] = request.get_header("User-agent")
+        sent["cookie"] = request.get_header("Cookie")
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert slack_session._slack_post(
+        "auth.test", token="xoxc-t", cookie_header="d=xoxd-c", user_agent="Mozilla/5.0 Chrome/140"
+    ) == {"ok": True}
+    assert sent == {"ua": "Mozilla/5.0 Chrome/140", "cookie": "d=xoxd-c"}
+
+
 def test_no_session_falls_back_to_polling_rather_than_syncing_nothing(monkeypatch):
     """Absent credential must degrade to the old behaviour, not to silence."""
     from personal_data_warehouse.defs import slack_sync as slack_defs
@@ -452,11 +515,6 @@ class _VerdictWarehouse(_Warehouse):
     def verdict(self):
         return self.rows[("zrl", "", "change_feed", "client.counts")]
 
-    heartbeats: list = []
-
-    def load_uploader_heartbeats(self, *, pipeline):
-        return [row for row in self.heartbeats if row["pipeline"] == pipeline]
-
 
 def test_an_unusable_change_feed_becomes_a_credential_verdict_after_an_hour():
     """A week of fallback polling must not be invisible again.
@@ -480,18 +538,6 @@ def test_an_unusable_change_feed_becomes_a_credential_verdict_after_an_hour():
             "published_at": datetime(2026, 9, 23, 19, 31, tzinfo=UTC),
         }
     )
-    # The Mac's hourly publisher posts a heartbeat; its failure is the cause,
-    # so the verdict quotes it where the alert is read.
-    warehouse.heartbeats = [
-        {
-            "pipeline": slack_defs.SLACK_SESSION_PUBLISHER_PIPELINE,
-            "device": "crobat",
-            "ran_at": datetime(2026, 9, 21, 11, 52, tzinfo=UTC),
-            "status": "error",
-            "exit_code": 1,
-            "error": "exit code 1",
-        }
-    ]
     start = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
     bad = slack_defs.SlackChangePlan(
         usable=False,
@@ -511,9 +557,13 @@ def test_an_unusable_change_feed_becomes_a_credential_verdict_after_an_hour():
     assert row["updated_at"] == later
     for needle in (
         "2026-09-21T12:00", "we hold 0", "example-other.slack.com", "pdw slack publish-session",
-        "crobat", "exit 1",
+        "app.slack.com",
     ):
         assert needle in row["error"], needle
+    # The repair is a paste from a browser. The desktop-app capture it used to
+    # name signed Zach out of every device on 2026-09-29.
+    for stale in ("desktop app", "hourly publisher"):
+        assert stale not in row["error"], stale
 
     slack_defs.record_slack_change_feed_verdict(
         warehouse=warehouse,

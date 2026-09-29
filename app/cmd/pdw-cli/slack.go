@@ -12,33 +12,31 @@ import (
 // verb included. A package var so tests can capture the dispatch.
 var slackRun localCommand = slack.Run
 
-const slackUsage = `pdw slack - manage the Slack client session the warehouse syncs with.
+const slackUsage = `pdw slack - manage the Slack web session the warehouse syncs with.
 
 USAGE
-  pdw slack publish-session [flags]
+  pdw slack publish-session [flags] < paste
 
 Slack's public API cannot say which conversations have new messages:
 conversations.list returns no last-message marker, so finding one costs a
 conversations.history call per conversation -- far more than Slack's rate limit
-allows, which is why backfills starve. Slack's own client answers it in a single
-request (client.counts), but only for a real signed-in session.
+allows. Slack's own client answers it in a single request (client.counts), but
+only for a real signed-in session, which also posts and marks read as you.
 
-publish-session reads that session from the Slack desktop app on this Mac (the
-xoxc token and the "d" cookie, which are useless apart), checks it against Slack,
-and publishes it to the warehouse. macOS will ask once to allow keychain
-access -- choose "Always Allow", because a one-shot "Allow" makes every later
-run fail.
-
-The session cookie is good for about a year and rolls forward as you use Slack,
-so this is setup, not a chore. The hourly slack-auth LaunchAgent re-publishes so
-the server's copy never lags the app's.
+publish-session reads that session from what you paste -- the JSON a DevTools
+console snippet copies on app.slack.com, then the "d" cookie -- and publishes
+it to the warehouse. It sends nothing to Slack: the old hourly capture from the
+Slack desktop app called Slack with your desktop login from a Go program, and
+Slack signed you out of every device each time it ran. Run it once from a
+terminal to see the steps; re-run it only when the change feed says the
+session stopped working.
 
 FLAGS (see "pdw slack publish-session --help")
   --account LABEL     Account the credential is stored under.
   --session-key KEY   Session key for multiple accounts (default "default").
-  --source NAME       Force a session source (default: the Slack desktop app).
-  --team-id T...      Workspace id, when the enterprise covers several.
-  --dry-run           Capture, validate and report without publishing.
+  --team-id T...      Workspace to publish, when the paste names several.
+  --user-id U...      Your user id, only for a bare xoxc token pasted without the JSON.
+  --dry-run           Read and check the paste without publishing.
 
 The session is posted over the same URL + token pdw uses for everything else:
 run "pdw login" once (or set PDW_API_URL + PDW_SECRET_TOKEN).
