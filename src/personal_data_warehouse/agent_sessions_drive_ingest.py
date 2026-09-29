@@ -715,7 +715,7 @@ def muse_event_row(
         seq=seq,
         line=line,
         event_uuid=uuid,
-        occurred_at=parse_datetime(str(line.get("created_at", ""))),
+        occurred_at=_muse_time(line.get("created_at")),
         ingested_at=ingested_at,
     )
     row["entrypoint"] = str(session.get("opening_source", ""))
@@ -790,6 +790,37 @@ def muse_event_row(
     return row
 
 
+def _muse_time(value: Any) -> datetime:
+    """A Muse timestamp, which is ISO text on most lines and epoch seconds on some.
+
+    Never raises: this runs inside the one ingest pass every agent-session
+    provider shares, and on 2026-09-29 a single ``"1790624108.0"`` failed that
+    pass -- stalling Claude Code, Codex and OpenClaw along with Muse. An
+    unreadable value is the epoch, the warehouse's "absent".
+    """
+    if isinstance(value, bool):
+        return parse_datetime("")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            seconds = float(text)
+        except ValueError:
+            try:
+                return parse_datetime(text)
+            except ValueError:
+                return parse_datetime("")
+    else:
+        return parse_datetime("")
+    if seconds > 1e11:  # milliseconds
+        seconds /= 1000.0
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return parse_datetime("")
+
+
 def _muse_parts_text(parts: Any) -> str:
     if not isinstance(parts, list):
         return ""
@@ -825,7 +856,7 @@ def muse_file_row(record: Mapping[str, Any], *, ingested_at: datetime) -> dict[s
         "device": str(record.get("device", "")),
         "content_sha256": str(payload.get("content_sha256", "")),
         "size_bytes": _int(payload.get("size_bytes")),
-        "modified_at": parse_datetime(str(payload.get("modified_at", ""))),
+        "modified_at": _muse_time(payload.get("modified_at")),
         "mime_type": str(payload.get("mime_type", "")),
         "is_text": 1 if payload.get("is_text") else 0,
         "content_text": str(payload.get("content_text", "")) if not deleted else "",

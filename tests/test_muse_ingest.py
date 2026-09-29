@@ -233,3 +233,16 @@ def test_runner_routes_muse_files_apart_from_events_and_keeps_the_newest_per_pat
     assert [e["source"] for e in warehouse.events] == ["muse"]
     assert [(f["path"], f["content_text"]) for f in warehouse.files] == [("MEMORY.md", "new")]
     assert (summary.events_written, summary.files_written) == (1, 1)
+
+
+def test_created_at_may_be_an_epoch_number_or_garbage_and_never_raises() -> None:
+    # Production 2026-09-29: some Muse lines stamp created_at as epoch seconds
+    # ("1790624108.0"), and one unparseable value failed the whole
+    # agent-sessions ingest run -- every provider's batches, not just Muse's.
+    expected = datetime(2026, 9, 28, 19, 35, 8, tzinfo=UTC)
+    for value in (1790624108.0, 1790624108, "1790624108.0", 1790624108000):
+        line = {"type": "compaction_checkpoint", "compaction_id": 1, "summary": "s", "created_at": value}
+        assert row(line)["occurred_at"] == expected, value
+    for value in ("not a time", None, "", {"nested": 1}):
+        line = {"type": "compaction_checkpoint", "compaction_id": 1, "summary": "s", "created_at": value}
+        assert row(line)["occurred_at"] == datetime(1970, 1, 1, tzinfo=UTC), value
