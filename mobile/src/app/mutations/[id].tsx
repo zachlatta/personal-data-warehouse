@@ -14,12 +14,11 @@ import { ContactMutationCard } from '@/components/contact-mutation-review';
 import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { SlackSendMessageCard } from '@/components/slack-send-review';
+import { ReviewFlash } from '@/components/review-flash';
 import { StatusPill } from '@/components/status-pill';
-import { approveMutationRequest, getMutationRequest, rejectMutationRequest, removeMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
+import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
-  appleContactsBatchSummary,
-  contactBatchSummary,
   gmailBatchSummary,
   hasGmailThreadMutations,
   gmailThreadDayGroups,
@@ -32,12 +31,16 @@ import {
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
   mutationReviewContext,
+  requestDecision,
+  requestKindLabel,
   requestLifecycle,
   requestLifecycleNote,
+  requestStatusTitle,
   slackMarkReadGroups,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
-import { peekMutationRequest, rememberMutationRequest } from '@/lib/mutation-cache';
+import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
+import { nextPendingRequestId, pendingReviewCount, setReviewFlash } from '@/lib/review-queue';
 import { useConfig } from '@/lib/session';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
@@ -67,11 +70,11 @@ function flattenPayload(payload: Record<string, unknown>): Record<string, unknow
 
 const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
 
-function MutationCard({ mutation, pending, busy, onRemove, onSaveEmail, onSaveSlackMessage, requestReason, alone }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveEmail: (input: UpdateEmailMutationInput) => Promise<void>; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; requestReason?: string; alone?: boolean }) {
+function MutationCard({ mutation, pending, busy, onRemove, onSaveEmail, onSaveSlackMessage, onDirtyChange, requestReason, alone }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveEmail: (input: UpdateEmailMutationInput) => Promise<void>; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onDirtyChange?: (dirty: boolean) => void; requestReason?: string; alone?: boolean }) {
   const theme = useTheme();
-  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveEmail} onRemove={onRemove} requestReason={requestReason} />;
+  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveEmail} onRemove={onRemove} onDirtyChange={onDirtyChange} requestReason={requestReason} alone={alone} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
-  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} requestReason={requestReason} />;
+  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onDirtyChange={onDirtyChange} requestReason={requestReason} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   if (isAppleContactsMutation(mutation)) return <AppleContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
@@ -112,27 +115,50 @@ function MutationCard({ mutation, pending, busy, onRemove, onSaveEmail, onSaveSl
   );
 }
 
+// The request's raw context, for the rare case it says something the review
+// does not: folded by default, where it used to be an always-open JSON card
+// under every request.
+function RequestDetails({ context }: { context: Record<string, unknown> }) {
+  const theme = useTheme();
+  const [open, setOpen] = useState(false);
+  return (
+    <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen((value) => !value)}>
+        <ThemedText type="small" style={styles.link}>{open ? 'Hide request details' : 'Request details'}</ThemedText>
+      </Pressable>
+      {open ? <ThemedText type="small" selectable>{pretty(context)}</ThemedText> : null}
+    </View>
+  );
+}
+
 function RequestOverview({
   request,
   error,
   filter,
   onFilter,
+  flush,
 }: {
   request: MutationRequest;
   error: string | null;
   filter?: string;
   onFilter?: (value: string) => void;
+  // Inside the padded ScrollView the overview must not pad itself again, or
+  // the header card sits indented from every card under it.
+  flush?: boolean;
 }) {
   const theme = useTheme();
   const context = mutationReviewContext(request.context);
   const lifecycle = requestLifecycle(request);
+  const mutations = request.mutations ?? [];
+  // An email's source line ("Gmail … thread 1a0e…, 12:35pm ET") says what
+  // the reply-to block below already shows, in a form nobody reads.
+  const emailOnly = mutations.length > 0 && mutations.every(isGmailSendEmailMutation);
   return (
-    <View style={styles.overview}>
+    <View style={[styles.overview, flush && styles.overviewFlush]}>
       <View style={[styles.hero, { backgroundColor: theme.backgroundElement }]}>
-        <View style={styles.heroIcon}><ThemedText style={styles.heroIconText}>✓</ThemedText></View>
         <View style={styles.heroCopy}>
           <View style={styles.heroEyebrow}>
-            <ThemedText type="small" themeColor="textSecondary">MUTATION REQUEST</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">{requestKindLabel(mutations).toUpperCase()}</ThemedText>
             <StatusPill status={request.status} />
           </View>
           <ThemedText type="subtitle" style={styles.requestTitle}>{request.title}</ThemedText>
@@ -174,7 +200,7 @@ function RequestOverview({
         </View>
       ) : null}
 
-      {context.snapshotAt || context.source ? (
+      {!emailOnly && (context.snapshotAt || context.source) ? (
         <ThemedText type="small" themeColor="textSecondary" numberOfLines={2}>
           {context.snapshotAt ? `Snapshot ${formatWhen(context.snapshotAt)}` : ''}{context.snapshotAt && context.source ? ' · ' : ''}{context.source}
         </ThemedText>
@@ -234,6 +260,11 @@ export default function MutationRequestScreen() {
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState('');
   const [scope, setScope] = useState<GmailScope>('all');
+  // Mutations with edits on screen that are not saved yet, by id.
+  const [dirty, setDirty] = useState<Record<string, boolean>>({});
+  const markDirty = useCallback((mutationId: string, value: boolean) => {
+    setDirty((all) => (Boolean(all[mutationId]) === value ? all : { ...all, [mutationId]: value }));
+  }, []);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -261,26 +292,67 @@ export default function MutationRequestScreen() {
     };
   }, [config, id]);
 
-  const act = async (fn: () => Promise<MutationRequest>) => {
+  // Read the next request in the queue while this one is being reviewed, so
+  // the screen a decision lands on paints at once instead of on a spinner.
+  const status = request?.status;
+  useEffect(() => {
+    if (!id || status !== 'pending_review') return;
+    const next = nextPendingRequestId(peekMutationRequests(), id);
+    if (!next || peekMutationRequest(next)?.mutations) return;
+    getMutationRequest(config, next).then(rememberMutationRequest).catch(() => undefined);
+  }, [config, id, status]);
+
+  const act = async (fn: () => Promise<MutationRequest>): Promise<boolean> => {
     setBusy(true);
     try {
       setRequest(rememberMutationRequest(await fn()));
       setError(null);
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
+  // A decided request is not somewhere to stay: open the next one waiting, or
+  // go back to the list when the queue is empty. The flash says what the
+  // decision did on whichever screen comes next.
+  const advance = async (decided: MutationRequest, done: string) => {
+    setReviewFlash(`${done} · ${decided.title}`);
+    let list = peekMutationRequests();
+    if (!list) {
+      try {
+        list = rememberMutationRequests(await listMutationRequests(config));
+      } catch {
+        list = null;
+      }
+    }
+    const next = nextPendingRequestId(list, decided.id);
+    if (next) router.replace({ pathname: '/mutations/[id]', params: { id: next } });
+    else if (router.canGoBack()) router.back();
+    else router.replace('/mutations');
+  };
+
+  // The confirm names what happens ("Send to sdg@…?"), because a confirm that
+  // reads the same on every request is tapped through unread.
   const approve = () => {
     if (!request) return;
-    const running = request.mutations?.length
-      ? request.mutations.filter((mutation) => mutation.status === 'pending_review').length
-      : request.mutation_count;
-    Alert.alert('Approve request?', `${running} mutation${running === 1 ? '' : 's'} will run upstream.`, [
+    if (Object.values(dirty).some(Boolean)) {
+      Alert.alert('Save your edits first', 'Approving runs the version saved on the server, not the edits on screen. Save them, or revert them.', [{ text: 'OK' }]);
+      return;
+    }
+    const decision = requestDecision(request);
+    Alert.alert(decision.confirmTitle, decision.confirmMessage, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Approve', style: 'default', onPress: () => act(() => approveMutationRequest(config, request.id)) },
+      {
+        text: decision.confirmLabel,
+        style: 'default',
+        onPress: async () => {
+          if (await act(() => approveMutationRequest(config, request.id))) await advance(request, decision.doneLabel);
+        },
+      },
     ]);
   };
   // The reason is asked for at the moment of denial rather than parked in a
@@ -288,17 +360,20 @@ export default function MutationRequestScreen() {
   // every screen, and it was empty almost every time.
   const deny = () => {
     if (!request) return;
-    const submit = (reason?: string) => act(() => rejectMutationRequest(config, request.id, (reason ?? '').trim()));
+    const decision = requestDecision(request);
+    const submit = async (reason?: string) => {
+      if (await act(() => rejectMutationRequest(config, request.id, (reason ?? '').trim()))) await advance(request, decision.deniedLabel);
+    };
     if (Platform.OS === 'ios') {
-      Alert.prompt('Deny this request?', 'Nothing runs upstream. A reason is optional.', [
+      Alert.prompt(decision.denyTitle, 'Nothing is sent or changed. A reason is optional.', [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Deny', style: 'destructive', onPress: submit },
+        { text: decision.denyLabel, style: 'destructive', onPress: submit },
       ], 'plain-text');
       return;
     }
-    Alert.alert('Deny this request?', 'Nothing runs upstream.', [
+    Alert.alert(decision.denyTitle, 'Nothing is sent or changed.', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Deny', style: 'destructive', onPress: () => submit('') },
+      { text: decision.denyLabel, style: 'destructive', onPress: () => submit('') },
     ]);
   };
   const keepInInbox = (review: GmailThreadReview) => {
@@ -384,19 +459,7 @@ export default function MutationRequestScreen() {
   const slackBatch = requestMutations.length > 1 && requestMutations.every((mutation) => isSlackMarkReadMutation(mutation));
   const gmailBatch = hasGmailThreadMutations(requestMutations);
   const otherMutations = requestMutations.filter((mutation) => !isGmailThreadMutation(mutation));
-  // A contact batch says what approval does — "Create 12" — because a
-  // request of twelve address-book writes deserves a verb, not "Approve".
-  const contactBatch = requestMutations.length > 0 && requestMutations.every((mutation) => isContactMutation(mutation));
-  const contactSummary = contactBatch ? contactBatchSummary(requestMutations) : null;
-  const appleBatch = requestMutations.length > 0 && requestMutations.every((mutation) => isAppleContactsMutation(mutation));
-  const appleSummary = appleBatch ? appleContactsBatchSummary(requestMutations) : null;
   const query = filter.trim().toLowerCase();
-  // A mutation kept out of the batch stays in the response as a rejected row,
-  // so the button has to count what is still going to run, not the request's
-  // original size.
-  const runningCount = requestMutations.length
-    ? requestMutations.filter((mutation) => mutation.status === 'pending_review').length
-    : request.mutation_count;
   const slackSections = slackBatch
     ? slackMarkReadGroups(requestMutations).map((group) => ({
         ...group,
@@ -424,10 +487,26 @@ export default function MutationRequestScreen() {
       .filter(Boolean).join(' ').toLowerCase().includes(query);
   });
   const gmailSections = gmailThreadDayGroups(gmailVisible);
+  const decision = requestDecision(request);
+  const queueList = peekMutationRequests();
+  const remaining = pending ? pendingReviewCount(queueList, request.id) : null;
+  const skipTo = pending ? nextPendingRequestId(queueList, request.id) : null;
   const overview = <RequestOverview request={request} error={error} filter={slackBatch ? filter : undefined} onFilter={slackBatch ? setFilter : undefined} />;
   return (
     <ThemedView style={styles.container}>
-      <Stack.Screen options={{ title: pending ? 'Review' : request.status.replace(/_/g, ' ') }} />
+      <Stack.Screen
+        options={{
+          title: remaining ? `${remaining} to review` : requestStatusTitle(request.status),
+          headerRight: skipTo
+            ? () => (
+                <Pressable accessibilityRole="button" accessibilityLabel="Skip to the next request" hitSlop={8} onPress={() => router.replace({ pathname: '/mutations/[id]', params: { id: skipTo } })}>
+                  <ThemedText style={styles.link}>Skip</ThemedText>
+                </Pressable>
+              )
+            : undefined,
+        }}
+      />
+      <ReviewFlash bottom={pending ? 50 + Spacing.two + Spacing.three * 2 + insets.bottom : Spacing.three + insets.bottom} />
       <KeyboardAvoidingView style={styles.reviewBody} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         {gmailBatch ? (
           <SectionList
@@ -458,7 +537,7 @@ export default function MutationRequestScreen() {
                 <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
                 <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
                 {otherMutations.map((mutation) => (
-                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveEmail={(input) => saveEmail(mutation, input)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} requestReason={request.reason} />
+                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveEmail={(input) => saveEmail(mutation, input)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onDirtyChange={(value) => markDirty(mutation.id, value)} requestReason={request.reason} />
                 ))}
               </View>
             ) : null}
@@ -467,7 +546,7 @@ export default function MutationRequestScreen() {
                 No threads match that filter.
               </ThemedText>
             }
-            renderSectionHeader={({ section }) => (
+            renderSectionHeader={({ section }) => gmailReviews.length <= 1 ? null : (
               <View style={[styles.dayHeader, { backgroundColor: theme.background, borderBottomColor: theme.backgroundSelected }]}>
                 <ThemedText type="smallBold" themeColor="textSecondary">{section.label.toUpperCase()}</ThemedText>
                 <ThemedText type="small" themeColor="textSecondary">{section.data.length}</ThemedText>
@@ -503,7 +582,7 @@ export default function MutationRequestScreen() {
           />
         ) : (
           <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-            {overview}
+            <RequestOverview request={request} error={error} flush />
             {request.partial && requestMutations.length === 0 ? (
               <View style={styles.partialRow}>
                 <ActivityIndicator />
@@ -518,15 +597,13 @@ export default function MutationRequestScreen() {
                 busy={busy}
                 onRemove={() => remove(mutation)}
                 onSaveEmail={(input) => saveEmail(mutation, input)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
+                onDirtyChange={(value) => markDirty(mutation.id, value)}
                 requestReason={request.reason}
                 alone={requestMutations.length === 1}
               />
             ))}
-            {Object.keys(request.context ?? {}).length > 0 && mutationReviewContext(request.context).counts.length === 0 ? (
-              <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
-                <ThemedText type="smallBold" themeColor="textSecondary">context</ThemedText>
-                <ThemedText type="small" selectable>{pretty(request.context)}</ThemedText>
-              </View>
+            {request.context && Object.keys(request.context).length > 0 && mutationReviewContext(request.context).counts.length === 0 ? (
+              <RequestDetails context={request.context} />
             ) : null}
           </ScrollView>
         )}
@@ -539,14 +616,11 @@ export default function MutationRequestScreen() {
               { backgroundColor: theme.background, borderTopColor: theme.backgroundSelected, paddingBottom: Spacing.three + insets.bottom },
             ]}>
             <View style={styles.actionButtons}>
-              <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, styles.deny, busy && styles.disabled]}>
-                <ThemedText style={styles.buttonText}>Deny all</ThemedText>
+              <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, { backgroundColor: theme.backgroundElement }, busy && styles.disabled]}>
+                <ThemedText style={[styles.buttonText, styles.denyText]}>{decision.denyLabel}</ThemedText>
               </Pressable>
-              <Pressable accessibilityRole="button" onPress={approve} disabled={busy || runningCount === 0} style={[styles.button, styles.approve, (busy || runningCount === 0) && styles.disabled]}>
-                <ThemedText style={styles.buttonText}>
-                  {gmailBatch && otherMutations.length === 0 && gmailSummary.verb !== 'Review' ? `${gmailSummary.verb} ${runningCount}`
-                    : contactSummary ? `${contactSummary.verb} ${runningCount}` : appleSummary ? `${appleSummary.verb} ${runningCount}` : `Approve ${runningCount}`}
-                </ThemedText>
+              <Pressable accessibilityRole="button" onPress={approve} disabled={busy || decision.running === 0} style={[styles.button, styles.approve, (busy || decision.running === 0) && styles.disabled]}>
+                {busy ? <ActivityIndicator color="#fff" /> : <ThemedText style={styles.buttonText}>{decision.approveLabel}</ThemedText>}
               </Pressable>
             </View>
           </View>
@@ -565,9 +639,8 @@ const styles = StyleSheet.create({
   content: { padding: Spacing.three, gap: Spacing.three, paddingBottom: Spacing.five * 2 },
   batchContent: { paddingBottom: Spacing.five * 2 },
   overview: { padding: Spacing.three, gap: Spacing.two },
+  overviewFlush: { padding: 0 },
   hero: { flexDirection: 'row', gap: 12, borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#D9770644' },
-  heroIcon: { width: 42, height: 42, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: '#D977061A', borderWidth: 1, borderColor: '#D9770666' },
-  heroIconText: { color: '#D97706', fontSize: 18, fontWeight: '800' },
   heroCopy: { flex: 1, minWidth: 0, gap: 4 },
   heroEyebrow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 7 },
   requestTitle: { fontSize: 21, lineHeight: 26 },
@@ -604,7 +677,7 @@ const styles = StyleSheet.create({
   actionButtons: { flexDirection: 'row', gap: Spacing.two },
   button: { flex: 1, minHeight: 50, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
   approve: { backgroundColor: '#16A34A' },
-  deny: { backgroundColor: '#DC2626' },
+  denyText: { color: '#DC2626' },
   disabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   input: { borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 12, fontSize: 16 },

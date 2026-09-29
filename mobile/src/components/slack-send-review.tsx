@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
@@ -61,12 +61,16 @@ export function SlackSendMessageCard({
   pending: requestPending = mutation.status === 'pending_review',
   busy = false,
   onSave,
+  onDirtyChange,
   requestReason,
 }: {
   mutation: Mutation;
   pending?: boolean;
   busy?: boolean;
   onSave?: (input: UpdateSlackMessageMutationInput) => Promise<void>;
+  // Unsaved text is reported up: Approve sends the stored message, so the
+  // screen refuses to approve over an edit that was never saved.
+  onDirtyChange?: (dirty: boolean) => void;
   requestReason?: string;
 }) {
   const theme = useTheme();
@@ -85,6 +89,21 @@ export function SlackSendMessageCard({
     setSaved(false);
   }
   const dirty = text.trim() !== review.text.trim();
+  // The callback is held in a ref: the parent passes a fresh closure every
+  // render, and keying the effects on it made each report re-render the
+  // parent, which re-reported — an update loop on the first keystroke.
+  const reportDirty = useRef(onDirtyChange);
+  useEffect(() => {
+    reportDirty.current = onDirtyChange;
+  }, [onDirtyChange]);
+  const unsaved = editable && dirty;
+  useEffect(() => {
+    reportDirty.current?.(unsaved);
+  }, [unsaved]);
+  useEffect(() => {
+    const report = reportDirty;
+    return () => report.current?.(false);
+  }, []);
   const save = async () => {
     if (!onSave) return;
     const trimmed = text.trim();

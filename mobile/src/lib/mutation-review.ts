@@ -6,6 +6,7 @@ type MutationLike = {
   operation?: string;
   account?: string;
   status?: string;
+  title?: string;
   payload?: Record<string, unknown>;
   preview?: Record<string, unknown>;
   result?: Record<string, unknown>;
@@ -1733,4 +1734,186 @@ export function requestLifecycleNote(request: RequestLifecycleLike): string {
   const life = requestLifecycle(request);
   if (!life.withdrawn) return '';
   return `Withdrawn by ${life.withdrawn.by}${life.withdrawn.reason ? `: ${life.withdrawn.reason}` : '.'}`;
+}
+
+// --- the decision a request asks for -----------------------------------------
+//
+// The buttons, the confirm and the note left behind all say what approving
+// does to THIS request. A reviewer tapped "Approve 1" and "1 mutation will
+// run upstream" three times running on 2026-09-29 without either line saying
+// that an email was about to go to an outside business; the confirm is worth its
+// tap only when it names the recipient.
+
+export type RequestDecision = {
+  running: number;
+  approveLabel: string;
+  denyLabel: string;
+  denyTitle: string;
+  confirmTitle: string;
+  confirmMessage: string;
+  confirmLabel: string;
+  // Past tense for the note shown after the decision: "Sent", "Archived",
+  // and after a denial: "Not sent", "Kept in inbox".
+  doneLabel: string;
+  deniedLabel: string;
+};
+
+type RequestLike = { mutations?: MutationLike[]; mutation_count?: number };
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+function selectedEmailVariant(mutation: MutationLike): { review: GmailEmailReview; variant: GmailEmailVariant } {
+  const review = gmailEmailReview(mutation);
+  const variant = review.variants.find((item) => item.id === review.selectedVariantId) ?? review.variants[0];
+  return { review, variant };
+}
+
+function recipientList(addresses: string[], limit = 3): string {
+  if (addresses.length <= limit) return addresses.join(', ');
+  return `${addresses.slice(0, limit).join(', ')} and ${addresses.length - limit} more`;
+}
+
+function emailDecision(live: MutationLike[]): RequestDecision {
+  const emails = live.map(selectedEmailVariant);
+  const drafts = emails.every(({ review }) => review.deliveryMode === 'draft');
+  if (emails.length === 1) {
+    const { variant } = emails[0];
+    const to = recipientList(variant.to) || 'no recipient';
+    const lines = [variant.subject ? `\u201c${variant.subject}\u201d` : '(no subject)'];
+    if (variant.cc.length) lines.push(`Cc ${recipientList(variant.cc)}`);
+    if (variant.bcc.length) lines.push(`Bcc ${recipientList(variant.bcc)}`);
+    return drafts
+      ? { running: 1, approveLabel: 'Save draft', denyLabel: 'Don\u2019t save', denyTitle: 'Don\u2019t save this draft?', confirmTitle: `Save a draft to ${to}?`, confirmMessage: lines.join('\n'), confirmLabel: 'Save draft', doneLabel: 'Draft saved', deniedLabel: 'Not saved' }
+      : { running: 1, approveLabel: 'Send', denyLabel: 'Don\u2019t send', denyTitle: 'Don\u2019t send this email?', confirmTitle: `Send to ${to}?`, confirmMessage: lines.join('\n'), confirmLabel: 'Send', doneLabel: 'Sent', deniedLabel: 'Not sent' };
+  }
+  const count = emails.length;
+  const recipients = recipientList([...new Set(emails.flatMap(({ variant }) => variant.to))], 4);
+  const noun = drafts ? 'draft' : 'email';
+  return {
+    running: count,
+    approveLabel: drafts ? `Save ${count} drafts` : `Send ${count}`,
+    denyLabel: 'Deny all',
+    denyTitle: `Deny all ${count} ${noun}s?`,
+    confirmTitle: drafts ? `Save ${count} drafts?` : `Send ${count} emails?`,
+    confirmMessage: `To ${recipients}`,
+    confirmLabel: drafts ? 'Save drafts' : 'Send',
+    doneLabel: drafts ? `${count} drafts saved` : `${count} sent`,
+    deniedLabel: drafts ? 'Not saved' : 'Not sent',
+  };
+}
+
+const GMAIL_DONE: Record<string, string> = { Archive: 'Archived', Unarchive: 'Unarchived', Relabel: 'Relabeled' };
+
+export function requestDecision(request: RequestLike): RequestDecision {
+  const mutations = request.mutations ?? [];
+  const live = mutations.filter((mutation) => mutation.status === 'pending_review');
+  const running = mutations.length ? live.length : Math.max(0, request.mutation_count ?? 0);
+  const generic = (): RequestDecision => {
+    const single = running === 1;
+    const title = single ? text(live[0]?.title) : '';
+    return {
+      running,
+      approveLabel: single ? 'Approve' : `Approve ${running}`,
+      denyLabel: single ? 'Deny' : 'Deny all',
+      denyTitle: 'Deny this request?',
+      confirmTitle: single ? 'Approve this request?' : `Approve ${running} actions?`,
+      confirmMessage: title || (single ? 'It runs as soon as you approve.' : 'They run as soon as you approve.'),
+      confirmLabel: 'Approve',
+      doneLabel: 'Approved',
+      deniedLabel: 'Denied',
+    };
+  };
+  if (!live.length) return generic();
+  if (live.every(isGmailSendEmailMutation)) return emailDecision(live);
+  if (live.length === 1 && isSlackSendMessageMutation(live[0])) {
+    const review = slackSendMessageReview(live[0]);
+    return {
+      running,
+      approveLabel: 'Send',
+      denyLabel: 'Don\u2019t send',
+      denyTitle: 'Don\u2019t send this message?',
+      confirmTitle: `Send to ${review.recipientLabel || 'Slack'}?`,
+      confirmMessage: review.text.length > 160 ? `${review.text.slice(0, 157)}\u2026` : review.text,
+      confirmLabel: 'Send',
+      doneLabel: 'Sent',
+      deniedLabel: 'Not sent',
+    };
+  }
+  if (mutations.every(isGmailThreadMutation)) {
+    const summary = gmailBatchSummary(mutations, gmailThreadReviews(mutations));
+    if (summary.verb === 'Review') return generic();
+    const threads = summary.threadCount;
+    const single = threads === 1;
+    return {
+      running,
+      approveLabel: single ? summary.verb : `${summary.verb} ${threads}`,
+      denyLabel: single ? (summary.verb === 'Archive' ? 'Keep in inbox' : `Don\u2019t ${summary.verb.toLowerCase()}`) : 'Deny all',
+      denyTitle: single ? `Don\u2019t ${summary.verb.toLowerCase()} this thread?` : 'Deny this request?',
+      confirmTitle: `${summary.verb} ${plural(threads, 'thread')}?`,
+      confirmMessage: summary.effect,
+      confirmLabel: summary.verb,
+      doneLabel: GMAIL_DONE[summary.verb] ?? 'Approved',
+      deniedLabel: single && summary.verb === 'Archive' ? 'Kept in inbox' : 'Denied',
+    };
+  }
+  const contacts = mutations.every(isContactMutation) ? contactBatchSummary(mutations)
+    : mutations.every(isAppleContactsMutation) ? appleContactsBatchSummary(mutations) : null;
+  if (contacts && contacts.verb !== 'Approve') {
+    const count = contacts.running;
+    return {
+      running,
+      approveLabel: `${contacts.verb} ${count}`,
+      denyLabel: 'Deny all',
+      denyTitle: 'Deny this request?',
+      confirmTitle: `${contacts.verb} ${plural(count, 'contact')}?`,
+      confirmMessage: 'They change as soon as you approve.',
+      confirmLabel: contacts.verb,
+      doneLabel: `${contacts.verb === 'Merge' ? 'Merged' : `${contacts.verb}d`}`,
+      deniedLabel: 'Denied',
+    };
+  }
+  return generic();
+}
+
+// What a request is, in the words a reviewer would use, for the header
+// eyebrow in place of "MUTATION REQUEST".
+export function requestKindLabel(mutations: MutationLike[] | undefined): string {
+  const all = mutations ?? [];
+  if (!all.length) return 'Request';
+  if (all.every(isGmailSendEmailMutation)) {
+    const { review, variant } = selectedEmailVariant(all[0]);
+    const reply = Boolean(variant.replyToThreadId || variant.inReplyTo || review.replyThreads.length);
+    if (review.deliveryMode === 'draft') return reply ? 'Draft reply' : 'Gmail draft';
+    if (all.length > 1) return 'Emails';
+    return reply ? 'Email reply' : 'New email';
+  }
+  if (all.every(isSlackSendMessageMutation)) return 'Slack message';
+  if (all.every(isSlackMarkReadMutation)) return 'Slack mark read';
+  if (all.every(isCalendarCreateMutation)) return 'Calendar event';
+  if (all.every(isGmailThreadMutation)) return 'Gmail';
+  if (all.every(isContactMutation) || all.every(isAppleContactsMutation)) return 'Contacts';
+  return 'Request';
+}
+
+const STATUS_TITLES: Record<string, string> = {
+  pending_review: 'Review',
+  approved: 'Approved',
+  rejected: 'Denied',
+  executing: 'Running',
+  executed: 'Done',
+  failed: 'Failed',
+  superseded: 'Superseded',
+  withdrawn: 'Withdrawn',
+};
+
+export function requestStatusTitle(status: string): string {
+  return STATUS_TITLES[status] ?? (status.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase()) || 'Request');
+}
+
+// The signature is the same on every email; folded, it is one line naming who
+// it signs as, with the rest a tap away.
+export function emailSignatureSummary(signature: string): string {
+  return signature.split('\n').map((line) => line.trim()).find((line) => line && line !== '--') ?? '';
 }

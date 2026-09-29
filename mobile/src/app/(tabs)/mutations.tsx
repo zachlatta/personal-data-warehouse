@@ -4,6 +4,7 @@ import { Pressable, RefreshControl, SectionList, StyleSheet, View } from 'react-
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { ReviewFlash } from '@/components/review-flash';
 import { StatusPill } from '@/components/status-pill';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -33,8 +34,13 @@ export default function MutationsScreen() {
     }
   }, [config]);
 
+  // Coming back from a review, the cache already knows what was decided:
+  // paint that first, so a request just approved is not still listed under
+  // "Needs review" while the refresh is in flight.
   useFocusEffect(
     useCallback(() => {
+      const cached = peekMutationRequests();
+      if (cached) setRequests(cached.slice());
       void load();
     }, [load]),
   );
@@ -48,6 +54,7 @@ export default function MutationsScreen() {
 
   return (
     <ThemedView style={styles.container}>
+      <ReviewFlash />
       {error ? (
         <Pressable onPress={load} style={styles.errorBox}>
           <ThemedText style={styles.errorText}>{error} — tap to retry</ThemedText>

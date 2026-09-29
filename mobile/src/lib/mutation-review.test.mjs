@@ -26,7 +26,11 @@ import {
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
+  emailSignatureSummary,
   looksAutomatedSender,
+  requestDecision,
+  requestKindLabel,
+  requestStatusTitle,
   mutationReviewContext,
   requestLifecycle,
   requestLifecycleNote,
@@ -906,4 +910,118 @@ test('email review exposes attachments without losing them on a body edit', () =
   const input = gmailEmailUpdateInput(review.variants[0], { to: 'a@example.test', cc: '', bcc: '', subject: 'Edited', editorText: 'Edited' }, 'draft');
   // Omit attachment edits on mobile: the server preserves the selected variant's bytes.
   assert.equal(Object.hasOwn(input.message, 'attachments'), false);
+});
+
+// --- the decision a request asks for -----------------------------------------
+
+function emailRequest(mutationOverrides = {}, requestOverrides = {}) {
+  const mutation = sendEmailMutation(mutationOverrides);
+  mutation.email = { ...mutation.email, has_variants: false, variants: [] };
+  return { id: 'req-email', status: 'pending_review', title: 'Reply to vendor', mutation_count: 1, mutations: [mutation], ...requestOverrides };
+}
+
+test('one email is decided as Send / Don\u2019t send, and the confirm names who it goes to', () => {
+  const decision = requestDecision(emailRequest());
+  assert.equal(decision.approveLabel, 'Send');
+  assert.equal(decision.denyLabel, 'Don\u2019t send');
+  assert.equal(decision.confirmTitle, 'Send to vendor@example.test?');
+  assert.match(decision.confirmMessage, /Re: quote/);
+  assert.equal(decision.confirmLabel, 'Send');
+  assert.equal(decision.doneLabel, 'Sent');
+  assert.equal(decision.deniedLabel, 'Not sent');
+  assert.equal(decision.running, 1);
+});
+
+test('an email the reviewer set to draft is decided as a draft', () => {
+  const request = emailRequest();
+  request.mutations[0].email = { ...request.mutations[0].email, delivery_mode: 'draft' };
+  const decision = requestDecision(request);
+  assert.equal(decision.approveLabel, 'Save draft');
+  assert.equal(decision.confirmTitle, 'Save a draft to vendor@example.test?');
+  assert.equal(decision.doneLabel, 'Draft saved');
+});
+
+test('a Cc on the email is part of the confirm, because it is part of who reads it', () => {
+  const request = emailRequest();
+  request.mutations[0].email.message = { ...request.mutations[0].email.message, cc: ['boss@example.test'] };
+  assert.match(requestDecision(request).confirmMessage, /Cc boss@example\.test/);
+});
+
+test('several emails count, and an email dropped from the request is not counted', () => {
+  const request = emailRequest();
+  const second = { ...sendEmailMutation(), id: 'mut-email-2' };
+  second.email = { ...second.email, has_variants: false, variants: [], message: { ...second.email.message, to: ['other@example.test'] } };
+  const dropped = { ...sendEmailMutation(), id: 'mut-email-3', status: 'rejected' };
+  request.mutations.push(second, dropped);
+  const decision = requestDecision(request);
+  assert.equal(decision.running, 2);
+  assert.equal(decision.approveLabel, 'Send 2');
+  assert.equal(decision.denyLabel, 'Deny all');
+  assert.equal(decision.confirmTitle, 'Send 2 emails?');
+  assert.match(decision.confirmMessage, /vendor@example\.test/);
+  assert.match(decision.confirmMessage, /other@example\.test/);
+});
+
+test('one archived thread is Archive / Keep; a batch keeps its count', () => {
+  const thread = { thread_id: 'thread-1', subject: 'Dinner', latest_from_name: 'Pat', latest_at: '2026-08-30T15:36:00Z', messages: [] };
+  const one = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [archiveMutation('m1', thread)] });
+  assert.equal(one.approveLabel, 'Archive');
+  assert.equal(one.denyLabel, 'Keep in inbox');
+  assert.equal(one.confirmTitle, 'Archive 1 thread?');
+  assert.equal(one.doneLabel, 'Archived');
+  assert.equal(one.deniedLabel, 'Kept in inbox');
+  const many = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 2, mutations: [archiveMutation('m1', thread), archiveMutation('m2', { ...thread, thread_id: 'thread-2' })] });
+  assert.equal(many.approveLabel, 'Archive 2');
+  assert.equal(many.denyLabel, 'Deny all');
+  assert.equal(many.confirmTitle, 'Archive 2 threads?');
+});
+
+test('a Slack message names its recipient', () => {
+  const mutation = { id: 'm', status: 'pending_review', provider: 'slack', operation: 'slack.send_message', account: 'zrl', payload: { conversation_id: 'C1', text: 'Deploy is fixed.' }, preview: { slack_message: { recipient_label: '#ops', delivery: 'conversation', recipient_found: true } } };
+  const decision = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [mutation] });
+  assert.equal(decision.approveLabel, 'Send');
+  assert.equal(decision.confirmTitle, 'Send to #ops?');
+  assert.match(decision.confirmMessage, /Deploy is fixed\./);
+});
+
+test('anything else falls back to Approve, and a header-only copy counts from mutation_count', () => {
+  const one = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [{ id: 'm', status: 'pending_review', provider: 'x', operation: 'x.do', title: 'Do the thing' }] });
+  assert.equal(one.approveLabel, 'Approve');
+  assert.equal(one.denyLabel, 'Deny');
+  assert.equal(one.confirmTitle, 'Approve this request?');
+  assert.equal(one.deniedLabel, 'Denied');
+  const partial = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 4, partial: true });
+  assert.equal(partial.running, 4);
+  assert.equal(partial.approveLabel, 'Approve 4');
+  assert.equal(partial.confirmTitle, 'Approve 4 actions?');
+  assert.doesNotMatch(partial.confirmMessage, /upstream/);
+});
+
+test('a request is labelled by what it does, not as a mutation', () => {
+  assert.equal(requestKindLabel(emailRequest().mutations), 'Email reply');
+  const fresh = emailRequest().mutations;
+  fresh[0].email.message = { ...fresh[0].email.message, reply_to_thread_id: '', in_reply_to: '' };
+  fresh[0].email.reply_threads = [];
+  assert.equal(requestKindLabel(fresh), 'New email');
+  const draft = emailRequest().mutations;
+  draft[0].email = { ...draft[0].email, delivery_mode: 'draft' };
+  assert.equal(requestKindLabel(draft), 'Draft reply');
+  assert.equal(requestKindLabel([{ provider: 'slack', operation: 'slack.send_message' }]), 'Slack message');
+  assert.equal(requestKindLabel([{ provider: 'google_calendar', operation: 'calendar.create_event' }]), 'Calendar event');
+  assert.equal(requestKindLabel([]), 'Request');
+});
+
+test('a finished request is titled in words', () => {
+  assert.equal(requestStatusTitle('pending_review'), 'Review');
+  assert.equal(requestStatusTitle('approved'), 'Approved');
+  assert.equal(requestStatusTitle('rejected'), 'Denied');
+  assert.equal(requestStatusTitle('executing'), 'Running');
+  assert.equal(requestStatusTitle('executed'), 'Done');
+  assert.equal(requestStatusTitle('withdrawn'), 'Withdrawn');
+});
+
+test('a signature folds to its first real line', () => {
+  assert.equal(emailSignatureSummary('--\nZach Latta\nFounder + Executive Director, Hack Club'), 'Zach Latta');
+  assert.equal(emailSignatureSummary('-- \n\n  Zach  '), 'Zach');
+  assert.equal(emailSignatureSummary(''), '');
 });

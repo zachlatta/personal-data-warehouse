@@ -1791,6 +1791,17 @@ back it, all behind the static bearer the CLI uses:
     `POST …/mutations/<id>/remove`, which is operation-agnostic and has always been; the
     phone offers it per thread as "Keep this in the inbox", and the approve button then
     counts what will still run rather than the request's original size.
+  - **The phone reviews a queue, and every word of a decision names its effect.**
+    Measured from a screen recording on 2026-09-29: three one-email requests took ~10s
+    each, ~3s of it tapping back, waiting on the list and re-opening, and the confirm
+    read "1 mutation will run upstream" on all three. Now a decision opens the next
+    pending request (`mobile/src/lib/review-queue.ts`, title "3 to review", Skip in the
+    header, the next one prefetched) and leaves a one-line note ("Sent · …"); and the
+    buttons, confirm and note come from `requestDecision` in `mutation-review.ts` —
+    "Send" / "Don't send" and "Send to front@…?" for one email, "Archive" / "Keep in
+    inbox" for one thread. An email reply shows the message it answers first, and
+    Approve is refused while an edit on screen is unsaved, because approval runs the
+    stored version, never the screen's.
   - **The Slack URL shape lives in `app/internal/deeplink`**, used by both
     `timeline_links.go` and the mutation preview, so a permalink cannot drift between
     them. The part that drifts silently is the thread query string: without

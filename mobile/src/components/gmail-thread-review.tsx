@@ -234,7 +234,8 @@ export function GmailOverview({
       {request.error ? <ThemedText style={styles.error}>{request.error}</ThemedText> : null}
       {error ? <ThemedText style={styles.error}>{error}</ThemedText> : null}
 
-      <View style={styles.scopeRow}>
+      {/* One thread has nothing to filter: an "All 1" chip is only noise. */}
+      {summary.threadCount + summary.keptCount > 1 ? <View style={styles.scopeRow}>
         {GMAIL_SCOPES.filter((option) => option.key === 'all' || scopeCounts[option.key] > 0).map((option) => {
           const active = scope === option.key;
           return (
@@ -250,7 +251,7 @@ export function GmailOverview({
             </Pressable>
           );
         })}
-      </View>
+      </View> : null}
       {/* A short batch is entirely on screen; a filter box would only cost it a row. */}
       {summary.threadCount + summary.keptCount > 8 ? (
         <TextInput
