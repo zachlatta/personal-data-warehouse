@@ -379,6 +379,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 				maxBytes: cfg.IngestMaxObjectBytes,
 				timeout:  cfg.QueryTimeout,
 				logger:   logger,
+				notify:   notifier.NotifyAsync,
 			}
 			mux.Handle(uploaderHeartbeatEndpoint, hbSvc.handler())
 			logger.Info("uploader heartbeat ingestion enabled", "endpoint", uploaderHeartbeatEndpoint)

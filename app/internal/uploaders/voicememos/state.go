@@ -24,7 +24,12 @@ type StateEntry struct {
 	LastSuccessAt    string `json:"last_success_at"`
 	LastFailureAt    string `json:"last_failure_at"`
 	LastError        string `json:"last_error"`
-	LastCheckedAt    string `json:"last_checked_at"`
+	// ConsecutiveFailures and FirstFailureAt are the file's current failure
+	// streak, reset by a success. They are what turns "HTTP 504" into "this
+	// recording has failed 38 runs in a row since 13:24" in the run's error.
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	FirstFailureAt      string `json:"first_failure_at"`
+	LastCheckedAt       string `json:"last_checked_at"`
 }
 
 // Matches reports whether the file is unchanged since the entry was written.
@@ -84,17 +89,19 @@ func (s *State) Save(path string) error {
 	entries := map[string]any{}
 	for key, entry := range s.Entries {
 		entries[key] = map[string]any{
-			"path":              entry.Path,
-			"size_bytes":        entry.SizeBytes,
-			"mtime_ns":          entry.MtimeNS,
-			"birthtime_ns":      entry.BirthtimeNS,
-			"content_sha256":    entry.ContentSHA256,
-			"audio_uploaded":    entry.AudioUploaded,
-			"metadata_uploaded": entry.MetadataUploaded,
-			"last_success_at":   entry.LastSuccessAt,
-			"last_failure_at":   entry.LastFailureAt,
-			"last_error":        entry.LastError,
-			"last_checked_at":   entry.LastCheckedAt,
+			"path":                 entry.Path,
+			"size_bytes":           entry.SizeBytes,
+			"mtime_ns":             entry.MtimeNS,
+			"birthtime_ns":         entry.BirthtimeNS,
+			"content_sha256":       entry.ContentSHA256,
+			"audio_uploaded":       entry.AudioUploaded,
+			"metadata_uploaded":    entry.MetadataUploaded,
+			"last_success_at":      entry.LastSuccessAt,
+			"last_failure_at":      entry.LastFailureAt,
+			"last_error":           entry.LastError,
+			"last_checked_at":      entry.LastCheckedAt,
+			"consecutive_failures": entry.ConsecutiveFailures,
+			"first_failure_at":     entry.FirstFailureAt,
 		}
 	}
 	encoded, err := common.IndentedJSON(map[string]any{
@@ -144,10 +151,15 @@ func (s *State) MarkFailure(c Candidate, contentSHA256, errText string, now time
 	if sha == "" {
 		sha = existing.ContentSHA256
 	}
+	firstFailureAt := existing.FirstFailureAt
+	if existing.ConsecutiveFailures == 0 || firstFailureAt == "" {
+		firstFailureAt = timestamp
+	}
 	s.Entries[key] = StateEntry{
 		Path: key, SizeBytes: c.SizeBytes, MtimeNS: c.MtimeNS, BirthtimeNS: c.BirthtimeNS, ContentSHA256: sha,
 		AudioUploaded: existing.AudioUploaded, MetadataUploaded: existing.MetadataUploaded, LastSuccessAt: existing.LastSuccessAt,
 		LastFailureAt: timestamp, LastError: errText, LastCheckedAt: timestamp,
+		ConsecutiveFailures: existing.ConsecutiveFailures + 1, FirstFailureAt: firstFailureAt,
 	}
 }
 

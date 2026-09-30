@@ -257,7 +257,7 @@ func TestPhotoFileUploadsInChunksAndVerifiesDriveChecksum(t *testing.T) {
 	app.secret = "s"
 	app.handler = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == photoResumableEndpoint:
+		case r.Method == http.MethodPost && r.URL.Path == "/ingest/photos/file/resumable":
 			var start map[string]any
 			json.Unmarshal(body, &start)
 			if start["size_bytes"].(float64) != 25 || start["content_sha256"] != sha {
@@ -293,6 +293,68 @@ func TestPhotoFileUploadsInChunksAndVerifiesDriveChecksum(t *testing.T) {
 		t.Fatalf("stored = %+v", stored)
 	}
 	want := []string{"bytes 0-9/25", "bytes 10-19/25", "bytes 20-24/25"}
+	if strings.Join(chunks, ",") != strings.Join(want, ",") {
+		t.Fatalf("chunks = %v", chunks)
+	}
+}
+
+// A voice memo streams through the same Drive resumable session a photo does:
+// only the small signed start request reaches the app, so no proxy read
+// timeout or body cap can cut a multi-hour recording (Traefik's 60s
+// entrypoint readTimeout cut every memo that took longer than a minute).
+func TestVoiceMemoAudioStreamsInChunksThroughAResumableSession(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memo.qta")
+	content := []byte(strings.Repeat("v", 23))
+	os.WriteFile(path, content, 0o644)
+	sum := sha256.Sum256(content)
+	sha := hex.EncodeToString(sum[:])
+
+	var chunks []string
+	var start map[string]any
+	app := &fakeApp{}
+	server := httptest.NewServer(app)
+	defer server.Close()
+	app.secret = "s"
+	app.handler = func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/ingest/voice-memos/audio/resumable":
+			json.Unmarshal(body, &start)
+			json.NewEncoder(w).Encode(map[string]any{
+				"storage_backend": "google_drive", "storage_key": "apple-voice-memos/inbox/k",
+				"upload_url": server.URL + "/drive-session", "chunk_size_bytes": 10,
+			})
+			return true
+		case r.Method == http.MethodPut && r.URL.Path == "/drive-session":
+			chunks = append(chunks, r.Header.Get("Content-Range"))
+			if strings.HasPrefix(r.Header.Get("Content-Range"), "bytes 20-22") {
+				json.NewEncoder(w).Encode(map[string]any{"id": "drive-memo", "sha256Checksum": sha, "size": "23"})
+				return true
+			}
+			w.Header().Set("Range", "bytes=0-"+fmt.Sprint(rangeEnd(r.Header.Get("Content-Range"))))
+			w.WriteHeader(308)
+			return true
+		case r.Method == http.MethodPost && r.URL.Path == "/ingest/voice-memos/audio":
+			t.Error("the raw-body audio route must not be used")
+		}
+		return false
+	}
+	client, err := New(server.URL, "s", WithSleep(func(time.Duration) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := client.UploadVoiceMemoAudio(path, "2026-09-30T10:23:29", ".qta", "audio/quicktime", sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.StorageFileID != "drive-memo" || stored.StorageKey != "apple-voice-memos/inbox/k" {
+		t.Fatalf("stored = %+v", stored)
+	}
+	wantStart := map[string]any{"recorded_at": "2026-09-30T10:23:29", "extension": ".qta", "content_type": "audio/quicktime", "content_sha256": sha, "size_bytes": float64(23)}
+	if fmt.Sprint(start) != fmt.Sprint(wantStart) {
+		t.Fatalf("start request = %v, want %v", start, wantStart)
+	}
+	want := []string{"bytes 0-9/23", "bytes 10-19/23", "bytes 20-22/23"}
 	if strings.Join(chunks, ",") != strings.Join(want, ",") {
 		t.Fatalf("chunks = %v", chunks)
 	}

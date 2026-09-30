@@ -2,6 +2,7 @@ package voicememos
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -31,7 +32,7 @@ type Summary struct {
 
 // Uploader is what the runner needs from the ingest client.
 type Uploader interface {
-	UploadVoiceMemoAudio(content []byte, recordedAt, extension, contentType string) (ingestclient.StoredObject, error)
+	UploadVoiceMemoAudio(path, recordedAt, extension, contentType, contentSHA256 string) (ingestclient.StoredObject, error)
 	UploadVoiceMemoMetadata(payload map[string]any, recordedAt, audioContentSHA256 string) (ingestclient.StoredObject, error)
 }
 
@@ -53,9 +54,6 @@ type Runner struct {
 	State             *State
 	MinFileAgeSeconds int
 	BeforeUploadCheck func() string
-	// MaxUploadBytes is the route's ceiling; 0 means unbounded. The CLI sets
-	// it from the client's EffectiveMaxUploadBytes.
-	MaxUploadBytes int64
 	// EnsureApp defaults to EnsureVoiceMemosAppRunning against the process
 	// environment; tests inject a no-op.
 	EnsureApp AppKicker
@@ -187,16 +185,11 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 	}
 	r.Logger.Infof("Found %d Voice Memos recordings totaling %s", len(candidates), common.FormatBytes(bytesSeen))
 	var selected []Candidate
-	stateSkipped, ageDeferred, partialDeferred, oversizeDeferred := 0, 0, 0, 0
+	stateSkipped, ageDeferred, partialDeferred := 0, 0, 0
 	now := r.Now()
 	for _, c := range candidates {
 		if r.MinFileAgeSeconds > 0 && now.Sub(c.FileModifiedAt).Seconds() < float64(r.MinFileAgeSeconds) {
 			ageDeferred++
-			continue
-		}
-		if r.MaxUploadBytes > 0 && c.SizeBytes > r.MaxUploadBytes {
-			oversizeDeferred++
-			r.Logger.Warningf("Deferring %s (%s): exceeds the %s upload ceiling for the current route", c.Filename, common.FormatBytes(c.SizeBytes), common.FormatBytes(r.MaxUploadBytes))
 			continue
 		}
 		if IsPartiallyMaterialized(c) {
@@ -210,7 +203,7 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 		}
 		selected = append(selected, c)
 	}
-	deferred := ageDeferred + partialDeferred + oversizeDeferred
+	deferred := ageDeferred + partialDeferred
 	r.Logger.Infof("Incremental selection: selected=%d skipped=%d deferred=%d", len(selected), stateSkipped, deferred)
 	completeBytes := func() int64 {
 		var total int64
@@ -255,7 +248,7 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 	for i, err := range errs {
 		if err != nil {
 			r.Logger.Warningf("Failed to upload %s: %s", recordings[i].Filename, err)
-			failures = append(failures, err)
+			failures = append(failures, r.failureStreakError(recordings[i], err))
 			continue
 		}
 		summary.RecordingsUploaded += results[i].uploaded
@@ -300,6 +293,22 @@ func (r *Runner) uploadAll(recordings []Recording) ([]recordingResult, []error) 
 	return results, errs
 }
 
+// failureStreakError names the file and its current failure streak. It is the
+// run's returned error, so it is what `pdw ingest` prints last and what the
+// uploader heartbeat carries into pipeline_health.last_error.
+func (r *Runner) failureStreakError(recording Recording, err error) error {
+	if r.State == nil {
+		return fmt.Errorf("%s: %w", recording.Filename, err)
+	}
+	r.stateMu.Lock()
+	entry, ok := r.State.EntryFor(recording.Candidate)
+	r.stateMu.Unlock()
+	if !ok || entry.ConsecutiveFailures == 0 {
+		return fmt.Errorf("%s: %w", recording.Filename, err)
+	}
+	return fmt.Errorf("%s has failed %d consecutive run(s) since %s: %w", recording.Filename, entry.ConsecutiveFailures, entry.FirstFailureAt, err)
+}
+
 func (r *Runner) isStateComplete(c Candidate) bool {
 	if r.State == nil {
 		return false
@@ -327,11 +336,9 @@ func (r *Runner) syncRecording(index, total int, recording Recording) (recording
 	// sha, so we always send and let the app collapse duplicates.
 	recordedAt := common.ISOFormat(recording.RecordedAt)
 	r.Logger.Infof("[%d/%d] upload %s (%s, sha256=%s) -> app", index, total, recording.Filename, common.FormatBytes(recording.SizeBytes), common.ShortSHA256(recording.ContentSHA256))
-	content, err := os.ReadFile(recording.Path)
-	if err != nil {
-		return recordingResult{}, err
-	}
-	if _, err := r.Client.UploadVoiceMemoAudio(content, recordedAt, recording.Extension, recording.ContentType); err != nil {
+	// Streamed from disk in chunks to a resumable Drive session: a multi-hour
+	// recording is never held in memory or sent as one request body.
+	if _, err := r.Client.UploadVoiceMemoAudio(recording.Path, recordedAt, recording.Extension, recording.ContentType, recording.ContentSHA256); err != nil {
 		return recordingResult{}, err
 	}
 	payload := BuildMetadata(r.Account, recording, r.Now())

@@ -410,16 +410,8 @@ func (c *Client) UploadAppleContactsBatch(gzipBytes []byte, exportedAt string) (
 
 // --- voice memos ------------------------------------------------------------
 
-// UploadVoiceMemoAudio posts a recording's bytes.
-func (c *Client) UploadVoiceMemoAudio(content []byte, recordedAt, extension, contentType string) (StoredObject, error) {
-	ct := contentType
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	return c.post("/ingest/voice-memos/audio", content, ct, map[string]string{
-		"recorded_at": recordedAt, "extension": extension, "content_type": contentType,
-	})
-}
+// UploadVoiceMemoAudio lives in resumable.go: a recording streams to a Drive
+// resumable session, never through this raw-body path.
 
 // UploadVoiceMemoMetadata posts a recording's JSON sidecar.
 func (c *Client) UploadVoiceMemoMetadata(payload map[string]any, recordedAt, audioContentSHA256 string) (StoredObject, error) {

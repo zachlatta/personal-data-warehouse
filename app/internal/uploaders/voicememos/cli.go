@@ -303,7 +303,6 @@ func runUploadPhase(opts Options, settings Settings, state *State, workers int, 
 		State:             state,
 		MinFileAgeSeconds: minAge,
 		BeforeUploadCheck: beforeUploadCheck(policy, cfg.BaseURL, common.PreflightTimeout(env, "VOICE_MEMOS")),
-		MaxUploadBytes:    client.EffectiveMaxUploadBytes(),
 		EnsureApp: func(path string, logger common.Logger) AppKick {
 			return EnsureVoiceMemosAppRunning(path, logger, env, "", nil)
 		},

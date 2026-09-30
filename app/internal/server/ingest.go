@@ -26,10 +26,34 @@ import (
 // internals leak to client devices.
 const ingestPathPrefix = "/ingest/"
 
-const (
-	photoResumableEndpoint = "/ingest/photos/file/resumable"
-	photoChunkSizeBytes    = 16 * 1024 * 1024
-)
+// resumableChunkSizeBytes is the chunk a client sends per PUT to a Drive
+// resumable session (a multiple of Drive's required 256 KiB).
+const resumableChunkSizeBytes = 16 * 1024 * 1024
+
+// resumableFileArtifact is a file endpoint whose bytes never cross the app or
+// the proxy in front of it. The client posts a small signed JSON request; the
+// app applies the same dedup/key/tag contract PutFile would and answers with
+// a scoped Drive resumable session the client streams the file into in
+// bounded chunks. This exists because the raw-body route has a hard ceiling
+// set by whatever sits in front of the app: Traefik v3's entrypoint
+// readTimeout (60s) cut every voice memo that took longer than a minute to
+// send, and Cloudflare caps a public body at 100 MiB.
+type resumableFileArtifact struct {
+	endpoint   string
+	sourceSlug string
+	kind       string
+	// timeField is the one JSON field naming the wall-clock time the object
+	// key is dated by ("captured_at" for photos, "recorded_at" for memos).
+	timeField string
+	keyPrefix string
+}
+
+func resumableFileArtifacts() []resumableFileArtifact {
+	return []resumableFileArtifact{
+		{endpoint: "/ingest/photos/file/resumable", sourceSlug: "photos", kind: "photo_file", timeField: "captured_at", keyPrefix: "photos/inbox"},
+		{endpoint: "/ingest/voice-memos/audio/resumable", sourceSlug: "apple_voice_memos", kind: "voice_memo_audio", timeField: "recorded_at", keyPrefix: "apple-voice-memos/inbox"},
+	}
+}
 
 // ingestSourceDef describes the object-store identity for one ingestion source.
 // Source and LegacySources must match the values the Dagster *_drive_ingest
@@ -85,6 +109,7 @@ type ingestArtifact struct {
 // registry and verifies upload signatures.
 type ingestService struct {
 	artifacts map[string]ingestArtifact
+	resumable map[string]resumableFileArtifact
 	stores    map[string]objectstore.ObjectStore
 	signer    *pdwauth.Service
 	maxBytes  int64
@@ -126,10 +151,18 @@ func newIngestService(cfg config.Config, signer *pdwauth.Service, now func() tim
 		}
 		artifacts[a.endpoint] = a
 	}
-	if len(artifacts) == 0 {
+	resumable := map[string]resumableFileArtifact{}
+	for _, a := range resumableFileArtifacts() {
+		if _, ok := stores[a.sourceSlug]; !ok {
+			logger.Warn("ingestion endpoint disabled: no folder configured", "endpoint", a.endpoint, "source", a.sourceSlug)
+			continue
+		}
+		resumable[a.endpoint] = a
+	}
+	if len(artifacts) == 0 && len(resumable) == 0 {
 		return nil, false, nil
 	}
-	return &ingestService{artifacts: artifacts, stores: stores, signer: signer, maxBytes: cfg.IngestMaxObjectBytes, now: now, logger: logger}, true, nil
+	return &ingestService{artifacts: artifacts, resumable: resumable, stores: stores, signer: signer, maxBytes: cfg.IngestMaxObjectBytes, now: now, logger: logger}, true, nil
 }
 
 type ingestResponse struct {
@@ -139,15 +172,15 @@ type ingestResponse struct {
 	StorageURL     string `json:"storage_url,omitempty"`
 }
 
-type photoResumableRequest struct {
-	CapturedAt    string `json:"captured_at"`
+type resumableFileRequest struct {
+	Timestamp     string `json:"-"`
 	Extension     string `json:"extension"`
 	ContentType   string `json:"content_type"`
 	ContentSHA256 string `json:"content_sha256"`
 	SizeBytes     int64  `json:"size_bytes"`
 }
 
-type photoResumableResponse struct {
+type resumableFileResponse struct {
 	Complete       bool   `json:"complete"`
 	UploadURL      string `json:"upload_url,omitempty"`
 	ChunkSizeBytes int64  `json:"chunk_size_bytes,omitempty"`
@@ -164,8 +197,8 @@ func (svc *ingestService) handler() http.Handler {
 			return
 		}
 		endpoint := path.Clean(r.URL.Path)
-		if endpoint == photoResumableEndpoint {
-			svc.handlePhotoResumable(w, r)
+		if artifact, ok := svc.resumable[endpoint]; ok {
+			svc.handleResumableFile(w, r, artifact)
 			return
 		}
 		artifact, ok := svc.artifacts[endpoint]
@@ -253,33 +286,60 @@ func (svc *ingestService) readSignedBody(w http.ResponseWriter, r *http.Request,
 }
 
 var (
-	sha256HexPattern      = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-	photoExtensionPattern = regexp.MustCompile(`^\.[A-Za-z0-9]{1,16}$`)
+	sha256HexPattern     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	fileExtensionPattern = regexp.MustCompile(`^\.[A-Za-z0-9]{1,16}$`)
 )
 
-func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Request) {
-	store, ok := svc.stores["photos"]
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	resumableStore, ok := store.(objectstore.ResumableFileStore)
-	if !ok {
-		http.Error(w, "photo resumable uploads are unavailable", http.StatusNotImplemented)
-		return
-	}
-	body, _, ok := svc.readSignedBody(w, r, photoResumableEndpoint)
-	if !ok {
-		return
-	}
-	var request photoResumableRequest
+// decodeResumableFileRequest reads exactly the artifact's fields: its own
+// timestamp field plus the file facts. An unknown or missing field is refused,
+// so a photo request posted to the memo endpoint cannot be keyed on nothing.
+func decodeResumableFileRequest(body []byte, timeField string) (resumableFileRequest, error) {
+	var fields map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		http.Error(w, "invalid resumable upload request", http.StatusBadRequest)
-		return
+	if err := decoder.Decode(&fields); err != nil {
+		return resumableFileRequest{}, err
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return resumableFileRequest{}, fmt.Errorf("trailing data")
+	}
+	allowed := map[string]bool{timeField: true, "extension": true, "content_type": true, "content_sha256": true, "size_bytes": true}
+	for key := range fields {
+		if !allowed[key] {
+			return resumableFileRequest{}, fmt.Errorf("unknown field %q", key)
+		}
+	}
+	raw, ok := fields[timeField]
+	if !ok {
+		return resumableFileRequest{}, fmt.Errorf("missing %s", timeField)
+	}
+	var request resumableFileRequest
+	if err := json.Unmarshal(raw, &request.Timestamp); err != nil {
+		return resumableFileRequest{}, err
+	}
+	delete(fields, timeField)
+	rest, err := json.Marshal(fields)
+	if err != nil {
+		return resumableFileRequest{}, err
+	}
+	if err := json.Unmarshal(rest, &request); err != nil {
+		return resumableFileRequest{}, err
+	}
+	return request, nil
+}
+
+func (svc *ingestService) handleResumableFile(w http.ResponseWriter, r *http.Request, artifact resumableFileArtifact) {
+	store := svc.stores[artifact.sourceSlug]
+	resumableStore, ok := store.(objectstore.ResumableFileStore)
+	if !ok {
+		http.Error(w, "resumable uploads are unavailable", http.StatusNotImplemented)
+		return
+	}
+	body, _, ok := svc.readSignedBody(w, r, artifact.endpoint)
+	if !ok {
+		return
+	}
+	request, err := decodeResumableFileRequest(body, artifact.timeField)
+	if err != nil {
 		http.Error(w, "invalid resumable upload request", http.StatusBadRequest)
 		return
 	}
@@ -292,13 +352,15 @@ func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Re
 		http.Error(w, "size_bytes must be positive", http.StatusBadRequest)
 		return
 	}
-	if !photoExtensionPattern.MatchString(request.Extension) {
+	if !fileExtensionPattern.MatchString(request.Extension) {
 		http.Error(w, "invalid extension", http.StatusBadRequest)
 		return
 	}
-	capturedAt, err := parseTimestamp(request.CapturedAt)
+	// Wall clock, never shifted to UTC: the date in the key is the local day
+	// the photo was taken or the memo recorded.
+	stamp, err := parseTimestamp(request.Timestamp)
 	if err != nil {
-		http.Error(w, "invalid captured_at", http.StatusBadRequest)
+		http.Error(w, "invalid "+artifact.timeField, http.StatusBadRequest)
 		return
 	}
 	contentType := request.ContentType
@@ -306,10 +368,11 @@ func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Re
 		contentType = "application/octet-stream"
 	}
 	objectKey := fmt.Sprintf(
-		"photos/inbox/%04d/%02d/%s-%s%s",
-		capturedAt.Year(),
-		int(capturedAt.Month()),
-		capturedAt.Format("2006-01-02"),
+		"%s/%04d/%02d/%s-%s%s",
+		artifact.keyPrefix,
+		stamp.Year(),
+		int(stamp.Month()),
+		stamp.Format("2006-01-02"),
 		request.ContentSHA256,
 		request.Extension,
 	)
@@ -320,15 +383,15 @@ func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Re
 			ContentSHA256: request.ContentSHA256,
 			ContentType:   contentType,
 			SizeBytes:     request.SizeBytes,
-			Kind:          "photo_file",
+			Kind:          artifact.kind,
 		},
 	)
 	if err != nil {
-		svc.logger.ErrorContext(r.Context(), "photo resumable upload initiation failed", "storage_key", objectKey, "error", err)
+		svc.logger.ErrorContext(r.Context(), "resumable upload initiation failed", "endpoint", artifact.endpoint, "storage_key", objectKey, "error", err)
 		http.Error(w, "object store error", http.StatusBadGateway)
 		return
 	}
-	response := photoResumableResponse{
+	response := resumableFileResponse{
 		StorageBackend: store.Backend(),
 		StorageKey:     objectKey,
 	}
@@ -338,11 +401,11 @@ func (svc *ingestService) handlePhotoResumable(w http.ResponseWriter, r *http.Re
 		response.StorageKey = started.Existing.StorageKey
 		response.StorageFileID = started.Existing.StorageFileID
 		response.StorageURL = started.Existing.StorageURL
-		svc.logger.InfoContext(r.Context(), "photo resumable upload dedup hit", "storage_key", response.StorageKey, "bytes", request.SizeBytes)
+		svc.logger.InfoContext(r.Context(), "resumable upload dedup hit", "endpoint", artifact.endpoint, "storage_key", response.StorageKey, "bytes", request.SizeBytes)
 	} else {
 		response.UploadURL = started.UploadURL
-		response.ChunkSizeBytes = photoChunkSizeBytes
-		svc.logger.InfoContext(r.Context(), "photo resumable upload session created", "storage_key", objectKey, "bytes", request.SizeBytes)
+		response.ChunkSizeBytes = resumableChunkSizeBytes
+		svc.logger.InfoContext(r.Context(), "resumable upload session created", "endpoint", artifact.endpoint, "storage_key", objectKey, "bytes", request.SizeBytes)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -519,25 +582,8 @@ func ingestArtifacts() []ingestArtifact {
 				}, nil
 			},
 		},
-		// --- voice memos: audio blob + JSON metadata sidecar --------------
-		{
-			endpoint:   "/ingest/voice-memos/audio",
-			sourceSlug: "apple_voice_memos",
-			kind:       "voice_memo_audio",
-			// The app dedups by content sha (stable), replacing the client's old
-			// Drive presence probe; no probe endpoint is needed.
-			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
-				// recorded_at is used as wall-clock (the Python builder does NOT
-				// convert to UTC), so the date in the key matches the recording.
-				recordedAt, err := parseTimestamp(q.Get("recorded_at"))
-				if err != nil {
-					return ingestBuildResult{}, fmt.Errorf("invalid recorded_at: %w", err)
-				}
-				key := fmt.Sprintf("apple-voice-memos/inbox/%04d/%02d/%s-%s%s",
-					recordedAt.Year(), int(recordedAt.Month()), recordedAt.Format("2006-01-02"), sha, q.Get("extension"))
-				return ingestBuildResult{objectKey: key, contentType: q.Get("content_type"), appProperties: map[string]string{}}, nil
-			},
-		},
+		// --- voice memos: resumable audio session + JSON metadata sidecar ---
+		// The audio is a resumableFileArtifact (resumableFileArtifacts).
 		{
 			endpoint:   "/ingest/voice-memos/metadata",
 			sourceSlug: "apple_voice_memos",

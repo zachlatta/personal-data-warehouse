@@ -320,3 +320,67 @@ def test_every_heartbeat_posting_wrapper_can_resolve_credentials():
         if "_pdw-upload-lib.sh" not in text:
             missing.append(path.name)
     assert missing == [], f"these wrappers post a heartbeat without sourcing the lib: {missing}"
+
+
+def _run_log(tmp_path: Path) -> Path:
+    log = tmp_path / "x-upload.run.log"
+    log.write_text(
+        "[2026-09-30T17:00:00-04:00] starting Voice Memos upload\n"
+        "error: an older run's failure\n"
+        "[2026-09-30T17:00:30-04:00] finished Voice Memos upload exit_code=1 duration_seconds=30\n"
+        "[2026-09-30T18:25:37-04:00] starting Voice Memos upload\n"
+        "Failed to upload 20260930 102329-2DAE4BC0.qta: /ingest/voice-memos/audio: HTTP 504\n"
+        "error: 20260930 102329-2DAE4BC0.qta has failed 38 consecutive run(s) since 2026-09-30T17:24:05+00:00: HTTP 504\n"
+    )
+    return log
+
+
+def test_run_error_is_this_runs_last_error_line(tmp_path: Path):
+    out = _run(f'pdw_run_error "{_run_log(tmp_path)}"')
+    assert out.strip() == (
+        "20260930 102329-2DAE4BC0.qta has failed 38 consecutive run(s) since 2026-09-30T17:24:05+00:00: HTTP 504"
+    )
+
+
+def test_run_error_never_reports_an_earlier_runs_failure(tmp_path: Path):
+    log = tmp_path / "x-upload.run.log"
+    log.write_text(
+        "[2026-09-30T17:00:00-04:00] starting Voice Memos upload\n"
+        "error: an older run's failure\n"
+        "[2026-09-30T18:25:37-04:00] starting Voice Memos upload\n"
+        "Voice Memos upload finished with nothing printed as an error\n"
+    )
+    assert _run(f'pdw_run_error "{log}"').strip() == ""
+
+
+def test_post_heartbeat_carries_the_runs_error_so_pipeline_health_can_name_it(tmp_path: Path):
+    """Without --error, marts_ops.pipeline_health.last_error read NULL beside a
+    failing row for the whole of a 37-run voice memo wedge."""
+    fake_pdw = _fake_pdw(tmp_path, 'printf "%s\\n" "$@" > "$FAKE_PDW_LOG"\n')
+    argv_log = tmp_path / "pdw.log"
+    run_log = _run_log(tmp_path)
+    _run(
+        f'pdw_post_heartbeat "apple_voice_memos" "2026-09-30T18:28:45-04:00" 1 188 "{run_log}"',
+        env={"PDW_BIN": str(fake_pdw), "FAKE_PDW_LOG": str(argv_log)},
+    )
+    argv = argv_log.read_text().split("\n")
+    assert argv[argv.index("--error") + 1].startswith("20260930 102329-2DAE4BC0.qta has failed 38 consecutive run(s)")
+    # A successful run sends no error, whatever the log holds.
+    _run(
+        f'pdw_post_heartbeat "apple_voice_memos" "2026-09-30T18:33:45-04:00" 0 20 "{run_log}"',
+        env={"PDW_BIN": str(fake_pdw), "FAKE_PDW_LOG": str(argv_log)},
+    )
+    assert "--error" not in argv_log.read_text().split("\n")
+
+
+def test_every_heartbeat_posting_wrapper_passes_its_run_log():
+    """The run log is where the run's error line is; a wrapper that omits it
+    posts failures with no reason."""
+    missing = []
+    for path in sorted(LIB.parent.iterdir()):
+        if not path.is_file() or path.name == LIB.name:
+            continue
+        for line in path.read_text(errors="ignore").splitlines():
+            if line.strip().startswith("pdw_post_heartbeat ") and '"$LOG_FILE"' not in line:
+                missing.append(path.name)
+    assert missing == [], f"these wrappers post a heartbeat without their run log: {missing}"

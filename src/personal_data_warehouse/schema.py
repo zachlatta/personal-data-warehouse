@@ -2532,6 +2532,11 @@ UPLOADER_HEARTBEAT_COLUMNS = (
     "error",
     "exit_code",
     "duration_seconds",
+    # The (pipeline, device) failure streak the app computes on every post:
+    # consecutive non-zero exits and when the streak began (epoch when ok).
+    # Six in a row sends one push (app/internal/server/heartbeat_ingest.go).
+    "consecutive_failures",
+    "failing_since",
     "updated_at",
     "sync_version",
 )

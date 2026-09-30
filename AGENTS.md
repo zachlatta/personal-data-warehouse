@@ -1233,6 +1233,18 @@ The five-minute uploaders must report within `UPLOADER_RUN_INTERVAL` (30 min: la
 stale at 3h); the heartbeat is best-effort and never changes the uploader's own exit code.
 The `uploader_heartbeats` pipeline row says whether ANY device is reporting at all.
 
+**A failing uploader names what is stuck, and a long streak pushes.** Until 2026-09-30 the
+wrappers posted only the exit code, so a 625 MiB voice memo failed 37 runs in a row while
+`apple_voice_memos` read `status = failing`, `data_status = ok` (smaller memos kept landing)
+and `last_error` NULL — nothing said which file, or for how long. Now the wrapper passes its
+run log to `pdw_post_heartbeat`, which sends the run's last `error:` line as `--error`
+(`pdw_run_error`, scoped to lines after the run's own `starting` marker); the voice-memos
+uploader keeps a per-file failure streak in its state file, so that line reads
+`<file> has failed N consecutive run(s) since <T>: <cause>`. The app keeps a per
+(pipeline, device) streak on the row (`consecutive_failures`, `failing_since`, computed in the
+upsert) and sends one push on the sixth failed run in a row (`uploaderFailureAlertRuns`); a
+success resets it.
+
 **The heartbeat post is `pdw heartbeat`, and it resolves credentials the way every other
 pdw command does.** `pdw_post_heartbeat` in `bin/_pdw-upload-lib.sh` runs
 `pdw heartbeat --pipeline a,b --exit-code N --duration-seconds F --ran-at ISO` (native Go,
@@ -2608,7 +2620,7 @@ Every *remote-device* uploader (agent-sessions, voice-memos, apple-notes, apple-
 through the app — those devices are untrusted and must not hold the Drive credential. Each device
 POSTs domain payloads to the app's semantic ingestion endpoints (`POST /ingest/<source>/<type>`,
 e.g. `/ingest/agent-sessions/batch`, `/ingest/apple-messages/batch` + `/attachment`,
-`/ingest/voice-memos/audio` + `/metadata`, `/ingest/apple-notes/body` + `/attachment` +
+`/ingest/voice-memos/audio/resumable` + `/metadata`, `/ingest/apple-notes/body` + `/attachment` +
 `/revision`). The app owns the Drive credential, folder ids, object keys, `kind` values, and
 `pdw_*` tags; the device holds none of that. The app writes byte-identical Drive objects, so the
 Dagster `*_drive_ingest` readers are unchanged.
@@ -2661,13 +2673,27 @@ post agent-session batches from Dagster) handles this two ways:
   on the tailnet machines, so the committed repo stays generic. `PDW_TAILSCALE_BIN` overrides the
   CLI path.
 - **Defer what the route still can't carry.** `Client.EffectiveMaxUploadBytes` reports the
-  real ceiling for the chosen route (512 MiB direct, else min(app cap, 100 MiB)). The voice-memos
-  runner defers any recording above it (like its partial/age deferrals) instead of 413-ing and
-  wedging — so e.g. a lone 588 MiB memo is skipped while every other memo uploads.
-- **Photos do not use the capped body route.** Their signed start request is tiny, and their full
-  bytes go straight into an app-created Drive resumable session in 16 MiB chunks. This works
-  through the public app URL and has no 100/512/640 MiB per-file ceiling; Drive's acknowledged
-  range handles lost responses and its final sha256 + size gate the metadata upload.
+  real ceiling for the chosen route (512 MiB direct, else min(app cap, 100 MiB)); the Muse
+  uploader defers a blob above it instead of 413-ing and wedging.
+- **Photos and voice-memo audio do not use a body route at all.** Their signed start request
+  (`/ingest/photos/file/resumable`, `/ingest/voice-memos/audio/resumable`) is tiny, and the
+  file's bytes go straight into an app-created Drive resumable session in 16 MiB chunks. This
+  works through the public app URL and has no per-file ceiling; Drive's acknowledged range
+  handles lost responses and its final sha256 + size gate the metadata upload.
+
+**The Tailscale-direct route has a TIME ceiling, not just a size one: Traefik's 60-second
+entrypoint `readTimeout`.** Coolify's proxy on mew-coolify is Traefik v3 with no
+`respondingTimeouts` set, and Traefik v3 defaults `readTimeout` to 60s, so any request body
+that takes longer than a minute to send is cut: the app logs `status=400 duration=1m0.2s`
+(the body read failed) and the client receives `499` or `504`. At the ~6-10 MiB/s porygon
+reaches over Tailscale that is roughly 350-600 MiB, which is why a 371 MiB and a 430 MiB memo
+each needed 60-150 failed runs to land in August/September 2026 (a run succeeded only when
+the link happened to be fast), and why a 625 MiB, 2 h 42 m recording on 2026-09-30 failed
+every run until voice-memo audio moved to the resumable session. The client's own timeout
+scales with size (~1 MiB/s floor), so a 499 there is the proxy, not the client. The
+remaining raw-body endpoints (Apple Messages / Notes attachments, manual-finance documents,
+Muse files) are still bounded by it; a file that needs more than a minute belongs on the
+resumable path, not on a longer proxy timeout.
 
 Agent-session SQL starting points are the source-owned raw event tables
 `base_claude_code.events`, `base_codex.events`, `base_openclaw.events`, `base_pi.events`, `base_claude_desktop.events`, and

@@ -49,7 +49,7 @@ finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
-pdw_post_heartbeat "apple_photos" "$finished_at_iso" "$exit_code" "$duration_seconds"
+pdw_post_heartbeat "apple_photos" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
 echo "[$finished_at_iso] finished photos upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

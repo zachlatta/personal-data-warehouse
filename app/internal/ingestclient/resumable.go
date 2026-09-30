@@ -18,28 +18,43 @@ import (
 )
 
 const (
-	photoResumableEndpoint       = "/ingest/photos/file/resumable"
-	photoResumableStatusCode     = 308
-	photoResumableRetryAttempts  = 5
-	photoResumableSessionRestart = 3
+	photoResumableEndpoint     = "/ingest/photos/file/resumable"
+	voiceMemoResumableEndpoint = "/ingest/voice-memos/audio/resumable"
+	resumableStatusCode        = 308
+	resumableRetryAttempts     = 5
+	resumableSessionRestart    = 3
 )
 
 var errResumableSessionExpired = errors.New("resumable session expired")
 
 // UploadPhotoFile uploads a complete photo resource through a resumable Drive
-// session. Only the small, signed initiation request traverses the app/proxy;
-// the file itself streams in bounded chunks to the scoped Drive upload URL
-// the app creates with its credential, so neither Cloudflare's body cap nor a
-// long app request can truncate a large original. Drive's final sha256 and
-// size are checked before metadata is allowed to reference the object.
+// session (see uploadResumableFile).
 func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(photoResumableEndpoint, "photo", "captured_at", capturedAt, path, extension, contentType, contentSHA256)
+}
+
+// UploadVoiceMemoAudio uploads a recording through a resumable Drive session.
+// It used to POST the whole recording as one request body, which Traefik's
+// 60s entrypoint read timeout cut for any memo that took longer than a
+// minute to send: a 2 h 42 m, 625 MiB recording failed every run for a day.
+func (c *Client) UploadVoiceMemoAudio(path, recordedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(voiceMemoResumableEndpoint, "voice memo", "recorded_at", recordedAt, path, extension, contentType, contentSHA256)
+}
+
+// uploadResumableFile uploads a file through a resumable Drive session. Only
+// the small, signed initiation request traverses the app/proxy; the file
+// itself streams in bounded chunks to the scoped Drive upload URL the app
+// creates with its credential, so neither Cloudflare's body cap nor a proxy
+// read timeout can truncate a large file. Drive's final sha256 and size are
+// checked before metadata is allowed to reference the object.
+func (c *Client) uploadResumableFile(endpoint, label, timeField, timeValue, path, extension, contentType, contentSHA256 string) (StoredObject, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return StoredObject{}, err
 	}
 	sizeBytes := info.Size()
 	if sizeBytes <= 0 {
-		return StoredObject{}, errors.New("photo file must not be empty")
+		return StoredObject{}, fmt.Errorf("%s file must not be empty", label)
 	}
 	sha := strings.ToLower(contentSHA256)
 	if len(sha) != 64 || strings.Trim(sha, "0123456789abcdef") != "" {
@@ -49,7 +64,7 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 		contentType = "application/octet-stream"
 	}
 	startBody, err := common.CanonicalJSON(map[string]any{
-		"captured_at":    capturedAt,
+		timeField:        timeValue,
 		"content_sha256": sha,
 		"content_type":   contentType,
 		"extension":      extension,
@@ -59,15 +74,16 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 		return StoredObject{}, err
 	}
 
-	for restart := 0; restart < photoResumableSessionRestart; restart++ {
-		started, err := c.SignedPost(photoResumableEndpoint, startBody, "application/json", nil)
+	for restart := 0; restart < resumableSessionRestart; restart++ {
+		started, err := c.SignedPost(endpoint, startBody, "application/json", nil)
 		if err != nil {
-			return StoredObject{}, errors.New("could not start resumable photo upload")
+			// Summarised, never wrapped: a transport error carries the signed URL.
+			return StoredObject{}, fmt.Errorf("could not start resumable %s upload: %s", label, errorSummary(err))
 		}
 		if complete, _ := started["complete"].(bool); complete {
 			stored := storedObjectFromPayload(started)
 			if stored.StorageKey == "" || stored.StorageFileID == "" {
-				return StoredObject{}, errors.New("app returned an invalid existing photo object")
+				return StoredObject{}, fmt.Errorf("app returned an invalid existing %s object", label)
 			}
 			return stored, nil
 		}
@@ -75,21 +91,21 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 		storageKey := stringField(started, "storage_key")
 		chunkSize := int64(common.ToInt(started["chunk_size_bytes"]))
 		if uploadURL == "" || storageKey == "" || chunkSize <= 0 {
-			return StoredObject{}, errors.New("app returned an invalid resumable photo upload session")
+			return StoredObject{}, fmt.Errorf("app returned an invalid resumable %s upload session", label)
 		}
 		parsed, err := url.Parse(uploadURL)
 		if err != nil {
-			return StoredObject{}, errors.New("app returned an invalid resumable photo upload session")
+			return StoredObject{}, fmt.Errorf("app returned an invalid resumable %s upload session", label)
 		}
 		loopback := parsed.Scheme == "http" && (parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1" || parsed.Hostname() == "localhost")
 		if parsed.Scheme != "https" && !loopback {
-			return StoredObject{}, errors.New("app returned a non-HTTPS resumable photo upload session")
+			return StoredObject{}, fmt.Errorf("app returned a non-HTTPS resumable %s upload session", label)
 		}
 
-		completed, err := c.uploadPhotoChunks(path, uploadURL, contentType, sizeBytes, chunkSize)
+		completed, err := c.uploadResumableChunks(path, label, uploadURL, contentType, sizeBytes, chunkSize)
 		if errors.Is(err, errResumableSessionExpired) {
-			if restart == photoResumableSessionRestart-1 {
-				return StoredObject{}, errors.New("resumable photo upload session expired repeatedly")
+			if restart == resumableSessionRestart-1 {
+				return StoredObject{}, fmt.Errorf("resumable %s upload session expired repeatedly", label)
 			}
 			continue
 		}
@@ -97,7 +113,7 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 			return StoredObject{}, err
 		}
 		if strings.ToLower(stringField(completed, "sha256Checksum")) != sha {
-			return StoredObject{}, errors.New("Drive checksum does not match the complete photo file")
+			return StoredObject{}, fmt.Errorf("Drive checksum does not match the complete %s file", label)
 		}
 		actualSize := int64(-1)
 		switch v := completed["size"].(type) {
@@ -107,11 +123,11 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 			actualSize = int64(v)
 		}
 		if actualSize != sizeBytes {
-			return StoredObject{}, errors.New("Drive size does not match the complete photo file")
+			return StoredObject{}, fmt.Errorf("Drive size does not match the complete %s file", label)
 		}
 		fileID := stringField(completed, "id")
 		if fileID == "" {
-			return StoredObject{}, errors.New("Drive did not return a file id for the complete photo file")
+			return StoredObject{}, fmt.Errorf("Drive did not return a file id for the complete %s file", label)
 		}
 		backend := stringField(started, "storage_backend")
 		if backend == "" {
@@ -124,10 +140,10 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 			StorageURL:     stringField(completed, "webViewLink"),
 		}, nil
 	}
-	return StoredObject{}, errors.New("resumable photo upload session expired repeatedly")
+	return StoredObject{}, fmt.Errorf("resumable %s upload session expired repeatedly", label)
 }
 
-func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeBytes, chunkSize int64) (map[string]any, error) {
+func (c *Client) uploadResumableChunks(path, label, uploadURL, contentType string, sizeBytes, chunkSize int64) (map[string]any, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -143,10 +159,10 @@ func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeByte
 		chunk := make([]byte, size)
 		n, err := file.ReadAt(chunk, offset)
 		if err != nil && !(errors.Is(err, io.EOF) && int64(n) == size) {
-			return nil, errors.New("photo file ended before its declared size")
+			return nil, fmt.Errorf("%s file ended before its declared size", label)
 		}
 		if n == 0 {
-			return nil, errors.New("photo file ended before its declared size")
+			return nil, fmt.Errorf("%s file ended before its declared size", label)
 		}
 		chunk = chunk[:n]
 		end := offset + int64(n) - 1
@@ -156,7 +172,7 @@ func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeByte
 			"Content-Type":   contentType,
 		}, c.uploadTimeout(n))
 		if err != nil {
-			next, completed, qerr := c.queryResumableStatus(uploadURL, sizeBytes)
+			next, completed, qerr := c.queryResumableStatus(uploadURL, label, sizeBytes)
 			if qerr != nil {
 				return nil, qerr
 			}
@@ -169,7 +185,7 @@ func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeByte
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
 			return decodeJSONObject(body)
-		case resp.StatusCode == photoResumableStatusCode:
+		case resp.StatusCode == resumableStatusCode:
 			next, err := resumableNextOffset(resp.Header.Get("Range"), sizeBytes)
 			if err != nil {
 				return nil, err
@@ -178,7 +194,7 @@ func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeByte
 		case resp.StatusCode == http.StatusNotFound:
 			return nil, errResumableSessionExpired
 		case retryableStatusCodes[resp.StatusCode]:
-			next, completed, qerr := c.queryResumableStatus(uploadURL, sizeBytes)
+			next, completed, qerr := c.queryResumableStatus(uploadURL, label, sizeBytes)
 			if qerr != nil {
 				return nil, qerr
 			}
@@ -187,21 +203,21 @@ func (c *Client) uploadPhotoChunks(path, uploadURL, contentType string, sizeByte
 			}
 			offset = next
 		default:
-			return nil, fmt.Errorf("resumable photo upload failed with HTTP status %d", resp.StatusCode)
+			return nil, fmt.Errorf("resumable %s upload failed with HTTP status %d", label, resp.StatusCode)
 		}
 	}
-	return nil, errors.New("Drive did not confirm the complete photo upload")
+	return nil, fmt.Errorf("Drive did not confirm the complete %s upload", label)
 }
 
-func (c *Client) queryResumableStatus(uploadURL string, sizeBytes int64) (int64, map[string]any, error) {
-	for attempt := 0; attempt < photoResumableRetryAttempts; attempt++ {
+func (c *Client) queryResumableStatus(uploadURL, label string, sizeBytes int64) (int64, map[string]any, error) {
+	for attempt := 0; attempt < resumableRetryAttempts; attempt++ {
 		resp, body, err := c.put(uploadURL, nil, map[string]string{
 			"Content-Length": "0",
 			"Content-Range":  fmt.Sprintf("bytes */%d", sizeBytes),
 		}, c.timeout)
 		if err != nil {
-			if attempt == photoResumableRetryAttempts-1 {
-				return 0, nil, errors.New("could not determine resumable photo upload status")
+			if attempt == resumableRetryAttempts-1 {
+				return 0, nil, fmt.Errorf("could not determine resumable %s upload status", label)
 			}
 			c.sleep(time.Duration(UploadRetryBaseSeconds * float64(int(1)<<attempt) * float64(time.Second)))
 			continue
@@ -210,19 +226,19 @@ func (c *Client) queryResumableStatus(uploadURL string, sizeBytes int64) (int64,
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
 			completed, err := decodeJSONObject(body)
 			return sizeBytes, completed, err
-		case resp.StatusCode == photoResumableStatusCode:
+		case resp.StatusCode == resumableStatusCode:
 			next, err := resumableNextOffset(resp.Header.Get("Range"), sizeBytes)
 			return next, nil, err
 		case resp.StatusCode == http.StatusNotFound:
 			return 0, nil, errResumableSessionExpired
-		case retryableStatusCodes[resp.StatusCode] && attempt < photoResumableRetryAttempts-1:
+		case retryableStatusCodes[resp.StatusCode] && attempt < resumableRetryAttempts-1:
 			c.sleep(time.Duration(UploadRetryBaseSeconds * float64(int(1)<<attempt) * float64(time.Second)))
 			continue
 		default:
-			return 0, nil, fmt.Errorf("resumable photo upload failed with HTTP status %d", resp.StatusCode)
+			return 0, nil, fmt.Errorf("resumable %s upload failed with HTTP status %d", label, resp.StatusCode)
 		}
 	}
-	return 0, nil, errors.New("could not determine resumable photo upload status")
+	return 0, nil, fmt.Errorf("could not determine resumable %s upload status", label)
 }
 
 // put issues a PUT and returns the response plus a bounded body; the error is
@@ -233,7 +249,7 @@ func (c *Client) put(target string, body []byte, headers map[string]string, time
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, errors.New("resumable photo upload transport failed")
+		return nil, nil, errors.New("resumable upload transport failed")
 	}
 	for key, value := range headers {
 		if key == "Content-Length" {
@@ -245,7 +261,7 @@ func (c *Client) put(target string, body []byte, headers map[string]string, time
 	req.Header.Set("User-Agent", userAgent)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, errors.New("resumable photo upload transport failed")
+		return nil, nil, errors.New("resumable upload transport failed")
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

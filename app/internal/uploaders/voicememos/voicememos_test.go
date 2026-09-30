@@ -189,14 +189,22 @@ func TestStateMarksAndMatches(t *testing.T) {
 	if entry.Complete() || entry.LastError != "boom" || entry.LastFailureAt != "2026-05-21T12:00:00+00:00" || entry.LastSuccessAt != "" {
 		t.Fatalf("failure entry = %+v", entry)
 	}
+	if entry.ConsecutiveFailures != 1 || entry.FirstFailureAt != "2026-05-21T12:00:00+00:00" {
+		t.Fatalf("first failure streak = %+v", entry)
+	}
+	state.MarkFailure(c, "", "boom again", testNow.Add(5*time.Minute))
+	entry, _ = state.EntryFor(c)
+	if entry.ConsecutiveFailures != 2 || entry.FirstFailureAt != "2026-05-21T12:00:00+00:00" || entry.LastFailureAt != "2026-05-21T12:05:00+00:00" {
+		t.Fatalf("a repeat failure extends the streak from its first failure: %+v", entry)
+	}
 	state.MarkSuccess(c, "sha", true, true, testNow)
 	entry, _ = state.EntryFor(c)
-	if !entry.Complete() || !entry.Matches(c) || entry.Path != c.Filename || entry.LastFailureAt != "" {
+	if !entry.Complete() || !entry.Matches(c) || entry.Path != c.Filename || entry.LastFailureAt != "" || entry.ConsecutiveFailures != 0 || entry.FirstFailureAt != "" {
 		t.Fatalf("success entry = %+v", entry)
 	}
 	state.MarkFailure(c, "", "again", testNow.Add(time.Minute))
 	entry, _ = state.EntryFor(c)
-	if entry.ContentSHA256 != "sha" || !entry.AudioUploaded || entry.LastSuccessAt != "2026-05-21T12:00:00+00:00" || entry.LastError != "again" {
+	if entry.ContentSHA256 != "sha" || !entry.AudioUploaded || entry.LastSuccessAt != "2026-05-21T12:00:00+00:00" || entry.LastError != "again" || entry.ConsecutiveFailures != 1 {
 		t.Fatalf("second failure must keep the earlier success: %+v", entry)
 	}
 	if got := state.SHAByFilename(); got[c.Filename] != "sha" {
@@ -220,7 +228,14 @@ type fakeUploader struct {
 	peak     atomic.Int32
 }
 
-func (f *fakeUploader) UploadVoiceMemoAudio(content []byte, recordedAt, extension, contentType string) (ingestclient.StoredObject, error) {
+func (f *fakeUploader) UploadVoiceMemoAudio(path, recordedAt, extension, contentType, contentSHA256 string) (ingestclient.StoredObject, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return ingestclient.StoredObject{}, err
+	}
+	if common.BytesSHA256(content) != contentSHA256 {
+		return ingestclient.StoredObject{}, errors.New("declared sha does not match the file")
+	}
 	n := f.inflight.Add(1)
 	defer f.inflight.Add(-1)
 	for {
@@ -330,16 +345,16 @@ func TestIncrementalRunUploadsAudioThenMetadataAndRecordsState(t *testing.T) {
 	}
 }
 
-func TestIncrementalRunDefersPartialRecentAndOversizeFiles(t *testing.T) {
+func TestIncrementalRunDefersPartialAndRecentFilesButNeverALargeOne(t *testing.T) {
 	root := t.TempDir()
 	writeRecordings(t, root, "20260430 110736-8BB8E57D.qta", "20260427 100004-40DC0200.m4a", "20260101 000000-BIGBIG00.m4a")
 	createCloudRecordingsDB(t, root, []any{"U1", "20260430 110736-8BB8E57D.qta", "New Recording 1", 4100, 9349.66, 6228.63})
 	if err := os.WriteFile(filepath.Join(root, "20260101 000000-BIGBIG00.m4a"), bytes.Repeat([]byte("x"), 100), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// The age rule runs first, in Python and here, so only the recent file
-	// may carry a fresh mtime: the partial and oversize files must be old
-	// enough to reach their own rules (and log their own reasons).
+	// The age rule runs first, so only the recent file may carry a fresh
+	// mtime: the partial and large files must be old enough to reach their
+	// own rules.
 	old := time.Now().Add(-time.Hour)
 	for _, name := range []string{"20260430 110736-8BB8E57D.qta", "20260101 000000-BIGBIG00.m4a"} {
 		if err := os.Chtimes(filepath.Join(root, name), old, old); err != nil {
@@ -354,22 +369,23 @@ func TestIncrementalRunDefersPartialRecentAndOversizeFiles(t *testing.T) {
 	runner.Logger = logger
 	runner.Now = func() time.Time { return time.Now() }
 	runner.MinFileAgeSeconds = 120
-	runner.MaxUploadBytes = 50
 	summary, err := runner.Sync()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.RecordingsSeen != 3 || summary.RecordingsSelected != 0 || summary.RecordingsDeferred != 3 || len(client.audio) != 0 {
+	// The audio streams to a resumable Drive session, so there is no route
+	// ceiling left to defer a long recording against: it uploads.
+	if summary.RecordingsSeen != 3 || summary.RecordingsSelected != 1 || summary.RecordingsDeferred != 2 || len(client.audio) != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
 	lines := strings.Join(logger.Lines(), "\n")
 	if !strings.Contains(lines, "Deferring 20260430 110736-8BB8E57D.qta because Voice Memos reports 9349.66s total but only 6228.63s local audio") {
 		t.Fatalf("partial warning missing: %s", lines)
 	}
-	if !strings.Contains(lines, "Deferring 20260101 000000-BIGBIG00.m4a (100 B): exceeds the 50 B upload ceiling for the current route") {
-		t.Fatalf("oversize warning missing: %s", lines)
+	if strings.Contains(lines, "ceiling") {
+		t.Fatalf("no upload ceiling may be applied: %s", lines)
 	}
-	if !strings.Contains(lines, "Incremental selection: selected=0 skipped=0 deferred=3") {
+	if !strings.Contains(lines, "Incremental selection: selected=1 skipped=0 deferred=2") {
 		t.Fatalf("selection line missing: %s", lines)
 	}
 }
@@ -401,8 +417,14 @@ func TestIncrementalRunContinuesPastAFailingUploadThenReturnsIt(t *testing.T) {
 	state := EmptyState("zach@example.com", root)
 	runner := newRunner(root, client, state)
 	summary, err := runner.Sync()
-	if err == nil || !strings.Contains(err.Error(), "499 simulated timeout") {
+	// The run's error names the stuck file and how long it has been stuck,
+	// because it is what the heartbeat carries to pipeline_health.last_error:
+	// a bare "HTTP 504" read the same for one blip and a day-long wedge.
+	if err == nil || err.Error() != "20260101 110000-BBBB0002.m4a has failed 1 consecutive run(s) since 2026-05-21T12:00:00+00:00: 499 simulated timeout" {
 		t.Fatalf("err = %v", err)
+	}
+	if _, err := runner.Sync(); err == nil || !strings.HasPrefix(err.Error(), "20260101 110000-BBBB0002.m4a has failed 2 consecutive run(s) since 2026-05-21T12:00:00+00:00: ") {
+		t.Fatalf("second run err = %v", err)
 	}
 	if summary.RecordingsUploaded != 2 || summary.RecordingsSelected != 3 {
 		t.Fatalf("summary = %+v", summary)
@@ -416,7 +438,7 @@ func TestIncrementalRunContinuesPastAFailingUploadThenReturnsIt(t *testing.T) {
 		t.Fatalf("uploaded = %v", uploaded)
 	}
 	failed := state.Entries["20260101 110000-BBBB0002.m4a"]
-	if failed.Complete() || failed.LastError != "499 simulated timeout" || failed.ContentSHA256 == "" {
+	if failed.Complete() || failed.LastError != "499 simulated timeout" || failed.ContentSHA256 == "" || failed.ConsecutiveFailures != 2 {
 		t.Fatalf("failed entry = %+v", failed)
 	}
 	if !state.Entries["20260101 100000-AAAA0001.m4a"].Complete() {
@@ -515,7 +537,8 @@ func newFakeApp(t *testing.T) (*httptest.Server, *[]recorded) {
 	t.Helper()
 	var mu sync.Mutex
 	requests := &[]recorded{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		query := map[string]string{}
 		for key := range r.URL.Query() {
@@ -539,6 +562,14 @@ func newFakeApp(t *testing.T) (*httptest.Server, *[]recorded) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/ingest/voice-memos/audio/resumable" {
+			json.NewEncoder(w).Encode(map[string]any{"storage_backend": "google_drive", "storage_key": "key", "upload_url": server.URL + "/drive-session", "chunk_size_bytes": 16 * 1024 * 1024})
+			return
+		}
+		if r.URL.Path == "/drive-session" {
+			json.NewEncoder(w).Encode(map[string]any{"id": "file-1", "sha256Checksum": common.BytesSHA256(body), "size": fmt.Sprint(len(body))})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"storage_backend": "google_drive", "storage_key": "key", "storage_file_id": "file-1"})
 	}))
 	t.Cleanup(server.Close)
@@ -555,24 +586,26 @@ func TestWirePayloadsMatchThePythonUploader(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := newRunner(root, client, EmptyState("zach@example.com", root))
-	runner.MaxUploadBytes = client.EffectiveMaxUploadBytes()
 	if _, err := runner.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if len(*requests) != 2 {
+	if len(*requests) != 3 {
 		t.Fatalf("requests = %d", len(*requests))
 	}
-	audio, metadata := (*requests)[0], (*requests)[1]
-	if audio.Path != "/ingest/voice-memos/audio" || audio.ContentType != "audio/mp4" || string(audio.Body) != "audio-20260427 100004-40DC0200.m4a" {
-		t.Fatalf("audio request = %+v", audio)
+	start, chunk, metadata := (*requests)[0], (*requests)[1], (*requests)[2]
+	audioBody := "audio-20260427 100004-40DC0200.m4a"
+	audioSHA := common.BytesSHA256([]byte(audioBody))
+	wantStart := `{"content_sha256":"` + audioSHA + `","content_type":"audio/mp4","extension":".m4a","recorded_at":"2026-04-27T10:00:04+00:00","size_bytes":34}`
+	if start.Path != "/ingest/voice-memos/audio/resumable" || string(start.Body) != wantStart || start.Query["sig"] == "" {
+		t.Fatalf("audio start request = %+v", start)
 	}
-	if audio.Query["recorded_at"] != "2026-04-27T10:00:04+00:00" || audio.Query["extension"] != ".m4a" || audio.Query["content_sha256"] != common.BytesSHA256(audio.Body) || audio.Query["sig"] == "" {
-		t.Fatalf("audio query = %v", audio.Query)
+	if chunk.Path != "/drive-session" || string(chunk.Body) != audioBody {
+		t.Fatalf("audio chunk = %+v", chunk)
 	}
-	if metadata.Path != "/ingest/voice-memos/metadata" || metadata.Query["audio_content_sha256"] != common.BytesSHA256(audio.Body) || metadata.Query["recorded_at"] != "2026-04-27T10:00:04+00:00" {
+	if metadata.Path != "/ingest/voice-memos/metadata" || metadata.Query["audio_content_sha256"] != audioSHA || metadata.Query["recorded_at"] != "2026-04-27T10:00:04+00:00" {
 		t.Fatalf("metadata request = %+v", metadata)
 	}
-	want := `{"account":"zach@example.com","recording":{"content_sha256":"` + common.BytesSHA256(audio.Body) + `","content_type":"audio/mp4","duration_seconds":12.5,"extension":".m4a","file_created_at":"`
+	want := `{"account":"zach@example.com","recording":{"content_sha256":"` + audioSHA + `","content_type":"audio/mp4","duration_seconds":12.5,"extension":".m4a","file_created_at":"`
 	if !strings.HasPrefix(string(metadata.Body), want) {
 		t.Fatalf("metadata body = %s", metadata.Body)
 	}
@@ -1127,7 +1160,8 @@ func TestRunExitCodes(t *testing.T) {
 	if !strings.Contains(out, "Voice Memos upload complete: seen=1 selected=1 uploaded=1 skipped=0 deferred=0 metadata=1") || !strings.Contains(out, "[1/1] upload 20260427 100004-40DC0200.m4a") {
 		t.Fatalf("stdout = %q", out)
 	}
-	if len(*requests) != 2 {
+	// audio session start + one Drive chunk + metadata
+	if len(*requests) != 3 {
 		t.Fatalf("requests = %d", len(*requests))
 	}
 	state := LoadState(stateFile, "zach@example.com", root)

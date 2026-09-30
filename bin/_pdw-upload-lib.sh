@@ -152,10 +152,27 @@ pdw_export_app_credentials() {
   return 0
 }
 
-# pdw_post_heartbeat PIPELINES ISO EXIT_CODE DURATION_SECONDS
+# pdw_run_error LOG_FILE -> the current run's last "error: ..." line (without
+# the prefix), or nothing. Only lines after the run's own "] starting " marker
+# count, so an earlier run's failure is never reported as this run's. `pdw`
+# prints its returned error last as "error: <text>"; the voice-memos uploader
+# makes that text name the stuck file and its failure streak.
+pdw_run_error() {
+  [ -f "$1" ] || return 0
+  tail -n 2000 "$1" | awk '
+    /^\[[^]]*\] starting / { err = "" }
+    /^error: / { err = substr($0, 8) }
+    END { if (err != "") print err }
+  '
+}
+
+# pdw_post_heartbeat PIPELINES ISO EXIT_CODE DURATION_SECONDS [LOG_FILE]
 # Post the run's verdict to the warehouse (ops.uploader_heartbeats) so
 # marts_ops.pipeline_health can tell a failing uploader from a quiet source.
 # PIPELINES is comma-separated (the agent-sessions uploader covers several).
+# On a failed run, LOG_FILE's last error line rides along as --error, which is
+# what marts_ops.pipeline_health.last_error shows; without it a 37-run voice
+# memo wedge read `failing` with last_error NULL.
 # Runs `pdw heartbeat` (native Go; resolves the URL/token the way every other
 # pdw command does). Best effort: never changes the uploader's own exit code,
 # and a host with no pdw binary just skips.
@@ -164,14 +181,26 @@ pdw_post_heartbeat() {
   _iso="$2"
   _code="$3"
   _duration="${4:-0}"
+  _run_log="${5:-}"
   _pdw="$(pdw_resolve_bin)"
   if [ -z "$_pdw" ]; then
     return 0
   fi
   pdw_export_app_credentials
-  "$_pdw" heartbeat \
-    --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
-    >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
+  _error=""
+  if [ "$_code" != "0" ] && [ -n "$_run_log" ]; then
+    _error="$(pdw_run_error "$_run_log")"
+  fi
+  if [ -n "$_error" ]; then
+    "$_pdw" heartbeat \
+      --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
+      --error "$_error" \
+      >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
+  else
+    "$_pdw" heartbeat \
+      --pipeline "$_pipelines" --ran-at "$_iso" --exit-code "$_code" --duration-seconds "$_duration" \
+      >/dev/null 2>&1 || echo "[$_iso] heartbeat post failed for $_pipelines (ignored)" >&2
+  fi
   return 0
 }
 

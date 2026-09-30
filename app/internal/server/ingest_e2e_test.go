@@ -286,12 +286,6 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "apple_message_attachment", "attachment_guid": "A1", "message_guid": "M1"},
 		},
 		{
-			name: "voice-memos/audio", endpoint: "/ingest/voice-memos/audio", body: audio,
-			extra:    url.Values{"recorded_at": {"2025-07-15T09:00:00"}, "extension": {".m4a"}, "content_type": {"audio/m4a"}},
-			wantName: "2025-07-15-" + audioSHA + ".m4a", wantMime: "audio/m4a",
-			wantProps: map[string]string{"pdw_kind": "voice_memo_audio", "pdw_source": "apple_voice_memos"},
-		},
-		{
 			name: "voice-memos/metadata", endpoint: "/ingest/voice-memos/metadata", body: meta,
 			extra:    url.Values{"recorded_at": {"2025-07-15T09:00:00"}, "audio_content_sha256": {audioSHA}},
 			wantName: "2025-07-15-" + audioSHA + ".json", wantMime: "application/json",
@@ -357,19 +351,19 @@ func TestIngestEndToEndPhotoResumableUpload(t *testing.T) {
 	service := e2eService(t, driveServer.URL)
 	photo := []byte("heic-bytes")
 	photoSHA := sha256Hex(photo)
-	startBody, _ := json.Marshal(photoResumableRequest{
-		CapturedAt:    "2026-06-01T14:30:00",
-		Extension:     ".heic",
-		ContentType:   "image/heic",
-		ContentSHA256: photoSHA,
-		SizeBytes:     int64(len(photo)),
+	startBody, _ := json.Marshal(map[string]any{
+		"captured_at":    "2026-06-01T14:30:00",
+		"extension":      ".heic",
+		"content_type":   "image/heic",
+		"content_sha256": photoSHA,
+		"size_bytes":     len(photo),
 	})
-	startTarget := signedIngestTarget(photoResumableEndpoint, startBody, nil)
+	startTarget := signedIngestTarget("/ingest/photos/file/resumable", startBody, nil)
 	startRecorder := postIngest(t, service, startTarget, startBody)
 	if startRecorder.Code != http.StatusOK {
 		t.Fatalf("start status = %d, body %q", startRecorder.Code, startRecorder.Body.String())
 	}
-	var started photoResumableResponse
+	var started resumableFileResponse
 	if err := json.Unmarshal(startRecorder.Body.Bytes(), &started); err != nil {
 		t.Fatalf("decode start: %v", err)
 	}
@@ -487,6 +481,10 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 	if err := os.WriteFile(photoPath, photo, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	audioPath := filepath.Join(t.TempDir(), "memo.m4a")
+	if err := os.WriteFile(audioPath, audio, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	type step struct {
 		name string
@@ -516,7 +514,7 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 				"2026-06-01T14:30:00", photoSHA, photoDedupSHA)
 		}},
 		{"voice-memos/audio", func() (ingestclient.StoredObject, error) {
-			return client.UploadVoiceMemoAudio(audio, "2025-07-15T09:00:00", ".m4a", "audio/m4a")
+			return client.UploadVoiceMemoAudio(audioPath, "2025-07-15T09:00:00", ".m4a", "audio/m4a", audioSHA)
 		}},
 		{"voice-memos/metadata", func() (ingestclient.StoredObject, error) {
 			return client.UploadVoiceMemoMetadata(map[string]any{"schema_version": 1}, "2025-07-15T09:00:00", audioSHA)
@@ -545,8 +543,17 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 				"2026-06-30T10:00:00", "Acme-Checking-0001", statementSHA, statementDedupSHA)
 		}},
 	}
-	if len(steps) != len(ingestArtifacts())+1 {
-		t.Fatalf("e2e client drives %d endpoints but %d artifacts (+1 photo file) are registered", len(steps), len(ingestArtifacts()))
+	// Resumable file endpoints are not body artifacts: the client streams the
+	// bytes to the Drive session, so each is checked on its own below.
+	resumable := map[string]struct {
+		name, kind string
+		media      []byte
+	}{
+		"photos/file":       {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
+		"voice-memos/audio": {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
+	}
+	if len(steps) != len(ingestArtifacts())+len(resumable) {
+		t.Fatalf("e2e client drives %d endpoints but %d artifacts (+%d resumable files) are registered", len(steps), len(ingestArtifacts()), len(resumable))
 	}
 
 	// The handler-level cases are the byte-for-byte contract; the client must
@@ -568,9 +575,10 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 			t.Fatalf("%s: expected exactly one Drive upload, got %d new", st.name, len(drive.uploads)-before)
 		}
 		up := drive.lastUpload()
-		if st.name == "photos/file" {
-			if up.Name != "2026-06-01-"+photoSHA+".heic" || string(up.Media) != string(photo) || up.AppProps["pdw_kind"] != "photo_file" {
-				t.Fatalf("photos/file uploaded = %+v", up)
+		if r, ok := resumable[st.name]; ok {
+			if up.Name != r.name || string(up.Media) != string(r.media) || up.AppProps["pdw_kind"] != r.kind ||
+				up.AppProps["content_sha256"] != sha256Hex(r.media) {
+				t.Fatalf("%s uploaded = %+v", st.name, up)
 			}
 			continue
 		}
@@ -593,7 +601,7 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 			}
 		}
 	}
-	if got := len(drive.uploads); got != len(ingestArtifacts())+1 {
-		t.Fatalf("expected %d uploads from the Go client, got %d", len(ingestArtifacts())+1, got)
+	if got := len(drive.uploads); got != len(ingestArtifacts())+len(resumable) {
+		t.Fatalf("expected %d uploads from the Go client, got %d", len(ingestArtifacts())+len(resumable), got)
 	}
 }

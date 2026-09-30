@@ -2394,6 +2394,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # ops.uploader_heartbeats: when the current run-failure streak began.
+    "failing_since",
     # Muse workspace files: when a path stopped existing (epoch while it does).
     "deleted_at",
     # SimpleFIN: the bridge's own balance stamp, the day a transaction
@@ -2514,6 +2516,8 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # ops.uploader_heartbeats: failed uploader runs in a row.
+    "consecutive_failures",
     # Muse workspace files: 1 when the content is inline text.
     "is_text",
     # hacker_news

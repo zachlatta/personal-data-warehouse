@@ -96,8 +96,13 @@ func ingestTestService() (*ingestService, map[string]*capturingStore) {
 	for _, a := range ingestArtifacts() {
 		artifacts[a.endpoint] = a
 	}
+	resumable := map[string]resumableFileArtifact{}
+	for _, a := range resumableFileArtifacts() {
+		resumable[a.endpoint] = a
+	}
 	svc := &ingestService{
 		artifacts: artifacts,
+		resumable: resumable,
 		stores:    ifaceStores,
 		signer:    objectsTestSigner(),
 		maxBytes:  1024,
@@ -390,22 +395,60 @@ func TestIngestVoiceMemosAudioAndMetadataKeys(t *testing.T) {
 	svc, stores := ingestTestService()
 	audio := []byte("audio-bytes")
 	audioSHA := sha256Hex(audio)
-	// Audio: recorded_at is wall-clock (no UTC shift), extension verbatim.
-	target := signedIngestTarget("/ingest/voice-memos/audio", audio, url.Values{
-		"recorded_at":  {"2025-07-15T09:00:00"},
-		"extension":    {".m4a"},
-		"content_type": {"audio/m4a"},
+	// Audio: a resumable Drive session, never a raw body through the proxy.
+	// recorded_at is wall-clock (no UTC shift), extension verbatim.
+	startBody, _ := json.Marshal(map[string]any{
+		"recorded_at":    "2025-07-15T09:00:00",
+		"extension":      ".m4a",
+		"content_type":   "audio/m4a",
+		"content_sha256": audioSHA,
+		"size_bytes":     len(audio),
 	})
-	if rec := postIngest(t, svc, target, audio); rec.Code != http.StatusOK {
-		t.Fatalf("audio status = %d, body %q", rec.Code, rec.Body.String())
+	target := signedIngestTarget("/ingest/voice-memos/audio/resumable", startBody, nil)
+	rec := postIngest(t, svc, target, startBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("audio start status = %d, body %q", rec.Code, rec.Body.String())
 	}
-	put := stores["apple_voice_memos"].lastFile
+	put := stores["apple_voice_memos"].lastResumable
 	wantAudioKey := "apple-voice-memos/inbox/2025/07/2025-07-15-" + audioSHA + ".m4a"
 	if put.ObjectKey != wantAudioKey {
 		t.Fatalf("audio key = %q, want %q", put.ObjectKey, wantAudioKey)
 	}
-	if put.Kind != "voice_memo_audio" || put.SkipExistingCheck || put.ContentType != "audio/m4a" {
+	if put.Kind != "voice_memo_audio" || put.ContentType != "audio/m4a" ||
+		put.ContentSHA256 != audioSHA || put.SizeBytes != int64(len(audio)) {
 		t.Fatalf("audio put = %+v", put)
+	}
+	var started resumableFileResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
+		t.Fatalf("decode start response: %v", err)
+	}
+	if started.Complete || started.UploadURL == "" || started.StorageKey != wantAudioKey ||
+		started.ChunkSizeBytes < 256*1024 {
+		t.Fatalf("start response = %+v", started)
+	}
+
+	// A photo's timestamp field is not a voice memo's: the request is refused
+	// rather than keyed on an empty recorded_at.
+	wrongField, _ := json.Marshal(map[string]any{
+		"captured_at":    "2025-07-15T09:00:00",
+		"extension":      ".m4a",
+		"content_type":   "audio/m4a",
+		"content_sha256": audioSHA,
+		"size_bytes":     len(audio),
+	})
+	wrongTarget := signedIngestTarget("/ingest/voice-memos/audio/resumable", wrongField, nil)
+	if bad := postIngest(t, svc, wrongTarget, wrongField); bad.Code != http.StatusBadRequest {
+		t.Fatalf("wrong timestamp field status = %d, want 400", bad.Code)
+	}
+
+	// The raw-body route is gone: Traefik's 60s entrypoint read timeout cut
+	// every recording that took longer than a minute to send.
+	legacyTarget := signedIngestTarget("/ingest/voice-memos/audio", audio, url.Values{
+		"recorded_at": {"2025-07-15T09:00:00"},
+		"extension":   {".m4a"},
+	})
+	if old := postIngest(t, svc, legacyTarget, audio); old.Code != http.StatusNotFound {
+		t.Fatalf("legacy audio route status = %d, want 404", old.Code)
 	}
 
 	// Metadata sidecar shares the audio's basename via audio_content_sha256.
@@ -455,7 +498,7 @@ func TestIngestPhotosResumableFileAndMetadataKeys(t *testing.T) {
 		put.ContentSHA256 != photoSHA || put.SizeBytes != int64(len(photo)) {
 		t.Fatalf("file put = %+v", put)
 	}
-	var started photoResumableResponse
+	var started resumableFileResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
 		t.Fatalf("decode start response: %v", err)
 	}
@@ -512,7 +555,7 @@ func TestIngestPhotosResumableReturnsExistingAndRemovesLegacyRoute(t *testing.T)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
 	}
-	var response photoResumableResponse
+	var response resumableFileResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}

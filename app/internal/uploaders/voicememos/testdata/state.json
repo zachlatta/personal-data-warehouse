@@ -4,7 +4,9 @@
     "20260325 145019-DAAC9394.qta": {
       "audio_uploaded": true,
       "birthtime_ns": 1789348224770840832,
+      "consecutive_failures": 0,
       "content_sha256": "abc",
+      "first_failure_at": "",
       "last_checked_at": "2026-05-21T12:00:00+00:00",
       "last_error": "",
       "last_failure_at": "",
