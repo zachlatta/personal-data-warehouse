@@ -1799,9 +1799,24 @@ back it, all behind the static bearer the CLI uses:
     header, the next one prefetched) and leaves a one-line note ("Sent · …"); and the
     buttons, confirm and note come from `requestDecision` in `mutation-review.ts` —
     "Send" / "Don't send" and "Send to front@…?" for one email, "Archive" / "Keep in
-    inbox" for one thread. An email reply shows the message it answers first, and
-    Approve is refused while an edit on screen is unsaved, because approval runs the
-    stored version, never the screen's.
+    inbox" for one thread. An email reply shows the message it answers first, with
+    its quoted history folded.
+  - **An email's paragraphs survive a phone edit, in Gmail's own shape.** Gmail's
+    composer writes one `<div>` per line and `<div><br></div>` per blank line (checked
+    against handwritten sent mail, 2026-09-29). Until then `editor_text` came from
+    `htmlFragmentText`, which drops blank lines, and the phone rebuilt an edit as one
+    `<div>` joined by `<br>`: two replies edited on the phone that day went out as one
+    run-on block while every unedited `<p>`-paragraphed proposal was fine.
+    `htmlEmailText` (Go, mirrored in `mutation-review.ts`) keeps the paragraphs, and
+    `emailPlainTextToHTML` on both sides writes the Gmail shape;
+    `TestEmailTextSurvivesARoundTripThroughHTML` pins the round trip.
+  - **The editor is open, the keyboard is not.** In the same recording the keyboard
+    rose unasked in five of nine emails: a touch that stops a moving page lands
+    natively on the text view. `scroll-lock.ts` makes the inputs unfocusable while the
+    page moves and for 350ms after it rests; a tap on still text still puts the cursor
+    where it lands. Edits on screen are saved on the way to sending ("Save & send"),
+    because approval runs the stored version, never the screen's — the old "save your
+    edits first" refusal cost five taps and a hunt under the keyboard for Save.
   - **The Slack URL shape lives in `app/internal/deeplink`**, used by both
     `timeline_links.go` and the mutation preview, so a permalink cannot drift between
     them. The part that drifts silently is the thread query string: without

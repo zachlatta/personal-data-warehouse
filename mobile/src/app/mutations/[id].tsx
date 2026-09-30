@@ -1,11 +1,12 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View, useColorScheme } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useScrollLock } from '@/hooks/use-scroll-lock';
 import { useTheme } from '@/hooks/use-theme';
 import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gmail-thread-review';
 import { CalendarMutationCard } from '@/components/calendar-mutation-review';
@@ -31,6 +32,7 @@ import {
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
   mutationReviewContext,
+  pendingApproveLabel,
   requestDecision,
   requestKindLabel,
   requestLifecycle,
@@ -70,11 +72,15 @@ function flattenPayload(payload: Record<string, unknown>): Record<string, unknow
 
 const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
 
-function MutationCard({ mutation, pending, busy, onRemove, onSaveEmail, onSaveSlackMessage, onDirtyChange, requestReason, alone }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveEmail: (input: UpdateEmailMutationInput) => Promise<void>; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onDirtyChange?: (dirty: boolean) => void; requestReason?: string; alone?: boolean }) {
+// An edit on screen that approval has to save first: approval runs the stored
+// version, never the screen's.
+type PendingEdit = { kind: 'email'; input: UpdateEmailMutationInput } | { kind: 'slack'; input: UpdateSlackMessageMutationInput };
+
+function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
   const theme = useTheme();
-  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveEmail} onRemove={onRemove} onDirtyChange={onDirtyChange} requestReason={requestReason} alone={alone} />;
+  if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
-  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onDirtyChange={onDirtyChange} requestReason={requestReason} />;
+  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   if (isAppleContactsMutation(mutation)) return <AppleContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
@@ -153,6 +159,9 @@ function RequestOverview({
   // An email's source line ("Gmail … thread 1a0e…, 12:35pm ET") says what
   // the reply-to block below already shows, in a form nobody reads.
   const emailOnly = mutations.length > 0 && mutations.every(isGmailSendEmailMutation);
+  // The agent's note is two lines until tapped: in full it pushed the email
+  // itself below the first screen.
+  const [reasonOpen, setReasonOpen] = useState(false);
   return (
     <View style={[styles.overview, flush && styles.overviewFlush]}>
       <View style={[styles.hero, { backgroundColor: theme.backgroundElement }]}>
@@ -162,7 +171,11 @@ function RequestOverview({
             <StatusPill status={request.status} />
           </View>
           <ThemedText type="subtitle" style={styles.requestTitle}>{request.title}</ThemedText>
-          {request.reason ? <ThemedText type="small" themeColor="textSecondary" style={styles.requestReason}>{request.reason}</ThemedText> : null}
+          {request.reason ? (
+            <Pressable accessibilityRole="button" accessibilityState={{ expanded: reasonOpen }} onPress={() => setReasonOpen((value) => !value)}>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.requestReason} numberOfLines={reasonOpen ? undefined : 2}>{request.reason}</ThemedText>
+            </Pressable>
+          ) : null}
           <ThemedText type="small" themeColor="textSecondary">
             {formatWhen(request.created_at)} · by {request.requested_by || 'unknown'}
           </ThemedText>
@@ -221,7 +234,7 @@ function RequestOverview({
       ) : null}
       {lifecycle.replaces ? (
         <Pressable accessibilityRole="link" onPress={() => router.push({ pathname: '/mutations/[id]', params: { id: lifecycle.replaces } })}>
-          <ThemedText type="small" style={styles.link}>Replaces {lifecycle.replaces} (withdrawn for this one) →</ThemedText>
+          <ThemedText type="small" style={styles.link}>Replaces an earlier version, withdrawn for this one →</ThemedText>
         </Pressable>
       ) : null}
       {error ? <ThemedText style={styles.error}>{error}</ThemedText> : null}
@@ -260,11 +273,25 @@ export default function MutationRequestScreen() {
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState('');
   const [scope, setScope] = useState<GmailScope>('all');
-  // Mutations with edits on screen that are not saved yet, by id.
-  const [dirty, setDirty] = useState<Record<string, boolean>>({});
-  const markDirty = useCallback((mutationId: string, value: boolean) => {
-    setDirty((all) => (Boolean(all[mutationId]) === value ? all : { ...all, [mutationId]: value }));
+  // Edits on screen that are not saved yet, by mutation id. The values live in
+  // a ref (they change on every keystroke); the summary the button reads is
+  // state, and changes only when the count or the draft mode does.
+  const pendingEdits = useRef<Record<string, PendingEdit>>({});
+  const [pendingSummary, setPendingSummary] = useState({ count: 0, draft: false });
+  const markPending = useCallback((mutationId: string, edit: PendingEdit | null) => {
+    if (edit) pendingEdits.current[mutationId] = edit;
+    else delete pendingEdits.current[mutationId];
+    const edits = Object.values(pendingEdits.current);
+    const next = { count: edits.length, draft: edits.length > 0 && edits.every((item) => item.kind === 'email' && item.input.delivery_mode === 'draft') };
+    setPendingSummary((prev) => (prev.count === next.count && prev.draft === next.draft ? prev : next));
   }, []);
+  const scroll = useScrollLock();
+  // KeyboardAvoidingView measures itself relative to its parent; under a
+  // native header it needs the header's height as an offset, or the keyboard
+  // covers the action bar (it did, on every edit in the 2026-09-29 recording).
+  const containerRef = useRef<View>(null);
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
+  const colorScheme = useColorScheme();
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -336,21 +363,39 @@ export default function MutationRequestScreen() {
   };
 
   // The confirm names what happens ("Send to sdg@…?"), because a confirm that
-  // reads the same on every request is tapped through unread.
-  const approve = () => {
+  // reads the same on every request is tapped through unread. Edits on
+  // screen are saved first and the confirm is built from the saved request,
+  // so it names the recipients that will actually receive it.
+  const approve = async () => {
     if (!request) return;
-    if (Object.values(dirty).some(Boolean)) {
-      Alert.alert('Save your edits first', 'Approving runs the version saved on the server, not the edits on screen. Save them, or revert them.', [{ text: 'OK' }]);
-      return;
+    let current = request;
+    const edits = Object.entries(pendingEdits.current);
+    if (edits.length) {
+      setBusy(true);
+      try {
+        for (const [mutationId, edit] of edits) {
+          if (edit.kind === 'email') await updateEmailMutation(config, request.id, mutationId, edit.input);
+          else await updateSlackMessageMutation(config, request.id, mutationId, edit.input);
+        }
+        current = rememberMutationRequest(await getMutationRequest(config, request.id));
+        setRequest(current);
+        setError(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        return;
+      } finally {
+        setBusy(false);
+      }
     }
-    const decision = requestDecision(request);
-    Alert.alert(decision.confirmTitle, decision.confirmMessage, [
+    const decision = requestDecision(current);
+    const message = edits.length ? `${decision.confirmMessage}\n\nYour edits are saved.` : decision.confirmMessage;
+    Alert.alert(decision.confirmTitle, message, [
       { text: 'Cancel', style: 'cancel' },
       {
         text: decision.confirmLabel,
         style: 'default',
         onPress: async () => {
-          if (await act(() => approveMutationRequest(config, request.id))) await advance(request, decision.doneLabel);
+          if (await act(() => approveMutationRequest(config, current.id))) await advance(current, decision.doneLabel);
         },
       },
     ]);
@@ -403,18 +448,6 @@ export default function MutationRequestScreen() {
         },
       ],
     );
-  };
-  // The edit lands on the server before approval, so the reload is what
-  // proves it stuck: approval sends the stored message, never the screen's.
-  const saveEmail = async (mutation: Mutation, input: UpdateEmailMutationInput) => {
-    if (!request) return;
-    setBusy(true);
-    try {
-      await updateEmailMutation(config, request.id, mutation.id, input);
-      await load();
-    } finally {
-      setBusy(false);
-    }
   };
   const saveSlackMessage = async (mutation: Mutation, input: UpdateSlackMessageMutationInput) => {
     if (!request) return;
@@ -500,16 +533,21 @@ export default function MutationRequestScreen() {
           headerRight: skipTo
             ? () => (
                 <Pressable accessibilityRole="button" accessibilityLabel="Skip to the next request" hitSlop={8} onPress={() => router.replace({ pathname: '/mutations/[id]', params: { id: skipTo } })}>
-                  <ThemedText style={styles.link}>Skip</ThemedText>
+                  <ThemedText type="smallBold" style={{ color: colorScheme === 'dark' ? '#93C5FD' : '#1D4ED8' }}>Skip</ThemedText>
                 </Pressable>
               )
             : undefined,
         }}
       />
       <ReviewFlash bottom={pending ? 50 + Spacing.two + Spacing.three * 2 + insets.bottom : Spacing.three + insets.bottom} />
-      <KeyboardAvoidingView style={styles.reviewBody} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <View
+        ref={containerRef}
+        style={styles.reviewBody}
+        onLayout={() => containerRef.current?.measureInWindow((_x, y) => setKeyboardOffset((prev) => (prev === y ? prev : y)))}>
+      <KeyboardAvoidingView style={styles.reviewBody} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={keyboardOffset}>
         {gmailBatch ? (
           <SectionList
+            {...scroll.handlers}
             style={styles.scroll}
             contentContainerStyle={styles.batchContent}
             sections={gmailSections}
@@ -537,7 +575,7 @@ export default function MutationRequestScreen() {
                 <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
                 <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
                 {otherMutations.map((mutation) => (
-                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveEmail={(input) => saveEmail(mutation, input)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onDirtyChange={(value) => markDirty(mutation.id, value)} requestReason={request.reason} />
+                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
                 ))}
               </View>
             ) : null}
@@ -558,6 +596,7 @@ export default function MutationRequestScreen() {
           />
         ) : slackBatch ? (
           <SectionList
+            {...scroll.handlers}
             style={styles.scroll}
             contentContainerStyle={styles.batchContent}
             sections={slackSections}
@@ -581,7 +620,7 @@ export default function MutationRequestScreen() {
             )}
           />
         ) : (
-          <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+          <ScrollView {...scroll.handlers} style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
             <RequestOverview request={request} error={error} flush />
             {request.partial && requestMutations.length === 0 ? (
               <View style={styles.partialRow}>
@@ -596,8 +635,9 @@ export default function MutationRequestScreen() {
                 pending={pending}
                 busy={busy}
                 onRemove={() => remove(mutation)}
-                onSaveEmail={(input) => saveEmail(mutation, input)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
-                onDirtyChange={(value) => markDirty(mutation.id, value)}
+                onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
+                onPendingChange={(edit) => markPending(mutation.id, edit)}
+                locked={scroll.locked}
                 requestReason={request.reason}
                 alone={requestMutations.length === 1}
               />
@@ -620,12 +660,13 @@ export default function MutationRequestScreen() {
                 <ThemedText style={[styles.buttonText, styles.denyText]}>{decision.denyLabel}</ThemedText>
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy || decision.running === 0} style={[styles.button, styles.approve, (busy || decision.running === 0) && styles.disabled]}>
-                {busy ? <ActivityIndicator color="#fff" /> : <ThemedText style={styles.buttonText}>{decision.approveLabel}</ThemedText>}
+                {busy ? <ActivityIndicator color="#fff" /> : <ThemedText style={styles.buttonText}>{pendingApproveLabel(decision, pendingSummary)}</ThemedText>}
               </Pressable>
             </View>
           </View>
         ) : null}
       </KeyboardAvoidingView>
+      </View>
     </ThemedView>
   );
 }

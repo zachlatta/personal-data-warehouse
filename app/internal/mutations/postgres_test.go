@@ -569,12 +569,49 @@ func TestAppendGmailSignatureToMessageReplacesPlainTextSignatureForHTML(t *testi
 	}
 }
 
-func TestEmailPlainTextToHTMLUsesGmailStyleDivs(t *testing.T) {
-	bodyHTML := emailPlainTextToHTML("First line\nSecond line\n\nNext paragraph")
+// Gmail's own composer writes one <div> per line and an empty
+// <div><br></div> per blank line; a handwritten multi-paragraph reply from
+// the account (2026-09-28) reads exactly that way. Text typed on the phone has
+// to come out the same, or a reply the reviewer edited arrives as one block.
+func TestEmailPlainTextToHTMLMatchesGmailComposer(t *testing.T) {
+	bodyHTML := emailPlainTextToHTML("Hey Sam,\n\nI hope you had a great summer & fall.\n\nBest,\nZach")
 
-	want := "<div>First line<br>Second line</div><div><br></div><div>Next paragraph</div>"
+	want := "<div>Hey Sam,</div><div><br></div><div>I hope you had a great summer &amp; fall.</div><div><br></div><div>Best,</div><div>Zach</div>"
 	if bodyHTML != want {
 		t.Fatalf("body_html = %q, want %q", bodyHTML, want)
+	}
+	if got := emailPlainTextToHTML("\n\nOne\n\n\nTwo\n\n"); got != "<div>One</div><div><br></div><div><br></div><div>Two</div>" {
+		t.Fatalf("blank lines = %q", got)
+	}
+	if got := emailPlainTextToHTML("  "); got != "<div><br></div>" {
+		t.Fatalf("empty = %q", got)
+	}
+}
+
+// The reviewer's plain-text editor must see the paragraphs the HTML has, in
+// every shape the body arrives in: Gmail's composer, an agent's <p>s, and the
+// one-div-with-<br>s shape older phone edits stored.
+func TestHTMLEmailTextKeepsParagraphs(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"gmail composer", `<div dir="ltr"><div>Hey Sam,<br></div><div><br></div><div>I hope you had a great summer.</div><div><br></div><div>Zach</div></div>`, "Hey Sam,\n\nI hope you had a great summer.\n\nZach"},
+		{"agent paragraphs", `<p>Hey Sam,</p><p>Awesome, that sounds great.</p><p>Best,<br>Zach</p>`, "Hey Sam,\n\nAwesome, that sounds great.\n\nBest,\nZach"},
+		{"lines in one div", `<div>A<br>B</div><div><br></div><div>C</div>`, "A\nB\n\nC"},
+		{"source whitespace and entities", "<p>It&#x27;s\n  fine</p>\n<p>ok &amp; done</p>", "It's fine\n\nok & done"},
+		{"text before a nested block", `<div>Intro<div>Inner</div></div>`, "Intro\nInner"},
+		{"empty", ``, ""},
+	}
+	for _, tc := range cases {
+		if got := htmlEmailText(tc.in); got != tc.want {
+			t.Errorf("%s: htmlEmailText = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestEmailTextSurvivesARoundTripThroughHTML(t *testing.T) {
+	for _, text := range []string{"Hey,\n\nPara one.\nSame para.\n\nBest,\nZach", "One line", "A\n\n\nB"} {
+		if got := htmlEmailText(emailPlainTextToHTML(text)); got != text {
+			t.Fatalf("round trip of %q = %q", text, got)
+		}
 	}
 }
 

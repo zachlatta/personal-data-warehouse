@@ -11,6 +11,7 @@ import type { Mutation, UpdateEmailMutationInput } from '@/lib/api';
 import { cleanSnippet, formatWhen } from '@/lib/format';
 import {
   emailSignatureSummary,
+  splitIncomingEmailText,
   gmailEmailEditsFor,
   gmailEmailReview,
   gmailEmailUpdateInput,
@@ -29,12 +30,14 @@ function sameEdits(a: GmailEmailEdits, b: GmailEmailEdits): boolean {
 }
 
 // What is being replied to, above the reply: the message just answered is
-// what a reviewer checks the draft against, so it is open by default (a few
-// lines of it), and the rest of the thread is a tap away. It used to sit
-// below the signature, closed, as "REPLYING IN THREAD · 1 message".
+// what a reviewer checks the draft against, so its first lines show by
+// default and the rest of the thread is a tap away. Each message's quoted
+// history ("On … wrote:" and the "> " lines under it) folds behind its own
+// link — on a forwarded thread it was most of the screen.
 function ReplyThread({ thread, account }: { thread: GmailEmailReplyThread; account: string }) {
   const theme = useTheme();
   const [open, setOpen] = useState(false);
+  const [quotesOpen, setQuotesOpen] = useState<Record<string, boolean>>({});
   const latest = thread.messages[thread.messages.length - 1];
   const earlier = thread.messages.length - 1;
   const shown = open ? thread.messages : latest ? [latest] : [];
@@ -43,14 +46,17 @@ function ReplyThread({ thread, account }: { thread: GmailEmailReplyThread; accou
       <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityHint={open ? 'Shows only the latest message' : 'Shows the whole thread'} onPress={() => setOpen((value) => !value)} style={styles.threadHead}>
         <View style={styles.threadCopy}>
           <ThemedText type="small" themeColor="textSecondary">REPLYING TO</ThemedText>
-          <ThemedText type="smallBold" numberOfLines={open ? undefined : 2}>{thread.subject || '(no subject)'}</ThemedText>
+          <ThemedText type="smallBold" numberOfLines={open ? undefined : 1}>{thread.subject || '(no subject)'}</ThemedText>
         </View>
         <ThemedText type="small" style={styles.link}>{open ? 'Less' : earlier > 0 ? `+${earlier} earlier` : 'More'}</ThemedText>
       </Pressable>
       {shown.map((message, index) => {
-        const body = message.hasFullBody ? message.text : cleanSnippet(message.text ?? '').trim();
+        const key = message.messageId || String(index);
+        const raw = message.hasFullBody ? message.text : cleanSnippet(message.text ?? '').trim();
+        const { body, quoted } = splitIncomingEmailText(raw ?? '');
+        const quoteOpen = Boolean(quotesOpen[key]);
         return (
-          <Pressable key={message.messageId || index} accessibilityRole="button" onPress={() => setOpen((value) => !value)} style={[styles.threadMessage, { borderTopColor: theme.backgroundSelected }]}>
+          <Pressable key={key} accessibilityRole="button" onPress={() => setOpen((value) => !value)} style={[styles.threadMessage, { borderTopColor: theme.backgroundSelected }]}>
             <View style={styles.threadMessageHead}>
               <Avatar name={message.senderName} size={28} />
               <View style={styles.threadCopy}>
@@ -59,7 +65,13 @@ function ReplyThread({ thread, account }: { thread: GmailEmailReplyThread; accou
               </View>
               <ThemedText type="small" themeColor="textSecondary">{formatWhen(message.sentAt)}</ThemedText>
             </View>
-            {body ? <ThemedText selectable={open} numberOfLines={open ? undefined : 5} style={styles.threadBody}>{body}</ThemedText> : null}
+            {body ? <ThemedText selectable={open} numberOfLines={open ? undefined : 3} style={styles.threadBody}>{body}</ThemedText> : null}
+            {open && quoted ? (
+              <Pressable accessibilityRole="button" accessibilityState={{ expanded: quoteOpen }} hitSlop={6} onPress={() => setQuotesOpen((all) => ({ ...all, [key]: !quoteOpen }))} style={styles.quoteToggle}>
+                <ThemedText type="small" style={styles.link}>{quoteOpen ? 'Hide quoted text' : 'Show quoted text'}</ThemedText>
+              </Pressable>
+            ) : null}
+            {open && quoted && quoteOpen ? <ThemedText type="small" themeColor="textSecondary" selectable>{quoted}</ThemedText> : null}
             {open && !message.hasFullBody ? <ThemedText type="small" themeColor="textSecondary">Only a preview is available.</ThemedText> : null}
           </Pressable>
         );
@@ -68,18 +80,22 @@ function ReplyThread({ thread, account }: { thread: GmailEmailReplyThread; accou
   );
 }
 
-function Field({ label, value, onChange, editable, autoCapitalize, keyboardType, wrap, accessory }: {
+type InputFocus = { onFocus: () => void; onBlur: () => void };
+
+function Field({ label, value, onChange, editable, focus, autoCapitalize, keyboardType, accessory }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   editable: boolean;
+  focus: InputFocus;
   autoCapitalize?: 'none' | 'sentences';
   keyboardType?: 'default' | 'email-address';
-  // Wrap instead of truncating: a long subject was cut at "submis…".
-  wrap?: boolean;
   accessory?: ReactNode;
 }) {
   const theme = useTheme();
+  // Every field wraps rather than truncating: a long subject was cut at
+  // "submis…" and a long address at "haven.hack…". submitBehavior keeps
+  // Return from typing a newline into a one-line value.
   return (
     <View style={[styles.fieldRow, { borderBottomColor: theme.backgroundSelected }]}>
       <ThemedText type="small" themeColor="textSecondary" style={styles.fieldLabel}>{label}</ThemedText>
@@ -88,13 +104,15 @@ function Field({ label, value, onChange, editable, autoCapitalize, keyboardType,
         value={value}
         onChangeText={onChange}
         editable={editable}
+        onFocus={focus.onFocus}
+        onBlur={focus.onBlur}
         autoCapitalize={autoCapitalize ?? 'none'}
         autoCorrect={autoCapitalize === 'sentences'}
         keyboardType={keyboardType ?? 'default'}
-        multiline={wrap}
-        scrollEnabled={wrap ? false : undefined}
-        submitBehavior={wrap ? 'blurAndSubmit' : undefined}
-        style={[styles.fieldInput, wrap && styles.fieldInputWrap, { color: theme.text }]}
+        multiline
+        scrollEnabled={false}
+        submitBehavior="blurAndSubmit"
+        style={[styles.fieldInput, { color: theme.text }]}
       />
       {accessory}
     </View>
@@ -102,12 +120,17 @@ function Field({ label, value, onChange, editable, autoCapitalize, keyboardType,
 }
 
 // One gmail.send_email mutation, rendered as the composer it is: what it
-// replies to first, then recipients, subject and the body, editable; the
-// signature and quoted thread sit below read-only exactly as they will be
-// sent, and a proposal with several variants is chosen from here. Saving
-// posts to update-email, so the edit is on the server before the request is
-// approved — approval sends what is stored, never what is on screen, which is
-// why the card reports unsaved edits up to the screen that owns Approve.
+// replies to first, then recipients, subject and the body, all editable in
+// place; the signature and quoted thread sit below read-only exactly as they
+// will be sent, and a proposal with several variants is chosen from here.
+//
+// Approval runs the stored version, never the screen's, so the card reports
+// the update its edits amount to (onPendingChange) and the screen saves it on
+// the way to sending — there is no separate Save step to find.
+//
+// `locked` is the screen's scroll lock: while the page moves the inputs are
+// not focusable, so a touch that stops a scroll cannot raise the keyboard. A
+// focused input stays editable through a scroll.
 //
 // `alone` is the common case — a request that is exactly this email — where
 // the screen's header already names the request and its status, so the card
@@ -116,20 +139,20 @@ export function GmailEmailComposeCard({
   mutation,
   pending,
   busy,
-  onSave,
   onRemove,
-  onDirtyChange,
+  onPendingChange,
   requestReason,
   alone,
+  locked,
 }: {
   mutation: Mutation;
   pending: boolean;
   busy: boolean;
-  onSave: (input: UpdateEmailMutationInput) => Promise<void>;
   onRemove: () => void;
-  onDirtyChange?: (dirty: boolean) => void;
+  onPendingChange?: (input: UpdateEmailMutationInput | null) => void;
   requestReason?: string;
   alone?: boolean;
+  locked?: boolean;
 }) {
   const theme = useTheme();
   const review = useMemo(() => gmailEmailReview(mutation), [mutation]);
@@ -139,55 +162,60 @@ export function GmailEmailComposeCard({
   const [quotedOpen, setQuotedOpen] = useState(false);
   const [signatureOpen, setSignatureOpen] = useState(false);
   const [copiesOpen, setCopiesOpen] = useState(false);
-  const [error, setError] = useState('');
-  const [saved, setSaved] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const focus = useMemo<InputFocus>(() => ({ onFocus: () => setFocused(true), onBlur: () => setFocused(false) }), []);
+  // A new server baseline (the save on the way to sending, or any reload)
+  // replaces the local edits, so the card never reports a difference the
+  // server has already absorbed — its normalisation of the saved text would
+  // otherwise leave "Edited" up and save a second time. Reset during render,
+  // not in an effect, as the Slack card does.
+  const baselineSignature = `${review.deliveryMode}|${review.selectedVariantId}|${JSON.stringify(review.variants.map(gmailEmailEditsFor))}`;
+  const [baseline, setBaseline] = useState(baselineSignature);
+  if (baseline !== baselineSignature) {
+    setBaseline(baselineSignature);
+    setSelectedId(review.selectedVariantId);
+    setDeliveryMode(review.deliveryMode);
+    setEdits(Object.fromEntries(review.variants.map((variant) => [variant.id, gmailEmailEditsFor(variant)])));
+  }
 
   const variant: GmailEmailVariant = review.variants.find((item) => item.id === selectedId) ?? review.variants[0];
   const current = edits[variant.id] ?? gmailEmailEditsFor(variant);
   const removed = mutation.status === 'removed' || mutation.status === 'skipped' || mutation.status === 'rejected';
   const editable = pending && !busy && !removed;
+  const inputsEditable = editable && (focused || !locked);
   const dirty = !sameEdits(current, gmailEmailEditsFor(variant)) || selectedId !== review.selectedVariantId || deliveryMode !== review.deliveryMode;
-  // Empty Cc and Bcc rows were two blank lines on every email; they appear
-  // when they hold something or when asked for.
-  const showCopies = copiesOpen || Boolean(current.cc.trim() || current.bcc.trim());
+  // Empty Cc and Bcc rows were blank lines on every email; each appears when
+  // it holds something or when asked for.
+  const showCc = copiesOpen || Boolean(current.cc.trim());
+  const showBcc = copiesOpen || Boolean(current.bcc.trim());
   const signatureSummary = emailSignatureSummary(variant.signatureText);
 
+  const pendingInput = useMemo(
+    () => (editable && dirty ? gmailEmailUpdateInput(variant, current, deliveryMode) : null),
+    [editable, dirty, variant, current, deliveryMode],
+  );
   // The callback is held in a ref: the parent passes a fresh closure every
   // render, and keying the effects on it made each report re-render the
   // parent, which re-reported — an update loop on the first keystroke.
-  const reportDirty = useRef(onDirtyChange);
+  const report = useRef(onPendingChange);
   useEffect(() => {
-    reportDirty.current = onDirtyChange;
-  }, [onDirtyChange]);
-  const unsaved = editable && dirty;
+    report.current = onPendingChange;
+  }, [onPendingChange]);
   useEffect(() => {
-    reportDirty.current?.(unsaved);
-  }, [unsaved]);
+    report.current?.(pendingInput);
+  }, [pendingInput]);
   useEffect(() => {
-    const report = reportDirty;
-    return () => report.current?.(false);
+    const reporter = report;
+    return () => reporter.current?.(null);
   }, []);
 
   const setField = (key: keyof GmailEmailEdits) => (value: string) => {
-    setSaved(false);
     setEdits((all) => ({ ...all, [variant.id]: { ...(all[variant.id] ?? gmailEmailEditsFor(variant)), [key]: value } }));
   };
   const revert = () => {
-    setSaved(false);
-    setError('');
     setSelectedId(review.selectedVariantId);
     setDeliveryMode(review.deliveryMode);
     setEdits(Object.fromEntries(review.variants.map((item) => [item.id, gmailEmailEditsFor(item)])));
-  };
-
-  const save = async () => {
-    setError('');
-    try {
-      await onSave(gmailEmailUpdateInput(variant, current, deliveryMode));
-      setSaved(true);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
   };
 
   return (
@@ -215,7 +243,7 @@ export function GmailEmailComposeCard({
                 accessibilityRole="button"
                 accessibilityState={{ selected: item.id === variant.id }}
                 disabled={!editable}
-                onPress={() => { setSaved(false); setSelectedId(item.id); }}
+                onPress={() => setSelectedId(item.id)}
                 style={[styles.modeChip, { backgroundColor: theme.backgroundElement }, item.id === variant.id && styles.modeChipActive]}>
                 <ThemedText type="small" style={item.id === variant.id ? styles.modeChipActiveText : undefined}>{item.title}</ThemedText>
               </Pressable>
@@ -224,33 +252,31 @@ export function GmailEmailComposeCard({
         </View>
       ) : null}
 
+      {alone ? <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>From {mutation.account}</ThemedText> : null}
       <View style={[styles.fields, { backgroundColor: alone ? theme.backgroundElement : theme.background }]}>
-        {alone ? (
-          <View style={[styles.fieldRow, { borderBottomColor: theme.backgroundSelected }]}>
-            <ThemedText type="small" themeColor="textSecondary" style={styles.fieldLabel}>From</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary" style={styles.fieldStatic} numberOfLines={1}>{mutation.account}</ThemedText>
-          </View>
-        ) : null}
         <Field
           label="To"
           value={current.to}
           onChange={setField('to')}
-          editable={editable}
+          editable={inputsEditable}
+          focus={focus}
           keyboardType="email-address"
-          accessory={!showCopies && editable ? (
+          accessory={!(showCc && showBcc) && editable ? (
             <Pressable accessibilityRole="button" accessibilityLabel="Add Cc or Bcc" onPress={() => setCopiesOpen(true)} hitSlop={8}>
               <ThemedText type="small" style={styles.link}>Cc/Bcc</ThemedText>
             </Pressable>
           ) : null}
         />
-        {showCopies ? <Field label="Cc" value={current.cc} onChange={setField('cc')} editable={editable} keyboardType="email-address" /> : null}
-        {showCopies ? <Field label="Bcc" value={current.bcc} onChange={setField('bcc')} editable={editable} keyboardType="email-address" /> : null}
-        <Field label="Subject" value={current.subject} onChange={setField('subject')} editable={editable} autoCapitalize="sentences" wrap />
+        {showCc ? <Field label="Cc" value={current.cc} onChange={setField('cc')} editable={inputsEditable} focus={focus} keyboardType="email-address" /> : null}
+        {showBcc ? <Field label="Bcc" value={current.bcc} onChange={setField('bcc')} editable={inputsEditable} focus={focus} keyboardType="email-address" /> : null}
+        <Field label="Subject" value={current.subject} onChange={setField('subject')} editable={inputsEditable} focus={focus} autoCapitalize="sentences" />
         <TextInput
           accessibilityLabel="Email body"
           value={current.editorText}
           onChangeText={setField('editorText')}
-          editable={editable}
+          editable={inputsEditable}
+          onFocus={focus.onFocus}
+          onBlur={focus.onBlur}
           multiline
           scrollEnabled={false}
           textAlignVertical="top"
@@ -282,6 +308,15 @@ export function GmailEmailComposeCard({
         ) : null}
       </View>
 
+      {editable && dirty ? (
+        <View style={styles.editedRow}>
+          <ThemedText type="small" themeColor="textSecondary">Edited · saved when you {deliveryMode === 'draft' ? 'save the draft' : 'send'}</ThemedText>
+          <Pressable accessibilityRole="button" onPress={revert} hitSlop={8}>
+            <ThemedText type="smallBold" style={styles.link}>Revert</ThemedText>
+          </Pressable>
+        </View>
+      ) : null}
+
       {pending && !removed ? (
         <View style={styles.modeRow}>
           {(['send', 'draft'] as DeliveryMode[]).map((mode) => (
@@ -290,7 +325,7 @@ export function GmailEmailComposeCard({
               accessibilityRole="button"
               accessibilityState={{ selected: deliveryMode === mode }}
               disabled={!editable}
-              onPress={() => { setSaved(false); setDeliveryMode(mode); }}
+              onPress={() => setDeliveryMode(mode)}
               style={[styles.modeChip, { backgroundColor: alone ? theme.backgroundElement : theme.background }, deliveryMode === mode && styles.modeChipActive]}>
               <ThemedText type="small" style={deliveryMode === mode ? styles.modeChipActiveText : undefined}>{mode === 'send' ? 'Send on approval' : 'Save as draft'}</ThemedText>
             </Pressable>
@@ -299,29 +334,12 @@ export function GmailEmailComposeCard({
       ) : null}
 
       {mutation.error ? <ThemedText style={styles.error}>{mutation.error}</ThemedText> : null}
-      {error ? <ThemedText style={styles.error}>{error}</ThemedText> : null}
-      {saved && !dirty ? <ThemedText type="small" style={styles.saved}>Saved. Approval {deliveryMode === 'draft' ? 'saves this draft' : 'sends this version'}.</ThemedText> : null}
 
-      {/* Save appears once there is something to save; the per-email drop is
-          only for a request of several emails, where Deny would drop them all. */}
-      {editable && (dirty || !alone) ? (
-        <View style={styles.actions}>
-          {dirty ? (
-            <View style={styles.saveGroup}>
-              <Pressable accessibilityRole="button" onPress={save} style={styles.saveButton}>
-                <ThemedText style={styles.saveText}>{review.hasVariants ? 'Use this version' : 'Save changes'}</ThemedText>
-              </Pressable>
-              <Pressable accessibilityRole="button" onPress={revert} style={styles.linkButton} hitSlop={6}>
-                <ThemedText type="small" themeColor="textSecondary">Revert</ThemedText>
-              </Pressable>
-            </View>
-          ) : <View />}
-          {!alone ? (
-            <Pressable accessibilityRole="button" onPress={onRemove} style={styles.linkButton}>
-              <ThemedText type="smallBold" style={styles.danger}>Don’t send this one</ThemedText>
-            </Pressable>
-          ) : null}
-        </View>
+      {/* Only a request of several emails can drop one; for one email that is Don't send. */}
+      {editable && !alone ? (
+        <Pressable accessibilityRole="button" onPress={onRemove} style={styles.linkButton}>
+          <ThemedText type="smallBold" style={styles.danger}>Don’t send this one</ThemedText>
+        </Pressable>
       ) : null}
     </View>
   );
@@ -341,9 +359,7 @@ const styles = StyleSheet.create({
   fields: { borderRadius: 10, paddingHorizontal: Spacing.three },
   fieldRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, minHeight: 44, borderBottomWidth: StyleSheet.hairlineWidth },
   fieldLabel: { width: 52 },
-  fieldInput: { flex: 1, minHeight: 44, fontSize: 15 },
-  fieldInputWrap: { paddingVertical: 12 },
-  fieldStatic: { flex: 1 },
+  fieldInput: { flex: 1, minHeight: 44, fontSize: 15, paddingVertical: 12 },
   body: { minHeight: 140, paddingVertical: 12, fontSize: 16, lineHeight: 24 },
   signature: { borderTopWidth: StyleSheet.hairlineWidth, paddingVertical: 10, gap: 6 },
   quoteToggle: { minHeight: 32, justifyContent: 'center', alignSelf: 'flex-start' },
@@ -353,13 +369,9 @@ const styles = StyleSheet.create({
   threadMessage: { borderTopWidth: StyleSheet.hairlineWidth, paddingVertical: 10, gap: 6 },
   threadMessageHead: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   threadBody: { fontSize: 15, lineHeight: 22 },
-  actions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.three, paddingTop: Spacing.one },
-  saveButton: { minHeight: 44, paddingHorizontal: 18, borderRadius: 12, justifyContent: 'center', alignItems: 'center', backgroundColor: ACCENT },
-  saveText: { color: '#fff', fontWeight: '600', fontSize: 15 },
-  saveGroup: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
+  editedRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.three },
   linkButton: { minHeight: 44, justifyContent: 'center' },
   link: { color: '#3c87f7' },
   danger: { color: DANGER },
-  saved: { color: '#16A34A' },
   error: { color: '#D0342C' },
 });

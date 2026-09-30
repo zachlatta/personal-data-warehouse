@@ -1567,7 +1567,7 @@ function decodeHTMLEntities(value: string): string {
 
 function gmailEmailVariant(raw: Record<string, unknown>, fallback: { id: string; title: string; selected: boolean }): GmailEmailVariant {
   const editorHTML = text(raw.editor_html);
-  const editorText = typeof raw.editor_text === 'string' ? raw.editor_text.replace(/\s+$/, '') : editorHTML ? htmlFragmentText(editorHTML) : text(raw.body_text);
+  const editorText = typeof raw.editor_text === 'string' ? raw.editor_text.replace(/\s+$/, '') : editorHTML ? htmlEmailText(editorHTML) : text(raw.body_text);
   const signatureHTML = text(raw.signature_html);
   return {
     id: text(raw.id) || fallback.id,
@@ -1619,14 +1619,95 @@ function escapeHTML(value: string): string {
 }
 
 // The server's emailPlainTextToHTML, so text typed on the phone is stored in
-// the same shape the server would have produced from body_text: paragraphs
-// as <div>s separated by an empty <div>, lines within one joined by <br>.
+// Gmail's composer shape (a <div> per line, <div><br></div> per blank line),
+// the same shape the server produces from body_text.
 export function emailPlainTextToHTML(value: string): string {
-  const trimmed = value.replace(/\r\n/g, '\n').trim();
-  if (!trimmed) return '<div><br></div>';
-  const paragraphs = trimmed.split('\n\n').map((paragraph) => paragraph.split('\n').map((line) => line.trim()).filter(Boolean)).filter((lines) => lines.length);
-  if (!paragraphs.length) return '<div><br></div>';
-  return paragraphs.map((lines) => `<div>${lines.map(escapeHTML).join('<br>')}</div>`).join('<div><br></div>');
+  const lines = value.replace(/\r\n/g, '\n').split('\n');
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (!lines.length) return '<div><br></div>';
+  return lines.map((line) => {
+    const trimmed = line.replace(/[ \t]+$/, '');
+    return trimmed.trim() ? `<div>${escapeHTML(trimmed)}</div>` : '<div><br></div>';
+  }).join('');
+}
+
+const EMAIL_TEXT_BLOCKS = new Set(['div', 'li', 'tr', 'blockquote', 'ul', 'ol', 'table', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+
+function htmlTagName(tag: string): { name: string; closing: boolean } {
+  let body = tag.replace(/^</, '').replace(/>$/, '');
+  const closing = body.startsWith('/');
+  if (closing) body = body.slice(1);
+  const end = body.search(/[ \t\n/]/);
+  return { name: (end >= 0 ? body.slice(0, end) : body).toLowerCase(), closing };
+}
+
+// The server's htmlEmailText (postgres.go): the text a reader sees, with its
+// paragraphs — a line per block or <br>, a blank line for each empty Gmail
+// <div><br></div> and between <p>s. The phone edits this text and writes it
+// back as the email, so a lost blank line is a lost paragraph break.
+export function htmlEmailText(value: string): string {
+  const source = value.replace(/\r\n/g, '\n');
+  const lower = source.toLowerCase();
+  const lines: string[] = [];
+  let current = '';
+  let emptyLine = false;
+  let softBlank = false;
+  const emit = (line: string) => {
+    if (softBlank && lines.length && line !== '') lines.push('');
+    softBlank = false;
+    lines.push(line);
+  };
+  const pending = () => decodeHTMLEntities(current.split(/[ \n\t]+/).filter(Boolean).join(' ')).trim();
+  const flush = (keepEmpty: boolean) => {
+    const line = pending();
+    current = '';
+    if (line || keepEmpty) emit(line);
+  };
+  const nextClosesBlock = (from: number) => {
+    const rest = lower.slice(from).replace(/^[ \t\n]+/, '');
+    if (!rest.startsWith('</')) return false;
+    const end = rest.indexOf('>');
+    if (end < 0) return false;
+    const { name } = htmlTagName(rest.slice(0, end + 1));
+    return name === 'p' || EMAIL_TEXT_BLOCKS.has(name);
+  };
+  for (let index = 0; index < source.length;) {
+    if (source[index] !== '<') {
+      current += source[index];
+      index += 1;
+      continue;
+    }
+    const end = source.indexOf('>', index);
+    if (end < 0) {
+      current += source.slice(index);
+      break;
+    }
+    const { name, closing } = htmlTagName(lower.slice(index, end + 1));
+    index = end + 1;
+    if (name === 'br') {
+      if (nextClosesBlock(index)) {
+        if (!pending()) emptyLine = true;
+        continue;
+      }
+      flush(true);
+    } else if (name === 'p' && !closing) {
+      flush(false);
+    } else if (name === 'p') {
+      flush(emptyLine);
+      emptyLine = false;
+      softBlank = true;
+    } else if (EMAIL_TEXT_BLOCKS.has(name) && !closing) {
+      flush(false);
+    } else if (EMAIL_TEXT_BLOCKS.has(name)) {
+      flush(emptyLine);
+      emptyLine = false;
+    }
+  }
+  flush(false);
+  while (lines.length && lines[0] === '') lines.shift();
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
 }
 
 function normalizeEmailText(value: string): string {
@@ -1916,4 +1997,42 @@ export function requestStatusTitle(status: string): string {
 // it signs as, with the rest a tap away.
 export function emailSignatureSummary(signature: string): string {
   return signature.split('\n').map((line) => line.trim()).find((line) => line && line !== '--') ?? '';
+}
+
+// With edits on screen, the primary button saves them on the way: approval
+// runs the stored version, and asking the reviewer to find a Save button
+// first (under the keyboard, below the body) cost five taps on 2026-09-29.
+export function pendingApproveLabel(decision: RequestDecision, pending: { count: number; draft: boolean }): string {
+  if (!pending.count) return decision.approveLabel;
+  if (pending.draft && decision.running === 1) return 'Save draft';
+  const label = decision.approveLabel;
+  if (label.startsWith('Save')) return label;
+  return `Save & ${label.charAt(0).toLowerCase()}${label.slice(1)}`;
+}
+
+// --- the message being replied to ---------------------------------------------
+//
+// An incoming message's text carries its whole quoted history ("On … wrote:"
+// and every "> " line under it), which on a forwarded thread was most of the
+// screen. The body is what the sender wrote; a forwarded message stays in it,
+// since it is usually the point.
+
+// Gmail's plain-text part renders a tapped phone number as "617… <(617)%20…>".
+const PHONE_LINK = /[ \t]*<\(\d{3}\)(?:%20|\s)?\d{3}-\d{4}>/g;
+
+export function splitIncomingEmailText(value: string): { body: string; quoted: string } {
+  const lines = value.replace(/\r\n/g, '\n').split('\n').map((line) => line.replace(PHONE_LINK, ''));
+  let cut = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (line.startsWith('>')) { cut = index; break; }
+    if (/^On\b.*\bwrote:$/.test(line)) { cut = index; break; }
+    const next = (lines[index + 1] ?? '').trim();
+    if (/^On\b/.test(line) && line.length < 200 && /\bwrote:$/.test(next)) { cut = index; break; }
+  }
+  const body = (cut < 0 ? lines : lines.slice(0, cut)).join('\n').trim();
+  const quoted = cut < 0 ? '' : lines.slice(cut).join('\n').trim();
+  // A message that is nothing but a quote still has to say something.
+  if (!body) return { body: quoted, quoted: '' };
+  return { body, quoted };
 }

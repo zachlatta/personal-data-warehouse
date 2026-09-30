@@ -61,17 +61,20 @@ export function SlackSendMessageCard({
   pending: requestPending = mutation.status === 'pending_review',
   busy = false,
   onSave,
-  onDirtyChange,
+  onPendingChange,
   requestReason,
+  locked,
 }: {
   mutation: Mutation;
   pending?: boolean;
   busy?: boolean;
   onSave?: (input: UpdateSlackMessageMutationInput) => Promise<void>;
   // Unsaved text is reported up: Approve sends the stored message, so the
-  // screen refuses to approve over an edit that was never saved.
-  onDirtyChange?: (dirty: boolean) => void;
+  // screen saves this on the way to sending.
+  onPendingChange?: (input: UpdateSlackMessageMutationInput | null) => void;
   requestReason?: string;
+  // The screen's scroll lock: not focusable while the page moves.
+  locked?: boolean;
 }) {
   const theme = useTheme();
   const review = useMemo(() => slackSendMessageReview(mutation), [mutation]);
@@ -89,20 +92,21 @@ export function SlackSendMessageCard({
     setSaved(false);
   }
   const dirty = text.trim() !== review.text.trim();
+  const [focused, setFocused] = useState(false);
   // The callback is held in a ref: the parent passes a fresh closure every
   // render, and keying the effects on it made each report re-render the
   // parent, which re-reported — an update loop on the first keystroke.
-  const reportDirty = useRef(onDirtyChange);
+  const report = useRef(onPendingChange);
   useEffect(() => {
-    reportDirty.current = onDirtyChange;
-  }, [onDirtyChange]);
-  const unsaved = editable && dirty;
+    report.current = onPendingChange;
+  }, [onPendingChange]);
+  const unsavedText = editable && dirty && text.trim() ? text.trim() : '';
   useEffect(() => {
-    reportDirty.current?.(unsaved);
-  }, [unsaved]);
+    report.current?.(unsavedText ? { text: unsavedText } : null);
+  }, [unsavedText]);
   useEffect(() => {
-    const report = reportDirty;
-    return () => report.current?.(false);
+    const reporter = report;
+    return () => reporter.current?.(null);
   }, []);
   const save = async () => {
     if (!onSave) return;
@@ -171,7 +175,9 @@ export function SlackSendMessageCard({
               accessibilityLabel="Message text"
               value={text}
               onChangeText={(value) => { setText(value); setSaved(false); }}
-              editable={!busy}
+              editable={!busy && (focused || !locked)}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
               multiline
               autoCapitalize="sentences"
               autoCorrect

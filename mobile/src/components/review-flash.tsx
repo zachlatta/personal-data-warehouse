@@ -10,7 +10,8 @@ import { takeReviewFlash } from '@/lib/review-queue';
 // the reviewer lands on next — the next request in the queue, or the list
 // once the queue is empty — so moving on never hides what just happened. It
 // sits above the action bar, not over the header, where it covered the title
-// of the request being read.
+// of the request being read. One line for 2.5s: at two lines for 3.5s it sat
+// over the first lines of the next email while they were being read.
 export function ReviewFlash({ bottom = Spacing.three }: { bottom?: number }) {
   const [message, setMessage] = useState<string | null>(null);
   useFocusEffect(
@@ -21,14 +22,14 @@ export function ReviewFlash({ bottom = Spacing.three }: { bottom?: number }) {
   );
   useEffect(() => {
     if (!message) return;
-    const timer = setTimeout(() => setMessage(null), 3500);
+    const timer = setTimeout(() => setMessage(null), 2500);
     return () => clearTimeout(timer);
   }, [message]);
   if (!message) return null;
   return (
     <View pointerEvents="none" style={[styles.wrap, { bottom }]} accessibilityLiveRegion="polite">
       <View style={styles.pill}>
-        <ThemedText type="smallBold" style={styles.text} numberOfLines={2}>✓ {message}</ThemedText>
+        <ThemedText type="smallBold" style={styles.text} numberOfLines={1}>✓ {message}</ThemedText>
       </View>
     </View>
   );

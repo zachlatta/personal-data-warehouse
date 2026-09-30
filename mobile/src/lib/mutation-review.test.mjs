@@ -26,8 +26,12 @@ import {
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
+  emailPlainTextToHTML,
   emailSignatureSummary,
+  htmlEmailText,
   looksAutomatedSender,
+  pendingApproveLabel,
+  splitIncomingEmailText,
   requestDecision,
   requestKindLabel,
   requestStatusTitle,
@@ -817,7 +821,8 @@ test('the edited plain text is assembled into the body the server splits again: 
     quotedHTML: '<div class="gmail_quote">older</div>',
     quotedText: 'older',
   });
-  assert.equal(body.body_html, '<div>Hi there,</div><div><br></div><div>See &lt;you&gt; Monday.<br>Thanks</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
+  // Gmail's composer: a <div> per line and <div><br></div> per blank line.
+  assert.equal(body.body_html, '<div>Hi there,</div><div><br></div><div>See &lt;you&gt; Monday.</div><div>Thanks</div><div><br></div><div class="gmail_signature"><b>Zach</b></div><div><br></div><div class="gmail_quote">older</div>');
   assert.equal(body.body_text, 'Hi there,\n\nSee <you> Monday.\nThanks\n\nZach\n\nolder\n');
   const bare = assembleEmailBody({ editorText: 'Just this.', signatureHTML: '', signatureText: '', quotedHTML: '', quotedText: '' });
   assert.equal(bare.body_html, '<div>Just this.</div>');
@@ -1024,4 +1029,77 @@ test('a signature folds to its first real line', () => {
   assert.equal(emailSignatureSummary('--\nZach Latta\nFounder + Executive Director, Hack Club'), 'Zach Latta');
   assert.equal(emailSignatureSummary('-- \n\n  Zach  '), 'Zach');
   assert.equal(emailSignatureSummary(''), '');
+});
+
+// --- paragraphs --------------------------------------------------------------
+//
+// On 2026-09-29 two replies edited on the phone went out as one run-on block:
+// the editor text had lost its blank lines, and the rebuild joined every line
+// with <br> inside one <div>. These mirror the Go tests of the same names.
+
+test('text is written the way Gmail\u2019s composer writes it', () => {
+  assert.equal(emailPlainTextToHTML('Hey Sam,\n\nI hope you had a great summer & fall.\n\nBest,\nZach'),
+    '<div>Hey Sam,</div><div><br></div><div>I hope you had a great summer &amp; fall.</div><div><br></div><div>Best,</div><div>Zach</div>');
+  assert.equal(emailPlainTextToHTML('\n\nOne\n\n\nTwo\n\n'), '<div>One</div><div><br></div><div><br></div><div>Two</div>');
+  assert.equal(emailPlainTextToHTML('  '), '<div><br></div>');
+});
+
+test('the editor text keeps the paragraphs of every body shape', () => {
+  const cases = [
+    ['<div dir="ltr"><div>Hey Sam,<br></div><div><br></div><div>I hope you had a great summer.</div><div><br></div><div>Zach</div></div>', 'Hey Sam,\n\nI hope you had a great summer.\n\nZach'],
+    ['<p>Hey Sam,</p><p>Awesome, that sounds great.</p><p>Best,<br>Zach</p>', 'Hey Sam,\n\nAwesome, that sounds great.\n\nBest,\nZach'],
+    ['<div>A<br>B</div><div><br></div><div>C</div>', 'A\nB\n\nC'],
+    ['<p>It&#x27;s\n  fine</p>\n<p>ok &amp; done</p>', "It's fine\n\nok & done"],
+    ['<div>Intro<div>Inner</div></div>', 'Intro\nInner'],
+    ['', ''],
+  ];
+  for (const [html, want] of cases) assert.equal(htmlEmailText(html), want, html);
+  for (const text of ['Hey,\n\nPara one.\nSame para.\n\nBest,\nZach', 'One line', 'A\n\n\nB']) {
+    assert.equal(htmlEmailText(emailPlainTextToHTML(text)), text);
+  }
+});
+
+test('a body with no server editor text is read with its paragraphs', () => {
+  const review = gmailEmailReview({ provider: 'gmail', operation: 'gmail.send_email',
+    email: { message: { to: ['a@example.test'], subject: 's', editor_html: '<p>One.</p><p>Two.</p>' } } });
+  assert.equal(review.variants[0].editorText, 'One.\n\nTwo.');
+});
+
+// --- saving on the way to sending --------------------------------------------
+
+test('with edits on screen the primary button saves them on the way', () => {
+  const one = requestDecision(emailRequest());
+  assert.equal(pendingApproveLabel(one, { count: 0, draft: false }), 'Send');
+  assert.equal(pendingApproveLabel(one, { count: 1, draft: false }), 'Save & send');
+  assert.equal(pendingApproveLabel(one, { count: 1, draft: true }), 'Save draft');
+  const generic = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 3, partial: true });
+  assert.equal(pendingApproveLabel(generic, { count: 1, draft: false }), 'Save & approve 3');
+});
+
+// --- the message being replied to ----------------------------------------------
+
+test('the quoted history under an incoming message folds away', () => {
+  const text = 'Hey Zach, just forwarding this.\n\nThanks,\n- Kai\n\nOn Sat, Sep 26, 2026 at 2:11 PM Kai Pereira\n<kai@example.test> wrote:\n\n> Hi Christina,\n> older';
+  const split = splitIncomingEmailText(text);
+  assert.equal(split.body, 'Hey Zach, just forwarding this.\n\nThanks,\n- Kai');
+  assert.match(split.quoted, /^On Sat, Sep 26/);
+  const oneLine = splitIncomingEmailText('Sure!\n\nOn Mon, Sep 28, 2026 at 6:44 PM Zach <z@example.test> wrote:\n> hi');
+  assert.equal(oneLine.body, 'Sure!');
+  const bare = splitIncomingEmailText('Just a note.\n> a quoted line\n> another');
+  assert.equal(bare.body, 'Just a note.');
+  assert.equal(bare.quoted, '> a quoted line\n> another');
+  assert.deepEqual(splitIncomingEmailText('Nothing quoted here.'), { body: 'Nothing quoted here.', quoted: '' });
+});
+
+test('a forwarded message stays in the body; only its quoted history folds', () => {
+  const text = 'FYI\n\n---------- Forwarded message ---------\nFrom: Pat <pat@example.test>\n\nThe real question.\n\nOn Fri, Sep 25, 2026 at 1:00 PM Sam <s@example.test> wrote:\n> earlier';
+  const split = splitIncomingEmailText(text);
+  assert.match(split.body, /Forwarded message/);
+  assert.match(split.body, /The real question\./);
+  assert.match(split.quoted, /^On Fri/);
+});
+
+test('a phone number Gmail turned into a tel link reads as the number', () => {
+  const split = splitIncomingEmailText('Pat Doe\n6175550123 <(617)%20555-0123>');
+  assert.equal(split.body, 'Pat Doe\n6175550123');
 });

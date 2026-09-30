@@ -475,6 +475,20 @@ func TestAPIGetRendersTheGmailEmailView(t *testing.T) {
 	}
 }
 
+// An agent proposes <p> paragraphs; the phone's plain-text editor must show
+// them as paragraphs. On 2026-09-29 editor_text dropped the blank lines, and
+// two replies the reviewer edited went out as one run-on block.
+func TestGmailEmailViewEditorTextKeepsParagraphs(t *testing.T) {
+	view := gmailEmailMessageView(map[string]any{
+		"to":        []any{"a@example.test"},
+		"subject":   "Re: hi",
+		"body_html": `<p>Hey Sam,</p><p>Awesome, that sounds great.</p><p>Best,<br>Zach</p><div><br></div><div class="gmail_signature">--<br>Zach Latta</div>`,
+	})
+	if got := view["editor_text"]; got != "Hey Sam,\n\nAwesome, that sounds great.\n\nBest,\nZach" {
+		t.Fatalf("editor_text = %q", got)
+	}
+}
+
 // The merged email (payload message + preview) is what a read-only review shows.
 func TestGmailEmailViewSplitsSignatureAndQuoteFromTheBody(t *testing.T) {
 	view := gmailEmailView(sendEmailFixture().Mutations[0])
