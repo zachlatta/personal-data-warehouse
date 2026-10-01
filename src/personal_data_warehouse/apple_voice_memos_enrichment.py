@@ -654,6 +654,7 @@ def load_event_identity_hints(
     snippets.extend(load_drive_event_identity_snippets(warehouse, event_terms, first_name_terms))
     snippets.extend(load_gmail_event_identity_snippets(warehouse, recording, event_terms, first_name_terms))
     snippets.extend(load_slack_event_identity_snippets(warehouse, recording, event_terms, first_name_terms))
+    snippets.extend(load_chat_event_identity_snippets(warehouse, recording, event_terms, first_name_terms))
     hints["warehouse_snippets"] = dedupe_event_identity_snippets(snippets)[:PROMPT_EVENT_IDENTITY_HINTS_LIMIT]
     return hints
 
@@ -1063,6 +1064,50 @@ def load_slack_event_identity_snippets(
             )
         )
     return snippets
+
+
+def load_chat_event_identity_snippets(
+    warehouse,
+    recording: Mapping[str, Any],
+    event_terms: Sequence[str],
+    first_name_terms: Sequence[str],
+) -> list[dict[str, Any]]:
+    """iMessage and WhatsApp, through the conforming chat mart (C5).
+
+    Gmail, Drive and Slack each had a loader; the two chat sources had none,
+    so a person known only from a text thread never reached the agent's
+    prompt. Reading marts_messages.messages rather than either raw table means
+    a third chat source is covered the day it joins that mart.
+    """
+    try:
+        rows = warehouse._query(
+            f"""
+            SELECT
+                m.message_at,
+                COALESCE(NULLIF(m.sender_name, ''), NULLIF(m.chat_name, ''), m.sender_address, '') AS speaker,
+                m.body_text
+            FROM @marts_messages_messages AS m
+            WHERE m.is_deleted = 0
+              AND {event_identity_time_window_sql(recording, "m.message_at")}
+              AND {event_identity_match_sql("COALESCE(m.body_text, '')", event_terms)}
+              AND {event_identity_person_or_team_match_sql("COALESCE(m.body_text, '')", first_name_terms)}
+            ORDER BY m.message_at DESC
+            LIMIT {PROMPT_EVENT_IDENTITY_SOURCE_LIMIT}
+            """
+        )
+    except Exception:
+        return []
+    return [
+        event_identity_snippet(
+            source="marts_messages_messages",
+            occurred_at=occurred_at,
+            title=str(speaker),
+            text=str(text),
+            event_terms=event_terms,
+            first_name_terms=first_name_terms,
+        )
+        for occurred_at, speaker, text in rows
+    ]
 
 
 def event_identity_match_sql(field_sql: str, terms: Sequence[str]) -> str:

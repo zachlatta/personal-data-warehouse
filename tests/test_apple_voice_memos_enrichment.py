@@ -791,6 +791,14 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
                         "Quill is helping staff Launch Week.",
                     )
                 ]
+            if "FROM @marts_messages_messages" in sql:
+                return [
+                    (
+                        datetime(2026, 4, 23, tzinfo=UTC),
+                        "Nova Example",
+                        "Launch Week dinner is at 7, Quill is bringing the slides",
+                    )
+                ]
             return []
 
     hints = load_event_identity_hints(
@@ -808,10 +816,13 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
     assert "Launch Week" in hints["event_terms"]
     assert "Nova" in hints["first_name_terms"]
     assert "Quill" in hints["first_name_terms"]
+    # iMessage and WhatsApp reach the agent through the conforming chat mart
+    # (C5): a person known only from a text thread was invisible before.
     assert {snippet["source"] for snippet in hints["warehouse_snippets"]} == {
         "google_drive_file_texts",
         "gmail_messages",
         "slack_messages",
+        "marts_messages_messages",
     }
     assert any("google_drive_file_texts" in query for query in queries)
     assert any("gmail_messages" in query for query in queries)
