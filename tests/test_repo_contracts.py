@@ -49,6 +49,12 @@ from personal_data_warehouse.timeline import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
+# Per-source and incident detail moved out of AGENTS.md on 2026-10-01 (C12):
+# the file every session loads holds the contracts; topic files hold the rest.
+AGENT_DOCS = REPO_ROOT / "docs/agents"
+FINANCE_DOC = AGENT_DOCS / "finance.md"
+SEARCH_DOC = AGENT_DOCS / "search.md"
+HEALTH_SOURCES_DOC = AGENT_DOCS / "health-sources.md"
 README_MD = REPO_ROOT / "README.md"
 APP_README_MD = REPO_ROOT / "app/README.md"
 PYTHON_TESTS_WORKFLOW = REPO_ROOT / ".github/workflows/python-tests.yml"
@@ -241,9 +247,9 @@ def test_agents_md_states_every_contract() -> None:
     had no valid backup for a day while every health surface read green.
     """
     text = AGENTS_MD.read_text()
-    assert "## The eleven contracts" in text
-    section = text.split("## The eleven contracts", 1)[1]
-    for marker in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11"):
+    assert "## The contracts" in text
+    section = text.split("## The contracts", 1)[1]
+    for marker in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12"):
         assert re.search(rf"\*\*{marker}\b", section[:12000]), f"contract {marker} is not stated"
 
 
@@ -256,9 +262,9 @@ def test_every_stated_contract_has_a_living_audit_check() -> None:
     written down without also being measured.
     """
     text = AGENTS_MD.read_text()
-    section = text.split("## The eleven contracts", 1)[1].split("\n## ", 1)[0]
+    section = text.split("## The contracts", 1)[1].split("\n## ", 1)[0]
     stated = set(re.findall(r"\*\*([CS]\d+) —", section))
-    assert {"C1", "C11", "S1", "S2", "S3"} <= stated, stated
+    assert {"C1", "C11", "C12", "S1", "S2", "S3"} <= stated, stated
     audit = (REPO_ROOT / "scripts/contract_audit.py").read_text()
     checks = audit.split("CHECKS = [", 1)[1].split("]", 1)[0]
     registered = {name.upper() for name in re.findall(r"\b([cs]\d+)_", checks)}
@@ -290,7 +296,7 @@ def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:
     voice source was invisible to it. The contract has to constrain the input.
     """
     text = AGENTS_MD.read_text()
-    section = text.split("## The eleven contracts", 1)[1].split("\n## ", 1)[0]
+    section = text.split("## The contracts", 1)[1].split("\n## ", 1)[0]
     c5 = section.split("**C5", 1)[1].split("**C6", 1)[0]
     assert "READ" in c5, "C5 does not say what a transformation must read from"
     assert "alice" in c5.lower(), (
@@ -351,7 +357,7 @@ def test_the_unclassified_sentinel_is_not_presented_as_a_sixth_tier() -> None:
         )
 
 
-@pytest.mark.parametrize("path", (AGENTS_MD, README_MD))
+@pytest.mark.parametrize("path", (FINANCE_DOC, README_MD))
 def test_plaid_docs_use_update_mode_for_existing_item_repairs(path: Path) -> None:
     """Repairing consent must preserve the existing Plaid Item identity.
 
@@ -451,7 +457,8 @@ def test_agents_md_has_a_general_add_a_source_checklist() -> None:
 
 def test_agents_md_states_the_performance_contract() -> None:
     """C6 is documented nowhere and has already cost three incidents."""
-    text = AGENTS_MD.read_text()
+    assert "docs/agents/search.md#performance-contract" in AGENTS_MD.read_text()
+    text = SEARCH_DOC.read_text()
     assert "## Performance contract" in text
     section = text.split("## Performance contract", 1)[1].split("\n## ", 1)[0]
     assert "statement timeout" in section
@@ -462,8 +469,8 @@ def test_agents_md_states_the_performance_contract() -> None:
 
 def test_agents_md_covers_whoop() -> None:
     """WHOOP appeared zero times in AGENTS.md despite being a first-class source."""
-    text = AGENTS_MD.read_text()
-    assert "## WHOOP" in text, "AGENTS.md does not mention WHOOP at all"
+    text = HEALTH_SOURCES_DOC.read_text()
+    assert "## WHOOP" in text, "the agent docs do not mention WHOOP at all"
     section = text.split("## WHOOP", 1)[1].split("\n## ", 1)[0]
     assert "base_whoop.cycles" in section
     assert "private.whoop_oauth_tokens" in section
@@ -478,8 +485,8 @@ def test_agents_md_covers_whoop_private() -> None:
     milliseconds of the same measurement), so both have to be written down
     where an agent reading AGENTS.md will hit them.
     """
-    text = AGENTS_MD.read_text()
-    assert "## WHOOP private API" in text, "AGENTS.md does not mention the WHOOP private API"
+    text = HEALTH_SOURCES_DOC.read_text()
+    assert "## WHOOP private API" in text, "the agent docs do not mention the WHOOP private API"
     section = text.split("## WHOOP private API", 1)[1].split("\n## ", 1)[0]
     assert "base_whoop_private.journal_entries" in section
     assert "private.whoop_private_sessions" in section
@@ -825,3 +832,24 @@ def test_only_the_dagster_image_owns_index_definitions() -> None:
     assert "PDW_INDEX_DEFINITION_OWNER=1" in dockerfile
     for launchd in (REPO_ROOT / "ops" / "launchd").glob("*.plist"):
         assert "PDW_INDEX_DEFINITION_OWNER" not in launchd.read_text(encoding="utf-8"), launchd
+
+
+#: C12. AGENTS.md (CLAUDE.md) is loaded into every agent session in this
+#: repository. At 328 KB on 2026-09-30 it was ~80k tokens of incident history
+#: before the first question, with the contracts in its first 15 KB.
+from scripts.contract_audit import AGENTS_MD_MAX_BYTES  # noqa: E402 - the audit's cap is the test's cap
+
+
+def test_agents_md_fits_one_sitting() -> None:
+    size = len(AGENTS_MD.read_bytes())
+    assert size <= AGENTS_MD_MAX_BYTES, (
+        f"AGENTS.md is {size} bytes (cap {AGENTS_MD_MAX_BYTES}); move per-source or incident "
+        "detail into docs/agents/ and link it from 'Where the detail lives'"
+    )
+
+
+def test_every_agent_doc_is_indexed_from_agents_md() -> None:
+    text = AGENTS_MD.read_text()
+    index = text.split("## Where the detail lives", 1)[1].split("\n## ", 1)[0]
+    for path in sorted(AGENT_DOCS.glob("*.md")):
+        assert f"docs/agents/{path.name}" in index, f"{path.name} is not linked from AGENTS.md"

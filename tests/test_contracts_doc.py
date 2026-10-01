@@ -1,4 +1,4 @@
-"""The eleven contracts in CLAUDE.md name the tests that hold them up.
+"""The contracts in CLAUDE.md name the tests that hold them up.
 
 A contract whose named test no longer exists is one refactor away from quietly
 becoming untrue -- the document itself says so. This test reads every
@@ -19,7 +19,7 @@ TESTS_DIR = REPO_ROOT / "tests"
 
 def _contracts_section() -> str:
     text = CLAUDE_MD.read_text(encoding="utf-8")
-    start = text.index("## The eleven contracts")
+    start = text.index("## The contracts")
     end = text.index("\n## ", start + 10)
     # Markdown wraps prose at ~95 columns, so "*Held up\n  by*" is one phrase.
     return re.sub(r"\n[ \t]+", " ", text[start:end])
@@ -62,6 +62,6 @@ def test_every_test_named_by_a_contract_exists() -> None:
 def test_every_contract_names_what_holds_it_up() -> None:
     section = _contracts_section()
     contracts = re.findall(r"^- \*\*C(\d+) — ", section, re.M)
-    assert [int(n) for n in contracts] == list(range(1, 12))
+    assert [int(n) for n in contracts] == list(range(1, 13))
     for block in re.split(r"^- \*\*C\d+ — ", section, flags=re.M)[1:]:
         assert "*Held up by*" in block, block[:80]

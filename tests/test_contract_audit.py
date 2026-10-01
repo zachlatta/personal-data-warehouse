@@ -537,3 +537,14 @@ def test_c7_is_yellow_when_the_collector_snapshot_is_unknown(
     monkeypatch.setattr(contract_audit, "pdw_sql", _c7_sql(responses))
     verdict = contract_audit.c7_pipeline_health()
     assert verdict.status == contract_audit.YELLOW
+
+
+def test_c12_is_green_while_agents_md_fits_and_names_live_tests() -> None:
+    verdict = contract_audit.c12_future_developers()
+    assert verdict.status == contract_audit.GREEN, verdict.evidence
+    assert "AGENTS.md" in verdict.evidence
+
+
+def test_c12_is_red_when_agents_md_outgrows_one_sitting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "AGENTS_MD_MAX_BYTES", 100)
+    assert contract_audit.c12_future_developers().status == contract_audit.RED

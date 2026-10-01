@@ -515,7 +515,8 @@ def c9_one_way() -> Verdict:
     except (OSError, subprocess.TimeoutExpired):
         return _unavailable("C9", title, "pdw list")
     tools = set(re.findall(r"^\s*([a-z_]+)\b", out, re.M))
-    expected = {"search", "sql", "schema_overview", "describe_table"}
+    # context joined on 2026-10-01: the one way to read a hit's conversation.
+    expected = {"search", "context", "sql", "schema_overview", "describe_table"}
     forbidden = {"query", "search_hybrid", "grep_rows"}
     ok = expected <= tools and not (forbidden & tools)
     return Verdict("C9", title, GREEN if ok else RED, f"CLI tools {sorted(tools & (expected | forbidden))}")
@@ -523,7 +524,7 @@ def c9_one_way() -> Verdict:
 
 def c10_backups() -> Verdict:
     title = "backed up, restore performed"
-    rows = pdw_sql("backup posture", "SELECT stanza, status, backup_count, last_full_at, full_age_seconds, last_archived_at, restore_status, last_restore_label, restore_age_seconds FROM marts_ops.pgbackrest_health")
+    rows = pdw_sql("backup posture", "SELECT stanza, status, backup_count, last_full_at, full_age_seconds, last_archived_at, restore_status, last_restore_label, restore_age_seconds, expire_status, last_expire_error FROM marts_ops.pgbackrest_health")
     if not rows:
         return Verdict("C10", title, RED, "marts_ops.pgbackrest_health has no row: backup existence is unobservable")
     r = rows[0]
@@ -531,7 +532,7 @@ def c10_backups() -> Verdict:
     age_days = (float(r["full_age_seconds"]) / 86400) if r["full_age_seconds"] is not None else None
     restore_days = (float(r["restore_age_seconds"]) / 86400) if r.get("restore_age_seconds") is not None else None
     status = RED if count == 0 or r["status"] in ("failing",) else (YELLOW if r["status"] in ("late", "stale", "unknown", "attention") else GREEN)
-    return Verdict("C10", title, status, f"{count} backups, status {r['status']}, last full {age_days and f'{age_days:.1f}d'} ago; restore {r.get('restore_status')} ({r.get('last_restore_label') or 'none'}, {restore_days and f'{restore_days:.1f}d'} ago)")
+    return Verdict("C10", title, status, f"{count} backups, status {r['status']}, last full {age_days and f'{age_days:.1f}d'} ago; retention {r.get('expire_status')}{' (' + r['last_expire_error'] + ')' if r.get('last_expire_error') else ''}; restore {r.get('restore_status')} ({r.get('last_restore_label') or 'none'}, {restore_days and f'{restore_days:.1f}d'} ago)")
 
 
 def c11_source_slas() -> Verdict:
@@ -619,9 +620,45 @@ def s3_finance() -> Verdict:
     return Verdict("S3", title, status, f"kinds {sorted(have)}; missing {sorted(missing) or 'none'}; stale/late: {[(r['kind'], r['staleness'], r['age_days']) for r in stale] or 'none'}; receipts {receipts and {r['decision']: r['n'] for r in receipts}}")
 
 
+#: C12's cap, shared with test_agents_md_fits_one_sitting: AGENTS.md is loaded
+#: into every session in this repository.
+AGENTS_MD_MAX_BYTES = 48 * 1024
+
+
+def c12_future_developers() -> Verdict:
+    """Future developers can read the contracts in one sitting, and every test
+    a contract names still exists (a rename must rename its mention)."""
+    title = "future developers understand and honor the contracts"
+    agents = REPO_ROOT / "AGENTS.md"
+    text = agents.read_text(encoding="utf-8")
+    size = len(text.encode("utf-8"))
+    section = text.split("## The contracts", 1)[1].split("\n## ", 1)[0] if "## The contracts" in text else ""
+    named = set(re.findall(r"`(?:[\w./-]+::)?(test_[A-Za-z0-9_]+)`", re.sub(r"\n[ \t]+", " ", section)))
+    defined: set[str] = set()
+    for path in (REPO_ROOT / "tests").rglob("test_*.py"):
+        defined.update(re.findall(r"^def (test_[A-Za-z0-9_]+)\(", path.read_text(encoding="utf-8"), re.M))
+    missing = sorted(named - defined)
+    unindexed = sorted(
+        p.name for p in (REPO_ROOT / "docs/agents").glob("*.md") if f"docs/agents/{p.name}" not in text
+    )
+    grades = [GREEN]
+    if not section:
+        grades.append(RED)
+    if size > AGENTS_MD_MAX_BYTES:
+        grades.append(RED)
+    if missing or unindexed:
+        grades.append(YELLOW)
+    evidence = (
+        f"AGENTS.md {size} bytes (cap {AGENTS_MD_MAX_BYTES}); contracts name {len(named)} tests"
+        f"{', missing: ' + ', '.join(missing) if missing else ', all exist'}"
+        f"{'; docs/agents not indexed: ' + ', '.join(unindexed) if unindexed else ''}"
+    )
+    return Verdict("C12", title, worst(grades), evidence)
+
+
 CHECKS = [c1_timeline_coverage, c2_priority_tiers, c3_agents_start_at_timeline, c4_raw_data_queryable,
           c5_layering, c6_performance, c7_pipeline_health, c8_search_quality, c9_one_way, c10_backups,
-          c11_source_slas, s1_slack, s2_voice, s3_finance]
+          c11_source_slas, c12_future_developers, s1_slack, s2_voice, s3_finance]
 
 
 def main(argv: list[str] | None = None) -> int:
