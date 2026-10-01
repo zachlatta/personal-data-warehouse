@@ -346,10 +346,15 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
         "private_channel": timedelta(minutes=_int_env("SLACK_ASSET_PRIVATE_WINDOW_MINUTES", 180)),
         "public_channel": timedelta(minutes=_int_env("SLACK_ASSET_PUBLIC_WINDOW_MINUTES", 120)),
     }
+    # A poll-only pass schedules every candidate by when it is due (see
+    # SLACK_FRESHNESS_DUE_INTERVALS), so DMs, group DMs and private channels are
+    # all candidates; the old 500/250/100 activity caps dropped the long tail
+    # before scheduling could reach it, and a group DM quiet for weeks waited a
+    # day. Public channels keep a cap: the public sweep rotates the rest.
     limit_by_type = {
-        "im": _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 500),
-        "mpim": _int_env("SLACK_ASSET_MPIM_FRESHNESS_LIMIT", 250),
-        "private_channel": _int_env("SLACK_ASSET_PRIVATE_FRESHNESS_LIMIT", 100),
+        "im": _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 10000),
+        "mpim": _int_env("SLACK_ASSET_MPIM_FRESHNESS_LIMIT", 10000),
+        "private_channel": _int_env("SLACK_ASSET_PRIVATE_FRESHNESS_LIMIT", 1000),
         "public_channel": _int_env("SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT", 100),
     }
     if changed_ids is not None:
@@ -381,6 +386,12 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             # paged discovery walk to reach it -- which cost a new group DM 13.6
             # hours of landing latency on 2026-08-27.
             new_conversation_limit=_int_env("SLACK_ASSET_NEW_CONVERSATION_LIMIT", 25),
+            # Without a change feed nothing names a conversation created since the
+            # paged discovery walk last passed (group DMs waited ~8 hours on
+            # 2026-09-30), so a poll-only pass lists DMs, group DMs and private
+            # channels itself -- ~8 conversations.list calls -- and streams any new
+            # one in full. Ignored on a change-feed pass, which names them.
+            discover_new_direct_conversations=_bool_env("SLACK_ASSET_DISCOVER_DIRECT_CONVERSATIONS", True),
             # Stop gracefully when the rate-limit budget is exhausted instead of
             # failing the run. The history cursor is persisted per conversation as
             # the pass proceeds, so the next freshness run resumes from there.

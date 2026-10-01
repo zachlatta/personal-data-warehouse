@@ -173,10 +173,15 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
         "private_channel": timedelta(minutes=180),
         "public_channel": timedelta(minutes=120),
     }
+    # A poll-only pass schedules every DM, group DM and private channel by when it
+    # is due, so their caps cover all of them (~3,700 / ~2,900 / ~120 on
+    # 2026-10-01); the old 500/250/100 activity caps dropped the long tail before
+    # scheduling could reach it. Public channels keep their cap: the public sweep
+    # rotates the rest.
     assert freshness["freshness_limit_by_type"] == {
-        "im": 500,
-        "mpim": 250,
-        "private_channel": 100,
+        "im": 10000,
+        "mpim": 10000,
+        "private_channel": 1000,
         "public_channel": 100,
     }
     # The blanket poll's warm tier: conversations active in the last two weeks

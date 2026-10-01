@@ -3801,8 +3801,8 @@ def test_blanket_freshness_rotates_types_by_last_poll_and_reaches_quiet_group_dm
                 empty,
                 empty,
                 empty,
-                {"ok": True, "messages": [{"ts": f"{warm + 60:.6f}", "user": "U9", "text": "hi"}], "response_metadata": {}},
                 empty,
+                {"ok": True, "messages": [{"ts": f"{warm + 60:.6f}", "user": "U9", "text": "hi"}], "response_metadata": {}},
             ],
         }
     )
@@ -3824,11 +3824,13 @@ def test_blanket_freshness_rotates_types_by_last_poll_and_reaches_quiet_group_dm
     ).sync_all()
 
     history = [params for method, params in client.calls if method == "conversations.history"]
-    # Never polled first, then the longest-waiting; types interleave; then
-    # warm, then cold.
-    assert [params["channel"] for params in history] == ["G_HOT", "D_WAITING", "D_RECENT", "G_QUIET", "D_COLD"]
+    # Conversations active inside the window go first (never polled, then the
+    # longest-waiting; types interleave). Everything else follows by how overdue
+    # it is: the cold DM last polled 50 days ago before the quiet group DM last
+    # polled 3 days ago.
+    assert [params["channel"] for params in history] == ["G_HOT", "D_WAITING", "D_RECENT", "D_COLD", "G_QUIET"]
     # The quiet group DM is read from its own cursor, not from the window.
-    assert float(history[3]["oldest"]) == pytest.approx(warm)
+    assert float(history[4]["oldest"]) == pytest.approx(warm)
     assert [m["conversation_id"] for m in warehouse.messages] == ["G_QUIET"]
     # Every poll is stamped, so the next pass starts somewhere else.
     assert {touch["conversation_id"] for touch in warehouse.conversation_touches} == {
@@ -3881,3 +3883,155 @@ def test_change_feed_freshness_keeps_type_priority(monkeypatch):
         sleep=lambda seconds: None,
     ).sync_all()
     assert [p["channel"] for m, p in client.calls if m == "conversations.history"] == ["D_MOVED", "G_QUIET"]
+
+
+def test_a_poll_only_freshness_pass_lists_direct_conversations_to_find_new_ones(monkeypatch):
+    # Without client.counts (team_is_restricted since 2026-10-01) nothing names a
+    # conversation created since the paged discovery walk last passed, and that walk
+    # covers five 200-row pages a run across four rotating types. Group DMs created on
+    # 2026-09-30 waited ~8 hours to land. A poll-only pass therefore lists every DM, group
+    # DM and private channel itself -- about eight calls at 1,000 a page -- and streams
+    # any id we have never cached, in full, in the same pass.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "D_KNOWN", "user": "U1", "is_im": True},
+    ]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.list": [
+                {
+                    "ok": True,
+                    "channels": [{"id": "D_KNOWN", "user": "U1", "is_im": True}],
+                    "response_metadata": {"next_cursor": "page2"},
+                },
+                {
+                    "ok": True,
+                    "channels": [{"id": "C_NEW_GROUP", "is_mpim": True, "created": 1990}],
+                    "response_metadata": {"next_cursor": ""},
+                },
+            ],
+            "conversations.history": [
+                {"ok": True, "messages": [{"ts": "1995.000000", "user": "U2", "text": "hey all"}], "response_metadata": {}},
+                {"ok": True, "messages": [], "response_metadata": {}},
+            ],
+        }
+    )
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10),
+        sync_users=False,
+        sync_members=False,
+        use_existing_conversations=True,
+        freshness_priority=True,
+        conversation_types=("im", "mpim", "private_channel"),
+        conversation_ids=None,
+        discover_new_direct_conversations=True,
+        sync_thread_replies=False,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    list_calls = [params for method, params in client.calls if method == "conversations.list"]
+    assert list_calls and list_calls[0]["types"] == "im,mpim,private_channel"
+    assert int(list_calls[0]["limit"]) == 1000
+    # Only the never-cached conversation is written, so a five-minute walk of ~6,700 rows
+    # does not rewrite them all.
+    assert [row["conversation_id"] for row in warehouse.conversations] == ["C_NEW_GROUP"]
+    history = [params for method, params in client.calls if method == "conversations.history"]
+    assert history[0]["channel"] == "C_NEW_GROUP" and "oldest" not in history[0]
+    assert [row["message_ts"] for row in warehouse.messages] == ["1995.000000"]
+
+
+def test_a_change_feed_pass_does_not_list_conversations(monkeypatch):
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [{"id": "D_KNOWN", "user": "U1", "is_im": True}]
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [{"ok": True, "messages": [], "response_metadata": {}}],
+        }
+    )
+    SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: datetime.fromtimestamp(2000, tz=UTC),
+        history_window=timedelta(minutes=10), sync_users=False, sync_members=False,
+        use_existing_conversations=True, freshness_priority=True, conversation_types=("im",),
+        conversation_ids=("D_KNOWN",), discover_new_direct_conversations=True,
+        sync_thread_replies=False, sleep=lambda seconds: None,
+    ).sync_all()
+    assert not any(method == "conversations.list" for method, _params in client.calls)
+
+
+
+def test_blanket_freshness_polls_each_conversation_when_it_is_due(monkeypatch):
+    """Polling every candidate in tier order spent each pass on the ~250
+    conversations active in the last fortnight and never reached the rest:
+    measured 2026-10-01, 108 of 3,717 DMs and 114 of 2,889 group DMs had been
+    polled at all in 24 hours, and a group DM quiet since 09-10 took 28 hours to
+    land. Each conversation is now due again after an interval set by how
+    recently it was active, the most overdue go first, and one not yet due is
+    skipped -- which is what leaves budget for the quiet ones."""
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    day = 86_400
+
+    def state(conversation_id, cursor, polled_minutes_ago):
+        return {
+            "account": "zrl", "team_id": "T1", "object_type": "conversation",
+            "object_id": conversation_id, "cursor_ts": f"{cursor:.6f}", "last_sync_type": "partial",
+            "status": "ok", "error": "", "updated_at": now - timedelta(minutes=polled_minutes_ago),
+        }
+
+    t = 1_790_000_000
+    warehouse = FakeWarehouse(
+        states={
+            # warm (3 days) -- due every 15 minutes
+            ("zrl", "T1", "conversation", "D_WARM_FRESH"): state("D_WARM_FRESH", t - 3 * day, 5),
+            ("zrl", "T1", "conversation", "D_WARM_DUE"): state("D_WARM_DUE", t - 3 * day, 20),
+            # cool (60 days) -- due hourly
+            ("zrl", "T1", "conversation", "G_COOL_FRESH"): state("G_COOL_FRESH", t - 60 * day, 30),
+            ("zrl", "T1", "conversation", "G_COOL_DUE"): state("G_COOL_DUE", t - 60 * day, 90),
+            # cold (two years) -- due every six hours
+            ("zrl", "T1", "conversation", "D_COLD_FRESH"): state("D_COLD_FRESH", t - 700 * day, 120),
+            ("zrl", "T1", "conversation", "D_COLD_DUE"): state("D_COLD_DUE", t - 700 * day, 7 * 60),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": cid, "user": "U1", "is_im": True} if cid.startswith("D") else {"id": cid, "name": "mpdm-x", "is_mpim": True}
+        for cid in ("D_WARM_FRESH", "D_WARM_DUE", "G_COOL_FRESH", "G_COOL_DUE", "D_COLD_FRESH", "D_COLD_DUE")
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty, empty, empty],
+        }
+    )
+    SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: now,
+        history_window=timedelta(hours=4), freshness_warm_window=timedelta(days=14),
+        sync_users=False, sync_members=False, use_existing_conversations=True,
+        freshness_priority=True, sync_thread_replies=False, sleep=lambda seconds: None,
+    ).sync_all()
+
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    # Most overdue first: the cold DM (due 60 minutes ago), the cool group DM
+    # (due 30 minutes ago), the warm DM (due 5 minutes ago). Nothing not yet due.
+    assert polled == ["D_COLD_DUE", "G_COOL_DUE", "D_WARM_DUE"]

@@ -609,3 +609,34 @@ def test_the_freshness_pass_records_the_feed_verdict(monkeypatch):
     slack_defs.run_slack_freshness_sync(settings=_settings(monkeypatch), warehouse=warehouse, logger=NullLog())
     assert warehouse.verdict()["status"] == "degraded"
     assert "invalid_auth" in warehouse.verdict()["error"]
+
+
+def test_a_poll_only_freshness_pass_lists_direct_conversations(monkeypatch):
+    """With the change feed unusable, the pass finds new DMs and group DMs by listing
+    them itself, not by waiting hours for the rotating discovery walk."""
+    from personal_data_warehouse.defs import slack_sync as slack_defs
+
+    captured: list[dict] = []
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+        def sync_all(self):
+            return []
+
+    monkeypatch.setattr(
+        slack_defs,
+        "slack_change_plan",
+        lambda **_: slack_defs.SlackChangePlan(usable=False, reason="client.counts failed: team_is_restricted"),
+    )
+    monkeypatch.setattr(slack_defs, "record_slack_change_feed_verdict", lambda **_: None)
+    monkeypatch.setattr(slack_defs, "SlackSyncRunner", _Runner)
+    monkeypatch.setenv("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", "0")
+
+    slack_defs.run_slack_freshness_sync(
+        settings=_settings(monkeypatch), warehouse=_Warehouse(), logger=NullLog()
+    )
+
+    assert captured and all(kwargs["conversation_ids"] is None for kwargs in captured)
+    assert all(kwargs["discover_new_direct_conversations"] is True for kwargs in captured)
