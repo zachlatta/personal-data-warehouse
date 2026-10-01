@@ -868,6 +868,15 @@ var columnRemaps = map[string]string{
 		"the search functions return the matched preview as text, and each source's raw table names its body differently (base_slack.messages.text, base_gmail.messages.body_text, base_whatsapp.messages.body_text)",
 	"body_content": "no warehouse relation has a body_content column — timeline.events carries the preview in snippet and the indexed body in search_text; " +
 		"raw tables name it per source (base_slack.messages.text, base_gmail.messages.body_text, base_whatsapp.messages.body_text)",
+	// The four below were the most common wrong columns in the fortnight to
+	// 2026-09-30, `ref` alone in 13 sessions.
+	"ref": "a search hit's ref is not a column: it is <adapter>:<event_id>. On timeline.events filter WHERE adapter = '<text before the first colon>' AND event_id = '<the rest>'; " +
+		"to read the conversation around a hit use the context tool (pdw context '<ref>') instead of SQL",
+	"body": "timeline.events carries the preview in snippet and the indexed body in search_text; raw tables name it per source " +
+		"(base_slack.messages.text, base_gmail.messages.body_markdown_clean, base_whatsapp.messages.body_text, marts_ai_conversations.events.text)",
+	"content": "agent-session and chat text is in text (marts_ai_conversations.events.text) or body_text (marts_messages.messages); timeline.events has snippet and search_text",
+	"provider": "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse), not provider",
+	"turn_index": "agent-session turns are ordered by seq within (source, session_id)",
 }
 
 // tableRemaps point a wrong table name at the right one. The catalog supplies
@@ -1182,10 +1191,16 @@ func timelineEventsColumnHint(col, sql string) string {
 	if !containsWord(lower, "timeline.events") || searchFunctionCallRe.MatchString(sql) {
 		return ""
 	}
-	return fmt.Sprintf(
+	hint := fmt.Sprintf(
 		"(hint: %q is a column of the search FUNCTIONS' result, not of timeline.events. The table uses event_ts (time), actor (who), title, snippet (preview) and search_text (the indexed body), plus priority/source/source_table/source_pk. "+
 			"timeline.search_text('needle', 50) returns (%s) instead — pick the one whose names you want.)",
 		col, searchHitColumns)
+	if col == "ref" {
+		// The most common wrong column of the fortnight to 2026-09-30 (13
+		// sessions): the caller holds a hit's ref and wants its row.
+		hint = strings.TrimSuffix(hint, ")") + " " + columnRemaps["ref"] + ".)"
+	}
+	return hint
 }
 
 var searchFunctionCallRe = regexp.MustCompile(`(?i)(?:"?timeline"?\s*\.\s*)?"?(search_text(?:_exact)?|search_hybrid)"?\s*\(`)

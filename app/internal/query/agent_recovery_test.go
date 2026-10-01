@@ -94,6 +94,14 @@ func TestRecurringWrongColumnNamesAreRemapped(t *testing.T) {
 	}{
 		{"from_email", "SELECT from_email FROM base_gmail.messages LIMIT 1", []string{"from_address"}},
 		{"text_content", "SELECT text_content FROM base_slack.messages LIMIT 1", []string{"snippet", "search_text"}},
+		// The fortnight to 2026-09-30: `ref` on timeline.events was the single
+		// most common wrong column (13 sessions) -- a search hit carries a ref,
+		// the table carries adapter and event_id.
+		{"ref", "SELECT * FROM timeline.events WHERE ref = 'gmail_email:a|b'", []string{"adapter", "event_id", "context"}},
+		{"content", "SELECT content FROM marts_ai_conversations.events LIMIT 1", []string{"text"}},
+		{"provider", "SELECT provider FROM marts_ai_conversations.sessions LIMIT 1", []string{"source"}},
+		{"turn_index", "SELECT turn_index FROM marts_ai_conversations.events LIMIT 1", []string{"seq"}},
+		{"body", "SELECT body FROM timeline.events LIMIT 1", []string{"snippet", "search_text"}},
 	} {
 		hint := schemaErrorHint(`ERROR: column "`+c.column+`" does not exist (SQLSTATE 42703)`, c.sql)
 		for _, want := range c.want {
