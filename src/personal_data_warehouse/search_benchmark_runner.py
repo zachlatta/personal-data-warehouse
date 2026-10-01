@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 #: Term-bag queries in the shape that retrieves well; common words on purpose,
 #: because a rare term never shows the broad-pool cost.
-DEFAULT_PROBE_QUERIES: tuple[str, ...] = (
+TERM_BAG_PROBE_QUERIES: tuple[str, ...] = (
     "runway burn rate months cash remaining",
     "trip planning flights hotel booking",
     "invoice payment received thanks",
@@ -54,6 +54,16 @@ DEFAULT_PROBE_QUERIES: tuple[str, ...] = (
     "offer letter start date salary",
     "shipping tracking order delivered",
 )
+#: One- and two-word queries: the shape the guide teaches ("search a name or
+#: an identifier alone") and the only one the literal leg runs for. Until
+#: 2026-09-30 the probes were term bags alone, which skip that leg, and the
+#: benchmark read p50 1.1s while a common one-word search took 4-11s.
+SHORT_PROBE_QUERIES: tuple[str, ...] = (
+    "invoice",
+    "Sonoma",
+    "flight confirmation",
+)
+DEFAULT_PROBE_QUERIES: tuple[str, ...] = TERM_BAG_PROBE_QUERIES + SHORT_PROBE_QUERIES
 DEFAULT_DEPTH = 50
 LATENCY_DEPTH = 20
 #: The goal set for the tool: p50 under two seconds, end to end.

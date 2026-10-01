@@ -205,6 +205,7 @@ def test_c6_measures_paired_scopes_serially_and_grades_the_slower_scope(
         )
 
     monkeypatch.setattr(contract_audit, "run_search", fake_run_search)
+    monkeypatch.setattr(contract_audit, "SEARCH_PROBE_QUERIES", ("one", "two", "three"))
     monkeypatch.setattr(
         contract_audit, "pdw_sql", lambda intent, sql: [_benchmark_host_row()]
     )
@@ -255,6 +256,7 @@ def test_c6_invalid_probes_remain_in_the_grade_and_are_not_latency_samples(
             priority_scope="all",
         )
 
+    monkeypatch.setattr(contract_audit, "SEARCH_PROBE_QUERIES", ("one", "two", "three"))
     monkeypatch.setattr(contract_audit, "run_search", fake_run_search)
     monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql: [])
 
@@ -447,3 +449,91 @@ def test_c8_attention_errors_are_graded_without_treating_exclusions_as_failures(
     assert verdict.status == contract_audit.RED
     assert "attention p50 500ms over 3 probes, errors=2" in verdict.evidence
     assert "20 all-tier relevant answers were lower-tier; exclusions are expected" in verdict.evidence
+
+
+def test_latency_probes_time_the_short_queries_the_guide_teaches() -> None:
+    """The guide says to search a name or an identifier alone, and the hybrid
+    literal leg only runs for a query of at most three words. Timing only
+    4-6 word term bags let C6 read green at 1.3s on 2026-09-30 while a
+    one-word search took 4-11s. Both the weekly benchmark and this audit must
+    time both shapes."""
+    from personal_data_warehouse import search_benchmark_runner as runner
+    from personal_data_warehouse.postgres import SEARCH_HYBRID_EXACT_MAX_WORDS
+
+    for probes in (runner.DEFAULT_PROBE_QUERIES, contract_audit.SEARCH_PROBE_QUERIES):
+        word_counts = [len(query.split()) for query in probes]
+        assert sum(count <= 2 for count in word_counts) >= 2, probes
+        assert any(count > SEARCH_HYBRID_EXACT_MAX_WORDS for count in word_counts), probes
+
+
+def _c7_sql(responses: dict[str, list[dict] | None]) -> Callable[[str, str], list[dict] | None]:
+    def fake(intent: str, sql: str) -> list[dict] | None:
+        for needle, rows in responses.items():
+            if needle in sql:
+                return rows
+        raise AssertionError(f"unexpected C7 query: {sql}")
+
+    return fake
+
+
+def _c7_healthy() -> dict[str, list[dict] | None]:
+    return {
+        "marts_ops.pipeline_health": [
+            {"pipeline": "gmail", "status": "ok", "snapshot_age_seconds": 120},
+            {"pipeline": "slack", "status": "attention", "snapshot_age_seconds": 120},
+        ],
+        "marts_ops.mart_view_health": [
+            {"view_name": "huddles", "status": "attention", "input_status": "attention",
+             "cause_pipelines": ["slack"], "probe_status": "ok", "snapshot_age_seconds": 120},
+        ],
+        "marts_ops.timeline_adapter_health": [{"n": 27, "unknown": 0}],
+        "marts_ops.table_freshness": [{"n": 160}],
+        "marts_ops.collation_health": [{"n": 300}],
+    }
+
+
+def test_c7_grades_whether_health_is_inspectable_not_whether_it_is_good(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C7 is "health is inspectable": a source that is down and SAYS so is the
+    contract working. Down sources are graded by their own contracts (C11,
+    S1-S3); C7 reports them as evidence only."""
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c7_sql(_c7_healthy()))
+    verdict = contract_audit.c7_pipeline_health()
+    assert verdict.status == contract_audit.GREEN, verdict.evidence
+    assert "slack" in verdict.evidence and "attention" in verdict.evidence
+
+
+def test_c7_is_red_when_a_health_level_cannot_be_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = _c7_healthy()
+    responses["marts_ops.timeline_adapter_health"] = None
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c7_sql(responses))
+    verdict = contract_audit.c7_pipeline_health()
+    assert verdict.status == contract_audit.RED
+    assert "timeline_adapter_health" in verdict.evidence
+
+
+def test_c7_is_yellow_when_a_mart_cannot_name_why_it_is_not_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _c7_healthy()
+    responses["marts_ops.mart_view_health"] = [
+        {"view_name": "notifications", "status": "late", "input_status": "late",
+         "cause_pipelines": [], "probe_status": "ok", "snapshot_age_seconds": 120},
+    ]
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c7_sql(responses))
+    verdict = contract_audit.c7_pipeline_health()
+    assert verdict.status == contract_audit.YELLOW
+    assert "notifications" in verdict.evidence
+
+
+def test_c7_is_yellow_when_the_collector_snapshot_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _c7_healthy()
+    responses["marts_ops.pipeline_health"] = [
+        {"pipeline": "gmail", "status": "unknown", "snapshot_age_seconds": 99999},
+    ]
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c7_sql(responses))
+    verdict = contract_audit.c7_pipeline_health()
+    assert verdict.status == contract_audit.YELLOW

@@ -35,6 +35,7 @@ from personal_data_warehouse.search_benchmark import (
 from personal_data_warehouse.search_benchmark_runner import (
     LATENCY_P50_TARGET_MS,
     MRR_FLOOR,
+    SHORT_PROBE_QUERIES,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,11 +46,13 @@ GREEN, YELLOW, RED = "green", "yellow", "red"
 SEARCH_P50_TARGET_SECONDS = LATENCY_P50_TARGET_MS / 1000
 SEARCH_P50_YELLOW_SECONDS = 5.0
 SEARCH_ATTENTION_PRIORITIES = tuple(ATTENTION_PRIORITIES)
+#: Three term bags plus the short shapes the guide teaches; the short ones are
+#: the only queries the hybrid literal leg runs for.
 SEARCH_PROBE_QUERIES = (
     "runway burn rate months cash remaining",
     "trip planning flights hotel booking",
     "invoice payment received thanks",
-)
+) + SHORT_PROBE_QUERIES
 
 
 @dataclass
@@ -281,15 +284,77 @@ def c6_performance() -> Verdict:
 
 
 def c7_pipeline_health() -> Verdict:
+    """Health is INSPECTABLE: every level readable, current, and able to say why.
+
+    A source that is down and says so on /pipelines is this contract working;
+    whether that source is healthy is graded by its own contract (C11, S1-S3).
+    Until 2026-09-30 this check graded the data state, so a ChatGPT token about
+    to expire read C7 red while every health surface was doing its job.
+    """
     title = "pipeline health inspectable via SQL and web"
-    rows = pdw_sql("pipeline health", "SELECT pipeline, status FROM marts_ops.pipeline_health")
-    marts = pdw_sql("mart health", "SELECT view_name, status FROM marts_ops.mart_view_health WHERE status NOT IN ('ok')")
-    if rows is None or marts is None:
-        return _unavailable("C7", title, "marts_ops.pipeline_health / mart_view_health")
-    bad = {r["pipeline"]: r["status"] for r in rows if r["status"] in ("failing", "stale", "attention", "unknown")}
-    late = [r["pipeline"] for r in rows if r["status"] == "late"]
-    status = RED if any(s in ("failing", "stale") for s in bad.values()) else (YELLOW if bad or late else GREEN)
-    return Verdict("C7", title, status, f"{len(rows)} pipelines; not ok: {bad or 'none'}; late: {late or 'none'}; non-ok marts: {len(marts)}")
+    levels = {
+        "pipeline_health": (
+            "pipeline health",
+            "SELECT pipeline, status, snapshot_age_seconds FROM marts_ops.pipeline_health",
+        ),
+        "table_freshness": (
+            "table freshness", "SELECT count(*) AS n FROM marts_ops.table_freshness",
+        ),
+        "mart_view_health": (
+            "mart health",
+            "SELECT view_name, status, input_status, cause_pipelines, probe_status, "
+            "snapshot_age_seconds FROM marts_ops.mart_view_health WHERE status NOT IN ('ok')",
+        ),
+        "timeline_adapter_health": (
+            "adapter health",
+            "SELECT count(*) AS n, count(*) FILTER (WHERE status = 'unknown') AS unknown "
+            "FROM marts_ops.timeline_adapter_health",
+        ),
+        "collation_health": (
+            "collation health", "SELECT count(*) AS n FROM marts_ops.collation_health",
+        ),
+    }
+    results = {name: pdw_sql(intent, sql) for name, (intent, sql) in levels.items()}
+    unreadable = sorted(name for name, rows in results.items() if rows is None)
+    if unreadable:
+        return Verdict("C7", title, RED, f"unreadable health levels: {', '.join(unreadable)}")
+
+    grades = [GREEN]
+    problems: list[str] = []
+    pipelines = results["pipeline_health"] or []
+    unknown = sorted(r["pipeline"] for r in pipelines if r.get("status") == "unknown")
+    if unknown:
+        grades.append(YELLOW)
+        problems.append(f"pipelines with no current snapshot: {unknown}")
+    adapters = (results["timeline_adapter_health"] or [{}])[0]
+    if int(adapters.get("unknown") or 0):
+        grades.append(YELLOW)
+        problems.append(f"{adapters['unknown']} timeline adapters unknown")
+
+    def causes(row: dict) -> list[str]:
+        value = row.get("cause_pipelines") or []
+        if isinstance(value, str):
+            value = [part for part in value.strip("{}").split(",") if part]
+        return list(value)
+
+    unexplained = sorted(
+        r["view_name"] for r in results["mart_view_health"] or []
+        if r.get("status") not in ("ok", "manual", "no_data", "unknown")
+        and r.get("probe_status") in ("ok", "empty", "skipped_expensive")
+        and not causes(r)
+    )
+    if unexplained:
+        grades.append(YELLOW)
+        problems.append(f"marts not ok with no named cause: {unexplained}")
+
+    down = {r["pipeline"]: r["status"] for r in pipelines if r.get("status") not in ("ok", "manual", "unknown")}
+    evidence = (
+        f"{len(pipelines)} pipelines, {results['table_freshness'][0]['n']} tables, "
+        f"{adapters.get('n', 0)} adapters, {results['collation_health'][0]['n']} collation rows readable"
+        f"; {'; '.join(problems) if problems else 'every non-ok mart names its cause'}"
+        f"; current state (graded by C11/S1-S3, not here): {down or 'all ok'}"
+    )
+    return Verdict("C7", title, worst(grades), evidence)
 
 
 def c8_search_quality() -> Verdict:
