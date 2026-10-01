@@ -2703,3 +2703,25 @@ def test_an_unusable_slack_change_feed_reads_attention_on_the_slack_row(warehous
         "SELECT status FROM @marts_pipeline_health WHERE pipeline = 'slack'"
     )[0]
     assert row["status"] != "attention", "the hour of grace must not colour the row"
+
+
+def test_no_pipeline_declares_an_interval_the_collector_cannot_observe():
+    """Freshness is a fact captured by the ten-minute collector and judged
+    against now(), so a snapshot ages by up to one collector interval before
+    the next one. A run SLA of one minute (late at two) therefore read `late`
+    or `stale` between almost every pair of snapshots: timeline_notifications
+    flapped like that while its worker stamped last_run_at every five seconds
+    (2026-09-30). An interval shorter than the collector's cadence is not a
+    stricter check, it is a false alarm."""
+    from personal_data_warehouse.defs.pipeline_health import PIPELINE_HEALTH_CRON
+    from personal_data_warehouse.pipeline_health import LATE_MULTIPLIER, PIPELINES
+
+    assert PIPELINE_HEALTH_CRON == "*/10 * * * *"
+    collector = timedelta(minutes=10)
+    too_tight = {
+        pipeline.id: interval
+        for pipeline in PIPELINES
+        for interval in (pipeline.expected_run_interval, pipeline.expected_data_interval)
+        if interval is not None and interval * LATE_MULTIPLIER <= collector
+    }
+    assert too_tight == {}, too_tight

@@ -1177,7 +1177,11 @@ PIPELINES: tuple[Pipeline, ...] = (
     Pipeline(
         id="timeline_notifications", label="Timeline notifications", kind="internal",
         cadence="every 5 seconds", transport="transactional timeline outbox → app push worker",
-        expected_data_interval=None, expected_run_interval=MINUTE,
+        # The worker stamps last_run_at every five seconds, but the collector
+        # reads it every ten minutes; a one-minute SLA read late or stale
+        # between nearly every pair of snapshots (2026-09-30). Ten minutes is
+        # the shortest interval the collector can honestly judge.
+        expected_data_interval=None, expected_run_interval=10 * MINUTE,
         state=StateSource(table="notification_state", updated_column="last_run_at",
                           status_column="status", error_column="error"),
         note="optional experiment; marts_ops.notification_health distinguishes paused from stale",
