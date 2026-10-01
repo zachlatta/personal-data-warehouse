@@ -2585,6 +2585,14 @@ PGBACKREST_HEALTH_COLUMNS = (
     "last_restore_label",
     "last_restore_rows",
     "last_restore_note",
+    # Retention, apart from the backup. The loop runs `expire` as its own
+    # command since 2026-10-01: a failed expire leaves every backup valid but
+    # stops the repository shrinking, and on the SFTP Recycle Bin it failed on
+    # every run for a month while this row read ok (2.3 TiB, ~8 days of history
+    # behind a 4-full policy). The epoch means no expire has been recorded.
+    "last_expire_at",
+    "last_expire_ok",
+    "last_expire_error",
 )
 
 

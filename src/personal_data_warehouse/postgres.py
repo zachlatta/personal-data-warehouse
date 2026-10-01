@@ -2447,6 +2447,7 @@ TIMESTAMP_COLUMNS = {
     "embedded_at",
     # receipts: the last transaction research attempt drives its retry window
     "last_attempt_at",
+    "last_expire_at",
     # slack file fingerprints: when the backoff lets this file be retried.
     # Every warehouse column is NOT NULL, so a terminal row carries the epoch
     # sentinel rather than NULL ("no retry scheduled").
@@ -2603,6 +2604,7 @@ INTEGER_COLUMNS = {
     "archived_count",
     "failed_count",
     "last_attempt_ok",
+    "last_expire_ok",
     "configured",
     "pgvector_available",
     "timeline_max_seq",
@@ -5252,7 +5254,10 @@ class PostgresWarehouse:
                         AS last_restore_verified_at,
                     NULLIF(last_restore_label, '') AS last_restore_label,
                     last_restore_rows,
-                    NULLIF(last_restore_note, '') AS last_restore_note
+                    NULLIF(last_restore_note, '') AS last_restore_note,
+                    NULLIF(last_expire_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_expire_at,
+                    last_expire_ok,
+                    NULLIF(last_expire_error, '') AS last_expire_error
                 FROM @pgbackrest_health
             )
             SELECT
@@ -5293,6 +5298,11 @@ class PostgresWarehouse:
                     -- The loop is failing while an older good backup still
                     -- stands: not an outage yet, but the clock is running.
                     WHEN last_attempt_ok = 0 THEN 'attention'
+                    -- Retention failing: every backup is valid, but the
+                    -- repository grows without bound and the policy is not
+                    -- what is on disk -- 2.3 TiB and ~8 days of history on
+                    -- 2026-09-28 behind a 4-full policy, with this row ok.
+                    WHEN last_expire_at IS NOT NULL AND last_expire_ok = 0 THEN 'attention'
                     -- A backup nobody has restored is a hypothesis. The drill
                     -- is recorded here by hand (pgbackrest_restore_drill), so
                     -- an old or missing record is the row saying "unverified",
@@ -5338,7 +5348,14 @@ class PostgresWarehouse:
                 last_error,
                 collected_at,
                 EXTRACT(EPOCH FROM now() - last_full_at)::bigint AS full_age_seconds,
-                EXTRACT(EPOCH FROM now() - collected_at)::bigint AS snapshot_age_seconds
+                EXTRACT(EPOCH FROM now() - collected_at)::bigint AS snapshot_age_seconds,
+                CASE
+                    WHEN last_expire_at IS NULL THEN 'unknown'
+                    WHEN last_expire_ok = 0 THEN 'failing'
+                    ELSE 'ok'
+                END AS expire_status,
+                last_expire_at,
+                last_expire_error
             FROM measured
             """,
         )

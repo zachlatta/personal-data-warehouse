@@ -2125,6 +2125,25 @@ def test_a_healthy_repository_reads_ok(warehouse):
     assert warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]["status"] == "ok"
 
 
+def test_a_failing_retention_is_attention_even_when_every_backup_succeeds(warehouse):
+    """Expire failing means the repository grows without bound and the
+    retention policy is not what is on disk: 2.3 TiB and ~8 days of history
+    on 2026-09-28 while this row read ok."""
+
+    warehouse.ensure_pipeline_health_tables()
+    _backup_row(
+        warehouse,
+        last_expire_at="now() - interval '2 hours'",
+        last_expire_ok=0,
+        last_expire_error="'expire failed: [104]'",
+    )
+    warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="20260826-120000F", rows=1, note="")
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["status"] == "attention", row["status"]
+    assert row["expire_status"] == "failing"
+    assert row["last_expire_error"] == "expire failed: [104]"
+
+
 def test_a_failing_loop_with_an_older_good_backup_is_attention_not_ok(warehouse):
     """Distinct from "no backup": the clock is running but the floor still holds."""
 

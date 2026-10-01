@@ -82,8 +82,15 @@ has_backup() {
 # It is deliberately best-effort: a reporting failure must never abort or fail
 # a backup. Losing the signal is bad; losing the backup because the signal
 # broke would be absurd.
+# Arguments: attempt_type attempt_ok attempt_error [expire_ok expire_error].
+# An empty attempt_type means "no backup attempt in this report" and an empty
+# expire_ok "no expire in this report": the row then KEEPS the last recorded
+# attempt and expire. Until 2026-10-01 every cycle closed with
+# `report_health "" 1 ""`, which overwrote a failed attempt with ok a second
+# after run_backup recorded it, so the row could never show a failed backup.
 report_health() {
   local attempt_type="${1:-}" attempt_ok="${2:-1}" attempt_error="${3:-}"
+  local expire_ok="${4:-}" expire_error="${5:-}"
   if ! bool_enabled "${PDW_PGBACKREST_HEALTH_REPORT_ENABLED:-true}"; then
     return 0
   fi
@@ -124,7 +131,9 @@ report_health() {
     -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" \
     -v stanza="$stanza" -v info="$info" -v wal_ready="$wal_ready_count" \
     -v attempt_type="${attempt_type:-}" -v attempt_ok="${attempt_ok:-1}" \
-    -v attempt_error="${attempt_error:-}" >/dev/null 2>&1 <<'SQLEOF' || log "health report failed (backup itself unaffected)"
+    -v attempt_error="${attempt_error:-}" \
+    -v expire_ok="${expire_ok:-}" -v expire_error="${expire_error:-}" \
+    >/dev/null 2>&1 <<'SQLEOF' || log "health report failed (backup itself unaffected)"
 WITH doc AS (
     SELECT NULLIF(:'info', '')::jsonb AS j
 ), entry AS (
@@ -153,7 +162,8 @@ INSERT INTO ops.pgbackrest_health AS t (
     last_full_at, last_diff_at, last_incr_at,
     last_backup_label, last_backup_type, backup_count, repo_bytes,
     wal_min, wal_max, wal_ready_count, archived_count, failed_count, last_archived_at,
-    last_attempt_at, last_attempt_type, last_attempt_ok, last_error, collected_at)
+    last_attempt_at, last_attempt_type, last_attempt_ok, last_error, collected_at,
+    last_expire_at, last_expire_ok, last_expire_error)
 SELECT
     :'stanza',
     CASE
@@ -179,7 +189,9 @@ SELECT
     NULLIF(:'wal_ready','')::bigint,
     COALESCE(a.archived_count, 0), COALESCE(a.failed_count, 0),
     COALESCE(a.last_archived_time, '1970-01-01 00:00:00+00'::timestamptz),
-    now(), :'attempt_type', NULLIF(:'attempt_ok','')::bigint, :'attempt_error', now()
+    now(), :'attempt_type', NULLIF(:'attempt_ok','')::bigint, :'attempt_error', now(),
+    CASE WHEN :'expire_ok' = '' THEN '1970-01-01 00:00:00+00'::timestamptz ELSE now() END,
+    COALESCE(NULLIF(:'expire_ok','')::bigint, 1), :'expire_error'
 FROM (SELECT archived_count, failed_count, last_archived_time FROM pg_stat_archiver) a
 ON CONFLICT (stanza) DO UPDATE SET
     repo_status = EXCLUDED.repo_status, repo_message = EXCLUDED.repo_message,
@@ -189,9 +201,15 @@ ON CONFLICT (stanza) DO UPDATE SET
     repo_bytes = EXCLUDED.repo_bytes, wal_min = EXCLUDED.wal_min, wal_max = EXCLUDED.wal_max,
     wal_ready_count = EXCLUDED.wal_ready_count,
     archived_count = EXCLUDED.archived_count, failed_count = EXCLUDED.failed_count,
-    last_archived_at = EXCLUDED.last_archived_at, last_attempt_at = EXCLUDED.last_attempt_at,
-    last_attempt_type = EXCLUDED.last_attempt_type, last_attempt_ok = EXCLUDED.last_attempt_ok,
-    last_error = EXCLUDED.last_error, collected_at = EXCLUDED.collected_at
+    last_archived_at = EXCLUDED.last_archived_at,
+    last_attempt_at = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_at ELSE EXCLUDED.last_attempt_at END,
+    last_attempt_type = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_type ELSE EXCLUDED.last_attempt_type END,
+    last_attempt_ok = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_ok ELSE EXCLUDED.last_attempt_ok END,
+    last_error = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_error ELSE EXCLUDED.last_error END,
+    last_expire_at = CASE WHEN :'expire_ok' = '' THEN t.last_expire_at ELSE EXCLUDED.last_expire_at END,
+    last_expire_ok = CASE WHEN :'expire_ok' = '' THEN t.last_expire_ok ELSE EXCLUDED.last_expire_ok END,
+    last_expire_error = CASE WHEN :'expire_ok' = '' THEN t.last_expire_error ELSE EXCLUDED.last_expire_error END,
+    collected_at = EXCLUDED.collected_at
 SQLEOF
 }
 
@@ -202,7 +220,11 @@ run_backup() {
   # Capture the output so a LOCK collision can be told apart from a real
   # failure. pgBackRest exits non-zero for both, and they are opposite facts:
   # "another backup is already running" means backups are working.
-  output="$(run_pgbackrest --type="$type" backup 2>&1)"
+  # --no-expire-auto: retention runs as its own command (run_expire). By
+  # default pgBackRest expires after every backup and a failed expire fails
+  # the backup; on the SFTP repository's Recycle Bin that was every run, so
+  # the Sunday full was never marked done and repeated 2-3 times a week.
+  output="$(run_pgbackrest --type="$type" --no-expire-auto backup 2>&1)"
   status=$?
   printf '%s\n' "$output"
   if [ "$status" -ne 0 ]; then
@@ -225,6 +247,31 @@ run_backup() {
   fi
   log "completed ${type} backup"
   report_health "$type" 1 ""
+}
+
+# Retention, recorded as its own fact. A failed expire leaves every backup
+# valid -- the repository simply stops shrinking and the policy stops being
+# what is on disk -- so it is reported beside the attempt, never as it.
+run_expire() {
+  local output status
+  output="$(run_pgbackrest expire 2>&1)"
+  status=$?
+  printf '%s\n' "$output"
+  if [ "$status" -ne 0 ]; then
+    case "$output" in
+      *"unable to acquire lock"*)
+        log "expire skipped: another pgBackRest operation holds the lock"
+        return 0
+        ;;
+    esac
+    local reason
+    reason="$(printf '%s\n' "$output" | grep -m1 'ERROR' | cut -c1-300)"
+    log "expire failed: ${reason:-exit $status}"
+    report_health "" 1 "" 0 "expire failed: ${reason:-exit $status}"
+    return 1
+  fi
+  log "completed expire"
+  report_health "" 1 "" 1 ""
 }
 
 backup_state_dir() {
@@ -309,6 +356,7 @@ main() {
     if run_backup full; then
       mark_backup_type_done full
     fi
+    run_expire || log "retention did not complete; backups are unaffected"
   fi
 
   local interval="${PDW_PGBACKREST_BACKUP_INTERVAL_SECONDS:-21600}"
@@ -323,6 +371,7 @@ main() {
     if run_backup "$type"; then
       mark_backup_type_done "$type"
     fi
+    run_expire || log "retention did not complete; backups are unaffected"
     # And once more per cycle regardless, so `collected_at` keeps moving and the
     # view can tell "no backup yet" from "nobody has looked in three days".
     report_health "" 1 ""

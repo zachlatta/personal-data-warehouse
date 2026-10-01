@@ -368,3 +368,48 @@ def test_the_postgres_image_is_published_for_both_amd64_and_arm64() -> None:
     platforms_lines = [line.strip() for line in workflow.splitlines() if line.strip().startswith("platforms:")]
     assert platforms_lines == ["platforms: linux/amd64,linux/arm64"]
     assert "docker/setup-qemu-action" in workflow, "a multi-arch build on the amd64 builder needs QEMU binfmt"
+
+
+def test_expire_runs_apart_from_the_backup_so_a_retention_failure_cannot_fail_it() -> None:
+    """pgBackRest runs expire after every backup by default, and a failed expire
+    fails the backup. Since the SFTP cutover the repository's Recycle Bin made
+    expire abort with exception 104 on every run, so every backup "failed",
+    the loop never marked the Sunday full done, and it took 2-3 fulls every
+    Sunday (sysadmin slowking/2026-09-28-backup-health.md) -- leaving ~8 days
+    of recovery history behind a 4-full retention policy."""
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    backup_call = next(line for line in loop.splitlines() if "backup 2>&1" in line and "run_pgbackrest" in line)
+    assert "--no-expire-auto" in backup_call, backup_call
+    assert "run_pgbackrest expire" in loop, "retention must still run, as its own command"
+    cycle = loop[loop.index("while true; do"):]
+    assert cycle.index("run_expire") > cycle.index('if run_backup "$type"'), (
+        "expire runs after the backup and never decides whether the backup succeeded"
+    )
+
+
+def test_a_cycle_end_report_does_not_erase_the_attempt_it_follows() -> None:
+    """run_backup recorded a failure, then the same cycle's closing
+    `report_health "" 1 ""` overwrote last_attempt_ok with 1 a second later, so
+    marts_ops.pgbackrest_health could never show a failed backup. An empty
+    attempt type means "no attempt in this report", which must keep the last
+    recorded attempt -- and the last recorded expire -- as they were."""
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    for column in ("last_attempt_at", "last_attempt_type", "last_attempt_ok", "last_error"):
+        assert (
+            f"{column} = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.{column} "
+            f"ELSE EXCLUDED.{column} END"
+        ) in loop, column
+    for column in ("last_expire_at", "last_expire_ok", "last_expire_error"):
+        assert (
+            f"{column} = CASE WHEN :'expire_ok' = '' THEN t.{column} ELSE EXCLUDED.{column} END"
+        ) in loop, column
+
+
+def test_expire_result_columns_are_in_the_reconciled_spec() -> None:
+    from personal_data_warehouse.postgres import POSTGRES_TABLES
+
+    columns = POSTGRES_TABLES["pgbackrest_health"].columns
+    for column in ("last_expire_at", "last_expire_ok", "last_expire_error"):
+        assert column in columns
