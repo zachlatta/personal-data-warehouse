@@ -215,6 +215,14 @@ SEARCH_TEXT_PREVIEW_CHARS = 8000
 # broad search_text() call. Beyond this prefix the preview falls back to the
 # head cut, which is what it would have shown anyway before windowing.
 SEARCH_TEXT_PREVIEW_SCAN_CHARS = 200_000
+#: The broad path ranks its floor and fill candidates with the bm25 operator,
+#: which re-tokenizes the document it is given. A 5 MB Drive file cost 620ms
+#: to score (measured 2026-09-30, production), and a one-word search spent
+#: 1.86s of a 3.8s leg scoring three of them that did not make the top 10. A
+#: candidate larger than this many bytes is scored on its first this-many
+#: characters: the same prefix the retrieval chunks embed and the preview
+#: windows, so no part of search reads past it except the BM25 index itself.
+SEARCH_TEXT_SCORE_SCAN_CHARS = SEARCH_TEXT_PREVIEW_SCAN_CHARS
 # search_text() still runs one timeline branch per coarse source. Even though
 # those branches share one BM25 corpus, a single flat `ORDER BY score LIMIT n`
 # would let high-volume sources (gmail/slack) crowd out one matching contact card
@@ -13660,18 +13668,28 @@ class PostgresWarehouse:
         # through: the two partitions are two BM25 corpora with their own
         # statistics, so a low-volume row scored against the global index is
         # not the number the merge was built on.
+        # octet_length reads the stored size without detoasting; left() of a
+        # compressed value decompresses only the slice it returns.
+        broad_candidate_prefix_scored_sql = (
+            f"(octet_length(t.search_text) > {SEARCH_TEXT_SCORE_SCAN_CHARS})"
+        )
+        broad_candidate_scored_text_sql = (
+            f"(CASE WHEN {broad_candidate_prefix_scored_sql} "
+            f"THEN left(t.search_text, {SEARCH_TEXT_SCORE_SCAN_CHARS}) "
+            "ELSE t.search_text END)"
+        )
         broad_candidate_score_sql = (
             f"CASE WHEN c.part = {SEARCH_TEXT_POOL_PART_HIGH_VOLUME} "
-            "THEN (t.search_text <@> "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
             "to_bm25query(query, 'timeline_events_search_text_bm25_idx'))::real "
             f"WHEN c.part = {SEARCH_TEXT_POOL_PART_LOW_VOLUME} "
-            "THEN (t.search_text <@> "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
             "to_bm25query(query, 'timeline_events_search_text_bm25_lowvol_idx'))::real "
             f"WHEN c.part = {SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME} "
-            "THEN (t.search_text <@> "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
             "to_bm25query(query, 'timeline_events_search_text_bm25_attention_idx'))::real "
             f"WHEN c.part = {SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME} "
-            "THEN (t.search_text <@> "
+            f"THEN ({broad_candidate_scored_text_sql} <@> "
             "to_bm25query(query, "
             "'timeline_events_search_text_bm25_attention_lowvol_idx'))::real "
             # Deliberately no ELSE: every partition names itself. A catch-all
@@ -14052,37 +14070,47 @@ class PostgresWarehouse:
                             UNION ALL
                             SELECT adapter, event_id, source, part, src_rank FROM broad_fill
                         ),
-                        -- One heap visit per candidate: the score and the
-                        -- windowed preview both read the same document, so
-                        -- doing them in one join detoasts it once. A pooled row
-                        -- always carries a matching (negative) score -- a BM25
-                        -- index scan only emits documents that contain a query
-                        -- term -- so this filter is a guard, not the merge.
+                        -- A pooled row always carries a matching (negative)
+                        -- score -- a BM25 index scan only emits documents that
+                        -- contain a query term -- so `score < 0` is a guard,
+                        -- not the merge. The one exception is a document too
+                        -- big to score whole: its prefix can miss a match the
+                        -- index saw, and it is kept, ranked after every scored
+                        -- candidate, rather than silently dropped.
                         broad_scored AS (
-                            SELECT c.source AS source,
-                                   """ + pool_subsource_case + r""" AS subsource,
-                                   t.context AS context, t.actor AS who,
-                                   t.event_ts AS occurred_at,
-                                   COALESCE(t.source_pk->>'account',
-                                            t.metadata->>'account', '') AS account,
-                                   t.adapter || ':' || t.event_id AS ref,
-                                   """ + preview_fn_sql + r"""(t.search_text, query) AS text,
+                            SELECT c.adapter, c.event_id, c.source,
                                    """ + broad_candidate_score_sql + r""" AS score,
-                                   t.title AS title, t.source_table AS source_table,
-                                   t.source_pk AS source_pk, t.priority::text AS priority,
+                                   """ + broad_candidate_prefix_scored_sql + r""" AS prefix_scored,
                                    c.src_rank AS src_rank
                             FROM broad_candidates c
                             JOIN @timeline_events t
                               ON t.adapter = c.adapter AND t.event_id = c.event_id
+                        ),
+                        broad_top AS (
+                            SELECT s.* FROM broad_scored s
+                            WHERE s.score < 0 OR (s.prefix_scored AND s.score = 0)
+                            ORDER BY (s.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
+                                     (s.score = 0) ASC, s.score ASC
+                            LIMIT per_source
                         )
-                        SELECT s.source, s.subsource, s.context, s.who, s.occurred_at,
-                               s.account, s.ref, s.text, s.score, s.occurred_at,
-                               s.title, s.source_table, s.source_pk, s.priority
-                        FROM broad_scored s
-                        WHERE s.score < 0
-                        ORDER BY (s.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
-                                 s.score ASC
-                        LIMIT per_source;
+                        -- The preview is windowed only for the rows returned:
+                        -- one more heap visit per returned row, against a
+                        -- multi-megabyte window for every candidate.
+                        SELECT c.source,
+                               """ + pool_subsource_case + r""" AS subsource,
+                               t.context, t.actor, t.event_ts,
+                               COALESCE(t.source_pk->>'account',
+                                        t.metadata->>'account', ''),
+                               t.adapter || ':' || t.event_id,
+                               """ + preview_fn_sql + r"""(t.search_text, query),
+                               CASE WHEN c.score = 0 THEN (-1e-9)::real ELSE c.score END,
+                               t.event_ts,
+                               t.title, t.source_table, t.source_pk, t.priority::text
+                        FROM broad_top c
+                        JOIN @timeline_events t
+                          ON t.adapter = c.adapter AND t.event_id = c.event_id
+                        ORDER BY (c.src_rank > """ + str(SEARCH_TEXT_SOURCE_FLOOR) + r""") ASC,
+                                 (c.score = 0) ASC, c.score ASC;
                     RETURN;
                 END IF;
 """

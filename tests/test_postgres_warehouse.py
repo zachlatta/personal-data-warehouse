@@ -3959,6 +3959,48 @@ def test_search_text_caps_hit_text_to_preview(warehouse: PostgresWarehouse) -> N
     assert len(by_ref[short_ref]) < SEARCH_TEXT_PREVIEW_CHARS
 
 
+def test_search_text_broad_path_keeps_a_huge_document_whose_match_is_past_the_scored_prefix(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Scoring a bounded prefix must never drop a document the index matched.
+
+    A huge document is scored on its first SEARCH_TEXT_SCORE_SCAN_CHARS. When
+    its only match lies beyond that prefix the prefix scores zero, and the
+    `score < 0` guard would silently drop a real hit; it ranks last instead.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+
+    created_at = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    cap = postgres_module.SEARCH_TEXT_SCORE_SCAN_CHARS
+    huge_body = ("padding " * (cap // 8 + 10)) + "quokkaterm appears late"
+    assert huge_body.index("quokkaterm") > cap
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1", message_ts="400.1", message_datetime=created_at, text=huge_body,
+            ),
+            _slack_message_row(
+                conversation_id="C1", message_ts="400.2", message_datetime=created_at,
+                text="quokkaterm in a short note",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    refs = [row[0] for row in warehouse._query("SELECT ref FROM @search_text('quokkaterm', 50)")]
+    assert any(ref.endswith("400.1") for ref in refs), refs
+    assert refs[0].endswith("400.2"), "the fully scored short note must outrank the prefix-scored giant"
+
+
 def test_search_text_low_volume_source_survives_high_volume_source(warehouse: PostgresWarehouse) -> None:
     # A low-volume source (one matching contact card) must surface in a bare
     # cross-source search even when a high-volume source (many slack hits) would
@@ -6618,6 +6660,42 @@ def test_search_text_broad_pool_previews_only_the_returned_rows() -> None:
         "the broad path must window previews after the per-source floor merge, "
         "not for every pooled candidate"
     )
+
+
+def test_search_text_broad_path_windows_previews_only_for_the_rows_it_returns() -> None:
+    """Preview after the LIMIT, not for every floor and fill candidate.
+
+    Measured 2026-09-30 on production: a one-word search ("Sonoma") pooled
+    18 floor candidates, three of them 5 MB Drive documents that did not make
+    the top 10. Windowing their previews cost 170ms of a 3.8s leg; the rows
+    that are returned are the only ones whose preview anybody reads.
+    """
+    sql = _search_text_function_sql()
+    broad = sql[sql.index("WITH broad_ranked"):]
+    broad = broad[: broad.index("RETURN;")]
+    limit_at = broad.index("LIMIT per_source")
+    assert broad.index("search_text_preview") > limit_at, (
+        "the broad path must window previews only for the rows that survive "
+        "LIMIT per_source"
+    )
+
+
+def test_search_text_broad_candidates_score_a_bounded_prefix_of_huge_documents() -> None:
+    """Scoring re-tokenizes the document, and a 5 MB Drive file cost 620ms.
+
+    The same 2026-09-30 one-word search spent 1.86s scoring three 5 MB Drive
+    candidates. Retrieval chunks and previews already read only the first
+    SEARCH_TEXT_SCORE_SCAN_CHARS; scoring the same prefix bounds the cost per
+    candidate, and the size test reads octet_length, which does not detoast.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    sql = _search_text_function_sql()
+    broad = sql[sql.index("WITH broad_ranked"):]
+    cap = postgres_module.SEARCH_TEXT_SCORE_SCAN_CHARS
+    assert cap == postgres_module.SEARCH_TEXT_PREVIEW_SCAN_CHARS
+    assert f"octet_length(t.search_text) > {cap}" in broad
+    assert f"left(t.search_text, {cap})" in broad
 
 
 def test_search_text_broad_pool_ranks_by_scan_ordinal_not_a_per_row_rescore() -> None:
