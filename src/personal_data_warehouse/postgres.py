@@ -5096,7 +5096,7 @@ class PostgresWarehouse:
             classified AS (
                 SELECT
                     measured.*,
-                    input_health.input_status
+                    input_health.*
                 FROM measured
                 CROSS JOIN LATERAL (
                     -- Reuse the level-1 verdict for every DECLARED input. That
@@ -5128,7 +5128,20 @@ class PostgresWarehouse:
                         WHEN bool_or(upstream.status = 'manual') THEN 'manual'
                         WHEN bool_or(upstream.status = 'no_data') THEN 'no_data'
                         ELSE 'unknown'
-                    END AS input_status
+                    END AS input_status,
+                    -- Which declared inputs carry each non-ok verdict, so the
+                    -- row can name the one that coloured it (cause_pipelines).
+                    coalesce(array_agg(declared_input.pipeline ORDER BY declared_input.pipeline)
+                        FILTER (WHERE upstream.status = 'failing'), '{{}}') AS failing_inputs,
+                    coalesce(array_agg(declared_input.pipeline ORDER BY declared_input.pipeline)
+                        FILTER (WHERE upstream.status = 'attention'), '{{}}') AS attention_inputs,
+                    coalesce(array_agg(declared_input.pipeline ORDER BY declared_input.pipeline)
+                        FILTER (WHERE upstream.status = 'stale'), '{{}}') AS stale_inputs,
+                    coalesce(array_agg(declared_input.pipeline ORDER BY declared_input.pipeline)
+                        FILTER (WHERE upstream.status = 'late'), '{{}}') AS late_inputs,
+                    coalesce(array_agg(declared_input.pipeline ORDER BY declared_input.pipeline)
+                        FILTER (WHERE upstream.pipeline IS NULL
+                                   OR upstream.status = 'unknown'), '{{}}') AS unknown_inputs
                     FROM unnest(measured.input_pipelines)
                         AS declared_input(pipeline)
                     LEFT JOIN @marts_pipeline_health AS upstream
@@ -5184,7 +5197,19 @@ class PostgresWarehouse:
                     AS definition_age_seconds,
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
-                note
+                note,
+                -- The inputs responsible for input_status. stalest_pipeline is
+                -- the OLDEST input relative to its SLA and says nothing about
+                -- the verdict: on 2026-09-30 it named `pi` (ok) beside two
+                -- agent-session marts reading attention because of chatgpt.
+                CASE input_status
+                    WHEN 'failing' THEN failing_inputs
+                    WHEN 'attention' THEN attention_inputs
+                    WHEN 'stale' THEN stale_inputs
+                    WHEN 'late' THEN late_inputs
+                    WHEN 'unknown' THEN unknown_inputs
+                    ELSE '{{}}'::text[]
+                END AS cause_pipelines
             FROM classified
             """,
         )

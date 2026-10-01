@@ -1549,7 +1549,8 @@ def test_declared_upstream_failure_attention_and_recovery_reach_the_mart(warehou
             "SELECT status FROM @marts_pipeline_health WHERE pipeline = 'plaid'"
         )[0]
         mart_row = warehouse._query_dicts(
-            "SELECT status, input_status, probe_status, probe_detail, input_pipelines"
+            "SELECT status, input_status, probe_status, probe_detail, input_pipelines,"
+            " cause_pipelines"
             " FROM @marts_mart_view_health"
             " WHERE view_id = 'marts_finance_investment_holdings'"
         )[0]
@@ -1558,6 +1559,10 @@ def test_declared_upstream_failure_attention_and_recovery_reach_the_mart(warehou
     pipeline_row, mart_row = collect()
     assert pipeline_row["status"] == "failing"
     assert mart_row["input_pipelines"] == ["plaid"]
+    # The row names the input that coloured it. stalest_pipeline is the
+    # OLDEST input relative to its SLA, which on 2026-09-30 named an `ok`
+    # pipeline beside six marts reading attention because of a different one.
+    assert mart_row["cause_pipelines"] == ["plaid"]
     assert mart_row["input_status"] == "failing"
     assert mart_row["status"] == "failing"
     assert mart_row["probe_status"] == PROBE_OK
@@ -1582,6 +1587,7 @@ def test_declared_upstream_failure_attention_and_recovery_reach_the_mart(warehou
     assert pipeline_row["status"] == "ok"
     assert mart_row["input_status"] == "ok"
     assert mart_row["status"] == "ok"
+    assert mart_row["cause_pipelines"] == []
 
 
 def test_an_unrelated_failed_pipeline_does_not_colour_the_mart(warehouse):

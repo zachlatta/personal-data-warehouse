@@ -61,7 +61,7 @@ SELECT view_id, domain, view_schema, view_name, status, input_status, probe_stat
        probe_detail, probe_ms, has_rows, input_tables, input_pipelines, input_count, inputs_unmeasured,
        stalest_pipeline, stalest_pipeline_at, stalest_pipeline_age_seconds,
        stalest_pipeline_expected_seconds, definition_sha256, first_seen_at,
-       definition_age_seconds, collected_at, note
+       definition_age_seconds, collected_at, note, cause_pipelines
 FROM ` + warehouse.SQLRelation("marts_mart_view_health") + `
 ORDER BY view_schema, view_name`
 

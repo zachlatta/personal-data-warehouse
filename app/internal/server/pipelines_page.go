@@ -687,9 +687,22 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
           "sha256 " + (m.definition_sha256 || "").slice(0, 12) +
           " — a redefinition that drops a source table changes no rows, only this", true]
       ],
-      m.probe_status && m.probe_status !== "ok" && m.probe_status !== "empty"
-        ? "probe " + m.probe_status.replace(/_/g, " ") + (m.probe_detail ? ": " + m.probe_detail : "")
-        : "");
+      martDetail(m));
+  }
+
+  // Which input coloured the row. stalest_pipeline is only the oldest input
+  // relative to its SLA; cause_pipelines names the ones whose status IS the
+  // mart's input status.
+  function martDetail(m) {
+    var parts = [];
+    var causes = list(m.cause_pipelines);
+    if (causes.length && m.input_status && m.input_status !== "ok") {
+      parts.push(m.input_status.replace(/_/g, " ") + " because of " + causes.join(", "));
+    }
+    if (m.probe_status && m.probe_status !== "ok" && m.probe_status !== "empty") {
+      parts.push("probe " + m.probe_status.replace(/_/g, " ") + (m.probe_detail ? ": " + m.probe_detail : ""));
+    }
+    return parts.join(" · ");
   }
 
   function adapterNode(a) {

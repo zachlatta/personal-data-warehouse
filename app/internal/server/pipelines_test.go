@@ -577,3 +577,16 @@ func TestPipelinesPageTreatsPausedAsIntentional(t *testing.T) {
 		}
 	}
 }
+
+// A mart's colour comes from its worst input, and the row has to say which
+// one: stalest_pipeline is the oldest input relative to its SLA, and on
+// 2026-09-30 it named an `ok` pipeline beside two marts reading attention
+// because of a different one.
+func TestPipelinesPageNamesTheInputThatColouredAMart(t *testing.T) {
+	if !strings.Contains(pipelineMartHealthSQL, "cause_pipelines") {
+		t.Fatalf("the marts query must read cause_pipelines")
+	}
+	if !strings.Contains(pipelinesPageHTML, "m.cause_pipelines") || !strings.Contains(pipelinesPageHTML, "because of") {
+		t.Fatalf("the page must render the inputs responsible for a mart's status")
+	}
+}
