@@ -345,6 +345,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		fmt.Fprintln(stderr, "pdw:", err)
 		return 2
 	}
+	client.SetTraceID(resolveTraceID(getenv))
 
 	switch cmd {
 	case "list":

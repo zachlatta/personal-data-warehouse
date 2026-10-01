@@ -442,7 +442,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		Logger:       slog.Default().With("component", "mcp_streamable"),
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
-	mux.Handle("/mcp", protected)
+	mux.Handle("/mcp", mcpproxy.TraceMiddleware(protected))
 
 	apiHandler := api.NewDynamicHandler(func(ctx context.Context) (*tool.Registry, error) {
 		current, err := snapshot(ctx)
@@ -452,8 +452,9 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		return current.Filter(toolShowsOnCLI), nil
 	}, slog.Default())
 	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
-	mux.Handle("/api/tools", apiProtected)
-	mux.Handle("/api/tools/", apiProtected)
+	apiTraced := mcpproxy.TraceMiddleware(apiProtected)
+	mux.Handle("/api/tools", apiTraced)
+	mux.Handle("/api/tools/", apiTraced)
 
 	// Unified timeline: JSON API + browser page. The endpoints need
 	// parameterized queries, so they register only when the runner supports

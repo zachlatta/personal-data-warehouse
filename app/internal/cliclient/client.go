@@ -20,6 +20,7 @@ type Client struct {
 	baseURL    string
 	clientName string
 	token      string
+	traceID    string
 	http       *http.Client
 }
 
@@ -84,6 +85,13 @@ func (c *Client) SetHTTPClient(h *http.Client) {
 	if h != nil {
 		c.http = h
 	}
+}
+
+// SetTraceID names the agent session this client's calls belong to. It is
+// sent as X-Trace-ID, and the server forwards it to proxied MCP connections so
+// an upstream (the skills service) can group one session's calls.
+func (c *Client) SetTraceID(id string) {
+	c.traceID = id
 }
 
 // ListTools fetches GET /api/tools.
@@ -158,6 +166,9 @@ func (c *Client) CallTool(ctx context.Context, name string, input json.RawMessag
 
 func (c *Client) authorize(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+c.clientName+":"+c.token)
+	if c.traceID != "" {
+		req.Header.Set("X-Trace-ID", c.traceID)
+	}
 }
 
 func decodeAPIError(status int, body []byte) error {

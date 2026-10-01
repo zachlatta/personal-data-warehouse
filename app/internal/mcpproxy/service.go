@@ -78,6 +78,9 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if t.token != "" {
 		copy.Header.Set("Authorization", "Bearer "+t.token)
 	}
+	if id := TraceIDFromContext(r.Context()); id != "" {
+		copy.Header.Set(TraceHeader, id)
+	}
 	return t.base.RoundTrip(copy)
 }
 func (s *Service) authorizedClient(ctx context.Context, c *record) (*http.Client, error) {
