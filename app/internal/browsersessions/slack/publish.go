@@ -166,8 +166,11 @@ func defaultDeps(getenv func(string) string, cfg ingestclient.Config, stdin io.R
 // Instructions is what a person at a terminal needs to produce the paste.
 var Instructions = `Publish a Slack web session for the warehouse's change feed and Slack writes.
 
-1. In a browser, open https://app.slack.com and sign in to Hack Club. Use a
-   browser profile you leave signed in: signing out there ends this session.
+1. Open a new private (incognito) window, go to https://app.slack.com and sign
+   in to Hack Club there. This session must be used by nothing but the
+   warehouse: every sign-out-everywhere Slack applied in September was a
+   session it knew as the desktop app suddenly used by another client. When
+   you are done, close the window -- do not sign out, which ends the session.
 2. Open DevTools (Cmd-Opt-J in Chrome). If the console refuses pastes, type
    "allow pasting" first. Paste this and press Enter; it copies one line of
    JSON to the clipboard:

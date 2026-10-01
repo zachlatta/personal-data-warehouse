@@ -349,9 +349,21 @@ mew-coolify with Python's TLS fingerprint. Slack has not flagged that shape, but
 barely been exercised: the session died with each reset. If `slack.audit_logs` ever shows
 `unexpected_scraping` without a manual publish beside it, the server is the cause, and the
 fix is to stop spending a login at all (official user-token scopes for sends and mark-read,
-the Events API for "what changed"), not to disguise the requests better. Keep the browser
-profile the session came from signed in: signing out there ends the session, and the
-change-feed verdict goes `action_required` within the hour.
+the Events API for "what changed"), not to disguise the requests better.
+
+**Mint the session in a private window used for nothing else, then close it without
+signing out.** All six `unexpected_scraping` anomalies from 2026-09-20 to 09-29 in
+`slack.audit_logs` (the Hack Club warehouse) carry `scraping_tool: Go-based tool` and a
+`previous_ua` of the Slack desktop app: a session Slack knew as the desktop client suddenly
+used by another one. The Python server spent those same desktop sessions for months and was
+never flagged. A session whose whole history is the warehouse's has no other client to
+contradict. Signing out ends it, and the change-feed verdict goes `action_required` within
+the hour.
+
+**Since 2026-10-01 `client.counts` answers `team_is_restricted` to a fresh session** pasted
+this way, although `auth.test` accepts it as the right user and workspace, on every host and
+`slack_route` variant. It is Slack refusing the call, not a bad paste; re-pasting does not
+help, and adding browser headers is the disguise this section rules out.
 
 **Enterprise Grid is a live trap here.** Hack Club is an Enterprise Grid org, so a client
 session's `auth.test` returns the **org** id `E09V59WQY1E` where the app token returns the
