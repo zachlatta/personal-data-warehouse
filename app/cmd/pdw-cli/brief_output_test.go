@@ -75,22 +75,25 @@ func TestSearchRejectsUnknownFlagsAnywhereAndAcceptsLimit(t *testing.T) {
 
 func TestContextCommandNamesColumnsAndPrintsOneLinePerEvent(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"format":"json","total_rows":2,"rows":[{"adapter":"slack_message","event_id":"zrl|T|C|1.0","priority":"direct","event_ts":"2026-08-13T15:38:16.040079Z","actor":"sam","title":"","snippet":"fallout postcards? magazines and t-shirt?"},{"adapter":"slack_message","event_id":"zrl|T|C|2.0","priority":"direct","event_ts":"2026-08-13T15:41:08Z","actor":"lee","title":"","snippet":"are these the mini magazines perhaps?"}]}}`)
+		_, _ = io.WriteString(w, `{"data":{"ref":"slack_message:zrl|T|C|1.0","before":2,"after":3,"total_rows":2,"rows":[{"adapter":"slack_message","event_id":"zrl|T|C|1.0","priority":"direct","event_ts":"2026-08-13T15:38:16.040079Z","actor":"sam","title":"","snippet":"fallout postcards? magazines and t-shirt?"},{"adapter":"slack_message","event_id":"zrl|T|C|2.0","priority":"direct","event_ts":"2026-08-13T15:41:08Z","actor":"lee","title":"","snippet":"are these the mini magazines perhaps?"}]}}`)
 	})
 	out, errOut, code := runCLI(t, srv.URL, "", "context", "slack_message:zrl|T|C|1.0", "--before", "2", "-a", "3")
 	if code != 0 || errOut != "" {
 		t.Fatalf("code=%d stderr=%q", code, errOut)
 	}
-	if srv.lastPath != "/api/tools/sql" {
-		t.Fatalf("context should run through the sql tool, got %s", srv.lastPath)
+	// One path on both surfaces: the CLI calls the same context tool MCP
+	// agents call, rather than composing timeline.context() SQL itself.
+	if srv.lastPath != "/api/tools/context" {
+		t.Fatalf("context should run through the context tool, got %s", srv.lastPath)
 	}
-	var input map[string]string
+	var input struct {
+		Ref    string `json:"ref"`
+		Before int    `json:"before"`
+		After  int    `json:"after"`
+	}
 	_ = json.Unmarshal(srv.lastBody, &input)
-	if input["sql"] != "SELECT adapter, event_id, priority, event_ts, actor, title, snippet FROM timeline.context('slack_message:zrl|T|C|1.0', 2, 3)" {
-		t.Fatalf("sql = %q", input["sql"])
-	}
-	if input["format"] != "json" {
-		t.Fatalf("format = %q", input["format"])
+	if input.Ref != "slack_message:zrl|T|C|1.0" || input.Before != 2 || input.After != 3 {
+		t.Fatalf("input = %#v", input)
 	}
 	want := "Context: slack_message:zrl|T|C|1.0 (2 before, 3 after) — 2 events\n2026-08-13 15:38 · direct · sam — fallout postcards? magazines and t-shirt?\n2026-08-13 15:41 · direct · lee — are these the mini magazines perhaps?\n"
 	if out != want {

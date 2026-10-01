@@ -158,7 +158,7 @@ func TestServerInstructionsCarryDiscoveryKeywords(t *testing.T) {
 }
 
 func TestServerInstructionsTellAgentsToSearchBeforeSchemaDiscovery(t *testing.T) {
-	for _, want := range []string{"text, topic, person", "search first", "no schema discovery", "timeline.context"} {
+	for _, want := range []string{"text, topic, person", "search first", "no schema discovery", "the context tool"} {
 		if !strings.Contains(strings.ToLower(serverInstructions), strings.ToLower(want)) {
 			t.Fatalf("serverInstructions missing %q: %s", want, serverInstructions)
 		}
@@ -490,18 +490,17 @@ func TestMCPServerExposesSchemaOverviewTool(t *testing.T) {
 	found := map[string]bool{}
 	for _, tool := range tools.Tools {
 		found[tool.Name] = true
-		// Tool descriptions are intentionally short and must point callers at the
-		// two-step discovery path: schema_overview for the relations, then
-		// describe_table for a relation's columns. Those two tools' own
-		// descriptions don't need the reminder.
+		// The query description points callers at describe_table for every
+		// relation they reference, and keeps schema_overview for a relation they
+		// cannot name -- the brief's rule, so the two surfaces teach one path.
 		if tool.Name == "query" {
-			if !strings.Contains(tool.Description, "Call schema_overview first") ||
-				!strings.Contains(tool.Description, "describe_table") {
-				t.Fatalf("%s description should point callers at schema_overview then describe_table: %q", tool.Name, tool.Description)
+			if !strings.Contains(tool.Description, "Call describe_table for each relation") ||
+				!strings.Contains(tool.Description, "schema_overview only to find a relation") {
+				t.Fatalf("%s description should point callers at describe_table, schema_overview only for discovery: %q", tool.Name, tool.Description)
 			}
 		}
 	}
-	for _, name := range []string{"readme", "query", "search", "schema_overview", "describe_table"} {
+	for _, name := range []string{"readme", "query", "search", "context", "schema_overview", "describe_table"} {
 		if !found[name] {
 			t.Fatalf("%s tool not listed: %#v", name, tools.Tools)
 		}

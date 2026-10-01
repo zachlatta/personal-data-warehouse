@@ -51,13 +51,9 @@ than paging deeper.
 Every hit carries `priority`, `ref`, `source_table` and `source_pk`. `source_table` is the
 catalog's logical id (`gmail_messages`, `slack_messages`), not a physical name;
 `source_pk` is the JSON primary key of the authoritative row. One hop reaches the raw
-record; usually the better hop is the conversation:
+record; usually the better hop is the conversation, read with {{if .CLI}}`pdw context '<ref>'`{{else}}the `context` tool, `{"ref": "<ref>"}`{{end}}.
 
-```sql
-SELECT * FROM timeline.context('<ref>', 5, 5);
-```
-
-`timeline.context(ref, before, after)` returns the hit's REAL conversation, chosen per
+It returns the hit's REAL conversation, chosen per
 source: a Gmail hit returns its thread, a Slack hit its thread when it is a reply or a
 parent with replies and otherwise the messages around it in that conversation, an
 iMessage or WhatsApp hit the rest of that chat, an agent turn the neighbouring turns of

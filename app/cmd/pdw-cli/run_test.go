@@ -1059,3 +1059,13 @@ func TestSearchCommandPrintsTheEffectiveScopeAndReturnedMix(t *testing.T) {
 		t.Fatalf("all-tier scope is not visible: code=%d stderr=%q stdout=%q", code, errOut, out)
 	}
 }
+
+func TestCallRedirectsContextToContextCommand(t *testing.T) {
+	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be hit through call context")
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "call", "context", "--data", `{"ref":"gmail_email:a|b"}`)
+	if code != 2 || !strings.Contains(errOut, "pdw context") {
+		t.Fatalf("call context must redirect to pdw context: code=%d %s", code, errOut)
+	}
+}

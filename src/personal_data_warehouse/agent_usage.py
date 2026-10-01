@@ -113,7 +113,7 @@ _KNOWN = "|".join(PDW_READ_SUBCOMMANDS + PDW_ADMIN_SUBCOMMANDS)
 CLI_INVENTED_RE = (
     _CLI_BEFORE + r"(?!(" + _KNOWN + r")" + _CLI_AFTER + r")[-a-z]"
     + "|"
-    + _cli_re("call") + r"(sql|query|search|schema_overview|describe_table)" + _CLI_AFTER
+    + _cli_re("call") + r"(sql|query|search|context|schema_overview|describe_table)" + _CLI_AFTER
 )
 CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")

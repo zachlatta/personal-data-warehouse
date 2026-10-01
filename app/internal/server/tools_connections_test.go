@@ -131,14 +131,16 @@ func TestMCPListsConnectionToolsBehindTwoToolsNotFlat(t *testing.T) {
 		t.Fatalf("upstream errors pass through as errors: %#v", result)
 	}
 
-	// The escape hatch restores the flat listing.
-	t.Setenv(connectionToolsEnv, "1")
-	flat := toolNames(t, connectMCP(t, registry))
-	if _, ok := flat["hcdw__list_columns"]; !ok {
-		t.Fatalf("%s=1 should list proxied tools flat", connectionToolsEnv)
+	// There is one way to reach a connected tool over MCP. The flat listing
+	// that PDW_MCP_LIST_CONNECTION_TOOLS=1 used to restore is gone (C9), and
+	// setting the variable changes nothing.
+	t.Setenv("PDW_MCP_LIST_CONNECTION_TOOLS", "1")
+	again := toolNames(t, connectMCP(t, registry))
+	if _, ok := again["hcdw__list_columns"]; ok {
+		t.Fatal("proxied tools must never be listed flat")
 	}
-	if _, ok := flat["connections"]; ok {
-		t.Fatal("the flat listing has no connections tool")
+	if _, ok := again["connections"]; !ok {
+		t.Fatal("connections is the one way to discover a connected tool")
 	}
 }
 

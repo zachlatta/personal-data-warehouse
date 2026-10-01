@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
@@ -588,5 +589,26 @@ func TestPipelinesPageNamesTheInputThatColouredAMart(t *testing.T) {
 	}
 	if !strings.Contains(pipelinesPageHTML, "m.cause_pipelines") || !strings.Contains(pipelinesPageHTML, "because of") {
 		t.Fatalf("the page must render the inputs responsible for a mart's status")
+	}
+}
+
+// One way to read the conversation around a hit, on both surfaces. Until
+// 2026-10-01 the CLI composed timeline.context() SQL itself and MCP agents had
+// to hand-write it through query.
+func TestContextIsOneToolOnEverySurface(t *testing.T) {
+	var found tool.Tool
+	for _, candidate := range readOnlyTools(nil) {
+		if candidate.Name() == "context" {
+			found = candidate
+		}
+	}
+	if found == nil {
+		t.Fatalf("no context tool")
+	}
+	if !found.Surfaces().ShowsOnMCP() || !found.Surfaces().ShowsOnCLI() {
+		t.Fatalf("context must be on both surfaces, got %v", found.Surfaces())
+	}
+	if strings.Contains(searchDescription, "through query") {
+		t.Fatalf("the search description must point at the context tool, not hand-written SQL")
 	}
 }

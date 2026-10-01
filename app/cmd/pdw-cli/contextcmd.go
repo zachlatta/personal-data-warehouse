@@ -22,8 +22,8 @@ REF is a hit's ref from pdw search (gmail_email:..., slack_message:...,
 apple_message:..., agent_session_turn:...). A Gmail hit returns its thread, a
 Slack hit its thread or channel, a chat hit the rest of that chat, an agent
 turn its neighbouring turns; everything else returns the neighbouring events
-of the same stream. It runs timeline.context(ref, before, after) and prints
-one line per event, oldest first.
+of the same stream. It calls the server's context tool (the one MCP agents call) and
+prints one line per event, oldest first.
 
 FLAGS
   -b, --before N   Events before the hit (default 5, max 50).
@@ -37,6 +37,19 @@ const (
 	contextMaxWindow     = 50
 	contextSnippetRunes  = 400
 )
+
+// contextToolInput is the server's context tool input: the same tool MCP
+// agents call, so the two surfaces read a hit's conversation one way.
+type contextToolInput struct {
+	Ref    string `json:"ref"`
+	Before int    `json:"before"`
+	After  int    `json:"after"`
+}
+
+type contextToolResponse struct {
+	Rows  json.RawMessage `json:"rows"`
+	Error string          `json:"error"`
+}
 
 type contextRow struct {
 	Adapter  string `json:"adapter"`
@@ -96,15 +109,14 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "pdw context: --output must be text or json")
 		return 2
 	}
-	sql := fmt.Sprintf("SELECT adapter, event_id, priority, event_ts, actor, title, snippet FROM timeline.context('%s', %d, %d)", ref, before, after)
-	input, err := json.Marshal(sqlCommandInput{Question: "conversation around " + ref, SQL: sql, Format: "json"})
+	input, err := json.Marshal(contextToolInput{Ref: ref, Before: before, After: after})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw context:", err)
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLTimeout)
 	defer cancel()
-	out, err := client.CallTool(ctx, "sql", input)
+	out, err := client.CallTool(ctx, "context", input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
@@ -114,7 +126,7 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "pdw context:", err)
 		return 1
 	}
-	var payload sqlCommandResponse
+	var payload contextToolResponse
 	if err := json.Unmarshal(out, &payload); err != nil {
 		fmt.Fprintln(stdout, string(out))
 		return 0

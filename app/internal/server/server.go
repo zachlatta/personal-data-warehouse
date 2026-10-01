@@ -71,6 +71,12 @@ type describeTableInput struct {
 	Relation string `json:"relation" jsonschema:"schema-qualified relation to describe, e.g. base_gmail.messages; a bare table name resolves when only one schema has it"`
 }
 
+type contextInput struct {
+	Ref    string `json:"ref" jsonschema:"a search hit's ref, e.g. gmail_email:<account>|<message_id> or slack_message:<account>|<team>|<conversation>|<ts>"`
+	Before *int   `json:"before,omitempty" jsonschema:"events before the hit, 0-50, default 5"`
+	After  *int   `json:"after,omitempty" jsonschema:"events after the hit, 0-50, default 5"`
+}
+
 type searchInput struct {
 	Query      string   `json:"query" jsonschema:"search text to run against the cross-source timeline corpus"`
 	MaxResults int      `json:"max_results,omitempty" jsonschema:"maximum hits to return, default 20; request more only for recall work"`
@@ -102,10 +108,10 @@ var serverInstructions = "Call the readme tool first: it is the brief agent guid
 	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
 	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
-	"For an email, chat/channel, or agent-turn hit, read the conversation around it with timeline.context(ref, 5, 5) through the query tool — a Gmail hit returns its thread, a Slack hit its thread or channel, a message its chat; each hit's source_table/source_pk drill straight to the authoritative row. " +
-	"Only for structured predicates, aggregates, joins, or drill-down after a hit, write SQL — and walk the layers in order: timeline (the event stream) -> marts_* (stable per-domain read views) -> base_* (raw provider detail), with derived_* as the modelled facts between them. Call schema_overview, then describe_table on every relation you reference. Do not guess relation or column names."
+	"For an email, chat/channel, or agent-turn hit, read the conversation around it with the context tool (the hit's ref) — a Gmail hit returns its thread, a Slack hit its thread or channel, a message its chat; each hit's source_table/source_pk drill straight to the authoritative row. " +
+	"Only for structured predicates, aggregates, joins, or drill-down after a hit, write SQL — and walk the layers in order: timeline (the event stream) -> marts_* (stable per-domain read views) -> base_* (raw provider detail), with derived_* as the modelled facts between them. Call describe_table on every relation you reference; call schema_overview only to find a relation you do not know. Do not guess relation or column names."
 
-const schemaFirstReminder = "Call schema_overview first, then describe_table for each relation before SQL that references relations. A timeline.context(ref, before, after) follow-up to a search hit needs no relation discovery."
+const schemaFirstReminder = "Call describe_table for each relation before SQL that references it; call schema_overview only to find a relation you do not know. The conversation around a search hit is the context tool, not SQL."
 
 const queryDescription = "The single MCP SQL entry point. Run read-only Postgres SQL and return each bounded result in full, without cursor helper tools or field truncation. " + schemaFirstReminder + timelinePrioritySQLReminder + " Each SQL statement must be paired with question, a concise plain-English question this SQL statement is trying to answer."
 
@@ -113,11 +119,14 @@ var searchDescription = "FIRST tool for any text, topic, person, phrase, or iden
 	"Query with the FEWEST distinctive words the answering record would contain (\"runway burn rate months cash remaining\", not \"how long our money lasts\"); on a miss drop words. " +
 	"hybrid (default) fuses semantic, keyword and literal retrieval; exact when every hit must contain an identifier, path, amount or literal phrase; keyword is BM25-only. " +
 	"Scope with priorities for attention questions — " + warehouse.TimelinePriorityParentheticalDefinitions() + "; attention or correspondence is " + strings.Join(warehouse.TimelineAttentionPriorities(), ",") + ". Default max_results 10. " +
-	"Every hit carries priority, ref, source_table and source_pk: timeline.context(ref, 5, 5) through query reads the conversation around it; source_table/source_pk reach the raw row."
+	"Every hit carries priority, ref, source_table and source_pk: the context tool reads the conversation around a hit by its ref; source_table/source_pk reach the raw row."
+
+const contextDescription = "The conversation around one search hit, by the hit's ref: a Gmail hit returns its thread, a Slack hit its thread (or its channel when it is not in one), an iMessage/WhatsApp hit the rest of that chat, an agent-session turn its neighbouring turns, and anything else the neighbouring events of its stream. " +
+	"before/after are events either side (0-50, default 5). Each row carries adapter, event_id (adapter:event_id is that event's own ref, for a further hop), priority, event_ts, actor, title and snippet, oldest first."
 
 const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
 
-const schemaOverviewDescription = "Required before relation-based SQL, but not before the search tool. Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL; pass schema (a name or prefix such as marts_finance or marts) to list one domain instead of the ~36 KB whole." + timelinePrioritySQLReminder + " It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
+const schemaOverviewDescription = "For finding a relation you do not know: not before the search tool, and not before SQL over a relation you can already name (call describe_table for that). Lists every relation in the warehouse with its row estimate, primary key, and primary time column, plus the search and layer conventions needed to write correct SQL; pass schema (a name or prefix such as marts_finance or marts) to list one domain instead of the ~36 KB whole." + timelinePrioritySQLReminder + " It deliberately does NOT list every column — call describe_table for that. Row estimates come from planner statistics, formatted as `(~N rows, estimated)`; use them for sizing decisions instead of running SELECT COUNT(*) over large tables."
 
 const describeTableDescription = "Return one relation's exact columns with their Postgres types, plus its indexes and row estimate. This is the authoritative column list: schema_overview intentionally omits columns, so call this for each relation you are about to reference instead of guessing column names. Accepts a schema-qualified name (base_gmail.messages) or a bare table name when only one schema has it, and names concrete candidates when the relation does not exist."
 
@@ -155,7 +164,7 @@ func newMCPServerFromRegistry(registry *tool.Registry, logger *slog.Logger) *mcp
 	hooks := mcpToolHooks(serverLogger)
 	var proxied []tool.Tool
 	for _, t := range registry.Filter(toolShowsOnMCP).All() {
-		if isConnectionTool(t) && !listConnectionToolsFlat() {
+		if isConnectionTool(t) {
 			proxied = append(proxied, t)
 			continue
 		}

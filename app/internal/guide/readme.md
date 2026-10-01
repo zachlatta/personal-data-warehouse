@@ -20,9 +20,10 @@ discovery calls below are what is current.
 2. **Read the conversation** around a useful hit — a Gmail hit returns its thread, a Slack
    hit its thread or channel, a chat hit the rest of that chat, an agent turn its
    neighbouring turns:
-{{if .CLI}}   `pdw context '<ref>'` (or `pdw sql -q 'context around a hit' "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"`){{else}}   `query` with `{"queries": [{"question": "context around a hit", "sql": "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"}]}`{{end}}
-   Name the columns: `SELECT *` on `timeline.context()` returns `metadata` and the full
-   `search_text` of every row, seven times the size of the three columns you read.
+{{if .CLI}}   `pdw context '<ref>'`{{else}}   `context` with `{"ref": "<ref>"}` (`before`/`after` default 5, at most 50){{end}}
+   That is the one way to read it. Inside a larger SQL statement `timeline.context(ref,
+   before, after)` is the same function; name its columns, because `SELECT *` returns
+   `metadata` and the full `search_text` of every row.
 3. **Structured questions** (aggregates, joins, predicates, drill-down) are SQL, walked
    in layer order: bounded `timeline.events` filtered by priority → `marts_*` (stable
    per-domain read views) → `base_*` (raw provider rows, reached from a hit's
@@ -50,7 +51,7 @@ server's hint rather than guessing a second name. `marts_ops.agent_usage` measur
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
 
 Commands agents invent that do not exist: `pdw query`, `pdw schema_overview`,
-`pdw describe_table`, `pdw call sql|query|search|schema_overview|describe_table` (refused
+`pdw describe_table`, `pdw call sql|query|search|context|schema_overview|describe_table` (refused
 with the real command). Pass a
 real `-q` intent; the SQL tool logs it server-side. Shape hints go to stderr only for the
 default CSV output, so `--output json` stays parseable through `2>&1`.
@@ -59,6 +60,7 @@ default CSV output, so `--output json` stays parseable through `2>&1`.
 | --- | --- |
 | The brief, this full guide, or one topic | `readme` (`{}`, `{"topic": "full"}` or `{"topic": "<name>"}`) |
 | Search every source | `search` `{"query": "...", "priorities": [...], "sources": [...], "since": "YYYY-MM-DD", "mode": "hybrid|keyword|exact", "max_results": N}` |
+| The conversation around a hit | `context` `{"ref": "<ref>", "before": 5, "after": 5}` |
 | Read-only SQL | `query` `{"queries": [{"question": "<why>", "sql": "<SQL>"}], "format": "csv|json|ndjson"}` |
 | One relation's exact columns | `describe_table` `{"relation": "<schema.relation>"}` |
 | Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |

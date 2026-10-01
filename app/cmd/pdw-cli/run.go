@@ -1157,6 +1157,7 @@ var commandRedirects = map[string]string{
 // first-class command whose output is readable rather than raw JSON.
 var callToolRedirects = map[string]string{
 	"readme":          "pdw readme [topic]",
+	"context":         "pdw context '<ref>' [--before N] [--after N]",
 	"schema_overview": "pdw schema",
 	"describe_table":  "pdw columns <table>",
 }

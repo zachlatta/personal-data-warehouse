@@ -13,7 +13,7 @@ including this page. This is the brief; {{if .CLI}}`pdw readme full`{{else}}`rea
 {{if .CLI}}   `pdw search --priority {{.Attention}} '<terms>'`  (`-n 10` default; `--source`, `--since`, `--mode exact` for ids/paths/amounts; `--full` for long previews){{else}}   `search` `{"query": "<terms>", "priorities": {{jsonList (split .Attention)}}}` (also `sources`, `since`, `mode: exact` for ids/paths/amounts){{end}}
 2. **Read the conversation** around a hit (its email thread, Slack thread/channel, chat, or
    neighbouring agent turns):
-{{if .CLI}}   `pdw context '<ref>'` (or `pdw sql -q why "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"`){{else}}   `query` `{"queries": [{"question": "why", "sql": "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"}]}`{{end}}
+{{if .CLI}}   `pdw context '<ref>'`{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5){{end}}
 3. **SQL** only for aggregates, joins, predicates and drill-down, walking
    `timeline.events` (bounded, priority-filtered) → `marts_*` → `base_*`.
 4. **Columns before SQL, every time:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
@@ -35,7 +35,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 
-Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search` (each is refused with the real one).
+Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context` (each is refused with the real one).
 {{- else -}}
 ## Tool map
 
@@ -43,6 +43,7 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 | --- | --- |
 | This brief / the full guide / one topic | `readme` (`{}`, `{"topic": "full"}` or `{"topic": "<name>"}`) |
 | Search | `search` `{"query", "priorities", "sources", "since", "mode", "max_results"}` |
+| Conversation around a hit | `context` `{"ref", "before", "after"}` |
 | Read-only SQL | `query` `{"queries": [{"question", "sql"}], "format": "csv|json|ndjson"}` (CSV by default) |
 | One relation's exact columns | `describe_table` `{"relation"}` |
 | Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |

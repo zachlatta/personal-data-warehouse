@@ -16,6 +16,7 @@ func readOnlyTools(svc *query.Service) []tool.Tool {
 		readmeTool(),
 		queryTool(svc),
 		searchTool(svc),
+		contextTool(svc),
 		schemaOverviewTool(svc),
 		describeTableTool(svc),
 		sqlTool(svc),
@@ -83,6 +84,29 @@ func searchTool(svc *query.Service) tool.Tool {
 			}), nil
 		},
 		IsError: func(r query.SearchResponse) bool { return r.Error != "" },
+	}
+}
+
+// contextTool is the conversation around a search hit, on every surface: MCP
+// agents call it directly and `pdw context` calls it over HTTP. Before
+// 2026-10-01 the CLI composed timeline.context() SQL itself and MCP agents had
+// to write the same SQL by hand through query -- two paths to one answer.
+func contextTool(svc *query.Service) tool.Tool {
+	return &tool.Typed[contextInput, query.ContextResponse]{
+		NameStr:        "context",
+		TitleStr:       "Conversation Around a Hit",
+		DescriptionStr: contextDescription,
+		Handle: func(ctx context.Context, in contextInput) (query.ContextResponse, error) {
+			before, after := query.ContextDefaultWindow, query.ContextDefaultWindow
+			if in.Before != nil {
+				before = *in.Before
+			}
+			if in.After != nil {
+				after = *in.After
+			}
+			return svc.Context(ctx, query.ContextRequest{Ref: in.Ref, Before: before, After: after}), nil
+		},
+		IsError: func(r query.ContextResponse) bool { return r.Error != "" },
 	}
 }
 

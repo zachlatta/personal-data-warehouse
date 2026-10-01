@@ -237,8 +237,9 @@ search output (`--full` for the old previews, `-n 10` default, an unknown flag a
 is an error rather than query text), and on MCP `connections` + `connection_call` in
 place of a flat listing of every connected upstream tool: that list was 196 tools /
 153 KB (~38k tokens) of definitions in every MCP session, 142 KB of it proxied, and the
-sessions paying it almost never called one (`PDW_MCP_LIST_CONNECTION_TOOLS=1` restores
-the flat list; `pdw list` / `pdw call` are unchanged). The follow-up the same day: search
+sessions paying it almost never called one (the flat listing is gone, not switchable;
+`pdw list` / `pdw call` are unchanged). Since 2026-10-01 `context` is a server tool on both
+surfaces and `pdw context` calls it, so a hit's conversation is read one way everywhere. The follow-up the same day: search
 previews are cleaned after windowing (tracking URLs, markdown-table scaffolding, zero-width
 padding — a newsletter hit's whole 800-char preview had been squarespace-mail.com redirect
 links); a textless Slack hit (a file, image or canvas post, ~5,000 a week) is labelled at

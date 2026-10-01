@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"sort"
 	"strings"
 
@@ -22,18 +21,9 @@ import (
 // So the list now carries two tools instead: `connections` to discover a
 // connection's tools (names and summaries, or one tool's full schema) and
 // `connection_call` to invoke one. The CLI is unchanged (`pdw list` /
-// `pdw call` already were this shape), and PDW_MCP_LIST_CONNECTION_TOOLS=1
-// restores the flat listing for a client that needs it.
-
-const connectionToolsEnv = "PDW_MCP_LIST_CONNECTION_TOOLS"
-
-func listConnectionToolsFlat() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(connectionToolsEnv))) {
-	case "1", "true", "yes":
-		return true
-	}
-	return false
-}
+// `pdw call` already were this shape). The PDW_MCP_LIST_CONNECTION_TOOLS=1
+// switch that restored the flat listing was removed on 2026-10-01: one way to
+// reach a connected tool (C9), and production never set it.
 
 // isConnectionTool reports whether a registry entry is a proxied upstream
 // tool, which the proxy names <connection>__<tool>.
