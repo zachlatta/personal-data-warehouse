@@ -396,6 +396,8 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	statement := ""
 	var args []any
 	var hybridVector string
+	var embedDuration time.Duration
+	var timings *hybridTimings
 	switch mode {
 	case SearchModeExact:
 		statement = searchExactSQL
@@ -404,7 +406,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		statement = searchTextSQL
 		args = []any{resp.Query, maxResults, sources, since, priorities}
 	case SearchModeHybrid:
+		embedStarted := time.Now()
 		vector, reason := s.hybridQueryVector(ctx, resp.Query)
+		embedDuration = time.Since(embedStarted)
 		if reason != "" {
 			resp.Mode = SearchModeKeyword
 			resp.FallbackReason = reason
@@ -416,15 +420,18 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		statement = searchHybridFuseSQL
 	}
 
-	started := time.Now()
+	started := time.Now().Add(-embedDuration)
 	s.logger.InfoContext(ctx, "search started", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "max_results", maxResults, "sources", req.Sources, "since", req.Since, "priorities", req.Priorities)
 	var raw RawResult
 	var err error
 	if hybridVector != "" {
-		raw, err = s.runHybridSearch(
+		var legs hybridTimings
+		raw, legs, err = s.runHybridSearch(
 			ctx, runner, resp.Query, maxResults, sources, since, priorities,
 			hybridVector, s.embedder.Model(),
 		)
+		legs.Embed = embedDuration
+		timings = &legs
 	} else {
 		raw, err = runner.QueryArgs(ctx, statement, args, maxResults)
 	}
@@ -457,7 +464,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		s.logger.ErrorContext(ctx, "search encoding failed", "query", resp.Query, "mode", resp.Mode, "error", err, "duration", time.Since(started))
 		return resp
 	}
-	s.logger.InfoContext(ctx, "search completed", "query", resp.Query, "mode", resp.Mode, "fallback_reason", resp.FallbackReason, "rows", resp.TotalRows, "duration", time.Since(started))
+	s.logSearchCompleted(ctx, resp, time.Since(started), timings)
 	return resp
 }
 
@@ -529,15 +536,18 @@ func (s *Service) runHybridSearch(
 	priorities any,
 	vector string,
 	embeddingModel string,
-) (RawResult, error) {
+) (RawResult, hybridTimings, error) {
 	var (
 		lexical  RawResult
 		exact    RawResult
 		semantic RawResult
+		timings  hybridTimings
 	)
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		var err error
+		started := time.Now()
+		defer func() { timings.Lexical = time.Since(started) }()
 		lexical, err = runner.QueryArgs(
 			groupCtx, searchHybridLexicalSQL,
 			[]any{query, maxResults, sources, since, priorities}, maxResults,
@@ -549,6 +559,8 @@ func (s *Service) runHybridSearch(
 	})
 	group.Go(func() error {
 		var err error
+		started := time.Now()
+		defer func() { timings.Exact = time.Since(started) }()
 		exact, err = runner.QueryArgs(
 			groupCtx, searchHybridExactSQL,
 			[]any{query, maxResults, sources, since, priorities}, maxResults,
@@ -560,6 +572,8 @@ func (s *Service) runHybridSearch(
 	})
 	group.Go(func() error {
 		var err error
+		started := time.Now()
+		defer func() { timings.Semantic = time.Since(started) }()
 		// The SQL function owns the measured candidate bound. maxRows=0
 		// lets SQL return every event inside it for rank fusion.
 		semantic, err = runner.QueryArgs(
@@ -572,7 +586,7 @@ func (s *Service) runHybridSearch(
 		return nil
 	})
 	if err := group.Wait(); err != nil {
-		return RawResult{}, err
+		return RawResult{}, timings, err
 	}
 
 	// A source can legitimately have no embedded chunks. A nil Go slice
@@ -583,9 +597,10 @@ func (s *Service) runHybridSearch(
 	semanticRows = append(semanticRows, semantic.Rows...)
 	semanticJSON, err := json.Marshal(semanticRows)
 	if err != nil {
-		return RawResult{}, fmt.Errorf("encode hybrid semantic evidence: %w", err)
+		return RawResult{}, timings, fmt.Errorf("encode hybrid semantic evidence: %w", err)
 	}
-	return runner.QueryArgs(
+	fuseStarted := time.Now()
+	fused, err := runner.QueryArgs(
 		ctx, searchHybridFuseSQL,
 		[]any{
 			query, maxResults, searchRefs(lexical), string(semanticJSON),
@@ -593,6 +608,8 @@ func (s *Service) runHybridSearch(
 		},
 		maxResults,
 	)
+	timings.Fuse = time.Since(fuseStarted)
+	return fused, timings, err
 }
 
 func searchRefs(result RawResult) []string {

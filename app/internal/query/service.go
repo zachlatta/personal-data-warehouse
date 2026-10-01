@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -60,6 +61,11 @@ type Service struct {
 	opts     Options
 	logger   *slog.Logger
 	embedder Embedder
+	// slowSearchThreshold is the C6 line: a search slower than this logs its
+	// leg timings beside the host's CPU and I/O pressure. readHostFile reads
+	// /proc for that snapshot; tests replace both.
+	slowSearchThreshold time.Duration
+	readHostFile        func(string) ([]byte, error)
 }
 
 type tableRef struct {
@@ -180,7 +186,10 @@ func NewService(runner Runner, opts Options) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder}
+	return &Service{
+		runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder,
+		slowSearchThreshold: slowSearchThreshold, readHostFile: os.ReadFile,
+	}
 }
 
 func normalizeStatements(statements []Statement) ([]Statement, statementValidationError) {

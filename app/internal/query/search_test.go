@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
@@ -843,5 +844,79 @@ func TestSearchSQLPassesPrioritiesToEverySQLFunction(t *testing.T) {
 	}
 	if strings.Contains(searchHybridProbeSQL, "timeline.search_hybrid(") {
 		t.Fatalf("the app never calls the compatibility wrapper; probing it wedges rolling signature upgrades: %q", searchHybridProbeSQL)
+	}
+}
+
+func TestSlowHybridSearchLogsEachLegAndTheHostPressure(t *testing.T) {
+	// C6 asks whether a search that took more than two seconds used the host.
+	// That is a question about one request, so the request has to record it:
+	// which leg was the long pole, and how busy the CPU and disks were then.
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridLexicalSQL:  searchRefRows("gmail_email:a|m1"),
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows(),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		delays: map[string]time.Duration{searchHybridExactSQL: 40 * time.Millisecond},
+	}
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svc := NewService(runner, Options{
+		SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}},
+		Logger:         logger,
+	})
+	svc.slowSearchThreshold = 10 * time.Millisecond
+	svc.readHostFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/pressure/cpu":
+			return []byte("some avg10=1.50 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"), nil
+		case "/proc/pressure/io":
+			return []byte("some avg10=12.25 avg60=0.00 avg300=0.00 total=1\nfull avg10=9.75 avg60=0.00 avg300=0.00 total=1\n"), nil
+		case "/proc/loadavg":
+			return []byte("3.70 2.55 1.99 2/900 1234\n"), nil
+		}
+		return nil, errors.New("unexpected " + path)
+	}
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter"})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
+	}
+	out := logs.String()
+	slow := ""
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `msg="slow search"`) {
+			slow = line
+		}
+	}
+	if slow == "" {
+		t.Fatalf("no slow-search line in:\n%s", out)
+	}
+	for _, want := range []string{
+		"exact_ms=", "lexical_ms=", "semantic_ms=", "fuse_ms=", "embed_ms=",
+		"slowest_leg=exact", "cpu_some_avg10=1.5", "io_full_avg10=9.75", "load_1m=3.7", "cpu_count=",
+	} {
+		if !strings.Contains(slow, want) {
+			t.Fatalf("slow-search line lacks %q: %s", want, slow)
+		}
+	}
+	if !strings.Contains(out, `msg="search completed"`) || !strings.Contains(out, "exact_ms=") {
+		t.Fatalf("every completed hybrid search must carry its leg timings:\n%s", out)
+	}
+}
+
+func TestFastSearchDoesNotReadHostPressure(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner:  fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{searchTextSQL: searchHit()},
+	}
+	svc := NewService(runner, Options{})
+	read := 0
+	svc.readHostFile = func(string) ([]byte, error) { read++; return nil, errors.New("no") }
+	svc.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: SearchModeKeyword})
+	if read != 0 {
+		t.Fatalf("a fast search read host files %d times", read)
 	}
 }
