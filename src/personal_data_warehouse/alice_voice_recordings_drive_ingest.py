@@ -273,7 +273,13 @@ def artifact_content_type(artifact: Mapping[str, Any], metadata: Mapping[str, An
 
 def artifact_size(artifact: Mapping[str, Any], metadata: Mapping[str, Any]) -> int:
     if artifact.get("kind") == AUDIO_KIND:
-        return int(nested_mapping(metadata, "recording").get("size_bytes", 0) or 0)
+        size = int(nested_mapping(metadata, "recording").get("size_bytes", 0) or 0)
+        if size:
+            return size
+        # An email-recovered recording's audio is a Gmail attachment, and only
+        # the attachment carries a byte size; the API path's recording.size_bytes
+        # is absent. Returning 0 here hid two 22- and 37-minute meetings from
+        # transcription, which skips size_bytes = 0 (2026-10-01).
     storage_id = str(nested_mapping(artifact, "storage").get("storage_file_id", ""))
     gmail = nested_mapping(metadata, "gmail")
     attachments = gmail.get("attachments") if isinstance(gmail.get("attachments"), list) else []

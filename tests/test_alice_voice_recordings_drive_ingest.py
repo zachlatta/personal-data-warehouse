@@ -152,3 +152,38 @@ def test_archive_reader_rejects_metadata_without_a_stable_identity() -> None:
         assert "recording.recording_id" in str(error)
     else:
         raise AssertionError("metadata without a recording id must fail loudly")
+
+
+def test_an_email_recovered_recording_takes_its_audio_size_from_the_gmail_attachment() -> None:
+    """A recording recovered from Alice's transcript email has its audio as a
+    Gmail attachment, and only the attachment carries a byte size. Reading the
+    size from recording.size_bytes alone stored 0 for two meetings of 22 and 37
+    minutes whose audio was in storage -- and the transcription pass, which
+    skips size_bytes = 0, never transcribed them (2026-10-01)."""
+    from personal_data_warehouse.alice_voice_recordings_drive_ingest import (
+        metadata_to_recording_row,
+    )
+
+    storage = {
+        "storage_backend": "google_drive",
+        "storage_key": "alice-voice-recordings/library/2024/12/rec-9.audio.m4a",
+        "storage_file_id": "drive-audio-9",
+        "storage_url": "https://drive/drive-audio-9",
+    }
+    row = metadata_to_recording_row(
+        {
+            "account": "owner@example.test",
+            "uploaded_at": "2026-07-10T04:17:27Z",
+            "recovery_source": "gmail_alice_transcript_email",
+            "recording": {"recording_id": "rec-9", "title": "Board call", "size": "11 MB"},
+            "gmail": {
+                "attachments": [
+                    {"kind": "voice_recording_audio", "size": 11685722, "filename": "Board call.m4a",
+                     "storage": storage},
+                ]
+            },
+            "_artifacts": [{"kind": "voice_recording_audio", "filename": "Board call.m4a", "storage": storage}],
+        }
+    )
+    assert row["size_bytes"] == 11685722
+    assert row["storage_file_id"] == "drive-audio-9"
