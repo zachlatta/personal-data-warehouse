@@ -79,6 +79,23 @@ def _seed(wh: PostgresWarehouse) -> None:
             # the denominator of a metric about how questions start.
             _event("g", 1, tool="Bash", inp='{"command":"pdw ingest apple-notes"}'),
             _event("g", 2, res="ok"),
+            # Session H: a question to ANOTHER system reached through PDW's
+            # proxy (316 Hack Club warehouse queries in the fortnight to
+            # 2026-09-30), then a real search. The proxied call is not a PDW
+            # question, so the search is the opener.
+            _event("h", 1, tool="Bash",
+                   inp='{"command":"pdw call hack_club_data_warehouse__query --data \'{\\"sql\\":\\"SELECT 1\\"}\'"}'),
+            _event("h", 2, res="ok"),
+            _event("h", 3, tool="Bash", inp='{"command":"pdw search \"lease\""}'),
+            _event("h", 4, res='Search: "lease" — 1 results (hybrid)\nScope: all tiers\nReturned priorities: self=1'),
+            # Session I: only proxied MCP calls -- a session about another
+            # system, not a PDW session at all.
+            _event("i", 1, tool="mcp__claude_ai_Personal_Data_Warehouse__connection_call",
+                   inp='{"tool":"airtable__query","arguments":{}}'),
+            _event("i", 2, res="ok"),
+            _event("i", 3, tool="mcp__claude_ai_Personal_Data_Warehouse__hack_club_data_warehouse__query",
+                   inp='{"sql":"SELECT 1"}'),
+            _event("i", 4, res="ok"),
         ]
     )
 
@@ -89,13 +106,15 @@ def test_agent_usage_measures_first_call_priority_filter_and_base_only_sql(wareh
     snapshots = {s.source: s for s in AgentUsageCollector(warehouse, window_days=14).run()}
 
     a = snapshots["all"]
-    assert a.sessions == 7
-    # Sessions A, B, D and F asked the warehouse something. C never touched PDW,
-    # E only mentioned the three letters, and G only ran an uploader.
-    assert a.pdw_sessions == 4
-    assert (a.first_search, a.first_schema, a.first_sql, a.first_invented) == (2, 1, 0, 1)
+    assert a.sessions == 9
+    # Sessions A, B, D, F and H asked the warehouse something. C never touched
+    # PDW, E only mentioned the three letters, G only ran an uploader, and I
+    # only asked other systems through the proxy.
+    assert a.pdw_sessions == 5
+    assert (a.first_search, a.first_schema, a.first_sql, a.first_invented) == (3, 1, 0, 1)
     assert a.admin_calls == 3
-    assert a.search_calls == 3
+    assert a.connection_calls == 3
+    assert a.search_calls == 4
     assert a.search_with_priority == 2
     assert a.search_attention_only == 2
     assert a.search_including_lower_tiers == 0
@@ -108,16 +127,17 @@ def test_agent_usage_measures_first_call_priority_filter_and_base_only_sql(wareh
     assert a.sql_base_only == 1
     assert a.sql_error_sessions == 1
     assert a.invented_calls == 1
-    assert snapshots["claude_code"].pdw_sessions == 3
+    assert snapshots["claude_code"].pdw_sessions == 4
     assert snapshots["codex"].first_invented == 1
 
     rows = {row["source"]: row for row in warehouse._query_dicts("SELECT * FROM @marts_agent_usage")}
-    assert float(rows["all"]["priority_filter_rate"]) == round(2 / 3, 3)
+    assert float(rows["all"]["priority_filter_rate"]) == round(2 / 4, 3)
+    assert int(rows["all"]["connection_calls"]) == 3
     assert int(rows["all"]["search_attention_only"]) == 2
     assert int(rows["all"]["bulk_hints_shown"]) == 1
     assert float(rows["all"]["bulk_hint_retry_rate"]) == 0.0
     assert float(rows["all"]["sql_base_only_rate"]) == 1.0
-    # Four PDW sessions is not a sample: the verdict withholds itself.
+    # Five PDW sessions is not a sample: the verdict withholds itself.
     assert rows["all"]["status"] == "no_data"
 
 
@@ -210,7 +230,7 @@ def test_agent_usage_view_judges_against_the_targets(warehouse: PostgresWarehous
                     bulk_hints_shown=8, bulk_hint_scoped_retries=5,
                     bulk_hint_improved_retries=4,
                     sql_calls=60, sql_base_only=10, sql_error_sessions=2, sql_timeouts=0, invented_calls=0,
-                    admin_calls=4, newest_session_at=now)
+                    admin_calls=4, connection_calls=0, newest_session_at=now)
         base.update(over)
         return AgentUsageSnapshot(**base)
 

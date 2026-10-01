@@ -119,6 +119,15 @@ CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")
 CLI_SCHEMA_RE = _cli_re("schema|columns")
 CLI_OTHER_READ_RE = _cli_re("context|call|list|describe")
+#: `pdw call <connection>__<tool>`: a question to ANOTHER system (the Hack Club
+#: warehouse, Airtable, Orchard, ...) reached through PDW's MCP proxy. 316 of
+#: the fortnight's calls to 2026-09-30 were Hack Club warehouse queries, and
+#: counting them as PDW reads made sessions about other systems read as
+#: sessions that failed to start at the timeline.
+CLI_CONNECTION_RE = _CLI_BEFORE + r"call[[:space:]]+[A-Za-z0-9_-]+__[A-Za-z0-9_]"
+#: The MCP spellings of the same: connection_call/connections, and the flat
+#: `<pdw>__<connection>__<tool>` names older clients still list.
+MCP_CONNECTION_TOOL_RE = r"personal_data_warehouse__(connection_call|connections)$|personal_data_warehouse__[A-Za-z0-9_]+__"
 CLI_ADMIN_RE = _cli_re("|".join(PDW_ADMIN_SUBCOMMANDS))
 #: Any real invocation at all -- what makes a session a PDW session.
 CLI_INVOKED_RE = _CLI_BEFORE
@@ -151,6 +160,7 @@ class AgentUsageSnapshot:
     sql_timeouts: int
     invented_calls: int
     admin_calls: int
+    connection_calls: int
     newest_session_at: datetime | None
 
 
@@ -521,6 +531,8 @@ pdw AS (
   SELECT *,
     CASE
       WHEN NOT is_mcp AND inp ~ '{invented}' THEN 'invented'
+      WHEN (is_mcp AND tool_name ~* '{mcp_connection}')
+        OR (NOT is_mcp AND inp ~ '{connection}') THEN 'connection'
       WHEN tool_name ILIKE '%%__search' OR tool_name ILIKE '%%.search'
         OR (NOT is_mcp AND inp ~ '{search}') THEN 'search'
       WHEN tool_name ILIKE '%%__query' OR tool_name ILIKE '%%.query'
@@ -541,7 +553,7 @@ pdw AS (
 AGENT_USAGE_SQL = _AGENT_USAGE_CALLS_CTE + """,
 reads AS (
   SELECT *, row_number() OVER (PARTITION BY source, session_id ORDER BY seq) AS nth
-  FROM pdw WHERE kind <> 'admin'
+  FROM pdw WHERE kind NOT IN ('admin', 'connection')
 ),
 per_session AS (
   SELECT source, session_id,
@@ -561,8 +573,10 @@ per_session AS (
   GROUP BY source, session_id
 ),
 admin AS (
-  SELECT source, session_id, count(*) AS admin_calls
-  FROM pdw WHERE kind = 'admin' GROUP BY source, session_id
+  SELECT source, session_id,
+         count(*) FILTER (WHERE kind = 'admin') AS admin_calls,
+         count(*) FILTER (WHERE kind = 'connection') AS connection_calls
+  FROM pdw WHERE kind IN ('admin', 'connection') GROUP BY source, session_id
 ),
 by_source AS (
   SELECT s.source,
@@ -579,6 +593,7 @@ by_source AS (
          coalesce(sum(p.sql_timeouts), 0) AS sql_timeouts,
          coalesce(sum(p.invented_calls), 0) AS invented_calls,
          coalesce(sum(a.admin_calls), 0) AS admin_calls,
+         coalesce(sum(a.connection_calls), 0) AS connection_calls,
          max(s.newest) AS newest_session_at
   FROM sessions s
   LEFT JOIN per_session p ON p.source = s.source AND p.session_id = s.session_id
@@ -590,7 +605,7 @@ UNION ALL
 SELECT 'all', sum(sessions), sum(pdw_sessions), sum(first_search), sum(first_schema), sum(first_sql),
        sum(first_invented), sum(search_calls), sum(sql_calls),
        sum(sql_base_only), sum(sql_error_sessions), sum(sql_timeouts), sum(invented_calls),
-       sum(admin_calls), max(newest_session_at)
+       sum(admin_calls), sum(connection_calls), max(newest_session_at)
 FROM by_source
 """
 
@@ -615,6 +630,8 @@ def _expand_agent_usage_regexes(statement: str) -> str:
         .replace("{sql}", CLI_SQL_RE)
         .replace("{schema}", CLI_SCHEMA_RE)
         .replace("{admin}", CLI_ADMIN_RE)
+        .replace("{connection}", CLI_CONNECTION_RE)
+        .replace("{mcp_connection}", MCP_CONNECTION_TOOL_RE)
     )
 
 
@@ -672,6 +689,7 @@ class AgentUsageCollector:
                     sql_timeouts=int(row["sql_timeouts"] or 0),
                     invented_calls=int(row["invented_calls"] or 0),
                     admin_calls=int(row["admin_calls"] or 0),
+                    connection_calls=int(row["connection_calls"] or 0),
                     newest_session_at=row["newest_session_at"],
                 )
             )

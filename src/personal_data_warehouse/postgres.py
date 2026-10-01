@@ -2593,6 +2593,7 @@ INTEGER_COLUMNS = {
     "sql_timeouts",
     "invented_calls",
     "admin_calls",
+    "connection_calls",
     "events_7d",
     "events_1d",
     # backups: counts and sizes, plus last_attempt_ok as the warehouse's
@@ -5580,6 +5581,7 @@ class PostgresWarehouse:
                        bulk_hint_scoped_retries, bulk_hint_improved_retries,
                        sql_calls, sql_base_only,
                        sql_error_sessions, sql_timeouts, invented_calls, admin_calls,
+                       connection_calls,
                        newest_session AS newest_session_at,
                        collected AS collected_at,
                        CASE WHEN pdw_sessions > 0 THEN round(first_search::numeric / pdw_sessions, 3) END AS search_first_rate,

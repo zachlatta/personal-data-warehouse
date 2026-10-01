@@ -2500,6 +2500,9 @@ AGENT_USAGE_COLUMNS = (
     "sql_timeouts",
     "invented_calls",
     "admin_calls",
+    # Questions to other systems through PDW's MCP proxy; excluded from the
+    # C3 rates like admin_calls, because they are not questions to PDW.
+    "connection_calls",
     "newest_session_at",
     "collected_at",
 )
