@@ -497,6 +497,12 @@ SEARCH_HYBRID_LEXICAL_HEAD_RANKS = 2
 # common words is not.
 SEARCH_HYBRID_EXACT_WEIGHT = 3.0
 SEARCH_HYBRID_EXACT_MAX_WORDS = 3
+# A literal match is evidence only while it is rare. A needle found in more
+# chunks than this ('Robinhood': 113,227 on 2026-09-30, grouped for 7.4s) is a
+# word every BM25 hit already contains, so the literal leg returns nothing for
+# it. Only one of the 74 labeled needles exceeds it, and the leg never ranked
+# that one's answer.
+SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES = 5000
 # search_text_exact() raises below this needle length, so the leg must not be
 # attempted for a shorter query.
 SEARCH_HYBRID_EXACT_MIN_CHARS = 3
@@ -14669,6 +14675,7 @@ class PostgresWarehouse:
                 + r""");
                 exact_refs text[];
                 chat_exact_refs text[];
+                exact_match_count integer;
                 exact_needle text := btrim(coalesce(query, ''));
                 exact_needle_b text;
                 exact_needle_c text;
@@ -14769,6 +14776,22 @@ class PostgresWarehouse:
                                 exact_needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                             exact_pattern_c := '%' || replace(replace(replace(
                                 exact_needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                            SELECT count(*) INTO exact_match_count
+                              FROM (
+                                SELECT 1
+                                FROM @search_chunks c
+                                WHERE (c.text ILIKE exact_pattern ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
+                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                  AND (
+                                      sem_adapters IS NULL
+                                      OR c.adapter = ANY (sem_adapters)
+                                  )
+                                LIMIT """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES + 1) + r"""
+                              ) n;
+                            IF exact_match_count > """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES) + r""" THEN
+                                exact_refs := NULL;
+                            ELSE
                             SELECT array_agg(
                                        x.ref
                                        ORDER BY x.match_chunk ASC NULLS LAST,
@@ -14832,42 +14855,67 @@ class PostgresWarehouse:
                               ) x;
 
                             -- A conversation-window chunk represents the last
-                            -- event in its hour, not necessarily the member that
-                            -- contains the literal. Only if the bounded index
-                            -- finds a matching chat window, use exact's full-
-                            -- document path to recover the actual member ref.
-                            IF EXISTS (
-                                SELECT 1
-                                FROM @search_chunks c
-                                WHERE c.anchor LIKE c.adapter || '|w|%'
-                                  AND (c.text ILIKE exact_pattern ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
-                                  AND (
-                                      sem_adapters IS NULL
-                                      OR c.adapter = ANY (sem_adapters)
+                            -- event in its (context, hour), not necessarily the
+                            -- member that contains the literal. The chunk knows
+                            -- its conversation and hour, so the member is found
+                            -- by re-reading only those events -- through
+                            -- timeline_events_context_time_idx -- for the most
+                            -- recent matching windows. Until 2026-09-30 this ran
+                            -- search_text_exact over every chat event instead: a
+                            -- trigram scan of the 45 GB timeline heap that took
+                            -- 1.6-11s ("Mt Foolery" 7.3s, an amount 10.7s, a
+                            -- phone number 8.9s) and was the slowest leg of
+                            -- every short hybrid search that touched a chat.
+                            SELECT array_agg(m.ref ORDER BY m.event_ts DESC)
+                              INTO chat_exact_refs
+                              FROM (
+                                SELECT t.adapter || ':' || t.event_id AS ref,
+                                       t.event_ts
+                                FROM (
+                                    SELECT c.source, c.context, c.adapter,
+                                           c.event_ts AS window_start
+                                    FROM @search_chunks c
+                                    WHERE c.anchor LIKE c.adapter || '|w|%'
+                                      AND (c.text ILIKE exact_pattern ESCAPE '\'
+                                           OR c.text ILIKE exact_pattern_b ESCAPE '\'
+                                           OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                      AND (
+                                          sem_adapters IS NULL
+                                          OR c.adapter = ANY (sem_adapters)
+                                      )
+                                      AND (
+                                          since IS NULL
+                                          OR c.event_ts + interval '1 hour' > since
+                                      )
+                                    GROUP BY c.source, c.context, c.adapter, c.event_ts
+                                    ORDER BY c.event_ts DESC
+                                    LIMIT per_source * 2
+                                ) w
+                                JOIN @timeline_events t
+                                  ON t.source = w.source
+                                 AND t.context = w.context
+                                 AND t.event_ts >= w.window_start
+                                 AND t.event_ts < w.window_start + interval '1 hour'
+                                 AND t.adapter = w.adapter
+                                WHERE (t.search_text ILIKE exact_pattern ESCAPE '\'
+                                       OR t.search_text ILIKE exact_pattern_b ESCAPE '\'
+                                       OR t.search_text ILIKE exact_pattern_c ESCAPE '\')
+                                  AND t.search_text != ''
+                                  AND NOT COALESCE(
+                                      (t.metadata->>'deleted')::boolean, false
                                   )
+                                  AND (since IS NULL OR t.event_ts >= since)
                                   AND (
-                                      since IS NULL
-                                      OR c.event_ts + interval '1 hour' > since
+                                      priorities IS NULL
+                                      OR t.priority::text = ANY (priorities)
                                   )
-                                LIMIT 1
-                            ) THEN
-                                SELECT array_agg(h.ref ORDER BY h.event_ts DESC)
-                                  INTO chat_exact_refs
-                                  FROM @search_text_exact(
-                                      query,
-                                      per_source,
-                                      ARRAY['imessage', 'slack', 'whatsapp'],
-                                      since,
-                                      priorities
-                                  ) AS h
-                                  WHERE sem_adapters IS NULL
-                                     OR split_part(h.ref, ':', 1) = ANY (sem_adapters);
-                                exact_refs := (
-                                    coalesce(exact_refs, ARRAY[]::text[])
-                                    || coalesce(chat_exact_refs, ARRAY[]::text[])
-                                )[1:per_source];
+                                ORDER BY t.event_ts DESC
+                                LIMIT per_source
+                              ) m;
+                            exact_refs := (
+                                coalesce(exact_refs, ARRAY[]::text[])
+                                || coalesce(chat_exact_refs, ARRAY[]::text[])
+                            )[1:per_source];
                             END IF;
                         ELSE
                             SELECT array_agg(x.ref)

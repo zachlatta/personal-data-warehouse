@@ -449,6 +449,41 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
         warehouse._query("SELECT * FROM @search_hybrid('x', '')")
 
 
+def test_hybrid_literal_leg_returns_the_chat_member_that_holds_the_literal(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A conversation-window chunk carries its LAST member's id; the literal
+    leg must answer with the member whose text actually contains the needle,
+    and honour the priority scope while doing it."""
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    _provision(warehouse)
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["morning standup", "the zq9token budget is approved", "lunch plans"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    SearchEmbeddingRunner(warehouse, _FakeEmbeddingClient()).run()
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+
+    window = warehouse._query(
+        "SELECT event_id FROM @search_chunks WHERE anchor LIKE 'slack_message|w|%%'"
+    )
+    assert window and window[0][0].endswith("|100.2"), "the window is keyed by its last member"
+
+    refs = [r[0] for r in warehouse._query("SELECT ref FROM @search_hybrid_exact('zq9token', 10)")]
+    assert len(refs) == 1 and refs[0].endswith("|100.1"), refs
+
+    priority = warehouse._query(
+        "SELECT priority::text FROM @timeline_events WHERE event_id LIKE '%%|100.1'"
+    )[0][0]
+    other = "noise" if priority != "noise" else "self"
+    scoped = warehouse._query(
+        "SELECT ref FROM @search_hybrid_exact('zq9token', 10, NULL, NULL, ARRAY[%s])", (other,)
+    )
+    assert scoped == []
+
+
 def _embed_state(wh: PostgresWarehouse) -> tuple:
     rows = wh._query(
         "SELECT embed_fresh_built_at, embed_fresh_chunk_id, embed_cursor_ts,"

@@ -6875,17 +6875,23 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     assert "t.priority::text = ANY (priorities)" in literal, (
         "bounded exact candidates must be priority-scoped before top-k"
     )
-    assert "ARRAY['imessage', 'slack', 'whatsapp']" in literal
-    assert """ARRAY['imessage', 'slack', 'whatsapp'],
-                                      since,
-                                      priorities""" in literal, (
+    # A matching chat window is resolved to the member that holds the literal
+    # by re-reading only that window's events. A full-corpus search_text_exact
+    # over every chat event took 1.6-11s on production (2026-09-30).
+    chat = literal[literal.index("INTO chat_exact_refs"):]
+    chat = chat[: chat.index("ELSE")]
+    assert "@search_text_exact(" not in chat, (
+        "chat-window recovery must not rescan every chat event in the timeline"
+    )
+    assert "ON t.source = w.source" in chat and "AND t.context = w.context" in chat
+    assert "t.event_ts < w.window_start + interval '1 hour'" in chat
+    assert "t.search_text ILIKE exact_pattern ESCAPE" in chat, (
+        "the member that actually contains the literal is the one returned"
+    )
+    assert "t.priority::text = ANY (priorities)" in chat, (
         "chat exact-ref recovery must preserve the hybrid priority scope"
     )
-    assert "split_part(h.ref, ':', 1) = ANY (sem_adapters)" in literal
-    assert "@search_text_exact(" in literal, (
-        "chat-window identifiers must keep full-document matching so hybrid "
-        "returns the member event that actually contains the literal"
-    )
+    assert "c.adapter = ANY (sem_adapters)" in chat
     assert "GROUP BY" in literal, (
         "several chunks from one event must produce one literal rank"
     )
@@ -6921,6 +6927,27 @@ def test_search_hybrid_literal_leg_is_gated_on_query_length() -> None:
         "a shorter needle makes search_text_exact raise, which would take the "
         "whole hybrid search down with it"
     )
+
+
+def test_search_hybrid_literal_leg_steps_aside_for_a_needle_too_common_to_be_evidence() -> None:
+    """A literal match is evidence only while it is rare.
+
+    'Robinhood' matched 113,227 chunks on production (2026-09-30) and the leg
+    grouped all of them single-threaded for 7.4s, to rank a word every BM25
+    hit already contains. Of the 74 labeled cases only one needle exceeds the
+    cap (7,651 chunks) and the leg never ranked its answer, so the cap changes
+    no labeled result. The count stops at cap + 1, so a rare needle pays for
+    the matches it has and a common one for no more than the cap.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    cap = postgres_module.SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES
+    sql = _search_text_function_sql()
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact("):]
+    literal = exact[exact.index("exact_refs"):exact.index("RETURN QUERY")]
+    gate_at = literal.index(f"LIMIT {cap + 1}")
+    assert gate_at < literal.index("INTO exact_refs"), "the count must gate the ranking query"
+    assert f"> {cap}" in literal
 
 
 def postgres_module_exact_max_words() -> int:
