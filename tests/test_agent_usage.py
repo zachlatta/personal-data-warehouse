@@ -441,3 +441,42 @@ def test_a_piped_cli_search_without_its_header_is_unknown_not_failed() -> None:
         _search_row('{"command":"pdw search budget | head -5"}', "1. gmail · noise · 2026-09-10 · x — y")
     )
     assert not unscoped_piped.explicit_filter and unscoped_piped.success
+
+
+def _go_dispatcher_commands() -> set[str]:
+    """Every subcommand `pdw` dispatches, read from app/cmd/pdw-cli/run.go itself."""
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "app/cmd/pdw-cli/run.go").read_text()
+    start = source.index("rest := rootFlags.Args()")
+    end = source.index('pdw: unknown command %q', start)
+    body = source[start:end]
+    commands = set(re.findall(r'\bcmd == "([a-z][a-z-]*)"', body))
+    switch = body[body.index("switch cmd {"):]
+    commands |= set(re.findall(r'case "([a-z][a-z-]*)":', switch))
+    return commands
+
+
+def test_the_python_subcommand_lists_are_the_go_dispatchers_commands() -> None:
+    """`pdw context` shipped on 2026-09-22 and was counted as an invented call
+    for a week, because this list was hand-kept beside the dispatcher."""
+    from personal_data_warehouse.pdw_cli_commands import (
+        PDW_CLI_ADMIN_SUBCOMMANDS,
+        PDW_CLI_READ_SUBCOMMANDS,
+    )
+
+    assert set(PDW_CLI_READ_SUBCOMMANDS) | set(PDW_CLI_ADMIN_SUBCOMMANDS) == _go_dispatcher_commands()
+    assert not set(PDW_CLI_READ_SUBCOMMANDS) & set(PDW_CLI_ADMIN_SUBCOMMANDS)
+
+
+def test_reading_the_conversation_around_a_hit_is_a_read_not_an_invention() -> None:
+    from personal_data_warehouse.agent_usage import CLI_OTHER_READ_RE
+    from personal_data_warehouse.agent_runner import pdw_cli_invocation
+
+    command = '{"command":"pdw context \'gmail_email:z|abc\' --before 5"}'
+    assert not _matches(CLI_INVENTED_RE, command)
+    assert _matches(CLI_OTHER_READ_RE, command)
+    assert not _matches(CLI_INVENTED_RE, '{"command":"pdw hn publish-session"}')
+    assert _matches(CLI_ADMIN_RE, '{"command":"pdw heartbeat --pipeline x"}')
+    assert pdw_cli_invocation("pdw context 'gmail_email:z|abc'") == "pdw context"

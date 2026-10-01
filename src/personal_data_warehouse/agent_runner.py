@@ -19,6 +19,7 @@ import time
 import uuid
 from typing import Any
 
+from personal_data_warehouse.pdw_cli_commands import PDW_CLI_READ_SUBCOMMANDS
 from personal_data_warehouse.agent_tool_proxy import (
     DEFAULT_AGENT_TOOL_ALLOWLIST,
     DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
@@ -917,7 +918,7 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
     return ""
 
 
-PDW_CLI_SUBCOMMANDS = frozenset({"search", "sql", "schema", "columns", "call", "list", "describe"})
+PDW_CLI_SUBCOMMANDS = frozenset(PDW_CLI_READ_SUBCOMMANDS)
 
 
 def pdw_cli_invocation(command: str) -> str:

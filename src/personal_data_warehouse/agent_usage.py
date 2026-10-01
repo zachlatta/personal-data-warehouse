@@ -44,6 +44,11 @@ from typing import Any
 
 import psycopg2
 
+from personal_data_warehouse.pdw_cli_commands import (
+    PDW_CLI_ADMIN_SUBCOMMANDS,
+    PDW_CLI_FLAG_SPELLINGS,
+    PDW_CLI_READ_SUBCOMMANDS,
+)
 from personal_data_warehouse.warehouse_catalog import CATALOG
 
 logger = logging.getLogger(__name__)
@@ -66,21 +71,13 @@ SEARCH_FIRST_TARGET = 0.6
 PRIORITY_FILTER_TARGET = 0.4
 SQL_ERROR_SESSION_CEILING = 0.1
 
-#: The pdw CLI's real subcommands, split by whether they are a question.
-#: Kept in the same order the dispatcher lists them so a new one is easy to add;
-#: app/cmd/pdw-cli/usage_test.go is what keeps that list honest on the Go side.
-PDW_READ_SUBCOMMANDS = ("search", "sql", "schema", "columns", "call", "list", "describe", "readme")
-PDW_ADMIN_SUBCOMMANDS = (
-    # `readme` is the agent guide (bare `pdw` prints it too): reading the manual
-    # is neither a question nor a wrong first move, so it is excluded from the
-    # denominator and the first-call decision like the other admin commands.
-    "readme",
-    "ingest", "login", "logout", "config", "chatgpt", "slack", "whoop", "version", "update",
-    # run() accepts all three spellings of help before it dispatches, and since
-    # 2026-09-09 the version flag spellings run `pdw version` instead of a
-    # redirect -- they were 302 of the 623 "invented" calls in that fortnight.
-    "--help", "-h", "help", "--version", "-version", "-v",
-)
+#: The pdw CLI's real subcommands, split by whether they are a question. The
+#: lists live in pdw_cli_commands, which a test pins to the Go dispatcher.
+#: `readme` is the agent guide: reading the manual is neither a question nor a
+#: wrong first move, so it is admin like setup. The version flag spellings run
+#: `pdw version` (they were 302 of the 623 "invented" calls before 2026-09-09).
+PDW_READ_SUBCOMMANDS = PDW_CLI_READ_SUBCOMMANDS
+PDW_ADMIN_SUBCOMMANDS = PDW_CLI_ADMIN_SUBCOMMANDS + PDW_CLI_FLAG_SPELLINGS
 
 #: `pdw` as the invoked binary rather than the three letters. A command position
 #: is the start of the string (which in a tool's JSON is right after
@@ -121,7 +118,7 @@ CLI_INVENTED_RE = (
 CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")
 CLI_SCHEMA_RE = _cli_re("schema|columns")
-CLI_OTHER_READ_RE = _cli_re("call|list|describe")
+CLI_OTHER_READ_RE = _cli_re("context|call|list|describe")
 CLI_ADMIN_RE = _cli_re("|".join(PDW_ADMIN_SUBCOMMANDS))
 #: Any real invocation at all -- what makes a session a PDW session.
 CLI_INVOKED_RE = _CLI_BEFORE
