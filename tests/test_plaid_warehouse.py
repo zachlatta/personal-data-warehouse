@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import psycopg2
 import pytest
@@ -646,3 +646,34 @@ def test_plaid_item_health_ignores_removed_accounts_when_looking_for_duplicates(
         "SELECT item_id, status FROM @marts_ops_plaid_item_health ORDER BY item_id"
     )
     assert rows == [("item-a", "ok"), ("item-b", "ok")]
+
+
+def test_delete_missing_plaid_investment_transactions_only_inside_the_fetched_window(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_plaid_tables()
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+
+    def row(txn_id: str, day: datetime, item_id: str = "item-1") -> dict:
+        return {
+            "account": "zach@example.com", "item_id": item_id, "account_id": "acc-1",
+            "investment_transaction_id": txn_id, "security_id": "sec-1", "transaction_at": day,
+            "name": "buy", "quantity": 1.0, "amount": 10.0, "price": 10.0, "fees": 0.0,
+            "type": "buy", "subtype": "buy", "iso_currency_code": "USD",
+            "unofficial_currency_code": "", "raw_json": {}, "synced_at": now, "sync_version": 1,
+        }
+
+    warehouse.insert_plaid_investment_transactions([
+        row("old-id", datetime(2026, 5, 22, tzinfo=UTC)),
+        row("new-id", datetime(2026, 5, 22, tzinfo=UTC)),
+        row("before-window", datetime(2023, 1, 1, tzinfo=UTC)),
+        row("other-item", datetime(2026, 5, 22, tzinfo=UTC), item_id="item-2"),
+    ])
+    assert warehouse.delete_missing_plaid_investment_transactions(
+        account="zach@example.com", item_id="item-1",
+        start_date=date(2024, 10, 1), end_date=date(2026, 10, 1),
+        active_transaction_ids={"new-id"},
+    ) == 1
+    assert sorted(r[0] for r in warehouse._query(
+        f"SELECT investment_transaction_id FROM {warehouse.sql_relation('plaid_investment_transactions')}"
+    )) == ["before-window", "new-id", "other-item"]

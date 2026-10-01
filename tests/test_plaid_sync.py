@@ -231,6 +231,10 @@ class FakePlaidWarehouse:
     def insert_plaid_investment_transactions(self, rows):
         self.investment_transactions = rows
 
+    def delete_missing_plaid_investment_transactions(self, **kwargs):
+        self.investment_transaction_window = kwargs
+        return 0
+
     def insert_plaid_liabilities(self, rows):
         self.liabilities = rows
 
@@ -486,3 +490,52 @@ def test_plaid_sync_action_required_product_keeps_prior_cursor_and_success_time(
     # re-linking would replay the entire history.
     assert states["transactions"]["cursor"] == "cursor-1"
     assert states["transactions"]["last_synced_at"] == datetime.fromtimestamp(0, tz=UTC)
+
+
+def _investments_config() -> PlaidConfig:
+    return PlaidConfig(
+        account="zach@example.com",
+        client_id="client-id",
+        secret="secret",
+        environment="sandbox",
+        products=("transactions", "investments", "liabilities"),
+        country_codes=("US",),
+        client_name="Personal Data Warehouse",
+        transactions_lookback_days=730,
+    )
+
+
+def test_a_complete_investment_fetch_reconciles_the_window_it_read() -> None:
+    """Plaid re-issues investment transactions under new ids and has no removed
+    list for them. Rows it stopped returning stayed forever: 427 of 1,764 rows
+    in production were content duplicates on 2026-10-01, and the ledger booked
+    those buys twice (open lots exactly 2x the shares held). A fetch that read
+    every page Plaid reported is the authoritative set for its date window."""
+    warehouse = FakePlaidWarehouse()
+    PlaidSyncRunner(
+        config=_investments_config(), warehouse=warehouse, plaid_client=FakePlaidClient(),
+        logger=FakeLogger(), now=lambda: datetime(2026, 7, 2, tzinfo=UTC),
+    ).sync_all()
+    window = warehouse.investment_transaction_window
+    assert window["account"] == "zach@example.com" and window["item_id"] == "item-1"
+    assert window["active_transaction_ids"] == {"itxn-1"}
+    assert window["start_date"] == date(2024, 7, 2) and window["end_date"] == date(2026, 7, 2)
+
+
+def test_an_incomplete_investment_fetch_reconciles_nothing() -> None:
+    class ShortClient(FakePlaidClient):
+        def investments_transactions_get(self, access_token, *, start_date, end_date, count, offset):
+            response = super().investments_transactions_get(
+                access_token, start_date=start_date, end_date=end_date, count=count, offset=0
+            )
+            if offset:
+                return {"investment_transactions": [], "securities": [], "total_investment_transactions": 3}
+            response["total_investment_transactions"] = 3
+            return response
+
+    warehouse = FakePlaidWarehouse()
+    PlaidSyncRunner(
+        config=_investments_config(), warehouse=warehouse, plaid_client=ShortClient(),
+        logger=FakeLogger(), now=lambda: datetime(2026, 7, 2, tzinfo=UTC),
+    ).sync_all()
+    assert getattr(warehouse, "investment_transaction_window", None) is None

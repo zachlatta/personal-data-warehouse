@@ -510,6 +510,22 @@ class PlaidSyncRunner:
         securities = list(security_by_id.values())
         self._warehouse.insert_plaid_investment_securities(securities)
         self._warehouse.insert_plaid_investment_transactions(investment_transactions)
+        # Plaid re-issues investment transactions under new ids and publishes
+        # no removed list for them, so an id it stopped returning stayed in
+        # base_plaid.investment_transactions forever: 427 of 1,764 rows were
+        # content duplicates on 2026-10-01 and the ledger booked those buys
+        # twice. A fetch that read every page Plaid reported is the whole set
+        # for its date window; a short one proves nothing and removes nothing.
+        if offset >= total and len(investment_transactions) == total:
+            self._warehouse.delete_missing_plaid_investment_transactions(
+                account=item.account,
+                item_id=item_id,
+                start_date=start_date,
+                end_date=end_date,
+                active_transaction_ids={
+                    str(row["investment_transaction_id"]) for row in investment_transactions
+                },
+            )
         return PlaidSyncSummary(
             investment_securities=len(securities),
             investment_holdings=len(holdings),

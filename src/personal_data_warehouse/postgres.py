@@ -10334,6 +10334,32 @@ class PostgresWarehouse:
     def insert_plaid_investment_transactions(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("plaid_investment_transactions", rows, PLAID_INVESTMENT_TRANSACTION_COLUMNS)
 
+    def delete_missing_plaid_investment_transactions(
+        self,
+        *,
+        account: str,
+        item_id: str,
+        start_date: date,
+        end_date: date,
+        active_transaction_ids: set[str],
+    ) -> int:
+        """Remove an Item's investment transactions Plaid no longer reports.
+
+        Only inside the window the caller fetched completely: a row outside it
+        was not asked about, so its absence says nothing.
+        """
+        removed = self._query(
+            """
+            DELETE FROM @plaid_investment_transactions
+            WHERE account = %s AND item_id = %s
+              AND transaction_at >= %s::date AND transaction_at < (%s::date + 1)
+              AND NOT (investment_transaction_id = ANY(%s))
+            RETURNING investment_transaction_id
+            """,
+            (account, item_id, start_date, end_date, sorted(active_transaction_ids)),
+        )
+        return len(removed)
+
     def insert_plaid_liabilities(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("plaid_liabilities", rows, PLAID_LIABILITY_COLUMNS)
 
