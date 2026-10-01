@@ -2,9 +2,9 @@
 
 Sending a message as Zach and marking a conversation read need a real logged-in
 session: two pieces which are useless apart, an ``xoxc-`` token from the web
-client's localStorage and the ``d`` cookie. (The sync used to spend it on
-``client.counts`` too, to learn which conversations moved; Slack refused that
-with ``team_is_restricted`` on 2026-10-01 and the sync now polls instead.)
+client's localStorage and the ``d`` cookie. The sync's freshness pass polls with
+the same session through ``slack_sync.SlackSessionApiClient`` (Zach's choice on
+2026-10-01: Slack rate-limits it far less than the workspace OAuth token).
 
 Zach pastes that pair from a browser into ``pdw slack publish-session``
 (app/internal/browsersessions/slack), together with the browser's own

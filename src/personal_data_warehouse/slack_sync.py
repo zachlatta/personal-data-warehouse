@@ -135,6 +135,102 @@ class SlackWebApiClient:
         return data
 
 
+#: Errors that mean the pasted session itself was refused, as opposed to one
+#: conversation failing: the pass falls back to the OAuth token for the rest of
+#: its run rather than failing or polling nothing.
+SLACK_SESSION_REJECTED_CODES = frozenset(
+    {"invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired",
+     "team_is_restricted", "user_is_restricted", "http_401", "http_403"}
+)
+
+
+class SlackSessionApiClient:
+    """The sync's Slack client, spending Zach's pasted web session.
+
+    Zach's choice on 2026-10-01: poll with his own session (the `xoxc-` token
+    and `d` cookie he pastes into `pdw slack publish-session`), which Slack
+    rate-limits far less than the workspace OAuth token -- the OAuth token's
+    conversations.history ceiling (~39/min) is what made a poll of ~6,700
+    conversations impossible to keep current. It sends the token, the cookie and
+    the browser's own User-Agent and nothing else: no client headers it never
+    sent. It raises the same errors as SlackWebApiClient, so the runner's
+    rate-limit budget and retries apply unchanged. Nothing here logs a secret.
+    """
+
+    def __init__(self, *, token: str, cookie: str, user_agent: str) -> None:
+        self._token = token
+        self._cookie = cookie
+        self._user_agent = user_agent
+        self._timeout = int(os.getenv("SLACK_API_TIMEOUT_SECONDS", str(DEFAULT_SLACK_API_TIMEOUT_SECONDS)))
+
+    def call(self, method: str, **params) -> dict[str, Any]:
+        import json
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        from personal_data_warehouse.slack_session import FALLBACK_USER_AGENT
+
+        form = {"token": self._token}
+        for key, value in params.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                form[key] = "true" if value else "false"
+            elif isinstance(value, (list, tuple)):
+                form[key] = ",".join(str(item) for item in value)
+            else:
+                form[key] = str(value)
+        request = urllib.request.Request(
+            f"https://slack.com/api/{method}",
+            data=urllib.parse.urlencode(form).encode("utf-8"),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                "Cookie": f"d={self._cookie}",
+                "User-Agent": self._user_agent or FALLBACK_USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise SlackRateLimitedError(retry_after=int(exc.headers.get("Retry-After", "60") or 60)) from exc
+            raise SlackApiCallError(f"{method} failed: http_{exc.code}", code=f"http_{exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise SlackTransientError(f"{method} transient request failure: {exc}") from exc
+        if not isinstance(data, dict) or not data.get("ok", False):
+            error_code = (data or {}).get("error", "unknown_error") if isinstance(data, dict) else "unknown_error"
+            raise SlackApiCallError(f"{method} failed: {error_code}", code=error_code)
+        return data
+
+
+class SlackSessionFallbackClient:
+    """Use the pasted session; if Slack refuses the session itself, use the
+    OAuth token for the rest of the pass. A dead or signed-out session costs
+    speed, never the sync."""
+
+    def __init__(self, session_client: Any, oauth_client: Any, *, logger: Any) -> None:
+        self._session = session_client
+        self._oauth = oauth_client
+        self._logger = logger
+        self._using_session = True
+
+    def call(self, method: str, **params) -> dict[str, Any]:
+        if self._using_session:
+            try:
+                return self._session.call(method, **params)
+            except SlackApiCallError as exc:
+                if exc.code not in SLACK_SESSION_REJECTED_CODES:
+                    raise
+                self._using_session = False
+                self._logger.warning(
+                    "Slack refused the pasted session (%s); polling with the OAuth token for the rest of this pass",
+                    exc.code,
+                )
+        return self._oauth.call(method, **params)
+
+
 # Marker row in slack_sync_state recording that the unbounded missing-replies
 # walk last came up (nearly) empty, so the next full walk can wait.
 THREAD_BACKFILL_WALK_TYPE = "thread_backfill_walk"
@@ -224,6 +320,8 @@ class SlackSyncRunner:
         freshness_warm_window: timedelta | None = None,
         freshness_due_intervals: tuple[timedelta, timedelta, timedelta] | None = None,
         freshness_cool_window: timedelta = timedelta(days=365),
+        freshness_pass_budget: timedelta | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
@@ -284,6 +382,12 @@ class SlackSyncRunner:
         # window are polled every pass.
         self._freshness_due_intervals = freshness_due_intervals or SLACK_FRESHNESS_DUE_INTERVALS
         self._freshness_cool_window = freshness_cool_window
+        # How long one freshness pass may spend polling. With the pasted
+        # session a pass is no longer stopped by the OAuth token's rate limit,
+        # so without this a backlog of thousands would hold the job for twenty
+        # minutes while hot DMs waited behind it.
+        self._freshness_pass_budget = freshness_pass_budget
+        self._monotonic = monotonic
 
     def sync_all(self) -> list[SlackSyncSummary]:
         self._warehouse.ensure_slack_tables()
@@ -942,7 +1046,20 @@ class SlackSyncRunner:
         planned_by_type: dict[str, int] = {}
         for _conversation, group, _oldest in planned:
             planned_by_type[group[0]] = planned_by_type.get(group[0], 0) + 1
+        pass_started = self._monotonic()
         for conversation, group, oldest_ts in planned:
+            if (
+                self._freshness_pass_budget is not None
+                and self._monotonic() - pass_started >= self._freshness_pass_budget.total_seconds()
+            ):
+                self._logger.info(
+                    "Stopping Slack freshness pass for %s at its %ss time budget (%s of %s candidates polled)",
+                    account.account,
+                    int(self._freshness_pass_budget.total_seconds()),
+                    conversations_seen,
+                    len(planned),
+                )
+                break
             cursor_ts = _conversation_cursor_ts(conversation)
             is_new = str(conversation["id"]) in newly_discovered_ids
             # Resume from our own cursor when it predates the freshness window so a

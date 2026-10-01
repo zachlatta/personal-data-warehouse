@@ -35,7 +35,7 @@ people talking about him in public are `cc`.
 ## What is synced, and the edges
 
 - Everything Zach participates in — DMs, group DMs, private channels, his active member
-  channels — is **polled**: a conversation active in the last four hours every five
+  channels — is **polled** with his own pasted Slack session: a conversation active in the last four hours every five
   minutes, within two weeks every 15 minutes, within a year hourly, older every six
   hours, and a brand-new DM or group DM is found by listing within five minutes. A DM
   that wakes after months of quiet can therefore take hours to land. DM landing latency

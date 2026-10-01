@@ -1,11 +1,11 @@
 // Package slack publishes a Slack web session that Zach copies by hand from a
 // browser (`pdw slack publish-session`).
 //
-// Reviewed Slack writes (sending as Zach, marking read) need a signed-in
-// session: two pieces that are useless apart, an `xoxc-` token kept in the web
-// client's localStorage and the HttpOnly `d` cookie. (The sync also spent it on
-// `client.counts` until Slack refused that with team_is_restricted on
-// 2026-10-01; it now polls with OAuth tokens.)
+// The warehouse polls Slack with a signed-in session (Slack rate-limits it far
+// less than the workspace token) and reviewed writes spend it too. It is two
+// pieces that are useless apart: an `xoxc-` token kept in the web client's
+// localStorage and the HttpOnly `d` cookie. (`client.counts` refuses this
+// session with team_is_restricted since 2026-10-01; history reads do not.)
 //
 // Until 2026-09-29 this package read both out of the Slack DESKTOP app on
 // crobat every hour and called auth.test + client.counts with them to pick the

@@ -236,9 +236,17 @@ three things:
 - **It stamps every poll** (`touch_slack_conversation_sync_state`), including one that found
   nothing, because the schedule reads the last poll.
 
-The budget is the token's `conversations.history` rate limit, shared with the public sweep
-and coverage: measured 2026-10-01 a pass made ~310 calls in 3.5 minutes before its 120-second
-sleep budget ran out. `marts_ops.slack_conversation_health` judges every type on
+**It polls with Zach's pasted session, not the workspace OAuth token** — his decision on
+2026-10-01, because the session is rate-limited far less. With the OAuth token a pass made
+~210 `conversations.history` calls before its 120-second sleep budget ran out, and the due
+backlog stopped shrinking at ~5,600 of ~6,700 conversations: the schedule asked for more than
+the token's ~39 calls a minute could give. `SlackSessionApiClient` sends the session's token,
+`d` cookie and the browser's own User-Agent; if Slack refuses the session itself
+(`invalid_auth`, `team_is_restricted`, …) `SlackSessionFallbackClient` polls with the OAuth
+token for the rest of the pass and logs it. A pass stops after
+`SLACK_ASSET_FRESHNESS_PASS_SECONDS` (240) of polling, so the job fits its five-minute
+schedule and hot DMs are polled every tick while a backlog drains across passes.
+`SLACK_ASSET_FRESHNESS_USE_SESSION=0` polls with the OAuth token only. `marts_ops.slack_conversation_health` judges every type on
 `history_polled_fraction` within its cycle (twelve hours for DMs, group DMs and private
 channels) beside DM landing latency.
 
@@ -293,11 +301,14 @@ warehouse through the SQL tool. The browser's User-Agent is stored in
 it (`slack_session._slack_post`), rather than the Slack desktop User-Agent the helper used to
 hard-code, which a browser-minted session has never presented.
 
-**Only reviewed writes spend the session now.** Sends and mark-reads run from Python on
-mew-coolify with Python's TLS fingerprint; the sync no longer touches the session. If
-`slack.audit_logs` ever shows `unexpected_scraping` without a manual publish beside it, a
-write is the cause, and the fix is to stop spending a login at all (official user-token
-scopes for sends and mark-read), not to disguise the requests better.
+**The server spends the session every five minutes, by Zach's choice, and that is a known
+risk.** The freshness pass polls with it (hundreds of `conversations.history` calls a pass)
+and sends and mark-reads use it, all from Python on mew-coolify with Python's TLS fingerprint
+and the browser's User-Agent. Python spending a session was never flagged in months of
+`client.counts`; this volume is new. Watch `slack.audit_logs` (Hack Club warehouse) for an
+`anomaly` on Zach's user from mew's address: if Slack flags it, set
+`SLACK_ASSET_FRESHNESS_USE_SESSION=0` on the Dagster deployment and tell him, rather than
+disguising the requests better.
 
 **Mint the session in a private window used for nothing else, then close it without
 signing out.** All six `unexpected_scraping` anomalies from 2026-09-20 to 09-29 in

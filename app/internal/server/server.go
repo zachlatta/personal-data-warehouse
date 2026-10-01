@@ -346,8 +346,8 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			logger.Info("whoop private session publishing enabled", "endpoint", whoopsession.Endpoint)
 		}
 
-		// Reviewed Slack writes need a real client session, pasted by Zach. Same
-		// signed-publish shape.
+		// Slack polling and reviewed writes use a real client session, pasted by
+		// Zach. Same signed-publish shape.
 		slackStore, sderr := slacksession.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
 		if sderr != nil {
 			logger.Error("slack session store failed to initialize; session publishing disabled", "error", sderr.Error())

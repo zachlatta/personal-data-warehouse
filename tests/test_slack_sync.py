@@ -3725,3 +3725,35 @@ def test_a_poll_only_freshness_pass_lists_direct_conversations_to_find_new_ones(
     history = [params for method, params in client.calls if method == "conversations.history"]
     assert history[0]["channel"] == "C_NEW_GROUP" and "oldest" not in history[0]
     assert [row["message_ts"] for row in warehouse.messages] == ["1995.000000"]
+
+
+def test_a_freshness_pass_stops_polling_at_its_time_budget(monkeypatch):
+    """With the pasted session (2026-10-01) a pass is no longer stopped by the
+    OAuth token's rate limit, so a backlog of thousands would make one run poll
+    for twenty minutes while hot DMs waited behind it. A pass stops at its time
+    budget instead and the next one resumes from the most overdue."""
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [{"id": f"D{i}", "user": "U1", "is_im": True} for i in range(5)]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty] * 5,
+        }
+    )
+    ticks = iter(range(0, 1000, 100))  # every read of the clock is 100 seconds later
+    SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: now,
+        history_window=timedelta(hours=4), sync_users=False, sync_members=False,
+        use_existing_conversations=True, freshness_priority=True, sync_thread_replies=False,
+        sleep=lambda seconds: None,
+        freshness_pass_budget=timedelta(seconds=240), monotonic=lambda: float(next(ticks)),
+    ).sync_all()
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert len(polled) == 2, polled

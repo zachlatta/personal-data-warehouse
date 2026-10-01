@@ -164,7 +164,7 @@ func defaultDeps(getenv func(string) string, cfg ingestclient.Config, stdin io.R
 }
 
 // Instructions is what a person at a terminal needs to produce the paste.
-var Instructions = `Publish a Slack web session for reviewed Slack writes (sending as you, marking read).
+var Instructions = `Publish a Slack web session for the warehouse's Slack polling and reviewed writes.
 
 1. Open a new private (incognito) window, go to https://app.slack.com and sign
    in to Hack Club there. This session must be used by nothing but the
@@ -191,10 +191,9 @@ Read a Slack web session from stdin and publish it to the warehouse.
 
 `
 
-// verifyHint says when the session is first used. Nothing calls Slack with it on
-// a schedule: since 2026-10-01 the sync polls with OAuth tokens, and only a
-// reviewed write spends the session.
-const verifyHint = `the warehouse uses this session only when a reviewed Slack write (a message sent as you, a mark-read) executes; that write's result says whether Slack accepted it`
+// verifyHint says when the session is first used: the next freshness pass,
+// which polls with it (Zach's choice, 2026-10-01).
+const verifyHint = `the warehouse polls with this session on its next Slack freshness pass (every five minutes); if Slack refuses it, that pass logs so and falls back to the slower workspace token`
 
 // Run is the `pdw slack` entry point; args start with the verb.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string, cfg ingestclient.Config) int {

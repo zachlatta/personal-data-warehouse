@@ -1,7 +1,6 @@
 // Package slacksession persists the Slack *client* session that Zach pastes
-// into `pdw slack publish-session`, so reviewed Slack writes (a message sent as
-// him, a conversation marked read) can run server-side. The sync does not use
-// it: since 2026-10-01 it polls with OAuth tokens.
+// into `pdw slack publish-session`. The sync polls Slack with it (rate-limited far
+// less than the workspace token) and reviewed Slack writes spend it too.
 //
 // The credential is two parts that are useless apart: an `xoxc-` token and the
 // `d` cookie. Both are stored here because both must be replayed together.

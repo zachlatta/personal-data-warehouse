@@ -23,8 +23,11 @@ from personal_data_warehouse.slack_sync import (
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
     SLACK_COVERAGE_STAGE_STATE_TYPE,
+    SlackSessionApiClient,
+    SlackSessionFallbackClient,
     SlackSyncRunner,
     SlackSyncSummary,
+    SlackWebApiClient,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
@@ -84,6 +87,48 @@ def _user_sync_lock_wait_seconds() -> int:
 RETIRED_SLACK_CHANGE_FEED_STATE_KEY = ("", "change_feed", "client.counts")
 
 
+def _session_client_factory(*, settings, warehouse, logger):
+    """Poll with Zach's pasted Slack session when one is published.
+
+    His choice on 2026-10-01: the session is rate-limited far less than the
+    workspace OAuth token, whose ~39 conversations.history calls a minute could
+    not keep ~6,700 conversations current. A session Slack refuses falls back to
+    the OAuth token for the rest of the pass (SlackSessionFallbackClient).
+    Returns None (the runner's OAuth default) when no account has a session, or
+    when SLACK_ASSET_FRESHNESS_USE_SESSION=0.
+    """
+    if not _bool_env("SLACK_ASSET_FRESHNESS_USE_SESSION", True) or not hasattr(warehouse, "load_slack_session"):
+        return None
+    sessions: dict[str, Mapping[str, object]] = {}
+    for account in settings.slack_accounts:
+        try:
+            session = warehouse.load_slack_session(account=account.account) or {}
+        except Exception as exc:  # pragma: no cover - a missing table must not stop the sync
+            logger.warning("Could not read the Slack session; polling with the OAuth token: %s", exc)
+            session = {}
+        if session.get("session_token") and session.get("session_cookie"):
+            sessions[account.account] = session
+    if not sessions:
+        return None
+
+    def factory(account):
+        oauth = SlackWebApiClient(account.token)
+        session = sessions.get(account.account)
+        if session is None:
+            return oauth
+        return SlackSessionFallbackClient(
+            SlackSessionApiClient(
+                token=str(session["session_token"]),
+                cookie=str(session["session_cookie"]),
+                user_agent=str(session.get("user_agent") or ""),
+            ),
+            oauth,
+            logger=logger,
+        )
+
+    return factory
+
+
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     """Poll Slack for new messages in DMs, group DMs and channels.
 
@@ -127,6 +172,11 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             settings=settings,
             warehouse=warehouse,
             logger=logger,
+            client_factory=_session_client_factory(settings=settings, warehouse=warehouse, logger=logger),
+            # Four minutes of polling a pass, so the job finishes inside its
+            # five-minute schedule and hot DMs are polled every tick while a
+            # backlog drains across passes.
+            freshness_pass_budget=timedelta(seconds=_int_env("SLACK_ASSET_FRESHNESS_PASS_SECONDS", 240)),
             history_window=max(window_by_type.values()),
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,
