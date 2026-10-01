@@ -874,8 +874,8 @@ var columnRemaps = map[string]string{
 		"to read the conversation around a hit use the context tool (pdw context '<ref>') instead of SQL",
 	"body": "timeline.events carries the preview in snippet and the indexed body in search_text; raw tables name it per source " +
 		"(base_slack.messages.text, base_gmail.messages.body_markdown_clean, base_whatsapp.messages.body_text, marts_ai_conversations.events.text)",
-	"content": "agent-session and chat text is in text (marts_ai_conversations.events.text) or body_text (marts_messages.messages); timeline.events has snippet and search_text",
-	"provider": "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse), not provider",
+	"content":    "agent-session and chat text is in text (marts_ai_conversations.events.text) or body_text (marts_messages.messages); timeline.events has snippet and search_text",
+	"provider":   "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse), not provider",
 	"turn_index": "agent-session turns are ordered by seq within (source, session_id)",
 }
 
