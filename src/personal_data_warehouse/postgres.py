@@ -9785,33 +9785,6 @@ class PostgresWarehouse:
         )
         return rows[0] if rows else {}
 
-    def load_slack_conversation_cursors(self, *, account: str, team_id: str) -> dict[str, float]:
-        """Per-conversation high-water marks, for diffing against client.counts.
-
-        Read from derived_slack.conversation_stats, not from a max() over
-        base_slack.messages. Measured on production the direct aggregate is a
-        parallel index-only scan of 45M rows at **34.9s**, against **115ms** for
-        the 19k-row stats table -- and this runs on every freshness pass, so the
-        difference is the whole benefit.
-
-        Staleness here is safe in the only direction that matters: a stats row
-        behind the messages table yields a low cursor, so the conversation is
-        re-fetched. A conversation with no row at all reads as 0 and is fetched.
-        Both err toward doing work, never toward missing a message.
-        """
-        rows = self._query(
-            "SELECT conversation_id, EXTRACT(EPOCH FROM latest_message_at) "
-            "FROM @slack_conversation_stats WHERE account = %s AND team_id = %s",
-            (account, team_id),
-        )
-        cursors: dict[str, float] = {}
-        for conversation_id, latest in rows:
-            try:
-                cursors[str(conversation_id)] = float(latest)
-            except (TypeError, ValueError):
-                continue
-        return cursors
-
     def load_whoop_private_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:
         """The stored browser session, or an empty dict when none is published.
 
@@ -11552,7 +11525,7 @@ class PostgresWarehouse:
     ) -> set[str]:
         """Which of these conversation ids we already hold a row for.
 
-        The freshness pass asks this about the ids ``client.counts`` said moved, so it
+        The freshness pass asks this about the ids its conversation listing returns, so it
         can tell "nothing new happened here" from "we have never seen this conversation
         at all". The second case used to be indistinguishable from the first and cost
         hours of landing latency on every newly created DM and group DM.
@@ -11581,8 +11554,8 @@ class PostgresWarehouse:
     ) -> list[dict[str, Any]]:
         """Live public channels due a history poll, hottest bucket first.
 
-        Membership is deliberately NOT a filter here. The change feed
-        (``client.counts``) only reports conversations Zach participates in, and
+        Membership is deliberately NOT a filter here. Freshness polls only the
+        conversations Zach participates in plus his most active channels, and
         coverage only offers a channel whose history has never been completed, so
         a public channel he is not in was polled exactly once — at backfill — and
         then never again. Measured 2026-08-27 against Slack's own admin
@@ -12062,24 +12035,20 @@ class PostgresWarehouse:
             CREATE OR REPLACE VIEW @marts_ops_slack_conversation_health AS
             WITH expected(conversation_type, cycle_seconds, history_cycle_seconds, landing_p95_seconds) AS (
                 -- history_cycle_seconds is how often we must re-ASK a
-                -- conversation for new messages. It is NULL for the three types
-                -- the change feed covers (client.counts reports every
-                -- conversation Zach participates in), because there "we have not
-                -- polled it" is not evidence of anything: Slack told us nothing
-                -- happened. Public channels have no such signal -- he is not in
-                -- 13k of them -- so only a poll can find out, and only there is
-                -- the poll age judged. The number is the sweep's own rotation
-                -- (~2 days at its default limits) with margin.
+                -- conversation for new messages. Polling is the only way PDW
+                -- learns a Slack message exists (client.counts was refused with
+                -- team_is_restricted on 2026-10-01 and removed), so every type
+                -- is judged. DMs, group DMs and private channels: the freshness
+                -- pass's coldest interval is six hours, so twelve with margin.
+                -- Public channels: the sweep's own rotation (~2 days) with margin.
                 --
-                -- landing_p95_seconds is the opposite way round: judged for the
-                -- two DM types only, where a person is waiting on the other end
-                -- and the change feed plus a five-minute tick is supposed to
-                -- deliver in minutes. NULL for channels, whose landing time is
-                -- the sweep rotation by design.
+                -- landing_p95_seconds is judged for the two DM types only, where
+                -- a person is waiting on the other end. NULL for channels, whose
+                -- landing time is the sweep rotation by design.
                 VALUES
-                    ('im', 172800::bigint, NULL::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
-                    ('mpim', 172800::bigint, NULL::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
-                    ('private_channel', 172800::bigint, NULL::bigint, NULL::bigint),
+                    ('im', 172800::bigint, 43200::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('mpim', 172800::bigint, 43200::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('private_channel', 172800::bigint, 43200::bigint, NULL::bigint),
                     ('public_channel', 432000::bigint, 345600::bigint, NULL::bigint)
             ),
             per_type AS (
@@ -12131,7 +12100,7 @@ class PostgresWarehouse:
                 -- old messages is therefore excluded rather than read as a
                 -- day-long delay). A message written in that window that has
                 -- not landed at all is invisible here -- discovery and the
-                -- change feed are the detectors for that, and this row is the
+                -- poll age are the detectors for that, and this row is the
                 -- detector for "it landed, but late". Measured 2026-08-28 on
                 -- production: ~50k rows, 95ms warm, 39k shared buffers, all of
                 -- them the newest pages of the heap.
@@ -12155,15 +12124,6 @@ class PostgresWarehouse:
                   AND e.adapter = 'slack_message'
                   AND e.event_ts >= now() - interval '24 hours'
                 GROUP BY c.account, c.team_id, c.conversation_type
-            ),
-            feed AS (
-                -- The change feed's own verdict (defs/slack_sync.py,
-                -- record_slack_change_feed_verdict): one row per account.
-                SELECT DISTINCT ON (f.account)
-                    f.account, f.status, f.error, f.updated_at
-                FROM @slack_sync_state AS f
-                WHERE f.object_type = 'change_feed' AND f.object_id = 'client.counts'
-                ORDER BY f.account, f.updated_at DESC
             ),
             judged AS (
                 SELECT
@@ -12250,13 +12210,6 @@ class PostgresWarehouse:
                       OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.75)
                       OR p.landing_status = 'stale'
-                      -- The three types history_cycle_seconds leaves unjudged
-                      -- are unjudged BECAUSE the change feed says what moved.
-                      -- With the feed down for an hour that premise is false:
-                      -- from 2026-09-21 these rows read ok for a week while
-                      -- 164 of 219 group-DM messages never landed.
-                      OR (p.history_cycle_seconds IS NULL
-                          AND fv.status = 'action_required')
                         THEN 'stale'
                     WHEN p.refreshed_count::numeric / p.live_count < 0.95
                       OR (p.history_cycle_seconds IS NOT NULL
@@ -12264,12 +12217,8 @@ class PostgresWarehouse:
                       OR p.landing_status = 'late'
                         THEN 'late'
                     ELSE 'ok'
-                END AS status,
-                COALESCE(fv.status, 'unknown') AS change_feed_status,
-                COALESCE(fv.error, '') AS change_feed_error,
-                fv.updated_at AS change_feed_checked_at
+                END AS status
             FROM judged AS p
-            LEFT JOIN feed AS fv ON fv.account = p.account
             LEFT JOIN @slack_sync_state AS st
                    ON st.account = p.account
                   AND st.team_id = p.team_id
@@ -12702,6 +12651,16 @@ class PostgresWarehouse:
         except Exception:
             self._command("ROLLBACK")
             raise
+
+    def delete_slack_sync_state(
+        self, account: str, team_id: str, object_type: str, object_id: str
+    ) -> None:
+        """Delete one sync-state row by its full primary key (an index lookup)."""
+        self._command(
+            "DELETE FROM @slack_sync_state"
+            " WHERE account = %s AND team_id = %s AND object_type = %s AND object_id = %s",
+            (account, team_id, object_type, object_id),
+        )
 
     def insert_slack_sync_state(
         self,

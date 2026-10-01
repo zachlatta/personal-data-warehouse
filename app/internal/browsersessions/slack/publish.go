@@ -164,7 +164,7 @@ func defaultDeps(getenv func(string) string, cfg ingestclient.Config, stdin io.R
 }
 
 // Instructions is what a person at a terminal needs to produce the paste.
-var Instructions = `Publish a Slack web session for the warehouse's change feed and Slack writes.
+var Instructions = `Publish a Slack web session for reviewed Slack writes (sending as you, marking read).
 
 1. Open a new private (incognito) window, go to https://app.slack.com and sign
    in to Hack Club there. This session must be used by nothing but the
@@ -191,9 +191,10 @@ Read a Slack web session from stdin and publish it to the warehouse.
 
 `
 
-// verifyHint is how to confirm the session works: the warehouse is the first
-// thing to use it, on its next freshness pass.
-const verifyHint = `the warehouse first uses this session on its next Slack freshness pass (every five minutes); confirm with: pdw sql -q "slack change feed" "SELECT conversation_type, change_feed_status FROM marts_ops.slack_conversation_health"`
+// verifyHint says when the session is first used. Nothing calls Slack with it on
+// a schedule: since 2026-10-01 the sync polls with OAuth tokens, and only a
+// reviewed write spends the session.
+const verifyHint = `the warehouse uses this session only when a reviewed Slack write (a message sent as you, a mark-read) executes; that write's result says whether Slack accepted it`
 
 // Run is the `pdw slack` entry point; args start with the verb.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string, cfg ingestclient.Config) int {
@@ -298,8 +299,8 @@ func RunWith(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv fu
 
 // selectSession picks the session to publish from every team the paste named.
 // Workspace-scoped sessions come before org (Enterprise Grid) ones: an org
-// session's client.counts can answer about a sibling workspace, which is the
-// shape that took the change feed down on 2026-08-28 and again in September.
+// session can act in a sibling workspace, and a write must land in the one the
+// warehouse syncs.
 // Each candidate must resolve to one workspace the warehouse syncs (unless
 // --team-id names it). The report lists every candidate and why it was passed
 // over.

@@ -1,10 +1,11 @@
 // Package slack publishes a Slack web session that Zach copies by hand from a
 // browser (`pdw slack publish-session`).
 //
-// Slack's public Web API cannot say which conversations changed; the client's
-// own `client.counts` can, but only for a signed-in session. That session is
-// two pieces that are useless apart: an `xoxc-` token kept in the web client's
-// localStorage and the HttpOnly `d` cookie.
+// Reviewed Slack writes (sending as Zach, marking read) need a signed-in
+// session: two pieces that are useless apart, an `xoxc-` token kept in the web
+// client's localStorage and the HttpOnly `d` cookie. (The sync also spent it on
+// `client.counts` until Slack refused that with team_is_restricted on
+// 2026-10-01; it now polls with OAuth tokens.)
 //
 // Until 2026-09-29 this package read both out of the Slack DESKTOP app on
 // crobat every hour and called auth.test + client.counts with them to pick the

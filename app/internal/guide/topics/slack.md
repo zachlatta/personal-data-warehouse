@@ -34,9 +34,12 @@ people talking about him in public are `cc`.
 
 ## What is synced, and the edges
 
-- Everything Zach participates in — member channels, DMs, group DMs — is refreshed from
-  a change feed within minutes; DM landing latency is judged in
-  `marts_ops.slack_conversation_health` (`landing_p95_seconds`).
+- Everything Zach participates in — DMs, group DMs, private channels, his active member
+  channels — is **polled**: a conversation active in the last four hours every five
+  minutes, within two weeks every 15 minutes, within a year hourly, older every six
+  hours, and a brand-new DM or group DM is found by listing within five minutes. A DM
+  that wakes after months of quiet can therefore take hours to land. DM landing latency
+  is judged in `marts_ops.slack_conversation_health` (`landing_p95_seconds`).
 - The ~13k public channels he is **not** in are swept on a rotation of about a day. They
   were listed but never re-read between roughly May and 2026-08-27, so any answer drawn
   from a non-member public channel in that window came from a fraction of the corpus.
@@ -59,15 +62,12 @@ people talking about him in public are `cc`.
 messages a day keep it `ok` through a total group-DM outage, so the per-type check is
 `marts_ops.slack_conversation_health`: one row per conversation type with
 `refreshed_fraction` (share of live conversations re-listed within a cycle — the number
-that means something; ok ≥ 95%), `history_polled_fraction` (judged for public channels),
-the DM landing latency columns, and `status` as the worst of them. The status is about
-the sync attempt, not message volume: group DMs have legitimate zero-message days.
-DMs, group DMs and private channels stay current only through the change feed (a
-Slack web session Zach pastes with `pdw slack publish-session`). `change_feed_status`
-on the same view says whether it works; when it reads `action_required`, those three
-types read `stale` and a missing recent DM or group-DM message is a sync gap, not
-evidence. Never capture or replay his Slack login from a script to repair it: that is
-what got him signed out of every device on 2026-09-29. Ask him to paste a new session.
+that means something; ok ≥ 95%), `history_polled_fraction` (share polled within the
+type's cycle; polling is the only way a message is found), the DM landing latency
+columns, and `status` as the worst of them. The status is about the sync attempt, not
+message volume: group DMs have legitimate zero-message days. Never capture or replay
+Zach's Slack login from a script: that got him signed out of every device on
+2026-09-29.
 
 ## Writing
 

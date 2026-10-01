@@ -201,8 +201,6 @@ class SlackSyncRunner:
         skip_known_errors: bool = False,
         conversation_limit: int | None = None,
         conversation_page_limit: int | None = None,
-        conversation_ids: Sequence[str] | None = None,
-        new_conversation_limit: int = 25,
         discover_new_direct_conversations: bool = False,
         sync_thread_replies: bool = True,
         sync_thread_replies_only: bool = False,
@@ -247,13 +245,8 @@ class SlackSyncRunner:
         self._skip_known_errors = skip_known_errors
         self._conversation_limit = conversation_limit
         self._conversation_page_limit = conversation_page_limit
-        # When set, only these conversations are candidates: the change feed has
-        # already established that nothing else moved.
-        self._conversation_ids = conversation_ids
-        # How many conversations one freshness pass may look up with
-        # conversations.info. Each unknown id costs one call out of the rate
-        # budget every stage shares, and the normal figure is a handful a day.
-        self._new_conversation_limit = new_conversation_limit
+        # List DMs, group DMs and private channels each freshness pass to find
+        # ones never cached (see _discover_unlisted_direct_conversations).
         self._discover_new_direct_conversations = discover_new_direct_conversations
         self._sync_thread_replies = sync_thread_replies
         self._sync_thread_replies_only = sync_thread_replies_only
@@ -442,7 +435,6 @@ class SlackSyncRunner:
                 zero_messages_only=self._zero_messages_only,
                 skip_known_errors=self._skip_known_errors,
                 limit=self._conversation_limit,
-                conversation_ids=self._conversation_ids,
             )
             self._logger.info(
                 "Loaded %s cached Slack conversations for %s",
@@ -691,96 +683,6 @@ class SlackSyncRunner:
         else:
             self._logger.warning("Could not sync Slack conversation %s: %s", conversation_id, exc)
 
-    def _discover_named_conversations(
-        self,
-        *,
-        account: str,
-        team_id: str,
-        client,
-        synced_at: datetime,
-        conversations: list,
-    ) -> tuple[list, set[str]]:
-        """Fetch conversations the change feed named that we have never cached.
-
-        The freshness pass takes its candidates from ``base_slack.conversations``,
-        which is filled by the paged ``conversations.list`` walk. That walk rotates
-        conversation types and covers a few pages a run, so a conversation created
-        since it last passed is named by ``client.counts`` and then dropped on the
-        floor -- there is no cached row to load. Measured 2026-08-28, that was the
-        whole DM landing-latency tail: a group DM created at 16:02 first reached
-        ``timeline.events`` at 05:36 the next day, and a DM created at 19:20 landed at
-        23:30, the minute the discovery walk finally cached it. Both read `ok` on every
-        other Slack health number the whole time.
-
-        One ``conversations.info`` per genuinely unknown id closes that, and the
-        bound is what keeps it honest: a normal day names a handful, so the cost is
-        invisible against the ~39 calls/minute ceiling every Slack stage shares, but
-        a feed that suddenly names hundreds (a restored session, a lost conversations
-        table) must not spend the whole pass on metadata. The rest are picked up by
-        the next pass and by the discovery walk, exactly as before.
-        """
-        newly_discovered: set[str] = set()
-        if not self._conversation_ids or self._new_conversation_limit <= 0:
-            return conversations, newly_discovered
-        if not hasattr(self._warehouse, "load_slack_known_conversation_ids"):
-            return conversations, newly_discovered
-        requested = [str(conversation_id) for conversation_id in self._conversation_ids if conversation_id]
-        if not requested:
-            return conversations, newly_discovered
-        known = self._warehouse.load_slack_known_conversation_ids(
-            account=account,
-            team_id=team_id,
-            conversation_ids=requested,
-        )
-        unknown = [conversation_id for conversation_id in requested if conversation_id not in known]
-        if not unknown:
-            return conversations, newly_discovered
-        if len(unknown) > self._new_conversation_limit:
-            self._logger.warning(
-                "Slack change feed named %s conversations we have never cached; looking up %s this pass",
-                len(unknown),
-                self._new_conversation_limit,
-            )
-            unknown = unknown[: self._new_conversation_limit]
-        rows = []
-        discovered_payloads = []
-        for conversation_id in unknown:
-            try:
-                response = self._call(client, "conversations.info", channel=conversation_id)
-            except SlackApiCallError as exc:
-                self._logger.warning(
-                    "Could not look up newly changed Slack conversation %s: %s", conversation_id, exc
-                )
-                continue
-            info = response.get("channel")
-            if not isinstance(info, Mapping) or not info.get("id"):
-                continue
-            rows.append(
-                conversation_to_row(
-                    account=account,
-                    team_id=team_id,
-                    conversation=info,
-                    synced_at=synced_at,
-                )
-            )
-            discovered_payloads.append(info)
-        if not rows:
-            return conversations, newly_discovered
-        # Write every one of them, whatever its type: this pass only syncs the types it
-        # was asked for, but the row makes the conversation visible to every other stage.
-        self._warehouse.insert_slack_conversations(rows)
-        self._logger.info(
-            "Discovered %s Slack conversations the change feed named but we had never cached for %s",
-            len(rows),
-            account,
-        )
-        for payload in discovered_payloads:
-            if self._conversation_types and conversation_type(payload) not in self._conversation_types:
-                continue
-            conversations = [*conversations, payload]
-            newly_discovered.add(str(payload["id"]))
-        return conversations, newly_discovered
-
     def _discover_unlisted_direct_conversations(
         self,
         *,
@@ -792,9 +694,9 @@ class SlackSyncRunner:
     ) -> tuple[list, set[str]]:
         """List every DM, group DM and private channel, and return the ones never cached.
 
-        Only a poll-only pass (no change feed) does this. With client.counts gone
-        (`team_is_restricted` since 2026-10-01) nothing else names a conversation
-        created since the paged discovery walk last passed, and that walk covers a
+        Nothing else names a conversation created since the paged discovery walk
+        last passed (the client.counts change feed that did was refused with
+        `team_is_restricted` on 2026-10-01 and removed), and that walk covers a
         few 200-row pages a run across four rotating types: group DMs created on
         2026-09-30 waited ~8 hours to land. These three types are ~6,700
         conversations, so the whole list is about eight calls at 1,000 a page --
@@ -862,19 +764,10 @@ class SlackSyncRunner:
                 include_archived=False,
                 archived_only=False,
                 conversation_types=self._conversation_types,
-                # The change feed has already established which conversations
-                # moved; everything else is known not to need a history call.
-                conversation_ids=self._conversation_ids,
             )
             self._logger.info("Freshness loaded %s cached active Slack conversations for %s", len(conversations), account.account)
-            conversations, newly_discovered_ids = self._discover_named_conversations(
-                account=account.account,
-                team_id=team_id,
-                client=client,
-                synced_at=synced_at,
-                conversations=conversations,
-            )
-            if self._conversation_ids is None and self._discover_new_direct_conversations:
+            newly_discovered_ids: set[str] = set()
+            if self._discover_new_direct_conversations:
                 conversations, listed_new_ids = self._discover_unlisted_direct_conversations(
                     account=account.account,
                     team_id=team_id,
@@ -976,79 +869,74 @@ class SlackSyncRunner:
                     continue
                 planned.append((conversation, group, oldest_ts))
 
-        # The blanket poll (no change feed) cannot fetch everything: the shared
-        # rate budget ends it after roughly thirty conversations.history calls.
-        # Walking the types in priority order, each sorted by activity, spent
-        # that budget on the same ~30 most recently active DMs every pass and
-        # never reached a group DM -- from 2026-09-21, while the change feed was
-        # down, 164 of 219 group-DM messages in a week never landed. So a
-        # blanket pass takes candidates in activity tiers (inside the freshness
-        # window, inside the warm window, the rest) and inside a tier by when
-        # we last polled them, across types; every poll is stamped below, so
-        # the next pass starts where this one's budget ran out. A change-feed
-        # pass is already bounded by what moved and keeps the type priority.
-        blanket = self._conversation_ids is None
-        if blanket:
-            now_ts = synced_at.timestamp()
-            warm_floor = (
-                now_ts - self._freshness_warm_window.total_seconds()
-                if self._freshness_warm_window is not None
-                else None
+        # Nothing tells PDW which conversations moved, and the shared rate
+        # budget ends a pass after a few hundred conversations.history calls.
+        # Walking the types in priority order spent that budget on the same
+        # recently active DMs every pass (from 2026-09-21, 164 of 219 group-DM
+        # messages in a week never landed); taking them in activity tiers still
+        # never reached anything quiet for a fortnight. So candidates are
+        # scheduled by when each is due; every poll is stamped below, so the
+        # next pass starts where this one's budget ran out.
+        now_ts = synced_at.timestamp()
+        warm_floor = (
+            now_ts - self._freshness_warm_window.total_seconds()
+            if self._freshness_warm_window is not None
+            else None
+        )
+        cool_floor = now_ts - self._freshness_cool_window.total_seconds()
+        warm_interval, cool_interval, cold_interval = (
+            interval.total_seconds() for interval in self._freshness_due_intervals
+        )
+        type_rank = {group: index for index, group in enumerate(priority_groups)}
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+        def _last_polled(conversation: Mapping[str, object]) -> float:
+            state = state_by_key.get((account.account, team_id, "conversation", str(conversation["id"])))
+            updated = state.get("updated_at") if isinstance(state, Mapping) else None
+            if not isinstance(updated, datetime) or updated <= epoch:
+                return float("-inf")
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=UTC)
+            return updated.timestamp()
+
+        def _hot(conversation: Mapping[str, object], oldest_ts: float) -> bool:
+            if str(conversation["id"]) in newly_discovered_ids:
+                return True
+            return conversation_activity_ts(
+                conversation, cursor_ts=_conversation_cursor_ts(conversation)
+            ) >= oldest_ts
+
+        def _interval(conversation: Mapping[str, object]) -> float:
+            activity = conversation_activity_ts(
+                conversation, cursor_ts=_conversation_cursor_ts(conversation)
             )
-            cool_floor = now_ts - self._freshness_cool_window.total_seconds()
-            warm_interval, cool_interval, cold_interval = (
-                interval.total_seconds() for interval in self._freshness_due_intervals
-            )
-            type_rank = {group: index for index, group in enumerate(priority_groups)}
-            epoch = datetime(1970, 1, 1, tzinfo=UTC)
+            if warm_floor is not None and activity >= warm_floor:
+                return warm_interval
+            if activity >= cool_floor:
+                return cool_interval
+            return cold_interval
 
-            def _last_polled(conversation: Mapping[str, object]) -> float:
-                state = state_by_key.get((account.account, team_id, "conversation", str(conversation["id"])))
-                updated = state.get("updated_at") if isinstance(state, Mapping) else None
-                if not isinstance(updated, datetime) or updated <= epoch:
-                    return float("-inf")
-                if updated.tzinfo is None:
-                    updated = updated.replace(tzinfo=UTC)
-                return updated.timestamp()
-
-            def _hot(conversation: Mapping[str, object], oldest_ts: float) -> bool:
-                if str(conversation["id"]) in newly_discovered_ids:
-                    return True
-                return conversation_activity_ts(
-                    conversation, cursor_ts=_conversation_cursor_ts(conversation)
-                ) >= oldest_ts
-
-            def _interval(conversation: Mapping[str, object]) -> float:
-                activity = conversation_activity_ts(
-                    conversation, cursor_ts=_conversation_cursor_ts(conversation)
-                )
-                if warm_floor is not None and activity >= warm_floor:
-                    return warm_interval
-                if activity >= cool_floor:
-                    return cool_interval
-                return cold_interval
-
-            # Polling every candidate in tier order spent each pass on the ~250
-            # conversations active in the last fortnight and never reached the
-            # rest: on 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group
-            # DMs had been polled in 24 hours, and a group DM quiet since 09-10
-            # took 28 hours to land. So a conversation active inside the window
-            # is polled every pass, and every other one is due again after an
-            # interval set by how recently it was active; the most overdue go
-            # first, and one not yet due is not polled, which is what leaves
-            # budget for the quiet ones. Every poll is stamped below.
-            scheduled = []
-            for entry in planned:
-                conversation, group, oldest_ts = entry
-                if _hot(conversation, oldest_ts):
-                    scheduled.append(((0, _last_polled(conversation), type_rank[group]), entry))
-                    continue
-                due = _last_polled(conversation) + _interval(conversation)
-                if due > now_ts:
-                    continue
-                scheduled.append(((1, due, type_rank[group]), entry))
-            scheduled.sort(key=lambda item: item[0])
-            planned = [entry for _key, entry in scheduled]
+        # Polling every candidate in tier order spent each pass on the ~250
+        # conversations active in the last fortnight and never reached the
+        # rest: on 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group
+        # DMs had been polled in 24 hours, and a group DM quiet since 09-10
+        # took 28 hours to land. So a conversation active inside the window
+        # is polled every pass, and every other one is due again after an
+        # interval set by how recently it was active; the most overdue go
+        # first, and one not yet due is not polled, which is what leaves
+        # budget for the quiet ones. Every poll is stamped below.
+        scheduled = []
+        for entry in planned:
+            conversation, group, oldest_ts = entry
+            if _hot(conversation, oldest_ts):
+                scheduled.append(((0, _last_polled(conversation), type_rank[group]), entry))
+                continue
+            due = _last_polled(conversation) + _interval(conversation)
+            if due > now_ts:
+                continue
+            scheduled.append(((1, due, type_rank[group]), entry))
+        scheduled.sort(key=lambda item: item[0])
+        planned = [entry for _key, entry in scheduled]
 
         written_by_type: dict[str, int] = {}
         planned_by_type: dict[str, int] = {}
@@ -1123,17 +1011,16 @@ class SlackSyncRunner:
                     sync_version=sync_version,
                 )
                 continue
-            if blanket:
-                # A poll that found nothing writes no cursor, and the rotation
-                # above orders by the last poll: without this stamp a quiet
-                # conversation would be first in line on every pass.
-                self._warehouse.touch_slack_conversation_sync_state(
-                    account=account.account,
-                    team_id=team_id,
-                    conversation_id=str(conversation["id"]),
-                    updated_at=synced_at,
-                    sync_version=sync_version,
-                )
+            # A poll that found nothing writes no cursor, and the schedule above
+            # orders by the last poll: without this stamp a quiet conversation
+            # would be first in line on every pass.
+            self._warehouse.touch_slack_conversation_sync_state(
+                account=account.account,
+                team_id=team_id,
+                conversation_id=str(conversation["id"]),
+                updated_at=synced_at,
+                sync_version=sync_version,
+            )
             messages_written += result["messages_written"]
             files_written += result["files_written"]
             written_by_type[group[0]] = written_by_type.get(group[0], 0) + result["messages_written"]
@@ -1496,8 +1383,8 @@ class SlackSyncRunner:
         """Keep every live public channel current, member or not.
 
         This is the only stage that polls a public channel Zach has not joined
-        after its first backfill. Freshness asks ``client.counts``, which reports
-        only conversations he participates in; coverage offers only channels
+        after its first backfill. Freshness polls the conversations he
+        participates in plus his most active public channels; coverage offers only channels
         whose history is not yet complete. So a public channel he can read but is
         not in was fetched once and then frozen — measured 2026-08-27, 10,711 of
         them had gone untouched for a fortnight while Slack's own analytics said

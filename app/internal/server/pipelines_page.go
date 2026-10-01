@@ -883,9 +883,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       ? "unknown" : (Number(s.refreshed_fraction) * 100).toFixed(1) + "%";
     // Discovery is only half of it. A public channel Zach is not in is listed
     // by discovery, backfilled once, and then asked for nothing ever again --
-    // the change feed only reports conversations he is in, and coverage drops a
-    // channel once its history is complete. 11,488 sat frozen behind a 99.2%
-    // re-listed number until 2026-08-27, so the poll share is shown beside it.
+    // coverage drops a channel once its history is complete. 11,488 sat frozen
+    // behind a 99.2% re-listed number until 2026-08-27, so the poll share is
+    // shown beside it, and since polling is the only way a message is found
+    // (2026-10-01) it is judged for every type.
     var polled = s.history_polled_fraction === null || s.history_polled_fraction === undefined
       ? "n/a" : (Number(s.history_polled_fraction) * 100).toFixed(1) + "%";
     var landing = s.landing_p95_seconds === null || s.landing_p95_seconds === undefined
@@ -901,8 +902,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         ["re-read", polled,
           s.expected_history_cycle_seconds
             ? s.history_polled_count + " of " + s.live_count +
-              " asked for new messages within one sweep cycle — listing a channel is not reading it"
-            : "not judged: the change feed reports every conversation Zach is in, so an unpolled quiet one is evidence of nothing",
+              " asked for new messages within one poll cycle — listing a conversation is not reading it"
+            : "not judged",
           false],
         ["discovery", s.discovery_status || "unknown",
           s.last_discovery_at ? "last walk " + ago(ageOf(s.last_discovery_at)) + " ago" : "never walked", true],

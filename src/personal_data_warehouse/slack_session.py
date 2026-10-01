@@ -1,11 +1,10 @@
-"""Slack *client-session* HTTP helper for the Dagster-side sync.
+"""Slack *client-session* HTTP helper for the reviewed Slack writes.
 
-Slack's public Web API cannot tell us *which* conversations changed:
-``conversations.list`` returns no last-message marker at all (only ``updated``,
-which tracks topic/member edits). Slack's own client answers that question in a
-single request (``client.counts``), but only for a real logged-in session. That
-session is two pieces which are useless apart: an ``xoxc-`` token from the web
-client's localStorage and the ``d`` cookie.
+Sending a message as Zach and marking a conversation read need a real logged-in
+session: two pieces which are useless apart, an ``xoxc-`` token from the web
+client's localStorage and the ``d`` cookie. (The sync used to spend it on
+``client.counts`` too, to learn which conversations moved; Slack refused that
+with ``team_is_restricted`` on 2026-10-01 and the sync now polls instead.)
 
 Zach pastes that pair from a browser into ``pdw slack publish-session``
 (app/internal/browsersessions/slack), together with the browser's own
@@ -13,8 +12,7 @@ User-Agent; the app stores all three in ``private.slack_sessions``. It is never
 captured on a schedule: an hourly capture from the desktop app, calling Slack
 from Go with the desktop's own login, got him signed out of every device on
 each run (2026-09-29). This module is the server-side half: the one HTTP shape
-every Dagster caller (``slack_change_feed``, ``slack_mutations``,
-``defs/slack_sync``) uses to spend that session.
+``slack_mutations`` uses to spend that session.
 
 Nothing here logs a secret.
 """

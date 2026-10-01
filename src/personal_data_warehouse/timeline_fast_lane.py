@@ -6,7 +6,7 @@ serial five-minute clocks -- the source's own poll or upload, then the
 ``timeline_sync`` schedule. Two uniform 0-5 minute waits is ~5 min expected
 and ~10 min worst case, which is exactly what the tiers read. The sources
 themselves were fast (the WhatsApp client is live; a Slack DM is one
-``client.counts`` call); the schedule was the latency.
+history poll); the schedule was the latency.
 
 So an ingest asset that just wrote rows calls :func:`land_sources_on_timeline`
 before it returns, and the timeline rows of THAT source land in the same run

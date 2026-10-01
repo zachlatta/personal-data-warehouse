@@ -7605,6 +7605,19 @@ def test_search_text_filters_hits_to_the_requested_priority(warehouse: PostgresW
 # --- marts_ops.slack_conversation_health --------------------------------------
 
 
+def _poll_every_health_conversation(warehouse: PostgresWarehouse) -> None:
+    """Stamp every seeded conversation as polled a minute ago (poll age is judged)."""
+    now = datetime.now(tz=UTC)
+    for account, team_id, conversation_id in warehouse._query(
+        "SELECT account, team_id, conversation_id FROM @slack_conversations"
+    ):
+        warehouse.insert_slack_sync_state(
+            account=account, team_id=team_id, object_type="conversation", object_id=conversation_id,
+            cursor_ts="1770000000.000001", last_sync_type="partial", status="ok", error="",
+            updated_at=now - timedelta(minutes=1), sync_version=1,
+        )
+
+
 def _health_conversation_row(
     conversation_id: str,
     conversation_type: str,
@@ -7668,6 +7681,8 @@ def test_slack_conversation_health_catches_a_discovery_walk_that_never_advances(
             _health_conversation_row("C_TAIL_B", "mpim", synced_at=ancient),
         ]
     )
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
 
     rows = {
         row[0]: row[1:]
@@ -7714,9 +7729,8 @@ def test_slack_conversation_health_catches_public_channels_discovered_but_never_
             _health_conversation_row("C_POLLED", "public_channel", synced_at=fresh),
             _health_conversation_row("C_FROZEN_A", "public_channel", synced_at=fresh),
             _health_conversation_row("C_FROZEN_B", "public_channel", synced_at=fresh),
-            # A DM is judged on discovery alone: the change feed answers
-            # "did anything happen here" authoritatively, so an unpolled quiet
-            # DM is evidence of nothing.
+            # A DM nobody polled is judged too: polling is the only way a
+            # message in it is found.
             _health_conversation_row("D_QUIET", "im", synced_at=fresh),
         ]
     )
@@ -7768,9 +7782,9 @@ def test_slack_conversation_health_catches_public_channels_discovered_but_never_
     assert public[5] == 345600
 
     dm = rows["im"]
-    assert dm[5] is None, "types the change feed covers are not judged on poll age"
-    assert dm[3] == "ok"
-    assert dm[4] == "ok"
+    # Never polled: since the change feed was removed, that is evidence.
+    assert dm[5] == 43200
+    assert dm[3] == "stale"
 
 
 def _landed_slack_messages(warehouse: PostgresWarehouse, *, now: datetime, written: dict[str, list[int]]) -> None:
@@ -7834,6 +7848,8 @@ def test_slack_conversation_health_judges_dm_landing_latency(
             _health_conversation_row("C_SWEPT", "public_channel", synced_at=fresh),
         ]
     )
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
     warehouse.insert_slack_sync_state(
         account="zrl",
         team_id="T1",
@@ -7915,6 +7931,8 @@ def test_slack_conversation_health_reads_late_dms_as_late_and_quiet_dms_as_unkno
             _health_conversation_row("G_SILENT", "mpim", synced_at=fresh),
         ]
     )
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
     # Four fast messages and one forty-minute straggler: p50 is fine, p95 is
     # past the ok bound and short of the hour that means stale.
     _landed_slack_messages(warehouse, now=now, written={"D_LATE": [1, 2, 3, 4, 40]})
@@ -7996,6 +8014,8 @@ def test_slack_conversation_health_reports_the_discovery_cursor(
     warehouse.insert_slack_conversations(
         [_health_conversation_row("C1", "mpim", synced_at=now - timedelta(minutes=5))]
     )
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
     warehouse.insert_slack_sync_state(
         account="zrl",
         team_id="T1",
@@ -8236,6 +8256,8 @@ def test_slack_conversation_health_ignores_archived_conversations(
             },
         ]
     )
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
 
     rows = warehouse._query(
         """
@@ -8278,6 +8300,8 @@ def test_slack_conversation_health_tolerates_a_handful_of_unreachable_stragglers
         _health_conversation_row("C_STRAGGLER", "private_channel", synced_at=now - timedelta(days=120))
     )
     warehouse.insert_slack_conversations(rows)
+    # Polling is not this test's subject; every conversation was just polled.
+    _poll_every_health_conversation(warehouse)
 
     status, fraction = warehouse._query(
         """
@@ -8345,59 +8369,53 @@ def test_postgres_slack_account_state_refresh_is_debounced(warehouse: PostgresWa
     assert _inbox_rows(warehouse)["D2"][0] == 0
 
 
-def test_slack_conversation_health_reads_the_change_feed_types_stale_when_the_feed_is_down(
+def test_slack_conversation_health_judges_every_type_on_how_recently_it_was_polled(
     warehouse: PostgresWarehouse,
 ) -> None:
-    """The three feed-covered types are only 'ok' while the feed works.
+    """Polling is the only way PDW learns a Slack message exists.
 
-    history_cycle_seconds is NULL for im / mpim / private_channel because the
-    change feed says what moved -- so "not polled" is no evidence there. From
-    2026-09-21 the feed was unusable for a week and those rows kept reading
-    `ok` while 164 of 219 group-DM messages never landed: a type with nothing
-    landed has no latency to judge (`unknown`), and the premise that justified
-    not judging polls was false. The feed's own verdict row settles it.
+    Until 2026-10-01 DMs, group DMs and private channels were left unjudged on
+    poll age because client.counts said what moved. That feed is gone
+    (team_is_restricted, then removed), and on that day only 108 of 3,717 DMs
+    and 114 of 2,889 group DMs had been polled in 24 hours while these rows read
+    `ok`. Every type is now judged on the share polled within its cycle.
     """
     warehouse.ensure_slack_tables()
     now = datetime.now(tz=UTC)
     warehouse.insert_slack_conversations(
         [
-            _health_conversation_row("D1", "im", synced_at=now - timedelta(minutes=5)),
-            _health_conversation_row("G1", "mpim", synced_at=now - timedelta(minutes=5)),
-            _health_conversation_row("C1", "public_channel", synced_at=now - timedelta(minutes=5)),
+            _health_conversation_row("D_POLLED", "im", synced_at=now - timedelta(minutes=5)),
+            _health_conversation_row("D_FORGOTTEN", "im", synced_at=now - timedelta(minutes=5)),
+            _health_conversation_row("G_POLLED", "mpim", synced_at=now - timedelta(minutes=5)),
         ]
     )
-
-    def statuses() -> dict:
-        return {
-            row[0]: (row[1], row[2])
-            for row in warehouse._query(
-                """
-                SELECT conversation_type, status, change_feed_status
-                FROM @marts_ops_slack_conversation_health WHERE account = 'zrl'
-                """
-            )
-        }
-
-    before = statuses()
-    assert before["mpim"] == ("ok", "unknown")
-
-    def verdict(status: str) -> None:
+    for conversation_id, polled in (
+        ("D_POLLED", now - timedelta(hours=2)),
+        ("D_FORGOTTEN", now - timedelta(days=3)),
+        ("G_POLLED", now - timedelta(hours=5)),
+    ):
         warehouse.insert_slack_sync_state(
-            account="zrl", team_id="", object_type="change_feed", object_id="client.counts",
-            cursor_ts=f"{(now - timedelta(hours=2)).timestamp():.6f}", last_sync_type="change_feed",
-            status=status, error="Slack change feed unusable since ...", updated_at=now,
-            sync_version=int(now.timestamp() * 1_000_000),
+            account="zrl", team_id="T1", object_type="conversation", object_id=conversation_id,
+            cursor_ts="1770000000.000001", last_sync_type="partial", status="ok", error="",
+            updated_at=polled, sync_version=1,
         )
-
-    verdict("degraded")  # inside the hour of grace: not yet a verdict
-    assert statuses()["mpim"] == ("ok", "degraded")
-
-    verdict("action_required")
-    rows = statuses()
-    assert rows["im"] == ("stale", "action_required")
-    assert rows["mpim"] == ("stale", "action_required")
-    # Public channels never relied on the feed; their sweep is judged directly.
-    assert rows["public_channel"][0] == before["public_channel"][0]
-
-    verdict("ok")
-    assert statuses()["mpim"] == ("ok", "ok")
+    rows = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, history_polled_fraction, history_status, status,
+                   expected_history_cycle_seconds
+            FROM @marts_ops_slack_conversation_health WHERE account = 'zrl'
+            """
+        )
+    }
+    assert float(rows["im"][0]) == 0.5 and rows["im"][1] == "stale" and rows["im"][2] == "stale"
+    assert rows["im"][3] == 43200
+    assert rows["mpim"][1] == "ok" and rows["mpim"][2] == "ok"
+    view = warehouse.sql_relation("marts_ops_slack_conversation_health")
+    columns = [d[0] for d in warehouse._query_description(f"SELECT * FROM {view} LIMIT 0")] if hasattr(
+        warehouse, "_query_description"
+    ) else [r[0] for r in warehouse._query(
+        "SELECT attname FROM pg_attribute WHERE attrelid = %s::regclass AND attnum > 0", (view,)
+    )]
+    assert not [c for c in columns if c.startswith("change_feed")], columns

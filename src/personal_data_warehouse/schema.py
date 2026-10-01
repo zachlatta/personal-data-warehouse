@@ -2048,9 +2048,8 @@ WHOOP_PRIVATE_SYNC_STATE_COLUMNS = (
 #: the app's upsert names ``ON CONFLICT (account, session_key)``, so even the
 #: primary key is part of the contract.
 # The Slack *client* session: an xoxc token plus the `d` cookie, which are
-# useless apart. It exists because Slack's public API has no bulk "what changed"
-# call -- see slack_session.py -- and client.counts does, but only for a real
-# signed-in session.
+# useless apart. Reviewed Slack writes (sending as Zach, marking read) spend it;
+# see slack_session.py.
 SLACK_SESSION_COLUMNS = (
     "account",
     "session_key",

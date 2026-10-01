@@ -127,9 +127,12 @@ Three sources carry a contract of their own, because each is where "the pipeline
 and "the data is right" have come apart:
 
 - **S1 — Slack: every message, DM, group DM, private channel, public channel and thread is
-  synced and current, and a DM lands fast.** *Held up by*
-  `marts_ops.slack_conversation_health` (discovery share, history-poll share, DM landing
-  latency, change-feed verdict). See [Slack](docs/agents/slack.md).
+  synced and current, and a DM lands fast — by polling.** Nothing tells PDW which
+  conversations moved (`client.counts` was refused and removed on 2026-10-01), so the
+  freshness pass lists DMs and group DMs to find new ones and polls every conversation
+  when it is due. *Held up by* `marts_ops.slack_conversation_health` (discovery share,
+  poll share for every type, DM landing latency) and
+  `test_blanket_freshness_polls_each_conversation_when_it_is_due`. See [Slack](docs/agents/slack.md).
 - **S2 — every voice source lands in `base_*`, unifies in `marts_voice_memos.recordings`, is
   transcribed by AssemblyAI, enriched by an agent that can query PDW, and matched to a
   calendar event, with unmatched recordings kept in the same mart.** *Held up by*
@@ -153,7 +156,7 @@ Read the file for the area you are changing before you change it.
 | --- | --- |
 | search, hybrid retrieval, landing latency, the performance contract and its incidents | [docs/agents/search.md](docs/agents/search.md) |
 | pipeline freshness and health, collation drift and index corruption | [docs/agents/pipeline-health.md](docs/agents/pipeline-health.md) |
-| Slack: discovery, coverage, change feed, huddles, sending, file bytes | [docs/agents/slack.md](docs/agents/slack.md) |
+| Slack: polling, discovery, coverage, huddles, sending, file bytes | [docs/agents/slack.md](docs/agents/slack.md) |
 | voice recordings and the Voice Memos uploader | [docs/agents/voice.md](docs/agents/voice.md) |
 | finance: Plaid, SimpleFIN, the ledger, manual documents, securities | [docs/agents/finance.md](docs/agents/finance.md) |
 | WHOOP and the health mart | [docs/agents/health-sources.md](docs/agents/health-sources.md) |

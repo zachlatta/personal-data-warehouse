@@ -17,18 +17,16 @@ const slackUsage = `pdw slack - manage the Slack web session the warehouse syncs
 USAGE
   pdw slack publish-session [flags] < paste
 
-Slack's public API cannot say which conversations have new messages:
-conversations.list returns no last-message marker, so finding one costs a
-conversations.history call per conversation -- far more than Slack's rate limit
-allows. Slack's own client answers it in a single request (client.counts), but
-only for a real signed-in session, which also posts and marks read as you.
+Reviewed Slack writes -- a message sent as you, a conversation marked read --
+need a real signed-in session. The sync itself polls with the workspace's
+OAuth tokens and never uses this session.
 
 publish-session reads that session from what you paste -- the JSON a DevTools
 console snippet copies on app.slack.com, then the "d" cookie -- and publishes
 it to the warehouse. It sends nothing to Slack: the old hourly capture from the
 Slack desktop app called Slack with your desktop login from a Go program, and
 Slack signed you out of every device each time it ran. Run it once from a
-terminal to see the steps; re-run it only when the change feed says the
+terminal to see the steps; re-run it only when a Slack write reports the
 session stopped working.
 
 FLAGS (see "pdw slack publish-session --help")

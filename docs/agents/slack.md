@@ -131,8 +131,8 @@ shared rate-limit budget, so over-asking does not fail runs, it starves the
 other stages.
 
 - **Membership is deliberately not a filter, and `is_member` is not trustworthy
-  anyway.** `base_slack.conversations.is_member` said 202 while the change feed
-  covers 316 channels; it is refreshed only by whatever last wrote the
+  anyway.** `base_slack.conversations.is_member` said 202 while Slack's own client
+  reported 316 member channels (2026-08); it is refreshed only by whatever last wrote the
   conversation row.
 - **A poll that returns nothing must still be recorded**
   (`touch_slack_conversation_sync_state`, which advances `updated_at` and
@@ -141,10 +141,9 @@ other stages.
   never reached. This is the one invariant that makes the rotation a rotation.
 - **`marts_ops.slack_conversation_health` now judges both halves.**
   `history_polled_fraction` is the share of live conversations asked for new
-  messages within a cycle, and it is judged **only for `public_channel`** —
-  for the other three types the change feed authoritatively reports that nothing
-  happened, so "not polled" is evidence of nothing. `status` is the worse of the
-  two halves; both are on `/pipelines`.
+  messages within a cycle, judged for every type since 2026-10-01 (polling is the
+  only way a message is found). `status` is the worst of the halves; all are on
+  `/pipelines`.
 - **Ground truth for this lives outside PDW.** The Hack Club warehouse's
   `slack.public_channel_analytics` is Slack's own admin analytics, one row per
   channel per day with `messages_posted_count`. Compare against it rather than
@@ -154,7 +153,7 @@ other stages.
 coverage walks DOWN.** Measured 2026-08-28: of 15 member public channels created after
 2026-05-18 and first listed by the page-1 discovery fix on 08-24, 8 held nothing before
 08-24/25 — one of them a channel created in May that Slack shows posting ~3k messages a
-day. The change feed named them, freshness read its four-hour window and persisted the
+day. Freshness polled them, read its four-hour window and persisted the
 newest message as the cursor with `last_sync_type = 'partial'`, and coverage — which
 selects on `NOT (ok AND full)` — then topped each one up from `cursor - 14 days` on every
 rotation, which never reaches further back than the window it already had. A full stream
@@ -197,100 +196,51 @@ while every other Slack number was `ok`. The per-type windows and caps survive a
 the one pass; `test_slack_freshness_sync_runs_priority_cycle` pins the single runner.
 
 **The tail was a conversation we had never heard of, not a slow fetch.** The freshness
-pass takes its candidates from the *cached* `base_slack.conversations` rows, so an id
-`client.counts` names that has no row is loaded as nothing and silently dropped. Discovery
+pass takes its candidates from the *cached* `base_slack.conversations` rows, and discovery
 is a paged `conversations.list` walk that rotates conversation types, so a conversation
-created since it last passed waits for it: measured 2026-08-28, `im` discovery was 14.3
-hours old, a group DM created 16:02 first reached `timeline.events` at **05:36 the next
-day** (13.6h), and a DM created 19:20 landed at 23:30 — the minute the walk cached it. The
-median DM was 3 minutes the whole time, which is why this reads as a p95 problem and not
-as an outage. Two halves fix it, and each was independently necessary:
+created since it last passed waits for it: measured 2026-08-28, a group DM created 16:02
+first reached `timeline.events` at **05:36 the next day** (13.6h). The median DM was 3
+minutes the whole time, which is why this reads as a p95 problem and not as an outage. The
+freshness pass now lists DMs, group DMs and private channels itself every pass (see
+[Polling](#polling-how-the-sync-finds-new-messages)), and **a brand-new conversation streams in
+full and skips the activity gate**: one production DM's first message sat *eight minutes*
+outside the four-hour window and waited eight more hours for the coverage floor walk.
+Streaming in full is cheap precisely because the conversation is new.
 
-- **An id the feed names that we hold no row for is looked up with `conversations.info`
-  there and then**, written to `base_slack.conversations` (whatever its type, so every
-  other stage sees it too), and synced in the same pass. It costs one call for something
-  that happens a handful of times a day, bounded by `SLACK_ASSET_NEW_CONVERSATION_LIMIT`
-  (25) so a feed that suddenly names hundreds — a restored session, a lost conversations
-  table — cannot spend a whole pass on metadata against the ~39 calls/minute ceiling every
-  Slack stage shares.
-- **A brand-new conversation streams in full and skips the activity gate.** The freshness
-  window is four hours and the gate falls back to the cached `latest.ts` when there is no
-  cursor, so the pass that first finds a conversation would otherwise truncate it, or skip
-  it outright: one production DM's first message sat *eight minutes* outside the
-  window and waited eight more hours for the coverage floor walk. Streaming in full is
-  cheap precisely because the conversation is new — this branch is reachable only when we
-  hold no row for it at all, so a busy channel Zach merely joined is not affected.
+## Polling: how the sync finds new messages
 
-**An `ok: true` payload about someone else's conversations is not a change feed, and it
-stopped Slack ingestion dead for eleven hours.** Hack Club is an Enterprise Grid org, and a
-session's `client.counts` can come back scoped to a sibling workspace. Production did it
-twice — 2026-08-27 18:15–19:15 and again from 2026-08-28 03:25 — going from 694
-conversations covered to **17**, whose ids `conversations.info` answered
-`channel_not_found`. `SlackChangePlan.usable` stayed True, so the freshness pass polled
-those 13 permanently-"changed" ids (unfetchable, so their cursors could never advance),
-logged `Freshness loaded 0 cached active Slack conversations` and `synced 0 Slack messages`
-on every five-minute tick, and **no other Slack health number moved**: discovery 100%,
-history polling `ok`, the pipeline green. The 18:15–19:15 episode is exactly the DM
-landing-latency spike that motivated `landing_p95_seconds` — that column is the only thing
-that saw it, and it saw it an hour late.
+**Slack's API cannot tell PDW which conversations have new messages, so the freshness pass
+polls.** `conversations.list` returns no last-message marker — its `updated` tracks topic and
+member edits (measured 2026-10-01, it matched the newest message for 16 of 116 recently
+active DMs) — so the only way to find a message is `conversations.history` on the
+conversation. From 2026-08-24 the sync asked Slack's own `client.counts` instead, in one
+request through Zach's pasted web session; on 2026-10-01 Slack answered
+`team_is_restricted` to a fresh, valid session (`auth.test` accepted it) and the change feed
+was removed. Polling is the design.
 
-The plan is now unusable unless at least `SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION` (half) of
-the conversations the feed names are ones we already hold, which degrades to the blanket
-poll — throughput, never coverage, the trade this whole path is built on. The threshold sits
-far below any honest miss rate (a conversation created since the discovery walk last ran is
-legitimately unknown, a handful against ~690), and a fresh warehouse that holds nothing to
-vouch with correctly falls back to the poll that fills the table in the first place.
+One freshness pass runs every five minutes on its own lock (`slack_workspace_sync`) and does
+three things:
 
-## Slack change feed: how the sync knows what to fetch
+- **It lists DMs, group DMs and private channels** (`conversations.list`,
+  `types=im,mpim,private_channel`, 1,000 a page: ~8 calls for ~6,700 conversations), writes
+  only the ids never cached, and streams those in full in the same pass. Before this a new
+  conversation waited for the rotating discovery walk: group DMs created on 2026-09-30 took
+  ~8 hours to land.
+- **It polls each conversation when it is due** (`SLACK_FRESHNESS_DUE_INTERVALS`): active
+  inside the freshness window (four hours for DMs and group DMs) every pass, within 14 days
+  every 15 minutes, within a year hourly, older every six hours. The most overdue go first
+  and one not yet due is skipped. Before this the pass polled every candidate in tier order,
+  spent its budget on the ~250 conversations active in the last fortnight, and never reached
+  the rest: in the 24 hours to 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group DMs
+  were polled at all, and a group DM quiet since 09-10 took 28 hours to land.
+- **It stamps every poll** (`touch_slack_conversation_sync_state`), including one that found
+  nothing, because the schedule reads the last poll.
 
-**Slack's public API cannot tell you which conversations have new messages.**
-`conversations.list` returns no last-message marker at all — only `updated`, which tracks
-topic and member edits. So with an app token the only way to find a new message is to call
-`conversations.history` on every conversation. Measured 2026-08-24: the freshness pass
-attempts **950 conversations per five-minute cron** against a token ceiling of **~39
-`conversations.history` calls/minute** (37-call burst, then a steady `Retry-After: 10`).
-It is ~5x oversubscribed, so it spends ~10 minutes of every hour asleep on 429s *while
-holding the exclusive Slack lock* — which is why 70% of coverage runs and 83% of metadata
-runs were lock-skipped no-ops, and why backfills never drained.
-
-**`client.counts` answers the same question in one request** — but only for a real
-signed-in session, which is why `private.slack_sessions` exists. The credential is two
-pieces that are useless apart: an `xoxc-` token from the Slack web client's localStorage
-and the HttpOnly `d` cookie. Zach pastes both by hand; see
-[Publishing the Slack session](#publishing-the-slack-session-a-paste-never-a-capture).
-
-**What the feed does and does not cover.** Measured on the real workspace: 316 channels
-(exactly the 317 the account belongs to), 237 open DMs, 137 open group DMs — 690 total. It
-is complete for everything Zach participates in and **silent about the ~13k public channels
-he is not a member of**, which keep the slow coverage sweep. `slack_change_feed.py` reports
-that coverage rather than assuming it.
-
-Three behaviours are load-bearing and each failure would be silent:
-
-- **An entry with no `latest` marker is ignored, not fetched.** Treating unknown as changed
-  restores the blanket poll this replaces.
-- **A failed `client.counts` raises; it never returns an empty list.** "Nothing changed" and
-  "we could not ask" must not look alike — the empty reading would stop ingestion silently.
-- **Any failure degrades to the old polling path** (`SlackChangePlan.usable = False`), so a
-  revoked or missing session costs throughput and never coverage. `SLACK_ASSET_USE_CHANGE_FEED=0`
-  forces that fallback.
-- **A sibling-workspace answer is retried with the workspace named before it degrades.**
-  The `ok: true`-about-another-workspace shape came back a third and fourth time — 2026-09-02
-  15:00–17:00 and **2026-09-08 12:00 → 2026-09-09 03:00, fifteen hours** — with the SAME
-  token the hourly republish on crobat had verified against 685 conversations that
-  afternoon. The session was fine; Slack's routing of an org-scoped session was not. The
-  guard degraded correctly, but the blanket poll it degrades to loads 3,660 IMs, hits
-  `Retry-After: 10` on its ~30th `conversations.history` call, exhausts its 120s sleep
-  budget two minutes in, and synced **zero** IM messages per pass — so the freshness job
-  took ~10 minutes, its schedule skipped two ticks in three, and DM landing p95 read 32
-  minutes (1:1) / 42 minutes (group) on `marts_ops.slack_conversation_health`. The plan now
-  asks again with the workspace named the way the web client does on Enterprise Grid — a
-  `team_id` form field, then `slack_route=E:T` on the URL (`CLIENT_COUNTS_WORKSPACE_VARIANTS`)
-  — uses the first answer that names conversations we hold, and logs
-  `recovered by naming the workspace explicitly (variant=…)`. Which variant it was is the
-  thing nobody could measure during the outage; read that log line next time before
-  theorising. A healthy feed is unchanged: the plain call is first, and all three variants
-  returned the same 686 rows on 2026-09-10.
+The budget is the token's `conversations.history` rate limit, shared with the public sweep
+and coverage: measured 2026-10-01 a pass made ~310 calls in 3.5 minutes before its 120-second
+sleep budget ran out. `marts_ops.slack_conversation_health` judges every type on
+`history_polled_fraction` within its cycle (twelve hours for DMs, group DMs and private
+channels) beside DM landing latency.
 
 **`derived_slack.inbox_items` is refreshed incrementally, and the watermark is the reason.**
 Every Slack stage ends by refreshing that snapshot (`refresh_slack_account_state_items`).
@@ -343,13 +293,11 @@ warehouse through the SQL tool. The browser's User-Agent is stored in
 it (`slack_session._slack_post`), rather than the Slack desktop User-Agent the helper used to
 hard-code, which a browser-minted session has never presented.
 
-**The server still spends the session every five minutes, and that is a known risk, not a
-solved one.** The change feed (`client.counts`) and the Slack writes run from Python on
-mew-coolify with Python's TLS fingerprint. Slack has not flagged that shape, but it had
-barely been exercised: the session died with each reset. If `slack.audit_logs` ever shows
-`unexpected_scraping` without a manual publish beside it, the server is the cause, and the
-fix is to stop spending a login at all (official user-token scopes for sends and mark-read,
-the Events API for "what changed"), not to disguise the requests better.
+**Only reviewed writes spend the session now.** Sends and mark-reads run from Python on
+mew-coolify with Python's TLS fingerprint; the sync no longer touches the session. If
+`slack.audit_logs` ever shows `unexpected_scraping` without a manual publish beside it, a
+write is the cause, and the fix is to stop spending a login at all (official user-token
+scopes for sends and mark-read), not to disguise the requests better.
 
 **Mint the session in a private window used for nothing else, then close it without
 signing out.** All six `unexpected_scraping` anomalies from 2026-09-20 to 09-29 in
@@ -357,13 +305,12 @@ signing out.** All six `unexpected_scraping` anomalies from 2026-09-20 to 09-29 
 `previous_ua` of the Slack desktop app: a session Slack knew as the desktop client suddenly
 used by another one. The Python server spent those same desktop sessions for months and was
 never flagged. A session whose whole history is the warehouse's has no other client to
-contradict. Signing out ends it, and the change-feed verdict goes `action_required` within
-the hour.
+contradict. Signing out ends it.
 
-**Since 2026-10-01 `client.counts` answers `team_is_restricted` to a fresh session** pasted
-this way, although `auth.test` accepts it as the right user and workspace, on every host and
-`slack_route` variant. It is Slack refusing the call, not a bad paste; re-pasting does not
-help, and adding browser headers is the disguise this section rules out.
+**`client.counts` answered `team_is_restricted` to a fresh session** pasted this way on
+2026-10-01, although `auth.test` accepted it as the right user and workspace, on every host
+and `slack_route` variant. That is why the change feed was removed rather than repaired:
+adding browser headers is the disguise this section rules out.
 
 **Enterprise Grid is a live trap here.** Hack Club is an Enterprise Grid org, so a client
 session's `auth.test` returns the **org** id `E09V59WQY1E` where the app token returns the
@@ -375,38 +322,16 @@ endpoint rejects it, `publish-session` prefers the workspace entry, and an org-o
 resolved through `base_slack.teams.enterprise_id` rather than guessed (an org covering
 several workspaces raises instead).
 
-### When the change feed goes down: the week of 2026-09-21
+### History: the week the change feed went down (2026-09-21)
 
-**Seven days of "change feed unusable" read `ok` everywhere, and group DMs stopped landing.**
-Three failures lined up, and each is now closed:
-
-- **The desktop-app capture could not see the working tokens, and then took the wrong
-  one.** It byte-scanned the app's LevelDB, where Snappy compression hid the working Hack
-  Club tokens, and on 2026-09-23 it published another workspace's session as production's.
-  The capture is gone (see
-  [Publishing the Slack session](#publishing-the-slack-session-a-paste-never-a-capture));
-  what survives is the choice: the paste names every signed-in team, and `publish-session`
-  takes workspace-scoped (`T…`) entries before org (`E…`) ones and only a workspace the
-  warehouse syncs, listing every candidate and why it was passed over.
-- **The blanket poll never reached a group DM.** With no usable feed the freshness pass
-  polls cached conversations one by one, and the shared rate budget ends it after ~30
-  `conversations.history` calls. It walked `im`, then `mpim`, then channels, each by
-  recency, so it spent every pass on the same ~30 DMs. Measured 2026-09-28 against Slack's
-  own history for 150 active conversations: 1:1 DMs p50 3 min with 5 of 600 messages
-  missing, **group DMs 164 of 219 missing**, some untouched since 09-17. A blanket pass now
-  takes candidates in tiers (active inside the freshness window, inside
-  `SLACK_ASSET_FRESHNESS_WARM_DAYS` = 14, the rest) and inside a tier by **last poll**
-  across types, stamping every poll (`touch_slack_conversation_sync_state`) so the next
-  pass starts where the budget ran out. A change-feed pass is unchanged.
-
-**The verdict is a row, not a log line.** Every freshness pass writes the feed's verdict to
-`ops.slack_sync_state` (`team_id = ''`, `object_type = 'change_feed'`, `object_id =
-'client.counts'`, `cursor_ts` = when the failure began). An unusable feed is `degraded`
-for its first hour and `action_required` after, which the Slack row of
-`marts_ops.pipeline_health` reads as `attention` with the reason, the published session's
-workspace and age, and the repair: Zach pastes a new session. `marts_ops.slack_conversation_health` carries it as `change_feed_status` and
-reads `im` / `mpim` / `private_channel` **stale** while it is `action_required`: those
-types are unjudged on history polls only because the feed says what moved.
+Seven days of "change feed unusable" read `ok` everywhere while group DMs stopped landing.
+The desktop-app capture had published another workspace's session as production's (the
+capture is gone; `publish-session` takes workspace-scoped `T…` entries first and only a
+workspace the warehouse syncs), and the poll the sync fell back to walked `im`, then `mpim`,
+each by recency, so it spent every pass on the same ~30 DMs: measured 2026-09-28 against
+Slack's own history, **164 of 219 group-DM messages** in a week were missing. Both lessons
+are now the design above: polling is judged, never a fallback, and it is scheduled by when
+each conversation is due.
 
 **To verify a Slack claim against Slack itself**, the user token (`SLACK_<ACCOUNT>_TOKEN`
 in the gitignored `.env`) reads `conversations.history` for any DM or group DM; its

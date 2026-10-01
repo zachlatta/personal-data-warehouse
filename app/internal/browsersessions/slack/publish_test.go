@@ -134,8 +134,8 @@ func TestRunPublishesThePastedWorkspaceSessionWithoutCallingSlack(t *testing.T) 
 		p.TeamURL != "https://hackclub.slack.com/" {
 		t.Fatalf("published = %+v", p)
 	}
-	if !strings.Contains(report["next"].(string), "change_feed_status") {
-		t.Fatalf("report does not say how to confirm the session works: %v", report)
+	if !strings.Contains(report["next"].(string), "reviewed Slack write") {
+		t.Fatalf("report does not say when the session is first used: %v", report)
 	}
 }
 

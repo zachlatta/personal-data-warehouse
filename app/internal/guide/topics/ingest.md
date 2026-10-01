@@ -32,7 +32,7 @@ Item that double-counts net worth. Retire a confirmed duplicate with
 
 | command | what it does |
 | --- | --- |
-| `pdw slack publish-session` | reads a Slack web session Zach pastes from app.slack.com (a console snippet's JSON, then the `d` cookie) so the sync can ask Slack what changed in one request; sends nothing to Slack, and is run by hand only when the change feed says the session died |
+| `pdw slack publish-session` | reads a Slack web session Zach pastes from a private window on app.slack.com (a console snippet's JSON, then the `d` cookie) for reviewed Slack writes (sending as him, marking read); sends nothing to Slack, and is run by hand only when a Slack write reports the session died |
 | `pdw chatgpt publish-session` | captures the chatgpt.com browser session for the server-side ChatGPT poller; the token lives ~10 days and only a running, signed-in browser renews it |
 | `pdw whoop publish-session` | captures the app.whoop.com browser session for the private WHOOP source; self-renews while sync runs |
 | `pdw hn publish-session` | captures the news.ycombinator.com login cookie so the Hacker News sync can read the upvoted and hidden lists; long-lived, re-run when `/pipelines` says `action_required` |

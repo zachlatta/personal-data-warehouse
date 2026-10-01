@@ -1,13 +1,7 @@
-// Package slacksession persists the Slack *client* session that the local
-// `pdw slack publish-session` helper captures, so the server-side sync can ask
-// Slack what changed in one request instead of polling every conversation.
-//
-// Slack's public Web API has no bulk "what changed" call: conversations.list
-// returns no last-message marker, only `updated` (topic/member edits). Finding
-// new messages with an app token therefore costs one conversations.history call
-// per conversation -- ~950 per five-minute cycle against a measured ceiling of
-// ~39 calls/minute. Slack's own client answers it once via client.counts, but
-// only for a signed-in session.
+// Package slacksession persists the Slack *client* session that Zach pastes
+// into `pdw slack publish-session`, so reviewed Slack writes (a message sent as
+// him, a conversation marked read) can run server-side. The sync does not use
+// it: since 2026-10-01 it polls with OAuth tokens.
 //
 // The credential is two parts that are useless apart: an `xoxc-` token and the
 // `d` cookie. Both are stored here because both must be replayed together.

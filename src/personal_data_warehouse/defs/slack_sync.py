@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 import os
 
@@ -20,7 +19,6 @@ from dagster import (
 from personal_data_warehouse.build_info import build_metadata
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
-from personal_data_warehouse.slack_change_feed import SlackChangeFeed
 from personal_data_warehouse.slack_sync import (
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
@@ -44,13 +42,11 @@ SLACK_SYNC_POSTGRES_LOCK_ID = 7_403_111_837
 # between real executions. DM ingest latency was p50 13.4 min but p95 10.3
 # DAYS, and 13.6% of DMs arrived more than a day late.
 #
-# Serializing it made sense when freshness meant calling conversations.history
-# on ~950 conversations against a ~39/min ceiling. It does not now: the
-# client.counts change feed tells it which conversations moved, and production
-# logs it fetching 11-43 of ~690 per tick. That is a small, bounded share of
-# the API budget, so it no longer needs to wait behind sweeps that take
-# minutes -- and the sweeps still serialize against each other on the original
-# lock.
+# Freshness is the stage a waiting person feels, so it must never queue behind
+# sweeps that take minutes; the sweeps still serialize against each other on
+# the original lock. (It was split out while a client.counts change feed bounded
+# it to the conversations that moved; since 2026-10-01 it polls on a schedule
+# and its budget is the rate limiter's, not the lock's.)
 # Deliberately clear of the 7_403_111_83x-85x block: several ids in it are
 # written as `<OTHER>_LOCK_ID + 1`, so the next free-looking literal is not
 # free. `tests/test_sync_locks.py::test_advisory_lock_ids_are_unique` resolves
@@ -80,258 +76,27 @@ def _user_sync_lock_wait_seconds() -> int:
     return _int_env("SLACK_USER_SYNC_LOCK_WAIT_SECONDS", 1800)
 
 
-#: How much of a client.counts payload has to be conversations we already hold
-#: before the plan is trusted. A conversation created since the discovery walk
-#: last ran is legitimately unknown -- a handful against ~690 -- so this is set
-#: far below any honest miss rate and only fires when the feed is describing a
-#: different workspace, or a fresh warehouse holds nothing to vouch with.
-SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION = 0.5
-
-
-@dataclass(frozen=True)
-class SlackChangePlan:
-    """What Slack says has moved, or why we could not ask."""
-
-    usable: bool
-    changed_conversation_ids: tuple[str, ...] = ()
-    coverage: Mapping[str, int] = field(default_factory=dict)
-    reason: str = ""
-
-
-#: How the change feed names the workspace when Slack answers an org-scoped
-#: session with a sibling workspace's conversations. The plain call is first
-#: because it is what works every other day; the scoped variants are what the
-#: web client itself sends on an Enterprise Grid session (a `team_id` form
-#: field, then `slack_route=E:T` on the URL). Which variant recovers a bad
-#: answer is logged, because on 2026-09-08 the plain call described another
-#: workspace for fifteen hours with a token that the hourly republish had
-#: verified against 685 conversations that same afternoon -- the session was
-#: fine, Slack's routing of it was not, and nothing here could ask again.
-CLIENT_COUNTS_WORKSPACE_VARIANTS: tuple[str, ...] = ("plain", "team_id", "slack_route")
-
-
-def fetch_client_counts(
-    *,
-    token: str,
-    cookie: str,
-    user_agent: str,
-    team_id: str = "",
-    enterprise_id: str = "",
-    variant: str = "plain",
-) -> Mapping[str, object]:
-    """One request that reports every conversation's newest message."""
-    from personal_data_warehouse.slack_session import _slack_post
-
-    form = {"thread_counts_by_channel": "true", "org_wide_aware": "true"}
-    query: dict[str, str] = {}
-    if variant == "team_id" and team_id:
-        form["team_id"] = team_id
-    elif variant == "slack_route" and team_id:
-        query["slack_route"] = f"{enterprise_id}:{team_id}" if enterprise_id else team_id
-    return _slack_post(
-        "client.counts",
-        token=token,
-        cookie_header=f"d={cookie}",
-        user_agent=user_agent,
-        form=form,
-        query=query or None,
-    )
-
-
-def slack_change_plan(*, settings, warehouse, account: str, logger) -> SlackChangePlan:
-    """Ask Slack what changed, in one request, using the published session.
-
-    Every failure here degrades to `usable=False`, which leaves the caller
-    polling exactly as before. That direction is deliberate: a revoked or
-    missing session must cost throughput, never coverage -- returning "nothing
-    changed" would silently stop ingestion, which is a far worse outcome than
-    the rate-limited polling this replaces.
-    """
-    try:
-        session = warehouse.load_slack_session(account=account)
-    except Exception as exc:  # pragma: no cover - a missing table must not break sync
-        return SlackChangePlan(usable=False, reason=f"could not read the Slack session: {exc}")
-    token = str(session.get("session_token") or "")
-    cookie = str(session.get("session_cookie") or "")
-    if not token or not cookie:
-        # Both halves or nothing: an xoxc token without the `d` cookie
-        # authenticates as nobody.
-        return SlackChangePlan(
-            usable=False, reason="no published Slack session (Zach pastes one into `pdw slack publish-session`)"
-        )
-
-    team_id = str(session.get("team_id") or "")
-    enterprise_id = str(session.get("enterprise_id") or "")
-    user_agent = str(session.get("user_agent") or "")
-
-    # An `ok: true` payload about SOMEONE ELSE'S conversations is not a change
-    # feed. Hack Club is an Enterprise Grid org and a session's client.counts can
-    # come back scoped to a sibling workspace: production did it twice, on
-    # 2026-08-27 18:15-19:15 and again from 2026-08-28 03:25, going from 694
-    # conversations to 17 whose ids conversations.info answered
-    # `channel_not_found`. The plan stayed usable, so the freshness pass polled
-    # those 13 permanently-"changed" ids -- unfetchable, so their cursors could
-    # never advance -- and synced ZERO messages for eleven hours while every
-    # other Slack health number read `ok`. Only the DM landing-latency column
-    # noticed. Degrading to the blanket poll costs throughput and never coverage,
-    # which is the trade this whole module is built on -- but that poll burns
-    # its whole rate budget in two minutes and synced zero DMs per pass through
-    # the fifteen-hour episode of 2026-09-08, so before degrading, the plan asks
-    # again with the workspace named explicitly (CLIENT_COUNTS_WORKSPACE_VARIANTS).
-    feed = None
-    reason = ""
-    for variant in CLIENT_COUNTS_WORKSPACE_VARIANTS:
-        payload = fetch_client_counts(
-            token=token,
-            cookie=cookie,
-            user_agent=user_agent,
-            team_id=team_id,
-            enterprise_id=enterprise_id,
-            variant=variant,
-        )
-        try:
-            candidate = SlackChangeFeed.from_counts(payload)
-        except SlackChangeFeed.Error as exc:
-            logger.warning("Slack change feed unavailable, falling back to polling: %s", exc)
-            return SlackChangePlan(usable=False, reason=str(exc))
-        covered = sorted(candidate.covered_conversation_ids)
-        if covered and hasattr(warehouse, "load_slack_known_conversation_ids"):
-            known = warehouse.load_slack_known_conversation_ids(
-                account=account, team_id=team_id, conversation_ids=covered
-            )
-            if len(known) < SLACK_CHANGE_FEED_MIN_KNOWN_FRACTION * len(covered):
-                reason = (
-                    f"client.counts named {len(covered)} conversations and we hold {len(known)} of them; "
-                    "the feed is not describing this workspace"
-                )
-                logger.warning(
-                    "Slack change feed (%s) describes another workspace: %s", variant, reason
-                )
-                continue
-        if variant != "plain":
-            logger.warning(
-                "Slack change feed recovered by naming the workspace explicitly (variant=%s)", variant
-            )
-        feed = candidate
-        break
-    if feed is None:
-        logger.warning("Slack change feed unusable, falling back to polling: %s", reason)
-        return SlackChangePlan(usable=False, reason=reason)
-
-    cursors = warehouse.load_slack_conversation_cursors(account=account, team_id=team_id)
-    changed = feed.changed_since(cursors)
-    logger.info(
-        "Slack change feed: %s conversations covered, %s changed since our high-water",
-        sum(feed.coverage.values()),
-        len(changed),
-    )
-    return SlackChangePlan(
-        usable=True,
-        changed_conversation_ids=tuple(changed),
-        coverage=feed.coverage,
-    )
-
-
-#: How long the change feed may stay unusable before its verdict reads
-#: ``action_required`` (the Slack pipeline row's ``attention``). One bad pass is
-#: not an incident: the 2026-09-02 sibling-workspace blips cleared themselves.
-SLACK_CHANGE_FEED_ATTENTION_AFTER = timedelta(hours=1)
-#: The one ops.slack_sync_state row that carries the feed's verdict. team_id is
-#: empty on purpose: the published session may belong to the WRONG workspace,
-#: which is exactly when this row matters.
-SLACK_CHANGE_FEED_STATE_KEY = ("", "change_feed", "client.counts")
-
-
-def record_slack_change_feed_verdict(*, warehouse, account: str, plan: SlackChangePlan, now: datetime) -> None:
-    """Stamp whether the change feed worked, where /pipelines can see it.
-
-    From 2026-09-21 to 09-28 every freshness pass logged "change feed
-    unusable" -- the published session belonged to another workspace -- and
-    fell back to the blanket poll, which never reached a group DM: 164 of 219
-    group-DM messages in a week never landed. The session row still read
-    ``ok`` and so did the Slack pipeline, because nothing recorded the verdict
-    anywhere a health surface reads. It now lives in ``ops.slack_sync_state``,
-    the Slack pipeline's own StateSource, whose ``action_required`` rows read as
-    ``attention`` with this error. ``cursor_ts`` holds when the failure began
-    (epoch seconds), so the hour of grace survives across passes; a healthy
-    pass clears it. A deliberately disabled feed records nothing.
-    """
-    if plan.usable is False and plan.reason == "change feed disabled":
-        return
-    team_id, object_type, object_id = SLACK_CHANGE_FEED_STATE_KEY
-    now = now.astimezone(UTC)
-    row = {
-        "account": account,
-        "team_id": team_id,
-        "object_type": object_type,
-        "object_id": object_id,
-        "last_sync_type": "change_feed",
-        "updated_at": now,
-        "sync_version": int(now.timestamp() * 1_000_000),
-    }
-    if plan.usable:
-        warehouse.insert_slack_sync_state(**row, cursor_ts="", status="ok", error="")
-        return
-    previous = warehouse.load_slack_sync_state_by_type(object_type).get((account, *SLACK_CHANGE_FEED_STATE_KEY)) or {}
-    try:
-        since = float(previous.get("cursor_ts") or "")
-    except ValueError:
-        since = now.timestamp()
-    failing_for = timedelta(seconds=max(0.0, now.timestamp() - since))
-    status = "action_required" if failing_for >= SLACK_CHANGE_FEED_ATTENTION_AFTER else "degraded"
-    session_note = ""
-    try:
-        session = warehouse.load_slack_session(account=account) or {}
-    except Exception:  # pragma: no cover - the verdict must never break the sync
-        session = {}
-    if session:
-        published = session.get("published_at")
-        published_text = published.astimezone(UTC).isoformat(timespec="minutes") if isinstance(published, datetime) else "?"
-        session_note = (
-            f" The published session is for {session.get('team_url') or session.get('team_id') or 'an unknown workspace'},"
-            f" published {published_text}."
-        )
-    error = (
-        f"Slack change feed unusable since {datetime.fromtimestamp(since, tz=UTC).isoformat(timespec='minutes')}"
-        f" ({plan.reason}); freshness is falling back to polling conversations one by one, which cannot keep"
-        f" DMs and group DMs current.{session_note} Repair (Zach, by hand): sign in to Hack Club at"
-        " https://app.slack.com in a browser and paste the session into `pdw slack publish-session`, which"
-        " prints the steps. Never capture or replay his Slack login from a script: that signed him out of"
-        " every device on 2026-09-29."
-    )
-    warehouse.insert_slack_sync_state(**row, cursor_ts=f"{since:.6f}", status=status, error=error)
+#: The ops.slack_sync_state row the retired client.counts change feed wrote its
+#: verdict to. client.counts answered team_is_restricted to a fresh, valid
+#: session on 2026-10-01 and the feed was removed in favour of polling; its last
+#: verdict (action_required) would otherwise read the Slack pipeline as
+#: attention forever. Deleted by primary key on each freshness pass.
+RETIRED_SLACK_CHANGE_FEED_STATE_KEY = ("", "change_feed", "client.counts")
 
 
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
-    summaries: list[SlackSyncSummary] = []
+    """Poll Slack for new messages in DMs, group DMs and channels.
 
-    # Ask Slack once what moved. When that works, the per-type blanket polls
-    # below collapse to just those conversations; when it does not, they run
-    # exactly as before, so a missing or revoked session costs throughput and
-    # never coverage.
-    plan = SlackChangePlan(usable=False, reason="change feed disabled")
-    if _bool_env("SLACK_ASSET_USE_CHANGE_FEED", True):
-        for account in settings.slack_accounts:
-            plan = slack_change_plan(
-                settings=settings, warehouse=warehouse, account=account.account, logger=logger
-            )
-            try:
-                record_slack_change_feed_verdict(
-                    warehouse=warehouse, account=account.account, plan=plan, now=datetime.now(tz=UTC)
-                )
-            except Exception as exc:  # pragma: no cover - the verdict must never break the sync
-                logger.warning("Could not record the Slack change feed verdict: %s", exc)
-            break
-    changed_ids: Sequence[str] | None = None
-    if plan.usable:
-        changed_ids = plan.changed_conversation_ids
-        if not changed_ids:
-            logger.info("Slack change feed reports nothing new; skipping the freshness fetch")
-            if _bool_env("SLACK_ASSET_READ_STATE_WITH_FRESHNESS", True):
-                summaries.extend(run_slack_read_state_sync(settings=settings, warehouse=warehouse, logger=logger))
-            return summaries
-    else:
-        logger.info("Slack change feed unusable (%s); polling as before", plan.reason)
+    Polling is the design: nothing tells PDW which conversations moved. The
+    client.counts change feed that did (through Zach's pasted web session) was
+    refused with team_is_restricted on 2026-10-01 and removed, so this pass
+    lists DMs, group DMs and private channels to find new ones and polls every
+    conversation when it is due (SLACK_FRESHNESS_DUE_INTERVALS).
+    """
+    summaries: list[SlackSyncSummary] = []
+    for account in settings.slack_accounts:
+        if hasattr(warehouse, "delete_slack_sync_state"):
+            warehouse.delete_slack_sync_state(account.account, *RETIRED_SLACK_CHANGE_FEED_STATE_KEY)
 
     # Per-type windows and candidate caps, applied by the ONE runner below per
     # priority group. This used to be four runners, one per type, and each paid
@@ -357,12 +122,6 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
         "private_channel": _int_env("SLACK_ASSET_PRIVATE_FRESHNESS_LIMIT", 1000),
         "public_channel": _int_env("SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT", 100),
     }
-    if changed_ids is not None:
-        # A change-feed pass is bounded by what actually moved (~51 on a
-        # normal day), so the per-type caps that exist to ration a blanket
-        # poll would only get in the way.
-        changed_limit = _int_env("SLACK_ASSET_CHANGED_LIMIT", 500)
-        limit_by_type = {conversation_type: changed_limit for conversation_type in limit_by_type}
     summaries.extend(
         SlackSyncRunner(
             settings=settings,
@@ -371,8 +130,8 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             history_window=max(window_by_type.values()),
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,
-            # A blanket poll (no usable change feed) rotates candidates by when
-            # they were last polled, tier by tier; this is the middle tier.
+            # Conversations active inside this window are due every 15 minutes
+            # (SLACK_FRESHNESS_DUE_INTERVALS); within a year hourly; older six-hourly.
             freshness_warm_window=timedelta(days=_int_env("SLACK_ASSET_FRESHNESS_WARM_DAYS", 14)),
             sync_users=False,
             sync_members=False,
@@ -380,17 +139,10 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             use_existing_conversations=True,
             conversation_types=("im", "mpim", "private_channel", "public_channel"),
             conversation_limit=None,
-            conversation_ids=changed_ids,
-            # A conversation the feed names but we have never cached is fetched
-            # with conversations.info there and then, instead of waiting for the
-            # paged discovery walk to reach it -- which cost a new group DM 13.6
-            # hours of landing latency on 2026-08-27.
-            new_conversation_limit=_int_env("SLACK_ASSET_NEW_CONVERSATION_LIMIT", 25),
-            # Without a change feed nothing names a conversation created since the
-            # paged discovery walk last passed (group DMs waited ~8 hours on
-            # 2026-09-30), so a poll-only pass lists DMs, group DMs and private
-            # channels itself -- ~8 conversations.list calls -- and streams any new
-            # one in full. Ignored on a change-feed pass, which names them.
+            # Nothing names a conversation created since the paged discovery walk
+            # last passed (group DMs waited ~8 hours on 2026-09-30), so the pass
+            # lists DMs, group DMs and private channels itself -- ~8
+            # conversations.list calls -- and streams any new one in full.
             discover_new_direct_conversations=_bool_env("SLACK_ASSET_DISCOVER_DIRECT_CONVERSATIONS", True),
             # Stop gracefully when the rate-limit budget is exhausted instead of
             # failing the run. The history cursor is persisted per conversation as
@@ -473,8 +225,8 @@ def _record_coverage_stage_run(*, warehouse, stage, summaries, now: datetime) ->
 def run_slack_public_sweep_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     """Poll live public channels for new history, member or not.
 
-    The other stages cannot reach these. Freshness asks the change feed, which
-    only knows conversations Zach participates in; coverage only offers channels
+    The other stages cannot reach these. Freshness polls the conversations Zach
+    participates in plus his most active channels; coverage only offers channels
     whose history is incomplete, so a public channel drops out of it for good the
     moment its backfill finishes. That left 11,488 non-member public channels
     frozen at their April backfill (measured 2026-08-27), and PDW holding 40% of
