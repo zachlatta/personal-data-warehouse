@@ -93,15 +93,19 @@ WHERE tool_name ILIKE '%skill_write%'
    OR (source = 'codex' AND tool_name = 'exec' AND tool_input_json ILIKE '%skill_write%')
 ORDER BY occurred_at DESC LIMIT 25;
 
--- Codex sessions that reached the skills connection from the shell, with exit codes.
-SELECT c.session_id, c.occurred_at, cmd, r.tool_result_json::jsonb -> 'exit_codes' AS exit_codes
+-- Codex calls into the skills connection, as an inner MCP tool or a shell command.
+SELECT c.session_id, c.occurred_at, c.tool_input_json::jsonb -> 'tools' AS tools,
+       r.tool_result_json::jsonb -> 'exit_codes' AS exit_codes
 FROM marts_ai_conversations.events c
-CROSS JOIN LATERAL jsonb_array_elements_text(c.tool_input_json::jsonb -> 'commands') cmd
 LEFT JOIN marts_ai_conversations.events r
   ON r.source = c.source AND r.session_id = c.session_id
  AND r.turn_id = c.turn_id AND r.role = 'tool'
 WHERE c.source = 'codex' AND c.tool_name = 'exec'
-  AND c.occurred_at >= now() - interval '14 days' AND cmd LIKE 'pdw call skills\_\_%'
+  AND c.occurred_at >= now() - interval '30 days'
+  AND (EXISTS (SELECT 1 FROM jsonb_array_elements_text(c.tool_input_json::jsonb -> 'tools') t
+               WHERE t ILIKE '%skill%')
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(c.tool_input_json::jsonb -> 'commands') cmd
+               WHERE cmd LIKE '%pdw call skills\_\_%'))
 ORDER BY c.occurred_at DESC LIMIT 25;
 
 -- What work happened in a repo, or on a machine?
