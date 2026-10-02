@@ -36,6 +36,9 @@ class FakeWarehouse:
     def insert_agent_session_events(self, rows) -> None:
         self.events.extend(rows)
 
+    def legacy_codex_tool_rows(self, *, limit: int) -> list[dict[str, object]]:
+        return []
+
 
 def test_pi_event_row_normalizes_session_messages_and_tools() -> None:
     session = pi_event_row(
@@ -330,6 +333,153 @@ def test_codex_function_call_and_output_rows() -> None:
     assert "file1.txt" in out_row["text"]
 
 
+# Codex runs nearly every tool through one *custom* tool since mid-2026: an
+# `exec` call whose input is a small JS program that can make several inner
+# tool calls, answered by a custom_tool_call_output row with the same call_id.
+# Until 2026-10-02 both rows landed as role 'meta' with no tool_name, input or
+# result, so every "pair tool calls" query silently missed almost all Codex work.
+_CODEX_EXEC_SCRIPT = (
+    'text(await tools.exec_command({cmd:"sk read start-here",max_output_tokens:12000}));\n'
+    "text(await tools.exec_command({cmd:'pdw call skills__skill_read --data \\'{\"name\":\"x\"}\\'', yield_time_ms:1000}));\n"
+    "const r = await tools.mcp__skills__skill_search({query: 'browser'});\n"
+    "text(await tools.exec_command({\"cmd\": \"git status --short\\n\"}));\n"
+    "text(await tools.exec_command({cmd:`gh pr view ${n} --json title`}));\n"
+    "text(ALL_TOOLS.filter(x=>/search/i.test(x.name)));\n"
+)
+
+
+def _codex_custom_call(name: str, tool_input: str, *, call_id: str = "call_exec1") -> dict:
+    return {
+        "type": "response_item",
+        "timestamp": "2026-10-01T09:18:10.233Z",
+        "ordinal": 10.0,
+        "payload": {
+            "type": "custom_tool_call",
+            "name": name,
+            "call_id": call_id,
+            "id": "ctc_1",
+            "input": tool_input,
+            "status": "completed",
+        },
+    }
+
+
+def _codex_custom_output(output, *, call_id: str = "call_exec1") -> dict:
+    return {
+        "type": "response_item",
+        "timestamp": "2026-10-01T09:18:14.740Z",
+        "payload": {"type": "custom_tool_call_output", "call_id": call_id, "id": "ctco_1", "output": output},
+    }
+
+
+def test_codex_custom_exec_call_names_the_tool_and_lists_its_inner_calls() -> None:
+    row = codex_event_row(
+        _codex_custom_call("exec", _CODEX_EXEC_SCRIPT),
+        session_id=CODEX_SESSION, account="a", device="d", seq=10, ingested_at=INGESTED_AT,
+    )
+    assert row["role"] == "assistant"
+    assert row["subtype"] == "tool_use"
+    assert row["tool_name"] == "exec"
+    # The call id is the pairing key, exactly as for a function_call.
+    assert row["turn_id"] == "call_exec1"
+    # Tool rows carry no turn text: the timeline indexes user/assistant TEXT,
+    # and a script is not something the agent said.
+    assert row["text"] == ""
+    tool_input = json.loads(row["tool_input_json"])
+    assert tool_input["input"] == _CODEX_EXEC_SCRIPT
+    # Distinct inner tools in first-call order.
+    assert tool_input["tools"] == ["exec_command", "mcp__skills__skill_search"]
+    assert tool_input["commands"] == [
+        "sk read start-here",
+        "pdw call skills__skill_read --data '{\"name\":\"x\"}'",
+        "git status --short\n",
+        "gh pr view ${n} --json title",
+    ]
+
+
+def test_codex_custom_apply_patch_call_lists_the_files_it_touches() -> None:
+    patch = (
+        "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n"
+        "*** Add File: docs/b.md\n+hello\n*** Delete File: old.txt\n*** End Patch\n"
+    )
+    row = codex_event_row(
+        _codex_custom_call("apply_patch", patch, call_id="call_patch"),
+        session_id=CODEX_SESSION, account="a", device="d", seq=11, ingested_at=INGESTED_AT,
+    )
+    assert row["tool_name"] == "apply_patch"
+    tool_input = json.loads(row["tool_input_json"])
+    assert tool_input == {"input": patch, "files": ["src/a.py", "docs/b.md", "old.txt"]}
+
+
+def test_codex_custom_tool_output_is_a_tool_result_with_its_exit_codes() -> None:
+    chunk = json.dumps({"chunk_id": "ef0e76", "exit_code": 2, "original_token_count": 10, "output": "boom"})
+    output = [
+        {"type": "input_text", "text": "Script completed\nWall time 0.3 seconds\nOutput:\n"},
+        {"type": "input_text", "text": "Warning: truncated output (original token count: 38406)\nTotal output lines: 3\n\n" + chunk + "\n"},
+        {"type": "input_text", "text": json.dumps({"chunk_id": "a1", "exit_code": 0, "output": "ok"})},
+    ]
+    row = codex_event_row(
+        _codex_custom_output(output),
+        session_id=CODEX_SESSION, account="a", device="d", seq=14, ingested_at=INGESTED_AT,
+    )
+    assert row["role"] == "tool"
+    assert row["subtype"] == "tool_result"
+    assert row["tool_name"] == ""
+    assert row["turn_id"] == "call_exec1"
+    assert "Script completed" in row["text"] and "boom" in row["text"]
+    result = json.loads(row["tool_result_json"])
+    assert result["output"] == output
+    assert result["exit_codes"] == [2, 0]
+    assert result["truncated"] is True
+
+
+def test_codex_custom_tool_output_as_a_plain_string() -> None:
+    row = codex_event_row(
+        _codex_custom_output("Script running with cell ID 94\nWall time 31.0 seconds\nOutput:\n"),
+        session_id=CODEX_SESSION, account="a", device="d", seq=15, ingested_at=INGESTED_AT,
+    )
+    assert row["subtype"] == "tool_result"
+    assert row["text"].startswith("Script running with cell ID 94")
+    assert json.loads(row["tool_result_json"]) == {
+        "output": "Script running with cell ID 94\nWall time 31.0 seconds\nOutput:\n",
+        "exit_codes": [],
+        "truncated": False,
+    }
+
+
+def test_codex_hosted_tool_calls_are_named_tool_rows() -> None:
+    def row_for(payload: dict, seq: int) -> dict:
+        line = {"type": "response_item", "timestamp": "2026-04-29T22:00:15.161Z", "payload": payload}
+        return codex_event_row(line, session_id=CODEX_SESSION, account="a", device="d", seq=seq, ingested_at=INGESTED_AT)
+
+    web = row_for(
+        {"type": "web_search_call", "status": "completed", "action": {"type": "search", "query": "pgvector hnsw"}}, 1
+    )
+    assert (web["role"], web["subtype"], web["tool_name"]) == ("assistant", "tool_use", "web_search")
+    assert json.loads(web["tool_input_json"]) == {"type": "search", "query": "pgvector hnsw"}
+
+    search = row_for(
+        {"type": "tool_search_call", "call_id": "call_ts", "arguments": {"limit": 8, "query": "calendar"}}, 2
+    )
+    assert (search["role"], search["subtype"], search["tool_name"]) == ("assistant", "tool_use", "tool_search")
+    assert search["turn_id"] == "call_ts"
+    assert json.loads(search["tool_input_json"]) == {"limit": 8, "query": "calendar"}
+
+    found = row_for(
+        {"type": "tool_search_output", "call_id": "call_ts", "tools": [{"name": "mcp__codex_apps__google_calendar"}]}, 3
+    )
+    assert (found["role"], found["subtype"], found["turn_id"]) == ("tool", "tool_result", "call_ts")
+    assert json.loads(found["tool_result_json"]) == {"tools": [{"name": "mcp__codex_apps__google_calendar"}]}
+
+    image = row_for(
+        {"type": "image_generation_call", "status": "generating", "revised_prompt": "a fox", "result": "iVBORw0KGgo="}, 4
+    )
+    assert (image["role"], image["subtype"], image["tool_name"]) == ("assistant", "tool_use", "image_generation")
+    assert json.loads(image["tool_input_json"]) == {"revised_prompt": "a fox"}
+    # The base64 image stays in raw_json only.
+    assert "iVBORw0KGgo" not in image["tool_result_json"]
+
+
 def test_codex_token_count_event_uses_last_turn_usage() -> None:
     line = {
         "type": "event_msg",
@@ -548,3 +698,99 @@ def test_runner_dedupes_repeated_lines_idempotently() -> None:
     # Same two lines across two batches collapse to two rows.
     assert summary.events_written == 2
     assert len(warehouse.events) == 2
+
+
+class LegacyCodexWarehouse(FakeWarehouse):
+    """Holds rows the pre-2026-10-02 normalizer wrote: Codex custom tool calls
+    as role 'meta' with no tool_name. A row stops being legacy once rewritten."""
+
+    def __init__(self, legacy: list[dict[str, object]]) -> None:
+        super().__init__()
+        self.legacy = list(legacy)
+        self.limits: list[int] = []
+
+    def legacy_codex_tool_rows(self, *, limit: int) -> list[dict[str, object]]:
+        self.limits.append(limit)
+        return self.legacy[:limit]
+
+    def insert_agent_session_events(self, rows) -> None:
+        super().insert_agent_session_events(rows)
+        fixed = {(row["session_id"], row["event_uuid"]) for row in rows}
+        self.legacy = [row for row in self.legacy if (row["session_id"], row["event_uuid"]) not in fixed]
+
+
+def _legacy_codex_row(line: dict, *, seq: int) -> dict[str, object]:
+    return {
+        "source": "codex",
+        "session_id": CODEX_SESSION,
+        "event_uuid": f"{CODEX_SESSION}#{seq}",
+        "account": "zach@example.com",
+        "device": "porygon",
+        "seq": seq,
+        "raw_json": json.dumps(line, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def test_runner_renormalizes_legacy_codex_tool_rows_from_their_raw_json() -> None:
+    # History is fixed from the line each row already stores: the normalizer is
+    # a pure function of (line, session, seq), so re-running it over raw_json
+    # through the normal upsert rewrites the row in place, same primary key.
+    warehouse = LegacyCodexWarehouse(
+        [
+            _legacy_codex_row(_codex_custom_call("exec", _CODEX_EXEC_SCRIPT), seq=10),
+            _legacy_codex_row(_codex_custom_output([{"type": "input_text", "text": "done"}]), seq=14),
+            _legacy_codex_row(_codex_custom_call("apply_patch", "*** Update File: a.py\n", call_id="c2"), seq=20),
+        ]
+    )
+    summary = AgentSessionsDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [],
+        logger=FakeLogger(),
+        now=lambda: INGESTED_AT,
+        codex_renormalize_batch_rows=2,
+    ).sync()
+    assert summary.codex_rows_renormalized == 3
+    assert warehouse.legacy == []
+    by_seq = {row["seq"]: row for row in warehouse.events}
+    assert by_seq[10]["tool_name"] == "exec" and by_seq[10]["subtype"] == "tool_use"
+    assert by_seq[10]["event_uuid"] == f"{CODEX_SESSION}#10"
+    assert by_seq[10]["account"] == "zach@example.com" and by_seq[10]["device"] == "porygon"
+    assert by_seq[14]["subtype"] == "tool_result" and by_seq[14]["text"] == "done"
+    assert by_seq[20]["tool_name"] == "apply_patch"
+    # A rewrite is an ingest: it carries this run's ingested_at, so the
+    # timeline's incremental pass re-reads the sessions it touched.
+    assert {row["ingested_at"] for row in warehouse.events} == {INGESTED_AT}
+
+
+def test_runner_renormalization_is_bounded_per_run() -> None:
+    legacy = [
+        _legacy_codex_row(_codex_custom_call("exec", "text(1)", call_id=f"c{seq}"), seq=seq) for seq in range(5)
+    ]
+    warehouse = LegacyCodexWarehouse(legacy)
+    summary = AgentSessionsDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [],
+        logger=FakeLogger(),
+        now=lambda: INGESTED_AT,
+        codex_renormalize_batch_rows=2,
+        codex_renormalize_max_rows=3,
+    ).sync()
+    # Batches of two until the per-run cap: 2 + 1, and two rows left for later.
+    assert warehouse.limits == [2, 1]
+    assert summary.codex_rows_renormalized == 3
+    assert len(warehouse.legacy) == 2
+
+
+def test_runner_stops_when_a_legacy_row_cannot_be_renormalized() -> None:
+    # A row whose raw_json no longer parses would otherwise be fetched forever.
+    warehouse = LegacyCodexWarehouse(
+        [{**_legacy_codex_row(_codex_custom_call("exec", "text(1)"), seq=1), "raw_json": "not json"}]
+    )
+    summary = AgentSessionsDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [],
+        logger=FakeLogger(),
+        now=lambda: INGESTED_AT,
+    ).sync()
+    assert summary.codex_rows_renormalized == 0
+    assert warehouse.limits and len(warehouse.limits) == 1

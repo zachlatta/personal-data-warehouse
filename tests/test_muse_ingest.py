@@ -61,6 +61,9 @@ class FakeWarehouse:
     def insert_muse_files(self, rows) -> None:
         self.files.extend(rows)
 
+    def legacy_codex_tool_rows(self, *, limit: int) -> list[dict]:
+        return []
+
 
 def test_session_header_row() -> None:
     header = row(

@@ -162,6 +162,65 @@ content is available through `timeline.search_text()` with `source = 'agent_sess
 confused with `ops.ai_processing_agent_runs` / `ops.ai_processing_agent_run_events`, which log the
 warehouse's own internal enrichment agent.)
 
+### Codex tool calls: one custom tool, many inner calls
+
+**Codex runs nearly every tool through a custom tool, and until 2026-10-02 PDW stored those
+rows as noise.** A custom tool takes free-form text instead of JSON arguments: `exec`, whose
+input is a small JS program that may make several inner calls (`tools.exec_command`,
+`tools.mcp__skills__skill_read`, `tools.web__run`, `tools.apply_patch`, ...), and
+`apply_patch`. The normalizer handled only `function_call`/`function_call_output`, so every
+`custom_tool_call` and `custom_tool_call_output` row landed as `role = 'meta'` with an
+empty `tool_name`, `tool_input_json` and `tool_result_json`. Measured on production that
+morning: 75,541 calls and 75,690 outputs against 82,323 function calls over the whole
+history, and from July on the custom shape was most of Codex's tool use (22,482 calls in
+the week of 2026-08-31). Every "pair tool calls with results" query — the guide's own
+advice — saw almost none of it, and a skills-usage audit had to parse `raw_json`. The
+hosted `web_search_call`, `tool_search_call`/`tool_search_output` and
+`image_generation_call` items had the same gap.
+
+What the normalizer writes now (`_apply_codex_response_item`):
+
+- **The call** is `role = 'assistant'`, `subtype = 'tool_use'`, `tool_name` = the custom
+  tool's own name (`exec`, `apply_patch`), `turn_id` = the call id. `tool_input_json` is
+  `{"input": <verbatim text>}` plus, for `exec`, `tools` (distinct inner tool names in
+  first-call order) and `commands` (every `cmd` string literal, decoded; a command built
+  from a variable is only in `input`), and for `apply_patch`, `files`. `tool_name` stays the
+  custom tool rather than one inner tool because a script routinely calls several; the
+  inner names are an array lookup away.
+- **The output** is `role = 'tool'`, `subtype = 'tool_result'`, same `turn_id`, `text` = the
+  joined output text, `tool_result_json` = `{"output", "exit_codes", "truncated"}`.
+  `exit_codes` are read only from an `exec_command` result chunk's header
+  (`{"chunk_id":…,"exit_code":N,…,"output":…}`), so an `exit_code` printed inside some
+  command's own output never counts.
+- `web_search`, `tool_search` and `image_generation` are named tool rows; a generated
+  image's base64 stays in `raw_json` only.
+- Tool rows carry no turn text, so the timeline's `agent_session_turn` adapter (user and
+  assistant rows **with** text) and search are unchanged.
+
+Codex also writes an `event_msg` / `item_completed` row per inner call since 2026-08-31
+(`CommandExecution` with `command`, `aggregated_output`, `exit_code`; `McpToolCall`;
+`FileChange`). Those stay `meta` with the detail in `raw_json`: they have no call id linking
+them to their `exec`, they do not exist before 2026-08-31, and naming them as tool rows too
+would count every command twice. `marts_ops.agent_usage` reads them for exactly that reason
+and skips the `exec` call they follow.
+
+**History was rewritten from each row's own `raw_json`, not re-ingested from Drive.** Every
+row stores its source line and `codex_event_row` is a pure function of (line, session,
+seq), so `AgentSessionsDriveIngestRunner` re-runs the normalizer over stored rows whose
+`subtype` is still one of `LEGACY_CODEX_TOOL_SUBTYPES` and upserts them through the normal
+write path, newest first, same primary key. The table is the cursor: a rewritten row no
+longer carries a legacy subtype (the normalizer never writes one), so each ingest run
+resumes where the last stopped, and `codex_events_legacy_tool_rows_idx` — partial over
+exactly those subtypes — makes the probe an index scan that is empty once converged. It is
+capped at `AGENT_SESSIONS_CODEX_RENORMALIZE_ROWS_PER_RUN` (5,000) rows a run because an
+output row is ~16 KB of `raw_json` and the rewrite adds the output to `text` and
+`tool_result_json` as every other provider's tool rows do: ~150k rows is ~1 GB on disk,
+and spreading it over ~30 runs keeps its WAL far under what the archiver ships. A rewritten
+row carries the run's `ingested_at`, so the `agent_session` timeline adapter re-reads the
+sessions it touched (their `assistant_events` count grows). `base_codex.events` rows still
+in a legacy subtype after convergence are ones whose `raw_json` would not parse; the run
+logs them and stops rather than refetching them forever.
+
 ### OpenClaw Agent Sessions (openclaw VM)
 
 OpenClaw runs on the `openclaw` Ubuntu VM (libvirt/KVM guest on `rotom`; reach it with

@@ -38,11 +38,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import gzip
 import json
+import os
+import re
 import threading
 from typing import Any
 
 from personal_data_warehouse.apple_voice_memos_drive_ingest import parse_datetime
 from personal_data_warehouse.objectstore import ObjectListing, ObjectStore
+from personal_data_warehouse.schema import LEGACY_CODEX_TOOL_SUBTYPES
 
 OBJECT_PREFIX = "agent-sessions"
 INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
@@ -59,6 +62,16 @@ class AgentSessionsDriveIngestSummary:
     events_written: int
     files_promoted: int
     files_written: int = 0
+    codex_rows_renormalized: int = 0
+
+
+#: Rows of legacy Codex tool shapes rewritten per ingest run, and per
+#: statement. A rewrite re-toasts raw_json and adds the tool output to
+#: text/tool_result_json (~16 KB a row for an exec output), so the per-run cap
+#: keeps the one-time convergence of ~150k rows to a few hundred MB of WAL an
+#: hour rather than one multi-GB burst against the WAL archiver.
+CODEX_RENORMALIZE_MAX_ROWS_PER_RUN = int(os.getenv("AGENT_SESSIONS_CODEX_RENORMALIZE_ROWS_PER_RUN", "5000"))
+CODEX_RENORMALIZE_BATCH_ROWS = 1000
 
 
 class AgentSessionsDriveIngestRunner:
@@ -72,6 +85,8 @@ class AgentSessionsDriveIngestRunner:
         promotion_workers: int = 1,
         logger,
         now: Callable[[], datetime] | None = None,
+        codex_renormalize_max_rows: int = CODEX_RENORMALIZE_MAX_ROWS_PER_RUN,
+        codex_renormalize_batch_rows: int = CODEX_RENORMALIZE_BATCH_ROWS,
     ) -> None:
         if object_store is not None and object_store_factory is not None:
             raise ValueError("pass only one of object_store or object_store_factory")
@@ -83,6 +98,8 @@ class AgentSessionsDriveIngestRunner:
         self._thread_local = threading.local()
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
+        self._codex_renormalize_max_rows = max(0, codex_renormalize_max_rows)
+        self._codex_renormalize_batch_rows = max(1, codex_renormalize_batch_rows)
 
     def sync(self) -> AgentSessionsDriveIngestSummary:
         self._warehouse.ensure_agent_sessions_tables()
@@ -117,18 +134,62 @@ class AgentSessionsDriveIngestRunner:
                     futures = [executor.submit(self._promote_batch, batch) for batch in batches]
                     promoted = sum(future.result() for future in as_completed(futures))
 
+        renormalized = self._renormalize_legacy_codex_tool_rows(ingested_at)
+
         self._logger.info(
-            "Ingested %s agent-session batches, %s events, %s Muse workspace files",
+            "Ingested %s agent-session batches, %s events, %s Muse workspace files; "
+            "renormalized %s legacy Codex tool rows",
             len(batches),
             len(event_rows),
             len(file_rows),
+            renormalized,
         )
         return AgentSessionsDriveIngestSummary(
             batches_seen=len(batches),
             events_written=len(event_rows),
             files_promoted=promoted,
             files_written=len(file_rows),
+            codex_rows_renormalized=renormalized,
         )
+
+    def _renormalize_legacy_codex_tool_rows(self, ingested_at: datetime) -> int:
+        """Rewrite stored Codex tool rows the old normalizer left as 'meta'.
+
+        Every row keeps its own line in raw_json and codex_event_row is a pure
+        function of (line, session, seq), so history is fixed by re-running
+        the current normalizer over what is stored and upserting through the
+        normal write path, newest first. The table is the cursor: a rewritten
+        row no longer carries a legacy subtype, so the next run resumes where
+        this one stopped and the probe is an empty partial-index scan once the
+        history has converged. Rewritten rows carry this run's ingested_at,
+        which is what makes the timeline re-read the sessions they belong to.
+        """
+        rewritten = 0
+        remaining = self._codex_renormalize_max_rows
+        while remaining > 0:
+            limit = min(self._codex_renormalize_batch_rows, remaining)
+            stored = self._warehouse.legacy_codex_tool_rows(limit=limit)
+            if not stored:
+                break
+            rows = [
+                row
+                for row in (_renormalize_codex_row(item, ingested_at=ingested_at) for item in stored)
+                if row is not None
+            ]
+            if not rows:
+                # Nothing in this batch could be rewritten (an unparseable
+                # raw_json): stop rather than fetch the same rows forever.
+                self._logger.warning(
+                    "Could not renormalize %s legacy Codex tool rows; leaving them for inspection",
+                    len(stored),
+                )
+                break
+            self._warehouse.insert_agent_session_events(rows)
+            rewritten += len(rows)
+            remaining -= len(stored)
+            if len(stored) < limit:
+                break
+        return rewritten
 
     def _promote_batch(self, batch: Mapping[str, Any]) -> int:
         return promote_batch(self._object_store_for_thread(), batch)
@@ -242,6 +303,29 @@ def record_to_event_row(record: Mapping[str, Any], *, ingested_at: datetime) -> 
         seq=seq,
         ingested_at=ingested_at,
     )
+
+
+def _renormalize_codex_row(stored: Mapping[str, Any], *, ingested_at: datetime) -> dict[str, Any] | None:
+    """Re-run codex_event_row over a stored row's own line; None if unusable."""
+    try:
+        line = json.loads(str(stored.get("raw_json") or ""))
+    except ValueError:
+        return None
+    if not isinstance(line, Mapping):
+        return None
+    session_id = str(stored.get("session_id", ""))
+    row = codex_event_row(
+        line,
+        session_id=session_id,
+        account=str(stored.get("account", "")),
+        device=str(stored.get("device", "")),
+        seq=int(stored.get("seq", 0) or 0),
+        ingested_at=ingested_at,
+    )
+    # Same primary key or nothing: a rewrite must land on the row it came from.
+    if row["event_uuid"] != str(stored.get("event_uuid", "")) or row["subtype"] in LEGACY_CODEX_TOOL_SUBTYPES:
+        return None
+    return row
 
 
 def _tool_from_record_type(record: Mapping[str, Any]) -> str:
@@ -571,9 +655,181 @@ def _apply_codex_response_item(row: dict[str, Any], payload: Mapping[str, Any]) 
         row["text"] = _stringify(payload.get("output"))
         row["tool_result_json"] = _as_json_text(payload.get("output"))
         row["turn_id"] = str(payload.get("call_id", ""))
+    elif item_type == "custom_tool_call":
+        # Codex's custom (free-form input) tools. Since mid-2026 nearly every
+        # tool runs through one of them: `exec`, whose input is a small JS
+        # program that may call several inner tools (tools.exec_command,
+        # tools.mcp__skills__skill_read, ...), and `apply_patch`. The call row
+        # names the custom tool, as a function_call row names its function;
+        # the inner calls are listed inside tool_input_json.
+        name = str(payload.get("name", ""))
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = name
+        row["tool_input_json"] = raw_json(_codex_custom_tool_input(name, payload.get("input")))
+        row["turn_id"] = str(payload.get("call_id", ""))
+    elif item_type == "custom_tool_call_output":
+        output = payload.get("output")
+        text = _codex_output_text(output)
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["text"] = text
+        row["tool_result_json"] = raw_json(
+            {
+                "output": output,
+                "exit_codes": _codex_exit_codes(text),
+                "truncated": "Warning: truncated output" in text,
+            }
+        )
+        row["turn_id"] = str(payload.get("call_id", ""))
+    elif item_type == "web_search_call":
+        # Hosted tool: the call carries what it did and no output row follows.
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = "web_search"
+        row["tool_input_json"] = _as_json_text(payload.get("action"))
+    elif item_type == "tool_search_call":
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = "tool_search"
+        row["tool_input_json"] = _as_json_text(payload.get("arguments"))
+        row["turn_id"] = str(payload.get("call_id", ""))
+    elif item_type == "tool_search_output":
+        tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["text"] = "\n".join(
+            str(tool.get("name", "")) for tool in tools if isinstance(tool, Mapping) and tool.get("name")
+        )
+        row["tool_result_json"] = raw_json({"tools": tools})
+        row["turn_id"] = str(payload.get("call_id", ""))
+    elif item_type == "image_generation_call":
+        # The generated image is base64 in `result`; it stays in raw_json only.
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = "image_generation"
+        row["tool_input_json"] = raw_json(
+            {"revised_prompt": payload["revised_prompt"]} if payload.get("revised_prompt") else {}
+        )
     elif item_type == "reasoning":
         row["role"] = "assistant"
         row["subtype"] = "thinking"
+
+
+# An inner tool call inside a Codex `exec` script: `tools.<name>(`.
+_CODEX_INNER_TOOL_RE = re.compile(r"\btools\.([A-Za-z_$][\w$]*)\s*\(")
+# The start of a `cmd` argument, as a bare or quoted object key.
+_CODEX_CMD_KEY_RE = re.compile(r"""(?:\bcmd|"cmd"|'cmd')\s*:\s*(?=["'`])""")
+_CODEX_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.MULTILINE)
+# exit_code in an exec_command result chunk's header, i.e. before its
+# "output" field, so an exit_code inside some command's own output (which is
+# JSON-escaped within the chunk) never counts.
+_CODEX_EXIT_CODE_RE = re.compile(
+    r'\{"chunk_id"\s*:\s*"[^"]*"(?:\s*,\s*"(?!output")[a-z_]+"\s*:\s*[^,"{}\[\]]*)*'
+    r'\s*,\s*"exit_code"\s*:\s*(-?\d+)'
+)
+_JS_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+
+
+def _codex_custom_tool_input(name: str, tool_input: Any) -> dict[str, Any]:
+    """tool_input_json for a Codex custom tool call.
+
+    ``input`` is the call's free-form text verbatim. An ``exec`` script also
+    gets ``tools`` (the distinct inner tools it calls, in first-call order) and
+    ``commands`` (every ``cmd`` string literal it passes, decoded), so "which
+    sessions ran X" is an array lookup instead of a regex over JavaScript. An
+    ``apply_patch`` call gets the ``files`` it adds, updates or deletes.
+    Extraction is best-effort over literals: a command built at runtime from
+    a variable is only in ``input``.
+    """
+    text = tool_input if isinstance(tool_input, str) else _stringify(tool_input)
+    result: dict[str, Any] = {"input": text}
+    if name == "exec":
+        result["tools"] = list(dict.fromkeys(_CODEX_INNER_TOOL_RE.findall(text)))
+        result["commands"] = _js_cmd_literals(text)
+    elif name == "apply_patch":
+        result["files"] = _CODEX_PATCH_FILE_RE.findall(text)
+    return result
+
+
+def _js_cmd_literals(script: str) -> list[str]:
+    commands: list[str] = []
+    for match in _CODEX_CMD_KEY_RE.finditer(script):
+        literal = _js_string_literal(script, match.end())
+        if literal is not None:
+            commands.append(literal)
+    return commands
+
+
+def _js_string_literal(source: str, start: int) -> str | None:
+    """Decode the JS string literal opening at ``source[start]``.
+
+    Handles '...', "..." and `...` with the common escapes. A template
+    literal's ``${...}`` placeholders are kept verbatim. Returns None for an
+    unterminated literal.
+    """
+    quote = source[start]
+    out: list[str] = []
+    index = start + 1
+    while index < len(source):
+        char = source[index]
+        if char == quote:
+            return "".join(out)
+        if char == "\\" and index + 1 < len(source):
+            nxt = source[index + 1]
+            if nxt == "u" and source[index + 2 : index + 3] == "{":
+                end = source.find("}", index + 3)
+                if end != -1:
+                    try:
+                        out.append(chr(int(source[index + 3 : end], 16)))
+                        index = end + 1
+                        continue
+                    except ValueError:
+                        pass
+            if nxt == "u":
+                digits = source[index + 2 : index + 6]
+                try:
+                    out.append(chr(int(digits, 16)))
+                    index += 6
+                    continue
+                except ValueError:
+                    pass
+            if nxt == "x":
+                digits = source[index + 2 : index + 4]
+                try:
+                    out.append(chr(int(digits, 16)))
+                    index += 4
+                    continue
+                except ValueError:
+                    pass
+            if nxt == "\n":
+                # A line continuation contributes nothing.
+                index += 2
+                continue
+            out.append(_JS_SIMPLE_ESCAPES.get(nxt, nxt))
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return None
+
+
+def _codex_output_text(output: Any) -> str:
+    """A custom tool output is a string or a list of ``{type, text}`` items."""
+    if isinstance(output, list):
+        return "".join(
+            str(item.get("text", "")) if isinstance(item, Mapping) else _stringify(item) for item in output
+        )
+    return _stringify(output)
+
+
+def _codex_exit_codes(text: str) -> list[int]:
+    """Exit codes of the inner exec_command calls, in order.
+
+    An exec_command result is a JSON chunk (``{"chunk_id":..,"exit_code":..,
+    "output":..}``) inside the output text; a script can make several.
+    """
+    return [int(code) for code in _CODEX_EXIT_CODE_RE.findall(text)]
 
 
 def _codex_role(role: str) -> str:

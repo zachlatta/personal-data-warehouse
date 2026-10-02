@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from personal_data_warehouse.agent_sessions_drive_ingest import _codex_custom_tool_input, raw_json
 from personal_data_warehouse.agent_usage import (
     AgentUsageCollector,
     AgentUsageSnapshot,
@@ -13,6 +14,11 @@ from personal_data_warehouse.agent_usage import (
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
 from tests.test_postgres_warehouse import _default_row, warehouse  # noqa: F401 - fixture
+
+
+def _codex_exec_input(script: str) -> str:
+    """tool_input_json of a Codex custom `exec` call, as the ingest writes it."""
+    return raw_json(_codex_custom_tool_input("exec", script))
 
 
 def _event(session: str, seq: int, *, source: str = "claude_code", tool: str = "", inp: str = "",
@@ -52,9 +58,9 @@ def _seed(wh: PostgresWarehouse) -> None:
             # Session C: never touched PDW.
             _event("c", 1),
             # Session D (codex script mode): invented command first.
-            _event("d", 1, source="codex", subtype="custom_tool_call",
-                   raw='{"cmd":"pdw query \"SELECT 1\""}'),
-            _event("d", 2, source="codex", raw='{"output":"unknown command"}'),
+            _event("d", 1, source="codex", subtype="tool_use", tool="exec",
+                   inp=_codex_exec_input('text(await tools.exec_command({cmd:"pdw query \\"SELECT 1\\""}));')),
+            _event("d", 2, source="codex", subtype="tool_result", raw='{"output":"unknown command"}'),
             # Session E: the three letters "pdw" appear, but nothing ran the CLI.
             # Every one of these was counted as a PDW session by the substring
             # matcher this replaced -- 18 of 284 sessions on 2026-08-28.
@@ -191,9 +197,9 @@ def test_codex_item_completed_is_not_double_counted_with_its_call_row(
                 "codex-pair",
                 1,
                 source="codex",
-                subtype="custom_tool_call",
-                tool="exec_command",
-                raw='{"cmd":"pdw search budget"}',
+                subtype="tool_use",
+                tool="exec",
+                inp=_codex_exec_input('text(await tools.exec_command({cmd:"pdw search budget"}));'),
             ),
             _event(
                 "codex-pair",

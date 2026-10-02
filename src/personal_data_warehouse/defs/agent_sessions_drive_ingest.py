@@ -88,6 +88,9 @@ def agent_sessions_drive_ingest(context) -> MaterializeResult:
             "events_written": MetadataValue.int(summary.events_written if summary else 0),
             "files_promoted": MetadataValue.int(summary.files_promoted if summary else 0),
             "muse_files_written": MetadataValue.int(files_written),
+            "codex_rows_renormalized": MetadataValue.int(
+                int(getattr(summary, "codex_rows_renormalized", 0) or 0) if summary else 0
+            ),
         }
     )
 

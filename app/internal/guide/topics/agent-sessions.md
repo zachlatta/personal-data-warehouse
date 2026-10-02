@@ -73,15 +73,36 @@ A tool *call* and its *result* are separate rows: the assistant row carries `too
 `lead(tool_result_json) OVER (PARTITION BY source, session_id ORDER BY seq)`, coalesced
 with the same row's value because some providers fill both. Absent values are empty
 strings, not NULL (`tool_name <> ''`). All three JSON columns are `text`; cast before `->>`.
-`is_sidechain = 1` marks subagent turns: include them when auditing what an agent did,
-exclude them when reconstructing the human-visible conversation.
+Codex stamps its call id in `turn_id` on both rows; pair by it there, because parallel calls
+are not adjacent. `is_sidechain = 1` marks subagent turns: include them when auditing what
+an agent did, exclude them when reconstructing the human-visible conversation.
+
+**Codex runs nearly every tool through one custom tool**, so its `tool_name` is mostly
+`exec` (or `apply_patch`), not the tool it ran. The `exec` call's `tool_input_json` is
+`{"input": <the JS script>, "tools": [inner tools called, e.g. "exec_command",
+"mcp__skills__skill_read"], "commands": [each shell cmd literal]}`; `apply_patch` carries
+`{"input", "files"}`. The result row's `tool_result_json` is `{"output", "exit_codes",
+"truncated"}`. Hosted calls are `web_search`, `tool_search`, `image_generation`. A search by
+`tool_name` alone misses Codex: look inside `tools` or `commands` too.
 
 ```sql
 -- How does the fleet actually call a tool? Real arguments beat a description.
 SELECT source, tool_name, left(tool_input_json, 400) AS args, occurred_at
 FROM marts_ai_conversations.events
 WHERE tool_name ILIKE '%skill_write%'
+   OR (source = 'codex' AND tool_name = 'exec' AND tool_input_json ILIKE '%skill_write%')
 ORDER BY occurred_at DESC LIMIT 25;
+
+-- Codex sessions that reached the skills connection from the shell, with exit codes.
+SELECT c.session_id, c.occurred_at, cmd, r.tool_result_json::jsonb -> 'exit_codes' AS exit_codes
+FROM marts_ai_conversations.events c
+CROSS JOIN LATERAL jsonb_array_elements_text(c.tool_input_json::jsonb -> 'commands') cmd
+LEFT JOIN marts_ai_conversations.events r
+  ON r.source = c.source AND r.session_id = c.session_id
+ AND r.turn_id = c.turn_id AND r.role = 'tool'
+WHERE c.source = 'codex' AND c.tool_name = 'exec'
+  AND c.occurred_at >= now() - interval '14 days' AND cmd LIKE 'pdw call skills\_\_%'
+ORDER BY c.occurred_at DESC LIMIT 25;
 
 -- What work happened in a repo, or on a machine?
 SELECT source, device, session_id, title, started_at, event_count, output_tokens

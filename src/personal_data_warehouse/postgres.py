@@ -35,6 +35,7 @@ from personal_data_warehouse.schema import (
     AGENT_RUN_EVENT_COLUMNS,
     AGENT_RUN_TOOL_CALL_COLUMNS,
     AGENT_SESSION_EVENT_COLUMNS,
+    LEGACY_CODEX_TOOL_SUBTYPES,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     ATTACHMENT_ENRICHMENT_COLUMNS,
@@ -1204,6 +1205,20 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
                 f"ON @{table} (ingested_at)",
             )
         )
+    # The agent-sessions ingest rewrites Codex tool rows an older normalizer
+    # left as role 'meta' (see LEGACY_CODEX_TOOL_SUBTYPES), newest first, and
+    # probes for them on every run. Partial over exactly those subtypes, so the
+    # probe never scans the table and the index is empty once history has
+    # converged -- new rows are never written with a legacy subtype.
+    legacy_subtypes = ", ".join(f"'{subtype}'" for subtype in LEGACY_CODEX_TOOL_SUBTYPES)
+    specs.append(
+        IndexSpec(
+            "codex_events_legacy_tool_rows_idx",
+            "codex_events",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS codex_events_legacy_tool_rows_idx "
+            f"ON @codex_events (occurred_at DESC) WHERE subtype IN ({legacy_subtypes})",
+        )
+    )
     return tuple(specs)
 
 
@@ -11078,6 +11093,25 @@ class PostgresWarehouse:
             rows_by_table.setdefault(table, []).append(row)
         for table, table_rows in rows_by_table.items():
             self._insert_rows(table, table_rows, AGENT_SESSION_EVENT_COLUMNS)
+
+    def legacy_codex_tool_rows(self, *, limit: int) -> list[dict[str, Any]]:
+        """Newest Codex rows still in a pre-2026-10-02 tool shape.
+
+        Served by codex_events_legacy_tool_rows_idx, whose predicate this
+        WHERE clause must imply. Only what the normalizer needs to rebuild the
+        row is read.
+        """
+        placeholders = ", ".join(["%s"] * len(LEGACY_CODEX_TOOL_SUBTYPES))
+        return self._query_dicts(
+            f"""
+            SELECT source, session_id, event_uuid, account, device, seq, raw_json
+            FROM @codex_events
+            WHERE subtype IN ({placeholders})
+            ORDER BY occurred_at DESC
+            LIMIT %s
+            """,
+            (*LEGACY_CODEX_TOOL_SUBTYPES, int(limit)),
+        )
 
     def insert_muse_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("muse_files", rows, MUSE_FILE_COLUMNS)

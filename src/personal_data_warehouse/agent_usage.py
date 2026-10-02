@@ -476,7 +476,7 @@ def analyze_search_calls(rows: list[dict[str, Any]]) -> SearchUsageMetrics:
 _AGENT_USAGE_CALLS_CTE = """
 WITH ev AS (
   SELECT source, session_id, seq, occurred_at, subtype, tool_name, turn_id,
-         CASE WHEN source = 'codex' AND subtype IN ('custom_tool_call', 'item_completed')
+         CASE WHEN source = 'codex' AND subtype = 'item_completed'
               THEN raw_json ELSE tool_input_json END AS inp0,
          CASE WHEN source = 'codex' THEN raw_json ELSE tool_result_json END AS res0
   FROM @ai_conversation_events
@@ -520,10 +520,10 @@ calls AS (
   )
     -- Modern Codex repeats the command beside aggregated_output in the
     -- item_completed row. Count that self-contained row, not both it and the
-    -- preceding custom_tool_call, regardless of which candidate branch the
-    -- latter matched. Older transcripts retain the lead()-based fallback.
+    -- preceding custom `exec` call, regardless of which candidate branch the
+    -- latter matched. Older transcripts retain the id/lead()-based pairing.
     AND NOT (
-      source = 'codex' AND subtype = 'custom_tool_call'
+      source = 'codex' AND subtype = 'tool_use' AND tool_name = 'exec'
       AND next_subtype = 'item_completed'
     )
 ),

@@ -13,6 +13,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
     sync_version,
 )
 from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.relations import relation
 from personal_data_warehouse.schema import AGENT_SESSION_EVENT_COLUMNS
 from personal_data_warehouse.timeline import TimelineSyncEngine
 
@@ -279,3 +280,90 @@ def test_runner_persists_into_warehouse_end_to_end(warehouse) -> None:
         "SELECT first_prompt, event_count FROM @clean_agent_sessions WHERE session_id = 'sess-xyz'"
     )
     assert view == [("hello warehouse", 1)]
+
+
+def test_legacy_codex_custom_tool_rows_are_renormalized_in_place(warehouse) -> None:
+    # Rows written by the pre-2026-10-02 normalizer: Codex's custom `exec` tool
+    # call and its output as role 'meta' with no tool_name. The ingest run
+    # rewrites them from their own raw_json through the normal upsert, newest
+    # first, and a partial index keeps the probe free once the drain is done.
+    import json
+
+    warehouse.ensure_agent_sessions_tables()
+    call_line = {
+        "type": "response_item",
+        "timestamp": "2026-09-30T09:18:10.233Z",
+        "payload": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_a",
+            "input": 'text(await tools.exec_command({cmd:"pdw call skills__skill_read --data x"}));',
+        },
+    }
+    output_line = {
+        "type": "response_item",
+        "timestamp": "2026-09-30T09:18:11.233Z",
+        "payload": {
+            "type": "custom_tool_call_output",
+            "call_id": "call_a",
+            "output": [{"type": "input_text", "text": '{"chunk_id":"x","exit_code":0,"output":"ok"}'}],
+        },
+    }
+    legacy = []
+    for seq, line in ((10, call_line), (11, output_line)):
+        legacy.append(
+            _event_row(
+                source="codex",
+                session_id="codex-sess",
+                event_uuid=f"codex-sess#{seq}",
+                seq=seq,
+                role="meta",
+                event_type="response_item",
+                subtype=line["payload"]["type"],
+                occurred_at=datetime(2026, 9, 30, 9, 18, seq, tzinfo=UTC),
+                raw_json=json.dumps(line, sort_keys=True, separators=(",", ":")),
+            )
+        )
+    warehouse.insert_agent_session_events(legacy)
+    assert len(warehouse.legacy_codex_tool_rows(limit=10)) == 2
+    codex_events = relation("codex_events").with_namespace(warehouse.schema_namespace)
+    assert warehouse._query(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = %s AND tablename = %s "
+        "AND indexname = 'codex_events_legacy_tool_rows_idx'",
+        (codex_events.schema, codex_events.name),
+    )
+
+    rerun_at = datetime(2026, 10, 2, 12, tzinfo=UTC)
+    summary = AgentSessionsDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [],
+        logger=FakeLogger(),
+        now=lambda: rerun_at,
+    ).sync()
+    assert summary.codex_rows_renormalized == 2
+    assert warehouse.legacy_codex_tool_rows(limit=10) == []
+
+    rows = warehouse._query(
+        """
+        SELECT seq, role, subtype, tool_name, turn_id, tool_input_json, tool_result_json, ingested_at
+        FROM @ai_conversation_events WHERE source = 'codex' AND session_id = 'codex-sess' ORDER BY seq
+        """
+    )
+    (_, role, subtype, tool_name, turn_id, tool_input, _, ingested_at) = rows[0]
+    assert (role, subtype, tool_name, turn_id) == ("assistant", "tool_use", "exec", "call_a")
+    assert json.loads(tool_input)["commands"] == ["pdw call skills__skill_read --data x"]
+    assert ingested_at == rerun_at
+    (_, role, subtype, tool_name, turn_id, _, tool_result, _) = rows[1]
+    assert (role, subtype, tool_name, turn_id) == ("tool", "tool_result", "", "call_a")
+    assert json.loads(tool_result)["exit_codes"] == [0]
+
+    # The guide's example: Codex sessions that ran `pdw call skills__`.
+    hits = warehouse._query(
+        """
+        SELECT session_id FROM @ai_conversation_events
+        WHERE source = 'codex' AND tool_name = 'exec'
+          AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(tool_input_json::jsonb -> 'commands') c
+                      WHERE c LIKE 'pdw call skills\\_\\_%%')
+        """
+    )
+    assert hits == [("codex-sess",)]

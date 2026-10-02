@@ -1461,6 +1461,24 @@ AGENT_SESSION_EVENT_COLUMNS = (
     "sync_version",
 )
 
+#: Codex ``response_item`` types that the normalizer before 2026-10-02 stored
+#: as ``role = 'meta'`` with no ``tool_name``/``tool_input_json``/
+#: ``tool_result_json``: the custom ``exec``/``apply_patch`` tool Codex runs
+#: nearly every tool through, and the hosted web/tool-search and image calls.
+#: The normalizer now writes every one of them as ``tool_use``/``tool_result``,
+#: so a row still carrying one of these subtypes is legacy by construction; the
+#: agent-sessions ingest rewrites them from their own ``raw_json``, newest
+#: first, and a partial index over exactly these subtypes keeps that probe free
+#: once the history has converged.
+LEGACY_CODEX_TOOL_SUBTYPES = (
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "web_search_call",
+    "tool_search_call",
+    "tool_search_output",
+    "image_generation_call",
+)
+
 SLACK_TEAM_COLUMNS = (
     "account",
     "team_id",
