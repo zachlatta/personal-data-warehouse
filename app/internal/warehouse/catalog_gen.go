@@ -37,7 +37,7 @@ var TimelinePriorities = TimelinePriorityContract{
 		"cc",
 	},
 	Tiers: []TimelinePriorityTier{
-		{Name: "self", Meaning: "Zach initiated it", TypicalRows: "his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, and his card purchases and payments"},
+		{Name: "self", Meaning: "Zach initiated it", TypicalRows: "his sent mail and messages, his notes, photos and voice memos, his agent sessions and the turns he typed into them, his own calendar events, his workouts, even WHOOP-detected ones, and his card purchases and payments"},
 		{Name: "direct", Meaning: "a real person reaching him directly", TypicalRows: "DMs, email addressed to him, small group threads, big group chats for the week he takes part in them, a real `<@id>` ping, and replies in a thread of his that are conversation rather than announcements"},
 		{Name: "cc", Meaning: "real-people activity he is peripheral to", TypicalRows: "cc'd mail, private team channels he sits in, big group chats he is not taking part in that week, replies under his channel-wide broadcasts, people talking about him in public, and others editing a file he owns"},
 		{Name: "noise", Meaning: "bulk or automated traffic", TypicalRows: "newsletters, notifications, bots, Slackbot file posts, GitHub and CI relays, Gmail's auto-created plus deleted or declined calendar events, his own health telemetry, and public-channel chatter not aimed at him whether or not he is a member"},

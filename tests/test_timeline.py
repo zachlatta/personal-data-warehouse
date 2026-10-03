@@ -3624,3 +3624,27 @@ def test_a_muse_loop_session_is_titled_by_its_loop_not_left_blank(warehouse):
     assert session("claude_code", "blank")[0] == ""
     # The label is a title, never a reason to promote a loop.
     assert {session("muse", s)[2] for s in ("improve", "feed", "novel", "sub")} == {"background"}
+
+
+def test_a_whoop_workout_is_self_even_when_whoop_detected_it():
+    """Zach, 2026-10-03: auto-detected WHOOP workouts are `self`.
+
+    A walk the strap noticed on its own is still a walk he took. The tier
+    contract's "his own health telemetry is noise" means the scores the strap
+    computes about him (cycles, recoveries, sleeps), not the activity itself.
+    The workout adapter reads no column that tells detected from logged, so
+    the rule is one constant, and the published contract has to say so.
+    """
+    from personal_data_warehouse.timeline import TIMELINE_ADAPTERS
+    import json
+
+    from personal_data_warehouse.warehouse_catalog import CATALOG_PATH
+
+    workout = next(a for a in TIMELINE_ADAPTERS if a.name == "whoop_workout")
+    assert workout.priority_expression == "'self'"
+    for name in ("whoop_cycle", "whoop_recovery", "whoop_sleep"):
+        telemetry = next(a for a in TIMELINE_ADAPTERS if a.name == name)
+        assert telemetry.priority_expression == "'noise'", name
+    catalog = json.loads(CATALOG_PATH.read_text())
+    tiers = {t["name"]: t["typical_rows"] for t in catalog["timeline_priorities"]["tiers"]}
+    assert "even WHOOP-detected ones" in tiers["self"]
