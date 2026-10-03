@@ -300,11 +300,11 @@ def process_upstream_mutation_batch(
     gmail_executor: GmailMutationExecutor,
     contact_executor: GoogleContactMutationExecutor,
     calendar_executor: CalendarMutationExecutor,
+    slack_executor: SlackMutationExecutor,
     limit: int,
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
-    slack_executor: SlackMutationExecutor | None = None,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -349,7 +349,7 @@ def process_upstream_mutation_batch(
             result = calendar_executor.execute(mutation)
         elif provider == "gmail":
             result = gmail_executor.execute(mutation)
-        elif provider == SLACK_PROVIDER and slack_executor is not None:
+        elif provider == SLACK_PROVIDER:
             result = slack_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker

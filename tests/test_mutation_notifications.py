@@ -72,3 +72,46 @@ def test_dagster_container_supervises_the_resident_cloud_worker() -> None:
 
     assert "python -m personal_data_warehouse.upstream_mutation_worker" in start_script
     assert 'mutation_worker_pid=""' in start_script
+
+
+def test_resident_worker_executes_slack_mutations_instead_of_spinning_on_them(monkeypatch) -> None:
+    # Without a Slack executor the resident worker claimed every approved Slack
+    # mutation, deferred it as an unknown provider, was woken by its own status
+    # change and claimed it again: 68 claim/defer cycles in 12 seconds for the
+    # first production send on 2026-10-03 (709 for one mark-read batch), until
+    # the Dagster fallback won the lock.
+    from personal_data_warehouse import upstream_mutation_worker
+    from personal_data_warehouse.slack_mutations import SlackMutationExecutor
+    from personal_data_warehouse.defs.upstream_mutations import UpstreamMutationWorkerSummary
+
+    class _Warehouse:
+        def ensure_upstream_mutation_tables(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_batch(**kwargs):
+        seen.update(kwargs)
+        return UpstreamMutationWorkerSummary()
+
+    class _Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "warehouse_from_settings", lambda settings: _Warehouse())
+    monkeypatch.setattr(upstream_mutation_worker, "GmailMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "GoogleContactMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "CalendarMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "exclusive_sync_lock", lambda **kwargs: _Lock())
+    monkeypatch.setattr(upstream_mutation_worker, "process_upstream_mutation_batch", fake_batch)
+
+    upstream_mutation_worker.CloudMutationProcessor().process_pending()
+
+    assert isinstance(seen.get("slack_executor"), SlackMutationExecutor)

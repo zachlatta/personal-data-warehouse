@@ -23,6 +23,7 @@ from personal_data_warehouse.mutation_notifications import (
     PostgresMutationNotificationListener,
     run_notification_loop,
 )
+from personal_data_warehouse.slack_mutations import SlackMutationExecutor
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -39,6 +40,7 @@ class CloudMutationProcessor:
         self.gmail_executor = GmailMutationExecutor(settings=self.settings)
         self.contact_executor = GoogleContactMutationExecutor(settings=self.settings)
         self.calendar_executor = CalendarMutationExecutor(settings=self.settings)
+        self.slack_executor = SlackMutationExecutor(warehouse=self.warehouse)
         self.claimed_by = f"resident:{socket.gethostname()}:upstream_mutation_worker"
 
     @property
@@ -61,6 +63,7 @@ class CloudMutationProcessor:
                 gmail_executor=self.gmail_executor,
                 contact_executor=self.contact_executor,
                 calendar_executor=self.calendar_executor,
+                slack_executor=self.slack_executor,
                 limit=_upstream_mutation_batch_size(),
                 claimed_by=self.claimed_by,
                 reclaim_after=_upstream_mutation_reclaim_after(),
