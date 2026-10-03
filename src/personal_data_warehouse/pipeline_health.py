@@ -460,6 +460,26 @@ class TableFreshness:
     note: str = ""
 
 
+def _health_view_verdict(view: str, updated_column: str, *, count_attention: bool = True) -> StateSource:
+    """A pipeline whose health is judged by its own ``marts_ops`` view.
+
+    search_index, pgbackrest and collation_health each have a view that says
+    whether they are healthy, and until 2026-10-03 none of their /pipelines
+    rows read it: search_health said `failing` (embeddings stopped by a corrupt
+    HNSW page) and every backup had copied corrupt pages, under three green
+    rows. The view's per-row `status` is the state; `failing` is its word for
+    an error.
+    """
+    return StateSource(
+        table=view,
+        updated_column=updated_column,
+        status_column="status",
+        error_column="last_error" if view != "marts_collation_health" else "detail",
+        error_statuses=("error", "failed", "failing"),
+        attention_statuses=("action_required", "attention") if count_attention else ("action_required",),
+    )
+
+
 def _uploader_heartbeat(pipeline_id: str) -> StateSource:
     """The run heartbeat a remote-device uploader posts after every run.
 
@@ -1168,6 +1188,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Dagster search_chunks / search_chunk_embeddings over timeline.events",
         expected_data_interval=2 * HOUR,
         expected_run_interval=None,
+        state=_health_view_verdict("marts_search_health", "updated_at"),
         note=(
             "chunks follow the timeline seq cursor; embeddings drain through the "
             "configured OpenAI-compatible endpoint and skip (not fail) while "
@@ -1275,6 +1296,10 @@ PIPELINES: tuple[Pipeline, ...] = (
         expected_data_interval=2 * DAY,
         expected_run_interval=None,
         data_basis="a daily asset; 2d puts late at 4d, so one missed run is not an alarm",
+        # Failing findings only: the missing collation baseline is a permanent
+        # `attention` row that would otherwise pin this pipeline amber forever.
+        # Corruption (data_checksums, amcheck, duplicate keys) is `failing`.
+        state=_health_view_verdict("marts_collation_health", "collected_at", count_attention=False),
         note=(
             "this database has NO collation baseline (datcollversion is NULL) and"
             " REFRESH COLLATION VERSION cannot create one, so Postgres will never"
@@ -1296,6 +1321,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="backup loop every 6h",
         transport="pgBackRest backup loop in the Postgres container -> ops.pgbackrest_health",
         expected_data_interval=DAY,
+        state=_health_view_verdict("marts_pgbackrest_health", "collected_at"),
         expected_run_interval=None,
         data_basis=(
             "the loop wakes every 6h (PDW_PGBACKREST_BACKUP_INTERVAL_SECONDS=21600) and writes a"

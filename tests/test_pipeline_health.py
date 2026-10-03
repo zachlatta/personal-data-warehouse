@@ -133,6 +133,13 @@ def test_pipeline_metadata_is_complete():
             # uploader's runs); an unscoped one must own a state table.
             if entry.state.scope_column:
                 assert entry.state.table in TABLE_PIPELINES, entry.id
+            elif entry.state.table.startswith("marts_"):
+                # The pipeline's own health view (search_index, pgbackrest,
+                # collation_health): it must read at least one table the
+                # pipeline owns, so it judges this pipeline and no other.
+                owned = {table for table, cov in TABLE_PIPELINES.items() if cov.pipeline == entry.id}
+                assert CATALOG.object(entry.state.table).kind == "view", entry.id
+                assert entry.state.table.removeprefix("marts_") in owned, entry.id
             else:
                 # Either a dedicated state table, or one of the pipeline's own
                 # tables doubling as its failure record (transcription runs).
@@ -2737,3 +2744,55 @@ def test_no_pipeline_declares_an_interval_the_collector_cannot_observe():
         if interval is not None and interval * LATE_MULTIPLIER <= collector
     }
     assert too_tight == {}, too_tight
+
+
+
+# --- a pipeline row must carry its own health view's verdict -------------------
+#
+# On 2026-10-03 marts_ops.search_health read `failing` (embeddings had not
+# written since 10-01: a corrupt HNSW page) and pgBackRest had copied corrupt
+# pages into every backup for two days, while /pipelines showed `search_index`,
+# `pgbackrest` and `collation_health` all ok: none of the three rows read the
+# verdict of the health view built for it.
+
+
+def test_health_view_pipelines_read_their_own_verdict():
+    for pipeline_id, view in (
+        ("search_index", "marts_search_health"),
+        ("pgbackrest", "marts_pgbackrest_health"),
+        ("collation_health", "marts_collation_health"),
+    ):
+        state = pipeline(pipeline_id).state
+        assert state is not None, pipeline_id
+        assert state.table == view, pipeline_id
+        assert state.status_column == "status", pipeline_id
+        assert "failing" in state.error_statuses, pipeline_id
+
+
+def test_a_failing_search_health_component_fails_the_search_index_pipeline(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command("DELETE FROM @search_health")
+    warehouse._command(
+        """
+        INSERT INTO @search_health
+            (component, configured, pgvector_available, caught_up, last_success_at,
+             last_run_at, last_error, updated_at)
+        VALUES
+            ('chunks', 1, 1, 1, %(now)s, %(now)s, '', %(now)s),
+            ('embeddings', 1, 1, 0, %(old)s, %(now)s,
+             'invalid page in block 963680 of relation "base/5/49520807"', %(now)s)
+        """,
+        {"now": now, "old": now - timedelta(days=2)},
+    )
+    verdicts = {
+        r["component"]: r["status"]
+        for r in warehouse._query_dicts("SELECT component, status FROM @marts_search_health")
+    }
+    assert verdicts["embeddings"] == "failing", verdicts
+    PipelineHealthCollector(warehouse).run()
+    row = warehouse._query_dicts(
+        "SELECT status, last_error FROM @marts_pipeline_health WHERE pipeline = 'search_index'"
+    )[0]
+    assert row["status"] == "failing", row
+    assert "invalid page" in row["last_error"]
