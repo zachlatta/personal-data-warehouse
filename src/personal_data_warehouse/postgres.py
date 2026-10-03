@@ -11776,6 +11776,38 @@ class PostgresWarehouse:
             (account, team_id, conversation_id, _ensure_utc(updated_at), int(sync_version)),
         )
 
+    def touch_slack_read_state_sync_state(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_ids: Sequence[str],
+        updated_at: datetime,
+        sync_version: int,
+    ) -> None:
+        """Record when each conversation's read state (`last_read`) was refreshed.
+
+        Its own object_type, so it never moves the 'conversation' row whose
+        updated_at the freshness schedule reads as the last history poll.
+        """
+        ids = sorted({str(conversation_id) for conversation_id in conversation_ids if conversation_id})
+        if not ids:
+            return
+        self._command(
+            """
+            INSERT INTO @slack_sync_state (
+                account, team_id, object_type, object_id,
+                cursor_ts, last_sync_type, status, error, updated_at, sync_version
+            )
+            SELECT %s, %s, 'read_state', object_id, '', 'conversation_info', 'ok', '', %s, %s
+            FROM unnest(%s::text[]) AS ids(object_id)
+            ON CONFLICT (account, team_id, object_type, object_id) DO UPDATE
+               SET updated_at = EXCLUDED.updated_at,
+                   sync_version = EXCLUDED.sync_version
+            """,
+            (account, team_id, _ensure_utc(updated_at), int(sync_version), ids),
+        )
+
     def load_slack_thread_parent_refs(
         self,
         *,
@@ -11914,6 +11946,15 @@ class PostgresWarehouse:
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
+        # Rotate by when last_read was last refreshed (the 'read_state' stamp
+        # touch_slack_read_state_sync_state writes). Ordered by recent activity
+        # alone, a 25-a-run pass refreshed the same busiest conversations every
+        # run and froze the rest: on 2026-10-03 six of eight sampled
+        # conversations were behind Slack, one by 105 days, so inbox_items
+        # showed read conversations as unread and approved mark-reads were
+        # never observed. Never-refreshed first; then the ones the warehouse
+        # thinks are unread (only Zach reading them moves last_read), oldest
+        # stamp first; a conversation read past its newest message waits.
         rows = self._query(
             f"""
             SELECT c.raw_json
@@ -11922,9 +11963,16 @@ class PostgresWarehouse:
               ON c.account = m.account
              AND c.team_id = m.team_id
              AND c.conversation_id = m.conversation_id
+            LEFT JOIN @slack_sync_state AS r
+              ON r.account = c.account
+             AND r.team_id = c.team_id
+             AND r.object_type = 'read_state'
+             AND r.object_id = c.conversation_id
             WHERE {" AND ".join(where)}
             ORDER BY
-                ({_json_numeric("c.raw_json", "last_read")} = 0) DESC,
+                (r.updated_at IS NULL) DESC,
+                (EXTRACT(EPOCH FROM m.latest_message_at) > {_json_numeric("c.raw_json", "last_read")}) DESC,
+                r.updated_at ASC,
                 m.latest_message_at DESC,
                 CASE
                     WHEN c.is_im = 1 THEN 1
@@ -12207,7 +12255,17 @@ class PostgresWarehouse:
                               secs => COALESCE(e.history_cycle_seconds, 345600))
                     )::bigint AS history_polled_count,
                     min(h.updated_at) FILTER (WHERE c.is_archived = 0)
-                        AS oldest_history_poll_at
+                        AS oldest_history_poll_at,
+                    -- Read state: the conversations the warehouse thinks are
+                    -- unread (the read-state pass's own candidates, see
+                    -- load_slack_read_state_candidate_payloads), and how many
+                    -- had last_read re-read within two hours. Until 2026-10-03
+                    -- the pass re-read the same busiest 25 every run and froze
+                    -- the rest while every other column here read ok.
+                    count(*) FILTER (WHERE ru.unread)::bigint AS read_state_unread_count,
+                    count(*) FILTER (
+                        WHERE ru.unread AND r.updated_at > now() - interval '2 hours'
+                    )::bigint AS read_state_refreshed_count
                 FROM @slack_conversations AS c
                 LEFT JOIN @slack_conversation_stats AS s
                        ON s.account = c.account
@@ -12218,6 +12276,18 @@ class PostgresWarehouse:
                       AND h.team_id = c.team_id
                       AND h.object_type = 'conversation'
                       AND h.object_id = c.conversation_id
+                LEFT JOIN @slack_sync_state AS r
+                       ON r.account = c.account
+                      AND r.team_id = c.team_id
+                      AND r.object_type = 'read_state'
+                      AND r.object_id = c.conversation_id
+                CROSS JOIN LATERAL (
+                    SELECT c.is_archived = 0
+                       AND (c.is_member = 1 OR c.is_im = 1 OR c.is_mpim = 1)
+                       AND s.latest_message_at >= now() - interval '30 days'
+                       AND EXTRACT(EPOCH FROM s.latest_message_at)
+                           > {_json_numeric("c.raw_json", "last_read")} AS unread
+                ) AS ru
                 LEFT JOIN expected AS e ON e.conversation_type = c.conversation_type
                 WHERE c.conversation_type <> ''
                 GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds, e.history_cycle_seconds
@@ -12274,7 +12344,13 @@ class PostgresWarehouse:
                         WHEN l.landing_p95 > {SLACK_DM_LANDING_LATE_P95_SECONDS} THEN 'stale'
                         WHEN l.landing_p95 > e.landing_p95_seconds THEN 'late'
                         ELSE 'ok'
-                    END AS landing_status
+                    END AS landing_status,
+                    CASE
+                        WHEN p.read_state_unread_count = 0 THEN 'unknown'
+                        WHEN p.read_state_refreshed_count::numeric / p.read_state_unread_count < 0.75 THEN 'stale'
+                        WHEN p.read_state_refreshed_count::numeric / p.read_state_unread_count < 0.95 THEN 'late'
+                        ELSE 'ok'
+                    END AS read_state_status
                 FROM per_type AS p
                 LEFT JOIN expected AS e ON e.conversation_type = p.conversation_type
                 LEFT JOIN landing AS l
@@ -12326,7 +12402,7 @@ class PostgresWarehouse:
                 p.landing_p95_seconds,
                 p.expected_landing_p95_seconds,
                 p.landing_status,
-                -- Discovery, history and landing are separate failures and any
+                -- Discovery, history, landing and read state are separate failures and any
                 -- one alone makes the type wrong, so the row reports the worst
                 -- of them. Listing a channel we then never read is the shape
                 -- that hid 11,488 frozen public channels behind a 99.2%
@@ -12339,14 +12415,21 @@ class PostgresWarehouse:
                       OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.75)
                       OR p.landing_status = 'stale'
+                      OR p.read_state_status = 'stale'
                         THEN 'stale'
                     WHEN p.refreshed_count::numeric / p.live_count < 0.95
                       OR (p.history_cycle_seconds IS NOT NULL
                           AND p.history_polled_count::numeric / p.live_count < 0.95)
                       OR p.landing_status = 'late'
+                      OR p.read_state_status = 'late'
                         THEN 'late'
                     ELSE 'ok'
-                END AS status
+                END AS status,
+                p.read_state_unread_count,
+                p.read_state_refreshed_count,
+                round(p.read_state_refreshed_count::numeric / NULLIF(p.read_state_unread_count, 0), 4)
+                    AS read_state_refreshed_fraction,
+                p.read_state_status
             FROM judged AS p
             LEFT JOIN @slack_sync_state AS st
                    ON st.account = p.account

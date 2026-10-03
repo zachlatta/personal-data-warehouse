@@ -135,7 +135,7 @@ and "the data is right" have come apart:
   conversations moved (`client.counts` was refused and removed on 2026-10-01), so the
   freshness pass lists DMs and group DMs to find new ones and polls every conversation
   when it is due. *Held up by* `marts_ops.slack_conversation_health` (discovery share,
-  poll share for every type, DM landing latency) and
+  poll share for every type, DM landing latency, read-state rotation) and
   `test_blanket_freshness_polls_each_conversation_when_it_is_due`. See [Slack](docs/agents/slack.md).
 - **S2 — every voice source lands in `base_*`, unifies in `marts_voice_memos.recordings`, is
   transcribed by AssemblyAI, enriched by an agent that can query PDW, and matched to a

@@ -63,6 +63,7 @@ class FakeWarehouse:
         self.member_candidate_payloads = []
         self.member_candidate_calls = []
         self.read_state_candidate_calls = []
+        self.read_state_touches = []
         self.thread_refs = []
         self.thread_ref_calls = []
         self.teams = []
@@ -187,6 +188,9 @@ class FakeWarehouse:
 
     def touch_slack_conversation_sync_state(self, **kwargs):
         self.conversation_touches.append(kwargs)
+
+    def touch_slack_read_state_sync_state(self, **kwargs):
+        self.read_state_touches.append(kwargs)
 
     def load_slack_thread_parent_refs(
         self,
@@ -851,6 +855,45 @@ def test_runner_can_refresh_conversation_info_only(monkeypatch):
     assert warehouse.conversations[0]["conversation_id"] == "C1"
     assert "last_read" in warehouse.conversations[0]["raw_json"]
     assert [method for method, _params in client.calls] == ["auth.test", "team.info", "conversations.info"]
+    # The refresh is stamped, so the next run's candidates rotate past it.
+    assert [touch["conversation_ids"] for touch in warehouse.read_state_touches] == [["C1"]]
+
+
+def test_runner_conversation_info_stamps_a_conversation_slack_refused(monkeypatch):
+    # A conversation whose info call fails is stamped too: unstamped it would
+    # sort first on every run and spend a slot forever.
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club", "user_id": "U1"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club", "domain": "hackclub"}}],
+            "conversations.info": [
+                {"ok": False, "error": "channel_not_found"},
+                {"ok": True, "channel": {"id": "D2", "is_im": True, "user": "U2", "last_read": "1713974400.000100"}},
+            ],
+        }
+    )
+    warehouse = FakeWarehouse()
+    warehouse.conversation_payloads = [
+        {"id": "C1", "name": "gone", "is_channel": True, "is_member": True},
+        {"id": "D2", "is_im": True, "user": "U2"},
+    ]
+
+    SlackSyncRunner(
+        settings=settings,
+        warehouse=warehouse,
+        logger=NullLogger(),
+        client_factory=lambda account: client,
+        conversation_limit=2,
+        sync_conversation_info_only=True,
+        sleep=lambda seconds: None,
+    ).sync_all()
+
+    assert [row["conversation_id"] for row in warehouse.conversations] == ["D2"]
+    assert [touch["conversation_ids"] for touch in warehouse.read_state_touches] == [["C1", "D2"]]
+    assert warehouse.read_state_touches[0]["team_id"] == "T1"
 
 
 def test_runner_incremental_uses_lookback_and_skips_unchanged_threads(monkeypatch):

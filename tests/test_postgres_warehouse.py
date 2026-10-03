@@ -5425,6 +5425,74 @@ def test_postgres_slack_read_state_candidates_use_stats_latest_message_at(
     assert payloads == [{"id": "C-recent", "last_read": "0"}]
 
 
+def test_postgres_slack_read_state_candidates_rotate_by_last_refresh(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # The read-state pass refreshes `last_read` for a bounded number of
+    # conversations a run. Ordered by recent activity alone it refreshed the
+    # same most-active 25 every run, and every other conversation kept the
+    # last_read it had when it last ranked: on 2026-10-03 six of eight sampled
+    # conversations were behind Slack, one by 105 days, and 110 approved
+    # mark-reads could never be observed. So candidates rotate: never-refreshed
+    # first, then those the warehouse thinks are unread (only Zach reading them
+    # can change that), oldest refresh first; one already read waits.
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_slack_tables()
+    warehouse.insert_slack_conversations(
+        [
+            # Read up to its newest message: nothing to learn until a new one lands.
+            _slack_conversation_row(conversation_id="D-read", raw_json=f'{{"id":"D-read","last_read":"{now.timestamp() + 60:.6f}"}}'),
+            # Unread as far as the warehouse knows, refreshed long ago.
+            _slack_conversation_row(conversation_id="D-stale", raw_json='{"id":"D-stale","last_read":"1700000000.000001"}'),
+            # Unread too, but refreshed a minute ago, and the busiest.
+            _slack_conversation_row(conversation_id="D-fresh", raw_json='{"id":"D-fresh","last_read":"1700000000.000001"}'),
+            # Never refreshed at all.
+            _slack_conversation_row(conversation_id="D-new", raw_json='{"id":"D-new","last_read":"1700000000.000001"}'),
+        ]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(conversation_id="D-read", message_ts=f"{(now - timedelta(hours=3)).timestamp():.6f}", message_datetime=now - timedelta(hours=3)),
+            _slack_message_row(conversation_id="D-stale", message_ts=f"{(now - timedelta(hours=2)).timestamp():.6f}", message_datetime=now - timedelta(hours=2)),
+            _slack_message_row(conversation_id="D-fresh", message_ts=f"{(now - timedelta(minutes=1)).timestamp():.6f}", message_datetime=now - timedelta(minutes=1)),
+            _slack_message_row(conversation_id="D-new", message_ts=f"{(now - timedelta(days=5)).timestamp():.6f}", message_datetime=now - timedelta(days=5)),
+        ]
+    )
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=["D-read", "D-stale"], updated_at=now - timedelta(hours=6), sync_version=1
+    )
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=["D-fresh"], updated_at=now - timedelta(minutes=1), sync_version=2
+    )
+
+    payloads = warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1")
+
+    assert [payload["id"] for payload in payloads] == ["D-new", "D-stale", "D-fresh", "D-read"]
+    limited = warehouse.load_slack_read_state_candidate_payloads(account="zrl", team_id="T1", limit=2)
+    assert [payload["id"] for payload in limited] == ["D-new", "D-stale"]
+
+
+def test_postgres_slack_read_state_stamp_is_its_own_sync_state(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # The stamp says when last_read was refreshed. It must not touch the
+    # conversation's history cursor, which the freshness schedule reads.
+    warehouse.ensure_slack_tables()
+    _insert_sync_state(warehouse, object_type="conversation", object_id="D1", status="ok")
+    stamped_at = datetime(2026, 10, 3, 20, tzinfo=UTC)
+
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=["D1"], updated_at=stamped_at, sync_version=7
+    )
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=[], updated_at=stamped_at, sync_version=8
+    )
+
+    states = warehouse.load_slack_sync_state()
+    assert states[("zrl", "T1", "read_state", "D1")]["updated_at"] == stamped_at
+    assert states[("zrl", "T1", "conversation", "D1")]["updated_at"] == datetime(2026, 5, 19, 12, tzinfo=UTC)
+
+
 def test_postgres_slack_read_state_candidate_query_uses_stats_not_message_grouping(
     warehouse: PostgresWarehouse,
     monkeypatch: pytest.MonkeyPatch,
@@ -7616,6 +7684,10 @@ def _poll_every_health_conversation(warehouse: PostgresWarehouse) -> None:
             cursor_ts="1770000000.000001", last_sync_type="partial", status="ok", error="",
             updated_at=now - timedelta(minutes=1), sync_version=1,
         )
+        warehouse.touch_slack_read_state_sync_state(
+            account=account, team_id=team_id, conversation_ids=[conversation_id],
+            updated_at=now - timedelta(minutes=1), sync_version=1,
+        )
 
 
 def _health_conversation_row(
@@ -8271,6 +8343,73 @@ def test_slack_conversation_health_ignores_archived_conversations(
     # Both rows are still counted -- the archived one is simply not judged.
     assert (total, archived) == (2, 1)
     assert oldest >= now - timedelta(minutes=11)
+
+
+def test_slack_conversation_health_judges_how_recently_unread_state_was_refreshed(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A conversation the warehouse thinks is unread must have its read state re-read.
+
+    `last_read` arrives only through conversations.info, a bounded number a run.
+    Until 2026-10-03 the pass took the same most-active conversations every run
+    and froze the rest -- one public channel 105 days behind Slack, 313 of 412
+    recent conversations showing unread -- while every column here read `ok`.
+    A conversation already read past its newest message is not judged: only a
+    new message can make it unread, and that puts it back in the rotation.
+    """
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    newest = now - timedelta(hours=1)
+    unread = f'{{"last_read":"{(newest - timedelta(days=1)).timestamp():.6f}"}}'
+    read = f'{{"last_read":"{(newest + timedelta(seconds=1)).timestamp():.6f}"}}'
+    rows = []
+    for conversation_id, raw_json in (
+        ("D_UNREAD_FRESH", unread),
+        ("D_UNREAD_FROZEN", unread),
+        ("D_READ_UNSTAMPED", read),
+        ("G_UNREAD_FRESH", unread),
+    ):
+        row = _health_conversation_row(
+            conversation_id, "mpim" if conversation_id.startswith("G") else "im", synced_at=now - timedelta(minutes=5)
+        )
+        row["raw_json"] = raw_json
+        rows.append(row)
+    warehouse.insert_slack_conversations(rows)
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id=row["conversation_id"],
+                message_ts=f"{newest.timestamp():.6f}",
+                message_datetime=newest,
+            )
+            for row in rows
+        ]
+    )
+    _poll_every_health_conversation(warehouse)
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=["D_UNREAD_FRESH", "G_UNREAD_FRESH"],
+        updated_at=now - timedelta(minutes=20), sync_version=1,
+    )
+    warehouse.touch_slack_read_state_sync_state(
+        account="zrl", team_id="T1", conversation_ids=["D_UNREAD_FROZEN"],
+        updated_at=now - timedelta(days=30), sync_version=1,
+    )
+
+    rows_by_type = {
+        row[0]: row[1:]
+        for row in warehouse._query(
+            """
+            SELECT conversation_type, read_state_unread_count, read_state_refreshed_count,
+                   read_state_refreshed_fraction, read_state_status, status
+            FROM @marts_ops_slack_conversation_health WHERE account = 'zrl'
+            """
+        )
+    }
+    assert rows_by_type["im"][:2] == (2, 1)
+    assert float(rows_by_type["im"][2]) == 0.5
+    assert rows_by_type["im"][3] == "stale" and rows_by_type["im"][4] == "stale"
+    assert rows_by_type["mpim"][:2] == (1, 1)
+    assert rows_by_type["mpim"][3] == "ok"
 
 
 def test_slack_conversation_health_tolerates_a_handful_of_unreachable_stragglers(

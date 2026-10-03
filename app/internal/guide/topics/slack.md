@@ -19,7 +19,8 @@ somebody else. Confirm any id you build a who-said-what query on from `base_slac
   id and a group DM's is `mpdm-a--b--c-1`.
 - `base_slack.users`, `base_slack.conversation_members`, `base_slack.message_reactions`,
   `base_slack.files`, `base_slack.teams`, `base_slack.account_identities`.
-- `marts_inbox.slack_items` — what is unread or waiting on Zach.
+- `marts_inbox.slack_items` — what is unread or waiting on Zach. Read state is refreshed
+  on a ~30-minute rotation, so something he read in Slack minutes ago can still show unread.
 - `marts_slack.huddles` — one row per huddle: `started_at`, `ended_at` (NULL while live),
   `duration_seconds`, `created_by`, `participant_user_ids`, `conversation_name`.
 - `marts_slack.image_fingerprints` — perceptual hashes of Slack images; "who posted this
@@ -35,7 +36,7 @@ people talking about him in public are `cc`.
 ## What is synced, and the edges
 
 - Everything Zach participates in — DMs, group DMs, private channels, his active member
-  channels — is **polled** with his own pasted Slack session: a conversation active in the last four hours every five
+  channels — is **polled**: a conversation active in the last four hours every five
   minutes, within two weeks every 15 minutes, within a year hourly, older every six
   hours, and a brand-new DM or group DM is found by listing within five minutes. A DM
   that wakes after months of quiet can therefore take hours to land. DM landing latency

@@ -1658,10 +1658,12 @@ class SlackSyncRunner:
             limit=self._conversation_limit,
         )
         rows = []
+        attempted: list[str] = []
         for conversation in conversations:
             if not isinstance(conversation, Mapping) or not conversation.get("id"):
                 continue
             conversation_id = str(conversation["id"])
+            attempted.append(conversation_id)
             try:
                 response = self._call(client, "conversations.info", channel=conversation_id)
             except SlackApiCallError as exc:
@@ -1679,6 +1681,18 @@ class SlackSyncRunner:
                 )
 
         self._warehouse.insert_slack_conversations(rows)
+        # Stamp every conversation asked about, refused ones included: the
+        # candidates rotate by this stamp, and an unstamped one would take a
+        # slot on every run (load_slack_read_state_candidate_payloads).
+        stamp = getattr(self._warehouse, "touch_slack_read_state_sync_state", None)
+        if stamp is not None and attempted:
+            stamp(
+                account=account.account,
+                team_id=team_id,
+                conversation_ids=attempted,
+                updated_at=synced_at,
+                sync_version=sync_version_from_datetime(synced_at),
+            )
         return SlackSyncSummary(
             account=account.account,
             team_id=team_id,

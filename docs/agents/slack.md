@@ -236,8 +236,10 @@ three things:
 - **It stamps every poll** (`touch_slack_conversation_sync_state`), including one that found
   nothing, because the schedule reads the last poll.
 
-**It polls with Zach's pasted session, not the workspace OAuth token** — his decision on
-2026-10-01, because the session is rate-limited far less. With the OAuth token a pass made
+**It can poll with Zach's pasted session instead of the workspace OAuth token** — his
+decision on 2026-10-01, because the session is rate-limited far less, and switched off
+again on 2026-10-03 when Slack flagged it (see
+[Publishing the Slack session](#publishing-the-slack-session-a-paste-never-a-capture)). With the OAuth token a pass made
 ~210 `conversations.history` calls before its 120-second sleep budget ran out, and the due
 backlog stopped shrinking at ~5,600 of ~6,700 conversations: the schedule asked for more than
 the token's ~39 calls a minute could give. `SlackSessionApiClient` sends the session's token,
@@ -249,6 +251,21 @@ schedule and hot DMs are polled every tick while a backlog drains across passes.
 `SLACK_ASSET_FRESHNESS_USE_SESSION=0` polls with the OAuth token only. `marts_ops.slack_conversation_health` judges every type on
 `history_polled_fraction` within its cycle (twelve hours for DMs, group DMs and private
 channels) beside DM landing latency.
+
+**Read state rotates; it is not refreshed by activity.** `last_read` (what the inbox's
+unread state is computed from) arrives only through `conversations.info`, which the
+read-state pass calls for 25 conversations a run, both on its own five-minute schedule and
+at the end of every freshness pass. Until 2026-10-03 it took the 25 most recently active
+conversations every run, so the same busiest ones were refreshed every five minutes and the
+rest froze at whatever `last_read` they had when they last ranked: six of eight sampled
+conversations were behind Slack, one public channel by 105 days, `inbox_items` showed 313 of
+412 recent conversations unread, and 110 approved `slack.mark_conversation_read` mutations
+could never reach `observed`. Each refresh now writes a `read_state` row in
+`ops.slack_sync_state` (`touch_slack_read_state_sync_state`, refused calls included), and
+`load_slack_read_state_candidate_payloads` takes never-refreshed conversations first, then
+the ones the warehouse thinks are unread, oldest refresh first. One already read past its
+newest message waits, because only a new message can make it unread. A full rotation of the
+apparently unread ones takes about half an hour.
 
 **`derived_slack.inbox_items` is refreshed incrementally, and the watermark is the reason.**
 Every Slack stage ends by refreshing that snapshot (`refresh_slack_account_state_items`).
@@ -309,6 +326,18 @@ and the browser's User-Agent. Python spending a session was never flagged in mon
 `anomaly` on Zach's user from mew's address: if Slack flags it, set
 `SLACK_ASSET_FRESHNESS_USE_SESSION=0` on the Dagster deployment and tell him, rather than
 disguising the requests better.
+
+**It was flagged, and polling is back on the OAuth token (2026-10-03).** From 2026-10-01
+17:30Z, three hours after the session was published, `slack.audit_logs` recorded an
+`anomaly` on Zach's user from mew's egress IP every hour: `unexpected_api_call_volume`
+plus `spoofed_user_agent` and `unexpected_client`, 67 in 35 hours. Slack did not reset his
+sessions (its auto-response fires on `unexpected_scraping`, which this never drew), but
+those are the reasons a Grid admin reads. `SLACK_ASSET_FRESHNESS_USE_SESSION=0` was set
+on the Dagster deployment on 2026-10-03 at about 19:50Z. Sends and mark-reads still spend the
+session, one approved request at a time. Those are the only session calls left, so an
+`anomaly` from mew after 10-03 means one of them, or the env var was lost in a redeploy.
+The `excessive_downloads` anomalies from AWS addresses with a `Go-http-client` User-Agent
+in the same log come from AWS addresses, not mew, so they are not PDW.
 
 **Mint the session in a private window used for nothing else, then close it without
 signing out.** All six `unexpected_scraping` anomalies from 2026-09-20 to 09-29 in
@@ -428,9 +457,16 @@ the reviewer saw it going, once. Nothing is posted before a human approves the r
   `base_slack.messages` (`observe_succeeded_slack_send_message_mutations`), the same
   way a Gmail send is observed through its message id.
 - Deployment needs nothing new: `SLACK_ACCOUNTS` already gates Slack proposals in the
-  app, the Dagster worker already runs `SlackMutationExecutor` with the published
-  session, and both deploy from `main`. There is no way to test a send without sending —
-  the first real use should be a one-line DM to Zach himself.
+  app, both cloud workers run `SlackMutationExecutor` with the published session, and both
+  deploy from `main`. The first real send was a one-line DM to Zach himself on
+  2026-10-03 (approved on the phone, posted 12 seconds later).
+- **Both workers must hold every cloud executor.** The resident low-latency worker
+  (`upstream_mutation_worker.py`, supervised inside the Dagster container) was built
+  without the Slack executor, so it claimed each approved Slack mutation, deferred it as an
+  unknown provider, was woken by its own status change and claimed it again. That
+  happened 68 times in 12 seconds for that first send, and 709 times for one mark-read
+  batch, until the Dagster fallback job won the lock. `slack_executor` is now a required
+  argument of `process_upstream_mutation_batch`, so a worker cannot be built without it.
 ## Slack file bytes and "who sent this image?"
 
 ### Getting a Slack file's bytes: `get_object` already does this
