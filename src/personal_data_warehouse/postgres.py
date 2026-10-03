@@ -3721,11 +3721,15 @@ class PostgresWarehouse:
                     WHEN conn.status = 'action_required' THEN 'action_required'
                     WHEN conn.status = 'failed' THEN 'failing'
                     WHEN COALESCE(s.status, '') IN ('attention', 'action_required', 'failed') THEN 'attention'
-                    WHEN conn.status = 'attention' THEN 'attention'
+                    WHEN conn.status = 'attention' AND conn_applies.applies THEN 'attention'
                     WHEN s.status IS NULL THEN 'unknown'
                     ELSE 'ok'
                 END AS status,
-                COALESCE(NULLIF(s.error, ''), conn.error, '') AS error,
+                COALESCE(
+                    NULLIF(s.error, ''),
+                    CASE WHEN conn.status <> 'attention' OR conn_applies.applies THEN conn.error END,
+                    ''
+                ) AS error,
                 NULLIF(s.last_synced_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_synced_at,
                 tx.newest_transaction_at,
                 tx.transactions_30d,
@@ -3745,6 +3749,22 @@ class PostgresWarehouse:
               ON s.account = a.account AND s.account_id = a.account_id
             LEFT JOIN @simplefin_sync_state AS conn
               ON conn.account = a.account AND conn.account_id = ''
+            -- The bridge's per-connection message names one institution
+            -- ("Connection to <org> may need attention"). It colours that
+            -- institution's accounts only; a message naming none of the
+            -- linked institutions still colours every account. On 2026-10-03
+            -- the mortgage servicer's re-login request read `attention` on
+            -- both credit cards, which were current to the hour.
+            LEFT JOIN LATERAL (
+                SELECT
+                    position(lower(a.org_name) IN lower(COALESCE(conn.error, ''))) > 0
+                    OR NOT EXISTS (
+                        SELECT 1 FROM @simplefin_accounts AS other
+                        WHERE other.account = a.account AND other.is_removed = 0
+                          AND other.org_name <> ''
+                          AND position(lower(other.org_name) IN lower(COALESCE(conn.error, ''))) > 0
+                    ) AS applies
+            ) AS conn_applies ON TRUE
             LEFT JOIN LATERAL (
                 SELECT
                     NULLIF(max(t.posted_at), '1970-01-01 00:00:00+00'::timestamptz) AS newest_transaction_at,

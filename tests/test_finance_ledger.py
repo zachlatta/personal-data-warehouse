@@ -3375,6 +3375,45 @@ def test_simplefin_balance_is_frozen_while_the_access_url_is_action_required(war
     assert has_pending_finance_observations(warehouse) is False
 
 
+def test_a_bridge_message_naming_one_institution_colours_only_its_accounts(warehouse):
+    """On 2026-10-03 the bridge said "Connection to <mortgage servicer> may
+    need attention. Auth required" and both credit cards, current to the
+    hour, read `attention` with the mortgage's message."""
+    warehouse.ensure_plaid_tables()
+    _seed_simplefin(
+        warehouse,
+        [
+            _simplefin_account_row(account_id="ACT-card", org_name="Card Co", name="Venture (5520)"),
+            _simplefin_account_row(account_id="ACT-loan", org_name="Loan Servicing", name="Mortgage (0775)"),
+        ],
+    )
+    warehouse.insert_simplefin_sync_state(
+        account="z@x.test", account_id="", cursor="", status="attention",
+        error="Connection to Loan Servicing may need attention. Auth required",
+        last_synced_at=_TS, updated_at=_TS,
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    rows = {
+        r["account_id"]: r
+        for r in warehouse._query_dicts("SELECT account_id, status, error FROM @marts_ops_simplefin_account_health")
+    }
+    assert rows["ACT-loan"]["status"] == "attention"
+    assert "Loan Servicing" in rows["ACT-loan"]["error"]
+    assert rows["ACT-card"]["status"] == "ok", rows["ACT-card"]
+    assert rows["ACT-card"]["error"] == ""
+
+
+def test_a_bridge_message_naming_no_institution_still_colours_every_account(warehouse):
+    warehouse.ensure_plaid_tables()
+    _seed_simplefin(warehouse, [_simplefin_account_row(account_id="ACT-card", org_name="Card Co", name="Venture (5520)")])
+    warehouse.insert_simplefin_sync_state(
+        account="z@x.test", account_id="", cursor="", status="attention",
+        error="The bridge is degraded", last_synced_at=_TS, updated_at=_TS,
+    )
+    FinanceLedgerRunner(warehouse=warehouse, now=_TS + timedelta(hours=2)).sync()
+    assert warehouse._query_dicts("SELECT status FROM @marts_ops_simplefin_account_health") == [{"status": "attention"}]
+
+
 def test_simplefin_replay_rebuilds_identically(warehouse):
     _seed_plaid(warehouse, [_plaid_account_row()])
     warehouse.insert_plaid_transactions([_plaid_transaction_row(transaction_id="tx-1", amount=4.5)])
