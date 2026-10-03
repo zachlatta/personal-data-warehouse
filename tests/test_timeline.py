@@ -2063,6 +2063,26 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
             ),
         )
 
+    # Codex's approval reviewer replays the session to the model on the user
+    # channel. 241 of these read `self` in the fortnight to 2026-10-03.
+    warehouse._command(
+        """
+        INSERT INTO @codex_events (source, session_id, event_uuid, seq, occurred_at,
+                                   role, text, entrypoint, ingested_at)
+        VALUES ('codex', 'codex-a', 'h2', 2, %s, 'user', %s, 'codex_cli_rs', %s),
+               ('codex', 'codex-a', 'h3', 3, %s, 'user', %s, 'codex_cli_rs', %s)
+        """,
+        (
+            _NOW + timedelta(minutes=2),
+            "The following is the Codex agent history added since your last approval "
+            "decision. Decide whether the requested action is safe.",
+            _NOW,
+            _NOW + timedelta(minutes=3),
+            "The following is the Codex agent history whose request action you are assessing.",
+            _NOW,
+        ),
+    )
+
     # --- agent turns: Zach's own words are searchable under 'self' -----------
     # sdk-typed is a session he drove; its typed user turn is his, its
     # assistant turn and a harness-injected task notification are not.
@@ -2218,6 +2238,9 @@ def test_priority_separates_conversations_automation_and_machinery(warehouse):
     assert priority_of("claude_code|sdk-typed|2") == "background", "a harness notification on the user channel is not him"
     assert priority_of("claude_code|cli-brief|1") == "background", "typed into an orchestrated session is still machinery"
     # codex
+    assert priority_of("codex|codex-a|1") == "self", "the words he typed into codex are his"
+    assert priority_of("codex|codex-a|2") == "background", "codex's approval-review replay is not him"
+    assert priority_of("codex|codex-a|3") == "background", "nor its request-assessment replay"
     assert priority_of("codex|codex-a") == "self", (
         "the identical <recommended_plugins> preamble every codex session opens with "
         "must not read as a recurring scheduled prompt"

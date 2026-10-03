@@ -2641,7 +2641,10 @@ _AGENT_HARNESS_USER_TURN_PATTERN = (
     "'^\\s*(<task-notification>|<system-reminder>|<command-name>|<local-command-stdout>|"
     "<realtime_delegation>|<local-command-caveat>|\\[openclaw heartbeat poll\\]|"
     "\\[request interrupted|stop hook feedback:|\\[system notification|"
-    "another claude session|\\[image: |a session-scoped stop hook)'"
+    "another claude session|\\[image: |a session-scoped stop hook|"
+    # Codex's approval reviewer replays the session on the user channel: 241
+    # of these read `self` in the fortnight to 2026-10-03.
+    "the following is the codex agent history)'"
 )
 
 # The words Zach typed are his. A user turn is 'self' when the SESSION is
