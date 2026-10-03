@@ -2452,6 +2452,7 @@ TIMESTAMP_COLUMNS = {
     "last_incr_at",
     "last_archived_at",
     "last_restore_verified_at",
+    "last_clean_backup_at",
     "oldest_pending_at",
     "last_success_at",
     # mart health: the stalest input pipeline's last write. (When the view's
@@ -2621,6 +2622,8 @@ INTEGER_COLUMNS = {
     "failed_count",
     "last_attempt_ok",
     "last_expire_ok",
+    "last_backup_error",
+    "error_backup_count",
     "configured",
     "pgvector_available",
     "timeline_max_seq",
@@ -5273,7 +5276,12 @@ class PostgresWarehouse:
                     NULLIF(last_restore_note, '') AS last_restore_note,
                     NULLIF(last_expire_at, '1970-01-01 00:00:00+00'::timestamptz) AS last_expire_at,
                     last_expire_ok,
-                    NULLIF(last_expire_error, '') AS last_expire_error
+                    NULLIF(last_expire_error, '') AS last_expire_error,
+                    last_backup_error,
+                    error_backup_count,
+                    NULLIF(last_clean_backup_label, '') AS last_clean_backup_label,
+                    NULLIF(last_clean_backup_at, '1970-01-01 00:00:00+00'::timestamptz)
+                        AS last_clean_backup_at
                 FROM @pgbackrest_health
             )
             SELECT
@@ -5295,7 +5303,15 @@ class PostgresWarehouse:
                     -- reached 5,910 segments while archived_count kept rising
                     -- and every other field read healthy.
                     WHEN wal_ready_count >= {WAL_READY_FAILING} THEN 'failing'
+                    -- Every retained backup copied corrupt pages: none
+                    -- restores clean, which is no restorable backup at all.
+                    WHEN last_backup_error = 1 AND last_clean_backup_at IS NULL THEN 'failing'
                     WHEN wal_ready_count >= {WAL_READY_ATTENTION} THEN 'attention'
+                    -- The newest backup met corrupt pages (pgBackRest's
+                    -- "error(s) detected during backup", exit 0 regardless):
+                    -- restoring it restores the corruption. An older clean one
+                    -- still stands, named in last_clean_backup_label.
+                    WHEN last_backup_error = 1 THEN 'attention'
                     -- WAL archiving broken: the backup is a floor, not a
                     -- recovery point, until shipping resumes. Judged against
                     -- collected_at, NOT now(): last_archived_at is a fact
@@ -5371,7 +5387,17 @@ class PostgresWarehouse:
                     ELSE 'ok'
                 END AS expire_status,
                 last_expire_at,
-                last_expire_error
+                last_expire_error,
+                CASE
+                    WHEN last_backup_error = 1 AND last_clean_backup_at IS NULL THEN 'no_clean_backup'
+                    WHEN last_backup_error = 1 THEN 'errors_detected'
+                    -- A loop that predates these columns reports neither.
+                    WHEN last_clean_backup_label IS NULL THEN 'unmeasured'
+                    ELSE 'ok'
+                END AS integrity_status,
+                error_backup_count,
+                last_clean_backup_label,
+                last_clean_backup_at
             FROM measured
             """,
         )
@@ -5423,6 +5449,11 @@ class PostgresWarehouse:
                             secs => {COLLATION_SNAPSHOT_STALE_SECONDS}) THEN 'unknown'
                     -- Duplicate rows under a UNIQUE index are the loudest
                     -- evidence: a working ON CONFLICT cannot produce them.
+                    -- A page failed checksum verification recently: the
+                    -- database itself is corrupt (2026-10-03, 9,125 failures
+                    -- behind an all-green dashboard).
+                    WHEN finding = 'checksum_failures' THEN 'failing'
+                    WHEN finding = 'checksums_disabled' THEN 'attention'
                     WHEN scope = 'index' AND amcheck_status = 'failed' THEN 'failing'
                     WHEN finding = 'duplicate_keys' THEN 'failing'
                     -- A recorded baseline that no longer matches the library.
@@ -5893,6 +5924,20 @@ class PostgresWarehouse:
         self._command(
             "DELETE FROM @collation_health WHERE object_id <> ALL(%s)",
             ([finding.object_id for finding in findings],),
+        )
+
+    def upsert_collation_health(
+        self, findings: Sequence[Any], *, collected_at: datetime
+    ) -> None:
+        """Upsert a few collation/integrity rows without pruning the rest.
+
+        The ten-minute collector refreshes the database checksum row this way;
+        the daily ``write_collation_health`` snapshot owns pruning.
+        """
+        self._insert_rows(
+            "collation_health",
+            [_pipeline_health_row(finding, collected_at=collected_at) for finding in findings],
+            COLLATION_HEALTH_COLUMNS,
         )
 
     def bm25_timeline_index_names(self) -> list[str]:

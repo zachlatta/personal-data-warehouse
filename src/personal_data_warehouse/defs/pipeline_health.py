@@ -12,6 +12,7 @@ from dagster import (
     schedule,
 )
 
+from personal_data_warehouse.collation_health import CollationHealthCollector
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.pipeline_health import (
     PROBE_EMPTY,
@@ -63,6 +64,10 @@ def pipeline_health(context) -> MaterializeResult:
                 )
             else:
                 warehouse.ensure_pipeline_health_tables()
+                # The checksum counter first: one catalog read, and the
+                # database's own integrity must reach /pipelines within ten
+                # minutes rather than at the daily collation run.
+                CollationHealthCollector(warehouse).refresh_database_integrity()
                 pipelines, tables, marts = PipelineHealthCollector(warehouse).run_all()
     finally:
         warehouse.close()

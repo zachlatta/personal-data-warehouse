@@ -15,7 +15,7 @@ app's `/pipelines` page.
 | agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier, per agent source |
 | search | `marts_ops.search_health`, `marts_ops.search_benchmark`, `marts_ops.search_benchmark_history` | chunk/embedding convergence, BM25 index integrity, cache residency; weekly latency and MRR |
 | per-source SLAs | `marts_ops.slack_conversation_health`, `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health` | Slack per conversation type; each Plaid institution (a `duplicate` or dead Item is a named row); each SimpleFIN account and which ledger account it reconciled onto |
-| integrity and backups | `marts_ops.collation_health`, `marts_ops.pgbackrest_health` | did the sort order move under an index; is the database backed up and has a restore been drilled |
+| integrity and backups | `marts_ops.collation_health`, `marts_ops.pgbackrest_health` | did a page fail its checksum (row `data_checksums`) or the sort order move under an index; is the database backed up, is the newest backup clean (`integrity_status`), has a restore been drilled |
 
 {{if .CLI}}Run these with `pdw sql --output json -q '<why>' '<SQL>'`.{{else}}Run these through `query`.{{end}}
 

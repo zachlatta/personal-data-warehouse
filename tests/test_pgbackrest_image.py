@@ -413,3 +413,19 @@ def test_expire_result_columns_are_in_the_reconciled_spec() -> None:
     columns = POSTGRES_TABLES["pgbackrest_health"].columns
     for column in ("last_expire_at", "last_expire_ok", "last_expire_error"):
         assert column in columns
+
+
+def test_the_loop_reports_backups_that_copied_corrupt_pages() -> None:
+    """`pgbackrest info --output=json` marks a backup that met a page checksum
+    failure with `"error": true` and the backup still exits 0. The loop must
+    publish that flag, how many retained backups carry it, and the newest
+    backup that does not -- the restore point that is actually clean."""
+
+    from personal_data_warehouse.postgres import POSTGRES_TABLES
+
+    loop = (REPO_ROOT / "docker/postgres-pgbackrest/backup-loop.sh").read_text()
+    columns = POSTGRES_TABLES["pgbackrest_health"].columns
+    for column in ("last_backup_error", "error_backup_count", "last_clean_backup_label", "last_clean_backup_at"):
+        assert column in columns, column
+        assert column in loop, f"the loop never writes {column}"
+    assert "b->>'error'" in loop, "the flag is read from each backup's JSON `error` field"

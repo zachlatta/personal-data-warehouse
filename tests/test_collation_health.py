@@ -852,3 +852,100 @@ def test_duplicate_key_finding_is_classified_as_failing(warehouse):
     row = _findings(warehouse)["index:base_slack.message_reactions_pkey"]
     assert row["status"] == "failing"
     assert row["excess_rows"] == 6_622
+
+
+# --- data checksums (C10: the database itself is healthy) ----------------------
+#
+# On 2026-10-03 production had logged 9,125 checksum failures over three days:
+# corrupt pages in the HNSW embeddings index, the timeline BM25 index and the
+# TOAST heap of base_muse.events. Embedding writes had failed since 10-01 and
+# every pgBackRest backup since then carried the corrupt pages, while every
+# health surface read ok -- nothing read pg_stat_database.checksum_failures.
+
+
+def test_a_recent_checksum_failure_is_a_failing_integrity_finding(warehouse):
+    from personal_data_warehouse.collation_health import (
+        FINDING_CHECKSUM_FAILURES,
+        OBJECT_ID_DATA_CHECKSUMS,
+        checksum_finding,
+    )
+
+    now = datetime.now(tz=UTC)
+    finding = checksum_finding(
+        database="postgres",
+        data_checksums="on",
+        failures=9125,
+        last_failure=now - timedelta(minutes=5),
+        now=now,
+    )
+    assert finding.object_id == OBJECT_ID_DATA_CHECKSUMS
+    assert finding.scope == SCOPE_DATABASE
+    assert finding.finding == FINDING_CHECKSUM_FAILURES
+    assert "9125" in finding.detail
+    warehouse.write_collation_health([finding], collected_at=now)
+    assert _findings(warehouse)[OBJECT_ID_DATA_CHECKSUMS]["status"] == "failing"
+
+
+def test_a_checksum_failure_older_than_the_window_reads_ok_and_keeps_its_count(warehouse):
+    """The counter never resets; a repaired database stops failing reads, so
+    the last failure ages out instead of pinning the row red forever."""
+    from personal_data_warehouse.collation_health import (
+        CHECKSUM_FAILURE_WINDOW,
+        OBJECT_ID_DATA_CHECKSUMS,
+        checksum_finding,
+    )
+
+    now = datetime.now(tz=UTC)
+    finding = checksum_finding(
+        database="postgres",
+        data_checksums="on",
+        failures=12,
+        last_failure=now - CHECKSUM_FAILURE_WINDOW - timedelta(hours=1),
+        now=now,
+    )
+    assert finding.finding == FINDING_OK
+    assert "12" in finding.detail
+    warehouse.write_collation_health([finding], collected_at=now)
+    assert _findings(warehouse)[OBJECT_ID_DATA_CHECKSUMS]["status"] == "ok"
+
+
+def test_disabled_data_checksums_is_attention_because_corruption_is_then_invisible(warehouse):
+    from personal_data_warehouse.collation_health import (
+        FINDING_CHECKSUMS_DISABLED,
+        OBJECT_ID_DATA_CHECKSUMS,
+        checksum_finding,
+    )
+
+    now = datetime.now(tz=UTC)
+    finding = checksum_finding(
+        database="postgres", data_checksums="off", failures=None, last_failure=None, now=now
+    )
+    assert finding.finding == FINDING_CHECKSUMS_DISABLED
+    warehouse.write_collation_health([finding], collected_at=now)
+    assert _findings(warehouse)[OBJECT_ID_DATA_CHECKSUMS]["status"] == "attention"
+
+
+def test_the_collector_reads_the_live_checksum_counter(warehouse):
+    from personal_data_warehouse.collation_health import (
+        FINDING_CHECKSUMS_DISABLED,
+        OBJECT_ID_DATA_CHECKSUMS,
+    )
+
+    findings = {f.object_id: f for f in CollationHealthCollector(warehouse).collect()}
+    assert OBJECT_ID_DATA_CHECKSUMS in findings
+    assert findings[OBJECT_ID_DATA_CHECKSUMS].finding in {FINDING_OK, FINDING_CHECKSUMS_DISABLED}
+
+
+def test_the_integrity_row_refreshes_alone_without_pruning_the_daily_snapshot(warehouse):
+    """The ten-minute collector refreshes the checksum row; the daily
+    collation/amcheck rows it did not measure must survive untouched."""
+    from personal_data_warehouse.collation_health import OBJECT_ID_DATA_CHECKSUMS
+
+    collector = CollationHealthCollector(warehouse)
+    collector.run()
+    before = _findings(warehouse)
+    refreshed = collector.refresh_database_integrity()
+    assert refreshed.object_id == OBJECT_ID_DATA_CHECKSUMS
+    after = _findings(warehouse)
+    assert set(after) == set(before)
+    assert after[OBJECT_ID_DATA_CHECKSUMS]["collected_at"] >= before[OBJECT_ID_DATA_CHECKSUMS]["collected_at"]

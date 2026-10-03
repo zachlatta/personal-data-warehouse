@@ -31,6 +31,16 @@ class _FakeWarehouse:
         self.closed = True
 
 
+class _FakeIntegrityCollector:
+    refreshed: list[object] = []
+
+    def __init__(self, warehouse) -> None:
+        self.warehouse = warehouse
+
+    def refresh_database_integrity(self):
+        _FakeIntegrityCollector.refreshed.append(self.warehouse)
+
+
 class _FakeCollector:
     instances: list["_FakeCollector"] = []
 
@@ -173,6 +183,8 @@ def _patch_common(monkeypatch) -> _FakeWarehouse:
     )
     monkeypatch.setattr(pipeline_health_defs, "warehouse_from_settings", lambda _settings: warehouse)
     monkeypatch.setattr(pipeline_health_defs, "PipelineHealthCollector", _FakeCollector)
+    _FakeIntegrityCollector.refreshed = []
+    monkeypatch.setattr(pipeline_health_defs, "CollationHealthCollector", _FakeIntegrityCollector)
     return warehouse
 
 
@@ -185,6 +197,9 @@ def test_asset_collects_and_reports_probe_outcomes(monkeypatch):
     assert warehouse.ensured
     assert warehouse.closed
     assert _FakeCollector.instances[0].ran
+    # The database's page-checksum row refreshes every ten minutes (C10), not
+    # only with the daily collation run.
+    assert _FakeIntegrityCollector.refreshed == [warehouse]
     assert result.metadata["pipelines"].value == 3
     assert result.metadata["tables"].value == 3
     # A cost-guard skip is expected; a timeout is the one worth noticing.

@@ -2613,6 +2613,17 @@ PGBACKREST_HEALTH_COLUMNS = (
     "last_expire_at",
     "last_expire_ok",
     "last_expire_error",
+    # Page integrity of the backups themselves. pgBackRest verifies checksums
+    # as it copies and marks a backup that met a corrupt page `"error": true`
+    # -- and still exits 0. From 2026-10-01 every backup carried the flag
+    # while this row read ok. The clean label/time name the newest retained
+    # backup WITHOUT the flag: the restore point that does not restore the
+    # corruption. '' / the epoch mean "not reported" (a loop that predates
+    # these columns) or, beside last_backup_error = 1, "none is clean".
+    "last_backup_error",
+    "error_backup_count",
+    "last_clean_backup_label",
+    "last_clean_backup_at",
 )
 
 

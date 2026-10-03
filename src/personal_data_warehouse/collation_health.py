@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg2
@@ -63,9 +63,12 @@ import psycopg2
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHECKSUM_FAILURE_WINDOW",
     "CollationFinding",
     "CollationHealthCollector",
     "DIVERGENCE_MAX_HEAP_BYTES",
+    "FINDING_CHECKSUM_FAILURES",
+    "FINDING_CHECKSUMS_DISABLED",
     "FINDING_DUPLICATE_KEYS",
     "FINDING_ERROR",
     "FINDING_NO_BASELINE",
@@ -79,9 +82,11 @@ __all__ = [
     "AMCHECK_STATEMENT_TIMEOUT_MS",
     "AMCHECK_MAX_PER_RUN",
     "AMCHECK_RUN_BUDGET_SECONDS",
+    "OBJECT_ID_DATA_CHECKSUMS",
     "SCOPE_COLLATION",
     "SCOPE_DATABASE",
     "SCOPE_INDEX",
+    "checksum_finding",
 ]
 
 #: One row per checked object. The three scopes answer three different
@@ -106,6 +111,25 @@ FINDING_SKIPPED_EXPRESSION = "skipped_expression"
 FINDING_SKIPPED_LARGE = "skipped_large"
 FINDING_TIMEOUT = "timeout"
 FINDING_ERROR = "error"
+
+#: The database's own page-integrity verdict, one row beside the collation
+#: baseline. Postgres verifies a page's checksum only when it reads it, and
+#: counts every failure in ``pg_stat_database.checksum_failures`` -- a counter
+#: no surface here read until 2026-10-03, when production had logged 9,125 of
+#: them over three days (the HNSW embeddings index, the timeline BM25 index and
+#: the TOAST heap of base_muse.events) behind an all-green /pipelines.
+OBJECT_ID_DATA_CHECKSUMS = "data_checksums"
+#: A checksum failure inside :data:`CHECKSUM_FAILURE_WINDOW`: some page the
+#: database read recently is corrupt, and every backup since copies it.
+FINDING_CHECKSUM_FAILURES = "checksum_failures"
+#: Data checksums are off, so a corrupt page is invisible until it breaks a
+#: query -- the database cannot answer the integrity question at all.
+FINDING_CHECKSUMS_DISABLED = "checksums_disabled"
+#: The counter never resets, so the verdict keys off the LAST failure. A
+#: repaired database stops failing reads and ages out of this window instead
+#: of reading red forever; a week is long enough that a corrupt page read only
+#: by a daily or weekly job still keeps the row failing.
+CHECKSUM_FAILURE_WINDOW = timedelta(days=7)
 
 #: Heap-size ceiling for the corroborating divergence probe. The probe is a
 #: ``count(*)`` plus a ``count(DISTINCT key)`` with index plans disabled, so it
@@ -207,7 +231,7 @@ class CollationHealthCollector:
     # -- collection --------------------------------------------------------
 
     def collect(self) -> list[CollationFinding]:
-        findings = [self._database_finding()]
+        findings = [self._database_finding(), self._checksum_finding()]
         findings.extend(self._collation_findings())
         findings.extend(self._index_findings())
         return findings
@@ -216,6 +240,39 @@ class CollationHealthCollector:
         findings = self.collect()
         self._warehouse.write_collation_health(findings, collected_at=self._now())
         return findings
+
+    def refresh_database_integrity(self) -> CollationFinding:
+        """Re-measure only the checksum row, for the ten-minute collector.
+
+        The collation and amcheck rows cost a daily amount of work; the
+        checksum counter is one catalog read, and corruption should colour
+        /pipelines within minutes, not by tomorrow's 03:41 run. Upserts the one
+        row and prunes nothing.
+        """
+        finding = self._checksum_finding()
+        self._warehouse.upsert_collation_health([finding], collected_at=self._now())
+        return finding
+
+    def _checksum_finding(self) -> CollationFinding:
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT
+                current_database() AS name,
+                current_setting('data_checksums') AS data_checksums,
+                s.checksum_failures AS failures,
+                s.checksum_last_failure AS last_failure
+            FROM pg_stat_database AS s
+            WHERE s.datname = current_database()
+            """
+        )
+        row = rows[0] if rows else {}
+        return checksum_finding(
+            database=str(row.get("name") or ""),
+            data_checksums=str(row.get("data_checksums") or ""),
+            failures=row.get("failures"),
+            last_failure=row.get("last_failure"),
+            now=self._now(),
+        )
 
     # -- the database's own collation -------------------------------------
 
@@ -702,3 +759,56 @@ def _ident(value: str) -> str:
     if not value.replace("_", "a").isalnum() or value[0].isdigit():
         raise ValueError(f"invalid SQL identifier: {value!r}")
     return '"' + value + '"'
+
+
+def checksum_finding(
+    *,
+    database: str,
+    data_checksums: str,
+    failures: int | None,
+    last_failure: datetime | None,
+    now: datetime,
+) -> CollationFinding:
+    """Judge the database's checksum counter into one finding.
+
+    A pure function of the catalog facts so the verdict is testable without a
+    corrupt page to produce one.
+    """
+    finding = CollationFinding(
+        object_id=OBJECT_ID_DATA_CHECKSUMS,
+        scope=SCOPE_DATABASE,
+        object_name=database,
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding=FINDING_OK,
+        detail="",
+    )
+    if data_checksums.lower() != "on":
+        finding.finding = FINDING_CHECKSUMS_DISABLED
+        finding.detail = (
+            "data checksums are off: a corrupt page is invisible until it breaks a query, "
+            "and pgBackRest cannot flag one in a backup"
+        )
+        return finding
+    count = int(failures or 0)
+    if count == 0 or last_failure is None:
+        finding.detail = "data checksums on; no page has ever failed verification"
+        return finding
+    last = last_failure.isoformat()
+    if now - last_failure <= CHECKSUM_FAILURE_WINDOW:
+        finding.finding = FINDING_CHECKSUM_FAILURES
+        finding.detail = (
+            f"{count} page checksum failure(s), the last at {last}: a page read in the last "
+            f"{CHECKSUM_FAILURE_WINDOW.days} days is corrupt and every backup since copies it. "
+            "Find the relations in the server log ('invalid page in block N of relation "
+            "base/<db>/<filenode>', map with pg_class.relfilenode); check the host's memory and "
+            "disk before repairing, then REINDEX an index or restore a heap from the last "
+            "backup pgbackrest info lists without 'error(s) detected'."
+        )
+        return finding
+    finding.detail = (
+        f"{count} page checksum failure(s) recorded since the stats reset, none since {last}"
+    )
+    return finding

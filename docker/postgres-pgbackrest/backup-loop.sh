@@ -152,6 +152,14 @@ WITH doc AS (
     FROM backups
 ), newest AS (
     SELECT b FROM backups ORDER BY (b->'timestamp'->>'stop')::bigint DESC LIMIT 1
+), clean AS (
+    -- pgBackRest verifies page checksums while it copies and marks a backup
+    -- that met a corrupt page `"error": true` -- yet exits 0. From 2026-10-01
+    -- every backup carried the flag while the health row read ok. The newest
+    -- backup WITHOUT it is the restore point that does not restore the damage.
+    SELECT b FROM backups
+    WHERE COALESCE(b->>'error', 'false') <> 'true'
+    ORDER BY (b->'timestamp'->>'stop')::bigint DESC LIMIT 1
 ), arch AS (
     SELECT a->>'min' AS wal_min, a->>'max' AS wal_max
     FROM entry, LATERAL jsonb_array_elements(entry.e->'archive') AS a
@@ -163,7 +171,8 @@ INSERT INTO ops.pgbackrest_health AS t (
     last_backup_label, last_backup_type, backup_count, repo_bytes,
     wal_min, wal_max, wal_ready_count, archived_count, failed_count, last_archived_at,
     last_attempt_at, last_attempt_type, last_attempt_ok, last_error, collected_at,
-    last_expire_at, last_expire_ok, last_expire_error)
+    last_expire_at, last_expire_ok, last_expire_error,
+    last_backup_error, error_backup_count, last_clean_backup_label, last_clean_backup_at)
 SELECT
     :'stanza',
     CASE
@@ -191,7 +200,11 @@ SELECT
     COALESCE(a.last_archived_time, '1970-01-01 00:00:00+00'::timestamptz),
     now(), :'attempt_type', NULLIF(:'attempt_ok','')::bigint, :'attempt_error', now(),
     CASE WHEN :'expire_ok' = '' THEN '1970-01-01 00:00:00+00'::timestamptz ELSE now() END,
-    COALESCE(NULLIF(:'expire_ok','')::bigint, 1), :'expire_error'
+    COALESCE(NULLIF(:'expire_ok','')::bigint, 1), :'expire_error',
+    CASE WHEN (SELECT b->>'error' FROM newest) = 'true' THEN 1 ELSE 0 END,
+    (SELECT count(*) FROM backups WHERE b->>'error' = 'true'),
+    COALESCE((SELECT b->>'label' FROM clean), ''),
+    to_timestamp(COALESCE((SELECT (b->'timestamp'->>'stop')::bigint FROM clean), 0))
 FROM (SELECT archived_count, failed_count, last_archived_time FROM pg_stat_archiver) a
 ON CONFLICT (stanza) DO UPDATE SET
     repo_status = EXCLUDED.repo_status, repo_message = EXCLUDED.repo_message,
@@ -202,6 +215,10 @@ ON CONFLICT (stanza) DO UPDATE SET
     wal_ready_count = EXCLUDED.wal_ready_count,
     archived_count = EXCLUDED.archived_count, failed_count = EXCLUDED.failed_count,
     last_archived_at = EXCLUDED.last_archived_at,
+    last_backup_error = EXCLUDED.last_backup_error,
+    error_backup_count = EXCLUDED.error_backup_count,
+    last_clean_backup_label = EXCLUDED.last_clean_backup_label,
+    last_clean_backup_at = EXCLUDED.last_clean_backup_at,
     last_attempt_at = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_at ELSE EXCLUDED.last_attempt_at END,
     last_attempt_type = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_type ELSE EXCLUDED.last_attempt_type END,
     last_attempt_ok = CASE WHEN EXCLUDED.last_attempt_type = '' THEN t.last_attempt_ok ELSE EXCLUDED.last_attempt_ok END,

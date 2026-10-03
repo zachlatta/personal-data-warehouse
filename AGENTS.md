@@ -110,7 +110,11 @@ that, not from this prose.
   runs retention as its own step. *Held up by* `tests/test_pgbackrest_image.py` and
   `marts_ops.pgbackrest_health`, written by the backup loop itself: `attention` when a
   backup attempt or retention (`expire_status`) fails, and when the last restore drill
-  (`pgbackrest_restore_drill record`) is older than 45 days. Runbook:
+  (`pgbackrest_restore_drill record`) is older than 45 days; `failing`/`attention` when the
+  newest backup copied corrupt pages (`integrity_status`, `last_clean_backup_label`). The
+  database's own pages: the `data_checksums` row of `marts_ops.collation_health` reads
+  `pg_stat_database.checksum_failures` every ten minutes and fails on one in the last week
+  (2026-10-03: 9,125 failures under an all-green dashboard). Runbook:
   `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
   green.** *Held up by* per-source detectors: `marts_ops.slack_conversation_health`,

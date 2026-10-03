@@ -2073,6 +2073,10 @@ def _backup_row(warehouse, **overrides):
         "stanza", "repo_status", "repo_message", "last_backup_label",
         "last_backup_type", "wal_min", "wal_max", "last_attempt_type", "last_error",
     }
+    # A row the default fixture describes as clean must say so explicitly once
+    # the loop reports backup integrity; the old loop's rows carry defaults.
+    columns.setdefault("last_clean_backup_label", "'20260826-120000F'")
+    columns.setdefault("last_clean_backup_at", "now() - interval '2 hours'")
     values = ", ".join(
         (f"'{v}'" if k in text_cols else str(v)) for k, v in columns.items()
     )
@@ -2142,6 +2146,54 @@ def test_a_failing_retention_is_attention_even_when_every_backup_succeeds(wareho
     assert row["status"] == "attention", row["status"]
     assert row["expire_status"] == "failing"
     assert row["last_expire_error"] == "expire failed: [104]"
+
+
+def test_a_newest_backup_that_copied_corrupt_pages_is_attention_and_names_the_clean_one(warehouse):
+    """pgBackRest verifies page checksums while it copies, marks a backup that
+    met corrupt pages with `"error": true`, and still exits 0. From 2026-10-01
+    every backup carried that flag (`error(s) detected during backup`) while
+    this row read ok. Restoring the newest backup would restore the corruption;
+    the row must say so, and name the newest backup that is clean."""
+
+    warehouse.ensure_pipeline_health_tables()
+    _backup_row(
+        warehouse,
+        last_backup_error=1,
+        error_backup_count=9,
+        last_clean_backup_label="'20260927-223107F_20260928-071503I'",
+        last_clean_backup_at="now() - interval '5 days'",
+    )
+    warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="20260826-120000F", rows=1, note="")
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["status"] == "attention", row["status"]
+    assert row["integrity_status"] == "errors_detected"
+    assert row["error_backup_count"] == 9
+    assert row["last_clean_backup_label"] == "20260927-223107F_20260928-071503I"
+    assert row["last_clean_backup_at"] is not None
+
+
+def test_no_clean_backup_at_all_is_failing(warehouse):
+    """Every retained backup copied corrupt pages: nothing restores clean."""
+
+    warehouse.ensure_pipeline_health_tables()
+    row = _backup_row(
+        warehouse,
+        last_backup_error=1,
+        error_backup_count=3,
+        last_clean_backup_label="''",
+        last_clean_backup_at="'1970-01-01 00:00:00+00'::timestamptz",
+    )
+    assert row["status"] == "failing", row["status"]
+    assert row["last_clean_backup_at"] is None
+
+
+def test_a_clean_newest_backup_reads_ok_integrity(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    _backup_row(warehouse)
+    warehouse.record_pgbackrest_restore_drill(stanza="pdw", label="20260826-120000F", rows=1, note="")
+    row = warehouse._query_dicts("SELECT * FROM @marts_pgbackrest_health")[0]
+    assert row["integrity_status"] == "ok"
+    assert row["status"] == "ok"
 
 
 def test_a_failing_loop_with_an_older_good_backup_is_attention_not_ok(warehouse):
