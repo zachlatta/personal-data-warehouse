@@ -7,6 +7,7 @@ import pytest
 
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.slack_sync import (
+    SLACK_FRESHNESS_DUE_INTERVALS,
     iter_cursor_pages,
     SlackRateLimitedError,
     SlackApiCallError,
@@ -3557,12 +3558,12 @@ def test_blanket_freshness_polls_each_conversation_when_it_is_due(monkeypatch):
             # warm (3 days) -- due every 15 minutes
             ("zrl", "T1", "conversation", "D_WARM_FRESH"): state("D_WARM_FRESH", t - 3 * day, 5),
             ("zrl", "T1", "conversation", "D_WARM_DUE"): state("D_WARM_DUE", t - 3 * day, 20),
-            # cool (60 days) -- due hourly
-            ("zrl", "T1", "conversation", "G_COOL_FRESH"): state("G_COOL_FRESH", t - 60 * day, 30),
-            ("zrl", "T1", "conversation", "G_COOL_DUE"): state("G_COOL_DUE", t - 60 * day, 90),
-            # cold (two years) -- due every six hours
-            ("zrl", "T1", "conversation", "D_COLD_FRESH"): state("D_COLD_FRESH", t - 700 * day, 120),
-            ("zrl", "T1", "conversation", "D_COLD_DUE"): state("D_COLD_DUE", t - 700 * day, 7 * 60),
+            # cool (60 days) -- due every two hours
+            ("zrl", "T1", "conversation", "G_COOL_FRESH"): state("G_COOL_FRESH", t - 60 * day, 90),
+            ("zrl", "T1", "conversation", "G_COOL_DUE"): state("G_COOL_DUE", t - 60 * day, 150),
+            # cold (two years) -- due every twelve hours
+            ("zrl", "T1", "conversation", "D_COLD_FRESH"): state("D_COLD_FRESH", t - 700 * day, 7 * 60),
+            ("zrl", "T1", "conversation", "D_COLD_DUE"): state("D_COLD_DUE", t - 700 * day, 13 * 60),
         }
     )
     warehouse.conversation_payloads = [
@@ -3589,6 +3590,82 @@ def test_blanket_freshness_polls_each_conversation_when_it_is_due(monkeypatch):
     # Most overdue first: the cold DM (due 60 minutes ago), the cool group DM
     # (due 30 minutes ago), the warm DM (due 5 minutes ago). Nothing not yet due.
     assert polled == ["D_COLD_DUE", "G_COOL_DUE", "D_WARM_DUE"]
+
+
+def test_freshness_polls_every_due_dm_before_any_public_channel(monkeypatch):
+    """On the OAuth token a pass ends at the rate limit after ~210-250 polls.
+
+    Measured 2026-10-03, the first passes after session polling was switched off
+    reached 211-417 of 1,327-1,440 due conversations, and ~95 of each pass's polls
+    went to public channels active in the last two hours -- mostly chatter not
+    aimed at Zach -- while DMs waited. So DMs, group DMs and private channels,
+    hot and due, go before any public channel; the public sweep covers what a
+    pass does not reach.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    t = 1_790_000_000
+
+    def state(conversation_id, cursor, polled_minutes_ago):
+        return {
+            "account": "zrl", "team_id": "T1", "object_type": "conversation",
+            "object_id": conversation_id, "cursor_ts": f"{cursor:.6f}", "last_sync_type": "partial",
+            "status": "ok", "error": "", "updated_at": now - timedelta(minutes=polled_minutes_ago),
+        }
+
+    warehouse = FakeWarehouse(
+        states={
+            ("zrl", "T1", "conversation", "C_PUBLIC_HOT"): state("C_PUBLIC_HOT", t - 60, 30),
+            ("zrl", "T1", "conversation", "D_HOT"): state("D_HOT", t - 60, 5),
+            ("zrl", "T1", "conversation", "D_WARM_DUE"): state("D_WARM_DUE", t - 3 * 86_400, 20),
+            ("zrl", "T1", "conversation", "C_PRIVATE_HOT"): state("C_PRIVATE_HOT", t - 60, 5),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "C_PUBLIC_HOT", "name": "lounge", "is_channel": True, "is_member": True},
+        {"id": "D_HOT", "user": "U1", "is_im": True},
+        {"id": "D_WARM_DUE", "user": "U2", "is_im": True},
+        {"id": "C_PRIVATE_HOT", "name": "team", "is_channel": True, "is_private": True, "is_member": True},
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty, empty, empty, empty],
+        }
+    )
+    SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: now,
+        history_window=timedelta(hours=4), freshness_warm_window=timedelta(days=14),
+        freshness_window_by_type={
+            "im": timedelta(hours=4), "mpim": timedelta(hours=4),
+            "private_channel": timedelta(hours=3), "public_channel": timedelta(hours=2),
+        },
+        sync_users=False, sync_members=False, use_existing_conversations=True,
+        freshness_priority=True, sync_thread_replies=False, sleep=lambda seconds: None,
+    ).sync_all()
+
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert polled == ["D_HOT", "C_PRIVATE_HOT", "D_WARM_DUE", "C_PUBLIC_HOT"]
+
+
+def test_freshness_due_intervals_fit_the_oauth_token_and_can_be_tightened(monkeypatch):
+    from personal_data_warehouse.defs import slack_sync as slack_sync_defs
+
+    assert SLACK_FRESHNESS_DUE_INTERVALS == (timedelta(minutes=15), timedelta(hours=2), timedelta(hours=12))
+    monkeypatch.delenv("SLACK_ASSET_FRESHNESS_DUE_MINUTES", raising=False)
+    assert slack_sync_defs._freshness_due_intervals() == SLACK_FRESHNESS_DUE_INTERVALS
+    monkeypatch.setenv("SLACK_ASSET_FRESHNESS_DUE_MINUTES", "15,60,360")
+    assert slack_sync_defs._freshness_due_intervals() == (
+        timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6)
+    )
+    monkeypatch.setenv("SLACK_ASSET_FRESHNESS_DUE_MINUTES", "15,60")
+    with pytest.raises(ValueError):
+        slack_sync_defs._freshness_due_intervals()
 
 
 def test_member_channel_first_seen_by_freshness_is_backfilled_below_its_floor_by_coverage(monkeypatch):

@@ -12216,16 +12216,17 @@ class PostgresWarehouse:
                 -- learns a Slack message exists (client.counts was refused with
                 -- team_is_restricted on 2026-10-01 and removed), so every type
                 -- is judged. DMs, group DMs and private channels: the freshness
-                -- pass's coldest interval is six hours, so twelve with margin.
+                -- pass's coldest interval is twelve hours on the OAuth token
+                -- (SLACK_FRESHNESS_DUE_INTERVALS), so twenty-four with margin.
                 -- Public channels: the sweep's own rotation (~2 days) with margin.
                 --
                 -- landing_p95_seconds is judged for the two DM types only, where
                 -- a person is waiting on the other end. NULL for channels, whose
                 -- landing time is the sweep rotation by design.
                 VALUES
-                    ('im', 172800::bigint, 43200::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
-                    ('mpim', 172800::bigint, 43200::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
-                    ('private_channel', 172800::bigint, 43200::bigint, NULL::bigint),
+                    ('im', 172800::bigint, 86400::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('mpim', 172800::bigint, 86400::bigint, {SLACK_DM_LANDING_P95_SECONDS}::bigint),
+                    ('private_channel', 172800::bigint, 86400::bigint, NULL::bigint),
                     ('public_channel', 432000::bigint, 345600::bigint, NULL::bigint)
             ),
             per_type AS (

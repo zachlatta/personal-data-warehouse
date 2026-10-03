@@ -20,6 +20,7 @@ from personal_data_warehouse.build_info import build_metadata
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import (
+    SLACK_FRESHNESS_DUE_INTERVALS,
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
     SLACK_COVERAGE_STAGE_STATE_TYPE,
@@ -129,6 +130,22 @@ def _session_client_factory(*, settings, warehouse, logger):
     return factory
 
 
+def _freshness_due_intervals() -> tuple[timedelta, timedelta, timedelta]:
+    """SLACK_ASSET_FRESHNESS_DUE_MINUTES="warm,cool,cold", or the OAuth-sized default.
+
+    Tighten it (the session allowed "15,60,360") only when polling has the
+    budget for it; marts_ops.slack_conversation_health judges the cold interval.
+    """
+    raw = os.getenv("SLACK_ASSET_FRESHNESS_DUE_MINUTES", "").strip()
+    if not raw:
+        return SLACK_FRESHNESS_DUE_INTERVALS
+    minutes = [int(part) for part in raw.split(",") if part.strip()]
+    if len(minutes) != 3 or any(value <= 0 for value in minutes):
+        raise ValueError("SLACK_ASSET_FRESHNESS_DUE_MINUTES must be three positive minute counts: warm,cool,cold")
+    warm, cool, cold = (timedelta(minutes=value) for value in minutes)
+    return warm, cool, cold
+
+
 def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSummary]:
     """Poll Slack for new messages in DMs, group DMs and channels.
 
@@ -181,8 +198,10 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,
             # Conversations active inside this window are due every 15 minutes
-            # (SLACK_FRESHNESS_DUE_INTERVALS); within a year hourly; older six-hourly.
+            # (SLACK_FRESHNESS_DUE_INTERVALS); within a year every two hours;
+            # older every twelve.
             freshness_warm_window=timedelta(days=_int_env("SLACK_ASSET_FRESHNESS_WARM_DAYS", 14)),
+            freshness_due_intervals=_freshness_due_intervals(),
             sync_users=False,
             sync_members=False,
             freshness_priority=True,

@@ -26,10 +26,14 @@ SLACK_CONVERSATION_LIST_STATE_TYPE = "conversation_list"
 SLACK_DIRECT_DISCOVERY_TYPES = "im,mpim,private_channel"
 SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: How long a poll-only freshness pass waits before asking a quiet conversation
-#: again: active inside the warm window (14 days), inside a year, and older. At
-#: ~300 polls a pass these cover the ~6,700 DMs, group DMs and private channels
-#: with room left for the active ones every pass.
-SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6))
+#: again: active inside the warm window (14 days), inside a year, and older.
+#: Sized for the workspace OAuth token, which ends a pass at the rate limit
+#: after ~210-250 conversations.history calls (measured 2026-10-03): with ~180
+#: warm, ~1,230 cool and ~5,500 cold DMs, group DMs and private channels this is
+#: ~150 polls a pass, leaving the rest for conversations active right now. The
+#: pasted session (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
+#: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
+SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=15), timedelta(hours=2), timedelta(hours=12))
 
 # The end of a conversations.list walk cannot be recorded by storing an empty
 # cursor: ops.slack_sync_state.cursor_ts is upsert-preserved against empty values
@@ -1029,16 +1033,23 @@ class SlackSyncRunner:
         # interval set by how recently it was active; the most overdue go
         # first, and one not yet due is not polled, which is what leaves
         # budget for the quiet ones. Every poll is stamped below.
+        #
+        # Public channels go after every DM, group DM and private channel, hot
+        # or due: on the OAuth token a pass ends at the rate limit after
+        # ~210-250 polls, and ~95 of them went to public channels active in the
+        # last two hours -- mostly chatter not aimed at Zach -- while due DMs
+        # waited (2026-10-03). The public sweep covers what a pass misses.
         scheduled = []
         for entry in planned:
             conversation, group, oldest_ts = entry
+            public = 1 if group[0] == "public_channel" else 0
             if _hot(conversation, oldest_ts):
-                scheduled.append(((0, _last_polled(conversation), type_rank[group]), entry))
+                scheduled.append(((public, 0, _last_polled(conversation), type_rank[group]), entry))
                 continue
             due = _last_polled(conversation) + _interval(conversation)
             if due > now_ts:
                 continue
-            scheduled.append(((1, due, type_rank[group]), entry))
+            scheduled.append(((public, 1, due, type_rank[group]), entry))
         scheduled.sort(key=lambda item: item[0])
         planned = [entry for _key, entry in scheduled]
 

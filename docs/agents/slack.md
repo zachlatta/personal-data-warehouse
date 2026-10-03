@@ -228,8 +228,10 @@ three things:
   ~8 hours to land.
 - **It polls each conversation when it is due** (`SLACK_FRESHNESS_DUE_INTERVALS`): active
   inside the freshness window (four hours for DMs and group DMs) every pass, within 14 days
-  every 15 minutes, within a year hourly, older every six hours. The most overdue go first
-  and one not yet due is skipped. Before this the pass polled every candidate in tier order,
+  every 15 minutes, within a year every two hours, older every twelve hours
+  (`SLACK_ASSET_FRESHNESS_DUE_MINUTES=warm,cool,cold` overrides; the session allowed
+  `15,60,360`). DMs, group DMs and private channels go before any public channel, and
+  within each the most overdue go first; one not yet due is skipped. Before this the pass polled every candidate in tier order,
   spent its budget on the ~250 conversations active in the last fortnight, and never reached
   the rest: in the 24 hours to 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group DMs
   were polled at all, and a group DM quiet since 09-10 took 28 hours to land.
@@ -249,8 +251,18 @@ token for the rest of the pass and logs it. A pass stops after
 `SLACK_ASSET_FRESHNESS_PASS_SECONDS` (240) of polling, so the job fits its five-minute
 schedule and hot DMs are polled every tick while a backlog drains across passes.
 `SLACK_ASSET_FRESHNESS_USE_SESSION=0` polls with the OAuth token only. `marts_ops.slack_conversation_health` judges every type on
-`history_polled_fraction` within its cycle (twelve hours for DMs, group DMs and private
+`history_polled_fraction` within its cycle (24 hours for DMs, group DMs and private
 channels) beside DM landing latency.
+
+**On the OAuth token alone the schedule has to fit ~240 polls a pass (2026-10-03).** The
+first three passes after the session was switched off each stopped at the rate limit after
+211-417 of 1,327-1,440 due conversations, and ~95 polls a pass went to public channels
+active in the last two hours, ahead of due DMs. So public channels now go last, and the
+cool and cold intervals doubled (1h to 2h, 6h to 12h): ~150 polls a pass for the quiet
+DMs, group DMs and private channels, the rest for whatever is active. The cost is a DM
+that wakes after more than a year of quiet: it can take up to twelve hours to land. Only
+an event feed fixes that: an Events API subscription on the workspace app, which is
+Zach's to set up.
 
 **Read state rotates; it is not refreshed by activity.** `last_read` (what the inbox's
 unread state is computed from) arrives only through `conversations.info`, which the

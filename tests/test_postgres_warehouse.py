@@ -7855,7 +7855,7 @@ def test_slack_conversation_health_catches_public_channels_discovered_but_never_
 
     dm = rows["im"]
     # Never polled: since the change feed was removed, that is evidence.
-    assert dm[5] == 43200
+    assert dm[5] == 86400
     assert dm[3] == "stale"
 
 
@@ -8549,7 +8549,7 @@ def test_slack_conversation_health_judges_every_type_on_how_recently_it_was_poll
         )
     }
     assert float(rows["im"][0]) == 0.5 and rows["im"][1] == "stale" and rows["im"][2] == "stale"
-    assert rows["im"][3] == 43200
+    assert rows["im"][3] == 86400
     assert rows["mpim"][1] == "ok" and rows["mpim"][2] == "ok"
     view = warehouse.sql_relation("marts_ops_slack_conversation_health")
     columns = [d[0] for d in warehouse._query_description(f"SELECT * FROM {view} LIMIT 0")] if hasattr(

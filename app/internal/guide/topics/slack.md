@@ -37,9 +37,9 @@ people talking about him in public are `cc`.
 
 - Everything Zach participates in — DMs, group DMs, private channels, his active member
   channels — is **polled**: a conversation active in the last four hours every five
-  minutes, within two weeks every 15 minutes, within a year hourly, older every six
-  hours, and a brand-new DM or group DM is found by listing within five minutes. A DM
-  that wakes after months of quiet can therefore take hours to land. DM landing latency
+  minutes, within two weeks every 15 minutes, within a year every two hours, older every
+  twelve hours, and a brand-new DM or group DM is found by listing within five minutes. A
+  DM that wakes after months of quiet can therefore take hours to land. DM landing latency
   is judged in `marts_ops.slack_conversation_health` (`landing_p95_seconds`).
 - The ~13k public channels he is **not** in are swept on a rotation of about a day. They
   were listed but never re-read between roughly May and 2026-08-27, so any answer drawn
