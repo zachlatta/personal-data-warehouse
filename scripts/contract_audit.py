@@ -175,13 +175,32 @@ def c3_agents_start_at_timeline() -> Verdict:
     return Verdict("C3", title, status, ev)
 
 
+def _checksum_verdict() -> dict | None:
+    """The database's page-integrity row (marts_ops.collation_health)."""
+    rows = pdw_sql(
+        "database page integrity",
+        "SELECT status, detail FROM marts_ops.collation_health WHERE object_id = 'data_checksums'",
+    )
+    return rows[0] if rows else None
+
+
 def c4_raw_data_queryable() -> Verdict:
     title = "raw source data queryable via SQL"
     rows = pdw_sql("base schemas", "SELECT count(DISTINCT table_schema) AS n FROM information_schema.tables WHERE table_schema LIKE 'base\\_%'")
     if not rows:
         return _unavailable("C4", title, "information_schema through the query role")
     n = int(rows[0]["n"])
-    return Verdict("C4", title, GREEN if n > 0 else RED, f"{n} base_* schemas readable by the query role")
+    evidence = f"{n} base_* schemas readable by the query role"
+    # Readable schemas are not readable rows: on 2026-10-03 a corrupt TOAST
+    # page made a full read of base_muse.events fail while 25 schemas counted.
+    checksum = _checksum_verdict()
+    if n == 0:
+        return Verdict("C4", title, RED, evidence)
+    if checksum is None:
+        return Verdict("C4", title, YELLOW, evidence + "; page integrity unreadable")
+    if checksum["status"] != "ok":
+        return Verdict("C4", title, YELLOW, evidence + f"; page integrity {checksum['status']}: {checksum.get('detail') or ''}"[:400])
+    return Verdict("C4", title, GREEN, evidence + "; no recent page checksum failure")
 
 
 def c5_layering() -> Verdict:
@@ -523,16 +542,40 @@ def c9_one_way() -> Verdict:
 
 
 def c10_backups() -> Verdict:
-    title = "backed up, restore performed"
-    rows = pdw_sql("backup posture", "SELECT stanza, status, backup_count, last_full_at, full_age_seconds, last_archived_at, restore_status, last_restore_label, restore_age_seconds, expire_status, last_expire_error FROM marts_ops.pgbackrest_health")
+    title = "database healthy, backed up, restore performed"
+    # SELECT * so the audit reads both before and after a deploy adds columns.
+    rows = pdw_sql("backup posture", "SELECT * FROM marts_ops.pgbackrest_health")
     if not rows:
         return Verdict("C10", title, RED, "marts_ops.pgbackrest_health has no row: backup existence is unobservable")
     r = rows[0]
     count = int(r["backup_count"] or 0)
     age_days = (float(r["full_age_seconds"]) / 86400) if r["full_age_seconds"] is not None else None
     restore_days = (float(r["restore_age_seconds"]) / 86400) if r.get("restore_age_seconds") is not None else None
-    status = RED if count == 0 or r["status"] in ("failing",) else (YELLOW if r["status"] in ("late", "stale", "unknown", "attention") else GREEN)
-    return Verdict("C10", title, status, f"{count} backups, status {r['status']}, last full {age_days and f'{age_days:.1f}d'} ago; retention {r.get('expire_status')}{' (' + r['last_expire_error'] + ')' if r.get('last_expire_error') else ''}; restore {r.get('restore_status')} ({r.get('last_restore_label') or 'none'}, {restore_days and f'{restore_days:.1f}d'} ago)")
+    grades = [RED if count == 0 or r["status"] in ("failing",) else (YELLOW if r["status"] in ("late", "stale", "unknown", "attention") else GREEN)]
+    # The database itself: a backup of corrupt pages is not "healthy" and
+    # neither is the database it copied (2026-10-03).
+    checksum = _checksum_verdict()
+    if checksum is None:
+        grades.append(YELLOW)
+        integrity = "page integrity unreadable"
+    else:
+        grades.append(RED if checksum["status"] == "failing" else (GREEN if checksum["status"] == "ok" else YELLOW))
+        integrity = f"page checksums {checksum['status']}" + (f" ({checksum.get('detail')})" if checksum["status"] != "ok" else "")
+    backup_integrity = r.get("integrity_status")
+    if backup_integrity in ("errors_detected", "no_clean_backup"):
+        grades.append(RED if backup_integrity == "no_clean_backup" else YELLOW)
+    elif backup_integrity != "ok":
+        grades.append(YELLOW)
+    return Verdict(
+        "C10",
+        title,
+        worst(grades),
+        f"{integrity}; {count} backups, status {r['status']}, backup integrity {backup_integrity or 'unreported'}"
+        f" ({r.get('error_backup_count') or 0} flagged, newest clean {r.get('last_clean_backup_label') or 'none'}),"
+        f" last full {age_days and f'{age_days:.1f}d'} ago; retention {r.get('expire_status')}"
+        f"{' (' + r['last_expire_error'] + ')' if r.get('last_expire_error') else ''}; restore {r.get('restore_status')}"
+        f" ({r.get('last_restore_label') or 'none'}, {restore_days and f'{restore_days:.1f}d'} ago)",
+    )
 
 
 def c11_source_slas() -> Verdict:

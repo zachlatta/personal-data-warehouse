@@ -548,3 +548,59 @@ def test_c12_is_green_while_agents_md_fits_and_names_live_tests() -> None:
 def test_c12_is_red_when_agents_md_outgrows_one_sitting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(contract_audit, "AGENTS_MD_MAX_BYTES", 100)
     assert contract_audit.c12_future_developers().status == contract_audit.RED
+
+
+# --- C4/C10 must see the database's own integrity -----------------------------
+#
+# On 2026-10-03 the audit graded C4 and C10 green while production held 9,125
+# page checksum failures (base_muse.events unreadable, every backup since 10-01
+# flagged `error(s) detected`): neither check read anything but row presence.
+
+
+def _integrity_sql(*, checksum: str, integrity: str = "ok", backup_status: str = "ok"):
+    def fake(intent: str, sql: str, **_: object):
+        if "collation_health" in sql:
+            return [{"status": checksum, "detail": "9125 page checksum failure(s)"}]
+        if "pgbackrest_health" in sql:
+            return [
+                {
+                    "stanza": "pdw", "status": backup_status, "backup_count": 15,
+                    "last_full_at": "2026-09-27T22:48:09Z", "full_age_seconds": 400000,
+                    "last_archived_at": "2026-10-03T08:55:32Z", "restore_status": "ok",
+                    "last_restore_label": "x", "restore_age_seconds": 86400,
+                    "expire_status": "ok", "last_expire_error": None,
+                    "integrity_status": integrity, "error_backup_count": 9,
+                    "last_clean_backup_label": "20260927-223107F_20260928-071503I",
+                }
+            ]
+        if "information_schema" in sql:
+            return [{"n": 25}]
+        return []
+
+    return fake
+
+
+def test_c10_is_red_while_the_database_fails_page_checksums(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _integrity_sql(checksum="failing"))
+    verdict = contract_audit.c10_backups()
+    assert verdict.status == contract_audit.RED
+    assert "checksum" in verdict.evidence
+
+
+def test_c10_is_not_green_when_the_newest_backup_copied_corrupt_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        contract_audit, "pdw_sql", _integrity_sql(checksum="ok", integrity="errors_detected")
+    )
+    verdict = contract_audit.c10_backups()
+    assert verdict.status != contract_audit.GREEN
+    assert "20260927-223107F_20260928-071503I" in verdict.evidence
+
+
+def test_c10_reads_green_only_with_clean_pages_and_clean_backups(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _integrity_sql(checksum="ok"))
+    assert contract_audit.c10_backups().status == contract_audit.GREEN
+
+
+def test_c4_cannot_vouch_for_raw_data_while_pages_fail_checksums(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _integrity_sql(checksum="failing"))
+    assert contract_audit.c4_raw_data_queryable().status != contract_audit.GREEN
