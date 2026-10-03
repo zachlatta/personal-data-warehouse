@@ -176,6 +176,26 @@ def test_search_health_distinguishes_fresh_work_from_convergence(
     assert row["last_success_at"] == success_at
 
 
+def test_a_failed_run_does_not_inherit_the_last_good_run_s_caught_up(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """From 2026-10-01 every embeddings run died on a corrupt HNSW page, and
+    the failure write kept the last good run's `caught_up = 1, pending = 0`, so
+    marts_ops.search_health said `failing` and "caught up, nothing pending"
+    in the same row while two days of chunks had no vector."""
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.write_search_health(
+        "embeddings", caught_up=1, pending_count=0, last_success_at=datetime.now(tz=UTC)
+    )
+    warehouse.write_search_health(
+        "embeddings", last_error='invalid page in block 963680 of relation "base/5/49520807"'
+    )
+    row = warehouse._query_dicts("SELECT * FROM @marts_search_health WHERE component = 'embeddings'")[0]
+    assert row["status"] == "failing"
+    assert row["caught_up"] == 0
+    assert row["pending_count"] is None
+
+
 def test_oldest_pending_timeline_write_is_the_epoch_when_nothing_is_pending(
     warehouse: PostgresWarehouse,
 ) -> None:

@@ -6210,6 +6210,13 @@ class PostgresWarehouse:
             row.update(previous[0])
             row["last_run_at"] = now
             row["updated_at"] = now
+            # A run that failed proved nothing about convergence. Inheriting
+            # the last good run's caught_up=1 / pending=0 made the row read
+            # "failing" and "caught up, nothing pending" at once for two days
+            # (2026-10-01..03) while no chunk was embedded.
+            if facts.get("last_error") and "caught_up" not in facts:
+                row["caught_up"] = 0
+                row["pending_count"] = -1
         row.update(facts)
         self._insert_rows("search_health", [row], SEARCH_HEALTH_COLUMNS)
 
