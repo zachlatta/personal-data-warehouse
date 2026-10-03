@@ -594,10 +594,14 @@ func TestSchemaErrorHint(t *testing.T) {
 			want:    []string{"cursor_ts", "NULLIF"},
 		},
 		{
-			name:    "statement timeout steers to the search layer",
-			message: `ERROR: canceling statement due to statement timeout (SQLSTATE 57014)`,
-			sql:     "SELECT * FROM gmail.messages WHERE body_text ILIKE '%offer%'",
-			want:    []string{"timeline.search_text(", "timeline.search_text_exact("},
+			// The search tool first: it is the one search path on both
+			// surfaces (C9), and on 2026-10-03 this hint was sending CLI
+			// callers to the SQL functions with SQL-only argument syntax.
+			name:     "statement timeout steers to the search tool",
+			message:  `ERROR: canceling statement due to statement timeout (SQLSTATE 57014)`,
+			sql:      "SELECT * FROM gmail.messages WHERE body_text ILIKE '%offer%'",
+			want:     []string{"search tool", "pdw search", "--mode exact", "--priority", "--since"},
+			wantNone: []string{"sources => ARRAY"},
 		},
 		{
 			name:     "unrelated syntax error gets no hint",
