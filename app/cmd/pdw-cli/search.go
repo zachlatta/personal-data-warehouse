@@ -224,6 +224,15 @@ func runSearch(client *cliclient.Client, args []string, stdout, stderr io.Writer
 // "Howden" --limit 15` searched for the string "Howden --limit 15", the header
 // said so, and two sessions ran three polluted searches each without noticing.
 func searchFlagsFirst(fs *flag.FlagSet, args []string) ([]string, error) {
+	return flagsFirst(fs, args, "search")
+}
+
+// flagsFirst reorders args so every known flag precedes the positionals, since
+// Go's flag package stops at the first positional and agents put flags after
+// the query or the SQL as often as before it. An argument containing
+// whitespace is always positional: a SQL statement may open with a `-- `
+// comment, and no flag contains a space.
+func flagsFirst(fs *flag.FlagSet, args []string, command string) ([]string, error) {
 	known := map[string]bool{}
 	boolean := map[string]bool{}
 	fs.VisitAll(func(f *flag.Flag) {
@@ -254,11 +263,18 @@ func searchFlagsFirst(fs *flag.FlagSet, args []string) ([]string, error) {
 			}
 			continue
 		}
+		if strings.ContainsAny(arg, " \t\n") {
+			positionals = append(positionals, arg)
+			continue
+		}
 		if strings.HasPrefix(arg, "-") && len(arg) > 1 && !isNumeric(arg[1:]) {
-			return nil, fmt.Errorf("unknown flag %s (run `pdw search --help`; put the query in quotes if it really starts with a dash)", name)
+			return nil, fmt.Errorf("unknown flag %s (run `pdw %s --help`; put the argument in quotes if it really starts with a dash)", name, command)
 		}
 		positionals = append(positionals, arg)
 	}
+	// The terminator keeps a positional that begins with a dash (a `-- `
+	// SQL comment, a negative amount) from being parsed as a flag.
+	flags = append(flags, "--")
 	return append(flags, positionals...), nil
 }
 

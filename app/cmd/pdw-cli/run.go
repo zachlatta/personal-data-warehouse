@@ -460,7 +460,12 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	questionFlag := fs.String("question", "", "plain-English description of what the SQL answers, logged server-side as intent")
 	questionShort := fs.String("q", "", "alias for --question")
 	noTimeout := fs.Bool("no-timeout", false, "wait indefinitely for the query")
-	if err := fs.Parse(args); err != nil {
+	ordered, err := flagsFirst(fs, args, "sql")
+	if err != nil {
+		fmt.Fprintln(stderr, "pdw sql:", err)
+		return 2
+	}
+	if err := fs.Parse(ordered); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(stdout, usage)
 			return 0

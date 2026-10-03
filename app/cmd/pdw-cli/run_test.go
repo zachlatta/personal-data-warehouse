@@ -1069,3 +1069,43 @@ func TestCallRedirectsContextToContextCommand(t *testing.T) {
 		t.Fatalf("call context must redirect to pdw context: code=%d %s", code, errOut)
 	}
 }
+
+// TestSQLCommandAcceptsFlagsAfterTheSQL pins the habit that produced the most
+// common pdw sql failure of 2026-09-19..10-03: `pdw sql -q '…' "SELECT …"
+// --output json` answered "too many arguments" in 42 agent sessions, because
+// Go's flag package stops at the first positional. Flags may go anywhere.
+func TestSQLCommandAcceptsFlagsAfterTheSQL(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":[{"n":1}]}}`)
+	})
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "How many?", "SELECT 1 AS n", "--output", "json")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v\n%s", err, srv.lastBody)
+	}
+	if input["sql"] != "SELECT 1 AS n" || input["question"] != "How many?" || input["format"] != "json" {
+		t.Fatalf("input = %#v", input)
+	}
+}
+
+// A statement that opens with a SQL comment is still the statement, not a flag.
+func TestSQLCommandTreatsALeadingSQLCommentAsTheStatement(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":"n\n1"}}`)
+	})
+	stmt := "-- count one\nSELECT 1 AS n"
+	_, errOut, code := runCLI(t, srv.URL, "", "sql", "-q", "why", stmt)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, errOut)
+	}
+	var input map[string]string
+	if err := json.Unmarshal(srv.lastBody, &input); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if input["sql"] != stmt {
+		t.Fatalf("sql = %q", input["sql"])
+	}
+}
