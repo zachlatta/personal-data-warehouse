@@ -15,6 +15,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+// queryParallelWorkersPerGather is the per-statement parallel worker budget for
+// every query the app runs (the agent SQL surface and search). See C6.
+const queryParallelWorkersPerGather = 16
+
 type PostgresRunner struct {
 	db           *sql.DB
 	queryTimeout time.Duration
@@ -120,6 +124,15 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 	// transaction; under autocommit it would only affect the SET statement.
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", timeoutMs)); err != nil {
 		logger.ErrorContext(ctx, "Postgres set statement_timeout failed", "error", err, "duration", time.Since(started))
+		return RawResult{}, err
+	}
+	// C6: a slow statement should use the host, not 5 of its 28 vCPUs (the
+	// server default of 4 workers per Gather). Measured 2026-10-03: searches of
+	// 7.6 s and 9.0 s ran at load 7/28 with zero CPU pressure. The cluster-wide
+	// max_parallel_workers still bounds the total across concurrent callers;
+	// the planner only reaches this many workers on the large relations.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL max_parallel_workers_per_gather = %d", queryParallelWorkersPerGather)); err != nil {
+		logger.ErrorContext(ctx, "Postgres set max_parallel_workers_per_gather failed", "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
 	if roleSQL, err := queryRoleSQL(r.queryRole); err != nil {

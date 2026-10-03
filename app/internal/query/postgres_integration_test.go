@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -110,5 +111,34 @@ func TestPostgresRunnerAppliesStatementTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "statement timeout") && !strings.Contains(err.Error(), "SQLSTATE 57014") {
 		t.Fatalf("expected statement_timeout error, got %v", err)
+	}
+}
+
+// C6: a response over two seconds uses the whole host before anyone optimizes
+// further. The server default gives one statement 4 parallel workers on a
+// 28-vCPU host; on 2026-10-03 slow searches ran at load 7/28 with zero CPU
+// pressure. The query surface asks for more per statement (the cluster-wide
+// max_parallel_workers still caps the total).
+func TestPostgresRunnerRaisesParallelWorkersPerStatement(t *testing.T) {
+	runner, err := NewPostgresRunner(postgresURLForIntegrationTest(t), 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewPostgresRunner returned error: %v", err)
+	}
+	defer runner.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := runner.Query(ctx, "SELECT current_setting('max_parallel_workers_per_gather') AS n", 2)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if got := fmt.Sprint(result.Rows[0]["n"]); got != fmt.Sprint(queryParallelWorkersPerGather) {
+		t.Fatalf("max_parallel_workers_per_gather = %s, want %d", got, queryParallelWorkersPerGather)
+	}
+}
+
+func TestQueryParallelWorkersPerGatherUsesMostOfTheHost(t *testing.T) {
+	if queryParallelWorkersPerGather < 12 {
+		t.Fatalf("queryParallelWorkersPerGather = %d; the production host has 28 vCPUs", queryParallelWorkersPerGather)
 	}
 }
