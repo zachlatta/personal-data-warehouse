@@ -47,7 +47,7 @@ that, not from this prose.
   event from every source, with `source_table` + `source_pk` drilling back to the
   authoritative row. *Held up by* `TIMELINE_TABLE_COVERAGE`: every table declares itself
   `events`, `detail`, `entity` or `state`, `tests/test_timeline.py` checks that against the
-  **live** schema, and a non-`events` table must carry a `no_adapter_reason`.
+  **live** schema, and a `detail`/`entity` table must say in its `note` how a reader reaches it instead.
   `marts_ops.timeline_adapter_health` judges ingest lag against the source's own interval.
   *Gap:* registering an adapter for a new events table is still a silent step.
 - **C2 — five priority tiers, and everything is properly categorized.** `self` (Zach did
