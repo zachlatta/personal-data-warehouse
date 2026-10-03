@@ -927,3 +927,26 @@ def test_bm25_index_bloat_is_a_search_health_row(warehouse: PostgresWarehouse) -
     assert rows[0][0] == "attention"
 
 
+
+
+def test_ensure_takes_no_exclusive_lock_once_the_columns_exist(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ADD COLUMN IF NOT EXISTS` still queues for an ACCESS EXCLUSIVE lock when
+    the column exists. On 2026-10-03 a REINDEX CONCURRENTLY of the HNSW index
+    held SHARE UPDATE EXCLUSIVE on chunk_embeddings; the embeddings worker's
+    every-ten-minutes ensure queued its no-op ALTER behind it, every reader of
+    the table queued behind the ALTER, and the hybrid search semantic leg timed
+    out for ~19 minutes. An ensure that changes nothing must issue no ALTER."""
+    warehouse.ensure_search_index_tables()
+    statements: list[str] = []
+    original = warehouse._command
+
+    def record(sql, *args, **kwargs):
+        statements.append(str(sql))
+        return original(sql, *args, **kwargs)
+
+    monkeypatch.setattr(warehouse, "_command", record)
+    warehouse.ensure_search_index_tables()
+    alters = [s for s in statements if "ALTER TABLE" in s.upper()]
+    assert alters == [], alters

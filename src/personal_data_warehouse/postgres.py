@@ -6322,6 +6322,14 @@ class PostgresWarehouse:
         )
         # The embedding drain's persisted cursors joined an existing table;
         # CREATE TABLE IF NOT EXISTS cannot add them to a live deployment.
+        #
+        # Every ALTER here is issued only when its column is missing. `ADD
+        # COLUMN IF NOT EXISTS` still queues for ACCESS EXCLUSIVE when the column
+        # exists, and this runs on every embeddings tick: on 2026-10-03 the
+        # no-op ALTER on chunk_embeddings waited behind a REINDEX CONCURRENTLY
+        # of the HNSW index, every reader queued behind the ALTER, and hybrid
+        # search's semantic leg timed out for ~19 minutes.
+        sync_columns = self._present_columns("search_chunk_sync_state")
         for column in (
             "embed_fresh_built_at",
             "embed_fresh_chunk_id",
@@ -6331,6 +6339,8 @@ class PostgresWarehouse:
             "embed_orphan_checked_at",
             "embed_orphan_status",
         ):
+            if column in sync_columns:
+                continue
             self._command(
                 "ALTER TABLE @search_chunk_sync_state ADD COLUMN IF NOT EXISTS "
                 f"{_identifier(column)} {_postgres_type(column)} NOT NULL DEFAULT "
@@ -6340,10 +6350,11 @@ class PostgresWarehouse:
             if not self._pgvector_ensured:
                 self._command("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
                 self._pgvector_ensured = True
-            self._command(
-                "ALTER TABLE @search_chunk_embeddings "
-                "ADD COLUMN IF NOT EXISTS embedding public.halfvec(512)"
-            )
+            if "embedding" not in self._present_columns("search_chunk_embeddings"):
+                self._command(
+                    "ALTER TABLE @search_chunk_embeddings "
+                    "ADD COLUMN IF NOT EXISTS embedding public.halfvec(512)"
+                )
             # Re-walk the index specs now that the vector column exists (the
             # first pass above ran before it and skipped the HNSW build).
             self._ensured_index_names.discard("search_chunk_embeddings_hnsw_idx")
@@ -8295,6 +8306,18 @@ class PostgresWarehouse:
         for table in tables:
             self._ensure_table(table)
         self._ensure_indexes(tables)
+
+    def _present_columns(self, table: str) -> set[str]:
+        """The columns a cataloged table has right now (a catalog read, no lock)."""
+        rel = canonical_relation(table).with_namespace(self._schema)
+        return {
+            str(row[0])
+            for row in self._query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s",
+                (rel.schema, rel.name),
+            )
+        }
 
     def _reconcile_table_columns(self, table: str) -> list[str]:
         """Add any ``TableSpec`` column an existing table is missing.
