@@ -17,7 +17,7 @@ from personal_data_warehouse.agent_runner import (
     agent_run_tool_call_rows,
     extract_tool_name,
 )
-from personal_data_warehouse.apple_voice_memos_transcription import voice_recording_source
+from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_KEYTERMS_PROMPT, voice_recording_source
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
@@ -2291,6 +2291,7 @@ def enrichment_instructions() -> list[str]:
         "For event recordings, search the event term together with the spoken first name across Slack, Gmail, Google Drive text, calendar, and contacts. Prefer event-specific organizer/team/roster evidence over broad global Slack first-name matches.",
         "A global first-name Slack user result is not enough to assign a surname when event-specific context has not been checked or points to another person.",
         "Normalize spoken name mentions in transcript to verified participant spellings when ASR produces a close variant, especially in greetings and introductions.",
+        "Keep the spelling of a name as the source transcript has it unless warehouse evidence (an email signature, a contact card, a calendar attendee, a roster) shows a different spelling; your own memory of a public figure is not evidence. Every other mention is rewritten to match the name you choose, so a wrong spelling spreads.",
         "If the transcript says a person or organization name differently than the calendar candidate, query for that spoken name/project before deciding.",
         "contact_alias_hints come from human-edited Google Contacts nicknames. Use them as a source-of-truth candidate for bare first-name references, nicknames, and ASR name variants, then verify with recent Slack/Gmail/calendar context before expanding the name in summary, action items, evidence, or transcript.",
         "Do not expand a bare first-name third-party reference to a stale or merely exact contact match when a human-edited contact alias points to another current person.",
@@ -2750,9 +2751,25 @@ def canonicalize_value_verified_name_mentions(value: Any, verified_names: Sequen
     return value
 
 
+def protected_domain_words() -> frozenset[str]:
+    """Words of known domain terms that name canonicalization must never rewrite.
+
+    The fuzzy first-name pass rewrote every "Hack" in 27 stored transcripts --
+    to "Hacker", "Jack", "Hackle" or "Zack" -- whenever a "name" one edit away
+    was in play: a participant spelled Zack, or an ASR variant the agent had
+    named in its evidence ("the ASR rendered Hacker Club") harvested as a
+    person. A domain term is never a misspelled name.
+    """
+    terms = [*ASSEMBLYAI_KEYTERMS_PROMPT, *(intended for _heard, intended, _why in ASR_CONFUSION_HINTS)]
+    return frozenset(word.lower() for term in terms for word in re.findall(r"[A-Za-z]+", term))
+
+
 def canonicalize_text_verified_name_mentions(text: str, *, verified_names: Sequence[str]) -> str:
     if not text:
         return text
+    # A word the same text also uses in lowercase ("changes", "challenge") is an
+    # ordinary word, not a misheard name.
+    protected = protected_domain_words() | {word for word in re.findall(r"\b[a-z]{4,}\b", text)}
     replacements: dict[str, str] = {}
     for name in verified_names:
         text = canonicalize_full_name_mentions(text, verified_name=name)
@@ -2760,6 +2777,8 @@ def canonicalize_text_verified_name_mentions(text: str, *, verified_names: Seque
         if len(first_name) < 4:
             continue
         for token in set(re.findall(r"\b[A-Z][A-Za-z]{3,}\b", text)):
+            if token.lower() in protected:
+                continue
             if should_canonicalize_name_token(token, first_name):
                 replacements[token] = first_name
     for token, replacement in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
@@ -2777,9 +2796,11 @@ def canonicalize_full_name_mentions(text: str, *, verified_name: str) -> str:
         return text
     pattern = re.compile(rf"\b{re.escape(first_name)}\s+([A-Z][A-Za-z]{{3,}})\b")
 
+    protected = protected_domain_words()
+
     def replace(match: re.Match[str]) -> str:
         spoken_last = match.group(1)
-        if spoken_last == last_name:
+        if spoken_last == last_name or spoken_last.lower() in protected:
             return match.group(0)
         if should_canonicalize_name_token(spoken_last, last_name):
             return f"{first_name} {last_name}"
@@ -2796,10 +2817,14 @@ def should_canonicalize_name_token(token: str, verified_first_name: str) -> bool
     if token[0].lower() == verified_first_name[0].lower():
         ratio = SequenceMatcher(a=token.lower(), b=verified_first_name.lower()).ratio()
         return ratio >= 0.78 or (len(token) >= 5 and len(verified_first_name) >= 5 and ratio >= 0.6)
-    return SequenceMatcher(
-        a=phonetic_name_key(token),
-        b=phonetic_name_key(verified_first_name),
-    ).ratio() >= 0.75
+    token_key = phonetic_name_key(token)
+    name_key = phonetic_name_key(verified_first_name)
+    # Different first letters are only a spelling variant when they make the
+    # same sound (Kristen/Cristen). Without this, "Hack" scored exactly 0.75
+    # against "Zack" and every "Hack Club" in a transcript became "Zack Club".
+    if token_key[:1] != name_key[:1]:
+        return False
+    return SequenceMatcher(a=token_key, b=name_key).ratio() >= 0.75
 
 
 def phonetic_name_key(name: str) -> str:

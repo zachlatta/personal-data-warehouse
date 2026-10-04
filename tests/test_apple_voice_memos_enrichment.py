@@ -1628,3 +1628,79 @@ def test_enrichment_candidates_carry_the_transcript_they_were_read_from() -> Non
     load_enrichment_candidates(Warehouse(), provider="agent_codex", prompt_version="v", limit=1)
 
     assert "r.provider_transcript_id" in queries[0]
+
+
+def test_name_canonicalization_never_turns_a_domain_word_into_a_name() -> None:
+    # 2026-10-04: one verified name spelled "Zack" rewrote all 25 "Hack Club"
+    # mentions in a transcript to "Zack Club" ("hack"/"zack" scored exactly the
+    # 0.75 phonetic threshold although the first sounds differ).
+    assert (
+        canonicalize_text_verified_name_mentions(
+            "We run Hack Club for teenagers.",
+            verified_names=["Zack Rivera"],
+        )
+        == "We run Hack Club for teenagers."
+    )
+
+
+def test_name_canonicalization_leaves_another_verified_persons_first_name_alone() -> None:
+    assert (
+        canonicalize_text_verified_name_mentions(
+            "Zach introduced Zack.",
+            verified_names=["Zach Latta", "Zack Rivera"],
+        )
+        == "Zach introduced Zack."
+    )
+
+
+def test_name_canonicalization_still_maps_equivalent_first_sounds() -> None:
+    assert (
+        canonicalize_text_verified_name_mentions(
+            "I met Kristen yesterday.",
+            verified_names=["Cristen Doe"],
+        )
+        == "I met Cristen yesterday."
+    )
+
+
+def test_prompt_keeps_the_sources_name_spelling_without_warehouse_evidence() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+
+    assert "your own memory of a public figure is not evidence" in prompt
+
+
+def test_local_assembly_does_not_rewrite_hack_club_from_an_asr_variant_named_in_evidence() -> None:
+    # 27 stored transcripts lost every "Hack Club" to "Hacker Club", "Jack Club"
+    # or "Hackle Club": the agent's evidence named the mishearing it had
+    # corrected, the capitalized pair was harvested as a person's name, and the
+    # fuzzy first-name pass rewrote every "Hack" toward it.
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "A", "start_ms": 0, "end_ms": 4_000, "text": "Welcome to Hack Club."},
+        ],
+        result={
+            "participants": ["Alex Rivera"],
+            "speaker_map": [{"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "x"}],
+            "speaker_turns": [],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [
+                "The ASR rendered Hacker Club and Jack Club in places; warehouse mail verifies Hack Club.",
+            ],
+        },
+    )
+
+    assert result["transcript"] == "Alex Rivera: Welcome to Hack Club."
+
+
+def test_name_canonicalization_leaves_ordinary_words_that_also_appear_lowercase() -> None:
+    # "Congressional App Challenge" was stored as "Congressional App Charles"
+    # because a participant was named Charles; a word the same text also uses in
+    # lowercase is an ordinary word, not a misheard name.
+    assert (
+        canonicalize_text_verified_name_mentions(
+            "Changes are coming. These changes matter.",
+            verified_names=["Charles Rivera"],
+        )
+        == "Changes are coming. These changes matter."
+    )

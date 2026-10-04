@@ -183,6 +183,20 @@ summary, in about ten minutes a run. Wrong names are worse than unresolved ones;
 prompt changes. The harness is `scripts/voice_memo_speaker_benchmark.py`; its hand labels
 name real people and live outside the repo in `~/.config/pdw/voice-benchmark/`.
 
+**Name canonicalization rewrote domain words for months.** After the agent returns, a fuzzy
+pass (`canonicalize_text_verified_name_mentions`) corrects near-miss spellings of verified
+names everywhere in the result. Its only guard was string similarity, so a "name" one edit
+away from a common word rewrote that word everywhere: an audit on 2026-10-04 found 27
+recordings whose enriched transcript had lost every "Hack Club" (to "Hacker Club", "Jack
+Club", "Hackle Club", "Zack Club"), 12 that lost "OpenAI", and "Congressional App Challenge"
+stored as "Congressional App Charles". The "names" came from a participant spelled Zack, a
+participant named Charles, and ASR variants the agent had named in its evidence ("the ASR
+rendered Hacker Club"), which local assembly harvests as people. The pass now never touches
+a word of a known domain term (`protected_domain_words`, from the keyterms and the confusion
+hints), a word the same text also uses in lowercase, or a different first letter unless it
+makes the same sound (Kristen/Cristen). The source transcript was never affected; repair is
+re-enrichment.
+
 **Validation issues never reach the agent.** `validate_enrichment_result` runs after the
 agent returns, and its issues are stored on the row (`raw_result_json.__validation_issues`)
 rather than sent back for a retry, so a check there is a measurement, not a guard. The
