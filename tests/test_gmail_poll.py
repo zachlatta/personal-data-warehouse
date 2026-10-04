@@ -26,9 +26,10 @@ from personal_data_warehouse.gmail_sync import GmailPollConfig, GmailSyncRunner,
 class FakeLogger:
     def __init__(self) -> None:
         self.warnings: list[str] = []
+        self.infos: list[str] = []
 
-    def info(self, *args, **kwargs) -> None:
-        pass
+    def info(self, message, *args, **kwargs) -> None:
+        self.infos.append(message % args if args else message)
 
     def warning(self, message, *args, **kwargs) -> None:
         self.warnings.append(message % args if args else message)
@@ -444,3 +445,17 @@ def test_poll_config_reads_its_knobs_from_the_environment(monkeypatch) -> None:
     monkeypatch.setenv("GMAIL_POLL_INTERVAL_SECONDS", "0")
     with pytest.raises(ValueError, match="GMAIL_POLL_INTERVAL_SECONDS"):
         GmailPollConfig.from_env()
+
+
+def test_an_idle_tick_writes_no_log_line(settings) -> None:
+    """The loop reads history every 15 s; a line per mailbox per idle tick was
+    ~11.5k Dagster event-log rows a day saying nothing."""
+    mailboxes = {ACCOUNT: FakeMailbox(), OTHER: FakeMailbox()}
+    warehouse = FakeWarehouse({ACCOUNT: 100, OTHER: 100})
+    logger = FakeLogger()
+    clock = FakeClock()
+    runner = _runner(settings, warehouse, mailboxes, clock=clock, logger=logger)
+
+    runner.run(config=_config(window_seconds=60.0))
+
+    assert logger.infos == []

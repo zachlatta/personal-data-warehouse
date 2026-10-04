@@ -581,12 +581,16 @@ class GmailSyncRunner:
         attachment_text_chars = 0
         attachments_stored = 0
 
-        self._logger.info(
-            "Starting incremental Gmail sync for %s from history %s (%s messages changed)",
-            account.email_address,
-            start_history_id,
-            len(changed_message_ids),
-        )
+        # Logged only when there is work: the poll loop reads history every
+        # 15 s, and an empty line per mailbox per tick was ~11.5k Dagster
+        # event-log rows a day saying nothing.
+        if changed_message_ids:
+            self._logger.info(
+                "Starting incremental Gmail sync for %s from history %s (%s messages changed)",
+                account.email_address,
+                start_history_id,
+                len(changed_message_ids),
+            )
 
         for message_ids in chunked(sorted(changed_message_ids), self._settings.gmail_page_size):
             rows = []
