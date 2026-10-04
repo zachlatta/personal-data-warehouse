@@ -16329,6 +16329,8 @@ class PostgresWarehouse:
                     account,
                     recording_id,
                     provider,
+                    provider_transcript_id,
+                    model,
                     transcript_text,
                     completed_at
                 FROM @apple_voice_memos_transcription_runs
@@ -16371,7 +16373,12 @@ class PostgresWarehouse:
                 v.ingested_at,
                 -- Appended, never inserted: CREATE OR REPLACE VIEW only
                 -- tolerates new columns at the end.
-                NULLIF(run.completed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS transcribed_at
+                NULLIF(run.completed_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS transcribed_at,
+                -- The speech model AssemblyAI reports it ran (speech_model_used),
+                -- not the head of the requested chain, and the transcript it
+                -- produced: the answer to "which model labelled these speakers?"
+                NULLIF(run.model, '') AS transcript_model,
+                NULLIF(run.provider_transcript_id, '') AS provider_transcript_id
             FROM recordings v
             LEFT JOIN latest_enrichment en
               ON en.source = v.source AND en.account = v.account AND en.recording_id = v.recording_id
@@ -16402,12 +16409,21 @@ class PostgresWarehouse:
                 s.end_ms,
                 s.confidence,
                 s.text,
-                r.recorded_at + make_interval(secs => s.start_ms / 1000.0) AS spoken_at
+                r.recorded_at + make_interval(secs => s.start_ms / 1000.0) AS spoken_at,
+                -- Matched on the transcript id, so a segment left over from a
+                -- superseded transcript never borrows the newer run's model.
+                NULLIF(run.model, '') AS transcript_model
             FROM @apple_voice_memos_transcript_segments s
             LEFT JOIN @marts_voice_memos_recordings r
               ON r.source = s.source
              AND r.account = s.account
              AND r.recording_id = s.recording_id
+            LEFT JOIN @apple_voice_memos_transcription_runs run
+              ON run.source = s.source
+             AND run.account = s.account
+             AND run.recording_id = s.recording_id
+             AND run.provider = s.provider
+             AND run.provider_transcript_id = s.provider_transcript_id
             """,
         )
         # The marts_calendar transcript views consume the mart, so they are

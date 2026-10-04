@@ -153,9 +153,11 @@ def test_assemblyai_request_enables_diarization_and_best_models() -> None:
     assert request["speaker_labels"] is True
     assert request["speaker_options"] == {"min_speakers_expected": 1, "max_speakers_expected": 8}
     assert request["language_detection"] is True
-    # Universal-3.5 Pro first, older models only as fallback. AssemblyAI rejects an
-    # unknown slug with 400, so a typo here fails loud rather than silently downgrading.
-    assert request["speech_models"] == ["universal-3-5-pro", "universal-3-pro", "universal-2"]
+    # Universal-3.5 Pro, AssemblyAI's newest model, with Universal-2 only as the
+    # fallback for a language 3.5 Pro does not cover -- AssemblyAI's own default
+    # chain. Universal-3 Pro is superseded and no longer a fallback: a recording
+    # must never quietly land on the older model.
+    assert request["speech_models"] == ["universal-3-5-pro", "universal-2"]
     assert request["speech_models"][0] == "universal-3-5-pro"
     assert "keyterms_prompt" in request
     assert "prompt" not in request

@@ -593,6 +593,79 @@ def test_voice_memo_transcript_segments_carry_recording_context(
     assert rows[1]["spoken_at"] == TS.replace(minute=1)
 
 
+def test_voice_memo_marts_name_the_speech_model_that_transcribed_each_recording(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Which AssemblyAI model produced a transcript is an answerable question.
+
+    transcription_runs.model has stored speech_model_used since the first run,
+    but neither read mart exposed it, so a question like "which model labelled
+    the speakers on this recording?" was answered "the warehouse doesn't
+    record it". The recording mart names the model and transcript id of the
+    transcript it serves, and every segment names the model that produced it.
+    """
+    _seed_voice_memos(warehouse)
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id="rec-1",
+                content_sha256="sha-1",
+                provider="assemblyai",
+                provider_transcript_id="tid-1",
+                model="universal-3-5-pro",
+                status="completed",
+                transcript_text="run transcript",
+                requested_at=TS,
+                completed_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+
+    recordings = {
+        row["recording_id"]: row
+        for row in _dicts(warehouse, "marts_voice_memos_recordings")
+        if row["source"] == "apple_voice_memos"
+    }
+    assert recordings["rec-1"]["transcript_model"] == "universal-3-5-pro"
+    assert recordings["rec-1"]["provider_transcript_id"] == "tid-1"
+    # A run that stored no model reads NULL, not an empty string.
+    assert recordings["rec-2"]["transcript_model"] is None
+    assert recordings["rec-2"]["provider_transcript_id"] == "tid-2"
+
+    segments = _dicts(warehouse, "marts_voice_memos_transcript_segments", "recording_id, segment_index")
+    assert [row["transcript_model"] for row in segments] == ["universal-3-5-pro", "universal-3-5-pro"]
+
+
+def test_a_segment_from_a_superseded_transcript_does_not_borrow_the_new_runs_model(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _seed_voice_memos(warehouse)
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id="rec-1",
+                content_sha256="sha-1",
+                provider="assemblyai",
+                provider_transcript_id="tid-newer",
+                model="universal-3-5-pro",
+                status="completed",
+                requested_at=TS,
+                completed_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    segments = _dicts(warehouse, "marts_voice_memos_transcript_segments", "recording_id, segment_index")
+    assert [row["transcript_model"] for row in segments] == [None, None]
+
+
 def test_calendar_transcript_views_read_the_voice_memo_mart(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -1630,4 +1703,8 @@ def test_voice_memo_mart_column_order_only_ever_grows_at_the_end(
     ]
     actual = _column_types(warehouse, "marts_voice_memos_recordings")
     assert actual[: len(deployed)] == deployed
-    assert actual[len(deployed) :] == [("transcribed_at", "timestamp with time zone")]
+    assert actual[len(deployed) :] == [
+        ("transcribed_at", "timestamp with time zone"),
+        ("transcript_model", "text"),
+        ("provider_transcript_id", "text"),
+    ]

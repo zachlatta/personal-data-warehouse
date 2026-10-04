@@ -18,7 +18,10 @@ from personal_data_warehouse.schema import voice_memo_transcription_failure_stat
 
 
 ASSEMBLYAI_PROVIDER = "assemblyai"
-ASSEMBLYAI_SPEECH_MODELS = ("universal-3-5-pro", "universal-3-pro", "universal-2")
+# Universal-3.5 Pro is AssemblyAI's newest and most accurate model; Universal-2 is
+# the fallback only for a language 3.5 Pro does not cover. This is AssemblyAI's
+# own default chain. Universal-3 Pro is superseded and deliberately absent.
+ASSEMBLYAI_SPEECH_MODELS = ("universal-3-5-pro", "universal-2")
 DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS = {"min_speakers_expected": 1, "max_speakers_expected": 8}
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
 ASSEMBLYAI_KEYTERMS_PROMPT = (

@@ -92,13 +92,19 @@ leaving `transcript` untouched and recording what it did in `evidence`. Adding a
 mishearing is one tuple. The prompt version bump (`...-agent-v7`) re-enriches within
 `VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS` rather than the whole corpus.
 
-**Universal-3.5 Pro is the model, with the older two as fallback.**
-`ASSEMBLYAI_SPEECH_MODELS` is `("universal-3-5-pro", "universal-3-pro", "universal-2")`,
-sent as the `speech_models` fallback chain. Those three are the only slugs the API accepts;
-an unknown one is a 400 that names the valid list, so a typo fails loud instead of quietly
-transcribing at a lower quality. `speech_model_used` on the response records which one ran,
-and it is what `derived_voice_memos.transcription_runs.model` stores -- read that column
-rather than assuming the head of the chain served the request.
+**Universal-3.5 Pro is the model, with Universal-2 only as the language fallback.**
+`ASSEMBLYAI_SPEECH_MODELS` is `("universal-3-5-pro", "universal-2")`, sent as the
+`speech_models` fallback chain -- AssemblyAI's own default, where Universal-2 serves only a
+language 3.5 Pro does not cover. Universal-3 Pro was dropped from the chain on 2026-10-04
+once AssemblyAI stopped listing it. An unknown slug is a 400 that names the valid list, so
+a typo fails loud instead of quietly transcribing at a lower quality. `speech_model_used`
+on the response records which one ran, and it is what
+`derived_voice_memos.transcription_runs.model` stores -- read that rather than assuming
+the head of the chain served the request. The marts expose it too:
+`marts_voice_memos.recordings.transcript_model` / `provider_transcript_id` for the
+transcript the mart serves, and `marts_voice_memos.transcript_segments.transcript_model`
+for the run that produced each speaker-labelled segment. The rest of the request
+(speaker options, keyterms, language detection) is in that run's `raw_result_json`.
 
 **That mart is the INPUT to transcription and enrichment, not only an output.** Both
 passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)
