@@ -35,11 +35,13 @@ LONG_RECORDING_MAX_SPEAKERS_EXPECTED = 30
 # Diarization can return two people who share a microphone as one label and one
 # multi-minute utterance (the 2026-10-03 stage talks: an interviewer and her
 # guest, 12.5 minutes, one label under every speaker_options setting tried).
-# Utterances longer than this are stored as sentence-bounded segments with the
-# same label, so the enrichment agent's speaker_turns can split the people
-# inside them.
-LONG_UTTERANCE_SPLIT_MS = 60_000
-SPLIT_SEGMENT_TARGET_MS = 8_000
+# Utterances longer than this are stored one sentence per segment with the same
+# label, so the enrichment agent's speaker_turns can split the people inside
+# them. 20 s, not 60: a 42-second utterance of the benchmark held a guest's
+# remark and Zach's reply, and local assembly merges a speaker's consecutive
+# sentences back into one paragraph, so finer segments cost readability nothing.
+LONG_UTTERANCE_SPLIT_MS = 20_000
+SPLIT_SEGMENT_TARGET_MS = 0
 SPLIT_SEGMENT_MAX_MS = 45_000
 SENTENCE_END_CHARACTERS = (".", "?", "!")
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000

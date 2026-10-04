@@ -21,7 +21,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_K
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v9"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v10"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -1912,51 +1912,71 @@ def recording_time_bounds(
     return start, end
 
 
-def build_segment_preserving_corrected_transcript(
+def segment_speaker_names(
     *,
     transcript_segments: Sequence[Mapping[str, Any]],
     result: Mapping[str, Any],
-) -> str:
+) -> list[str]:
+    """The name local assembly gives each segment, in segment order."""
     speaker_map = [item for item in result.get("speaker_map", []) if isinstance(item, Mapping)]
-    verified_names = [name for name in result_participants(result) if isinstance(name, str)]
-    speaker_names = [str(item.get("speaker_name") or "") for item in speaker_map]
-    evidence_names = evidence_names_from_result(result)
-    known_speaker_names = list(
-        dict.fromkeys(
-            [
-                *verified_names,
-                *[
-                    name
-                    for name in speaker_names
-                    if " " in name and not unresolved_speaker_name_for_enrichment(name)
-                ],
-            ]
-        )
-    )
-    known_text_names = list(dict.fromkeys([*known_speaker_names, *evidence_names]))
     label_to_name = {
         str(item.get("speaker_label") or ""): segment_preserving_name_for_label(item)
         for item in speaker_map
     }
-    local_opening_names = opening_dialogue_local_speaker_names(transcript_segments, known_names=known_speaker_names)
+    local_opening_names = opening_dialogue_local_speaker_names(
+        transcript_segments, known_names=known_speaker_names_from_result(result)
+    )
     # The agent's turn-level assignments outrank both the label mapping and the
     # opening-greeting heuristic: they are how one diarization label that
     # carried several stage speakers is split back into the people who spoke.
-    turn_names = speaker_turn_names_by_segment(result)
-
-    lines = []
+    turn_names = speaker_turn_names_by_segment(result, transcript_segments)
+    names = []
     for segment in transcript_segments:
         segment_index = int(segment.get("segment_index") or 0)
         label = str(segment.get("speaker_label") or "")
-        speaker = (
+        names.append(
             turn_names.get(segment_index)
             or local_opening_names.get(segment_index)
             or label_to_name.get(label)
             or f"Speaker {label}".strip()
         )
+    return names
+
+
+def known_speaker_names_from_result(result: Mapping[str, Any]) -> list[str]:
+    verified_names = [name for name in result_participants(result) if isinstance(name, str)]
+    speaker_names = [
+        str(item.get("speaker_name") or "") for item in result.get("speaker_map", []) if isinstance(item, Mapping)
+    ]
+    return list(
+        dict.fromkeys(
+            [
+                *verified_names,
+                *[name for name in speaker_names if " " in name and not unresolved_speaker_name_for_enrichment(name)],
+            ]
+        )
+    )
+
+
+def build_segment_preserving_corrected_transcript(
+    *,
+    transcript_segments: Sequence[Mapping[str, Any]],
+    result: Mapping[str, Any],
+) -> str:
+    known_text_names = list(
+        dict.fromkeys([*known_speaker_names_from_result(result), *evidence_names_from_result(result)])
+    )
+    names = segment_speaker_names(transcript_segments=transcript_segments, result=result)
+    # One paragraph per turn: long utterances are stored sentence by sentence,
+    # and a speaker's consecutive segments read as one paragraph.
+    paragraphs: list[tuple[str, list[str]]] = []
+    for speaker, segment in zip(names, transcript_segments):
         text = canonicalize_text_verified_name_mentions(str(segment.get("text") or ""), verified_names=known_text_names)
-        lines.append(f"{speaker}: {text}")
-    return "\n".join(lines)
+        if paragraphs and paragraphs[-1][0] == speaker:
+            paragraphs[-1][1].append(text)
+        else:
+            paragraphs.append((speaker, [text]))
+    return "\n".join(f"{speaker}: {' '.join(texts)}" for speaker, texts in paragraphs)
 
 
 def segment_preserving_name_for_label(item: Mapping[str, Any]) -> str:
@@ -2317,6 +2337,8 @@ def enrichment_instructions() -> list[str]:
         "If the first few short greeting segments conflict with later stable diarization, prefer a coherent dialogue chain over the raw short-segment labels. It is better to merge or reattribute short opening greetings than to create a transcript where someone asks how they themselves are.",
         "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
         "Diarization merges people when there are more speakers than it can separate: a stage event, panel, conference or talk series often gives several speakers one speaker_label. When a label carries more than one person, keep it mixed/unresolved in speaker_map and split it with speaker_turns: contiguous diarized segment_index ranges, each with the one verified person speaking. Find the boundaries from on-stage introductions and handoffs ('please welcome NAME', 'thank you, NAME', 'next up'), self-introductions, and the selected calendar event's agenda, description or speaker list, which give the order of speakers; search the warehouse for the event's agenda when the calendar description lacks it.",
+        "Cover each session completely with few entries: when a label is one person for a whole session (a guest's label during their interview, the MC's label during handoffs), write one label-scoped speaker_turns entry (speaker_label set) over the session's whole segment range; it names every segment of that label there. Then add exact turns (speaker_label empty) only where a label holds two people, such as an interviewer's questions on the guest's label; an exact turn outranks a label-scoped one. Long sessions left without any entry print as unresolved.",
+        "Before finalizing speaker_turns, check the segment just before each range: a turn often opens with a short lead-in sentence ('Yeah, so...', 'There's a lot more...') that belongs to it. Then look for gaps: an unassigned segment between two ranges of the same person, or right after one of their ranges, that continues the same line of thought is part of their turn. Coverage matters; a person's turn left half-assigned prints half of it as unresolved.",
         "Every speaker_turns entry needs confidence of at least 0.9 to be applied; ranges must not overlap and must use segment_index values present in diarized_segments. Leave a stretch out of speaker_turns rather than guess. Use an empty speaker_turns list when speaker_map already attributes every turn. speaker_turns matters most for long recordings, whose transcript the pipeline assembles locally from diarized_segments.",
         "Every diarized speaker_label that speaks for a minute or more needs a speaker_map entry: a verified name, or a clean mixed/unresolved label.",
         "Long recordings often hold several sessions: talks, interviews, panels, breaks, and side conversations. Before naming anyone, split the recording into sessions by time using introductions, handoffs, applause, and topic changes, and write down each session's start offset and who was introduced. Labels are clustered across the whole file, so one label can be different people in different sessions; attribute speakers session by session.",
@@ -2502,6 +2524,10 @@ def enrichment_schema() -> dict[str, Any]:
                             "type": "integer",
                             "description": "Last diarized_segments segment_index of the turn, inclusive.",
                         },
+                        "speaker_label": {
+                            "type": "string",
+                            "description": "Empty for an exact turn that names every segment in the range. A diarized speaker_label to name only that label's segments in the range, e.g. a guest's label over their whole session.",
+                        },
                         "speaker_name": {
                             "type": "string",
                             "description": "Verified full name of the person speaking in these segments, or the first name exactly as introduced when no surname can be verified.",
@@ -2518,6 +2544,7 @@ def enrichment_schema() -> dict[str, Any]:
                     "required": [
                         "start_segment_index",
                         "end_segment_index",
+                        "speaker_label",
                         "speaker_name",
                         "confidence",
                         "evidence",
@@ -2640,13 +2667,25 @@ def speaker_turns_from_result(result: Mapping[str, Any]) -> list[Mapping[str, An
     return [item for item in turns if isinstance(item, Mapping)]
 
 
-def speaker_turn_names_by_segment(result: Mapping[str, Any]) -> dict[int, str]:
+def speaker_turn_label(item: Mapping[str, Any]) -> str:
+    return str(item.get("speaker_label") or "").strip()
+
+
+def speaker_turn_names_by_segment(
+    result: Mapping[str, Any], transcript_segments: Sequence[Mapping[str, Any]]
+) -> dict[int, str]:
     """segment_index -> verified person, from the agent's turn-level assignments.
 
-    Only a confident assignment to a real name counts; anything else leaves the
-    segment to its diarization label, which is the same bar speaker_map holds.
+    An entry without a speaker_label names every segment in its range (an exact
+    turn); an entry with one names only that label's segments in the range (a
+    session-wide "label J is this person"). Exact turns win, so a session default
+    can be split turn by turn where two people share the label. Only a confident
+    assignment to a real name counts; anything else leaves the segment to its
+    diarization label, which is the same bar speaker_map holds.
     """
-    names: dict[int, str] = {}
+    labels = {int(segment.get("segment_index") or 0): str(segment.get("speaker_label") or "") for segment in transcript_segments}
+    exact: dict[int, str] = {}
+    scoped: dict[int, str] = {}
     for item in speaker_turns_from_result(result):
         name = str(item.get("speaker_name") or "").strip()
         if not name or unresolved_speaker_name_for_enrichment(name):
@@ -2657,17 +2696,26 @@ def speaker_turn_names_by_segment(result: Mapping[str, Any]) -> dict[int, str]:
         end = _int_or_none(item.get("end_segment_index"))
         if start is None or end is None or start > end:
             continue
+        label = speaker_turn_label(item)
         for index in range(start, end + 1):
-            names.setdefault(index, name)
-    return names
+            if not label:
+                exact.setdefault(index, name)
+            elif labels.get(index) == label:
+                scoped.setdefault(index, name)
+    return {**scoped, **exact}
 
 
 def speaker_turn_issues(
     result: Mapping[str, Any], transcript_segments: Sequence[Mapping[str, Any]]
 ) -> list[str]:
-    known = {int(segment.get("segment_index") or 0) for segment in transcript_segments}
+    labels = {int(segment.get("segment_index") or 0): str(segment.get("speaker_label") or "") for segment in transcript_segments}
+    known = set(labels)
+    known_labels = set(labels.values())
     issues: list[str] = []
-    claimed: dict[int, int] = {}
+    # Two exact turns, or two entries scoped to the same label, may not claim
+    # one segment; an exact turn inside a label-scoped session entry is the
+    # intended way to split a shared label and is allowed.
+    claimed: dict[tuple[str, int], int] = {}
     for position, item in enumerate(speaker_turns_from_result(result)):
         start = _int_or_none(item.get("start_segment_index"))
         end = _int_or_none(item.get("end_segment_index"))
@@ -2684,13 +2732,20 @@ def speaker_turn_issues(
                 issues.append(
                     f"speaker_turns[{position}] names segment_index {bound}, which is not in diarized_segments"
                 )
+        label = speaker_turn_label(item)
+        if label and known_labels and label not in known_labels:
+            issues.append(f"speaker_turns[{position}] speaker_label {label!r} is not a diarized label")
+            continue
         for index in range(start, end + 1):
-            if index in claimed:
+            if label and labels.get(index) != label:
+                continue
+            key = (label, index)
+            if key in claimed:
                 issues.append(
-                    f"speaker_turns[{position}] and speaker_turns[{claimed[index]}] overlap at segment_index {index}; each segment has one speaker"
+                    f"speaker_turns[{position}] and speaker_turns[{claimed[key]}] overlap at segment_index {index}; each segment has one speaker"
                 )
                 break
-            claimed[index] = position
+            claimed[key] = position
     return issues
 
 

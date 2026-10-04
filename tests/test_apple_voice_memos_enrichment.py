@@ -429,9 +429,9 @@ def test_segment_preserving_fallback_rebuilds_compressed_transcript_with_opening
     # A mixed label stays unresolved however its evidence leans: "mostly
     # consistent with Morgan Lee" at 0.5 is the shape that put 302 turns of a
     # multi-speaker stage event under one organizer's name.
-    assert corrected.splitlines()[:5] == [
-        "Alex Rivera: Hey, Priya.",
-        "Alex Rivera: Hey, how are you?",
+    # Consecutive segments by one speaker read as one paragraph.
+    assert corrected.splitlines()[:4] == [
+        "Alex Rivera: Hey, Priya. Hey, how are you?",
         "Priya Narayan: I'm doing great. How are you, Alex?",
         "Alex Rivera: I'm good.",
         "A (mixed/unresolved): We have 33 centers.",
@@ -494,11 +494,9 @@ def test_speaker_turns_split_one_mixed_label_into_the_people_who_spoke() -> None
 
     assert result["transcript"].splitlines() == [
         "Morgan Lee: Welcome, everyone. Please welcome our first speaker.",
-        "Riley Chen: Thank you. I want to talk about open science.",
-        "Riley Chen: Funding should follow the work.",
+        "Riley Chen: Thank you. I want to talk about open science. Funding should follow the work.",
         "Morgan Lee: Thank you. Next up is our second speaker.",
-        "Jordan Ellis: Thanks. My talk is about civic institutions.",
-        "Jordan Ellis: And how they decay.",
+        "Jordan Ellis: Thanks. My talk is about civic institutions. And how they decay.",
     ]
 
 
@@ -537,9 +535,7 @@ def test_speaker_turns_below_the_confidence_bar_or_unresolved_do_not_name_anyone
     assert prefixes == [
         "Morgan Lee",
         "Unresolved speaker (label C)",
-        "Unresolved speaker (label C)",
         "Morgan Lee",
-        "Unresolved speaker (label C)",
         "Unresolved speaker (label C)",
     ]
 
@@ -580,6 +576,7 @@ def test_enrichment_schema_requires_speaker_turns() -> None:
     assert set(item["required"]) == set(item["properties"]) == {
         "start_segment_index",
         "end_segment_index",
+        "speaker_label",
         "speaker_name",
         "confidence",
         "evidence",
@@ -590,7 +587,7 @@ def test_enrichment_prompt_teaches_turn_level_speakers_from_the_agenda() -> None
     prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
     assert "speaker_turns" in prompt
     assert "agenda" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v9"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v10"
 
 
 def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> None:
@@ -1478,7 +1475,7 @@ def test_enrichment_prompt_teaches_sessions_spans_and_sectioned_summaries() -> N
     assert "one speaker_turns entry per turn" in prompt
     assert "introduced by first name only" in prompt
     assert "recording owner" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v9"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v10"
 
 
 def test_an_unresolved_label_is_not_named_after_someone_its_evidence_merely_mentions() -> None:
@@ -1704,3 +1701,139 @@ def test_name_canonicalization_leaves_ordinary_words_that_also_appear_lowercase(
         )
         == "Changes are coming. These changes matter."
     )
+
+
+def test_local_assembly_merges_consecutive_segments_by_the_same_speaker_into_one_paragraph() -> None:
+    # Long utterances are stored sentence by sentence so speaker_turns can split
+    # people inside them; the reader still gets one paragraph per turn.
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "G", "start_ms": 0, "end_ms": 2_000, "text": "Why now?"},
+            {"segment_index": 1, "speaker_label": "G", "start_ms": 2_000, "end_ms": 4_000, "text": "Because money moved."},
+            {"segment_index": 2, "speaker_label": "G", "start_ms": 4_000, "end_ms": 6_000, "text": "And it keeps moving."},
+        ],
+        result={
+            "participants": ["Alex Rivera", "Priya Narayan"],
+            "speaker_map": [{"speaker_label": "G", "speaker_name": "Mixed/unresolved G", "confidence": 0.9, "evidence": "x"}],
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 0, "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "q"},
+                {"start_segment_index": 1, "end_segment_index": 2, "speaker_name": "Priya Narayan", "confidence": 0.95, "evidence": "a"},
+            ],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [],
+        },
+    )
+
+    assert result["transcript"].splitlines() == [
+        "Alex Rivera: Why now?",
+        "Priya Narayan: Because money moved. And it keeps moving.",
+    ]
+
+
+def test_segment_speaker_names_gives_one_resolved_name_per_segment() -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import segment_speaker_names
+
+    names = segment_speaker_names(
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "G", "text": "Why now?"},
+            {"segment_index": 1, "speaker_label": "G", "text": "Because."},
+            {"segment_index": 2, "speaker_label": "H", "text": "Next."},
+        ],
+        result={
+            "participants": ["Alex Rivera"],
+            "speaker_map": [{"speaker_label": "G", "speaker_name": "Mixed/unresolved G", "confidence": 0.9, "evidence": "x"}],
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 0, "speaker_name": "Alex Rivera", "confidence": 0.95, "evidence": "q"},
+            ],
+        },
+    )
+
+    assert names == ["Alex Rivera", "Mixed/unresolved G", "Speaker H"]
+
+
+def test_prompt_asks_for_turn_coverage_and_start_boundaries() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+
+    assert "check the segment just before each range" in prompt
+    assert "gaps" in prompt
+
+
+def _session_segments() -> list[dict]:
+    # One session: host on label A, the guest on label C, and the guest's
+    # interviewer sharing label C for one question.
+    return [
+        {"segment_index": 0, "speaker_label": "A", "text": "Next up, our guest."},
+        {"segment_index": 1, "speaker_label": "C", "text": "What brought you here?"},
+        {"segment_index": 2, "speaker_label": "C", "text": "Curiosity, mostly."},
+        {"segment_index": 3, "speaker_label": "A", "text": "Nice."},
+        {"segment_index": 4, "speaker_label": "C", "text": "And stubbornness."},
+    ]
+
+
+def test_a_label_scoped_turn_names_every_segment_of_that_label_in_its_range() -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import segment_speaker_names
+
+    names = segment_speaker_names(
+        transcript_segments=_session_segments(),
+        result={
+            "participants": ["Riley Chen"],
+            "speaker_map": [],
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 4, "speaker_label": "C", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "guest for the session"},
+            ],
+        },
+    )
+
+    assert names == ["Speaker A", "Riley Chen", "Riley Chen", "Speaker A", "Riley Chen"]
+
+
+def test_an_exact_turn_outranks_a_label_scoped_one() -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import segment_speaker_names
+
+    names = segment_speaker_names(
+        transcript_segments=_session_segments(),
+        result={
+            "participants": ["Riley Chen", "Morgan Lee"],
+            "speaker_map": [],
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 4, "speaker_label": "C", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "guest"},
+                {"start_segment_index": 1, "end_segment_index": 1, "speaker_label": "", "speaker_name": "Morgan Lee", "confidence": 0.95, "evidence": "the question"},
+            ],
+        },
+    )
+
+    assert names[1] == "Morgan Lee"
+    assert names[2] == "Riley Chen"
+
+
+def test_a_label_scoped_turn_and_an_exact_turn_may_overlap_but_two_exact_turns_may_not() -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import speaker_turn_issues
+
+    allowed = speaker_turn_issues(
+        {
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 4, "speaker_label": "C", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "e"},
+                {"start_segment_index": 1, "end_segment_index": 1, "speaker_label": "", "speaker_name": "Morgan Lee", "confidence": 0.95, "evidence": "e"},
+            ]
+        },
+        _session_segments(),
+    )
+    clash = speaker_turn_issues(
+        {
+            "speaker_turns": [
+                {"start_segment_index": 0, "end_segment_index": 4, "speaker_label": "C", "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "e"},
+                {"start_segment_index": 2, "end_segment_index": 3, "speaker_label": "C", "speaker_name": "Morgan Lee", "confidence": 0.95, "evidence": "e"},
+            ]
+        },
+        _session_segments(),
+    )
+
+    assert allowed == []
+    assert any("overlap" in issue for issue in clash)
+
+
+def test_prompt_teaches_one_label_scoped_turn_per_session() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+
+    assert "one label-scoped speaker_turns entry" in prompt

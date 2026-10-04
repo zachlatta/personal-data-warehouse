@@ -152,9 +152,19 @@ More room helps, forcing a floor hurts, and leaving `speaker_options` out does N
 documented default. A 45-minute, twelve-person breakout from the day before came back as
 **one utterance from one speaker** at max 8 and 108 utterances from 16 speakers at max 30.
 The one merge max 30 still makes -- an interviewer and her guest on the same stage
-microphones, one label and one 12-minute utterance -- survives every setting, so utterances
-longer than a minute are stored as sentence-bounded segments (`split_long_utterance`, same
-label): a `speaker_turns` range can only split people at a segment boundary.
+microphones, one label and one 12-minute utterance -- survives every setting, so an
+utterance longer than 20 seconds is stored one sentence per segment (`split_long_utterance`,
+same label): a `speaker_turns` range can only split people at a segment boundary. Local
+assembly merges a speaker's consecutive segments back into one paragraph, and
+`segment_speaker_names` is the one place that decides each segment's printed name (the
+benchmark harness scores through it).
+
+**A `speaker_turns` entry may be scoped to one label.** With `speaker_label` set, an entry
+names only that label's segments inside its range -- one entry says "label J is the guest for
+the whole interview". With it empty, the entry is an exact turn and outranks a label-scoped
+one, which is how a question on the guest's label goes to the interviewer. Without scoping,
+covering a 3,000-segment recording meant listing every turn: one run left 2,299 segments
+unresolved, including a whole 35-minute interview.
 
 **The enrichment agent runs on GPT-6 Astra, not the fleet model.**
 `DEFAULT_VOICE_MEMOS_ENRICHMENT_MODEL` is `gpt-6-astra`; `VOICE_MEMOS_ENRICHMENT_MODEL` /
@@ -165,7 +175,7 @@ model nor the prompt version is part of an enrichment's completion identity (unl
 to re-transcribed ones; re-enriching all ~775 existing recordings on Astra was judged not
 worth ~40 hours of serial agent runs, most of them over the old 8-speaker diarization.
 
-**A long recording is several sessions; the prompt (`...-agent-v9`) attributes per session.**
+**A long recording is several sessions; the prompt (`...-agent-v10`) attributes per session.**
 The agent splits the recording into sessions from introductions and handoffs, writes one
 `speaker_turns` range per question and per answer when two people share a label, names a
 speaker introduced by first name only by that first name rather than leaving every turn
@@ -175,8 +185,9 @@ be in `speaker_map`, and a recording of 20 minutes or more gets a sectioned summ
 its length (`summary_length_issues`). On the benchmark, the v7/Sol enrichment over the
 8-speaker diarization named the WRONG person at 55 of 82 anchors -- every line the MC spoke
 was attributed to Zach, every question the interviewer asked to her guest -- and summarized
-5.7 hours in 720 characters. Over the max-30 diarization, Astra with these instructions got
-67 of 82 right with **zero** wrong names (a prototype of the same rules: 70 and 69), the rest
+5.7 hours in 720 characters. Over the max-30 diarization, v10 (sentence segments, label-scoped turns) got
+73 of 82 right, zero wrong, the remaining nine almost all an interviewer nobody names;
+v9 got 67 of 82 right with **zero** wrong names (a prototype of the same rules: 70 and 69), the rest
 unresolved -- an interviewer nobody names, segments holding both a question and its answer,
 and the owner's reception turns, the one gap still open -- with a 17,000-character sectioned
 summary, in about ten minutes a run. Wrong names are worse than unresolved ones; that is the number to watch when this

@@ -19,9 +19,11 @@ person's then counts as correct).
         are the same person. Also reports label count and how much audio sits in
         utterances over three minutes.
 
-    attribution <labels.json> <assemblyai_result.json> <transcript.txt>
-        The transcript is the locally assembled one (one "Name: text" line per
-        stored segment). Counts anchors attributed correctly, attributed to the
+    attribution <labels.json> <assemblyai_result.json> <enrichment.json>
+        enrichment.json is the agent's result (speaker_map, speaker_turns,
+        participants), bare or under "result" -- e.g. an enrichment row's
+        raw_result_json. Each segment gets the name local assembly would print
+        (segment_speaker_names). Counts anchors attributed correctly, attributed to the
         WRONG person (the number that matters -- a wrong name is worse than an
         unresolved one), or left unresolved.
 """
@@ -36,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from personal_data_warehouse.apple_voice_memos_enrichment import segment_speaker_names
 from personal_data_warehouse.apple_voice_memos_transcription import transcription_segment_rows
 
 UNRESOLVED_MARKERS = ("speaker", "unresolved", "mixed", "unknown", "unidentified")
@@ -96,12 +99,9 @@ def diarization_report(labels: dict[str, Any], result: dict[str, Any]) -> dict[s
     }
 
 
-def attribution_report(labels: dict[str, Any], result: dict[str, Any], transcript: str) -> dict[str, Any]:
+def attribution_report(labels: dict[str, Any], result: dict[str, Any], enrichment: dict[str, Any]) -> dict[str, Any]:
     segments = transcription_segment_rows({"recording_id": labels["recording_id"]}, result, created_at=datetime.now(tz=UTC))
-    lines = transcript.splitlines()
-    if len(lines) != len(segments):
-        raise SystemExit(f"transcript has {len(lines)} lines for {len(segments)} segments; score the locally assembled transcript")
-    names = [line.split(":", 1)[0].strip() for line in lines]
+    names = segment_speaker_names(transcript_segments=segments, result=enrichment)
     expected_names: dict[str, str | None] = labels["expected_names"]
     counts = {"correct": 0, "wrong": 0, "unresolved": 0}
     wrong: list[dict[str, Any]] = []
@@ -147,14 +147,14 @@ def main() -> None:
     attribution = sub.add_parser("attribution")
     attribution.add_argument("labels", type=Path)
     attribution.add_argument("result", type=Path)
-    attribution.add_argument("transcript", type=Path)
+    attribution.add_argument("enrichment", type=Path)
     args = parser.parse_args()
     labels = json.loads(args.labels.read_text())
     if args.command == "diarization":
         for path in args.results:
             print(path.name, json.dumps(diarization_report(labels, load_result(path)), sort_keys=True))
     else:
-        print(json.dumps(attribution_report(labels, load_result(args.result), args.transcript.read_text()), indent=2))
+        print(json.dumps(attribution_report(labels, load_result(args.result), load_result(args.enrichment)), indent=2))
 
 
 if __name__ == "__main__":

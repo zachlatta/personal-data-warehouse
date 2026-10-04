@@ -36,9 +36,13 @@ def test_diarization_report_counts_a_label_that_holds_two_people() -> None:
 
 
 def test_attribution_report_separates_wrong_names_from_unresolved_ones() -> None:
-    transcript = "Alex Rivera: host words.\nAlex Rivera: guest words.\nSpeaker B: host again."
+    enrichment = {
+        "participants": ["Alex Rivera"],
+        "speaker_map": [{"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "x"}],
+        "speaker_turns": [],
+    }
 
-    report = benchmark.attribution_report(LABELS, RESULT, transcript)
+    report = benchmark.attribution_report(LABELS, RESULT, enrichment)
 
     assert (report["correct"], report["wrong"], report["unresolved"]) == (1, 1, 1)
     assert report["wrong_examples"] == [{"person": "guest", "attributed": "Alex Rivera", "minute": 0}]

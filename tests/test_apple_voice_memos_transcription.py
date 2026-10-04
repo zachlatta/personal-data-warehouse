@@ -410,17 +410,49 @@ def test_transcription_segment_rows_split_a_long_utterance_at_sentence_boundarie
 
 
 def test_transcription_segment_rows_keep_a_normal_utterance_whole() -> None:
-    words = [_word(f"w{i}.", i * 2, i * 2 + 2) for i in range(20)]  # 40 s
+    words = [_word(f"w{i}.", i * 1, i * 1 + 1) for i in range(15)]  # 15 s, under the split threshold
     rows = transcription_segment_rows(
         {"recording_id": "memo-1", "account": "a"},
         {
             "id": "tx-1",
             "utterances": [
-                {"speaker": "A", "start": 0, "end": 40_000, "confidence": 0.9, "text": "Forty seconds.", "words": words},
+                {"speaker": "A", "start": 0, "end": 15_000, "confidence": 0.9, "text": "Fifteen seconds.", "words": words},
             ],
         },
         created_at=datetime(2026, 10, 4, tzinfo=UTC),
     )
 
     assert len(rows) == 1
-    assert rows[0]["text"] == "Forty seconds."
+    assert rows[0]["text"] == "Fifteen seconds."
+
+
+def test_a_long_utterance_is_split_at_every_sentence_so_a_question_is_its_own_segment() -> None:
+    # Measured on the 2026-10-03 benchmark: with ~8-second pieces, an
+    # interviewer's question and the start of her guest's answer shared a
+    # segment, and no speaker_turns range could separate them.
+    words = [
+        _word("Why", 0, 1), _word("now?", 1, 2),
+        _word("Because", 2, 3), _word("money", 3, 4), _word("moved.", 4, 5),
+    ]
+    words += [_word(f"w{i}.", 5 + i, 6 + i) for i in range(70)]  # pad past the 60 s split threshold
+    rows = transcription_segment_rows(
+        {"recording_id": "memo-1", "account": "a"},
+        {"id": "tx", "utterances": [{"speaker": "G", "start": 0, "end": 75_000, "confidence": 0.9, "text": "...", "words": words}]},
+        created_at=datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+    assert rows[0]["text"] == "Why now?"
+    assert rows[1]["text"] == "Because money moved."
+
+
+def test_a_mixed_utterance_over_twenty_seconds_is_split_into_sentences() -> None:
+    # A 42-second utterance held a guest's remark and Zach's reply under one
+    # label; under the old 60-second threshold it stayed one unattributable segment.
+    words = [_word(f"s{i}.", i * 3, i * 3 + 3) for i in range(14)]  # 42 s
+    rows = transcription_segment_rows(
+        {"recording_id": "memo-1", "account": "a"},
+        {"id": "tx", "utterances": [{"speaker": "A", "start": 0, "end": 42_000, "confidence": 0.9, "text": "...", "words": words}]},
+        created_at=datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+    assert len(rows) == 14
