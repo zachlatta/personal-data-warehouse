@@ -1165,7 +1165,8 @@ def test_load_enrichment_candidates_uses_agent_error_budget() -> None:
     assert "FROM @apple_voice_memos_enrichments" in queries[0]
     assert "provider = 'codex'" in queries[0]
     assert "provider = 'agent_codex'" in queries[0]
-    assert "prompt_version = 'test-prompt'" not in queries[0].split("SELECT subject_id, count(*) AS error_attempts", 1)[1]
+    assert "prompt_version = 'test-prompt'" not in queries[0].split("count(*) AS error_attempts", 1)[1]
+    assert "failures.failed_at >= r.completed_at" in queries[0]
     assert "COALESCE(a.error_attempts, 0) < 7" in queries[0]
 
 

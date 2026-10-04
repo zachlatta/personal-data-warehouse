@@ -1862,3 +1862,75 @@ def test_voice_memo_mart_column_order_only_ever_grows_at_the_end(
         ("transcript_model", "text"),
         ("provider_transcript_id", "text"),
     ]
+
+
+def test_enrichment_failures_against_an_older_transcript_do_not_block_a_new_one(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The error budget counts failures against the CURRENT transcript only.
+
+    Two recordings failed enrichment five times in April and then succeeded, so
+    after a 2026-10-04 re-transcription (repairing a corrupted transcript) the
+    lifetime count kept them out of the queue for good.
+    """
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_enrichment_candidates
+
+    _seed_voice_memos(warehouse)
+    warehouse.ensure_agent_tables()
+
+    def fail(at: datetime, attempt: int) -> None:
+        warehouse.insert_apple_voice_memos_enrichments(
+            [
+                _row(
+                    VOICE_MEMO_ENRICHMENT_COLUMNS,
+                    source="apple_voice_memos",
+                    account="zach",
+                    recording_id="rec-1",
+                    content_sha256="sha-1",
+                    provider="agent",
+                    model="m",
+                    prompt_version=f"failed-{at.isoformat()}-{attempt}",
+                    status="error",
+                    error="boom",
+                    created_at=at,
+                    sync_version=attempt,
+                )
+            ]
+        )
+
+    def transcribe(completed_at: datetime) -> None:
+        warehouse.insert_apple_voice_memos_transcription_runs(
+            [
+                _row(
+                    VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                    source="apple_voice_memos",
+                    account="zach",
+                    recording_id="rec-1",
+                    content_sha256="sha-1",
+                    provider="assemblyai",
+                    provider_transcript_id="tid-1",
+                    status="completed",
+                    transcript_text="run transcript",
+                    requested_at=completed_at,
+                    completed_at=completed_at,
+                    sync_version=int(completed_at.timestamp()),
+                )
+            ]
+        )
+
+    def candidates() -> set[str]:
+        return {
+            row["recording_id"]
+            for row in load_enrichment_candidates(
+                warehouse, provider="agent", prompt_version="v2", limit=None, max_error_attempts=5
+            )
+        }
+
+    for attempt in range(5):
+        fail(datetime(2026, 4, 20, tzinfo=UTC), attempt)
+    transcribe(datetime(2026, 10, 4, tzinfo=UTC))
+    assert "rec-1" in candidates()
+
+    for attempt in range(5):
+        fail(datetime(2026, 10, 5, tzinfo=UTC), attempt)
+    assert "rec-1" not in candidates()

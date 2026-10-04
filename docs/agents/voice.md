@@ -194,6 +194,11 @@ summary, in about ten minutes a run. Wrong names are worse than unresolved ones;
 prompt changes. The harness is `scripts/voice_memo_speaker_benchmark.py`; its hand labels
 name real people and live outside the repo in `~/.config/pdw/voice-benchmark/`.
 
+**The enrichment error budget is per transcript.** `max_error_attempts` counts failures
+newer than the recording's current transcription run, not every failure ever: two
+recordings that failed five times in April and then succeeded were shut out of the queue
+for good when they were re-transcribed to repair a corrupted transcript on 2026-10-04.
+
 **Name canonicalization rewrote domain words for months.** After the agent returns, a fuzzy
 pass (`canonicalize_text_verified_name_mentions`) corrects near-miss spellings of verified
 names everywhere in the result. Its only guard was string similarity, so a "name" one edit

@@ -341,26 +341,30 @@ def load_enrichment_candidates(
     agent_run_provider = provider.removeprefix("agent_")
     error_attempts_join = ""
     if max_error_attempts > 0:
+        # Only failures against the CURRENT transcript count: a re-transcription
+        # is new input, and a lifetime count kept recordings that failed five
+        # times in April (then succeeded) out of the queue after a repair.
         error_attempts_join = f"""
-        LEFT JOIN
+        LEFT JOIN LATERAL
         (
-            SELECT subject_id, count(*) AS error_attempts
+            SELECT count(*) AS error_attempts
             FROM
             (
-                SELECT subject_id
+                SELECT started_at AS failed_at
                 FROM @agent_runs
                 WHERE task_type = 'apple_voice_memo_enrichment'
                   AND provider = {_sql_string(agent_run_provider)}
                   AND status = 'error'
+                  AND subject_id = f.recording_id
                 UNION ALL
-                SELECT recording_id AS subject_id
+                SELECT created_at AS failed_at
                 FROM @apple_voice_memos_enrichments
                 WHERE provider = {_sql_string(provider)}
                   AND status = 'error'
-            )
-            GROUP BY subject_id
-        ) AS a
-            ON f.recording_id = a.subject_id
+                  AND recording_id = f.recording_id
+            ) AS failures
+            WHERE failures.failed_at >= r.completed_at
+        ) AS a ON TRUE
         """
     # Reads the MART, not base_apple_voice_memos.files. Scanning the raw table
     # made enrichment structurally blind to every voice source but the first:
