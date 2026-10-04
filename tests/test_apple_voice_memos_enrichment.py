@@ -590,7 +590,7 @@ def test_enrichment_prompt_teaches_turn_level_speakers_from_the_agenda() -> None
     prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
     assert "speaker_turns" in prompt
     assert "agenda" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v8"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v9"
 
 
 def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> None:
@@ -1388,3 +1388,142 @@ def test_canonicalize_text_verified_name_mentions_only_rewrites_close_name_varia
     )
 
     assert text == "Hey Taylor, maybe we should talk with Morgan and Cory."
+
+
+def _long_session_segments() -> list[dict]:
+    # Two sessions of one long recording: label A is a moderator in the first
+    # session and a different person in the second, which a single
+    # whole-recording speaker_map entry cannot express.
+    return [
+        {"segment_index": 0, "speaker_label": "A", "start_ms": 0, "end_ms": 600_000, "text": "Welcome to the first panel."},
+        {"segment_index": 1, "speaker_label": "B", "start_ms": 600_000, "end_ms": 1_200_000, "text": "Thanks for having me."},
+        {"segment_index": 2, "speaker_label": "A", "start_ms": 1_800_000, "end_ms": 2_400_000, "text": "I run the second session."},
+        {"segment_index": 3, "speaker_label": "C", "start_ms": 2_400_000, "end_ms": 2_430_000, "text": "Yeah."},
+    ]
+
+
+def _valid_long_result(**overrides) -> dict:
+    result = {
+        "title": "Long Event",
+        "start_at": "2026-04-27T14:00:00+00:00",
+        "end_at": "2026-04-27T14:45:00+00:00",
+        "participants": ["Alex Rivera", "Priya Narayan"],
+        "speaker_map": [
+            {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
+            {"speaker_label": "B", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "test"},
+        ],
+        "speaker_turns": [],
+        "summary": "s" * 5_000,
+        "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+    }
+    result.update(overrides)
+    return result
+
+
+def test_validate_enrichment_result_flags_a_substantial_label_missing_from_speaker_map() -> None:
+    segments = _long_session_segments()
+    issues = validate_enrichment_result(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=segments,
+        result=_valid_long_result(
+            speaker_map=[
+                {"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"},
+            ]
+        ),
+    )
+
+    # B speaks for ten minutes and is unmapped; C's single 30-second "Yeah." is not substantial.
+    assert any("speaker_map is missing diarized labels ['B']" in issue for issue in issues)
+
+
+def test_validate_enrichment_result_requires_a_summary_that_scales_with_a_long_recording() -> None:
+    segments = _long_session_segments()  # 40.5 minutes
+    short = validate_enrichment_result(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=segments,
+        result=_valid_long_result(summary="A panel happened."),
+    )
+    long_enough = validate_enrichment_result(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=segments,
+        result=_valid_long_result(summary="s" * 2_100),
+    )
+
+    assert any("summary is too short for a 40-minute recording" in issue for issue in short)
+    assert not any("summary is too short" in issue for issue in long_enough)
+
+
+def test_validate_enrichment_result_does_not_demand_a_long_summary_for_a_short_note() -> None:
+    issues = validate_enrichment_result(
+        recording={"transcript_text": "Remember to email Priya."},
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "A", "start_ms": 0, "end_ms": 20_000, "text": "Remember to email Priya."}
+        ],
+        result=_valid_long_result(
+            summary="Reminder to email Priya.",
+            transcript="Alex Rivera: Remember to email Priya.",
+            speaker_map=[{"speaker_label": "A", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "test"}],
+        ),
+    )
+
+    assert not any("summary is too short" in issue for issue in issues)
+
+
+def test_enrichment_prompt_teaches_sessions_spans_and_sectioned_summaries() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+
+    assert "speaker_turns" in prompt
+    assert "sessions" in prompt
+    assert "sectioned summary" in prompt
+    assert "one speaker_turns entry per turn" in prompt
+    assert "introduced by first name only" in prompt
+    assert "recording owner" in prompt
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v9"
+
+
+def test_an_unresolved_label_is_not_named_after_someone_its_evidence_merely_mentions() -> None:
+    # Measured on the 2026-10-03 benchmark: the agent marked the interviewer's
+    # label unresolved with evidence "interviewer turns in <guest>'s session",
+    # and local assembly printed every interviewer line as the guest.
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "C", "start_ms": 0, "end_ms": 5_000, "text": "What do you mean by that?"},
+            {"segment_index": 1, "speaker_label": "D", "start_ms": 5_000, "end_ms": 9_000, "text": "I mean power."},
+        ],
+        result={
+            "participants": ["Alex Rivera"],
+            "speaker_map": [
+                {
+                    "speaker_label": "C",
+                    "speaker_name": "Unresolved speaker C",
+                    "confidence": 0.98,
+                    "evidence": "Substantive interviewer turns in Alex Rivera's session; the introduced name is unclear.",
+                },
+                {"speaker_label": "D", "speaker_name": "Alex Rivera", "confidence": 0.99, "evidence": "long answers"},
+            ],
+            "speaker_turns": [],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [],
+        },
+    )
+
+    assert result["transcript"].splitlines() == [
+        "Unresolved speaker C: What do you mean by that?",
+        "Alex Rivera: I mean power.",
+    ]
+
+
+def test_mixed_or_unresolved_label_wording_is_not_flagged_as_an_ambiguous_name() -> None:
+    issues = validate_enrichment_result(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=[],
+        result=_valid_long_result(
+            speaker_map=[
+                {"speaker_label": "A", "speaker_name": "Mixed or unresolved speakers A", "confidence": 0.98, "evidence": "x"},
+                {"speaker_label": "B", "speaker_name": "Priya Narayan", "confidence": 0.99, "evidence": "x"},
+            ]
+        ),
+    )
+
+    assert not any("ambiguous speaker_name" in issue for issue in issues)

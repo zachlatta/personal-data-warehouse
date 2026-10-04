@@ -89,8 +89,9 @@ the evidence that the mishearing happened and would corrupt a genuine mention. I
 why) triple, `enrichment_system_prompt()` hands it to the enrichment agent, and the
 agent resolves the term in `title`, `summary`, `participants` and `action_items` while
 leaving `transcript` untouched and recording what it did in `evidence`. Adding a future
-mishearing is one tuple. The prompt version bump (`...-agent-v7`) re-enriches within
-`VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS` rather than the whole corpus.
+mishearing is one tuple. A prompt version bump re-enriches nothing on its own: a recording
+with any completed enrichment is not a candidate again unless the Dagster deployment sets
+`VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION=1`, which re-enriches the whole corpus.
 
 **Universal-3.5 Pro is the model, with Universal-2 only as the language fallback.**
 `ASSEMBLYAI_SPEECH_MODELS` is `("universal-3-5-pro", "universal-2")`, sent as the
@@ -127,6 +128,61 @@ created after the transcription run it read (`e.created_at >= r.completed_at` in
 no prompt-version bump. The runner replaces the recording's segments
 (`replace_voice_recording_transcript_segments`) instead of upserting over them, so a
 shorter new transcript leaves no tail of the old one for the agent to read.
+
+**The ceiling, measured.** On 2026-10-04 the stage-talks recording was hand-labelled -- 14
+identifiable speakers, 82 anchor moments whose speaker is certain -- and re-diarized under
+several `speaker_options`, scored as pairwise "same person iff same label" F1:
+
+| speaker_options | labels | pairwise F1 |
+| --- | --- | --- |
+| max 8 (the old ceiling) | 5 | 0.39 |
+| max 30 | 14 | 0.84 |
+| min 10, max 30 | 14 | 0.84 |
+| max 50 | 13 | 0.80 |
+| min 16, max 30 | 18 | 0.71 |
+| min 20, max 40 | 19 | 0.69 |
+| omitted entirely | 4 | 0.33 |
+
+More room helps, forcing a floor hurts, and leaving `speaker_options` out does NOT get the
+documented default. A 45-minute, twelve-person breakout from the day before came back as
+**one utterance from one speaker** at max 8 and 108 utterances from 16 speakers at max 30.
+The one merge max 30 still makes -- an interviewer and her guest on the same stage
+microphones, one label and one 12-minute utterance -- survives every setting, so utterances
+longer than a minute are stored as sentence-bounded segments (`split_long_utterance`, same
+label): a `speaker_turns` range can only split people at a segment boundary.
+
+**The enrichment agent runs on GPT-6 Astra, not the fleet model.**
+`DEFAULT_VOICE_MEMOS_ENRICHMENT_MODEL` is `gpt-6-astra`; `VOICE_MEMOS_ENRICHMENT_MODEL` /
+`VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT` override it per deployment, and the client builds
+its own agent resource because the injected fleet one carries `AGENT_MODEL`. Neither the
+model nor the prompt version is part of an enrichment's completion identity (unless
+`VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION=1`), so the switch applies to new recordings and
+to re-transcribed ones; re-enriching all ~775 existing recordings on Astra was judged not
+worth ~40 hours of serial agent runs, most of them over the old 8-speaker diarization.
+
+**A long recording is several sessions; the prompt (`...-agent-v9`) attributes per session.**
+The agent splits the recording into sessions from introductions and handoffs, writes one
+`speaker_turns` range per question and per answer when two people share a label, names a
+speaker introduced by first name only by that first name rather than leaving every turn
+unresolved (participants still need full names), and names the recording owner's
+identifiable turns in side conversations. Every label that speaks for a minute or more must
+be in `speaker_map`, and a recording of 20 minutes or more gets a sectioned summary sized to
+its length (`summary_length_issues`). On the benchmark, the v7/Sol enrichment over the
+8-speaker diarization named the WRONG person at 55 of 82 anchors -- every line the MC spoke
+was attributed to Zach, every question the interviewer asked to her guest -- and summarized
+5.7 hours in 720 characters. Over the max-30 diarization, Astra with these instructions got
+67 of 82 right with **zero** wrong names (a prototype of the same rules: 70 and 69), the rest
+unresolved -- an interviewer nobody names, segments holding both a question and its answer,
+and the owner's reception turns, the one gap still open -- with a 17,000-character sectioned
+summary, in about ten minutes a run. Wrong names are worse than unresolved ones; that is the number to watch when this
+prompt changes. The harness is `scripts/voice_memo_speaker_benchmark.py`; its hand labels
+name real people and live outside the repo in `~/.config/pdw/voice-benchmark/`.
+
+**Validation issues never reach the agent.** `validate_enrichment_result` runs after the
+agent returns, and its issues are stored on the row (`raw_result_json.__validation_issues`)
+rather than sent back for a retry, so a check there is a measurement, not a guard. The
+agent sees only the JSON schema (`$PDW_VALIDATE_JSON`). A rule that must hold belongs in the
+prompt or in local post-processing.
 
 **That mart is the INPUT to transcription and enrichment, not only an output.** Both
 passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)

@@ -371,3 +371,56 @@ def test_a_transcript_is_never_rewritten_to_repair_a_misheard_term() -> None:
     assert clean_transcript_text("800 weighted grants from HackPad.") == (
         "800 weighted grants from HackPad."
     )
+
+
+def _word(text: str, start_s: float, end_s: float) -> dict:
+    return {"text": text, "start": int(start_s * 1000), "end": int(end_s * 1000), "confidence": 0.9, "speaker": "H"}
+
+
+def test_transcription_segment_rows_split_a_long_utterance_at_sentence_boundaries() -> None:
+    # Two people sharing a stage microphone can come back as ONE label and one
+    # multi-minute utterance. Sentence-sized segments are what lets the
+    # enrichment agent attribute the questions and the answers inside it.
+    words = []
+    t = 0.0
+    for sentence in range(12):  # 12 sentences x 10 s = 120 s, one utterance
+        for index in range(5):
+            text = f"w{sentence}_{index}" + ("?" if index == 4 and sentence % 2 == 0 else "." if index == 4 else "")
+            words.append(_word(text, t, t + 2))
+            t += 2
+    rows = transcription_segment_rows(
+        {"recording_id": "memo-1", "account": "a"},
+        {
+            "id": "tx-1",
+            "utterances": [
+                {"speaker": "H", "start": 0, "end": 120_000, "confidence": 0.9, "text": "...", "words": words},
+            ],
+        },
+        created_at=datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+    assert len(rows) > 1
+    assert {row["speaker_label"] for row in rows} == {"H"}
+    assert [row["segment_index"] for row in rows] == list(range(len(rows)))
+    assert rows[0]["start_ms"] == 0 and rows[-1]["end_ms"] == 120_000
+    for row in rows:
+        assert row["end_ms"] - row["start_ms"] <= 45_000
+        assert row["text"].endswith((".", "?"))
+    assert " ".join(row["text"] for row in rows) == " ".join(word["text"] for word in words)
+
+
+def test_transcription_segment_rows_keep_a_normal_utterance_whole() -> None:
+    words = [_word(f"w{i}.", i * 2, i * 2 + 2) for i in range(20)]  # 40 s
+    rows = transcription_segment_rows(
+        {"recording_id": "memo-1", "account": "a"},
+        {
+            "id": "tx-1",
+            "utterances": [
+                {"speaker": "A", "start": 0, "end": 40_000, "confidence": 0.9, "text": "Forty seconds.", "words": words},
+            ],
+        },
+        created_at=datetime(2026, 10, 4, tzinfo=UTC),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["text"] == "Forty seconds."

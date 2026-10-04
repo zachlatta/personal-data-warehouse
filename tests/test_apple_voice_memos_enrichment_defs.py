@@ -19,6 +19,7 @@ from personal_data_warehouse.defs.apple_voice_memos_enrichment import (
 )
 from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription
 from personal_data_warehouse.apple_voice_memos_enrichment import AGENT_ENRICHMENT_PROMPT_VERSION
+from personal_data_warehouse.config import AgentConfig
 
 
 def test_apple_voice_memos_enrichment_job_selects_asset() -> None:
@@ -60,6 +61,54 @@ def test_apple_voice_memos_enrichment_client_uses_configured_agent_over_unconfig
     )
 
     assert client._agent.docker_image == "pdw-agent:latest"
+
+
+def test_apple_voice_memos_enrichment_runs_on_astra_not_the_fleet_default(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_MODEL", raising=False)
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT", raising=False)
+
+    client = apple_voice_memos_enrichment_defs.apple_voice_memos_enrichment_client(
+        settings=FakeSettings(),
+        warehouse=object(),
+        logger=None,
+        agent=UNCONFIGURED_AGENT_RESOURCE,
+    )
+
+    assert apple_voice_memos_enrichment_defs.DEFAULT_VOICE_MEMOS_ENRICHMENT_MODEL == "gpt-6-astra"
+    assert client.model == "gpt-6-astra"
+    assert client._agent.model == "gpt-6-astra"
+    assert client._agent.reasoning_effort == "medium"
+
+
+def test_apple_voice_memos_enrichment_does_not_reuse_the_fleet_resource_when_the_model_differs(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_MODEL", raising=False)
+    fleet = apple_voice_memos_enrichment_defs.AgentResource.from_config(FakeSettings().agent)
+
+    client = apple_voice_memos_enrichment_defs.apple_voice_memos_enrichment_client(
+        settings=FakeSettings(),
+        warehouse=object(),
+        logger=None,
+        agent=fleet,
+    )
+
+    assert fleet.model == "gpt-agent"
+    assert client._agent.model == "gpt-6-astra"
+
+
+def test_apple_voice_memos_enrichment_model_and_effort_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_MODEL", "gpt-5.6-terra")
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT", "high")
+
+    client = apple_voice_memos_enrichment_defs.apple_voice_memos_enrichment_client(
+        settings=FakeSettings(),
+        warehouse=object(),
+        logger=None,
+        agent=UNCONFIGURED_AGENT_RESOURCE,
+    )
+
+    assert client.model == "gpt-5.6-terra"
+    assert client._agent.model == "gpt-5.6-terra"
+    assert client._agent.reasoning_effort == "high"
 
 
 def test_apple_voice_memos_defs_provides_default_agent_resource() -> None:
@@ -164,26 +213,22 @@ def test_apple_voice_memos_enrichment_backlog_sensor_launches_when_backlog_exist
 
 class FakeSettings:
     postgres_database_url = "postgresql://example"
-    agent = type(
-        "FakeAgentConfig",
-        (),
-        {
-            "provider": "codex",
-            "model": "gpt-agent",
-            "reasoning_effort": "medium",
-            "docker_image": "pdw-agent:latest",
-            "auth_volume": "auth-vol",
-            "runs_volume": "runs-vol",
-            "runs_dir": "/tmp/runs",
-            "docker_network": "bridge",
-            "docker_memory": "4g",
-            "docker_cpus": "2",
-            "docker_pids_limit": 512,
-            "timeout_seconds": 1800,
-            "tool_proxy_bind_host": "127.0.0.1",
-            "tool_proxy_public_host": "127.0.0.1",
-        },
-    )()
+    agent = AgentConfig(
+        provider="codex",
+        model="gpt-agent",
+        reasoning_effort="medium",
+        docker_image="pdw-agent:latest",
+        auth_volume="auth-vol",
+        runs_volume="runs-vol",
+        runs_dir="/tmp/runs",
+        docker_network="bridge",
+        docker_memory="4g",
+        docker_cpus="2",
+        docker_pids_limit=512,
+        timeout_seconds=1800,
+        tool_proxy_bind_host="127.0.0.1",
+        tool_proxy_public_host="127.0.0.1",
+    )
 
 
 class FakeWarehouse:

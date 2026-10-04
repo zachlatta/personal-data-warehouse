@@ -21,12 +21,26 @@ from personal_data_warehouse.apple_voice_memos_transcription import voice_record
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v8"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v9"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
 PROMPT_TRANSCRIPT_WITH_SEGMENTS_MAX_CHARS = 8_000
+# A bound, not a sample: the locally assembled transcript is built from these
+# rows, so a recording with more segments than this would silently lose its
+# tail. 2,000 is reachable once long utterances are stored sentence by sentence
+# (the 5.7-hour 2026-10-03 benchmark is ~1,350).
+TRANSCRIPT_SEGMENTS_READ_LIMIT = 20_000
+# A diarized label that speaks this long is a participant the agent must account
+# for in speaker_map, not an interjection.
+SUBSTANTIAL_SPEAKER_LABEL_MS = 60_000
+# A recording this long gets a sectioned summary that scales with its length:
+# the 2026-10-03 stage-talks benchmark (5.7 hours, a dozen speakers) was
+# summarized in 720 characters, which is no record of the day.
+SECTIONED_SUMMARY_MIN_MINUTES = 20
+SECTIONED_SUMMARY_CHARS_PER_MINUTE = 50
+SECTIONED_SUMMARY_MAX_REQUIRED_CHARS = 6_000
 PROMPT_TRANSCRIPT_WITHOUT_SEGMENTS_MAX_CHARS = 60_000
 PROMPT_CONTACT_ALIAS_HINTS_LIMIT = 20
 PROMPT_CONTACT_ALIAS_TERMS_LIMIT = 40
@@ -95,7 +109,6 @@ class ContainerAgentStructuredClient:
         min_tool_calls: int = 0,
         require_tool_call: bool = False,
         result_validator: Callable[[Mapping[str, Any]], Sequence[str]] | None = None,
-        max_validation_retries: int = 2,
         input_files: Mapping[str, str] | None = None,
         logger=None,
         recording_id: str = "",
@@ -459,7 +472,7 @@ def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[di
           AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
           AND provider = 'assemblyai'
         ORDER BY segment_index
-        LIMIT 2000
+        LIMIT {TRANSCRIPT_SEGMENTS_READ_LIMIT}
         """
     )
     return [
@@ -1631,6 +1644,8 @@ def validate_enrichment_result(
             )
 
     issues.extend(speaker_turn_issues(result, transcript_segments))
+    issues.extend(speaker_coverage_issues(transcript_segments=transcript_segments, result=result))
+    issues.extend(summary_length_issues(transcript_segments=transcript_segments, result=result))
 
     prefix_names = corrected_transcript_prefixes(transcript)
     resolved_prefix_names = [*speaker_names, *participant_names]
@@ -1669,6 +1684,56 @@ def validate_enrichment_result(
     return issues
 
 
+def speaker_label_durations_ms(transcript_segments: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    durations: dict[str, int] = {}
+    for segment in transcript_segments:
+        label = str(segment.get("speaker_label") or "")
+        if not label:
+            continue
+        start = _int_or_none(segment.get("start_ms")) or 0
+        end = _int_or_none(segment.get("end_ms")) or 0
+        durations[label] = durations.get(label, 0) + max(0, end - start)
+    return durations
+
+
+def speaker_coverage_issues(
+    *,
+    transcript_segments: Sequence[Mapping[str, Any]],
+    result: Mapping[str, Any],
+) -> list[str]:
+    durations = speaker_label_durations_ms(transcript_segments)
+    mapped = {
+        str(item.get("speaker_label") or "") for item in result.get("speaker_map", []) if isinstance(item, Mapping)
+    }
+    missing = sorted(
+        label for label, duration in durations.items() if duration >= SUBSTANTIAL_SPEAKER_LABEL_MS and label not in mapped
+    )
+    if not missing:
+        return []
+    return [
+        f"speaker_map is missing diarized labels {missing}; every label that speaks for a minute or more needs a speaker_map entry (a name, or a clean mixed/unresolved label)"
+    ]
+
+
+def summary_length_issues(
+    *,
+    transcript_segments: Sequence[Mapping[str, Any]],
+    result: Mapping[str, Any],
+) -> list[str]:
+    duration_ms = max((_int_or_none(segment.get("end_ms")) or 0 for segment in transcript_segments), default=0)
+    minutes = duration_ms // 60_000
+    if minutes < SECTIONED_SUMMARY_MIN_MINUTES:
+        return []
+    required = min(SECTIONED_SUMMARY_MAX_REQUIRED_CHARS, minutes * SECTIONED_SUMMARY_CHARS_PER_MINUTE)
+    summary = str(result.get("summary") or "").strip()
+    if len(summary) >= required:
+        return []
+    return [
+        f"summary is too short for a {minutes}-minute recording: {len(summary)} chars, need at least {required}; "
+        "write a sectioned summary with one section per session, naming who spoke and their key points"
+    ]
+
+
 def incomplete_enrichment_person_names(names: Any) -> list[str]:
     if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
         return []
@@ -1699,7 +1764,7 @@ def ambiguous_enrichment_person_name(name: str) -> bool:
             return True
         if unresolved_speaker_name_contains_person_guess(name):
             return True
-        if " or " in normalized:
+        if " or " in normalized.replace(" mixed or unresolved ", " mixed/unresolved "):
             return True
         return bool(re.search(r"\b[A-Z][a-z]+ [A-Z][a-z]+\s*/\s*[A-Z][a-z]+ [A-Z][a-z]+", name))
     return " or " in normalized or "/" in name
@@ -2211,7 +2276,13 @@ def enrichment_instructions() -> list[str]:
         "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
         "Diarization merges people when there are more speakers than it can separate: a stage event, panel, conference or talk series often gives several speakers one speaker_label. When a label carries more than one person, keep it mixed/unresolved in speaker_map and split it with speaker_turns: contiguous diarized segment_index ranges, each with the one verified person speaking. Find the boundaries from on-stage introductions and handoffs ('please welcome NAME', 'thank you, NAME', 'next up'), self-introductions, and the selected calendar event's agenda, description or speaker list, which give the order of speakers; search the warehouse for the event's agenda when the calendar description lacks it.",
         "Every speaker_turns entry needs confidence of at least 0.9 to be applied; ranges must not overlap and must use segment_index values present in diarized_segments. Leave a stretch out of speaker_turns rather than guess. Use an empty speaker_turns list when speaker_map already attributes every turn. speaker_turns matters most for long recordings, whose transcript the pipeline assembles locally from diarized_segments.",
-        f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, domain-term evidence, summary, and action items.",
+        "Every diarized speaker_label that speaks for a minute or more needs a speaker_map entry: a verified name, or a clean mixed/unresolved label.",
+        "Long recordings often hold several sessions: talks, interviews, panels, breaks, and side conversations. Before naming anyone, split the recording into sessions by time using introductions, handoffs, applause, and topic changes, and write down each session's start offset and who was introduced. Labels are clustered across the whole file, so one label can be different people in different sessions; attribute speakers session by session.",
+        "An on-stage introduction ('next up we have NAME, interviewed by NAME') names who speaks in the following session: the interviewer asks the questions and the guest gives the long answers. Use that question/answer shape, not the label alone, to tell interviewer from guest.",
+        "When one label holds two people inside a session (an interviewer and a guest sharing stage microphones is common), write one speaker_turns entry per turn: each question's segment range to the interviewer and each answer's range to the guest. Long utterances are already split into sentence-sized segments for this. A range spanning both people's turns attributes one person's words to the other.",
+        "A speaker introduced by first name only (on stage, in a greeting, or by a host) whose surname you cannot verify is named by that first name exactly as introduced, for example 'Sam', in speaker_map and speaker_turns. That is accurate; leaving every one of their turns unresolved is not. participants still needs full names, so put them in evidence instead.",
+        "Zach Latta is the recording owner and is usually closest to the microphone. In breaks, receptions, and side conversations his label also holds other people's turns, so name his identifiable turns (first-person statements about Hack Club, self-introductions, his own plans) with speaker_turns rather than leaving the whole label unresolved.",
+        f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, speaker_turns, domain-term evidence, summary, and action items.",
         "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
         "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
         "Use full resolved person names as turn prefixes, for example 'Person One:' instead of 'Person:'.",
@@ -2220,6 +2291,7 @@ def enrichment_instructions() -> list[str]:
         "Only replace an original diarization label with a real person name when local turn evidence or stable speaker_map evidence supports it. If a label is mixed, unstable, or below 0.9 confidence, speaker_map should say mixed/unresolved, while transcript may still use real names for individual turns that have strong local evidence.",
         "Write transcript as a faithful speaker-labeled transcript. Correct obvious ASR errors, names, punctuation, and paragraph breaks, but do not summarize, reorder, omit substantive sections, merge unrelated turns, or convert the transcript into prose notes.",
         "Create a concise useful title.",
+        f"Scale summary to the recording. A short note gets one or two sentences. A recording of {SECTIONED_SUMMARY_MIN_MINUTES} minutes or more gets a sectioned summary: one section per session in chronological order, each opening with its offset and who spoke (for example '0:18 - Guest Name interviewed by Host Name'), then the key arguments, claims, numbers, decisions, and follow-ups from that session attributed to named speakers. Aim for roughly {SECTIONED_SUMMARY_CHARS_PER_MINUTE} characters per recorded minute, at least {SECTIONED_SUMMARY_MIN_MINUTES * SECTIONED_SUMMARY_CHARS_PER_MINUTE} characters.",
         "Extract participants and action items.",
     ]
 
@@ -2390,7 +2462,7 @@ def enrichment_schema() -> dict[str, Any]:
                         },
                         "speaker_name": {
                             "type": "string",
-                            "description": "Verified full name of the person speaking in these segments.",
+                            "description": "Verified full name of the person speaking in these segments, or the first name exactly as introduced when no surname can be verified.",
                         },
                         "confidence": {
                             "type": "number",

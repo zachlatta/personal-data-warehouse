@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 
 from dagster import (
@@ -38,6 +39,14 @@ DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 10
 VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 60
 VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV = "VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION"
 VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS"
+VOICE_MEMOS_ENRICHMENT_MODEL_ENV = "VOICE_MEMOS_ENRICHMENT_MODEL"
+VOICE_MEMOS_ENRICHMENT_EFFORT_ENV = "VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT"
+# Voice enrichment runs on GPT-6 Astra, not the fleet default (AGENT_MODEL,
+# gpt-5.6-sol in production): a multi-hour, many-speaker recording needs the
+# agent to attribute speakers across hundreds of turns and research every
+# name, and that is where the stronger model earns its cost. Override
+# per-deployment with VOICE_MEMOS_ENRICHMENT_MODEL / _REASONING_EFFORT.
+DEFAULT_VOICE_MEMOS_ENRICHMENT_MODEL = "gpt-6-astra"
 UNCONFIGURED_AGENT_RESOURCE = AgentResource.disabled()
 
 
@@ -162,14 +171,30 @@ def apple_voice_memos_enrichment_max_error_attempts() -> int:
     return attempts
 
 
+def voice_memo_agent_config(base):
+    """The fleet AgentConfig with the voice-memo model/effort applied."""
+    model = os.getenv(VOICE_MEMOS_ENRICHMENT_MODEL_ENV, "").strip() or DEFAULT_VOICE_MEMOS_ENRICHMENT_MODEL
+    effort = os.getenv(VOICE_MEMOS_ENRICHMENT_EFFORT_ENV, "").strip() or base.reasoning_effort
+    if model == base.model and effort == base.reasoning_effort:
+        return base
+    return dataclasses.replace(base, model=model, reasoning_effort=effort)
+
+
 def apple_voice_memos_enrichment_client(*, settings, warehouse, logger, agent: AgentResource | None = None):
     if settings.agent is None:
         raise RuntimeError("Agent runner is not configured")
-    agent_resource = agent if agent is not None and agent.is_configured else agent_resource_from_settings(settings)
+    config = voice_memo_agent_config(settings.agent)
+    if config is settings.agent and agent is not None and agent.is_configured:
+        agent_resource = agent
+    else:
+        # The injected fleet resource carries the fleet model and effort, so a
+        # voice-specific config needs its own resource.
+        agent_resource = AgentResource.from_config(config)
     return ContainerAgentStructuredClient(
         agent=agent_resource,
-        provider=settings.agent.provider,
-        model=settings.agent.model,
+        provider=config.provider,
+        # Recorded as the enrichment row's model -- must match what runs.
+        model=config.model,
         warehouse=warehouse,
         logger=logger,
     )

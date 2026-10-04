@@ -32,6 +32,16 @@ DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS = {"min_speakers_expected": 1, "max_speakers_
 # speakers, five labels -- is the case this exists for.
 LONG_RECORDING_MIN_SECONDS = 30 * 60
 LONG_RECORDING_MAX_SPEAKERS_EXPECTED = 30
+# Diarization can return two people who share a microphone as one label and one
+# multi-minute utterance (the 2026-10-03 stage talks: an interviewer and her
+# guest, 12.5 minutes, one label under every speaker_options setting tried).
+# Utterances longer than this are stored as sentence-bounded segments with the
+# same label, so the enrichment agent's speaker_turns can split the people
+# inside them.
+LONG_UTTERANCE_SPLIT_MS = 60_000
+SPLIT_SEGMENT_TARGET_MS = 8_000
+SPLIT_SEGMENT_MAX_MS = 45_000
+SENTENCE_END_CHARACTERS = (".", "?", "!")
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
 ASSEMBLYAI_KEYTERMS_PROMPT = (
     "Hack Club",
@@ -422,28 +432,68 @@ def transcription_segment_rows(
             }
         ]
     rows: list[dict[str, Any]] = []
-    for index, utterance in enumerate(utterances):
+    for utterance in utterances:
         if not isinstance(utterance, Mapping):
             continue
-        rows.append(
+        for piece in split_long_utterance(utterance):
+            rows.append(
+                {
+                    "source": voice_recording_source(recording),
+                    "account": str(recording.get("account", "")),
+                    "recording_id": str(recording.get("recording_id", "")),
+                    "provider": ASSEMBLYAI_PROVIDER,
+                    "provider_transcript_id": str(result.get("id", "")),
+                    "segment_index": len(rows),
+                    "speaker_label": str(piece.get("speaker", "") or ""),
+                    "start_ms": int(piece.get("start", 0) or 0),
+                    "end_ms": int(piece.get("end", 0) or 0),
+                    "confidence": float(piece.get("confidence", 0) or 0),
+                    "text": clean_transcript_text(str(piece.get("text", "") or "")),
+                    "words_json": json.dumps(piece.get("words") or [], sort_keys=True, separators=(",", ":")),
+                    "created_at": created_at,
+                    "sync_version": int(created_at.timestamp() * 1_000_000),
+                }
+            )
+    return rows
+
+
+def split_long_utterance(utterance: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Split an over-long utterance into sentence-bounded pieces with its label.
+
+    A piece closes at the first sentence end once it is SPLIT_SEGMENT_TARGET_MS
+    long, and never grows past SPLIT_SEGMENT_MAX_MS. The pieces' words, in order,
+    are exactly the utterance's words, so no text is lost or reordered.
+    """
+    start = int(utterance.get("start", 0) or 0)
+    end = int(utterance.get("end", 0) or 0)
+    words = [word for word in utterance.get("words") or [] if isinstance(word, Mapping)]
+    if end - start <= LONG_UTTERANCE_SPLIT_MS or not words:
+        return [utterance]
+    chunks: list[list[Mapping[str, Any]]] = [[]]
+    for word in words:
+        current = chunks[-1]
+        if current and int(word.get("end", 0) or 0) - int(current[0].get("start", 0) or 0) > SPLIT_SEGMENT_MAX_MS:
+            chunks.append([word])
+            continue
+        current.append(word)
+        duration = int(word.get("end", 0) or 0) - int(current[0].get("start", 0) or 0)
+        if duration >= SPLIT_SEGMENT_TARGET_MS and str(word.get("text", "")).rstrip().endswith(SENTENCE_END_CHARACTERS):
+            chunks.append([])
+    chunks = [chunk for chunk in chunks if chunk]
+    pieces: list[Mapping[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        confidences = [float(word.get("confidence", 0) or 0) for word in chunk]
+        pieces.append(
             {
-                "source": voice_recording_source(recording),
-                "account": str(recording.get("account", "")),
-                "recording_id": str(recording.get("recording_id", "")),
-                "provider": ASSEMBLYAI_PROVIDER,
-                "provider_transcript_id": str(result.get("id", "")),
-                "segment_index": index,
-                "speaker_label": str(utterance.get("speaker", "") or ""),
-                "start_ms": int(utterance.get("start", 0) or 0),
-                "end_ms": int(utterance.get("end", 0) or 0),
-                "confidence": float(utterance.get("confidence", 0) or 0),
-                "text": clean_transcript_text(str(utterance.get("text", "") or "")),
-                "words_json": json.dumps(utterance.get("words") or [], sort_keys=True, separators=(",", ":")),
-                "created_at": created_at,
-                "sync_version": int(created_at.timestamp() * 1_000_000),
+                "speaker": utterance.get("speaker", ""),
+                "start": start if index == 0 else int(chunk[0].get("start", 0) or 0),
+                "end": end if index == len(chunks) - 1 else int(chunk[-1].get("end", 0) or 0),
+                "confidence": sum(confidences) / len(confidences),
+                "text": " ".join(str(word.get("text", "")) for word in chunk),
+                "words": chunk,
             }
         )
-    return rows
+    return pieces
 
 
 SPEAKER_MARKUP_RE = re.compile(r"\[Speaker(?::[^\]]+)?\]\s*", re.IGNORECASE)
