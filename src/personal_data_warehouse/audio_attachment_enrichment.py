@@ -233,11 +233,22 @@ class AudioAttachmentTranscriptionRunner:
             path = Path(directory) / _safe_audio_filename(str(candidate.get("filename", "")))
             path.write_bytes(content)
             transcription_result = self._transcription_client.transcribe_file(path=path, content_type=mime_type)
+        transcription_model = str(transcription_result.get("speech_model_used") or "")
         raw_transcript = clean_transcript_text(str(transcription_result.get("text", "") or ""))
 
         if not raw_transcript:
             self._warehouse.insert_attachment_enrichments(
-                [self._enrichment_row(candidate, text="", status=STATUS_NOT_USEFUL, error="", prompt="", result=None)]
+                [
+                    self._enrichment_row(
+                        candidate,
+                        text="",
+                        status=STATUS_NOT_USEFUL,
+                        error="",
+                        prompt="",
+                        result=None,
+                        transcription_model=transcription_model,
+                    )
+                ]
             )
             return STATUS_NOT_USEFUL
 
@@ -275,6 +286,7 @@ class AudioAttachmentTranscriptionRunner:
                     error="",
                     prompt=prompt,
                     result=result,
+                    transcription_model=transcription_model,
                 )
             ]
         )
@@ -313,6 +325,7 @@ class AudioAttachmentTranscriptionRunner:
         error: str,
         prompt: str,
         result: AgentRunResult | None,
+        transcription_model: str = "",
     ) -> dict[str, Any]:
         updated_at = self._now()
         elapsed_ms = 0
@@ -336,6 +349,7 @@ class AudioAttachmentTranscriptionRunner:
             "ai_processed_at": processed_at,
             "updated_at": updated_at,
             "sync_version": int(updated_at.timestamp() * 1000),
+            "transcription_model": transcription_model,
         }
 
     def _record_agent_result(self, result: AgentRunResult) -> None:

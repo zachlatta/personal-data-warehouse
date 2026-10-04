@@ -426,14 +426,171 @@ def test_segment_preserving_fallback_rebuilds_compressed_transcript_with_opening
     )
 
     corrected = result["transcript"]
+    # A mixed label stays unresolved however its evidence leans: "mostly
+    # consistent with Morgan Lee" at 0.5 is the shape that put 302 turns of a
+    # multi-speaker stage event under one organizer's name.
     assert corrected.splitlines()[:5] == [
         "Alex Rivera: Hey, Priya.",
         "Alex Rivera: Hey, how are you?",
         "Priya Narayan: I'm doing great. How are you, Alex?",
         "Alex Rivera: I'm good.",
-        "Morgan Lee: We have 33 centers.",
+        "A (mixed/unresolved): We have 33 centers.",
     ]
     assert any("too compressed" in issue for issue in result["__validation_issues"])
+
+
+def stage_event_segments() -> list[dict]:
+    return [
+        {"segment_index": 0, "speaker_label": "A", "text": "Welcome, everyone. Please welcome our first speaker."},
+        {"segment_index": 1, "speaker_label": "C", "text": "Thank you. I want to talk about open science."},
+        {"segment_index": 2, "speaker_label": "C", "text": "Funding should follow the work."},
+        {"segment_index": 3, "speaker_label": "A", "text": "Thank you. Next up is our second speaker."},
+        {"segment_index": 4, "speaker_label": "C", "text": "Thanks. My talk is about civic institutions."},
+        {"segment_index": 5, "speaker_label": "C", "text": "And how they decay."},
+    ]
+
+
+def test_speaker_turns_split_one_mixed_label_into_the_people_who_spoke() -> None:
+    """Diarization gave three stage speakers one label; the agenda tells them apart.
+
+    speaker_map can only say a label is mixed. speaker_turns lets the agent put
+    a verified person on a contiguous run of segments -- from on-stage
+    introductions and the event agenda -- and local assembly applies it.
+    """
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=stage_event_segments(),
+        result={
+            "participants": ["Morgan Lee", "Riley Chen", "Jordan Ellis"],
+            "speaker_map": [
+                {"speaker_label": "A", "speaker_name": "Morgan Lee", "confidence": 0.95, "evidence": "host"},
+                {
+                    "speaker_label": "C",
+                    "speaker_name": "Unresolved mixed speaker (label C)",
+                    "confidence": 0.3,
+                    "evidence": "every stage speaker",
+                },
+            ],
+            "speaker_turns": [
+                {
+                    "start_segment_index": 1,
+                    "end_segment_index": 2,
+                    "speaker_name": "Riley Chen",
+                    "confidence": 0.95,
+                    "evidence": "introduced as the first speaker; agenda order",
+                },
+                {
+                    "start_segment_index": 4,
+                    "end_segment_index": 5,
+                    "speaker_name": "Jordan Ellis",
+                    "confidence": 0.93,
+                    "evidence": "introduced second; talk title matches the agenda",
+                },
+            ],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [],
+        },
+    )
+
+    assert result["transcript"].splitlines() == [
+        "Morgan Lee: Welcome, everyone. Please welcome our first speaker.",
+        "Riley Chen: Thank you. I want to talk about open science.",
+        "Riley Chen: Funding should follow the work.",
+        "Morgan Lee: Thank you. Next up is our second speaker.",
+        "Jordan Ellis: Thanks. My talk is about civic institutions.",
+        "Jordan Ellis: And how they decay.",
+    ]
+
+
+def test_speaker_turns_below_the_confidence_bar_or_unresolved_do_not_name_anyone() -> None:
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=stage_event_segments(),
+        result={
+            "participants": ["Morgan Lee", "Riley Chen"],
+            "speaker_map": [
+                {"speaker_label": "A", "speaker_name": "Morgan Lee", "confidence": 0.95, "evidence": "host"},
+                {"speaker_label": "C", "speaker_name": "Unresolved speaker (label C)", "confidence": 0.3, "evidence": "mixed"},
+            ],
+            "speaker_turns": [
+                {
+                    "start_segment_index": 1,
+                    "end_segment_index": 2,
+                    "speaker_name": "Riley Chen",
+                    "confidence": 0.6,
+                    "evidence": "a guess",
+                },
+                {
+                    "start_segment_index": 4,
+                    "end_segment_index": 5,
+                    "speaker_name": "Unresolved speaker",
+                    "confidence": 0.95,
+                    "evidence": "unknown",
+                },
+            ],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [],
+        },
+    )
+
+    prefixes = [line.split(":", 1)[0] for line in result["transcript"].splitlines()]
+    assert prefixes == [
+        "Morgan Lee",
+        "Unresolved speaker (label C)",
+        "Unresolved speaker (label C)",
+        "Morgan Lee",
+        "Unresolved speaker (label C)",
+        "Unresolved speaker (label C)",
+    ]
+
+
+def test_validate_flags_speaker_turns_that_do_not_fit_the_segments() -> None:
+    issues = validate_enrichment_result(
+        recording={"transcript_text": "short"},
+        transcript_segments=stage_event_segments(),
+        result={
+            "title": "t",
+            "start_at": "2026-10-03T23:00:00Z",
+            "end_at": "2026-10-04T02:00:00Z",
+            "participants": ["Riley Chen", "Jordan Ellis"],
+            "speaker_map": [],
+            "speaker_turns": [
+                {"start_segment_index": 2, "end_segment_index": 1, "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "e"},
+                {"start_segment_index": 4, "end_segment_index": 99, "speaker_name": "Jordan Ellis", "confidence": 0.95, "evidence": "e"},
+                {"start_segment_index": 0, "end_segment_index": 1, "speaker_name": "Riley Chen", "confidence": 0.95, "evidence": "e"},
+                {"start_segment_index": 1, "end_segment_index": 3, "speaker_name": "Jordan Ellis", "confidence": 0.95, "evidence": "e"},
+            ],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+        },
+    )
+
+    turn_issues = [issue for issue in issues if issue.startswith("speaker_turns")]
+    assert any("start_segment_index 2 is after end_segment_index 1" in issue for issue in turn_issues)
+    assert any("segment_index 99" in issue for issue in turn_issues)
+    assert any("overlap" in issue for issue in turn_issues)
+
+
+def test_enrichment_schema_requires_speaker_turns() -> None:
+    schema = enrichment_schema()
+    turns = schema["properties"]["speaker_turns"]
+    assert "speaker_turns" in schema["required"]
+    assert turns["type"] == "array"
+    item = turns["items"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == set(item["properties"]) == {
+        "start_segment_index",
+        "end_segment_index",
+        "speaker_name",
+        "confidence",
+        "evidence",
+    }
+
+
+def test_enrichment_prompt_teaches_turn_level_speakers_from_the_agenda() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+    assert "speaker_turns" in prompt
+    assert "agenda" in prompt
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v8"
 
 
 def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> None:

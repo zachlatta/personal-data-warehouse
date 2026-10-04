@@ -239,6 +239,9 @@ def test_runner_transcribes_and_cleans_up_voice_message() -> None:
     assert row["ai_prompt_version"] == "apple-messages-audio-agent-v1"
     assert row["text_extraction_status"] == STATUS_OK
     assert "dinner tonight" in row["text"]
+    # The speech model is not part of the identity, but it is recorded: which
+    # AssemblyAI model heard the audio is an answerable question.
+    assert row["transcription_model"] == "universal-3-5-pro"
 
 
 def test_enrich_candidate_never_joins_untrusted_filename_into_path() -> None:

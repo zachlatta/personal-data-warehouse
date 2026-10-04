@@ -666,6 +666,160 @@ def test_a_segment_from_a_superseded_transcript_does_not_borrow_the_new_runs_mod
     assert [row["transcript_model"] for row in segments] == [None, None]
 
 
+def test_untranscribed_candidates_carry_the_recording_duration(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The speaker ceiling is chosen per recording, so the duration must reach the runner."""
+    _seed_voice_memos(warehouse)
+    warehouse.insert_apple_voice_memos_files(
+        [
+            _row(
+                VOICE_MEMO_FILE_COLUMNS,
+                account="zach",
+                recording_id="rec-long",
+                filename="long.m4a",
+                content_type="audio/mp4",
+                content_sha256="sha-long",
+                size_bytes=1000,
+                recorded_at=TS,
+                raw_metadata_json='{"recording": {"duration_seconds": 20394.5}}',
+                ingested_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+
+    candidates = {
+        row["recording_id"]: row
+        for row in warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=50)
+    }
+    assert float(candidates["rec-long"]["duration_seconds"]) == 20394.5
+
+
+def test_replacing_a_recordings_segments_drops_the_superseded_transcripts_segments(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A re-transcription with fewer segments must not leave the old tail behind.
+
+    Segments are keyed by segment_index, so an upsert of a 3-segment transcript
+    over a 585-segment one would leave segments 3..584 of the old transcript in
+    place -- and the enrichment agent reads every segment for the recording.
+    """
+    _seed_voice_memos(warehouse)
+    warehouse.replace_voice_recording_transcript_segments(
+        source="apple_voice_memos",
+        account="zach",
+        recording_id="rec-1",
+        provider="assemblyai",
+        provider_transcript_id="tid-new",
+        rows=[
+            _row(
+                VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id="rec-1",
+                provider="assemblyai",
+                provider_transcript_id="tid-new",
+                segment_index=0,
+                speaker_label="C",
+                start_ms=0,
+                end_ms=500,
+                confidence=0.95,
+                text="fresh",
+                created_at=TS,
+                sync_version=2,
+            )
+        ],
+    )
+
+    rows = warehouse._query(
+        "SELECT segment_index, provider_transcript_id, text FROM @apple_voice_memos_transcript_segments "
+        "WHERE recording_id = 'rec-1' ORDER BY segment_index"
+    )
+    assert rows == [(0, "tid-new", "fresh")]
+
+
+def test_a_recording_transcribed_again_after_its_enrichment_is_enriched_again(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Re-transcription flows on to enrichment without a prompt-version bump.
+
+    The enrichment was keyed only by the audio's hash, so a better transcript of
+    the same audio left the summary, speakers and participants built from the
+    old one forever.
+    """
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_enrichment_candidates
+
+    _seed_voice_memos(warehouse)
+
+    def candidates() -> set[str]:
+        return {
+            row["recording_id"]
+            for row in load_enrichment_candidates(
+                warehouse, provider="agent", prompt_version="v2", limit=None, max_error_attempts=0
+            )
+        }
+
+    def transcribe(completed_at: datetime) -> None:
+        warehouse.insert_apple_voice_memos_transcription_runs(
+            [
+                _row(
+                    VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                    source="apple_voice_memos",
+                    account="zach",
+                    recording_id="rec-1",
+                    content_sha256="sha-1",
+                    provider="assemblyai",
+                    provider_transcript_id="tid-1",
+                    status="completed",
+                    transcript_text="run transcript",
+                    requested_at=completed_at,
+                    completed_at=completed_at,
+                    sync_version=int(completed_at.timestamp()),
+                )
+            ]
+        )
+
+    # rec-1's newest enrichment was created 2026-08-03; a transcript from
+    # before it is the one it consumed.
+    transcribe(datetime(2026, 8, 1, tzinfo=UTC))
+    assert "rec-1" not in candidates()
+
+    transcribe(datetime(2026, 10, 4, tzinfo=UTC))
+    assert "rec-1" in candidates()
+
+
+def test_attachment_enrichments_record_the_speech_model(
+    warehouse: PostgresWarehouse,
+) -> None:
+    from personal_data_warehouse.schema import ATTACHMENT_ENRICHMENT_COLUMNS
+
+    warehouse.ensure_file_attachment_enrichment_tables()
+    warehouse.insert_attachment_enrichments(
+        [
+            _row(
+                ATTACHMENT_ENRICHMENT_COLUMNS,
+                content_sha256="audio-sha",
+                ai_provider="agent_codex",
+                ai_model="",
+                ai_prompt_version="apple-messages-audio-agent-v1",
+                transcription_model="universal-3-5-pro",
+                updated_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    rows = warehouse._query(
+        "SELECT transcription_model FROM @file_attachment_enrichments WHERE content_sha256 = 'audio-sha'"
+    )
+    assert rows == [("universal-3-5-pro",)]
+
+    # A warehouse created before the column existed gains it on the next ensure.
+    warehouse._command("ALTER TABLE @file_attachment_enrichments DROP COLUMN transcription_model")
+    warehouse.ensure_file_attachment_enrichment_tables()
+    assert "transcription_model" in _columns(warehouse, "file_attachment_enrichments")
+
+
 def test_calendar_transcript_views_read_the_voice_memo_mart(
     warehouse: PostgresWarehouse,
 ) -> None:

@@ -23,6 +23,15 @@ ASSEMBLYAI_PROVIDER = "assemblyai"
 # own default chain. Universal-3 Pro is superseded and deliberately absent.
 ASSEMBLYAI_SPEECH_MODELS = ("universal-3-5-pro", "universal-2")
 DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS = {"min_speakers_expected": 1, "max_speakers_expected": 8}
+# max_speakers_expected is a HARD ceiling: AssemblyAI merges every speaker past
+# it into an existing label. The configured ceiling (8) suits a conversation,
+# where a high ceiling over-splits one voice; a long recording is where a stage
+# event, a panel or a conference session lives, and there the low ceiling
+# guarantees mixed labels. 30 is AssemblyAI's own default for audio over ten
+# minutes. The 5.7-hour stage-talks recording of 2026-10-03 -- ten named
+# speakers, five labels -- is the case this exists for.
+LONG_RECORDING_MIN_SECONDS = 30 * 60
+LONG_RECORDING_MAX_SPEAKERS_EXPECTED = 30
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
 ASSEMBLYAI_KEYTERMS_PROMPT = (
     "Hack Club",
@@ -78,9 +87,14 @@ class AssemblyAIClient:
         self._sleep = sleep
         self._headers = {"authorization": api_key}
 
-    def transcribe_file(self, *, path: Path, content_type: str) -> Mapping[str, Any]:
+    def transcribe_file(
+        self, *, path: Path, content_type: str, duration_seconds: float | None = None
+    ) -> Mapping[str, Any]:
         upload_url = self.upload_file(path=path, content_type=content_type)
-        transcript_id = self.submit_transcript(audio_url=upload_url)
+        transcript_id = self.submit_transcript(
+            audio_url=upload_url,
+            speaker_options=assemblyai_speaker_options(self._speaker_options, duration_seconds=duration_seconds),
+        )
         return self.poll_transcript(transcript_id=transcript_id)
 
     def upload_file(self, *, path: Path, content_type: str) -> str:
@@ -98,11 +112,11 @@ class AssemblyAIClient:
             raise RuntimeError("AssemblyAI upload response did not include upload_url")
         return upload_url
 
-    def submit_transcript(self, *, audio_url: str) -> str:
+    def submit_transcript(self, *, audio_url: str, speaker_options: Mapping[str, int]) -> str:
         response = self._session.post(
             f"{self._base_url}/v2/transcript",
             headers={**self._headers, "content-type": "application/json"},
-            json=assemblyai_transcript_request(audio_url=audio_url, speaker_options=self._speaker_options),
+            json=assemblyai_transcript_request(audio_url=audio_url, speaker_options=speaker_options),
             timeout=self._timeout_seconds,
         )
         _raise_for_status_with_body(response)
@@ -159,6 +173,19 @@ def _raise_for_status_with_body(response) -> None:
                 body = f"{body[:MAX_ASSEMBLYAI_ERROR_BODY_CHARS]}...<truncated>"
             raise RuntimeError(f"{exc}; response_body={body}") from exc
         raise
+
+
+def assemblyai_speaker_options(
+    configured: Mapping[str, int], *, duration_seconds: float | None
+) -> dict[str, int]:
+    """The diarization range for one recording: the configured one, widened when long."""
+    options = dict(configured)
+    if duration_seconds is None or float(duration_seconds) < LONG_RECORDING_MIN_SECONDS:
+        return options
+    options["max_speakers_expected"] = max(
+        int(options.get("max_speakers_expected") or 0), LONG_RECORDING_MAX_SPEAKERS_EXPECTED
+    )
+    return options
 
 
 def assemblyai_transcript_request(
@@ -248,13 +275,21 @@ class VoiceMemosTranscriptionRunner:
                     result = self._transcription_client.transcribe_file(
                         path=path,
                         content_type=str(recording.get("content_type", "")),
+                        duration_seconds=recording_duration_seconds(recording),
                     )
                 completed_at = self._now()
                 self._warehouse.insert_apple_voice_memos_transcription_runs(
                     [transcription_run_row(recording, result, requested_at=requested_at, completed_at=completed_at)]
                 )
                 segment_rows = transcription_segment_rows(recording, result, created_at=completed_at)
-                self._warehouse.insert_apple_voice_memos_transcript_segments(segment_rows)
+                self._warehouse.replace_voice_recording_transcript_segments(
+                    source=voice_recording_source(recording),
+                    account=str(recording.get("account", "")),
+                    recording_id=recording_id,
+                    provider=self._provider,
+                    provider_transcript_id=str(result.get("id", "")),
+                    rows=segment_rows,
+                )
                 transcribed += 1
                 segments_written += len(segment_rows)
                 self._logger.info(
@@ -299,6 +334,16 @@ def voice_recording_source(recording: Mapping[str, Any]) -> str:
     without a source can only have come from the pre-multi-source path.
     """
     return str(recording.get("source", "") or DEFAULT_VOICE_RECORDING_SOURCE)
+
+
+def recording_duration_seconds(recording: Mapping[str, Any]) -> float | None:
+    value = recording.get("duration_seconds")
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def transcription_run_row(

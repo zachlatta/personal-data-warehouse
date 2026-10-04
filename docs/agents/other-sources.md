@@ -177,6 +177,10 @@ it is not transcribed twice. Slack rows carry `storage_backend = 'slack'` and a 
 `storage_url` rather than claiming object-store residency; the fingerprint candidate scan
 reads this mart and the existing Slack fetcher retrieves the bytes. `ALLOWED_RAW_ATTACHMENT_SOURCES` in
 `tests/test_repo_contracts.py` is empty on purpose; adding an entry re-opens the hole.
+An audio enrichment (iMessage and WhatsApp voice notes) records the AssemblyAI speech model
+that heard the audio in `file_attachment_enrichments.transcription_model`. The model is
+recorded but is not part of the key: the AI model, provider and prompt version are the
+identity, and every non-audio row stores `''`.
 
 `gmail_attachment_enrichments` was renamed to `file_attachment_enrichments` and generalized into
 a single source-agnostic enrichment pipeline (`file_attachment_enrichment.py`). To add a new

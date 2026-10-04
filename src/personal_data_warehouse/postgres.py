@@ -3151,6 +3151,7 @@ class PostgresWarehouse:
                 "file_attachment_enrichments",
             ]
         )
+        self._ensure_file_attachment_enrichment_columns()
         for column in ("storage_backend", "storage_key", "storage_file_id", "storage_url", "storage_status"):
             self._command(
                 f"ALTER TABLE @gmail_attachments ADD COLUMN IF NOT EXISTS {_identifier(column)} text NOT NULL DEFAULT ''"
@@ -3166,6 +3167,7 @@ class PostgresWarehouse:
         results without depending on any one source's ensure_* path.
         """
         self._ensure_table_group(["file_attachment_enrichments"])
+        self._ensure_file_attachment_enrichment_columns()
         self._ensure_search_views_if_possible()
 
     def ensure_calendar_tables(self) -> None:
@@ -8834,7 +8836,31 @@ class PostgresWarehouse:
         return {str(row[0]): dict(zip(columns, row, strict=True)) for row in rows}
 
     def insert_attachment_enrichments(self, rows: list[dict[str, Any]]) -> None:
+        # Only audio enrichments have a speech model; every other writer
+        # (vision, text extraction) leaves it absent rather than spelling ''.
+        rows = [{"transcription_model": "", **row} for row in rows]
         self._insert_rows("file_attachment_enrichments", rows, ATTACHMENT_ENRICHMENT_COLUMNS)
+
+    def _ensure_file_attachment_enrichment_columns(self) -> None:
+        """Add the columns an attachment-enrichment table created before them lacks.
+
+        CREATE TABLE IF NOT EXISTS never revisits a table, and an ALTER TABLE
+        takes ACCESS EXCLUSIVE even when IF NOT EXISTS makes it a no-op, so the
+        catalog is read first and the ALTER only runs when a column is missing.
+        """
+        rel = canonical_relation("file_attachment_enrichments").with_namespace(self._schema)
+        existing = {
+            str(row[0])
+            for row in self._query(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                (rel.schema, rel.name),
+            )
+        }
+        if "transcription_model" not in existing:
+            self._command(
+                "ALTER TABLE @file_attachment_enrichments "
+                "ADD COLUMN IF NOT EXISTS transcription_model text NOT NULL DEFAULT ''"
+            )
 
     def ensure_google_drive_source_tables(self) -> None:
         self._ensure_table_group(
@@ -11069,6 +11095,36 @@ class PostgresWarehouse:
     def insert_voice_memo_transcript_segments(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_transcript_segments(rows)
 
+    def replace_voice_recording_transcript_segments(
+        self,
+        *,
+        source: str,
+        account: str,
+        recording_id: str,
+        provider: str,
+        provider_transcript_id: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Make ``rows`` the recording's only segments for ``provider``.
+
+        Segments are keyed by segment_index, so an upsert alone would leave the
+        tail of a longer superseded transcript in place, and enrichment reads
+        every segment the recording has. Insert first, then delete what the new
+        transcript did not write: the recording never reads as segment-less.
+        """
+        self.insert_apple_voice_memos_transcript_segments(rows)
+        self._command(
+            """
+            DELETE FROM @apple_voice_memos_transcript_segments
+             WHERE source = %s
+               AND account = %s
+               AND recording_id = %s
+               AND provider = %s
+               AND provider_transcript_id <> %s
+            """,
+            (source, account, recording_id, provider, provider_transcript_id),
+        )
+
     def insert_apple_voice_memos_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_voice_memos_enrichments", rows, VOICE_MEMO_ENRICHMENT_COLUMNS)
 
@@ -11288,7 +11344,8 @@ class PostgresWarehouse:
                 r.storage_backend,
                 r.storage_key,
                 r.storage_file_id,
-                r.storage_url
+                r.storage_url,
+                r.duration_seconds
             FROM @marts_voice_memos_recordings AS r
             LEFT JOIN (
                 SELECT source, account, recording_id, content_sha256, completed_at
@@ -11328,6 +11385,7 @@ class PostgresWarehouse:
             "storage_key",
             "storage_file_id",
             "storage_url",
+            "duration_seconds",
         )
         return [dict(zip(columns, row, strict=True)) for row in rows]
 

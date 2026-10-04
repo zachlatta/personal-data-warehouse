@@ -21,7 +21,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import voice_record
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v7"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v8"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -368,6 +368,10 @@ def load_enrichment_candidates(
               AND f.account = e.account
               AND f.recording_id = e.recording_id
               AND e.content_sha256 = r.content_sha256
+              -- An enrichment counts only for the transcript it consumed: a
+              -- recording transcribed again after it was enriched (a better
+              -- model, a wider speaker range) is enriched again.
+              AND e.created_at >= r.completed_at
         {error_attempts_join}
         WHERE {" AND ".join(filters)}
         ORDER BY f.recorded_at DESC NULLS LAST
@@ -1626,6 +1630,8 @@ def validate_enrichment_result(
                 f"speaker {item.get('speaker_label')} has ambiguous speaker_name {name!r}; use one verified full name or a clearly mixed/unresolved label"
             )
 
+    issues.extend(speaker_turn_issues(result, transcript_segments))
+
     prefix_names = corrected_transcript_prefixes(transcript)
     resolved_prefix_names = [*speaker_names, *participant_names]
     multi_prefix_lines = lines_with_multiple_speaker_prefixes(transcript, resolved_prefix_names)
@@ -1823,32 +1829,36 @@ def build_segment_preserving_corrected_transcript(
     )
     known_text_names = list(dict.fromkeys([*known_speaker_names, *evidence_names]))
     label_to_name = {
-        str(item.get("speaker_label") or ""): segment_preserving_name_for_label(item, known_names=known_speaker_names)
+        str(item.get("speaker_label") or ""): segment_preserving_name_for_label(item)
         for item in speaker_map
     }
     local_opening_names = opening_dialogue_local_speaker_names(transcript_segments, known_names=known_speaker_names)
+    # The agent's turn-level assignments outrank both the label mapping and the
+    # opening-greeting heuristic: they are how one diarization label that
+    # carried several stage speakers is split back into the people who spoke.
+    turn_names = speaker_turn_names_by_segment(result)
 
     lines = []
     for segment in transcript_segments:
         segment_index = int(segment.get("segment_index") or 0)
         label = str(segment.get("speaker_label") or "")
-        speaker = local_opening_names.get(segment_index) or label_to_name.get(label) or f"Speaker {label}".strip()
+        speaker = (
+            turn_names.get(segment_index)
+            or local_opening_names.get(segment_index)
+            or label_to_name.get(label)
+            or f"Speaker {label}".strip()
+        )
         text = canonicalize_text_verified_name_mentions(str(segment.get("text") or ""), verified_names=known_text_names)
         lines.append(f"{speaker}: {text}")
     return "\n".join(lines)
 
 
-def segment_preserving_name_for_label(item: Mapping[str, Any], *, known_names: Sequence[str]) -> str:
+def segment_preserving_name_for_label(item: Mapping[str, Any]) -> str:
+    # A label the agent called mixed or unresolved stays that way. Reading a
+    # name out of its evidence ("mostly consistent with X") is what put 302
+    # turns of a ten-speaker stage event under one organizer's name; a label
+    # that really is several people is split with speaker_turns instead.
     name = str(item.get("speaker_name") or "").strip()
-    if name and not unresolved_speaker_name_for_enrichment(name):
-        return name
-    evidence = str(item.get("evidence") or "")
-    for known_name in known_names:
-        if known_name and re.search(rf"\bmostly\b[^.]{{0,60}}\b{re.escape(known_name)}\b", evidence, flags=re.IGNORECASE):
-            return known_name
-    for known_name in known_names:
-        if known_name and re.search(rf"\b{re.escape(known_name)}\b", evidence, flags=re.IGNORECASE):
-            return known_name
     return name or "Unresolved Speaker"
 
 
@@ -2199,6 +2209,8 @@ def enrichment_instructions() -> list[str]:
         "In opening greetings, the same speaker should not ask 'how are you?' and then immediately answer 'I'm doing great'. If diarization splits 'Hey NAME, how are you?' into two short segments, merge or attribute those short greeting fragments to the greeter.",
         "If the first few short greeting segments conflict with later stable diarization, prefer a coherent dialogue chain over the raw short-segment labels. It is better to merge or reattribute short opening greetings than to create a transcript where someone asks how they themselves are.",
         "Use diarized_segments as the source of truth for speaker turns. Preserve chronological turn order in transcript.",
+        "Diarization merges people when there are more speakers than it can separate: a stage event, panel, conference or talk series often gives several speakers one speaker_label. When a label carries more than one person, keep it mixed/unresolved in speaker_map and split it with speaker_turns: contiguous diarized segment_index ranges, each with the one verified person speaking. Find the boundaries from on-stage introductions and handoffs ('please welcome NAME', 'thank you, NAME', 'next up'), self-introductions, and the selected calendar event's agenda, description or speaker list, which give the order of speakers; search the warehouse for the event's agenda when the calendar description lacks it.",
+        "Every speaker_turns entry needs confidence of at least 0.9 to be applied; ranges must not overlap and must use segment_index values present in diarized_segments. Leave a stretch out of speaker_turns rather than guess. Use an empty speaker_turns list when speaker_map already attributes every turn. speaker_turns matters most for long recordings, whose transcript the pipeline assembles locally from diarized_segments.",
         f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, domain-term evidence, summary, and action items.",
         "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
         "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
@@ -2361,6 +2373,43 @@ def enrichment_schema() -> dict[str, Any]:
                     "required": ["speaker_label", "speaker_name", "confidence", "evidence"],
                 },
             },
+            "speaker_turns": {
+                "type": "array",
+                "description": "Turn-level speaker assignments for diarization labels that carry more than one person. Empty when speaker_map already attributes every turn.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "start_segment_index": {
+                            "type": "integer",
+                            "description": "First diarized_segments segment_index of this person's contiguous turn.",
+                        },
+                        "end_segment_index": {
+                            "type": "integer",
+                            "description": "Last diarized_segments segment_index of the turn, inclusive.",
+                        },
+                        "speaker_name": {
+                            "type": "string",
+                            "description": "Verified full name of the person speaking in these segments.",
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": "0 to 1 confidence that speaker_name spoke every segment in the range.",
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "Introduction, handoff or agenda evidence for the boundary and the identity.",
+                        },
+                    },
+                    "required": [
+                        "start_segment_index",
+                        "end_segment_index",
+                        "speaker_name",
+                        "confidence",
+                        "evidence",
+                    ],
+                },
+            },
             "transcript": {"type": "string"},
             "summary": {"type": "string"},
             "action_items": {"type": "array", "items": {"type": "string"}},
@@ -2374,6 +2423,7 @@ def enrichment_schema() -> dict[str, Any]:
             "end_at",
             "participants",
             "speaker_map",
+            "speaker_turns",
             "transcript",
             "summary",
             "action_items",
@@ -2463,10 +2513,87 @@ def speaker_names_from_result(result: Mapping[str, Any]) -> list[str]:
     if not isinstance(speaker_map, list):
         return []
     names = []
-    for item in speaker_map:
+    for item in [*speaker_map, *speaker_turns_from_result(result)]:
         if isinstance(item, Mapping) and item.get("speaker_name"):
             names.append(str(item["speaker_name"]))
+    return list(dict.fromkeys(names))
+
+
+def speaker_turns_from_result(result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    turns = result.get("speaker_turns") or []
+    if not isinstance(turns, list):
+        return []
+    return [item for item in turns if isinstance(item, Mapping)]
+
+
+def speaker_turn_names_by_segment(result: Mapping[str, Any]) -> dict[int, str]:
+    """segment_index -> verified person, from the agent's turn-level assignments.
+
+    Only a confident assignment to a real name counts; anything else leaves the
+    segment to its diarization label, which is the same bar speaker_map holds.
+    """
+    names: dict[int, str] = {}
+    for item in speaker_turns_from_result(result):
+        name = str(item.get("speaker_name") or "").strip()
+        if not name or unresolved_speaker_name_for_enrichment(name):
+            continue
+        if _float_or_zero(item.get("confidence")) < LOW_CONFIDENCE_RESOLVED_SPEAKER_THRESHOLD:
+            continue
+        start = _int_or_none(item.get("start_segment_index"))
+        end = _int_or_none(item.get("end_segment_index"))
+        if start is None or end is None or start > end:
+            continue
+        for index in range(start, end + 1):
+            names.setdefault(index, name)
     return names
+
+
+def speaker_turn_issues(
+    result: Mapping[str, Any], transcript_segments: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    known = {int(segment.get("segment_index") or 0) for segment in transcript_segments}
+    issues: list[str] = []
+    claimed: dict[int, int] = {}
+    for position, item in enumerate(speaker_turns_from_result(result)):
+        start = _int_or_none(item.get("start_segment_index"))
+        end = _int_or_none(item.get("end_segment_index"))
+        if start is None or end is None:
+            issues.append(f"speaker_turns[{position}] needs integer start_segment_index and end_segment_index")
+            continue
+        if start > end:
+            issues.append(
+                f"speaker_turns[{position}] start_segment_index {start} is after end_segment_index {end}"
+            )
+            continue
+        for bound in (start, end):
+            if known and bound not in known:
+                issues.append(
+                    f"speaker_turns[{position}] names segment_index {bound}, which is not in diarized_segments"
+                )
+        for index in range(start, end + 1):
+            if index in claimed:
+                issues.append(
+                    f"speaker_turns[{position}] and speaker_turns[{claimed[index]}] overlap at segment_index {index}; each segment has one speaker"
+                )
+                break
+            claimed[index] = position
+    return issues
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def canonicalize_result_verified_name_mentions(result: Mapping[str, Any]) -> dict[str, Any]:

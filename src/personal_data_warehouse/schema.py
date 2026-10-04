@@ -94,6 +94,10 @@ ATTACHMENT_ENRICHMENT_COLUMNS = (
     "ai_processed_at",
     "updated_at",
     "sync_version",
+    # The speech model that produced the transcript an audio enrichment
+    # cleaned up (AssemblyAI's speech_model_used); '' for every non-audio
+    # enrichment. Recorded, never part of the key.
+    "transcription_model",
 )
 
 CALENDAR_EVENT_COLUMNS = (

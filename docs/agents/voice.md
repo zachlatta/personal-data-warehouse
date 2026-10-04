@@ -106,6 +106,28 @@ transcript the mart serves, and `marts_voice_memos.transcript_segments.transcrip
 for the run that produced each speaker-labelled segment. The rest of the request
 (speaker options, keyterms, language detection) is in that run's `raw_result_json`.
 
+**Speakers: a wider ceiling for long recordings, and turn-level names from the agent.**
+`max_speakers_expected` is a hard ceiling -- AssemblyAI merges every speaker past it into
+an existing label -- so `assemblyai_speaker_options()` keeps the configured 8 for a
+conversation and lifts it to 30 (AssemblyAI's own long-audio default) for a recording of
+30 minutes or more. Diarization still merges stage speakers: the 5.7-hour stage-talks
+recording of 2026-10-03 had ten identified speakers in five labels. So the enrichment
+agent (prompt `...-agent-v8`) returns `speaker_turns` beside `speaker_map`: contiguous
+`segment_index` ranges, each with one verified person, found from on-stage introductions,
+handoffs and the event agenda. Local transcript assembly applies a turn at confidence
+0.9 or more ahead of the label mapping, and `validate_enrichment_result` rejects reversed,
+overlapping or out-of-range turns. A label the agent calls mixed or unresolved now stays
+that way in the assembled transcript. The assembler used to read a name out of the label's
+evidence ("mostly consistent with X"), which is how 302 turns of that event landed under
+the organizer's name.
+
+**A new transcript means a new enrichment.** An enrichment counts as done only when it was
+created after the transcription run it read (`e.created_at >= r.completed_at` in
+`load_enrichment_candidates`). Re-transcribing a recording therefore re-enriches it with
+no prompt-version bump. The runner replaces the recording's segments
+(`replace_voice_recording_transcript_segments`) instead of upserting over them, so a
+shorter new transcript leaves no tail of the old one for the agent to read.
+
 **That mart is the INPUT to transcription and enrichment, not only an output.** Both
 passes (`defs/apple_voice_memos_transcription.py`, `defs/apple_voice_memos_enrichment.py`)
 take their candidates from it, so a new voice source is transcribed and enriched by

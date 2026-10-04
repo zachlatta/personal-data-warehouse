@@ -63,7 +63,8 @@ and state the window and freshness.
 - `marts_voice_memos.recordings` — one row per recording from every voice source (Apple
   Voice Memos, a second recorder, Notes audio) with `title`, `summary`, `transcript`,
   `participants`, `action_items` and the calendar match; `marts_voice_memos.transcript_segments`
-  the speaker-labelled utterances. Search scope `voice_memos`/`transcripts`.
+  the speaker-labelled utterances. Search scope `voice_memos`/`transcripts`. Both name the
+  speech model that produced the transcript in `transcript_model`.
 - The speech model sometimes mishears one organisation name ("Hack Club" as "HackPad");
   search both spellings when completeness matters.
 

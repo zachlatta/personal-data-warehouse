@@ -10,8 +10,11 @@ import requests
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.apple_voice_memos_transcription import (
     ASSEMBLYAI_PROVIDER,
+    LONG_RECORDING_MAX_SPEAKERS_EXPECTED,
+    LONG_RECORDING_MIN_SECONDS,
     AssemblyAIClient,
     VoiceMemosTranscriptionRunner,
+    assemblyai_speaker_options,
     assemblyai_transcript_request,
     clean_transcript_text,
     transcription_segment_rows,
@@ -83,6 +86,7 @@ class FakeWarehouse:
         ]
         self.run_rows = []
         self.segment_rows = []
+        self.segment_replacements = []
 
     def ensure_apple_voice_memos_tables(self) -> None:
         self.ensure_called = True
@@ -94,7 +98,18 @@ class FakeWarehouse:
     def insert_apple_voice_memos_transcription_runs(self, rows) -> None:
         self.run_rows.extend(rows)
 
-    def insert_apple_voice_memos_transcript_segments(self, rows) -> None:
+    def replace_voice_recording_transcript_segments(
+        self, *, source, account, recording_id, provider, provider_transcript_id, rows
+    ) -> None:
+        self.segment_replacements.append(
+            {
+                "source": source,
+                "account": account,
+                "recording_id": recording_id,
+                "provider": provider,
+                "provider_transcript_id": provider_transcript_id,
+            }
+        )
         self.segment_rows.extend(rows)
 
 
@@ -110,7 +125,11 @@ class FakeAudioSource:
 
 
 class FakeTranscriptionClient:
-    def transcribe_file(self, *, path: Path, content_type: str):
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def transcribe_file(self, *, path: Path, content_type: str, duration_seconds=None):
+        self.calls.append({"content_type": content_type, "duration_seconds": duration_seconds})
         return {
             "id": "tx1",
             "status": "completed",
@@ -188,6 +207,64 @@ def test_assemblyai_client_uploads_submits_and_polls(tmp_path) -> None:
     assert len(session.gets) == 2
 
 
+def test_a_long_recording_lifts_the_speaker_ceiling_to_assemblyais_long_audio_default() -> None:
+    """A stage event has more speakers than a meeting, and the ceiling is hard.
+
+    AssemblyAI merges every speaker past max_speakers_expected into an existing
+    label, so a fixed ceiling of 8 on a five-hour colloquium is a guarantee of
+    mixed labels. AssemblyAI's own default for audio over ten minutes is 30.
+    """
+    configured = {"min_speakers_expected": 1, "max_speakers_expected": 8}
+
+    assert assemblyai_speaker_options(configured, duration_seconds=20_394) == {
+        "min_speakers_expected": 1,
+        "max_speakers_expected": LONG_RECORDING_MAX_SPEAKERS_EXPECTED,
+    }
+    assert LONG_RECORDING_MAX_SPEAKERS_EXPECTED == 30
+    assert assemblyai_speaker_options(configured, duration_seconds=LONG_RECORDING_MIN_SECONDS) == {
+        "min_speakers_expected": 1,
+        "max_speakers_expected": 30,
+    }
+    # A conversation keeps the configured ceiling: a high one over-splits.
+    assert assemblyai_speaker_options(configured, duration_seconds=LONG_RECORDING_MIN_SECONDS - 1) == configured
+    # Unknown duration is not evidence of a long recording.
+    assert assemblyai_speaker_options(configured, duration_seconds=None) == configured
+    # A configured ceiling above the long-recording one is never lowered.
+    assert assemblyai_speaker_options(
+        {"min_speakers_expected": 2, "max_speakers_expected": 40}, duration_seconds=20_394
+    ) == {"min_speakers_expected": 2, "max_speakers_expected": 40}
+
+
+def test_assemblyai_client_sends_the_long_recording_ceiling(tmp_path) -> None:
+    audio = tmp_path / "memo.m4a"
+    audio.write_bytes(b"audio")
+    session = FakeSession()
+
+    AssemblyAIClient(
+        api_key="test-key",
+        session=session,
+        poll_interval_seconds=1,
+        sleep=lambda _seconds: None,
+    ).transcribe_file(path=audio, content_type="audio/mp4", duration_seconds=20_394)
+
+    assert session.posts[1][1]["json"]["speaker_options"]["max_speakers_expected"] == 30
+
+
+def test_runner_passes_each_recordings_duration_to_the_client() -> None:
+    warehouse = FakeWarehouse()
+    warehouse.recordings[0]["duration_seconds"] = 20_394.5
+    client = FakeTranscriptionClient()
+
+    VoiceMemosTranscriptionRunner(
+        warehouse=warehouse,
+        audio_source=FakeAudioSource(),
+        transcription_client=client,
+        logger=FakeLogger(),
+    ).sync(limit=1)
+
+    assert client.calls == [{"content_type": "audio/mp4", "duration_seconds": 20_394.5}]
+
+
 def test_assemblyai_client_submit_error_includes_response_body(tmp_path) -> None:
     class SubmitErrorSession(FakeSession):
         def post(self, url, **kwargs):
@@ -250,6 +327,17 @@ def test_transcription_runner_writes_run_and_segments() -> None:
     assert warehouse.run_rows[0]["provider_transcript_id"] == "tx1"
     assert warehouse.run_rows[0]["content_sha256"] == "audio-hash"
     assert warehouse.segment_rows[0]["speaker_label"] == "A"
+    # A re-transcription replaces the recording's segments rather than
+    # upserting over them, so no segment from the old transcript survives.
+    assert warehouse.segment_replacements == [
+        {
+            "source": "apple_voice_memos",
+            "account": "zach@example.com",
+            "recording_id": "20260427 100004-40DC0200",
+            "provider": "assemblyai",
+            "provider_transcript_id": "tx1",
+        }
+    ]
 
 
 def test_the_enrichment_agent_is_told_hackpad_probably_means_hack_club() -> None:
