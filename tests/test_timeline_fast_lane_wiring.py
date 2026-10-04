@@ -46,9 +46,6 @@ def _runner_returning(summary):
         def sync(self):
             return summary
 
-        def sync_all(self):
-            return summary
-
     return _Runner
 
 
@@ -113,26 +110,29 @@ def test_drive_ingest_lands_its_source_on_the_timeline_only_when_it_wrote_rows(
     assert result.metadata["timeline_fast_lane"].value["rows"] == 1
 
 
-def test_gmail_sync_lands_gmail_on_the_timeline_when_a_mailbox_wrote(monkeypatch) -> None:
-    monkeypatch.setattr(gmail_defs, "load_settings", lambda **_k: _Settings())
+def test_gmail_poll_lands_gmail_on_the_timeline_in_each_tick_that_wrote(monkeypatch) -> None:
+    from personal_data_warehouse.gmail_sync import GmailPollSummary
+
+    monkeypatch.setattr(gmail_defs, "load_settings", lambda **_k: _Settings(gmail_accounts=()))
     monkeypatch.setattr(gmail_defs, "build_attachment_object_store_factory", lambda **_k: None)
     monkeypatch.setattr(gmail_defs, "warehouse_from_settings", lambda _s: _FakeWarehouse())
     calls = _capture(monkeypatch, gmail_defs)
 
-    def mailbox(n: int):
-        return SimpleNamespace(
-            account="z@x.test", sync_type="incremental", next_history_id="1", messages_written=n,
-            deleted_messages=0, attachments_written=0, attachments_stored=0, attachment_text_chars=0,
-            attachment_backfill_candidates=0, attachment_backfill_rows_written=0, query="",
-        )
+    class _PollRunner:
+        def __init__(self, **_kwargs) -> None:
+            pass
 
-    monkeypatch.setattr(gmail_defs, "GmailSyncRunner", _runner_returning([mailbox(0)]))
-    gmail_defs.gmail_mailbox_sync(build_asset_context())
-    assert calls == []
+        def run(self, *, config, on_messages_written):
+            # Two ticks wrote; the loop calls back once per writing tick.
+            on_messages_written()
+            on_messages_written()
+            return GmailPollSummary(ticks=5, messages_written=3)
 
-    monkeypatch.setattr(gmail_defs, "GmailSyncRunner", _runner_returning([mailbox(2)]))
-    gmail_defs.gmail_mailbox_sync(build_asset_context())
-    assert calls == [{"postgres_url": URL, "sources": ["gmail"]}]
+    monkeypatch.setattr(gmail_defs, "GmailSyncRunner", _PollRunner)
+    result = gmail_defs.gmail_mailbox_sync(build_asset_context())
+
+    assert calls == [{"postgres_url": URL, "sources": ["gmail"]}] * 2
+    assert result.metadata["timeline_fast_lane"].value == {"calls": 2, "rows": 2, "errors": 0}
 
 
 def test_only_the_slack_freshness_stage_lands_slack_on_the_timeline(monkeypatch) -> None:

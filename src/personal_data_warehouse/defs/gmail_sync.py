@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import time
+
 from dagster import (
-    DefaultScheduleStatus,
+    DefaultSensorStatus,
     Definitions,
     MaterializeResult,
     MetadataValue,
-    RetryPolicy,
+    RunRequest,
+    SkipReason,
     asset,
     define_asset_job,
     definitions,
-    schedule,
+    sensor,
 )
 
 from personal_data_warehouse.config import (
@@ -22,10 +25,15 @@ from personal_data_warehouse.gmail_sync import (
     GMAIL_ATTACHMENT_STORAGE_KIND,
     GMAIL_ATTACHMENT_STORAGE_METADATA_KIND,
     GMAIL_ATTACHMENT_STORAGE_SOURCE,
+    GmailPollConfig,
     GmailSyncRunner,
 )
 from personal_data_warehouse.objectstore import ObjectStore, build_object_store, google_drive_spec
-from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.schedule_guards import (
+    finished_job_runs,
+    keepalive_crash_backoff_skip,
+    skip_if_job_in_progress,
+)
 from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 
 
@@ -61,67 +69,63 @@ def build_attachment_object_store_factory(*, settings: Settings, logger):
     return factory
 
 
-@asset(
-    group_name="gmail",
-    retry_policy=RetryPolicy(max_retries=3, delay=30),
-)
+@asset(group_name="gmail")
 def gmail_mailbox_sync(context) -> MaterializeResult:
+    """Poll every mailbox's history every ~15 s for one bounded window.
+
+    No retry policy: the keepalive sensor relaunches a finished or failed run
+    within a tick, and the history cursor makes the relaunch pick up exactly
+    where the last write left off.
+    """
     settings = load_settings(require_gmail_client_secrets=False)
+    config = GmailPollConfig.from_env()
     attachment_object_store_factory = build_attachment_object_store_factory(
         settings=settings,
         logger=context.log,
     )
     warehouse = warehouse_from_settings(settings)
-    summaries = GmailSyncRunner(
-        settings=settings,
-        warehouse=warehouse,
-        logger=context.log,
-        attachment_object_store_factory=attachment_object_store_factory,
-    ).sync_all()
+    fast_lane = {"calls": 0, "rows": 0, "errors": 0}
 
-    # Land this source's timeline rows in the same run instead of waiting
-    # for the five-minute timeline_sync tick on top of this five-minute one.
-    fast_lane = {"enabled": False, "rows": 0}
-    if any(summary.messages_written for summary in summaries):
-        fast_lane = land_sources_on_timeline(
+    def land_on_timeline() -> None:
+        # Land this source's timeline rows in the tick that wrote them instead
+        # of waiting for the five-minute timeline_sync schedule.
+        result = land_sources_on_timeline(
             postgres_url=settings.postgres_database_url or "",
             sources=["gmail"],
             logger=context.log,
         )
+        fast_lane["calls"] += 1
+        fast_lane["rows"] += int(result.get("rows", 0))
+        fast_lane["errors"] += len(result.get("errors") or {})
+
+    try:
+        summary = GmailSyncRunner(
+            settings=settings,
+            warehouse=warehouse,
+            logger=context.log,
+            attachment_object_store_factory=attachment_object_store_factory,
+        ).run(config=config, on_messages_written=land_on_timeline)
+    finally:
+        warehouse.close()
 
     return MaterializeResult(
         metadata={
             "timeline_fast_lane": MetadataValue.json(fast_lane),
-            "mailboxes": MetadataValue.json(
-                [
-                    {
-                        "account": summary.account,
-                        "sync_type": summary.sync_type,
-                        "next_history_id": summary.next_history_id,
-                        "messages_written": summary.messages_written,
-                        "deleted_messages": summary.deleted_messages,
-                        "attachments_written": summary.attachments_written,
-                        "attachments_stored": summary.attachments_stored,
-                        "attachment_text_chars": summary.attachment_text_chars,
-                        "attachment_backfill_candidates": summary.attachment_backfill_candidates,
-                        "attachment_backfill_rows_written": summary.attachment_backfill_rows_written,
-                        "query": summary.query,
-                    }
-                    for summary in summaries
-                ]
-            ),
-            "mailbox_count": len(summaries),
-            "messages_written": sum(summary.messages_written for summary in summaries),
-            "deleted_messages": sum(summary.deleted_messages for summary in summaries),
-            "attachments_written": sum(summary.attachments_written for summary in summaries),
-            "attachments_stored": sum(summary.attachments_stored for summary in summaries),
-            "attachment_text_chars": sum(summary.attachment_text_chars for summary in summaries),
-            "attachment_backfill_candidates": sum(
-                summary.attachment_backfill_candidates for summary in summaries
-            ),
-            "attachment_backfill_rows_written": sum(
-                summary.attachment_backfill_rows_written for summary in summaries
-            ),
+            "lock_acquired": summary.lock_acquired,
+            "ticks": summary.ticks,
+            "failed_ticks": summary.failed_ticks,
+            "poll_interval_seconds": config.poll_interval_seconds,
+            "window_seconds": config.window_seconds,
+            "mailbox_count": len(settings.gmail_accounts),
+            "messages_written": summary.messages_written,
+            "deleted_messages": summary.deleted_messages,
+            "reconciled_messages": summary.reconciled_messages,
+            "full_syncs": summary.full_syncs,
+            "attachments_written": summary.attachments_written,
+            "attachments_stored": summary.attachments_stored,
+            "attachment_text_chars": summary.attachment_text_chars,
+            "attachment_backfill_candidates": summary.attachment_backfill_candidates,
+            "attachment_backfill_rows_written": summary.attachment_backfill_rows_written,
         }
     )
 
@@ -132,25 +136,37 @@ gmail_mailbox_sync_job = define_asset_job(
     # A run-time cap below the global 4-hour run-monitoring one: on 2026-09-09
     # seven short jobs hung in their step subprocess for 3.5 hours after a
     # deploy and starved the five-minute syncs of run slots (see
-    # tests/test_dagster_job_runtime_caps.py).
+    # tests/test_dagster_job_runtime_caps.py). The poll window
+    # (GMAIL_POLL_WINDOW_SECONDS, 45 min) stays under it with room for a
+    # stale-cursor full sync that starts near the end of a window.
     tags={"dagster/max_runtime": "3600"},
 )
 
+GMAIL_KEEPALIVE_SENSOR_INTERVAL_SECONDS = 30
 
-# A full mailbox sync takes ~9 minutes, so an every-minute cadence once ran it
-# back-to-back and continuously; the cron was spaced to every 15 minutes to
-# guarantee an idle gap (the host was thrashing swap and starving the Dagster
-# gRPC heartbeat). Incremental history-id runs average ~160s (measured
-# 2026-09-16 over 284 runs), so every five minutes keeps that gap while
-# landing mail in ~3 minutes instead of ~10. The skip_if_job_in_progress guard
-# still prevents a slow full sync from overlapping itself.
-@schedule(
-    cron_schedule="*/5 * * * *",
+
+# Gmail used to be a five-minute cron job: ~5 s of work per run, and a mean
+# landing latency of ~2.5 minutes that was all clock (measured 2026-10-04). A
+# poll loop that holds one run open and asks history every 15 s lands mail in
+# ~15 s instead, and this sensor keeps exactly one such run alive.
+@sensor(
     job=gmail_mailbox_sync_job,
-    default_status=DefaultScheduleStatus.RUNNING,
+    default_status=DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=GMAIL_KEEPALIVE_SENSOR_INTERVAL_SECONDS,
 )
-def gmail_mailbox_sync_every_five_minutes(context):
-    return skip_if_job_in_progress(context, job_name="gmail_mailbox_sync_job")
+def gmail_mailbox_sync_keepalive_sensor(context):
+    active = skip_if_job_in_progress(context, job_name="gmail_mailbox_sync_job")
+    if isinstance(active, SkipReason):
+        return active
+    crash_skip = keepalive_crash_backoff_skip(
+        finished_job_runs(context.instance, job_name="gmail_mailbox_sync_job"),
+        job_name="gmail_mailbox_sync_job",
+        now=time.time(),
+        hint="ops.gmail_sync_state.error names the failing mailbox.",
+    )
+    if crash_skip is not None:
+        return crash_skip
+    return RunRequest(tags={"gmail_trigger": "keepalive"})
 
 
 @definitions
@@ -158,5 +174,5 @@ def defs() -> Definitions:
     return Definitions(
         assets=[gmail_mailbox_sync],
         jobs=[gmail_mailbox_sync_job],
-        schedules=[gmail_mailbox_sync_every_five_minutes],
+        sensors=[gmail_mailbox_sync_keepalive_sensor],
     )

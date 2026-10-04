@@ -71,6 +71,7 @@ class MailboxSyncSummary:
     attachment_backfill_candidates: int = 0
     attachment_backfill_rows_written: int = 0
     attachments_stored: int = 0
+    reconciled_messages: int = 0
 
 
 @dataclass(frozen=True)
@@ -158,7 +159,86 @@ def exclusive_process_lock(path: Path) -> Iterator[bool]:
         lock_file.close()
 
 
+@dataclass(frozen=True)
+class GmailPollConfig:
+    """How the poll loop paces itself. Every knob is an env var on the Dagster deployment.
+
+    ``window_seconds`` bounds one Dagster run (the keepalive sensor relaunches the
+    next one, and the history cursor carries over, so the gap loses nothing) and
+    stays under the job's ``dagster/max_runtime`` tag. ``poll_interval_seconds``
+    is the landing latency: a ``history.list`` per mailbox per tick costs two
+    quota units, ~11.5k calls a day per mailbox at 15 s, against a per-user cap
+    of 15k units a *second*. The attachment backfill and the reconcile pass are
+    the expensive parts and keep their own slower clocks.
+    """
+
+    window_seconds: float = 2700.0
+    poll_interval_seconds: float = 15.0
+    attachment_backfill_interval_seconds: float = 300.0
+    reconcile_interval_seconds: float = 600.0
+    reconcile_query: str = "newer_than:2d"
+    max_backoff_seconds: float = 300.0
+
+    @classmethod
+    def from_env(cls) -> GmailPollConfig:
+        def seconds(name: str, default: float, *, minimum: float) -> float:
+            raw = os.getenv(name, "").strip()
+            value = float(raw) if raw else default
+            if value < minimum:
+                raise ValueError(f"{name} must be at least {minimum:g}")
+            return value
+
+        return cls(
+            window_seconds=seconds("GMAIL_POLL_WINDOW_SECONDS", cls.window_seconds, minimum=0),
+            poll_interval_seconds=seconds("GMAIL_POLL_INTERVAL_SECONDS", cls.poll_interval_seconds, minimum=1),
+            attachment_backfill_interval_seconds=seconds(
+                "GMAIL_ATTACHMENT_BACKFILL_INTERVAL_SECONDS", cls.attachment_backfill_interval_seconds, minimum=0
+            ),
+            reconcile_interval_seconds=seconds(
+                "GMAIL_RECONCILE_INTERVAL_SECONDS", cls.reconcile_interval_seconds, minimum=0
+            ),
+            reconcile_query=os.getenv("GMAIL_RECONCILE_QUERY", "").strip() or cls.reconcile_query,
+        )
+
+
+@dataclass
+class GmailPollSummary:
+    lock_acquired: bool = True
+    ticks: int = 0
+    failed_ticks: int = 0
+    messages_written: int = 0
+    deleted_messages: int = 0
+    reconciled_messages: int = 0
+    attachments_written: int = 0
+    attachments_stored: int = 0
+    attachment_text_chars: int = 0
+    attachment_backfill_candidates: int = 0
+    attachment_backfill_rows_written: int = 0
+    full_syncs: int = 0
+    last_errors: dict[str, str] | None = None
+
+
+@dataclass
+class _MailboxClock:
+    service: object | None = None
+    next_attempt_at: float = 0.0
+    consecutive_failures: int = 0
+    last_backfill_at: float | None = None
+    last_reconcile_at: float | None = None
+    last_error: str = ""
+
+
 class GmailSyncRunner:
+    """Keeps every mailbox current by polling its history on a short clock.
+
+    Consistency rests on two independent mechanisms. The history cursor in
+    ``ops.gmail_sync_state`` advances only after every change it covers has
+    been written, so a failed or killed tick is re-read by the next one and
+    writes are idempotent upserts. And the reconcile pass lists recent mail
+    without consulting history at all and fetches whatever the warehouse does
+    not hold, so a change history never reported still converges.
+    """
+
     def __init__(
         self,
         *,
@@ -166,87 +246,230 @@ class GmailSyncRunner:
         warehouse: PostgresWarehouse,
         logger,
         attachment_object_store_factory: Callable[[GmailAccount], ObjectStore | None] | None = None,
+        service_factory: Callable[..., object] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._settings = settings
         self._warehouse = warehouse
         self._logger = logger
         self._attachment_object_store_factory = attachment_object_store_factory
+        self._service_factory = service_factory
+        self._monotonic = monotonic
+        self._sleep = sleep
 
-    def sync_all(self) -> list[MailboxSyncSummary]:
+    def run(
+        self,
+        *,
+        config: GmailPollConfig,
+        on_messages_written: Callable[[], None] | None = None,
+    ) -> GmailPollSummary:
+        """Poll every mailbox until ``config.window_seconds`` has elapsed.
+
+        Raises at the end of the window if any mailbox's newest attempt failed,
+        so a mailbox that stays broken turns the run red rather than reading
+        green for 45 minutes at a time.
+        """
         with exclusive_gmail_sync_lock() as acquired:
             if not acquired:
-                self._logger.warning("Skipping Gmail sync because another Gmail sync is already running")
-                return []
+                self._logger.warning("Skipping Gmail poll because another Gmail sync holds the mailbox lock")
+                return GmailPollSummary(lock_acquired=False)
 
             self._warehouse.ensure_tables()
-            state_by_account = self._warehouse.load_sync_state()
+            summary = GmailPollSummary()
+            clocks = {account.email_address: _MailboxClock() for account in self._settings.gmail_accounts}
+            started = self._monotonic()
+            while True:
+                tick_started = self._monotonic()
+                wrote = self._tick(clocks=clocks, now=tick_started, config=config, summary=summary)
+                summary.ticks += 1
+                if wrote and on_messages_written is not None:
+                    on_messages_written()
+                now = self._monotonic()
+                if now - started >= config.window_seconds:
+                    break
+                self._sleep(max(0.0, config.poll_interval_seconds - (now - tick_started)))
 
-            summaries: list[MailboxSyncSummary] = []
-            failures: list[str] = []
+            failing = {email: clock.last_error for email, clock in clocks.items() if clock.consecutive_failures}
+            summary.last_errors = failing
+            if failing:
+                raise RuntimeError(
+                    "Mailbox sync failed for: " + "; ".join(f"{email}: {error}" for email, error in failing.items())
+                )
+            return summary
 
-            for account in self._settings.gmail_accounts:
-                state = state_by_account.get(account.email_address)
-                try:
-                    summary = self._sync_account(account, state)
-                except Exception as exc:
-                    last_history_id = state.last_history_id if state else 0
-                    self._warehouse.insert_sync_state(
-                        account=account.email_address,
-                        last_history_id=last_history_id,
-                        last_sync_type=state.last_sync_type if state else "unknown",
-                        status="failed",
-                        error=str(exc),
-                        updated_at=datetime.now(tz=UTC),
-                    )
-                    failures.append(f"{account.email_address}: {exc}")
-                    continue
-
+    def _tick(
+        self,
+        *,
+        clocks: dict[str, _MailboxClock],
+        now: float,
+        config: GmailPollConfig,
+        summary: GmailPollSummary,
+    ) -> bool:
+        state_by_account = self._warehouse.load_sync_state()
+        wrote = False
+        for account in self._settings.gmail_accounts:
+            clock = clocks[account.email_address]
+            if now < clock.next_attempt_at:
+                continue
+            state = state_by_account.get(account.email_address)
+            run_backfill = _due(clock.last_backfill_at, now, config.attachment_backfill_interval_seconds)
+            run_reconcile = _due(clock.last_reconcile_at, now, config.reconcile_interval_seconds)
+            try:
+                if clock.service is None:
+                    clock.service = self._build_service(account)
+                mailbox = self._sync_account(
+                    account,
+                    state,
+                    service=clock.service,
+                    run_backfill=run_backfill,
+                    reconcile_query=config.reconcile_query if run_reconcile else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - one mailbox must not stop the others
+                clock.service = None
+                clock.consecutive_failures += 1
+                clock.last_error = str(exc)
+                backoff = min(
+                    config.poll_interval_seconds * 2 ** (clock.consecutive_failures - 1),
+                    config.max_backoff_seconds,
+                )
+                clock.next_attempt_at = now + backoff
+                summary.failed_ticks += 1
+                self._logger.warning(
+                    "Gmail poll failed for %s (attempt %s, retrying in %ss): %s",
+                    account.email_address,
+                    clock.consecutive_failures,
+                    int(backoff),
+                    exc,
+                )
                 self._warehouse.insert_sync_state(
-                    account=summary.account,
-                    last_history_id=summary.next_history_id,
-                    last_sync_type=summary.sync_type,
-                    status="ok",
-                    error="",
+                    account=account.email_address,
+                    last_history_id=state.last_history_id if state else 0,
+                    last_sync_type=state.last_sync_type if state else "unknown",
+                    status="failed",
+                    error=str(exc),
                     updated_at=datetime.now(tz=UTC),
                 )
-                summaries.append(summary)
+                continue
 
-            if failures:
-                raise RuntimeError("Mailbox sync failed for: " + "; ".join(failures))
+            clock.consecutive_failures = 0
+            clock.last_error = ""
+            clock.next_attempt_at = 0.0
+            if run_backfill:
+                clock.last_backfill_at = now
+            if run_reconcile:
+                clock.last_reconcile_at = now
+            self._warehouse.insert_sync_state(
+                account=mailbox.account,
+                last_history_id=mailbox.next_history_id,
+                last_sync_type=mailbox.sync_type,
+                status="ok",
+                error="",
+                updated_at=datetime.now(tz=UTC),
+            )
+            _accumulate(summary, mailbox)
+            if mailbox.messages_written or mailbox.reconciled_messages:
+                wrote = True
+        return wrote
 
-            return summaries
+    def _build_service(self, account: GmailAccount):
+        factory = self._service_factory or build_gmail_service
+        return factory(account=account, settings=self._settings)
 
-    def _sync_account(self, account: GmailAccount, state: SyncState | None) -> MailboxSyncSummary:
-        service = build_gmail_service(account=account, settings=self._settings)
+    def _sync_account(
+        self,
+        account: GmailAccount,
+        state: SyncState | None,
+        *,
+        service,
+        run_backfill: bool,
+        reconcile_query: str | None,
+    ) -> MailboxSyncSummary:
         object_store = self._attachment_object_store(account)
         if self._settings.gmail_force_full_sync or not state or state.last_history_id == 0:
             summary = self._full_sync(account=account, service=service, object_store=object_store)
-            return self._with_attachment_backfill(
+        else:
+            try:
+                summary = self._partial_sync(
+                    account=account,
+                    service=service,
+                    start_history_id=state.last_history_id,
+                    object_store=object_store,
+                )
+            except HttpError as exc:
+                if _http_status(exc) != 404:
+                    raise
+                self._logger.warning(
+                    "History cursor for %s is stale at %s, falling back to full sync",
+                    account.email_address,
+                    state.last_history_id,
+                )
+                summary = self._full_sync(account=account, service=service, object_store=object_store)
+        if reconcile_query is not None:
+            summary = self._reconcile(
+                account=account, service=service, summary=summary, query=reconcile_query, object_store=object_store
+            )
+        if run_backfill:
+            summary = self._with_attachment_backfill(
                 account=account, service=service, summary=summary, object_store=object_store
             )
+        return summary
 
-        try:
-            summary = self._partial_sync(
+    def _reconcile(
+        self,
+        *,
+        account: GmailAccount,
+        service,
+        summary: MailboxSyncSummary,
+        query: str,
+        object_store: ObjectStore | None,
+    ) -> MailboxSyncSummary:
+        """Fetch recent mail the warehouse does not hold, without consulting history.
+
+        A message found here that history did not deliver is either one that
+        arrived between this tick's history read and this list (harmless), or a
+        change history never reported; either way it lands now.
+        """
+        synced_at = datetime.now(tz=UTC)
+        fetched = 0
+        attachments_written = 0
+        for message_ids in iter_full_message_id_batches(
+            service=service,
+            page_size=self._settings.gmail_page_size,
+            include_spam_trash=self._settings.gmail_include_spam_trash,
+            query=query,
+        ):
+            existing = self._warehouse.existing_message_ids(account=account.email_address, message_ids=message_ids)
+            missing = [message_id for message_id in message_ids if message_id not in existing]
+            if not missing:
+                continue
+            messages = [message for message in (fetch_message_or_none(service, mid) for mid in missing) if message]
+            self._warehouse.insert_messages(
+                [message_to_row(account=account.email_address, message=message, synced_at=synced_at) for message in messages]
+            )
+            attachment_rows = self._attachment_rows_for_messages(
                 account=account,
                 service=service,
-                start_history_id=state.last_history_id,
+                messages=messages,
+                message_ids=missing,
+                synced_at=synced_at,
+                enrichment_cache=self._attachment_enrichment_cache(),
                 object_store=object_store,
             )
-            return self._with_attachment_backfill(
-                account=account, service=service, summary=summary, object_store=object_store
-            )
-        except HttpError as exc:
-            if _http_status(exc) != 404:
-                raise
-            self._logger.warning(
-                "History cursor for %s is stale at %s, falling back to full sync",
+            self._warehouse.insert_attachments(attachment_rows)
+            fetched += len(messages)
+            attachments_written += len(attachment_rows)
+        if fetched:
+            self._logger.info(
+                "Gmail reconcile for %s fetched %s recent message(s) history had not delivered",
                 account.email_address,
-                state.last_history_id,
+                fetched,
             )
-            summary = self._full_sync(account=account, service=service, object_store=object_store)
-            return self._with_attachment_backfill(
-                account=account, service=service, summary=summary, object_store=object_store
-            )
+        return replace(
+            summary,
+            reconciled_messages=summary.reconciled_messages + fetched,
+            attachments_written=summary.attachments_written + attachments_written,
+        )
 
     def _attachment_object_store(self, account: GmailAccount) -> ObjectStore | None:
         if self._attachment_object_store_factory is None:
@@ -719,6 +942,23 @@ class GmailSyncRunner:
         ):
             return None
         return WarehouseAttachmentEnrichmentCache(warehouse=warehouse)
+
+
+def _due(last_at: float | None, now: float, interval: float) -> bool:
+    return last_at is None or now - last_at >= interval
+
+
+def _accumulate(summary: GmailPollSummary, mailbox: MailboxSyncSummary) -> None:
+    summary.messages_written += mailbox.messages_written
+    summary.deleted_messages += mailbox.deleted_messages
+    summary.reconciled_messages += mailbox.reconciled_messages
+    summary.attachments_written += mailbox.attachments_written
+    summary.attachments_stored += mailbox.attachments_stored
+    summary.attachment_text_chars += mailbox.attachment_text_chars
+    summary.attachment_backfill_candidates += mailbox.attachment_backfill_candidates
+    summary.attachment_backfill_rows_written += mailbox.attachment_backfill_rows_written
+    if mailbox.sync_type == "full":
+        summary.full_syncs += 1
 
 
 class WarehouseAttachmentEnrichmentCache:

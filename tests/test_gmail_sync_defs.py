@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from dagster import DagsterInstance, RunRequest, SkipReason, build_sensor_context
+
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs import gmail_sync as gmail_sync_defs
 from personal_data_warehouse.objectstore import google_drive as objectstore_google_drive
@@ -105,18 +107,57 @@ def test_factory_uses_shared_voice_memos_account_when_attachment_account_unset(m
     assert captured == ["zach@zachlatta.com"]
 
 
-def test_gmail_schedule_skips_when_prior_run_is_in_progress(monkeypatch) -> None:
-    calls: list[tuple[object, str]] = []
-    expected = object()
+def test_gmail_keepalive_sensor_skips_while_a_poll_run_is_alive(monkeypatch) -> None:
+    calls: list[str] = []
+    expected = SkipReason("busy")
 
     def fake_skip_if_job_in_progress(context, *, job_name: str):
-        calls.append((context, job_name))
+        calls.append(job_name)
         return expected
 
     monkeypatch.setattr(gmail_sync_defs, "skip_if_job_in_progress", fake_skip_if_job_in_progress)
-    context = object()
 
-    result = gmail_sync_defs.gmail_mailbox_sync_every_five_minutes._execution_fn.decorated_fn(context)
+    with DagsterInstance.ephemeral() as instance:
+        result = gmail_sync_defs.gmail_mailbox_sync_keepalive_sensor(build_sensor_context(instance=instance))
 
     assert result is expected
-    assert calls == [(context, "gmail_mailbox_sync_job")]
+    assert calls == ["gmail_mailbox_sync_job"]
+
+
+def test_gmail_keepalive_sensor_relaunches_the_poll_loop_when_no_run_is_alive() -> None:
+    with DagsterInstance.ephemeral() as instance:
+        result = gmail_sync_defs.gmail_mailbox_sync_keepalive_sensor(build_sensor_context(instance=instance))
+
+    assert isinstance(result, RunRequest)
+    assert result.tags == {"gmail_trigger": "keepalive"}
+    assert gmail_sync_defs.gmail_mailbox_sync_keepalive_sensor.minimum_interval_seconds == 30
+    assert gmail_sync_defs.gmail_mailbox_sync_keepalive_sensor.default_status.value == "RUNNING"
+
+
+def test_gmail_keepalive_sensor_waits_out_a_crash_loop(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gmail_sync_defs,
+        "finished_job_runs",
+        lambda _instance, *, job_name: [("FAILURE", 1000.0), ("FAILURE", 900.0), ("FAILURE", 800.0)],
+    )
+    monkeypatch.setattr(gmail_sync_defs.time, "time", lambda: 1060.0)
+
+    with DagsterInstance.ephemeral() as instance:
+        result = gmail_sync_defs.gmail_mailbox_sync_keepalive_sensor(build_sensor_context(instance=instance))
+
+    assert isinstance(result, SkipReason)
+    assert "gmail_mailbox_sync_job failed 3 consecutive runs" in result.skip_message
+
+
+def test_the_poll_window_fits_under_the_jobs_runtime_cap(monkeypatch) -> None:
+    from personal_data_warehouse.gmail_sync import GmailPollConfig
+
+    monkeypatch.delenv("GMAIL_POLL_WINDOW_SECONDS", raising=False)
+    cap = int(gmail_sync_defs.gmail_mailbox_sync_job.tags["dagster/max_runtime"])
+    # Room for a stale-cursor full sync (~9 min) that starts at the window's end.
+    assert GmailPollConfig.from_env().window_seconds + 600 <= cap
+
+
+def test_gmail_is_no_longer_driven_by_a_cron_schedule() -> None:
+    definitions = gmail_sync_defs.defs()
+    assert list(definitions.schedules or []) == []
