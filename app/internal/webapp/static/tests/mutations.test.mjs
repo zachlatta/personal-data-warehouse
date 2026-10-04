@@ -17,6 +17,18 @@ import {
 
 // --- gmail --------------------------------------------------------------------
 
+test("gmailForwardView names the original and the files that go with it", () => {
+  assert.equal(V.gmailForwardView({ message: {} }), null);
+  const forward = V.gmailForwardView({ forward: {
+    message_id: "orig-1", subject: "Invoice 4831", from: "Vendor <billing@vendor.test>",
+    attachments: [{ filename: "invoice-4831.pdf", content_type: "application/pdf", size: 48213 }],
+  } });
+  assert.equal(forward.heading, "Forwarding \u201cInvoice 4831\u201d from Vendor <billing@vendor.test>");
+  assert.equal(forward.filesText, "Also sends the original's 1 attachment: invoice-4831.pdf");
+  assert.equal(forward.quoteLabel, "Forwarded message");
+  assert.equal(V.gmailForwardView({ forward: { message_id: "orig-2" } }).filesText, "The original has no attachments.");
+});
+
 test("gmailSenderDisplayName prefers the display name, then recognises known senders", () => {
   assert.equal(gmailSenderDisplayName("HCB <receipts@hcb.example>", "Receipt"), "HCB");
   assert.equal(gmailSenderDisplayName('"Ada Example" <ada@example.test>', ""), "Ada Example");

@@ -232,6 +232,12 @@ export function GmailEmailComposeCard({
       {!alone && requestReason ? <ThemedText type="small" themeColor="textSecondary">{requestReason}</ThemedText> : null}
 
       {review.replyThreads.map((thread) => <ReplyThread key={thread.threadId} thread={thread} account={mutation.account} />)}
+      {review.forward ? (
+        <View style={styles.variantBlock}>
+          <ThemedText type="smallBold">{review.forward.heading}</ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">{review.forward.filesText}</ThemedText>
+        </View>
+      ) : null}
 
       {review.hasVariants ? (
         <View style={styles.variantBlock}>
@@ -301,7 +307,7 @@ export function GmailEmailComposeCard({
         {variant.quotedText ? (
           <View style={[styles.signature, { borderTopColor: theme.backgroundSelected }]}>
             <Pressable accessibilityRole="button" accessibilityState={{ expanded: quotedOpen }} onPress={() => setQuotedOpen((value) => !value)} style={styles.quoteToggle}>
-              <ThemedText type="small" style={styles.link}>{quotedOpen ? 'Hide quoted thread' : 'Show quoted thread'}</ThemedText>
+              <ThemedText type="small" style={styles.link}>{`${quotedOpen ? 'Hide' : 'Show'} ${review.forward?.quoteLabel ?? 'quoted thread'}`}</ThemedText>
             </Pressable>
             {quotedOpen ? <ThemedText type="small" themeColor="textSecondary" selectable>{variant.quotedText}</ThemedText> : null}
           </View>

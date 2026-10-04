@@ -52,6 +52,25 @@ back it, all behind the static bearer the CLI uses:
   with `PDW_SECRET_TOKEN` exactly like the phone (`Bearer web:<token>`). The old
   server-rendered review pages and their password cookie are gone; a still-set
   `PDW_MUTATION_UI_*` variable is reported as deprecated at startup.
+- **A forward is a `gmail.send_email`, not a type of its own.** `message.forward_message_id`
+  (the original's `base_gmail.messages.message_id`) makes a send a forward the way
+  `reply_to_thread_id` makes it a reply, so variants, drafts, the signature and
+  edit-before-approve all apply unchanged; the two are refused together, and the variants
+  of a forward must all forward one message. At proposal time
+  (`app/internal/mutations/gmail_forward.go`) the store reads the original from the
+  warehouse — and refuses the proposal when it is not there, because an empty forward is
+  a proposal to fix, not one to review — then writes it in exactly as Gmail's Forward
+  composes it: `Fwd: <subject>` when the agent gave none, the note, the signature, then
+  the `---------- Forwarded message ---------` block (whose `gmail_quote` container is
+  what the view splits off as the folded quote), with `In-Reply-To`/`References` set to
+  the original. The original's **files** are not snapshotted: they can be 25 MB and the
+  sent message is immutable, so the executor (`gmail_mutations.py`) re-reads its raw
+  MIME from Gmail (`messages.get format=raw`, so the send asks for `gmail.modify` beside
+  `gmail.compose`) and re-attaches every file part as-is, inline `Content-ID` images
+  included; the review's `email.forward` lists them so the reviewer sees what goes out.
+  The forward is filed in the original's thread, as Gmail files its own.
+  `tests/test_email_attachments_e2e.py` drives the whole path: real proposal, phone-shaped
+  edit and approval through the API, real worker, loopback Gmail.
 - **A batch is reviewed as the thing it is about, not as its payload.** A request is
   n mutations, and n is routinely in the hundreds — 43 Gmail threads, 277 Slack
   conversations — so a review that renders each mutation's JSON is a review that gets

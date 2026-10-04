@@ -198,13 +198,13 @@ func MutationHelp() MutationHelpDocument {
 			},
 			{
 				Type:        GmailSendEmailOperation,
-				Summary:     "Send or draft a Gmail message. Supports multiple titled variants for human reviewer to pick from.",
+				Summary:     "Send or draft a Gmail message — new, a reply, or a forward. Supports multiple titled variants for human reviewer to pick from.",
 				RequiresEnv: "GMAIL_ACCOUNTS",
 				Fields: []MutationHelpArg{
 					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailSendEmailOperation},
 					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
 					{Name: "delivery_mode", JSONType: "string", Required: false, Description: `"send" or "draft"; defaults to "send"`},
-					{Name: "message", JSONType: "object", Required: true, Description: "base message; fields: to[], cc[], bcc[], subject, body_text, body_html, reply_to_thread_id, in_reply_to, references[], attachments[]. Each attachment is {filename, content_type, data_base64}: a plain filename (no paths/control characters, max 255 UTF-8 bytes), a non-multipart MIME type without parameters (e.g. application/pdf), and canonical standard base64 file bytes (not base64url, a URL or a local path). Up to 100 files and 20 MiB total decoded bytes per message. Bytes are snapshotted for human review; variants inherit base attachments, message.attachments overrides them, [] removes them. Must include at least one recipient, a subject, and body_text or body_html."},
+					{Name: "message", JSONType: "object", Required: true, Description: "base message; fields: to[], cc[], bcc[], subject, body_text, body_html, reply_to_thread_id, forward_message_id, in_reply_to, references[], attachments[]. Each attachment is {filename, content_type, data_base64}: a plain filename (no paths/control characters, max 255 UTF-8 bytes), a non-multipart MIME type without parameters (e.g. application/pdf), and canonical standard base64 file bytes (not base64url, a URL or a local path). Up to 100 files and 20 MiB total decoded bytes per message. Bytes are snapshotted for human review; variants inherit base attachments, message.attachments overrides them, [] removes them. Must include at least one recipient, a subject, and body_text or body_html; a forward needs only recipients."},
 					{Name: "variants", JSONType: "array<object>", Required: false, Description: "optional alternate proposals; each needs a two-word `title` for the review tab. Variant fields override the base message; omitted fields inherit from message."},
 				},
 				Example: map[string]any{
@@ -218,7 +218,10 @@ func MutationHelp() MutationHelpDocument {
 						"attachments": []map[string]any{{"filename": "agenda.txt", "content_type": "text/plain", "data_base64": "THVuY2gK"}},
 					},
 				},
-				ExtraNotes: "When variants is non-empty, every variant must have a two-word title (max 32 chars), and each fully-resolved variant must independently pass the same recipient/subject/body validation.",
+				ExtraNotes: "When variants is non-empty, every variant must have a two-word title (max 32 chars), and each fully-resolved variant must independently pass the same recipient/subject/body validation. " +
+					"To reply, set reply_to_thread_id to the Gmail thread_id; the thread headers and quoted history are added for you. " +
+					"To forward, set forward_message_id to the Gmail message_id of a synced message (base_gmail.messages.message_id, a gmail search hit's source_pk.message_id) and write only your note in body_text: the subject defaults to \"Fwd: <original subject>\", Gmail's forwarded-message block with the original is added below the signature, and the original's attachments are re-sent from Gmail at execution, alongside any attachments[] you add. " +
+					"A forward is filed in the original's conversation, cannot also be a reply, and every variant must forward the same message.",
 			},
 			{
 				Type:        GooglePeopleContactsOperation,

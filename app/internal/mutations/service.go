@@ -286,12 +286,20 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 				messages = append(messages, mapFromAny(variant["message"]))
 			}
 		}
+		if err := validateGmailForward(messages); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 		for messageIndex, message := range messages {
 			if err := validateEmailAttachments(message["attachments"]); err != nil {
 				return fmt.Errorf("mutation %d: %w", index, err)
 			}
 			if !hasAnyRecipient(message) {
 				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include at least one recipient", index, messageIndex+1)
+			}
+			if gmailForwardMessageID(message) != "" {
+				// A forward's subject and body default to Gmail's: "Fwd: <subject>"
+				// over the forwarded original, written in at proposal time.
+				continue
 			}
 			if strings.TrimSpace(stringFromAny(message["subject"])) == "" {
 				return fmt.Errorf("mutation %d Gmail email mutation variant %d must include subject", index, messageIndex+1)

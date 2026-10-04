@@ -156,6 +156,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	normalized = s.enrichGmailEmailReplyHeaders(ctx, normalized)
 	normalized = s.enrichGmailEmailSignatures(ctx, normalized)
 	normalized = s.enrichGmailEmailReplyQuotes(ctx, normalized)
+	if normalized, err = s.enrichGmailEmailForwards(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
@@ -617,6 +620,9 @@ func (s *PostgresStore) UpdateGmailEmailMutation(ctx context.Context, requestID 
 	}
 	enriched = s.enrichGmailEmailSignatures(ctx, enriched)
 	enriched = s.enrichGmailEmailReplyQuotes(ctx, enriched)
+	if enriched, err = s.enrichGmailEmailForwards(ctx, enriched); err != nil {
+		return Mutation{}, err
+	}
 	if len(enriched) == 1 {
 		payload = enriched[0].Payload
 		preview = enriched[0].Preview
@@ -1921,6 +1927,9 @@ func normalizeMessageForStorage(message map[string]any) map[string]any {
 	if replyToThreadID := strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])); replyToThreadID != "" {
 		out["reply_to_thread_id"] = replyToThreadID
 	}
+	if forwardMessageID := gmailForwardMessageID(message); forwardMessageID != "" {
+		out["forward_message_id"] = forwardMessageID
+	}
 	if inReplyTo := strings.TrimSpace(stringFromAny(message["in_reply_to"])); inReplyTo != "" {
 		out["in_reply_to"] = inReplyTo
 	}
@@ -2504,6 +2513,9 @@ func htmlFragmentText(value string) string {
 }
 
 func emailPreviewMode(message map[string]any) string {
+	if gmailForwardMessageID(message) != "" {
+		return "forward"
+	}
 	if strings.TrimSpace(stringFromAny(message["reply_to_thread_id"])) != "" {
 		return "reply"
 	}

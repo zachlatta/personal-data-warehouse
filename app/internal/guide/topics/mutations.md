@@ -29,7 +29,9 @@ authoritative when this list and it disagree.
   mark-read batches as conversations with permalinks; calendar proposals on a day grid
   with conflicts flagged.
 - **Email as Zach:** preserve CC lists on replies, reply in the thread you found, and
-  never send from a guessed account. The reviewer can edit an email before approving it,
+  never send from a guessed account. To forward, set `message.forward_message_id` to the
+  original's `base_gmail.messages.message_id` and write only your note: the `Fwd:`
+  subject, Gmail's forwarded block and the original's attachments are added for you. The reviewer can edit an email before approving it,
   drop one item from a batch without denying the rest, or mark a dead request superseded.
 - **Email attachments:** set `message.attachments` to an array of
   `{filename, content_type, data_base64}` (standard base64 bytes, not a path or URL).

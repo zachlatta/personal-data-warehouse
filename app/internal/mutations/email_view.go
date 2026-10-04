@@ -36,13 +36,19 @@ func gmailEmailView(mutation Mutation) map[string]any {
 	for _, thread := range threads {
 		threadViews = append(threadViews, gmailThreadView(thread))
 	}
-	return map[string]any{
+	view := map[string]any{
 		"delivery_mode": deliveryMode,
 		"message":       gmailEmailMessageView(email),
 		"variants":      out,
 		"reply_threads": threadViews,
 		"has_variants":  len(variants) > 1,
 	}
+	// A forward names the message it carries and the files that will go
+	// with it; the forwarded text itself is the body's quoted part.
+	if forward := mapFromAny(mutation.Preview["forward"]); len(forward) > 0 {
+		view["forward"] = forward
+	}
+	return view
 }
 
 // gmailEmailMessageView splits one email body the way the editor needs it:
@@ -75,6 +81,7 @@ func gmailEmailMessageView(email map[string]any) map[string]any {
 		"quoted_html":        quotedHTML,
 		"quoted_text":        htmlEmailText(quotedHTML),
 		"reply_to_thread_id": stringFromAny(email["reply_to_thread_id"]),
+		"forward_message_id": stringFromAny(email["forward_message_id"]),
 		"in_reply_to":        stringFromAny(email["in_reply_to"]),
 		"references":         stringSliceFromAny(email["references"]),
 	}

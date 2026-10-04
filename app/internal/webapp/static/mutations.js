@@ -300,6 +300,8 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   });
   paintAttachments();
   form.appendChild(attachmentWrap);
+  const forward = V.gmailForwardView(mutation.email);
+  if (forward) form.appendChild(renderForwardNote(forward));
 
   const editorWrap = h("div", "editor-wrap");
   const toolbar = h("div", "toolbar");
@@ -326,7 +328,7 @@ function renderComposer(request, mutation, variant, deliveryMode, hasVariants, a
   }
   const quotedHTML = V.trimStr(variant.quoted_html);
   if (quotedHTML) {
-    const q = details("Quoted thread", "gquoted");
+    const q = details(forward ? forward.quoteLabel : "Quoted thread", "gquoted");
     q.appendChild(bodyFrame(quotedHTML, true));
     editorWrap.appendChild(q);
   }
@@ -446,10 +448,19 @@ function renderGmailEmail(request, mutation, actions) {
       ["Bcc", V.stringSlice(message.bcc).join(", ")], ["Subject", V.str(message.subject)],
     ]));
     ro.appendChild(attachmentList(V.emailAttachments(message)));
+    const forward = V.gmailForwardView(email);
+    if (forward) ro.appendChild(renderForwardNote(forward));
     ro.appendChild(bodyFrame(V.trimStr(message.body_html), false));
     article.appendChild(ro);
   }
   return article;
+}
+
+function renderForwardNote(forward) {
+  const note = h("div", "forward-note");
+  note.appendChild(h("div", "eyebrow", forward.heading));
+  note.appendChild(h("p", "m", forward.filesText));
+  return note;
 }
 
 // Download as opaque bytes: never render an attachment as active HTML in our origin.

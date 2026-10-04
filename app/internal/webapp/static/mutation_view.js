@@ -345,6 +345,27 @@ export function gmailMutationGroupStatus(status, mutationCount) {
   return mutationCount <= 1 ? status : mutationCount + " " + status;
 }
 
+// A forward (email.forward, from email_view.go) names the original and the
+// files the executor re-sends from Gmail with it. The forwarded text is the
+// body's quoted part; the files are not editable in review.
+export function gmailForwardView(email) {
+  const forward = asMap(asMap(email).forward);
+  if (!trimStr(forward.message_id)) return null;
+  const subject = trimStr(forward.subject);
+  const from = trimStr(forward.from);
+  const files = mapSlice(forward.attachments).map((file) => ({
+    filename: str(file.filename), contentType: str(file.content_type), size: intFromAny(file.size),
+  }));
+  return {
+    heading: "Forwarding " + (subject ? "“" + subject + "”" : "a message") + (from ? " from " + from : ""),
+    files,
+    filesText: files.length
+      ? "Also sends the original's " + files.length + " attachment" + plural(files.length) + ": " + files.map((file) => file.filename).join(", ")
+      : "The original has no attachments.",
+    quoteLabel: "Forwarded message",
+  };
+}
+
 export function gmailEmailTitle(deliveryMode) { return deliveryMode === "draft" ? "Create Gmail draft" : "Send Gmail email"; }
 export function gmailEmailActionText(deliveryMode) {
   return deliveryMode === "draft" ? "Creates a Gmail draft after approval." : "Will send this email after approval.";

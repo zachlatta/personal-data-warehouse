@@ -1538,13 +1538,34 @@ export type GmailEmailVariant = {
 
 export type GmailEmailReplyThread = { threadId: string; subject: string; messages: GmailReviewMessage[] };
 
+// A forward (email.forward, email_view.go) names the original and the files
+// the executor re-sends from Gmail with it; the forwarded text itself is the
+// body's quoted part, and the files are not editable in review.
+export type GmailEmailForward = { heading: string; filesText: string; quoteLabel: string };
+
 export type GmailEmailReview = {
   deliveryMode: 'send' | 'draft';
   hasVariants: boolean;
   selectedVariantId: string;
   variants: GmailEmailVariant[];
   replyThreads: GmailEmailReplyThread[];
+  forward: GmailEmailForward | null;
 };
+
+function gmailEmailForward(raw: unknown): GmailEmailForward | null {
+  const forward = asRecord(raw);
+  if (!text(forward.message_id)) return null;
+  const subject = text(forward.subject);
+  const from = text(forward.from);
+  const files = records(forward.attachments).map((file) => text(file.filename)).filter(Boolean);
+  return {
+    heading: `Forwarding ${subject ? `\u201c${subject}\u201d` : 'a message'}${from ? ` from ${from}` : ''}`,
+    filesText: files.length
+      ? `Also sends the original's ${files.length} attachment${files.length === 1 ? '' : 's'}: ${files.join(', ')}`
+      : 'The original has no attachments.',
+    quoteLabel: 'forwarded message',
+  };
+}
 
 // A plain-text rendering of an HTML fragment, the same reduction the server's
 // htmlFragmentText makes: block and line-break tags become newlines, every
@@ -1611,6 +1632,7 @@ export function gmailEmailReview(mutation: MutationLike): GmailEmailReview {
       subject: text(thread.subject),
       messages: records(thread.messages).map(gmailReviewMessage),
     })),
+    forward: gmailEmailForward(email.forward),
   };
 }
 

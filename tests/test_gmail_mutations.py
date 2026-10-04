@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from email import policy
+from email.message import EmailMessage
 from email.parser import BytesParser
 
 from personal_data_warehouse import gmail_mutations
@@ -46,6 +47,13 @@ class FakeMessagesResource:
         if self._service.batch_modify_errors:
             return FakeGmailRequest(response={}, error=self._service.batch_modify_errors.pop(0))
         return FakeGmailRequest(response={})
+
+    def get(self, **kwargs):
+        self._service.get_calls.append(kwargs)
+        original = self._service.originals.get(kwargs["id"])
+        if original is None:
+            return FakeGmailRequest(error=_http_error(404))
+        return FakeGmailRequest(response=original)
 
     def send(self, **kwargs):
         self._service.send_calls.append(kwargs)
@@ -116,7 +124,10 @@ class FakeGmailService:
         label_create_responses=None,
         label_create_errors=None,
         label_create_error_labels=None,
+        originals=None,
     ) -> None:
+        self.originals = dict(originals or {})
+        self.get_calls = []
         self.errors = list(errors or [])
         self.batch_modify_errors = list(batch_modify_errors or [])
         self.modify_calls = []
@@ -636,6 +647,115 @@ def test_gmail_mutation_failure_status_treats_refresh_error_as_blocked() -> None
     error = RefreshError("invalid_scope: Bad Request", {"error": "invalid_scope"})
 
     assert gmail_mutation_failure_status(error) == "blocked_missing_credentials"
+
+
+def _http_error(status: int):
+    class Response:
+        reason = "error"
+
+    response = Response()
+    response.status = status
+    return gmail_mutations.HttpError(response, b'{"error":"error"}')
+
+
+def _original_message_raw() -> str:
+    original = EmailMessage()
+    original["From"] = "Vendor <billing@vendor.test>"
+    original["To"] = "zach@example.test"
+    original["Subject"] = "Invoice 4831"
+    original["Message-ID"] = "<invoice-4831@vendor.test>"
+    original.set_content("Your invoice is attached.")
+    original.add_alternative('<p>Your invoice is attached.</p><img src="cid:logo@vendor.test">', subtype="html")
+    original.get_payload()[1].add_related(
+        b"\x89PNG-logo", maintype="image", subtype="png", cid="<logo@vendor.test>"
+    )
+    original.add_attachment(b"%PDF-invoice", maintype="application", subtype="pdf", filename="invoice-4831.pdf")
+    return base64.urlsafe_b64encode(original.as_bytes()).decode("ascii")
+
+
+def _forward_payload(mode: str) -> dict:
+    return {
+        "delivery_mode": mode,
+        "message": {
+            "to": ["accountant@example.test"],
+            "subject": "Fwd: Invoice 4831",
+            "body_text": "Can you file this?\n\n---------- Forwarded message ---------\nFrom: Vendor <billing@vendor.test>\n",
+            "body_html": "<div>Can you file this?</div>",
+            "forward_message_id": "orig-1",
+            "in_reply_to": "<invoice-4831@vendor.test>",
+            "references": ["<invoice-4831@vendor.test>"],
+            "attachments": [
+                {"filename": "note.txt", "content_type": "text/plain", "data_base64": base64.b64encode(b"note").decode()},
+            ],
+        },
+    }
+
+
+def test_gmail_forward_carries_the_originals_attachments_into_its_thread() -> None:
+    for mode in ("send", "draft"):
+        service = FakeGmailService(
+            originals={"orig-1": {"id": "orig-1", "threadId": "thread-orig", "raw": _original_message_raw()}}
+        )
+        result = GmailMutationExecutor(settings=object(), service_factory=lambda account: service).execute(
+            {
+                "provider": "gmail",
+                "operation": GMAIL_SEND_EMAIL_OPERATION,
+                "account": "zach@example.test",
+                "payload_json": _forward_payload(mode),
+            }
+        )
+
+        assert result.status == "succeeded", result.error
+        assert service.get_calls == [{"userId": "me", "id": "orig-1", "format": "raw"}]
+        assert result.result_json["forwarded_message_id"] == "orig-1"
+        assert result.result_json["thread_id"] == "thread-orig"
+        body = service.send_calls[0]["body"] if mode == "send" else service.draft_create_calls[0]["body"]["message"]
+        # Gmail files its own forward in the original's conversation.
+        assert body["threadId"] == "thread-orig"
+        email = _decode_raw_message(body["raw"])
+        assert email["Subject"] == "Fwd: Invoice 4831"
+        assert email["In-Reply-To"] == "<invoice-4831@vendor.test>"
+        assert email["References"] == "<invoice-4831@vendor.test>"
+        # The reviewed words are the body; the original's text is not re-sent as a part.
+        assert email.get_body(preferencelist=("plain",)).get_content().startswith("Can you file this?")
+        attachments = {part.get_filename() or part["Content-ID"]: part for part in email.iter_attachments()}
+        assert set(attachments) == {"note.txt", "invoice-4831.pdf", "<logo@vendor.test>"}
+        assert attachments["invoice-4831.pdf"].get_payload(decode=True) == b"%PDF-invoice"
+        assert attachments["invoice-4831.pdf"].get_content_type() == "application/pdf"
+        assert attachments["<logo@vendor.test>"].get_payload(decode=True) == b"\x89PNG-logo"
+        assert attachments["note.txt"].get_payload(decode=True) == b"note"
+
+
+def test_gmail_forward_of_a_message_gone_from_gmail_sends_nothing() -> None:
+    service = FakeGmailService()
+    result = GmailMutationExecutor(settings=object(), service_factory=lambda account: service).execute(
+        {
+            "provider": "gmail",
+            "operation": GMAIL_SEND_EMAIL_OPERATION,
+            "account": "zach@example.test",
+            "payload_json": _forward_payload("send"),
+        }
+    )
+
+    assert result.status == "failed_terminal"
+    assert service.send_calls == []
+    assert service.draft_create_calls == []
+
+
+def test_gmail_forward_cannot_also_be_a_reply() -> None:
+    service = FakeGmailService(
+        originals={"orig-1": {"id": "orig-1", "threadId": "thread-orig", "raw": _original_message_raw()}}
+    )
+    payload = _forward_payload("send")
+    payload["message"]["reply_to_thread_id"] = "thread-other"
+    result = GmailMutationExecutor(settings=object(), service_factory=lambda account: service).execute(
+        {"provider": "gmail", "operation": GMAIL_SEND_EMAIL_OPERATION, "account": "zach@example.test", "payload_json": payload}
+    )
+
+    assert result.status == "failed_terminal"
+    assert "forward" in result.error
+    assert service.get_calls == []
+    assert service.send_calls == []
 
 
 def _decode_raw_message(raw: str):

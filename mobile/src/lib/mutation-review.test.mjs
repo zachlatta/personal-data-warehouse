@@ -794,6 +794,23 @@ test('a send_email mutation becomes an editable composer: variants, the selected
   assert.equal(review.replyThreads[0].messages[0].text, 'hi there');
 });
 
+test('a forward names the original and the files that go with it; a plain email names none', () => {
+  assert.equal(gmailEmailReview(sendEmailMutation()).forward, null);
+  const mutation = sendEmailMutation();
+  mutation.email = {
+    ...mutation.email,
+    forward: {
+      message_id: 'orig-1', subject: 'Invoice 4831', from: 'Vendor <billing@vendor.test>',
+      attachments: [{ filename: 'invoice-4831.pdf', content_type: 'application/pdf', size: 48213 }],
+    },
+  };
+  assert.deepEqual(gmailEmailReview(mutation).forward, {
+    heading: 'Forwarding \u201cInvoice 4831\u201d from Vendor <billing@vendor.test>',
+    filesText: "Also sends the original's 1 attachment: invoice-4831.pdf",
+    quoteLabel: 'forwarded message',
+  });
+});
+
 test('a send_email mutation without variants offers its one message as the only variant', () => {
   const mutation = sendEmailMutation();
   mutation.email = { ...mutation.email, has_variants: false, variants: [] };

@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from email import policy as email_policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 import re
 import ssl
 from typing import Any
@@ -242,6 +244,13 @@ class GmailMutationExecutor:
         delivery_mode = _delivery_mode(payload.get("delivery_mode"))
         try:
             reply_to_thread_id = str(message.get("reply_to_thread_id") or "").strip()
+            forward_message_id = str(message.get("forward_message_id") or "").strip()
+            if reply_to_thread_id and forward_message_id:
+                return GmailMutationResult(
+                    status="failed_terminal",
+                    result_json={"delivery_mode": delivery_mode},
+                    error="an email is a reply (reply_to_thread_id) or a forward (forward_message_id), not both",
+                )
             if reply_to_thread_id and not str(message.get("in_reply_to") or "").strip():
                 return GmailMutationResult(
                     status="failed_terminal",
@@ -249,12 +258,32 @@ class GmailMutationExecutor:
                     error="reply email is missing In-Reply-To metadata; recreate the mutation after Gmail thread enrichment is available",
                 )
             message = _message_with_reply_references(message)
-            raw = build_email_raw(account=account, message=message)
+            service = self._service(
+                account=account,
+                operation=GMAIL_SEND_EMAIL_OPERATION,
+                reads_mail=bool(forward_message_id),
+            )
+            thread_id = reply_to_thread_id
+            forwarded_parts: list[EmailMessage] = []
+            if forward_message_id:
+                # The reviewed body already carries the original's header block and
+                # text (the proposal snapshotted it); what only Gmail holds is the
+                # original's files. A sent message is immutable, so reading it at
+                # execution time sends exactly what the reviewer saw listed.
+                original = execute_gmail_request(
+                    lambda: service.users()
+                    .messages()
+                    .get(userId="me", id=forward_message_id, format="raw")
+                    .execute()
+                )
+                thread_id = str(original.get("threadId") or "")
+                forwarded_parts = forwarded_attachment_parts(_decode_gmail_raw(original.get("raw")))
+            raw = build_email_raw(account=account, message=message, forwarded_parts=forwarded_parts)
             gmail_message: dict[str, Any] = {"raw": raw}
-            if reply_to_thread_id:
-                gmail_message["threadId"] = reply_to_thread_id
+            if thread_id:
+                gmail_message["threadId"] = thread_id
+            forward_result = {"forwarded_message_id": forward_message_id} if forward_message_id else {}
 
-            service = self._service(account=account, operation=GMAIL_SEND_EMAIL_OPERATION)
             if delivery_mode == "draft":
                 response = execute_gmail_request(
                     lambda: service.users().drafts().create(userId="me", body={"message": gmail_message}).execute()
@@ -266,7 +295,8 @@ class GmailMutationExecutor:
                         "delivery_mode": "draft",
                         "draft_id": str(response.get("id") or ""),
                         "draft_message_id": str(draft_message.get("id") or ""),
-                        "thread_id": str(draft_message.get("threadId") or reply_to_thread_id),
+                        "thread_id": str(draft_message.get("threadId") or thread_id),
+                        **forward_result,
                         "response": response,
                     },
                 )
@@ -278,7 +308,8 @@ class GmailMutationExecutor:
                 result_json={
                     "delivery_mode": "send",
                     "sent_message_id": str(response.get("id") or ""),
-                    "thread_id": str(response.get("threadId") or reply_to_thread_id),
+                    "thread_id": str(response.get("threadId") or thread_id),
+                    **forward_result,
                     "response": response,
                 },
             )
@@ -289,7 +320,7 @@ class GmailMutationExecutor:
                 error=str(exc),
             )
 
-    def _service(self, *, account: str, operation: str):
+    def _service(self, *, account: str, operation: str, reads_mail: bool = False):
         if self._service_factory is not None:
             return self._service_factory(account)
         scopes = (
@@ -297,6 +328,9 @@ class GmailMutationExecutor:
             if operation == GMAIL_SEND_EMAIL_OPERATION
             else self._settings.gmail_mutation_scopes
         )
+        if reads_mail:
+            # gmail.compose can send but not read; a forward reads its original.
+            scopes = (*scopes, *self._settings.gmail_mutation_scopes)
         return build_gmail_mutation_service(account=account, settings=self._settings, scopes=scopes)
 
 
@@ -557,7 +591,12 @@ def _chunks(values: list[str], size: int):
         yield values[index : index + size]
 
 
-def build_email_raw(*, account: str, message: Mapping[str, Any]) -> str:
+def build_email_raw(
+    *,
+    account: str,
+    message: Mapping[str, Any],
+    forwarded_parts: list[EmailMessage] | None = None,
+) -> str:
     recipients = {
         "To": _string_list(message.get("to")),
         "Cc": _string_list(message.get("cc")),
@@ -596,10 +635,51 @@ def build_email_raw(*, account: str, message: Mapping[str, Any]) -> str:
     for attachment, data in _email_attachments(message.get("attachments")):
         maintype, subtype = attachment["content_type"].split("/")
         email.add_attachment(data, maintype=maintype, subtype=subtype, filename=attachment["filename"])
+    for part in forwarded_parts or []:
+        if email.get_content_type() != "multipart/mixed":
+            email.make_mixed()
+        # Attached as-is: the original's own encoding, filename and Content-ID,
+        # so an inline image the forwarded HTML names by cid: still resolves.
+        email.attach(part)
     raw = email.as_bytes()
     if len(raw) > 35_000_000:
         raise ValueError("email MIME message exceeds 35 MB")
     return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def forwarded_attachment_parts(original: EmailMessage) -> list[EmailMessage]:
+    """The parts of a message that are files rather than its text, in order.
+
+    A forward re-sends the original's attachments the way Gmail's own Forward
+    does, including inline images (a ``Content-ID`` part) and attached messages,
+    but never the original's text/plain or text/html body: that is already in
+    the reviewed body, below the forwarded-message header block.
+    """
+    parts: list[EmailMessage] = []
+
+    def visit(part: EmailMessage) -> None:
+        if part.get_content_maintype() == "multipart":
+            for child in part.iter_parts():
+                visit(child)
+            return
+        is_file = (
+            bool(part.get_filename())
+            or part.get_content_disposition() == "attachment"
+            or (bool(part.get("Content-ID")) and part.get_content_maintype() != "text")
+        )
+        if is_file:
+            parts.append(part)
+
+    visit(original)
+    return parts
+
+
+def _decode_gmail_raw(value: Any) -> EmailMessage:
+    raw = str(value or "")
+    if not raw:
+        raise ValueError("Gmail returned the original message without its raw MIME")
+    data = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+    return BytesParser(policy=email_policy.default).parsebytes(data)
 
 
 def _delivery_mode(value: Any) -> str:
