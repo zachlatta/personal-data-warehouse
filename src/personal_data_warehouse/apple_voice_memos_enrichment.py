@@ -267,6 +267,22 @@ class VoiceMemosEnrichmentRunner:
                     contact_alias_hints=contact_alias_hints,
                 )
                 result = withhold_low_confidence_resolved_speaker_names(result)
+                # An enrichment is current while created after its transcript, so
+                # a run that started on the old segments of a recording that was
+                # re-transcribed meanwhile would land after the new transcript and
+                # read as done. Write nothing; the next run enriches the new one.
+                consumed = str(recording.get("provider_transcript_id") or "")
+                current = current_provider_transcript_id(self._warehouse, recording)
+                if consumed and current != consumed:
+                    self._logger.warning(
+                        "[%s/%s] %s was re-transcribed during enrichment (%s -> %s); not writing the stale result",
+                        index,
+                        len(recordings),
+                        recording_id,
+                        consumed,
+                        current,
+                    )
+                    continue
                 self._warehouse.insert_apple_voice_memos_enrichments(
                     [
                         enrichment_row(
@@ -362,7 +378,8 @@ def load_enrichment_candidates(
             r.content_sha256,
             COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
             f.source_title,
-            r.transcript_text
+            r.transcript_text,
+            r.provider_transcript_id
         FROM @marts_voice_memos_recordings AS f
         INNER JOIN @apple_voice_memos_transcription_runs AS r
             ON f.source = r.source
@@ -391,8 +408,32 @@ def load_enrichment_candidates(
         {limit_sql}
         """
     )
-    columns = ("source", "account", "recording_id", "content_sha256", "recorded_at", "title", "transcript_text")
+    columns = (
+        "source",
+        "account",
+        "recording_id",
+        "content_sha256",
+        "recorded_at",
+        "title",
+        "transcript_text",
+        "provider_transcript_id",
+    )
     return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def current_provider_transcript_id(warehouse, recording: Mapping[str, Any]) -> str:
+    """The AssemblyAI transcript the recording's segments now come from."""
+    rows = warehouse._query(
+        f"""
+        SELECT provider_transcript_id
+        FROM @apple_voice_memos_transcription_runs
+        WHERE source = {_sql_string(voice_recording_source(recording))}
+          AND account = {_sql_string(str(recording.get("account", "")))}
+          AND recording_id = {_sql_string(str(recording.get("recording_id", "")))}
+          AND provider = 'assemblyai'
+        """
+    )
+    return str(rows[0][0]) if rows else ""
 
 
 def load_calendar_candidates(warehouse, recording: Mapping[str, Any]) -> list[dict[str, Any]]:

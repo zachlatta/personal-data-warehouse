@@ -127,7 +127,12 @@ created after the transcription run it read (`e.created_at >= r.completed_at` in
 `load_enrichment_candidates`). Re-transcribing a recording therefore re-enriches it with
 no prompt-version bump. The runner replaces the recording's segments
 (`replace_voice_recording_transcript_segments`) instead of upserting over them, so a
-shorter new transcript leaves no tail of the old one for the agent to read.
+shorter new transcript leaves no tail of the old one for the agent to read. The rule is about wall
+time, so the runner also checks, just before writing, that the recording still has the
+transcript the candidate was read from (`provider_transcript_id`); a run that started on
+the old segments of a recording re-transcribed meanwhile writes nothing instead of landing
+after the new transcript as if it were current (2026-10-04: an enrichment started at 17:28,
+the re-transcription finished at 17:35).
 
 **The ceiling, measured.** On 2026-10-04 the stage-talks recording was hand-labelled -- 14
 identifiable speakers, 82 anchor moments whose speaker is certain -- and re-diarized under

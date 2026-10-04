@@ -1527,3 +1527,104 @@ def test_mixed_or_unresolved_label_wording_is_not_flagged_as_an_ambiguous_name()
     )
 
     assert not any("ambiguous speaker_name" in issue for issue in issues)
+
+
+class _RunnerWarehouse:
+    def __init__(self, current_transcript_id: str) -> None:
+        self.current_transcript_id = current_transcript_id
+        self.enrichment_rows: list[dict] = []
+
+    def ensure_apple_voice_memos_tables(self) -> None:
+        pass
+
+    def insert_apple_voice_memos_enrichments(self, rows) -> None:
+        self.enrichment_rows.extend(rows)
+
+
+class _RunnerClient:
+    model = "gpt-6-astra"
+
+    def create_agentic_structured(self, **_kwargs):
+        return {
+            "calendar_event_id": "",
+            "calendar_confidence": 0,
+            "title": "A note",
+            "start_at": "2026-10-03T19:00:00+00:00",
+            "end_at": "2026-10-03T19:01:00+00:00",
+            "participants": ["Zach Latta"],
+            "speaker_map": [{"speaker_label": "A", "speaker_name": "Zach Latta", "confidence": 0.99, "evidence": "x"}],
+            "speaker_turns": [],
+            "transcript": "Zach Latta: Hello.",
+            "summary": "A note.",
+            "action_items": [],
+            "evidence": [],
+        }
+
+
+class _Logger:
+    def info(self, *args, **kwargs) -> None:
+        pass
+
+    def warning(self, *args, **kwargs) -> None:
+        pass
+
+
+def _run_enrichment_with_transcript_changing_to(monkeypatch, current_transcript_id: str) -> _RunnerWarehouse:
+    from personal_data_warehouse import apple_voice_memos_enrichment as module
+
+    candidate = {
+        "source": "apple_voice_memos",
+        "account": "zach",
+        "recording_id": "memo-1",
+        "content_sha256": "sha",
+        "recorded_at": datetime(2026, 10, 3, 19, tzinfo=UTC),
+        "title": "",
+        "transcript_text": "Hello.",
+        "provider_transcript_id": "tx-old",
+    }
+    warehouse = _RunnerWarehouse(current_transcript_id)
+    monkeypatch.setattr(module, "load_enrichment_candidates", lambda *_a, **_k: [dict(candidate)])
+    monkeypatch.setattr(module, "load_calendar_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        module,
+        "load_transcript_segments",
+        lambda *_a, **_k: [{"segment_index": 0, "speaker_label": "A", "start_ms": 0, "end_ms": 1000, "text": "Hello."}],
+    )
+    monkeypatch.setattr(module, "load_contact_alias_hints", lambda *_a, **_k: [])
+    monkeypatch.setattr(module, "load_event_identity_hints", lambda *_a, **_k: {})
+    monkeypatch.setattr(module, "current_provider_transcript_id", lambda wh, _recording: wh.current_transcript_id)
+    summary = module.VoiceMemosEnrichmentRunner(warehouse=warehouse, client=_RunnerClient(), logger=_Logger()).sync(limit=1)
+    warehouse.summary = summary
+    return warehouse
+
+
+def test_an_enrichment_is_not_written_when_the_recording_was_retranscribed_mid_run(monkeypatch) -> None:
+    # 2026-10-04: an enrichment of the stage-talks recording started at 17:28 on
+    # the old segments, the recording was re-transcribed at 17:35, and the stale
+    # result would have landed after the new transcript and read as current.
+    warehouse = _run_enrichment_with_transcript_changing_to(monkeypatch, "tx-new")
+
+    assert warehouse.enrichment_rows == []
+    assert warehouse.summary.recordings_enriched == 0
+    assert warehouse.summary.recordings_failed == 0
+
+
+def test_an_enrichment_is_written_when_its_transcript_is_still_current(monkeypatch) -> None:
+    warehouse = _run_enrichment_with_transcript_changing_to(monkeypatch, "tx-old")
+
+    assert len(warehouse.enrichment_rows) == 1
+    assert warehouse.enrichment_rows[0]["status"] == "completed"
+    assert warehouse.summary.recordings_enriched == 1
+
+
+def test_enrichment_candidates_carry_the_transcript_they_were_read_from() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(Warehouse(), provider="agent_codex", prompt_version="v", limit=1)
+
+    assert "r.provider_transcript_id" in queries[0]
