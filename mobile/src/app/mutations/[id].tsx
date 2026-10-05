@@ -15,7 +15,7 @@ import { ContactMutationCard } from '@/components/contact-mutation-review';
 import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { SlackSendMessageCard } from '@/components/slack-send-review';
-import { ReviewFlash } from '@/components/review-flash';
+import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
@@ -42,7 +42,8 @@ import {
   type GmailThreadReview,
 } from '@/lib/mutation-review';
 import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
-import { nextPendingRequestId, pendingReviewCount, setReviewFlash } from '@/lib/review-queue';
+import { nextPendingRequestId, pendingReviewCount } from '@/lib/review-queue';
+import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
@@ -292,6 +293,7 @@ export default function MutationRequestScreen() {
   const containerRef = useRef<View>(null);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const colorScheme = useColorScheme();
+  const decided = useDecidedRequestIds();
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -329,25 +331,19 @@ export default function MutationRequestScreen() {
     getMutationRequest(config, next).then(rememberMutationRequest).catch(() => undefined);
   }, [config, id, status]);
 
-  const act = async (fn: () => Promise<MutationRequest>): Promise<boolean> => {
-    setBusy(true);
-    try {
-      setRequest(rememberMutationRequest(await fn()));
-      setError(null);
-      return true;
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // A decided request is not somewhere to stay: open the next one waiting, or
-  // go back to the list when the queue is empty. The flash says what the
-  // decision did on whichever screen comes next.
-  const advance = async (decided: MutationRequest, done: string) => {
-    setReviewFlash(`${done} · ${decided.title}`);
+  // No confirm: a decision is held for ten seconds (undo-decision.ts) while
+  // the screen moves straight on to the next request waiting, or back to the
+  // list when the queue is empty. The Undo bar names what the decision does
+  // and an Undo inside the window cancels it before anything is sent, then
+  // reopens the request.
+  const decide = async (target: MutationRequest, note: string, send: () => Promise<MutationRequest>) => {
+    decisions.hold({
+      requestId: target.id,
+      note: `${note} · ${target.title}`,
+      commit: async () => {
+        rememberMutationRequest(await send());
+      },
+    });
     let list = peekMutationRequests();
     if (!list) {
       try {
@@ -356,16 +352,15 @@ export default function MutationRequestScreen() {
         list = null;
       }
     }
-    const next = nextPendingRequestId(list, decided.id);
+    const next = nextPendingRequestId(list, target.id, decisions.decidedRequestIds());
     if (next) router.replace({ pathname: '/mutations/[id]', params: { id: next } });
     else if (router.canGoBack()) router.back();
     else router.replace('/mutations');
   };
 
-  // The confirm names what happens ("Send to sdg@…?"), because a confirm that
-  // reads the same on every request is tapped through unread. Edits on
-  // screen are saved first and the confirm is built from the saved request,
-  // so it names the recipients that will actually receive it.
+  // Edits on screen are saved first, because approval runs the stored
+  // version, never the screen's; the note is built from the saved request so
+  // it names the recipients that will actually receive it.
   const approve = async () => {
     if (!request) return;
     let current = request;
@@ -387,39 +382,12 @@ export default function MutationRequestScreen() {
         setBusy(false);
       }
     }
-    const decision = requestDecision(current);
-    const message = edits.length ? `${decision.confirmMessage}\n\nYour edits are saved.` : decision.confirmMessage;
-    Alert.alert(decision.confirmTitle, message, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: decision.confirmLabel,
-        style: 'default',
-        onPress: async () => {
-          if (await act(() => approveMutationRequest(config, current.id))) await advance(current, decision.doneLabel);
-        },
-      },
-    ]);
+    await decide(current, requestDecision(current).doneLabel, () => approveMutationRequest(config, current.id));
   };
-  // The reason is asked for at the moment of denial rather than parked in a
-  // permanent text field: on a phone that field cost a row of the list on
-  // every screen, and it was empty almost every time.
-  const deny = () => {
+  const deny = async () => {
     if (!request) return;
-    const decision = requestDecision(request);
-    const submit = async (reason?: string) => {
-      if (await act(() => rejectMutationRequest(config, request.id, (reason ?? '').trim()))) await advance(request, decision.deniedLabel);
-    };
-    if (Platform.OS === 'ios') {
-      Alert.prompt(decision.denyTitle, 'Nothing is sent or changed. A reason is optional.', [
-        { text: 'Cancel', style: 'cancel' },
-        { text: decision.denyLabel, style: 'destructive', onPress: submit },
-      ], 'plain-text');
-      return;
-    }
-    Alert.alert(decision.denyTitle, 'Nothing is sent or changed.', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: decision.denyLabel, style: 'destructive', onPress: () => submit('') },
-    ]);
+    const current = request;
+    await decide(current, requestDecision(current).deniedLabel, () => rejectMutationRequest(config, current.id, ''));
   };
   const keepInInbox = (review: GmailThreadReview) => {
     if (!request) return;
@@ -522,8 +490,8 @@ export default function MutationRequestScreen() {
   const gmailSections = gmailThreadDayGroups(gmailVisible);
   const decision = requestDecision(request);
   const queueList = peekMutationRequests();
-  const remaining = pending ? pendingReviewCount(queueList, request.id) : null;
-  const skipTo = pending ? nextPendingRequestId(queueList, request.id) : null;
+  const remaining = pending ? pendingReviewCount(queueList, request.id, decided) : null;
+  const skipTo = pending ? nextPendingRequestId(queueList, request.id, decided) : null;
   const overview = <RequestOverview request={request} error={error} filter={slackBatch ? filter : undefined} onFilter={slackBatch ? setFilter : undefined} />;
   return (
     <ThemedView style={styles.container}>
@@ -539,7 +507,12 @@ export default function MutationRequestScreen() {
             : undefined,
         }}
       />
-      <ReviewFlash bottom={pending ? 50 + Spacing.two + Spacing.three * 2 + insets.bottom : Spacing.three + insets.bottom} />
+      <UndoBar
+        bottom={pending ? 50 + Spacing.two + Spacing.three * 2 + insets.bottom : Spacing.three + insets.bottom}
+        onOpen={(undone) => {
+          if (undone.requestId !== id) router.replace({ pathname: '/mutations/[id]', params: { id: undone.requestId } });
+        }}
+      />
       <View
         ref={containerRef}
         style={styles.reviewBody}

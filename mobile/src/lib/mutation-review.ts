@@ -1841,22 +1841,20 @@ export function requestLifecycleNote(request: RequestLifecycleLike): string {
 
 // --- the decision a request asks for -----------------------------------------
 //
-// The buttons, the confirm and the note left behind all say what approving
-// does to THIS request. A reviewer tapped "Approve 1" and "1 mutation will
-// run upstream" three times running on 2026-09-29 without either line saying
-// that an email was about to go to an outside business; the confirm is worth its
-// tap only when it names the recipient.
+// The buttons and the note left behind all say what approving does to THIS
+// request. A reviewer tapped "Approve 1" and "1 mutation will run upstream"
+// three times running on 2026-09-29 without either line saying that an email
+// was about to go to an outside business. There is no confirm dialog: a
+// decision is held for ten seconds with an Undo (undo-decision.ts), and the
+// note on that Undo bar is what names the recipient.
 
 export type RequestDecision = {
   running: number;
   approveLabel: string;
   denyLabel: string;
-  denyTitle: string;
-  confirmTitle: string;
-  confirmMessage: string;
-  confirmLabel: string;
-  // Past tense for the note shown after the decision: "Sent", "Archived",
-  // and after a denial: "Not sent", "Kept in inbox".
+  // Past tense for the note on the Undo bar, naming where it went where
+  // there is a where: "Sent to vendor@…", "Archived 2 threads"; and after a
+  // denial: "Not sent", "Kept in inbox".
   doneLabel: string;
   deniedLabel: string;
 };
@@ -1884,25 +1882,17 @@ function emailDecision(live: MutationLike[]): RequestDecision {
   if (emails.length === 1) {
     const { variant } = emails[0];
     const to = recipientList(variant.to) || 'no recipient';
-    const lines = [variant.subject ? `\u201c${variant.subject}\u201d` : '(no subject)'];
-    if (variant.cc.length) lines.push(`Cc ${recipientList(variant.cc)}`);
-    if (variant.bcc.length) lines.push(`Bcc ${recipientList(variant.bcc)}`);
     return drafts
-      ? { running: 1, approveLabel: 'Save draft', denyLabel: 'Don\u2019t save', denyTitle: 'Don\u2019t save this draft?', confirmTitle: `Save a draft to ${to}?`, confirmMessage: lines.join('\n'), confirmLabel: 'Save draft', doneLabel: 'Draft saved', deniedLabel: 'Not saved' }
-      : { running: 1, approveLabel: 'Send', denyLabel: 'Don\u2019t send', denyTitle: 'Don\u2019t send this email?', confirmTitle: `Send to ${to}?`, confirmMessage: lines.join('\n'), confirmLabel: 'Send', doneLabel: 'Sent', deniedLabel: 'Not sent' };
+      ? { running: 1, approveLabel: 'Save draft', denyLabel: 'Don\u2019t save', doneLabel: `Draft for ${to} saved`, deniedLabel: 'Not saved' }
+      : { running: 1, approveLabel: 'Send', denyLabel: 'Don\u2019t send', doneLabel: `Sent to ${to}`, deniedLabel: 'Not sent' };
   }
   const count = emails.length;
   const recipients = recipientList([...new Set(emails.flatMap(({ variant }) => variant.to))], 4);
-  const noun = drafts ? 'draft' : 'email';
   return {
     running: count,
     approveLabel: drafts ? `Save ${count} drafts` : `Send ${count}`,
     denyLabel: 'Deny all',
-    denyTitle: `Deny all ${count} ${noun}s?`,
-    confirmTitle: drafts ? `Save ${count} drafts?` : `Send ${count} emails?`,
-    confirmMessage: `To ${recipients}`,
-    confirmLabel: drafts ? 'Save drafts' : 'Send',
-    doneLabel: drafts ? `${count} drafts saved` : `${count} sent`,
+    doneLabel: drafts ? `${count} drafts saved` : `${count} sent to ${recipients}`,
     deniedLabel: drafts ? 'Not saved' : 'Not sent',
   };
 }
@@ -1915,16 +1905,11 @@ export function requestDecision(request: RequestLike): RequestDecision {
   const running = mutations.length ? live.length : Math.max(0, request.mutation_count ?? 0);
   const generic = (): RequestDecision => {
     const single = running === 1;
-    const title = single ? text(live[0]?.title) : '';
     return {
       running,
       approveLabel: single ? 'Approve' : `Approve ${running}`,
       denyLabel: single ? 'Deny' : 'Deny all',
-      denyTitle: 'Deny this request?',
-      confirmTitle: single ? 'Approve this request?' : `Approve ${running} actions?`,
-      confirmMessage: title || (single ? 'It runs as soon as you approve.' : 'They run as soon as you approve.'),
-      confirmLabel: 'Approve',
-      doneLabel: 'Approved',
+      doneLabel: single ? 'Approved' : `${running} approved`,
       deniedLabel: 'Denied',
     };
   };
@@ -1936,11 +1921,7 @@ export function requestDecision(request: RequestLike): RequestDecision {
       running,
       approveLabel: 'Send',
       denyLabel: 'Don\u2019t send',
-      denyTitle: 'Don\u2019t send this message?',
-      confirmTitle: `Send to ${review.recipientLabel || 'Slack'}?`,
-      confirmMessage: review.text.length > 160 ? `${review.text.slice(0, 157)}\u2026` : review.text,
-      confirmLabel: 'Send',
-      doneLabel: 'Sent',
+      doneLabel: `Sent to ${review.recipientLabel || 'Slack'}`,
       deniedLabel: 'Not sent',
     };
   }
@@ -1953,11 +1934,7 @@ export function requestDecision(request: RequestLike): RequestDecision {
       running,
       approveLabel: single ? summary.verb : `${summary.verb} ${threads}`,
       denyLabel: single ? (summary.verb === 'Archive' ? 'Keep in inbox' : `Don\u2019t ${summary.verb.toLowerCase()}`) : 'Deny all',
-      denyTitle: single ? `Don\u2019t ${summary.verb.toLowerCase()} this thread?` : 'Deny this request?',
-      confirmTitle: `${summary.verb} ${plural(threads, 'thread')}?`,
-      confirmMessage: summary.effect,
-      confirmLabel: summary.verb,
-      doneLabel: GMAIL_DONE[summary.verb] ?? 'Approved',
+      doneLabel: single ? (GMAIL_DONE[summary.verb] ?? 'Approved') : `${GMAIL_DONE[summary.verb] ?? 'Approved'} ${plural(threads, 'thread')}`,
       deniedLabel: single && summary.verb === 'Archive' ? 'Kept in inbox' : 'Denied',
     };
   }
@@ -1969,11 +1946,7 @@ export function requestDecision(request: RequestLike): RequestDecision {
       running,
       approveLabel: `${contacts.verb} ${count}`,
       denyLabel: 'Deny all',
-      denyTitle: 'Deny this request?',
-      confirmTitle: `${contacts.verb} ${plural(count, 'contact')}?`,
-      confirmMessage: 'They change as soon as you approve.',
-      confirmLabel: contacts.verb,
-      doneLabel: `${contacts.verb === 'Merge' ? 'Merged' : `${contacts.verb}d`}`,
+      doneLabel: `${contacts.verb === 'Merge' ? 'Merged' : `${contacts.verb}d`} ${plural(count, 'contact')}`,
       deniedLabel: 'Denied',
     };
   }

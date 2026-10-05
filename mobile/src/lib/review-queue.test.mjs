@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { nextPendingRequestId, pendingReviewCount, setReviewFlash, takeReviewFlash } from './review-queue.ts';
+import { nextPendingRequestId, pendingReviewCount } from './review-queue.ts';
 
 const list = [
   { id: 'a', status: 'pending_review' },
@@ -42,9 +42,11 @@ test('the header counts what is left to review, this one included, and says noth
   assert.equal(pendingReviewCount(null, 'a'), null);
 });
 
-test('a flash is read once', () => {
-  assert.equal(takeReviewFlash(), null);
-  setReviewFlash('Sent · Reply to the vendor');
-  assert.equal(takeReviewFlash(), 'Sent · Reply to the vendor');
-  assert.equal(takeReviewFlash(), null);
+test('a request decided but held for undo (or in flight) is out of the queue, though the server still says pending', () => {
+  // Deciding 'a' moves straight on to 'b'; from 'b' the next one is 'c', not 'a'.
+  assert.equal(nextPendingRequestId(list, 'b', ['a']), 'c');
+  assert.equal(nextPendingRequestId(list, 'c', ['a']), 'b');
+  assert.equal(nextPendingRequestId([{ id: 'a', status: 'pending_review' }, { id: 'b', status: 'pending_review' }], 'b', ['a']), null);
+  assert.equal(pendingReviewCount(list, 'b', ['a']), 2);
+  assert.equal(pendingReviewCount([{ id: 'a', status: 'pending_review' }, { id: 'b', status: 'pending_review' }], 'b', ['a']), null);
 });

@@ -31,6 +31,16 @@ payload. The pure part of that lives in `src/lib/mutation-review.ts` and has
 node tests (`npm test`, also run in CI before the OTA publish); the source-shaped
 components live in `src/components/*-review.tsx`.
 
+**Approve and Deny do not ask to confirm.** The screen moves straight on to the
+next request waiting, and an Undo bar ("Sent to vendor@… · Reply to …",
+counting down from 10s) sits above the action bar. Nothing reaches the server
+until the window closes; Undo cancels it and reopens the request. Only the last
+decision can be undone: deciding the next request sends the previous one at
+once, and leaving the app sends a held decision immediately. The hold lives in
+memory (`src/lib/undo-decision.ts`), so if the app dies inside the window the
+request is still waiting for review rather than half-sent. A deny no longer
+asks for a reason.
+
 - **Gmail thread reviews** (archive / unarchive / relabel) read as an inbox:
   sender, subject, snippet, time, and proposed action, grouped by the day each
   thread last moved. This also applies to mixed Gmail/Slack requests; other

@@ -1,16 +1,17 @@
 import { useFocusEffect, useRouter } from 'expo-router';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Pressable, RefreshControl, SectionList, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { ReviewFlash } from '@/components/review-flash';
 import { StatusPill } from '@/components/status-pill';
+import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { listMutationRequests, type MutationRequest } from '@/lib/api';
 import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
 import { formatWhen } from '@/lib/format';
+import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
 
 export default function MutationsScreen() {
@@ -45,7 +46,19 @@ export default function MutationsScreen() {
     }, [load]),
   );
 
-  const pending = requests.filter((r) => r.status === 'pending_review');
+  // A decision being held for undo is not "needs review" any more, though the
+  // server has not heard it yet; when it is sent (or undone) the cache moves
+  // and the list repaints from it.
+  const decided = useDecidedRequestIds();
+  useEffect(
+    () =>
+      decisions.subscribe(() => {
+        const cached = peekMutationRequests();
+        if (cached) setRequests(cached.slice());
+      }),
+    [],
+  );
+  const pending = requests.filter((r) => r.status === 'pending_review' && !decided.includes(r.id));
   const past = requests.filter((r) => r.status !== 'pending_review');
   const sections = [
     { title: `Needs review (${pending.length})`, data: pending, empty: 'Nothing waiting on you.' },
@@ -54,7 +67,7 @@ export default function MutationsScreen() {
 
   return (
     <ThemedView style={styles.container}>
-      <ReviewFlash />
+      <UndoBar onOpen={(undone) => router.push({ pathname: '/mutations/[id]', params: { id: undone.requestId } })} />
       {error ? (
         <Pressable onPress={load} style={styles.errorBox}>
           <ThemedText style={styles.errorText}>{error} — tap to retry</ThemedText>

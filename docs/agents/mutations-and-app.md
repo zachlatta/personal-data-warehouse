@@ -118,10 +118,18 @@ back it, all behind the static bearer the CLI uses:
     each, ~3s of it tapping back, waiting on the list and re-opening, and the confirm
     read "1 mutation will run upstream" on all three. Now a decision opens the next
     pending request (`mobile/src/lib/review-queue.ts`, title "3 to review", Skip in the
-    header, the next one prefetched) and leaves a one-line note ("Sent · …"); and the
-    buttons, confirm and note come from `requestDecision` in `mutation-review.ts` —
-    "Send" / "Don't send" and "Send to front@…?" for one email, "Archive" / "Keep in
-    inbox" for one thread. An email reply shows the message it answers first, with
+    header, the next one prefetched); and the buttons and note come from
+    `requestDecision` in `mutation-review.ts` — "Send" / "Don't send" and "Sent to
+    front@…" for one email, "Archive" / "Keep in inbox" for one thread.
+  - **A decision is undoable for ten seconds instead of confirmed.** The confirm
+    dialog was a second tap on every request and was read once, then tapped through.
+    Now Approve/Deny moves on at once and the decision is held in the phone's memory
+    (`mobile/src/lib/undo-decision.ts`) behind an Undo bar that names the recipient;
+    the API call goes out when the window closes, when the next request is decided,
+    or when the app is backgrounded. The server is never asked to un-send anything:
+    a held decision has not been sent, and one lost to a killed app leaves the
+    request pending, which is the safe way to fail. A held or in-flight request is
+    left out of the queue and the list, since the server still says pending. An email reply shows the message it answers first, with
     its quoted history folded.
   - **An email's paragraphs survive a phone edit, in Gmail's own shape.** Gmail's
     composer writes one `<div>` per line and `<div><br></div>` per blank line (checked

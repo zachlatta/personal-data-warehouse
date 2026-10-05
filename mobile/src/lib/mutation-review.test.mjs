@@ -942,14 +942,11 @@ function emailRequest(mutationOverrides = {}, requestOverrides = {}) {
   return { id: 'req-email', status: 'pending_review', title: 'Reply to vendor', mutation_count: 1, mutations: [mutation], ...requestOverrides };
 }
 
-test('one email is decided as Send / Don\u2019t send, and the confirm names who it goes to', () => {
+test('one email is decided as Send / Don\u2019t send, and the note left to undo names who it went to', () => {
   const decision = requestDecision(emailRequest());
   assert.equal(decision.approveLabel, 'Send');
   assert.equal(decision.denyLabel, 'Don\u2019t send');
-  assert.equal(decision.confirmTitle, 'Send to vendor@example.test?');
-  assert.match(decision.confirmMessage, /Re: quote/);
-  assert.equal(decision.confirmLabel, 'Send');
-  assert.equal(decision.doneLabel, 'Sent');
+  assert.equal(decision.doneLabel, 'Sent to vendor@example.test');
   assert.equal(decision.deniedLabel, 'Not sent');
   assert.equal(decision.running, 1);
 });
@@ -959,14 +956,7 @@ test('an email the reviewer set to draft is decided as a draft', () => {
   request.mutations[0].email = { ...request.mutations[0].email, delivery_mode: 'draft' };
   const decision = requestDecision(request);
   assert.equal(decision.approveLabel, 'Save draft');
-  assert.equal(decision.confirmTitle, 'Save a draft to vendor@example.test?');
-  assert.equal(decision.doneLabel, 'Draft saved');
-});
-
-test('a Cc on the email is part of the confirm, because it is part of who reads it', () => {
-  const request = emailRequest();
-  request.mutations[0].email.message = { ...request.mutations[0].email.message, cc: ['boss@example.test'] };
-  assert.match(requestDecision(request).confirmMessage, /Cc boss@example\.test/);
+  assert.equal(decision.doneLabel, 'Draft for vendor@example.test saved');
 });
 
 test('several emails count, and an email dropped from the request is not counted', () => {
@@ -979,9 +969,7 @@ test('several emails count, and an email dropped from the request is not counted
   assert.equal(decision.running, 2);
   assert.equal(decision.approveLabel, 'Send 2');
   assert.equal(decision.denyLabel, 'Deny all');
-  assert.equal(decision.confirmTitle, 'Send 2 emails?');
-  assert.match(decision.confirmMessage, /vendor@example\.test/);
-  assert.match(decision.confirmMessage, /other@example\.test/);
+  assert.equal(decision.doneLabel, '2 sent to vendor@example.test, other@example.test');
 });
 
 test('one archived thread is Archive / Keep; a batch keeps its count', () => {
@@ -989,34 +977,38 @@ test('one archived thread is Archive / Keep; a batch keeps its count', () => {
   const one = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [archiveMutation('m1', thread)] });
   assert.equal(one.approveLabel, 'Archive');
   assert.equal(one.denyLabel, 'Keep in inbox');
-  assert.equal(one.confirmTitle, 'Archive 1 thread?');
   assert.equal(one.doneLabel, 'Archived');
   assert.equal(one.deniedLabel, 'Kept in inbox');
   const many = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 2, mutations: [archiveMutation('m1', thread), archiveMutation('m2', { ...thread, thread_id: 'thread-2' })] });
   assert.equal(many.approveLabel, 'Archive 2');
   assert.equal(many.denyLabel, 'Deny all');
-  assert.equal(many.confirmTitle, 'Archive 2 threads?');
+  assert.equal(many.doneLabel, 'Archived 2 threads');
 });
 
 test('a Slack message names its recipient', () => {
   const mutation = { id: 'm', status: 'pending_review', provider: 'slack', operation: 'slack.send_message', account: 'zrl', payload: { conversation_id: 'C1', text: 'Deploy is fixed.' }, preview: { slack_message: { recipient_label: '#ops', delivery: 'conversation', recipient_found: true } } };
   const decision = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [mutation] });
   assert.equal(decision.approveLabel, 'Send');
-  assert.equal(decision.confirmTitle, 'Send to #ops?');
-  assert.match(decision.confirmMessage, /Deploy is fixed\./);
+  assert.equal(decision.doneLabel, 'Sent to #ops');
 });
 
 test('anything else falls back to Approve, and a header-only copy counts from mutation_count', () => {
   const one = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 1, mutations: [{ id: 'm', status: 'pending_review', provider: 'x', operation: 'x.do', title: 'Do the thing' }] });
   assert.equal(one.approveLabel, 'Approve');
   assert.equal(one.denyLabel, 'Deny');
-  assert.equal(one.confirmTitle, 'Approve this request?');
+  assert.equal(one.doneLabel, 'Approved');
   assert.equal(one.deniedLabel, 'Denied');
   const partial = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 4, partial: true });
   assert.equal(partial.running, 4);
   assert.equal(partial.approveLabel, 'Approve 4');
-  assert.equal(partial.confirmTitle, 'Approve 4 actions?');
-  assert.doesNotMatch(partial.confirmMessage, /upstream/);
+  assert.equal(partial.doneLabel, '4 approved');
+});
+
+test('a contact batch names how many contacts it changed', () => {
+  const create = (id) => ({ ...contactMutation({ op: 'create_contact', person: { names: [{ givenName: 'A' }] } }), id });
+  const decision = requestDecision({ id: 'r', status: 'pending_review', mutation_count: 2, mutations: [create('a'), create('b')] });
+  assert.equal(decision.approveLabel, 'Create 2');
+  assert.equal(decision.doneLabel, 'Created 2 contacts');
 });
 
 test('a request is labelled by what it does, not as a mutation', () => {

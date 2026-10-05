@@ -5,6 +5,7 @@ import { useEffect, useRef } from 'react';
 import { Alert, AppState, useColorScheme } from 'react-native';
 
 import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
+import { decisions } from '@/lib/undo-decision';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
 
@@ -22,6 +23,16 @@ function Root() {
   // Apply a newer OTA bundle on this launch rather than the next one.
   useEffect(() => {
     void applyUpdateNow(() => {});
+  }, []);
+
+  // A decision still inside its undo window is sent when the app leaves the
+  // foreground: the reviewer has moved on, and a suspended or killed app
+  // would otherwise leave it unsent with no one watching.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'background') void decisions.flush();
+    });
+    return () => sub.remove();
   }, []);
 
   // Categories give alerts their action buttons; the list is the server's.
