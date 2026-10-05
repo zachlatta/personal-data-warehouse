@@ -747,16 +747,31 @@ class SearchEmbeddingRunner:
             state["orphan_status"] = "running"
             return False
         probe_limit = budget.remaining + 1
-        candidates = self._wh._query(
-            "SELECT DISTINCT ON (c.text_sha256) c.text_sha256, c.chunk_id"
-            " FROM @search_chunks c"
-            " WHERE NOT EXISTS ("
-            "   SELECT 1 FROM @search_chunk_embeddings e"
-            "   WHERE e.model = %s AND e.text_sha256 = c.text_sha256"
-            " )"
-            " ORDER BY c.text_sha256, c.chunk_id LIMIT %s",
-            (client.model, probe_limit),
-        )
+        # Planned for this statement only with hash joins and parallel
+        # workers off, so it stays the ordered index-only anti-join it was
+        # designed as. From 2026-10-04 17:44Z, with chunk_embeddings never
+        # analyzed after its rebuild, the planner chose a four-worker Parallel
+        # Hash Anti Join over 9.3M chunks; each worker asked for a 256 MB DSM
+        # segment against the container's 1 GB /dev/shm and every embeddings
+        # run failed with "could not resize shared memory segment".
+        self._wh._command("BEGIN")
+        try:
+            self._wh._command("SET LOCAL max_parallel_workers_per_gather = 0")
+            self._wh._command("SET LOCAL enable_hashjoin = off")
+            candidates = self._wh._query(
+                "SELECT DISTINCT ON (c.text_sha256) c.text_sha256, c.chunk_id"
+                " FROM @search_chunks c"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM @search_chunk_embeddings e"
+                "   WHERE e.model = %s AND e.text_sha256 = c.text_sha256"
+                " )"
+                " ORDER BY c.text_sha256, c.chunk_id LIMIT %s",
+                (client.model, probe_limit),
+            )
+            self._wh._command("COMMIT")
+        except Exception:
+            self._wh._command("ROLLBACK")
+            raise
         stats.orphaned_found = len(candidates)
         complete_probe = len(candidates) <= budget.remaining
         offered = candidates if complete_probe else candidates[: budget.remaining]

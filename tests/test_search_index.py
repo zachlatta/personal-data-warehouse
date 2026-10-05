@@ -652,6 +652,64 @@ def test_embedding_runner_repairs_orphans_behind_both_cursors(
     )[0][0] == 1
 
 
+def test_the_orphan_probe_cannot_be_planned_as_a_parallel_hash_join(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The daily completeness proof must stay an ordered index-only anti-join.
+
+    From 2026-10-04 17:44Z every production embeddings run failed with
+    ``could not resize shared memory segment ... No space left on device``:
+    with ``chunk_embeddings`` never analyzed after its rebuild, the planner
+    turned this probe into a four-worker Parallel Hash Anti Join over 9.3M
+    chunks, each worker asking for a 256 MB DSM segment against the warehouse
+    container's 1 GB /dev/shm. The probe is now planned with hash joins and
+    parallel workers disabled for its statement only, whatever the statistics
+    say.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["orphan probe plan alpha"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    client = _FakeEmbeddingClient()
+    assert SearchEmbeddingRunner(warehouse, client).run().caught_up
+    warehouse._command(
+        "UPDATE @search_chunk_sync_state"
+        " SET embed_orphan_checked_at = TIMESTAMPTZ '1970-01-01 00:00:00+00',"
+        "     embed_orphan_status = 'done' WHERE id = 'embeddings'"
+    )
+
+    observed: list[tuple[str, str]] = []
+    real_query = warehouse._query
+
+    def spying_query(sql, params=None):
+        if "NOT EXISTS" in sql and "@search_chunk_embeddings" in sql:
+            observed.append(
+                real_query(
+                    "SELECT current_setting('max_parallel_workers_per_gather'),"
+                    " current_setting('enable_hashjoin')"
+                )[0]
+            )
+        return real_query(sql, params)
+
+    warehouse._query = spying_query
+    try:
+        stats = SearchEmbeddingRunner(warehouse, client).run()
+    finally:
+        del warehouse._query
+
+    assert observed == [("0", "off")]
+    assert stats.orphans_caught_up
+    # Scoped to the probe: the session's own settings are untouched afterwards.
+    assert warehouse._query(
+        "SELECT current_setting('max_parallel_workers_per_gather') <> '0'"
+        " OR current_setting('enable_hashjoin') = 'on'"
+    )[0][0]
+
+
 def test_orphaned_chunks_is_a_first_class_search_health_component(
     warehouse: PostgresWarehouse,
 ) -> None:
