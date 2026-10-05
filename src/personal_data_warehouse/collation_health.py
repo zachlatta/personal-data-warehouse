@@ -48,6 +48,15 @@ by count and wall time; never-checked, old, large, and previously failing
 indexes go first, while unvisited indexes retain their last result. It
 never creates the extension or repairs an index; unavailable/error/timeout are
 published explicitly instead of being mistaken for a pass.
+
+**Page checksums cannot see damage done before the checksum was computed.** On
+2026-10-05 one bit flipped in shared-buffers RAM (the host's memory, not the
+disk) moved a line pointer of ``base_gmail.messages`` from offset 6984 to 6986.
+A hint-bit write then persisted that page with a fresh, valid checksum, so
+``pg_stat_database.checksum_failures`` never moved while every read of
+``marts_inbox.gmail_threads`` failed. The same collector therefore also rotates
+amcheck's ``verify_heapam`` (with TOAST pointer checks) across every heap table,
+under the same bounded-rotation rules as the btree checks.
 """
 
 from __future__ import annotations
@@ -78,6 +87,9 @@ __all__ = [
     "FINDING_TIMEOUT",
     "FINDING_UNKNOWN_ACTUAL",
     "FINDING_VERSION_CHANGED",
+    "HEAPCHECK_MAX_PER_RUN",
+    "HEAPCHECK_RUN_BUDGET_SECONDS",
+    "HEAPCHECK_STATEMENT_TIMEOUT_MS",
     "PROBE_STATEMENT_TIMEOUT_MS",
     "AMCHECK_STATEMENT_TIMEOUT_MS",
     "AMCHECK_MAX_PER_RUN",
@@ -85,6 +97,7 @@ __all__ = [
     "OBJECT_ID_DATA_CHECKSUMS",
     "SCOPE_COLLATION",
     "SCOPE_DATABASE",
+    "SCOPE_HEAP",
     "SCOPE_INDEX",
     "checksum_finding",
 ]
@@ -95,6 +108,11 @@ __all__ = [
 SCOPE_DATABASE = "database"
 SCOPE_COLLATION = "collation"
 SCOPE_INDEX = "index"
+#: A heap table's structural verdict from amcheck's ``verify_heapam``: line
+#: pointers, tuple headers, xid bounds and TOAST pointers. The finding a page
+#: checksum cannot make when the page was damaged in memory before it was
+#: written (2026-10-05).
+SCOPE_HEAP = "heap"
 
 FINDING_OK = "ok"
 #: Postgres has no recorded baseline to compare against, so it can never warn.
@@ -172,6 +190,18 @@ AMCHECK_MAX_PER_RUN = 50
 AMCHECK_RUN_BUDGET_SECONDS = 45 * 60
 AMCHECK_STALE_SECONDS = 14 * 24 * 60 * 60
 AMCHECK_FAILURE_RETRY_CAP = 5
+# The heap rotation's own bounds, separate from the btree one so neither can
+# starve the other. Measured 2026-10-05, pg_amcheck verified all 144 production
+# heaps (130 GB, the largest 63 GB) plus every btree in ~13 minutes on six
+# workers, so 45 heaps a day (~3.2 days per lap) in a 45-minute budget is cheap
+# and leaves the 14-day staleness window a wide margin. A single 63 GB heap
+# with TOAST checks needs more than the btree statement budget.
+HEAPCHECK_MAX_PER_RUN = 50
+HEAPCHECK_RUN_BUDGET_SECONDS = 45 * 60
+HEAPCHECK_STATEMENT_TIMEOUT_MS = 30 * 60_000
+#: How many verify_heapam reports one finding quotes. The first few name the
+#: block and tuple to inspect; the rest is the same damage restated.
+HEAPCHECK_REPORT_LIMIT = 5
 
 
 @dataclass
@@ -234,6 +264,7 @@ class CollationHealthCollector:
         findings = [self._database_finding(), self._checksum_finding()]
         findings.extend(self._collation_findings())
         findings.extend(self._index_findings())
+        findings.extend(self._heap_findings())
         return findings
 
     def run(self) -> list[CollationFinding]:
@@ -525,7 +556,7 @@ class CollationHealthCollector:
             """
             SELECT object_name, amcheck_status, amcheck_detail, amcheck_ms,
                    NULLIF(amcheck_at, '1970-01-01 00:00:00+00'::timestamptz) AS amcheck_at
-            FROM @collation_health WHERE scope = 'index'
+            FROM @collation_health WHERE scope IN ('index', 'heap')
             """
         )
         return {str(row["object_name"]): row for row in rows}
@@ -536,11 +567,15 @@ class CollationHealthCollector:
         prior: dict[str, dict[str, Any]],
         *,
         limit: int,
+        name_of=None,
+        size_key: str = "index_bytes",
+        max_per_run: int = AMCHECK_MAX_PER_RUN,
     ) -> list[dict[str, Any]]:
         now = self._now()
+        name_of = name_of or self._candidate_name
 
         def priority(row: dict[str, Any]) -> tuple[int, float, int, str]:
-            name = self._candidate_name(row)
+            name = name_of(row)
             old = prior.get(name)
             status = str((old or {}).get("amcheck_status") or "")
             at = (old or {}).get("amcheck_at")
@@ -553,7 +588,7 @@ class CollationHealthCollector:
             else:
                 tier = 3
             age = (now - at).total_seconds() if at else float("inf")
-            return (tier, -age, -int(row.get("index_bytes") or 0), name)
+            return (tier, -age, -int(row.get(size_key) or 0), name)
 
         ordered = sorted(candidates, key=priority)
         failed = [row for row in ordered if priority(row)[0] == 0]
@@ -562,7 +597,7 @@ class CollationHealthCollector:
         # never-checked tail forever. Retried failures still lead every run,
         # but consume only a bounded share of the rotation.
         chosen = failed[:AMCHECK_FAILURE_RETRY_CAP]
-        chosen.extend(rest[: max(0, min(limit, AMCHECK_MAX_PER_RUN) - len(chosen))])
+        chosen.extend(rest[: max(0, min(limit, max_per_run) - len(chosen))])
         return chosen
 
     @staticmethod
@@ -620,6 +655,152 @@ class CollationHealthCollector:
             finding.amcheck_ms = int((time.monotonic() - started) * 1000)
             finding.amcheck_at = self._now()
             self._warehouse._raw_command(f"SET statement_timeout = {PROBE_STATEMENT_TIMEOUT_MS}")
+
+    # -- heap structure ----------------------------------------------------
+
+    def _heap_findings(self) -> list[CollationFinding]:
+        """One row per heap table, a bounded rotation of them verified today.
+
+        Mirrors the btree rotation: never-checked, stale and previously failing
+        heaps go first, every unvisited heap keeps its last rigorous verdict,
+        and a missing extension is published as ``unavailable`` rather than as
+        a pass.
+        """
+        if not self._run_structural_checks:
+            return []
+        candidates = self._heapcheck_candidates()
+        if not candidates:
+            return []
+        function_schema = self._amcheck_heap_function()
+        prior = self._previous_amcheck_results()
+        selected = {
+            _table_name(row)
+            for row in self._select_amcheck_candidates(
+                candidates,
+                prior,
+                limit=HEAPCHECK_MAX_PER_RUN,
+                name_of=_table_name,
+                size_key="heap_bytes",
+                max_per_run=HEAPCHECK_MAX_PER_RUN,
+            )
+        }
+        deadline = time.monotonic() + HEAPCHECK_RUN_BUDGET_SECONDS
+        findings: list[CollationFinding] = []
+        for row in candidates:
+            name = _table_name(row)
+            finding = CollationFinding(
+                object_id=f"heap:{name}",
+                scope=SCOPE_HEAP,
+                object_name=name,
+                provider="",
+                recorded_version="",
+                actual_version="",
+                dependent_indexes=0,
+                finding=FINDING_OK,
+                detail="heap table; structure verified by the verify_heapam rotation",
+                table_name=name,
+            )
+            findings.append(finding)
+            previous = prior.get(name)
+            if previous and not (
+                function_schema and str(previous.get("amcheck_status") or "") == "unavailable"
+            ):
+                self._restore_amcheck(finding, previous)
+            elif not function_schema:
+                finding.amcheck_status = "unavailable"
+                finding.amcheck_detail = "amcheck extension/verify_heapam is not installed"
+            else:
+                finding.amcheck_status = "never_checked"
+                finding.amcheck_detail = "pending the bounded daily verify_heapam rotation"
+            if name in selected and function_schema and time.monotonic() < deadline:
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                self._run_heapcheck(
+                    row,
+                    finding,
+                    function_schema,
+                    timeout_ms=min(HEAPCHECK_STATEMENT_TIMEOUT_MS, remaining_ms),
+                )
+            elif name in selected and function_schema:
+                finding.amcheck_status = "pending"
+                finding.amcheck_detail = "daily verify_heapam wall-time budget exhausted"
+        return findings
+
+    def _heapcheck_candidates(self) -> list[dict[str, Any]]:
+        return self._warehouse._query_dicts(
+            """
+            SELECT n.nspname AS table_schema, c.relname AS table_name,
+                   pg_relation_size(c.oid) AS heap_bytes
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_am am ON am.oid = c.relam
+            WHERE c.relkind IN ('r', 'm') AND am.amname = 'heap'
+              AND n.nspname = ANY(%s)
+            ORDER BY 1, 2
+            """,
+            (self._warehouse.physical_schema_names(include_hidden=True),),
+        )
+
+    def _amcheck_heap_function(self) -> str:
+        """The schema holding ``verify_heapam``, never CREATE it."""
+        rows = self._warehouse._query(
+            """
+            SELECT n.nspname
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_extension e ON e.extnamespace = n.oid
+            WHERE e.extname = 'amcheck' AND p.proname = 'verify_heapam'
+            LIMIT 1
+            """
+        )
+        return str(rows[0][0]) if rows else ""
+
+    def _run_heapcheck(
+        self,
+        row: dict[str, Any],
+        finding: CollationFinding,
+        function_schema: str,
+        *,
+        timeout_ms: int = HEAPCHECK_STATEMENT_TIMEOUT_MS,
+    ) -> None:
+        if not function_schema:
+            return
+        started = time.monotonic()
+        self._warehouse._raw_command(f"SET statement_timeout = {timeout_ms}")
+        try:
+            qualified = f"{_ident(row['table_schema'])}.{_ident(row['table_name'])}"
+            # verify_heapam reports corruption as ROWS, not as an ERROR: an
+            # empty result is the pass, and any row is a definitive failure.
+            reports = self._warehouse._query(
+                f"SELECT blkno, offnum, attnum, msg FROM {_ident(function_schema)}.verify_heapam("
+                "%s::regclass, on_error_stop => false, check_toast => true)",
+                (qualified,),
+            )
+            if reports:
+                quoted = "; ".join(
+                    f"block {blkno} offset {offnum}"
+                    + (f" attribute {attnum}" if attnum is not None else "")
+                    + f": {msg}"
+                    for blkno, offnum, attnum, msg in reports[:HEAPCHECK_REPORT_LIMIT]
+                )
+                finding.amcheck_status = "failed"
+                finding.amcheck_detail = (
+                    f"verify_heapam reported {len(reports)} corruption(s): {quoted}. "
+                    "Check the host's memory before repairing; inspect the block with "
+                    "pageinspect, recover the tuple, then heap_force_kill the damaged item."
+                )[:1000]
+            else:
+                finding.amcheck_status = "ok"
+                finding.amcheck_detail = "verify_heapam heap and TOAST-pointer verification passed"
+        except psycopg2.errors.QueryCanceled as error:
+            finding.amcheck_status = "timeout"
+            finding.amcheck_detail = _one_line(str(error))[:500]
+        except psycopg2.Error as error:
+            detail = _one_line(str(error))[:500]
+            finding.amcheck_status = "failed" if "corrupt" in detail.lower() else "error"
+            finding.amcheck_detail = detail
+        finally:
+            finding.amcheck_ms = int((time.monotonic() - started) * 1000)
+            finding.amcheck_at = self._now()
+            self._warehouse._raw_command("SET statement_timeout = DEFAULT")
 
     def _unique_index_candidates(self) -> list[dict[str, Any]]:
         """Unique btree indexes over plain columns, with their partial predicate.
@@ -749,6 +930,10 @@ class CollationHealthCollector:
                 "re-verify with amcheck."
             )
         return finding
+
+
+def _table_name(row: dict[str, Any]) -> str:
+    return f"{row['table_schema']}.{row['table_name']}"
 
 
 def _one_line(text: str) -> str:

@@ -5476,7 +5476,10 @@ class PostgresWarehouse:
                     -- behind an all-green dashboard).
                     WHEN finding = 'checksum_failures' THEN 'failing'
                     WHEN finding = 'checksums_disabled' THEN 'attention'
-                    WHEN scope = 'index' AND amcheck_status = 'failed' THEN 'failing'
+                    -- 'heap' is verify_heapam's verdict: a page damaged in
+                    -- memory and then written carries a VALID checksum
+                    -- (2026-10-05), so only a structural check can see it.
+                    WHEN scope IN ('index', 'heap') AND amcheck_status = 'failed' THEN 'failing'
                     WHEN finding = 'duplicate_keys' THEN 'failing'
                     -- A recorded baseline that no longer matches the library.
                     WHEN finding = 'version_changed' THEN 'failing'
@@ -5485,7 +5488,7 @@ class PostgresWarehouse:
                     -- drift either, and text index ordering is unverified.
                     WHEN finding = 'no_baseline' THEN 'attention'
                     WHEN finding = 'unknown_actual' THEN 'attention'
-                    WHEN scope = 'index'
+                    WHEN scope IN ('index', 'heap')
                       AND amcheck_status IN ('timeout', 'error') THEN 'attention'
                     -- `unavailable` describes the EXTENSION, not the index. It
                     -- is only a finding while amcheck is genuinely missing;
@@ -5496,13 +5499,13 @@ class PostgresWarehouse:
                     -- the snapshot, because on 2026-08-27 production held 98
                     -- such rows as `attention` beside 48 rows the same
                     -- collector had just amchecked `ok`.
-                    WHEN scope = 'index' AND amcheck_status = 'unavailable'
+                    WHEN scope IN ('index', 'heap') AND amcheck_status = 'unavailable'
                       AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'amcheck')
                       THEN 'attention'
-                    WHEN scope = 'index'
+                    WHEN scope IN ('index', 'heap')
                       AND amcheck_status IN ('pending', 'never_checked', 'unavailable')
                       THEN 'unmeasured'
-                    WHEN scope = 'index' AND amcheck_at IS NOT NULL
+                    WHEN scope IN ('index', 'heap') AND amcheck_at IS NOT NULL
                       AND now() - amcheck_at > interval '14 days' THEN 'attention'
                     WHEN finding IN ('timeout', 'error') THEN 'attention'
                     WHEN finding IN ('skipped_expression', 'skipped_large')

@@ -297,3 +297,23 @@ All 220 btree indexes were swept; the large ones (`base_gmail.messages`,
 `base_slack.messages`, `timeline.events`) were clean. All 178 collatable indexes use the
 database default collation — the 871 drifted `*-x-icu` collations have no dependent index
 and are noise.
+
+## Damage written with a valid checksum (2026-10-05)
+
+**A page checksum proves the page was written as it was in memory, not that memory was right.**
+After the 10-03 checksum incident was repaired, one bit flipped in shared-buffers RAM on mew
+moved line pointer 1 of `base_gmail.messages` block 50651 from offset 6984 to 6986. At
+10:32Z a hint-bit write logged a full-page image *already carrying the flip* (the page's
+previous LSN was months old) and the page then reached disk with a fresh, valid checksum.
+`pg_stat_database.checksum_failures` never moved; every read of `marts_inbox.gmail_threads`
+failed with `array size exceeds the maximum allowed` or `compressed pglz data is corrupt`.
+A whole-row sweep (`md5(t::text)` over every TID range) read that table without an error
+while `cardinality(label_ids)` over the same rows failed, so a read sweep is not the
+detector for this class; `verify_heapam` is (`line pointer ... is not maximally aligned`).
+
+The `collation_health` asset therefore rotates amcheck's `verify_heapam` (with
+`check_toast`) across every heap as `heap:<schema>.<table>` rows, under the same rules as the
+btree rotation (`HEAPCHECK_MAX_PER_RUN`, a separate 45-minute budget, `failed` reads
+`failing`). Repair recipe, used that day: decode the misplaced tuple from
+`get_raw_page` with `tuple_data_split`, cross-check it against its own `payload_json`,
+`heap_force_kill` the damaged item and re-insert the decoded row in one transaction.

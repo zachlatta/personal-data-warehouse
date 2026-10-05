@@ -84,6 +84,11 @@ def collation_health(context) -> MaterializeResult:
         context.log.warning("%s: %s", finding.object_name, finding.detail)
     for finding in unbaselined:
         context.log.warning("%s: %s", finding.object_name, finding.detail)
+    structurally_failed = [
+        f for f in findings if f.scope in {"index", "heap"} and f.amcheck_status == "failed"
+    ]
+    for finding in structurally_failed:
+        context.log.warning("%s %s: %s", finding.scope, finding.object_name, finding.amcheck_detail)
 
     return MaterializeResult(
         metadata={
@@ -101,6 +106,12 @@ def collation_health(context) -> MaterializeResult:
                     if f.scope == "index"
                     and f.amcheck_status in {"pending", "never_checked", "unavailable"}
                 )
+            ),
+            "heaps_with_amcheck_result": MetadataValue.int(
+                sum(1 for f in findings if f.scope == "heap" and f.amcheck_at is not None)
+            ),
+            "structurally_failed": MetadataValue.json(
+                sorted(f"{f.scope}:{f.object_name}" for f in structurally_failed)
             ),
             "excess_rows": MetadataValue.int(sum(f.excess_rows for f in duplicates)),
             "collations_version_changed": MetadataValue.json(

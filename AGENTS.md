@@ -114,7 +114,9 @@ that, not from this prose.
   newest backup copied corrupt pages (`integrity_status`, `last_clean_backup_label`). The
   database's own pages: the `data_checksums` row of `marts_ops.collation_health` reads
   `pg_stat_database.checksum_failures` every ten minutes and fails on one in the last week
-  (2026-10-03: 9,125 failures under an all-green dashboard). Runbook:
+  (2026-10-03: 9,125 failures under an all-green dashboard). A page damaged in RAM *before*
+  it is written carries a valid checksum (2026-10-05), so `heap:*` rows there rotate
+  amcheck's `verify_heapam` across every table. Runbook:
   `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
   green.** *Held up by* per-source detectors: `marts_ops.slack_conversation_health`,

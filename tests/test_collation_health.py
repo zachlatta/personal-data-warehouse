@@ -659,7 +659,7 @@ def test_a_stale_unavailable_row_is_relabelled_on_the_first_run_with_amcheck(war
     collector = CollationHealthCollector(warehouse, run_amcheck=True)
     # Pin the rotation to visit NOTHING so the re-label is what the run proves,
     # not a side effect of the index happening to be checked.
-    collector._select_amcheck_candidates = lambda rows, prior, limit: []
+    collector._select_amcheck_candidates = lambda rows, prior, limit, **_: []
     collector.run()
     row = _findings(warehouse)[f"index:{name}"]
     assert row["amcheck_status"] == "never_checked", row
@@ -771,6 +771,7 @@ def test_every_finding_lands_in_the_snapshot_and_the_read_view(warehouse):
         SCOPE_DATABASE,
         SCOPE_COLLATION,
         SCOPE_INDEX,
+        "heap",
     }
     assert any(row["scope"] == SCOPE_INDEX for row in rows.values())
     # Every exposed timestamp is NULLIF'd, or none: the epoch sentinel must
@@ -949,3 +950,190 @@ def test_the_integrity_row_refreshes_alone_without_pruning_the_daily_snapshot(wa
     after = _findings(warehouse)
     assert set(after) == set(before)
     assert after[OBJECT_ID_DATA_CHECKSUMS]["collected_at"] >= before[OBJECT_ID_DATA_CHECKSUMS]["collected_at"]
+
+
+# --- heap structure (C10: a flipped bit written with a valid checksum) ---------
+#
+# On 2026-10-05 a single bit flipped in shared-buffers RAM moved line pointer 1
+# of base_gmail.messages block 50651 from offset 6984 to 6986. A hint-bit write
+# then persisted the page with a fresh, VALID checksum, so pg_stat_database
+# never counted a failure and every surface stayed green, while
+# marts_inbox.gmail_threads failed every read ("array size exceeds the maximum
+# allowed", "compressed pglz data is corrupt"). Page checksums cannot see damage
+# that happened before the checksum was computed; amcheck's verify_heapam can.
+
+
+def _heap_finding(name: str = "base_gmail.messages") -> CollationFinding:
+    from personal_data_warehouse.collation_health import SCOPE_HEAP
+
+    return CollationFinding(
+        object_id=f"heap:{name}",
+        scope=SCOPE_HEAP,
+        object_name=name,
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding=FINDING_OK,
+        detail="",
+        table_name=name,
+    )
+
+
+class _HeapCheckWarehouse:
+    schema_namespace = "public"
+
+    def __init__(self, rows) -> None:
+        self.rows = rows
+        self.commands: list[str] = []
+        self.queries: list[tuple[str, tuple]] = []
+
+    def _raw_command(self, sql: str) -> None:
+        self.commands.append(sql)
+
+    def _query(self, sql: str, params=()):
+        self.queries.append((sql, params))
+        return self.rows
+
+
+def test_a_heap_check_that_reports_corruption_fails_and_names_the_tuple() -> None:
+    from personal_data_warehouse.collation_health import HEAPCHECK_STATEMENT_TIMEOUT_MS
+
+    fake = _HeapCheckWarehouse(
+        [(50651, 1, None, "line pointer to page offset 6986 is not maximally aligned")]
+    )
+    collector = CollationHealthCollector(fake, run_amcheck=True)
+    finding = _heap_finding()
+    collector._run_heapcheck(
+        {"table_schema": "base_gmail", "table_name": "messages"}, finding, "public"
+    )
+    assert finding.amcheck_status == "failed"
+    assert "block 50651" in finding.amcheck_detail
+    assert "offset 1" in finding.amcheck_detail
+    assert "not maximally aligned" in finding.amcheck_detail
+    sql, params = fake.queries[0]
+    assert '"public".verify_heapam' in sql
+    assert "check_toast => true" in sql
+    assert params == ('"base_gmail"."messages"',)
+    assert any(str(HEAPCHECK_STATEMENT_TIMEOUT_MS) in command for command in fake.commands)
+    assert finding.amcheck_at is not None
+
+
+def test_a_clean_heap_check_is_recorded_ok() -> None:
+    collector = CollationHealthCollector(_HeapCheckWarehouse([]), run_amcheck=True)
+    finding = _heap_finding()
+    collector._run_heapcheck(
+        {"table_schema": "base_gmail", "table_name": "messages"}, finding, "public"
+    )
+    assert finding.amcheck_status == "ok"
+    assert "verify_heapam" in finding.amcheck_detail
+
+
+def test_heap_check_candidates_are_every_heap_table_in_the_warehouse() -> None:
+    class FakeWarehouse:
+        schema_namespace = "public"
+
+        def physical_schema_names(self, *, include_hidden: bool):
+            assert include_hidden
+            return ["base_gmail"]
+
+        def _query_dicts(self, sql: str, params):
+            assert "relkind IN ('r', 'm')" in sql
+            assert "amname = 'heap'" in sql
+            assert params == (["base_gmail"],)
+            return [{"table_schema": "base_gmail", "table_name": "messages"}]
+
+    assert CollationHealthCollector(FakeWarehouse())._heapcheck_candidates() == [
+        {"table_schema": "base_gmail", "table_name": "messages"}
+    ]
+
+
+def test_heap_rotation_is_bounded_emits_every_heap_and_preserves_unvisited_results() -> None:
+    from personal_data_warehouse.collation_health import (
+        HEAPCHECK_MAX_PER_RUN,
+        HEAPCHECK_STATEMENT_TIMEOUT_MS,
+        SCOPE_HEAP,
+    )
+
+    now = datetime(2026, 10, 5, tzinfo=UTC)
+    collector = CollationHealthCollector(_HeapCheckWarehouse([]), now=lambda: now)
+    collector._amcheck_heap_function = lambda: "public"
+    candidates = [
+        {"table_schema": "base_gmail", "table_name": f"t_{i:03d}", "heap_bytes": i}
+        for i in range(HEAPCHECK_MAX_PER_RUN + 5)
+    ]
+    collector._heapcheck_candidates = lambda: candidates
+    retained_name = f"base_gmail.t_{0:03d}"
+    collector._previous_amcheck_results = lambda: {
+        retained_name: {
+            "amcheck_status": "ok",
+            "amcheck_detail": "previous pass",
+            "amcheck_ms": 9,
+            "amcheck_at": now - timedelta(days=1),
+        }
+    }
+    checked: list[str] = []
+
+    def fake_check(row, finding, _schema, *, timeout_ms):
+        assert 0 < timeout_ms <= HEAPCHECK_STATEMENT_TIMEOUT_MS
+        checked.append(row["table_name"])
+        finding.amcheck_status = "ok"
+        finding.amcheck_at = now
+
+    collector._run_heapcheck = fake_check
+    findings = collector._heap_findings()
+    assert len(checked) == HEAPCHECK_MAX_PER_RUN
+    assert retained_name.split(".")[1] not in checked, "a recently verified heap waits its turn"
+    assert len(findings) == len(candidates)
+    assert {f.scope for f in findings} == {SCOPE_HEAP}
+    assert {f.object_id for f in findings} == {
+        f"heap:base_gmail.{row['table_name']}" for row in candidates
+    }
+    retained = next(f for f in findings if f.object_name == retained_name)
+    assert retained.amcheck_detail == "previous pass"
+
+
+def test_heap_rotation_laps_the_production_heaps_well_inside_the_stale_window() -> None:
+    from personal_data_warehouse.collation_health import (
+        AMCHECK_FAILURE_RETRY_CAP,
+        AMCHECK_STALE_SECONDS,
+        HEAPCHECK_MAX_PER_RUN,
+    )
+
+    production_heaps = 144  # measured 2026-10-05
+    days_per_lap = production_heaps / (HEAPCHECK_MAX_PER_RUN - AMCHECK_FAILURE_RETRY_CAP)
+    assert days_per_lap * 2 <= AMCHECK_STALE_SECONDS / 86_400
+
+
+def test_a_failed_heap_check_reads_failing_and_a_stale_one_attention(warehouse):
+    from personal_data_warehouse.collation_health import SCOPE_HEAP
+
+    failed = _heap_finding("base_gmail.messages")
+    failed.amcheck_status = "failed"
+    failed.amcheck_detail = "block 50651 offset 1: line pointer to page offset 6986 is not maximally aligned"
+    failed.amcheck_at = datetime.now(tz=UTC)
+    stale = _heap_finding("base_slack.messages")
+    stale.amcheck_status = "ok"
+    stale.amcheck_at = datetime.now(tz=UTC) - timedelta(days=20)
+    pending = _heap_finding("timeline.events")
+    pending.amcheck_status = "never_checked"
+    warehouse.write_collation_health([failed, stale, pending], collected_at=datetime.now(tz=UTC))
+    rows = _findings(warehouse)
+    assert rows["heap:base_gmail.messages"]["status"] == "failing"
+    assert rows["heap:base_gmail.messages"]["scope"] == SCOPE_HEAP
+    assert rows["heap:base_slack.messages"]["status"] == "attention"
+    assert rows["heap:timeline.events"]["status"] == "unmeasured"
+
+
+def test_the_collector_verifies_real_heaps_with_amcheck(warehouse):
+    from personal_data_warehouse.collation_health import SCOPE_HEAP
+
+    _require_amcheck(warehouse)
+    findings = CollationHealthCollector(warehouse, run_amcheck=True).run()
+    heaps = [f for f in findings if f.scope == SCOPE_HEAP]
+    assert heaps, "the warehouse's own tables must be in the heap rotation"
+    checked = [f for f in heaps if f.amcheck_at is not None]
+    assert checked
+    assert {f.amcheck_status for f in checked} == {"ok"}
+    rows = _findings(warehouse)
+    assert all(rows[f.object_id]["status"] == "ok" for f in checked)
