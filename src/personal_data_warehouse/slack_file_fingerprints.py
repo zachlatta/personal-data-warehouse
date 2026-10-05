@@ -218,9 +218,11 @@ class SlackThumbnailFetcher:
                 raise SlackFileMissingError(f"Slack answered {status} for {ref.file_id}")
             if status >= 400:
                 raise SlackFileFetchError(f"HTTP {status} fetching {ref.file_id}")
-            # Slack answers an unauthorized file fetch with a 200 HTML login page.
+            # Slack answers a deleted (or inaccessible) file with a 200 HTML login
+            # page; files.info says file_not_found for those. A broken token
+            # would fail every file, which the run's failed/missing counts show.
             if str(headers.get("Content-Type") or "").startswith("text/html"):
-                raise SlackFileFetchError(f"Slack returned HTML instead of {ref.file_id}; check files:read")
+                raise SlackFileMissingError(f"Slack returned its login page for {ref.file_id}: deleted or no access")
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=_CHUNK_BYTES):

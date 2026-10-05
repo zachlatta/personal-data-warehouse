@@ -461,12 +461,18 @@ def test_slack_rate_limiting_stops_the_run():
     assert excinfo.value.retry_after == 30
 
 
-def test_slacks_html_login_page_is_a_fetch_error_not_an_image():
+def test_slacks_html_login_page_means_the_file_is_gone():
+    """Slack answers a deleted file's thumbnail with its 200 HTML login page.
+
+    The first thumbnail run (2026-10-05) met 25 of these in 600; files.info
+    said file_not_found for them. They are `missing` (retried with backoff),
+    as the old get_object path recorded them, not an unexplained failure.
+    """
     fetcher, _ = make_thumb_fetcher(
         [FakeResp(body=b"<!DOCTYPE html><html>sign in</html>", headers={"Content-Type": "text/html"})]
     )
 
-    with pytest.raises(SlackFileFetchError):
+    with pytest.raises(SlackFileMissingError):
         fetcher.fetch(candidate_ref())
 
 
