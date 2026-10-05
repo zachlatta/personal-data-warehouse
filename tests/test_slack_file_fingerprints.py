@@ -17,7 +17,7 @@ from PIL import Image
 
 from personal_data_warehouse.photo_fingerprint import HASH_VERSION
 from personal_data_warehouse.slack_file_fingerprints import (
-    AppObjectFetcher,
+    SlackThumbnailFetcher,
     SlackFileFetchError,
     SlackFileMissingError,
     SlackFileRateLimitedError,
@@ -51,6 +51,7 @@ def candidate(**overrides) -> dict:
         "team_id": "T_TESTTEAM",
         "file_id": "F_TESTPOSTER",
         "url_private": "https://files.slack.com/files-pri/T09-F_TESTPOSTER/11x17.png",
+        "thumbnail_url": "https://files.slack.com/files-tmb/T09-F_TESTPOSTER-abc/11x17_1024.png",
         "mimetype": "image/png",
         "name": "11x17.png",
         "size": 20055308,
@@ -264,6 +265,31 @@ def test_rate_limiting_stops_the_run_cleanly_so_it_resumes_next_time():
     assert all(row["file_id"] != "F1" or row["status"] != STATUS_FAILED for row in warehouse.links)
 
 
+def test_downloads_are_spaced_out_never_a_burst():
+    """Slack flags a burst of downloads on one user as `excessive_downloads`.
+
+    The hourly slice used to fetch ~300 images in about five minutes. Spacing
+    each download keeps the run's rate close to a person browsing.
+    """
+    rows = [candidate(file_id=f"F{i}", url_private=f"https://x/F{i}") for i in range(3)]
+    slept: list[float] = []
+    warehouse = FakeWarehouse(rows)
+    fetcher = FakeFetcher({f"F{i}": png_bytes(color=(i * 40 % 255, 60, 10)) for i in range(3)})
+    runner = SlackFileFingerprintRunner(
+        warehouse=warehouse,
+        fetcher=fetcher,
+        logger=NullLogger(),
+        now=lambda: NOW,
+        sleep=slept.append,
+        download_spacing_seconds=90,
+    )
+
+    runner.run()
+
+    assert fetcher.fetched == ["F0", "F1", "F2"]
+    assert slept == [90, 90]  # between downloads, not before the first or after the last
+
+
 def test_wall_clock_budget_stops_the_run():
     rows = [candidate(file_id=f"F{i}", url_private=f"https://x/F{i}") for i in range(5)]
     ticks = iter([NOW + timedelta(seconds=i * 30) for i in range(20)])
@@ -337,45 +363,33 @@ def test_an_image_beyond_even_the_raised_ceiling_is_recorded_as_too_large(monkey
     assert "pixel" in link["last_error"].lower()
 
 
-# --- fetching through the app's existing get_object -------------------------
+# --- fetching a thumbnail, not the file ---------------------------------------
 #
-# The app already resolves Slack files (objectstore/slack.go). These tests pin
-# that the backfill delegates to it rather than re-implementing Slack auth.
+# Slack's audit log records every full download (`file_downloaded`), and ~6,500
+# of them a day drew an `excessive_downloads` anomaly on Zach's user every three
+# hours until 2026-10-05. A thumbnail fetch (files-tmb) is not audited, is ~100
+# KB instead of ~600 KB, and its dhash is within 0-7 of 256 bits of the full
+# image's (measured on 12 production files; lookups match within 40).
 
 
 class FakeHTTP:
-    def __init__(self, post=None, get=None):
-        self._post = post
-        self._get = get
-        self.posts = []
+    def __init__(self, responses):
+        self._responses = list(responses)
         self.gets = []
 
-    def post(self, url, *, json=None, headers=None, timeout=None):
-        self.posts.append({"url": url, "json": json, "headers": dict(headers or {})})
-        if isinstance(self._post, Exception):
-            raise self._post
-        return self._post
-
     def get(self, url, *, headers=None, stream=False, timeout=None):
-        self.gets.append({"url": url, "stream": stream})
-        if isinstance(self._get, Exception):
-            raise self._get
-        return self._get
+        self.gets.append({"url": url, "headers": dict(headers or {}), "stream": stream})
+        result = self._responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class FakeResp:
-    def __init__(self, *, status_code=200, payload=None, body=b"", headers=None):
+    def __init__(self, *, status_code=200, body=b"", headers=None):
         self.status_code = status_code
-        self._payload = payload
         self._body = body
         self.headers = headers or {}
-
-    def json(self):
-        return self._payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
 
     def iter_content(self, chunk_size=1):
         for i in range(0, len(self._body), chunk_size):
@@ -385,115 +399,98 @@ class FakeResp:
         pass
 
 
-def object_payload(**overrides):
-    data = {
-        "exists": True,
-        "content_type": "image/png",
-        "size_bytes": 512,
-        "filename": "poster.png",
-        "download_url": "https://app.example/objects/F_TESTPOSTER?exp=1&sig=x",
-    }
-    data.update(overrides)
-    return {"data": data}
+def candidate_ref(**overrides):
+    row = candidate(size=512)
+    row.update(overrides)
+    return SlackFileRef.from_row(row)
 
 
-def make_app_fetcher(post=None, get=None, **kwargs):
-    http = FakeHTTP(post=post, get=get)
-    fetcher = AppObjectFetcher(
-        base_url="https://app.example", secret_token="t0ken", session=http, **kwargs
-    )
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def make_thumb_fetcher(responses, **kwargs):
+    http = FakeHTTP(responses)
+    fetcher = SlackThumbnailFetcher(tokens={"zrl": "xoxp-test"}, session=http, **kwargs)
     return fetcher, http
 
 
-def test_fetch_calls_get_object_then_downloads_the_signed_url():
-    body = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-    fetcher, http = make_app_fetcher(
-        post=FakeResp(payload=object_payload()), get=FakeResp(body=body)
-    )
+def test_fetch_downloads_the_thumbnail_with_the_accounts_token():
+    fetcher, http = make_thumb_fetcher([FakeResp(body=PNG)])
 
-    assert fetcher.fetch(candidate_ref()) == body
+    assert fetcher.fetch(candidate_ref()) == PNG
 
-    # It uses the app's existing tool, not the Slack API.
-    assert http.posts[0]["url"].endswith("/api/tools/get_object")
-    assert http.posts[0]["json"]["storage_file_id"] == "F_TESTPOSTER"
-    assert "slack.com" not in http.gets[0]["url"]
+    assert http.gets[0]["url"] == "https://files.slack.com/files-tmb/T09-F_TESTPOSTER-abc/11x17_1024.png"
+    assert http.gets[0]["headers"]["Authorization"] == "Bearer xoxp-test"
+    assert len(http.gets) == 1  # no files.info, no app hop, no full download
 
 
-def test_no_slack_credential_or_slack_endpoint_is_referenced_by_the_backfill():
-    """The app holds the Slack credential and owns Slack file resolution.
+def test_a_file_without_a_thumbnail_falls_back_to_the_full_download():
+    fetcher, http = make_thumb_fetcher([FakeResp(body=PNG)])
 
-    Checked against the parsed module rather than its text, so the comments
-    that *explain* the delegation do not trip it.
-    """
-    import ast
-    import inspect
+    fetcher.fetch(candidate_ref(thumbnail_url=""))
 
-    from personal_data_warehouse import slack_file_fingerprints as module
-
-    tree = ast.parse(inspect.getsource(module))
-    literals = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    names = [n.id for n in ast.walk(tree) if isinstance(n, ast.Name)]
-    attrs = [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
-
-    # Docstrings are literals too, so only look at what the code would *use*.
-    code_literals = [
-        text for text in literals
-        if not text.strip().startswith(("Fetch", "The ", "Any ", "Bigger", "One ", "Slack carries"))
-    ]
-    for text in code_literals:
-        assert "slack.com" not in text, text
-        assert "files.info" not in text, text
-        assert "_TOKEN" not in text, text
-    for identifier in names + attrs:
-        assert "slack_account" not in identifier, identifier
-        assert identifier != "token", identifier
+    assert http.gets[0]["url"] == "https://files.slack.com/files-pri/T09-F_TESTPOSTER/11x17.png"
 
 
-def test_a_missing_object_is_classified_missing():
-    fetcher, _ = make_app_fetcher(post=FakeResp(payload={"data": {"exists": False}}))
+def test_a_huge_original_is_still_fingerprinted_from_its_thumbnail():
+    fetcher, http = make_thumb_fetcher([FakeResp(body=PNG)], max_bytes=100)
+
+    assert fetcher.fetch(candidate_ref(size=500_000_000)) == PNG
+
+
+def test_an_oversized_full_download_is_rejected_without_a_request():
+    fetcher, http = make_thumb_fetcher([], max_bytes=100)
+
+    with pytest.raises(SlackFileTooLargeError):
+        fetcher.fetch(candidate_ref(thumbnail_url="", size=101))
+    assert http.gets == []
+
+
+def test_a_404_is_classified_missing():
+    fetcher, _ = make_thumb_fetcher([FakeResp(status_code=404)])
 
     with pytest.raises(SlackFileMissingError):
         fetcher.fetch(candidate_ref())
 
 
-def test_a_tool_error_becomes_a_fetch_error():
-    fetcher, _ = make_app_fetcher(
-        post=FakeResp(payload={"data": {"error": "slack files.info: invalid_auth"}})
-    )
+def test_slack_rate_limiting_stops_the_run():
+    fetcher, _ = make_thumb_fetcher([FakeResp(status_code=429, headers={"Retry-After": "30"})])
 
-    with pytest.raises(SlackFileFetchError) as excinfo:
+    with pytest.raises(SlackFileRateLimitedError) as excinfo:
         fetcher.fetch(candidate_ref())
-    assert "invalid_auth" in str(excinfo.value)
+    assert excinfo.value.retry_after == 30
 
 
-def test_slack_rate_limiting_surfaced_by_the_app_stops_the_run():
-    fetcher, _ = make_app_fetcher(
-        post=FakeResp(payload={"data": {"error": "slack files.info: HTTP 429"}})
-    )
-
-    with pytest.raises(SlackFileRateLimitedError):
-        fetcher.fetch(candidate_ref())
-
-
-def test_oversized_rows_are_rejected_without_calling_the_app():
-    fetcher, http = make_app_fetcher(max_bytes=100)
-
-    with pytest.raises(SlackFileTooLargeError):
-        fetcher.fetch(candidate_ref(size=101))
-    assert http.posts == []
-
-
-def test_a_body_that_is_not_an_image_is_rejected():
-    fetcher, _ = make_app_fetcher(
-        post=FakeResp(payload=object_payload()),
-        get=FakeResp(body=b"<!DOCTYPE html><html>sign in</html>"),
+def test_slacks_html_login_page_is_a_fetch_error_not_an_image():
+    fetcher, _ = make_thumb_fetcher(
+        [FakeResp(body=b"<!DOCTYPE html><html>sign in</html>", headers={"Content-Type": "text/html"})]
     )
 
     with pytest.raises(SlackFileFetchError):
         fetcher.fetch(candidate_ref())
 
 
-def candidate_ref(**overrides):
-    row = {"account": "zrl", "team_id": "T_TESTTEAM", "file_id": "F_TESTPOSTER", "size": 512}
-    row.update(overrides)
-    return SlackFileRef.from_row(row)
+def test_an_account_without_a_token_is_a_fetch_error():
+    fetcher, http = make_thumb_fetcher([])
+
+    with pytest.raises(SlackFileFetchError):
+        fetcher.fetch(candidate_ref(account="someone-else"))
+    assert http.gets == []
+
+
+def test_full_downloads_are_capped_per_run_so_they_never_burst():
+    """The rare image with no thumbnail costs an audited download; a run takes few."""
+    rows = [candidate(file_id=f"F{i}", thumbnail_url="", url_private=f"https://x/F{i}") for i in range(5)]
+    rows.append(candidate(file_id="F_THUMB"))
+    runner, warehouse, fetcher = make_runner(
+        rows,
+        {**{f"F{i}": png_bytes(color=(i * 40 % 255, 60, 10)) for i in range(5)}, "F_THUMB": png_bytes()},
+        max_full_downloads=2,
+    )
+
+    summary = runner.run()
+
+    assert fetcher.fetched == ["F0", "F1", "F_THUMB"]
+    assert summary.full_downloads == 2
+    # The skipped ones are not recorded, so the next run picks them up.
+    assert {row["file_id"] for row in warehouse.links} == {"F0", "F1", "F_THUMB"}

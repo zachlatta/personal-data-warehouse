@@ -133,6 +133,30 @@ def test_only_undone_live_images_are_candidates(warehouse):
     assert ids(candidates(warehouse)) == ["F_IMG"]
 
 
+def test_candidates_carry_the_largest_thumbnail_url(warehouse):
+    """The fetcher hashes a thumbnail, never the audited full file, when one exists."""
+    insert_files(
+        warehouse,
+        [
+            file_row(
+                file_id="F_THUMBS",
+                raw_json='{"thumb_360": "https://files.slack.com/files-tmb/x/a_360.png",'
+                ' "thumb_1024": "https://files.slack.com/files-tmb/x/a_1024.png",'
+                ' "thumb_480": "https://files.slack.com/files-tmb/x/a_480.png"}',
+            ),
+            file_row(file_id="F_SMALL", raw_json='{"thumb_360": "https://files.slack.com/files-tmb/x/b_360.png"}'),
+            file_row(file_id="F_NONE", raw_json='{"thumb_tiny": "AwAeADDO"}'),
+        ],
+    )
+
+    by_id = {row["file_id"]: row["thumbnail_url"] for row in candidates(warehouse)}
+    assert by_id == {
+        "F_THUMBS": "https://files.slack.com/files-tmb/x/a_1024.png",
+        "F_SMALL": "https://files.slack.com/files-tmb/x/b_360.png",
+        "F_NONE": "",
+    }
+
+
 def test_newest_first_so_a_bounded_slice_covers_what_people_ask_about(warehouse):
     insert_files(
         warehouse,

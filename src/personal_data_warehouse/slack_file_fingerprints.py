@@ -18,6 +18,13 @@ Two deliberate choices:
   them to answer a rare "who sent this?" would cost ~3000x what the answer
   needs; the fingerprint is ~200 bytes per file. Once a lookup names a file,
   its bytes are one ``get_object`` call away, so nothing is lost.
+* **The hash comes from Slack's own thumbnail, not the file.** Slack's audit log
+  records every full download (``file_downloaded``); until 2026-10-05 this
+  backfill made ~6,500 a day, and Slack flagged Zach's user for
+  ``excessive_downloads`` every three hours. Thumbnail fetches (``files-tmb``)
+  are not audited, are a fraction of the bytes, and hash within 0-7 of 256 bits
+  of the full image (lookups match within 40). Only an image Slack made no
+  thumbnail for is downloaded in full, and a run takes few of those.
 * **The table is the cursor.** No row = never attempted; ``next_attempt_at`` in
   the future = backed off. A run takes a bounded newest-first slice, so an
   interrupted run loses only the in-flight file and the next run resumes.
@@ -35,7 +42,7 @@ from typing import Any
 from personal_data_warehouse.photo_fingerprint import HASH_VERSION, ImageTooLargeError, compute_dhash
 
 __all__ = [
-    "AppObjectFetcher",
+    "SlackThumbnailFetcher",
     "SlackFileFetchError",
     "SlackFileMissingError",
     "SlackFileRateLimitedError",
@@ -68,6 +75,8 @@ TERMINAL_STATUSES = (STATUS_OK, STATUS_UNDECODABLE, STATUS_TOO_LARGE)
 
 DEFAULT_LIMIT = 500
 MAX_ATTEMPTS = 5
+#: Full (audited) downloads a run may make for images Slack has no thumbnail of.
+DEFAULT_MAX_FULL_DOWNLOADS = 3
 
 #: Slack carries print artwork, not just camera photos. The file that motivated
 #: this pipeline is 420,750,000 pixels (11x17 inches at 1500 DPI), well past
@@ -85,15 +94,9 @@ NO_RETRY = datetime(1970, 1, 1, tzinfo=UTC)
 
 # --- fetching bytes ---------------------------------------------------------
 #
-# There is exactly one Slack-file-fetch implementation and it is not here: the
-# app already resolves a Slack file id through files.info across every
-# configured workspace token, downloads url_private, and rejects Slack's
-# 200-with-an-HTML-login-page answer (app/internal/objectstore/slack.go, served
-# by the get_object tool). The app also already holds the tokens.
-#
-# So this backfill is a *client* of that, not a second copy of it. Python never
-# sees a Slack credential, and a fix to Slack file resolution lands in one
-# place for every caller.
+# The largest thumbnail Slack made (thumb_1024 down to thumb_360; the URLs are
+# already in base_slack.files.raw_json), fetched with the account's own token.
+# url_private only when there is no thumbnail. See the module docstring for why.
 
 
 class SlackFileFetchError(Exception):
@@ -135,7 +138,7 @@ def _looks_like_an_image(head: bytes) -> bool:
 
 @dataclass(frozen=True)
 class SlackFileRef:
-    """The parts of a candidate row needed to ask the app for its bytes."""
+    """The parts of a candidate row needed to fetch something to hash."""
 
     account: str
     team_id: str
@@ -143,6 +146,12 @@ class SlackFileRef:
     mimetype: str = ""
     name: str = ""
     size: int = 0
+    url_private: str = ""
+    thumbnail_url: str = ""
+
+    @property
+    def needs_full_download(self) -> bool:
+        return not self.thumbnail_url
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "SlackFileRef":
@@ -153,19 +162,19 @@ class SlackFileRef:
             mimetype=str(row.get("mimetype") or ""),
             name=str(row.get("name") or ""),
             size=int(row.get("size") or 0),
+            url_private=str(row.get("url_private") or ""),
+            thumbnail_url=str(row.get("thumbnail_url") or ""),
         )
 
 
-class AppObjectFetcher:
-    """Fetch a Slack file's bytes through the app's get_object tool."""
+class SlackThumbnailFetcher:
+    """Fetch a Slack image's thumbnail (or, lacking one, the file) to hash it."""
 
     def __init__(
         self,
         *,
-        base_url: str,
-        secret_token: str,
+        tokens: Mapping[str, str],
         session: Any | None = None,
-        client_name: str = "pdw",
         max_bytes: int = DEFAULT_MAX_FETCH_BYTES,
         timeout: float = DEFAULT_FETCH_TIMEOUT_SECONDS,
     ) -> None:
@@ -174,69 +183,44 @@ class AppObjectFetcher:
 
             session = requests.Session()
         self._session = session
-        self._base_url = base_url.rstrip("/")
-        self._secret_token = secret_token
-        self._client_name = client_name
+        self._tokens = {str(account): str(token) for account, token in tokens.items() if token}
         self._max_bytes = int(max_bytes)
         self._timeout = timeout
 
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._client_name}:{self._secret_token}",
-            # Cloudflare 403s default urllib-ish agents in front of the app.
-            "User-Agent": "personal-data-warehouse-slack-fingerprints/1",
-        }
-
     def fetch(self, ref: SlackFileRef) -> bytes:
-        # The row already knows the size; do not spend a request to learn it.
-        if ref.size and ref.size > self._max_bytes:
+        token = self._tokens.get(ref.account)
+        if not token:
+            raise SlackFileFetchError(f"no Slack token for account {ref.account!r}")
+        url = ref.thumbnail_url or ref.url_private
+        if not url:
+            raise SlackFileFetchError(f"{ref.file_id} has neither a thumbnail nor url_private")
+        # The row already knows the original's size; only a full download pays it.
+        if ref.needs_full_download and ref.size and ref.size > self._max_bytes:
             raise SlackFileTooLargeError(
                 f"file {ref.file_id} is {ref.size} bytes, over the {self._max_bytes} ceiling"
             )
-
-        response = self._session.post(
-            f"{self._base_url}/api/tools/get_object",
-            json={"storage_file_id": ref.file_id},
-            headers=self._headers(),
+        response = self._session.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "personal-data-warehouse-slack-fingerprints/2",
+            },
+            stream=True,
             timeout=self._timeout,
         )
-        response.raise_for_status()
-        data = (response.json() or {}).get("data") or {}
-
-        error = str(data.get("error") or "")
-        if error:
-            # The app surfaces Slack's own error text; a 429 in it means the
-            # workspace is throttling and the whole slice should stop.
-            if "429" in error or "rate" in error.lower():
-                raise SlackFileRateLimitedError(f"Slack rate limited {ref.file_id}: {error}")
-            if "not found" in error.lower() or "deleted" in error.lower():
-                raise SlackFileMissingError(f"{ref.file_id}: {error}")
-            raise SlackFileFetchError(f"{ref.file_id}: {error}")
-        if data.get("exists") is False:
-            raise SlackFileMissingError(f"the app reports Slack file {ref.file_id} does not exist")
-
-        declared = data.get("size_bytes")
-        if isinstance(declared, int) and declared > self._max_bytes:
-            raise SlackFileTooLargeError(
-                f"file {ref.file_id} is {declared} bytes, over the {self._max_bytes} ceiling"
-            )
-        download_url = str(data.get("download_url") or "")
-        if not download_url:
-            raise SlackFileFetchError(f"get_object returned no download_url for {ref.file_id}")
-
-        return self._download(ref, download_url)
-
-    def _download(self, ref: SlackFileRef, download_url: str) -> bytes:
-        # The signed URL needs no auth, so no credential leaves this process.
-        response = self._session.get(download_url, headers={
-            "User-Agent": "personal-data-warehouse-slack-fingerprints/1",
-        }, stream=True, timeout=self._timeout)
         try:
             status = int(getattr(response, "status_code", 0))
-            if status == 404:
-                raise SlackFileMissingError(f"signed download for {ref.file_id} returned 404")
+            headers = getattr(response, "headers", {}) or {}
+            if status == 429:
+                retry_after = int(str(headers.get("Retry-After") or "60").strip() or 60)
+                raise SlackFileRateLimitedError(f"Slack rate limited {ref.file_id}", retry_after=retry_after)
+            if status in (404, 410):
+                raise SlackFileMissingError(f"Slack answered {status} for {ref.file_id}")
             if status >= 400:
-                raise SlackFileFetchError(f"HTTP {status} downloading {ref.file_id}")
+                raise SlackFileFetchError(f"HTTP {status} fetching {ref.file_id}")
+            # Slack answers an unauthorized file fetch with a 200 HTML login page.
+            if str(headers.get("Content-Type") or "").startswith("text/html"):
+                raise SlackFileFetchError(f"Slack returned HTML instead of {ref.file_id}; check files:read")
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=_CHUNK_BYTES):
@@ -252,9 +236,7 @@ class AppObjectFetcher:
             if not content:
                 raise SlackFileFetchError(f"empty body for {ref.file_id}")
             if not _looks_like_an_image(content[:16]):
-                raise SlackFileFetchError(
-                    f"body for {ref.file_id} is not a recognized image container"
-                )
+                raise SlackFileFetchError(f"body for {ref.file_id} is not a recognized image container")
             return content
         finally:
             close = getattr(response, "close", None)
@@ -271,6 +253,7 @@ class SlackFileFingerprintSummary:
     missing: int = 0
     failed: int = 0
     bytes_downloaded: int = 0
+    full_downloads: int = 0
     rate_limited: bool = False
     stopped_for_time: bool = False
 
@@ -297,6 +280,8 @@ class SlackFileFingerprintRunner:
         hash_version: str = HASH_VERSION,
         max_run_seconds: float | None = None,
         max_pixels: int = DEFAULT_MAX_PIXELS,
+        download_spacing_seconds: float = 0.0,
+        max_full_downloads: int = DEFAULT_MAX_FULL_DOWNLOADS,
     ) -> None:
         self._warehouse = warehouse
         self._fetcher = fetcher
@@ -311,6 +296,8 @@ class SlackFileFingerprintRunner:
         self._hash_version = hash_version
         self._max_run_seconds = max_run_seconds
         self._max_pixels = int(max_pixels)
+        self._download_spacing_seconds = float(download_spacing_seconds)
+        self._max_full_downloads = int(max_full_downloads)
 
     def run(self) -> SlackFileFingerprintSummary:
         self._warehouse.ensure_slack_file_fingerprint_tables()
@@ -323,6 +310,7 @@ class SlackFileFingerprintRunner:
         )
         summary.candidates = len(candidates)
 
+        fetched_any = False
         for row in candidates:
             now = self._now()
             if (
@@ -334,6 +322,14 @@ class SlackFileFingerprintRunner:
 
             ref = SlackFileRef.from_row(row)
             prior_attempts = int(row.get("attempts") or 0)
+            if ref.needs_full_download:
+                if summary.full_downloads >= self._max_full_downloads:
+                    # Left unrecorded, so a later run takes it within its own cap.
+                    continue
+                summary.full_downloads += 1
+            if fetched_any and self._download_spacing_seconds > 0:
+                self._sleep(self._download_spacing_seconds)
+            fetched_any = True
             try:
                 content = self._fetcher.fetch(ref)
             except SlackFileRateLimitedError as exc:
@@ -424,7 +420,7 @@ class SlackFileFingerprintRunner:
 
         self._logger.info(
             "Slack file fingerprints: %s candidates, %s fingerprinted, %s undecodable, "
-            "%s too large, %s missing, %s failed, %.1f MB downloaded%s",
+            "%s too large, %s missing, %s failed, %.1f MB downloaded (%s full downloads)%s",
             summary.candidates,
             summary.fingerprinted,
             summary.undecodable,
@@ -432,6 +428,7 @@ class SlackFileFingerprintRunner:
             summary.missing,
             summary.failed,
             summary.bytes_downloaded / 1_048_576,
+            summary.full_downloads,
             " (rate limited)" if summary.rate_limited else "",
         )
         return summary

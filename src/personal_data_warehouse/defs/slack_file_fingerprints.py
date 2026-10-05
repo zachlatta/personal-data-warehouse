@@ -1,16 +1,13 @@
 """Dagster wiring for the Slack image fingerprint backfill.
 
-Bytes come from the app's existing ``get_object`` tool rather than a second
-Slack client: ``app/internal/objectstore/slack.go`` already resolves a Slack
-file id through ``files.info`` across every configured workspace token and
-handles Slack's 200-with-an-HTML-login-page answer. This asset therefore needs
-no Slack credential at all.
+Each image is hashed from Slack's own thumbnail, fetched with the workspace
+token (slack_file_fingerprints.SlackThumbnailFetcher), because Slack's audit log
+records every full download and flagged this backfill's ~6,500 a day as
+``excessive_downloads`` every three hours until 2026-10-05. Only an image with
+no thumbnail is downloaded in full, a few a run.
 
-Deliberately a *schedule*, not a backlog sensor. The photos identity pipeline
-uses a sensor because its backlog is small, bursty, and local; this one has a
-~905k-image / ~552 GB backlog that is drained over weeks against a rate-limited
-third-party API. A sensor that fires whenever work exists would simply run it
-continuously. An hourly bounded slice is the whole design.
+Deliberately a *schedule*, not a backlog sensor: the backlog is ~750k images,
+drained in bounded hourly slices.
 """
 
 from __future__ import annotations
@@ -32,8 +29,9 @@ from dagster import (
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_file_fingerprints import (
-    AppObjectFetcher,
+    DEFAULT_MAX_FULL_DOWNLOADS,
     SlackFileFingerprintRunner,
+    SlackThumbnailFetcher,
 )
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -41,12 +39,14 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 SLACK_FILE_FINGERPRINTS_POSTGRES_LOCK_ID = 8_407_112_473
 SLACK_FILE_FINGERPRINT_LIMIT_ENV = "SLACK_FILE_FINGERPRINT_LIMIT"
 SLACK_FILE_FINGERPRINT_RUN_SECONDS_ENV = "SLACK_FILE_FINGERPRINT_RUN_SECONDS"
+SLACK_FILE_FINGERPRINT_SPACING_SECONDS_ENV = "SLACK_FILE_FINGERPRINT_SPACING_SECONDS"
+SLACK_FILE_FINGERPRINT_MAX_FULL_DOWNLOADS_ENV = "SLACK_FILE_FINGERPRINT_MAX_FULL_DOWNLOADS"
 
-#: One hourly slice. Chosen to be obviously bounded rather than fast: at this
-#: rate the backlog drains over months, which is the correct trade against a
-#: rate-limited API that this repo has already been throttled by once.
-DEFAULT_LIMIT = 300
-DEFAULT_RUN_SECONDS = 900
+#: One hourly slice of thumbnails, about one a second, so a run is ~10 minutes
+#: and never a burst.
+DEFAULT_LIMIT = 600
+DEFAULT_RUN_SECONDS = 1500
+DEFAULT_SPACING_SECONDS = 1.0
 
 
 def slack_file_fingerprint_limit() -> int:
@@ -57,16 +57,20 @@ def slack_file_fingerprint_run_seconds() -> float:
     return float(os.getenv(SLACK_FILE_FINGERPRINT_RUN_SECONDS_ENV, str(DEFAULT_RUN_SECONDS)))
 
 
-def app_credentials() -> tuple[str, str]:
-    """The app URL + token this backfill fetches bytes through.
+def slack_file_fingerprint_spacing_seconds() -> float:
+    return float(os.getenv(SLACK_FILE_FINGERPRINT_SPACING_SECONDS_ENV, str(DEFAULT_SPACING_SECONDS)))
 
-    Slack file bytes come from the app's get_object tool, which already owns
-    Slack file resolution and already holds the workspace tokens, so this
-    process needs no Slack credential of its own.
-    """
-    base_url = (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip()
-    secret_token = (os.getenv("PDW_SECRET_TOKEN") or os.getenv("MCP_SECRET_TOKEN") or "").strip()
-    return base_url, secret_token
+
+def slack_file_fingerprint_max_full_downloads() -> int:
+    return int(os.getenv(SLACK_FILE_FINGERPRINT_MAX_FULL_DOWNLOADS_ENV, str(DEFAULT_MAX_FULL_DOWNLOADS)))
+
+
+def slack_tokens_by_account(settings) -> dict[str, str]:
+    return {
+        str(account.account): str(account.token)
+        for account in getattr(settings, "slack_accounts", ()) or ()
+        if getattr(account, "token", "")
+    }
 
 
 @asset(
@@ -75,14 +79,10 @@ def app_credentials() -> tuple[str, str]:
 )
 def slack_file_fingerprints(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_slack=False)
-    base_url, secret_token = app_credentials()
-    if not base_url or not secret_token:
-        context.log.warning(
-            "Skipping Slack file fingerprints: PDW_API_URL / PDW_SECRET_TOKEN are not set"
-        )
-        return MaterializeResult(
-            metadata={"skipped": MetadataValue.text("app credentials not configured")}
-        )
+    tokens = slack_tokens_by_account(settings)
+    if not tokens:
+        context.log.warning("Skipping Slack file fingerprints: no Slack account token is configured")
+        return MaterializeResult(metadata={"skipped": MetadataValue.text("no Slack token configured")})
 
     warehouse = warehouse_from_settings(settings)
     summary = None
@@ -98,10 +98,12 @@ def slack_file_fingerprints(context) -> MaterializeResult:
             else:
                 summary = SlackFileFingerprintRunner(
                     warehouse=warehouse,
-                    fetcher=AppObjectFetcher(base_url=base_url, secret_token=secret_token),
+                    fetcher=SlackThumbnailFetcher(tokens=tokens),
                     logger=context.log,
                     limit=slack_file_fingerprint_limit(),
                     max_run_seconds=slack_file_fingerprint_run_seconds(),
+                    download_spacing_seconds=slack_file_fingerprint_spacing_seconds(),
+                    max_full_downloads=slack_file_fingerprint_max_full_downloads(),
                 ).run()
     finally:
         warehouse.close()
@@ -114,6 +116,7 @@ def slack_file_fingerprints(context) -> MaterializeResult:
             "too_large": MetadataValue.int(summary.too_large if summary else 0),
             "missing": MetadataValue.int(summary.missing if summary else 0),
             "failed": MetadataValue.int(summary.failed if summary else 0),
+            "full_downloads": MetadataValue.int(summary.full_downloads if summary else 0),
             "megabytes_downloaded": MetadataValue.float(
                 round((summary.bytes_downloaded if summary else 0) / 1_048_576, 1)
             ),

@@ -655,6 +655,9 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 # im and mpim: a public channel Zach is not in is polled by the sweep on a
 # rotation measured in days, and its landing time is a rate budget, not a
 # fault.
+#: Slack thumbnail sizes, largest first, that the image fingerprint backfill hashes
+#: in place of the audited full file (slack_file_fingerprints.py).
+SLACK_FINGERPRINT_THUMB_SIZES = (1024, 960, 800, 720, 480, 360, 160)
 SLACK_DM_LANDING_P95_SECONDS = 900
 SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
 
@@ -12577,8 +12580,15 @@ class PostgresWarehouse:
         high-water mark for the incremental half plus a separate descending
         backfill cursor, not a bigger limit.
         """
+        # thumbnail_url is the largest thumbnail Slack made: the fetcher hashes
+        # that instead of the full file, because Slack audits every full
+        # download and flagged ~6,500 a day as excessive_downloads. Looked up
+        # only for the selected slice: parsing raw_json for the whole pending
+        # set on every run would cost far more than the slice.
         rows = self._query_dicts(
             """
+            SELECT c.*, COALESCE(t.thumbnail_url, '') AS thumbnail_url
+            FROM (
             SELECT
                 f.account,
                 f.storage_key AS team_id,
@@ -12609,6 +12619,18 @@ class PostgresWarehouse:
             GROUP BY f.account, f.storage_key, f.attachment_id
             ORDER BY max(f.occurred_at) DESC
             LIMIT %s
+            ) AS c
+            LEFT JOIN LATERAL (
+                SELECT a.thumbnail_url
+                FROM @marts_files_attachments a
+                WHERE a.source = 'slack'
+                  AND a.account = c.account
+                  AND a.storage_key = c.team_id
+                  AND a.attachment_id = c.file_id
+                  AND a.thumbnail_url <> ''
+                LIMIT 1
+            ) AS t ON true
+            ORDER BY c.created_at DESC
             """,
             ("image/%", int(max_attempts), now, int(limit)),
         )
@@ -16097,6 +16119,14 @@ class PostgresWarehouse:
             ]
         )
         epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
+        # One parse per row (a scalar subquery), and an empty raw_json is no
+        # thumbnail rather than a cast error. Only evaluated when a query reads
+        # the column: UNION ALL branches compute just the referenced outputs.
+        slack_thumb = (
+            "(SELECT COALESCE("
+            + ", ".join(f"NULLIF(x.j->>'thumb_{size}', '')" for size in SLACK_FINGERPRINT_THUMB_SIZES)
+            + ") FROM (SELECT NULLIF(a.raw_json, '')::jsonb AS j) AS x)"
+        )
         self._ensure_view(
             "marts_files_attachments",
             f"""
@@ -16115,7 +16145,11 @@ class PostgresWarehouse:
                 a.is_deleted::bigint AS is_deleted,
                 NULLIF(a.internal_date, {epoch}) AS occurred_at,
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
-                NULLIF(a.synced_at, {epoch}) AS ingested_at
+                NULLIF(a.synced_at, {epoch}) AS ingested_at,
+                -- A source-made thumbnail, when the source has one (Slack). The
+                -- image fingerprint backfill hashes it instead of downloading
+                -- the file, because Slack audits full downloads.
+                ''::text AS thumbnail_url
             FROM @gmail_attachments a
             UNION ALL
             SELECT
@@ -16131,7 +16165,8 @@ class PostgresWarehouse:
                 0::bigint,
                 NULLIF(a.message_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
-                NULLIF(a.ingested_at, {epoch})
+                NULLIF(a.ingested_at, {epoch}),
+                ''::text
             FROM @whatsapp_media_items a
             UNION ALL
             SELECT
@@ -16147,7 +16182,8 @@ class PostgresWarehouse:
                 0::bigint,
                 NULLIF(a.created_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
-                NULLIF(a.ingested_at, {epoch})
+                NULLIF(a.ingested_at, {epoch}),
+                ''::text
             FROM @apple_message_attachments a
             UNION ALL
             SELECT
@@ -16163,7 +16199,8 @@ class PostgresWarehouse:
                 0::bigint,
                 NULLIF(r.modified_at, {epoch}),
                 a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
-                NULLIF(a.ingested_at, {epoch})
+                NULLIF(a.ingested_at, {epoch}),
+                ''::text
             FROM @apple_note_attachments a
             LEFT JOIN @apple_note_revisions r
               ON r.account = a.account AND r.note_id = a.note_id AND r.revision_id = a.revision_id
@@ -16184,7 +16221,8 @@ class PostgresWarehouse:
                 a.team_id,
                 a.file_id,
                 a.url_private,
-                NULLIF(a.synced_at, {epoch})
+                NULLIF(a.synced_at, {epoch}),
+                COALESCE({slack_thumb}, '')
             FROM @slack_files a
             """,
         )

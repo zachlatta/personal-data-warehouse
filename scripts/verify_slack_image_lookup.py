@@ -7,7 +7,8 @@ It proves the whole chain without writing to any production relation:
 
 1. read the real ``base_slack.files`` row, its uploader and its conversation
    from the warehouse,
-2. fetch the file's real bytes through the app's existing get_object tool,
+2. fetch its largest Slack thumbnail the way the backfill does (a full
+   download is what Slack audits),
 3. fingerprint them with the production code path,
 4. seed all of that into a throwaway ``pdw_test_*`` schema,
 5. run the real ranking SQL there with a probe image and report what an agent
@@ -43,28 +44,24 @@ from personal_data_warehouse.slack_file_fingerprints import (
     NO_RETRY,
     STATUS_OK,
 )
-from personal_data_warehouse.slack_file_fingerprints import AppObjectFetcher, SlackFileRef
+from personal_data_warehouse.config import load_settings
+from personal_data_warehouse.defs.slack_file_fingerprints import slack_tokens_by_account
+from personal_data_warehouse.postgres import SLACK_FINGERPRINT_THUMB_SIZES
+from personal_data_warehouse.slack_file_fingerprints import SlackFileRef, SlackThumbnailFetcher
 from personal_data_warehouse.slack_image_lookup import build_lookup_sql, format_matches, parse_matches
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
 NOW = datetime.now(tz=UTC)
 
 
-def _app_credentials() -> tuple[str, str]:
-    """Env first, then `pdw login`'s config -- the bin/*-launchd convention."""
-    base_url = (os.environ.get("PDW_API_URL") or os.environ.get("MCP_BASE_URL") or "").strip()
-    token = (os.environ.get("PDW_SECRET_TOKEN") or os.environ.get("MCP_SECRET_TOKEN") or "").strip()
-    if base_url and token:
-        return base_url, token
-    config_path = os.path.expanduser("~/.config/pdw/config.json")
-    try:
-        import json as _json
+def _thumbnail_url(row) -> str:
+    import json as _json
 
-        with open(config_path) as handle:
-            config = _json.load(handle)
-    except (OSError, ValueError):
-        return base_url, token
-    return base_url or str(config.get("base_url") or ""), token or str(config.get("token") or "")
+    raw = _json.loads(row.get("raw_json") or "{}")
+    for size in SLACK_FINGERPRINT_THUMB_SIZES:
+        if raw.get(f"thumb_{size}"):
+            return str(raw[f"thumb_{size}"])
+    return ""
 
 
 def _fetch_source_rows(prod: PostgresWarehouse, file_id: str):
@@ -137,20 +134,19 @@ def main() -> int:
           f"({'resolved in base_slack.users' if users else 'NOT in base_slack.users'})")
     print(f"                shared into {len(files)} conversation row(s)")
 
-    # Bytes come through the app's get_object tool, the same path the backfill
-    # and any agent uses -- so this exercises the real fetch, not a copy of it.
-    base_url, secret_token = _app_credentials()
-    if not base_url or not secret_token:
-        raise SystemExit("set PDW_API_URL + PDW_SECRET_TOKEN, or run `pdw login`")
-    fetcher = AppObjectFetcher(base_url=base_url, secret_token=secret_token)
-    content = fetcher.fetch(SlackFileRef.from_row(head))
+    # The same fetch the backfill makes: the largest thumbnail, with the account's token.
+    tokens = slack_tokens_by_account(load_settings(require_gmail=False, require_slack=False))
+    if not tokens:
+        raise SystemExit("set SLACK_ACCOUNTS and SLACK_<ACCOUNT>_TOKEN")
+    ref = SlackFileRef.from_row({**head, "thumbnail_url": _thumbnail_url(head)})
+    content = SlackThumbnailFetcher(tokens=tokens).fetch(ref)
     fingerprint = compute_dhash(content, max_pixels=DEFAULT_MAX_PIXELS)
     sha = hashlib.sha256(content).hexdigest()
     print(f"\nfetched       : {len(content)} bytes, {fingerprint.width}x{fingerprint.height} "
           f"({fingerprint.width * fingerprint.height / 1e6:.0f} MP)")
     print(f"                sha256 {sha}")
     print(f"                dhash  {fingerprint.dhash}")
-    if len(content) != int(head["size"]):
+    if ref.needs_full_download and len(content) != int(head["size"]):
         print(f"                WARNING: byte size differs from the stored row ({head['size']})")
 
     schema = make_test_schema("verify")

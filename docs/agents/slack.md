@@ -549,11 +549,25 @@ useless here — one re-encode was *larger* than the original, and the two copie
 differed by 1.3 MB.
 
 Backfill: the `slack_file_fingerprints` Dagster asset (hourly `:19`) takes a bounded
-newest-first slice (`SLACK_FILE_FINGERPRINT_LIMIT`, default 300; `..._RUN_SECONDS`, default
-900). Newest-first because recency is what people ask about. It fetches bytes **through the
-app's `get_object`**, so it holds no Slack credential of its own and there is one Slack-file
-implementation to fix. A 429 ends the slice cleanly without burning the file's retry budget.
+newest-first slice of every image in the workspace (`SLACK_FILE_FINGERPRINT_LIMIT`, default
+600, one fetch a second via `..._SPACING_SECONDS`). Newest-first because recency is what
+people ask about. A 429 ends the slice cleanly without burning the file's retry budget.
 **The table is the cursor**, so it resumes by itself; there is no watermark to repair.
+
+**It hashes Slack's thumbnail, never the full file, because Slack audits full downloads.**
+Until 2026-10-05 it fetched each full file through the app's `get_object`: ~6,500
+`file_downloaded` events a day on the `personal-dw` app, all between :19 and :25, and Slack
+recorded an `excessive_downloads` anomaly on Zach's user every three hours, eight a day for
+over a month. The anomaly rows carry AWS addresses, but the downloads themselves came from mew.
+A `files-tmb` fetch with the same token leaves no audit row (probed 2026-10-05). The thumbnail's
+dhash is within 0–7 of 256 bits of the full image's on 12 production files, well inside the
+lookup's 40, so the 302k full-file fingerprints and the new ones are interchangeable. The
+candidate row carries `thumbnail_url`, the largest of `thumb_1024` down to `thumb_160` from
+`base_slack.files.raw_json`, and `SlackThumbnailFetcher` fetches it with the account's token.
+About 0.07% of images have no thumbnail. Those are downloaded in full, at most
+`..._MAX_FULL_DOWNLOADS` (3) a run, counted in the run's `full_downloads` metadata. Check
+`slack.audit_logs` in the Hack Club warehouse for `excessive_downloads` before raising any of
+these defaults.
 
 Two gotchas worth knowing:
 
