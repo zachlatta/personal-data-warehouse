@@ -5,6 +5,7 @@ import (
 	"html"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,51 @@ func notificationThreadID(row map[string]any) string {
 	return "timeline:" + source + ":" + key
 }
 
+// appleGroupContext names an unnamed iMessage group by its people. chat.db
+// gives such a group only an opaque identifier ("0f6d2c1e9b8a…", "chat1234…"),
+// which the timeline row carries as its context, so the alert said
+// "Messages · 0f6d2c1e9b8a47d5a3c2e1f0b9d8c7a6" and nothing on the phone said
+// which conversation to open. A named group, a 1:1 chat, any other source,
+// and a group whose people cannot be looked up keep the context they had.
+func appleGroupContext(row map[string]any, members func(account, chatID string) []string) string {
+	context := linkString(row, "context")
+	if linkString(row, "source") != "apple_messages" || members == nil {
+		return context
+	}
+	chatID := linkString(decodeLinkJSON(row["metadata"]), "chat_id")
+	parts := strings.SplitN(chatID, ";", 3)
+	if len(parts) != 3 || parts[1] != "+" || (context != "" && context != parts[2]) {
+		return context
+	}
+	names := members(linkString(decodeLinkJSON(row["source_pk"]), "account"), chatID)
+	if len(names) == 0 {
+		return context
+	}
+	const shown = 3
+	if len(names) <= shown {
+		return strings.Join(names, ", ")
+	}
+	return strings.Join(names[:shown], ", ") + " +" + strconv.Itoa(len(names)-shown)
+}
+
+// appleGroupMembersSQL lists who has spoken in a chat recently, earliest
+// first, by the same contact-resolved sender name the timeline shows. Only
+// the chat's newest 200 messages are read, through the chat_messages
+// (account, chat_id, message_date) index.
+const appleGroupMembersSQL = `
+SELECT recent.sender_name
+FROM (
+    SELECT m.sender_name, m.message_at
+    FROM @apple_message_chat_messages cm
+    JOIN @clean_apple_messages m ON m.account = cm.account AND m.message_id = cm.message_id
+    WHERE cm.account = $1 AND cm.chat_id = $2 AND m.is_from_me = 0 AND m.sender_name <> ''
+    ORDER BY cm.message_date DESC
+    LIMIT 200
+) recent
+GROUP BY recent.sender_name
+ORDER BY min(recent.message_at)
+LIMIT 20`
+
 func renderTimelineNotification(row map[string]any, baseURL string, env timelineLinkEnv) notifications.Alert {
 	source := linkString(row, "source")
 	brand, ok := notificationSources[source]
@@ -142,6 +188,26 @@ func NewTimelineNotifications(cfg config.Config, publicKey, privateKey, subscrib
 				env.slackDomains[teamID] = domain
 			}
 		}
+		row["context"] = appleGroupContext(row, func(account, chatID string) []string {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			rows, err := svc.DB.QueryContext(ctx, warehouse.ExpandRelations(appleGroupMembersSQL), account, chatID)
+			if err != nil {
+				return nil
+			}
+			defer rows.Close()
+			var names []string
+			for rows.Next() {
+				var name string
+				if rows.Scan(&name) == nil {
+					names = append(names, name)
+				}
+			}
+			if rows.Err() != nil {
+				return nil
+			}
+			return names
+		})
 		return renderTimelineNotification(row, cfg.BaseURL, env)
 	}
 	return svc, nil

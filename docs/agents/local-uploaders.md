@@ -144,6 +144,33 @@ binaries are signed with a stable identity; if it breaks anyway, `codesign -d --
 and does NOT inherit the grant — install a release with `pdw update --force`). Then kickstart
 the LaunchAgent again.
 
+### This Mac's chat.db is not the phone's
+
+PDW sees iMessage through the uploading Mac's `chat.db`, and that Mac is its own iMessage
+device: what it holds and what the iPhone shows can differ. Until 2026-10-05 the Mac received
+nothing live and took every message from Messages in iCloud in one daily batch (about 19:15Z;
+`ingested_at − message_at` was 8–24 h, and every row had `ck_sync_state = 1`). From 19:14Z
+that day it receives iMessages directly, minutes after they are sent, and **does not upload
+them to iCloud** until its own background sync runs (all 69 live-received rows in the first
+16 h read `ck_sync_state = 0` with no `ck_record_id`; opening Messages.app or restarting
+`imagent` does not force it). So a message that reached the Mac but not the phone — sent
+while the phone was in the air, in the reported case — shows up in PDW and in PDW's push
+alert but not in iMessage on the phone, and the phone cannot backfill it from iCloud. Read
+the CloudKit state from the raw row:
+
+```sql
+SELECT message_rowid, message_at, is_from_me,
+       raw_metadata_json::jsonb->'raw'->>'ck_sync_state' AS ck_sync_state
+FROM base_apple_messages.messages
+WHERE account = '<account>' AND message_at > now() - interval '2 days'
+ORDER BY message_rowid DESC LIMIT 50;
+```
+
+`ck_sync_state = 0` means "only on this Mac so far", not "missing from the phone": the phone
+may well have received the same message directly. PDW cannot repair delivery to the phone;
+the remedy to try is Messages ▸ Settings ▸ iMessage ▸ Sync Now on the Mac (a GUI session),
+which should put the Mac's copy in iCloud for the phone to pull (untested as of 2026-10-06).
+
 Apple Messages SQL starting points are `base_apple_messages.messages`, `base_apple_messages.chats`,
 `base_apple_messages.handles`, `base_apple_messages.chat_handles`,
 `base_apple_messages.chat_messages`, and `base_apple_messages.attachments`, with the resolved

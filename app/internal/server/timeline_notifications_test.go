@@ -80,3 +80,36 @@ func TestNotificationsGroupByConversationNotBySource(t *testing.T) {
 		t.Fatalf("source_pk arriving as JSON text is not decoded: %q", got)
 	}
 }
+
+// An iMessage group with no name has only chat.db's opaque identifier as its
+// context, so its alert read "Messages · 0f6d2c1e9b8a47d5a3c2e1f0b9d8c7a6":
+// nothing on the phone says which conversation to open. The alert names the
+// people in it instead; a named group or a 1:1 chat keeps its own context.
+func TestUnnamedIMessageGroupAlertNamesItsPeople(t *testing.T) {
+	members := map[string][]string{"me|any;+;0f6d": {"Sam Example", "+15555550100"}, "me|any;+;big": {"A", "B", "C", "D", "E"}}
+	lookup := func(account, chatID string) []string { return members[account+"|"+chatID] }
+	row := func(chatID, context string) map[string]any {
+		return map[string]any{"source": "apple_messages", "actor": "+15555550100", "context": context, "snippet": "Hi",
+			"source_pk": map[string]any{"account": "me", "message_id": "m1"}, "metadata": map[string]any{"chat_id": chatID}}
+	}
+	cases := []struct {
+		name string
+		row  map[string]any
+		want string
+	}{
+		{"unnamed group", row("any;+;0f6d", "0f6d"), "Messages · Sam Example, +15555550100"},
+		{"big unnamed group", row("any;+;big", "big"), "Messages · A, B, C +2"},
+		{"named group keeps its name", row("any;+;0f6d", "Dinner crew"), "Messages · Dinner crew"},
+		{"1:1 chat is untouched", row("any;-;+15555550199", "+15555550199"), "Messages · +15555550199"},
+		{"unknown roster keeps the identifier", row("any;+;nobody", "nobody"), "Messages · nobody"},
+	}
+	for _, tc := range cases {
+		tc.row["context"] = appleGroupContext(tc.row, lookup)
+		if got := renderTimelineNotification(tc.row, "", timelineLinkEnv{}).Subtitle; got != tc.want {
+			t.Errorf("%s: subtitle %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := appleGroupContext(map[string]any{"source": "slack", "context": "#general"}, lookup); got != "#general" {
+		t.Fatalf("non-iMessage context rewritten: %q", got)
+	}
+}
