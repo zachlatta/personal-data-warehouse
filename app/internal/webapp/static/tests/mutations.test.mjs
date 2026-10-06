@@ -588,3 +588,35 @@ test("attachment review preserves bytes and enforces aggregate limits", () => {
   assert.doesNotThrow(() => V.checkAttachmentLimits([attachment]));
   assert.throws(() => V.checkAttachmentLimits(Array(101).fill(attachment)), /100 files/);
 });
+
+// --- paging ---------------------------------------------------------------------
+
+test("mutationPageFromSearch reads a 1-based ?page= and falls back to the first", () => {
+  assert.equal(V.mutationPageFromSearch(""), 1);
+  assert.equal(V.mutationPageFromSearch("?page=3"), 3);
+  for (const bad of ["?page=0", "?page=-2", "?page=abc", "?page=1.5"]) assert.equal(V.mutationPageFromSearch(bad), 1, bad);
+});
+
+test("mutationPageQuery asks the API for the page's window", () => {
+  assert.deepEqual(V.mutationPageQuery(1), { offset: 0, limit: V.MUTATION_PAGE_SIZE });
+  assert.deepEqual(V.mutationPageQuery(3), { offset: 2 * V.MUTATION_PAGE_SIZE, limit: V.MUTATION_PAGE_SIZE });
+});
+
+test("mutationPageView names the window, the page count and the neighbours", () => {
+  const mutations = Array.from({ length: 50 }, (_, i) => ({ id: "m" + i }));
+  const middle = V.mutationPageView({ mutation_count: 1053, mutations, mutations_page: { offset: 50, limit: 50, total: 1053, next_offset: 100 } });
+  assert.deepEqual(middle, { page: 2, pages: 22, from: 51, to: 100, total: 1053, prevPage: 1, nextPage: 3 });
+  const last = V.mutationPageView({ mutation_count: 1053, mutations: mutations.slice(0, 3), mutations_page: { offset: 1050, limit: 50, total: 1053, next_offset: null } });
+  assert.equal(last.page, 22);
+  assert.equal(last.nextPage, null);
+  assert.equal(last.to, 1053);
+  // A request read before paging existed (or the push copy) is one page.
+  const whole = V.mutationPageView({ mutation_count: 2, mutations: [{}, {}] });
+  assert.deepEqual(whole, { page: 1, pages: 1, from: 1, to: 2, total: 2, prevPage: null, nextPage: null });
+  assert.equal(V.mutationPageView({ mutation_count: 0, mutations: [] }).from, 0);
+});
+
+test("requestApproveCount counts what approval runs across every page", () => {
+  assert.equal(V.requestApproveCount({ mutation_count: 1053, pending_mutation_count: 1050, mutations: [{}] }), 1050);
+  assert.equal(V.requestApproveCount({ mutation_count: 4, mutations: [] }), 4);
+});

@@ -159,7 +159,7 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 	if input.Replaces != nil && request.ReplacesRequestID != "" {
 		// The old request's fate is part of the answer: withdrawn, or linked
 		// under its unchanged terminal status. One read, only on this path.
-		if replaced, err := s.store.GetRequest(ctx, request.ReplacesRequestID); err == nil {
+		if replaced, err := s.store.GetRequest(ctx, request.ReplacesRequestID, AllMutations); err == nil {
 			response.ReplacedRequestID = replaced.ID
 			response.ReplacedRequestStatus = replaced.Status
 			if replaced.Status == StatusWithdrawn && s.cfg.RequestWithdrawn != nil {

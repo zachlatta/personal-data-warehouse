@@ -25,7 +25,7 @@ func (s *recordingStore) ListRequests(context.Context, RequestFilter) ([]Request
 	return nil, nil
 }
 
-func (s *recordingStore) GetRequest(context.Context, string) (Request, error) {
+func (s *recordingStore) GetRequest(context.Context, string, MutationPage) (Request, error) {
 	return Request{}, nil
 }
 

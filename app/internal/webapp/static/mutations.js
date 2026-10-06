@@ -1242,7 +1242,7 @@ function renderDecisionDock(request, actions) {
   const dock = h("section", "decision-dock");
   const errorNode = h("span", "bad decision-error");
   if (request.status === "pending_review") {
-    const count = V.requestMutationCount(request);
+    const count = V.requestApproveCount(request);
     const copy = h("div", "decision-copy");
     copy.appendChild(h("strong", "", "Ready to decide"));
     copy.appendChild(h("span", "", count + " reviewed action" + V.plural(count)));
@@ -1337,12 +1337,16 @@ async function renderDetail(root, ctx, id, alive) {
   ctx.setSubtitle("mutation review");
   ctx.setControls(link(LIST_PATH, "← all requests"));
   const actions = { reload() { if (alive()) renderDetail(root, ctx, id, alive); } };
+  const query = V.mutationPageQuery(V.mutationPageFromSearch(location.search));
   // A request already read this session paints from memory while the API
-  // confirms it (a back-navigation from a review must not spin).
-  const cached = cache.peek(id);
+  // confirms it (a back-navigation from a review must not spin) — but only
+  // when it is the same page, or the list would jump under the reader.
+  const peeked = cache.peek(id);
+  const cachedOffset = peeked && peeked.mutations_page ? peeked.mutations_page.offset : 0;
+  const cached = peeked && cachedOffset === query.offset ? peeked : null;
   if (cached) paintDetail(root, ctx, cached, actions, true); else clear(root).appendChild(h("p", "m", "loading…"));
   let request;
-  try { request = await mutations.get(id); } catch (err) {
+  try { request = await mutations.get(id, query); } catch (err) {
     if (!alive()) return;
     if (cached) { ctx.setStats(errorText(err) || "could not refresh"); return; }
     clear(root);
@@ -1354,9 +1358,26 @@ async function renderDetail(root, ctx, id, alive) {
   paintDetail(root, ctx, cache.remember(request), actions, false);
 }
 
+// The pager under and over a page of mutations: previous, where this page
+// sits in the whole request, next. A request that fits on one page has none.
+function renderPager(request) {
+  const view = V.mutationPageView(request);
+  if (view.pages <= 1) return null;
+  const nav = h("nav", "mutation-pager");
+  nav.setAttribute("aria-label", "Mutation pages");
+  const pageHref = (page) => requestPath(request.id) + (page > 1 ? "?page=" + page : "");
+  nav.appendChild(view.prevPage ? link(pageHref(view.prevPage), "← Previous", "pager-link") : h("span", "pager-link off", "← Previous"));
+  nav.appendChild(h("span", "pager-where", view.from + "–" + view.to + " of " + view.total + " · page " + view.page + " of " + view.pages));
+  nav.appendChild(view.nextPage ? link(pageHref(view.nextPage), "Next →", "pager-link") : h("span", "pager-link off", "Next →"));
+  return nav;
+}
+
+let lastPainted = "";
+
 function paintDetail(root, ctx, request, actions, refreshing) {
   const list = Array.isArray(request.mutations) ? request.mutations : [];
-  ctx.setStats(list.length + " mutation" + V.plural(list.length) + " · " + V.requestListStatus(request) + (refreshing ? " · refreshing…" : ""));
+  const total = V.requestMutationCount(request);
+  ctx.setStats(total + " mutation" + V.plural(total) + " · " + V.requestListStatus(request) + (refreshing ? " · refreshing…" : ""));
   clear(root);
   root.appendChild(link(LIST_PATH, "← all requests", "back"));
   root.appendChild(renderRequestHeader(request));
@@ -1364,13 +1385,15 @@ function paintDetail(root, ctx, request, actions, refreshing) {
   if (decision) root.appendChild(decision);
   const context = renderContext(request.context);
   if (context) root.appendChild(context);
+  const pagerTop = renderPager(request);
+  if (pagerTop) root.appendChild(pagerTop);
   const slackBatch = list.length > 1 && list.every((mutation) => V.isSlackMarkReadMutation(mutation));
   if (slackBatch) {
     root.appendChild(renderSlackBatch(request, list));
   } else {
     const sect = h("section", "rsect");
     sect.appendChild(h("h2", "", "Mutations"));
-    if (!list.length) sect.appendChild(h("p", "m", "This request carries no mutations."));
+    if (!list.length) sect.appendChild(h("p", "m", total ? "No mutations on this page." : "This request carries no mutations."));
     for (const item of V.groupMutations(list)) {
       if (item.kind === "gmail") sect.appendChild(renderGmailGroup(item));
       else if (item.kind === "contact") sect.appendChild(renderContactGroup(item));
@@ -1378,7 +1401,13 @@ function paintDetail(root, ctx, request, actions, refreshing) {
     }
     root.appendChild(sect);
   }
-  root.scrollTop = 0;
+  const pagerBottom = renderPager(request);
+  if (pagerBottom) root.appendChild(pagerBottom);
+  // A new request or a new page starts at its top; a repaint of the same
+  // page (a refresh, a dropped thread) keeps the reader where they were.
+  const shown = request.id + ":" + V.mutationPageView(request).page;
+  if (shown !== lastPainted) root.scrollTop = 0;
+  lastPainted = shown;
 }
 
 export function mount(container, ctx) {

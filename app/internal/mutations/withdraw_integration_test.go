@@ -31,7 +31,7 @@ func requestEvents(t *testing.T, store *PostgresStore, id string) []string {
 
 func mutationStatuses(t *testing.T, store *PostgresStore, id string) []string {
 	t.Helper()
-	request, err := store.GetRequest(context.Background(), id)
+	request, err := store.GetRequest(context.Background(), id, AllMutations)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestWithdrawRequestTakesAPendingRequestBackWithProvenance(t *testing.T) {
 	if got := requestEvents(t, store, old.ID); len(got) != 2 || got[1] != "withdrawn/agent/claude-code" {
 		t.Fatalf("events = %v", got)
 	}
-	linked, err := store.GetRequest(ctx, replacement.ID)
+	linked, err := store.GetRequest(ctx, replacement.ID, AllMutations)
 	if err != nil {
 		t.Fatalf("get replacement: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestWithdrawRequestRefusesAnApprovedRequest(t *testing.T) {
 	if !errors.As(err, &stateErr) || stateErr.Status != "approved" || !strings.Contains(err.Error(), "do not propose the same change again") {
 		t.Fatalf("expected an approved refusal, got %v", err)
 	}
-	after, _ := store.GetRequest(ctx, request.ID)
+	after, _ := store.GetRequest(ctx, request.ID, AllMutations)
 	if after.Status != "approved" || after.Error != "" {
 		t.Fatalf("approved request must be untouched: %#v", after)
 	}
@@ -140,7 +140,7 @@ func TestWithdrawRequestRefusesAStaleRevisionAfterAReviewerEdit(t *testing.T) {
 	if _, err := store.RemoveMutation(ctx, edited.ID, edited.Mutations[0].ID, "app:web"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if after, _ := store.GetRequest(ctx, edited.ID); after.Revision != 2 {
+	if after, _ := store.GetRequest(ctx, edited.ID, AllMutations); after.Revision != 2 {
 		t.Fatalf("revision after a reviewer edit = %d", after.Revision)
 	}
 	var stateErr *RequestStateError
@@ -152,7 +152,7 @@ func TestWithdrawRequestRefusesAStaleRevisionAfterAReviewerEdit(t *testing.T) {
 	if !errors.As(err, &stateErr) || !strings.Contains(err.Error(), "revision 2, not 1") {
 		t.Fatalf("stale revision must be refused: %v", err)
 	}
-	if still, _ := store.GetRequest(ctx, edited.ID); still.Status != StatusPendingReview {
+	if still, _ := store.GetRequest(ctx, edited.ID, AllMutations); still.Status != StatusPendingReview {
 		t.Fatalf("refused withdrawals must not move the request: %s", still.Status)
 	}
 	done, err := store.WithdrawRequest(ctx, edited.ID, WithdrawInput{Reason: "seen the edit; still moot", ExpectedRevision: 2})
@@ -177,7 +177,7 @@ func TestWithdrawRequestRefusesADeadReplacement(t *testing.T) {
 	if _, err := store.WithdrawRequest(ctx, request.ID, WithdrawInput{Reason: "x", ReplacedBy: denied.ID}); err == nil || !strings.Contains(err.Error(), "cannot stand in") {
 		t.Fatalf("denied replacement must be refused: %v", err)
 	}
-	if after, _ := store.GetRequest(ctx, request.ID); after.Status != StatusPendingReview {
+	if after, _ := store.GetRequest(ctx, request.ID, AllMutations); after.Status != StatusPendingReview {
 		t.Fatalf("request must be untouched after a refused withdrawal: %s", after.Status)
 	}
 }
@@ -199,7 +199,7 @@ func TestCreateRequestWithReplacesWithdrawsThePendingOriginalAtomically(t *testi
 	if replacement.Status != StatusPendingReview || replacement.ReplacesRequestID != old.ID {
 		t.Fatalf("replacement = %#v", replacement)
 	}
-	withdrawn, _ := store.GetRequest(ctx, old.ID)
+	withdrawn, _ := store.GetRequest(ctx, old.ID, AllMutations)
 	if withdrawn.Status != StatusWithdrawn || withdrawn.SupersededBy != replacement.ID || withdrawn.Error != "v1 missed the CC list" || withdrawn.WithdrawnBy != "codex" {
 		t.Fatalf("original = %#v", withdrawn)
 	}
@@ -263,7 +263,7 @@ func TestCreateRequestWithReplacesLinksADeadOriginalWithoutRewritingIt(t *testin
 		if err != nil {
 			t.Fatalf("%s: create: %v", status, err)
 		}
-		linked, _ := store.GetRequest(ctx, old.ID)
+		linked, _ := store.GetRequest(ctx, old.ID, AllMutations)
 		if linked.Status != status || linked.SupersededBy != replacement.ID {
 			t.Fatalf("%s: original = %s / %q", status, linked.Status, linked.SupersededBy)
 		}
@@ -304,7 +304,7 @@ func TestCreateRequestWithReplacesIsIdempotentOnRetry(t *testing.T) {
 	if second.ID != first.ID {
 		t.Fatalf("retry minted a second request: %s vs %s", first.ID, second.ID)
 	}
-	withdrawn, _ := store.GetRequest(ctx, old.ID)
+	withdrawn, _ := store.GetRequest(ctx, old.ID, AllMutations)
 	if withdrawn.Status != StatusWithdrawn || withdrawn.SupersededBy != first.ID || withdrawn.Revision != old.Revision+1 {
 		t.Fatalf("original must be withdrawn exactly once: %#v", withdrawn)
 	}
@@ -339,7 +339,7 @@ func TestApproveAndWithdrawRaceHasExactlyOneWinner(t *testing.T) {
 		if (approveErr == nil) == (withdrawErr == nil) {
 			t.Fatalf("round %d: exactly one must win: approve=%v withdraw=%v", round, approveErr, withdrawErr)
 		}
-		final, _ := store.GetRequest(ctx, request.ID)
+		final, _ := store.GetRequest(ctx, request.ID, AllMutations)
 		switch {
 		case approveErr == nil && final.Status != "approved":
 			t.Fatalf("round %d: approve won but status = %s", round, final.Status)

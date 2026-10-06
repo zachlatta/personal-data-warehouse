@@ -974,6 +974,17 @@ export function gmailBatchSummary(mutations: MutationLike[], reviews: GmailThrea
   };
 }
 
+// A request is read a page at a time, so a summary of the threads on screen
+// is not a summary of the request: the headline counts come from the server's
+// whole-request counts until every page is loaded.
+export function gmailRequestSummary(request: RequestLike, reviews: GmailThreadReview[]): GmailBatchSummary {
+  const mutations = request.mutations ?? [];
+  const summary = gmailBatchSummary(mutations, reviews);
+  if (!requestIsPartial(request) || typeof request.pending_mutation_count !== 'number') return summary;
+  const total = request.mutation_count ?? mutations.length;
+  return { ...summary, threadCount: request.pending_mutation_count, keptCount: Math.max(0, total - request.pending_mutation_count) };
+}
+
 // Threads group by the day they last moved, newest first — the order mail is
 // read in, and the one grouping that invents nothing.
 export function gmailThreadDayGroups(reviews: GmailThreadReview[], now = new Date()): { key: string; label: string; data: GmailThreadReview[] }[] {
@@ -1859,7 +1870,12 @@ export type RequestDecision = {
   deniedLabel: string;
 };
 
-type RequestLike = { mutations?: MutationLike[]; mutation_count?: number };
+type RequestLike = { mutations?: MutationLike[]; mutation_count?: number; pending_mutation_count?: number };
+
+// True while only some of a request's mutations have been read.
+function requestIsPartial(request: RequestLike): boolean {
+  return (request.mutations ?? []).length < (request.mutation_count ?? 0);
+}
 
 function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`;
@@ -1902,7 +1918,12 @@ const GMAIL_DONE: Record<string, string> = { Archive: 'Archived', Unarchive: 'Un
 export function requestDecision(request: RequestLike): RequestDecision {
   const mutations = request.mutations ?? [];
   const live = mutations.filter((mutation) => mutation.status === 'pending_review');
-  const running = mutations.length ? live.length : Math.max(0, request.mutation_count ?? 0);
+  // What approval runs is the whole request's count, which a page of it
+  // cannot give; the server's count is the answer whenever it is there.
+  const running = typeof request.pending_mutation_count === 'number'
+    ? request.pending_mutation_count
+    : mutations.length ? live.length : Math.max(0, request.mutation_count ?? 0);
+  const partial = requestIsPartial(request);
   const generic = (): RequestDecision => {
     const single = running === 1;
     return {
@@ -1914,8 +1935,8 @@ export function requestDecision(request: RequestLike): RequestDecision {
     };
   };
   if (!live.length) return generic();
-  if (live.every(isGmailSendEmailMutation)) return emailDecision(live);
-  if (live.length === 1 && isSlackSendMessageMutation(live[0])) {
+  if (!partial && live.every(isGmailSendEmailMutation)) return emailDecision(live);
+  if (!partial && live.length === 1 && isSlackSendMessageMutation(live[0])) {
     const review = slackSendMessageReview(live[0]);
     return {
       running,
@@ -1928,7 +1949,7 @@ export function requestDecision(request: RequestLike): RequestDecision {
   if (mutations.every(isGmailThreadMutation)) {
     const summary = gmailBatchSummary(mutations, gmailThreadReviews(mutations));
     if (summary.verb === 'Review') return generic();
-    const threads = summary.threadCount;
+    const threads = partial ? running : summary.threadCount;
     const single = threads === 1;
     return {
       running,
@@ -1941,7 +1962,7 @@ export function requestDecision(request: RequestLike): RequestDecision {
   const contacts = mutations.every(isContactMutation) ? contactBatchSummary(mutations)
     : mutations.every(isAppleContactsMutation) ? appleContactsBatchSummary(mutations) : null;
   if (contacts && contacts.verb !== 'Approve') {
-    const count = contacts.running;
+    const count = partial ? running : contacts.running;
     return {
       running,
       approveLabel: `${contacts.verb} ${count}`,
@@ -2030,4 +2051,45 @@ export function splitIncomingEmailText(value: string): { body: string; quoted: s
   // A message that is nothing but a quote still has to say something.
   if (!body) return { body: quoted, quoted: '' };
   return { body, quoted };
+}
+
+// --- paging ---------------------------------------------------------------------
+
+// A request's review is read a page of mutations at a time; the screen grows
+// its list as the reader scrolls.
+export const MUTATION_PAGE_SIZE = 50;
+
+export type MutationsPage = { offset: number; limit: number; total: number; next_offset: number | null };
+
+type PagedRequest = RequestLike & { id: string; mutations_page?: MutationsPage; partial?: boolean };
+
+// mergeMutationPage folds one page read from the API into what the screen
+// already holds: the header (status, counts, revision) is the page's, a row
+// the page carries replaces the held one, and rows past it stay loaded. Pages
+// are read in order from the start and a mutation is never deleted (a dropped
+// one changes status), so the loaded rows are always the first N.
+export function mergeMutationPage<T extends PagedRequest>(current: T | null, page: T): T {
+  const held = current && current.id === page.id ? current.mutations ?? [] : [];
+  if (!held.length) return page;
+  const incoming = page.mutations ?? [];
+  const byId = new Map(incoming.map((mutation) => [mutation.id, mutation]));
+  const merged = held.map((mutation) => byId.get(mutation.id) ?? mutation);
+  const known = new Set(held.map((mutation) => mutation.id));
+  for (const mutation of incoming) if (!known.has(mutation.id)) merged.push(mutation);
+  const total = page.mutation_count ?? merged.length;
+  return {
+    ...page,
+    mutations: merged,
+    mutations_page: { offset: 0, limit: merged.length, total, next_offset: merged.length < total ? merged.length : null },
+  };
+}
+
+// withMutationStatus applies what a drop answered — the status and revision —
+// to the held row. The answer is the stored mutation, without the thread
+// preview the review read enriched it with, so it must not replace the row.
+export function withMutationStatus<T extends PagedRequest>(request: T, changed: { id: string; status?: string; revision?: number }): T {
+  const mutations = (request.mutations ?? []).map((mutation) => (
+    mutation.id === changed.id ? { ...mutation, status: changed.status ?? mutation.status, revision: changed.revision ?? (mutation as { revision?: number }).revision } : mutation
+  ));
+  return { ...request, mutations };
 }

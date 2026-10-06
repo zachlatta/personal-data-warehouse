@@ -115,8 +115,8 @@ func TestNormalizeSlackSendMessageForStorage(t *testing.T) {
 	if preview["delivery"] != slackSendDeliveryThreadReply || !strings.Contains(stringFromAny(preview["effect"]), "cannot be unsent") || !strings.Contains(stringFromAny(preview["effect"]), "broadcast") {
 		t.Fatalf("reply preview must state its irreversible effect: %#v", preview)
 	}
-	if mapFromAny(reply.Preview["context"])["source"] != "timeline" {
-		t.Fatalf("preview lost the request context: %#v", reply.Preview)
+	if _, has := reply.Preview["context"]; has {
+		t.Fatalf("the request context belongs on the request, not in each preview: %#v", reply.Preview)
 	}
 	dm := stored[1]
 	if dm.Payload["reply_broadcast"] != false || dm.Payload["conversation_id"] != "" || dm.Payload["user_id"] != "U0ABCDEF1" || dm.Payload["thread_ts"] != "" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +19,7 @@ type apiFakeStore struct {
 	removed   []string
 	actors    []string
 	listCalls []RequestFilter
+	pages     []MutationPage
 }
 
 func newAPIFakeStore(requests ...Request) *apiFakeStore {
@@ -47,11 +49,18 @@ func (s *apiFakeStore) ListRequests(_ context.Context, filter RequestFilter) ([]
 	}
 	return out, nil
 }
-func (s *apiFakeStore) GetRequest(_ context.Context, id string) (Request, error) {
+func (s *apiFakeStore) GetRequest(_ context.Context, id string, page MutationPage) (Request, error) {
 	r, ok := s.requests[id]
 	if !ok {
 		return Request{}, ErrNotFound
 	}
+	s.pages = append(s.pages, page)
+	start := min(page.Offset, len(r.Mutations))
+	end := len(r.Mutations)
+	if page.Limit > 0 {
+		end = min(start+page.Limit, end)
+	}
+	r.Mutations = r.Mutations[start:end]
 	return r, nil
 }
 func (s *apiFakeStore) UpdateGmailEmailMutation(context.Context, string, string, UpdateGmailEmailMutationInput, string) (Mutation, error) {
@@ -80,6 +89,7 @@ func (s *apiFakeStore) ApproveRequest(_ context.Context, id, actor string) (Requ
 	s.requests[id] = r
 	s.approved = append(s.approved, id)
 	s.actors = append(s.actors, actor)
+	r.Mutations = nil
 	return r, nil
 }
 func (s *apiFakeStore) RejectRequest(_ context.Context, id, actor, reason string) (Request, error) {
@@ -91,6 +101,7 @@ func (s *apiFakeStore) RejectRequest(_ context.Context, id, actor, reason string
 	s.requests[id] = r
 	s.rejected[id] = reason
 	s.actors = append(s.actors, actor)
+	r.Mutations = nil
 	return r, nil
 }
 func (s *apiFakeStore) WithdrawRequest(context.Context, string, WithdrawInput) (Request, error) {
@@ -542,4 +553,78 @@ func mustGet(t *testing.T, url string) *http.Response {
 		t.Fatal(err)
 	}
 	return resp
+}
+
+// bigRequestFixture is an inbox cleanup: one request, one archive mutation per
+// thread. Production's was 1,053 mutations and 270 MB read in one response.
+func bigRequestFixture(count int) Request {
+	request := pendingFixture()
+	request.ID = "req-big"
+	request.Mutations = nil
+	for i := 0; i < count; i++ {
+		request.Mutations = append(request.Mutations, Mutation{
+			ID: fmt.Sprintf("mut-%03d", i), RequestID: "req-big", RequestIndex: int64(i),
+			Provider: "gmail", Operation: GmailArchiveOperation, Status: "pending_review",
+		})
+	}
+	request.MutationCount = count
+	request.PendingMutationCount = count - 1
+	return request
+}
+
+func TestAPIGetReturnsOnePageOfMutations(t *testing.T) {
+	store := newAPIFakeStore(bigRequestFixture(120))
+	srv := newAPIServer(t, store)
+
+	// Unasked, the review reads the first page, never the whole request.
+	resp, _ := http.Get(srv.URL + APIPath + "/requests/req-big")
+	request := decodeBody(t, resp)["request"].(map[string]any)
+	if got := len(request["mutations"].([]any)); got != apiDefaultMutationPage {
+		t.Fatalf("default page carried %d mutations, want %d", got, apiDefaultMutationPage)
+	}
+	page := request["mutations_page"].(map[string]any)
+	if page["offset"] != float64(0) || page["limit"] != float64(apiDefaultMutationPage) || page["total"] != float64(120) || page["next_offset"] != float64(apiDefaultMutationPage) {
+		t.Fatalf("first page = %v", page)
+	}
+	if request["mutation_count"] != float64(120) || request["pending_mutation_count"] != float64(119) {
+		t.Fatalf("counts must describe the whole request, not the page: %v", request)
+	}
+
+	resp, _ = http.Get(srv.URL + APIPath + "/requests/req-big?offset=100&limit=50")
+	request = decodeBody(t, resp)["request"].(map[string]any)
+	mutations := request["mutations"].([]any)
+	if len(mutations) != 20 || mutations[0].(map[string]any)["id"] != "mut-100" {
+		t.Fatalf("last page = %d mutations starting %v", len(mutations), mutations[0])
+	}
+	page = request["mutations_page"].(map[string]any)
+	if page["offset"] != float64(100) || page["next_offset"] != nil {
+		t.Fatalf("the last page must say there is no next one: %v", page)
+	}
+	if last := store.pages[len(store.pages)-1]; last != (MutationPage{Offset: 100, Limit: 50}) {
+		t.Fatalf("store read page %+v", last)
+	}
+}
+
+func TestAPIGetRefusesAMalformedPage(t *testing.T) {
+	srv := newAPIServer(t, newAPIFakeStore(bigRequestFixture(3)))
+	for _, query := range []string{"limit=0", "limit=-1", "limit=abc", fmt.Sprintf("limit=%d", apiMaxMutationPage+1), "offset=-1", "offset=x"} {
+		resp, _ := http.Get(srv.URL + APIPath + "/requests/req-big?" + query)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d", query, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestAPIDecisionAnswersWithTheFirstPage(t *testing.T) {
+	store := newAPIFakeStore(bigRequestFixture(120))
+	srv := newAPIServer(t, store)
+	resp, _ := http.Post(srv.URL+APIPath+"/requests/req-big/approve", "application/json", nil)
+	request := decodeBody(t, resp)["request"].(map[string]any)
+	if request["status"] != "approved" {
+		t.Fatalf("approve answer = %v", request)
+	}
+	if got := len(request["mutations"].([]any)); got != apiDefaultMutationPage {
+		t.Fatalf("approve answered with %d mutations, want the first page", got)
+	}
 }

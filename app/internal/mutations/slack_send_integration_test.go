@@ -135,7 +135,7 @@ func TestUpdateSlackMessageMutationEditsTheWordsBeforeApproval(t *testing.T) {
 	if edited.Payload["text"] != "Final words." || edited.Revision != mutation.Revision+1 {
 		t.Fatalf("edited = %#v", edited)
 	}
-	got, err := store.GetRequest(ctx, request.ID)
+	got, err := store.GetRequest(ctx, request.ID, AllMutations)
 	if err != nil {
 		t.Fatalf("GetRequest: %v", err)
 	}

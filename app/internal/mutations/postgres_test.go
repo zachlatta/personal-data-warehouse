@@ -95,6 +95,14 @@ func TestNormalizeForStorageMatchesWorkerPayloads(t *testing.T) {
 	if len(mutations) != 6 {
 		t.Fatalf("mutation count = %d", len(mutations))
 	}
+	// The request's context is stored once, on the request. A copy in every
+	// mutation's preview made a 1,053-thread inbox cleanup 247 MB of the same
+	// 234 KB, read back on every review.
+	for index, mutation := range mutations {
+		if _, has := mutation.Preview["context"]; has {
+			t.Fatalf("mutation %d preview repeats the request context: %#v", index, mutation.Preview)
+		}
+	}
 
 	if mutations[0].Operation != GmailArchiveOperation || mutations[0].Provider != "gmail" {
 		t.Fatalf("archive mutation metadata = %#v", mutations[0])
@@ -170,8 +178,8 @@ func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
 			},
 		},
 		Preview: map[string]any{
-			"context": map[string]any{"source": "test"},
-			"email":   map[string]any{"subject": "Original", "body_text": "Original body"},
+			"reply_threads": []any{map[string]any{"thread_id": "thread-1"}},
+			"email":         map[string]any{"subject": "Original", "body_text": "Original body"},
 		},
 	}
 
@@ -205,8 +213,8 @@ func TestUpdatedGmailEmailPayloadConvertsSendToDraft(t *testing.T) {
 	if previewEmail["delivery_mode"] != "draft" || previewEmail["mode"] != "reply" {
 		t.Fatalf("preview email = %#v", previewEmail)
 	}
-	if mapFromAny(preview["context"])["source"] != "test" {
-		t.Fatalf("preview context = %#v", preview["context"])
+	if threads, _ := preview["reply_threads"].([]any); len(threads) != 1 {
+		t.Fatalf("an edit dropped the rest of the preview: %#v", preview)
 	}
 }
 

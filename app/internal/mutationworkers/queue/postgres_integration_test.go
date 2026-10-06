@@ -285,7 +285,7 @@ func TestIntegrationCompleteAndFailWriteTheResultAndRollUpTheRequest(t *testing.
 	if status, _ := requestStatus(t, worker, request.ID); status != "succeeded" {
 		t.Fatalf("request status %q", status)
 	}
-	got, err := app.GetRequest(ctx, request.ID)
+	got, err := app.GetRequest(ctx, request.ID, mutations.AllMutations)
 	if err != nil || got.Status != "succeeded" {
 		t.Fatalf("app sees %q err %v", got.Status, err)
 	}
@@ -420,7 +420,7 @@ func TestIntegrationProcessEndToEndThroughTheRealStore(t *testing.T) {
 	if mine == nil || mine.Payload["card_id"] != "8537DF38-BF0D-4468-9061-D2D41468E05A:ABPerson" {
 		t.Fatalf("executor did not see our row: %+v", seen)
 	}
-	got, err := app.GetRequest(ctx, request.ID)
+	got, err := app.GetRequest(ctx, request.ID, mutations.AllMutations)
 	if err != nil || got.Status != "succeeded" || len(got.Mutations) != 1 || got.Mutations[0].Status != "succeeded" {
 		t.Fatalf("request %+v err %v", got, err)
 	}

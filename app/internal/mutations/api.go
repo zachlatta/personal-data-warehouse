@@ -42,6 +42,15 @@ var apiStatusPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 // asks for a few hundred, the phone for fifty.
 const apiMaxListLimit = 500
 
+// A request's detail is paged. An inbox cleanup is one request of a thousand
+// archive mutations, each enriched with its thread's messages on read; served
+// whole, production's 1,053-thread cleanup was a 270 MB response that neither
+// the phone nor the browser finished loading.
+const (
+	apiDefaultMutationPage = 50
+	apiMaxMutationPage     = 200
+)
+
 type apiUpdateEmailBody struct {
 	DeliveryMode      string         `json:"delivery_mode"`
 	SelectedVariantID string         `json:"selected_variant_id"`
@@ -105,21 +114,20 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	if actor == apiReviewerActorPrefix {
 		actor = apiReviewerActorPrefix + "ios"
 	}
+	page, err := apiMutationPage(r)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	switch {
 	case len(parts) == 1 && r.Method == http.MethodGet:
-		request, err := s.store.GetRequest(r.Context(), requestID)
-		if err != nil {
-			apiStoreError(w, err)
-			return
-		}
-		apiJSON(w, http.StatusOK, map[string]any{"request": s.requestJSON(request, true)})
+		s.apiWriteRequestPage(w, r, requestID, page)
 	case len(parts) == 2 && parts[1] == "approve" && r.Method == http.MethodPost:
-		request, err := s.store.ApproveRequest(r.Context(), requestID, actor)
-		if err != nil {
+		if _, err := s.store.ApproveRequest(r.Context(), requestID, actor); err != nil {
 			apiStoreError(w, err)
 			return
 		}
-		apiJSON(w, http.StatusOK, map[string]any{"request": s.requestJSON(request, true)})
+		s.apiWriteRequestPage(w, r, requestID, page)
 	case len(parts) == 2 && parts[1] == "reject" && r.Method == http.MethodPost:
 		var body struct {
 			Reason string `json:"reason"`
@@ -128,12 +136,11 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		request, err := s.store.RejectRequest(r.Context(), requestID, actor, strings.TrimSpace(body.Reason))
-		if err != nil {
+		if _, err := s.store.RejectRequest(r.Context(), requestID, actor, strings.TrimSpace(body.Reason)); err != nil {
 			apiStoreError(w, err)
 			return
 		}
-		apiJSON(w, http.StatusOK, map[string]any{"request": s.requestJSON(request, true)})
+		s.apiWriteRequestPage(w, r, requestID, page)
 	case len(parts) == 2 && parts[1] == "supersede" && r.Method == http.MethodPost:
 		var body struct {
 			SupersededBy string `json:"superseded_by"`
@@ -147,12 +154,11 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		request, err := s.store.SupersedeRequest(r.Context(), requestID, supersededBy, actor)
-		if err != nil {
+		if _, err := s.store.SupersedeRequest(r.Context(), requestID, supersededBy, actor); err != nil {
 			apiStoreError(w, err)
 			return
 		}
-		apiJSON(w, http.StatusOK, map[string]any{"request": s.requestJSON(request, true)})
+		s.apiWriteRequestPage(w, r, requestID, page)
 	case len(parts) == 4 && parts[1] == "mutations" && parts[3] == "update-email" && r.Method == http.MethodPost:
 		var body apiUpdateEmailBody
 		if err := decodeOptionalJSONLimit(r, &body, 32<<20); err != nil {
@@ -187,6 +193,48 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// apiMutationPage reads ?offset=&limit= — the window of the request's
+// mutations a detail read (or a decision's answer) carries.
+func apiMutationPage(r *http.Request) (MutationPage, error) {
+	page := MutationPage{Limit: apiDefaultMutationPage}
+	query := r.URL.Query()
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit <= 0 || limit > apiMaxMutationPage {
+			return MutationPage{}, errors.New("limit must be between 1 and " + strconv.Itoa(apiMaxMutationPage))
+		}
+		page.Limit = limit
+	}
+	if raw := strings.TrimSpace(query.Get("offset")); raw != "" {
+		offset, err := strconv.Atoi(raw)
+		if err != nil || offset < 0 {
+			return MutationPage{}, errors.New("offset must be a non-negative integer")
+		}
+		page.Offset = offset
+	}
+	return page, nil
+}
+
+func (s *Service) apiWriteRequestPage(w http.ResponseWriter, r *http.Request, requestID string, page MutationPage) {
+	request, err := s.store.GetRequest(r.Context(), requestID, page)
+	if err != nil {
+		apiStoreError(w, err)
+		return
+	}
+	item := s.requestJSON(request, true)
+	var nextOffset any
+	if next := page.Offset + len(request.Mutations); len(request.Mutations) > 0 && next < request.MutationCount {
+		nextOffset = next
+	}
+	item["mutations_page"] = map[string]any{
+		"offset":      page.Offset,
+		"limit":       page.Limit,
+		"total":       request.MutationCount,
+		"next_offset": nextOffset,
+	}
+	apiJSON(w, http.StatusOK, map[string]any{"request": item})
 }
 
 func decodeOptionalJSON(r *http.Request, into any) error {
@@ -237,7 +285,8 @@ func nullableTime(value time.Time) any {
 }
 
 // RequestJSON is the wire shape of one request: the row a list shows, or —
-// withMutations — the whole review, which is also what a push notification
+// withMutations — the review with whatever mutations the request carries (a
+// page of them, from the API), which is also what a push notification
 // carries so the phone can render a request before it has network.
 func (s *Service) RequestJSON(request Request, withMutations bool) map[string]any {
 	return s.requestJSON(request, withMutations)
@@ -263,7 +312,9 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		"executed_at":    nullableTime(request.ExecutedAt),
 		"observed_at":    nullableTime(request.ObservedAt),
 		"mutation_count": request.MutationCount,
-		"review_url":     s.requestURL(request.ID),
+		// What approving runs now, across every page of the request.
+		"pending_mutation_count": request.PendingMutationCount,
+		"review_url":             s.requestURL(request.ID),
 		// Only a request nothing else can move may be closed out by naming
 		// its replacement; the status list lives here, not in each client.
 		"can_supersede": strings.TrimSpace(request.SupersededBy) == "" && requestIsSupersedable(request.Status),

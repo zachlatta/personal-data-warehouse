@@ -54,7 +54,7 @@ func TestGmailForwardProposalReviewApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := store.GetRequest(ctx, proposal.RequestID)
+	request, err := store.GetRequest(ctx, proposal.RequestID, AllMutations)
 	if err != nil {
 		t.Fatal(err)
 	}

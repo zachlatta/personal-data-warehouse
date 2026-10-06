@@ -81,7 +81,7 @@ func (s *PostgresStore) SupersedeRequest(ctx context.Context, id string, superse
 		return Request{}, err
 	}
 	committed = true
-	return s.GetRequest(ctx, id)
+	return s.getRequest(ctx, id)
 }
 
 func validateSupersedeInput(id string, supersededBy string) error {

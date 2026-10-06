@@ -86,6 +86,49 @@ export function requestMutationCount(request) {
   return count || (Array.isArray(request.mutations) ? request.mutations.length : 0);
 }
 
+// What approving runs now, across every page — not the page on screen.
+export function requestApproveCount(request) {
+  if (typeof request.pending_mutation_count === "number") return request.pending_mutation_count;
+  return requestMutationCount(request);
+}
+
+// --- paging --------------------------------------------------------------------
+
+// A request's review is read a page of mutations at a time: an inbox cleanup
+// is one request of a thousand archives, and read whole it never finished
+// loading. The page lives in the address (?page=N) so a reload keeps it.
+export const MUTATION_PAGE_SIZE = 50;
+
+export function mutationPageFromSearch(search) {
+  const raw = new URLSearchParams(search || "").get("page");
+  if (!raw || !/^\d+$/.test(raw)) return 1;
+  const page = Number(raw);
+  return page >= 1 ? page : 1;
+}
+
+export function mutationPageQuery(page) {
+  return { offset: (Math.max(1, page) - 1) * MUTATION_PAGE_SIZE, limit: MUTATION_PAGE_SIZE };
+}
+
+export function mutationPageView(request) {
+  const shown = Array.isArray(request.mutations) ? request.mutations.length : 0;
+  const meta = request.mutations_page && typeof request.mutations_page === "object" ? request.mutations_page : null;
+  const total = meta ? intFromAny(meta.total) : Math.max(requestMutationCount(request), shown);
+  const offset = meta ? intFromAny(meta.offset) : 0;
+  const size = meta ? intFromAny(meta.limit) || MUTATION_PAGE_SIZE : Math.max(shown, 1);
+  const page = Math.floor(offset / size) + 1;
+  const pages = Math.max(1, Math.ceil(total / size));
+  return {
+    page,
+    pages,
+    from: shown ? offset + 1 : 0,
+    to: offset + shown,
+    total,
+    prevPage: page > 1 ? page - 1 : null,
+    nextPage: meta && meta.next_offset !== null && meta.next_offset !== undefined ? page + 1 : null,
+  };
+}
+
 // --- mutation classification and grouping -----------------------------------
 
 export const GMAIL_ARCHIVE = "gmail.archive_threads";

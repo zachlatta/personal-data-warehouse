@@ -33,6 +33,9 @@ import {
   pendingApproveLabel,
   splitIncomingEmailText,
   requestDecision,
+  gmailRequestSummary,
+  mergeMutationPage,
+  withMutationStatus,
   requestKindLabel,
   requestStatusTitle,
   mutationReviewContext,
@@ -1111,4 +1114,70 @@ test('a forwarded message stays in the body; only its quoted history folds', () 
 test('a phone number Gmail turned into a tel link reads as the number', () => {
   const split = splitIncomingEmailText('Pat Doe\n6175550123 <(617)%20555-0123>');
   assert.equal(split.body, 'Pat Doe\n6175550123');
+});
+
+// --- paging -------------------------------------------------------------------
+
+function pagedArchiveRequest(from, count, total, extra = {}) {
+  const thread = (i) => ({ thread_id: `thread-${i}`, subject: `Subject ${i}`, latest_from_name: 'Pat', latest_at: '2026-08-30T15:36:00Z', messages: [] });
+  const mutations = Array.from({ length: count }, (_, i) => archiveMutation(`m${from + i}`, thread(from + i)));
+  const next = from + count < total ? from + count : null;
+  return {
+    id: 'r', status: 'pending_review', mutation_count: total, pending_mutation_count: total,
+    mutations, mutations_page: { offset: from, limit: 50, total, next_offset: next }, ...extra,
+  };
+}
+
+test('the next page appends, and the merged request says where to read from next', () => {
+  const merged = mergeMutationPage(pagedArchiveRequest(0, 50, 120), pagedArchiveRequest(50, 50, 120));
+  assert.equal(merged.mutations.length, 100);
+  assert.equal(merged.mutations[50].id, 'm50');
+  assert.deepEqual(merged.mutations_page, { offset: 0, limit: 100, total: 120, next_offset: 100 });
+  const done = mergeMutationPage(merged, pagedArchiveRequest(100, 20, 120));
+  assert.equal(done.mutations.length, 120);
+  assert.equal(done.mutations_page.next_offset, null);
+});
+
+test('a refreshed first page updates the header and its rows without dropping later pages', () => {
+  const loaded = mergeMutationPage(pagedArchiveRequest(0, 50, 120), pagedArchiveRequest(50, 50, 120));
+  const fresh = pagedArchiveRequest(0, 50, 120, { pending_mutation_count: 118, revision: 3 });
+  fresh.mutations[0] = { ...fresh.mutations[0], status: 'rejected' };
+  const merged = mergeMutationPage(loaded, fresh);
+  assert.equal(merged.mutations.length, 100);
+  assert.equal(merged.mutations[0].status, 'rejected');
+  assert.equal(merged.pending_mutation_count, 118);
+  assert.equal(merged.revision, 3);
+  assert.equal(merged.mutations_page.next_offset, 100);
+});
+
+test('a page of another request, or onto a header-only copy, is taken as is', () => {
+  const page = pagedArchiveRequest(0, 50, 120);
+  assert.equal(mergeMutationPage({ ...page, id: 'other' }, page), page);
+  const header = { id: 'r', status: 'pending_review', mutation_count: 120, partial: true };
+  assert.equal(mergeMutationPage(header, page).mutations.length, 50);
+  assert.equal(mergeMutationPage(header, page).partial, undefined);
+});
+
+test('a dropped thread changes status in place and keeps its enriched preview', () => {
+  const request = pagedArchiveRequest(0, 3, 3);
+  const before = request.mutations[1];
+  const after = withMutationStatus(request, { id: 'm1', status: 'rejected', revision: 2, preview: {} });
+  assert.equal(after.mutations[1].status, 'rejected');
+  assert.equal(after.mutations[1].revision, 2);
+  assert.deepEqual(after.mutations[1].preview, before.preview);
+  assert.equal(request.mutations[1].status, 'pending_review');
+});
+
+test('a request read a page at a time is labelled by the whole request, not the page', () => {
+  const request = pagedArchiveRequest(0, 50, 1053, { pending_mutation_count: 1050 });
+  const decision = requestDecision(request);
+  assert.equal(decision.running, 1050);
+  assert.equal(decision.approveLabel, 'Archive 1050');
+  assert.equal(decision.doneLabel, 'Archived 1050 threads');
+  const summary = gmailRequestSummary(request, gmailThreadReviews(request.mutations));
+  assert.equal(summary.threadCount, 1050);
+  assert.equal(summary.keptCount, 3);
+  // Read whole, the page's own count still stands.
+  const whole = pagedArchiveRequest(0, 2, 2);
+  assert.equal(gmailRequestSummary(whole, gmailThreadReviews(whole.mutations)).threadCount, 2);
 });

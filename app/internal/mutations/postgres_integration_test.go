@@ -85,7 +85,7 @@ func TestSupersedeRequestPersistsTheLinkAndEvent(t *testing.T) {
 	}
 
 	// It has to survive a fresh read, since the review UI re-reads on every page.
-	reread, err := store.GetRequest(ctx, old.ID)
+	reread, err := store.GetRequest(ctx, old.ID, AllMutations)
 	if err != nil {
 		t.Fatalf("GetRequest: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestGetRequestHydratesAnOlderSlackSnapshotWithLinksAndFaces(t *testing.T) {
 		t.Fatalf("age the stored preview: %v", err)
 	}
 
-	got, err := store.GetRequest(ctx, created.ID)
+	got, err := store.GetRequest(ctx, created.ID, AllMutations)
 	if err != nil {
 		t.Fatalf("GetRequest: %v", err)
 	}
@@ -531,5 +531,62 @@ func TestSlackMarkReadPreviewLinksAReplyToItsThread(t *testing.T) {
 	want := "https://example.slack.com/archives/C1/p1593473566000200?thread_ts=1593473500.000100&cid=C1"
 	if got := previewLinkURL(reply["open"]); got != want {
 		t.Fatalf("reply permalink = %q, want %q", got, want)
+	}
+}
+
+func TestGetRequestReadsOnePageOfMutationsAndCountsTheWhole(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	title := fmt.Sprintf("%s %d", t.Name(), time.Now().UnixNano())
+	operations := []map[string]any{}
+	for i := 0; i < 5; i++ {
+		operations = append(operations, map[string]any{
+			"op":            "delete_contact",
+			"resource_name": fmt.Sprintf("people/%s-%d", strings.ReplaceAll(title, " ", "-"), i),
+			"etag":          fmt.Sprintf("etag-%d", i),
+		})
+	}
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: title, Reason: "integration test", RequestedBy: "test",
+		Context: map[string]any{"source": "test"},
+		Mutations: []MutationInput{{
+			Type: GooglePeopleContactsOperation, Account: "zach@example.test", Operations: operations,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	if len(created.Mutations) != 5 {
+		t.Fatalf("a proposal reads back every mutation, got %d", len(created.Mutations))
+	}
+	if _, err := store.RemoveMutation(ctx, created.ID, created.Mutations[0].ID, "web-ui"); err != nil {
+		t.Fatalf("remove mutation: %v", err)
+	}
+
+	page, err := store.GetRequest(ctx, created.ID, MutationPage{Offset: 2, Limit: 2})
+	if err != nil {
+		t.Fatalf("get page: %v", err)
+	}
+	if len(page.Mutations) != 2 || page.Mutations[0].ID != created.Mutations[2].ID || page.Mutations[1].ID != created.Mutations[3].ID {
+		t.Fatalf("page = %+v, want mutations 2 and 3 in request order", page.Mutations)
+	}
+	if page.MutationCount != 5 || page.PendingMutationCount != 4 {
+		t.Fatalf("counts must cover the whole request: total %d pending %d", page.MutationCount, page.PendingMutationCount)
+	}
+	if page.Context["source"] != "test" {
+		t.Fatalf("the request carries its context: %#v", page.Context)
+	}
+	for _, mutation := range page.Mutations {
+		if _, has := mutation.Preview["context"]; has {
+			t.Fatalf("mutation preview repeats the request context: %#v", mutation.Preview)
+		}
+	}
+
+	approved, err := store.ApproveRequest(ctx, created.ID, "web-ui")
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if approved.Status != "approved" || approved.PendingMutationCount != 0 || approved.Mutations != nil {
+		t.Fatalf("approve answers with the header alone: status %q pending %d mutations %d", approved.Status, approved.PendingMutationCount, len(approved.Mutations))
 	}
 }

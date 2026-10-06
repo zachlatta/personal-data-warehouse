@@ -195,7 +195,7 @@ func (s *PostgresStore) WithdrawRequest(ctx context.Context, id string, input Wi
 		return Request{}, err
 	}
 	committed = true
-	return s.GetRequest(ctx, id)
+	return s.GetRequest(ctx, id, AllMutations)
 }
 
 // checkReplacementIsLive refuses a replacement pointer at a request that is

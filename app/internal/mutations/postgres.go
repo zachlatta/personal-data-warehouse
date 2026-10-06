@@ -176,7 +176,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			if err := s.applyReplacementStandalone(ctx, existing.ID, *input.Replaces, input.RequestedBy); err != nil {
 				return Request{}, err
 			}
-			return s.GetRequest(ctx, existing.ID)
+			return s.GetRequest(ctx, existing.ID, AllMutations)
 		}
 		return existing, nil
 	}
@@ -252,7 +252,7 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 		return Request{}, err
 	}
 	committed = true
-	return s.GetRequest(ctx, requestID)
+	return s.GetRequest(ctx, requestID, AllMutations)
 }
 
 func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) ([]Request, error) {
@@ -287,7 +287,8 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       request.requested_by, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
-		       count(mutation.id)::bigint AS mutation_count
+		       count(mutation.id)::bigint AS mutation_count,
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		%s
@@ -313,7 +314,7 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 	return requests, nil
 }
 
-func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, error) {
+func (s *PostgresStore) GetRequest(ctx context.Context, id string, page MutationPage) (Request, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	if err := s.EnsureTables(ctx); err != nil {
@@ -323,7 +324,9 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	if err != nil {
 		return Request{}, err
 	}
-	mutations, err := s.listMutationsForRequest(ctx, id)
+	// Every enrichment below is bounded by the page, not the request: the
+	// thread previews alone read each thread's messages with their bodies.
+	mutations, err := s.listMutationsForRequest(ctx, id, page)
 	if err != nil {
 		return Request{}, err
 	}
@@ -335,9 +338,6 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string) (Request, err
 	mutations = s.hydrateSlackPreviewLinks(ctx, mutations)
 	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
 	request.Mutations = mutations
-	if request.MutationCount == 0 {
-		request.MutationCount = len(mutations)
-	}
 	return request, nil
 }
 
@@ -826,7 +826,7 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 		return Request{}, err
 	}
 	committed = true
-	return s.GetRequest(ctx, id)
+	return s.getRequest(ctx, id)
 }
 
 func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error) {
@@ -886,7 +886,7 @@ func (s *PostgresStore) RejectRequest(ctx context.Context, id string, actor stri
 		return Request{}, err
 	}
 	committed = true
-	return s.GetRequest(ctx, id)
+	return s.getRequest(ctx, id)
 }
 
 func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key string) (Request, error) {
@@ -898,7 +898,7 @@ func (s *PostgresStore) getRequestByIdempotencyKey(ctx context.Context, key stri
 	if err != nil {
 		return Request{}, err
 	}
-	return s.GetRequest(ctx, id)
+	return s.GetRequest(ctx, id, AllMutations)
 }
 
 func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, error) {
@@ -909,7 +909,8 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 		       request.requested_by, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
-		       count(mutation.id)::bigint AS mutation_count
+		       count(mutation.id)::bigint AS mutation_count,
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		WHERE request.id = $1
@@ -922,7 +923,15 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 	return request, err
 }
 
-func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID string) ([]Mutation, error) {
+func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID string, page MutationPage) ([]Mutation, error) {
+	if page.Offset < 0 || page.Limit < 0 {
+		return nil, fmt.Errorf("invalid mutation page offset %d limit %d", page.Offset, page.Limit)
+	}
+	// LIMIT NULL is no limit, which is what AllMutations (Limit 0) means.
+	var limit any
+	if page.Limit > 0 {
+		limit = page.Limit
+	}
 	rows, err := queryContext(ctx, s.db, `
 		SELECT id, request_id, request_index, provider, operation, account, status, title, reason,
 		       payload_json, preview_json, result_json, error, idempotency_key, revision, attempt_count,
@@ -931,7 +940,9 @@ func (s *PostgresStore) listMutationsForRequest(ctx context.Context, requestID s
 		FROM @upstream_mutations
 		WHERE request_id = $1
 		ORDER BY request_index ASC, created_at ASC, id ASC
-	`, requestID)
+		OFFSET $2
+		LIMIT $3
+	`, requestID, page.Offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1555,7 +1566,7 @@ type scanner interface {
 func scanRequest(row scanner) (Request, error) {
 	var request Request
 	var contextJSON, resultJSON []byte
-	var mutationCount int64
+	var mutationCount, pendingMutationCount int64
 	err := row.Scan(
 		&request.ID,
 		&request.Status,
@@ -1578,6 +1589,7 @@ func scanRequest(row scanner) (Request, error) {
 		&request.ObservedAt,
 		&request.WithdrawnAt,
 		&mutationCount,
+		&pendingMutationCount,
 	)
 	if err != nil {
 		return Request{}, err
@@ -1585,6 +1597,7 @@ func scanRequest(row scanner) (Request, error) {
 	request.Context = decodeJSONMap(contextJSON)
 	request.Result = decodeJSONMap(resultJSON)
 	request.MutationCount = int(mutationCount)
+	request.PendingMutationCount = int(pendingMutationCount)
 	return request, nil
 }
 
@@ -1652,7 +1665,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					Preview: map[string]any{
 						"thread_count": 1,
 						"threads":      []map[string]any{{"thread_id": threadID}},
-						"context":      input.Context,
 					},
 				})
 			}
@@ -1684,7 +1696,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 							"create_and_add": createAndAddLabels,
 							"remove":         removeLabels,
 						},
-						"context": input.Context,
 					},
 				})
 			}
@@ -1736,8 +1747,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 				Preview: map[string]any{
-					"email":   previewEmail,
-					"context": input.Context,
+					"email": previewEmail,
 				},
 			})
 		case GooglePeopleContactsOperation, ContactsBatchMutationOperation:
@@ -1756,7 +1766,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					Preview: map[string]any{
 						"operation_count": 1,
 						"operations":      []map[string]any{contactOperationPreview(op, operationIndex)},
-						"context":         input.Context,
 					},
 				})
 			}
@@ -1780,8 +1789,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 				Preview: map[string]any{
-					"event":   calendarEventPreview(event, "create", calendarID, sendUpdates, "", ""),
-					"context": input.Context,
+					"event": calendarEventPreview(event, "create", calendarID, sendUpdates, "", ""),
 				},
 			})
 		case CalendarUpdateEventOperation:
@@ -1806,8 +1814,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 				Preview: map[string]any{
-					"event":   calendarEventPreview(patch, "update", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
-					"context": input.Context,
+					"event": calendarEventPreview(patch, "update", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
 				},
 			})
 		case CalendarDeleteEventOperation:
@@ -1830,8 +1837,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   payload,
 				Preview: map[string]any{
-					"event":   calendarEventPreview(map[string]any{}, "delete", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
-					"context": input.Context,
+					"event": calendarEventPreview(map[string]any{}, "delete", calendarID, sendUpdates, mutation.EventID, mutation.ExpectedEtag),
 				},
 			})
 		case AppleNotesCreateNoteOperation, AppleNotesUpdateNoteOperation:
@@ -1846,8 +1852,7 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Reason:    reason,
 				Payload:   appleNotesPayload(mutation),
 				Preview: map[string]any{
-					"note":    appleNotesPreview(mutation),
-					"context": input.Context,
+					"note": appleNotesPreview(mutation),
 				},
 			})
 		case AppleContactsCreateContactOperation, AppleContactsUpdateContactOperation, AppleContactsMergeContactsOperation:
@@ -1863,7 +1868,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Payload:   appleContactsPayload(mutation),
 				Preview: map[string]any{
 					"contact": appleContactsPreview(mutation),
-					"context": input.Context,
 				},
 			})
 		case SlackMarkConversationReadOperation:
@@ -1885,7 +1889,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 						"message_ts":      messageTS,
 						"effect":          "Moves the entire conversation read cursor through this message.",
 					},
-					"context": input.Context,
 				},
 			})
 		case SlackSendMessageOperation:
@@ -1902,7 +1905,6 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Payload:   payload,
 				Preview: map[string]any{
 					"slack_message": slackSendMessagePreview(payload),
-					"context":       input.Context,
 				},
 			})
 		default:

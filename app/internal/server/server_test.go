@@ -59,7 +59,7 @@ func (s fakeMutationStore) ListRequests(context.Context, mutations.RequestFilter
 	return nil, nil
 }
 
-func (s fakeMutationStore) GetRequest(context.Context, string) (mutations.Request, error) {
+func (s fakeMutationStore) GetRequest(context.Context, string, mutations.MutationPage) (mutations.Request, error) {
 	return mutations.Request{}, mutations.ErrNotFound
 }
 
@@ -104,7 +104,7 @@ func (s *recordingMutationStore) ListRequests(context.Context, mutations.Request
 	return nil, nil
 }
 
-func (s *recordingMutationStore) GetRequest(context.Context, string) (mutations.Request, error) {
+func (s *recordingMutationStore) GetRequest(context.Context, string, mutations.MutationPage) (mutations.Request, error) {
 	return mutations.Request{}, mutations.ErrNotFound
 }
 

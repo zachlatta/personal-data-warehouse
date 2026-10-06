@@ -436,3 +436,16 @@ summary.slack-group-summary::-webkit-details-marker, summary.slack-review-summar
 .mv .attachment-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
 .mv .attachment-row button { overflow-wrap: anywhere; max-width: 100%; }
 .mv .attachments input[type="file"] { max-width: 100%; margin-top: 8px; }
+
+/* The pager over and under a page of a request's mutations. Links are
+   44px tall on a phone, like every other control in the review. */
+.mv .mutation-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0 14px; font-size: 11.5px; }
+.mv .mutation-pager .pager-link { display: inline-flex; align-items: center; min-height: 32px; padding: 0 10px; border: 1px solid var(--line2); border-radius: 3px; text-decoration: none; color: var(--text); white-space: nowrap; }
+.mv .mutation-pager a.pager-link:hover { color: var(--amber); border-color: var(--amber-dim); }
+.mv .mutation-pager .pager-link.off { color: var(--faint); border-color: var(--line); }
+.mv .mutation-pager .pager-where { color: var(--dim); text-align: center; }
+@media (max-width: 640px) {
+  .mv .mutation-pager { flex-wrap: wrap; }
+  .mv .mutation-pager .pager-where { order: -1; flex-basis: 100%; }
+  .mv .mutation-pager .pager-link { min-height: 44px; flex: 1; justify-content: center; }
+}

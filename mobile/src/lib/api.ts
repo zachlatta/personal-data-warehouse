@@ -187,8 +187,13 @@ export type MutationRequest = {
   executed_at: string | null;
   observed_at: string | null;
   mutation_count: number;
+  // What approving runs now, across every page of the request.
+  pending_mutation_count?: number;
   review_url: string;
+  // The detail read carries a page of the request's mutations, in order;
+  // mutations_page says which, and where the next one starts.
   mutations?: Mutation[];
+  mutations_page?: { offset: number; limit: number; total: number; next_offset: number | null };
   // true on the copy a push alert carries when the request was too big for
   // the 4 KB notification: the header is real, the mutations still need a read.
   partial?: boolean;
@@ -200,8 +205,12 @@ export async function listMutationRequests(config: AppConfig, statuses?: Mutatio
   return body.requests;
 }
 
-export async function getMutationRequest(config: AppConfig, id: string): Promise<MutationRequest> {
-  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}`);
+// A request is read a page of mutations at a time (the server's default is
+// the first page); an inbox cleanup of a thousand threads read whole never
+// finished loading.
+export async function getMutationRequest(config: AppConfig, id: string, page?: { offset: number; limit: number }): Promise<MutationRequest> {
+  const query = page ? `?offset=${page.offset}&limit=${page.limit}` : '';
+  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}${query}`);
   return body.request;
 }
 

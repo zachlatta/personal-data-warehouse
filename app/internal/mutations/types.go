@@ -61,15 +61,33 @@ type Config struct {
 type Store interface {
 	CreateRequest(ctx context.Context, input CreateRequestInput) (Request, error)
 	ListRequests(ctx context.Context, filter RequestFilter) ([]Request, error)
-	GetRequest(ctx context.Context, id string) (Request, error)
+	// GetRequest reads one request and the page of its mutations named by
+	// page; AllMutations reads every one. Review surfaces always ask for a
+	// page: an inbox cleanup is a request of a thousand mutations, and each
+	// read enriches its threads from the warehouse.
+	GetRequest(ctx context.Context, id string, page MutationPage) (Request, error)
 	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
 	UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error)
 	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
+	// ApproveRequest, RejectRequest and SupersedeRequest return the request
+	// header — status, counts, who and when — without its mutations; a caller
+	// that shows mutations reads the page it shows with GetRequest.
 	ApproveRequest(ctx context.Context, id string, actor string) (Request, error)
 	RejectRequest(ctx context.Context, id string, actor string, reason string) (Request, error)
 	SupersedeRequest(ctx context.Context, id string, supersededBy string, actor string) (Request, error)
 	WithdrawRequest(ctx context.Context, id string, input WithdrawInput) (Request, error)
 }
+
+// MutationPage selects a window of a request's mutations in request order.
+// Limit 0 means every mutation from Offset on.
+type MutationPage struct {
+	Offset int
+	Limit  int
+}
+
+// AllMutations is the page that is the whole request: what an agent's
+// proposal response and the push alert need, never a review screen.
+var AllMutations = MutationPage{}
 
 type RequestFilter struct {
 	Statuses []string
@@ -200,7 +218,11 @@ type Request struct {
 	ObservedAt    time.Time
 	WithdrawnAt   time.Time
 	MutationCount int
-	Mutations     []Mutation
+	// PendingMutationCount is how many mutations an approval would run now:
+	// the review's approve button, which a page of mutations cannot count.
+	PendingMutationCount int
+	// Mutations is the page GetRequest was asked for, in request order.
+	Mutations []Mutation
 }
 
 type Mutation struct {

@@ -20,7 +20,8 @@ import { StatusPill } from '@/components/status-pill';
 import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
-  gmailBatchSummary,
+  MUTATION_PAGE_SIZE,
+  gmailRequestSummary,
   hasGmailThreadMutations,
   gmailThreadDayGroups,
   gmailThreadReviews,
@@ -31,6 +32,7 @@ import {
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
+  mergeMutationPage,
   mutationReviewContext,
   pendingApproveLabel,
   requestDecision,
@@ -39,6 +41,7 @@ import {
   requestLifecycleNote,
   requestStatusTitle,
   slackMarkReadGroups,
+  withMutationStatus,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
 import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
@@ -295,15 +298,40 @@ export default function MutationRequestScreen() {
   const colorScheme = useColorScheme();
   const decided = useDecidedRequestIds();
 
+  // A refresh re-reads the first page — the header, the counts, the rows a
+  // reader starts at — and folds it into the pages already scrolled through,
+  // so dropping a thread on page five does not throw the reader back to one.
   const load = useCallback(async () => {
     if (!id) return;
     try {
-      setRequest(rememberMutationRequest(await getMutationRequest(config, id)));
+      const fresh = await getMutationRequest(config, id);
+      setRequest((current) => rememberMutationRequest(mergeMutationPage(current, fresh)));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, [config, id]);
+
+  // The next page is read as the list nears its end. One read at a time: a
+  // fast fling fires onEndReached repeatedly.
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
+  const nextOffset = request?.id === id ? request?.mutations_page?.next_offset ?? null : null;
+  const loadMore = useCallback(async () => {
+    if (!id || nextOffset === null || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const page = await getMutationRequest(config, id, { offset: nextOffset, limit: MUTATION_PAGE_SIZE });
+      setRequest((current) => rememberMutationRequest(mergeMutationPage(current, page)));
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [config, id, nextOffset]);
 
   useEffect(() => {
     if (!id) return;
@@ -405,7 +433,8 @@ export default function MutationRequestScreen() {
           onPress: async () => {
             setBusy(true);
             try {
-              await removeMutation(config, request.id, review.mutationId);
+              const removed = await removeMutation(config, request.id, review.mutationId);
+              setRequest((current) => (current ? withMutationStatus(current, removed) : current));
               await load();
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
@@ -438,7 +467,8 @@ export default function MutationRequestScreen() {
         onPress: async () => {
           setBusy(true);
           try {
-            await removeMutation(config, request.id, mutation.id);
+            const removed = await removeMutation(config, request.id, mutation.id);
+            setRequest((current) => (current ? withMutationStatus(current, removed) : current));
             await load();
           } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -472,9 +502,10 @@ export default function MutationRequestScreen() {
       })).filter((group) => group.data.length > 0)
     : [];
   const gmailReviews = gmailBatch ? gmailThreadReviews(requestMutations) : [];
-  const gmailSummary = gmailBatchSummary(requestMutations, gmailReviews);
+  const gmailSummary = gmailRequestSummary(request, gmailReviews);
   const gmailScopeCounts: Record<GmailScope, number> = {
-    all: gmailReviews.filter((review) => !review.removed).length,
+    // "All" is the whole request; the narrower chips count what is loaded.
+    all: gmailSummary.threadCount,
     unread: gmailReviews.filter((review) => !review.removed && review.unread).length,
     automated: gmailReviews.filter((review) => !review.removed && review.automated).length,
     kept: gmailReviews.filter((review) => review.removed).length,
@@ -493,6 +524,15 @@ export default function MutationRequestScreen() {
   const remaining = pending ? pendingReviewCount(queueList, request.id, decided) : null;
   const skipTo = pending ? nextPendingRequestId(queueList, request.id, decided) : null;
   const overview = <RequestOverview request={request} error={error} filter={slackBatch ? filter : undefined} onFilter={slackBatch ? setFilter : undefined} />;
+  const moreFooter = nextOffset !== null ? (
+    <View style={styles.moreRow}>
+      {loadingMore ? <ActivityIndicator /> : (
+        <Pressable accessibilityRole="button" onPress={loadMore} style={[styles.moreButton, { backgroundColor: theme.backgroundElement }]}>
+          <ThemedText type="smallBold">Load more · {requestMutations.length} of {request.mutation_count}</ThemedText>
+        </Pressable>
+      )}
+    </View>
+  ) : null;
   return (
     <ThemedView style={styles.container}>
       <Stack.Screen
@@ -529,6 +569,8 @@ export default function MutationRequestScreen() {
             keyboardDismissMode="on-drag"
             stickySectionHeadersEnabled
             initialNumToRender={12}
+            onEndReached={loadMore}
+            onEndReachedThreshold={0.6}
             ListHeaderComponent={
               <GmailOverview
                 request={request}
@@ -543,15 +585,18 @@ export default function MutationRequestScreen() {
                 otherActionCount={otherMutations.length}
               />
             }
-            ListFooterComponent={otherMutations.length ? (
-              <View style={styles.content}>
-                <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
-                <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
-                {otherMutations.map((mutation) => (
-                  <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
-                ))}
-              </View>
-            ) : null}
+            ListFooterComponent={<>
+              {moreFooter}
+              {otherMutations.length ? (
+                <View style={styles.content}>
+                  <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
+                  <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
+                  {otherMutations.map((mutation) => (
+                    <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
+                  ))}
+                </View>
+              ) : null}
+            </>}
             ListEmptyComponent={
               <ThemedText type="small" themeColor="textSecondary" style={styles.filterEmpty}>
                 No threads match that filter.
@@ -576,7 +621,10 @@ export default function MutationRequestScreen() {
             keyExtractor={(item) => item.mutation.id || item.review.messageTs}
             keyboardShouldPersistTaps="handled"
             stickySectionHeadersEnabled
+            onEndReached={loadMore}
+            onEndReachedThreshold={0.6}
             ListHeaderComponent={overview}
+            ListFooterComponent={moreFooter}
             ListEmptyComponent={query ? <ThemedText type="small" themeColor="textSecondary" style={styles.filterEmpty}>No conversations match that filter.</ThemedText> : null}
             renderSectionHeader={({ section }) => (
               <View style={[styles.batchSectionHeader, { backgroundColor: theme.background }]}>
@@ -615,6 +663,7 @@ export default function MutationRequestScreen() {
                 alone={requestMutations.length === 1}
               />
             ))}
+            {moreFooter}
             {request.context && Object.keys(request.context).length > 0 && mutationReviewContext(request.context).counts.length === 0 ? (
               <RequestDetails context={request.context} />
             ) : null}
@@ -646,6 +695,8 @@ export default function MutationRequestScreen() {
 
 const styles = StyleSheet.create({
   partialRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingVertical: Spacing.two },
+  moreRow: { alignItems: 'center', paddingVertical: Spacing.three, paddingHorizontal: Spacing.three },
+  moreButton: { minHeight: 44, alignSelf: 'stretch', borderRadius: 12, alignItems: 'center', justifyContent: 'center', paddingHorizontal: Spacing.three },
   container: { flex: 1 },
   reviewBody: { flex: 1 },
   scroll: { flex: 1 },

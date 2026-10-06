@@ -100,7 +100,8 @@ export const mutations = {
     const body = await request(REQUESTS, { params });
     return body.requests || [];
   },
-  async get(id) { return (await request(requestPath(id))).request; },
+  // page: { offset, limit } — the window of the request's mutations to read.
+  async get(id, page) { return (await request(requestPath(id), { params: page || {} })).request; },
   async approve(id) { return (await request(requestPath(id, "approve"), { method: "POST" })).request; },
   async reject(id, reason) { return (await request(requestPath(id, "reject"), { method: "POST", body: { reason: reason || "" } })).request; },
   async supersede(id, supersededBy) {
