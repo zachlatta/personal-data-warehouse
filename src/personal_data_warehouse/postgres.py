@@ -3036,6 +3036,8 @@ class PostgresWarehouse:
             "1", "true", "yes", "on"
         }
         self._pg_textsearch_ensured = False
+        self._pg_textsearch_update_checked = False
+        self._mutation_obsolete_indexes_checked = False
         self._pgvector_ensured = False
         self._ensure_canonical_schemas()
         self._set_search_path()
@@ -6043,43 +6045,59 @@ class PostgresWarehouse:
         }
 
     def probe_bm25_indexes(self) -> dict[str, str]:
-        """Scan one row through each timeline BM25 index; return errors by name.
+        """Scan rows through every BM25 index in the warehouse; return errors by name.
 
         pg_textsearch indexes are not covered by amcheck, and a crash can
         leave one with bad pages while it still reads `indisvalid`. On
-        2026-08-27 an OOM kill did exactly that to two of the four: every
-        low-volume source then failed keyword and hybrid search with
-        "invalid page index at block N" and nothing on /pipelines moved,
-        because no health surface ever read the indexes. This does, once per
-        chunk-builder run, with the cheapest query that touches them.
+        2026-08-27 an OOM kill did exactly that to two of the four timeline
+        indexes, and on 2026-10-06 an autovacuum segfault did it to all of
+        them: every search failed and nothing on /pipelines moved until a
+        probe read the indexes. This does, once per chunk-builder run, with
+        the cheapest query that touches them.
+
+        Every BM25 index found in the catalog is read, not only the ones the
+        timeline declares: a retired index on ops.upstream_mutation_requests
+        was still being maintained on 2026-10-06, corrupt, failing every
+        autovacuum of its table, while a timeline-only probe read `ok`.
         """
 
+        found = self._query(
+            """
+            SELECT c.relname, n.nspname, t.relname,
+                   pg_get_indexdef(c.oid, 1, true),
+                   pg_get_expr(i.indpred, i.indrelid)
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            INNER JOIN pg_index AS i ON i.indexrelid = c.oid
+            INNER JOIN pg_class AS t ON t.oid = i.indrelid
+            INNER JOIN pg_am AS a ON a.oid = c.relam
+            WHERE a.amname = 'bm25'
+              AND n.nspname = ANY(%s)
+              AND i.indisvalid
+            ORDER BY n.nspname, c.relname
+            """,
+            (self.physical_schema_names(include_hidden=True),),
+        )
+        declared_order = {name: position for position, name in enumerate(self.bm25_timeline_index_names())}
+        found = sorted(found, key=lambda row: (declared_order.get(row[0], len(declared_order)), row[0]))
         errors: dict[str, str] = {}
-        for name in self.bm25_timeline_index_names():
-            if not self._index_exists(name):
-                continue
+        for name, schema, table, column, predicate in found:
             # A partial index is only usable when the query implies its
-            # predicate; without it the planner picks the global index and
+            # predicate; without it the planner picks another index and
             # to_bm25query RAISES ("query specifies index X but planner chose
             # Y") -- a false "failing" that says nothing about the pages.
-            predicate = self._query(
-                "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i "
-                "JOIN pg_class c ON c.oid = i.indexrelid "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE c.relname = %s AND n.nspname = %s",
-                (name, self._object_schema("timeline_events")),
-            )
-            where = f"WHERE {predicate[0][0]} " if predicate and predicate[0][0] else ""
+            where = f"WHERE {predicate} " if predicate else ""
             try:
                 # Several common words rather than one: a bad page is only
                 # found by a scan that reads it, and each term walks its own
                 # posting list. On 2026-08-27 a single-term probe read `ok`
                 # while a query on other terms hit block 704084.
                 self._query(
-                    "SELECT 1 FROM @timeline_events t "
-                    + where +
-                    "ORDER BY t.search_text OPERATOR(public.<@>) "
-                    f"public.to_bm25query({_literal(BM25_PROBE_QUERY)}, {_literal(name)}) LIMIT 50"
+                    f"SELECT 1 FROM {_identifier(schema)}.{_identifier(table)} "
+                    + where
+                    + f"ORDER BY ({column}) OPERATOR(public.<@>) "
+                    f"public.to_bm25query({_literal(BM25_PROBE_QUERY)}, "
+                    f"{_literal(f'{_identifier(schema)}.{_identifier(name)}')}) LIMIT 50"
                 )
                 errors[name] = ""
             except Exception as error:  # noqa: BLE001 - reported, not raised
@@ -7107,6 +7125,13 @@ class PostgresWarehouse:
 
     def ensure_upstream_mutation_tables(self) -> None:
         self._ensure_upstream_mutation_tables_ddl()
+        # Once per process: this runs before every mutation call.
+        if not self._mutation_obsolete_indexes_checked:
+            self._mutation_obsolete_indexes_checked = True
+            self._drop_obsolete_indexes(
+                {"upstream_mutation_requests", "upstream_mutations", "upstream_mutation_events",
+                 "upstream_mutation_request_events", "push_devices"}
+            )
         for logical in (
             "upstream_mutation_requests",
             "upstream_mutations",
@@ -8564,6 +8589,11 @@ class PostgresWarehouse:
 
     def _ensure_indexes_locked(self, tables: Sequence[str]) -> None:
         table_names = set(tables)
+        if not self._pg_textsearch_update_checked and any(
+            index.requires_pg_textsearch and index.table in table_names for index in POSTGRES_INDEXES
+        ):
+            self._pg_textsearch_update_checked = True
+            self._ensure_pg_textsearch_current()
         for index in POSTGRES_INDEXES:
             if index.table not in table_names or index.name in self._ensured_index_names:
                 continue
@@ -8625,14 +8655,53 @@ class PostgresWarehouse:
                 # Tests often create only a subset of tables. Missing-table index failures
                 # are harmless because ensure_* is called again by each runtime asset.
                 pass
+        self._drop_obsolete_indexes(table_names)
+
+    def _drop_obsolete_indexes(self, table_names: set[str]) -> None:
+        """Drop the retired indexes declared on any of ``table_names``.
+
+        Every table group that declares its own indexes must call this, not
+        only the ones that pass through ``_ensure_indexes``: the mutation
+        tables never did, so their three retired BM25 indexes survived in
+        production until 2026-10-06, maintained on every write, and one of
+        them corrupt enough that every autovacuum of the table failed.
+        """
         for obsolete_name, obsolete_table in POSTGRES_OBSOLETE_INDEXES:
             if obsolete_table not in table_names:
                 continue
             try:
-                if self._index_exists(obsolete_name):
-                    self._command(f"DROP INDEX CONCURRENTLY IF EXISTS {_identifier(obsolete_name)}")
+                schema = self._index_schema(obsolete_name)
+                if schema:
+                    self._command(
+                        "DROP INDEX CONCURRENTLY IF EXISTS "
+                        f"{_identifier(schema)}.{_identifier(obsolete_name)}"
+                    )
             except Exception:
-                pass
+                logger.warning("Could not drop obsolete index %s", obsolete_name, exc_info=True)
+
+    def _ensure_pg_textsearch_current(self) -> None:
+        """Run ALTER EXTENSION ... UPDATE once the image ships a newer pg_textsearch.
+
+        Swapping the binary only changes the library; the extension's catalog
+        objects stay at the old version until this runs. 1.3.x recycled index
+        pages through the non-crash-safe FSM and, after crash recovery, handed
+        live segment pages to the allocator (upstream #426/#427/#430, fixed in
+        1.4.0): on 2026-10-06 one autovacuum segfault left every timeline BM25
+        index unreadable and all search down.
+        """
+        try:
+            rows = self._query(
+                "SELECT e.extversion, a.default_version FROM pg_extension e "
+                "JOIN pg_available_extensions a ON a.name = e.extname "
+                "WHERE e.extname = 'pg_textsearch'"
+            )
+            if rows and rows[0][0] != rows[0][1]:
+                logger.warning(
+                    "Updating pg_textsearch from %s to %s", rows[0][0], rows[0][1]
+                )
+                self._command("ALTER EXTENSION pg_textsearch UPDATE")
+        except Exception:
+            logger.warning("Could not update the pg_textsearch extension", exc_info=True)
 
     @staticmethod
     def index_definition_fingerprint(index: IndexSpec) -> str:
@@ -8695,6 +8764,22 @@ class PostgresWarehouse:
         schema = _identifier(str(invalid[0][0]))
         logger.warning("dropping invalid index %s.%s so it can be rebuilt", schema, index_name)
         self._raw_command(f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{_identifier(index_name)}")
+
+    def _index_schema(self, index_name: str) -> str | None:
+        """The warehouse schema holding ``index_name``, valid or not."""
+        rows = self._query(
+            """
+            SELECT n.nspname
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY(%s)
+              AND c.relname = %s
+              AND c.relkind = 'i'
+            LIMIT 1
+            """,
+            (self.physical_schema_names(include_hidden=True), index_name),
+        )
+        return str(rows[0][0]) if rows else None
 
     def _index_exists(self, index_name: str) -> bool:
         rows = self._query(

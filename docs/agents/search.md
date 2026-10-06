@@ -620,6 +620,32 @@ for an unrelated reason). Every index passing that scan was also the state left 
 for the next restart to test. `search_benchmark.py smoke` is the manual check: one call
 per source token, failing sources named.
 
+**Why the indexes kept breaking after a crash: pg_textsearch 1.3.x was not crash-safe
+(2026-10-06).** At 10:23Z an autovacuum `ANALYZE base_slack.users` segfaulted (the heap
+was clean under `verify_heapam`; the cause of the segfault itself is not established),
+the postmaster reinitialized, and crash recovery finished in seven seconds. Four minutes
+later every search failed: the global and attention indexes read `Invalid logical page
+360303464 (max 452)` / `corrupt segment: term length ... exceeds maximum`, and
+`marts_ops.search_health` turned `bm25_indexes` red. That is upstream pg_textsearch
+#430, word for word: 1.3.x claimed new pages from the index FSM, which Postgres does not
+make crash-safe, and re-initialized whatever block it was handed, so after recovery it
+overwrote pages a live segment (#430), memtable chain (#426) or tombstone chain (#427)
+still owned. Fixed upstream by #429 in 1.4.0; production ran 1.3.0. The 08-27 OOM
+episode above has the same shape (crash, recovery, unreadable BM25 pages) and was very
+likely the same bug. The image now pins 1.5.1
+(`test_pg_textsearch_is_pinned_past_the_crash_unsafe_page_reuse` refuses anything below
+1.4.0), and the ensure path runs `ALTER EXTENSION pg_textsearch UPDATE` whenever the
+installed version trails the binary. The fix prevents new damage; an index damaged
+before the upgrade still needs a `REINDEX`.
+
+The same day showed why the probe reads **every** BM25 index in the warehouse, not only
+the four on the timeline: the three retired `ops.upstream_mutation*_bm25_idx` indexes
+were still in production, because the mutation tables declare their indexes inline and
+never reached the obsolete-index drop. One had been corrupt since 10-05, and every
+autovacuum of `ops.upstream_mutation_requests` failed on it (`memtable marking dead chain
+page ... has invalid magic`) with nothing on `/pipelines` saying so.
+`ensure_upstream_mutation_tables` now drops them itself.
+
 **What warm actually costs, measured 2026-08-27 after the rebuilds** (serial, depth 10,
 eight labeled queries, host quiet): hybrid p50 **3.2s**, p90 5.0s; keyword p50 0.56s.
 The same sample taken on the cold cache earlier that night was hybrid p50 26s with six of

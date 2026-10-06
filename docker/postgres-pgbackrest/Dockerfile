@@ -24,10 +24,18 @@ RUN apt-get update \
 # postgresql.conf, a restart, then CREATE EXTENSION pg_textsearch per database.
 # pg_trgm needs no install step here: it ships with the base image's contrib
 # modules and the warehouse creates the extension itself.
+#
+# Never below 1.4.0: 1.3.x reused index pages handed out by the non-crash-safe
+# FSM, so after crash recovery it overwrote pages live segments still owned
+# (upstream #426/#427/#430, fixed by #429). On 2026-10-06 one autovacuum
+# segfault on 1.3.0 left every timeline BM25 index unreadable ("Invalid
+# logical page", "corrupt segment: term length ...") and all search down.
+# After bumping, the warehouse runs ALTER EXTENSION pg_textsearch UPDATE on
+# its own; already-damaged indexes still need a REINDEX.
 ARG TARGETARCH
-ARG PG_TEXTSEARCH_VERSION=1.3.0
-ARG PG_TEXTSEARCH_SHA256_AMD64=4a8291b44c2c700ef71f9230e14fbe434dc0f8b20bca13eb31b049367911de38
-ARG PG_TEXTSEARCH_SHA256_ARM64=9590a2c604372d6ff05a8012ffd8f2a0caa74a8a6c81917ea5d12f3d0dad6ec6
+ARG PG_TEXTSEARCH_VERSION=1.5.1
+ARG PG_TEXTSEARCH_SHA256_AMD64=6adc4c390c61109af337c5d5c15239623d6fc8b89e972625de04f52a5771cebf
+ARG PG_TEXTSEARCH_SHA256_ARM64=54843473cbad144812be0437bc708233087c7823018700ffb99a2fb92d1466bb
 RUN set -eu; \
     case "${TARGETARCH}" in \
         amd64) pgts_sha256="${PG_TEXTSEARCH_SHA256_AMD64}" ;; \

@@ -1962,6 +1962,7 @@ def test_postgres_concurrent_indexes_are_disabled_only_in_test_namespaces(
     warehouse._ensured_index_names = set()
     warehouse._pg_trgm_ensured = False
     warehouse._pg_textsearch_ensured = False
+    warehouse._pg_textsearch_update_checked = True
     commands: list[str] = []
     monkeypatch.setattr(warehouse, "_query", lambda sql, params=None: [(True,)])
     monkeypatch.setattr(warehouse, "_index_exists", lambda _name: False)
@@ -8558,3 +8559,59 @@ def test_slack_conversation_health_judges_every_type_on_how_recently_it_was_poll
         "SELECT attname FROM pg_attribute WHERE attrelid = %s::regclass AND attnum > 0", (view,)
     )]
     assert not [c for c in columns if c.startswith("change_feed")], columns
+
+
+def test_ensure_upstream_mutation_tables_drops_their_obsolete_bm25_indexes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The mutation tables declare their own indexes inline and never reached
+    _ensure_indexes, so the retired BM25 indexes on them were never dropped.
+    On 2026-10-06 all three still existed in production, were maintained on
+    every write, and one was corrupt: every autovacuum of
+    ops.upstream_mutation_requests failed with "memtable ... has invalid
+    magic". The drop is by name, so a btree stand-in proves it runs."""
+
+    warehouse.ensure_upstream_mutation_tables()
+    warehouse._command("CREATE INDEX upstream_mutation_requests_title_bm25_idx ON @upstream_mutation_requests (title)")
+    warehouse._command("CREATE INDEX upstream_mutation_requests_reason_bm25_idx ON @upstream_mutation_requests (status)")
+    warehouse._command("CREATE INDEX upstream_mutations_title_bm25_idx ON @upstream_mutations (title)")
+
+    # The next process to start (a deploy) converges the schema.
+    PostgresWarehouse(_postgres_url(), schema=warehouse._schema).ensure_upstream_mutation_tables()
+
+    for name in (
+        "upstream_mutation_requests_title_bm25_idx",
+        "upstream_mutation_requests_reason_bm25_idx",
+        "upstream_mutations_title_bm25_idx",
+    ):
+        assert not warehouse._index_exists(name), name
+
+
+def test_ensure_indexes_updates_a_stale_pg_textsearch_extension(
+    warehouse: PostgresWarehouse, monkeypatch
+) -> None:
+    """A new pg_textsearch binary does nothing for the catalog until
+    ALTER EXTENSION ... UPDATE runs; the ensure path does it once the image
+    ships a newer default_version than the database has installed."""
+
+    commands: list[str] = []
+    original_query = warehouse._query
+    original_command = warehouse._command
+
+    def fake_query(sql, params=None):
+        if "pg_available_extensions" in sql:
+            return [("1.3.0", "1.5.1")]
+        return original_query(sql, params)
+
+    def recording_command(sql, params=None):
+        commands.append(sql)
+        if "ALTER EXTENSION" in sql:
+            return None
+        return original_command(sql, params)
+
+    monkeypatch.setattr(warehouse, "_query", fake_query)
+    monkeypatch.setattr(warehouse, "_command", recording_command)
+
+    warehouse.ensure_timeline_tables()
+
+    assert "ALTER EXTENSION pg_textsearch UPDATE" in commands

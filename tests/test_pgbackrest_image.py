@@ -429,3 +429,23 @@ def test_the_loop_reports_backups_that_copied_corrupt_pages() -> None:
         assert column in columns, column
         assert column in loop, f"the loop never writes {column}"
     assert "b->>'error'" in loop, "the flag is read from each backup's JSON `error` field"
+
+
+def test_pg_textsearch_is_pinned_past_the_crash_unsafe_page_reuse() -> None:
+    """1.3.x claimed index pages from the FSM, which is not crash-safe, and
+    re-initialized whatever block it was handed -- after crash recovery, often
+    a page a live segment still owned (upstream #426/#427/#430, fixed in
+    1.4.0 by #429). On 2026-10-06 a single autovacuum segfault on 1.3.0 left
+    all four timeline BM25 indexes unreadable and every search failing."""
+
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "docker" / "postgres-pgbackrest" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    pins = [
+        line.split("=", 1)[1].strip()
+        for line in dockerfile.splitlines()
+        if line.startswith("ARG PG_TEXTSEARCH_VERSION=")
+    ]
+    assert len(pins) == 1
+    version = tuple(int(part) for part in pins[0].split("."))
+    assert version >= (1, 4, 0), pins[0]

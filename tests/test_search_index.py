@@ -922,6 +922,33 @@ def test_bm25_index_probe_covers_every_timeline_bm25_index(warehouse: PostgresWa
     assert rows and rows[0][0] == "ok"
 
 
+def test_bm25_index_probe_reads_every_bm25_index_in_the_warehouse(warehouse: PostgresWarehouse) -> None:
+    """Not just the timeline's. On 2026-10-06 a retired BM25 index on
+    ops.upstream_mutation_requests had been corrupt for a day (every
+    autovacuum of the table failed) while the probe, which only knew the
+    timeline's four, read `ok`. Any BM25 index that exists is maintained on
+    every write and can break the table it sits on, so every one is read."""
+
+    _provision(warehouse)
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["alpha bravo charlie"])
+    _sync_timeline(warehouse)
+    warehouse._command(
+        "INSERT INTO @upstream_mutation_requests (id, title) VALUES ('r1', 'order the budget meeting')"
+    )
+    warehouse._command(
+        "CREATE INDEX stray_requests_title_bm25_idx ON @upstream_mutation_requests "
+        "USING bm25 (title) WITH (text_config='english')"
+    )
+
+    probe = warehouse.probe_bm25_indexes()
+
+    assert "stray_requests_title_bm25_idx" in probe
+    assert set(warehouse.bm25_timeline_index_names()) <= set(probe)
+    assert all(err == "" for err in probe.values()), probe
+
+
 def test_parse_bm25_index_summary_reads_live_pages_and_segments() -> None:
     """The live bytes of a pg_textsearch index are in its segment summary.
 
