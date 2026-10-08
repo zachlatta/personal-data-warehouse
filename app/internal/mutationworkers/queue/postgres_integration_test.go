@@ -263,6 +263,9 @@ func TestIntegrationCompleteAndFailWriteTheResultAndRollUpTheRequest(t *testing.
 	if err := worker.Fail(ctx, ours[1].ID, StatusFailedRetryable, "busy", nil, actor); err != nil {
 		t.Fatal(err)
 	}
+	// Once its retry backoff has passed it is claimable again.
+	failedAt := time.Now().UTC()
+	worker.now = func() time.Time { return failedAt.Add(RetryBackoff(1) + time.Minute) }
 	reclaimed, err := worker.ClaimApproved(ctx, 50, actor, []string{"apple_notes"})
 	if err != nil {
 		t.Fatal(err)
@@ -464,5 +467,52 @@ func TestIntegrationAppleContactsMergedCardTargetReadsTheNewestSucceededMerge(t 
 		if err != nil || got != want {
 			t.Fatalf("target(%q) = %q, %v; want %q", cardID, got, err, want)
 		}
+	}
+}
+
+func TestIntegrationARetryableFailureWaitsOutItsBackoffBeforeItIsClaimedAgain(t *testing.T) {
+	// The resident worker drains until a claim comes back empty, and a
+	// failed_retryable row used to be claimable the instant it failed: with
+	// Contacts.app not running that was ~1 attempt a second for days (82,828
+	// attempts on one create, 1.28M failures in a fortnight).
+	app, worker := testStores(t)
+	ctx := context.Background()
+	request := approvedRequest(t, app, "backoff",
+		mutations.MutationInput{Type: mutations.AppleContactsUpdateContactOperation, CardID: "8537DF38-BF0D-4468-9061-D2D41468E05A:ABPerson", Contact: map[string]any{"organization": "Acme"}},
+	)
+	actor := "mac:test-host:apple_contacts_mutation_worker"
+	base := time.Now().UTC()
+	worker.now = func() time.Time { return base }
+	claimOurs := func() []Mutation {
+		t.Helper()
+		claimed, err := worker.ClaimApproved(ctx, 500, actor, []string{"apple_contacts"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ours []Mutation
+		for _, m := range claimed {
+			if m.RequestID == request.ID {
+				ours = append(ours, m)
+			} else if err := worker.Fail(ctx, m.ID, StatusFailedRetryable, "not mine", nil, actor); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return ours
+	}
+	ours := claimOurs()
+	if len(ours) != 1 {
+		t.Fatalf("claimed %d of our rows", len(ours))
+	}
+	id := ours[0].ID
+	if err := worker.Fail(ctx, id, StatusFailedRetryable, "Application isn't running. (-600)", nil, actor); err != nil {
+		t.Fatal(err)
+	}
+	if got := claimOurs(); len(got) != 0 {
+		t.Fatalf("a row that just failed was re-claimed at once: %+v", got)
+	}
+	worker.now = func() time.Time { return base.Add(RetryBackoff(1) + time.Second) }
+	ours = claimOurs()
+	if len(ours) != 1 || ours[0].ID != id || ours[0].AttemptCount != 2 {
+		t.Fatalf("after the backoff the row must be claimed again: %+v", ours)
 	}
 }

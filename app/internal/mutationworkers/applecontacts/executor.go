@@ -281,6 +281,49 @@ func changesFromPayload(contact map[string]any) changes {
 type Executor struct {
 	runner     applescript.Runner
 	mergedInto MergedInto
+	// ready launches Contacts.app before a mutation; nil skips the launch and
+	// the address-book probe (unit tests that script every answer).
+	ready func() error
+}
+
+// ContactsBundleID is Contacts.app's bundle identifier.
+const ContactsBundleID = "com.apple.AddressBook"
+
+// errNotReady marks Contacts.app being unable to take a write yet: it would
+// not launch, or it has not loaded the address book. Always retryable.
+var errNotReady = errors.New("Contacts.app is not ready")
+
+// WithReadiness installs the launcher run before every mutation and returns
+// the executor. After launching, the executor asks Contacts how many people
+// it holds and refuses to write until the answer is non-zero: a Contacts.app
+// that is still starting answers "Can't get person id" for a card that exists
+// and "Can't make class person" for a create, which retired real mutations
+// failed_terminal (2026-09-21 to 2026-10-08, after 1.28M -600 retries).
+func (e *Executor) WithReadiness(launch func() error) *Executor {
+	e.ready = launch
+	return e
+}
+
+func (e *Executor) ensureReady() error {
+	if e.ready == nil {
+		return nil
+	}
+	if err := e.ready(); err != nil {
+		return fmt.Errorf("%w: %v", errNotReady, err)
+	}
+	raw, err := e.runner(applescript.Dedent(fmt.Sprintf(`
+	with timeout of %d seconds
+	tell application "Contacts" to return (count of people) as text
+	end timeout
+	`, applescript.InScriptTimeoutSeconds)))
+	if err != nil {
+		return err
+	}
+	count := strings.TrimSpace(raw)
+	if count == "" || count == "0" {
+		return fmt.Errorf("%w: it has not loaded the address book yet (count of people = %q)", errNotReady, count)
+	}
+	return nil
 }
 
 // MergedInto names the card a deleted card was merged into ("" when nobody
@@ -363,11 +406,12 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 		payload = map[string]any{}
 	}
 	var result queue.Result
-	var err error
-	switch mutation.Operation {
-	case CreateContactOperation:
+	err := e.ensureReady()
+	switch {
+	case err != nil:
+	case mutation.Operation == CreateContactOperation:
 		result, err = e.create(payload)
-	case UpdateContactOperation:
+	case mutation.Operation == UpdateContactOperation:
 		result, err = e.update(payload)
 	default:
 		result, err = e.merge(payload)
@@ -381,7 +425,7 @@ func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
 			Error:  fmt.Sprintf("Contacts.app did not answer within %ds", int(applescript.DefaultScriptTimeout.Seconds())),
 		}
 	}
-	if errors.Is(err, errLedgerUnavailable) {
+	if errors.Is(err, errLedgerUnavailable) || errors.Is(err, errNotReady) {
 		return queue.Result{Status: queue.StatusFailedRetryable, Error: err.Error()}
 	}
 	if errors.Is(err, ErrCardNotFound) || errors.Is(err, ErrInvalidMutation) {

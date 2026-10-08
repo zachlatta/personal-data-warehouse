@@ -30,6 +30,8 @@ func TestClassify(t *testing.T) {
 		{"Notes got an error: Can’t get note id \"x\". (-1728)", "failed_terminal"},
 		{"Invalid key form", "failed_terminal"},
 		{"Application isn't running. (-600)", "failed_retryable"},
+		{"Contacts got an error: Connection is invalid. (-609)", "failed_retryable"},
+		{"Contacts got an error: Can’t make class person. (-2710)", "failed_retryable"},
 		{"something else entirely", "failed_terminal"},
 	}
 	for _, tc := range cases {

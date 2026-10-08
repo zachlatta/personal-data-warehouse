@@ -24,6 +24,31 @@ const (
 // ClaimableStatuses mirrors UPSTREAM_MUTATION_CLAIMABLE_STATUSES.
 var ClaimableStatuses = []string{"approved", "failed_retryable"}
 
+// A failed_retryable row is claimable again only RetryBackoff(attempt_count)
+// after it failed: RetryBackoffBase doubling per attempt, capped at
+// RetryBackoffMax. Without it the resident worker's drain loop re-claimed a
+// row the instant it failed, ~1 attempt a second for as long as the app was
+// down.
+const (
+	RetryBackoffBase = 10 * time.Second
+	RetryBackoffMax  = 15 * time.Minute
+)
+
+// RetryBackoff is the wait after a row's attempts-th failed attempt.
+func RetryBackoff(attempts int64) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	wait := RetryBackoffBase
+	for i := int64(1); i < attempts; i++ {
+		wait *= 2
+		if wait >= RetryBackoffMax {
+			return RetryBackoffMax
+		}
+	}
+	return wait
+}
+
 // Mutation is one claimed row of ops.upstream_mutation_operations.
 type Mutation struct {
 	ID           string

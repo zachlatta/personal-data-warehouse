@@ -382,6 +382,25 @@ target is already folded into the same kept card skips it (`already_merged_card_
 one folded into a *different* card stays terminal, because that is a real conflict. A card
 nobody merged is still simply missing.
 
+**The worker launches Contacts.app and waits for its address book before writing.** From
+2026-09-21 to 2026-10-08, osascript's implicit launch of Contacts kept answering
+`Application isn't running` (`-600`), even though `open -g -j -a Contacts` started the same
+app at once on porygon. Two bugs turned that outage into lost writes. First, the resident
+drain loop re-claimed a `failed_retryable` row the instant it failed. That came to about
+one attempt a second: 1.28M failures over the period, and 82,828 attempts on one create.
+Second, when Contacts finally answered, the first script reached it while it was still
+starting. A write to a card that existed got `Can't get person id` (`-1728`), and a create
+got `Can't make class person` (`-2710`). Both were classed `failed_terminal`, so the request
+failed with its Google half applied and its Apple half not. Now:
+
+- Before every mutation, the executor runs `open -g -j -b com.apple.AddressBook`, which
+  needs no Automation grant.
+- It then asks for `count of people`, and treats a launch failure or a count of zero as
+  `failed_retryable`.
+- `-609` and `-2710` are retryable in `applescript.Classify`.
+- A `failed_retryable` row is claimable again only after `queue.RetryBackoff(attempt_count)`:
+  10 s, doubling per attempt, capped at 15 min.
+
 Unknown `contact` keys are rejected at proposal time rather than dropped, because a
 misspelled `email` for `emails` would otherwise become an approved mutation that changes
 nothing and reports success. `GetRequest` hydrates every named card's current row into

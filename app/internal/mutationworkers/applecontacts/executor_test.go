@@ -561,3 +561,63 @@ func TestMergeRefusesACardAlreadyMergedSomewhereElse(t *testing.T) {
 		t.Fatalf("result = %+v scripts=%d", result, len(runner.scripts))
 	}
 }
+
+// readyExecutor is an executor whose readiness check launches and probes
+// through fakes, the way the resident worker's does through open(1) and
+// osascript.
+func readyExecutor(runner *fakeRunner, launches *int, launchErr error) *Executor {
+	return NewExecutor(runner.run).WithReadiness(func() error {
+		*launches++
+		return launchErr
+	})
+}
+
+func TestTheWorkerLaunchesContactsAndWaitsForItsAddressBookBeforeWriting(t *testing.T) {
+	// Contacts.app answers a script sent while it is still starting with
+	// "Can't make class person" or "Can't get person id" for a card that
+	// exists; those used to retire the mutation failed_terminal.
+	launches := 0
+	runner := &fakeRunner{results: []string{"0"}}
+	result := readyExecutor(runner, &launches, nil).Execute(mutation(CreateContactOperation, map[string]any{"contact": map[string]any{"given_name": "Ada"}}))
+	if result.Status != queue.StatusFailedRetryable || !strings.Contains(result.Error, "address book") {
+		t.Fatalf("result %+v", result)
+	}
+	if launches != 1 || len(runner.scripts) != 1 || !strings.Contains(runner.scripts[0], "count of people") {
+		t.Fatalf("launches %d scripts %v", launches, runner.scripts)
+	}
+
+	runner = &fakeRunner{results: []string{"2430", "NEW:ABPerson" + FieldSeparator + "Ada"}}
+	result = readyExecutor(runner, &launches, nil).Execute(mutation(CreateContactOperation, map[string]any{"contact": map[string]any{"given_name": "Ada"}}))
+	if result.Status != queue.StatusSucceeded || result.ResultJSON["card_id"] != "NEW:ABPerson" {
+		t.Fatalf("result %+v", result)
+	}
+}
+
+func TestContactsThatWillNotLaunchIsRetriedNotRetired(t *testing.T) {
+	launches := 0
+	runner := &fakeRunner{}
+	result := readyExecutor(runner, &launches, errors.New("LSOpenURLsWithRole() failed with error -600")).Execute(mutation(UpdateContactOperation, map[string]any{"card_id": keep, "contact": map[string]any{"organization": "x"}}))
+	if result.Status != queue.StatusFailedRetryable || !strings.Contains(result.Error, "-600") || len(runner.scripts) != 0 {
+		t.Fatalf("result %+v scripts %v", result, runner.scripts)
+	}
+
+	runner = &fakeRunner{err: errors.New("Contacts got an error: Application isn’t running. (-600)")}
+	result = readyExecutor(runner, &launches, nil).Execute(mutation(UpdateContactOperation, map[string]any{"card_id": keep, "contact": map[string]any{"organization": "x"}}))
+	if result.Status != queue.StatusFailedRetryable {
+		t.Fatalf("result %+v", result)
+	}
+}
+
+func TestAContactsAppThatCannotYetMakeAPersonIsRetryable(t *testing.T) {
+	runner := &fakeRunner{err: errors.New("73:174: execution error: Contacts got an error: Can’t make class person. (-2710)")}
+	result := NewExecutor(runner.run).Execute(mutation(CreateContactOperation, map[string]any{"contact": map[string]any{"given_name": "Ada"}}))
+	if result.Status != queue.StatusFailedRetryable {
+		t.Fatalf("result %+v", result)
+	}
+}
+
+func TestTheResidentWorkerChecksContactsIsReady(t *testing.T) {
+	if newLedgerExecutor(nil, nil).ready == nil {
+		t.Fatal("the worker's executor must launch Contacts and check its address book before writing")
+	}
+}

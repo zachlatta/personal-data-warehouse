@@ -33,7 +33,7 @@ type mergedCardLedger interface {
 // backed by the mutation ledger, so an update whose card an earlier merge
 // deleted lands on the surviving card instead of dying failed_terminal.
 func newLedgerExecutor(runner applescript.Runner, store queue.Store) *Executor {
-	executor := NewExecutor(runner)
+	executor := NewExecutor(runner).WithReadiness(func() error { return applescript.Launch(ContactsBundleID) })
 	if ledger, ok := store.(mergedCardLedger); ok {
 		executor.WithMergedInto(func(cardID string) (string, error) {
 			return ledger.AppleContactsMergedCardTarget(context.Background(), cardID)

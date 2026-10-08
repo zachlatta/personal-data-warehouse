@@ -69,6 +69,25 @@ func RunWithTimeout(script string, timeout time.Duration) (string, error) {
 	return strings.TrimRight(stdout.String(), "\n"), nil
 }
 
+// Launch starts an app in the background without raising it (open -g -j),
+// through LaunchServices rather than an Apple event, so it needs no
+// Automation grant. osascript's own implicit launch is what failed with
+// "Application isn't running" (-600) for days on porygon while `open` started
+// the same app at once.
+func Launch(bundleID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/open", "-g", "-j", "-b", bundleID).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("could not launch %s: %s", bundleID, message)
+	}
+	return nil
+}
+
 // String renders a Go string as an AppleScript string expression.
 //
 // Quotes and backslashes are escaped. Newlines cannot appear inside an
@@ -113,6 +132,11 @@ func Classify(message string, appName string) (status string, errorText string) 
 	case strings.Contains(message, "-1728") || strings.Contains(message, "-2753") || strings.Contains(message, "Invalid key form"):
 		return "failed_terminal", message
 	case strings.Contains(message, "-600") || strings.Contains(lower, "not running"):
+		return "failed_retryable", message
+	case strings.Contains(message, "-609") || strings.Contains(message, "-2710"):
+		// -609 "Connection is invalid": the app quit while answering.
+		// -2710 "Can't make class ...": an app that is still starting answers
+		// its own make-new with this. Neither says anything about the record.
 		return "failed_retryable", message
 	}
 	return "failed_terminal", message

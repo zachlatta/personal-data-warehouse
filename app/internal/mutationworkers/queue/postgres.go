@@ -192,13 +192,22 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 		args = append(args, included)
 	}
 	n := len(args)
-	args = append(args, limit, claimedBy, now, now)
+	args = append(args, limit, claimedBy, now, now, RetryBackoffBase.Seconds(), RetryBackoffMax.Seconds())
+	// A failed_retryable row waits out RetryBackoff(attempt_count) from its
+	// failure (updated_at) before it is claimable again.
 	statement := fmt.Sprintf(`
 		WITH candidates AS (
 			SELECT id
 			FROM @upstream_mutations
 			WHERE status = ANY($1)
 			  %s
+			  AND (
+			      status <> 'failed_retryable'
+			      OR updated_at <= $%d::timestamptz - make_interval(secs => LEAST(
+			          $%d::double precision,
+			          $%d::double precision * power(2, LEAST(GREATEST(attempt_count, 1), 20) - 1)
+			      ))
+			  )
 			ORDER BY approved_at ASC, created_at ASC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT $%d
@@ -213,7 +222,7 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 		 WHERE mutation.id = candidates.id
 		RETURNING mutation.id, mutation.request_id, mutation.provider, mutation.operation,
 		          mutation.account, mutation.status, mutation.attempt_count, mutation.payload_json::text
-	`, providerFilter, n+1, n+2, n+3, n+4)
+	`, providerFilter, n+3, n+6, n+5, n+1, n+2, n+3, n+4)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err

@@ -249,3 +249,12 @@ func TestTheLockIsReleasedAndErrorsPropagate(t *testing.T) {
 		t.Fatal("missing deps must be an error")
 	}
 }
+
+func TestRetryBackoffDoublesAndIsCapped(t *testing.T) {
+	cases := map[int64]time.Duration{0: 10 * time.Second, 1: 10 * time.Second, 2: 20 * time.Second, 4: 80 * time.Second, 7: 640 * time.Second, 8: 15 * time.Minute, 82828: 15 * time.Minute}
+	for attempts, want := range cases {
+		if got := RetryBackoff(attempts); got != want {
+			t.Fatalf("RetryBackoff(%d) = %s, want %s", attempts, got, want)
+		}
+	}
+}
