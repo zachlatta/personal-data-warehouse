@@ -220,7 +220,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
-        "private": 13,  # encrypted MCP connections, HN session
+        # +1 private: private.app_access_tokens, issued bearer tokens beside the
+        # master secret and the single-use cli_authorize codes.
+        "private": 14,  # encrypted MCP connections, HN session
         "internal": 3,
     }
 

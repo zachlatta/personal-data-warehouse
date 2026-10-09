@@ -3345,6 +3345,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whoop_private_sports": _entity("sport catalog resolving a workout's sport_id"),
     "whoop_private_sync_state": _state("per-collection private-API scan watermark"),
     "mcp_connections": _state("encrypted MCP proxy connection configuration and OAuth credentials; not synced source events"),
+    "app_access_tokens": _state("hashed bearer tokens issued beside PDW_SECRET_TOKEN and single-use cli_authorize codes; not synced source events"),
     "slack_sessions": _state("pasted Slack web session credential (xoxc token + `d` cookie)"),
     "whoop_private_sessions": _state("rotating private-API browser session credential"),
     # Plaid finance data is queryable through base_plaid.* and marts_finance.* but
@@ -3446,6 +3447,7 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "upstream_mutation_events",
     "upstream_mutation_request_events",
     "push_devices",
+    "app_access_tokens",
     "search_schema_state",
 )
 

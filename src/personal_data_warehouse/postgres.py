@@ -7140,6 +7140,42 @@ class PostgresWarehouse:
             "push_devices",
         ):
             self._apply_catalog_grant(logical)
+        self.ensure_app_access_token_tables()
+
+    def ensure_app_access_token_tables(self) -> None:
+        """Issued bearer tokens beside PDW_SECRET_TOKEN, and cli_authorize codes.
+
+        The Go app owns every read and write (app/internal/accesstokens); this is
+        the twin of its idempotent DDL so a fresh warehouse matches the catalog.
+        Only a SHA-256 of each secret is stored. The epoch in expires_at,
+        revoked_at and redeemed_at means "never". See
+        docs/agents/access-tokens.md.
+        """
+        for sql in (
+            """
+            CREATE TABLE IF NOT EXISTS @app_access_tokens (
+                id text PRIMARY KEY,
+                kind text NOT NULL,
+                scope text NOT NULL,
+                client_name text NOT NULL DEFAULT '',
+                label text NOT NULL DEFAULT '',
+                created_by text NOT NULL DEFAULT '',
+                secret_sha256 text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                last_used_at timestamptz NOT NULL DEFAULT now(),
+                idle_timeout_seconds bigint NOT NULL DEFAULT 0,
+                expires_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                revoked_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                grant_ttl_seconds bigint NOT NULL DEFAULT 0,
+                redeemed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                redeemed_token_id text NOT NULL DEFAULT '',
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS app_access_tokens_updated_idx ON @app_access_tokens (updated_at)",
+        ):
+            self._command(sql)
+        self._apply_catalog_grant("app_access_tokens")
 
     def _ensure_upstream_mutation_tables_ddl(self) -> None:
         self._command(

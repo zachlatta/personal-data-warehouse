@@ -39,7 +39,16 @@ COMMANDS
                                                to https://personal-data-warehouse.zachlatta.com/).
                                --token TOKEN   Bearer token (else prompted).
                                --client NAME   Client identifier (else prompted; default pdw).
+                               --bootstrap CODE  Redeem a cli_authorize code (what that MCP
+                                               tool's one-line command runs) for a
+                                               short-lived token; refuses to replace a
+                                               long-lived login without --force.
   logout                     Remove the saved configuration.
+  token list|create|revoke   Manage issued access tokens beside the master secret
+                             (needs the master secret). "create --name CLIENT
+                             [--idle 30d] [--ttl D]" prints a token once; an
+                             unused token dies after its idle limit. See
+                             "pdw token" for flags.
   config show                Print the resolved configuration with the token redacted.
   list                       List every tool the server exposes.
                                --json   Emit the raw tool list as a JSON array.
@@ -364,6 +373,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runContext(client, rest, stdout, stderr)
 	case "schema":
 		return runSchema(client, rest, stdout, stderr)
+	case "token":
+		return runToken(client, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "pdw: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)

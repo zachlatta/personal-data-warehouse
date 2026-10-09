@@ -193,3 +193,82 @@ func decodeAPIError(status int, body []byte) error {
 	}
 	return &APIError{Status: status, Code: "http_error", Message: msg}
 }
+
+// Request sends an authenticated request to an API path other than the tools
+// surface (the token API) and returns the raw response body. body, when not
+// nil, is sent as JSON.
+func (c *Client) Request(ctx context.Context, method, path string, body any) ([]byte, error) {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	c.authorize(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, decodeAPIError(resp.StatusCode, raw)
+	}
+	return raw, nil
+}
+
+// BootstrapGrant is what redeeming a cli_authorize code returns.
+type BootstrapGrant struct {
+	BaseURL    string `json:"base_url"`
+	Token      string `json:"token"`
+	TokenID    string `json:"token_id"`
+	ClientName string `json:"client_name"`
+	Scope      string `json:"scope"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
+// RedeemBootstrap exchanges a single-use cli_authorize code for a token. It
+// sends no bearer: the code is the credential.
+func RedeemBootstrap(ctx context.Context, httpClient *http.Client, baseURL, code string) (BootstrapGrant, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+	encoded, _ := json.Marshal(map[string]string{"code": code})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/api/cli/bootstrap", bytes.NewReader(encoded))
+	if err != nil {
+		return BootstrapGrant{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return BootstrapGrant{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return BootstrapGrant{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return BootstrapGrant{}, decodeAPIError(resp.StatusCode, raw)
+	}
+	var grant BootstrapGrant
+	if err := json.Unmarshal(raw, &grant); err != nil {
+		return BootstrapGrant{}, fmt.Errorf("decode bootstrap grant: %w", err)
+	}
+	if grant.Token == "" {
+		return BootstrapGrant{}, fmt.Errorf("bootstrap grant carried no token")
+	}
+	return grant, nil
+}

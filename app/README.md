@@ -167,6 +167,15 @@ characters.
 The OAuth flow at `/oauth/*` is MCP-only; the HTTP API uses the raw shared
 secret directly. Tokens are compared in constant time.
 
+The token half may also be an **issued token** (`pdw_<id>_<secret>`) from
+`private.app_access_tokens`. `pdw token create --name <client>` mints one;
+only the master secret can do that, through the root-only `/api/auth/tokens`.
+An issued token dies after its idle limit without use (default 30 days) or at
+an optional hard expiry. The MCP `cli_authorize` tool mints a single-use code
+that `pdw login --bootstrap` redeems for an `agent` token, which reaches
+`/api/tools` only and lives 24 hours by default. The full model is in
+[docs/agents/access-tokens.md](../docs/agents/access-tokens.md).
+
 ### Endpoints
 
 `GET /api/tools` — list all tools with their JSON Schema input definitions:

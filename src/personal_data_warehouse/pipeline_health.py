@@ -1557,6 +1557,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "notification_deliveries": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "web_push_devices": _state("timeline_notifications", "updated_at", "notification delivery instrumentation"),
     "mcp_connections": _data("mcp_proxy", "updated_at", note="encrypted owner-managed connection configuration; not an event source"),
+    "app_access_tokens": _state("mcp_proxy", "updated_at", "hashed issued bearer tokens and cli_authorize codes, written by the app on issue, use and revoke"),
     "push_devices": _state("upstream_mutations", "updated_at", "iOS app devices registered for push notifications"),
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),

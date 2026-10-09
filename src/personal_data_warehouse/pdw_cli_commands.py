@@ -19,7 +19,7 @@ PDW_CLI_READ_SUBCOMMANDS: tuple[str, ...] = (
 #: are left out of the first-call decision and of the denominator.
 PDW_CLI_ADMIN_SUBCOMMANDS: tuple[str, ...] = (
     "readme", "help",
-    "ingest", "login", "logout", "config", "version", "update",
+    "ingest", "login", "logout", "config", "token", "version", "update",
     "chatgpt", "slack", "whoop", "hn", "heartbeat", "mutations",
 )
 

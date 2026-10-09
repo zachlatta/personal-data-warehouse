@@ -17,7 +17,8 @@ type clientNameKey struct{}
 // back out after the handler returns. Context values are normally immutable,
 // so we share a pointer to a mutable struct instead.
 type clientNameHolder struct {
-	name string
+	name      string
+	principal *Principal
 }
 
 // WithClientNameHolder installs an empty client-name slot on the context.
@@ -25,6 +26,11 @@ type clientNameHolder struct {
 // middleware) so downstream auth middleware has somewhere to write.
 func WithClientNameHolder(ctx context.Context) context.Context {
 	return context.WithValue(ctx, clientNameKey{}, &clientNameHolder{})
+}
+
+func hasClientNameHolder(ctx context.Context) bool {
+	_, ok := ctx.Value(clientNameKey{}).(*clientNameHolder)
+	return ok
 }
 
 // SetClientName records the authenticated client name on the request's

@@ -26,6 +26,9 @@ type Config struct {
 	BaseURL    string `json:"base_url,omitempty"`
 	Token      string `json:"token,omitempty"`
 	ClientName string `json:"client_name,omitempty"`
+	// TokenExpiresAt is set when the token came from a cli_authorize code: it
+	// is short-lived, and `pdw config show` should say until when.
+	TokenExpiresAt string `json:"token_expires_at,omitempty"`
 }
 
 // Path resolves the canonical config file path from environment variables.

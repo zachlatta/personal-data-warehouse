@@ -11,6 +11,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/accesstokens"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
@@ -40,10 +41,19 @@ func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 				logger.InfoContext(ctx, "MCP tool result", "tool", name, "client", pdwauth.ClientNameFromContext(ctx), "is_error", true, "error", err.Error())
 				return
 			}
-			logger.InfoContext(ctx, "MCP tool result", "tool", name, "client", pdwauth.ClientNameFromContext(ctx), "is_error", isError, "output", marshalToolOutput(output))
+			logged := marshalToolOutput(output)
+			if redactedResultTools[name] && !isError {
+				logged = "[redacted: the result is a credential]"
+			}
+			logger.InfoContext(ctx, "MCP tool result", "tool", name, "client", pdwauth.ClientNameFromContext(ctx), "is_error", isError, "output", logged)
 		},
 	}
 }
+
+// redactedResultTools return a credential, which must not reach the logs: Loki
+// keeps them far longer than the credential lives, and anyone who can read
+// logs could redeem it first.
+var redactedResultTools = map[string]bool{cliAuthorizeToolName: true}
 
 func marshalToolOutput(output any) string {
 	data, err := json.Marshal(output)
@@ -104,7 +114,7 @@ type sqlInput struct {
 // the layer order to walk when SQL really is needed. Since 2026-09-09 the full
 // agent guide is the `readme` tool, so this paragraph opens by naming it: the
 // instructions are the one thing an MCP client shows before the first call.
-var serverInstructions = "Call the readme tool first: it is the brief agent guide to this warehouse (workflow, tool map, priority tiers, SQL traps, where each domain lives), with topic full for the long form and topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Connected upstream MCP servers (skills, tasks, other warehouses) are reached through the connections tool (list, then a tool's schema) and connection_call; they are live upstream calls with the connected account, not warehouse queries, and they may write. " +
+var serverInstructions = "Call the readme tool first: it is the brief agent guide to this warehouse (workflow, tool map, priority tiers, SQL traps, where each domain lives), with topic full for the long form and topics for search, sql, sources, agent-sessions, finance, health, slack, mutations, ops and connections. Connected upstream MCP servers (skills, tasks, other warehouses) are reached through the connections tool (list, then a tool's schema) and connection_call; they are live upstream calls with the connected account, not warehouse queries, and they may write. If you can run shell commands, cli_authorize returns a one-line command that sets up the pdw CLI there. " +
 	"Personal data warehouse for Zach's synced Slack, Gmail, Google Calendar, Google Contacts, Google Drive, Apple Notes, Apple Messages (iMessage/SMS/RCS), Apple Voice Memo transcripts, WhatsApp, AI conversation logs, photos, health, and Plaid-backed finance data. " +
 	"START AT THE TIMELINE. timeline.events is one row per real-world event from every source; the search tool queries it and needs no schema discovery, so call search FIRST for any text, topic, person, phrase, or identifier. Search with the FEWEST, most distinctive words the answering record would contain -- a name, an id, a product, an amount, a subject-line phrase -- not the question and not a long bag of generic terms: measured on the labeled benchmark, \"Mt Foolery\" ranks first and \"Woody Mt Foolery cancelled postponed weather\" is not in the top 50. Search an identifier alone. Prefer several short searches over one long one, and on a miss drop words rather than add them. " +
 	"Every event carries a priority tier, and scoping to it is usually the difference between an answer and the whole corpus: " + warehouse.TimelinePriorityEqualsDefinitions() + ". \"What needs my attention\" means priorities " + strings.Join(warehouse.TimelineAttentionPriorities(), "/") + ", not everything. " +
@@ -245,6 +255,13 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		}
 		logger.Info("push notification endpoints enabled", "register", push.RegisterPath, "expo_access_token", cfg.ExpoAccessToken != "")
 	}
+	// Issued access tokens beside the master secret, and the single-use
+	// cli_authorize codes (docs/agents/access-tokens.md). The static bearer
+	// consults the store per request, so registering it here also covers the
+	// routes mounted above.
+	tokenSvc := newAccessTokenService(cfg, logger)
+	authSvc.SetTokenAuthenticator(tokenSvc)
+	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logger.WarnContext(r.Context(), "unknown route", "method", r.Method, "path", r.URL.Path)
@@ -287,6 +304,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	// notifier itself is always there. A storage id is refused, not
 	// guessed, when there is no /objects/ route to serve it.
 	extra = append(extra, notifyTool(notifier, authSvc, baseURL, cfg.ObjectStoreURLTTL, storeEnabled, time.Now))
+	extra = append(extra, cliAuthorizeTool(tokenSvc, baseURL))
 	if tokens := cfg.SlackTokens(); len(tokens) > 0 {
 		slackStore := objectstore.NewSlackFileStore(objectstore.SlackFileStoreOptions{Tokens: tokens})
 		if storeEnabled {
@@ -501,6 +519,22 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	}
 
 	return logRequests(logger, mux)
+}
+
+// newAccessTokenService keeps tokens in Postgres when the app has it. Without
+// a database (tests, a bare local run) they live in memory and die with the
+// process, which is said loudly rather than silently.
+func newAccessTokenService(cfg config.Config, logger *slog.Logger) *accesstokens.Service {
+	if cfg.PostgresDatabaseURL != "" {
+		store, err := accesstokens.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if err == nil {
+			return accesstokens.NewService(store, time.Now, logger)
+		}
+		logger.Error("access token store failed to initialize; issued tokens are in memory only", "error", err.Error())
+	} else {
+		logger.Warn("no application database; issued access tokens are in memory only and die with the process")
+	}
+	return accesstokens.NewService(accesstokens.NewMemoryStore(), time.Now, logger)
 }
 
 // mutationNotification is the alert sent when a request lands in

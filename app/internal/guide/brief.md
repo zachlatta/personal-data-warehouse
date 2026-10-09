@@ -51,6 +51,7 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 | A reviewed write | `propose_mutation_help`, then `propose_mutation` (topic `mutations`) |
 | Connected upstream MCP servers (skills, tasks, other warehouses) | `connections` to list, `connection_call` to invoke (topic `connections`) |
 | A push notification to Zach's phone | `notify` |
+| The `pdw` CLI in your own shell (a sandbox, VM or container) | `cli_authorize`, then run the one-line command it returns; the CLI's token lasts 24 h |
 {{- end}}
 
 ## Priority tiers (the filter that turns the corpus into an answer)

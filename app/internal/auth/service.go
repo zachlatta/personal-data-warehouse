@@ -28,6 +28,7 @@ type Service struct {
 	consumedCodes map[string]int64
 	mu            sync.Mutex
 	logger        *slog.Logger
+	tokens        TokenAuthenticator
 }
 
 type Claims struct {
