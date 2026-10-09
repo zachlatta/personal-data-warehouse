@@ -41,7 +41,8 @@ Answers to the open questions in the original tasks:
   HMAC over that key.
 - **Command or link?** A command. The `cli_authorize` MCP tool returns
   `curl -fsSL <app>/cli/bootstrap.sh | sh -s -- <code>`. The script holds no secret.
-  It installs `pdw` from the GitHub release into `~/.local/bin` if there is none, then
+  It installs `pdw` into `~/.local/bin` if there is none, by piping the app's own
+  `/cli/install.sh`, which fetches the GitHub release through the app (see below), then
   runs `pdw login --bootstrap <code>`. That command POSTs the code to
   `/api/cli/bootstrap`, which redeems it inside one transaction (row lock, hash check,
   `redeemed_at` stamped) and returns the `agent` token. The CLI saves the token with its
@@ -71,6 +72,13 @@ keeps logs far longer than 15 minutes.
   The master secret is checked first, then `TokenAuthenticator`.
 - `app/internal/accesstokens`: the Postgres and in-memory stores, the token API and the
   redemption handlers, and the bootstrap script.
+- `app/internal/clirelease`: `/cli/install.sh` and the release proxy behind it.
+  `/cli/release/latest` is GitHub's latest-release JSON (cached 5 minutes, served stale
+  if GitHub refuses) with every download URL rewritten to
+  `/cli/release/download/<tag>/<asset>`, which streams the asset from GitHub. Only a
+  `pdw-cli/v*` tag's platform tarballs and `SHA256SUMS` pass, so it is not an open
+  proxy. It exists because a Claude Cowork sandbox got 403 from `api.github.com` on
+  2026-10-09: GitHub refuses many datacenter egress IPs, and the app's is not one.
 - `app/internal/server/tools_cli_authorize.go`: the MCP-only tool.
 - `app/cmd/pdw-cli/token.go`: `pdw token`. `auth.go` holds `pdw login --bootstrap`.
 - The Python twin of the DDL is `ensure_app_access_token_tables` in `postgres.py`, so a
@@ -81,5 +89,6 @@ keeps logs far longer than 15 minutes.
 - OAuth MCP connector tokens are still stateless HMAC tokens (24 h access, 365-day
   refresh). Revoking one connector means rotating the master secret. Moving refresh
   tokens into `app_access_tokens` would make connectors listable and revocable too.
-- A sandbox whose egress allowlist blocks `github.com` cannot install the binary. The
-  app could serve the release asset itself, from `/cli/download/<os>/<arch>`.
+- `pdw update` and the background auto-update still read GitHub directly. In a sandbox
+  GitHub refuses, they fail silently and the bootstrapped binary stays at the version
+  it installed, which is enough for a 24-hour token.

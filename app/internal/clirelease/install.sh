@@ -1,15 +1,18 @@
 #!/usr/bin/env sh
-# Install the latest pdw release from
-# github.com/zachlatta/personal-data-warehouse.
+# Install the latest pdw release, served by the Personal Data Warehouse app.
+#
+# The app serves this script at /cli/install.sh with its own URL filled in, and
+# proxies the GitHub release (metadata at /cli/release/latest, assets under
+# /cli/release/download/) so the install never talks to GitHub itself: agent
+# sandboxes on datacenter IPs are refused by GitHub's API.
 #
 # The command installs as `pdw`. Release artifacts retain the historical
 # `pdw-cli` name so binaries installed before the rename can still self-update.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/zachlatta/personal-data-warehouse/main/app/install.sh | sh
+#   curl -fsSL <app>/cli/install.sh | sh
 #
 # Environment overrides (legacy PDW_CLI_* names are still honored):
-#   PDW_REPO         GitHub repo (default: zachlatta/personal-data-warehouse)
 #   PDW_VERSION      Release tag to install (default: latest)
 #   PDW_INSTALL_DIR  Install directory (default: /usr/local/bin if writable,
 #                    else $HOME/.local/bin)
@@ -23,7 +26,8 @@ set -eu
 INSTALL_NAME="pdw"
 ASSET_PREFIX="pdw-cli"
 
-REPO="${PDW_REPO:-${PDW_CLI_REPO:-zachlatta/personal-data-warehouse}}"
+# Filled in by the app that serves this script.
+PDW_URL=__PDW_BASE_URL__
 VERSION="${PDW_VERSION:-${PDW_CLI_VERSION:-latest}}"
 
 log() { printf '==> %s\n' "$*"; }
@@ -50,27 +54,24 @@ case "$arch_raw" in
   *) err "unsupported architecture: $arch_raw" ;;
 esac
 
-api="https://api.github.com/repos/${REPO}/releases"
 if [ "$VERSION" = "latest" ]; then
-  release_url="${api}/latest"
+  release_url="${PDW_URL}/cli/release/latest"
+  log "Resolving the latest release from $PDW_URL"
+  release_json=$(curl -fsSL "$release_url") \
+    || err "could not fetch release metadata from $release_url"
+  resolved_tag=$(printf '%s' "$release_json" \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+  [ -n "$resolved_tag" ] || err "could not parse tag_name from release metadata"
 else
-  release_url="${api}/tags/${VERSION}"
+  resolved_tag="$VERSION"
 fi
-
-log "Resolving release ($VERSION) from $REPO"
-release_json=$(curl -fsSL "$release_url") \
-  || err "could not fetch release metadata from $release_url"
-
-resolved_tag=$(printf '%s' "$release_json" \
-  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
-[ -n "$resolved_tag" ] || err "could not parse tag_name from release metadata"
 
 # Tags look like pdw-cli/v0.0.42-sha.abcdef0; the asset file embeds only the
 # version portion after the slash.
 asset_version="${resolved_tag#${ASSET_PREFIX}/}"
 asset="${ASSET_PREFIX}_${asset_version}_${os}_${arch}.tar.gz"
 
-base="https://github.com/${REPO}/releases/download/${resolved_tag}"
+base="${PDW_URL}/cli/release/download/${resolved_tag}"
 asset_url="${base}/${asset}"
 sums_url="${base}/SHA256SUMS"
 

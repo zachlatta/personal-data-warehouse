@@ -219,8 +219,10 @@ func BootstrapCommand(baseURL, code string) string {
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// The script carries no secret: the code arrives as $1. It installs pdw from
-// the GitHub release when the environment has none, then redeems the code.
+// The script carries no secret: the code arrives as $1. When the environment
+// has no pdw it installs one through the app's own release proxy
+// (internal/clirelease), never from GitHub directly: GitHub's API refuses many
+// of the datacenter IPs agent sandboxes run on. Then it redeems the code.
 var bootstrapScript = template.Must(template.New("bootstrap").Parse(`#!/bin/sh
 # Bootstrap an authorized pdw CLI from a cli_authorize code.
 # Usage: curl -fsSL {{.BaseURL}}/cli/bootstrap.sh | sh -s -- <code>
@@ -240,8 +242,7 @@ else
   install_dir="${PDW_INSTALL_DIR:-$HOME/.local/bin}"
   mkdir -p "$install_dir"
   echo "==> installing pdw into $install_dir"
-  curl -fsSL https://raw.githubusercontent.com/zachlatta/personal-data-warehouse/main/app/install.sh \
-    | PDW_INSTALL_DIR="$install_dir" sh
+  curl -fsSL "$base_url/cli/install.sh" | PDW_INSTALL_DIR="$install_dir" sh
   pdw_bin="$install_dir/pdw"
   case ":$PATH:" in
     *":$install_dir:"*) ;;

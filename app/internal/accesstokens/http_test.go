@@ -140,10 +140,15 @@ func TestTheBootstrapScriptHoldsNoSecretAndLogsIn(t *testing.T) {
 		t.Fatalf("script: %d", rec.Code)
 	}
 	script := rec.Body.String()
-	for _, want := range []string{"#!/bin/sh", "'https://pdw.example.test'", "login --bootstrap", "install.sh", "PDW_INSTALL_DIR"} {
+	for _, want := range []string{"#!/bin/sh", "'https://pdw.example.test'", "login --bootstrap", `"$base_url/cli/install.sh"`, "PDW_INSTALL_DIR"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script lacks %q:\n%s", want, script)
 		}
+	}
+	// GitHub refuses many agent sandboxes' egress, so the install goes
+	// through the app's release proxy (internal/clirelease) only.
+	if strings.Contains(script, "github") {
+		t.Fatalf("script reaches GitHub directly:\n%s", script)
 	}
 	if strings.Contains(script, httpMaster) {
 		t.Fatal("script embeds the master secret")

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/accesstokens"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 )
 
 func mcpCallTool(t *testing.T, srv *httptest.Server, bearer, name string, args map[string]any) string {
@@ -86,6 +87,12 @@ func TestCLIAuthorizeBootstrapsAnAgentScopedCLIToken(t *testing.T) {
 	status, script := apiRequest(t, srv, http.MethodGet, "/cli/bootstrap.sh", "", "")
 	if status != http.StatusOK || !strings.Contains(script, "login --bootstrap") || strings.Contains(script, muxAPITestSecret) {
 		t.Fatalf("script: %d\n%s", status, script)
+	}
+	// The installer it pipes to is served by the same app, pointed back at
+	// the app's release proxy rather than GitHub.
+	status, installer := apiRequest(t, srv, http.MethodGet, clirelease.InstallScriptPath, "", "")
+	if status != http.StatusOK || !strings.Contains(installer, "PDW_URL='http://example.test'") || !strings.Contains(installer, "/cli/release/download/") {
+		t.Fatalf("installer: %d\n%s", status, installer)
 	}
 
 	status, body := apiRequest(t, srv, http.MethodPost, accesstokens.BootstrapRedeemPath, "", `{"code":"`+code+`"}`)

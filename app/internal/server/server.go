@@ -16,6 +16,7 @@ import (
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/buildinfo"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/hackernewssession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
@@ -262,6 +263,9 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	tokenSvc := newAccessTokenService(cfg, logger)
 	authSvc.SetTokenAuthenticator(tokenSvc)
 	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
+	// The pdw installer and its release, proxied from GitHub so a sandbox
+	// whose egress GitHub refuses can still install the CLI.
+	clirelease.Register(mux, clirelease.New(clirelease.Options{Logger: logger.With("component", "cli_release")}), baseURL)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logger.WarnContext(r.Context(), "unknown route", "method", r.Method, "path", r.URL.Path)
