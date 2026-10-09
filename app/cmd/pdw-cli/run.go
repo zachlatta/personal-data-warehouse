@@ -146,11 +146,10 @@ COMMANDS
                              the Hacker News sync can read your upvoted and
                              hidden lists. See "pdw hn --help".
   version                    Print the build version.
-  update                     Replace this binary with the latest GitHub release.
+  update                     Replace this binary with the latest release, fetched
+                             through the warehouse app (never GitHub directly).
                                --check  Only report whether an update is available.
                                --force  Reinstall even if already on the latest version.
-                               --repo OWNER/NAME  GitHub repo to pull from (default
-                                                  $PDW_REPO or zachlatta/personal-data-warehouse).
   help                       Show this message.
 
 AUTO-UPDATE
@@ -169,8 +168,6 @@ ENVIRONMENT
   PDW_API_URL        Base URL of the warehouse app (e.g. http://localhost:8080).
   PDW_SECRET_TOKEN   Shared secret matching the server's PDW_SECRET_TOKEN.
   PDW_CLIENT_NAME    Client identifier sent on every request. Default: pdw.
-  PDW_REPO           GitHub repo for self-update. Default: zachlatta/personal-data-warehouse.
-                     (The legacy PDW_CLI_REPO name is still honored.)
   PDW_NO_AUTO_UPDATE Set to 1/true to disable the background auto-update.
   XDG_CONFIG_HOME    Overrides the config directory root.
 
@@ -206,10 +203,6 @@ EXAMPLES
 
 // version is overridden at build time via -ldflags "-X main.version=v1.2.3".
 var version = "dev"
-
-// defaultRepo is the GitHub repo this CLI updates from when --repo and
-// PDW_CLI_REPO are unset.
-const defaultRepo = "zachlatta/personal-data-warehouse"
 
 // defaultBaseURL is the warehouse URL the login prompt offers when the user
 // has no saved config and doesn't type one in.
@@ -254,7 +247,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	// The hidden background worker performs the throttled self-update and
 	// exits. Dispatch it before maybeAutoUpdate so it never spawns another.
 	if cmd == autoUpdateCommand {
-		return runAutoUpdateWorker(rest, getenv)
+		return runAutoUpdateWorker(rest, getenv, *baseURL)
 	}
 	// Best-effort, non-blocking: kick a debounced background self-update so
 	// the binary keeps itself current without a manual `pdw update`.
@@ -324,7 +317,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runVersion(rest, stdout, stderr)
 	}
 	if cmd == "update" {
-		return runUpdate(rest, stdout, stderr, getenv)
+		return runUpdate(rest, stdout, stderr, getenv, *baseURL)
 	}
 	if cmd == "login" {
 		return runLogin(rest, stdin, stdout, stderr, getenv)

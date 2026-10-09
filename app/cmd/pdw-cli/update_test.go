@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 )
 
 func TestVersionPrintsBuildVersion(t *testing.T) {
@@ -50,10 +52,10 @@ func TestUpdateCheckReportsNewerVersionWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	api := newGitHubStub(t, "octo/repo", "v0.2.0", nil, "")
+	api := newReleaseStub(t, "v0.2.0", nil, "")
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--check", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--check", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
@@ -77,10 +79,10 @@ func TestUpdateCheckReportsUpToDate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	api := newGitHubStub(t, "octo/repo", "v0.2.0", nil, "")
+	api := newReleaseStub(t, "v0.2.0", nil, "")
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--check", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--check", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
@@ -103,11 +105,11 @@ func TestUpdateReplacesBinary(t *testing.T) {
 	}
 
 	newBinary := []byte("NEW REAL BINARY BYTES")
-	api := newGitHubStub(t, "octo/repo", "v1.0.0", newBinary, "")
+	api := newReleaseStub(t, "v1.0.0", newBinary, "")
 
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
@@ -135,10 +137,10 @@ func TestUpdateNoOpWhenAlreadyCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	api := newGitHubStub(t, "octo/repo", "v1.0.0", []byte("NEW"), "")
+	api := newReleaseStub(t, "v1.0.0", []byte("NEW"), "")
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
@@ -163,10 +165,10 @@ func TestUpdateForceReplacesEvenWhenCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	newBinary := []byte("FORCE REINSTALLED")
-	api := newGitHubStub(t, "octo/repo", "v1.0.0", newBinary, "")
+	api := newReleaseStub(t, "v1.0.0", newBinary, "")
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--force", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--force", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
@@ -187,11 +189,11 @@ func TestUpdatePropagatesChecksumMismatch(t *testing.T) {
 	if err := os.WriteFile(target, []byte("OLD"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	api := newGitHubStub(t, "octo/repo", "v1.0.0", []byte("NEW"), strings.Repeat("0", 64))
+	api := newReleaseStub(t, "v1.0.0", []byte("NEW"), strings.Repeat("0", 64))
 
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{"update", "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, "update", "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code == 0 {
@@ -205,15 +207,18 @@ func TestUpdatePropagatesChecksumMismatch(t *testing.T) {
 	}
 }
 
-// newGitHubStub spins up a fake GitHub API + asset host serving a release
-// with the given tag containing a tarball of binaryBody for the current OS/arch
-// and a SHA256SUMS file. If overrideChecksum is non-empty, it's published as
-// the tarball's checksum instead of the real one (used to simulate corruption).
-func newGitHubStub(t *testing.T, repo, tag string, binaryBody []byte, overrideChecksum string) *httptest.Server {
+// newReleaseStub stands up the warehouse app's real release proxy
+// (internal/clirelease) in front of a fake GitHub serving one release, tagged
+// pdw-cli/<tag>, with a tarball of binaryBody for the current OS/arch and a
+// SHA256SUMS file. If overrideChecksum is non-empty, it's published as the
+// tarball's checksum instead of the real one (used to simulate corruption).
+// It returns the app server: the CLI never talks to GitHub itself.
+func newReleaseStub(t *testing.T, tag string, binaryBody []byte, overrideChecksum string) *httptest.Server {
 	t.Helper()
 	if binaryBody == nil {
 		binaryBody = []byte("placeholder binary\n")
 	}
+	fullTag := "pdw-cli/" + tag
 	assetName := fmt.Sprintf("pdw-cli_%s_%s_%s.tar.gz", tag, runtime.GOOS, runtime.GOARCH)
 	tarball := makeTarGz(t, "pdw-cli", binaryBody)
 	sum := sha256.Sum256(tarball)
@@ -223,27 +228,54 @@ func newGitHubStub(t *testing.T, repo, tag string, binaryBody []byte, overrideCh
 	}
 	sumsBody := hexSum + "  " + assetName + "\n"
 
-	mux := http.NewServeMux()
-	var srvURL string
-	mux.HandleFunc("/repos/"+repo+"/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
+	github := http.NewServeMux()
+	github.HandleFunc("/repos/"+clirelease.Repo+"/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintf(w, `{
 			"tag_name": %q,
 			"assets": [
-				{"name": %q, "browser_download_url": %q, "size": %d},
-				{"name": "SHA256SUMS", "browser_download_url": %q, "size": %d}
+				{"name": %q, "browser_download_url": "https://github.invalid/a", "size": %d},
+				{"name": "SHA256SUMS", "browser_download_url": "https://github.invalid/s", "size": %d}
 			]
-		}`, tag, assetName, srvURL+"/dl/"+assetName, len(tarball), srvURL+"/dl/SHA256SUMS", len(sumsBody))
+		}`, fullTag, assetName, len(tarball), len(sumsBody))
 	})
-	mux.HandleFunc("/dl/"+assetName, func(w http.ResponseWriter, _ *http.Request) {
+	download := "/" + clirelease.Repo + "/releases/download/" + fullTag + "/"
+	github.HandleFunc(download+assetName, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(tarball)
 	})
-	mux.HandleFunc("/dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
+	github.HandleFunc(download+"SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, sumsBody)
 	})
-	srv := httptest.NewServer(mux)
-	srvURL = srv.URL
-	t.Cleanup(srv.Close)
-	return srv
+	upstream := httptest.NewServer(github)
+	t.Cleanup(upstream.Close)
+
+	appMux := http.NewServeMux()
+	app := httptest.NewServer(appMux)
+	t.Cleanup(app.Close)
+	clirelease.Register(appMux, clirelease.New(clirelease.Options{GitHubAPI: upstream.URL, GitHubDownload: upstream.URL}), app.URL)
+	return app
+}
+
+// With no --base-url, update reads the release from the same app every
+// other command talks to: PDW_API_URL, then the saved config.
+func TestUpdateUsesTheConfiguredWarehouseURL(t *testing.T) {
+	prev := version
+	t.Cleanup(func() { version = prev })
+	version = "v0.0.1"
+
+	target := filepath.Join(t.TempDir(), "pdw")
+	if err := os.WriteFile(target, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	api := newReleaseStub(t, "v0.3.0", []byte("FROM ENV URL"), "")
+	env := map[string]string{"HOME": t.TempDir(), "PDW_API_URL": api.URL + "/"}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"update", "--target", target}, strings.NewReader(""), &stdout, &stderr, func(k string) string { return env[k] })
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr=%s", code, stderr.String())
+	}
+	if got, _ := os.ReadFile(target); string(got) != "FROM ENV URL" {
+		t.Fatalf("target = %q", got)
+	}
 }
 
 func makeTarGz(t *testing.T, name string, body []byte) []byte {

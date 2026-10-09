@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/selfupdate"
 )
 
@@ -67,7 +68,10 @@ func TestShouldUpdate(t *testing.T) {
 
 // --- LatestRelease ---------------------------------------------------------
 
-func TestLatestReleaseParsesGitHubResponse(t *testing.T) {
+// The release metadata comes from the warehouse app's proxy of the GitHub
+// release (internal/clirelease), never from api.github.com: GitHub refuses
+// many datacenter and agent-sandbox IPs.
+func TestLatestReleaseReadsTheAppsReleaseProxy(t *testing.T) {
 	var gotPath string
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,17 +87,16 @@ func TestLatestReleaseParsesGitHubResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := selfupdate.NewClient("octo/repo")
-	c.SetBaseURL(srv.URL)
+	c := selfupdate.NewClient(srv.URL + "/")
 	rel, err := c.LatestRelease(context.Background())
 	if err != nil {
 		t.Fatalf("LatestRelease: %v", err)
 	}
-	if gotPath != "/repos/octo/repo/releases/latest" {
+	if gotPath != clirelease.LatestPath {
 		t.Fatalf("path = %q", gotPath)
 	}
 	if gotUA == "" {
-		t.Fatal("User-Agent must be set (GitHub requires it)")
+		t.Fatal("User-Agent must be set (Cloudflare refuses some default agents)")
 	}
 	if rel.Version != "v1.2.3" {
 		t.Fatalf("version = %q", rel.Version)
@@ -103,14 +106,13 @@ func TestLatestReleaseParsesGitHubResponse(t *testing.T) {
 	}
 }
 
-func TestLatestReleaseSurfacesGitHubErrors(t *testing.T) {
+func TestLatestReleaseSurfacesProxyErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = io.WriteString(w, `{"message":"Not Found"}`)
 	}))
 	defer srv.Close()
-	c := selfupdate.NewClient("octo/repo")
-	c.SetBaseURL(srv.URL)
+	c := selfupdate.NewClient(srv.URL)
 	_, err := c.LatestRelease(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("err = %v", err)
@@ -198,7 +200,7 @@ func TestDownloadAndVerifyExtractsBinaryFromTarGz(t *testing.T) {
 			{Name: "SHA256SUMS", DownloadURL: srv.URL + "/sums"},
 		},
 	}
-	c := selfupdate.NewClient("octo/repo")
+	c := selfupdate.NewClient("http://app.invalid")
 	got, err := c.FetchBinary(context.Background(), rel, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatalf("FetchBinary: %v", err)
@@ -231,7 +233,7 @@ func TestDownloadAndVerifyFailsOnChecksumMismatch(t *testing.T) {
 			{Name: "SHA256SUMS", DownloadURL: srv.URL + "/sums"},
 		},
 	}
-	c := selfupdate.NewClient("octo/repo")
+	c := selfupdate.NewClient("http://app.invalid")
 	_, err := c.FetchBinary(context.Background(), rel, runtime.GOOS, runtime.GOARCH)
 	if err == nil {
 		t.Fatal("expected checksum mismatch error, got nil")
@@ -247,7 +249,7 @@ func TestDownloadAndVerifyRequiresChecksumAsset(t *testing.T) {
 		Version: "v1.0.0",
 		Assets:  []selfupdate.Asset{{Name: assetName, DownloadURL: "http://x"}},
 	}
-	_, err := selfupdate.NewClient("octo/repo").FetchBinary(context.Background(), rel, runtime.GOOS, runtime.GOARCH)
+	_, err := selfupdate.NewClient("http://app.invalid").FetchBinary(context.Background(), rel, runtime.GOOS, runtime.GOARCH)
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "checksum") {
 		t.Fatalf("err = %v", err)
 	}
@@ -258,7 +260,7 @@ func TestDownloadAndVerifyRequiresPlatformAsset(t *testing.T) {
 		Version: "v1.0.0",
 		Assets:  []selfupdate.Asset{{Name: "SHA256SUMS", DownloadURL: "http://x"}},
 	}
-	_, err := selfupdate.NewClient("octo/repo").FetchBinary(context.Background(), rel, "linux", "amd64")
+	_, err := selfupdate.NewClient("http://app.invalid").FetchBinary(context.Background(), rel, "linux", "amd64")
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "no asset") {
 		t.Fatalf("err = %v", err)
 	}

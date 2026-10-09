@@ -1,9 +1,12 @@
-// Package selfupdate fetches pdw-cli release artifacts from GitHub Releases,
-// verifies them against the published SHA256SUMS, and atomically replaces the
-// running binary. The release artifact layout it expects:
+// Package selfupdate fetches pdw-cli release artifacts through the warehouse
+// app's proxy of the GitHub release (internal/clirelease), verifies them
+// against the published SHA256SUMS, and atomically replaces the running
+// binary. It never talks to GitHub itself: GitHub's API refuses many
+// datacenter and agent-sandbox IPs, and a bootstrapped CLI runs on exactly
+// those. The release artifact layout it expects:
 //
-//   pdw-cli_<version>_<goos>_<goarch>.tar.gz   (contains a single "pdw-cli" file)
-//   SHA256SUMS                                 (lines of "<hex>  <filename>")
+//	pdw-cli_<version>_<goos>_<goarch>.tar.gz   (contains a single "pdw-cli" file)
+//	SHA256SUMS                                 (lines of "<hex>  <filename>")
 //
 // Version strings use the GitHub tag form (e.g. "v1.2.3"). The package is
 // platform-agnostic; the calling command supplies runtime.GOOS / runtime.GOARCH.
@@ -26,10 +29,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-)
 
-// DefaultGitHubAPI is the public GitHub REST API root.
-const DefaultGitHubAPI = "https://api.github.com"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
+)
 
 const (
 	binaryName     = "pdw-cli"
@@ -37,7 +39,7 @@ const (
 	assetExtension = ".tar.gz"
 )
 
-// Release is the slimmed-down view of a GitHub release.
+// Release is the slimmed-down view of a release.
 type Release struct {
 	Version string
 	Assets  []Asset
@@ -50,26 +52,21 @@ type Asset struct {
 	Size        int64
 }
 
-// Client talks to GitHub Releases.
+// Client reads releases from the warehouse app's release proxy.
 type Client struct {
-	repo    string
-	baseURL string
-	http    *http.Client
-	ua      string
+	appURL string
+	http   *http.Client
+	ua     string
 }
 
-// NewClient returns a Client for the given "<owner>/<repo>".
-func NewClient(repo string) *Client {
+// NewClient returns a Client for the warehouse app at appURL.
+func NewClient(appURL string) *Client {
 	return &Client{
-		repo:    repo,
-		baseURL: DefaultGitHubAPI,
-		http:    &http.Client{Timeout: 60 * time.Second},
-		ua:      binaryName + "/selfupdate",
+		appURL: strings.TrimRight(appURL, "/"),
+		http:   &http.Client{Timeout: 60 * time.Second},
+		ua:     binaryName + "/selfupdate",
 	}
 }
-
-// SetBaseURL overrides the GitHub API root. Used by tests.
-func (c *Client) SetBaseURL(u string) { c.baseURL = strings.TrimRight(u, "/") }
 
 // SetHTTPClient overrides the underlying *http.Client.
 func (c *Client) SetHTTPClient(h *http.Client) {
@@ -85,9 +82,10 @@ func (c *Client) SetUserAgent(ua string) {
 	}
 }
 
-// LatestRelease fetches /repos/<repo>/releases/latest.
+// LatestRelease fetches the app's /cli/release/latest, which is GitHub's
+// latest-release JSON with every download URL pointing back at the app.
 func (c *Client) LatestRelease(ctx context.Context) (Release, error) {
-	url := c.baseURL + "/repos/" + c.repo + "/releases/latest"
+	url := c.appURL + clirelease.LatestPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return Release{}, err
@@ -104,7 +102,7 @@ func (c *Client) LatestRelease(ctx context.Context) (Release, error) {
 		return Release{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Release{}, fmt.Errorf("github releases: http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return Release{}, fmt.Errorf("release metadata from %s: http %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
 		TagName string `json:"tag_name"`

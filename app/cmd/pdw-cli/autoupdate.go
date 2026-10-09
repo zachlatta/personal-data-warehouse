@@ -21,7 +21,7 @@ const autoUpdateCommand = "__auto-update"
 // autoUpdateDebounce bounds how often pdw will kick off a background
 // self-update. At most one update attempt fires per window regardless of how
 // many times the CLI is invoked, so a burst of calls (e.g. an agent running
-// many SQL queries) costs at most one GitHub check.
+// many SQL queries) costs at most one release check.
 const autoUpdateDebounce = 5 * time.Minute
 
 // autoUpdateStateFile is the stamp file (next to config.json) recording when
@@ -186,9 +186,10 @@ func spawnBackgroundUpdate() error {
 // runAutoUpdateWorker is the hidden background command. It reuses the same
 // machinery as `pdw update` but stays silent — output is irrelevant in a
 // detached process, and any failure is simply retried after the next debounce
-// window. Args are forwarded so tests can point it at a fake GitHub.
-func runAutoUpdateWorker(args []string, getenv func(string) string) int {
-	return runUpdate(args, io.Discard, io.Discard, getenv)
+// window. Args and the root --base-url are forwarded so tests can point it at
+// a fake app.
+func runAutoUpdateWorker(args []string, getenv func(string) string, flagBase string) int {
+	return runUpdate(args, io.Discard, io.Discard, getenv, flagBase)
 }
 
 // truthyEnv reports whether an env value means "on" (1/true/yes/on,

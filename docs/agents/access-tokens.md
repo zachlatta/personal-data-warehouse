@@ -79,6 +79,8 @@ keeps logs far longer than 15 minutes.
   `pdw-cli/v*` tag's platform tarballs and `SHA256SUMS` pass, so it is not an open
   proxy. It exists because a Claude Cowork sandbox got 403 from `api.github.com` on
   2026-10-09: GitHub refuses many datacenter egress IPs, and the app's is not one.
+  `pdw update` and the background auto-update read the same proxy
+  (`app/internal/selfupdate`), so nothing the CLI does reaches GitHub.
 - `app/internal/server/tools_cli_authorize.go`: the MCP-only tool.
 - `app/cmd/pdw-cli/token.go`: `pdw token`. `auth.go` holds `pdw login --bootstrap`.
 - The Python twin of the DDL is `ensure_app_access_token_tables` in `postgres.py`, so a
@@ -89,6 +91,3 @@ keeps logs far longer than 15 minutes.
 - OAuth MCP connector tokens are still stateless HMAC tokens (24 h access, 365-day
   refresh). Revoking one connector means rotating the master secret. Moving refresh
   tokens into `app_access_tokens` would make connectors listable and revocable too.
-- `pdw update` and the background auto-update still read GitHub directly. In a sandbox
-  GitHub refuses, they fail silently and the bootstrapped binary stays at the version
-  it installed, which is enough for a 24-hour token.

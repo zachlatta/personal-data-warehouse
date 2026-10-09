@@ -564,8 +564,12 @@ envelope on stderr.
 ### Self-update
 
 `pdw update` replaces the running binary with the latest GitHub release
-from `zachlatta/personal-data-warehouse`, verifying the download against
-`SHA256SUMS`. Release artifacts keep the historical `pdw-cli` name (the
+from `zachlatta/personal-data-warehouse`, fetched through the warehouse app's
+release proxy (`/cli/release/latest`, `/cli/release/download/<tag>/<asset>`;
+see `app/internal/clirelease`) and verified against `SHA256SUMS`. It reads from
+the same app as every other command (`--base-url` > `PDW_API_URL` > saved
+config > the default app) and never talks to GitHub itself, because GitHub's
+API refuses many datacenter and agent-sandbox IPs. Release artifacts keep the historical `pdw-cli` name (the
 asset `pdw-cli_<version>_<os>_<arch>.tar.gz` packs a single `pdw-cli` file,
 and tags are `pdw-cli/v*`) so that binaries installed before the `pdw-cli` →
 `pdw` rename can still self-update; `pdw update` writes the new binary back to
@@ -590,12 +594,10 @@ pdw version        # prints the build version baked in via -ldflags
 pdw update --check # report whether a newer release exists
 pdw update         # download, verify SHA256, atomically replace this binary
 pdw update --force # reinstall even if already on the latest version
-pdw update --repo other/fork --github-api https://api.github.com  # alt source
 ```
 
-Override the GitHub repo with `PDW_REPO` or `--repo` (legacy `PDW_CLI_REPO`
-is still honored; the test suite uses both `--repo` and `--github-api` to
-drive end-to-end fakes).
+The test suite drives it end to end by pointing `--base-url` at the real
+proxy in front of a fake GitHub.
 
 #### Background auto-update
 
@@ -607,7 +609,7 @@ detached copy of itself running the hidden `__auto-update` worker, which does
 the same download-verify-replace as `pdw update`. The foreground command never
 blocks on it and never fails because of it — the refreshed binary is simply
 picked up on the next invocation. The five-minute debounce means a burst of
-calls (e.g. an agent firing many queries) costs at most one GitHub check.
+calls (e.g. an agent firing many queries) costs at most one release check.
 
 Auto-update is skipped for local `dev` builds (so a hand-built binary is never
 clobbered), for the `update`/`version`/`help` commands, and whenever

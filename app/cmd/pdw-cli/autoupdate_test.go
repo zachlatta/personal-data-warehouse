@@ -236,11 +236,11 @@ func TestRunDispatchesAutoUpdateWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	newBinary := []byte("NEW BACKGROUND BINARY")
-	api := newGitHubStub(t, "octo/repo", "v1.0.0", newBinary, "")
+	api := newReleaseStub(t, "v1.0.0", newBinary, "")
 
 	var stdout, stderr bytes.Buffer
 	code := run(
-		[]string{autoUpdateCommand, "--github-api", api.URL, "--repo", "octo/repo", "--target", target},
+		[]string{"--base-url", api.URL, autoUpdateCommand, "--target", target},
 		strings.NewReader(""), &stdout, &stderr, func(string) string { return "" },
 	)
 	if code != 0 {
