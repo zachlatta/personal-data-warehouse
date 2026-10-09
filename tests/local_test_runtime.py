@@ -254,8 +254,10 @@ class PostgresTestRuntime:
         self._owned_container = None
         if container is not None:
             try:
+                # -v also removes the anonymous volume the image declares for
+                # /var/lib/postgresql; without it every run leaks ~0.5 GB.
                 self._runner(
-                    ["docker", "rm", "-f", container],
+                    ["docker", "rm", "-f", "-v", container],
                     capture_output=True,
                     text=True,
                     check=False,

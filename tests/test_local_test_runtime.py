@@ -129,7 +129,7 @@ def test_default_start_launches_extension_complete_postgres_on_a_dynamic_port() 
 
     postgres.close()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
     assert "POSTGRES_DATABASE_URL" not in env
 
 
@@ -183,7 +183,7 @@ def test_readiness_timeout_removes_the_owned_container_and_reports_bounded_logs(
     with pytest.raises(LocalTestStartupError, match=r"(?s)did not become ready.*bounded postgres logs"):
         postgres.start()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
 
 
 def test_malformed_dynamic_port_removes_the_exact_owned_container() -> None:
@@ -193,7 +193,7 @@ def test_malformed_dynamic_port_removes_the_exact_owned_container() -> None:
     with pytest.raises(LocalTestStartupError, match=r"published port.*uv run pytest --unit-only"):
         postgres.start()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
 
 
 def test_unexpected_interrupt_during_startup_removes_the_exact_owned_container() -> None:
@@ -214,7 +214,7 @@ def test_unexpected_interrupt_during_startup_removes_the_exact_owned_container()
     with pytest.raises(KeyboardInterrupt):
         postgres.start()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
 
 
 def test_extension_creation_failure_is_actionable_and_cleans_up() -> None:
@@ -224,7 +224,7 @@ def test_extension_creation_failure_is_actionable_and_cleans_up() -> None:
     with pytest.raises(LocalTestStartupError, match=r"search extensions.*PDW_POSTGRES_IMAGE"):
         postgres.start()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
 
 
 def test_extension_verification_requires_every_extension() -> None:
@@ -234,7 +234,7 @@ def test_extension_verification_requires_every_extension() -> None:
     with pytest.raises(LocalTestStartupError, match=r"pg_textsearch"):
         postgres.start()
 
-    assert docker.calls[-1] == ["docker", "rm", "-f", "pdw-tests-owned-123"]
+    assert docker.calls[-1] == ["docker", "rm", "-f", "-v", "pdw-tests-owned-123"]
 
 
 @pytest.mark.parametrize(
