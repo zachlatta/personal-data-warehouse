@@ -9895,9 +9895,20 @@ class PostgresWarehouse:
         conversation_id: str,
         message_ts: str,
     ) -> dict[str, Any]:
-        """Return the exact live Slack message/conversation a reviewed read targets."""
-        return self.load_slack_message_target(
-            account=account, team_id=team_id, conversation_id=conversation_id, message_ts=message_ts
+        """Return the exact synced Slack message/conversation a reviewed read targets.
+
+        Unlike a thread-reply parent, the anchor may have been deleted since it
+        was proposed: a batch is snapshotted, reviewed and run minutes apart,
+        and a bot's auto-post deleted in between is still an exact point in
+        that conversation. `is_deleted` says so; the timestamp must still be
+        one this workspace synced, never an invented one.
+        """
+        return self._load_slack_message_target(
+            account=account,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            message_ts=message_ts,
+            include_deleted=True,
         )
 
     def load_slack_conversation_target(
@@ -10016,6 +10027,23 @@ class PostgresWarehouse:
         keeps an Enterprise Grid client session pinned to the warehouse workspace
         even when Slack temporarily reports a sibling workspace to client APIs.
         """
+        return self._load_slack_message_target(
+            account=account,
+            team_id=team_id,
+            conversation_id=conversation_id,
+            message_ts=message_ts,
+            include_deleted=False,
+        )
+
+    def _load_slack_message_target(
+        self,
+        *,
+        account: str,
+        team_id: str,
+        conversation_id: str,
+        message_ts: str,
+        include_deleted: bool,
+    ) -> dict[str, Any]:
         rows = self._query_dicts(
             """
             SELECT
@@ -10031,7 +10059,8 @@ class PostgresWarehouse:
                 message.message_datetime,
                 message.thread_ts,
                 message.parent_message_ts,
-                message.text
+                message.text,
+                message.is_deleted
             FROM @slack_conversations AS conversation
             JOIN @slack_messages AS message
               ON message.account = conversation.account
@@ -10041,10 +10070,10 @@ class PostgresWarehouse:
               AND conversation.team_id = %s
               AND conversation.conversation_id = %s
               AND message.message_ts = %s
-              AND message.is_deleted = 0
+              AND (%s OR message.is_deleted = 0)
             LIMIT 1
             """,
-            (account, team_id, conversation_id, message_ts),
+            (account, team_id, conversation_id, message_ts, include_deleted),
         )
         return rows[0] if rows else {}
 

@@ -80,6 +80,7 @@ def test_marks_exact_synced_message_read_with_xoxc_session() -> None:
         "message_ts": "1593473566.000200",
         "team_id": "T1",
         "already_read": False,
+        "target_deleted": False,
     }
     assert [item[0] for item in calls] == ["auth.test", "conversations.info", "conversations.mark"]
     assert all(item[2] == "d=secret-cookie" for item in calls)
@@ -152,6 +153,26 @@ def test_target_must_be_exact_synced_member_conversation() -> None:
     assert result.status == "failed_terminal"
     assert "synced" in result.error
     assert calls == ["auth.test"]
+
+
+def test_a_target_deleted_after_review_still_anchors_the_read_cursor() -> None:
+    calls = []
+
+    def call(method, *, token, cookie_header, user_agent, form=None):
+        calls.append((method, dict(form or {})))
+        return {
+            "auth.test": {"ok": True, "user_id": "U1", "team_id": "T1"},
+            "conversations.info": {"ok": True, "channel": {"id": "D1", "last_read": "1593473500.000100"}},
+            "conversations.mark": {"ok": True},
+        }[method]
+
+    result = SlackMutationExecutor(
+        warehouse=_Warehouse(session=_session(), target=_target(is_deleted=1)), slack_post=call
+    ).execute(_mutation())
+
+    assert result.status == "succeeded"
+    assert result.result_json["target_deleted"] is True
+    assert calls[-1] == ("conversations.mark", {"channel": "D1", "ts": "1593473566.000200"})
 
 
 def test_slack_errors_are_safely_classified() -> None:

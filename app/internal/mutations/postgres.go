@@ -2886,7 +2886,8 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 			message.is_thread_reply,
 			message.reply_count,
 			COALESCE(identity.user_id, ''),
-			COALESCE(team.domain, '')
+			COALESCE(team.domain, ''),
+			message.is_deleted <> 0
 		FROM @slack_messages AS message
 		JOIN @slack_conversations AS conversation
 		  ON conversation.account = message.account
@@ -2905,7 +2906,6 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 		WHERE message.account = $1
 		  AND message.conversation_id = $2
 		  AND message.message_ts = $3
-		  AND message.is_deleted = 0
 		ORDER BY message.team_id ASC
 		LIMIT 1
 	`, target.Account, target.ConversationID, target.MessageTS)
@@ -2934,6 +2934,7 @@ func (s *PostgresStore) loadSlackMarkReadPreviewDetail(
 		&replyCount,
 		&detail.SelfUserID,
 		&detail.TeamDomain,
+		&detail.TargetDeleted,
 	); err != nil {
 		return slackMarkReadPreviewDetail{}, false
 	}

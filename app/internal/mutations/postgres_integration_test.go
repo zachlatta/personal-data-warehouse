@@ -400,6 +400,53 @@ func TestCreateRequestFillsSlackMarkReadPreviewWithConversationContext(t *testin
 	}
 }
 
+// A batch is snapshotted, proposed and reviewed minutes apart, and a bot's
+// auto-post deleted in between is still where the read boundary lands. The
+// reviewer sees the live messages around it and that the target is gone,
+// rather than a bare row with no context.
+func TestSlackMarkReadPreviewShowsATargetDeletedSinceTheSnapshot(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedSlackPreviewSchema(t, store)
+
+	account := fmt.Sprintf("slack-preview-deleted-%d", time.Now().UnixNano())
+	for _, statement := range []string{
+		`INSERT INTO @slack_teams (account, team_id, team_name, domain) VALUES ($1, 'T1', 'Example', 'example')`,
+		`INSERT INTO @slack_conversations (account, team_id, conversation_id, conversation_type, name, raw_json)
+		 VALUES ($1, 'T1', 'C1', 'channel', 'help', '{"last_read":"1593473500.000100"}')`,
+		`INSERT INTO @slack_messages (
+			account, team_id, conversation_id, message_ts, message_datetime, thread_ts,
+			parent_message_ts, user_id, bot_id, username, text,
+			is_thread_parent, is_thread_reply, reply_count, is_deleted
+		 ) VALUES
+			($1, 'T1', 'C1', '1593473500.000100', '2026-08-29 14:00:00+00', '1593473500.000100', '', 'U-A', '', '', 'A question', 0, 0, 0, 0),
+			($1, 'T1', 'C1', '1593473566.000200', '2026-08-29 14:01:00+00', '1593473566.000200', '', '', '', '', '', 0, 0, 0, 1)`,
+	} {
+		if _, err := execContext(ctx, store.db, statement, account); err != nil {
+			t.Fatalf("seed Slack context: %v", err)
+		}
+	}
+
+	request, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: "Mark help read", Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type: SlackMarkConversationReadOperation, Account: account,
+			ConversationID: "C1", MessageTS: "1593473566.000200",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	preview := mapFromAny(request.Mutations[0].Preview["slack_read"])
+	if preview["conversation_name"] != "help" || preview["target_deleted"] != true {
+		t.Fatalf("Slack preview for a deleted target = %#v", preview)
+	}
+	messages := mapSliceFromAny(preview["messages"])
+	if len(messages) != 1 || messages[0]["text"] != "A question" || messages[0]["position"] != "before" {
+		t.Fatalf("Slack context around a deleted target = %#v", messages)
+	}
+}
+
 // A request proposed before links and faces existed has to get them on read:
 // the Slack conversation context is snapshotted at proposal time and never
 // re-read, so a batch already sitting in the queue would otherwise show

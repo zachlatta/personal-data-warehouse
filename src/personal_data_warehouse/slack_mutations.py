@@ -210,8 +210,12 @@ class SlackMutationExecutor:
         if not target:
             return _terminal(
                 safe_result,
-                "Slack mark-read target is not an exact, live message synced in this account/workspace",
+                "Slack mark-read target is not an exact message synced in this account/workspace",
             )
+        # A target deleted after review still anchors the cursor: its ts is a
+        # real point in this conversation, and the reviewer approved reading
+        # through it. The result says so rather than hiding it.
+        target_deleted = bool(target.get("is_deleted"))
         if str(target.get("team_id") or "") != team_id:
             return _terminal(safe_result, "Slack mark-read target belongs to a different workspace")
         if bool(target.get("is_archived")):
@@ -232,7 +236,7 @@ class SlackMutationExecutor:
             if _slack_ts(channel.get("last_read") or "0") >= _slack_ts(message_ts):
                 return SlackMutationResult(
                     status="succeeded",
-                    result_json={**safe_result, "already_read": True},
+                    result_json={**safe_result, "already_read": True, "target_deleted": target_deleted},
                 )
         except ValueError as exc:
             return _retryable(safe_result, str(exc))
@@ -245,7 +249,7 @@ class SlackMutationExecutor:
             return _api_failure(safe_result, "conversations.mark", marked)
         return SlackMutationResult(
             status="succeeded",
-            result_json={**safe_result, "already_read": False},
+            result_json={**safe_result, "already_read": False, "target_deleted": target_deleted},
         )
 
     # --- send message ------------------------------------------------------------

@@ -952,6 +952,33 @@ def test_slack_mark_read_target_and_observation_are_pinned_to_exact_message(
     assert _request_status(warehouse, request["id"]) == "observed"
 
 
+def test_slack_mark_read_target_survives_the_message_being_deleted_after_review(
+    warehouse: PostgresWarehouse,
+) -> None:
+    # A batch is snapshotted, proposed and approved minutes apart; a bot's
+    # auto-post deleted in between is still an exact point in that
+    # conversation, so a read cursor can be moved through it. A thread reply
+    # still needs a live parent.
+    warehouse.ensure_slack_tables()
+    conversation_id = "C1"
+    deleted_ts = "1593473566.000200"
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id=conversation_id, last_read="1593473500.000100")]
+    )
+    warehouse.insert_slack_messages(
+        [_slack_message_row(conversation_id=conversation_id, message_ts=deleted_ts, is_deleted=1)]
+    )
+
+    target = warehouse.load_slack_mark_read_target(
+        account="zrl", team_id="T1", conversation_id=conversation_id, message_ts=deleted_ts
+    )
+    assert target["message_ts"] == deleted_ts
+    assert target["is_deleted"] == 1
+    assert warehouse.load_slack_message_target(
+        account="zrl", team_id="T1", conversation_id=conversation_id, message_ts=deleted_ts
+    ) == {}
+
+
 def test_slack_send_targets_and_observation_are_pinned_to_synced_rows(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -1057,7 +1084,9 @@ def _slack_conversation_row(
     )
 
 
-def _slack_message_row(*, conversation_id: str, message_ts: str, client_msg_id: str = "") -> dict[str, Any]:
+def _slack_message_row(
+    *, conversation_id: str, message_ts: str, client_msg_id: str = "", is_deleted: int = 0
+) -> dict[str, Any]:
     now = datetime(2026, 5, 22, 12, tzinfo=UTC)
     return _default_row(
         SLACK_MESSAGE_COLUMNS,
@@ -1069,6 +1098,7 @@ def _slack_message_row(*, conversation_id: str, message_ts: str, client_msg_id: 
         thread_ts=message_ts,
         text="please review",
         client_msg_id=client_msg_id,
+        is_deleted=is_deleted,
         raw_json="{}",
         synced_at=now,
         sync_version=1,

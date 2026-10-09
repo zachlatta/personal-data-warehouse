@@ -29,6 +29,9 @@ type slackMarkReadPreviewDetail struct {
 	ThreadTS           string
 	SelfUserID         string
 	TeamDomain         string
+	// TargetDeleted: the message the boundary lands on was deleted in Slack
+	// after it was chosen. The executor still marks through its ts.
+	TargetDeleted bool
 }
 
 type slackMarkReadPreviewRow struct {
@@ -166,6 +169,7 @@ func applySlackMarkReadPreviewRows(
 		slackRead["context_kind"] = strings.TrimSpace(detail.ContextKind)
 		slackRead["thread_ts"] = strings.TrimSpace(detail.ThreadTS)
 		slackRead["team_domain"] = strings.TrimSpace(detail.TeamDomain)
+		slackRead["target_deleted"] = detail.TargetDeleted
 		if link := deeplink.Slack(detail.TeamID, detail.ConversationID, detail.MessageTS, detail.ThreadTS, detail.TeamDomain); link != nil {
 			slackRead["open"] = link
 		}
