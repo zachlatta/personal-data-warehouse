@@ -415,3 +415,52 @@ until the worker moved into pdw). `APPLE_CONTACTS_MUTATIONS_ENABLED=0`
 pauses the local worker; `pdw ingest apple-contacts --mutations-only` / `--no-mutations`
 split the two stages. The app needs `APPLE_CONTACTS_ACCOUNTS` (falls back to
 `GMAIL_ACCOUNTS`) to accept proposals for the account.
+
+## Sending text messages (apple_messages mutations)
+
+`apple_messages.send_message` sends one iMessage or SMS as Zach, in the Apple Notes /
+Contacts shape: iMessage and SMS have no server API, so the proposal and review halves live
+with every other mutation type (`app/internal/mutations/apple_messages.go`) and the executor
+is local — `app/internal/mutationworkers/applemessages` driving Messages.app over AppleScript,
+claimed by `pdw mutations apple-messages` (resident LaunchAgent
+`com.zachlatta.personal-data-warehouse.apple-messages-mutation-worker`, through
+`bin/apple-messages-mutation-worker-launchd`) on the Mac that already uploads Apple Messages
+(porygon). `apple_messages` is in `LOCAL_ONLY_MUTATION_PROVIDERS`, so the cloud worker never
+claims it.
+
+- **The proposal names one handle exactly.** `recipient` is normalized to E.164 (a bare
+  ten-digit number is read as `+1`, anything else must carry its country code) or a
+  lowercased email, and anything else — a name, a seven-digit number — is refused at
+  proposal time, because a wrong normalization is a text to a stranger. `text` is plain,
+  at most 4,000 characters; `service` is `auto` (default), `iMessage` or `SMS`. No group
+  chats: one recipient per mutation.
+- **The review names the person, on the read path.** `hydrateAppleMessagesPreviews` reads
+  the contact card(s) whose `marts_contacts.contact_points.normalized_value` is the handle
+  and the six newest messages with that handle from `base_apple_messages`, and warns when
+  the handle is on no card or has never been texted.
+- **One approval sends one message.** Messages has no idempotency key and a text cannot be
+  unsent, so before every attempt the executor reads chat.db (live, read-only) for an
+  outgoing message with the same text to the same handle since `approved_at` (minus a
+  minute) and records a hit as `succeeded` with `already_sent: true`. An unreadable chat.db
+  is `failed_retryable` with nothing sent; a timeout is retryable only because of that
+  check; nothing is reclaimed from a stale `executing` claim. After sending, the executor
+  waits up to 15 s for the row Messages writes and records its `message_guid`, `service`
+  and delivery flags; a row Messages marks with an `error` is `failed_terminal` (retrying
+  would put a second copy beside the failed one).
+- **Where it sends.** `auto` sends in the most recently active one-to-one chat with the
+  handle (`chat id "<chat.guid>"`), on whatever service that conversation uses, and only
+  addresses `participant <handle>` of the iMessage account when there is none (or when the
+  chat id does not resolve, which sends nothing). `SMS` needs the Mac to be paired with
+  Zach's iPhone for Text Message Forwarding.
+- **`APPLE_MESSAGES_SEND_ALLOWED_RECIPIENTS`** (comma-separated handles, read from the
+  worker's environment or the repo `.env`) restricts sends to those handles and fails
+  anything else terminal before Messages is asked; a list naming nobody valid fails closed.
+  It is the testing guard; unset means unrestricted. `APPLE_MESSAGES_MUTATIONS_ENABLED=0`
+  pauses the worker.
+- **Automation → Messages** is a TCC grant separate from Notes and Contacts, attributed to
+  `~/.local/bin/pdw` through the same `launchd → /bin/zsh → pdw → osascript` chain. A
+  missing grant reads `blocked_missing_credentials`. Never probe it with a shell-run
+  `osascript` on headless porygon: the prompt wedges tccd (see the Notes section above).
+- The app needs `APPLE_MESSAGES_ACCOUNTS` (falls back to `APPLE_MESSAGES_ACCOUNT`, then
+  `GMAIL_ACCOUNTS`) to accept proposals for the account, which is
+  `base_apple_messages.messages.account`.

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	mwapplecontacts "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applecontacts"
+	mwapplemessages "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applemessages"
 	mwapplenotes "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applenotes"
 )
 
@@ -16,6 +17,7 @@ import (
 var mutationWorkers = map[string]localCommand{
 	"apple-notes":    mwapplenotes.Spec.Run,
 	"apple-contacts": mwapplecontacts.Spec.Run,
+	"apple-messages": mwapplemessages.Spec.Run,
 }
 
 func mutationWorkerNames() []string {
@@ -32,7 +34,7 @@ const mutationsUsage = `pdw mutations - apply approved local-only mutations thro
 USAGE
   pdw mutations <provider> [--once]
 
-Apple Notes and Apple Contacts have no server API, so a reviewed mutation for
+Apple Notes, Apple Contacts and Apple Messages have no server API, so a reviewed mutation for
 them is applied here, by asking the app itself over AppleScript. Without
 flags the process is the resident worker: it LISTENs on the warehouse for
 approvals, drains the queue, polls as a fallback, and stops on SIGTERM/SIGINT.
@@ -43,6 +45,7 @@ PROVIDERS
   apple-notes      apple_notes.create_note / update_note through Notes.app
   apple-contacts   apple_contacts.create_contact / update_contact /
                    merge_contacts through Contacts.app
+  apple-messages   apple_messages.send_message through Messages.app
 
 FLAGS
   --once           Apply one batch and exit instead of staying resident.

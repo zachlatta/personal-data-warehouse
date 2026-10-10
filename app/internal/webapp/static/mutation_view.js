@@ -153,6 +153,9 @@ export function isContactMutation(m) {
 export function isCalendarMutation(m) { return m.provider === "google_calendar" || CALENDAR_OPS.includes(m.operation); }
 export function isAppleNotesMutation(m) { return m.provider === "apple_notes" || APPLE_NOTES_OPS.includes(m.operation); }
 export function isAppleContactsMutation(m) { return m.provider === "apple_contacts" || APPLE_CONTACTS_OPS.includes(m.operation); }
+export function isAppleMessagesMutation(m) {
+  return m.provider === "apple_messages" || m.operation === "apple_messages.send_message";
+}
 export function isSlackMarkReadMutation(m) {
   return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
 }
@@ -1324,4 +1327,42 @@ export function checkAttachmentLimits(attachments) {
   if (attachments.length > 100 || attachments.reduce((sum, a) => sum + attachmentSize(a), 0) > 20 * 1024 * 1024) {
     throw new Error("Attachments may contain at most 100 files and total at most 20 MiB.");
   }
+}
+
+// appleMessagesView is a text message as a reviewer must read it: the exact
+// handle it goes to, who the contact book says that is, the words (from the
+// payload, which is what runs), the latest messages with that handle, and the
+// warnings for a stranger or a first text. `resolved` is false when the read
+// path could not consult the warehouse, which is its own warning.
+export function appleMessagesView(mutation) {
+  const payload = asMap(mutation.payload);
+  const preview = asMap(asMap(mutation.preview).text_message);
+  const result = asMap(mutation.result);
+  const recipient = trimStr(payload.recipient) || trimStr(preview.recipient);
+  const names = stringSlice(preview.recipient_names);
+  const resolved = "warnings" in preview;
+  const warnings = stringSlice(preview.warnings);
+  if (!resolved) warnings.push("The recipient was not checked against the warehouse. Verify the number or address below before approving.");
+  const service = trimStr(payload.service) || trimStr(preview.service) || "auto";
+  const recent = mapSlice(preview.recent_messages).map((message) => ({
+    at: trimStr(message.message_at),
+    isFromMe: message.is_from_me === true,
+    actor: message.is_from_me === true ? "You" : (names[0] || recipient),
+    service: trimStr(message.service),
+    text: str(message.text),
+  })).reverse();
+  return {
+    heading: names.length ? "Text " + names.join(" / ") : "Text " + recipient,
+    recipient,
+    recipientName: names.join(" / "),
+    service,
+    serviceLabel: service === "auto" ? "existing conversation (iMessage if none)" : service,
+    text: str(payload.text) || str(preview.text),
+    recent,
+    warnings,
+    effect: "Sends this text as Zach from Messages on his Mac to " + recipient + ". It cannot be unsent once delivered.",
+    sent: trimStr(result.message_guid) !== "",
+    sentService: trimStr(result.service),
+    alreadySent: result.already_sent === true,
+  };
 }

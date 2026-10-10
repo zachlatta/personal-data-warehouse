@@ -924,3 +924,12 @@ def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -
         ("mut-slack-send", "failed_retryable", "Slack chat.postMessage request failed: TimeoutError", {"conversation_id": "C1", "client_msg_id": "abc"}, "worker-1")
     ]
     assert summary.failed_retryable == 1
+
+
+def test_the_cloud_worker_never_claims_a_text_message_send() -> None:
+    # A text is sent by Messages.app on Zach's Mac (`pdw mutations apple-messages`). If the
+    # cloud worker claimed one it would fail it as unknown-provider and hide it from the Mac.
+    from personal_data_warehouse.defs.upstream_mutations import LOCAL_ONLY_MUTATION_PROVIDERS
+
+    assert "apple_messages" in LOCAL_ONLY_MUTATION_PROVIDERS
+    assert {"apple_notes", "apple_contacts"} <= set(LOCAL_ONLY_MUTATION_PROVIDERS)

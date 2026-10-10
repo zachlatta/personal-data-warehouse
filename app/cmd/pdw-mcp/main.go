@@ -56,6 +56,7 @@ func main() {
 		CalendarAccounts:      cfg.CalendarAccounts,
 		AppleNotesAccounts:    cfg.AppleNotesAccounts,
 		AppleContactsAccounts: cfg.AppleContactsAccounts,
+		AppleMessagesAccounts: cfg.AppleMessagesAccounts,
 		SlackAccounts:         cfg.SlackMutationAccounts,
 	})
 	logger.Info("mutation review enabled", "path", mutations.ReviewPath, "api", mutations.APIPath)

@@ -1018,6 +1018,35 @@ function renderSlackSendMessage(request, mutation, actions) {
   return article;
 }
 
+function renderAppleMessages(mutation) {
+  const view = V.appleMessagesView(mutation);
+  const article = h("article", "mut text-message");
+  article.appendChild(mutationHead("Messages", mutation.title || view.heading, mutation.status));
+  const action = h("div", "slack-action");
+  action.appendChild(h("strong", "", "What will happen"));
+  action.appendChild(h("p", "", view.effect));
+  action.appendChild(dl([["To", view.recipient], ["Contact", view.recipientName || "not on any contact card"], ["Service", view.serviceLabel], ["From", mutation.account]]));
+  article.appendChild(action);
+  for (const warning of view.warnings) article.appendChild(h("p", "bad slack-warning", warning));
+  article.appendChild(h("div", "eyebrow", "Message"));
+  article.appendChild(pre(view.text));
+  if (view.recent.length) {
+    const context = h("section", "slack-context");
+    context.appendChild(h("h4", "", "Latest messages with " + (view.recipientName || view.recipient)));
+    for (const message of view.recent) {
+      const row = h("p", "m");
+      row.appendChild(h("strong", "", message.actor + " "));
+      if (message.at) row.appendChild(h("span", "m", formatWhen(message.at) + " "));
+      row.appendChild(document.createTextNode(message.text));
+      context.appendChild(row);
+    }
+    article.appendChild(context);
+  }
+  if (view.sent) article.appendChild(h("p", "m", (view.alreadySent ? "Already sent earlier" : "Sent") + (view.sentService ? " over " + view.sentService : "")));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  return article;
+}
+
 function renderGeneric(mutation) {
   const article = h("article", "mut generic");
   article.appendChild(mutationHead(mutation.provider || "mutation", mutation.title || mutation.operation || "mutation", mutation.status));
@@ -1034,6 +1063,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
   if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);
+  if (V.isAppleMessagesMutation(mutation)) return renderAppleMessages(mutation);
   if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
   if (V.isSlackSendMessageMutation(mutation)) return renderSlackSendMessage(request, mutation, actions);
   return renderGeneric(mutation);

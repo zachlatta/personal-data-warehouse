@@ -20,8 +20,8 @@ func withFakeMutationWorker(t *testing.T, provider string, code int) *capturedLo
 	return cap
 }
 
-func TestMutationsTableIsTheTwoLocalOnlyProviders(t *testing.T) {
-	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"apple-contacts", "apple-notes"}) {
+func TestMutationsTableIsTheThreeLocalOnlyProviders(t *testing.T) {
+	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"apple-contacts", "apple-messages", "apple-notes"}) {
 		t.Fatalf("providers = %v", got)
 	}
 	if !sort.StringsAreSorted(mutationWorkerNames()) {

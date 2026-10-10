@@ -446,6 +446,28 @@ func MutationHelp() MutationHelpDocument {
 					"The executor requires the Slack web session Zach pastes into `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
 			},
 			{
+				Type:        AppleMessagesSendMessageOperation,
+				Summary:     "Send a text (iMessage or SMS) as Zach to one phone number or iMessage email address. Executed on Zach's Mac through Messages.app, not in the cloud.",
+				RequiresEnv: "APPLE_MESSAGES_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleMessagesSendMessageOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Messages account label (base_apple_messages.messages.account)"},
+					{Name: "recipient", JSONType: "string", Required: true, Description: "ONE phone number in E.164 form (+13105550123; a bare 10-digit number is read as +1) or one iMessage email address. Take it from marts_contacts.contact_points or base_apple_messages.handles.address, never from a name alone."},
+					{Name: "text", JSONType: "string", Required: true, Description: "the message, plain text, at most 4000 characters"},
+					{Name: "service", JSONType: "string", Required: false, Description: `"auto" (default: reply in the conversation Zach already has with this handle, whatever its service; iMessage when there is none), "iMessage", or "SMS"`},
+				},
+				Example: map[string]any{
+					"type":      AppleMessagesSendMessageOperation,
+					"account":   "you@example.com",
+					"recipient": "+13105550123",
+					"text":      "Running 10 minutes late, sorry!",
+				},
+				ExtraNotes: "Nothing is sent until a human approves the request; the review shows the exact handle, the contact card(s) it belongs to, and the latest messages exchanged with it, and warns when the handle is on no card or has never been texted. " +
+					"Executed by the resident apple-messages worker on the Mac that syncs Apple Messages, so it normally sends within seconds of approval. " +
+					"One approval sends one message: before every attempt the executor looks in the Mac's chat.db for an outgoing message with the same text to the same handle since approval, and records an already-sent match as success instead of sending again. " +
+					"The result JSON carries the sent message's guid and service. Group chats are not supported: one recipient per mutation.",
+			},
+			{
 				Type:        SlackSendMessageOperation,
 				Summary:     "Send a Slack message as Zach: to a channel or group, as a DM to one person, or as a reply in a thread.",
 				RequiresEnv: "SLACK_ACCOUNTS",

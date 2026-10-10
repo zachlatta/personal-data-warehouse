@@ -59,6 +59,10 @@ type Mutation struct {
 	Status       string
 	AttemptCount int64
 	Payload      map[string]any
+	// ApprovedAt is when a human approved the row (zero when the ledger holds
+	// none). An executor whose upstream has no idempotency key looks for its
+	// own earlier send no further back than this.
+	ApprovedAt time.Time
 }
 
 // Result is what an executor reports for one mutation.

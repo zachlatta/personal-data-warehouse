@@ -74,7 +74,7 @@ function flattenPayload(payload: Record<string, unknown>): Record<string, unknow
   return out;
 }
 
-const HEADLINE_KEYS = ['to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
+const HEADLINE_KEYS = ['recipient', 'text', 'service', 'to', 'cc', 'bcc', 'subject', 'body_text', 'thread_ids', 'summary', 'start', 'end', 'location', 'description', 'attendees', 'name', 'body', 'append_body', 'folder', 'note_id'];
 
 // An edit on screen that approval has to save first: approval runs the stored
 // version, never the screen's.

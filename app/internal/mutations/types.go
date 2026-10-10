@@ -26,6 +26,8 @@ const (
 	AppleContactsCreateContactOperation = "apple_contacts.create_contact"
 	AppleContactsUpdateContactOperation = "apple_contacts.update_contact"
 	AppleContactsMergeContactsOperation = "apple_contacts.merge_contacts"
+	AppleMessagesProvider               = "apple_messages"
+	AppleMessagesSendMessageOperation   = "apple_messages.send_message"
 	SlackProvider                       = "slack"
 	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
 	SlackSendMessageOperation           = "slack.send_message"
@@ -45,6 +47,7 @@ type Config struct {
 	CalendarAccounts      []string
 	AppleNotesAccounts    []string
 	AppleContactsAccounts []string
+	AppleMessagesAccounts []string
 	SlackAccounts         []string
 	Now                   func() time.Time
 	// RequestCreated is called after a request lands in pending_review — the
@@ -176,6 +179,8 @@ type MutationInput struct {
 	Text               string
 	ThreadTS           string
 	ReplyBroadcast     bool
+	Recipient          string
+	Service            string
 }
 
 type GmailEmailVariantInput struct {

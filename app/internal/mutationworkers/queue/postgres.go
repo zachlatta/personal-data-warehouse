@@ -221,7 +221,8 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 		  FROM candidates
 		 WHERE mutation.id = candidates.id
 		RETURNING mutation.id, mutation.request_id, mutation.provider, mutation.operation,
-		          mutation.account, mutation.status, mutation.attempt_count, mutation.payload_json::text
+		          mutation.account, mutation.status, mutation.attempt_count, mutation.payload_json::text,
+		          mutation.approved_at
 	`, providerFilter, n+3, n+6, n+5, n+1, n+2, n+3, n+4)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -236,11 +237,15 @@ func (s *PostgresStore) ClaimApproved(ctx context.Context, limit int, claimedBy 
 	for rows.Next() {
 		var m Mutation
 		var payload string
-		if err := rows.Scan(&m.ID, &m.RequestID, &m.Provider, &m.Operation, &m.Account, &m.Status, &m.AttemptCount, &payload); err != nil {
+		var approvedAt sql.NullTime
+		if err := rows.Scan(&m.ID, &m.RequestID, &m.Provider, &m.Operation, &m.Account, &m.Status, &m.AttemptCount, &payload, &approvedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		m.Payload = decodeJSONMap(payload)
+		if approvedAt.Valid && approvedAt.Time.After(Epoch) {
+			m.ApprovedAt = approvedAt.Time
+		}
 		claimed = append(claimed, m)
 	}
 	rows.Close()
