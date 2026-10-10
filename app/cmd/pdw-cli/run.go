@@ -303,8 +303,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	// `pdw search --help` must print the search FlagSet's own help, not the
 	// global usage: the flags this command accepts (notably --priority) are
 	// otherwise undiscoverable from the command itself.
-	if cmd == "search" && hasHelpArg(rest) {
-		fmt.Fprint(stdout, searchUsage)
+	if help, ok := commandHelp[cmd]; ok && hasHelpArg(rest) {
+		fmt.Fprint(stdout, help)
 		return 0
 	}
 	if hasHelpArg(rest) {
@@ -1045,8 +1045,11 @@ func renderCallOutput(raw json.RawMessage, format string, stdout, stderr io.Writ
 		return nil
 	}
 	var content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		Resource *struct {
+			Text *string `json:"text"`
+		} `json:"resource"`
 	}
 	value, ok := result["content"]
 	if !ok || string(value) == "null" || json.Unmarshal(value, &content) != nil {
@@ -1062,9 +1065,14 @@ func renderCallOutput(raw json.RawMessage, format string, stdout, stderr io.Writ
 	}
 	skipped := 0
 	for _, block := range content {
-		if block.Type == "text" {
+		switch {
+		case block.Type == "text":
 			fmt.Fprintln(stdout, block.Text)
-		} else {
+		case block.Type == "resource" && block.Resource != nil && block.Resource.Text != nil:
+			// An embedded text resource (the skills connection's skill_file
+			// answers this way) is text; only a blob resource is not.
+			fmt.Fprintln(stdout, *block.Resource.Text)
+		default:
 			skipped++
 		}
 	}
@@ -1190,6 +1198,15 @@ func isVersionFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+// commandHelp is the help of the API commands that carry their own; the rest
+// are answered by the global usage. (The local commands -- ingest, chatgpt,
+// slack, ... -- are dispatched before the help check and print their own.)
+var commandHelp = map[string]string{
+	"search":  searchUsage,
+	"context": contextUsage,
+	"token":   tokenUsage,
 }
 
 // hasHelpArg reports whether a help flag appears before a "--" terminator.

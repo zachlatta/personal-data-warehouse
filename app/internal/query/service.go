@@ -710,11 +710,19 @@ func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) st
 	if len(refs) == 0 || len(refs) > maxHintRelations {
 		return out
 	}
+	missing := strings.ToLower(quotedIdentifier(message))
+	if idx := strings.LastIndex(missing, "."); idx >= 0 {
+		missing = missing[idx+1:]
+	}
 	parts := make([]string, 0, len(refs))
+	similar := make([]string, 0, 4)
 	for _, ref := range refs {
 		columns := s.relationColumnNames(ctx, ref)
 		if len(columns) == 0 {
 			continue
+		}
+		for _, column := range similarColumns(missing, columns) {
+			similar = append(similar, ref.DisplayName()+"."+column)
 		}
 		if len(columns) > maxHintColumns {
 			columns = append(columns[:maxHintColumns:maxHintColumns], "...")
@@ -724,7 +732,67 @@ func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) st
 	if len(parts) == 0 {
 		return out
 	}
+	if len(similar) > 0 {
+		out += " (did you mean " + strings.Join(similar, " / ") + "?)"
+	}
 	return out + " (" + strings.Join(parts, "; ") + ")"
+}
+
+// similarColumns names the real columns that share the missing name's words:
+// one is the other with a word added or dropped (operation_type -> operation,
+// value -> point_value, account_name -> account and name), or the same words
+// without the underscore (user_name -> username). That is the shape of the long
+// tail of wrong guesses, and it is out of reach of Postgres' own suggestion,
+// which only names a column a couple of edits away. At most four, in the
+// relation's own column order.
+func similarColumns(missing string, columns []string) []string {
+	missing = strings.ToLower(strings.TrimSpace(missing))
+	if missing == "" {
+		return nil
+	}
+	want := columnWords(missing)
+	flat := strings.ReplaceAll(missing, "_", "")
+	out := make([]string, 0, 4)
+	for _, column := range columns {
+		lower := strings.ToLower(column)
+		if lower == missing || lower == "..." {
+			continue
+		}
+		have := columnWords(lower)
+		if strings.ReplaceAll(lower, "_", "") == flat || wordsSubset(have, want) || wordsSubset(want, have) {
+			out = append(out, column)
+			if len(out) == 4 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// columnWords drops the generic suffix words that would make nearly every
+// column "similar" to every guess (an _id or _at is shared by half a table).
+func columnWords(name string) map[string]bool {
+	words := map[string]bool{}
+	for _, word := range strings.Split(name, "_") {
+		switch word {
+		case "", "id", "at", "is", "json":
+			continue
+		}
+		words[word] = true
+	}
+	return words
+}
+
+func wordsSubset(small, big map[string]bool) bool {
+	if len(small) == 0 || len(small) > len(big) {
+		return false
+	}
+	for word := range small {
+		if !big[word] {
+			return false
+		}
+	}
+	return true
 }
 
 // maxHintRelations bounds how many relations get their columns inlined. Two or
@@ -846,6 +914,10 @@ var timeGuessColumns = map[string]bool{
 	"occurred_date": true, "message_time": true, "msg_time": true, "epoch": true,
 	"unix_time": true, "unix_ts": true, "updated": true, "updated_at": true,
 	"synced": true, "synced_at": true,
+	// timeline.events' own time column, carried to other relations by habit
+	// (three sessions in the week to 2026-10-10, on the agent-session events,
+	// where Postgres' guess was the wrong column event_type).
+	"event_ts": true,
 }
 
 func init() {
@@ -877,6 +949,10 @@ var columnRemaps = map[string]string{
 	"content":    "agent-session and chat text is in text (marts_ai_conversations.events.text) or body_text (marts_messages.messages); timeline.events has snippet and search_text",
 	"provider":   "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse), not provider",
 	"turn_index": "agent-session turns are ordered by seq within (source, session_id)",
+	// The week to 2026-10-10: operation_type in six sessions, content_text in five.
+	"operation_type": "ops.upstream_mutation_operations names the operation in operation (e.g. gmail.send_email) and the system in provider",
+	"content_text": "a Google Drive document's text is derived_documents.google_drive_file_texts.text (join on account, file_id), an agent turn's is marts_ai_conversations.events.text, " +
+		"and timeline.events has snippet and search_text; base_muse.files is the only relation with a content_text column",
 }
 
 // tableRemaps point a wrong table name at the right one. The catalog supplies
@@ -929,6 +1005,9 @@ func schemaErrorHint(message, sql string) string {
 		return hint
 	}
 	if hint := datetimeOperatorHint(message); hint != "" {
+		return hint
+	}
+	if hint := jsonArrayMismatchHint(message); hint != "" {
 		return hint
 	}
 	if hint := undefinedFunctionHint(message); hint != "" {
@@ -1055,6 +1134,27 @@ func datetimeOperatorHint(message string) string {
 	return ""
 }
 
+var builtinOnJSONRe = regexp.MustCompile(`function [a-z_]+\((?:[a-z ]+, )*jsonb?(?:, [a-z ]+)*\) does not exist`)
+
+// jsonArrayMismatchHint fires when a text function or LIKE meets a jsonb or
+// text[] column (SQLSTATE 42883). Those used to fall through to the missing-
+// function advice ("schema-qualify warehouse functions"), which answers a
+// different mistake; left(jsonb, integer), jsonb ~~ and text[] ~~* recurred in
+// eight sessions in the week to 2026-10-10.
+func jsonArrayMismatchHint(message string) string {
+	if !strings.Contains(message, "does not exist") {
+		return ""
+	}
+	if strings.Contains(message, "operator does not exist: text[] ~~") {
+		return "(hint: that column is an array (text[]) — match an element with EXISTS (SELECT 1 FROM unnest(col) a WHERE a ILIKE '%…%'), or the whole list with array_to_string(col, ' ') ILIKE '%…%'.)"
+	}
+	if strings.Contains(message, "operator does not exist: jsonb ~~") || strings.Contains(message, "operator does not exist: json ~~") ||
+		builtinOnJSONRe.MatchString(message) {
+		return "(hint: that column is jsonb, and text functions and LIKE take text — cast it (col::text ILIKE '%…%', left(col::text, 200)) or extract a field first (col->>'key').)"
+	}
+	return ""
+}
+
 // functionRemaps point a bare function name at its schema-qualified form. The
 // search entry points are the ones agents reach for unqualified, because that
 // is how they were callable before the schema reorganization moved them.
@@ -1132,10 +1232,27 @@ func undefinedTableHint(message string) string {
 		return ""
 	}
 	rel := strings.ToLower(quotedIdentifier(message))
+	if inventedAgentSessionRelation(rel) {
+		return fmt.Sprintf("(hint: there is no %s relation — agent-session turns are marts_ai_conversations.events (one row per turn or tool call: source, session_id, seq, occurred_at, role, text, tool_name), and marts_ai_conversations.sessions has one row per session. Order turns by seq; there is no turn_index.)", rel)
+	}
 	if remap, ok := tableRemaps[rel]; ok {
 		return fmt.Sprintf("(hint: there is no %s relation — use %s. Run schema_overview for the exact relation names.)", rel, remap)
 	}
 	return "(hint: no such relation — run schema_overview for the relation list, or describe_table('<name>') to have the closest matches named for you.)"
+}
+
+// inventedAgentSessionRelation recognizes the agent-session tables models
+// invent: agent_sessions.turns (with turn_index) recurred in four sessions in
+// the week to 2026-10-10, and nothing in the catalog is spelled like it.
+func inventedAgentSessionRelation(rel string) bool {
+	schema, name, qualified := strings.Cut(rel, ".")
+	if !qualified {
+		name, schema = rel, ""
+	}
+	if strings.Contains(schema, "agent_session") {
+		return true
+	}
+	return strings.HasPrefix(name, "agent_session") || name == "turns" || name == "session_turns"
 }
 
 // undefinedColumnHint fires on a missing column (SQLSTATE 42703). A structural

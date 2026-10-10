@@ -147,3 +147,21 @@ func TestCallHTTPFailureDoesNotSuggestSchemaForOtherErrors(t *testing.T) {
 		})
 	}
 }
+
+// An embedded text resource is text. The skills connection's skill_file answers
+// with {"type":"resource","resource":{"text":...}}, and --output text used to
+// print nothing for it, so agents fell back to JSON and parsed
+// content[0].text — which a resource block does not have (KeyError 'text' in
+// five sessions in the week to 2026-10-10).
+func TestCallOutputTextPrintsEmbeddedTextResources(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":{"content":[{"type":"resource","resource":{"uri":"skills://file/x/1/a.md","mimeType":"text/markdown","text":"# A file"}},{"type":"resource","resource":{"uri":"skills://file/x/1/b.bin","blob":"AAAA"}}]}}`)
+	})
+	out, diagnostic, code := runCLI(t, srv.URL, "", "call", "--output", "text", "remote__list")
+	if code != 0 || out != "# A file\n" {
+		t.Fatalf("code=%d out=%q stderr=%s", code, out, diagnostic)
+	}
+	if !strings.Contains(diagnostic, "omitted 1 non-text content block") {
+		t.Fatalf("a blob resource is still omitted loudly: stderr=%s", diagnostic)
+	}
+}

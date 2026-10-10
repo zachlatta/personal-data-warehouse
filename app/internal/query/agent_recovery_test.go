@@ -204,3 +204,124 @@ func TestUnknownPriorityErrorSeparatesTheSentinelFromTheTiers(t *testing.T) {
 		t.Fatal("unclassified must still be accepted: it is how a classification outage is found")
 	}
 }
+
+// The week to 2026-10-10: the recurring wrong names Postgres cannot correct
+// itself, because the real name is too far away for its Levenshtein guess --
+// or, for event_ts on the agent-session events, because its guess (event_type)
+// is actively wrong.
+func TestWeekToOctoberTenthWrongColumnsAreAnswered(t *testing.T) {
+	for _, c := range []struct {
+		column  string
+		message string
+		sql     string
+		want    []string
+	}{
+		// six sessions
+		{"operation_type", `ERROR: column "operation_type" does not exist (SQLSTATE 42703)`,
+			"SELECT operation_type FROM ops.upstream_mutation_operations LIMIT 1", []string{"operation", "provider"}},
+		// five sessions: the text of a Drive document, and of an agent turn
+		{"content_text", `ERROR: column "content_text" does not exist (SQLSTATE 42703)`,
+			"SELECT content_text FROM base_google_drive.files LIMIT 1", []string{"derived_documents.google_drive_file_texts", "marts_ai_conversations.events.text"}},
+		// three sessions, each told "Perhaps you meant events.event_type"
+		{"event_ts", `ERROR: column "event_ts" does not exist (SQLSTATE 42703) HINT: Perhaps you meant to reference the column "events.event_type".`,
+			"SELECT event_ts, role FROM marts_ai_conversations.events WHERE session_id = 'x' ORDER BY event_ts", []string{"occurred_at"}},
+	} {
+		hint := schemaErrorHint(c.message, c.sql)
+		for _, want := range c.want {
+			if !strings.Contains(hint, want) {
+				t.Fatalf("hint for %q = %q, want it to name %q", c.column, hint, want)
+			}
+		}
+	}
+}
+
+// Four sessions in a week invented agent_sessions.turns (with turn_index); no
+// catalog id is spelled like it, so it got the bare "no such relation".
+func TestInventedAgentSessionRelationsPointAtTheMart(t *testing.T) {
+	for _, rel := range []string{"agent_sessions.turns", "base_agent_sessions.turns", "agent_sessions.events", "agent_session_turns"} {
+		hint := schemaErrorHint(`ERROR: relation "`+rel+`" does not exist (SQLSTATE 42P01)`, "SELECT * FROM "+rel+" LIMIT 1")
+		for _, want := range []string{"marts_ai_conversations.events", "seq", "marts_ai_conversations.sessions"} {
+			if !strings.Contains(hint, want) {
+				t.Fatalf("hint for %q = %q, want it to name %q", rel, hint, want)
+			}
+		}
+	}
+}
+
+// A built-in text function or LIKE applied to jsonb, or LIKE applied to a
+// text[] column, was told to schema-qualify warehouse functions -- advice for
+// a different mistake entirely.
+func TestTypeMismatchOnJSONAndArrayColumnsSaysHowToCast(t *testing.T) {
+	for _, c := range []struct {
+		message string
+		want    []string
+	}{
+		{`ERROR: function left(jsonb, integer) does not exist (SQLSTATE 42883)`, []string{"::text", "->>"}},
+		{`ERROR: function lower(jsonb) does not exist (SQLSTATE 42883)`, []string{"::text"}},
+		{`ERROR: operator does not exist: jsonb ~~ unknown (SQLSTATE 42883)`, []string{"::text", "->>"}},
+		{`ERROR: operator does not exist: jsonb ~~* unknown (SQLSTATE 42883)`, []string{"::text"}},
+		{`ERROR: operator does not exist: text[] ~~* unknown (SQLSTATE 42883)`, []string{"unnest", "array_to_string"}},
+	} {
+		hint := schemaErrorHint(c.message, "SELECT 1")
+		if strings.Contains(hint, "schema-qualify") {
+			t.Fatalf("hint for %q sends the caller to schema-qualify: %q", c.message, hint)
+		}
+		for _, want := range c.want {
+			if !strings.Contains(hint, want) {
+				t.Fatalf("hint for %q = %q, want it to name %q", c.message, hint, want)
+			}
+		}
+	}
+}
+
+// The long tail of wrong names is mostly a real column with a word added or
+// dropped -- operation_type for operation, account_name for account + name,
+// value for point_value -- which is out of reach of Postgres' own suggestion.
+func TestUndefinedColumnErrorNamesColumnsThatShareItsWords(t *testing.T) {
+	for _, c := range []struct {
+		missing string
+		columns []string
+		want    []string
+		not     []string
+	}{
+		{"operation_type", []string{"id", "provider", "operation", "status"}, []string{"operation"}, []string{"status"}},
+		{"account_name", []string{"account_id", "account", "name", "kind"}, []string{"account", "name"}, []string{"kind"}},
+		{"value", []string{"display_name", "point_type", "point_value", "normalized_value"}, []string{"point_value", "normalized_value"}, []string{"point_type"}},
+		{"user_name", []string{"user_id", "username", "text"}, []string{"username"}, []string{"text"}},
+		{"check_name", []string{"component", "status"}, nil, []string{"component", "status"}},
+	} {
+		got := similarColumns(c.missing, c.columns)
+		joined := "," + strings.Join(got, ",") + ","
+		for _, want := range c.want {
+			if !strings.Contains(joined, ","+want+",") {
+				t.Fatalf("similarColumns(%q) = %v, want %q", c.missing, got, want)
+			}
+		}
+		for _, not := range c.not {
+			if strings.Contains(joined, ","+not+",") {
+				t.Fatalf("similarColumns(%q) = %v, should not name %q", c.missing, got, not)
+			}
+		}
+	}
+}
+
+func TestUndefinedColumnErrorLeadsWithTheSimilarColumns(t *testing.T) {
+	const sql = "SELECT operation_type FROM ops.upstream_mutation_operations LIMIT 1"
+	runner := fakeRunner{
+		results: map[string]RawResult{
+			describeColumnsSQL("ops", "upstream_mutation_operations"): {
+				Columns: []string{"name", "type"},
+				Rows: []map[string]any{
+					{"name": "id", "type": "text"},
+					{"name": "operation", "type": "text"},
+				},
+			},
+		},
+		errs: map[string]error{sql: errors.New(`ERROR: column "operation_type" does not exist (SQLSTATE 42703)`)},
+	}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 200})
+	resp := svc.ExecuteFull(context.Background(), "mutation kinds", sql, "csv")
+	if !strings.Contains(resp.Error, `did you mean ops.upstream_mutation_operations.operation`) {
+		t.Fatalf("error should name the similar column, got: %s", resp.Error)
+	}
+}

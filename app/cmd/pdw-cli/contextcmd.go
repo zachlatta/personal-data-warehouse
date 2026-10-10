@@ -79,7 +79,20 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 	fs.IntVar(&after, "a", contextDefaultWindow, "alias for --after")
 	fs.BoolVar(&refs, "refs", false, "append each event's ref")
 	fs.StringVar(&output, "output", "text", "text or json")
-	ordered, err := searchFlagsFirst(fs, args)
+	for _, arg := range args {
+		if arg == "--full" || arg == "-full" {
+			// search has --full, so agents reach for it here (twice in the
+			// week to 2026-10-10). The context tool returns each event's
+			// stored preview, which is at most 500 characters; the whole
+			// text is one hop away, and only the error can say where.
+			fmt.Fprintln(stderr, "pdw context: there is no --full -- each line is the event's stored preview (at most 500 characters). "+
+				"For the whole text, add --output json (or --refs) and drill into the source row: an agent turn is marts_ai_conversations.events.text "+
+				"(WHERE source = '<provider>' AND session_id = '<id>' AND seq = <n>, all three read off the ref), an email base_gmail.messages.body_markdown_clean; "+
+				"for anything else, timeline.events.source_table + source_pk name the row.")
+			return 2
+		}
+	}
+	ordered, err := flagsFirst(fs, args, "context")
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw context:", err)
 		return 2
