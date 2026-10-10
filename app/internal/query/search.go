@@ -308,7 +308,8 @@ type SearchRequest struct {
 // SearchResponse mirrors the query tool's result shape: JSON row maps with the
 // same per-field truncation, plus search metadata. Mode is the mode that
 // actually executed; FallbackReason is set when hybrid was requested but the
-// keyword path ran instead; Hint carries retrieval advice for the NEXT call.
+// keyword path ran instead, or when a hybrid leg timed out and was left out of
+// the fusion; Hint carries retrieval advice for the NEXT call.
 type SearchResponse struct {
 	Query                  string            `json:"query"`
 	Mode                   string            `json:"mode"`
