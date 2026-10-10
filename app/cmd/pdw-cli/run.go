@@ -1169,7 +1169,19 @@ var commandRedirects = map[string]string{
 	"schema_overview": "print the warehouse schema with `pdw schema`",
 	"describe_table":  "list one relation's columns with `pdw columns <table>`",
 	"tools":           "list the server's tools with `pdw list`",
+	// `pdw get <ref>` and `pdw get-object <ref>`: five sessions in the fortnight
+	// to 2026-10-10 wanted a hit's whole record and got the global usage.
+	"get":        readHitRedirect,
+	"get-object": readHitRedirect,
+	"get_object": readHitRedirect,
+	"show":       readHitRedirect,
+	"fetch":      readHitRedirect,
 }
+
+const readHitRedirect = "read a search hit's conversation with `pdw context '<ref>'`. For its whole record, " +
+	"`pdw sql` on the row the ref names: timeline.events WHERE adapter = '<text before the first colon>' AND event_id = '<the rest>' " +
+	"gives source_table + source_pk (an agent turn's full text is marts_ai_conversations.events.text, an email's base_gmail.messages.body_markdown_clean). " +
+	"A stored file's bytes (attachment, recording, Drive file, Slack F… id) are `pdw call get_object --data '{\"storage_file_id\":\"…\"}'`"
 
 // callToolRedirects are the tools `call` refuses, because each already has a
 // first-class command whose output is readable rather than raw JSON.

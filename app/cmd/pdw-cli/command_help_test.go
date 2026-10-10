@@ -39,3 +39,12 @@ func TestContextUnknownFlagNamesContextAndFullSaysWhereFullTextIs(t *testing.T) 
 		t.Fatalf("code=%d stderr=%s", code, stderr)
 	}
 }
+
+func TestGetIsAnsweredWithHowToReadAHit(t *testing.T) {
+	for _, cmd := range []string{"get", "get-object", "get_object"} {
+		_, stderr, code := runCLI(t, "http://127.0.0.1:1", "", cmd, "gmail_email:a|b")
+		if code != 2 || !strings.Contains(stderr, "pdw context") || !strings.Contains(stderr, "source_pk") || !strings.Contains(stderr, "get_object") {
+			t.Fatalf("pdw %s: code=%d stderr=%s", cmd, code, stderr)
+		}
+	}
+}
