@@ -920,3 +920,75 @@ func TestFastSearchDoesNotReadHostPressure(t *testing.T) {
 		t.Fatalf("a fast search read host files %d times", read)
 	}
 }
+
+// One leg exhausting the statement budget used to fail the whole hybrid search
+// -- five sessions in the week to 2026-10-10, four of them the lexical leg on a
+// recent `since` -- while the other legs had already answered. A timed-out leg
+// now contributes nothing, the survivors are fused, and the response says
+// which leg is missing, the same contract as the keyword fallback.
+func TestSearchHybridFusesTheSurvivingLegsWhenOneTimesOut(t *testing.T) {
+	timeout := errors.New("ERROR: canceling statement due to statement timeout (SQLSTATE 57014)")
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows("gmail_email:a|m2"),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		argsErrs: map[string]error{searchHybridLexicalSQL: timeout},
+	}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}})
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "Hack Club be global", Since: "2026-10-07"})
+	if resp.Error != "" {
+		t.Fatalf("a single timed-out leg should not fail the search: %s", resp.Error)
+	}
+	if resp.Mode != SearchModeHybrid || !strings.Contains(resp.FallbackReason, "lexical leg") || !strings.Contains(resp.FallbackReason, "statement timeout") {
+		t.Fatalf("mode = %q fallback = %q", resp.Mode, resp.FallbackReason)
+	}
+	fuse := runner.callsFor(searchHybridFuseSQL)
+	if len(fuse) != 1 {
+		t.Fatalf("fuse calls = %#v", fuse)
+	}
+	if refs, ok := fuse[0][2].([]string); !ok || len(refs) != 0 {
+		t.Fatalf("a timed-out leg contributes no refs: %#v", fuse[0][2])
+	}
+	if refs, ok := fuse[0][4].([]string); !ok || len(refs) != 1 {
+		t.Fatalf("the literal leg's refs are still fused: %#v", fuse[0][4])
+	}
+}
+
+// Anything other than a timeout is still an error: an invalid tier, a broken
+// function or a dead connection is not an answer with a piece missing.
+func TestSearchHybridStillFailsOnANonTimeoutLegError(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows(),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		argsErrs: map[string]error{searchHybridLexicalSQL: errors.New(`ERROR: unknown priority "urgent" (SQLSTATE 22023)`)},
+	}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}})
+	resp := svc.Search(context.Background(), SearchRequest{Query: "budget"})
+	if !strings.Contains(resp.Error, "unknown priority") {
+		t.Fatalf("error = %q", resp.Error)
+	}
+}
+
+// When every leg times out there is nothing to fuse, and the timeout is the answer.
+func TestSearchHybridFailsWhenEveryLegTimesOut(t *testing.T) {
+	timeout := errors.New("ERROR: canceling statement due to statement timeout (SQLSTATE 57014)")
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsErrs: map[string]error{
+			searchHybridLexicalSQL: timeout, searchHybridSemanticSQL: timeout, searchHybridExactSQL: timeout,
+		},
+	}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}})
+	resp := svc.Search(context.Background(), SearchRequest{Query: "budget"})
+	if !strings.Contains(resp.Error, "statement timeout") {
+		t.Fatalf("error = %q", resp.Error)
+	}
+}

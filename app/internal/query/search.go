@@ -426,10 +426,14 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	var err error
 	if hybridVector != "" {
 		var legs hybridTimings
-		raw, legs, err = s.runHybridSearch(
+		var degraded string
+		raw, legs, degraded, err = s.runHybridSearch(
 			ctx, runner, resp.Query, maxResults, sources, since, priorities,
 			hybridVector, s.embedder.Model(),
 		)
+		if degraded != "" {
+			resp.FallbackReason = degraded
+		}
 		legs.Embed = embedDuration
 		timings = &legs
 	} else {
@@ -536,57 +540,52 @@ func (s *Service) runHybridSearch(
 	priorities any,
 	vector string,
 	embeddingModel string,
-) (RawResult, hybridTimings, error) {
+) (RawResult, hybridTimings, string, error) {
 	var (
-		lexical  RawResult
-		exact    RawResult
-		semantic RawResult
-		timings  hybridTimings
+		lexical, exact, semantic          RawResult
+		lexicalErr, exactErr, semanticErr error
+		timings                           hybridTimings
 	)
-	group, groupCtx := errgroup.WithContext(ctx)
+	// A plain group, not WithContext: one leg exhausting the statement budget
+	// must not cancel the legs that are about to answer. See degradedHybridLegs.
+	var group errgroup.Group
 	group.Go(func() error {
-		var err error
 		started := time.Now()
 		defer func() { timings.Lexical = time.Since(started) }()
-		lexical, err = runner.QueryArgs(
-			groupCtx, searchHybridLexicalSQL,
+		lexical, lexicalErr = runner.QueryArgs(
+			ctx, searchHybridLexicalSQL,
 			[]any{query, maxResults, sources, since, priorities}, maxResults,
 		)
-		if err != nil {
-			return fmt.Errorf("hybrid lexical leg: %w", err)
-		}
 		return nil
 	})
 	group.Go(func() error {
-		var err error
 		started := time.Now()
 		defer func() { timings.Exact = time.Since(started) }()
-		exact, err = runner.QueryArgs(
-			groupCtx, searchHybridExactSQL,
+		exact, exactErr = runner.QueryArgs(
+			ctx, searchHybridExactSQL,
 			[]any{query, maxResults, sources, since, priorities}, maxResults,
 		)
-		if err != nil {
-			return fmt.Errorf("hybrid literal leg: %w", err)
-		}
 		return nil
 	})
 	group.Go(func() error {
-		var err error
 		started := time.Now()
 		defer func() { timings.Semantic = time.Since(started) }()
 		// The SQL function owns the measured candidate bound. maxRows=0
 		// lets SQL return every event inside it for rank fusion.
-		semantic, err = runner.QueryArgs(
-			groupCtx, searchHybridSemanticSQL,
+		semantic, semanticErr = runner.QueryArgs(
+			ctx, searchHybridSemanticSQL,
 			[]any{vector, embeddingModel, maxResults, sources, since, nil}, 0,
 		)
-		if err != nil {
-			return fmt.Errorf("hybrid semantic leg: %w", err)
-		}
 		return nil
 	})
-	if err := group.Wait(); err != nil {
-		return RawResult{}, timings, err
+	_ = group.Wait()
+	degraded, err := degradedHybridLegs([]hybridLegResult{
+		{name: "lexical", err: lexicalErr},
+		{name: "literal", err: exactErr},
+		{name: "semantic", err: semanticErr},
+	})
+	if err != nil {
+		return RawResult{}, timings, "", err
 	}
 
 	// A source can legitimately have no embedded chunks. A nil Go slice
@@ -597,7 +596,7 @@ func (s *Service) runHybridSearch(
 	semanticRows = append(semanticRows, semantic.Rows...)
 	semanticJSON, err := json.Marshal(semanticRows)
 	if err != nil {
-		return RawResult{}, timings, fmt.Errorf("encode hybrid semantic evidence: %w", err)
+		return RawResult{}, timings, "", fmt.Errorf("encode hybrid semantic evidence: %w", err)
 	}
 	fuseStarted := time.Now()
 	fused, err := runner.QueryArgs(
@@ -609,7 +608,49 @@ func (s *Service) runHybridSearch(
 		maxResults,
 	)
 	timings.Fuse = time.Since(fuseStarted)
-	return fused, timings, err
+	return fused, timings, degraded, err
+}
+
+type hybridLegResult struct {
+	name string
+	err  error
+}
+
+// degradedHybridLegs decides what a leg failure means. A leg that exhausted
+// the statement budget is left out and the survivors are fused, reported the
+// way the keyword fallback is: in the week to 2026-10-10 a timed-out lexical
+// leg (four of them on a recent `since`) failed five whole searches whose
+// other legs had already answered. Any other failure -- an invalid tier, a
+// broken function, a dead connection -- is still the search's error, as is
+// every leg timing out, because then there is nothing left to answer with.
+func degradedHybridLegs(legs []hybridLegResult) (string, error) {
+	dropped := make([]string, 0, len(legs))
+	var firstTimeout error
+	for _, leg := range legs {
+		if leg.err == nil {
+			continue
+		}
+		if !isStatementTimeout(leg.err) {
+			return "", fmt.Errorf("hybrid %s leg: %w", leg.name, leg.err)
+		}
+		dropped = append(dropped, leg.name)
+		if firstTimeout == nil {
+			firstTimeout = fmt.Errorf("hybrid %s leg: %w", leg.name, leg.err)
+		}
+	}
+	if len(dropped) == 0 {
+		return "", nil
+	}
+	if len(dropped) == len(legs) {
+		return "", firstTimeout
+	}
+	return fmt.Sprintf("the hybrid %s leg hit the statement timeout and was left out; these results come from the other legs only "+
+		"(a narrow recent --since on common words is the usual cause -- scope by --source or --priority instead)",
+		strings.Join(dropped, " and ")), nil
+}
+
+func isStatementTimeout(err error) bool {
+	return strings.Contains(err.Error(), "canceling statement due to statement timeout") || strings.Contains(err.Error(), "57014")
 }
 
 func searchRefs(result RawResult) []string {

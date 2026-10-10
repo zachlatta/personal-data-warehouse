@@ -1117,7 +1117,7 @@ func textJSONHint(message string) string {
 // the recovery path names the search layer rather than suggesting a retry.
 func statementTimeoutHint(message string) string {
 	if strings.Contains(message, "canceling statement due to statement timeout") {
-		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates (a time bound, priority, source) and LIMIT. For a text, name or identifier lookup use the search tool instead of ILIKE/regex over text columns — `pdw search '<terms>'` on the CLI, `--mode exact` for an id, path or amount. If the timed-out call WAS a search, scope it instead of retrying: --priority self,direct,cc, --source <name>, --since <date>, and fewer results (MCP: priorities, sources, since, max_results).)"
+		return "(hint: the query exceeded the server's statement budget and a retry will too. Narrow it with selective indexed predicates (a time bound, priority, source) and LIMIT. For a text, name or identifier lookup use the search tool instead of ILIKE/regex over text columns — `pdw search '<terms>'` on the CLI, `--mode exact` for an id, path or amount. If the timed-out call WAS a search, scope it instead of retrying: --priority self,direct,cc or --source <name> (MCP: priorities, sources), and drop generic words. Do not add a narrow recent --since to a broad search on common words: the ranked scan then walks past every older match (measured 2026-10-10, 0.46s unscoped against past 60s with since three days ago).)"
 	}
 	return ""
 }

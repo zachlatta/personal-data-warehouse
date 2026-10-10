@@ -42,7 +42,11 @@ than paging deeper.
   `slack_files`, `mutations`, `muse_file`. An unknown token errors with the valid set.
 - `since` — a lower bound on event time (`2026-03-01`). It is also the lever that makes
   a scoped Google Drive search cheap: Drive documents are multi-megabyte and scoring 50
-  of them costs seconds.
+  of them costs seconds. **On a broad search it is the opposite**: a window of a few days
+  on common words makes the ranked scan walk past every older match, and it times out
+  (0.46s unscoped against past 60s with three days, 2026-10-10). Pair a recent `since`
+  with `sources` or `priorities`, or use distinctive words; for "what happened this
+  week" read `timeline.events` by `event_ts` instead of searching.
 - `max_results` — default 20. Raise it for recall work only; a scoped search pays per
   returned row.
 
