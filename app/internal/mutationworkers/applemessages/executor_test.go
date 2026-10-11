@@ -1,6 +1,7 @@
 package applemessages
 
 import (
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -220,7 +221,7 @@ func TestChatDBLookupsReadTheMessagesSchema(t *testing.T) {
 	statements := []string{
 		`CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)`,
 		`CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, chat_identifier TEXT, service_name TEXT, style INTEGER)`,
-		`CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, handle_id INTEGER, service TEXT, date INTEGER, is_from_me INTEGER, is_sent INTEGER, is_delivered INTEGER, error INTEGER)`,
+		`CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB, handle_id INTEGER, service TEXT, date INTEGER, is_from_me INTEGER, is_sent INTEGER, is_delivered INTEGER, error INTEGER)`,
 		`CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER, message_date INTEGER)`,
 		`INSERT INTO handle VALUES (1, '+13105550123')`,
 		`INSERT INTO chat VALUES (1, 'SMS;-;+13105550123', '+13105550123', 'SMS', 45), (2, 'any;-;+13105550123', '+13105550123', 'iMessage', 45), (3, 'chat123', 'chat123', 'iMessage', 43)`,
@@ -231,7 +232,7 @@ func TestChatDBLookupsReadTheMessagesSchema(t *testing.T) {
 		}
 	}
 	insert := func(rowid int, guid, text string, handle int, at time.Time, fromMe int, chat int) {
-		if _, err := db.Exec(`INSERT INTO message VALUES (?, ?, ?, ?, 'iMessage', ?, ?, 1, 1, 0)`, rowid, guid, text, handle, toAppleNanos(at), fromMe); err != nil {
+		if _, err := db.Exec(`INSERT INTO message VALUES (?, ?, ?, NULL, ?, 'iMessage', ?, ?, 1, 1, 0)`, rowid, guid, text, handle, toAppleNanos(at), fromMe); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(`INSERT INTO chat_message_join VALUES (?, ?, ?)`, chat, rowid, toAppleNanos(at)); err != nil {
@@ -242,12 +243,23 @@ func TestChatDBLookupsReadTheMessagesSchema(t *testing.T) {
 	insert(2, "INCOMING", "hi", 1, approved.Add(time.Minute), 0, 2)
 	insert(3, "SENT", "hi", 0, approved.Add(2*time.Minute), 1, 2) // handle_id 0: found through the chat
 	insert(4, "GROUP", "hi", 0, approved.Add(3*time.Minute), 1, 3)
+	// Modern macOS leaves message.text NULL and keeps the body only in the
+	// attributedBody archive: this is how every AppleScript send on porygon
+	// was stored on 2026-10-10, and a text-only match never saw them.
+	archived, _ := hex.DecodeString(plainAttributedBodyHex)
+	if _, err := db.Exec(`INSERT INTO message VALUES (5, 'ARCHIVED', NULL, ?, 1, 'iMessage', ?, 1, 1, 1, 0)`, archived, toAppleNanos(approved.Add(4*time.Minute))); err != nil {
+		t.Fatal(err)
+	}
 	db.Close()
 
 	store := NewChatDBStore(path)
 	sent, found, err := store.FindSent("+13105550123", "hi", approved)
 	if err != nil || !found || sent.GUID != "SENT" || !sent.IsDelivered {
 		t.Fatalf("FindSent = %+v %v %v", sent, found, err)
+	}
+	archivedSent, found, err := store.FindSent("+13105550123", "Hello from Messages", approved)
+	if err != nil || !found || archivedSent.GUID != "ARCHIVED" {
+		t.Fatalf("a sent row whose body lives only in attributedBody must match: %+v %v %v", archivedSent, found, err)
 	}
 	if _, found, _ := store.FindSent("+13105550123", "something else", approved); found {
 		t.Fatal("different text must not match")
@@ -267,3 +279,8 @@ func TestChatDBLookupsReadTheMessagesSchema(t *testing.T) {
 		t.Fatal("no chat expected for an unknown handle")
 	}
 }
+
+// plainAttributedBodyHex is the "plain" fixture from
+// uploaders/applemessages/testdata/attributed_bodies.jsonl: an NSArchiver blob
+// of "Hello from Messages" produced by Foundation.
+const plainAttributedBodyHex = "040b73747265616d747970656481e803840140848484124e5341747472696275746564537472696e67008484084e534f626a656374008592848484084e53537472696e67019484012b1348656c6c6f2066726f6d204d6573736167657386840269490113928484840c4e5344696374696f6e6172790094840169008686"

@@ -441,7 +441,12 @@ claims it.
 - **One approval sends one message.** Messages has no idempotency key and a text cannot be
   unsent, so before every attempt the executor reads chat.db (live, read-only) for an
   outgoing message with the same text to the same handle since `approved_at` (minus a
-  minute) and records a hit as `succeeded` with `already_sent: true`. An unreadable chat.db
+  minute) and records a hit as `succeeded` with `already_sent: true`. The body is matched
+  after decoding `attributedBody` (the uploader's typedstream decoder), never on
+  `message.text` alone: on this macOS every AppleScript send is stored with `text` NULL,
+  and the first production test (2026-10-11, delivered fine) read `verified: false`
+  because a `text = ?` match could not see it — the same blindness would have let a
+  retry send twice. An unreadable chat.db
   is `failed_retryable` with nothing sent; a timeout is retryable only because of that
   check; nothing is reclaimed from a stale `executing` claim. After sending, the executor
   waits up to 15 s for the row Messages writes and records its `message_guid`, `service`
