@@ -44,6 +44,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 
 from personal_data_warehouse.config import Settings, WhoopPrivateConfig, load_settings
 from personal_data_warehouse.warehouse import warehouse_from_settings
@@ -359,16 +360,18 @@ def parse_pg_date_range(value: Any) -> tuple[date, date]:
 
 
 def parse_timezone_offset(value: Any) -> timedelta:
-    """``"-04:00"`` -> a timedelta. Day boundaries here are user-local."""
+    """``"-0400"`` or ``"-04:00"`` -> a timedelta. Day boundaries here are user-local.
+
+    The live bootstrap sends ``"-0400"``, with no colon (checked 2026-10-11).
+    Until then only the colon form parsed, so every "user-local" day in this
+    source was silently the UTC day.
+    """
     text = _text(value).strip()
-    if not text or text[0] not in "+-" or ":" not in text:
+    match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", text)
+    if not match:
         return timedelta(0)
-    sign = -1 if text[0] == "-" else 1
-    try:
-        hours, minutes = text[1:].split(":", 1)
-        return sign * timedelta(hours=int(hours), minutes=int(minutes))
-    except ValueError:
-        return timedelta(0)
+    sign = -1 if match.group(1) == "-" else 1
+    return sign * timedelta(hours=int(match.group(2)), minutes=int(match.group(3)))
 
 
 def local_day(moment: datetime, offset: timedelta) -> date:
@@ -1496,6 +1499,13 @@ class WhoopPrivateSyncRunner:
                 break
         refs = coach_conversation_refs(pages, today=today, offset=offset)
         stored = self._warehouse.whoop_private_coach_conversation_ids(account=account)
+        # Messages carry no time, so the list is the only dating source. Every
+        # stored conversation is re-dated from it each run: one that is past
+        # the recent few is never re-read, and a wrong date (or a title the
+        # app later gave an untitled chat) would otherwise stay forever.
+        self._warehouse.redate_whoop_private_coach_conversations(
+            account=account, refs=[ref for ref in refs if ref.conversation_id in stored], synced_at=synced_at
+        )
         recent = refs[:WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS]
         missing = [
             ref for ref in refs[WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS:] if ref.conversation_id not in stored

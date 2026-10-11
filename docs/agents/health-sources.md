@@ -247,6 +247,10 @@ pdw whoop publish-session          # add --dry-run to verify cookie decryption f
 - **`during`, `days` and `optimal_sleep_times` are PostgreSQL range notation**
   (`['start','end')`). Parse the bounds; do not cast the string to a timestamp.
 - Day boundaries are user-local — take `timezone_offset` from the bootstrap response first.
+  It arrives as `-0400`, **without a colon**; until 2026-10-11 the parser accepted only
+  `-04:00`, so every "local" day in this source was really the UTC day and coach chats
+  landed four hours early. Coach conversations are re-dated from the list every run,
+  which corrected the stored ones.
 - The cycle carries `predicted_end` + `data_state`, which is a cleaner in-progress signal
   than the warehouse's epoch sentinel.
 - Rate limits are 2,000 per 5 minutes and 144,000 per day (~20x the public API), so a

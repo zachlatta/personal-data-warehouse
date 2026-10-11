@@ -9771,6 +9771,47 @@ class PostgresWarehouse:
             chain[week_start] = date.fromisoformat(str(previous)[:10]) if previous else None
         return chain
 
+    def redate_whoop_private_coach_conversations(
+        self, *, account: str, refs: Sequence[Any], synced_at: datetime
+    ) -> None:
+        """Apply the chat-history list's date and title to stored conversations.
+
+        Only rows that actually differ are touched, and their ``synced_at``
+        moves so the timeline's incremental pass re-reads them.
+        """
+        if not refs:
+            return
+        values = [
+            (
+                ref.conversation_id,
+                ref.title,
+                ref.started_on,
+                ref.started_at,
+                ref.started_at_precision,
+            )
+            for ref in refs
+        ]
+        self._command(
+            "UPDATE @whoop_private_coach_messages m SET "
+            "conversation_title = v.title, started_on = v.started_on, "
+            "conversation_started_at = v.started_at, started_at_precision = v.precision, "
+            "synced_at = %s "
+            "FROM (SELECT * FROM unnest(%s::text[], %s::text[], %s::date[], %s::timestamptz[], %s::text[]) "
+            "AS u(conversation_id, title, started_on, started_at, precision)) v "
+            "WHERE m.account = %s AND m.conversation_id = v.conversation_id "
+            "AND (m.conversation_title, m.started_on, m.conversation_started_at, m.started_at_precision) "
+            "IS DISTINCT FROM (v.title, v.started_on, v.started_at, v.precision)",
+            (
+                synced_at,
+                [v[0] for v in values],
+                [v[1] for v in values],
+                [v[2] for v in values],
+                [v[3] for v in values],
+                [v[4] for v in values],
+                account,
+            ),
+        )
+
     def whoop_private_coach_conversation_ids(self, *, account: str) -> set[str]:
         """Coach conversations already stored -- that walk's cursor."""
         rows = self._query(

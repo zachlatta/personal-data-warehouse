@@ -34,6 +34,7 @@ from personal_data_warehouse.whoop_private_sync import (
     heart_rate_samples_to_rows,
     journal_entries_to_rows,
     parse_pg_range,
+    parse_timezone_offset,
     plan_windows,
     public_whoop_private_sync_summary,
     recovery_to_row,
@@ -111,6 +112,7 @@ class FakeWhoopPrivateWarehouse:
         # Healthspan weeks stored by earlier runs: week_start -> previous week.
         self.healthspan_chain: dict = {}
         self.coach_conversation_ids: set[str] = set()
+        self.coach_redated: list = []
         # kind -> {doc_key: synced_at}, for the labs once-a-day cursor.
         self.document_synced_at: dict[str, dict] = {}
 
@@ -209,6 +211,9 @@ class FakeWhoopPrivateWarehouse:
 
     def whoop_private_healthspan_chain(self, *, account):
         return dict(self.healthspan_chain)
+
+    def redate_whoop_private_coach_conversations(self, *, account, refs, synced_at):
+        self.coach_redated.extend(refs)
 
     def whoop_private_coach_conversation_ids(self, *, account):
         return set(self.coach_conversation_ids)
@@ -1642,3 +1647,39 @@ def test_older_coach_conversations_already_stored_are_not_refetched(monkeypatch)
     assert [params["conversation_id"] for name, params in client.calls if name == "coach_conversation"] == [
         "conv-today"
     ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # What the live bootstrap actually sends (2026-10-11): no colon. Until
+        # then only "-04:00" parsed, so every "user-local" day in this source
+        # was silently a UTC day and coach chats were dated four hours early.
+        ("-0400", timedelta(hours=-4)),
+        ("-04:00", timedelta(hours=-4)),
+        ("+0530", timedelta(hours=5, minutes=30)),
+        ("+05:30", timedelta(hours=5, minutes=30)),
+        ("", timedelta(0)),
+        ("garbage", timedelta(0)),
+    ],
+)
+def test_the_bootstrap_timezone_offset_parses_with_or_without_a_colon(value, expected) -> None:
+    assert parse_timezone_offset(value) == expected
+
+
+def test_stored_coach_conversations_are_redated_from_the_list_every_run(monkeypatch) -> None:
+    """Messages carry no time, so the list is the only dating source.
+
+    A conversation stored under a wrong date (the colon-less offset above)
+    is never re-fetched once it is older than the recent few, so its date
+    has to be corrected from the list, not from a re-read.
+    """
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.coach_conversation_ids = {"conv-today", "conv-oct6", "conv-2025"}
+
+    _run(monkeypatch, warehouse=warehouse)
+
+    dated = {ref.conversation_id: ref for ref in warehouse.coach_redated}
+    assert set(dated) == {"conv-today", "conv-oct6", "conv-2025"}
+    # 21:15:00 on 2025-11-02 at -04:00 is 01:15 UTC the next day.
+    assert dated["conv-2025"].started_at == datetime(2025, 11, 3, 1, 15, tzinfo=UTC)

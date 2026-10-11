@@ -131,3 +131,36 @@ def test_healthspan_marts_translate_every_exposed_date_and_timestamp(
     row = next(row for row in _dicts(warehouse, logical) if row["account"] == "sentinel")
     for column in temporal:
         assert row[column] is None, f"{logical}.{column} still exposes the epoch sentinel"
+
+
+def test_redating_a_coach_conversation_moves_only_rows_that_differ(warehouse: PostgresWarehouse) -> None:
+    from datetime import timedelta
+
+    from personal_data_warehouse.whoop_private_healthspan import coach_conversation_refs, coach_message_rows
+
+    warehouse.ensure_whoop_private_tables()
+    wrong = coach_conversation_refs([fixtures.COACH_PAGE_ONE], today=date(2026, 10, 11), offset=timedelta(0))
+    for ref in wrong:
+        warehouse.insert_whoop_private_coach_messages(
+            coach_message_rows(account="zach", ref=ref, payload=fixtures.coach_conversation(ref.conversation_id), synced_at=NOW)
+        )
+    right = coach_conversation_refs([fixtures.COACH_PAGE_ONE], today=date(2026, 10, 11), offset=timedelta(hours=-4))
+    later = datetime(2026, 10, 11, 13, 0, tzinfo=UTC)
+
+    warehouse.redate_whoop_private_coach_conversations(account="zach", refs=right, synced_at=later)
+
+    rows = warehouse._query(
+        "SELECT conversation_id, conversation_started_at, synced_at FROM "
+        + warehouse.sql_relation("whoop_private_coach_messages")
+    )
+    by_conversation = {row[0]: (row[1], row[2]) for row in rows}
+    assert by_conversation["conv-today"] == (datetime(2026, 10, 11, 11, 0, 45, tzinfo=UTC), later)
+    # A day-precision chat starts at local midnight, which also moved.
+    assert by_conversation["conv-oct6"][0] == datetime(2026, 10, 6, 4, 0, tzinfo=UTC)
+
+    warehouse.redate_whoop_private_coach_conversations(
+        account="zach", refs=right, synced_at=datetime(2026, 10, 11, 14, 0, tzinfo=UTC)
+    )
+    unchanged = warehouse._query("SELECT DISTINCT synced_at FROM " + warehouse.sql_relation("whoop_private_coach_messages"))
+    # Nothing differed the second time, so nothing was re-synced.
+    assert unchanged == [(later,)]
