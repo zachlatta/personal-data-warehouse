@@ -401,6 +401,7 @@ def test_process_upstream_mutation_batch_completes_and_fails_claimed_rows() -> N
     contact_executor = FakeExecutor([])
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=executor,
         contact_executor=contact_executor,
@@ -425,6 +426,7 @@ def test_process_upstream_mutation_batch_claims_before_any_observation_work() ->
     warehouse = FakeWarehouse(claimed=[])
 
     upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeGmailExecutor([]),
         contact_executor=FakeExecutor([]),
@@ -460,6 +462,7 @@ def test_process_upstream_mutation_batch_reclaims_stale_executing_rows_before_cl
     warehouse = FakeWarehouse(reclaimed=3)
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeGmailExecutor([]),
         contact_executor=FakeExecutor([]),
@@ -513,6 +516,7 @@ def test_process_upstream_mutation_batch_batches_gmail_archive_rows() -> None:
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=FakeExecutor([]),
@@ -618,6 +622,7 @@ def test_process_upstream_mutation_batch_batches_matching_gmail_label_changes_se
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=FakeExecutor([]),
@@ -701,6 +706,7 @@ def test_process_upstream_mutation_batch_falls_back_when_batch_modify_has_no_mes
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=FakeExecutor([]),
@@ -750,6 +756,7 @@ def test_process_upstream_mutation_batch_records_retryable_batch_failure_progres
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=FakeExecutor([]),
@@ -789,6 +796,7 @@ def test_process_upstream_mutation_batch_routes_contact_mutations_to_contact_exe
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=gmail_executor,
         contact_executor=contact_executor,
@@ -809,6 +817,7 @@ def test_process_upstream_mutation_batch_defers_unknown_provider() -> None:
     warehouse = FakeWarehouse(claimed=[mutation])
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeExecutor([]),
         contact_executor=FakeExecutor([]),
@@ -839,6 +848,7 @@ def test_process_upstream_mutation_batch_routes_calendar_mutations_to_calendar_e
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeExecutor([]),
         contact_executor=FakeExecutor([]),
@@ -870,6 +880,7 @@ def test_process_upstream_mutation_batch_routes_slack_mark_read_to_slack_executo
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeExecutor([]),
         contact_executor=FakeExecutor([]),
@@ -914,6 +925,7 @@ def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -
     )
 
     summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        on_gmail_settings_changed=None,
         warehouse=warehouse,
         gmail_executor=FakeExecutor([]),
         contact_executor=FakeExecutor([]),

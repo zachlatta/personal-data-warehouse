@@ -160,7 +160,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
-                on_gmail_settings_changed=lambda accounts: _resync_gmail_settings(
+                on_gmail_settings_changed=lambda accounts: resync_gmail_settings(
                     settings=settings, warehouse=warehouse, accounts=accounts, logger=context.log
                 ),
             )
@@ -171,7 +171,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
     return asdict(summary)
 
 
-def _resync_gmail_settings(*, settings, warehouse, accounts: set[str], logger) -> None:
+def resync_gmail_settings(*, settings, warehouse, accounts: set[str], logger) -> None:
     """Re-snapshot the labels and filters a just-succeeded mutation changed.
 
     The review of the next proposal reads base_gmail.labels/filters, so this
@@ -333,7 +333,7 @@ def process_upstream_mutation_batch(
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
-    on_gmail_settings_changed: Callable[[set[str]], None] | None = None,
+    on_gmail_settings_changed: Callable[[set[str]], None] | None,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()

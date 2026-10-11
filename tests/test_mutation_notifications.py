@@ -115,3 +115,63 @@ def test_resident_worker_executes_slack_mutations_instead_of_spinning_on_them(mo
     upstream_mutation_worker.CloudMutationProcessor().process_pending()
 
     assert isinstance(seen.get("slack_executor"), SlackMutationExecutor)
+
+
+def test_resident_worker_resyncs_gmail_labels_and_filters_after_a_settings_mutation(monkeypatch) -> None:
+    # The resident worker, not the Dagster fallback, runs nearly every approved
+    # mutation. The first production gmail.create_label (2026-10-11) succeeded
+    # here, and base_gmail.labels did not learn of the new label until the
+    # half-hourly schedule, because only the Dagster caller passed the re-sync
+    # hook: a follow-up proposal naming the label was refused in that window.
+    from personal_data_warehouse import upstream_mutation_worker
+    from personal_data_warehouse.defs.upstream_mutations import UpstreamMutationWorkerSummary
+
+    class _Warehouse:
+        def ensure_upstream_mutation_tables(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    seen: dict[str, object] = {}
+
+    def fake_batch(**kwargs):
+        seen.update(kwargs)
+        return UpstreamMutationWorkerSummary()
+
+    class _Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *exc):
+            return False
+
+    resynced: list[set[str]] = []
+    monkeypatch.setattr(upstream_mutation_worker, "load_settings", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "warehouse_from_settings", lambda settings: _Warehouse())
+    monkeypatch.setattr(upstream_mutation_worker, "GmailMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "GoogleContactMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "CalendarMutationExecutor", lambda **kwargs: object())
+    monkeypatch.setattr(upstream_mutation_worker, "exclusive_sync_lock", lambda **kwargs: _Lock())
+    monkeypatch.setattr(upstream_mutation_worker, "process_upstream_mutation_batch", fake_batch)
+    monkeypatch.setattr(
+        upstream_mutation_worker,
+        "resync_gmail_settings",
+        lambda *, settings, warehouse, accounts, logger: resynced.append(set(accounts)),
+    )
+
+    upstream_mutation_worker.CloudMutationProcessor().process_pending()
+
+    hook = seen.get("on_gmail_settings_changed")
+    assert callable(hook)
+    hook({"zach@example.test"})
+    assert resynced == [{"zach@example.test"}]
+
+
+def test_every_mutation_batch_caller_must_say_what_happens_after_a_gmail_settings_change() -> None:
+    import inspect
+
+    from personal_data_warehouse.defs.upstream_mutations import process_upstream_mutation_batch
+
+    parameter = inspect.signature(process_upstream_mutation_batch).parameters["on_gmail_settings_changed"]
+    assert parameter.default is inspect.Parameter.empty

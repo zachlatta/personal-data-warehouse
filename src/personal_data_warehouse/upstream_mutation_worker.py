@@ -16,6 +16,7 @@ from personal_data_warehouse.defs.upstream_mutations import (
     _upstream_mutation_batch_size,
     _upstream_mutation_reclaim_after,
     process_upstream_mutation_batch,
+    resync_gmail_settings,
 )
 from personal_data_warehouse.gmail_mutations import GmailMutationExecutor
 from personal_data_warehouse.mutation_notifications import (
@@ -68,6 +69,9 @@ class CloudMutationProcessor:
                 claimed_by=self.claimed_by,
                 reclaim_after=_upstream_mutation_reclaim_after(),
                 ensure_tables=False,
+                on_gmail_settings_changed=lambda accounts: resync_gmail_settings(
+                    settings=self.settings, warehouse=self.warehouse, accounts=accounts, logger=logger
+                ),
             )
         if summary.claimed or summary.reclaimed:
             logger.info("processed upstream mutations: %s", summary)
