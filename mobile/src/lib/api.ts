@@ -238,6 +238,16 @@ export async function removeMutation(config: AppConfig, requestId: string, mutat
   return body.mutation;
 }
 
+// Undoes removeMutation: the thread goes back into the still-pending batch.
+export async function restoreMutation(config: AppConfig, requestId: string, mutationId: string): Promise<Mutation> {
+  const body = await request<{ mutation: Mutation }>(
+    config,
+    `/api/mutations/requests/${encodeURIComponent(requestId)}/mutations/${encodeURIComponent(mutationId)}/restore`,
+    { method: 'POST' },
+  );
+  return body.mutation;
+}
+
 // The edited email replaces the mutation's message (and, with variants, marks
 // the chosen one) before approval; the server normalizes and validates it.
 export type UpdateEmailMutationInput = {

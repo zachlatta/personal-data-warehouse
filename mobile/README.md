@@ -13,7 +13,7 @@ Keychain (`expo-secure-store`).
 | --- | --- |
 | Timeline (tiers default to `self`, `direct`, `cc`) | `GET /api/timeline`, `GET /api/timeline/item` |
 | Mutations (needs review / past) | `GET /api/mutations/requests[?status=…]` |
-| Review one request: approve, deny, skip an email, edit an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove`, `POST …/mutations/{mid}/update-email` |
+| Review one request: approve, deny, skip an email (and take the skip back), edit an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove`, `POST …/mutations/{mid}/restore`, `POST …/mutations/{mid}/update-email` |
 | Alerts: the global on/off switch for timeline notifications and the ledger of every one sent (delivered / opened / skipped / failed, paged by `next_cursor`) | `GET /api/notifications[?limit=&before=]`, `POST /api/notifications/settings` |
 | Settings: push registration, test push, disconnect | `POST /api/push/register`, `POST /api/push/test` |
 
@@ -47,14 +47,27 @@ asks for a reason.
   actions appear below the inbox and approval still covers the whole request.
   Tap a thread to see its full subject and messages. The latest message opens
   in full; earlier messages and sender/recipient details expand independently.
-  Bodies retain paragraphs and quoted replies, using the API's `body_text`
-  rather than its shortened `preview_text`. Missing bodies are explicitly
-  marked as previews, with an Open in Gmail link; remote email HTML is not run.
-  Filters cover unread / automated / skipped, with sender/subject search past
-  eight threads. Keep in inbox (or Skip action) removes the enclosing mutation;
-  if it affects multiple threads, the confirmation says how many. Missing
-  previews never hide affected thread IDs from the list. Approval counts only
-  mutations that will still run.
+  **A message renders its HTML part as the sender laid it out**
+  (`src/lib/email-html.ts`, `src/components/email-html-body.tsx`): a WebView
+  on white, scaled to the phone's width, as tall as the message up to 520pt
+  with "Show full email" past that, never scrolling inside the list. The
+  mail's own scripts never run: `<script>`, frames, forms, inline handlers
+  and refreshes are stripped, and the document's Content-Security-Policy
+  forbids scripts anyway; the only one that runs is the app's injected sizing
+  script. Remote images load (plain-http ones are upgraded to https), and a
+  tapped link opens in Safari, never inside the review. Until 2026-10-11 the
+  phone printed the text part, which for bulk mail is the HTML source (MSO
+  conditionals, CSS, analytics JavaScript) or empty. A text part that is
+  really HTML renders as HTML too; a message with neither part says so, with
+  Open in Superhuman. Filters cover unread / automated / skipped, with
+  sender/subject search past eight threads.
+  **Every row's action is a one-tap toggle**: "✓ Archive" while the thread is
+  in the batch, "Keep in inbox" once it is out, and the approve button's count
+  follows at once (`gmailThreadToggle`). Keeping is `POST …/mutations/{mid}/remove`;
+  tapping again is `POST …/mutations/{mid}/restore`, which takes back only a
+  drop made during review. One mutation that archives several threads asks
+  before keeping them all. Missing previews never hide affected thread IDs
+  from the list. Approval counts only mutations that will still run.
 - **Email proposals** (`gmail.send_email`) read as the composer they are: To,
   Cc, Bcc, Subject and the body are editable, the signature and quoted thread
   sit below read-only exactly as they will be sent, a proposal with several

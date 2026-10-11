@@ -190,6 +190,13 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		apiJSON(w, http.StatusOK, map[string]any{"mutation": mutationJSON(mutation)})
+	case len(parts) == 4 && parts[1] == "mutations" && parts[3] == "restore" && r.Method == http.MethodPost:
+		mutation, err := s.store.RestoreMutation(r.Context(), requestID, parts[2], actor)
+		if err != nil {
+			apiStoreError(w, err)
+			return
+		}
+		apiJSON(w, http.StatusOK, map[string]any{"mutation": mutationJSON(mutation)})
 	default:
 		http.NotFound(w, r)
 	}

@@ -109,10 +109,23 @@ back it, all behind the static bearer the CLI uses:
     changes their picture. The rule it leaves behind: anything cheap and derivable
     belongs on the read path, and only the expensive conversation walk belongs in the
     snapshot.
-  - **One mutation can be dropped from a batch without denying it** —
-    `POST …/mutations/<id>/remove`, which is operation-agnostic and has always been; the
-    phone offers it per thread as "Keep this in the inbox", and the approve button then
-    counts what will still run rather than the request's original size.
+  - **One mutation can be dropped from a batch without denying it, and put back** —
+    `POST …/mutations/<id>/remove`, which is operation-agnostic and has always been, and
+    since 2026-10-11 `POST …/mutations/<id>/restore` (`RestoreMutation`), which returns a
+    mutation to `pending_review` only when it was dropped during review (status
+    `rejected`, error `removed during review`) and its request is still pending; a denial
+    or a failure shares the status but not the error, and is never resurrected. Both bump
+    the request's revision and write a `mutation_removed` / `mutation_restored` event.
+    The phone makes it the row's own control: "✓ Archive" ⇄ "Keep in inbox", one tap each
+    way, applied optimistically, with the approve count following. In the 2026-10-11
+    screen recording keeping one thread cost an expand, a scroll past its body and a
+    confirm, and a mistaken keep could not be undone.
+  - **An email in a review is rendered, not printed.** The thread preview already
+    carried each message's `body_html` (capped at 200,000 characters); the phone showed
+    `body_text`, which for bulk mail is the HTML source or empty, so the same recording
+    was a scroll through MSO conditionals, CSS and analytics JavaScript. The phone now
+    renders the HTML part in a WebView with the mail's scripts stripped and forbidden by
+    CSP, links opened outside the review (`mobile/src/lib/email-html.ts`).
   - **The phone reviews a queue, and every word of a decision names its effect.**
     Measured from a screen recording on 2026-09-29: three one-email requests took ~10s
     each, ~3s of it tapping back, waiting on the list and re-opening, and the confirm

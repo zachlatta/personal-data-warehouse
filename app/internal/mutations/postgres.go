@@ -721,7 +721,6 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 	if remaining == 0 {
 		return Mutation{}, errors.New("cannot remove every pending mutation from a request; deny the request instead")
 	}
-	const removalError = "removed during review"
 	now := time.Now().UTC()
 	if _, err := execContext(ctx, tx, `
 		UPDATE @upstream_mutations
@@ -752,6 +751,78 @@ func (s *PostgresStore) RemoveMutation(ctx context.Context, requestID string, mu
 	committed = true
 	mutation.Status = "rejected"
 	mutation.Error = removalError
+	mutation.UpdatedAt = now
+	return mutation, nil
+}
+
+// removalError marks a mutation the reviewer dropped from a pending request.
+// It is what tells a drop RestoreMutation may undo from a denial or a failure,
+// which share the rejected status.
+const removalError = "removed during review"
+
+func (s *PostgresStore) RestoreMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error) {
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	if err := s.EnsureTables(ctx); err != nil {
+		return Mutation{}, err
+	}
+	if actor == "" {
+		actor = reviewerActorID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Mutation{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	requestStatus, err := requestStatusForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if requestStatus != "pending_review" {
+		return Mutation{}, fmt.Errorf("cannot restore mutation to request with status %s", requestStatus)
+	}
+	mutation, err := mutationForUpdate(ctx, tx, requestID, mutationID)
+	if err != nil {
+		return Mutation{}, err
+	}
+	if mutation.Status != "rejected" || mutation.Error != removalError {
+		return Mutation{}, fmt.Errorf("cannot restore mutation with status %s: only a mutation removed during review can be restored", mutation.Status)
+	}
+	now := time.Now().UTC()
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutations
+		   SET status = 'pending_review',
+		       error = '',
+		       updated_at = $1
+		 WHERE id = $2
+	`, now, mutationID); err != nil {
+		return Mutation{}, err
+	}
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutation_requests
+		   SET revision = revision + 1,
+		       updated_at = $1
+		 WHERE id = $2
+	`, now, requestID); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendMutationEvent(ctx, tx, mutationID, "restored", "human", actor, map[string]any{"request_id": requestID}); err != nil {
+		return Mutation{}, err
+	}
+	if err := appendRequestEvent(ctx, tx, requestID, "mutation_restored", "human", actor, map[string]any{"mutation_id": mutationID}); err != nil {
+		return Mutation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Mutation{}, err
+	}
+	committed = true
+	mutation.Status = "pending_review"
+	mutation.Error = ""
 	mutation.UpdatedAt = now
 	return mutation, nil
 }

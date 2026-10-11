@@ -17,6 +17,8 @@ import {
   hasGmailThreadMutations,
   gmailSenderName,
   gmailThreadDayGroups,
+  gmailThreadToggle,
+  gmailVisibleThreads,
   gmailThreadReviews,
   gmailThreadUrl,
   isAppleContactsMutation,
@@ -1180,4 +1182,70 @@ test('a request read a page at a time is labelled by the whole request, not the 
   // Read whole, the page's own count still stands.
   const whole = pagedArchiveRequest(0, 2, 2);
   assert.equal(gmailRequestSummary(whole, gmailThreadReviews(whole.mutations)).threadCount, 2);
+});
+
+test('each message carries its HTML part and a one-line preview that is never source', () => {
+  const [review] = gmailThreadReviews([archiveMutation('mut-h', {
+    thread_id: 'thread-h',
+    subject: 'Hotel message',
+    latest_from_name: 'Reservations',
+    latest_at: '2026-10-10T18:54:00Z',
+    messages: [{
+      message_id: 'h1', from_address: 'reservations@example.test', internal_date: '2026-10-10T18:54:00Z',
+      snippet: 'Booking Identifier: 1234',
+      preview_text: 'Booking Identifier: 1234 | |',
+      body_text: '<!DOCTYPE html><html><head><style>body{margin:0}</style></head><body>Booking</body></html>',
+      body_html: '<html><body><p>Booking</p></body></html>',
+    }],
+  })]);
+  const [message] = review.messages;
+  assert.equal(message.bodyHtml, '<html><body><p>Booking</p></body></html>');
+  assert.equal(message.hasFullBody, true);
+  // The collapsed message line reads the snippet, not the first 100 characters
+  // of a DOCTYPE.
+  assert.equal(message.preview, 'Booking Identifier: 1234');
+});
+
+test('a thread in the batch toggles between archive and keep in one tap, and back', () => {
+  const live = gmailThreadReviews([archiveMutation('mut-t', { thread_id: 't1', subject: 'S', messages: [] })])[0];
+  assert.deepEqual(gmailThreadToggle(live, true), {
+    state: 'included', label: 'Archive', accessibilityLabel: 'Will archive. Tap to keep in inbox.', confirm: null,
+  });
+  const kept = gmailThreadReviews([{ ...archiveMutation('mut-t', { thread_id: 't1', subject: 'S', messages: [] }), status: 'rejected', error: 'removed during review' }])[0];
+  assert.deepEqual(gmailThreadToggle(kept, true), {
+    state: 'kept', label: 'Keep in inbox', accessibilityLabel: 'Kept in inbox. Tap to archive with the rest.', confirm: null,
+  });
+  // A thread denied some other way, or a request already decided, is a label
+  // and not a control.
+  const denied = gmailThreadReviews([{ ...archiveMutation('mut-t', { thread_id: 't1', subject: 'S', messages: [] }), status: 'rejected', error: 'upstream refused' }])[0];
+  assert.equal(gmailThreadToggle(denied, true).state, 'static');
+  assert.equal(gmailThreadToggle(live, false).state, 'static');
+  // One mutation archiving several threads keeps all of them, so it says so first.
+  const pair = gmailThreadReviews([{ ...archiveMutation('mut-p', { thread_id: 'a', messages: [] }), payload: { thread_ids: ['a', 'b'] } }])[0];
+  assert.equal(gmailThreadToggle(pair, true).confirm, 'Keep 2 threads in the inbox? They archive together in this request.');
+});
+
+test('keeping a thread lowers the count the approve button names, and restoring raises it', () => {
+  const request = pagedArchiveRequest(0, 3, 3);
+  assert.equal(requestDecision(request).approveLabel, 'Archive 3');
+  const kept = withMutationStatus(request, { id: 'm1', status: 'rejected', error: 'removed during review' });
+  assert.equal(kept.pending_mutation_count, 2);
+  assert.equal(kept.mutations[1].error, 'removed during review');
+  assert.equal(requestDecision(kept).approveLabel, 'Archive 2');
+  const restored = withMutationStatus(kept, { id: 'm1', status: 'pending_review', error: '' });
+  assert.equal(restored.pending_mutation_count, 3);
+  assert.equal(requestDecision(restored).approveLabel, 'Archive 3');
+  // Re-applying what is already held changes nothing.
+  assert.equal(withMutationStatus(restored, { id: 'm1', status: 'pending_review' }).pending_mutation_count, 3);
+});
+
+test('a kept thread stays in place under All, so the same tap can put it back', () => {
+  const reviews = gmailThreadReviews([
+    archiveMutation('m-a', { thread_id: 'a', subject: 'Alpha', latest_from_name: 'Pat', latest_at: '2026-10-10T10:00:00Z', labels: ['Unread'], messages: [] }),
+    { ...archiveMutation('m-b', { thread_id: 'b', subject: 'Beta', latest_from_name: 'Lee', latest_at: '2026-10-10T09:00:00Z', labels: ['Unread'], messages: [] }), status: 'rejected', error: 'removed during review' },
+  ]);
+  assert.deepEqual(gmailVisibleThreads(reviews, 'all', '').map((r) => r.subject), ['Alpha', 'Beta']);
+  assert.deepEqual(gmailVisibleThreads(reviews, 'kept', '').map((r) => r.subject), ['Beta']);
+  assert.deepEqual(gmailVisibleThreads(reviews, 'unread', '').map((r) => r.subject), ['Alpha']);
+  assert.deepEqual(gmailVisibleThreads(reviews, 'all', 'lee').map((r) => r.subject), ['Beta']);
 });

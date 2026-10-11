@@ -740,7 +740,13 @@ export function hasGmailThreadMutations(mutations: MutationLike[]): boolean {
 }
 
 export type GmailReviewMessage = {
+  // The HTML part, rendered by the review; text is the fallback when a
+  // message has none (see lib/email-html.ts).
+  bodyHtml: string;
   hasFullBody: boolean;
+  // One clean line for the collapsed message: the snippet, never the body,
+  // because the body of bulk mail starts with a DOCTYPE.
+  preview: string;
   messageId: string;
   senderName: string;
   senderAddress: string;
@@ -770,6 +776,9 @@ export type GmailThreadReview = {
   unread: boolean;
   automated: boolean;
   removed: boolean;
+  // Dropped by the reviewer during review (not denied or failed), so one tap
+  // can put it back.
+  restorable: boolean;
   open: TimelineDeepLink | null;
   messages: GmailReviewMessage[];
 };
@@ -873,7 +882,9 @@ function gmailReviewMessage(raw: unknown): GmailReviewMessage {
     cc: list(message.cc_addresses),
     sentAt: text(message.internal_date),
     text: text(message.body_text) || text(message.preview_text) || text(message.snippet),
-    hasFullBody: Boolean(text(message.body_text)),
+    bodyHtml: text(message.body_html),
+    hasFullBody: Boolean(text(message.body_text) || text(message.body_html)),
+    preview: text(message.snippet) || text(message.preview_text),
     unread: hasUnreadLabel(labels),
   };
 }
@@ -927,12 +938,72 @@ export function gmailThreadReviews(mutations: MutationLike[]): GmailThreadReview
         unread: hasUnreadLabel(rawLabels) || hasUnreadLabel(messageLabels),
         automated: looksAutomatedSender(address, senderName, labels),
         removed: text(mutation.status) === 'rejected' || text(mutation.status) === 'removed' || text(mutation.status) === 'skipped',
+        restorable: text(mutation.status) === 'rejected' && text(asRecord(mutation).error) === REMOVED_DURING_REVIEW,
         open: url ? { url, label: 'Superhuman' } : null,
         messages: messages.map(gmailReviewMessage),
       });
     }
   }
   return reviews.sort((a, b) => (a.latestAt < b.latestAt ? 1 : a.latestAt > b.latestAt ? -1 : 0));
+}
+
+// The server's error on a mutation the reviewer dropped (RemoveMutation); the
+// only kind of rejection RestoreMutation takes back.
+export const REMOVED_DURING_REVIEW = 'removed during review';
+
+export type GmailThreadToggle = {
+  state: 'included' | 'kept' | 'static';
+  label: string;
+  accessibilityLabel: string;
+  // Asked first only when one tap would keep several threads.
+  confirm: string | null;
+};
+
+// The row's action is the control: in a pending batch it reads "Archive" while
+// the thread is in the batch and "Keep in inbox" once it is out, and a tap
+// flips it. Measured from the 2026-10-11 screen recording, keeping one thread
+// took a tap to expand, a scroll past its body to find the button, and a
+// confirm; a mistaken keep could not be taken back at all.
+export function gmailThreadToggle(review: GmailThreadReview, pending: boolean): GmailThreadToggle {
+  const archive = review.action === 'Archive';
+  const live = review.mutationStatus === 'pending_review' && !review.removed;
+  if (pending && live) {
+    const count = review.threadsInMutation;
+    return {
+      state: 'included',
+      label: review.action,
+      accessibilityLabel: archive ? 'Will archive. Tap to keep in inbox.' : `Will apply: ${review.action}. Tap to skip.`,
+      confirm: count > 1
+        ? (archive ? `Keep ${count} threads in the inbox? They archive together in this request.` : `Skip this action on ${count} threads? They change together in this request.`)
+        : null,
+    };
+  }
+  if (pending && review.restorable) {
+    return {
+      state: 'kept',
+      label: archive ? 'Keep in inbox' : 'Skipped',
+      accessibilityLabel: archive ? 'Kept in inbox. Tap to archive with the rest.' : `Skipped. Tap to apply: ${review.action}.`,
+      confirm: null,
+    };
+  }
+  return { state: 'static', label: review.removed ? (archive ? 'Kept in inbox' : 'Skipped') : review.action, accessibilityLabel: '', confirm: null };
+}
+
+// Which threads a scope shows. "All" is every thread in the request, the kept
+// ones included and marked in place: hiding a thread the moment it is kept
+// would take away the control that puts it back. The narrower chips are about
+// what will run, so they leave kept threads to "Skipped".
+export function gmailVisibleThreads(reviews: GmailThreadReview[], scope: 'all' | 'unread' | 'automated' | 'kept', query: string): GmailThreadReview[] {
+  const needle = query.trim().toLowerCase();
+  return reviews.filter((review) => {
+    if (scope === 'kept' && !review.removed) return false;
+    if ((scope === 'unread' || scope === 'automated') && review.removed) return false;
+    if (scope === 'unread' && !review.unread) return false;
+    if (scope === 'automated' && !review.automated) return false;
+    if (!needle) return true;
+    return [review.senderName, review.senderAddress, review.subject, review.preview, review.account]
+      .filter(Boolean).join(' ').toLowerCase().includes(needle);
+  });
 }
 
 export type GmailBatchSummary = {
@@ -2087,9 +2158,18 @@ export function mergeMutationPage<T extends PagedRequest>(current: T | null, pag
 // withMutationStatus applies what a drop answered — the status and revision —
 // to the held row. The answer is the stored mutation, without the thread
 // preview the review read enriched it with, so it must not replace the row.
-export function withMutationStatus<T extends PagedRequest>(request: T, changed: { id: string; status?: string; revision?: number }): T {
-  const mutations = (request.mutations ?? []).map((mutation) => (
-    mutation.id === changed.id ? { ...mutation, status: changed.status ?? mutation.status, revision: changed.revision ?? (mutation as { revision?: number }).revision } : mutation
-  ));
-  return { ...request, mutations };
+export function withMutationStatus<T extends PagedRequest>(request: T, changed: { id: string; status?: string; revision?: number; error?: string }): T {
+  let delta = 0;
+  const mutations = (request.mutations ?? []).map((mutation) => {
+    if (mutation.id !== changed.id) return mutation;
+    const status = changed.status ?? mutation.status;
+    if (mutation.status === 'pending_review' && status !== 'pending_review') delta = -1;
+    if (mutation.status !== 'pending_review' && status === 'pending_review') delta = 1;
+    const error = changed.error ?? (mutation as { error?: string }).error;
+    return { ...mutation, status, error, revision: changed.revision ?? (mutation as { revision?: number }).revision };
+  });
+  // The approve button names the server's pending count, so a drop or a
+  // restore moves it here too rather than waiting on a reload.
+  const pending = typeof request.pending_mutation_count === 'number' ? { pending_mutation_count: Math.max(0, request.pending_mutation_count + delta) } : {};
+  return { ...request, ...pending, mutations };
 }

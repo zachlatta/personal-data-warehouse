@@ -73,6 +73,9 @@ type Store interface {
 	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
 	UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error)
 	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
+	// RestoreMutation puts a mutation RemoveMutation dropped back into its
+	// still-pending request, so dropping one thread from a batch is undoable.
+	RestoreMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
 	// ApproveRequest, RejectRequest and SupersedeRequest return the request
 	// header — status, counts, who and when — without its mutations; a caller
 	// that shows mutations reads the page it shows with GetRequest.

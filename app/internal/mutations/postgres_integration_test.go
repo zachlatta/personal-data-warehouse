@@ -637,3 +637,62 @@ func TestGetRequestReadsOnePageOfMutationsAndCountsTheWhole(t *testing.T) {
 		t.Fatalf("approve answers with the header alone: status %q pending %d mutations %d", approved.Status, approved.PendingMutationCount, len(approved.Mutations))
 	}
 }
+
+// A thread kept in the inbox is one tap on the phone, so taking it back must be
+// one tap too: restore puts a mutation removed during review back into the
+// request it was dropped from, and only that kind of drop.
+func TestRestoreMutationUndoesARemovalDuringReview(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	title := fmt.Sprintf("%s %d", t.Name(), time.Now().UnixNano())
+	operations := []map[string]any{}
+	for i := 0; i < 3; i++ {
+		operations = append(operations, map[string]any{
+			"op":            "delete_contact",
+			"resource_name": fmt.Sprintf("people/%s-%d", strings.ReplaceAll(title, " ", "-"), i),
+			"etag":          fmt.Sprintf("etag-%d", i),
+		})
+	}
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title: title, Reason: "integration test", RequestedBy: "test",
+		Mutations: []MutationInput{{Type: GooglePeopleContactsOperation, Account: "zach@example.test", Operations: operations}},
+	})
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	target := created.Mutations[1].ID
+
+	if _, err := store.RestoreMutation(ctx, created.ID, target, "app:test"); err == nil {
+		t.Fatal("a mutation that was never removed has nothing to restore")
+	}
+	if _, err := store.RemoveMutation(ctx, created.ID, target, "app:test"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	restored, err := store.RestoreMutation(ctx, created.ID, target, "app:test")
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.Status != "pending_review" || restored.Error != "" {
+		t.Fatalf("restored mutation = status %q error %q, want pending_review and no error", restored.Status, restored.Error)
+	}
+	page, err := store.GetRequest(ctx, created.ID, MutationPage{Limit: 10})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if page.PendingMutationCount != 3 {
+		t.Fatalf("pending count after restore = %d, want 3", page.PendingMutationCount)
+	}
+	if page.Revision <= created.Revision+1 {
+		t.Fatalf("remove and restore each move the revision: %d -> %d", created.Revision, page.Revision)
+	}
+
+	if _, err := store.RemoveMutation(ctx, created.ID, target, "app:test"); err != nil {
+		t.Fatalf("remove again: %v", err)
+	}
+	if _, err := store.RejectRequest(ctx, created.ID, "app:test", ""); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if _, err := store.RestoreMutation(ctx, created.ID, target, "app:test"); err == nil {
+		t.Fatal("a decided request cannot take a mutation back")
+	}
+}

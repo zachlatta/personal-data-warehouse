@@ -2,14 +2,16 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
+import { EmailHtmlBody } from '@/components/email-html-body';
 import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { StatusPill } from '@/components/status-pill';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { MutationRequest } from '@/lib/api';
+import { emailBodyForDisplay } from '@/lib/email-html';
 import { cleanSnippet, formatWhen, truncate } from '@/lib/format';
-import type { GmailBatchSummary, GmailThreadReview } from '@/lib/mutation-review';
+import { gmailThreadToggle, type GmailBatchSummary, type GmailThreadReview } from '@/lib/mutation-review';
 
 const ACCENT = '#2563EB';
 const DANGER = '#DC2626';
@@ -33,7 +35,9 @@ function ThreadMessage({ message, account, defaultOpen }: { message: GmailThread
   const theme = useTheme();
   const [open, setOpen] = useState(defaultOpen);
   const [details, setDetails] = useState(false);
-  const body = message.hasFullBody ? message.text : cleanSnippet(message.text ?? '').trim();
+  const body = emailBodyForDisplay(message);
+  const text = body.kind === 'text' ? (message.hasFullBody ? body.text : cleanSnippet(body.text).trim()) : '';
+  const line = cleanSnippet(message.preview || (body.kind === 'text' ? body.text : '')).trim();
   return (
     <View style={[styles.message, { borderColor: theme.backgroundSelected }]}>
       <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }}
@@ -43,7 +47,7 @@ function ThreadMessage({ message, account, defaultOpen }: { message: GmailThread
         <View style={styles.rowCopy}>
           <ThemedText type="smallBold">{message.senderName}</ThemedText>
           <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
-            {open ? `to ${message.to.join(', ') || account}` : truncate(body, 100)}
+            {open ? `to ${message.to.join(', ') || account}` : truncate(line, 100)}
           </ThemedText>
         </View>
         <ThemedText type="small" themeColor="textSecondary">{timeOfDay(message.sentAt)}</ThemedText>
@@ -59,12 +63,37 @@ function ThreadMessage({ message, account, defaultOpen }: { message: GmailThread
           {message.cc.length ? <ThemedText type="small" selectable>Cc: {message.cc.join(', ')}</ThemedText> : null}
           <ThemedText type="small" selectable>{formatWhen(message.sentAt)}</ThemedText>
         </View> : null}
-        {body ? <ThemedText selectable style={styles.messageBody}>{body}</ThemedText> : null}
+        {body.kind === 'html' ? <EmailHtmlBody html={body.html} /> : null}
+        {text ? <ThemedText selectable style={styles.messageBody}>{text}</ThemedText> : null}
         {!message.hasFullBody ? <ThemedText type="small" themeColor="textSecondary">
-          {body ? 'Only a preview is available.' : 'This message’s body is not in the warehouse.'} Open in Superhuman to read the full message before approving.
+          {body.kind !== 'none' ? 'Only a preview is available.' : 'This message’s body is not in the warehouse.'} Open in Superhuman to read the full message before approving.
         </ThemedText> : null}
       </> : null}
     </View>
+  );
+}
+
+// The thread's place in the batch, as a control: "Archive" while it is in,
+// "Keep in inbox" once it is out, one tap either way.
+function ThreadToggle({ review, pending, onToggle }: { review: GmailThreadReview; pending: boolean; onToggle: (review: GmailThreadReview) => void }) {
+  const toggle = gmailThreadToggle(review, pending);
+  if (toggle.state === 'static') {
+    return <ThemedText type="small" style={review.removed ? styles.danger : styles.link}>{toggle.label}</ThemedText>;
+  }
+  const included = toggle.state === 'included';
+  return (
+    <Pressable
+      accessibilityRole="switch"
+      accessibilityState={{ checked: included }}
+      accessibilityLabel={toggle.accessibilityLabel}
+      onPress={() => onToggle(review)}
+      hitSlop={{ top: 10, bottom: 10, left: 8, right: 12 }}
+      style={({ pressed }) => [styles.toggle, included ? styles.toggleOn : styles.toggleOff, pressed && styles.pressed]}>
+      <View style={[styles.toggleBox, included ? styles.toggleBoxOn : styles.toggleBoxOff]}>
+        {included ? <ThemedText style={styles.toggleTick}>✓</ThemedText> : null}
+      </View>
+      <ThemedText type="smallBold" style={included ? styles.toggleOnText : styles.toggleOffText}>{toggle.label}</ThemedText>
+    </Pressable>
   );
 }
 
@@ -87,7 +116,7 @@ export function GmailThreadRow({
   const [open, setOpen] = useState(defaultOpen);
   const preview = truncate(review.preview ?? '', 140);
   return (
-    <View style={[styles.row, { borderBottomColor: theme.backgroundSelected }, review.removed && styles.rowKept]}>
+    <View style={[styles.row, { borderBottomColor: theme.backgroundSelected }]}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
@@ -96,7 +125,7 @@ export function GmailThreadRow({
         style={({ pressed }) => [styles.rowHead, pressed && { backgroundColor: theme.backgroundElement }]}>
         {/* Email has no profile picture, but the same circle keeps the row
             aligned with the Slack review's and marks an unread thread. */}
-        <Avatar name={review.senderName} size={40} highlight={review.unread} style={styles.avatar} />
+        <Avatar name={review.senderName} size={40} highlight={review.unread} style={[styles.avatar, review.removed && styles.dim]} />
         <View style={styles.rowCopy}>
           <View style={styles.rowTop}>
             <ThemedText type={review.unread ? 'smallBold' : 'small'} numberOfLines={1} style={styles.rowSender}>
@@ -108,21 +137,20 @@ export function GmailThreadRow({
           <ThemedText
             type={review.unread ? 'smallBold' : 'small'}
             numberOfLines={open ? undefined : 1}
-            style={[styles.rowSubject, review.removed && styles.struck]}>
+            style={[styles.rowSubject, review.removed && styles.dim]}>
             {review.subject}
           </ThemedText>
           {preview ? <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>{preview}</ThemedText> : null}
-          <ThemedText type="small" style={styles.link}>{review.action}</ThemedText>
-          {review.removed || review.unread || review.labels.length ? (
-            <View style={styles.rowChips}>
-              {review.removed ? <Chip label="SKIPPED" tone="danger" /> : null}
-              {review.unread ? <Chip label="UNREAD" tone="accent" /> : null}
-              {review.labels.map((label) => <Chip key={label} label={label} />)}
-            </View>
-          ) : null}
         </View>
         <ThemedText themeColor="textSecondary" style={[styles.chevron, open && styles.chevronOpen]}>›</ThemedText>
       </Pressable>
+      {/* Outside the row's button: nested in it, VoiceOver folds the toggle
+          into the row and it cannot be reached on its own. */}
+      <View style={styles.rowFoot}>
+        <ThreadToggle review={review} pending={pending} onToggle={onKeep} />
+        {review.unread ? <Chip label="UNREAD" tone="accent" /> : null}
+        {review.labels.map((label) => <Chip key={label} label={label} />)}
+      </View>
 
       {open ? (
         <View style={styles.expanded}>
@@ -143,13 +171,6 @@ export function GmailThreadRow({
           {review.error ? <ThemedText style={styles.error}>{review.error}</ThemedText> : null}
           <View style={styles.rowActions}>
             {review.open ? <OpenInSourceButton link={review.open} /> : null}
-            {pending && review.mutationStatus === 'pending_review' && !review.removed ? (
-              <Pressable accessibilityRole="button" onPress={() => onKeep(review)} style={styles.rowAction} hitSlop={6}>
-                <ThemedText type="smallBold" style={styles.danger}>
-                  {review.action === 'Archive' ? (review.threadsInMutation > 1 ? `Keep ${review.threadsInMutation} threads in inbox` : 'Keep in inbox') : (review.threadsInMutation > 1 ? `Skip action on ${review.threadsInMutation} threads` : 'Skip this action')}
-                </ThemedText>
-              </Pressable>
-            ) : null}
           </View>
         </View>
       ) : null}
@@ -266,10 +287,10 @@ export function GmailOverview({
           style={[styles.filterInput, { backgroundColor: theme.backgroundElement, color: theme.text }]}
         />
       ) : null}
-      {visible !== summary.threadCount ? (
+      {visible !== summary.threadCount + summary.keptCount ? (
         <ThemedText type="small" themeColor="textSecondary">
-          Showing {visible} of {summary.threadCount}
-          {summary.keptCount ? ` · ${summary.keptCount} skipped` : ''}
+          Showing {visible} of {summary.threadCount + summary.keptCount}
+          {summary.keptCount ? ` · ${summary.keptCount} kept out of this request` : ''}
         </ThemedText>
       ) : null}
     </View>
@@ -291,15 +312,25 @@ const styles = StyleSheet.create({
   filterInput: { minHeight: 44, borderRadius: 11, paddingHorizontal: Spacing.three, fontSize: 15 },
   error: { color: '#D0342C' },
   row: { borderBottomWidth: StyleSheet.hairlineWidth },
-  rowKept: { opacity: 0.45 },
+  dim: { opacity: 0.5 },
   rowHead: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, minHeight: 64, paddingHorizontal: Spacing.three, paddingVertical: 10 },
   avatar: { marginTop: 2 },
   rowCopy: { flex: 1, minWidth: 0, gap: 1 },
   rowTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
   rowSender: { flexShrink: 1 },
   rowSubject: { fontSize: 15, lineHeight: 21 },
-  struck: { textDecorationLine: 'line-through' },
-  rowChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 3 },
+  // Aligned under the row's text: padding (16) + avatar (40) + gap (10).
+  rowFoot: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: -4, paddingLeft: 66, paddingRight: Spacing.three, paddingBottom: 10 },
+  toggle: { flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 30, paddingLeft: 6, paddingRight: 10, borderRadius: 15, borderWidth: 1 },
+  toggleOn: { borderColor: '#2563EB', backgroundColor: '#2563EB1A' },
+  toggleOff: { borderColor: '#D97706', backgroundColor: '#D977061F' },
+  toggleBox: { width: 18, height: 18, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
+  toggleBoxOn: { backgroundColor: '#2563EB' },
+  toggleBoxOff: { borderWidth: 1.5, borderColor: '#D97706' },
+  toggleTick: { color: '#FFFFFF', fontSize: 12, lineHeight: 14, fontWeight: '800' },
+  toggleOnText: { color: '#3c87f7' },
+  toggleOffText: { color: '#D97706' },
+  pressed: { opacity: 0.6 },
   chip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 },
   chipText: { fontSize: 9, fontWeight: '700', letterSpacing: 0.6 },
   chevron: { fontSize: 20, lineHeight: 22, marginTop: 8 },

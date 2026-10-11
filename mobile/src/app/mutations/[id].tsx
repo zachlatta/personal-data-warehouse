@@ -17,7 +17,7 @@ import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { SlackSendMessageCard } from '@/components/slack-send-review';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { StatusPill } from '@/components/status-pill';
-import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
+import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
   MUTATION_PAGE_SIZE,
@@ -42,6 +42,9 @@ import {
   requestStatusTitle,
   slackMarkReadGroups,
   withMutationStatus,
+  gmailThreadToggle,
+  gmailVisibleThreads,
+  REMOVED_DURING_REVIEW,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
 import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
@@ -417,34 +420,39 @@ export default function MutationRequestScreen() {
     const current = request;
     await decide(current, requestDecision(current).deniedLabel, () => rejectMutationRequest(config, current.id, ''));
   };
-  const keepInInbox = (review: GmailThreadReview) => {
+  // One tap moves a thread in or out of the batch. The row and the approve
+  // count change at once; the server call follows, and a refusal puts the row
+  // back and says why. No confirm for one thread, because the tap is undone by
+  // tapping again; one mutation that archives several threads asks first.
+  const toggleThread = (review: GmailThreadReview) => {
     if (!request) return;
-    const count = review.threadsInMutation;
-    Alert.alert(
-      review.action === 'Archive' ? (count > 1 ? `Keep ${count} threads in the inbox?` : 'Keep this thread in the inbox?') : `Skip this action on ${count} thread${count === 1 ? '' : 's'}?`,
-      count > 1
-        ? 'They are dropped from this request; everything else still runs.'
-        : `“${review.subject}” is dropped from this request; everything else still runs.`,
-      [
+    const requestId = request.id;
+    const keep = review.mutationStatus === 'pending_review' && !review.removed;
+    const prior = { id: review.mutationId, status: review.mutationStatus, error: review.error };
+    const run = async () => {
+      setRequest((current) => (current ? withMutationStatus(current, keep
+        ? { id: review.mutationId, status: 'rejected', error: REMOVED_DURING_REVIEW }
+        : { id: review.mutationId, status: 'pending_review', error: '' }) : current));
+      try {
+        const changed = keep
+          ? await removeMutation(config, requestId, review.mutationId)
+          : await restoreMutation(config, requestId, review.mutationId);
+        setRequest((current) => (current ? withMutationStatus(current, changed) : current));
+        setError(null);
+      } catch (e) {
+        setRequest((current) => (current ? withMutationStatus(current, prior) : current));
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    };
+    const confirm = gmailThreadToggle(review, true).confirm;
+    if (keep && confirm) {
+      Alert.alert(confirm, undefined, [
         { text: 'Cancel', style: 'cancel' },
-        {
-          text: review.action === 'Archive' ? 'Keep' : 'Skip',
-          style: 'destructive',
-          onPress: async () => {
-            setBusy(true);
-            try {
-              const removed = await removeMutation(config, request.id, review.mutationId);
-              setRequest((current) => (current ? withMutationStatus(current, removed) : current));
-              await load();
-            } catch (e) {
-              setError(e instanceof Error ? e.message : String(e));
-            } finally {
-              setBusy(false);
-            }
-          },
-        },
-      ],
-    );
+        { text: review.action === 'Archive' ? 'Keep' : 'Skip', style: 'destructive', onPress: () => void run() },
+      ]);
+      return;
+    }
+    void run();
   };
   const saveSlackMessage = async (mutation: Mutation, input: UpdateSlackMessageMutationInput) => {
     if (!request) return;
@@ -505,19 +513,12 @@ export default function MutationRequestScreen() {
   const gmailSummary = gmailRequestSummary(request, gmailReviews);
   const gmailScopeCounts: Record<GmailScope, number> = {
     // "All" is the whole request; the narrower chips count what is loaded.
-    all: gmailSummary.threadCount,
+    all: gmailSummary.threadCount + gmailSummary.keptCount,
     unread: gmailReviews.filter((review) => !review.removed && review.unread).length,
     automated: gmailReviews.filter((review) => !review.removed && review.automated).length,
     kept: gmailReviews.filter((review) => review.removed).length,
   };
-  const gmailVisible = gmailReviews.filter((review) => {
-    if (scope === 'kept' ? !review.removed : review.removed) return false;
-    if (scope === 'unread' && !review.unread) return false;
-    if (scope === 'automated' && !review.automated) return false;
-    if (!query) return true;
-    return [review.senderName, review.senderAddress, review.subject, review.preview, review.account]
-      .filter(Boolean).join(' ').toLowerCase().includes(query);
-  });
+  const gmailVisible = gmailVisibleThreads(gmailReviews, scope, query);
   const gmailSections = gmailThreadDayGroups(gmailVisible);
   const decision = requestDecision(request);
   const queueList = peekMutationRequests();
@@ -609,7 +610,7 @@ export default function MutationRequestScreen() {
               </View>
             )}
             renderItem={({ item }) => (
-              <GmailThreadRow review={item} pending={pending && !busy} onKeep={keepInInbox} defaultOpen={gmailReviews.length === 1} />
+              <GmailThreadRow review={item} pending={pending && !busy} onKeep={toggleThread} defaultOpen={gmailReviews.length === 1} />
             )}
           />
         ) : slackBatch ? (

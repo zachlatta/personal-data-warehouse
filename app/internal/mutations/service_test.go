@@ -37,6 +37,10 @@ func (s *recordingStore) UpdateSlackMessageMutation(context.Context, string, str
 	return Mutation{}, nil
 }
 
+func (s *recordingStore) RestoreMutation(context.Context, string, string, string) (Mutation, error) {
+	return Mutation{}, nil
+}
+
 func (s *recordingStore) RemoveMutation(context.Context, string, string, string) (Mutation, error) {
 	return Mutation{}, nil
 }

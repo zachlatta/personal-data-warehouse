@@ -17,6 +17,7 @@ type apiFakeStore struct {
 	approved  []string
 	rejected  map[string]string
 	removed   []string
+	restored  []string
 	actors    []string
 	listCalls []RequestFilter
 	pages     []MutationPage
@@ -76,6 +77,14 @@ func (s *apiFakeStore) RemoveMutation(_ context.Context, requestID, mutationID, 
 	s.removed = append(s.removed, mutationID)
 	s.actors = append(s.actors, actor)
 	return Mutation{ID: mutationID, RequestID: requestID, Status: "removed"}, nil
+}
+func (s *apiFakeStore) RestoreMutation(_ context.Context, requestID, mutationID, actor string) (Mutation, error) {
+	if _, ok := s.requests[requestID]; !ok {
+		return Mutation{}, ErrNotFound
+	}
+	s.restored = append(s.restored, mutationID)
+	s.actors = append(s.actors, actor)
+	return Mutation{ID: mutationID, RequestID: requestID, Status: "pending_review"}, nil
 }
 func (s *apiFakeStore) ApproveRequest(_ context.Context, id, actor string) (Request, error) {
 	r, ok := s.requests[id]
@@ -246,6 +255,17 @@ func TestAPIApproveRejectAndRemoveUseAnAppActor(t *testing.T) {
 	resp, _ = http.Post(srv.URL+APIPath+"/requests/req-1/mutations/mut-1/remove", "application/json", nil)
 	if resp.StatusCode != http.StatusOK || len(store.removed) != 1 || store.removed[0] != "mut-1" {
 		t.Fatalf("remove failed: %d %v", resp.StatusCode, store.removed)
+	}
+
+	// A thread kept in the inbox by mistake goes back into the batch.
+	resp, _ = http.Post(srv.URL+APIPath+"/requests/req-1/mutations/mut-1/restore", "application/json", nil)
+	var restored map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&restored)
+	if resp.StatusCode != http.StatusOK || len(store.restored) != 1 || store.restored[0] != "mut-1" {
+		t.Fatalf("restore failed: %d %v", resp.StatusCode, store.restored)
+	}
+	if restored["mutation"].(map[string]any)["status"] != "pending_review" {
+		t.Fatalf("restore answers with the pending mutation: %v", restored)
 	}
 
 	for _, actor := range store.actors {
