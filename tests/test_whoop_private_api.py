@@ -231,3 +231,67 @@ def test_bootstrap_extracts_the_user_id_and_timezone_offset() -> None:
     assert identity.user_id == "7654321"
     assert identity.timezone_offset == "-04:00"
     assert identity.raw == payload
+
+
+@pytest.mark.parametrize(
+    ("call", "path", "params"),
+    [
+        # The Healthspan screen is one call per week; `date` picks the week and
+        # the bare path answers 404, so the date is not optional.
+        (lambda c: c.healthspan(day="2026-10-11"), "/healthspan-service/v1/healthspan/bff", {"date": "2026-10-11"}),
+        (
+            lambda c: c.healthspan_bloodwork_insights(pillar="SLEEP"),
+            "/healthspan-service/v1/healthspan/bff/bloodwork-insights",
+            {"healthspanPillar": "SLEEP"},
+        ),
+        (lambda c: c.health_monitor(day="2026-10-01"), "/coaching-service/v1/health/bff/monitor", {"date": "2026-10-01"}),
+        (lambda c: c.advanced_labs_home(), "/advanced-labs-service/v1/advanced-labs", {}),
+        (
+            lambda c: c.advanced_labs_biomarkers_summary(),
+            "/advanced-labs-service/v1/advanced-labs/biomarkers/summary",
+            {},
+        ),
+        (
+            lambda c: c.advanced_labs_test_history(),
+            "/advanced-labs-service/v1/advanced-labs/tests/history/paginated",
+            {},
+        ),
+        (lambda c: c.advanced_labs_test(test_id="t-1"), "/advanced-labs-service/v1/advanced-labs/tests/t-1", {}),
+        (lambda c: c.biomarker_test(test_id="t-1"), "/advanced-labs-service/v1/biomarker-tests/t-1", {}),
+        (
+            lambda c: c.advanced_labs_biomarker(biomarker_id="potassium"),
+            "/advanced-labs-service/v1/advanced-labs/biomarkers/potassium",
+            {},
+        ),
+        (
+            lambda c: c.advanced_labs_biomarker_recordings(biomarker_id="potassium"),
+            "/advanced-labs-service/v1/advanced-labs/all_recordings/potassium",
+            {},
+        ),
+        (
+            lambda c: c.achievements_hub(tab="HEALTHSPAN"),
+            "/milestones-service/v1/bff/milestones/hub",
+            {"selectedTab": "HEALTHSPAN"},
+        ),
+        (lambda c: c.weekly_plan(), "/progression-service/v1/weekly-plan", {}),
+        (lambda c: c.coach_conversations(), "/ai-conversation-service/v1/conversations", {}),
+        (
+            lambda c: c.coach_conversations(next_token="abc"),
+            "/ai-conversation-service/v1/conversations",
+            {"next_token": "abc"},
+        ),
+        (
+            lambda c: c.coach_conversation(conversation_id="c-1"),
+            "/ai-conversation-service/v2/conversation/c-1",
+            {},
+        ),
+    ],
+)
+def test_healthspan_labs_and_coach_use_their_discovered_paths(call, path, params) -> None:
+    client, http = make_client([FakeResponse(200, {})])
+
+    call(client)
+
+    assert http.calls[0]["method"] == "GET"
+    assert http.calls[0]["url"] == f"https://api.prod.whoop.com{path}"
+    assert {k: v for k, v in http.calls[0]["params"].items() if k != "apiVersion"} == params

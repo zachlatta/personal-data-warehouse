@@ -1211,7 +1211,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "What Zach logged himself, one row per (day, question). The only private-API table with a timeline adapter."
+      "comment": "What Zach logged himself, one row per (day, question). On the timeline as adapter whoop_private_journal (priority self)."
     },
     {
       "id": "whoop_private_sports",
@@ -1235,7 +1235,55 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Tier-2 BFF payloads (trends, stress, cardio details, sleep deep dive) kept as faithful raw_json only, keyed by (kind, doc_key). These are UI documents: WHOOP restyles them without notice, so a typed column over them goes quietly null."
+      "comment": "Tier-2 BFF payloads kept as faithful raw_json, keyed by (kind, doc_key): trends, stress, cardio details, sleep/strain deep dives, behavior impact, health_tab, health_monitor (per day), and the raw Healthspan, Advanced Labs, achievements and weekly-plan screens behind the typed healthspan_*/lab_results tables. These are UI documents: WHOOP restyles them without notice."
+    },
+    {
+      "id": "whoop_private_healthspan_weeks",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "healthspan_weeks",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Weekly WHOOP Age and Pace of Aging. week_start is the user-local week; years_difference uses WHOOP's sign: NEGATIVE means younger. Kept for every week back to calibration, not just the current one. Read marts_health.healthspan_weeks."
+    },
+    {
+      "id": "whoop_private_healthspan_contributors",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "healthspan_contributors",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "What moves WHOOP Age, per week. Each contributor's 6-month and 30-day value behind WHOOP Age (sleep consistency, hours of sleep, HR zones 1-3 and 4-5, strength time, steps, VO2 max, RHR, lean body mass), impact_years (+ adds years, - removes them), the younger_threshold where it starts lowering WHOOP Age, and WHOOP's coaching line. Durations are hours ('7:29' is 7.483). Read marts_health.healthspan_contributors."
+    },
+    {
+      "id": "whoop_private_lab_results",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "lab_results",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "WHOOP Advanced Labs results. One row per (test, biomarker), uploaded or WHOOP-run: value, unit, WHOOP's status (OPTIMAL/SUFFICIENT/OUT_OF_RANGE), the optimal range and every range band in the biomarker's own unit, and WHOOP's explanation and how_to_improve text. Read marts_health.lab_results."
+    },
+    {
+      "id": "whoop_private_coach_messages",
+      "kind": "table",
+      "layer": "base",
+      "domain": "whoop_private",
+      "schema": "base_whoop_private",
+      "name": "coach_messages",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "WHOOP Coach chat messages. Every message of the in-app AI, including the weekly Healthspan analysis: role user is Zach, assistant is WHOOP. Messages carry no timestamp; conversation_started_at comes from the chat-history list (started_at_precision says whether it is to the second or only the day)."
     },
     {
       "id": "whatsapp_chats",
@@ -3290,6 +3338,42 @@
       "query_access": "public",
       "secret": false,
       "comment": "Six-second heart rate scoped to one workout: marts_health.workouts joined to the one continuous series on the workout's own start/end bounds. elapsed_seconds is the offset into the workout, for plotting. Replaced the separate base_whoop_private.workout_heart_rate_samples table on 2026-08-26, when the continuous series moved to the same six-second grain and that table became a second copy of identical readings. Filter by workout_id or a time range; it is a range join over millions of samples."
+    },
+    {
+      "id": "marts_health_healthspan_weeks",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "health",
+      "schema": "marts_health",
+      "name": "healthspan_weeks",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Weekly WHOOP Age trend; start here. years_younger is POSITIVE when WHOOP Age is below chronological age; whoop_age_change is against the prior stored week. Start here for 'how is my WHOOP Age trending'."
+    },
+    {
+      "id": "marts_health_healthspan_contributors",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "health",
+      "schema": "marts_health",
+      "name": "healthspan_contributors",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "What drives WHOOP Age, weekly. six_month_value (what WHOOP scores), thirty_day_value (where it is heading), impact_years (+ adds years), younger_threshold and younger_direction (the side of it that lowers WHOOP Age), gap_to_younger (how far the 6-month value is from that boundary, in the contributor's unit; 0 when already there) and WHOOP's guidance. NULL values mean WHOOP has no data (lean body mass without a scan)."
+    },
+    {
+      "id": "marts_health_lab_results",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "health",
+      "schema": "marts_health",
+      "name": "lab_results",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Lab biomarkers with status and range. One row per (test, biomarker): value, unit, status, optimal_low/optimal_high (NULL when WHOOP gives no optimal band), is_latest for the newest result per biomarker, and WHOOP's how_to_improve. tested_at is when the blood was drawn."
     },
     {
       "id": "notification_state",

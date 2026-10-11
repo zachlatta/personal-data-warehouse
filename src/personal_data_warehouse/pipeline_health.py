@@ -1488,6 +1488,27 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         note="Tier-2 UI payloads kept as raw_json; collected_at is when the page was fetched",
     ),
     "whoop_private_sports": _support("whoop_private", "synced_at", note="sport catalog"),
+    "whoop_private_healthspan_weeks": _data(
+        "whoop_private",
+        "synced_at",
+        "week_start",
+        note="one row per weekly Healthspan update; the current week is re-fetched every run",
+    ),
+    "whoop_private_healthspan_contributors": _support(
+        "whoop_private", "synced_at", "week_start", note="the contributors behind each Healthspan week"
+    ),
+    "whoop_private_lab_results": _support(
+        "whoop_private",
+        "synced_at",
+        "tested_at",
+        note="Advanced Labs results; refreshed daily, and a new row only lands when a test does",
+    ),
+    "whoop_private_coach_messages": _support(
+        "whoop_private",
+        "synced_at",
+        "conversation_started_at",
+        note="WHOOP Coach chat history; quiet whenever Zach does not open the coach",
+    ),
     "whoop_private_sync_state": _state("whoop_private", "updated_at"),
     "whoop_private_sessions": _state(
         "whoop_private", "updated_at", "rotating browser-session credential (24h access, 30d refresh)"

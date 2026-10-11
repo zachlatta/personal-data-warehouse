@@ -137,8 +137,12 @@ from personal_data_warehouse.schema import (
     WHOOP_CYCLE_COLUMNS,
     WHOOP_OAUTH_TOKEN_COLUMNS,
     WHOOP_PRIVATE_CYCLE_COLUMNS,
+    WHOOP_PRIVATE_COACH_MESSAGE_COLUMNS,
     WHOOP_PRIVATE_DOCUMENT_COLUMNS,
+    WHOOP_PRIVATE_HEALTHSPAN_CONTRIBUTOR_COLUMNS,
+    WHOOP_PRIVATE_HEALTHSPAN_WEEK_COLUMNS,
     WHOOP_PRIVATE_HEART_RATE_SAMPLE_COLUMNS,
+    WHOOP_PRIVATE_LAB_RESULT_COLUMNS,
     WHOOP_PRIVATE_JOURNAL_ENTRY_COLUMNS,
     WHOOP_PRIVATE_RECOVERY_COLUMNS,
     SLACK_SESSION_COLUMNS,
@@ -346,11 +350,16 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
     ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
-    # The private (app) API contributes exactly one adapter: the journal. Its
-    # cycles/sleeps/recoveries/workouts are the same real-world events the
-    # public API already puts on the timeline, so re-emitting them would double
-    # every health event.
-    ("whoop_private", ("whoop_private_journal",), "t.kind"),
+    # The private (app) API contributes only events the public API has no
+    # equivalent of: the journal, the weekly Healthspan update and WHOOP Coach
+    # messages. Its cycles/sleeps/recoveries/workouts are the same real-world
+    # events the public API already puts on the timeline, so re-emitting them
+    # would double every health event.
+    (
+        "whoop_private",
+        ("whoop_private_journal", "whoop_private_healthspan", "whoop_private_coach"),
+        "t.kind",
+    ),
     # Stories and comments share one adapter; the subsource is the item type
     # (story / comment / job / poll) from metadata.
     ("hacker_news", ("hacker_news_item",), "COALESCE(t.metadata->>'item_type', t.kind)"),
@@ -407,6 +416,8 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
     "whoop_workout": "whoop",
     "whoop_journal": "whoop_private",
     "whoop_private_journal": "whoop_private",
+    "whoop_private_healthspan": "whoop_private",
+    "whoop_private_coach": "whoop_private",
 }
 # Hybrid retrieval (search_hybrid): reciprocal-rank-fusion constant. Rank-based
 # fusion sidesteps the cross-corpus score-comparability problem entirely — BM25
@@ -1028,6 +1039,22 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "whoop_private_documents": TableSpec(
         WHOOP_PRIVATE_DOCUMENT_COLUMNS,
         ("account", "kind", "doc_key"),
+    ),
+    "whoop_private_healthspan_weeks": TableSpec(
+        WHOOP_PRIVATE_HEALTHSPAN_WEEK_COLUMNS,
+        ("account", "week_start"),
+    ),
+    "whoop_private_healthspan_contributors": TableSpec(
+        WHOOP_PRIVATE_HEALTHSPAN_CONTRIBUTOR_COLUMNS,
+        ("account", "week_start", "contributor_key"),
+    ),
+    "whoop_private_lab_results": TableSpec(
+        WHOOP_PRIVATE_LAB_RESULT_COLUMNS,
+        ("account", "test_id", "biomarker_id"),
+    ),
+    "whoop_private_coach_messages": TableSpec(
+        WHOOP_PRIVATE_COACH_MESSAGE_COLUMNS,
+        ("account", "conversation_id", "message_id"),
     ),
     "whoop_private_sync_state": TableSpec(
         WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
@@ -1820,6 +1847,54 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS whoop_private_documents_kind_idx "
         "ON @whoop_private_documents (account, kind, collected_at DESC)",
     ),
+    IndexSpec(
+        "whoop_private_healthspan_weeks_synced_idx",
+        "whoop_private_healthspan_weeks",
+        "CREATE INDEX IF NOT EXISTS whoop_private_healthspan_weeks_synced_idx "
+        "ON @whoop_private_healthspan_weeks (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_healthspan_weeks_week_idx",
+        "whoop_private_healthspan_weeks",
+        "CREATE INDEX IF NOT EXISTS whoop_private_healthspan_weeks_week_idx "
+        "ON @whoop_private_healthspan_weeks (week_start)",
+    ),
+    IndexSpec(
+        "whoop_private_healthspan_contributors_synced_idx",
+        "whoop_private_healthspan_contributors",
+        "CREATE INDEX IF NOT EXISTS whoop_private_healthspan_contributors_synced_idx "
+        "ON @whoop_private_healthspan_contributors (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_healthspan_contributors_week_idx",
+        "whoop_private_healthspan_contributors",
+        "CREATE INDEX IF NOT EXISTS whoop_private_healthspan_contributors_week_idx "
+        "ON @whoop_private_healthspan_contributors (week_start)",
+    ),
+    IndexSpec(
+        "whoop_private_lab_results_synced_idx",
+        "whoop_private_lab_results",
+        "CREATE INDEX IF NOT EXISTS whoop_private_lab_results_synced_idx "
+        "ON @whoop_private_lab_results (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_lab_results_tested_idx",
+        "whoop_private_lab_results",
+        "CREATE INDEX IF NOT EXISTS whoop_private_lab_results_tested_idx "
+        "ON @whoop_private_lab_results (tested_at)",
+    ),
+    IndexSpec(
+        "whoop_private_coach_messages_synced_idx",
+        "whoop_private_coach_messages",
+        "CREATE INDEX IF NOT EXISTS whoop_private_coach_messages_synced_idx "
+        "ON @whoop_private_coach_messages (synced_at)",
+    ),
+    IndexSpec(
+        "whoop_private_coach_messages_started_idx",
+        "whoop_private_coach_messages",
+        "CREATE INDEX IF NOT EXISTS whoop_private_coach_messages_started_idx "
+        "ON @whoop_private_coach_messages (conversation_started_at)",
+    ),
     # Unified timeline read paths: keyset pagination by event time (with seq as
     # the tiebreak) and per-source filtered scans. The kind filter rides on the
     # time/priority indexes as a residual predicate.
@@ -2292,6 +2367,10 @@ JSONB_COLUMNS_BY_TABLE = {
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
     # a typed column over a UI payload goes quietly null when WHOOP restyles.
     "whoop_private_documents": {"raw_json"},
+    "whoop_private_healthspan_weeks": {"raw_json"},
+    "whoop_private_healthspan_contributors": {"raw_json"},
+    "whoop_private_lab_results": {"raw_json", "range_bands"},
+    "whoop_private_coach_messages": {"raw_json"},
     "plaid_items": {"error_json", "raw_json"},
     "plaid_accounts": {"raw_json"},
     "plaid_transactions": {"category_json", "raw_json"},
@@ -2401,6 +2480,11 @@ DATE_COLUMNS = {
     "day",
     "day_start",
     "day_end",
+    # WHOOP Healthspan updates weekly: a snapshot is "the week of", not an
+    # instant. A coach conversation is dated by its user-local day header.
+    "week_start",
+    "week_end",
+    "started_on",
 }
 
 
@@ -2426,6 +2510,10 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # WHOOP Advanced Labs: when the blood was drawn. WHOOP Coach: when the
+    # conversation began (to the second, or the local day's start).
+    "tested_at",
+    "conversation_started_at",
     # ops.uploader_heartbeats: when the current run-failure streak began.
     "failing_since",
     # Muse workspace files: when a path stopped existing (epoch while it does).
@@ -2811,9 +2899,36 @@ INTEGER_COLUMNS = {
     "has_gps",
     "has_survey",
     "is_current",
+    # WHOOP Healthspan, Advanced Labs and Coach: bigint 0/1 flags and orders.
+    "is_calibrating",
+    "sort_order",
+    "has_value",
+    "is_enabled",
+    "has_optimal_range",
+    "message_index",
+    "visible_to_user",
 }
 
 FLOAT_COLUMNS = {
+    # WHOOP Healthspan and Advanced Labs (whoop_private_healthspan.py).
+    "whoop_age",
+    "years_difference",
+    "chronological_age",
+    "pace_of_aging",
+    "previous_whoop_age",
+    "previous_pace_of_aging",
+    "six_month_value",
+    "thirty_day_value",
+    "impact_years",
+    "range_min",
+    "range_max",
+    "younger_threshold",
+    "six_month_range_fraction",
+    "thirty_day_range_fraction",
+    "result_value",
+    "optimal_low",
+    "optimal_high",
+    "range_meter_fraction",
     # SimpleFIN balances and holdings (provider floats, like Plaid's).
     "balance",
     "shares",
@@ -2914,6 +3029,10 @@ _WHOOP_PRIVATE_TABLES = (
     "whoop_private_journal_entries",
     "whoop_private_sports",
     "whoop_private_documents",
+    "whoop_private_healthspan_weeks",
+    "whoop_private_healthspan_contributors",
+    "whoop_private_lab_results",
+    "whoop_private_coach_messages",
     "whoop_private_sync_state",
     "whoop_private_sessions",
 )
@@ -4881,6 +5000,127 @@ class PostgresWarehouse:
             -- holds the epoch sentinel), and an open-ended range is not a
             -- window. It reappears the moment the workout is scored.
             WHERE w.start_at IS NOT NULL AND w.end_at IS NOT NULL
+            """,
+        )
+        self._ensure_healthspan_marts_views()
+
+    def _ensure_healthspan_marts_views(self) -> None:
+        """marts_health.healthspan_* and lab_results: the Healthspan read interface.
+
+        Two translations happen here and nowhere else. The base tables keep
+        WHOOP's own signs and the warehouse's NOT NULL convention; these views
+        say what an agent means:
+
+        * ``years_younger`` is POSITIVE when WHOOP Age is below chronological
+          age. WHOOP's ``years_difference`` is the opposite sign, and a reader
+          who sorts on it gets "most improved" backwards.
+        * A value WHOOP does not have (lean body mass with no scan, a biomarker
+          with no optimal band) is stored as 0 beside a ``has_*`` flag, because
+          warehouse floats are NOT NULL. A 0 there is not a measurement, so the
+          view turns it into NULL; ``AVG(six_month_value)`` over the base table
+          would otherwise average in zeros that were never readings.
+        """
+        self._ensure_table_group(
+            [
+                "whoop_private_healthspan_weeks",
+                "whoop_private_healthspan_contributors",
+                "whoop_private_lab_results",
+            ]
+        )
+        epoch = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
+        epoch_date = "DATE '1970-01-01'"
+        self._ensure_view(
+            "marts_health_healthspan_weeks",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_healthspan_weeks AS
+            SELECT
+                w.account,
+                NULLIF(w.week_start, {epoch_date}) AS week_start,
+                NULLIF(w.week_end, {epoch_date}) AS week_end,
+                w.whoop_age,
+                w.chronological_age,
+                -w.years_difference AS years_younger,
+                w.pace_of_aging,
+                w.whoop_age - lag(w.whoop_age) OVER (PARTITION BY w.account ORDER BY w.week_start)
+                    AS whoop_age_change,
+                w.pace_of_aging - lag(w.pace_of_aging) OVER (PARTITION BY w.account ORDER BY w.week_start)
+                    AS pace_of_aging_change,
+                w.is_calibrating,
+                NULLIF(w.synced_at, {epoch}) AS synced_at
+            FROM @whoop_private_healthspan_weeks w
+            """,
+        )
+        self._ensure_view(
+            "marts_health_healthspan_contributors",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_healthspan_contributors AS
+            SELECT
+                c.account,
+                NULLIF(c.week_start, {epoch_date}) AS week_start,
+                c.pillar,
+                c.contributor_key,
+                c.title,
+                c.sort_order,
+                NULLIF(c.unit, '') AS unit,
+                CASE WHEN c.has_value = 1 THEN c.six_month_value END AS six_month_value,
+                NULLIF(c.six_month_display, '') AS six_month_display,
+                CASE WHEN c.has_value = 1 THEN c.thirty_day_value END AS thirty_day_value,
+                NULLIF(c.thirty_day_display, '') AS thirty_day_display,
+                CASE WHEN c.has_value = 1 THEN c.impact_years END AS impact_years,
+                CASE WHEN c.has_value = 1 THEN
+                    c.impact_years - lag(c.impact_years) OVER (
+                        PARTITION BY c.account, c.contributor_key ORDER BY c.week_start)
+                END AS impact_years_change,
+                NULLIF(c.impact_direction, '') AS impact_direction,
+                NULLIF(c.younger_direction, '') AS younger_direction,
+                CASE WHEN c.younger_direction <> '' THEN c.younger_threshold END AS younger_threshold,
+                -- How far the scored (6-month) value is from the side that lowers
+                -- WHOOP Age, in the contributor's own unit; 0 once it is there.
+                CASE
+                    WHEN c.has_value <> 1 OR c.younger_direction = '' THEN NULL
+                    WHEN c.younger_direction = 'higher' THEN GREATEST(c.younger_threshold - c.six_month_value, 0)
+                    ELSE GREATEST(c.six_month_value - c.younger_threshold, 0)
+                END AS gap_to_younger,
+                CASE WHEN c.range_min_display NOT IN ('', '--') THEN c.range_min END AS range_min,
+                CASE WHEN c.range_max_display NOT IN ('', '--') THEN c.range_max END AS range_max,
+                NULLIF(c.guidance_title, '') AS guidance_title,
+                NULLIF(c.guidance_text, '') AS guidance_text,
+                c.is_enabled,
+                NULLIF(c.synced_at, {epoch}) AS synced_at
+            FROM @whoop_private_healthspan_contributors c
+            """,
+        )
+        self._ensure_view(
+            "marts_health_lab_results",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_lab_results AS
+            SELECT
+                r.account,
+                r.test_id,
+                NULLIF(r.test_name, '') AS test_name,
+                NULLIF(r.tested_at, {epoch}) AS tested_at,
+                r.biomarker_id,
+                r.biomarker_name,
+                CASE WHEN r.has_value = 1 THEN r.result_value END AS result_value,
+                NULLIF(r.value_display, '') AS value_display,
+                NULLIF(r.unit, '') AS unit,
+                NULLIF(r.status, '') AS status,
+                CASE WHEN r.has_optimal_range = 1 THEN r.optimal_low END AS optimal_low,
+                CASE WHEN r.has_optimal_range = 1 THEN r.optimal_high END AS optimal_high,
+                r.range_bands,
+                (row_number() OVER (
+                    PARTITION BY r.account, r.biomarker_id ORDER BY r.tested_at DESC, r.test_id
+                ) = 1)::int::bigint AS is_latest,
+                NULLIF(r.categories, '') AS categories,
+                NULLIF(r.coach_summary, '') AS coach_summary,
+                NULLIF(r.description, '') AS description,
+                NULLIF(r.why_it_matters, '') AS why_it_matters,
+                NULLIF(r.how_to_improve, '') AS how_to_improve,
+                NULLIF(r.relationship_to_whoop_metrics, '') AS relationship_to_whoop_metrics,
+                NULLIF(r.relationship_to_other_biomarkers, '') AS relationship_to_other_biomarkers,
+                NULLIF(r.test_source, '') AS test_source,
+                NULLIF(r.synced_at, {epoch}) AS synced_at
+            FROM @whoop_private_lab_results r
             """,
         )
 
@@ -9352,6 +9592,55 @@ class PostgresWarehouse:
 
     def insert_whoop_private_documents(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("whoop_private_documents", rows, WHOOP_PRIVATE_DOCUMENT_COLUMNS)
+
+    def insert_whoop_private_healthspan_weeks(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_healthspan_weeks", rows, WHOOP_PRIVATE_HEALTHSPAN_WEEK_COLUMNS)
+
+    def insert_whoop_private_healthspan_contributors(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows(
+            "whoop_private_healthspan_contributors", rows, WHOOP_PRIVATE_HEALTHSPAN_CONTRIBUTOR_COLUMNS
+        )
+
+    def insert_whoop_private_lab_results(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_lab_results", rows, WHOOP_PRIVATE_LAB_RESULT_COLUMNS)
+
+    def insert_whoop_private_coach_messages(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("whoop_private_coach_messages", rows, WHOOP_PRIVATE_COACH_MESSAGE_COLUMNS)
+
+    def whoop_private_healthspan_chain(self, *, account: str) -> dict[date, date | None]:
+        """Stored Healthspan weeks, each mapped to the week WHOOP said precedes it.
+
+        This is the history walk's cursor: a stored week is stepped over by the
+        chain in its own row, so the walk needs no watermark and an interrupted
+        one resumes where it stopped.
+        """
+        rows = self._query(
+            "SELECT week_start, raw_json -> 'date_picker' ->> 'previous_date_time' "
+            "FROM @whoop_private_healthspan_weeks WHERE account = %s",
+            (account,),
+        )
+        chain: dict[date, date | None] = {}
+        for week_start, previous in rows:
+            chain[week_start] = date.fromisoformat(str(previous)[:10]) if previous else None
+        return chain
+
+    def whoop_private_coach_conversation_ids(self, *, account: str) -> set[str]:
+        """Coach conversations already stored -- that walk's cursor."""
+        rows = self._query(
+            "SELECT DISTINCT conversation_id FROM @whoop_private_coach_messages WHERE account = %s",
+            (account,),
+        )
+        return {str(row[0]) for row in rows}
+
+    def whoop_private_document_collected_at(
+        self, *, account: str, kind: str
+    ) -> dict[str, datetime]:
+        """When each stored document of one kind was last fetched, by doc_key."""
+        rows = self._query(
+            "SELECT doc_key, synced_at FROM @whoop_private_documents WHERE account = %s AND kind = %s",
+            (account, kind),
+        )
+        return {str(row[0]): row[1] for row in rows}
 
     def whoop_private_document_keys(self, *, account: str, kinds: Sequence[str]) -> set[tuple[str, str]]:
         """Which (kind, doc_key) documents are already stored.

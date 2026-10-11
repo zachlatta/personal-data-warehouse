@@ -312,3 +312,83 @@ class WhoopPrivateClient:
         Account state rather than a day, so it is stored under a fixed doc_key.
         """
         return self.get_json("/health-tab-bff/v1/health-tab")
+
+    # ---- Healthspan, Advanced Labs, Health Monitor, WHOOP Coach ----------
+    #
+    # None of these is called by app.whoop.com (the web bundle has no
+    # Healthspan at all); the paths come from the Android app's own string
+    # table and were each confirmed against the live API on 2026-10-11. See
+    # docs/whoop-private-api.md, "Healthspan, labs and the coach".
+
+    def healthspan(self, *, day: str) -> Any:
+        """The Healthspan screen for the week containing ``day``.
+
+        WHOOP Age, Pace of Aging, every contributor's 6-month and 30-day value
+        and its years of impact, and the coaching line under each. The payload's
+        ``date_picker.previous_date_time`` names the prior week, which is how
+        the history is walked back to the week the account finished
+        calibrating. The bare path (no ``date``) is a 404.
+        """
+        return self.get_json("/healthspan-service/v1/healthspan/bff", {"date": day})
+
+    def healthspan_bloodwork_insights(self, *, pillar: str) -> Any:
+        """"Dive into the impact": the lab biomarkers WHOOP ties to one pillar.
+
+        ``pillar`` is SLEEP, STRAIN or FITNESS -- the request path the
+        Healthspan payload's own button carries.
+        """
+        return self.get_json(
+            "/healthspan-service/v1/healthspan/bff/bloodwork-insights", {"healthspanPillar": pillar}
+        )
+
+    def health_monitor(self, *, day: str) -> Any:
+        """The Health Monitor for one day: each vital against the member's own baseline band."""
+        return self.get_json("/coaching-service/v1/health/bff/monitor", {"date": day})
+
+    def advanced_labs_home(self) -> Any:
+        return self.get_json("/advanced-labs-service/v1/advanced-labs")
+
+    def advanced_labs_biomarkers_summary(self) -> Any:
+        """Every biomarker's latest value, unit and status (OPTIMAL / SUFFICIENT / OUT_OF_RANGE)."""
+        return self.get_json("/advanced-labs-service/v1/advanced-labs/biomarkers/summary")
+
+    def advanced_labs_test_history(self) -> Any:
+        """Every lab test on file, grouped by year; each item's ``id`` is a test id."""
+        return self.get_json("/advanced-labs-service/v1/advanced-labs/tests/history/paginated")
+
+    def advanced_labs_test(self, *, test_id: str) -> Any:
+        """One test's result screen: every biomarker it measured, with value and status."""
+        return self.get_json(f"/advanced-labs-service/v1/advanced-labs/tests/{test_id}")
+
+    def biomarker_test(self, *, test_id: str) -> Any:
+        """One test's record: ``test_date``, ``display_name``, source and status."""
+        return self.get_json(f"/advanced-labs-service/v1/biomarker-tests/{test_id}")
+
+    def advanced_labs_biomarker(self, *, biomarker_id: str) -> Any:
+        """One biomarker's detail screen: its range bands, categories and WHOOP's explanation."""
+        return self.get_json(f"/advanced-labs-service/v1/advanced-labs/biomarkers/{biomarker_id}")
+
+    def advanced_labs_biomarker_recordings(self, *, biomarker_id: str) -> Any:
+        """Every value ever recorded for one biomarker, across all tests."""
+        return self.get_json(f"/advanced-labs-service/v1/advanced-labs/all_recordings/{biomarker_id}")
+
+    def achievements_hub(self, *, tab: str) -> Any:
+        return self.get_json("/milestones-service/v1/bff/milestones/hub", {"selectedTab": tab})
+
+    def weekly_plan(self) -> Any:
+        return self.get_json("/progression-service/v1/weekly-plan")
+
+    def coach_conversations(self, *, next_token: str | None = None) -> Any:
+        """One page of WHOOP Coach chat history, newest first.
+
+        Pages carry ``next_token``; it is sent back as the ``next_token`` query
+        parameter (``nextToken`` is silently ignored and returns page one again).
+        """
+        return self.get_json(
+            "/ai-conversation-service/v1/conversations", {"next_token": next_token} if next_token else None
+        )
+
+    def coach_conversation(self, *, conversation_id: str) -> Any:
+        """Every message in one coach conversation, in order. GET only: the
+        ``ai-conversation-bff`` turn paths are POSTs that would write a turn."""
+        return self.get_json(f"/ai-conversation-service/v2/conversation/{conversation_id}")

@@ -246,7 +246,9 @@ def test_search_exposes_a_whoop_private_source_token() -> None:
     adapters = next(
         adapters for token, adapters, _ in SEARCH_SOURCE_DEFS if token == "whoop_private"
     )
-    assert adapters == ("whoop_private_journal",)
+    # Only events with no public equivalent: the journal, the weekly
+    # Healthspan update and WHOOP Coach messages.
+    assert adapters == ("whoop_private_journal", "whoop_private_healthspan", "whoop_private_coach")
     # The public source keeps its own token; the two must not be merged.
     assert "whoop" in tokens
     assert set(SEARCH_SOURCE_ALIASES).isdisjoint(tokens)

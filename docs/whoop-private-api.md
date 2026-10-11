@@ -181,11 +181,40 @@ Every one of the four answers **200 on any date**, including years before the ac
 existed (an empty payload, not a 404), so a backfill needs no missing-day handling -- but
 it also cannot detect its own floor, which is why the walk stops at the first cycle.
 
+### Healthspan, labs and the coach
+
+Found 2026-10-11. `app.whoop.com`'s bundle has no Healthspan at all, so guessing service
+names (the 2026-08-23 method) found nothing. The paths came from the Android app's dex
+string table (`com.whoop.android` 5.472.0); grep the strings for `-service/` and `-bff/`.
+Every path below was confirmed with a GET. In a 404, `default backend - 404` means no such
+service and `HTTP 404 Not Found` means the service exists but the path does not.
+
+| path | what |
+| --- | --- |
+| `/healthspan-service/v1/healthspan/bff?date=` | the Healthspan week containing `date`; `unlocked_content.date_picker.previous_date_time` names the prior week. The bare path is a 404 |
+| `/healthspan-service/v1/healthspan/bff/bloodwork-insights?healthspanPillar=SLEEP\|STRAIN\|FITNESS` | "Dive into the impact" |
+| `/healthspan-service/v1/widget` | the hero numbers only |
+| `/coaching-service/v1/health/bff/monitor?date=` | Health Monitor, per day |
+| `/advanced-labs-service/v1/advanced-labs`, `.../biomarkers/summary`, `.../tests/history/paginated` | labs home, every biomarker's latest value, the test list |
+| `/advanced-labs-service/v1/advanced-labs/tests/{testId}`, `/advanced-labs-service/v1/biomarker-tests/{testId}` | one test's results; its record (`test_date`, source) |
+| `/advanced-labs-service/v1/advanced-labs/biomarkers/{id}`, `.../all_recordings/{id}` | range bands (the y-axis labels of the detail chart) and explanation; every recorded value |
+| `/milestones-service/v1/bff/milestones/hub?selectedTab=HEALTHSPAN` | achievements |
+| `/progression-service/v1/weekly-plan` | the weekly plan |
+| `/ai-conversation-service/v1/conversations?next_token=` | WHOOP Coach chat history (`nextToken` is ignored) |
+| `/ai-conversation-service/v2/conversation/{id}` | one conversation's messages |
+
+The `ai-conversation-bff` conversation and turn paths answer 405 to GET; they are POSTs
+that write a turn, so the sync never calls them. Its list, `ai-conversation-bff/v1/conversations`,
+has different ids that resolve to the service ids through `.../conversation/{fingerprint}/metadata`.
+The service list already covers them. Trend keys that the Healthspan payload links to
+(`SLEEP_HOURS`, `STRENGTH_TRAINING_TIME`, `BODY_COMPOSITION_LEAN`) are not valid
+`progression-service` graph keys (400); `HR_ZONES_1_3` is.
+
 ### Confirmed absent
 
 No endpoint exists for the Strength Trainer, the weekly Performance Assessment, blood
-pressure, hormonal insights, or WHOOP Coach chat history (four service names probed, all
-404). Two unresolved leads: `/sleep-service/v1/sleep-planner` and
+pressure or hormonal insights (four service names probed, all 404). WHOOP Coach chat
+history was on this list until 2026-10-11; it exists (above). Two unresolved leads: `/sleep-service/v1/sleep-planner` and
 `/sleep-service/v1/sleep-need` answer **405** to both GET and POST, so the paths exist
 but want something else; `/notification-service/v1/notifications` answers **401**, so it
 wants different auth.

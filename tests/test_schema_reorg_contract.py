@@ -155,7 +155,11 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # the Plaid-founded ledger accounts is a row per account).
         # +2 base: the muse source (base_muse.events, the agent's transcripts,
         # and base_muse.files, its persistent workspace).
-        "base": 69,
+        # +4 base: base_whoop_private.healthspan_weeks/.healthspan_contributors/
+        # .lab_results/.coach_messages -- WHOOP Age, its contributors, Advanced
+        # Labs and the WHOOP Coach, typed because the questions they answer
+        # ("what is driving my WHOOP Age up") need numbers, not a 90 KB UI tree.
+        "base": 73,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -191,7 +195,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # said so. It is deliberately not a
         # net-worth liability -- a commitment is contingent on the fund calling
         # it -- so it needed its own read interface.
-            "marts": 54,
+            # +3 marts: marts_health.healthspan_weeks/.healthspan_contributors/
+            # .lab_results, the read interface over those four tables.
+            "marts": 57,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

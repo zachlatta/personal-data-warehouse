@@ -2009,10 +2009,11 @@ _WHOOP_WORKOUT = _simple_adapter(
 
 # The private WHOOP API (source `whoop_private`) re-fetches the same cycles,
 # sleeps, recoveries and workouts the public API already publishes, at a much
-# higher resolution. Exactly ONE of its tables becomes timeline events: the
-# journal. Everything else it syncs is classified `detail` of the public
-# base_whoop row it duplicates, because those events are already on the
-# timeline via the four adapters above — a second adapter over the private
+# higher resolution. Only tables with NO public equivalent become timeline
+# events: the journal, the weekly Healthspan update and WHOOP Coach messages.
+# The cycles, sleeps, recoveries and workouts it syncs are classified `detail`
+# of the public base_whoop row they duplicate, because those events are already
+# on the timeline via the four adapters above — an adapter over the private
 # copies would emit a duplicate of every health event Zach has ever recorded
 # onto a 43M-row table.
 _WHOOP_PRIVATE_JOURNAL = _simple_adapter(
@@ -2052,6 +2053,88 @@ _WHOOP_PRIVATE_JOURNAL = _simple_adapter(
     # the app and answered the question himself, which is the definition of the
     # self tier (the same reasoning that keeps whoop_workout at `self`).
     priority=TIMELINE_PRIORITY_SELF,
+)
+
+# The weekly Healthspan update: WHOOP Age and Pace of Aging, one event a week.
+# Health telemetry the strap computes about Zach, so `noise` like the cycle,
+# sleep and recovery scores -- the contributors behind it are `detail` rows an
+# agent reaches through marts_health.healthspan_contributors.
+_WHOOP_PRIVATE_HEALTHSPAN = _simple_adapter(
+    name="whoop_private_healthspan",
+    source_table="whoop_private_healthspan_weeks",
+    source="whoop_private",
+    kind="healthspan_update",
+    from_sql="@whoop_private_healthspan_weeks t",
+    event_id="concat_ws('|', t.account, t.week_start::text)",
+    # A week, not an instant: anchored at the week's first day, UTC midnight,
+    # the way the journal anchors its day.
+    event_ts="t.week_start::timestamp AT TIME ZONE 'UTC'",
+    ingest_ts="t.synced_at",
+    actor="'WHOOP'",
+    title=(
+        "concat('WHOOP Age ', to_char(t.whoop_age, 'FM990.0'), ' (', "
+        "CASE WHEN t.years_difference <= 0 THEN concat(to_char(-t.years_difference, 'FM990.0'), ' years younger') "
+        "ELSE concat(to_char(t.years_difference, 'FM990.0'), ' years older') END, "
+        "'), Pace of Aging ', to_char(t.pace_of_aging, 'FM990.0'), 'x')"
+    ),
+    snippet=(
+        "concat('Healthspan week of ', t.week_start::text, ': WHOOP Age ', "
+        "to_char(t.previous_whoop_age, 'FM990.0'), ' -> ', to_char(t.whoop_age, 'FM990.0'), "
+        "', Pace of Aging ', to_char(t.previous_pace_of_aging, 'FM990.0'), 'x -> ', "
+        "to_char(t.pace_of_aging, 'FM990.0'), 'x')"
+    ),
+    context="t.account",
+    source_pk="jsonb_build_object('account', t.account, 'week_start', t.week_start)",
+    metadata=(
+        "jsonb_build_object("
+        "'week_start', t.week_start, "
+        "'whoop_age', t.whoop_age, "
+        "'chronological_age', t.chronological_age, "
+        "'years_difference', t.years_difference, "
+        "'pace_of_aging', t.pace_of_aging, "
+        "'is_calibrating', t.is_calibrating)"
+    ),
+    priority=TIMELINE_PRIORITY_NOISE,
+)
+
+# WHOOP Coach, the in-app AI. Shaped like an agent session: what Zach typed is
+# `self` (his words, as with the turns he types into Claude or Codex), and the
+# coach's replies -- including the unprompted weekly Healthspan analysis -- are
+# `background`, as model answers are in agent sessions. Messages carry no time
+# of their own, so each is placed at its conversation's start plus its index
+# in seconds: the order survives, and nothing pretends to a precision the API
+# does not give.
+_WHOOP_PRIVATE_COACH = _simple_adapter(
+    name="whoop_private_coach",
+    source_table="whoop_private_coach_messages",
+    source="whoop_private",
+    kind="coach_message",
+    from_sql="@whoop_private_coach_messages t",
+    event_id="concat_ws('|', t.account, t.conversation_id, t.message_id)",
+    event_ts="t.conversation_started_at + make_interval(secs => t.message_index)",
+    ingest_ts="t.synced_at",
+    actor="CASE WHEN t.role = 'user' THEN 'me' ELSE 'WHOOP Coach' END",
+    title=(
+        "concat('WHOOP Coach: ', COALESCE(NULLIF(t.conversation_title, ''), 'conversation'))"
+    ),
+    snippet=_snippet("t.content"),
+    context="t.conversation_id",
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'conversation_id', t.conversation_id, "
+        "'message_id', t.message_id)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'conversation_id', t.conversation_id, "
+        "'message_index', t.message_index, "
+        "'role', t.role, "
+        "'agent', t.agent, "
+        "'started_at_precision', t.started_at_precision)"
+    ),
+    search_text=_search_concat("t.conversation_title", "t.content"),
+    # Tool calls and hidden harness turns are machinery, not conversation.
+    where="t.visible_to_user = 1 AND t.content <> '' AND t.role IN ('user', 'assistant')",
+    priority=f"CASE WHEN t.role = 'user' THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_BACKGROUND} END",
 )
 
 _HACKER_NEWS_ITEM = _simple_adapter(
@@ -2754,6 +2837,8 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_SLEEP,
     _WHOOP_WORKOUT,
     _WHOOP_PRIVATE_JOURNAL,
+    _WHOOP_PRIVATE_HEALTHSPAN,
+    _WHOOP_PRIVATE_COACH,
     _HACKER_NEWS_ITEM,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
@@ -2974,6 +3059,10 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "whoop_sleep",
         "whoop_workout",
         "whoop_private_journal",
+        # context is the account: the neighbours of a week are the weeks around it.
+        "whoop_private_healthspan",
+        # context is the conversation id, so (source, context) IS the conversation.
+        "whoop_private_coach",
         "hacker_news_item",
         "finance_transaction",
         "finance_observation",
@@ -3343,6 +3432,19 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "one event per journal question Zach answered; no public-API equivalent"
     ),
     "whoop_private_sports": _entity("sport catalog resolving a workout's sport_id"),
+    "whoop_private_healthspan_weeks": _events(
+        "one event per weekly Healthspan update: WHOOP Age and Pace of Aging"
+    ),
+    "whoop_private_healthspan_contributors": _detail(
+        "whoop_private_healthspan_weeks",
+        "the week's contributors behind WHOOP Age; read marts_health.healthspan_contributors",
+    ),
+    "whoop_private_lab_results": _entity(
+        "lab biomarker results (one row per test and biomarker); read marts_health.lab_results"
+    ),
+    "whoop_private_coach_messages": _events(
+        "one event per WHOOP Coach chat message; Zach's own words are self, the coach's background"
+    ),
     "whoop_private_sync_state": _state("per-collection private-API scan watermark"),
     "mcp_connections": _state("encrypted MCP proxy connection configuration and OAuth credentials; not synced source events"),
     "app_access_tokens": _state("hashed bearer tokens issued beside PDW_SECRET_TOKEN and single-use cli_authorize codes; not synced source events"),

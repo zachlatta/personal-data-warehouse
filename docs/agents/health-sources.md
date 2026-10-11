@@ -127,10 +127,14 @@ ORDER BY started_at DESC LIMIT 50;
 | `base_whoop_private.heart_rate_samples` | continuous heart rate at 6s, every hour of every day (`step` 6/60/600 are the only values the API accepts; 6 is the only one stored) |
 | `marts_health.workout_heart_rate_samples` | that same series joined to each workout's own bounds, with `elapsed_seconds` |
 | `base_whoop_private.sleep_events` | the hypnogram: one row per LIGHT / REM / SWS / DISTURBANCES stage |
-| `base_whoop_private.journal_entries` | the journal answers Zach typed; **the only table here with a timeline adapter** |
+| `base_whoop_private.journal_entries` | the journal answers Zach typed (timeline adapter `whoop_private_journal`) |
+| `base_whoop_private.healthspan_weeks` | one row per weekly Healthspan update: WHOOP Age, chronological age, Pace of Aging (adapter `whoop_private_healthspan`) |
+| `base_whoop_private.healthspan_contributors` | per week, each contributor's 6-month and 30-day value, years of impact, range bar, younger threshold and WHOOP's guidance |
+| `base_whoop_private.lab_results` | Advanced Labs, one row per (test, biomarker), with range bands and WHOOP's explanation |
+| `base_whoop_private.coach_messages` | every WHOOP Coach chat message (adapter `whoop_private_coach`) |
 | `base_whoop_private.cycles`, `.sleeps`, `.recoveries`, `.workouts` | high-resolution copies of the public rows (strain components, sleep debt, HRV/RHR components, zone durations, GPS) |
 | `base_whoop_private.sports` | the 204-sport catalog resolving a workout's `sport_id` |
-| `base_whoop_private.documents` | Tier-2 raw UI payloads kept as `raw_json`, keyed `(kind, doc_key)`: `trend`, `stress`, `cardio_details`, `sleep_deep_dive`, `strain_deep_dive`, `behavior_impact`, `health_tab` |
+| `base_whoop_private.documents` | Tier-2 raw UI payloads kept as `raw_json`, keyed `(kind, doc_key)`: `trend`, `stress`, `cardio_details`, `sleep_deep_dive`, `strain_deep_dive`, `behavior_impact`, `health_monitor`, `health_tab`, plus the raw screens behind the Healthspan, labs and coach tables (`healthspan`, `healthspan_bloodwork_insights`, `achievements`, `weekly_plan`, `advanced_labs*`) |
 | `ops.whoop_private_sync_state` | per-collection watermark, status and error |
 | `private.whoop_private_sessions` | the credential |
 
@@ -196,12 +200,16 @@ the walk spends ten years of runs asking for windows that cannot contain a
 reading — production had reached 2025-02-03 for an account whose first cycle is
 2025-10-23.
 
-**Only `journal_entries` reaches `timeline.events`** (adapter `whoop_private_journal`,
-source `whoop_private`, priority `self` — Zach opened the app and answered the question
-himself). The private cycles/sleeps/recoveries/workouts are classified `detail` of the
-`base_whoop` row they duplicate: those events are already on the timeline through the four
-public adapters, and a second adapter over the private copies would emit a duplicate of
-every health event onto a 43M-row table. Read a health *event* from `timeline.events`, then
+**Only tables with no public equivalent reach `timeline.events`**, all under source
+`whoop_private`. They are the journal (`whoop_private_journal`, priority `self`, because
+Zach opened the app and answered the question himself) and the weekly Healthspan update
+(`whoop_private_healthspan`, `noise`, health telemetry like the cycle scores). WHOOP Coach
+messages are the third (`whoop_private_coach`): what Zach typed is `self`, the coach's
+replies are `background`, as in agent sessions. The private
+cycles/sleeps/recoveries/workouts are classified `detail` of the `base_whoop` row they
+duplicate: those events are already on the timeline through the four public adapters, and
+an adapter over the private copies would emit a duplicate of every health event onto a
+43M-row table. Read a health *event* from `timeline.events`, then
 drill into `base_whoop_private.*` for the resolution the public row does not carry.
 
 ### Auth: a captured browser session, not OAuth
@@ -243,3 +251,53 @@ pdw whoop publish-session          # add --dry-run to verify cookie decryption f
   than the warehouse's epoch sentinel.
 - Rate limits are 2,000 per 5 minutes and 144,000 per day (~20x the public API), so a
   backfill is not limit-constrained.
+
+### Healthspan, Advanced Labs and the WHOOP Coach
+
+Added 2026-10-11. Zach asked to be able to answer "how do I reduce my WHOOP Age?" and
+ask detailed Healthspan questions. Before this, the warehouse held only the Health tab's
+current hero number. None of these screens exists in the web app. The paths came from the
+Android app's string table, and each was confirmed with a read-only GET (full list in
+[`docs/whoop-private-api.md`](../whoop-private-api.md#healthspan-labs-and-the-coach)).
+Three collections in `ops.whoop_private_sync_state` carry them, so a restyle fails one of
+them by name on `/pipelines` without stopping the rest.
+
+- **`healthspan`** fetches the current week every run. It then walks history newest-first
+  along WHOOP's own chain: each week's payload names the previous week, and the first week
+  (when calibration ended, 2025-11-22 for this account) was a Saturday, not a Sunday. The
+  limit is 12 weeks a run. `healthspan_weeks` is the cursor, and every week is kept, not
+  just "current". It also stores the three "Dive into the impact" screens, the Healthspan
+  achievements hub and the weekly plan as raw documents.
+- **`labs`** runs at most once a day (~50 requests). It fetches every test, every
+  biomarker's detail (range bands, explanation) and its full recording history. The
+  `advanced_labs_tests` document is written last and is the daily cursor.
+- **`coach`** reads the chat history. Every page runs from its offset to the END, so page
+  one is the whole list; the walk stops when a page brings no new ids. The five newest
+  conversations are re-read every run, and up to 50 never-stored ones are fetched per run.
+  Messages carry no timestamp. `conversation_started_at` comes from the list's day header,
+  which has no year (the year is inferred from the weekday), plus the clock time in an
+  untitled chat's title. `started_at_precision` says which.
+- **`health_monitor`** is a day-keyed document, backfilled to the first cycle like the
+  others.
+
+**These are typed tables over UI payloads, against this source's usual rule.** The
+questions need numbers an agent can sort, so the parsers (`whoop_private_healthspan.py`)
+raise `HealthspanShapeError` on a payload they cannot read. A week that parses to zero
+contributors fails the collection; it is never written empty. The raw payload is always
+stored beside the typed rows.
+
+Traps the marts translate:
+
+- `years_difference` is WHOOP's sign: **negative is younger**. The mart exposes
+  `years_younger` (positive is younger).
+- `7:29` with unit `h` is 7 h 29 min. It is stored as 7.483 hours, not 7.29.
+- A contributor with no data (lean body mass with no scan) and a biomarker with no optimal
+  band are stored as 0 beside a `has_*` flag, because warehouse floats are NOT NULL. The
+  marts turn them into NULL.
+- `younger_threshold` is read from WHOOP's ten-division range bar, as the boundary between
+  its OLDER and YOUNGER divisions. RHR's bar runs the other way (lower is younger). The bar
+  is drawn evenly across its labels, so the threshold is approximate.
+- WHOOP scores the **6-month** average. The 30-day value shows direction only.
+
+Worked queries are in the agent guide (`pdw readme health`, "Healthspan").
+

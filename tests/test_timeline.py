@@ -1090,6 +1090,34 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         # assertions treat as the oldest seeded row.
         (_NOW.date(), _NOW, sync_version),
     )
+    # The weekly Healthspan update: one event per week, anchored at the week's
+    # first day like the journal's day (so, again, not the oldest seeded row).
+    wh._command(
+        """
+        INSERT INTO @whoop_private_healthspan_weeks (account, week_start, week_end, whoop_age,
+                                                    years_difference, chronological_age, pace_of_aging,
+                                                    previous_whoop_age, previous_pace_of_aging,
+                                                    synced_at, sync_version)
+        VALUES ('z@x.test', %s, %s, 31.2, -0.6, 31.8, 0.9, 31.0, 0.5, %s, %s)
+        """,
+        (_NOW.date(), _NOW.date() + timedelta(days=6), _NOW, sync_version),
+    )
+    # WHOOP Coach: Zach's question (self), a hidden tool turn the adapter must
+    # skip, and the coach's answer (background).
+    for index, role, content, visible in (
+        (0, "user", "Should I run today?", 1),
+        (1, "tool", '{"recovery": 40}', 0),
+        (2, "assistant", "Keep it easy today.", 1),
+    ):
+        wh._command(
+            """
+            INSERT INTO @whoop_private_coach_messages (account, conversation_id, message_id, message_index,
+                                                      role, content, visible_to_user, conversation_title,
+                                                      conversation_started_at, synced_at, sync_version)
+            VALUES ('z@x.test', 'conv-1', %s, %s, %s, %s, %s, 'Is my run too much?', %s, %s, %s)
+            """,
+            (f"m{index}", index, role, content, visible, _NOW - timedelta(hours=2), _NOW, sync_version),
+        )
     # Hacker News: a story Zach upvoted, his comment under it, a reply to that
     # comment and a stranger's sibling comment — one row per classification
     # branch (self / self / direct / cc).
@@ -1159,6 +1187,9 @@ EXPECTED_SEEDED_PRIORITIES = {
     "whoop_sleep": "noise",
     "whoop_workout": "self",
     "whoop_private_journal": "self",
+    "whoop_private_healthspan": "noise",
+    # Newest-first, last row kept: Zach's own question, which is his words.
+    "whoop_private_coach": "self",
     # Four seeded rows, one per branch, asserted individually in
     # test_backfill_normalizes_every_source; this dict is built newest-first
     # and keeps the LAST row per adapter, which is the upvoted story (self).
@@ -1193,6 +1224,9 @@ EXPECTED_SEEDED_EVENTS = {
     "whoop_sleep": 1,
     "whoop_workout": 1,
     "whoop_private_journal": 1,
+    "whoop_private_healthspan": 1,
+    # The hidden tool turn is machinery, not conversation.
+    "whoop_private_coach": 2,
     "hacker_news_item": 4,
     "finance_transaction": 1,
     "finance_observation": 1,

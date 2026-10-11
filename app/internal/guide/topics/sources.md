@@ -73,6 +73,9 @@ and state the window and freshness.
 Two sources for one wearable: `marts_health.cycles`, `.sleeps`, `.recoveries`, `.workouts`
 conform them and translate every unit and sentinel; `base_whoop_private.*` holds the
 six-second heart rate, hypnogram, journal and trend documents the public API lacks.
+Healthspan (WHOOP Age, Pace of Aging, the contributors behind them, weekly), Advanced Labs
+biomarkers and WHOOP Coach chats are `marts_health.healthspan_weeks`, `.healthspan_contributors`,
+`.lab_results` and `base_whoop_private.coach_messages`.
 Read topic `health` before quoting a number — the unit traps are 1000x errors.
 
 ## Finance

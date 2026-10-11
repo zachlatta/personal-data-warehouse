@@ -2042,6 +2042,125 @@ WHOOP_PRIVATE_DOCUMENT_COLUMNS = (
     "sync_version",
 )
 
+# Healthspan, Advanced Labs and the WHOOP Coach. Typed from UI payloads on
+# purpose (see whoop_private_healthspan.py): the parsers fail loudly on a
+# restyle rather than writing a week with no contributors.
+WHOOP_PRIVATE_HEALTHSPAN_WEEK_COLUMNS = (
+    "account",
+    # The Healthspan week (Sunday-start, user-local) this snapshot is for.
+    "week_start",
+    "week_end",
+    "whoop_age",
+    # WHOOP's own sign: NEGATIVE when WHOOP Age is younger than chronological
+    # age ("0.1 years younger" is -0.1).
+    "years_difference",
+    "chronological_age",
+    "pace_of_aging",
+    "is_calibrating",
+    "previous_whoop_age",
+    "previous_pace_of_aging",
+    "age_subtitle",
+    "next_update_display",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_HEALTHSPAN_CONTRIBUTOR_COLUMNS = (
+    "account",
+    "week_start",
+    # WHOOP's trend key (SLEEP_CONSISTENCY, HR_ZONES_1_3, STRENGTH_TRAINING_TIME, ...).
+    "contributor_key",
+    "pillar",
+    "title",
+    "sort_order",
+    # percent / hours / steps / ml_kg_min / bpm; '7:29' h is stored as 7.483 hours.
+    "unit",
+    "has_value",
+    "six_month_value",
+    "six_month_display",
+    "thirty_day_value",
+    "thirty_day_display",
+    # Years this contributor adds to (+) or takes off (-) WHOOP Age.
+    "impact_years",
+    "impact_display",
+    "impact_direction",
+    "range_min",
+    "range_max",
+    "range_min_display",
+    "range_max_display",
+    # 'higher' when more lowers WHOOP Age (steps), 'lower' when less does (RHR).
+    "younger_direction",
+    # Where on the contributor's own scale it starts LOWERING WHOOP Age.
+    "younger_threshold",
+    "six_month_range_fraction",
+    "thirty_day_range_fraction",
+    "range_divisions",
+    "guidance_title",
+    "guidance_text",
+    "is_enabled",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_LAB_RESULT_COLUMNS = (
+    "account",
+    "test_id",
+    "biomarker_id",
+    "biomarker_name",
+    "test_name",
+    "tested_at",
+    "test_source",
+    "upload_source",
+    "has_value",
+    "result_value",
+    "value_display",
+    "unit",
+    # OPTIMAL / SUFFICIENT / OUT_OF_RANGE, WHOOP's own grading.
+    "status",
+    "has_optimal_range",
+    "optimal_low",
+    "optimal_high",
+    # [{low, high, status}] in the biomarker's own unit, from the detail chart.
+    "range_bands",
+    "range_meter_fraction",
+    "categories",
+    "coach_summary",
+    "description",
+    "why_it_matters",
+    "relationship_to_whoop_metrics",
+    "relationship_to_other_biomarkers",
+    "how_to_improve",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+WHOOP_PRIVATE_COACH_MESSAGE_COLUMNS = (
+    "account",
+    "conversation_id",
+    "message_id",
+    # Order within the conversation. Messages carry no timestamp of their own.
+    "message_index",
+    "turn_id",
+    # user / assistant / tool
+    "role",
+    "agent",
+    "content",
+    "visible_to_user",
+    "message_status",
+    "conversation_title",
+    # The conversation's user-local day, from the chat-history day header.
+    "started_on",
+    "conversation_started_at",
+    # 'second' when the list title carried a clock time, 'day' otherwise.
+    "started_at_precision",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
 WHOOP_PRIVATE_SYNC_STATE_COLUMNS = (
     "account",
     "collection",

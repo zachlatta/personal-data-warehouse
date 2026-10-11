@@ -555,14 +555,15 @@ def test_whoop_private_is_registered_in_both_registries() -> None:
     """The private API is a separate source and needs its own registrations.
 
     It syncs the same cycles/sleeps/recoveries/workouts the public API does, so
-    exactly one of its tables may be an events table: the journal, which has no
-    public equivalent. A second adapter over the private copies would emit a
-    duplicate of every health event onto a 43M-row timeline.
+    only tables with no public equivalent may be events tables: the journal,
+    the weekly Healthspan update and WHOOP Coach messages. An adapter over the
+    private copies would emit a duplicate of every health event onto a
+    43M-row timeline.
     """
     _assert_source_is_registered(
         "whoop_private_",
         pipeline_id="whoop_private",
-        expected_adapters={"whoop_private_journal"},
+        expected_adapters={"whoop_private_journal", "whoop_private_healthspan", "whoop_private_coach"},
     )
     tables, _ = _registered_names("whoop_private_")
     duplicated = {

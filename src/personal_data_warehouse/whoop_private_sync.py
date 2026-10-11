@@ -47,6 +47,15 @@ import logging
 
 from personal_data_warehouse.config import Settings, WhoopPrivateConfig, load_settings
 from personal_data_warehouse.warehouse import warehouse_from_settings
+from personal_data_warehouse.whoop_private_healthspan import (
+    HealthspanWeek,
+    coach_conversation_refs,
+    coach_message_rows,
+    lab_result_rows,
+    lab_test_biomarkers,
+    lab_test_ids,
+    parse_healthspan,
+)
 from personal_data_warehouse.whoop_private_api import (
     WhoopPrivateApiError,
     WhoopPrivateAuthError,
@@ -78,7 +87,31 @@ WHOOP_PRIVATE_COLLECTIONS = (
     "journal",
     "sports",
     "documents",
+    # Healthspan, Advanced Labs and the WHOOP Coach (whoop_private_healthspan.py).
+    # Separate collections so a restyled Healthspan screen fails on /pipelines
+    # by name without stopping the heart rate or the journal.
+    "healthspan",
+    "labs",
+    "coach",
 )
+
+#: Healthspan history weeks fetched per run, on top of the current week. The
+#: whole history (weekly since the account finished calibrating) was 47 weeks
+#: at ~90 KB each on 2026-10-11, so a fresh walk finishes in four runs.
+WHOOP_PRIVATE_HEALTHSPAN_WEEKS_PER_RUN = 12
+#: The Healthspan pillars whose "Dive into the impact" screen is collected.
+WHOOP_PRIVATE_HEALTHSPAN_PILLARS = ("SLEEP", "STRAIN", "FITNESS")
+#: Labs change when a test lands, months apart; the ~50 requests a full labs
+#: pass costs are spent at most once a day.
+WHOOP_PRIVATE_LABS_REFRESH = timedelta(hours=24)
+#: Coach conversations fetched per run. The newest few are always re-read (a
+#: conversation can continue for days); the rest of the budget walks the ones
+#: never stored, so 190 conversations land in four runs.
+WHOOP_PRIVATE_COACH_CONVERSATIONS_PER_RUN = 50
+WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS = 5
+#: Chat-history pages: every page is the history from its offset to the END,
+#: so page one is normally everything. This only bounds a misbehaving cursor.
+WHOOP_PRIVATE_COACH_MAX_PAGES = 20
 
 WHOOP_PRIVATE_STATUS_OK = "ok"
 WHOOP_PRIVATE_STATUS_FAILED = "failed"
@@ -910,6 +943,9 @@ class WhoopPrivateSyncRunner:
             "journal": self._sync_journal,
             "sports": self._sync_sports,
             "documents": self._sync_documents,
+            "healthspan": self._sync_healthspan,
+            "labs": self._sync_labs,
+            "coach": self._sync_coach,
         }[collection]
         return handler(
             config=config,
@@ -1112,7 +1148,15 @@ class WhoopPrivateSyncRunner:
     #: Document kinds keyed by a local day. ``trend`` and ``health_tab`` are
     #: whole-series/current-state snapshots a single call already covers, and
     #: ``cardio_details`` is keyed by activity, so none of them are here.
-    DAY_DOCUMENT_KINDS = ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact")
+    DAY_DOCUMENT_KINDS = (
+        "stress",
+        "sleep_deep_dive",
+        "strain_deep_dive",
+        "behavior_impact",
+        # Each vital against the member's own baseline band ("RHR 58, within
+        # 57 - 62"); the band is the part no other table carries. ~9 KB a day.
+        "health_monitor",
+    )
 
     #: The historic backfill walks all of them. These are not cheap -- measured
     #: against the live API on 2026-08-23, a recent `stress` day is ~1.7 MB and
@@ -1129,6 +1173,7 @@ class WhoopPrivateSyncRunner:
             "sleep_deep_dive": lambda: client.sleep_deep_dive(day=day),
             "strain_deep_dive": lambda: client.strain_deep_dive(day=day),
             "behavior_impact": lambda: client.behavior_impact(day=day),
+            "health_monitor": lambda: client.health_monitor(day=day),
         }[kind]()
 
     def _document_backfill_days(
@@ -1281,6 +1326,193 @@ class WhoopPrivateSyncRunner:
         if rows:
             self._warehouse.insert_whoop_private_documents(rows)
         return written + len(rows), "snapshot", synced_at
+
+    def _sync_healthspan(self, *, config, client, identity, state, synced_at, signature=""):
+        """The current Healthspan week, then history weeks never stored, newest first.
+
+        Each week's payload names the week before it (``previous_date_time``),
+        so the walk follows WHOOP's own chain rather than assuming weeks start
+        on Sunday -- the first one, the week calibration ended, did not. The
+        weeks table is the cursor: a stored week is stepped over using the
+        chain recorded in its own row.
+        """
+        account = config.account
+        offset = parse_timezone_offset(identity.timezone_offset)
+        today = local_day(synced_at, offset)
+        stored_chain = self._warehouse.whoop_private_healthspan_chain(account=account)
+        written = 0
+
+        def fetch(day: str) -> HealthspanWeek:
+            nonlocal written
+            payload = client.healthspan(day=day)
+            week = parse_healthspan(account=account, requested_day=day, payload=payload, synced_at=synced_at)
+            self._warehouse.insert_whoop_private_documents(
+                [
+                    document_to_row(
+                        account=account,
+                        kind="healthspan",
+                        doc_key=week.week_start.isoformat(),
+                        payload=payload,
+                        collected_at=datetime.combine(week.week_start, datetime.min.time(), tzinfo=UTC),
+                        synced_at=synced_at,
+                    )
+                ]
+            )
+            self._warehouse.insert_whoop_private_healthspan_weeks([week.week_row])
+            self._warehouse.insert_whoop_private_healthspan_contributors(week.contributor_rows)
+            written += 1 + len(week.contributor_rows)
+            return week
+
+        current = fetch(today.isoformat())
+        documents = [
+            document_to_row(
+                account=account,
+                kind="healthspan_bloodwork_insights",
+                doc_key=pillar,
+                payload=client.healthspan_bloodwork_insights(pillar=pillar),
+                collected_at=synced_at,
+                synced_at=synced_at,
+            )
+            for pillar in WHOOP_PRIVATE_HEALTHSPAN_PILLARS
+        ]
+        documents.append(
+            document_to_row(
+                account=account,
+                kind="achievements",
+                doc_key="HEALTHSPAN",
+                payload=client.achievements_hub(tab="HEALTHSPAN"),
+                collected_at=synced_at,
+                synced_at=synced_at,
+            )
+        )
+        documents.append(
+            document_to_row(
+                account=account,
+                kind="weekly_plan",
+                doc_key="current",
+                payload=client.weekly_plan(),
+                collected_at=synced_at,
+                synced_at=synced_at,
+            )
+        )
+        self._warehouse.insert_whoop_private_documents(documents)
+        written += len(documents)
+
+        budget = WHOOP_PRIVATE_HEALTHSPAN_WEEKS_PER_RUN
+        cursor = current.previous_week_start
+        visited: set[date] = {current.week_start}
+        while cursor is not None and cursor not in visited:
+            visited.add(cursor)
+            if cursor in stored_chain:
+                cursor = stored_chain[cursor]
+                continue
+            if budget <= 0:
+                break
+            budget -= 1
+            cursor = fetch(cursor.isoformat()).previous_week_start
+        return written, "snapshot", synced_at
+
+    def _sync_labs(self, *, config, client, identity, state, synced_at, signature=""):
+        """Every Advanced Labs test, biomarker by biomarker, at most once a day.
+
+        The ``advanced_labs_tests`` document is the once-a-day cursor and is
+        written LAST, so a pass that dies halfway is retried on the next run.
+        """
+        account = config.account
+        last_synced = self._warehouse.whoop_private_document_collected_at(
+            account=account, kind="advanced_labs_tests"
+        ).get("current")
+        if (
+            last_synced is not None
+            and stored_signature(state) == signature
+            and synced_at - last_synced < WHOOP_PRIVATE_LABS_REFRESH
+        ):
+            return 0, "skipped", self._cycles_watermark(state, synced_at)
+
+        def doc(kind: str, key: str, payload: Any) -> dict[str, Any]:
+            return document_to_row(
+                account=account, kind=kind, doc_key=key, payload=payload, collected_at=synced_at, synced_at=synced_at
+            )
+
+        history = client.advanced_labs_test_history()
+        documents = [
+            doc("advanced_labs", "current", client.advanced_labs_home()),
+            doc("advanced_labs_summary", "current", client.advanced_labs_biomarkers_summary()),
+        ]
+        rows: list[dict[str, Any]] = []
+        details: dict[str, Any] = {}
+        for test_id in lab_test_ids(history):
+            record = client.biomarker_test(test_id=test_id) or {}
+            page = client.advanced_labs_test(test_id=test_id)
+            for biomarker in lab_test_biomarkers(page):
+                biomarker_id = str(biomarker.get("id") or "")
+                if biomarker_id and biomarker_id not in details:
+                    details[biomarker_id] = client.advanced_labs_biomarker(biomarker_id=biomarker_id)
+                    recordings = client.advanced_labs_biomarker_recordings(biomarker_id=biomarker_id)
+                    documents.append(
+                        doc(
+                            "advanced_labs_biomarker",
+                            biomarker_id,
+                            {"detail": details[biomarker_id], "recordings": recordings},
+                        )
+                    )
+            documents.append(doc("advanced_labs_test", test_id, {"record": record, "results": page}))
+            rows.extend(
+                lab_result_rows(
+                    account=account,
+                    test_id=test_id,
+                    test_record=record,
+                    test_payload=page,
+                    biomarker_details=details,
+                    synced_at=synced_at,
+                )
+            )
+        self._warehouse.insert_whoop_private_documents(documents)
+        if rows:
+            self._warehouse.insert_whoop_private_lab_results(rows)
+        self._warehouse.insert_whoop_private_documents([doc("advanced_labs_tests", "current", history)])
+        return len(documents) + 1 + len(rows), "snapshot", synced_at
+
+    def _sync_coach(self, *, config, client, identity, state, synced_at, signature=""):
+        """WHOOP Coach chat history: recent conversations re-read, the rest walked once."""
+        account = config.account
+        offset = parse_timezone_offset(identity.timezone_offset)
+        today = local_day(synced_at, offset)
+        pages: list[Any] = []
+        seen: set[str] = set()
+        token: str | None = None
+        for _ in range(WHOOP_PRIVATE_COACH_MAX_PAGES):
+            page = client.coach_conversations(next_token=token)
+            pages.append(page)
+            ids = {
+                str(conversation.get("id") or "")
+                for group in (page or {}).get("chat_history") or []
+                for conversation in group.get("conversations") or []
+            }
+            fresh = ids - seen
+            seen |= ids
+            token = (page or {}).get("next_token")
+            if not token or not fresh:
+                break
+        refs = coach_conversation_refs(pages, today=today, offset=offset)
+        stored = self._warehouse.whoop_private_coach_conversation_ids(account=account)
+        recent = refs[:WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS]
+        missing = [
+            ref for ref in refs[WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS:] if ref.conversation_id not in stored
+        ]
+        targets = (recent + missing)[: max(WHOOP_PRIVATE_COACH_CONVERSATIONS_PER_RUN, len(recent))]
+        written = 0
+        for ref in targets:
+            rows = coach_message_rows(
+                account=account,
+                ref=ref,
+                payload=client.coach_conversation(conversation_id=ref.conversation_id),
+                synced_at=synced_at,
+            )
+            if rows:
+                self._warehouse.insert_whoop_private_coach_messages(rows)
+                written += len(rows)
+        return written, "snapshot", synced_at
 
     # -- plumbing ------------------------------------------------------
 

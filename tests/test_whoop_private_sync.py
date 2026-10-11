@@ -13,6 +13,8 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from tests import whoop_healthspan_fixtures as fixtures
+
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.whoop_private_api import (
     WhoopPrivateAuthError,
@@ -102,6 +104,15 @@ class FakeWhoopPrivateWarehouse:
         self.state_rows: list[dict] = []
         self.pruned: list[dict] = []
         self.rotations: list[dict] = []
+        self.healthspan_weeks: list[dict] = []
+        self.healthspan_contributors: list[dict] = []
+        self.lab_results: list[dict] = []
+        self.coach_messages: list[dict] = []
+        # Healthspan weeks stored by earlier runs: week_start -> previous week.
+        self.healthspan_chain: dict = {}
+        self.coach_conversation_ids: set[str] = set()
+        # kind -> {doc_key: synced_at}, for the labs once-a-day cursor.
+        self.document_synced_at: dict[str, dict] = {}
 
     def ensure_whoop_private_tables(self) -> None:
         self.ensure_called = True
@@ -183,6 +194,27 @@ class FakeWhoopPrivateWarehouse:
     def whoop_private_workouts_without_cardio_details(self, *, account, limit):
         self.cardio_details_lookups.append({"account": account, "limit": limit})
         return list(self.workouts_without_cardio_details[:limit])
+
+    def insert_whoop_private_healthspan_weeks(self, rows):
+        self.healthspan_weeks.extend(rows)
+
+    def insert_whoop_private_healthspan_contributors(self, rows):
+        self.healthspan_contributors.extend(rows)
+
+    def insert_whoop_private_lab_results(self, rows):
+        self.lab_results.extend(rows)
+
+    def insert_whoop_private_coach_messages(self, rows):
+        self.coach_messages.extend(rows)
+
+    def whoop_private_healthspan_chain(self, *, account):
+        return dict(self.healthspan_chain)
+
+    def whoop_private_coach_conversation_ids(self, *, account):
+        return set(self.coach_conversation_ids)
+
+    def whoop_private_document_collected_at(self, *, account, kind):
+        return dict(self.document_synced_at.get(kind, {}))
 
     def insert_whoop_private_sync_state(self, **row):
         self.state_rows.append(row)
@@ -418,6 +450,72 @@ class FakeWhoopPrivateClient:
     def behavior_impact(self, *, day):
         self._record("behavior_impact", day=day)
         return {"impact_summary_card": {"content": {"title": "BEHAVIOR INSIGHTS", "items": []}}}
+
+    def health_monitor(self, *, day):
+        self._record("health_monitor", day=day)
+        return {"title": "HEALTH MONITOR", "items": []}
+
+    #: The oldest Healthspan week WHOOP will name; its payload has no previous.
+    healthspan_first_week = date(2026, 7, 26)
+
+    def healthspan(self, *, day):
+        self._record("healthspan", day=day)
+        requested = date.fromisoformat(day)
+        week_start = requested - timedelta(days=(requested.weekday() + 1) % 7)
+        week_end = week_start + timedelta(days=6)
+        previous = week_start - timedelta(days=7)
+        return fixtures.healthspan_payload(
+            week_range=f"{week_start:%b} {week_start.day} - {week_end:%b} {week_end.day}",
+            previous=previous.isoformat() if week_start > self.healthspan_first_week else None,
+        )
+
+    def healthspan_bloodwork_insights(self, *, pillar):
+        self._record("healthspan_bloodwork_insights", pillar=pillar)
+        return {"content": {"items": []}}
+
+    def achievements_hub(self, *, tab):
+        self._record("achievements_hub", tab=tab)
+        return {"content": {}}
+
+    def weekly_plan(self):
+        self._record("weekly_plan")
+        return {"plan": {}}
+
+    def advanced_labs_home(self):
+        self._record("advanced_labs_home")
+        return {"sections": []}
+
+    def advanced_labs_biomarkers_summary(self):
+        self._record("advanced_labs_biomarkers_summary")
+        return {"items": []}
+
+    def advanced_labs_test_history(self):
+        self._record("advanced_labs_test_history")
+        return fixtures.LAB_TEST_HISTORY
+
+    def biomarker_test(self, *, test_id):
+        self._record("biomarker_test", test_id=test_id)
+        return fixtures.LAB_TEST_RECORD
+
+    def advanced_labs_test(self, *, test_id):
+        self._record("advanced_labs_test", test_id=test_id)
+        return fixtures.LAB_TEST_PAGE
+
+    def advanced_labs_biomarker(self, *, biomarker_id):
+        self._record("advanced_labs_biomarker", biomarker_id=biomarker_id)
+        return fixtures.EGFR_DETAIL if "glomerular" in biomarker_id else fixtures.POTASSIUM_DETAIL
+
+    def advanced_labs_biomarker_recordings(self, *, biomarker_id):
+        self._record("advanced_labs_biomarker_recordings", biomarker_id=biomarker_id)
+        return {"record_history": {"paginated_recordings": {"records": []}}}
+
+    def coach_conversations(self, *, next_token=None):
+        self._record("coach_conversations", next_token=next_token)
+        return fixtures.COACH_PAGE_TWO if next_token else fixtures.COACH_PAGE_ONE
+
+    def coach_conversation(self, *, conversation_id):
+        self._record("coach_conversation", conversation_id=conversation_id)
+        return fixtures.coach_conversation(conversation_id)
 
     def health_tab(self):
         self._record("health_tab")
@@ -1261,7 +1359,7 @@ def test_a_backfilled_day_is_never_fetched_twice(monkeypatch) -> None:
     """The documents table is the cursor, so a resumed run skips what it has."""
     stored = [
         {"account": ACCOUNT, "kind": kind, "doc_key": day}
-        for kind in ("strain_deep_dive", "behavior_impact", "stress", "sleep_deep_dive")
+        for kind in WhoopPrivateSyncRunner.DAY_DOCUMENT_KINDS
         for day in ("2026-08-22", "2026-08-21")
     ]
     warehouse = FakeWhoopPrivateWarehouse(
@@ -1356,7 +1454,7 @@ def test_a_partially_stored_day_only_fetches_the_kinds_it_is_missing(monkeypatch
 
 
 def test_historic_days_backfill_every_day_keyed_kind(monkeypatch) -> None:
-    """All four kinds get history, megabytes included.
+    """Every day-keyed kind gets history, megabytes included.
 
     `stress` and `sleep_deep_dive` are ~1.7 MB and ~935 KB per day against ~5 KB
     and 326 bytes for the other two, so this is a deliberate storage trade: an
@@ -1383,7 +1481,7 @@ def test_historic_days_backfill_every_day_keyed_kind(monkeypatch) -> None:
     }
     assert historic == {
         (kind, day)
-        for kind in ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact")
+        for kind in ("stress", "sleep_deep_dive", "strain_deep_dive", "behavior_impact", "health_monitor")
         for day in ("2026-08-21", "2026-08-22")
     }
 
@@ -1407,5 +1505,140 @@ def test_documents_are_flushed_per_day_not_accumulated(monkeypatch) -> None:
         batch
         for batch in warehouse.document_batches
         if {row["doc_key"] for row in batch} <= {"2026-08-21", "2026-08-22", "2026-08-23"}
+        and {row["kind"] for row in batch} <= set(WhoopPrivateSyncRunner.DAY_DOCUMENT_KINDS)
     ]
     assert len(day_batches) == 3, "one insert per day, not one insert for the whole run"
+
+
+# ------------------------------------------------- healthspan, labs, coach ----
+
+
+def _days(client, endpoint):
+    return [params["day"] for name, params in client.calls if name == endpoint]
+
+
+def test_healthspan_walks_whoops_own_week_chain_to_the_first_week(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    # Today is 2026-08-23 (a Sunday, user-local); each payload names the week
+    # before it, and the first week's names none.
+    assert _days(client, "healthspan") == ["2026-08-23", "2026-08-16", "2026-08-09", "2026-08-02", "2026-07-26"]
+    assert [row["week_start"] for row in warehouse.healthspan_weeks] == [
+        date(2026, 8, 23),
+        date(2026, 8, 16),
+        date(2026, 8, 9),
+        date(2026, 8, 2),
+        date(2026, 7, 26),
+    ]
+    assert len(warehouse.healthspan_contributors) == 5 * 6
+    raw = {(row["kind"], row["doc_key"]) for row in warehouse.documents}
+    assert ("healthspan", "2026-07-26") in raw
+    assert {("healthspan_bloodwork_insights", p) for p in ("SLEEP", "STRAIN", "FITNESS")} <= raw
+    assert ("achievements", "HEALTHSPAN") in raw
+
+
+def test_a_stored_healthspan_week_is_stepped_over_by_its_recorded_chain(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.healthspan_chain = {date(2026, 8, 16): date(2026, 8, 9), date(2026, 8, 9): date(2026, 8, 2)}
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    # The current week is always refreshed; stored history is never re-fetched.
+    assert _days(client, "healthspan") == ["2026-08-23", "2026-08-02", "2026-07-26"]
+
+
+def test_the_healthspan_history_walk_is_bounded_per_run(monkeypatch) -> None:
+    monkeypatch.setattr("personal_data_warehouse.whoop_private_sync.WHOOP_PRIVATE_HEALTHSPAN_WEEKS_PER_RUN", 2)
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    assert _days(client, "healthspan") == ["2026-08-23", "2026-08-16", "2026-08-09"]
+
+
+def test_a_restyled_healthspan_screen_fails_its_collection_by_name(monkeypatch) -> None:
+    class Restyled(FakeWhoopPrivateClient):
+        def healthspan(self, *, day):
+            self._record("healthspan", day=day)
+            return {"unlocked_content": {"whoop_age_amoeba": {"style_values": {"age": 30}}, "items": []}}
+
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+
+    with pytest.raises(RuntimeError, match="healthspan"):
+        _run(monkeypatch, warehouse=warehouse, client=Restyled())
+
+    failed = {row["collection"]: row for row in warehouse.state_rows if row["status"] == "failed"}
+    assert set(failed) == {"healthspan"}
+    assert "zero contributors" in failed["healthspan"]["error"]
+    # Every other collection, labs and coach included, still ran.
+    assert warehouse.lab_results and warehouse.coach_messages and warehouse.heart_rate_samples
+
+
+def test_labs_land_one_row_per_biomarker_with_raw_documents_beside_them(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+
+    _run(monkeypatch, warehouse=warehouse)
+
+    assert {row["biomarker_id"] for row in warehouse.lab_results} == {
+        "potassium",
+        "estimated_glomerular_filtration_rate",
+    }
+    kinds = [(row["kind"], row["doc_key"]) for row in warehouse.documents if row["kind"].startswith("advanced_labs")]
+    assert ("advanced_labs_test", "test-metabolic") in kinds
+    assert ("advanced_labs_biomarker", "potassium") in kinds
+    # The history list is the once-a-day cursor, so it is written last: a pass
+    # that dies halfway is retried rather than marked done.
+    assert kinds[-1] == ("advanced_labs_tests", "current")
+
+
+def test_labs_are_fetched_at_most_once_a_day(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(
+        session=_session_row(),
+        state={(ACCOUNT, "labs"): {"collection_signature": "", "watermark_updated_at": NOW - timedelta(hours=2)}},
+    )
+    warehouse.document_synced_at = {"advanced_labs_tests": {"current": NOW - timedelta(hours=2)}}
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    assert not [name for name, _ in client.calls if name.startswith("advanced_labs") or name == "biomarker_test"]
+    assert warehouse.lab_results == []
+
+    warehouse.document_synced_at = {"advanced_labs_tests": {"current": NOW - timedelta(hours=25)}}
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    assert warehouse.lab_results
+
+
+def test_coach_history_is_read_once_page_one_already_holds_everything(monkeypatch) -> None:
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    # Page two only repeated page one's tail, so the walk stopped there
+    # instead of following next_token forever.
+    assert [params["next_token"] for name, params in client.calls if name == "coach_conversations"] == [
+        None,
+        "page-2",
+    ]
+    assert {row["conversation_id"] for row in warehouse.coach_messages} == {"conv-today", "conv-oct6", "conv-2025"}
+
+
+def test_older_coach_conversations_already_stored_are_not_refetched(monkeypatch) -> None:
+    monkeypatch.setattr("personal_data_warehouse.whoop_private_sync.WHOOP_PRIVATE_COACH_RECENT_CONVERSATIONS", 1)
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.coach_conversation_ids = {"conv-today", "conv-oct6", "conv-2025"}
+    client = FakeWhoopPrivateClient()
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    # The newest conversation can still be growing, so it is always re-read.
+    assert [params["conversation_id"] for name, params in client.calls if name == "coach_conversation"] == [
+        "conv-today"
+    ]

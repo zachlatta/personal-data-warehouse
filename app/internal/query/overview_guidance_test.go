@@ -144,8 +144,15 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// the one fact that keeps a second provider from doubling net worth. Its
 	// base tables carry one sign-trap line each and holdings none. 9200
 	// leaves room for one more contract surface, not prose.
-	if guidance > 9200 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9200)", guidance)
+	//
+	// 9200 held until 2026-10-11, when WHOOP Healthspan landed: four base
+	// tables (healthspan weeks and contributors, lab results, coach messages)
+	// and three marts_health views over them, the read interface for "what is
+	// driving my WHOOP Age up". Their first sentences were cut to a few words
+	// each (9962 -> 9458) before the cap moved; the detail lives after the
+	// first period, which only describe_table renders. 9500 is that and no more.
+	if guidance > 9500 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9500)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)
