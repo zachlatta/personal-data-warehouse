@@ -37,6 +37,9 @@ from personal_data_warehouse.schema import (
     AGENT_SESSION_EVENT_COLUMNS,
     LEGACY_CODEX_TOOL_SUBTYPES,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
+    GMAIL_FILTER_COLUMNS,
+    GMAIL_LABEL_COLUMNS,
+    GMAIL_SETTINGS_SYNC_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     ATTACHMENT_ENRICHMENT_COLUMNS,
     APPLE_NOTE_ATTACHMENT_COLUMNS,
@@ -756,6 +759,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "gmail_attachments": TableSpec(ATTACHMENT_COLUMNS, ("account", "message_id", "part_id", "filename")),
     "gmail_sync_state": TableSpec(SYNC_STATE_COLUMNS, ("account",), "updated_at"),
+    "gmail_labels": TableSpec(GMAIL_LABEL_COLUMNS, ("account", "label_id")),
+    "gmail_filters": TableSpec(GMAIL_FILTER_COLUMNS, ("account", "filter_id")),
+    "gmail_settings_sync_state": TableSpec(GMAIL_SETTINGS_SYNC_STATE_COLUMNS, ("account",), "updated_at"),
     "gmail_attachment_backfill_state": TableSpec(
         ATTACHMENT_BACKFILL_STATE_COLUMNS,
         ("account", "message_id"),
@@ -2300,6 +2306,9 @@ ARRAY_COLUMNS = {
     "input_pipelines",
     "key_columns",
     "label_ids",
+    # base_gmail.filters: the label ids a filter adds / removes.
+    "add_label_ids",
+    "remove_label_ids",
     "to_addresses",
     "cc_addresses",
     "bcc_addresses",
@@ -2309,6 +2318,8 @@ ARRAY_COLUMNS = {
 }
 
 JSONB_COLUMNS_BY_TABLE = {
+    "gmail_labels": {"raw_json"},
+    "gmail_filters": {"criteria_json", "action_json", "raw_json"},
     "contact_cards": {
         "emails",
         "phones",
@@ -2638,6 +2649,9 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # ops.gmail_settings_sync_state: what the last snapshot held.
+    "label_count",
+    "filter_count",
     # ops.uploader_heartbeats: failed uploader runs in a row.
     "consecutive_failures",
     # Muse workspace files: 1 when the content is inline text.
@@ -3273,6 +3287,9 @@ class PostgresWarehouse:
                 "gmail_sync_state",
                 "gmail_attachment_backfill_state",
                 "file_attachment_enrichments",
+                "gmail_labels",
+                "gmail_filters",
+                "gmail_settings_sync_state",
             ]
         )
         self._ensure_file_attachment_enrichment_columns()
@@ -7598,7 +7615,10 @@ class PostgresWarehouse:
                 FROM @upstream_mutations
                 WHERE status = ANY(%s)
                   {provider_filter}
-                ORDER BY approved_at ASC, created_at ASC, id ASC
+                -- Mutations of one request share approved_at and created_at;
+                -- request_index keeps them in the order they were proposed
+                -- (a label is created before the filter that uses it).
+                ORDER BY approved_at ASC, created_at ASC, request_id ASC, request_index ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
             )
@@ -7620,6 +7640,16 @@ class PostgresWarehouse:
                 now,
                 now,
             ),
+        )
+        # UPDATE ... RETURNING comes back in heap order, not the CTE's.
+        rows.sort(
+            key=lambda row: (
+                row["approved_at"],
+                row["created_at"],
+                str(row["request_id"] or ""),
+                int(row["request_index"] or 0),
+                str(row["id"]),
+            )
         )
         for row in rows:
             self._append_upstream_mutation_event(
@@ -8249,6 +8279,63 @@ class PostgresWarehouse:
                         {"message_ids": message_ids, "delivery_mode": str(result.get("delivery_mode") or "")},
                     )
                 )
+        return self.observe_upstream_mutations(
+            observations=observations,
+            actor_id="upstream_mutation_observer",
+            ensure_tables=False,
+        )
+
+    def observe_succeeded_gmail_settings_mutations(
+        self, *, limit: int | None = None, ensure_tables: bool = True
+    ) -> int:
+        """Mark a label/filter mutation observed once base_gmail's snapshot shows its effect."""
+        if ensure_tables:
+            self.ensure_upstream_mutation_tables()
+        observations: list[tuple[str, Mapping[str, Any]]] = []
+        for operation in (
+            "gmail.create_label",
+            "gmail.update_label",
+            "gmail.delete_label",
+            "gmail.create_filter",
+            "gmail.replace_filter",
+            "gmail.delete_filter",
+        ):
+            for mutation in self._succeeded_upstream_mutations(provider="gmail", operation=operation, limit=limit):
+                account = str(mutation["account"])
+                payload = _as_json_dict(mutation["payload_json"])
+                result = _as_json_dict(mutation["result_json"])
+                labels = {
+                    str(row[0]): str(row[1])
+                    for row in self._query(
+                        "SELECT label_id, name FROM @gmail_labels WHERE account = %s AND is_deleted = 0", (account,)
+                    )
+                } if operation.endswith("_label") else {}
+                filters = {
+                    str(row[0])
+                    for row in self._query(
+                        "SELECT filter_id FROM @gmail_filters WHERE account = %s AND is_deleted = 0", (account,)
+                    )
+                } if operation.endswith("_filter") else set()
+                label_id = str(result.get("label_id") or payload.get("label_id") or "")
+                if operation == "gmail.create_label":
+                    seen = bool(label_id) and label_id in labels
+                elif operation == "gmail.update_label":
+                    new_name = str(payload.get("new_name") or "")
+                    seen = label_id in labels and (not new_name or labels[label_id] == new_name)
+                elif operation == "gmail.delete_label":
+                    seen = bool(label_id) and label_id not in labels
+                elif operation == "gmail.create_filter":
+                    filter_id = str(result.get("filter_id") or "")
+                    seen = bool(filter_id) and filter_id in filters
+                elif operation == "gmail.replace_filter":
+                    new_id = str(result.get("new_filter_id") or "")
+                    old_id = str(result.get("replaced_filter_id") or payload.get("filter_id") or "")
+                    seen = bool(new_id) and new_id in filters and (old_id == new_id or old_id not in filters)
+                else:
+                    filter_id = str(result.get("filter_id") or payload.get("filter_id") or "")
+                    seen = bool(filter_id) and filter_id not in filters
+                if seen:
+                    observations.append((str(mutation["id"]), {"operation": operation}))
         return self.observe_upstream_mutations(
             observations=observations,
             actor_id="upstream_mutation_observer",
@@ -9099,6 +9186,66 @@ class PostgresWarehouse:
 
     def insert_attachments(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("gmail_attachments", rows, ATTACHMENT_COLUMNS)
+
+    def replace_gmail_settings_snapshot(
+        self,
+        *,
+        account: str,
+        labels: list[dict[str, Any]],
+        filters: list[dict[str, Any]],
+        synced_at: datetime,
+    ) -> dict[str, int]:
+        """Write one account's full label and filter listing.
+
+        Every listed row is upserted (restamping ``synced_at``, which is the
+        pipeline's freshness), and a row Gmail no longer lists is kept as a
+        tombstone with ``is_deleted = 1``: a filter a reviewed mutation deleted
+        stays readable next to the mutation that deleted it.
+        """
+        sync_version = int(_ensure_utc(synced_at).timestamp() * 1_000_000)
+        stamped_labels = [
+            {**row, "account": account, "is_deleted": 0, "synced_at": synced_at, "sync_version": sync_version}
+            for row in labels
+        ]
+        stamped_filters = [
+            {**row, "account": account, "is_deleted": 0, "synced_at": synced_at, "sync_version": sync_version}
+            for row in filters
+        ]
+        self._insert_rows("gmail_labels", stamped_labels, GMAIL_LABEL_COLUMNS)
+        self._insert_rows("gmail_filters", stamped_filters, GMAIL_FILTER_COLUMNS)
+        deleted: dict[str, int] = {}
+        for table, key, live in (
+            ("gmail_labels", "label_id", [str(row["label_id"]) for row in labels]),
+            ("gmail_filters", "filter_id", [str(row["filter_id"]) for row in filters]),
+        ):
+            rows = self._query(
+                f"""
+                UPDATE @{table}
+                   SET is_deleted = 1, synced_at = %s, sync_version = %s
+                 WHERE account = %s AND is_deleted = 0 AND NOT ({_identifier(key)} = ANY(%s))
+                RETURNING 1
+                """,
+                (synced_at, sync_version, account, live),
+            )
+            deleted[table] = len(rows)
+        return deleted
+
+    def upsert_gmail_settings_sync_state(self, row: dict[str, Any]) -> None:
+        self._insert_rows("gmail_settings_sync_state", [row], GMAIL_SETTINGS_SYNC_STATE_COLUMNS)
+
+    def gmail_labels(self, *, account: str, include_deleted: bool = False) -> list[dict[str, Any]]:
+        deleted_filter = "" if include_deleted else "AND is_deleted = 0"
+        return self._query_dicts(
+            f"SELECT * FROM @gmail_labels WHERE account = %s {deleted_filter} ORDER BY name, label_id",
+            (account,),
+        )
+
+    def gmail_filters(self, *, account: str, include_deleted: bool = False) -> list[dict[str, Any]]:
+        deleted_filter = "" if include_deleted else "AND is_deleted = 0"
+        return self._query_dicts(
+            f"SELECT * FROM @gmail_filters WHERE account = %s {deleted_filter} ORDER BY filter_id",
+            (account,),
+        )
 
     def load_attachment_backfill_candidate_messages(
         self,

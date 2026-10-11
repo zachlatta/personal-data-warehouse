@@ -2061,6 +2061,7 @@ export function requestKindLabel(mutations: MutationLike[] | undefined): string 
   if (all.every(isSlackMarkReadMutation)) return 'Slack mark read';
   if (all.every(isCalendarCreateMutation)) return 'Calendar event';
   if (all.every(isGmailThreadMutation)) return 'Gmail';
+  if (all.every(isGmailSettingsMutation)) return 'Gmail rules';
   if (all.every(isContactMutation) || all.every(isAppleContactsMutation)) return 'Contacts';
   return 'Request';
 }
@@ -2172,4 +2173,114 @@ export function withMutationStatus<T extends PagedRequest>(request: T, changed: 
   // restore moves it here too rather than waiting on a reload.
   const pending = typeof request.pending_mutation_count === 'number' ? { pending_mutation_count: Math.max(0, request.pending_mutation_count + delta) } : {};
   return { ...request, ...pending, mutations };
+}
+
+
+// --- Gmail filters and labels ------------------------------------------------
+//
+// Mirrors gmailSettingsView in the web app (app/internal/webapp/static/
+// mutation_view.js). The server writes each rule as a sentence; a match
+// preview it could not make reads as words, never as a zero.
+
+export const GMAIL_SETTINGS_OPERATIONS = [
+  'gmail.create_filter', 'gmail.replace_filter', 'gmail.delete_filter',
+  'gmail.create_label', 'gmail.update_label', 'gmail.delete_label',
+];
+
+export function isGmailSettingsMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'gmail' && GMAIL_SETTINGS_OPERATIONS.includes(text(mutation.operation));
+}
+
+export type GmailSettingsExample = { threadId: string; sender: string; address: string; subject: string; date: string };
+
+export type GmailSettingsReview = {
+  kind: 'filter' | 'label';
+  heading: string;
+  before: string;
+  after: string;
+  filterId: string;
+  matchText: string;
+  matchNote: string;
+  examples: GmailSettingsExample[];
+  existingMailNote: string;
+  effect: string;
+  name: string;
+  newName: string;
+  changes: string[];
+  color: { background: string; text: string } | null;
+  labelFacts: string;
+  warnings: string[];
+  resultNote: string;
+};
+
+function pluralCount(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? '' : 's'}`;
+}
+
+function gmailMatchText(match: Record<string, unknown>): string {
+  const status = text(match.status);
+  if (!status) return '';
+  if (status === 'unknown') return 'Match preview unknown';
+  if (status === 'unavailable') return 'No match preview';
+  const threads = Number(match.thread_count) || 0;
+  const messages = Number(match.message_count) || 0;
+  const days = Number(match.window_days) || 90;
+  const bound = status === 'upper_bound' ? 'at most ' : '';
+  return `Matched ${bound}~${pluralCount(threads, 'thread')} (${pluralCount(messages, 'message')}) in the last ${days} days`;
+}
+
+export function gmailSettingsReview(mutation: MutationLike): GmailSettingsReview {
+  const payload = asRecord(mutation.payload);
+  const preview = asRecord(mutation.preview);
+  const result = asRecord(mutation.result);
+  const operation = text(mutation.operation);
+  const isFilter = operation.endsWith('_filter');
+  const view = asRecord(isFilter ? preview.gmail_filter : preview.gmail_label);
+  const warnings = list(view.warnings);
+  if (!('warnings' in view)) warnings.push('The current Gmail labels and filters could not be checked against the warehouse.');
+  const base: GmailSettingsReview = {
+    kind: isFilter ? 'filter' : 'label', heading: '', before: '', after: '', filterId: text(payload.filter_id),
+    matchText: '', matchNote: '', examples: [], existingMailNote: '', effect: text(view.effect),
+    name: '', newName: text(payload.new_name), changes: list(view.changes), color: null, labelFacts: '',
+    warnings,
+    resultNote: result.already_existed ? 'Already existed' : result.already_deleted ? 'Already deleted'
+      : result.already_replaced ? 'Already replaced' : result.already_applied ? 'Already looked like that' : '',
+  };
+  if (isFilter) {
+    const rule = text(asRecord(view.rule).text);
+    const previous = text(asRecord(view.previous_rule).text);
+    const match = asRecord(view.match);
+    const deleting = operation === 'gmail.delete_filter';
+    return {
+      ...base,
+      heading: operation === 'gmail.create_filter' ? 'New Gmail filter' : operation === 'gmail.replace_filter' ? 'Change Gmail filter' : 'Delete Gmail filter',
+      before: deleting ? rule : previous,
+      after: deleting ? '' : rule,
+      matchText: gmailMatchText(match),
+      matchNote: text(match.note),
+      examples: records(match.examples).map((example) => ({
+        threadId: text(example.thread_id),
+        sender: text(example.from_name) || text(example.from_address),
+        address: text(example.from_address),
+        subject: text(example.subject),
+        date: text(example.date),
+      })),
+      existingMailNote: deleting ? '' : 'Applies to new mail only; mail already in the mailbox is not moved unless this request also moves it.',
+    };
+  }
+  const current = asRecord(view.current);
+  const name = text(current.name) || text(payload.label) || text(payload.name);
+  const color = asRecord(payload.color);
+  let labelFacts = '';
+  if ('message_count' in view) {
+    labelFacts = `On ${pluralCount(Number(view.message_count) || 0, 'message')} in ${pluralCount(Number(view.thread_count) || 0, 'thread')}`;
+  }
+  return {
+    ...base,
+    heading: operation === 'gmail.create_label' ? `New Gmail label "${text(payload.name)}"`
+      : operation === 'gmail.update_label' ? `Change Gmail label "${name}"` : `Delete Gmail label "${name}"`,
+    name,
+    color: text(color.background_color) ? { background: text(color.background_color), text: text(color.text_color) } : null,
+    labelFacts,
+  };
 }

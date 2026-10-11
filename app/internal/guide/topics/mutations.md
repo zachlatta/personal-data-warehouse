@@ -2,7 +2,7 @@
 
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
-Prefer this path for any change to Zach's Gmail, Calendar, Google or Apple Contacts, Slack
+Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (iMessage/SMS); use a direct connector only for
 something PDW has no mutation type for, and say why.
 
@@ -15,7 +15,8 @@ something PDW has no mutation type for, and say why.
    entries. It returns a `request_id` and an `approval_url`; it executes nothing.
 
 Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_threads`,
-`gmail.modify_thread_labels`, `calendar.create_event`, `calendar.update_event`,
+`gmail.modify_thread_labels`, `gmail.create_filter`, `gmail.replace_filter`, `gmail.delete_filter`,
+`gmail.create_label`, `gmail.update_label`, `gmail.delete_label`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `apple_messages.send_message`,
@@ -54,6 +55,18 @@ authoritative when this list and it disagree.
   (`replaces_revision` / `expected_revision`) or the call is refused: never take back a
   version a human is still changing. Withdrawing removes work from the queue and never
   runs anything; approval and execution stay with the human and the workers.
+- **Gmail filters and labels:** read what exists first in `base_gmail.labels` and
+  `base_gmail.filters` (`is_deleted = 0`). A filter is `criteria` (from, to, subject, query,
+  negated_query, has_attachment, size) plus `action` (label names in `add_labels` /
+  `remove_labels`, `create_and_add_labels` to create one, and the booleans `skip_inbox`,
+  `mark_read`, `star`, `mark_important`, `never_important`, `never_spam`, `trash`, plus
+  `category`); label names resolve to ids at execution. Forwarding is refused. A filter only
+  touches **new** mail: to move what is already there, add a `gmail.modify_thread_labels` /
+  `gmail.archive_threads` batch for those threads in the same request (the review shows how
+  many recent threads match; label and filter changes run first, in order). Gmail has no
+  filter edit: `gmail.replace_filter` names the old `filter_id` and creates the new rule
+  before deleting the old one. `delete_*` and `replace_filter` snapshot what they change,
+  and the executor refuses if it changed before approval.
 - **Slack as Zach:** `slack.send_message` posts through his own Slack session (never a
   bot) to a `conversation_id` from `base_slack.conversations`, to one person by `user_id`
   from `base_slack.users` (the executor reuses or opens the DM), or under `thread_ts` (a

@@ -9,23 +9,66 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from personal_data_warehouse.config import (
     CALENDAR_MUTATION_SCOPE,
+    CALENDAR_READONLY_SCOPE,
+    CONTACTS_READONLY_SCOPE,
     CONTACTS_SCOPE,
     GMAIL_COMPOSE_SCOPE,
     GMAIL_MODIFY_SCOPE,
+    GMAIL_READONLY_SCOPE,
+    GMAIL_SETTINGS_BASIC_SCOPE,
+    GOOGLE_DRIVE_SCOPE,
+    Settings,
     email_domain,
     env_slug,
     load_settings,
 )
 
+# Every Google scope production uses, read and write. A consent REPLACES the
+# account's whole grant, so a re-auth that asks for less silently takes the
+# rest away: on 2026-07-15 one that omitted the write flags dropped every
+# write scope and the mutation queue went blocked_missing_credentials. This is
+# deliberately a fixed list rather than derived from the local .env, which
+# may not enable every Drive-backed source production runs.
+PRODUCTION_GOOGLE_SCOPES: tuple[str, ...] = (
+    GMAIL_READONLY_SCOPE,
+    GMAIL_MODIFY_SCOPE,
+    GMAIL_COMPOSE_SCOPE,
+    GMAIL_SETTINGS_BASIC_SCOPE,
+    CALENDAR_READONLY_SCOPE,
+    CALENDAR_MUTATION_SCOPE,
+    CONTACTS_READONLY_SCOPE,
+    CONTACTS_SCOPE,
+    GOOGLE_DRIVE_SCOPE,
+)
 
-def run_oauth_flow(
-    email_address: str,
+
+def requested_scopes(
+    settings: Settings,
     *,
     include_gmail_modify: bool = False,
     include_gmail_compose: bool = False,
     include_contacts_write: bool = False,
     include_calendar_write: bool = False,
-) -> dict[str, str]:
+    include_gmail_settings: bool = False,
+    production: bool = False,
+) -> tuple[str, ...]:
+    if production:
+        return PRODUCTION_GOOGLE_SCOPES
+    scopes = list(settings.google_scopes)
+    if include_gmail_modify:
+        scopes.append(GMAIL_MODIFY_SCOPE)
+    if include_gmail_compose:
+        scopes.append(GMAIL_COMPOSE_SCOPE)
+    if include_contacts_write:
+        scopes.append(CONTACTS_SCOPE)
+    if include_calendar_write:
+        scopes.append(CALENDAR_MUTATION_SCOPE)
+    if include_gmail_settings:
+        scopes.append(GMAIL_SETTINGS_BASIC_SCOPE)
+    return tuple(dict.fromkeys(scopes))
+
+
+def run_oauth_flow(email_address: str, *, scopes: tuple[str, ...]) -> dict[str, str]:
     settings = load_settings(
         require_postgres=False,
         require_gmail=False,
@@ -42,15 +85,6 @@ def run_oauth_flow(
             f"Account override names GOOGLE_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 and "
             f"GMAIL_{slug}_OAUTH_CLIENT_SECRETS_JSON_B64 are also supported."
         )
-    scopes = list(settings.google_scopes)
-    if include_gmail_modify:
-        scopes.append(GMAIL_MODIFY_SCOPE)
-    if include_gmail_compose:
-        scopes.append(GMAIL_COMPOSE_SCOPE)
-    if include_contacts_write:
-        scopes.append(CONTACTS_SCOPE)
-    if include_calendar_write:
-        scopes.append(CALENDAR_MUTATION_SCOPE)
     flow = InstalledAppFlow.from_client_config(
         json.loads(client_secrets_json),
         tuple(dict.fromkeys(scopes)),
@@ -96,6 +130,19 @@ def main() -> None:
         action="store_true",
         help="Request Google Calendar full scope so approved mutation jobs can create, update, or delete calendar events.",
     )
+    parser.add_argument(
+        "--include-gmail-settings",
+        action="store_true",
+        help="Request gmail.settings.basic so approved gmail.create_filter / replace_filter / delete_filter mutations can change filters.",
+    )
+    parser.add_argument(
+        "--production-scopes",
+        action="store_true",
+        help=(
+            "Request every scope production uses (Gmail read/modify/compose/settings, Calendar, Contacts, Drive). "
+            "Use this for any production re-consent: a consent replaces the whole grant, so asking for less drops the rest."
+        ),
+    )
     args = parser.parse_args()
 
     settings = load_settings(
@@ -136,14 +183,22 @@ def main() -> None:
         parser.error("no accounts configured in GMAIL_ACCOUNTS, CALENDAR_ACCOUNTS, or CONTACT_GOOGLE_ACCOUNTS")
         return
 
+    scopes = requested_scopes(
+        settings,
+        include_gmail_modify=args.include_gmail_modify,
+        include_gmail_compose=args.include_gmail_compose,
+        include_contacts_write=args.include_contacts_write,
+        include_calendar_write=args.include_calendar_write,
+        include_gmail_settings=args.include_gmail_settings,
+        production=args.production_scopes,
+    )
+    print("This consent replaces the account's whole Google grant. It will hold exactly:")
+    for scope in scopes:
+        print(f"  {scope}")
+    if not args.production_scopes:
+        print("For production tokens use --production-scopes, or every scope not listed above is dropped.")
     for email_address in emails:
-        env_values = run_oauth_flow(
-            email_address,
-            include_gmail_modify=args.include_gmail_modify,
-            include_gmail_compose=args.include_gmail_compose,
-            include_contacts_write=args.include_contacts_write,
-            include_calendar_write=args.include_calendar_write,
-        )
+        env_values = run_oauth_flow(email_address, scopes=scopes)
         if args.write_env:
             update_env_file(Path(".env"), env_values)
             print(f"Updated .env token env vars for {email_address}")

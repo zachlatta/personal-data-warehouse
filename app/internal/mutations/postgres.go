@@ -159,6 +159,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if normalized, err = s.enrichGmailEmailForwards(ctx, normalized); err != nil {
 		return Request{}, err
 	}
+	if normalized, err = s.enrichGmailSettings(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
@@ -339,6 +342,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string, page Mutation
 	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
 	mutations = s.hydrateAppleMessagesPreviews(ctx, mutations)
 	mutations = s.hydrateAppleMessagesMarkReadPreviews(ctx, mutations)
+	mutations = s.hydrateGmailSettingsPreviews(ctx, mutations)
 	request.Mutations = mutations
 	return request, nil
 }
@@ -1974,6 +1978,21 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Preview: map[string]any{
 					"mark_read": appleMessagesMarkReadPreview(payload),
 				},
+			})
+		case GmailCreateFilterOperation, GmailReplaceFilterOperation, GmailDeleteFilterOperation,
+			GmailCreateLabelOperation, GmailUpdateLabelOperation, GmailDeleteLabelOperation:
+			if err := validateGmailSettingsMutation(mutation); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			payload := gmailSettingsPayload(mutation)
+			out = append(out, storedMutation{
+				Provider:  "gmail",
+				Operation: mutation.Type,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, gmailSettingsTitle(mutation.Type, payload)),
+				Reason:    reason,
+				Payload:   payload,
+				Preview:   gmailSettingsPreview(mutation.Type, payload),
 			})
 		case SlackMarkConversationReadOperation:
 			conversationID := strings.TrimSpace(mutation.ConversationID)

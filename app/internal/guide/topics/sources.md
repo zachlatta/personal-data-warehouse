@@ -11,6 +11,9 @@ Start at the mart when one exists; drill to `base_*` from a hit's `source_table`
   `to_addresses`/`cc_addresses`/`bcc_addresses` are `text[]`; bodies in `body_text`/`body_html`.
 - `base_gmail.attachments` — attachment metadata with `storage_file_id` for the bytes.
 - `marts_inbox.gmail_threads` — the inbox as threads, for triage.
+- `base_gmail.labels` (`label_id` → `name`, so `messages.label_ids` reads as names) and
+  `base_gmail.filters` (`criteria_json`, `action_json`, `add_label_ids`) — the mailbox's
+  current labels and rules, snapshotted every 30 minutes; filter on `is_deleted = 0`.
 - Search scope `gmail`. A Gmail hit's `timeline.context()` is its thread.
 
 **Recent-email review:** pull a bounded local-time window of `timeline.events` with

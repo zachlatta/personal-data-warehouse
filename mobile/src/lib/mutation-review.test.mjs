@@ -46,6 +46,8 @@ import {
   slackMarkReadGroups,
   slackMarkReadReview,
   slackSendMessageReview,
+  gmailSettingsReview,
+  isGmailSettingsMutation,
 } from './mutation-review.ts';
 
 test('a calendar create mutation becomes a complete day view with real conflicts and guests', () => {
@@ -1248,4 +1250,45 @@ test('a kept thread stays in place under All, so the same tap can put it back', 
   assert.deepEqual(gmailVisibleThreads(reviews, 'kept', '').map((r) => r.subject), ['Beta']);
   assert.deepEqual(gmailVisibleThreads(reviews, 'unread', '').map((r) => r.subject), ['Alpha']);
   assert.deepEqual(gmailVisibleThreads(reviews, 'all', 'lee').map((r) => r.subject), ['Beta']);
+});
+
+test('gmailSettingsReview reads a filter as its rule with an honest match preview', () => {
+  const mutation = {
+    provider: 'gmail', operation: 'gmail.replace_filter', status: 'pending_review', account: 'you@example.com',
+    payload: { filter_id: 'F1' },
+    preview: { gmail_filter: {
+      kind: 'replace',
+      rule: { text: 'From news@x.com → skip inbox, mark read' },
+      previous_rule: { text: 'From news@x.com → skip inbox' },
+      match: { status: 'approximate', thread_count: 1, message_count: 2, window_days: 90,
+        examples: [{ thread_id: 't1', from_name: '', from_address: 'news@x.com', subject: 'Issue', date: '2026-10-10T00:00:00Z' }] },
+      warnings: ['Broad rule'],
+    } },
+  };
+  assert.equal(isGmailSettingsMutation(mutation), true);
+  assert.equal(isGmailThreadMutation(mutation), false);
+  const review = gmailSettingsReview(mutation);
+  assert.equal(review.heading, 'Change Gmail filter');
+  assert.equal(review.before, 'From news@x.com → skip inbox');
+  assert.equal(review.after, 'From news@x.com → skip inbox, mark read');
+  assert.equal(review.matchText, 'Matched ~1 thread (2 messages) in the last 90 days');
+  assert.equal(review.examples[0].sender, 'news@x.com');
+  assert.deepEqual(review.warnings, ['Broad rule']);
+  assert.equal(requestKindLabel([mutation]), 'Gmail rules');
+
+  const unknown = gmailSettingsReview({ provider: 'gmail', operation: 'gmail.create_filter', payload: {},
+    preview: { gmail_filter: { rule: { text: 'x' }, match: { status: 'unknown' } } } });
+  assert.equal(unknown.matchText, 'Match preview unknown');
+  assert.match(unknown.warnings[0], /could not be checked/);
+});
+
+test('gmailSettingsReview reads label changes', () => {
+  const remove = gmailSettingsReview({ provider: 'gmail', operation: 'gmail.delete_label', payload: { label: 'Old' },
+    preview: { gmail_label: { current: { name: 'Old' }, message_count: 1, thread_count: 1, warnings: [] } } });
+  assert.equal(remove.heading, 'Delete Gmail label "Old"');
+  assert.equal(remove.labelFacts, 'On 1 message in 1 thread');
+  const create = gmailSettingsReview({ provider: 'gmail', operation: 'gmail.create_label',
+    payload: { name: 'pdw-test', color: { background_color: '#16a766', text_color: '#ffffff' } }, preview: { gmail_label: { warnings: [] } } });
+  assert.equal(create.heading, 'New Gmail label "pdw-test"');
+  assert.deepEqual(create.color, { background: '#16a766', text: '#ffffff' });
 });

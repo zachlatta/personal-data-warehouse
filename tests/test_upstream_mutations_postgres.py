@@ -1296,3 +1296,75 @@ def test_withdrawn_mutations_are_never_claimed_and_roll_up_as_withdrawn(warehous
     warehouse._refresh_upstream_mutation_request_status("req_withdrawn")
     rows = warehouse._query_dicts("SELECT status FROM @upstream_mutation_requests WHERE id = 'req_withdrawn'")
     assert rows[0]["status"] == "rejected"
+
+
+def test_a_requests_mutations_are_claimed_in_the_order_they_were_proposed(warehouse: PostgresWarehouse) -> None:
+    # Every mutation of one request shares approved_at and created_at, so the
+    # claim used to fall through to the random id: a request that creates a
+    # label and then a filter using it ran them in either order. Ids here sort
+    # m0, m1, m10, m11, m2 as strings; the claim must follow request_index.
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_ordered",
+        title="Label then filter",
+        mutations=[
+            {"provider": "gmail", "operation": "gmail.create_label", "payload": {"name": f"L{index}"}}
+            for index in range(12)
+        ],
+    )
+    # An UPDATE moves a tuple to the end of the heap, and UPDATE ... RETURNING
+    # comes back in heap order, not the CTE's ORDER BY.
+    warehouse._command("UPDATE @upstream_mutations SET title = title WHERE request_index < 6")
+    claimed = warehouse.claim_approved_upstream_mutations(limit=50, claimed_by="worker-1")
+    assert [row["request_index"] for row in claimed] == list(range(12))
+    assert [row["id"] for row in claimed] == [child["id"] for child in request["mutations"]]
+
+
+def test_gmail_label_and_filter_mutations_are_observed_once_the_snapshot_shows_them(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_tables()
+    specs = [
+        ("gmail.create_label", {"name": "New"}, {"label_id": "Label_new"}),
+        ("gmail.update_label", {"label_id": "Label_7", "new_name": "Reading"}, {"label_id": "Label_7"}),
+        ("gmail.delete_label", {"label_id": "Label_gone"}, {"label_id": "Label_gone"}),
+        ("gmail.create_filter", {}, {"filter_id": "F_new"}),
+        ("gmail.replace_filter", {"filter_id": "F_old"}, {"replaced_filter_id": "F_old", "new_filter_id": "F_repl"}),
+        ("gmail.delete_filter", {"filter_id": "F_del"}, {"filter_id": "F_del"}),
+        # Not yet visible: the snapshot still lists the filter it deleted.
+        ("gmail.delete_filter", {"filter_id": "F_still"}, {"filter_id": "F_still"}),
+    ]
+    request = _seed_mutation_request(
+        warehouse,
+        request_id="req_settings",
+        title="Settings",
+        mutations=[{"provider": "gmail", "operation": op, "payload": payload} for op, payload, _ in specs],
+    )
+    for child, (_, _, result) in zip(request["mutations"], specs, strict=True):
+        warehouse._command(
+            "UPDATE @upstream_mutations SET status = 'succeeded', result_json = %s WHERE id = %s",
+            (_jsonb_param(result), child["id"]),
+        )
+    warehouse.replace_gmail_settings_snapshot(
+        account=ACCOUNT,
+        labels=[
+            {"label_id": "Label_new", "name": "New", "label_type": "user", "label_list_visibility": "", "message_list_visibility": "",
+             "background_color": "", "text_color": "", "raw_json": {}},
+            {"label_id": "Label_7", "name": "Reading", "label_type": "user", "label_list_visibility": "", "message_list_visibility": "",
+             "background_color": "", "text_color": "", "raw_json": {}},
+        ],
+        filters=[
+            {"filter_id": fid, "criteria_json": {}, "action_json": {}, "add_label_ids": [], "remove_label_ids": [], "forward_to": "", "raw_json": {}}
+            for fid in ("F_new", "F_repl", "F_still")
+        ],
+        synced_at=datetime.now(tz=UTC),
+    )
+
+    observed = warehouse.observe_succeeded_gmail_settings_mutations(ensure_tables=False)
+
+    statuses = {
+        row["request_index"]: row["status"]
+        for row in warehouse._query_dicts("SELECT request_index, status FROM @upstream_mutations WHERE request_id = 'req_settings'")
+    }
+    assert observed == 6
+    assert statuses == {0: "observed", 1: "observed", 2: "observed", 3: "observed", 4: "observed", 5: "observed", 6: "succeeded"}

@@ -1405,3 +1405,98 @@ export function appleMessagesMarkReadView(mutation) {
     alreadyRead: result.already_read === true,
   };
 }
+
+// --- Gmail filters and labels -------------------------------------------------
+//
+// The server renders each rule as words (preview.gmail_filter.rule.text, the
+// previous rule on a replace or delete) so the web and the phone show the same
+// sentence; these views only arrange it. A match preview is approximate by
+// construction and is never shown as a count when the server could not make
+// one: "unknown" and "unavailable" are words, not zeros.
+
+export const GMAIL_SETTINGS_OPS = [
+  "gmail.create_filter", "gmail.replace_filter", "gmail.delete_filter",
+  "gmail.create_label", "gmail.update_label", "gmail.delete_label",
+];
+
+export function isGmailSettingsMutation(m) {
+  return m.provider === "gmail" && GMAIL_SETTINGS_OPS.includes(m.operation);
+}
+
+function gmailMatchText(match) {
+  const status = trimStr(match.status);
+  if (!status) return "";
+  if (status === "unknown") return "Match preview unknown";
+  if (status === "unavailable") return "No match preview";
+  const threads = Number(match.thread_count) || 0;
+  const messages = Number(match.message_count) || 0;
+  const days = Number(match.window_days) || 90;
+  const bound = status === "upper_bound" ? "at most " : "";
+  return `Matched ${bound}~${threads} thread${threads === 1 ? "" : "s"} (${messages} message${messages === 1 ? "" : "s"}) in the last ${days} days`;
+}
+
+export function gmailSettingsView(mutation) {
+  const payload = asMap(mutation.payload);
+  const preview = asMap(mutation.preview);
+  const result = asMap(mutation.result);
+  const operation = trimStr(mutation.operation);
+  const isFilter = operation.endsWith("_filter");
+  const view = asMap(isFilter ? preview.gmail_filter : preview.gmail_label);
+  const resolved = "warnings" in view;
+  const warnings = stringSlice(view.warnings);
+  if (!resolved) warnings.push("The current Gmail labels and filters could not be checked against the warehouse.");
+  if (isFilter) {
+    const rule = trimStr(asMap(view.rule).text);
+    const previous = trimStr(asMap(view.previous_rule).text);
+    const match = asMap(view.match);
+    const heading = operation === "gmail.create_filter" ? "New Gmail filter"
+      : operation === "gmail.replace_filter" ? "Change Gmail filter" : "Delete Gmail filter";
+    return {
+      kind: "filter",
+      heading,
+      before: operation === "gmail.delete_filter" ? rule : previous,
+      after: operation === "gmail.delete_filter" ? "" : rule,
+      filterId: trimStr(payload.filter_id),
+      matchText: gmailMatchText(match),
+      matchNote: str(match.note),
+      examples: mapSlice(match.examples).map((example) => ({
+        threadId: trimStr(example.thread_id),
+        sender: trimStr(example.from_name) || trimStr(example.from_address),
+        address: trimStr(example.from_address),
+        subject: str(example.subject),
+        date: trimStr(example.date),
+      })),
+      existingMailNote: operation === "gmail.delete_filter" ? ""
+        : "Applies to new mail only; mail already in the mailbox is not moved unless this request also moves it.",
+      effect: str(view.effect),
+      warnings,
+      done: mutation.status === "succeeded" || mutation.status === "observed",
+      resultNote: result.already_existed ? "An identical filter already existed" : result.already_deleted ? "Already deleted"
+        : result.already_replaced ? "Already replaced" : "",
+    };
+  }
+  const current = asMap(view.current);
+  const name = trimStr(current.name) || trimStr(payload.label) || trimStr(payload.name);
+  const heading = operation === "gmail.create_label" ? `New Gmail label "${trimStr(payload.name)}"`
+    : operation === "gmail.update_label" ? `Change Gmail label "${name}"` : `Delete Gmail label "${name}"`;
+  const color = asMap(payload.color);
+  let labelFacts = "";
+  if ("message_count" in view) {
+    const messages = Number(view.message_count) || 0;
+    const threads = Number(view.thread_count) || 0;
+    labelFacts = `On ${messages} message${messages === 1 ? "" : "s"} in ${threads} thread${threads === 1 ? "" : "s"}`;
+  }
+  return {
+    kind: "label",
+    heading,
+    name,
+    newName: trimStr(payload.new_name),
+    changes: stringSlice(view.changes),
+    color: trimStr(color.background_color) ? { background: trimStr(color.background_color), text: trimStr(color.text_color) } : null,
+    labelFacts,
+    warnings,
+    done: mutation.status === "succeeded" || mutation.status === "observed",
+    resultNote: result.already_existed ? "That label already existed" : result.already_deleted ? "Already deleted"
+      : result.already_applied ? "Already looked like that" : "",
+  };
+}

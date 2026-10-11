@@ -514,3 +514,69 @@ Apple Messages, through the same `pdw mutations apple-messages` worker
 - `chat` accepts an E.164 phone, an email (iMessage or a business-chat sender such as
   `google@rbm.goog`), or a 3 to 8 digit short code; `recipient` is accepted as an alias.
   Group chats (`chat123…`) are refused at proposal time.
+
+## Gmail filters and labels (gmail.*_filter, gmail.*_label)
+
+Six reviewed types let an agent set up rules rather than only move mail:
+`gmail.create_filter`, `gmail.replace_filter`, `gmail.delete_filter`, `gmail.create_label`,
+`gmail.update_label`, `gmail.delete_label`. Proposal, snapshot and review live in
+`app/internal/mutations/gmail_settings.go` / `gmail_settings_store.go`; the executor is
+`src/personal_data_warehouse/gmail_settings_mutations.py`, run by the cloud worker beside every
+other Gmail mutation.
+
+- **The review reads the warehouse, so the warehouse holds the mailbox's configuration.**
+  The app server has no Google credentials, and nothing synced labels or filters before
+  this. `gmail_settings_sync` (`gmail_settings_sync.py`, Dagster, every 30 minutes) snapshots
+  both per account into `base_gmail.labels` and `base_gmail.filters` (full listing, two API
+  calls, `gmail.readonly`; a row Gmail stops returning is kept with `is_deleted = 1`), with
+  `ops.gmail_settings_sync_state` as its `gmail_settings` pipeline heartbeat. The worker
+  re-runs it inline for an account right after one of these mutations succeeds, so the next
+  review reads the new state, and the observer marks the mutation `observed` once the
+  snapshot shows the change. They are `entity` tables, not timeline events: what changes them
+  is the reviewed mutation, and that is on the timeline.
+- **Proposal-time snapshot, execution-time re-check.** `delete_filter` / `replace_filter`
+  copy the filter (Gmail's own criteria/action) into `payload.expected_filter`;
+  `update_label` / `delete_label` resolve the label to `label_id` + `expected_name`. A
+  proposal naming a filter or label the warehouse does not have, a system label, a rename onto
+  an existing name, an existing label name to create, or a filter identical to an existing one
+  is refused with the reason. After approval the executor re-reads Gmail and does nothing
+  (`failed_terminal`) when the rule or label changed since review; already gone on a delete is
+  `succeeded` with `already_deleted`.
+- **Gmail has no filter update, so replace is create-then-delete.** The mailbox is never
+  without the rule. If the delete fails after the create, the row is `failed_retryable` with
+  `new_filter_id` in `result_json`, and the retry finds that filter (identical criteria and
+  action) instead of creating a second one. `create_filter` does the same lookup, and treats
+  Gmail's 400 "Filter already exists" as done.
+- **Friendly actions, label names resolved at execution.** System labels are reachable only
+  through booleans (`skip_inbox` = remove INBOX, `mark_read` = remove UNREAD, `star`,
+  `mark_important` / `never_important`, `never_spam` = remove SPAM, `trash`, `category`), so
+  there is one way to say each. User labels are names: strict in `add_labels` /
+  `remove_labels` (resolved before anything is created), created only when listed in
+  `create_and_add_labels`. Unknown keys anywhere are refused, because a misspelled field is an
+  approved rule that does less than the reviewer read.
+- **Forwarding is refused.** It needs a verified forwarding address and
+  `gmail.settings.sharing`, and sending Zach's mail elsewhere is its own decision.
+- **Order inside a request.** The claim now orders a request's mutations by `request_index`
+  (they share `approved_at`/`created_at`, so it used to fall through to the random id, and
+  `UPDATE … RETURNING` comes back in heap order regardless; the rows are re-sorted in Python),
+  and the worker runs label/filter changes before the thread-label batches. So "create label
+  Receipts, create a filter that adds it, move these 40 threads under it" in one request works.
+- **Filters only touch new mail.** There is no apply-to-existing flag; the review shows how
+  many threads the criteria matched in the last 90 days (substring match on from/to/subject,
+  `has_attachment`, `size`, with up to five examples), and the agent proposes a
+  `gmail.modify_thread_labels` batch in the same request when existing mail should move. The
+  preview is computed on the read path and bounded (3 s, ten filters a page). Gmail search
+  syntax (`query`, `negated_query`, operators in `from`/`subject`) is not translated: with
+  other criteria the count is labelled an upper bound; with none it says "no preview". A
+  failed lookup reads "unknown", never 0. Warnings: a `trash` action, a broad rule (≥100
+  threads), deleting a filter, a label on messages or used by filters, nested labels a rename
+  does not carry.
+- **Scopes.** Label changes run under `gmail.modify`. Filter create/delete need
+  `gmail.settings.basic`, which only filter operations request (`Settings.gmail_settings_scopes`).
+  Requesting a scope the refresh token lacks fails the refresh, so adding it to the shared
+  `gmail_mutation_scopes` would have blocked every archive and send until re-consent. A missing
+  grant is `blocked_missing_credentials` with the fix in the error. The fix is
+  `uv run personal-data-warehouse-gmail-auth --email <account> --production-scopes`, which
+  asks for every scope production uses: a consent replaces the whole grant, and on 2026-07-15
+  a re-consent without the write flags silently dropped them. Put the printed
+  `GOOGLE_<SLUG>_TOKEN_JSON_B64` and `GMAIL_<SLUG>_TOKEN_JSON_B64` on the Dagster deployment.

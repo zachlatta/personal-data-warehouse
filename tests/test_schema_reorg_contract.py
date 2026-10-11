@@ -159,7 +159,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # .lab_results/.coach_messages -- WHOOP Age, its contributors, Advanced
         # Labs and the WHOOP Coach, typed because the questions they answer
         # ("what is driving my WHOOP Age up") need numbers, not a 90 KB UI tree.
-        "base": 73,
+        # +2 base: base_gmail.labels and base_gmail.filters, the snapshot a
+        # reviewed gmail.*_label / gmail.*_filter mutation is checked against,
+        # with +1 ops (gmail_settings_sync_state).
+        "base": 75,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -222,7 +225,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-            "ops": 38,
+            "ops": 39,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

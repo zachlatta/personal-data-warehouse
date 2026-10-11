@@ -15,6 +15,11 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from personal_data_warehouse.config import Settings
+from personal_data_warehouse.gmail_settings_mutations import (
+    GMAIL_FILTER_OPERATIONS,
+    GMAIL_SETTINGS_OPERATIONS,
+    execute_gmail_settings_mutation,
+)
 from personal_data_warehouse.gmail_sync import execute_gmail_request
 from personal_data_warehouse.google_auth import load_google_credentials
 
@@ -45,6 +50,15 @@ class GmailMutationExecutor:
 
     def execute(self, mutation: Mapping[str, Any]) -> GmailMutationResult:
         operation = str(mutation.get("operation") or "")
+        if mutation.get("provider") == "gmail" and operation in GMAIL_SETTINGS_OPERATIONS:
+            account = str(mutation.get("account") or "")
+            outcome = execute_gmail_settings_mutation(
+                operation=operation,
+                account=account,
+                payload=_mapping(mutation.get("payload_json")),
+                service_provider=lambda: self._service(account=account, operation=operation),
+            )
+            return GmailMutationResult(status=outcome.status, result_json=outcome.result_json, error=outcome.error)
         if mutation.get("provider") != "gmail" or operation not in {
             GMAIL_ARCHIVE_OPERATION,
             GMAIL_UNARCHIVE_OPERATION,
@@ -331,6 +345,11 @@ class GmailMutationExecutor:
         if reads_mail:
             # gmail.compose can send but not read; a forward reads its original.
             scopes = (*scopes, *self._settings.gmail_mutation_scopes)
+        if operation in GMAIL_FILTER_OPERATIONS:
+            # Only filter changes ask for gmail.settings.basic (modify covers the
+            # label lookups and creates they make). A token without it fails the
+            # refresh, so asking for it anywhere else would block every archive.
+            scopes = (*self._settings.gmail_settings_scopes, *self._settings.gmail_mutation_scopes)
         return build_gmail_mutation_service(account=account, settings=self._settings, scopes=scopes)
 
 

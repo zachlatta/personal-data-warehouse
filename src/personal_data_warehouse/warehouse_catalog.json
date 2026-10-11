@@ -527,6 +527,28 @@
       }
     },
     {
+      "id": "gmail_labels",
+      "kind": "table",
+      "layer": "base",
+      "domain": "gmail",
+      "schema": "base_gmail",
+      "name": "labels",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "gmail_filters",
+      "kind": "table",
+      "layer": "base",
+      "domain": "gmail",
+      "schema": "base_gmail",
+      "name": "filters",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "calendar_events",
       "kind": "table",
       "layer": "base",
@@ -2747,6 +2769,17 @@
         "schema": "gmail",
         "name": "attachment_backfill_state"
       }
+    },
+    {
+      "id": "gmail_settings_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "gmail_settings_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
     },
     {
       "id": "calendar_sync_state",

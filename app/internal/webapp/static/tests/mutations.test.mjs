@@ -679,3 +679,74 @@ test("appleMessagesMarkReadView warns when the warehouse was not consulted", () 
   assert.equal(view.heading, "Mark texts from 72975 read");
   assert.equal(view.warnings.length, 1);
 });
+
+// --- gmail filters and labels ---------------------------------------------------
+
+test("gmailSettingsView reads a new filter as its rule, with the match preview", () => {
+  const mutation = {
+    provider: "gmail", operation: "gmail.create_filter", account: "you@example.com", status: "pending_review",
+    payload: { criteria: { from: "news@x.com" }, action: { skip_inbox: true, add_labels: ["Newsletters"] } },
+    preview: { gmail_filter: {
+      kind: "create",
+      rule: { when: "From news@x.com", actions: ["skip inbox", "label \"Newsletters\""], text: "From news@x.com → skip inbox, label \"Newsletters\"" },
+      match: { status: "approximate", window_days: 90, thread_count: 12, message_count: 30, note: "Approximate: substring match on from over the last 90 days of synced mail.",
+        examples: [{ thread_id: "t1", from_name: "News", from_address: "news@x.com", subject: "Issue 9", date: "2026-10-10T12:00:00Z" }] },
+      warnings: [],
+    } },
+  };
+  assert.equal(V.isGmailSettingsMutation(mutation), true);
+  assert.equal(V.isGmailThreadMutation(mutation), false);
+  assert.equal(V.isGmailEmailMutation(mutation), false);
+  const view = V.gmailSettingsView(mutation);
+  assert.equal(view.heading, "New Gmail filter");
+  assert.equal(view.after, "From news@x.com → skip inbox, label \"Newsletters\"");
+  assert.equal(view.before, "");
+  assert.equal(view.matchText, "Matched ~12 threads (30 messages) in the last 90 days");
+  assert.equal(view.examples[0].sender, "News");
+  assert.match(view.existingMailNote, /new mail/);
+  assert.deepEqual(view.warnings, []);
+});
+
+test("gmailSettingsView shows a replacement as before and after, and never a fake zero", () => {
+  const view = V.gmailSettingsView({
+    provider: "gmail", operation: "gmail.replace_filter", status: "pending_review",
+    payload: { filter_id: "F1" },
+    preview: { gmail_filter: { kind: "replace", rule: { text: "From a → star" }, previous_rule: { text: "From a → skip inbox" },
+      match: { status: "unknown", note: "The match preview could not be computed in time; this is unknown, not zero." }, warnings: [] } },
+  });
+  assert.equal(view.heading, "Change Gmail filter");
+  assert.equal(view.before, "From a → skip inbox");
+  assert.equal(view.after, "From a → star");
+  assert.equal(view.matchText, "Match preview unknown");
+  const unavailable = V.gmailSettingsView({ provider: "gmail", operation: "gmail.create_filter", payload: {},
+    preview: { gmail_filter: { rule: { text: "Matches \"list:x\" → star" }, match: { status: "unavailable", note: "No preview" }, warnings: [] } } });
+  assert.equal(unavailable.matchText, "No match preview");
+  const upper = V.gmailSettingsView({ provider: "gmail", operation: "gmail.create_filter", payload: {},
+    preview: { gmail_filter: { rule: { text: "x" }, match: { status: "upper_bound", thread_count: 4, message_count: 5, window_days: 90 }, warnings: [] } } });
+  assert.equal(upper.matchText, "Matched at most ~4 threads (5 messages) in the last 90 days");
+});
+
+test("gmailSettingsView shows a deleted filter's rule and warns when the read path was not consulted", () => {
+  const view = V.gmailSettingsView({ provider: "gmail", operation: "gmail.delete_filter", payload: { filter_id: "F1" },
+    preview: { gmail_filter: { kind: "delete", rule: { text: "From a → skip inbox" } } } });
+  assert.equal(view.heading, "Delete Gmail filter");
+  assert.equal(view.before, "From a → skip inbox");
+  assert.equal(view.after, "");
+  assert.equal(view.warnings.length, 1);
+  assert.match(view.warnings[0], /could not be checked/);
+});
+
+test("gmailSettingsView reads label changes", () => {
+  const rename = V.gmailSettingsView({ provider: "gmail", operation: "gmail.update_label", payload: { label: "Old", new_name: "New" },
+    preview: { gmail_label: { kind: "update", current: { name: "Old" }, changes: ["name \"Old\" → \"New\""], warnings: [] } } });
+  assert.equal(rename.heading, "Change Gmail label \"Old\"");
+  assert.deepEqual(rename.changes, ["name \"Old\" → \"New\""]);
+  const remove = V.gmailSettingsView({ provider: "gmail", operation: "gmail.delete_label", payload: { label: "Old" },
+    preview: { gmail_label: { kind: "delete", current: { name: "Old" }, message_count: 42, thread_count: 30, warnings: ["42 messages carry this label"] } } });
+  assert.equal(remove.heading, "Delete Gmail label \"Old\"");
+  assert.equal(remove.labelFacts, "On 42 messages in 30 threads");
+  const create = V.gmailSettingsView({ provider: "gmail", operation: "gmail.create_label", payload: { name: "pdw-test", color: { background_color: "#16a766", text_color: "#ffffff" } },
+    preview: { gmail_label: { kind: "create", name: "pdw-test", warnings: [] } } });
+  assert.equal(create.heading, "New Gmail label \"pdw-test\"");
+  assert.deepEqual(create.color, { background: "#16a766", text: "#ffffff" });
+});

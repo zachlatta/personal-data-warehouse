@@ -13,6 +13,7 @@ import { CalendarMutationCard } from '@/components/calendar-mutation-review';
 import { AppleContactMutationCard } from '@/components/apple-contact-mutation-review';
 import { ContactMutationCard } from '@/components/contact-mutation-review';
 import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
+import { GmailSettingsCard } from '@/components/gmail-settings-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { SlackSendMessageCard } from '@/components/slack-send-review';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
@@ -29,6 +30,7 @@ import {
   isCalendarCreateMutation,
   isContactMutation,
   isGmailSendEmailMutation,
+  isGmailSettingsMutation,
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
@@ -88,6 +90,7 @@ function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, o
   if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
   if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} />;
+  if (isGmailSettingsMutation(mutation)) return <GmailSettingsCard mutation={mutation} requestReason={requestReason} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   if (isAppleContactsMutation(mutation)) return <AppleContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;

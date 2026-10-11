@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 import json
@@ -35,6 +36,8 @@ from personal_data_warehouse.gmail_mutations import (
     GmailMutationExecutor,
     GmailMutationResult,
 )
+from personal_data_warehouse.gmail_settings_mutations import GMAIL_SETTINGS_OPERATIONS
+from personal_data_warehouse.gmail_settings_sync import GmailSettingsSyncRunner
 from personal_data_warehouse.slack_mutations import (
     SLACK_MARK_CONVERSATION_READ_OPERATION,
     SLACK_PROVIDER,
@@ -157,12 +160,32 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
+                on_gmail_settings_changed=lambda accounts: _resync_gmail_settings(
+                    settings=settings, warehouse=warehouse, accounts=accounts, logger=context.log
+                ),
             )
     finally:
         warehouse.close()
 
     context.log.info("Processed upstream mutations: %s", summary)
     return asdict(summary)
+
+
+def _resync_gmail_settings(*, settings, warehouse, accounts: set[str], logger) -> None:
+    """Re-snapshot the labels and filters a just-succeeded mutation changed.
+
+    The review of the next proposal reads base_gmail.labels/filters, so this
+    runs inline (two API calls per account) instead of waiting up to half an
+    hour for the schedule. A failure here never fails the mutation: it already
+    succeeded upstream, and the schedule catches up.
+    """
+    try:
+        warehouse.ensure_tables()
+        GmailSettingsSyncRunner.from_settings(
+            settings=settings, warehouse=warehouse, logger=logger, accounts=sorted(accounts)
+        ).run()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Gmail settings re-sync after a mutation failed: %s", exc)
 
 
 @op
@@ -310,6 +333,7 @@ def process_upstream_mutation_batch(
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
     ensure_tables: bool = True,
+    on_gmail_settings_changed: Callable[[set[str]], None] | None = None,
 ) -> UpstreamMutationWorkerSummary:
     if ensure_tables:
         warehouse.ensure_upstream_mutation_tables()
@@ -331,6 +355,32 @@ def process_upstream_mutation_batch(
     failed_terminal = 0
     blocked_missing_credentials = 0
     processed_mutation_ids: set[str] = set()
+    changed_gmail_settings_accounts: set[str] = set()
+    # Label and filter changes first, in proposal order: a request that
+    # creates a label and moves threads under it needs the label to exist
+    # before the thread batch below resolves it.
+    for mutation in claimed:
+        if mutation.get("provider") != "gmail" or mutation.get("operation") not in GMAIL_SETTINGS_OPERATIONS:
+            continue
+        status = _record_mutation_result(
+            warehouse=warehouse,
+            mutation=mutation,
+            result=gmail_executor.execute(mutation),
+            claimed_by=claimed_by,
+        )
+        processed_mutation_ids.add(str(mutation["id"]))
+        if status == "succeeded":
+            succeeded += 1
+            changed_gmail_settings_accounts.add(str(mutation.get("account") or ""))
+        elif status == "failed_retryable":
+            failed_retryable += 1
+        elif status == "blocked_missing_credentials":
+            blocked_missing_credentials += 1
+        else:
+            failed_terminal += 1
+    if changed_gmail_settings_accounts and on_gmail_settings_changed is not None:
+        on_gmail_settings_changed(changed_gmail_settings_accounts)
+
     for group in _gmail_thread_label_mutation_groups(claimed):
         processed, counts = _process_gmail_thread_label_mutation_group(
             warehouse=warehouse,
@@ -400,6 +450,7 @@ def observe_upstream_mutation_batch(*, warehouse, ensure_tables: bool = True) ->
     observed += warehouse.observe_succeeded_calendar_event_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_slack_mark_conversation_read_mutations(ensure_tables=False)
     observed += warehouse.observe_succeeded_slack_send_message_mutations(ensure_tables=False)
+    observed += warehouse.observe_succeeded_gmail_settings_mutations(ensure_tables=False)
     return UpstreamMutationObservationSummary(observed=observed)
 
 

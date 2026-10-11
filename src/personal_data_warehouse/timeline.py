@@ -3270,6 +3270,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "gmail_messages": _events(),
     "gmail_attachments": _detail("gmail_messages", "listed in the email's detail view"),
     "gmail_sync_state": _state("gmail sync cursor"),
+    # Labels and filters are mailbox configuration, not events: what changes
+    # them is a reviewed gmail.*_label / gmail.*_filter mutation, and THAT is
+    # on the timeline (mutation_requests). Readers reach them by joining
+    # base_gmail.messages.label_ids to labels.label_id, or from the mutation.
+    "gmail_labels": _entity("label id -> name for base_gmail.messages.label_ids; changed via reviewed mutations, which are on the timeline"),
+    "gmail_filters": _entity("mailbox rules; changed via reviewed mutations, which are on the timeline"),
+    "gmail_settings_sync_state": _state("per-account label/filter snapshot status"),
     "gmail_attachment_backfill_state": _state("attachment backfill progress"),
     "file_attachment_enrichments": _detail(
         "gmail_attachments",

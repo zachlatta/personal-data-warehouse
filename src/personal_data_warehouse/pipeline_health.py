@@ -575,6 +575,23 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "gmail_settings",
+        "Gmail labels and filters",
+        cadence="every 30 min, and right after an approved label/filter mutation",
+        transport="Dagster gmail_settings_sync → Gmail API users.labels.list + users.settings.filters.list (full snapshot)",
+        # Every run restamps every row, so data lands exactly as often as the
+        # half-hourly run; an hour of no heartbeat is two missed ticks.
+        data=3 * HOUR,
+        run=HOUR,
+        state=StateSource(
+            table="gmail_settings_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note="the review of a gmail.*_filter / *_label mutation reads these tables; a failing row means reviews show stale rules",
+    ),
+    _source(
         "google_calendar",
         "Google Calendar",
         cadence="every 5 min",
@@ -1362,6 +1379,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "gmail_messages": _data("gmail", "synced_at", "internal_date"),
     "gmail_attachments": _support("gmail", "synced_at", "internal_date"),
     "gmail_sync_state": _state("gmail", "updated_at", "per-account history-id cursor"),
+    "gmail_labels": _data("gmail_settings", "synced_at"),
+    "gmail_filters": _data("gmail_settings", "synced_at"),
+    "gmail_settings_sync_state": _state("gmail_settings", "updated_at", "per-account snapshot status and error"),
     # Google Calendar
     "calendar_events": _data("google_calendar", "synced_at", "start_at"),
     "calendar_sync_state": _state("google_calendar", "updated_at"),

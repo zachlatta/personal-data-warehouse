@@ -186,6 +186,12 @@ type MutationInput struct {
 	Recipient          string
 	Service            string
 	Chat               string
+	// Raw is the entry as proposed. Types that refuse unknown keys (the Gmail
+	// filter and label types) validate against it.
+	Raw      map[string]any
+	FilterID string
+	Label    string
+	NewName  string
 }
 
 type GmailEmailVariantInput struct {

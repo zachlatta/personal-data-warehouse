@@ -12,7 +12,7 @@ const proposeMutationDescription = "Create a pending upstream mutation request f
 
 const withdrawMutationDescription = "Withdraw a pending mutation request you no longer stand behind — the change was made by hand, the recipient or account was wrong, events overtook it, or another request replaces it. Requires a reason; optionally names the request that replaces it. Only a request still pending review can be withdrawn: an approved, executing, finished, or denied request is refused with its status, and if a reviewer has edited the request you must pass the revision you read (expected_revision). Withdrawing never runs anything; it only removes work from the review queue and is recorded in the audit log with your client identity."
 
-const proposeMutationHelpDescription = "Return the catalog of mutation types supported by propose_mutation, with field-by-field descriptions and a worked example for each. With no arguments it returns every type (~27 KB); pass type (e.g. gmail.send_email) to get one type's fields and example, or list_only: true for just the type names and summaries. Call this before propose_mutation to see how to shape each mutation entry."
+const proposeMutationHelpDescription = "Return the catalog of mutation types supported by propose_mutation, with field-by-field descriptions and a worked example for each. With no arguments it returns every type (~36 KB); pass type (e.g. gmail.send_email) to get one type's fields and example, or list_only: true for just the type names and summaries. Call this before propose_mutation to see how to shape each mutation entry."
 
 // Tools returns the propose_mutation MCP tools backed by the given service.
 // Returns nil when service is nil so callers can pass the result straight into
@@ -195,6 +195,119 @@ func MutationHelp() MutationHelpDocument {
 				ExtraNotes: "At least one label list is required, and the same label cannot appear in more than one list. " +
 					"add_labels and remove_labels accept a Gmail label's exact display name (for example Receipts) or immutable label ID (for example Label_42 or STARRED), and stay strict when a label is unknown. " +
 					"Labels are created only when explicitly listed in create_and_add_labels; the executor reuses an existing same-name label on retries before applying it to the reviewed threads.",
+			},
+			{
+				Type:        GmailCreateFilterOperation,
+				Summary:     "Create a Gmail filter: which new mail it matches, and what happens to it (labels, skip inbox, mark read, star, importance, spam, category, trash).",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailCreateFilterOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "criteria", JSONType: "object", Required: true, Description: "at least one of: from, to, subject, query (Gmail search syntax), negated_query (string); has_attachment (bool); size (bytes) with size_comparison \"larger\"|\"smaller\"; exclude_chats (bool, not a criterion on its own). Gmail's camelCase names (negatedQuery, hasAttachment, sizeComparison) are accepted too; anything else is refused."},
+					{Name: "action", JSONType: "object", Required: true, Description: "at least one of: add_labels / remove_labels (existing label names from base_gmail.labels), create_and_add_labels (names to create if missing), and the booleans skip_inbox, mark_read, star, mark_important, never_important, never_spam, trash, plus category (primary|social|updates|forums|promotions). System labels (INBOX, UNREAD, STARRED...) go through the booleans, never the label lists. forward is refused."},
+				},
+				Example: map[string]any{
+					"type":     GmailCreateFilterOperation,
+					"account":  "you@example.com",
+					"criteria": map[string]any{"from": "newsletter@example.com"},
+					"action":   map[string]any{"skip_inbox": true, "create_and_add_labels": []string{"Newsletters"}},
+				},
+				ExtraNotes: "Gmail applies a filter only to new mail. To also move what is already in the mailbox, add a gmail.modify_thread_labels (or gmail.archive_threads) mutation for those thread_ids in the same request; the review shows how many recent threads the criteria match. " +
+					"Read current labels and filters in base_gmail.labels and base_gmail.filters (snapshotted every 30 minutes and right after one of these mutations runs). add_labels/remove_labels must name labels that exist there or are created earlier in the same request (gmail.create_label, or create_and_add_labels); mutations in a request run in order, and label/filter changes run before thread label changes. " +
+					"A filter that forwards mail is refused: forwarding needs a verified address and a separate decision. An identical existing filter is refused at proposal and treated as done at execution.",
+			},
+			{
+				Type:        GmailReplaceFilterOperation,
+				Summary:     "Change an existing Gmail filter (Gmail has no filter update: creates the new rule, then deletes the old one).",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailReplaceFilterOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "filter_id", JSONType: "string", Required: true, Description: "base_gmail.filters.filter_id of the live filter to replace"},
+					{Name: "criteria", JSONType: "object", Required: true, Description: "the complete new criteria, as for " + GmailCreateFilterOperation},
+					{Name: "action", JSONType: "object", Required: true, Description: "the complete new action, as for " + GmailCreateFilterOperation},
+				},
+				Example: map[string]any{
+					"type":      GmailReplaceFilterOperation,
+					"account":   "you@example.com",
+					"filter_id": "ANe1BmjExample",
+					"criteria":  map[string]any{"from": "newsletter@example.com"},
+					"action":    map[string]any{"skip_inbox": true, "mark_read": true, "add_labels": []string{"Newsletters"}},
+				},
+				ExtraNotes: "The old filter is snapshotted at proposal and the review shows before → after. The executor creates the new filter first and deletes the old one second, so the mailbox is never without the rule; if Gmail's copy of the old filter changed since review, nothing is changed.",
+			},
+			{
+				Type:        GmailDeleteFilterOperation,
+				Summary:     "Delete a Gmail filter.",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailDeleteFilterOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "filter_id", JSONType: "string", Required: true, Description: "base_gmail.filters.filter_id of the live filter to delete"},
+				},
+				Example: map[string]any{
+					"type":      GmailDeleteFilterOperation,
+					"account":   "you@example.com",
+					"filter_id": "ANe1BmjExample",
+				},
+				ExtraNotes: "The rule is snapshotted at proposal and shown in the review; the executor refuses if it changed since, and treats an already-deleted filter as done.",
+			},
+			{
+				Type:        GmailCreateLabelOperation,
+				Summary:     "Create a Gmail label, optionally with a color and visibility.",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailCreateLabelOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "name", JSONType: "string", Required: true, Description: "label name; nest with a slash (Parent/Child)"},
+					{Name: "color", JSONType: "object", Required: false, Description: "{background_color, text_color}, each one of Gmail's palette colors (for example #16a766, #4a86e8, #fb4c2f, #ffad47, #a479e2, #000000, #ffffff)"},
+					{Name: "label_list_visibility", JSONType: "string", Required: false, Description: "labelShow, labelShowIfUnread or labelHide"},
+					{Name: "message_list_visibility", JSONType: "string", Required: false, Description: "show or hide"},
+				},
+				Example: map[string]any{
+					"type":    GmailCreateLabelOperation,
+					"account": "you@example.com",
+					"name":    "Receipts",
+					"color":   map[string]any{"background_color": "#16a766", "text_color": "#ffffff"},
+				},
+				ExtraNotes: "A name already in base_gmail.labels is refused at proposal; at execution an existing same-name label counts as done.",
+			},
+			{
+				Type:        GmailUpdateLabelOperation,
+				Summary:     "Rename a Gmail label or change its color or visibility.",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailUpdateLabelOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "label", JSONType: "string", Required: true, Description: "the label's current name or label_id (base_gmail.labels)"},
+					{Name: "new_name", JSONType: "string", Required: false, Description: "new name; must not clash with another label"},
+					{Name: "color", JSONType: "object", Required: false, Description: "as for " + GmailCreateLabelOperation},
+					{Name: "label_list_visibility", JSONType: "string", Required: false, Description: "labelShow, labelShowIfUnread or labelHide"},
+					{Name: "message_list_visibility", JSONType: "string", Required: false, Description: "show or hide"},
+				},
+				Example: map[string]any{
+					"type":     GmailUpdateLabelOperation,
+					"account":  "you@example.com",
+					"label":    "Receipts",
+					"new_name": "Finance/Receipts",
+				},
+				ExtraNotes: "System labels cannot be changed. Renaming a parent does not rename its nested labels; propose each. Filters reference labels by id, so a rename keeps them working.",
+			},
+			{
+				Type:        GmailDeleteLabelOperation,
+				Summary:     "Delete a Gmail label (the label comes off its messages; the messages stay).",
+				RequiresEnv: "GMAIL_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + GmailDeleteLabelOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Gmail account email address"},
+					{Name: "label", JSONType: "string", Required: true, Description: "the label's current name or label_id (base_gmail.labels)"},
+				},
+				Example: map[string]any{
+					"type":    GmailDeleteLabelOperation,
+					"account": "you@example.com",
+					"label":   "Old Project",
+				},
+				ExtraNotes: "System labels cannot be deleted. The review shows how many messages carry the label and which filters use it.",
 			},
 			{
 				Type:        GmailSendEmailOperation,

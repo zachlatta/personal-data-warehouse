@@ -18,6 +18,8 @@ from personal_data_warehouse.agent_runner import (
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+# Filters (users.settings.filters.create/delete) need this; labels do not.
+GMAIL_SETTINGS_BASIC_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic"
 CALENDAR_READONLY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 CALENDAR_MUTATION_SCOPE = "https://www.googleapis.com/auth/calendar"
 CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
@@ -580,6 +582,11 @@ class Settings:
     slack_force_full_sync: bool
     gmail_mutation_scopes: tuple[str, ...] = (GMAIL_MODIFY_SCOPE,)
     gmail_compose_scopes: tuple[str, ...] = (GMAIL_COMPOSE_SCOPE,)
+    # Requested only by gmail.*_filter mutations, never added to
+    # gmail_mutation_scopes: asking for a scope the refresh token lacks fails
+    # the refresh, so a shared scope would block every archive and send until
+    # the account is re-consented.
+    gmail_settings_scopes: tuple[str, ...] = (GMAIL_SETTINGS_BASIC_SCOPE,)
     google_scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, CALENDAR_READONLY_SCOPE)
     calendar_accounts: tuple[CalendarAccount, ...] = ()
     calendar_scopes: tuple[str, ...] = (CALENDAR_READONLY_SCOPE,)
@@ -2043,6 +2050,7 @@ def load_settings(
         gmail_scopes=(GMAIL_READONLY_SCOPE,),
         gmail_mutation_scopes=(GMAIL_MODIFY_SCOPE,),
         gmail_compose_scopes=(GMAIL_COMPOSE_SCOPE,),
+        gmail_settings_scopes=(GMAIL_SETTINGS_BASIC_SCOPE,),
         gmail_page_size=page_size,
         gmail_include_spam_trash=_parse_bool_env(os.getenv("GMAIL_INCLUDE_SPAM_TRASH"), True),
         gmail_force_full_sync=_parse_bool_env(os.getenv("GMAIL_FORCE_FULL_SYNC"), False),

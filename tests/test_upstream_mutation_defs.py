@@ -111,6 +111,10 @@ class FakeWarehouse:
         self.calls.append("observe_slack_send")
         return 0
 
+    def observe_succeeded_gmail_settings_mutations(self, **_kwargs) -> int:
+        self.calls.append("observe_gmail_settings")
+        return 0
+
     def succeeded_upstream_mutation_count(self, *, ensure_tables=True, exclude_providers=None) -> int:
         self.calls.append("count_succeeded")
         return self.succeeded_count
@@ -448,6 +452,7 @@ def test_observation_batch_is_separate_from_execution() -> None:
         "observe_calendar",
         "observe_slack",
         "observe_slack_send",
+        "observe_gmail_settings",
     ]
 
 
@@ -933,3 +938,71 @@ def test_the_cloud_worker_never_claims_a_text_message_send() -> None:
 
     assert "apple_messages" in LOCAL_ONLY_MUTATION_PROVIDERS
     assert {"apple_notes", "apple_contacts"} <= set(LOCAL_ONLY_MUTATION_PROVIDERS)
+
+
+def test_gmail_label_and_filter_changes_run_before_thread_batches_and_resync_the_account() -> None:
+    # One request can create a label and a filter and also move existing mail
+    # under that label (modify_thread_labels with add_labels). The settings
+    # changes run first so the label exists by the time the threads move, and
+    # the account's labels/filters are re-snapshotted right away so the next
+    # review reads the new state rather than waiting for the schedule.
+    order: list[str] = []
+
+    class OrderedGmailExecutor(FakeGmailExecutor):
+        def execute(self, mutation):
+            order.append(str(mutation["operation"]))
+            return super().execute(mutation)
+
+        def execute_message_batch_modify(self, **kwargs):
+            order.append("batch:" + kwargs["operation"])
+            return super().execute_message_batch_modify(**kwargs)
+
+    move = {
+        "id": "mut-move",
+        "provider": "gmail",
+        "operation": GMAIL_MODIFY_THREAD_LABELS_OPERATION,
+        "account": "zach@example.test",
+        "payload_json": {"thread_ids": ["thread-1"], "add_labels": ["Receipts"]},
+    }
+    create_label = {
+        "id": "mut-label",
+        "provider": "gmail",
+        "operation": "gmail.create_label",
+        "account": "zach@example.test",
+        "payload_json": {"name": "Receipts"},
+    }
+    create_filter = {
+        "id": "mut-filter",
+        "provider": "gmail",
+        "operation": "gmail.create_filter",
+        "account": "other@example.test",
+        "payload_json": {"criteria": {"from": "a@example.com"}, "action": {"star": True}},
+    }
+    warehouse = FakeWarehouse(
+        claimed=[move, create_label, create_filter],
+        message_ids_by_thread_id={"thread-1": ["message-1"]},
+    )
+    gmail_executor = OrderedGmailExecutor(
+        [
+            GmailMutationResult(status="succeeded", result_json={"label_id": "Label_1"}),
+            GmailMutationResult(status="blocked_missing_credentials", result_json={}, error="no settings scope"),
+        ],
+        batch_results=[GmailMutationResult(status="succeeded", result_json={"batch_modified_message_ids": ["message-1"]})],
+    )
+    resynced: list[set[str]] = []
+
+    summary = upstream_mutation_defs.process_upstream_mutation_batch(
+        warehouse=warehouse,
+        gmail_executor=gmail_executor,
+        contact_executor=FakeExecutor([]),
+        slack_executor=FakeExecutor([]),
+        calendar_executor=FakeExecutor([]),
+        limit=100,
+        claimed_by="worker-1",
+        on_gmail_settings_changed=resynced.append,
+    )
+
+    assert order == ["gmail.create_label", "gmail.create_filter", "batch:" + GMAIL_MODIFY_THREAD_LABELS_OPERATION]
+    assert resynced == [{"zach@example.test"}]
+    assert summary.succeeded == 2 and summary.blocked_missing_credentials == 1
+

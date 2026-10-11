@@ -114,6 +114,8 @@ var Schemas = []CatalogSchema{
 var Objects = []CatalogObject{
 	{ID: "gmail_messages", Kind: "table", Layer: "base", Domain: "gmail", Schema: "base_gmail", Name: "messages", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "gmail_attachments", Kind: "table", Layer: "base", Domain: "gmail", Schema: "base_gmail", Name: "attachments", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "gmail_labels", Kind: "table", Layer: "base", Domain: "gmail", Schema: "base_gmail", Name: "labels", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "gmail_filters", Kind: "table", Layer: "base", Domain: "gmail", Schema: "base_gmail", Name: "filters", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "calendar_events", Kind: "table", Layer: "base", Domain: "google_calendar", Schema: "base_google_calendar", Name: "events", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "contact_cards", Kind: "table", Layer: "base", Domain: "google_contacts", Schema: "base_google_contacts", Name: "cards", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "google_drive_files", Kind: "table", Layer: "base", Domain: "google_drive", Schema: "base_google_drive", Name: "files", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
@@ -275,6 +277,7 @@ var Objects = []CatalogObject{
 	{ID: "search_hybrid", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "search_hybrid", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "gmail_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "gmail_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "gmail_attachment_backfill_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "gmail_attachment_backfill_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
+	{ID: "gmail_settings_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "gmail_settings_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "calendar_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_calendar_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "contact_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_contacts_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "google_drive_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "google_drive_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},

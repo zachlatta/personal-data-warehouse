@@ -1073,6 +1073,62 @@ function renderAppleMessagesMarkRead(mutation) {
   return article;
 }
 
+function renderGmailSettings(mutation) {
+  const view = V.gmailSettingsView(mutation);
+  const article = h("article", "mut gmail-settings");
+  article.appendChild(mutationHead("Gmail", view.heading, mutation.status));
+  const action = h("div", "slack-action");
+  if (view.kind === "filter") {
+    if (view.before) {
+      action.appendChild(h("strong", "", view.after ? "Now" : "Rule being removed"));
+      action.appendChild(h("p", view.after ? "m" : "", view.before));
+    }
+    if (view.after) {
+      action.appendChild(h("strong", "", view.before ? "Becomes" : "Rule"));
+      action.appendChild(h("p", "", view.after));
+    }
+    if (view.effect) action.appendChild(h("p", "m", view.effect));
+    action.appendChild(dl([["Account", mutation.account], ...(view.filterId ? [["Filter", view.filterId]] : [])]));
+  } else {
+    if (view.changes.length) {
+      action.appendChild(h("strong", "", "Changes"));
+      for (const change of view.changes) action.appendChild(h("p", "", change));
+    }
+    const pairs = [["Account", mutation.account]];
+    if (view.newName) pairs.push(["New name", view.newName]);
+    if (view.color) pairs.push(["Color", view.color.background + " on " + view.color.text]);
+    if (view.labelFacts) pairs.push(["Now", view.labelFacts]);
+    action.appendChild(dl(pairs));
+    if (view.color) {
+      const chip = h("span", "label-chip", view.newName || view.name);
+      chip.style.background = view.color.background;
+      chip.style.color = view.color.text;
+      chip.style.padding = "2px 8px";
+      chip.style.borderRadius = "4px";
+      action.appendChild(chip);
+    }
+  }
+  article.appendChild(action);
+  for (const warning of view.warnings) article.appendChild(h("p", "bad slack-warning", warning));
+  if (view.kind === "filter" && view.matchText) {
+    const context = h("section", "slack-context");
+    context.appendChild(h("h4", "", view.matchText));
+    if (view.matchNote) context.appendChild(h("p", "m", view.matchNote));
+    for (const example of view.examples) {
+      const row = h("p", "m");
+      if (example.date) row.appendChild(h("span", "m", formatWhen(example.date) + " "));
+      row.appendChild(h("strong", "", example.sender + " "));
+      row.appendChild(document.createTextNode(example.subject));
+      context.appendChild(row);
+    }
+    if (view.existingMailNote) context.appendChild(h("p", "m", view.existingMailNote));
+    article.appendChild(context);
+  }
+  if (view.done && view.resultNote) article.appendChild(h("p", "m", view.resultNote));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  return article;
+}
+
 function renderGeneric(mutation) {
   const article = h("article", "mut generic");
   article.appendChild(mutationHead(mutation.provider || "mutation", mutation.title || mutation.operation || "mutation", mutation.status));
@@ -1086,6 +1142,7 @@ function renderGeneric(mutation) {
 
 function renderMutation(request, mutation, actions) {
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
+  if (V.isGmailSettingsMutation(mutation)) return renderGmailSettings(mutation);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
   if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);

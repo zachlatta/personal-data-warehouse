@@ -65,6 +65,50 @@ SYNC_STATE_COLUMNS = (
     "updated_at",
 )
 
+# Gmail labels and filters (users.labels.list / users.settings.filters.list),
+# one full snapshot per account per sync. They are what a reviewed
+# gmail.*_label / gmail.*_filter mutation is checked against, and what turns
+# messages.label_ids into names. A label or filter Gmail no longer returns is
+# kept with is_deleted = 1 rather than dropped.
+GMAIL_LABEL_COLUMNS = (
+    "account",
+    "label_id",
+    "name",
+    "label_type",
+    "label_list_visibility",
+    "message_list_visibility",
+    "background_color",
+    "text_color",
+    "is_deleted",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+GMAIL_FILTER_COLUMNS = (
+    "account",
+    "filter_id",
+    "criteria_json",
+    "action_json",
+    "add_label_ids",
+    "remove_label_ids",
+    "forward_to",
+    "is_deleted",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+GMAIL_SETTINGS_SYNC_STATE_COLUMNS = (
+    "account",
+    "status",
+    "error",
+    "label_count",
+    "filter_count",
+    "last_synced_at",
+    "updated_at",
+)
+
 ATTACHMENT_BACKFILL_STATE_COLUMNS = (
     "account",
     "message_id",
