@@ -157,6 +157,14 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 		logger.ErrorContext(ctx, "Postgres columns read failed", "sql", statement, "error", err, "duration", time.Since(started))
 		return RawResult{}, err
 	}
+	// The scanned time.Time cannot tell a timestamptz from a wall-clock
+	// timestamp or a date, so render by the column's declared type.
+	dbTypes := make([]string, len(columns))
+	if columnTypes, err := rows.ColumnTypes(); err == nil {
+		for i, columnType := range columnTypes {
+			dbTypes[i] = columnType.DatabaseTypeName()
+		}
+	}
 	result := RawResult{Columns: columns}
 	for rows.Next() {
 		if maxRows > 0 && len(result.Rows) >= maxRows {
@@ -173,7 +181,7 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 		}
 		row := make(map[string]any, len(columns))
 		for i, column := range columns {
-			row[column] = normalizeValue(values[i])
+			row[column] = normalizeValue(values[i], dbTypes[i])
 		}
 		result.Rows = append(result.Rows, row)
 	}
@@ -233,13 +241,25 @@ func queryRoleSQL(role string) (string, error) {
 	return `SET LOCAL ROLE "` + role + `"`, nil
 }
 
-func normalizeValue(value any) any {
+// normalizeValue renders a scanned value for JSON. dbType is the Postgres
+// type name of the column. Only timestamptz is an instant, so only it gets a
+// "Z"; a timestamp without time zone (what AT TIME ZONE 'America/Chicago'
+// returns) is a wall-clock reading and keeps no zone suffix, and a date is a
+// bare day. On 2026-10-11 a local 13:30 rendered as "13:30:00Z" was converted
+// to Central a second time and an agent told Zach 8:30am.
+func normalizeValue(value any, dbType string) any {
 	switch v := value.(type) {
 	case nil:
 		return nil
 	case []byte:
 		return string(v)
 	case time.Time:
+		switch dbType {
+		case "TIMESTAMP":
+			return v.Format("2006-01-02T15:04:05.999999999")
+		case "DATE":
+			return v.Format("2006-01-02")
+		}
 		return v.UTC().Format(time.RFC3339Nano)
 	}
 	if _, err := json.Marshal(value); err == nil {

@@ -142,3 +142,21 @@ func TestQueryParallelWorkersPerGatherUsesMostOfTheHost(t *testing.T) {
 		t.Fatalf("queryParallelWorkersPerGather = %d; the production host has 28 vCPUs", queryParallelWorkersPerGather)
 	}
 }
+
+func TestPostgresRunnerRendersTimestampsByColumnType(t *testing.T) {
+	runner, err := NewPostgresRunner(postgresURLForIntegrationTest(t), 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewPostgresRunner returned error: %v", err)
+	}
+	result, err := runner.Query(context.Background(), `SELECT
+		timestamptz '2026-10-12 18:30:00+00' AS tz,
+		timestamptz '2026-10-12 18:30:00+00' AT TIME ZONE 'America/Chicago' AS local,
+		date '2026-10-12' AS day`, 1)
+	if err != nil {
+		t.Fatalf("Query returned error: %v", err)
+	}
+	row := result.Rows[0]
+	if row["tz"] != "2026-10-12T18:30:00Z" || row["local"] != "2026-10-12T13:30:00" || row["day"] != "2026-10-12" {
+		t.Fatalf("row = %#v", row)
+	}
+}
