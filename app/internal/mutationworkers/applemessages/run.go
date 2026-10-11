@@ -29,7 +29,8 @@ var Spec = queue.Spec{
 func newWorkerExecutor(runner applescript.Runner, store Store, getenv func(string) string) *Executor {
 	return NewExecutor(runner, store).
 		WithReadiness(func() error { return applescript.Launch(MessagesBundleID) }).
-		WithAllowedRecipients(AllowedRecipientsFromEnv(getenv))
+		WithAllowedRecipients(AllowedRecipientsFromEnv(getenv)).
+		WithScreenLock(ScreenLocked)
 }
 
 // Enabled is the APPLE_MESSAGES_MUTATIONS_ENABLED kill switch.

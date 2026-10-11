@@ -1,5 +1,6 @@
-// Package applemessages applies approved apple_messages.send_message mutations
-// through Messages.app on the Mac that syncs Apple Messages.
+// Package applemessages applies approved apple_messages.send_message and
+// apple_messages.mark_read mutations through Messages.app on the Mac that syncs
+// Apple Messages. Mark-read lives in markread.go.
 //
 // iMessage and SMS have no server API: the only way to send a text as Zach is to
 // ask Messages.app, on a Mac signed in to his Apple ID (and paired with his
@@ -78,6 +79,9 @@ type Store interface {
 	// OneToOneChat returns the most recently active one-to-one chat with this
 	// handle, restricted to service unless service is "auto".
 	OneToOneChat(handle, service string) (Chat, bool, error)
+	// UnreadCount counts incoming unread messages in the one-to-one chats with
+	// this identifier dated at or before through.
+	UnreadCount(chat string, through time.Time) (int, error)
 }
 
 // Executor executes apple_messages.send_message mutations.
@@ -88,6 +92,10 @@ type Executor struct {
 	allowed   map[string]bool
 	now       func() time.Time
 	sleep     func(time.Duration)
+	// opener shows a conversation in Messages (mark_read); screenLocked
+	// reports whether Messages' window could be on screen at all.
+	opener       func(url string) error
+	screenLocked func() (bool, error)
 }
 
 // NewExecutor builds an executor; a nil runner uses osascript and a nil store
@@ -99,11 +107,17 @@ func NewExecutor(runner applescript.Runner, store Store) *Executor {
 	if store == nil {
 		store = NewChatDBStore("")
 	}
-	return &Executor{runner: runner, store: store, now: time.Now, sleep: time.Sleep}
+	return &Executor{runner: runner, store: store, now: time.Now, sleep: time.Sleep, opener: OpenURL}
 }
 
 // WithReadiness installs the check run before every send (launching
 // Messages in the background).
+// WithScreenLock sets the lock check mark_read runs before opening Messages.
+func (e *Executor) WithScreenLock(locked func() (bool, error)) *Executor {
+	e.screenLocked = locked
+	return e
+}
+
 func (e *Executor) WithReadiness(readiness func() error) *Executor {
 	e.readiness = readiness
 	return e
@@ -171,6 +185,12 @@ func NormalizeHandle(value string) (string, error) {
 
 // Execute implements queue.Executor.
 func (e *Executor) Execute(mutation queue.Mutation) queue.Result {
+	if mutation.Provider == Provider && mutation.Operation == MarkReadOperation {
+		if mutation.Payload == nil {
+			mutation.Payload = map[string]any{}
+		}
+		return e.markRead(mutation)
+	}
 	if mutation.Provider != Provider || mutation.Operation != SendMessageOperation {
 		// Never burn an unrecognized row to failed_terminal: a newer worker
 		// may understand it.

@@ -153,7 +153,12 @@ export function isContactMutation(m) {
 export function isCalendarMutation(m) { return m.provider === "google_calendar" || CALENDAR_OPS.includes(m.operation); }
 export function isAppleNotesMutation(m) { return m.provider === "apple_notes" || APPLE_NOTES_OPS.includes(m.operation); }
 export function isAppleContactsMutation(m) { return m.provider === "apple_contacts" || APPLE_CONTACTS_OPS.includes(m.operation); }
+export const APPLE_MESSAGES_MARK_READ = "apple_messages.mark_read";
+export function isAppleMessagesMarkReadMutation(m) {
+  return m.operation === APPLE_MESSAGES_MARK_READ;
+}
 export function isAppleMessagesMutation(m) {
+  if (isAppleMessagesMarkReadMutation(m)) return false;
   return m.provider === "apple_messages" || m.operation === "apple_messages.send_message";
 }
 export function isSlackMarkReadMutation(m) {
@@ -1364,5 +1369,39 @@ export function appleMessagesView(mutation) {
     sent: trimStr(result.message_guid) !== "",
     sentService: trimStr(result.service),
     alreadySent: result.already_sent === true,
+  };
+}
+
+// appleMessagesMarkReadView is a conversation to mark read as a reviewer must
+// see it: whose conversation it is, what is unread in it now (hydrated on the
+// read path), and what approving does. `resolved` is false when the read path
+// could not consult the warehouse.
+export function appleMessagesMarkReadView(mutation) {
+  const payload = asMap(mutation.payload);
+  const preview = asMap(asMap(mutation.preview).mark_read);
+  const result = asMap(mutation.result);
+  const chat = trimStr(payload.chat) || trimStr(preview.chat);
+  const names = stringSlice(preview.chat_names);
+  const resolved = "warnings" in preview;
+  const warnings = stringSlice(preview.warnings);
+  if (!resolved) warnings.push("What is unread in this conversation could not be checked against the warehouse.");
+  const unread = mapSlice(preview.unread_messages).map((message) => ({
+    at: trimStr(message.message_at),
+    service: trimStr(message.service),
+    text: str(message.text),
+  })).reverse();
+  const unreadCount = Number(preview.unread_count) || unread.length;
+  const who = names.length ? names.join(" / ") : chat;
+  return {
+    heading: "Mark texts from " + who + " read",
+    chat,
+    chatName: names.join(" / "),
+    unread,
+    unreadCount,
+    warnings,
+    effect: str(preview.effect) || "Opens this conversation in Messages on Zach's Mac so it is marked read, then closes the window.",
+    done: mutation.status === "succeeded",
+    markedRead: Number(result.marked_read) || 0,
+    alreadyRead: result.already_read === true,
   };
 }

@@ -338,6 +338,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string, page Mutation
 	mutations = s.hydrateSlackPreviewLinks(ctx, mutations)
 	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
 	mutations = s.hydrateAppleMessagesPreviews(ctx, mutations)
+	mutations = s.hydrateAppleMessagesMarkReadPreviews(ctx, mutations)
 	request.Mutations = mutations
 	return request, nil
 }
@@ -1885,6 +1886,22 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Payload:   payload,
 				Preview: map[string]any{
 					"text_message": appleMessagesPreview(payload),
+				},
+			})
+		case AppleMessagesMarkReadOperation:
+			if err := validateAppleMessagesMarkRead(mutation); err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			payload := appleMessagesMarkReadPayload(mutation)
+			out = append(out, storedMutation{
+				Provider:  AppleMessagesProvider,
+				Operation: AppleMessagesMarkReadOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, appleMessagesMarkReadTitle(mutation)),
+				Reason:    reason,
+				Payload:   payload,
+				Preview: map[string]any{
+					"mark_read": appleMessagesMarkReadPreview(payload),
 				},
 			})
 		case SlackMarkConversationReadOperation:

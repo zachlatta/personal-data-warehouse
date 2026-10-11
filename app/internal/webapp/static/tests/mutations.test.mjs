@@ -652,3 +652,30 @@ test("appleMessagesView warns when the recipient was never checked", () => {
   assert.equal(view.warnings.length, 1);
   assert.match(view.warnings[0], /not checked/);
 });
+
+test("appleMessagesMarkReadView names the conversation and lists what is unread", () => {
+  const mutation = {
+    provider: "apple_messages", operation: "apple_messages.mark_read", account: "you@example.com", status: "pending_review",
+    payload: { chat: "+13105550123" },
+    preview: { mark_read: {
+      chat: "+13105550123", chat_names: ["Ada Lovelace"], warnings: [], unread_count: 2,
+      unread_messages: [
+        { message_at: "2026-10-10T12:00:00Z", text: "newest" },
+        { message_at: "2026-10-09T12:00:00Z", text: "older" },
+      ],
+    } },
+  };
+  assert.equal(V.isAppleMessagesMarkReadMutation(mutation), true);
+  assert.equal(V.isAppleMessagesMutation(mutation), false);
+  const view = V.appleMessagesMarkReadView(mutation);
+  assert.equal(view.heading, "Mark texts from Ada Lovelace read");
+  assert.equal(view.unreadCount, 2);
+  assert.deepEqual(view.unread.map((m) => m.text), ["older", "newest"]);
+  assert.deepEqual(view.warnings, []);
+});
+
+test("appleMessagesMarkReadView warns when the warehouse was not consulted", () => {
+  const view = V.appleMessagesMarkReadView({ provider: "apple_messages", operation: "apple_messages.mark_read", payload: { chat: "72975" }, preview: {} });
+  assert.equal(view.heading, "Mark texts from 72975 read");
+  assert.equal(view.warnings.length, 1);
+});

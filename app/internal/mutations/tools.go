@@ -468,6 +468,24 @@ func MutationHelp() MutationHelpDocument {
 					"The result JSON carries the sent message's guid and service. Group chats are not supported: one recipient per mutation.",
 			},
 			{
+				Type:        AppleMessagesMarkReadOperation,
+				Summary:     "Mark one one-to-one iMessage/SMS conversation read, as if Zach had opened it. Executed on Zach's Mac through Messages.app, not in the cloud.",
+				RequiresEnv: "APPLE_MESSAGES_ACCOUNTS",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleMessagesMarkReadOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Messages account label (base_apple_messages.messages.account)"},
+					{Name: "chat", JSONType: "string", Required: true, Description: "the conversation's handle, as base_apple_messages.chats.chat_identifier holds it for a one-to-one chat (style 45): an E.164 phone (+13105550123; a bare 10-digit number is read as +1), an email address, or a short code (72975). Group chats (chat123...) are refused."},
+				},
+				Example: map[string]any{
+					"type":    AppleMessagesMarkReadOperation,
+					"account": "you@example.com",
+					"chat":    "72975",
+				},
+				ExtraNotes: "Messages has no API for read state, so the executor opens the conversation in Messages on the Mac that syncs Apple Messages, waits until chat.db shows no unread incoming message in it, and closes the window. That needs the Mac's screen unlocked: while it is locked the mutation waits as failed_retryable and runs once it is unlocked. " +
+					"It marks the whole conversation read, including texts that arrive after review; senders with read receipts on see it as read, and iCloud syncs the read state to Zach's iPhone. " +
+					"The review lists what the warehouse shows unread in that conversation now. One mutation per conversation; batch several conversations in one request.",
+			},
+			{
 				Type:        SlackSendMessageOperation,
 				Summary:     "Send a Slack message as Zach: to a channel or group, as a DM to one person, or as a reply in a thread.",
 				RequiresEnv: "SLACK_ACCOUNTS",

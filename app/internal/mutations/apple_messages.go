@@ -37,10 +37,6 @@ var (
 	appleMessagesE164Pattern  = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
 )
 
-func isAppleMessagesMutation(mutation Mutation) bool {
-	return mutation.Provider == AppleMessagesProvider || mutation.Operation == AppleMessagesSendMessageOperation
-}
-
 // normalizeAppleMessagesRecipient turns what an agent pasted into the handle
 // Messages keys a conversation by: an E.164 phone number (+13105550123) or a
 // lowercased email address. A ten-digit number is read as North American, because
@@ -167,7 +163,7 @@ func appleMessagesTargets(mutations []Mutation) []appleMessagesTarget {
 	seen := map[appleMessagesTarget]bool{}
 	out := []appleMessagesTarget{}
 	for _, mutation := range mutations {
-		if !isAppleMessagesMutation(mutation) {
+		if !isAppleMessagesSendMutation(mutation) {
 			continue
 		}
 		target := appleMessagesTarget{account: mutation.Account, recipient: stringFromAny(mutation.Payload["recipient"])}
@@ -261,7 +257,7 @@ func (s *PostgresStore) hydrateAppleMessagesPreviews(ctx context.Context, mutati
 func applyAppleMessagesRecipientInfo(mutations []Mutation, infos map[appleMessagesTarget]*appleMessagesRecipientInfo) []Mutation {
 	for index := range mutations {
 		mutation := &mutations[index]
-		if !isAppleMessagesMutation(*mutation) {
+		if !isAppleMessagesSendMutation(*mutation) {
 			continue
 		}
 		target := appleMessagesTarget{account: mutation.Account, recipient: stringFromAny(mutation.Payload["recipient"])}

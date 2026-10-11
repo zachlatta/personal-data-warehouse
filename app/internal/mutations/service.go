@@ -376,6 +376,13 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if err := validateAppleMessagesSendMessage(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
+	case AppleMessagesMarkReadOperation:
+		if err := validateConfiguredAccount(account, s.cfg.AppleMessagesAccounts, "APPLE_MESSAGES_ACCOUNTS"); err != nil {
+			return err
+		}
+		if err := validateAppleMessagesMarkRead(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	case SlackMarkConversationReadOperation:
 		if err := validateConfiguredAccount(account, s.cfg.SlackAccounts, "SLACK_ACCOUNTS"); err != nil {
 			return err
@@ -395,7 +402,7 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, apple_messages.send_message, slack.mark_conversation_read, or slack.send_message", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, apple_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, or slack.send_message", index, mutationType)
 	}
 	return nil
 }
@@ -487,6 +494,7 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		ReplyBroadcast:     boolFromAny(raw["reply_broadcast"]),
 		Recipient:          strings.TrimSpace(stringFromAny(raw["recipient"])),
 		Service:            strings.TrimSpace(stringFromAny(raw["service"])),
+		Chat:               strings.TrimSpace(stringFromAny(raw["chat"])),
 	}, nil
 }
 

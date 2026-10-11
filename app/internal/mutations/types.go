@@ -28,6 +28,7 @@ const (
 	AppleContactsMergeContactsOperation = "apple_contacts.merge_contacts"
 	AppleMessagesProvider               = "apple_messages"
 	AppleMessagesSendMessageOperation   = "apple_messages.send_message"
+	AppleMessagesMarkReadOperation      = "apple_messages.mark_read"
 	SlackProvider                       = "slack"
 	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
 	SlackSendMessageOperation           = "slack.send_message"
@@ -181,6 +182,7 @@ type MutationInput struct {
 	ReplyBroadcast     bool
 	Recipient          string
 	Service            string
+	Chat               string
 }
 
 type GmailEmailVariantInput struct {

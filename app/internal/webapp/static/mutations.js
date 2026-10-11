@@ -1047,6 +1047,32 @@ function renderAppleMessages(mutation) {
   return article;
 }
 
+function renderAppleMessagesMarkRead(mutation) {
+  const view = V.appleMessagesMarkReadView(mutation);
+  const article = h("article", "mut text-message");
+  article.appendChild(mutationHead("Messages", mutation.title || view.heading, mutation.status));
+  const action = h("div", "slack-action");
+  action.appendChild(h("strong", "", "What will happen"));
+  action.appendChild(h("p", "", view.effect));
+  action.appendChild(dl([["Conversation", view.chat], ["Contact", view.chatName || "not on any contact card"], ["Unread now", String(view.unreadCount)], ["Account", mutation.account]]));
+  article.appendChild(action);
+  for (const warning of view.warnings) article.appendChild(h("p", "bad slack-warning", warning));
+  if (view.unread.length) {
+    const context = h("section", "slack-context");
+    context.appendChild(h("h4", "", "Unread from " + (view.chatName || view.chat)));
+    for (const message of view.unread) {
+      const row = h("p", "m");
+      if (message.at) row.appendChild(h("span", "m", formatWhen(message.at) + " "));
+      row.appendChild(document.createTextNode(message.text));
+      context.appendChild(row);
+    }
+    article.appendChild(context);
+  }
+  if (view.done) article.appendChild(h("p", "m", view.alreadyRead ? "Already read" : "Marked " + view.markedRead + " message(s) read"));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  return article;
+}
+
 function renderGeneric(mutation) {
   const article = h("article", "mut generic");
   article.appendChild(mutationHead(mutation.provider || "mutation", mutation.title || mutation.operation || "mutation", mutation.status));
@@ -1063,6 +1089,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
   if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);
+  if (V.isAppleMessagesMarkReadMutation(mutation)) return renderAppleMessagesMarkRead(mutation);
   if (V.isAppleMessagesMutation(mutation)) return renderAppleMessages(mutation);
   if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
   if (V.isSlackSendMessageMutation(mutation)) return renderSlackSendMessage(request, mutation, actions);

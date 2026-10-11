@@ -18,7 +18,8 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `gmail.modify_thread_labels`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
-`apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `apple_messages.send_message`. The help call is
+`apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `apple_messages.send_message`,
+`apple_messages.mark_read`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -90,6 +91,11 @@ authoritative when this list and it disagree.
   The review shows the handle, the contact card(s) it is on, the latest messages with it,
   and warns on a stranger or a first text. No group chats. One approval sends one
   message: the executor checks chat.db for the same text since approval before sending.
+- **Mark texts read:** `apple_messages.mark_read` marks ONE one-to-one conversation read;
+  `chat` is its `base_apple_messages.chats.chat_identifier` (E.164 phone, email, or short
+  code like `72975`). No group chats. The Mac opens the conversation in Messages, so it
+  runs only while porygon's screen is unlocked (it waits as `failed_retryable` until then),
+  marks the whole conversation read, and sends read receipts where the sender has them on.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

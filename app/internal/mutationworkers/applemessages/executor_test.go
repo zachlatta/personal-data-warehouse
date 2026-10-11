@@ -21,6 +21,10 @@ type fakeStore struct {
 	haveChat  bool
 	chatErr   error
 	sinces    []time.Time
+	// unread is returned by UnreadCount in order; then the last repeats.
+	unread      []int
+	unreadCalls int
+	unreadErr   error
 }
 
 func (f *fakeStore) FindSent(handle, text string, since time.Time) (SentMessage, bool, error) {
@@ -37,6 +41,21 @@ func (f *fakeStore) FindSent(handle, text string, since time.Time) (SentMessage,
 		return SentMessage{}, false, nil
 	}
 	return f.sent[index], true, nil
+}
+
+func (f *fakeStore) UnreadCount(chat string, through time.Time) (int, error) {
+	f.unreadCalls++
+	if f.unreadErr != nil {
+		return 0, f.unreadErr
+	}
+	index := f.unreadCalls - 1
+	if index >= len(f.unread) {
+		index = len(f.unread) - 1
+	}
+	if index < 0 {
+		return 0, nil
+	}
+	return f.unread[index], nil
 }
 
 func (f *fakeStore) OneToOneChat(handle, service string) (Chat, bool, error) {

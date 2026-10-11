@@ -469,3 +469,35 @@ claims it.
 - The app needs `APPLE_MESSAGES_ACCOUNTS` (falls back to `APPLE_MESSAGES_ACCOUNT`, then
   `GMAIL_ACCOUNTS`) to accept proposals for the account, which is
   `base_apple_messages.messages.account`.
+
+## Marking texts read (apple_messages.mark_read)
+
+`apple_messages.mark_read` marks one one-to-one conversation read on the Mac that syncs
+Apple Messages, through the same `pdw mutations apple-messages` worker
+(`app/internal/mutationworkers/applemessages/markread.go`; proposal and review half in
+`app/internal/mutations/apple_messages_read.go`).
+
+- **Why it drives the window.** Messages' AppleScript dictionary has no read state, and
+  the private IMCore call that does (`markAllMessagesAsRead`) is refused to unentitled
+  processes while SIP is on (porygon: SIP enabled). Writing `chat.db` directly would not
+  reach imagent or iCloud. So the executor does what a person does: `open sms:<chat>`
+  shows the conversation, Messages marks it read and syncs that through iCloud, and the
+  executor closes the window again (only if Messages had none open before), because a
+  conversation left on screen keeps marking new texts read.
+- **It needs the screen unlocked.** Tested on porygon 2026-10-11: under the lock screen,
+  `open sms:72975` left the message unread. The executor reads
+  `CGSSessionScreenIsLocked` from `ioreg -n Root -d1 -a` first and returns
+  `failed_retryable` while locked, so approved rows wait (backoff capped at 15 min) and run
+  after the next unlock.
+- **Verified in chat.db.** Before opening, it counts incoming unread ordinary messages
+  (`is_from_me = 0`, `is_read = 0`, `item_type = 0`, no tapbacks) in the style-45 chats with
+  that `chat_identifier`; zero is `succeeded` with `already_read: true` and opens nothing.
+  After opening it polls up to 20 s. All read: `verified: true`. Some read:
+  `succeeded`, `verified: false`, `still_unread`. None: `failed_retryable`.
+- **Review.** `hydrateAppleMessagesMarkReadPreviews` names the contact card(s) and lists up
+  to 10 messages the warehouse shows unread in the conversation now, warning when there
+  are none. Approving marks the whole conversation read, including texts that arrive
+  after review, and senders with read receipts on see it.
+- `chat` accepts an E.164 phone, an email (iMessage or a business-chat sender such as
+  `google@rbm.goog`), or a 3 to 8 digit short code; `recipient` is accepted as an alias.
+  Group chats (`chat123…`) are refused at proposal time.
