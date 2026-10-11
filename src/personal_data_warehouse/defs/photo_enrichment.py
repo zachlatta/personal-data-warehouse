@@ -42,10 +42,12 @@ PHOTO_ENRICHMENT_BATCH_SIZE_ENV = "PHOTO_ENRICHMENT_BATCH_SIZE"
 PHOTO_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "PHOTO_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 PHOTO_ENRICHMENT_ERROR_WINDOW_DAYS_ENV = "PHOTO_ENRICHMENT_ERROR_WINDOW_DAYS"
 # Photos-only model/effort override. Captioning 11k photos does not need the
-# fleet default (gpt-5.6-sol, which also serves Gmail/WhatsApp/iMessage
-# enrichment): the 2026-07-14 benchmark (scripts/photo_caption_benchmark.py)
-# showed gpt-5.6-luna:xhigh matches sol's grounding and text reading with
-# zero overreach at a quarter of the cost. Unset = fleet default.
+# fleet default effort (gpt-6.1-sol medium, which also serves Gmail/WhatsApp/
+# iMessage enrichment and finance extraction). Production sets
+# PHOTO_ENRICHMENT_MODEL=gpt-6.1-sol and PHOTO_ENRICHMENT_REASONING_EFFORT=low:
+# the 2026-10-11 eval (desk work/2026-10-11-pdw-gpt-6-1-sol-eval) found 6.1 Sol
+# low as good as or better than the previous gpt-5.6-luna:xhigh, at 20 s vs
+# 46 s and about a quarter of the tokens. Unset = fleet default.
 PHOTO_ENRICHMENT_MODEL_ENV = "PHOTO_ENRICHMENT_MODEL"
 PHOTO_ENRICHMENT_EFFORT_ENV = "PHOTO_ENRICHMENT_REASONING_EFFORT"
 PHOTO_TEXT_MAX_CHARS = 20_000

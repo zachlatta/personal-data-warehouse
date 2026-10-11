@@ -867,14 +867,14 @@ def test_agent_config_uses_container_hostname_for_non_bridge_proxy(monkeypatch) 
     assert default_agent_tool_proxy_public_host("bridge") == "host.docker.internal"
 
 
-def test_agent_config_defaults_codex_to_gpt_5_6_sol_with_medium_reasoning(monkeypatch) -> None:
+def test_agent_config_defaults_codex_to_gpt_6_1_sol_with_medium_reasoning(monkeypatch) -> None:
     monkeypatch.setenv("AGENT_PROVIDER", "codex")
     monkeypatch.delenv("AGENT_MODEL", raising=False)
     monkeypatch.delenv("AGENT_REASONING_EFFORT", raising=False)
 
     config = agent_config_from_env()
 
-    assert config.model == "gpt-5.6-sol"
+    assert config.model == "gpt-6.1-sol"
     assert config.reasoning_effort == "medium"
 
 
@@ -932,7 +932,7 @@ def test_agent_entrypoint_skips_codex_git_repo_check() -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in entrypoint
     assert "shell_environment_policy.inherit=all" in entrypoint
     assert 'model_reasoning_effort="$reasoning_effort"' in entrypoint
-    assert 'model="${model:-gpt-5.6-sol}"' in entrypoint
+    assert 'model="${model:-gpt-6.1-sol}"' in entrypoint
     assert 'export PATH="$tools_dir:$PATH"' in entrypoint
     assert '< "$prompt_path"' in entrypoint
 
@@ -1088,7 +1088,7 @@ def test_load_settings_derives_agent_image_when_required(monkeypatch) -> None:
     settings = load_settings(require_postgres=False, require_gmail=False, require_agent=True)
 
     assert settings.agent is not None
-    assert settings.agent.model == "gpt-5.6-sol"
+    assert settings.agent.model == "gpt-6.1-sol"
     assert settings.agent.reasoning_effort == "medium"
     assert settings.agent.docker_image.startswith("personal-data-warehouse-agent:")
     assert len(settings.agent.docker_image.rsplit(":", 1)[1]) == 6

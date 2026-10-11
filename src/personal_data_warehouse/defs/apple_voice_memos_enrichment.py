@@ -42,7 +42,7 @@ VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "VOICE_MEMOS_ENRICHMENT_MAX_ERRO
 VOICE_MEMOS_ENRICHMENT_MODEL_ENV = "VOICE_MEMOS_ENRICHMENT_MODEL"
 VOICE_MEMOS_ENRICHMENT_EFFORT_ENV = "VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT"
 # Voice enrichment runs on GPT-6 Astra, not the fleet default (AGENT_MODEL,
-# gpt-5.6-sol in production): a multi-hour, many-speaker recording needs the
+# gpt-6.1-sol in production): a multi-hour, many-speaker recording needs the
 # agent to attribute speakers across hundreds of turns and research every
 # name, and that is where the stronger model earns its cost. Override
 # per-deployment with VOICE_MEMOS_ENRICHMENT_MODEL / _REASONING_EFFORT.

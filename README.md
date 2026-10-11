@@ -1347,7 +1347,7 @@ ASSEMBLYAI_API_KEY=...
 VOICE_MEMOS_TRANSCRIPTION_PROVIDER=assemblyai
 VOICE_MEMOS_TRANSCRIPTION_BATCH_SIZE=3
 AGENT_PROVIDER=codex
-AGENT_MODEL=gpt-5.6-sol
+AGENT_MODEL=gpt-6.1-sol
 AGENT_REASONING_EFFORT=medium
 VOICE_MEMOS_ENRICHMENT_LOOKBACK_WEEKS=12
 VOICE_MEMOS_ENRICHMENT_BATCH_SIZE=0
@@ -1431,12 +1431,12 @@ Also mount the host Docker socket into the Dagster app only:
 
 Set the Dagster app env:
 
-Codex defaults to `gpt-5.6-sol` with `medium` reasoning. The explicit values below document the
+Codex defaults to `gpt-6.1-sol` with `medium` reasoning. The explicit values below document the
 production choice and can be changed when a run needs a different model or reasoning effort.
 
 ```bash
 AGENT_PROVIDER=codex
-AGENT_MODEL=gpt-5.6-sol
+AGENT_MODEL=gpt-6.1-sol
 AGENT_REASONING_EFFORT=medium
 AGENT_AUTH_VOLUME=pdw-agent-auth
 AGENT_RUNS_VOLUME=pdw-agent-runs

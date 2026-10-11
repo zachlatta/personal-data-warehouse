@@ -107,7 +107,7 @@ trap 'terminate_provider 143' TERM
 
 case "$provider" in
   codex)
-    model="${model:-gpt-5.6-sol}"
+    model="${model:-gpt-6.1-sol}"
     codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c shell_environment_policy.inherit=all -c model_reasoning_effort="$reasoning_effort" --model "$model" --output-last-message "$final_message_path" --output-schema "$schema_path" - < "$prompt_path" &
     provider_pid=$!
     set +e
