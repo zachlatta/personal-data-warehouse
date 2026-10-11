@@ -2606,7 +2606,9 @@ func splitEmailTextAndSignature(bodyText string) (string, string, bool) {
 			continue
 		}
 		signature := bodyText[index+1:]
-		if quoteIndex := strings.Index(signature, "\nOn "); quoteIndex >= 0 && strings.Contains(signature[quoteIndex:], " wrote:") {
+		// Cut a quoted reply ("On <date>, <name> wrote:"). Gmail wraps long
+		// attribution lines, so "wrote:" can start its own line.
+		if quoteIndex := strings.Index(signature, "\nOn "); quoteIndex >= 0 && strings.Contains(signature[quoteIndex:], "wrote:") {
 			signature = signature[:quoteIndex]
 		}
 		return strings.TrimRight(bodyText[:index], "\n"), strings.TrimSpace(signature), true
