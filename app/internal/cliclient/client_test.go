@@ -233,3 +233,30 @@ func TestCallToolFallsBackWhenServerReturnsNonJSONError(t *testing.T) {
 		t.Fatalf("message = %q", apiErr.Message)
 	}
 }
+
+// A gateway timeout on a proxied connection call or a search is not a slow SQL
+// statement: 17 sessions on 2026-10-11 were told to "add LIMIT" and avoid
+// raw_json scans after `pdw call skills__skill_read` timed out.
+func TestCallToolGatewayTimeoutAdviceMatchesTheTool(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = io.WriteString(w, "<html>504</html>")
+	})
+	for tool, want := range map[string]string{
+		"sql":                "LIMIT",
+		"skills__skill_read": "skills",
+		"search":             "--since",
+	} {
+		_, err := newClient(t, srv.URL).CallTool(context.Background(), tool, json.RawMessage(`{}`))
+		var apiErr *cliclient.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "timeout" {
+			t.Fatalf("%s: err = %v", tool, err)
+		}
+		if !strings.Contains(apiErr.Message, want) {
+			t.Fatalf("%s: message must mention %q: %q", tool, want, apiErr.Message)
+		}
+		if tool != "sql" && strings.Contains(apiErr.Message, "raw_json") {
+			t.Fatalf("%s: SQL advice on a non-SQL call: %q", tool, apiErr.Message)
+		}
+	}
+}

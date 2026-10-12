@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,7 +154,12 @@ func (c *Client) CallTool(ctx context.Context, name string, input json.RawMessag
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, decodeAPIError(resp.StatusCode, raw)
+		err := decodeAPIError(resp.StatusCode, raw)
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "timeout" {
+			apiErr.Message = timeoutAdvice(name)
+		}
+		return nil, err
 	}
 	var wrapper struct {
 		Data json.RawMessage `json:"data"`
@@ -189,9 +195,28 @@ func decodeAPIError(status int, body []byte) error {
 	// is useless to a caller. Replace it with an actionable hint instead.
 	switch status {
 	case 524, http.StatusGatewayTimeout, http.StatusRequestTimeout:
-		return &APIError{Status: status, Code: "timeout", Message: "the query took too long and the gateway timed out; narrow it with selective filters (conversation_id, thread_ts, sender, a tighter time range) or add LIMIT, and avoid full scans such as raw_json::text LIKE '%...%'"}
+		return &APIError{Status: status, Code: "timeout", Message: sqlTimeoutAdvice}
 	}
 	return &APIError{Status: status, Code: "http_error", Message: msg}
+}
+
+const sqlTimeoutAdvice = "the query took too long and the gateway timed out; narrow it with selective filters (conversation_id, thread_ts, sender, a tighter time range) or add LIMIT, and avoid full scans such as raw_json::text LIKE '%...%'"
+
+// timeoutAdvice is what a gateway timeout means for the tool that hit it. Only
+// a SQL statement is fixed by narrowing it; a connected upstream tool timed out
+// because that server was slow or down, and a search by its scope.
+func timeoutAdvice(tool string) string {
+	if connection, _, ok := strings.Cut(tool, "__"); ok {
+		return "the gateway timed out waiting for " + tool + ": it is a live call to the " + connection +
+			" connection, which was slow or down, not a slow query. Retry once after ~30s; if it times out again, report the upstream as down instead of looping"
+	}
+	switch tool {
+	case "sql", "query", "describe_table", "schema_overview":
+		return sqlTimeoutAdvice
+	case "search":
+		return "the search took too long and the gateway timed out; scope it with --priority, --source or a recent --since, and use fewer, more distinctive words"
+	}
+	return "the gateway timed out waiting for " + tool + "; retry once, and if it repeats the server is overloaded or restarting (a deploy takes a few minutes)"
 }
 
 // Request sends an authenticated request to an API path other than the tools

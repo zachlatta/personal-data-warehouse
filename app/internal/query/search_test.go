@@ -992,3 +992,23 @@ func TestSearchHybridFailsWhenEveryLegTimesOut(t *testing.T) {
 		t.Fatalf("error = %q", resp.Error)
 	}
 }
+
+// An unknown source token used to surface as "hybrid lexical leg: ... call
+// search_text_sources()" -- a SQL function a CLI caller cannot see -- so
+// `--source google_calendar` (a natural guess for the calendar token) ended
+// the search with no list to pick from.
+func TestSearchUnknownSourceNamesTheValidTokens(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: map[string]RawResult{
+			searchSourcesSQL: {Columns: []string{"source"}, Rows: []map[string]any{{"source": "calendar"}, {"source": "gmail"}}},
+		}},
+		argsErrs: map[string]error{
+			searchTextSQL: errors.New(`ERROR: search_text: unknown source google_calendar (SQLSTATE P0001) HINT: call search_text_sources() to list the valid source tokens`),
+		},
+	}
+	svc := NewService(runner, Options{})
+	resp := svc.Search(context.Background(), SearchRequest{Query: "Capitol", Mode: "keyword", Sources: []string{"google_calendar"}})
+	if !strings.Contains(resp.Error, `unknown source "google_calendar"`) || !strings.Contains(resp.Error, "calendar, gmail") {
+		t.Fatalf("error = %q", resp.Error)
+	}
+}

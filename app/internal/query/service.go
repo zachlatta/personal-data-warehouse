@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -470,6 +471,9 @@ func (s *Service) SchemaOverviewFiltered(ctx context.Context, filter string) Res
 		tables = kept
 		if len(tables) == 0 {
 			failure := fmt.Sprintf("no queryable schema matches %q; run schema_overview with no filter for the list", filter)
+			if filter == "ops" {
+				failure = "ops is hidden from schema_overview, but the query role reads these ops relations; describe one with describe_table (`pdw columns ops.<name>`): " + strings.Join(hiddenReadableRelationNames(), ", ")
+			}
 			schemaResult.Error = failure
 			schemaResult.CSV = errorCSV(failure)
 			return Response{Results: []Result{schemaResult}}
@@ -970,11 +974,23 @@ var tableRemaps = map[string]string{
 	"marts":              "the marts split by domain: marts_inbox, marts_contacts, marts_messages, marts_ai_conversations, marts_photos, marts_calendar, marts_finance, marts_receipts",
 	"search":             "the search functions moved into timeline: timeline.search_text(...) / timeline.search_text_exact(...)",
 	"searchable_text":    "timeline.search_text('needle', 50) for ranked search, or timeline.search_text_exact('needle', 50) for literal substrings",
+	// Invented in two or more sessions each in the week to 2026-10-12: the
+	// reviewed-write queue, the enrichment agent runs, and Gmail as "emails".
+	"mutation_requests":             "ops.upstream_mutation_requests (one row per review request; its operations are ops.upstream_mutation_operations)",
+	"mutations.requests":            "ops.upstream_mutation_requests (one row per review request; its operations are ops.upstream_mutation_operations)",
+	"mutation_operations":           "ops.upstream_mutation_operations (one row per proposed write: request_id, operation, status, error)",
+	"mutations.operations":          "ops.upstream_mutation_operations (one row per proposed write: request_id, operation, status, error)",
+	"derived_agent_runs.agent_runs": "ops.ai_processing_agent_runs",
+	"gmail_emails":                  "base_gmail.messages",
+	"gmail.emails":                  "base_gmail.messages",
+	"base_gmail.emails":             "base_gmail.messages",
 }
 
 func init() {
 	for _, obj := range warehouse.Objects {
-		if !obj.Discoverable {
+		// The hidden ops relations the query role reads are named too, so a
+		// logical id typed as a table (agent_runs) finds its physical name.
+		if !obj.Discoverable && !(obj.QueryAccess == "app_only" && obj.IsRelation()) {
 			continue
 		}
 		if _, manual := tableRemaps[obj.ID]; manual {
@@ -1503,4 +1519,14 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// hiddenReadableRelationNames lists the ops relations the query role may read.
+func hiddenReadableRelationNames() []string {
+	var names []string
+	for _, rel := range warehouse.QueryReadableHiddenRelations() {
+		names = append(names, rel.Schema+"."+rel.Name)
+	}
+	slices.Sort(names)
+	return names
 }

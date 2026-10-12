@@ -138,6 +138,16 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	} else if len(matches) > 1 {
 		return tableRef{}, fmt.Sprintf("%q is ambiguous — it exists as %s. Re-run with the schema-qualified name.", name, displayNames(matches))
 	}
+	// Not in a discoverable schema: one of the hidden relations the query role
+	// still reads (the mutation queue, agent runs, health tables) is described
+	// when named, since `pdw sql` answers it anyway.
+	if len(matches) == 0 {
+		for _, hidden := range warehouse.QueryReadableHiddenRelations() {
+			if hidden.Name == name && (schema == "" || hidden.Schema == schema) {
+				return tableRef{Schema: hidden.Schema, Name: hidden.Name}, ""
+			}
+		}
+	}
 
 	// Nothing matched the name as given. A known wrong name is answered with the
 	// right one; otherwise offer relations whose name contains the request, which

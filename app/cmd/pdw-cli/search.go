@@ -77,7 +77,9 @@ FLAGS
   -n, --max-results N  Maximum hits (default 10; alias --limit).
   --full               Long previews (up to 800 characters per hit) instead of the
                        default one line per hit.
-  --source NAMES       Source aliases, comma-separated; repeatable.
+  --source NAMES       Source tokens (gmail, slack, calendar, imessage, ...),
+                       comma-separated; repeatable. An unknown token is
+                       answered with the full list.
                        (alias: --sources)
   --priority TIERS     Attention tiers, comma-separated; repeatable.
                        (alias: --priorities)
@@ -268,7 +270,7 @@ func flagsFirst(fs *flag.FlagSet, args []string, command string) ([]string, erro
 			continue
 		}
 		if strings.HasPrefix(arg, "-") && len(arg) > 1 && !isNumeric(arg[1:]) {
-			return nil, fmt.Errorf("unknown flag %s (run `pdw %s --help`; put the argument in quotes if it really starts with a dash)", name, command)
+			return nil, unknownFlagError(name, command, known)
 		}
 		positionals = append(positionals, arg)
 	}
@@ -276,6 +278,61 @@ func flagsFirst(fs *flag.FlagSet, args []string, command string) ([]string, erro
 	// SQL comment, a negative amount) from being parsed as a flag.
 	flags = append(flags, "--")
 	return append(flags, positionals...), nil
+}
+
+// unknownFlagHints answer the invented flags real sessions typed with the
+// spelling that works, keyed by command then flag. Measured over the week to
+// 2026-10-12: `pdw sql --format` 6 times in 5 sessions, `pdw search --query`
+// 5 times in 5 sessions, `pdw search --table` twice.
+var unknownFlagHints = map[string]map[string]string{
+	"sql": {
+		"--format": "use --output json (or csv, nd-json)",
+		"-format":  "use --output json (or csv, nd-json)",
+		"--query":  "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>' (-q is the plain-English question)",
+		"--sql":    "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>'",
+	},
+	"search": {
+		"--format": "use --output json",
+		"-format":  "use --output json",
+		"--query":  "the query is the positional argument: pdw search [flags] '<words>'",
+		"-q":       "the query is the positional argument: pdw search [flags] '<words>'",
+		"--q":      "the query is the positional argument: pdw search [flags] '<words>'",
+		"--table":  "search spans the timeline; scope it with --source <token> (gmail, slack, calendar, imessage, ...; an unknown token is answered with the full list), or read one table with pdw sql",
+	},
+	"context": {
+		"--format": "use --output json",
+		"-format":  "use --output json",
+	},
+}
+
+// unknownFlagError refuses a flag the command does not take, naming the one
+// that works: a known substitute first, else the closest real flag by edit
+// distance (a typo such as --priorty).
+func unknownFlagError(name, command string, known map[string]bool) error {
+	if hint, ok := unknownFlagHints[command][name]; ok {
+		return fmt.Errorf("unknown flag %s: %s", name, hint)
+	}
+	if closest := closestFlag(name, known); closest != "" {
+		return fmt.Errorf("unknown flag %s (did you mean %s? run `pdw %s --help`; put the argument in quotes if it really starts with a dash)", name, closest, command)
+	}
+	return fmt.Errorf("unknown flag %s (run `pdw %s --help`; put the argument in quotes if it really starts with a dash)", name, command)
+}
+
+// closestFlag returns the double-dash flag nearest to name, if it is within
+// two edits; single-letter aliases are never suggested.
+func closestFlag(name string, known map[string]bool) string {
+	bare := strings.TrimLeft(name, "-")
+	best, bestDistance := "", 3
+	for flagName := range known {
+		if !strings.HasPrefix(flagName, "--") || len(flagName) <= 3 {
+			continue
+		}
+		distance := levenshtein(bare, strings.TrimPrefix(flagName, "--"))
+		if distance < bestDistance || (distance == bestDistance && best != "" && flagName < best) {
+			best, bestDistance = flagName, distance
+		}
+	}
+	return best
 }
 
 func isNumeric(s string) bool {

@@ -220,6 +220,21 @@ func DrillDownRelation(sourceTable string) (Relation, bool) {
 	return Relation{Schema: obj.Schema, Name: obj.Name}, true
 }
 
+// QueryReadableHiddenRelations are the relations outside the discoverable
+// schemas that the read-only query role may still SELECT (catalog
+// query_access "app_only": the ops tables the app's own mutation, agent-run and
+// health UI renders). schema_overview does not list them, but a caller who
+// names one -- to check a reviewed write's status, say -- can describe it.
+func QueryReadableHiddenRelations() []Relation {
+	var out []Relation
+	for _, obj := range Objects {
+		if obj.QueryAccess == "app_only" && obj.IsRelation() {
+			out = append(out, Relation{Schema: obj.Schema, Name: obj.Name})
+		}
+	}
+	return out
+}
+
 // IsRelation reports whether the object lives in pg_class as something a
 // SELECT can name.
 func (o CatalogObject) IsRelation() bool {

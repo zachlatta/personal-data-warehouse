@@ -392,3 +392,47 @@ func TestSoleRelationInSQL(t *testing.T) {
 		}
 	}
 }
+
+// The ops relations the query role may read (catalog query_access app_only:
+// the mutation queue, agent runs, the health tables) are hidden from
+// schema_overview but are not secret, and `pdw sql` reads them. Nine sessions
+// in the week to 2026-10-12 checked a reviewed write's status with
+// `pdw columns ops.upstream_mutation_operations`, were told it did not exist,
+// and then guessed column names against the real table.
+func TestDescribeTableDescribesAQueryReadableOpsRelation(t *testing.T) {
+	runner := fakeRunner{results: map[string]RawResult{
+		describeColumnsSQL("ops", "upstream_mutation_operations"): {
+			Columns: []string{"name", "type"},
+			Rows: []map[string]any{
+				{"name": "request_id", "type": "text"},
+				{"name": "operation", "type": "text"},
+				{"name": "status", "type": "text"},
+			},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	for _, relation := range []string{"ops.upstream_mutation_operations", "upstream_mutation_operations"} {
+		result := svc.DescribeTable(context.Background(), relation).Results[0]
+		if result.Error != "" {
+			t.Fatalf("describe_table(%q) refused a relation the query role reads: %s", relation, result.Error)
+		}
+		if !strings.Contains(result.CSV, "# ops.upstream_mutation_operations") || !strings.Contains(result.CSV, "request_id (text),operation (text),status (text)") {
+			t.Fatalf("describe_table(%q) = \n%s", relation, result.CSV)
+		}
+	}
+}
+
+func TestDescribeTableStillRefusesADeniedOpsRelation(t *testing.T) {
+	runner := fakeRunner{results: map[string]RawResult{
+		describeColumnsSQL("ops", "gmail_sync_state"): {
+			Columns: []string{"name", "type"},
+			Rows:    []map[string]any{{"name": "account", "type": "text"}},
+		},
+	}}
+	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 100})
+
+	if result := svc.DescribeTable(context.Background(), "ops.gmail_sync_state").Results[0]; result.Error == "" {
+		t.Fatalf("a denied ops relation must not be described:\n%s", result.CSV)
+	}
+}

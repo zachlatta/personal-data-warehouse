@@ -919,3 +919,19 @@ func TestExecuteFullReturnsTimelinePriorityHintBeforeRunning(t *testing.T) {
 		t.Fatalf("ExecuteFull hint = %q, want priority guidance", resp.Hint)
 	}
 }
+
+// `pdw schema ops` (Codex, 2026-10-10, looking for the mutation queue) was
+// told no schema matches. ops is hidden from discovery, but the relations the
+// query role reads there are named when ops is asked for by name.
+func TestSchemaOverviewFilterOnOpsNamesTheReadableRelations(t *testing.T) {
+	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+	result := svc.SchemaOverviewFiltered(context.Background(), "ops").Results[0]
+	for _, want := range []string{"ops.upstream_mutation_operations", "ops.ai_processing_agent_runs", "pdw columns"} {
+		if !strings.Contains(result.Error, want) {
+			t.Fatalf("schema ops must name %q: %#v", want, result)
+		}
+	}
+	if strings.Contains(result.Error, "ops.gmail_sync_state") {
+		t.Fatalf("a denied ops relation must not be listed: %s", result.Error)
+	}
+}

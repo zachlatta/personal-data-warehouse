@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -851,8 +852,87 @@ func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writ
 			return 0
 		}
 	}
-	fmt.Fprintf(stderr, "pdw describe: no tool named %q (try 'pdw list')\n", name)
+	fmt.Fprintf(stderr, "pdw describe: no tool named %q; %s\n", name, unknownToolHint(name, tools))
 	return 1
+}
+
+// unknownToolHint answers a tool name that does not exist with the names that
+// do. A warehouse relation or timeline function is pointed at the command that
+// describes it; a name under a known connection lists that connection's tools
+// nearest first, because the guessed verb (skill_create, run_query,
+// list_records) is rarely within a typo of the real one; anything else gets
+// the closest tool overall.
+func unknownToolHint(name string, tools []cliclient.ToolInfo) string {
+	lowered := strings.ToLower(strings.TrimSpace(name))
+	switch lowered {
+	case "timeline.context", "timeline_context", "context":
+		return "a search hit's conversation is `pdw context '<ref>'`"
+	}
+	connection, verb, namespaced := strings.Cut(lowered, "__")
+	if !namespaced && (strings.Contains(lowered, ".") || isWarehouseSchemaName(lowered)) {
+		return "describe is for tools; a relation's columns are `pdw columns <schema.table>` and the relation list is `pdw schema`"
+	}
+	if namespaced {
+		type candidate struct {
+			name     string
+			distance int
+		}
+		var siblings []candidate
+		for _, t := range tools {
+			tc, tv, ok := strings.Cut(strings.ToLower(t.Name), "__")
+			if ok && tc == connection {
+				distance := levenshtein(verb, tv)
+				if strings.Contains(tv, verb) || strings.Contains(verb, tv) {
+					distance = 0
+				}
+				siblings = append(siblings, candidate{t.Name, distance})
+			}
+		}
+		if len(siblings) > 0 {
+			sort.SliceStable(siblings, func(i, j int) bool {
+				if siblings[i].distance != siblings[j].distance {
+					return siblings[i].distance < siblings[j].distance
+				}
+				return siblings[i].name < siblings[j].name
+			})
+			names := make([]string, 0, len(siblings))
+			for _, c := range siblings {
+				names = append(names, c.name)
+			}
+			return "the " + connection + " connection's tools, nearest first: " + strings.Join(names, ", ")
+		}
+	}
+	best, bestDistance := "", 4
+	for _, t := range tools {
+		if d := levenshtein(lowered, strings.ToLower(t.Name)); d < bestDistance {
+			best, bestDistance = t.Name, d
+		}
+	}
+	if best != "" {
+		return fmt.Sprintf("did you mean %q? (`pdw list` lists every tool)", best)
+	}
+	return "`pdw list` lists every tool"
+}
+
+// isWarehouseSchemaName reports whether name is a warehouse schema or layer
+// prefix rather than a tool: base_gmail, marts_finance, timeline, gmail.
+func isWarehouseSchemaName(name string) bool {
+	for _, prefix := range []string{"base_", "derived_", "marts_"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	if name == "timeline" || name == "ops" {
+		return true
+	}
+	for _, schema := range warehouse.QueryableSchemas() {
+		for _, prefix := range []string{"base_", "derived_", "marts_"} {
+			if strings.TrimPrefix(schema, prefix) == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -933,13 +1013,17 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
 	}
+	if name == "get_object" && hasJSONField(input, "ref") {
+		fmt.Fprintln(stderr, "pdw call: get_object takes a stored file's storage_file_id (a row's storage_* column, or a Slack F… file id), not a search hit's ref. To "+readHitRedirect)
+		return 2
+	}
 	out, err := client.CallTool(context.Background(), name, input)
 	if err != nil {
 		var apiErr *cliclient.APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.Code == "tool_not_found" {
-				if s := suggestTool(client, name); s != "" {
-					fmt.Fprintf(stderr, "pdw call: %s (http %d): %s; did you mean %q? (run 'pdw list')\n", apiErr.Code, apiErr.Status, apiErr.Message, s)
+				if tools, listErr := client.ListTools(context.Background()); listErr == nil {
+					fmt.Fprintf(stderr, "pdw call: %s (http %d): %s; %s\n", apiErr.Code, apiErr.Status, apiErr.Message, unknownToolHint(name, tools))
 					return 1
 				}
 			}
@@ -1096,6 +1180,16 @@ func topLevelToolError(raw json.RawMessage) string {
 	return ""
 }
 
+// hasJSONField reports whether input is a JSON object carrying key.
+func hasJSONField(input json.RawMessage, key string) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(input, &fields) != nil {
+		return false
+	}
+	_, ok := fields[key]
+	return ok
+}
+
 func loadCallInput(data string, stdin io.Reader) (json.RawMessage, error) {
 	raw := strings.TrimSpace(data)
 	if raw == "" {
@@ -1169,6 +1263,12 @@ var commandRedirects = map[string]string{
 	"schema_overview": "print the warehouse schema with `pdw schema`",
 	"describe_table":  "list one relation's columns with `pdw columns <table>`",
 	"tools":           "list the server's tools with `pdw list`",
+	// `pdw connections` (the MCP tool's name): four sessions in the week to
+	// 2026-10-12, each followed by a ~100-line usage dump.
+	"connections":     "the CLI lists every connected upstream tool with `pdw list` (`pdw describe <connection>__<tool>` for its arguments) and calls one with `pdw call <connection>__<tool> --data '<json>'`",
+	"connection_call": "call a connected upstream tool with `pdw call <connection>__<tool> --data '<json>'`",
+	// `pdw mutation`: reviewed writes are proposed through the server tools.
+	"mutation": "reviewed writes go through `pdw call propose_mutation_help --data '{\"operation\":\"<provider.op>\"}'` then `pdw call propose_mutation`; `pdw readme mutations` is the guide (`pdw mutations` runs the local Apple workers)",
 	// `pdw get <ref>` and `pdw get-object <ref>`: five sessions in the fortnight
 	// to 2026-10-10 wanted a hit's whole record and got the global usage.
 	"get":        readHitRedirect,
@@ -1190,6 +1290,14 @@ var callToolRedirects = map[string]string{
 	"context":         "pdw context '<ref>' [--before N] [--after N]",
 	"schema_overview": "pdw schema",
 	"describe_table":  "pdw columns <table>",
+	// MCP-only tools and timeline functions spelled as connection tools, each
+	// tried in real sessions in the week to 2026-10-12.
+	"connections":                 "pdw list (every connected upstream tool; `pdw describe <connection>__<tool>` for one)",
+	"connection_call":             "pdw call <connection>__<tool> --data '<json>'",
+	"timeline__search_text":       "pdw search '<terms>'",
+	"timeline__search_text_exact": "pdw search --mode exact '<literal>'",
+	"timeline__search_hybrid":     "pdw search '<terms>'",
+	"timeline__context":           "pdw context '<ref>'",
 }
 
 // isVersionFlag reports whether a root-level version flag (--version,
@@ -1248,25 +1356,6 @@ func looksLikeKeyValue(args []string) bool {
 
 // suggestTool returns the closest existing tool name to want, or "" if none is
 // close enough to be worth suggesting.
-func suggestTool(client *cliclient.Client, want string) string {
-	tools, err := client.ListTools(context.Background())
-	if err != nil {
-		return ""
-	}
-	best := ""
-	bestDist := -1
-	for _, t := range tools {
-		d := levenshtein(strings.ToLower(want), strings.ToLower(t.Name))
-		if bestDist < 0 || d < bestDist {
-			bestDist, best = d, t.Name
-		}
-	}
-	if best != "" && bestDist <= 3 {
-		return best
-	}
-	return ""
-}
-
 func levenshtein(a, b string) int {
 	ra, rb := []rune(a), []rune(b)
 	prev := make([]int, len(rb)+1)

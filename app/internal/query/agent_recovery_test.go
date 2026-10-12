@@ -325,3 +325,27 @@ func TestUndefinedColumnErrorLeadsWithTheSimilarColumns(t *testing.T) {
 		t.Fatalf("error should name the similar column, got: %s", resp.Error)
 	}
 }
+
+// Invented names for the reviewed-write queue, the enrichment agent runs and
+// Gmail, each seen in two or more sessions in the week to 2026-10-12, got the
+// bare "no such relation" from both `pdw sql` and `pdw columns`.
+func TestInventedQueueAndMailRelationsNameTheRealOnes(t *testing.T) {
+	for rel, want := range map[string]string{
+		"mutations.requests":            "ops.upstream_mutation_requests",
+		"mutation_requests":             "ops.upstream_mutation_requests",
+		"mutations.operations":          "ops.upstream_mutation_operations",
+		"derived_agent_runs.agent_runs": "ops.ai_processing_agent_runs",
+		"agent_runs":                    "ops.ai_processing_agent_runs",
+		"base_gmail.emails":             "base_gmail.messages",
+		"gmail_emails":                  "base_gmail.messages",
+	} {
+		hint := schemaErrorHint(`ERROR: relation "`+rel+`" does not exist (SQLSTATE 42P01)`, "SELECT * FROM "+rel+" LIMIT 1")
+		if !strings.Contains(hint, want) {
+			t.Fatalf("sql hint for %q = %q, want it to name %s", rel, hint, want)
+		}
+		svc := NewService(fakeRunner{results: map[string]RawResult{}}, Options{MaxRows: 5, MaxFieldChars: 100})
+		if err := svc.DescribeTable(context.Background(), rel).Results[0].Error; !strings.Contains(err, want) {
+			t.Fatalf("describe_table(%q) = %q, want it to name %s", rel, err, want)
+		}
+	}
+}

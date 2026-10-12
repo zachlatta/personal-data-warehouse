@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -442,6 +443,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	if err != nil {
 		resp.Error = s.queryErrorMessage(ctx, err.Error(), statement)
+		if token, ok := unknownSourceToken(err.Error()); ok {
+			resp.Error = s.unknownSourceMessage(ctx, token)
+		}
 		s.logger.ErrorContext(ctx, "search failed", "query", resp.Query, "mode", resp.Mode, "sql", statement, "error", err, "duration", time.Since(started))
 		return resp
 	}
@@ -728,4 +732,35 @@ func (s *Service) searchHybridInstalled(ctx context.Context) (bool, error) {
 	}
 	installed, ok := result.Rows[0]["installed"].(bool)
 	return ok && installed, nil
+}
+
+// searchSourcesSQL lists the tokens the search functions' sources filter takes.
+const searchSourcesSQL = "SELECT source FROM timeline.search_text_sources() AS s(source) ORDER BY source"
+
+var unknownSourceRe = regexp.MustCompile(`unknown source (?:filter )?\{?([A-Za-z0-9_,.-]+)\}?`)
+
+// unknownSourceToken extracts the rejected token from the search functions'
+// "unknown source X" error, whichever hybrid leg raised it.
+func unknownSourceToken(message string) (string, bool) {
+	match := unknownSourceRe.FindStringSubmatch(message)
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
+// unknownSourceMessage answers an unknown source token with the valid ones,
+// so the caller can pick in the same turn instead of calling a SQL function
+// it may not know exists.
+func (s *Service) unknownSourceMessage(ctx context.Context, token string) string {
+	message := fmt.Sprintf("unknown source %q", token)
+	result, err := s.runner.Query(ctx, searchSourcesSQL, 0)
+	if err != nil || len(result.Rows) == 0 {
+		return message + "; timeline.search_text_sources() lists the valid tokens"
+	}
+	valid := make([]string, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		valid = append(valid, fmt.Sprint(row["source"]))
+	}
+	return message + "; valid sources: " + strings.Join(valid, ", ")
 }
