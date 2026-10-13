@@ -55,11 +55,12 @@ COMMANDS
                                --json   Emit the raw tool list as a JSON array.
   describe <name>            Print one tool's title, description, and input schema.
   call <name> [--data JSON]  Invoke a NON-SQL tool. With --data, send that JSON
-                             as the request body. Without --data, read JSON from
+                             as the request body (--data @file.json reads a file,
+                             --data @- reads stdin). Without --data, read JSON from
                              stdin. To run SQL, use the "sql" command below, not
                              "call sql" / "call query".
                                --output FORMAT  json (default), text, or structured.
-                               --data JSON   Inline JSON input
+                               --data JSON   Inline JSON, @file.json, or @- (stdin)
                                              (aliases: --args, --input, --json).
   search [flags] QUERY...    Hybrid search across every synced source. This is
                              the normal CLI search path; no JSON or SQL required.
@@ -1004,8 +1005,9 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return 2
 	}
 	inline := firstNonEmpty(*data, *dataArgs, *dataInput, *dataJSON)
-	if strings.HasPrefix(strings.TrimSpace(inline), "@") {
-		fmt.Fprintf(stderr, "pdw call: --data accepts inline JSON, not @file or @-. Read JSON from stdin instead: pdw call %s < input.json (or pipe JSON to pdw call %s without --data)\n", name, name)
+	inline, err = resolveAtData(inline, stdin)
+	if err != nil {
+		fmt.Fprintln(stderr, "pdw call:", err)
 		return 2
 	}
 	input, err := loadCallInput(inline, stdin)
@@ -1188,6 +1190,38 @@ func hasJSONField(input json.RawMessage, key string) bool {
 	}
 	_, ok := fields[key]
 	return ok
+}
+
+// resolveAtData expands curl-style `--data @path` (read the file) and
+// `--data @-` (read stdin). Inline JSON never starts with "@", so the forms
+// cannot be confused. Agents reach for this shorthand first; rejecting it
+// cost 17 retries in the week to 2026-10-12, and Zach approved it 2026-10-13.
+func resolveAtData(data string, stdin io.Reader) (string, error) {
+	trimmed := strings.TrimSpace(data)
+	if !strings.HasPrefix(trimmed, "@") {
+		return data, nil
+	}
+	path := strings.TrimPrefix(trimmed, "@")
+	var buf []byte
+	var err error
+	switch path {
+	case "":
+		return "", fmt.Errorf("--data @ needs a file path (--data @input.json) or @- for stdin")
+	case "-":
+		buf, err = io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read stdin: %w", err)
+		}
+	default:
+		buf, err = os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read --data file: %w", err)
+		}
+	}
+	if strings.TrimSpace(string(buf)) == "" {
+		return "", fmt.Errorf("--data %s is empty", trimmed)
+	}
+	return string(buf), nil
 }
 
 func loadCallInput(data string, stdin io.Reader) (json.RawMessage, error) {

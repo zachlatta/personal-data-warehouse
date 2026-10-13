@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -85,15 +87,57 @@ func TestCallOutputFormats(t *testing.T) {
 }
 
 func TestCallRejectsUnsupportedInputBeforeRequest(t *testing.T) {
-	for _, args := range [][]string{{"--data", "@file.json"}, {"--data", "@-"}, {"--output", "yaml"}} {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(bad, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--output", "yaml"}, "--output must be"},
+		{[]string{"--data", "@" + missing}, "read --data file"},
+		{[]string{"--data", "@"}, "--data @ needs a file path"},
+		{[]string{"--data", "@" + bad}, "invalid JSON input"},
+	} {
 		srv := newStubServer(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected network request") })
-		_, diagnostic, code := runCLI(t, srv.URL, "", append([]string{"call", "remote__list"}, args...)...)
-		if code != 2 {
-			t.Fatalf("code=%d stderr=%s", code, diagnostic)
+		_, diagnostic, code := runCLI(t, srv.URL, "", append([]string{"call", "remote__list"}, tc.args...)...)
+		if code != 2 || !strings.Contains(diagnostic, tc.want) {
+			t.Fatalf("args=%v code=%d stderr=%s", tc.args, code, diagnostic)
 		}
-		if args[0] == "--data" && !strings.Contains(diagnostic, "pdw call remote__list < input.json") {
-			t.Fatal(diagnostic)
-		}
+	}
+}
+
+// curl's `--data @file` / `--data @-` is what agents reach for first; on the
+// week to 2026-10-12 the old rejection cost 17 retries. Zach approved
+// accepting it on 2026-10-13.
+func TestCallReadsDataFromAtFileAndAtStdin(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "input.json")
+	if err := os.WriteFile(path, []byte(`{"from":"file"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		stdin string
+		want  string
+	}{
+		{"file", []string{"--data", "@" + path}, "", `{"from":"file"}`},
+		{"file equals form", []string{"--data=@" + path}, "", `{"from":"file"}`},
+		{"file via alias", []string{"--json", "@" + path}, "", `{"from":"file"}`},
+		{"stdin", []string{"--data", "@-"}, `{"from":"stdin"}`, `{"from":"stdin"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, `{"data":{"isError":false,"content":[]}}`)
+			})
+			_, diagnostic, code := runCLI(t, srv.URL, tc.stdin, append([]string{"call", "remote__list"}, tc.args...)...)
+			got := string(srv.lastBody)
+			if code != 0 || !strings.Contains(got, tc.want) {
+				t.Fatalf("code=%d body=%s stderr=%s", code, got, diagnostic)
+			}
+		})
 	}
 }
 

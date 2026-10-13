@@ -12,8 +12,8 @@ PDW's own tools and with other connected servers.
 Use `pdw list` to find a tool, then `pdw describe <tool>` **before the first call**.
 Use the exact argument names and types from that schema, not guesses. Describe every
 unfamiliar tool before launching parallel calls. Invoke with `pdw call <tool> --data '<json>'`.
-For input from a file, use `pdw call <tool> < input.json`; for a pipe, omit `--data`.
-`--data` accepts inline JSON only, not `@file` or `@-`.
+For input from a file, use `--data @input.json` (or `pdw call <tool> < input.json`); for a
+pipe, use `--data @-` or omit `--data`.
 
 The default `--output json` preserves the full result, including `content`,
 `structuredContent`, and `isError`. `--output text` prints text content blocks in order,
