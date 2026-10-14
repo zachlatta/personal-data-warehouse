@@ -45,6 +45,10 @@ SPLIT_SEGMENT_TARGET_MS = 0
 SPLIT_SEGMENT_MAX_MS = 45_000
 SENTENCE_END_CHARACTERS = (".", "?", "!")
 MAX_ASSEMBLYAI_ERROR_BODY_CHARS = 2000
+# No person-like names here: a keyterm pulls any similar-sounding word toward
+# it. "Gemma" (the Google model) turned "Jehn Balajadia" into "Gemma Balajoti"
+# on 2026-10-12 and stands in for other people's names across 56 of 778 stored
+# transcripts, so it was removed on 2026-10-14.
 ASSEMBLYAI_KEYTERMS_PROMPT = (
     "Hack Club",
     "Congressional App Challenge",
@@ -52,7 +56,6 @@ ASSEMBLYAI_KEYTERMS_PROMPT = (
     "Hackatime",
     "OpenAI",
     "Anthropic",
-    "Gemma",
     "Code.org",
     "Stardance",
     "Challenger",

@@ -182,6 +182,10 @@ def test_assemblyai_request_enables_diarization_and_best_models() -> None:
     assert "prompt" not in request
     assert "Pellegrino" in request["keyterms_prompt"]
     assert "Hackatime" in request["keyterms_prompt"]
+    # "Gemma" biased people's names toward it: "Jehn Balajadia" became "Gemma
+    # Balajoti" in the 2026-10-12 Musk Foundation meeting, and 56 of 778 stored
+    # transcripts say "Gemma", mostly for someone else.
+    assert "Gemma" not in request["keyterms_prompt"]
     assert {"from": ["hackertime", "hacker time", "hacka time"], "to": "Hackatime"} in request["custom_spelling"]
     assert {"from": ["open router"], "to": "OpenRouter"} in request["custom_spelling"]
     assert {"from": ["stardance", "star dance", "start dance"], "to": "Stardance"} in request["custom_spelling"]
