@@ -462,6 +462,9 @@ func runSQL(client *cliclient.Client, args []string, stdin io.Reader, stdout, st
 	fs := flag.NewFlagSet("sql", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	output := fs.String("output", "", "output format: csv, json, or nd-json")
+	// --format is the spelling agents type for --output (10 refusals in 9
+	// sessions over 2026-10-10..13 after it was answered with a hint).
+	fs.StringVar(output, "format", "", "alias for --output")
 	file := fs.String("file", "", "read the SQL statement from this file instead of an argument")
 	questionFlag := fs.String("question", "", "plain-English description of what the SQL answers, logged server-side as intent")
 	questionShort := fs.String("q", "", "alias for --question")

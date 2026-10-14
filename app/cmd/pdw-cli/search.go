@@ -282,14 +282,13 @@ func flagsFirst(fs *flag.FlagSet, args []string, command string) ([]string, erro
 
 // unknownFlagHints answer the invented flags real sessions typed with the
 // spelling that works, keyed by command then flag. Measured over the week to
-// 2026-10-12: `pdw sql --format` 6 times in 5 sessions, `pdw search --query`
-// 5 times in 5 sessions, `pdw search --table` twice.
+// 2026-10-12: `pdw search --query`
+// 5 times in 5 sessions, `pdw search --table` twice. (`pdw sql --format` is
+// now an alias of --output.)
 var unknownFlagHints = map[string]map[string]string{
 	"sql": {
-		"--format": "use --output json (or csv, nd-json)",
-		"-format":  "use --output json (or csv, nd-json)",
-		"--query":  "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>' (-q is the plain-English question)",
-		"--sql":    "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>'",
+		"--query": "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>' (-q is the plain-English question)",
+		"--sql":   "the SQL is the positional argument: pdw sql [-q '<question>'] '<sql>'",
 	},
 	"search": {
 		"--format": "use --output json",

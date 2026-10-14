@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -16,8 +17,6 @@ func TestUnknownFlagNamesTheFlagThatWorks(t *testing.T) {
 		args []string
 		want string
 	}{
-		// --format: 6 calls in 5 sessions.
-		{[]string{"sql", "--format", "json", "SELECT 1"}, "--output json"},
 		// --query: 5 calls in 5 sessions; the query is the positional argument.
 		{[]string{"search", "--query", "Howden"}, "pdw search [flags] '<words>'"},
 		{[]string{"search", "--table", "base_gmail.messages", "Howden"}, "--source"},
@@ -113,6 +112,31 @@ func TestCallOfTimelineFunctionsAndConnectionsRedirects(t *testing.T) {
 		_, errOut, code := runCLI(t, srv.URL, "", "call", tool, "--data", `{}`)
 		if code != 2 || !strings.Contains(errOut, want) {
 			t.Fatalf("call %s: code=%d, want a redirect naming %q: %s", tool, code, want, errOut)
+		}
+	}
+}
+
+// --format was refused with the right spelling from 2026-10-12, and agents
+// kept typing it anyway (10 refusals in 9 sessions over 2026-10-10..13): each
+// was a failed SQL call that cost a turn. It is now simply --output.
+func TestSQLAcceptsFormatAsOutput(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"rows":[{"x":1}]}}`)
+	})
+	for _, args := range [][]string{
+		{"sql", "--format", "json", "-q", "why", "SELECT 1 AS x"},
+		{"sql", "-q", "why", "SELECT 1 AS x", "--format=json"},
+	} {
+		out, errOut, code := runCLI(t, srv.URL, "", args...)
+		if code != 0 {
+			t.Fatalf("%v: code=%d stderr=%s", args, code, errOut)
+		}
+		var input struct {
+			Format string `json:"format"`
+		}
+		_ = json.Unmarshal(srv.lastBody, &input)
+		if input.Format != "json" || !strings.Contains(out, `"x": 1`) {
+			t.Fatalf("%v: format=%q out=%s", args, input.Format, out)
 		}
 	}
 }
