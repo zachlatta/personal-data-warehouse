@@ -1368,6 +1368,10 @@ def _muse_code_time(line: Mapping[str, Any]) -> datetime:
         except ValueError:
             child = {}
         value = child.get("recorded_at") if isinstance(child, Mapping) else None
+    # The Go uploader decodes lines into map[string]any, so an integer arrives
+    # here as a float (1791941196347462.0); float64 is exact to 2**53.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return parse_datetime("")
     try:

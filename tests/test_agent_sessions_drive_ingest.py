@@ -1060,3 +1060,16 @@ def test_muse_code_malformed_shapes_degrade_to_meta_rows() -> None:
         row = _muse_code_row(line, seq=3)
         assert row["source"] == "muse_code"
         assert row["event_uuid"] == f"{MUSE_CODE_SESSION}#3"
+
+
+def test_muse_code_recorded_at_survives_the_uploaders_float_round_trip() -> None:
+    # The Go uploader decodes each line into map[string]any, so an integer
+    # recorded_at reaches ingest as a float (1791941196347462.0). Measured on
+    # the first production batches 2026-10-14: 3,120 of 3,132 rows read as the
+    # epoch because only an int was accepted. float64 is exact to 2**53, which
+    # microsecond timestamps stay under until the 2250s.
+    line = _muse_code_record("runtime.session.metadata", {"kind": "metadata", "record": {}})
+    line["recorded_at"] = float(line["recorded_at"])
+    assert _muse_code_row(line)["occurred_at"] == _MUSE_CODE_AT
+    line["recorded_at"] = 1791941196347462.5
+    assert _muse_code_row(line)["occurred_at"] == datetime(1970, 1, 1, tzinfo=UTC)
