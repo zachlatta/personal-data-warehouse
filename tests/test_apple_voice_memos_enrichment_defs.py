@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from dagster import AssetKey, DagsterInstance, Definitions, RunRequest, SkipReason, build_sensor_context
 
 from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
@@ -10,6 +12,7 @@ from personal_data_warehouse.defs.apple_voice_memos_enrichment import (
     UNCONFIGURED_AGENT_RESOURCE,
     apple_voice_memos_enrichment,
     apple_voice_memos_enrichment_force_prompt_version,
+    apple_voice_memos_enrichment_force_prompt_version_since,
     apple_voice_memos_enrichment_job,
     apple_voice_memos_enrichment_hourly,
     apple_voice_memos_enrichment_max_error_attempts,
@@ -42,6 +45,17 @@ def test_apple_voice_memos_enrichment_force_prompt_version_env(monkeypatch) -> N
     monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION", "true")
 
     assert apple_voice_memos_enrichment_force_prompt_version() is True
+
+
+def test_apple_voice_memos_enrichment_force_prompt_version_since_env(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE", raising=False)
+    assert apple_voice_memos_enrichment_force_prompt_version_since() is None
+
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE", "2026-09-14")
+    assert apple_voice_memos_enrichment_force_prompt_version_since() == datetime(2026, 9, 14, tzinfo=UTC)
+
+    monkeypatch.setenv("VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE", "2026-09-14T00:00:00-04:00")
+    assert apple_voice_memos_enrichment_force_prompt_version_since() == datetime(2026, 9, 14, 4, tzinfo=UTC)
 
 
 def test_apple_voice_memos_enrichment_max_error_attempts_env(monkeypatch) -> None:
@@ -183,6 +197,7 @@ def test_apple_voice_memos_enrichment_backlog_sensor_skips_when_backlog_is_empty
     assert "model" not in calls[0][1]
     assert "recorded_after" not in calls[0][1]
     assert calls[0][1]["force_prompt_version"] is False
+    assert calls[0][1]["force_prompt_version_since"] is None
     assert calls[0][1]["max_error_attempts"] == 5
     assert warehouse.closed
 

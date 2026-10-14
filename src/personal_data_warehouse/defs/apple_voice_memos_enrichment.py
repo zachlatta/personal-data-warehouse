@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from datetime import UTC, datetime
 
 from dagster import (
     DefaultScheduleStatus,
@@ -38,6 +39,7 @@ VOICE_MEMOS_ENRICHMENT_POSTGRES_LOCK_ID = 7_403_111_841
 DEFAULT_VOICE_MEMOS_ENRICHMENT_BATCH_SIZE = 10
 VOICE_MEMOS_ENRICHMENT_SENSOR_INTERVAL_SECONDS = 60
 VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV = "VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION"
+VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE_ENV = "VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE"
 VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS_ENV = "VOICE_MEMOS_ENRICHMENT_MAX_ERROR_ATTEMPTS"
 VOICE_MEMOS_ENRICHMENT_MODEL_ENV = "VOICE_MEMOS_ENRICHMENT_MODEL"
 VOICE_MEMOS_ENRICHMENT_EFFORT_ENV = "VOICE_MEMOS_ENRICHMENT_REASONING_EFFORT"
@@ -88,6 +90,7 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
                 provider=apple_voice_memos_enrichment_provider(settings),
                 prompt_version=apple_voice_memos_enrichment_prompt_version(),
                 force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
+                force_prompt_version_since=apple_voice_memos_enrichment_force_prompt_version_since(),
                 max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
             ).sync(limit=batch_size if batch_size > 0 else None)
 
@@ -138,6 +141,7 @@ def apple_voice_memos_enrichment_backlog_sensor(context):
             prompt_version=apple_voice_memos_enrichment_prompt_version(),
             limit=1,
             force_prompt_version=apple_voice_memos_enrichment_force_prompt_version(),
+            force_prompt_version_since=apple_voice_memos_enrichment_force_prompt_version_since(),
             max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
         )
         if not candidates:
@@ -159,6 +163,22 @@ def apple_voice_memos_enrichment_prompt_version() -> str:
 def apple_voice_memos_enrichment_force_prompt_version() -> bool:
     value = os.getenv(VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apple_voice_memos_enrichment_force_prompt_version_since() -> datetime | None:
+    """Re-enrich recordings made on or after this date under the current prompt.
+
+    An ISO date or timestamp; a bare date is midnight UTC. Unset means no
+    bounded backfill. Self-limiting: once those recordings carry a current-prompt
+    enrichment they drop out of the queue, so the variable can stay set.
+    """
+    value = os.getenv(VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE_ENV, "").strip()
+    if not value:
+        return None
+    since = datetime.fromisoformat(value)
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    return since.astimezone(UTC)
 
 
 def apple_voice_memos_enrichment_max_error_attempts() -> int:

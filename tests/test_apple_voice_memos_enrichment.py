@@ -1183,6 +1183,50 @@ def test_load_enrichment_candidates_can_force_current_prompt_version() -> None:
     assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" in queries[0]
 
 
+def test_load_enrichment_candidates_can_force_current_prompt_version_since_a_date() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        prompt_version="test-prompt",
+        limit=1,
+        force_prompt_version_since=datetime(2026, 9, 14, tzinfo=UTC),
+    )
+
+    # An older prompt's enrichment still counts as done for a recording made
+    # before the cutoff, and no longer counts for one made on or after it.
+    assert (
+        "AND (e.prompt_version = 'test-prompt' OR "
+        "COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') "
+        "< '2026-09-14T00:00:00+00:00'::timestamptz)"
+    ) in queries[0]
+    assert "AND prompt_version = 'test-prompt'\n              AND status = 'completed'" not in queries[0]
+
+
+def test_load_enrichment_candidates_without_force_since_ignores_prompt_version() -> None:
+    queries = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return []
+
+    load_enrichment_candidates(
+        Warehouse(),
+        provider="agent_codex",
+        prompt_version="test-prompt",
+        limit=1,
+    )
+
+    assert "e.prompt_version" not in queries[0]
+
+
 def test_load_enrichment_candidates_does_not_use_model_for_completion_and_failure_identity() -> None:
     queries = []
 

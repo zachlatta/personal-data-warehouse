@@ -92,6 +92,12 @@ leaving `transcript` untouched and recording what it did in `evidence`. Adding a
 mishearing is one tuple. A prompt version bump re-enriches nothing on its own: a recording
 with any completed enrichment is not a candidate again unless the Dagster deployment sets
 `VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION=1`, which re-enriches the whole corpus.
+For a bounded backfill set `VOICE_MEMOS_ENRICHMENT_FORCE_PROMPT_VERSION_SINCE` to an ISO
+date instead: only recordings made on or after it are re-enriched under the current prompt,
+newest first, and they drop out of the queue once done, so the variable can stay set. Set to
+`2026-09-14` on 2026-10-14 to bring the last 30 days (96 recordings) onto prompt v11
+(`transcript_corrections`) after the "Gemma" for Jehn miss in the 2026-10-12 Musk
+Foundation recording.
 
 **Universal-3.5 Pro is the model, with Universal-2 only as the language fallback.**
 `ASSEMBLYAI_SPEECH_MODELS` is `("universal-3-5-pro", "universal-2")`, sent as the

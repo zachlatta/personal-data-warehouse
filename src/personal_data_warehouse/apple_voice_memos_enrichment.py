@@ -184,6 +184,7 @@ class VoiceMemosEnrichmentRunner:
         provider: str = DEFAULT_AGENT_ENRICHMENT_PROVIDER,
         prompt_version: str = AGENT_ENRICHMENT_PROMPT_VERSION,
         force_prompt_version: bool = False,
+        force_prompt_version_since: datetime | None = None,
         max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
     ) -> None:
         self._warehouse = warehouse
@@ -193,6 +194,7 @@ class VoiceMemosEnrichmentRunner:
         self._provider = provider
         self._prompt_version = prompt_version
         self._force_prompt_version = force_prompt_version
+        self._force_prompt_version_since = force_prompt_version_since
         self._max_error_attempts = max_error_attempts
 
     def sync(self, *, limit: int | None) -> VoiceMemosEnrichmentSummary:
@@ -203,6 +205,7 @@ class VoiceMemosEnrichmentRunner:
             prompt_version=self._prompt_version,
             limit=limit,
             force_prompt_version=self._force_prompt_version,
+            force_prompt_version_since=self._force_prompt_version_since,
             max_error_attempts=self._max_error_attempts,
         )
         enriched = 0
@@ -327,6 +330,7 @@ def load_enrichment_candidates(
     prompt_version: str,
     limit: int | None,
     force_prompt_version: bool = False,
+    force_prompt_version_since: datetime | None = None,
     max_error_attempts: int = DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
 ) -> list[dict[str, Any]]:
     filters = [
@@ -338,6 +342,16 @@ def load_enrichment_candidates(
         filters.append(f"COALESCE(a.error_attempts, 0) < {int(max_error_attempts)}")
     limit_sql = f"LIMIT {int(limit)}" if limit and limit > 0 else ""
     completed_prompt_filter = f"AND prompt_version = {_sql_string(prompt_version)}" if force_prompt_version else ""
+    # A bounded backfill: an older prompt's enrichment no longer counts as done
+    # for a recording made on or after the cutoff, so a prompt fix reaches
+    # recent recordings without re-enriching the whole corpus.
+    since_prompt_filter = ""
+    if force_prompt_version_since is not None and not force_prompt_version:
+        since_prompt_filter = (
+            f"AND (e.prompt_version = {_sql_string(prompt_version)} OR "
+            "COALESCE(f.recorded_at, f.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') "
+            f"< {_sql_string(force_prompt_version_since.isoformat())}::timestamptz)"
+        )
     agent_run_provider = provider.removeprefix("agent_")
     error_attempts_join = ""
     if max_error_attempts > 0:
@@ -392,7 +406,7 @@ def load_enrichment_candidates(
               AND f.content_sha256 = r.content_sha256
         LEFT JOIN
         (
-            SELECT source, account, recording_id, content_sha256, created_at
+            SELECT source, account, recording_id, content_sha256, prompt_version, created_at
             FROM @apple_voice_memos_enrichments
             WHERE provider = {_sql_string(provider)}
               {completed_prompt_filter}
@@ -406,6 +420,7 @@ def load_enrichment_candidates(
               -- recording transcribed again after it was enriched (a better
               -- model, a wider speaker range) is enriched again.
               AND e.created_at >= r.completed_at
+              {since_prompt_filter}
         {error_attempts_join}
         WHERE {" AND ".join(filters)}
         ORDER BY f.recorded_at DESC NULLS LAST
