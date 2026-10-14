@@ -378,7 +378,8 @@ class GitHubSyncRunner:
                 now=self._now(),
             )
             read += 1
-        self._summary.threads_read += read
+            # Counted as it happens: a spent budget raises out of this loop.
+            self._summary.threads_read += 1
         self._summary.threads_remaining = max(len(due) - read, 0)
         self._save(THREADS_STREAM, THREADS_SCOPE)
 

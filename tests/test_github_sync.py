@@ -290,4 +290,6 @@ def test_a_slow_backfill_leaves_the_threads_their_share_of_the_time(warehouse) -
         budget=budget, session=SlowSession(), sleep=lambda _s: None, clock=lambda: clock[0],
     )
     summary = GitHubSyncRunner(warehouse=warehouse, clients=[client], account=ACCOUNT, budget=budget, now=lambda: NOW).sync()
-    assert summary.threads_read >= 1
+    read = warehouse._query("SELECT count(*) FROM @github_issues WHERE thread_synced_at > '1971-01-01'")[0][0]
+    assert read >= 1
+    assert summary.threads_read == read
