@@ -374,13 +374,12 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
   A verified-hybrid, interleaved in-container A/B on the production host reduced mean warm
   end-to-end latency 32%, p50 17%, and p90 10%, with the maximum flat. When embeddings are not
   configured or `search_hybrid` is not installed (no pgvector), it automatically falls back to
-  keyword search and reports a `fallback_reason`. Agent-session-only searches bound each ANN
-  leg to 4x the requested depth (40-200 rows): those chunks are 3.05% of the global HNSW, and
-  the former 1,000-row floor made each filtered vector leg take about 31 seconds. Other scopes
-  use a measured 400-800 row pool. Drive-only semantic legs use a three-worker exact scan of the 223k
-  Drive chunks instead: even a 40-row filtered-HNSW leg took 16 seconds, while the exact scan
-  returned the then-full 1,000-row candidate pool in 7.0 seconds cold and 0.66 seconds warm. Broad
-  and mixed-source searches keep the global HNSW. Modes `keyword` and `exact` force
+  keyword search and reports a `fallback_reason`. Agent-session-only searches bound the semantic
+  pool to 4x the requested depth (40-200 rows); other scopes use a measured 400-800 row pool.
+  The semantic leg reads `derived_search.chunk_vectors`, partitioned by adapter with the filter
+  columns on the vector row: a partition wholly in scope walks its HNSW graph, a partial slice
+  of up to 1M rows is scanned exactly in parallel, and a larger one walks its graph filtered
+  (see `docs/agents/search.md`). Modes `keyword` and `exact` force
   `timeline.search_text` / `timeline.search_text_exact` directly. Takes
   `query`, `max_results` (default 20; raise it explicitly for recall work), `sources`, `since`, and `mode`.
   The first-class CLI uses this same tool without JSON quoting: `pdw search --source

@@ -366,10 +366,41 @@ resets a source adapter's backfill whenever that adapter's SQL changes, via
 `adapter_signature` in `ops.timeline_sync_state`). Chat sources chunk as per-(context,
 hour) conversation windows; other sources chunk per event with big documents split.
 `derived_search.chunk_embeddings` holds one 512-dim halfvec per distinct chunk text per
-model (content-sha keyed), filled by the `search_chunk_embeddings` asset through any
-OpenAI-compatible `/v1/embeddings` endpoint (`SEARCH_EMBEDDINGS_BASE_URL` / `_API_KEY` /
-`_MODEL` / `_DIMENSIONS` on the Dagster AND app deployments). Unconfigured or
-pre-pgvector hosts skip loudly, never red.
+model (content-sha keyed: the embedding cache, so repeated text is paid for once), filled by
+the `search_chunk_embeddings` asset through any OpenAI-compatible `/v1/embeddings` endpoint
+(`SEARCH_EMBEDDINGS_BASE_URL` / `_API_KEY` / `_MODEL` / `_DIMENSIONS` on the Dagster AND app
+deployments). Unconfigured or pre-pgvector hosts skip loudly, never red.
+
+**The semantic leg reads `derived_search.chunk_vectors`, not the cache.** One row per
+(chunk, model) carrying the vector *and* its filter columns (`adapter`, `event_ts`,
+`event_id`), LIST-partitioned by adapter: `chunk_vectors_gmail`, `_slack`, `_slack_file`
+(92% of chunks between them) and `_other` (the default partition). Row triggers on
+`chunks` and `chunk_embeddings` keep it exact, serialized by one transaction-scoped
+advisory lock so a chunk and the first vector for its text cannot miss each other; a weekly
+full reconcile in the embeddings runner is the independent proof (213 s over 9.4M chunks,
+too heavy for the daily orphan pass). The chunk builder only deletes chunks a rebuild no
+longer produces, so an unchanged chunk keeps its vector row: each rewritten row is an HNSW
+insert.
+
+`timeline.search_hybrid_semantic` routes **per partition**:
+
+- a partition wholly in scope walks its HNSW graph unfiltered;
+- a partial slice of at most 1M rows (sized from the planner's estimate, ~2 ms) joins one
+  combined exact scan: a flattened `UNION ALL` that plans as a Parallel Append on 8 workers
+  over the time-ordered heap, sorted on `(distance) + 0` so it cannot become an ANN scan;
+- a larger partial slice walks its graph with the filter on the same row.
+
+Why, measured 2026-10-14: the old layout kept vectors per sha and joined `chunks` for the
+filter, so a scoped search walked the global graph probing the join for survivors —
+`slack since 2026-06-01` took 10-20 s cold, and narrow scopes also came back short
+(`slack_file` since June returned 14 refs from a 400-row pool). Exact scans of a
+time-clustered slice are cheap even cold (805k rows: 461 ms cold, 401 ms warm), while a
+filtered graph walk at 4% of a partition took 581 ms p50 / 7.8 s max and missed a quarter of
+the true top-400. Counting a slice instead of estimating it cost up to 1.4 s. A scoped
+graph walk keeps `ef_search` 1,000 (at 400, two of twelve slack_file queries settled in the
+wrong neighbourhood entirely); an unscoped search walks four graphs at 3/8 of the pool each
+(150 for 400: 0.925 of the exact top-50 refs vs 0.935 for the old global graph). Before and
+after numbers are in the "Scoped semantic search" table below.
 
 **The production embedding server runs on `mew` (the GPU box, `ssh mew`) and is managed
 by Coolify** as the `personal-data-warehouse-embeddings` application. Coolify targets the
@@ -665,20 +696,36 @@ drags every index with it. Dropping the indexes first and rebuilding them after 
 down to ~50 minutes and shrank the table from 63 GB to 45 GB. Assume any `ALTER TYPE` on a
 table that size is an outage-shaped operation and plan it as one.
 
-A source-scoped agent-session ANN search uses a deliberately smaller candidate pool
-(`4 * max_results`, bounded to 40-200 per vector). Agent-session chunks are only 3.05% of
-the global HNSW: asking for 1,000 qualifying rows made one vector leg scan 97,245 embeddings
-and take 31.2s, so two legs exceeded the app's 60s statement budget. A 40-row leg took 2.25s;
-agent sessions have p95 three chunks per event, so the 4x pool still covers the requested
-event depth. Broad and every other scoped search retain the deeper 20x / 1,000-2,000 pool.
+A source-scoped agent-session search uses a deliberately smaller candidate pool
+(`4 * max_results`, bounded to 40-200). Agent-session chunks were 3.05% of the old global
+HNSW: asking it for 1,000 qualifying rows scanned 97,245 embeddings and took 31.2 s. Under
+per-partition routing an agent-session scope is an exact scan of a ~320k-row slice of
+`chunk_vectors_other` (~130 ms warm), and Drive (245k chunks, formerly its own `OFFSET 0`
+special case at 7.0 s cold) is the same path at ~105 ms.
 
-Google Drive is the opposite filtered-ANN case: reducing the pool did not fix it. A 40-row
-HNSW leg still walked 14,737 global embeddings and took 16.0s. For exactly the Drive scope,
-hybrid instead scans all 223k Drive chunks by exact cosine distance, source-first behind an
-`OFFSET 0` plan barrier. PostgreSQL launches three workers for that scan; it measured 7.0s
-cold and 0.66s warm while returning the full 1,000-row pool, so it is both faster and more
-exact than filtered ANN. Fetch chunk text only *after* the top-k: doing it below the sort
-detoasts every Drive document. Broad and mixed-source searches still use the global HNSW.
+### Scoped semantic search, before and after (2026-10-14)
+
+Semantic leg alone (`timeline.search_hybrid_semantic`), twelve fresh queries per scope, p50
+ms, production, both paths warm (second pass):
+
+| scope | old p50 | new p50 | old p90 | new p90 |
+| --- | --- | --- | --- | --- |
+| unscoped | 11 | 16 | 14 | 18 |
+| gmail | 21 | 32 | 30 | 48 |
+| gmail since 2026-06-01 | 282 | 83 | 421 | 85 |
+| slack | 66 | 21 | 169 | 27 |
+| slack since 2026-06-01 | 386 | 173 | 535 | 176 |
+| slack since 2026-10-01 | 1,573 | 60 | 3,111 | 67 |
+| slack_file | 1,102 | 39 | 1,437 | 222 |
+| slack_file since 2026-06-01 | 5,321 | 97 | 6,801 | 103 |
+| google_drive | 870 | 103 | 921 | 118 |
+| agent_session | 703 | 130 | 2,297 | 145 |
+| all sources since 2026-06-01 | 90 | 314 | 257 | 344 |
+
+The last row is the one trade: an exact 1.4M-row scan instead of a lossy graph walk (the old
+one found 0.93 of the exact top-50; the new one is exact). Cold first queries on the old path
+were the 10-20 s reports (up to 8.6 s in these runs); on the new path the worst cold query,
+straight after the build and before any prewarm, took 1.9 s.
 
 ## Landing latency: how long a source takes to reach the timeline
 

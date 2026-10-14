@@ -1677,6 +1677,23 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         "embedded_at",
         note="embedding coverage lags chunks by design; staleness here must not page while unconfigured",
     ),
+    # The semantic leg's read surface: one row per (chunk, model) carrying the
+    # filter columns, kept in step with chunks and embeddings by triggers.
+    # No write column of its own; chunks and embeddings carry the freshness.
+    **{
+        table: _support(
+            "search_index",
+            None,
+            note="trigger-maintained from search_chunks + search_chunk_embeddings",
+        )
+        for table in (
+            "search_chunk_vectors",
+            "search_chunk_vectors_gmail",
+            "search_chunk_vectors_slack",
+            "search_chunk_vectors_slack_file",
+            "search_chunk_vectors_other",
+        )
+    },
     "search_chunk_sync_state": _state("search_index", "updated_at", "timeline seq watermark"),
     "search_health": _state(
         "search_index", "updated_at", "first-class chunk and embedding convergence facts"
@@ -2011,10 +2028,12 @@ class PipelineHealthCollector:
             SELECT n.nspname, c.relname, c.reltuples, pg_total_relation_size(c.oid)
             FROM pg_class AS c
             INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE n.nspname = ANY(%s) AND c.relkind = 'r'
+            WHERE n.nspname = ANY(%s) AND c.relkind IN ('r', 'p')
             """,
             (self._warehouse.physical_schema_names(include_hidden=True),),
         )
+        # 'p' is a partitioned parent (search_chunk_vectors): it exists but
+        # stores nothing itself; its partitions are probed as their own rows.
         # reltuples is -1 on a table that has never been analyzed.
         return {
             (schema, name): (max(0, int(tuples)), int(size or 0))

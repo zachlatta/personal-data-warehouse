@@ -3783,6 +3783,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "search_schema_state": _state("search_text DDL signature cache"),
     "search_chunks": _state("derived retrieval chunks behind timeline.search_hybrid()"),
     "search_chunk_embeddings": _state("per-content-sha chunk embeddings (semantic search)"),
+    "search_chunk_vectors": _state(
+        "per-chunk search vectors with their filter columns, partitioned by adapter (semantic search)"
+    ),
+    "search_chunk_vectors_gmail": _state("gmail_email partition of search_chunk_vectors"),
+    "search_chunk_vectors_slack": _state("slack_message partition of search_chunk_vectors"),
+    "search_chunk_vectors_slack_file": _state("slack_file partition of search_chunk_vectors"),
+    "search_chunk_vectors_other": _state("default partition of search_chunk_vectors"),
     "search_chunk_sync_state": _state("chunk builder's timeline seq watermark"),
     # Pipeline freshness (personal_data_warehouse/pipeline_health.py): a
     # measurement of the warehouse's own pipelines, not activity in it.
@@ -3827,6 +3834,13 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "push_devices",
     "app_access_tokens",
     "search_schema_state",
+    # Partitioned (CREATE TABLE ... PARTITION BY), which TableSpec cannot
+    # express; created by ensure_search_index_tables where pgvector exists.
+    "search_chunk_vectors",
+    "search_chunk_vectors_gmail",
+    "search_chunk_vectors_slack",
+    "search_chunk_vectors_slack_file",
+    "search_chunk_vectors_other",
 )
 
 

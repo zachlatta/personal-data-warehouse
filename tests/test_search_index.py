@@ -1035,3 +1035,317 @@ def test_ensure_takes_no_exclusive_lock_once_the_columns_exist(
     warehouse.ensure_search_index_tables()
     alters = [s for s in statements if "ALTER TABLE" in s.upper()]
     assert alters == [], alters
+
+
+# --- per-chunk search vectors (the semantic leg's read surface) --------------
+
+
+def _vector_rows(wh: PostgresWarehouse) -> dict[str, tuple]:
+    return {
+        row[0]: tuple(row[1:])
+        for row in wh._query(
+            "SELECT v.chunk_id, v.tableoid::regclass::text, v.adapter, v.event_id,"
+            " v.event_ts, v.model"
+            " FROM @search_chunk_vectors v ORDER BY v.chunk_id"
+        )
+    }
+
+
+def _insert_chunk(
+    wh: PostgresWarehouse, chunk_id: str, adapter: str, sha: str, event_ts: datetime
+) -> None:
+    wh._command(
+        "INSERT INTO @search_chunks (chunk_id, anchor, adapter, event_id, source, context,"
+        " event_ts, chunk_index, text, text_sha256, char_count, built_at)"
+        " VALUES (%s, %s, %s, %s, 'x', '', %s, 0, 'text', %s, 4, now())",
+        (chunk_id, chunk_id, adapter, f"{chunk_id}-event", event_ts, sha),
+    )
+
+
+def _insert_embedding(
+    wh: PostgresWarehouse, sha: str, model: str = "fake-model", *, axis: float = 0.0
+) -> None:
+    vector = vector_literal([1.0, axis] + [0.0] * (SEARCH_EMBEDDING_DIMENSIONS - 2))
+    wh._command(
+        "INSERT INTO @search_chunk_embeddings (text_sha256, model, token_count, embedded_at, embedding)"
+        f" VALUES (%s, %s, 1, now(), %s::public.halfvec({SEARCH_EMBEDDING_DIMENSIONS}))",
+        (sha, model, vector),
+    )
+
+
+def test_chunk_vectors_follow_chunk_and_embedding_writes(warehouse: PostgresWarehouse) -> None:
+    """Every (chunk, vector) pair has exactly one row, in its adapter's partition.
+
+    The semantic leg filters on adapter and event_ts while it scans vectors,
+    so those columns must be on the vector row and must follow the chunk.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    ts = datetime(2026, 6, 2, 12, tzinfo=UTC)
+
+    _insert_chunk(warehouse, "gmail_email|a#0", "gmail_email", "sha-1", ts)
+    assert _vector_rows(warehouse) == {}, "no vector exists for the text yet"
+
+    _insert_embedding(warehouse, "sha-1")
+    rows = _vector_rows(warehouse)
+    assert set(rows) == {"gmail_email|a#0"}
+    partition, adapter, event_id, event_ts, model = rows["gmail_email|a#0"]
+    assert partition.endswith("chunk_vectors_gmail")
+    assert (adapter, event_id, event_ts, model) == (
+        "gmail_email", "gmail_email|a#0-event", ts, "fake-model"
+    )
+
+    # A chunk whose text is already embedded gets its vector immediately.
+    _insert_chunk(warehouse, "slack_file|b#0", "slack_file", "sha-1", ts)
+    _insert_chunk(warehouse, "voice_memo|c#0", "voice_memo", "sha-1", ts)
+    rows = _vector_rows(warehouse)
+    assert rows["slack_file|b#0"][0].endswith("chunk_vectors_slack_file")
+    assert rows["voice_memo|c#0"][0].endswith("chunk_vectors_other")
+
+    # A moved event time follows; changed text drops the stale vector until
+    # the new text is embedded.
+    later = ts + timedelta(days=3)
+    warehouse._command(
+        "UPDATE @search_chunks SET event_ts = %s WHERE chunk_id = 'voice_memo|c#0'", (later,)
+    )
+    assert _vector_rows(warehouse)["voice_memo|c#0"][3] == later
+    warehouse._command(
+        "UPDATE @search_chunks SET text_sha256 = 'sha-2' WHERE chunk_id = 'gmail_email|a#0'"
+    )
+    assert "gmail_email|a#0" not in _vector_rows(warehouse)
+    _insert_embedding(warehouse, "sha-2")
+    assert "gmail_email|a#0" in _vector_rows(warehouse)
+
+    warehouse._command("DELETE FROM @search_chunks WHERE chunk_id = 'slack_file|b#0'")
+    assert set(_vector_rows(warehouse)) == {"gmail_email|a#0", "voice_memo|c#0"}
+
+    warehouse._command("DELETE FROM @search_chunk_embeddings WHERE text_sha256 = 'sha-1'")
+    assert set(_vector_rows(warehouse)) == {"gmail_email|a#0"}
+
+
+def test_rebuilding_an_unchanged_anchor_does_not_rewrite_its_vectors(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A timeline re-walk re-chunks millions of unchanged events.
+
+    Each rewritten vector row is an HNSW insert, so an anchor whose chunks
+    come back identical must leave its vector rows physically untouched.
+    """
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["rewalk alpha", "rewalk bravo"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    SearchEmbeddingRunner(warehouse, _FakeEmbeddingClient()).run()
+    before = warehouse._query("SELECT chunk_id, ctid::text FROM @search_chunk_vectors ORDER BY 1")
+    assert before
+
+    warehouse._command("UPDATE @search_chunk_sync_state SET last_seq = 0 WHERE id = 'timeline'")
+    assert SearchChunkBuilder(warehouse).run().rebuilt_anchors > 0
+
+    after = warehouse._query("SELECT chunk_id, ctid::text FROM @search_chunk_vectors ORDER BY 1")
+    assert after == before
+
+
+def test_the_weekly_reconcile_repairs_missing_and_stale_vector_rows(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A deployment that creates the table finds history already there, and
+    a write can bypass triggers. The weekly completeness pass makes the table
+    whole without rereading 9.4M chunks every day."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["reconcile alpha", "reconcile bravo"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    client = _FakeEmbeddingClient()
+    assert SearchEmbeddingRunner(warehouse, client).run().caught_up
+    expected = _vector_rows(warehouse)
+    assert expected
+
+    missing = next(iter(expected))
+    warehouse._command(
+        "INSERT INTO @search_chunk_vectors (adapter, chunk_id, model, event_id, event_ts, embedding)"
+        " SELECT 'gmail_email', 'gmail_email|gone#0', model, 'gone', event_ts, embedding"
+        " FROM @search_chunk_vectors LIMIT 1"
+    )
+    warehouse._command("DELETE FROM @search_chunk_vectors WHERE chunk_id = %s", (missing,))
+    rerun = SearchEmbeddingRunner(warehouse, client).run()
+    assert rerun.vectors_restored == 0 and rerun.caught_up, "the proof is weekly, not every run"
+
+    warehouse._command(
+        "UPDATE @search_chunk_sync_state"
+        " SET embed_vectors_checked_at = now() - interval '8 days' WHERE id = 'embeddings'"
+    )
+    observed: list[tuple[str, str]] = []
+    real_query = warehouse._query
+
+    def spying_query(sql, params=None):
+        if "@search_chunk_vectors" in sql and "NOT EXISTS" in sql:
+            observed.append(
+                real_query(
+                    "SELECT current_setting('max_parallel_workers_per_gather'),"
+                    " current_setting('enable_hashjoin')"
+                )[0]
+            )
+        return real_query(sql, params)
+
+    warehouse._query = spying_query
+    try:
+        stats = SearchEmbeddingRunner(warehouse, client).run()
+    finally:
+        del warehouse._query
+
+    # Planned like the orphan probe: no parallel hash join against /dev/shm.
+    assert observed == [("0", "off")] * 2
+    assert stats.vectors_restored == 1
+    assert stats.vectors_removed == 1
+    assert stats.caught_up
+    assert _vector_rows(warehouse) == expected
+
+
+@pytest.mark.parametrize("exact_slice_rows", [1_000_000, 0], ids=["exact-route", "hnsw-route"])
+def test_semantic_leg_scopes_by_source_and_time_on_both_routes(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch, exact_slice_rows: int
+) -> None:
+    """A scoped semantic search returns only in-scope chunks, nearest first,
+    whether the router scans the slice exactly or walks the partition graphs."""
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    monkeypatch.setattr(postgres_module, "SEARCH_VECTOR_EXACT_SLICE_ROWS", exact_slice_rows)
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    old = datetime(2026, 1, 5, tzinfo=UTC)
+    new = datetime(2026, 7, 5, tzinfo=UTC)
+    chunks = [
+        ("gmail_email|near-old#0", "gmail_email", old, 0.0),
+        ("gmail_email|near-new#0", "gmail_email", new, 0.1),
+        ("gmail_email|far-new#0", "gmail_email", new, 3.0),
+        ("slack_file|near-new#0", "slack_file", new, 0.0),
+        ("voice_memo|near-new#0", "voice_memo", new, 0.0),
+    ]
+    for chunk_id, adapter, ts, axis in chunks:
+        _insert_chunk(warehouse, chunk_id, adapter, f"sha-{chunk_id}", ts)
+        _insert_embedding(warehouse, f"sha-{chunk_id}", axis=axis)
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+    query = vector_literal([1.0] + [0.0] * (SEARCH_EMBEDDING_DIMENSIONS - 1))
+
+    def refs(sources: list[str] | None, since: datetime | None) -> list[str]:
+        return [
+            row[0]
+            for row in warehouse._query(
+                "SELECT ref FROM @search_hybrid_semantic(%s, 'fake-model', 10, %s, %s)"
+                " ORDER BY best",
+                (query, sources, since),
+            )
+        ]
+
+    assert refs(["gmail"], None) == [
+        "gmail_email:gmail_email|near-old#0-event",
+        "gmail_email:gmail_email|near-new#0-event",
+        "gmail_email:gmail_email|far-new#0-event",
+    ]
+    assert refs(["gmail"], new) == [
+        "gmail_email:gmail_email|near-new#0-event",
+        "gmail_email:gmail_email|far-new#0-event",
+    ]
+    assert refs(["slack_file"], new) == ["slack_file:slack_file|near-new#0-event"]
+    assert refs(None, new) and all(
+        not ref.endswith("near-old#0-event") for ref in refs(None, new)
+    )
+    assert len(refs(None, None)) == len(chunks)
+    # gmail is wholly in scope (a graph walk), the default partition only in
+    # part (an exact scan of voice memos): both branches merge by distance.
+    mixed = refs(["gmail", "transcript"], None)
+    assert set(mixed[:2]) == {  # both at distance 0
+        "gmail_email:gmail_email|near-old#0-event",
+        "voice_memo:voice_memo|near-new#0-event",
+    }
+    assert mixed[2:] == [
+        "gmail_email:gmail_email|near-new#0-event",
+        "gmail_email:gmail_email|far-new#0-event",
+    ]
+
+
+def test_a_chunk_and_its_first_vector_committing_together_still_meet(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Without serialization each trigger misses the other's uncommitted row
+    and the chunk never gets a vector row until the weekly reconcile."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    other = PostgresWarehouse(_postgres_url(), schema=warehouse._schema)
+    try:
+        warehouse._command("BEGIN")
+        _insert_chunk(
+            warehouse, "gmail_email|race#0", "gmail_email", "sha-race", datetime(2026, 6, 1, tzinfo=UTC)
+        )
+        writer = threading.Thread(target=_insert_embedding, args=(other, "sha-race"))
+        writer.start()
+        writer.join(timeout=1.0)
+        assert writer.is_alive(), "the embedding trigger must wait for the open chunk write"
+        warehouse._command("COMMIT")
+        writer.join(timeout=30)
+        assert not writer.is_alive()
+    finally:
+        other.close()
+    assert "gmail_email|race#0" in _vector_rows(warehouse)
+
+
+def test_the_retired_global_graph_is_dropped_only_after_the_semantic_function_moves(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Dropping the old HNSW first would leave the previous semantic function
+    sorting every embedding without an index until the new one is created."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    warehouse._command(
+        "CREATE INDEX search_chunk_embeddings_hnsw_idx ON @search_chunk_embeddings"
+        " USING hnsw (embedding public.halfvec_cosine_ops)"
+    )
+    warehouse._command("DELETE FROM @search_schema_state")
+    statements: list[str] = []
+    real_command = warehouse._command
+    real_raw = warehouse._raw_command
+
+    def spy(sql, params=None):
+        statements.append(sql)
+        return real_command(sql, params)
+
+    def raw_spy(sql, *args, **kwargs):
+        statements.append(sql)
+        return real_raw(sql, *args, **kwargs)
+
+    warehouse._command = spy
+    warehouse._raw_command = raw_spy
+    try:
+        warehouse.ensure_search_index_tables()
+    finally:
+        del warehouse._command
+        del warehouse._raw_command
+
+    created = next(
+        i for i, sql in enumerate(statements)
+        if "CREATE OR REPLACE FUNCTION @search_hybrid_semantic(" in sql
+    )
+    dropped = next(
+        i for i, sql in enumerate(statements)
+        if "DROP INDEX" in sql and "search_chunk_embeddings_hnsw_idx" in sql
+    )
+    assert created < dropped
+    assert not warehouse._index_exists("search_chunk_embeddings_hnsw_idx")

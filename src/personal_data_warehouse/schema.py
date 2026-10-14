@@ -2413,6 +2413,9 @@ SEARCH_CHUNK_SYNC_STATE_COLUMNS = (
     # a row skipped by a formerly incomplete keyset.
     "embed_orphan_checked_at",
     "embed_orphan_status",
+    # Weekly full proof that search_chunk_vectors is exactly chunks JOIN
+    # embeddings (the triggers keep it so; this catches anything they missed).
+    "embed_vectors_checked_at",
 )
 
 # One row per search stage.  Unlike generic table freshness this records the

@@ -39,6 +39,7 @@ from personal_data_warehouse.postgres import (
     SEARCH_EMBEDDING_DEFAULT_MODEL,
     SEARCH_EMBEDDING_DIMENSIONS,
     PostgresWarehouse,
+    search_chunk_vectors_lock_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,14 @@ EMBED_FRESH_SCAN_ROWS = 500_000
 # is the independent completeness proof. It also repairs rows stranded behind
 # a cursor by an old bug or interrupted migration.
 EMBED_ORPHAN_RECHECK_INTERVAL = timedelta(hours=24)
+# search_chunk_vectors is kept exact by its triggers; the full reconcile is
+# the independent proof and the fill for history that predates the table. It
+# costs 213 s and a 1.3 GB sort over 9.4M chunks (production, 2026-10-14), so
+# it runs weekly, not with the daily orphan probe.
+EMBED_VECTOR_RECHECK_INTERVAL = timedelta(days=7)
+# Rows one reconcile may restore or remove; a deployment that creates the
+# table under existing history fills across runs, not in one statement.
+VECTOR_RECONCILE_BATCH_ROWS = 200_000
 
 
 #: Shared-buffer residency below which the search working set is treated as
@@ -254,6 +263,8 @@ class EmbedStats:
     orphaned_found: int = 0
     orphaned_repaired: int = 0
     orphans_caught_up: bool = False
+    vectors_restored: int = 0
+    vectors_removed: int = 0
     skipped_reason: str = ""
     caught_up: bool = False
 
@@ -363,8 +374,13 @@ class SearchChunkBuilder:
 
     def _replace_anchor_chunks(self, anchors: list[str], rows: list[_ChunkRow]) -> None:
         if anchors:
+            # Delete only the chunks the rebuild no longer produces; the rest
+            # are upserted in place. Deleting and re-inserting them all would
+            # drop and re-add their search_chunk_vectors rows (an HNSW insert
+            # each) for every unchanged chunk of a timeline re-walk.
             self._wh._command(
-                "DELETE FROM @search_chunks WHERE anchor = ANY(%s)", (anchors,)
+                "DELETE FROM @search_chunks WHERE anchor = ANY(%s) AND NOT (chunk_id = ANY(%s))",
+                (anchors, [row.chunk_id for row in rows]),
             )
         if not rows:
             return
@@ -592,7 +608,7 @@ class SearchEmbeddingRunner:
         rows = self._wh._query(
             "SELECT embed_fresh_built_at, embed_fresh_chunk_id, embed_cursor_ts,"
             " embed_cursor_id, embed_backfill_status, embed_orphan_checked_at,"
-            " embed_orphan_status"
+            " embed_orphan_status, embed_vectors_checked_at"
             " FROM @search_chunk_sync_state WHERE id = %s",
             (_EMBED_STATE_ID,),
         )
@@ -606,6 +622,7 @@ class SearchEmbeddingRunner:
             status,
             orphan_checked_at,
             orphan_status,
+            vectors_checked_at,
         ) = rows[0]
         # Warehouse-wide convention: absence is the epoch, never NULL. A
         # backfill that has not started yet has no keyset, and the walk
@@ -618,6 +635,7 @@ class SearchEmbeddingRunner:
             "backfill_status": status or "",
             "orphan_checked_at": orphan_checked_at,
             "orphan_status": orphan_status or "",
+            "vectors_checked_at": vectors_checked_at,
         }
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -625,8 +643,8 @@ class SearchEmbeddingRunner:
             "INSERT INTO @search_chunk_sync_state"
             " (id, last_seq, updated_at, embed_fresh_built_at, embed_fresh_chunk_id,"
             "  embed_cursor_ts, embed_cursor_id, embed_backfill_status,"
-            "  embed_orphan_checked_at, embed_orphan_status)"
-            " VALUES (%s, 0, now(), %s, %s, %s, %s, %s, %s, %s)"
+            "  embed_orphan_checked_at, embed_orphan_status, embed_vectors_checked_at)"
+            " VALUES (%s, 0, now(), %s, %s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT (id) DO UPDATE SET updated_at = now(),"
             "  embed_fresh_built_at = EXCLUDED.embed_fresh_built_at,"
             "  embed_fresh_chunk_id = EXCLUDED.embed_fresh_chunk_id,"
@@ -634,7 +652,8 @@ class SearchEmbeddingRunner:
             "  embed_cursor_id = EXCLUDED.embed_cursor_id,"
             "  embed_backfill_status = EXCLUDED.embed_backfill_status,"
             "  embed_orphan_checked_at = EXCLUDED.embed_orphan_checked_at,"
-            "  embed_orphan_status = EXCLUDED.embed_orphan_status",
+            "  embed_orphan_status = EXCLUDED.embed_orphan_status,"
+            "  embed_vectors_checked_at = EXCLUDED.embed_vectors_checked_at",
             (
                 _EMBED_STATE_ID,
                 state["fresh_built_at"],
@@ -644,6 +663,7 @@ class SearchEmbeddingRunner:
                 state["backfill_status"],
                 state["orphan_checked_at"],
                 state["orphan_status"],
+                state.get("vectors_checked_at") or _EPOCH,
             ),
         )
 
@@ -699,6 +719,7 @@ class SearchEmbeddingRunner:
                 "backfill_status": "",
                 "orphan_checked_at": _EPOCH,
                 "orphan_status": "",
+                "vectors_checked_at": _EPOCH,
             }
         # Two passes, both resumable and both bounded, so a run over a
         # caught-up corpus reads a few index pages rather than the 7 GB chunk
@@ -713,9 +734,18 @@ class SearchEmbeddingRunner:
         if fresh_done and backfill_done and not orphan_done and not budget.exhausted():
             orphan_done = self._repair_orphans(client, state, stats, budget, run_started)
         stats.orphans_caught_up = orphan_done
+        vectors_done = self._vectors_check_is_current(state, run_started)
+        if fresh_done and backfill_done and orphan_done and not vectors_done and not budget.exhausted():
+            vectors_done = self._reconcile_vectors(client.model, stats)
+            if vectors_done:
+                state["vectors_checked_at"] = run_started
         self._save_state(state)
-        stats.caught_up = fresh_done and backfill_done and orphan_done
+        stats.caught_up = fresh_done and backfill_done and orphan_done and vectors_done
         return stats
+
+    def _vectors_check_is_current(self, state: dict[str, Any], run_started: datetime) -> bool:
+        checked_at = state.get("vectors_checked_at") or _EPOCH
+        return checked_at > _EPOCH and run_started - checked_at < EMBED_VECTOR_RECHECK_INTERVAL
 
     def _orphan_check_is_current(
         self, state: dict[str, Any], run_started: datetime
@@ -784,6 +814,75 @@ class SearchEmbeddingRunner:
             return True
         state["orphan_status"] = "running"
         return False
+
+    def _reconcile_vectors(self, model: str, stats: EmbedStats) -> bool:
+        """Make search_chunk_vectors exactly (chunks JOIN embeddings) for ``model``.
+
+        Triggers keep it current; this is the independent proof, and the fill
+        for history that predates the table (a deployment that creates it, or
+        writes that bypassed triggers).
+        Planned like the orphan probe (no hash joins, no parallel workers) so
+        it stays index probes. Returns True when nothing was left over.
+        """
+
+        limit = VECTOR_RECONCILE_BATCH_ROWS
+        self._wh._command("BEGIN")
+        try:
+            # The triggers' lock: a chunk deleted or re-texted while this
+            # reads would otherwise leave a stale row for a week. It holds
+            # off the chunk builder for the reconcile's few minutes, weekly.
+            self._wh._query(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (search_chunk_vectors_lock_key(self._wh._schema),),
+            )
+            self._wh._command("SET LOCAL max_parallel_workers_per_gather = 0")
+            self._wh._command("SET LOCAL enable_hashjoin = off")
+            restored = self._wh._query(
+                "WITH missing AS ("
+                "  SELECT c.adapter, c.chunk_id, c.event_id, c.event_ts, c.text_sha256"
+                "  FROM @search_chunks c"
+                "  WHERE EXISTS (SELECT 1 FROM @search_chunk_embeddings e"
+                "                WHERE e.text_sha256 = c.text_sha256 AND e.model = %s)"
+                "    AND NOT EXISTS (SELECT 1 FROM @search_chunk_vectors v"
+                "                    WHERE v.adapter = c.adapter AND v.chunk_id = c.chunk_id"
+                "                      AND v.model = %s)"
+                "  LIMIT %s"
+                "), written AS ("
+                "  INSERT INTO @search_chunk_vectors"
+                "    (adapter, chunk_id, model, event_id, event_ts, embedding)"
+                "  SELECT m.adapter, m.chunk_id, e.model, m.event_id, m.event_ts, e.embedding"
+                "  FROM missing m JOIN @search_chunk_embeddings e"
+                "    ON e.text_sha256 = m.text_sha256 AND e.model = %s"
+                "  WHERE e.embedding IS NOT NULL"
+                "  ON CONFLICT (adapter, chunk_id, model) DO NOTHING"
+                "  RETURNING 1"
+                ") SELECT (SELECT count(*) FROM missing), (SELECT count(*) FROM written)",
+                (model, model, limit, model),
+            )
+            removed = self._wh._query(
+                "WITH stale AS ("
+                "  SELECT v.adapter, v.chunk_id FROM @search_chunk_vectors v"
+                "  WHERE v.model = %s AND NOT EXISTS ("
+                "    SELECT 1 FROM @search_chunks c JOIN @search_chunk_embeddings e"
+                "      ON e.text_sha256 = c.text_sha256 AND e.model = v.model"
+                "    WHERE c.chunk_id = v.chunk_id AND c.adapter = v.adapter)"
+                "  LIMIT %s"
+                "), deleted AS ("
+                "  DELETE FROM @search_chunk_vectors v USING stale s"
+                "  WHERE v.adapter = s.adapter AND v.chunk_id = s.chunk_id AND v.model = %s"
+                "  RETURNING 1"
+                ") SELECT (SELECT count(*) FROM stale), (SELECT count(*) FROM deleted)",
+                (model, limit, model),
+            )
+            self._wh._command("COMMIT")
+        except Exception:
+            self._wh._command("ROLLBACK")
+            raise
+        missing_found, written = (int(value) for value in restored[0])
+        stale_found, deleted = (int(value) for value in removed[0])
+        stats.vectors_restored += written
+        stats.vectors_removed += deleted
+        return missing_found < limit and stale_found < limit
 
     def _drain_fresh(
         self,

@@ -174,7 +174,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         "base": 82,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
-        "derived": 23,
+        # +5 derived: derived_search.chunk_vectors and its four adapter
+        # partitions, the semantic leg's per-chunk vectors with their filter
+        # columns (a scoped ANN scan joined per-sha vectors to chunks before).
+        "derived": 28,
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
@@ -244,7 +247,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 private: private.app_access_tokens, issued bearer tokens beside the
         # master secret and the single-use cli_authorize codes.
         "private": 14,  # encrypted MCP connections, HN session
-        "internal": 3,
+        # +2 internal: the row-trigger functions that keep
+        # derived_search.chunk_vectors in step with chunks and embeddings.
+        "internal": 5,
     }
 
 

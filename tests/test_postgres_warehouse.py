@@ -271,7 +271,12 @@ def test_search_cache_residency_targets_hnsw_and_all_bm25_indexes() -> None:
     }
     sql, params = calls[1]
     assert '"public"."pg_buffercache"' in sql
-    assert "search_chunk_embeddings_hnsw_idx" in params[3]
+    assert set(params[3]) == {
+        "search_chunk_vectors_gmail_hnsw_idx",
+        "search_chunk_vectors_slack_hnsw_idx",
+        "search_chunk_vectors_slack_file_hnsw_idx",
+        "search_chunk_vectors_other_hnsw_idx",
+    }
     assert set(params[1]) == set(warehouse.bm25_timeline_index_names())
 
 
@@ -348,10 +353,11 @@ def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
 
     assert result["warmed"] is True
-    assert prewarm_calls[:1] == [
-        ("derived_search.search_chunk_embeddings_hnsw_idx", "read"),
+    assert prewarm_calls[:4] == [
+        (f"derived_search.search_chunk_vectors_{partition}_hnsw_idx", "read")
+        for partition in ("gmail", "slack", "slack_file", "other")
     ]
-    assert prewarm_calls[1:] == [
+    assert prewarm_calls[4:] == [
         (f"timeline.{name}", "read")
         for name in warehouse.bm25_timeline_index_names()
     ]
@@ -2220,13 +2226,18 @@ def test_search_hybrid_is_composed_from_independently_callable_legs() -> None:
     )
 
 
-def test_search_hybrid_semantic_helper_runs_exactly_one_vector_leg() -> None:
+def _semantic_function_sql() -> str:
     sql = _search_text_function_sql()
     start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(")
     end = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(", start)
-    semantic = sql[start:end]
+    return sql[start:end]
 
-    assert semantic.count("OPERATOR(public.<=>) qvec") >= 2  # global + Drive plans
+
+def test_search_hybrid_semantic_helper_runs_exactly_one_vector_leg() -> None:
+    semantic = _semantic_function_sql()
+
+    # One query vector, scanned by exactly one of two routes.
+    assert semantic.count("RETURN QUERY EXECUTE") == 1
     assert "qvec_alt" not in semantic
     assert "sum(1.0 / (" in semantic
     assert "chunk_id" in semantic
@@ -2238,14 +2249,60 @@ def test_search_hybrid_semantic_helper_can_override_its_candidate_pool() -> None
     """
 
     sql = _search_text_function_sql()
-    start = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(")
-    end = sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(", start)
-    semantic = sql[start:end]
+    semantic = _semantic_function_sql()
 
     assert "candidate_limit integer DEFAULT NULL" in semantic
     assert "requested_candidates integer" in semantic
-    assert semantic.count("LIMIT requested_candidates") == 2  # global + Drive plans
+    assert "USING embedding_model, sem_adapters, since, qvec, requested_candidates" in semantic
+    assert semantic.count("LIMIT $5") == 3  # exact branch, graph branch, merge
     assert "DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz)" in sql
+
+
+def test_search_hybrid_semantic_reads_only_the_per_chunk_vector_table() -> None:
+    """The scoped-search fix is the data layout: filters on the vector row.
+
+    Joining per-sha vectors to chunks for adapter/event_ts made a scoped ANN
+    scan walk the global graph probing a join for survivors (10-20 s cold
+    for slack since a date on 2026-10-14). Neither input table may come back.
+    """
+
+    import personal_data_warehouse.postgres as postgres_module
+
+    semantic = _semantic_function_sql()
+    for table, _ in postgres_module.SEARCH_VECTOR_PARTITIONS:
+        assert f"$q$@{table}$q$" in semantic, f"no branch scans {table}"
+    assert "@search_chunk_embeddings" not in semantic
+    assert "@search_chunks" not in semantic
+    assert "ARRAY['drive_file']" not in semantic, "no per-source special case: the router covers it"
+
+
+def test_search_hybrid_semantic_routes_each_partition_by_its_slice() -> None:
+    import personal_data_warehouse.postgres as postgres_module
+
+    semantic = _semantic_function_sql()
+    limit = postgres_module.SEARCH_VECTOR_EXACT_SLICE_ROWS
+    partitions = len(postgres_module.SEARCH_VECTOR_PARTITIONS)
+    # A slice is sized from the planner's estimate: counting a 1M-row slice
+    # cost up to 1.4 s in production, more than the exact scan it chose.
+    assert semantic.count("EXPLAIN (FORMAT JSON) SELECT 1 FROM %s v WHERE TRUE%s") == partitions
+    assert semantic.count(f"<= {limit};") == partitions
+    assert "count(*)" not in semantic
+    # A partition wholly in scope never pays for an estimate or a filter.
+    assert semantic.count("IF NOT part_whole THEN") == partitions
+    # The exact branch sorts on an expression the HNSW operator cannot match,
+    # so the planner cannot turn it back into an ANN scan -- and, unlike an
+    # OFFSET 0 subquery barrier, it can still use parallel workers.
+    exact = semantic[semantic.index("exact_scan constant text") : semantic.index("ann_branch constant text")]
+    assert "(v.embedding OPERATOR(public.<=>) $4) + 0 AS distance" in exact
+    assert "LIMIT" not in exact, "a per-partition LIMIT would stop the scans sharing workers"
+    assert "(SELECT e.* FROM (%s) e ORDER BY e.distance LIMIT $5)" in semantic
+    assert (
+        "'max_parallel_workers_per_gather', "
+        f"'{postgres_module.SEARCH_VECTOR_EXACT_SCAN_WORKERS}', true"
+    ) in semantic
+    ann = semantic[semantic.index("ann_branch constant text") :]
+    assert "ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5" in ann
+    assert "ORDER BY u.distance LIMIT $5" in semantic
 
 
 def test_search_hybrid_fuse_accepts_compact_parallel_leg_results() -> None:
@@ -2305,26 +2362,6 @@ def test_search_hybrid_bounds_agent_session_semantic_candidate_work() -> None:
     assert sql.count("least(greatest(per_source * 4, 40), 200)") >= 1
 
 
-def test_search_hybrid_scans_drive_embeddings_source_first_in_parallel() -> None:
-    sql = _search_text_function_sql()
-
-    # Drive is large enough (223k chunks) for an exact three-worker scan to
-    # beat a filtered walk through the global HNSW. OFFSET 0 is the plan
-    # barrier that keeps the adapter-first join below the distance sort; text
-    # must only be fetched after the top-k or all Drive documents are detoasted.
-    assert "sem_adapters = ARRAY['drive_file']::text[]" in sql
-    assert "WITH sem_chunks AS" in sql
-    assert sql.count("OFFSET 0") >= 1
-    semantic = sql[
-        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_semantic(") :
-        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(")
-    ]
-    assert "JOIN @search_chunks c2" not in semantic
-    assert " c.text," not in semantic and " c2.text" not in semantic, (
-        "the parallel semantic helper must defer text until final fused top-k"
-    )
-
-
 def test_search_schema_signature_covers_hybrid_tuning(monkeypatch) -> None:
     import personal_data_warehouse.postgres as postgres_module
 
@@ -2369,8 +2406,8 @@ def test_search_hybrid_uses_iterative_hnsw_for_filtered_recent_searches() -> Non
     sql = _search_text_function_sql()
 
     assert "set_config('hnsw.iterative_scan', 'relaxed_order', true)" in sql
-    assert "sem_adapters IS NULL AND since IS NULL" in sql
-    assert "greatest(requested_candidates, 100)" in sql
+    assert "WHEN sem_adapters IS NULL AND since IS NULL" in sql
+    assert "THEN least(1000, greatest(requested_candidates * 3 / 8, 100))" in sql
     assert "ELSE 1000" in sql
     assert "set_config('hnsw.max_scan_tuples', '100000', true)" in sql
     assert "set_config('hnsw.scan_mem_multiplier', '4', true)" in sql
@@ -6863,7 +6900,7 @@ def test_search_hybrid_clamps_ef_search_to_pgvectors_maximum() -> None:
     assert "set_config('hnsw.ef_search', greatest(" not in sql, (
         "an unclamped ef_search errors for max_results > 125"
     )
-    assert "least(1000, greatest(requested_candidates, 100))" in sql
+    assert "least(1000, greatest(requested_candidates * 3 / 8, 100))" in sql
 
 
 def test_search_schema_signature_covers_the_broad_pool_constants() -> None:
@@ -7124,15 +7161,12 @@ def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
     # Measured on the production corpus, a photo-scoped hybrid search took 44.6s
     # that way -- past the app's 30s statement budget -- while the same ANN scan
     # with the adapter predicate pushed down took 1.0s. Resolve `sources` to
-    # adapters once, then filter the scan on c.adapter directly.
-    sql = _search_text_function_sql()
-    legs = sql[
-        sql.index("WITH sem_chunks AS") :
-        sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(")
-    ]
-    assert "sem_adapters" in legs, "the semantic legs must filter on resolved adapters"
-    assert "c.adapter = ANY (sem_adapters)" in legs
-    assert "map.source = ANY (sources)" not in legs, (
+    # adapters once, then filter the scan on the vector row's adapter directly.
+    semantic = _semantic_function_sql()
+    scan = semantic[semantic.index("part_scope :=") :]
+    assert "v.adapter = ANY ($2)" in scan
+    assert "v.event_ts >= $3" in scan
+    assert "map.source = ANY (sources)" not in scan, (
         "a post-join source filter blocks pgvector's filtered iterative scan"
     )
 

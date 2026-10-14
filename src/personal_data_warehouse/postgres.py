@@ -560,6 +560,27 @@ SEARCH_HYBRID_AGENT_MAX_CANDIDATES = 200
 # with dimensions=512 (Matryoshka truncation).
 SEARCH_EMBEDDING_DIMENSIONS = 512
 SEARCH_EMBEDDING_DEFAULT_MODEL = "text-embedding-3-small"
+# The semantic leg reads derived_search.chunk_vectors: one row per (chunk,
+# model) carrying the vector AND its filter columns (adapter, event_ts), so a
+# scoped ANN scan filters on the row it is already reading. The old layout
+# kept vectors per content sha and joined chunks for the filter: a scoped
+# search walked the global HNSW graph probing a join for survivors, 10-20 s
+# cold on 2026-10-14 for slack since a date. The three adapters that are 92%
+# of chunks get a partition (heap + HNSW) each; everything else shares the
+# default one. (catalog id, adapters); an empty tuple is the DEFAULT partition.
+#: The semantic leg's router: a scoped slice up to this many vector rows is
+#: scanned exactly; a larger one walks its partitions' HNSW graphs.
+SEARCH_VECTOR_EXACT_SLICE_ROWS = 1_000_000
+#: Parallel workers for that exact scan (each partition is created with this
+#: parallel_workers, and the function raises max_parallel_workers_per_gather
+#: to it for the statement).
+SEARCH_VECTOR_EXACT_SCAN_WORKERS = 8
+SEARCH_VECTOR_PARTITIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("search_chunk_vectors_gmail", ("gmail_email",)),
+    ("search_chunk_vectors_slack", ("slack_message",)),
+    ("search_chunk_vectors_slack_file", ("slack_file",)),
+    ("search_chunk_vectors_other", ()),
+)
 # Timeline rows every search must exclude, beyond the per-row deleted flag.
 SEARCH_DRIVE_EXCLUSION_SQL = (
     "NOT (t.adapter = 'drive_file' "
@@ -615,6 +636,19 @@ def index_refresh_lock_key(namespace: str) -> int:
     digest = hashlib.sha256(namespace.encode("utf-8")).digest()
     # Keep the derived key inside bigint range and away from the base key.
     return INDEX_SCHEMA_REFRESH_LOCK_ID ^ int.from_bytes(digest[:7], "big")
+# Serializes the search_chunk_vectors row triggers (chunk writes against
+# embedding writes) so neither can miss the other's uncommitted row.
+SEARCH_CHUNK_VECTORS_LOCK_ID = 8_407_112_491
+
+
+def search_chunk_vectors_lock_key(namespace: str) -> int:
+    """The trigger lock key, per namespace like :func:`index_refresh_lock_key`."""
+    if namespace == "public":
+        return SEARCH_CHUNK_VECTORS_LOCK_ID
+    digest = hashlib.sha256(namespace.encode("utf-8")).digest()
+    return SEARCH_CHUNK_VECTORS_LOCK_ID ^ int.from_bytes(digest[:7], "big")
+
+
 # Serializes _ensure_query_role's shared GRANT/REVOKEs across processes.
 # Distinct from TIMELINE_SYNC_POSTGRES_LOCK_ID, which held the same id: the two
 # happen to live in different databases today (this one on the warehouse, that
@@ -2099,16 +2133,30 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "ON @search_chunks USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
     ),
-    # ANN index for the hybrid semantic branch. Only buildable once the
-    # pgvector extension and the conditional halfvec column exist; on hosts
-    # without them the creation fails and is harmlessly skipped like every
-    # other missing-prerequisite index.
-    IndexSpec(
-        "search_chunk_embeddings_hnsw_idx",
-        "search_chunk_embeddings",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunk_embeddings_hnsw_idx "
-        "ON @search_chunk_embeddings USING hnsw (embedding public.halfvec_cosine_ops)",
-        requires_pgvector=True,
+    # The semantic leg's indexes, one set per chunk_vectors partition: an HNSW
+    # graph for the large-slice ANN scan and a time index for the exact scan
+    # of a small slice. The default partition mixes adapters, so its time
+    # index leads with adapter. Only buildable where pgvector exists; on other
+    # hosts the creation fails and is skipped like any missing prerequisite.
+    *(
+        spec
+        for table, adapters in SEARCH_VECTOR_PARTITIONS
+        for spec in (
+            IndexSpec(
+                f"{table}_hnsw_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_hnsw_idx "
+                f"ON @{table} USING hnsw (embedding public.halfvec_cosine_ops)",
+                requires_pgvector=True,
+            ),
+            IndexSpec(
+                f"{table}_ts_idx",
+                table,
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_ts_idx "
+                f"ON @{table} ({'event_ts' if adapters else 'adapter, event_ts'})",
+                requires_pgvector=True,
+            ),
+        )
     ),
     IndexSpec(
         "timeline_events_search_text_bm25_idx",
@@ -2270,7 +2318,111 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
 # during _ensure_indexes so existing deployments converge with fresh installs.
+def _semantic_partition_branches_sql() -> str:
+    """search_hybrid_semantic's per-partition routing, one IF block each.
+
+    A partition wholly in scope gets an unfiltered graph walk; otherwise its
+    slice is sized by estimate and either joins the one combined exact scan
+    (``exact_scans``) or gets a filtered graph walk of its own. A dedicated
+    partition holds one adapter, so its adapter filter is a no-op and only
+    ``since`` narrows it.
+    """
+    listed = [adapter for _, adapters in SEARCH_VECTOR_PARTITIONS for adapter in adapters]
+    listed_array = "ARRAY[" + ", ".join(f"'{a}'" for a in listed) + "]::text[]"
+    blocks = []
+    for table, adapters in SEARCH_VECTOR_PARTITIONS:
+        if adapters:
+            in_scope = (
+                "sem_adapters IS NULL OR sem_adapters && ARRAY["
+                + ", ".join(f"'{a}'" for a in adapters)
+                + "]::text[]"
+            )
+            scope = "CASE WHEN since IS NULL THEN '' ELSE ' AND v.event_ts >= $3' END"
+            whole = "since IS NULL"
+        else:
+            in_scope = (
+                "sem_adapters IS NULL OR EXISTS (SELECT 1 FROM unnest(sem_adapters) a"
+                f" WHERE a <> ALL ({listed_array}))"
+            )
+            scope = (
+                "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
+                " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.event_ts >= $3' END"
+            )
+            whole = "sem_adapters IS NULL AND since IS NULL"
+        blocks.append(
+            f"""IF {in_scope} THEN
+                    part_scope := {scope};
+                    part_whole := {whole};
+                    part_exact := false;
+                    IF NOT part_whole THEN
+                        EXECUTE format(
+                            'EXPLAIN (FORMAT JSON) SELECT 1 FROM %s v WHERE TRUE%s',
+                            $q$@{table}$q$,
+                            replace(replace(part_scope,
+                                '$2', format('%L::text[]', sem_adapters)),
+                                '$3', format('%L::timestamptz', since))
+                        ) INTO slice_plan;
+                        part_exact := (slice_plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric
+                            <= {SEARCH_VECTOR_EXACT_SLICE_ROWS};
+                    END IF;
+                    IF part_exact THEN
+                        exact_scans := exact_scans || format(exact_scan, $q$@{table}$q$, part_scope);
+                    ELSE
+                        branches := branches || format(ann_branch, $q$@{table}$q$, part_scope);
+                    END IF;
+                END IF;"""
+        )
+    return "\n                ".join(blocks)
+
+
+def search_vector_hnsw_index_specs() -> list[IndexSpec]:
+    """The semantic leg's ANN graphs, one per search_chunk_vectors partition."""
+    partitions = {table for table, _ in SEARCH_VECTOR_PARTITIONS}
+    return [
+        spec
+        for spec in POSTGRES_INDEXES
+        if spec.table in partitions and spec.name.endswith("_hnsw_idx")
+    ]
+
+
+#: The row triggers that keep search_chunk_vectors in step with its inputs.
+#: Only a chunk UPDATE that moves a filter column or the text changes a
+#: vector row: the chunk builder re-upserts unchanged chunks on every
+#: timeline re-walk, and each of those would otherwise be an HNSW insert.
+SEARCH_CHUNK_VECTOR_TRIGGERS: tuple[tuple[str, str], ...] = (
+    (
+        "search_chunk_vectors_chunk_write",
+        "CREATE TRIGGER search_chunk_vectors_chunk_write"
+        " AFTER INSERT OR DELETE ON @search_chunks"
+        " FOR EACH ROW EXECUTE FUNCTION @search_chunk_vectors_from_chunk()",
+    ),
+    (
+        "search_chunk_vectors_chunk_update",
+        "CREATE TRIGGER search_chunk_vectors_chunk_update"
+        " AFTER UPDATE ON @search_chunks FOR EACH ROW"
+        " WHEN (OLD.text_sha256 IS DISTINCT FROM NEW.text_sha256"
+        " OR OLD.adapter IS DISTINCT FROM NEW.adapter"
+        " OR OLD.chunk_id IS DISTINCT FROM NEW.chunk_id"
+        " OR OLD.event_id IS DISTINCT FROM NEW.event_id"
+        " OR OLD.event_ts IS DISTINCT FROM NEW.event_ts)"
+        " EXECUTE FUNCTION @search_chunk_vectors_from_chunk()",
+    ),
+    (
+        "search_chunk_vectors_embedding_write",
+        "CREATE TRIGGER search_chunk_vectors_embedding_write"
+        " AFTER INSERT OR UPDATE OF embedding OR DELETE ON @search_chunk_embeddings"
+        " FOR EACH ROW EXECUTE FUNCTION @search_chunk_vectors_from_embedding()",
+    ),
+)
+
+
 POSTGRES_OBSOLETE_INDEXES: tuple[tuple[str, str], ...] = (
+    # The global ANN graph over per-sha vectors (on search_chunk_embeddings),
+    # replaced by the per-partition graphs on search_chunk_vectors. Retired
+    # through the vector table's ensure, which runs only after the semantic
+    # function that walked it has been replaced: retiring it with its own
+    # table would leave the old function scanning without it until then.
+    ("search_chunk_embeddings_hnsw_idx", "search_chunk_vectors"),
     # Replaced by the covering search_chunks_sha_cover_idx and
     # search_chunks_ts_chunk_sha_idx (same keys, INCLUDE columns added).
     ("search_chunks_sha_idx", "search_chunks"),
@@ -2671,6 +2823,7 @@ TIMESTAMP_COLUMNS = {
     "embed_fresh_built_at",
     "embed_cursor_ts",
     "embed_orphan_checked_at",
+    "embed_vectors_checked_at",
     # timeline: when the coverage reconcile last swept this adapter
     "last_reconcile_at",
     # backups: newest backup of each type, and when WAL last shipped
@@ -6688,13 +6841,9 @@ class PostgresWarehouse:
         buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
 
         timeline_schema = self._object_schema("timeline_events")
-        embeddings_schema = self._object_schema("search_chunk_embeddings")
+        embeddings_schema = self._object_schema("search_chunk_vectors")
         bm25_names = self.bm25_timeline_index_names()
-        hnsw_names = [
-            spec.name
-            for spec in POSTGRES_INDEXES
-            if spec.table == "search_chunk_embeddings" and "hnsw" in spec.name
-        ]
+        hnsw_names = [spec.name for spec in search_vector_hnsw_index_specs()]
         rows = self._query(
             f"""
             WITH targets AS (
@@ -7054,6 +7203,7 @@ class PostgresWarehouse:
             "embed_backfill_status",
             "embed_orphan_checked_at",
             "embed_orphan_status",
+            "embed_vectors_checked_at",
         ):
             if column in sync_columns:
                 continue
@@ -7071,11 +7221,134 @@ class PostgresWarehouse:
                     "ALTER TABLE @search_chunk_embeddings "
                     "ADD COLUMN IF NOT EXISTS embedding public.halfvec(512)"
                 )
-            # Re-walk the index specs now that the vector column exists (the
-            # first pass above ran before it and skipped the HNSW build).
-            self._ensured_index_names.discard("search_chunk_embeddings_hnsw_idx")
             self._ensure_indexes(["search_chunk_embeddings"])
+            self._ensure_search_chunk_vectors()
         self._ensure_search_views_if_possible()
+        if self._relation_exists("search_chunk_vectors"):
+            # After the search functions: retires the index the previous
+            # semantic function walked (see POSTGRES_OBSOLETE_INDEXES).
+            self._ensure_indexes(["search_chunk_vectors"])
+
+    def _ensure_search_chunk_vectors(self) -> None:
+        """The semantic leg's partitioned per-chunk vector table and its triggers.
+
+        Each DDL statement runs only when its object is missing: this is on
+        the ten-minute embeddings path, and ``CREATE TABLE IF NOT EXISTS ...
+        PARTITION OF`` or ``CREATE TRIGGER`` still queue for a lock on a
+        table search reads (see the 2026-10-03 note above). The trigger
+        functions are replaced in place, which takes no table lock.
+        """
+        dims = str(SEARCH_EMBEDDING_DIMENSIONS)
+        if not self._relation_exists("search_chunk_vectors"):
+            self._command(
+                "CREATE TABLE IF NOT EXISTS @search_chunk_vectors ("
+                " adapter text NOT NULL,"
+                " chunk_id text NOT NULL,"
+                " model text NOT NULL,"
+                " event_id text NOT NULL,"
+                " event_ts timestamptz NOT NULL,"
+                f" embedding public.halfvec({dims}) NOT NULL,"
+                " PRIMARY KEY (adapter, chunk_id, model)"
+                ") PARTITION BY LIST (adapter)"
+            )
+        for table, adapters in SEARCH_VECTOR_PARTITIONS:
+            if self._relation_exists(table):
+                continue
+            bound = (
+                "FOR VALUES IN (" + ", ".join(f"'{a}'" for a in adapters) + ")"
+                if adapters
+                else "DEFAULT"
+            )
+            self._command(
+                f"CREATE TABLE IF NOT EXISTS @{table} PARTITION OF @search_chunk_vectors {bound}"
+                f" WITH (parallel_workers = {SEARCH_VECTOR_EXACT_SCAN_WORKERS})"
+            )
+        # Row triggers keep the table in step with both inputs. A chunk row
+        # takes every model's vector for its text; a new vector reaches every
+        # chunk carrying that text. Unserialized, a chunk and the first
+        # vector for its text committing at once would each miss the other,
+        # so both triggers take one transaction-scoped advisory lock first.
+        # The chunk builder and the embeddings runner are its only writers;
+        # each statement after the lock reads with a fresh snapshot, so the
+        # second writer sees the first one's committed row. One lock key
+        # cannot deadlock.
+        lock_sql = (
+            "PERFORM pg_advisory_xact_lock("
+            f"{search_chunk_vectors_lock_key(self._schema)});"
+        )
+        self._command(
+            r"""
+            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_chunk()
+            RETURNS trigger LANGUAGE plpgsql AS $fn$
+            BEGIN
+                """ + lock_sql + r"""
+                IF TG_OP IN ('UPDATE', 'DELETE') THEN
+                    DELETE FROM @search_chunk_vectors
+                    WHERE adapter = OLD.adapter AND chunk_id = OLD.chunk_id;
+                END IF;
+                IF TG_OP IN ('INSERT', 'UPDATE') THEN
+                    INSERT INTO @search_chunk_vectors
+                        (adapter, chunk_id, model, event_id, event_ts, embedding)
+                    SELECT NEW.adapter, NEW.chunk_id, e.model, NEW.event_id,
+                           NEW.event_ts, e.embedding
+                    FROM @search_chunk_embeddings e
+                    WHERE e.text_sha256 = NEW.text_sha256
+                      AND e.embedding IS NOT NULL
+                    ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
+                        event_id = EXCLUDED.event_id,
+                        event_ts = EXCLUDED.event_ts,
+                        embedding = EXCLUDED.embedding;
+                END IF;
+                RETURN NULL;
+            END
+            $fn$
+            """
+        )
+        self._command(
+            r"""
+            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_embedding()
+            RETURNS trigger LANGUAGE plpgsql AS $fn$
+            BEGIN
+                """ + lock_sql + r"""
+                IF TG_OP = 'DELETE' OR NEW.embedding IS NULL THEN
+                    DELETE FROM @search_chunk_vectors v
+                    USING @search_chunks c
+                    WHERE c.text_sha256 = OLD.text_sha256
+                      AND v.adapter = c.adapter
+                      AND v.chunk_id = c.chunk_id
+                      AND v.model = OLD.model;
+                    RETURN NULL;
+                END IF;
+                INSERT INTO @search_chunk_vectors
+                    (adapter, chunk_id, model, event_id, event_ts, embedding)
+                SELECT c.adapter, c.chunk_id, NEW.model, c.event_id, c.event_ts,
+                       NEW.embedding
+                FROM @search_chunks c
+                WHERE c.text_sha256 = NEW.text_sha256
+                ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
+                    event_id = EXCLUDED.event_id,
+                    event_ts = EXCLUDED.event_ts,
+                    embedding = EXCLUDED.embedding;
+                RETURN NULL;
+            END
+            $fn$
+            """
+        )
+        existing = {
+            str(row[0])
+            for row in self._query(
+                "SELECT tgname FROM pg_trigger WHERE tgrelid IN (%s::regclass, %s::regclass)"
+                " AND NOT tgisinternal",
+                (
+                    self.sql_relation("search_chunks"),
+                    self.sql_relation("search_chunk_embeddings"),
+                ),
+            )
+        }
+        for name, statement in SEARCH_CHUNK_VECTOR_TRIGGERS:
+            if name not in existing:
+                self._command(statement)
+        self._ensure_indexes([table for table, _ in SEARCH_VECTOR_PARTITIONS])
 
     def _ensure_timeline_priority_type(self) -> None:
         """Create the ``@timeline_priority`` enum if it does not exist.
@@ -14659,7 +14932,9 @@ class PostgresWarehouse:
             # changes what the generator emits (search_hybrid), so it is part
             # of the signature: rolling the postgres image to one with pgvector
             # triggers exactly one rebuild that creates the hybrid function.
-            hybrid_state = f"{self.pgvector_available()}:{self._relation_exists('search_chunks')}"
+            hybrid_state = (
+                f"{self.pgvector_available()}:{self._relation_exists('search_chunk_vectors')}"
+            )
         except Exception:  # noqa: BLE001 - degrade to always-rebuild
             hybrid_state = "unknown"
         payload = "\n".join(
@@ -14692,6 +14967,9 @@ class PostgresWarehouse:
                 str(SEARCH_HYBRID_AGENT_MIN_CANDIDATES),
                 str(SEARCH_HYBRID_AGENT_MAX_CANDIDATES),
                 str(SEARCH_EMBEDDING_DIMENSIONS),
+                str(SEARCH_VECTOR_EXACT_SLICE_ROWS),
+                str(SEARCH_VECTOR_EXACT_SCAN_WORKERS),
+                repr(SEARCH_VECTOR_PARTITIONS),
                 hybrid_state,
             ]
         )
@@ -14798,11 +15076,7 @@ class PostgresWarehouse:
         residency it reports is real.
         """
 
-        hnsw = [
-            spec
-            for spec in POSTGRES_INDEXES
-            if spec.table == "search_chunk_embeddings" and "hnsw" in spec.name
-        ]
+        hnsw = search_vector_hnsw_index_specs()
         bm25 = [
             spec
             for spec in POSTGRES_INDEXES
@@ -14939,7 +15213,7 @@ class PostgresWarehouse:
             (self._object_schema("search_text_preview"), "search_text_preview"),
             (self._object_schema("timeline_context"), "context"),
         )
-        if self.pgvector_available() and self._relation_exists("search_chunks"):
+        if self.pgvector_available() and self._relation_exists("search_chunk_vectors"):
             expected += (
                 (self._object_schema("search_hybrid"), "search_hybrid"),
                 (self._object_schema("search_hybrid_semantic"), "search_hybrid_semantic"),
@@ -15963,7 +16237,7 @@ class PostgresWarehouse:
             $ctx$;
             """
         )
-        if self.pgvector_available() and self._relation_exists("search_chunks"):
+        if self.pgvector_available() and self._relation_exists("search_chunk_vectors"):
             # Hybrid retrieval: BM25 (search_text) + ANN over chunk embeddings,
             # merged by reciprocal rank fusion. Only created where pgvector and
             # the chunk tables exist; the app's `search` tool falls back to
@@ -16000,7 +16274,9 @@ class PostgresWarehouse:
             )
             RETURNS TABLE (ref text, best bigint, fuse double precision, chunk_id text)
             LANGUAGE plpgsql
-            STABLE
+            -- VOLATILE only because the router EXPLAINs the scoped slice,
+            -- which Postgres refuses inside a STABLE function. It reads only.
+            VOLATILE
             AS $semantic$
             DECLARE
                 per_source integer := least(greatest(coalesce(max_results, 50), 1), """
@@ -16008,6 +16284,25 @@ class PostgresWarehouse:
                 + r""");
                 requested_candidates integer;
                 sem_adapters text[];
+                candidate_sql text;
+                slice_plan json;
+                part_scope text;
+                part_whole boolean;
+                part_exact boolean;
+                branches text[] := '{}';
+                exact_scans text[] := '{}';
+                -- "+ 0" is the exact scan's plan barrier: the sort key no
+                -- longer matches the HNSW ordering operator, so the planner
+                -- cannot turn it back into an ANN scan. An OFFSET 0 subquery
+                -- barrier also did that but forbids parallel workers: 880 ms
+                -- serial vs 270-310 ms with three workers for 642k gmail rows.
+                exact_scan constant text := $q$SELECT v.adapter, v.event_id, v.chunk_id,
+                        (v.embedding OPERATOR(public.<=>) $4) + 0 AS distance
+                    FROM %s v WHERE v.model = $1%s$q$;
+                ann_branch constant text := $q$(SELECT v.adapter, v.event_id, v.chunk_id,
+                        v.embedding OPERATOR(public.<=>) $4 AS distance
+                    FROM %s v WHERE v.model = $1%s
+                    ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5)$q$;
                 qvec public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
@@ -16064,19 +16359,57 @@ class PostgresWarehouse:
                 + str(SEARCH_HYBRID_MAX_CANDIDATES)
                 + r""")
                 END;
-                -- An unfiltered ANN scan only has to maintain the candidate
-                -- heap it will return.  Keeping ef_search at 1,000 for a
-                -- 400-row pool made every ordinary hybrid query read roughly
-                -- 12k cold HNSW blocks and spend ~1.8s in this leg alone on
-                -- 2026-09-02.  Source/time filters are different: iterative
-                -- scan may discard most visited rows, so they retain the
-                -- measured 1,000-row exploration budget.  Both branches stay
-                -- inside pgvector's hard 1,000 ceiling.
+                -- Route per partition. chunk_vectors carries adapter and
+                -- event_ts on the vector row and is LIST-partitioned by
+                -- adapter, so each branch scans one partition and filters
+                -- the row it reads. A partition wholly in scope walks its
+                -- HNSW graph unfiltered. A partial slice of at most
+                -- """ + f"{SEARCH_VECTOR_EXACT_SLICE_ROWS:,}" + r""" rows is scanned exactly, in
+                -- parallel, over the time-ordered heap: measured 2026-10-14,
+                -- 805k slack_file rows took 461 ms cold and 401 ms warm, and
+                -- the result is exact. Filtered HNSW lost on every slice that
+                -- size: at 4% of a partition it took 581 ms p50 / 7.8 s max
+                -- and missed a quarter of the true top-400. A larger partial
+                -- slice keeps most of its partition, where the graph wins.
+                -- The planner's estimate sizes a slice in ~2 ms from
+                -- per-partition event_ts statistics (648,951 estimated vs
+                -- 642,249 real for gmail since 2025-06-01); counting it
+                -- instead cost up to 1.4 s at this threshold.
+                """ + _semantic_partition_branches_sql() + r"""
+                -- Every exact slice is one scan: a flattened UNION ALL with no
+                -- per-partition LIMIT plans as a Parallel Append whose workers
+                -- share all the partitions. Per-partition exact branches ran
+                -- one after another: 1.4M rows since 2026-06-01 across all four
+                -- took ~800 ms that way, 325-370 ms as one scan on """ + str(SEARCH_VECTOR_EXACT_SCAN_WORKERS) + r""" workers
+                -- (contract C6: an idle 28-core host is the budget).
+                IF coalesce(array_length(exact_scans, 1), 0) > 0 THEN
+                    PERFORM set_config(
+                        'max_parallel_workers_per_gather', '""" + str(SEARCH_VECTOR_EXACT_SCAN_WORKERS) + r"""', true
+                    );
+                    branches := branches || format(
+                        '(SELECT e.* FROM (%s) e ORDER BY e.distance LIMIT $5)',
+                        array_to_string(exact_scans, ' UNION ALL ')
+                    );
+                END IF;
+                IF coalesce(array_length(branches, 1), 0) = 0 THEN
+                    RETURN;
+                END IF;
+                -- An unscoped search walks all four graphs, and the merge pulls
+                -- from each only as deep as the pool needs (iterative scan
+                -- continues a walk past ef_search on demand). 3/8 of the pool
+                -- per graph (150 for 400) touched 11.2k pages per query for
+                -- 0.925 of the exact top-50 refs; 400 per graph touched 19.9k
+                -- for 0.933, and the old global graph 7.6k for 0.935
+                -- (2026-10-14, twelve fresh queries). A scoped walk keeps
+                -- 1,000: on one partition's graph a 400-row walk can settle
+                -- in the wrong neighbourhood entirely (two of twelve
+                -- slack_file queries found none of the true top-50; 1,000
+                -- found 39-46). Both stay inside pgvector's 1,000 cap.
                 PERFORM set_config(
                     'hnsw.ef_search',
                     CASE
                         WHEN sem_adapters IS NULL AND since IS NULL
-                            THEN least(1000, greatest(requested_candidates, 100))
+                            THEN least(1000, greatest(requested_candidates * 3 / 8, 100))
                         ELSE 1000
                     END::text,
                     true
@@ -16084,66 +16417,25 @@ class PostgresWarehouse:
                 PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);
                 PERFORM set_config('hnsw.max_scan_tuples', '100000', true);
                 PERFORM set_config('hnsw.scan_mem_multiplier', '4', true);
-                RETURN QUERY
-                WITH sem_chunks AS (
-                    -- Most scopes use global HNSW. Drive is excluded because a
-                    -- source-first exact scan is materially faster for its
-                    -- selective 223k-chunk partition.
-                    (
-                    SELECT c.adapter || ':' || c.event_id AS ref,
-                           c.chunk_id,
-                           row_number() OVER (
-                               ORDER BY (e.embedding OPERATOR(public.<=>) qvec)
-                           ) AS rnk
-                    FROM @search_chunk_embeddings e
-                    JOIN @search_chunks c ON c.text_sha256 = e.text_sha256
-                    WHERE e.model = embedding_model
-                      AND e.embedding IS NOT NULL
-                      AND sem_adapters IS DISTINCT FROM ARRAY['drive_file']::text[]
-                      AND (sem_adapters IS NULL OR c.adapter = ANY (sem_adapters))
-                      AND (since IS NULL OR c.event_ts >= since)
-                    ORDER BY e.embedding OPERATOR(public.<=>) qvec
-                    LIMIT requested_candidates
-                    )
-                    UNION ALL
-                    (
-                    -- OFFSET 0 is the measured plan barrier that keeps this
-                    -- source-first and parallel instead of returning to global
-                    -- filtered HNSW. Text is deferred all the way to final
-                    -- fusion, so even the top-k candidates are not detoasted.
-                    SELECT top.adapter || ':' || top.event_id AS ref,
-                           top.chunk_id,
-                           top.rnk
-                    FROM (
-                        SELECT s.*,
-                               row_number() OVER (ORDER BY s.distance) AS rnk
-                        FROM (
-                            SELECT c.chunk_id, c.adapter, c.event_id,
-                                   e.embedding OPERATOR(public.<=>) qvec AS distance
-                            FROM @search_chunks c
-                            JOIN @search_chunk_embeddings e
-                              ON e.text_sha256 = c.text_sha256
-                            WHERE sem_adapters = ARRAY['drive_file']::text[]
-                              AND c.adapter = ANY (sem_adapters)
-                              AND e.model = embedding_model
-                              AND e.embedding IS NOT NULL
-                              AND (since IS NULL OR c.event_ts >= since)
-                            OFFSET 0
-                        ) s
-                        ORDER BY s.distance
-                        LIMIT requested_candidates
-                    ) top
-                    ORDER BY top.distance
-                    )
-                )
-                SELECT sc.ref,
-                       min(sc.rnk)::bigint AS best,
-                       sum(1.0 / ("""
-                + str(SEARCH_HYBRID_RRF_K)
-                + r""" + sc.rnk))::double precision AS fuse,
-                       (array_agg(sc.chunk_id ORDER BY sc.rnk))[1] AS chunk_id
-                FROM sem_chunks sc
-                GROUP BY sc.ref;
+                candidate_sql := format(
+                    'SELECT u.* FROM (%s) u ORDER BY u.distance LIMIT $5',
+                    array_to_string(branches, ' UNION ALL ')
+                );
+                -- Text is deferred all the way to final fusion: the vector
+                -- row has none, so not even the top-k is detoasted here.
+                RETURN QUERY EXECUTE format(
+                    $q$SELECT c.adapter || ':' || c.event_id AS ref,
+                              min(c.rnk)::bigint AS best,
+                              sum(1.0 / (""" + str(SEARCH_HYBRID_RRF_K) + r""" + c.rnk))::double precision AS fuse,
+                              (array_agg(c.chunk_id ORDER BY c.rnk))[1] AS chunk_id
+                       FROM (
+                           SELECT x.adapter, x.event_id, x.chunk_id,
+                                  row_number() OVER (ORDER BY x.distance) AS rnk
+                           FROM (%s) x
+                       ) c
+                       GROUP BY 1$q$,
+                    candidate_sql
+                ) USING embedding_model, sem_adapters, since, qvec, requested_candidates;
             END;
             $semantic$;
             """

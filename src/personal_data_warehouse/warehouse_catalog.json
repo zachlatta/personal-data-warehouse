@@ -2751,6 +2751,61 @@
       "secret": false
     },
     {
+      "id": "search_chunk_vectors",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_vectors",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_gmail",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_vectors_gmail",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_slack",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_vectors_slack",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_slack_file",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_vectors_slack_file",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_other",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "search",
+      "schema": "derived_search",
+      "name": "chunk_vectors_other",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "search_hybrid_semantic",
       "kind": "function",
       "layer": "timeline",
@@ -3665,6 +3720,28 @@
       "domain": "internal",
       "schema": "internal",
       "name": "capture_timeline_notification",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_from_chunk",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_chunk_vectors_from_chunk",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "search_chunk_vectors_from_embedding",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_chunk_vectors_from_embedding",
       "discoverable": false,
       "query_access": "denied",
       "secret": false
