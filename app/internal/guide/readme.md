@@ -16,14 +16,13 @@ discovery calls below are what is current.
 
 1. **Search** for any text, topic, person, phrase, or identifier:
 {{if .CLI}}   `pdw search --priority {{.Attention}} '<fewest distinctive words>'`{{else}}   `search` with `{"query": "<fewest distinctive words>", "priorities": {{jsonList (split .Attention)}}}`{{end}}
-   Every hit carries `priority`, `ref`, `source_table` and `source_pk`.
+   Every hit carries `priority`, `ref` and a ready {{if .CLI}}`sql:` line{{else}}`drill_sql`{{end}} that reads its source row.
 2. **Read the conversation** around a useful hit — a Gmail hit returns its thread, a Slack
    hit its thread or channel, a chat hit the rest of that chat, an agent turn its
    neighbouring turns:
-{{if .CLI}}   `pdw context '<ref>'`{{else}}   `context` with `{"ref": "<ref>"}` (`before`/`after` default 5, at most 50){{end}}
-   That is the one way to read it. Inside a larger SQL statement `timeline.context(ref,
-   before, after)` is the same function; name its columns, because `SELECT *` returns
-   `metadata` and the full `search_text` of every row.
+{{if .CLI}}   `pdw context '<ref>'` (`--full`: whole texts){{else}}   `context` with `{"ref": "<ref>"}` (`before`/`after` default 5, max 50; `full: true` for whole texts){{end}}
+   That is the one way to read it. In SQL, `timeline.context(ref, before, after)` is the
+   same function; name its columns (`SELECT *` returns the full `search_text`).
 3. **Structured questions** (aggregates, joins, predicates, drill-down) are SQL, walked
    in layer order: bounded `timeline.events` filtered by priority → `marts_*` (stable
    per-domain read views) → `base_*` (raw provider rows, reached from a hit's

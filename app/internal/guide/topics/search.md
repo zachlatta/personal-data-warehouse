@@ -52,10 +52,12 @@ than paging deeper.
 
 ## Reading a hit
 
-Every hit carries `priority`, `ref`, `source_table` and `source_pk`. `source_table` is the
-catalog's logical id (`gmail_messages`, `slack_messages`), not a physical name;
-`source_pk` is the JSON primary key of the authoritative row. One hop reaches the raw
-record; usually the better hop is the conversation, read with {{if .CLI}}`pdw context '<ref>'`{{else}}the `context` tool, `{"ref": "<ref>"}`{{end}}.
+Every hit carries `priority`, `ref`, `source_table`, `source_pk` and `drill_sql`.
+`source_table` is the catalog's logical id (`gmail_messages`, `slack_messages`), not a
+relation name, so do not build the drill-down by hand: {{if .CLI}}the `sql:` line under each hit{{else}}`drill_sql`{{end}} is
+the ready statement that reads the authoritative row (one row per column, payloads dropped,
+values capped). Usually the better hop is the conversation, read with {{if .CLI}}`pdw context '<ref>'`
+(`--full` for each event's whole text){{else}}the `context` tool, `{"ref": "<ref>"}` (`"full": true` for each event's whole text){{end}}.
 
 It returns the hit's REAL conversation, chosen per
 source: a Gmail hit returns its thread, a Slack hit its thread when it is a reply or a

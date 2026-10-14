@@ -13,10 +13,12 @@ including this page. This is the brief; {{if .CLI}}`pdw readme full`{{else}}`rea
 {{if .CLI}}   `pdw search --priority {{.Attention}} '<terms>'`  (`-n 10` default; `--source`, `--since`, `--mode exact` for ids/paths/amounts; `--full` for long previews){{else}}   `search` `{"query": "<terms>", "priorities": {{jsonList (split .Attention)}}}` (also `sources`, `since`, `mode: exact` for ids/paths/amounts){{end}}
 2. **Read the conversation** around a hit (its email thread, Slack thread/channel, chat, or
    neighbouring agent turns):
-{{if .CLI}}   `pdw context '<ref>'`{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5){{end}}
+{{if .CLI}}   `pdw context '<ref>'` (`--full` for whole texts); a hit's `sql:` line reads its source row verbatim{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5, `full: true` for whole texts); a hit's `drill_sql` reads its source row verbatim{{end}}
 3. **SQL** only for aggregates, joins, predicates and drill-down, walking
    `timeline.events` (bounded, priority-filtered) → `marts_*` → `base_*`.
-4. **Columns before SQL, every time:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
+4. **Columns before SQL, every time, and wait for them:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
+   Read the output before writing the query: a columns call run in parallel with the SQL, or
+   as a fallback after it, is still a guess.
 
 Do not open with schema discovery; do not `ILIKE` a raw `base_*` body column (it times out);
 after a 42703/42P01 read the server's hint — it lists the real columns — instead of guessing again.
@@ -28,7 +30,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | --- | --- |
 | This brief / the full guide / one topic | `pdw readme [full\|topic]` (bare `pdw` prints the brief) |
 | Search | `pdw search [--priority TIERS] [--source NAMES] [--since DATE] [--mode hybrid\|keyword\|exact] [-n N] [--full] '<terms>'` |
-| Conversation around a hit | `pdw context '<ref>' [--before N] [--after N]` |
+| Conversation around a hit | `pdw context '<ref>' [--before N] [--after N] [--full]` |
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL via `--file` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
@@ -43,7 +45,7 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 | --- | --- |
 | This brief / the full guide / one topic | `readme` (`{}`, `{"topic": "full"}` or `{"topic": "<name>"}`) |
 | Search | `search` `{"query", "priorities", "sources", "since", "mode", "max_results"}` |
-| Conversation around a hit | `context` `{"ref", "before", "after"}` |
+| Conversation around a hit | `context` `{"ref", "before", "after", "full"}` |
 | Read-only SQL | `query` `{"queries": [{"question", "sql"}], "format": "csv|json|ndjson"}` (CSV by default) |
 | One relation's exact columns | `describe_table` `{"relation"}` |
 | Every relation with row estimates, or one schema / layer | `schema_overview` `{}` or `{"schema": "marts_finance"}` |
@@ -68,6 +70,9 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 
 ## SQL traps
 
+- PDW is PostgreSQL 18, not ClickHouse. `timeline.events` has `event_ts`, `actor`, `snippet`,
+  `search_text` and `adapter` + `event_id`; `occurred_at`, `ref`, `who` and `text` exist only on
+  `timeline.search_text()` rows and `marts_ai_conversations.events` (`occurred_at`, `text`).
 - Booleans are `bigint` 0/1 (`is_deleted = 0`, never `= true`). Absence is the epoch
   `1970-01-01`, not NULL, on `base_*`; `marts_*` translate it. Name the time column per source
   (`base_gmail.messages.internal_date`, `base_slack.messages.message_datetime`, `timeline.events.event_ts`).

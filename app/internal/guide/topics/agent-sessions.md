@@ -25,8 +25,8 @@ for an id, error string or URL add `"mode": "exact"`.
 tool output are `background`, and orchestrator-spawned sessions are `background` entirely.
 Transcripts are indexed **per turn**, so a hit lands on the matching turn: a turn ref is
 `agent_session_turn:<provider>|<session_id>|<seq>`, a session headline ref is
-`agent_session:<provider>|<session_id>`. `timeline.context(ref, 5, 5)` pages the
-neighbouring turns. **Conclusions live at the end** — read the last assistant turns of
+`agent_session:<provider>|<session_id>`. {{if .CLI}}`pdw context '<ref>' --full`{{else}}`context` with `{"ref": "<ref>", "full": true}`{{end}} pages the
+neighbouring turns with their whole text. There is no `turns` table and no `turn_index`. **Conclusions live at the end** — read the last assistant turns of
 a hit's session before trusting a plan you found in its middle:
 
 ```sql
