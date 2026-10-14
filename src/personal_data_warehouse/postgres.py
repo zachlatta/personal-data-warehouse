@@ -16401,22 +16401,21 @@ class PostgresWarehouse:
                 IF coalesce(array_length(branches, 1), 0) = 0 THEN
                     RETURN;
                 END IF;
-                -- An unscoped search walks all four graphs, and the merge pulls
-                -- from each only as deep as the pool needs (iterative scan
-                -- continues a walk past ef_search on demand). 3/8 of the pool
-                -- per graph (150 for 400) touched 11.2k pages per query for
-                -- 0.925 of the exact top-50 refs; 400 per graph touched 19.9k
-                -- for 0.933, and the old global graph 7.6k for 0.935
-                -- (2026-10-14, twelve fresh queries). A scoped walk keeps
-                -- 1,000: on one partition's graph a 400-row walk can settle
-                -- in the wrong neighbourhood entirely (two of twelve
-                -- slack_file queries found none of the true top-50; 1,000
-                -- found 39-46). Both stay inside pgvector's 1,000 cap.
+                -- An unscoped search walks all four graphs with ef_search at
+                -- the pool size. 150 per graph touched 11.2k pages per query
+                -- against 19.9k at 400 (the old global graph: 7.6k), but on
+                -- the labeled benchmark it lost two voice-memo answers that
+                -- exact search ranks first and 400 ranks 1-2 (2026-10-14).
+                -- A scoped walk keeps 1,000: on one partition's graph a
+                -- 400-row walk can settle in the wrong neighbourhood entirely
+                -- (two of twelve slack_file queries found none of the true
+                -- top-50; 1,000 found 39-46). Both stay inside pgvector's
+                -- 1,000 cap.
                 PERFORM set_config(
                     'hnsw.ef_search',
                     CASE
                         WHEN sem_adapters IS NULL AND since IS NULL
-                            THEN least(1000, greatest(requested_candidates * 3 / 8, 100))
+                            THEN least(1000, greatest(requested_candidates, 100))
                         ELSE 1000
                     END::text,
                     true

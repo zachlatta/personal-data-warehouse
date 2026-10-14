@@ -398,8 +398,9 @@ time-clustered slice are cheap even cold (805k rows: 461 ms cold, 401 ms warm), 
 filtered graph walk at 4% of a partition took 581 ms p50 / 7.8 s max and missed a quarter of
 the true top-400. Counting a slice instead of estimating it cost up to 1.4 s. A scoped
 graph walk keeps `ef_search` 1,000 (at 400, two of twelve slack_file queries settled in the
-wrong neighbourhood entirely); an unscoped search walks four graphs at 3/8 of the pool each
-(150 for 400: 0.925 of the exact top-50 refs vs 0.935 for the old global graph). Before and
+wrong neighbourhood entirely); an unscoped search walks four graphs at the pool size (400). Cheaper
+settings lost labeled answers: at 150 per graph two voice-memo cases that exact search ranks
+first fell out of the leg. Before and
 after numbers are in the "Scoped semantic search" table below.
 
 **The production embedding server runs on `mew` (the GPU box, `ssh mew`) and is managed
