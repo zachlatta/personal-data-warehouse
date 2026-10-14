@@ -935,3 +935,13 @@ func TestSchemaOverviewFilterOnOpsNamesTheReadableRelations(t *testing.T) {
 		t.Fatalf("a denied ops relation must not be listed: %s", result.Error)
 	}
 }
+
+func TestUndefinedFunctionHintNamesThePostgresSpellingOfAClickHouseFunction(t *testing.T) {
+	for _, fn := range []string{"toString", "tuple", "countIf", "toStartOfDay", "arrayJoin", "groupArray", "uniq"} {
+		msg := `ERROR: function ` + strings.ToLower(fn) + `(record) does not exist (SQLSTATE 42883)`
+		hint := undefinedFunctionHint(msg)
+		if !strings.Contains(hint, "ClickHouse") || !strings.Contains(hint, "PostgreSQL") {
+			t.Fatalf("%s: hint = %q", fn, hint)
+		}
+	}
+}

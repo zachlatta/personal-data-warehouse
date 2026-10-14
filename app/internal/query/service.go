@@ -1181,6 +1181,31 @@ var functionRemaps = map[string]string{
 	"search_text_sources": "timeline.search_text_sources",
 }
 
+// clickHouseFunctions answer the ClickHouse functions agents write against
+// PDW (seen 2026-10-13: toString(tuple(*)) to grep a whole row) with the
+// PostgreSQL spelling. Keys are lower case, as Postgres reports them.
+var clickHouseFunctions = map[string]string{
+	"tostring":                "cast with x::text (a whole row: t::text)",
+	"tuple":                   "a whole row as text is t::text; a row value is ROW(a, b)",
+	"countif":                 "count(*) FILTER (WHERE cond)",
+	"sumif":                   "sum(x) FILTER (WHERE cond)",
+	"tostartofday":            "date_trunc('day', ts)",
+	"tostartofweek":           "date_trunc('week', ts)",
+	"tostartofmonth":          "date_trunc('month', ts)",
+	"todate":                  "ts::date",
+	"todatetime":              "x::timestamptz",
+	"formatdatetime":          "to_char(ts, 'YYYY-MM-DD HH24:MI')",
+	"arrayjoin":               "unnest(arr)",
+	"grouparray":              "array_agg(x) or string_agg(x, ', ')",
+	"uniq":                    "count(DISTINCT x)",
+	"uniqexact":               "count(DISTINCT x)",
+	"argmax":                  "(array_agg(x ORDER BY y DESC))[1]",
+	"argmin":                  "(array_agg(x ORDER BY y))[1]",
+	"lowerutf8":               "lower(x)",
+	"tounixtimestamp":         "extract(epoch FROM ts)",
+	"positioncaseinsensitive": "strpos(lower(s), lower(needle))",
+}
+
 // searchHitColumns is the exact output shape of timeline.search_text,
 // timeline.search_text_exact, and timeline.search_hybrid — mirror of the
 // composite type built in postgres.py (hit_type_columns_sql). It drifted once
@@ -1219,6 +1244,9 @@ func undefinedFunctionHint(message string) string {
 	name := qualified
 	if idx := strings.LastIndex(name, "."); idx >= 0 {
 		name = name[idx+1:]
+	}
+	if postgres, ok := clickHouseFunctions[name]; ok {
+		return "(hint: " + name + "() is ClickHouse — PDW is PostgreSQL 18. " + postgres + ".)"
 	}
 	if remap, ok := functionRemaps[name]; ok {
 		if name == "search_hybrid" {

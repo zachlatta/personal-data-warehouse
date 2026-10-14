@@ -1,6 +1,9 @@
 package query
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateReadOnlySQLAllowsReadOnlyStatements(t *testing.T) {
 	for _, sql := range []string{
@@ -72,5 +75,33 @@ func TestValidateReadOnlySQLUnderstandsCommentsAndDollarQuotes(t *testing.T) {
 				t.Fatalf("ValidateReadOnlySQL(%q) should refuse", sql)
 			}
 		})
+	}
+}
+
+// Agents still write ClickHouse catalog queries against PDW (system.tables in
+// 2 of 65 eval sessions, 2026-10-13). The guard used to answer "SYSTEM
+// statements are not allowed", which reads as a permissions problem; the
+// answer is that this is PostgreSQL and where the catalog is.
+func TestValidateReadOnlySQLAnswersAClickHouseCatalogReadWithThePostgresWay(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT name FROM system.tables WHERE name ILIKE '%mutation%'",
+		"select database, name from System.Columns limit 5",
+	} {
+		err := ValidateReadOnlySQL(sql)
+		if err == nil {
+			t.Fatalf("%q should be refused", sql)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "PostgreSQL") || !strings.Contains(msg, "pdw schema") || !strings.Contains(msg, "pdw columns") || strings.Contains(msg, "SYSTEM statements") {
+			t.Fatalf("%q: %s", sql, msg)
+		}
+	}
+	// A column or string that merely says "system" is not a catalog read.
+	for _, sql := range []string{
+		"SELECT role FROM marts_ai_conversations.events WHERE role = 'system' LIMIT 1",
+	} {
+		if err := ValidateReadOnlySQL(sql); err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
 	}
 }

@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -33,6 +34,12 @@ var forbiddenKeywords = map[string]bool{
 	"UPDATE":   true,
 }
 
+// clickHouseCatalogRe matches a read of ClickHouse's system catalog
+// (system.tables, system.columns). Agents still reach for it; without this the
+// SYSTEM keyword guard answered "SYSTEM statements are not allowed", which
+// reads as a permissions problem instead of "wrong database".
+var clickHouseCatalogRe = regexp.MustCompile(`(?i)\bsystem\s*\.\s*[a-z_]+`)
+
 func ValidateReadOnlySQL(sql string) error {
 	trimmed := strings.TrimSpace(sql)
 	if trimmed == "" {
@@ -42,6 +49,10 @@ func ValidateReadOnlySQL(sql string) error {
 		return err
 	}
 
+	if match := clickHouseCatalogRe.FindString(sqlCode(trimmed)); match != "" {
+		return fmt.Errorf("PDW is PostgreSQL 18, not ClickHouse: there is no %s. List relations with `pdw schema` (MCP: schema_overview) "+
+			"and one relation's columns with `pdw columns <schema.relation>` (MCP: describe_table)", strings.ToLower(strings.Join(strings.Fields(match), "")))
+	}
 	words := sqlWords(trimmed)
 	if len(words) == 0 {
 		return errors.New("SQL must contain a statement")
