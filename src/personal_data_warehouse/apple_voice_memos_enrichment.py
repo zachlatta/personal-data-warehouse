@@ -21,7 +21,7 @@ from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_K
 
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
-AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v10"
+AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v11"
 DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
@@ -1971,16 +1971,49 @@ def build_segment_preserving_corrected_transcript(
         dict.fromkeys([*known_speaker_names_from_result(result), *evidence_names_from_result(result)])
     )
     names = segment_speaker_names(transcript_segments=transcript_segments, result=result)
+    corrections = transcript_corrections_by_segment(result)
     # One paragraph per turn: long utterances are stored sentence by sentence,
     # and a speaker's consecutive segments read as one paragraph.
     paragraphs: list[tuple[str, list[str]]] = []
     for speaker, segment in zip(names, transcript_segments):
-        text = canonicalize_text_verified_name_mentions(str(segment.get("text") or ""), verified_names=known_text_names)
+        text = apply_segment_text_corrections(
+            str(segment.get("text") or ""),
+            corrections.get(_int_or_none(segment.get("segment_index")), []),
+        )
+        text = canonicalize_text_verified_name_mentions(text, verified_names=known_text_names)
         if paragraphs and paragraphs[-1][0] == speaker:
             paragraphs[-1][1].append(text)
         else:
             paragraphs.append((speaker, [text]))
     return "\n".join(f"{speaker}: {' '.join(texts)}" for speaker, texts in paragraphs)
+
+
+def transcript_corrections_by_segment(result: Mapping[str, Any]) -> dict[int, list[tuple[str, str]]]:
+    """The agent's word fixes for long recordings, keyed by segment_index.
+
+    A long recording's transcript is assembled here from the raw diarized
+    segments, so without these the agent's verified spellings reached only its
+    evidence: the 2026-10-12 Musk Foundation meeting kept "Gemma Balajoti" for
+    Jehn Balajadia and "Lisa Seifert" for Lisa Su although evidence named both.
+    Each fix is scoped to one segment, so a real Gemma elsewhere is untouched.
+    """
+    corrections: dict[int, list[tuple[str, str]]] = {}
+    for item in result.get("transcript_corrections") or []:
+        if not isinstance(item, Mapping):
+            continue
+        index = _int_or_none(item.get("segment_index"))
+        original = str(item.get("original") or "")
+        corrected = str(item.get("corrected") or "")
+        if index is None or not original.strip() or original == corrected:
+            continue
+        corrections.setdefault(index, []).append((original, corrected))
+    return corrections
+
+
+def apply_segment_text_corrections(text: str, corrections: Sequence[tuple[str, str]]) -> str:
+    for original, corrected in corrections:
+        text = text.replace(original, corrected)
+    return text
 
 
 def segment_preserving_name_for_label(item: Mapping[str, Any]) -> str:
@@ -2350,7 +2383,9 @@ def enrichment_instructions() -> list[str]:
         "When one label holds two people inside a session (an interviewer and a guest sharing stage microphones is common), write one speaker_turns entry per turn: each question's segment range to the interviewer and each answer's range to the guest. Long utterances are already split into sentence-sized segments for this. A range spanning both people's turns attributes one person's words to the other.",
         "A speaker introduced by first name only (on stage, in a greeting, or by a host) whose surname you cannot verify is named by that first name exactly as introduced, for example 'Sam', in speaker_map and speaker_turns. That is accurate; leaving every one of their turns unresolved is not. participants still needs full names, so put them in evidence instead.",
         "Zach Latta is the recording owner and is usually closest to the microphone. In breaks, receptions, and side conversations his label also holds other people's turns, so name his identifiable turns (first-person statements about Hack Club, self-introductions, his own plans) with speaker_turns rather than leaving the whole label unresolved.",
-        f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, speaker_turns, domain-term evidence, summary, and action items.",
+        f"If transcript_char_count is at least {LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS}, set transcript exactly to {LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL}. Do not emit the full transcript in your JSON for long recordings; focus on calendar matching, participant identities, speaker_map, speaker_turns, transcript_corrections, summary, and action items.",
+        "For a locally assembled transcript, transcript_corrections is the only way a fix reaches the transcript: a spelling you verify but leave only in evidence stays wrong in the transcript. Read every diarized segment and add one entry per error: segment_index, the exact original substring from that segment's text, the corrected text, and the evidence. Cover misheard person names, organizations, programs, products and domain terms, and every occurrence, not just the first.",
+        "People who are mentioned but not present are misheard most often (a participant's colleague or boss, the person a meeting is about), and ASR often turns an unfamiliar name into a familiar word or product name. For each unfamiliar or odd-sounding name, look it up: search the spoken form and its surname, and list the people at each participant's organization (contacts and email at the same email domain, the organization's correspondence), then use the verified spelling. Mark a name you cannot verify in evidence rather than guessing.",
         "When you are not using the local transcript assembly sentinel, every substantive diarized segment should be represented in transcript. Do not compress it into a summary.",
         "Format transcript as speaker turns, one turn per line or paragraph. Never put multiple 'Name:' speaker turns in the same paragraph.",
         "Use full resolved person names as turn prefixes, for example 'Person One:' instead of 'Person:'.",
@@ -2555,6 +2590,33 @@ def enrichment_schema() -> dict[str, Any]:
                     ],
                 },
             },
+            "transcript_corrections": {
+                "type": "array",
+                "description": "Word-level ASR fixes the pipeline applies to diarized segment text when it assembles a long recording's transcript locally. Empty when transcript is written in full.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "segment_index": {
+                            "type": "integer",
+                            "description": "diarized_segments segment_index whose text holds the error.",
+                        },
+                        "original": {
+                            "type": "string",
+                            "description": "Exact substring of that segment's text as transcribed, for example 'Gemma Balajoti'.",
+                        },
+                        "corrected": {
+                            "type": "string",
+                            "description": "Replacement text, for example 'Jehn Balajadia'.",
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "Warehouse evidence for the spelling: contact card, email signature, calendar attendee, roster, correspondence.",
+                        },
+                    },
+                    "required": ["segment_index", "original", "corrected", "evidence"],
+                },
+            },
             "transcript": {"type": "string"},
             "summary": {"type": "string"},
             "action_items": {"type": "array", "items": {"type": "string"}},
@@ -2569,6 +2631,7 @@ def enrichment_schema() -> dict[str, Any]:
             "participants",
             "speaker_map",
             "speaker_turns",
+            "transcript_corrections",
             "transcript",
             "summary",
             "action_items",

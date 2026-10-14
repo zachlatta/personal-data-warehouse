@@ -583,11 +583,67 @@ def test_enrichment_schema_requires_speaker_turns() -> None:
     }
 
 
+def test_transcript_corrections_reach_a_locally_assembled_transcript() -> None:
+    """A long recording's verified spellings must land in its transcript.
+
+    The 2026-10-12 Musk Foundation meeting was assembled from raw segments, so
+    "Gemma Balajoti" (for Jehn Balajadia) survived even where the agent had
+    verified a spelling: it could only write it into evidence. Fixes are scoped
+    to their segment, so a real Gemma in another segment is left alone.
+    """
+    result = apply_segment_preserving_transcript_fallback(
+        recording={"transcript_text": "x" * 20_000},
+        transcript_segments=[
+            {"segment_index": 0, "speaker_label": "A", "text": "I help while Gemma's out. Gemma Balajoti runs it."},
+            {"segment_index": 1, "speaker_label": "B", "text": "Gemma Boyer shipped a project."},
+            {"segment_index": 2, "speaker_label": "A", "text": "Lisa Seifert from AMD."},
+        ],
+        result={
+            "participants": ["Yvonne Seo", "Zach Latta"],
+            "speaker_map": [
+                {"speaker_label": "A", "speaker_name": "Yvonne Seo", "confidence": 0.95, "evidence": "e"},
+                {"speaker_label": "B", "speaker_name": "Zach Latta", "confidence": 0.95, "evidence": "e"},
+            ],
+            "speaker_turns": [],
+            "transcript_corrections": [
+                {"segment_index": 0, "original": "Gemma's", "corrected": "Jehn's", "evidence": "contact card"},
+                {"segment_index": 0, "original": "Gemma Balajoti", "corrected": "Jehn Balajadia", "evidence": "contact card"},
+                {"segment_index": 2, "original": "Lisa Seifert", "corrected": "Lisa Su", "evidence": "AMD correspondence"},
+                {"segment_index": 2, "original": "not in the text", "corrected": "ignored", "evidence": "e"},
+                {"segment_index": 99, "original": "Gemma", "corrected": "Jehn", "evidence": "no such segment"},
+            ],
+            "transcript": LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL,
+            "evidence": [],
+        },
+    )
+
+    assert result["transcript"].splitlines() == [
+        "Yvonne Seo: I help while Jehn's out. Jehn Balajadia runs it.",
+        "Zach Latta: Gemma Boyer shipped a project.",
+        "Yvonne Seo: Lisa Su from AMD.",
+    ]
+
+
+def test_enrichment_schema_requires_transcript_corrections() -> None:
+    schema = enrichment_schema()
+    corrections = schema["properties"]["transcript_corrections"]
+    assert "transcript_corrections" in schema["required"]
+    item = corrections["items"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == set(item["properties"]) == {"segment_index", "original", "corrected", "evidence"}
+
+
+def test_enrichment_prompt_says_long_transcripts_change_only_through_corrections() -> None:
+    prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
+    assert "transcript_corrections is the only way a fix reaches the transcript" in prompt
+    assert "mentioned but not present" in prompt
+
+
 def test_enrichment_prompt_teaches_turn_level_speakers_from_the_agenda() -> None:
     prompt = enrichment_user_prompt(input_file=AGENT_USER_PROMPT_INPUT_FILE)
     assert "speaker_turns" in prompt
     assert "agenda" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v10"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v11"
 
 
 def test_segment_preserving_fallback_assembles_local_transcript_sentinel() -> None:
@@ -1476,7 +1532,7 @@ def test_enrichment_prompt_teaches_sessions_spans_and_sectioned_summaries() -> N
     assert "one speaker_turns entry per turn" in prompt
     assert "introduced by first name only" in prompt
     assert "recording owner" in prompt
-    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v10"
+    assert AGENT_ENRICHMENT_PROMPT_VERSION == "apple-voice-memo-enrichment-agent-v11"
 
 
 def test_an_unresolved_label_is_not_named_after_someone_its_evidence_merely_mentions() -> None:
