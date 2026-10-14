@@ -105,3 +105,16 @@ func TestValidateReadOnlySQLAnswersAClickHouseCatalogReadWithThePostgresWay(t *t
 		}
 	}
 }
+
+// TABLESAMPLE SYSTEM is PostgreSQL's block sampler, and was refused as a
+// "SYSTEM statement" (a ClickHouse-era keyword guard; seen 2026-10). The
+// only Postgres statement spelled with SYSTEM is ALTER SYSTEM, which ALTER
+// already refuses.
+func TestValidateReadOnlySQLAllowsTablesampleSystem(t *testing.T) {
+	if err := ValidateReadOnlySQL("SELECT count(*) FROM timeline.events TABLESAMPLE SYSTEM (0.01)"); err != nil {
+		t.Fatalf("TABLESAMPLE SYSTEM is read-only: %v", err)
+	}
+	if err := ValidateReadOnlySQL("EXPLAIN ALTER SYSTEM SET work_mem = '1GB'"); err == nil {
+		t.Fatal("ALTER SYSTEM must stay refused")
+	}
+}

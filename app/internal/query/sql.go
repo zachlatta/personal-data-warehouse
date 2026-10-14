@@ -29,7 +29,6 @@ var forbiddenKeywords = map[string]bool{
 	"OPTIMIZE": true,
 	"RENAME":   true,
 	"REVOKE":   true,
-	"SYSTEM":   true,
 	"TRUNCATE": true,
 	"UPDATE":   true,
 }
