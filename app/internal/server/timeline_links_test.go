@@ -323,3 +323,15 @@ func TestTimelineItemDetailIncludesConversationContext(t *testing.T) {
 		t.Fatalf("context = %s", body)
 	}
 }
+
+func TestTimelineDeepLinkBrowserVisitOpensOnlyWebPages(t *testing.T) {
+	link := linkFor(t, "browser_visit", "browser_history_visits", `{}`, `{"url":"https://example.com/page?a=1"}`)
+	if link == nil || link.URL != "https://example.com/page?a=1" || link.Label != "Open page" {
+		t.Fatalf("link = %#v", link)
+	}
+	for _, page := range []string{"chrome://settings/", "file:///tmp/x.html", ""} {
+		if link := linkFor(t, "browser_visit", "browser_history_visits", `{}`, `{"url":"`+page+`"}`); link != nil {
+			t.Fatalf("%q: got %#v", page, link)
+		}
+	}
+}

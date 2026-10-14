@@ -2137,6 +2137,80 @@ _WHOOP_PRIVATE_COACH = _simple_adapter(
     priority=f"CASE WHEN t.role = 'user' THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_BACKGROUND} END",
 )
 
+# --- Browser history -------------------------------------------------------
+#
+# base_browser_history.visits holds every visit, but the timeline (and with it
+# the BM25 index and the embedding queue) carries only the visits a person
+# would call "I went to that page": redirect hops, subframe loads and reloads
+# stay in base_*, and a page revisited within 30 minutes of a previous visit
+# in the same profile is the same stretch of reading, not a new event. A web
+# search is its own kind (`search`) so "what did I search for" is one filter.
+# Both are `self`: Zach did it -- the rule that keeps a card swipe at self.
+_BROWSER_KEY = "t.account = p.account AND t.device = p.device AND t.browser = p.browser AND t.profile = p.profile"
+_BROWSER_NOT_REVISIT = (
+    "NOT EXISTS (SELECT 1 FROM @browser_history_visits p "
+    f"WHERE {_BROWSER_KEY} AND p.url_id = t.url_id "
+    "AND p.visited_at < t.visited_at "
+    "AND p.visited_at >= t.visited_at - interval '30 minutes')"
+)
+_BROWSER_PAGE_VIEW = (
+    "t.is_redirect = 0 "
+    "AND t.transition NOT IN ('auto_subframe', 'manual_subframe', 'reload') "
+    f"AND {_BROWSER_NOT_REVISIT}"
+)
+_BROWSER_COMMON = dict(
+    source_table="browser_history_visits",
+    source="browser_history",
+    from_sql="@browser_history_visits t",
+    event_id="concat_ws('|', t.account, t.device, t.browser, t.profile, t.visit_id)",
+    event_ts="t.visited_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    snippet=_snippet("t.url"),
+    # A profile's day of browsing is the "conversation": timeline.context()
+    # on a hit returns what else was read and searched around it.
+    context=(
+        "concat_ws('|', t.device, t.browser, t.profile, "
+        "to_char(t.visited_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'))"
+    ),
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'device', t.device, "
+        "'browser', t.browser, 'profile', t.profile, 'visit_id', t.visit_id)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'browser', t.browser, "
+        "'profile', t.profile, "
+        "'profile_name', t.profile_name, "
+        "'device', t.device, "
+        "'url', t.url, "
+        "'host', t.host, "
+        "'transition', t.transition, "
+        "'is_synced', t.is_synced <> 0, "
+        "'visit_duration_ms', t.visit_duration_ms, "
+        "'search_term', t.search_term)"
+    ),
+    priority="'self'",
+)
+
+_BROWSER_VISIT = _simple_adapter(
+    name="browser_visit",
+    kind="visit",
+    title="COALESCE(NULLIF(t.title, ''), NULLIF(t.host, ''), left(t.url, 200))",
+    search_text=_search_concat("t.title", "t.host", "left(t.url, 300)"),
+    where=f"t.search_term = '' AND {_BROWSER_PAGE_VIEW}",
+    **_BROWSER_COMMON,
+)
+
+_BROWSER_SEARCH = _simple_adapter(
+    name="browser_search",
+    kind="search",
+    title="concat('Searched: ', t.search_term)",
+    search_text=_search_concat("t.search_term", "t.host"),
+    where=f"t.search_term <> '' AND {_BROWSER_PAGE_VIEW}",
+    **_BROWSER_COMMON,
+)
+
 _HACKER_NEWS_ITEM = _simple_adapter(
     name="hacker_news_item",
     source_table="hacker_news_items",
@@ -3017,6 +3091,8 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _GITHUB_ISSUE,
     _GITHUB_COMMENT,
     _GITHUB_EVENT,
+    _BROWSER_VISIT,
+    _BROWSER_SEARCH,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
@@ -3246,6 +3322,8 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "github_issue",
         "github_comment",
         "github_event",
+        "browser_visit",
+        "browser_search",
         "finance_transaction",
         "finance_observation",
         "manual_finance_document",
@@ -3588,6 +3666,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # health event Zach has. Only the journal — which the public API does not
     # expose at all — is an events table here.
     # Hacker News: one events table; the why-rows and profile hang off it.
+    # Browser history: one events table, two adapters (page views, searches).
+    "browser_history_visits": _events(),
     "hacker_news_items": _events(),
     "hacker_news_user_items": _detail(
         "hacker_news_items", "why an item is archived (submitted / favorited / upvoted / hidden)"

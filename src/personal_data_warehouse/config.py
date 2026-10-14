@@ -318,6 +318,15 @@ class AppleContactsConfig:
 
 
 @dataclass(frozen=True)
+class BrowserHistoryConfig:
+    """Where the Mac browser-history uploader's batches land (via the app)."""
+
+    account: str
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class PhotosConfig:
     account: str
     library_path: str
@@ -639,6 +648,7 @@ class Settings:
     apple_notes: AppleNotesConfig | None = None
     apple_messages: AppleMessagesConfig | None = None
     apple_contacts: AppleContactsConfig | None = None
+    browser_history: BrowserHistoryConfig | None = None
     photos: PhotosConfig | None = None
     manual_finance: ManualFinanceConfig | None = None
     whatsapp: WhatsAppConfig | None = None
@@ -711,6 +721,8 @@ class Settings:
             configured_domains.add(email_domain(self.apple_messages.google_drive_account))
         if self.apple_contacts is not None:
             configured_domains.add(email_domain(self.apple_contacts.google_drive_account))
+        if self.browser_history is not None:
+            configured_domains.add(email_domain(self.browser_history.google_drive_account))
         if self.whatsapp is not None:
             configured_domains.add(email_domain(self.whatsapp.google_drive_account))
         if self.agent_sessions is not None:
@@ -752,6 +764,7 @@ def load_settings(
     require_apple_notes: bool = False,
     require_apple_messages: bool = False,
     require_apple_contacts: bool = False,
+    require_browser_history: bool = False,
     require_photos: bool = False,
     require_manual_finance: bool = False,
     require_whatsapp: bool = False,
@@ -1188,6 +1201,34 @@ def load_settings(
             storage_backend=apple_contacts_storage_backend,
             google_drive_account=apple_contacts_google_drive_account,
             google_drive_folder_id=apple_contacts_google_drive_folder_id,
+        )
+
+    # Browser history: the app writes the uploader's batches into the shared
+    # ingest folder; the Dagster reader lists the same folder.
+    browser_history_account = (
+        os.getenv("BROWSER_HISTORY_ACCOUNT") or apple_contacts_account
+    ).strip()
+    browser_history_google_drive_account = (
+        os.getenv("BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT") or apple_contacts_google_drive_account
+    ).strip()
+    browser_history_google_drive_folder_id = (
+        os.getenv("BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID") or apple_contacts_google_drive_folder_id
+    ).strip()
+    browser_history: BrowserHistoryConfig | None = None
+    if require_browser_history or os.getenv("BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID"):
+        if not browser_history_account:
+            raise ValueError("BROWSER_HISTORY_ACCOUNT or GMAIL_ACCOUNTS must be set for browser history sync")
+        if not browser_history_google_drive_account:
+            raise ValueError("BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT or BROWSER_HISTORY_ACCOUNT must be set")
+        if not browser_history_google_drive_folder_id:
+            raise ValueError(
+                "BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID, APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, "
+                "APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        browser_history = BrowserHistoryConfig(
+            account=browser_history_account,
+            google_drive_account=browser_history_google_drive_account,
+            google_drive_folder_id=browser_history_google_drive_folder_id,
         )
 
     photos_account = (
@@ -2097,6 +2138,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if apple_contacts and apple_contacts.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if browser_history:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if whatsapp and whatsapp.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
@@ -2151,6 +2194,7 @@ def load_settings(
         apple_notes=apple_notes,
         apple_messages=apple_messages,
         apple_contacts=apple_contacts,
+        browser_history=browser_history,
         photos=photos,
         manual_finance=manual_finance,
         whatsapp=whatsapp,

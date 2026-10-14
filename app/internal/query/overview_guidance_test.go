@@ -157,8 +157,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// Health Monitor, stress, trend points, GPS routes), the read interface
 	// that replaced walking raw JSON. Their first sentences are two or three
 	// words each (10204 -> 9625). 9700 is that and no more.
-	if guidance > 9700 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9700)", guidance)
+	//
+	// 9700 held until later on 2026-10-14, when the github and browser_history
+	// sources landed the same day, each with one START HERE relation
+	// (base_github.issues, base_browser_history.visits) whose rendered line is
+	// a few words. 9750 is those two entry points and no more.
+	if guidance > 9750 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9750)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

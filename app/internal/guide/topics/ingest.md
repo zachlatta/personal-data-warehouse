@@ -10,6 +10,7 @@ uploader's exec chain).
 | source | what it ships |
 | --- | --- |
 | `apple-messages`, `apple-notes`, `apple-contacts`, `apple-photos`, `voice-memos` | this Mac's Messages, Notes, Contacts, Photos and Voice Memos; normally run by a LaunchAgent every 5–30 minutes |
+| `browser-history` | this Mac's Chrome, Brave and Safari history (every profile); LaunchAgent every 15 minutes; Safari needs Full Disk Access |
 | `agent-sessions` | Claude Code, Codex, pi, Muse Code and OpenClaw transcripts from this machine |
 | `muse` | run ON a Muse VM (Meta's hosted agent) by a Muse hook: its transcripts plus its workspace files (memory, goals, feed, podcasts, uploads) |
 | `claude-desktop` | this Mac's Claude Desktop session credential, so the server can poll claude.ai conversations |

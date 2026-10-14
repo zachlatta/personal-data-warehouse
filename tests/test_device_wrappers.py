@@ -34,6 +34,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "agent-sessions-upload-systemd": ('"$PDW" ingest agent-sessions --mode incremental', "openclaw"),
     "apple-contacts-upload-launchd": ('"$PDW" ingest apple-contacts --mode incremental', "apple_contacts"),
     "apple-messages-upload-launchd": ('"$PDW" ingest apple-messages --mode incremental', "apple_messages"),
+    "browser-history-upload-launchd": ('"$PDW" ingest browser-history --mode incremental', "browser_history"),
     "apple-notes-upload-launchd": ('"$PDW" ingest apple-notes --mode incremental', "apple_notes"),
     "voice-memos-upload-launchd": ('"$PDW" ingest voice-memos --mode incremental', "apple_voice_memos"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
@@ -49,6 +50,7 @@ LAUNCH_AGENTS: dict[str, tuple[str, bool]] = {
     "agent-sessions-upload": ("agent-sessions-upload-launchd", False),
     "apple-contacts-upload": ("apple-contacts-upload-launchd", False),
     "apple-messages-upload": ("apple-messages-upload-launchd", False),
+    "browser-history-upload": ("browser-history-upload-launchd", False),
     "apple-notes-upload": ("apple-notes-upload-launchd", False),
     "voice-memos-upload": ("voice-memos-upload-launchd", False),
     "photos-upload": ("photos-upload-launchd", False),
@@ -110,7 +112,7 @@ def test_launch_agent_points_at_its_wrapper(label: str) -> None:
         assert plist["KeepAlive"] is True
         assert "StartInterval" not in plist
     else:
-        assert plist["StartInterval"] in (300, 1800, 3600), label
+        assert plist["StartInterval"] in (300, 900, 1800, 3600), label
     env = plist.get("EnvironmentVariables", {})
     assert not any("uv" in k.lower() or "python" in v.lower() for k, v in env.items()), env
 
@@ -128,6 +130,9 @@ def test_uploaders_run_every_five_minutes_and_photos_every_thirty() -> None:
     for label in ("agent-sessions-upload", "apple-contacts-upload", "apple-messages-upload", "apple-notes-upload", "voice-memos-upload"):
         assert interval(label) == 300, label
     assert interval("photos-upload") == 1800
+    # History lands in the browser's own database continuously; fifteen
+    # minutes keeps the copy of a large History file off the hot path.
+    assert interval("browser-history-upload") == 900
     for label in ("chatgpt-auth", "claude-desktop-auth"):
         assert interval(label) == 3600, label
 

@@ -645,6 +645,22 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("apple_contacts"),
     ),
     _source(
+        "browser_history",
+        "Browser history",
+        cadence="uploader every 15 min",
+        transport="Mac LaunchAgent → /ingest/browser-history/batch → Drive inbox → Dagster",
+        data=2 * DAY,
+        basis=(
+            "a Mac in daily use browses every day; 2 days (late at 4) leaves room"
+            " for a weekend away from the desk. The run heartbeat in"
+            " ops.uploader_heartbeats is what catches the uploader failing,"
+            " including a Safari Full Disk Access grant gone missing"
+        ),
+        note="run heartbeat posted by bin/browser-history-upload-launchd",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("browser_history"),
+    ),
+    _source(
         "google_drive",
         "Google Drive",
         cadence="every 30 min",
@@ -1436,6 +1452,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "contact_cards": _data("google_contacts", "synced_at", "source_updated_at"),
     "contact_sync_state": _state("google_contacts", "updated_at"),
     "apple_contact_cards": _data("apple_contacts", "synced_at", "source_updated_at"),
+    "browser_history_visits": _data("browser_history", "synced_at", "visited_at"),
     # Google Drive
     "google_drive_files": _data("google_drive", "ingested_at", "modified_time"),
     "google_drive_sync_state": _state("google_drive", "updated_at"),

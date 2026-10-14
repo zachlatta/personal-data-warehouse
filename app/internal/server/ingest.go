@@ -74,6 +74,7 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	"apple_messages":    {source: "apple_messages", blobKind: "apple_message_attachment", metadataKind: "apple_message_export_batch"},
 	"apple_voice_memos": {source: "apple_voice_memos", blobKind: "voice_memo_audio", metadataKind: "voice_memo_metadata", legacySources: []string{"voice_memos"}},
 	"apple_notes":       {source: "apple_notes", blobKind: "apple_note_body_html", metadataKind: "apple_note_revision_metadata"},
+	"browser_history":   {source: "browser_history", blobKind: "browser_history_blob", metadataKind: "browser_history_export_batch"},
 	// One shared transport for every photo source (apple_photos now;
 	// google_photos / photo_imports later): the metadata envelope carries the
 	// photo source slug and the Dagster reader routes rows into that source's
@@ -532,6 +533,7 @@ func ingestArtifacts() []ingestArtifact {
 		batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"),
 		batch("/ingest/apple-contacts/batch", "apple_contacts", "apple-contacts/inbox", "apple_contact_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
+		batch("/ingest/browser-history/batch", "browser_history", "browser-history/inbox", "browser_history_export_batch"),
 		// --- muse: a workspace file whose bytes do not ride inline in a batch
 		{
 			endpoint: "/ingest/muse/file",

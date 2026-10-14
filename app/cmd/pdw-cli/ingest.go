@@ -11,6 +11,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applecontacts"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applemessages"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applenotes"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/browserhistory"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/manualfinance"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/muse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/photos"
@@ -36,15 +37,16 @@ type localCommand func(args []string, stdin io.Reader, stdout, stderr io.Writer,
 // (claudedesktop.go) and runIngestWithConfig dispatches it before this table.
 // (Its actual conversation polling runs serverside in Dagster.)
 var ingestSources = map[string]localCommand{
-	"agent-sessions": agentsessions.Run,
-	"apple-contacts": applecontacts.Run,
-	"apple-messages": applemessages.Run,
-	"apple-notes":    applenotes.Run,
-	"apple-photos":   photos.Run,
-	"manual-finance": manualfinance.Run,
-	"muse":           muse.Run,
-	"plaid":          plaid.Run,
-	"voice-memos":    voicememos.Run,
+	"agent-sessions":  agentsessions.Run,
+	"apple-contacts":  applecontacts.Run,
+	"apple-messages":  applemessages.Run,
+	"apple-notes":     applenotes.Run,
+	"apple-photos":    photos.Run,
+	"browser-history": browserhistory.Run,
+	"manual-finance":  manualfinance.Run,
+	"muse":            muse.Run,
+	"plaid":           plaid.Run,
+	"voice-memos":     voicememos.Run,
 }
 
 // resolveIngestSource returns the uploader for a source, or ok=false when the
@@ -83,6 +85,7 @@ SOURCES
   apple-contacts   Upload local Apple/iCloud Contacts
   agent-sessions   Upload AI agent CLI session transcripts
   apple-photos     Upload local Apple Photos originals + metadata
+  browser-history  Upload Chrome, Brave and Safari history (every profile)
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
   plaid            Link, repair, list and unlink Plaid Items (sync runs in Dagster)
   manual-finance   Upload finance documents (statements, valuations, exports)

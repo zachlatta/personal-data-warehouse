@@ -89,6 +89,7 @@ from personal_data_warehouse.schema import (
     GITHUB_ISSUE_COLUMNS,
     GITHUB_SYNC_STATE_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
+    BROWSER_HISTORY_VISIT_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
     HACKER_NEWS_SESSION_COLUMNS,
     HACKER_NEWS_SYNC_STATE_COLUMNS,
@@ -377,6 +378,13 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         "github",
         ("github_commit", "github_issue", "github_comment", "github_event"),
         "COALESCE(t.metadata->>'subtype', t.kind)",
+    ),
+    # Page views and web searches from the Mac's browsers; the subsource is
+    # the browser (chrome / brave / safari).
+    (
+        "browser_history",
+        ("browser_visit", "browser_search"),
+        "COALESCE(t.metadata->>'browser', t.kind)",
     ),
 )
 # The adapters the broad-search pool scans through the low-volume partial BM25
@@ -1079,6 +1087,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         WHOOP_PRIVATE_SYNC_STATE_COLUMNS,
         ("account", "collection"),
     ),
+    # Browser history: one row per visit, keyed by the browser's own ids.
+    "browser_history_visits": TableSpec(
+        BROWSER_HISTORY_VISIT_COLUMNS,
+        ("account", "device", "browser", "profile", "visit_id"),
+    ),
     # Hacker News. `account` is the HN username.
     "hacker_news_items": TableSpec(HACKER_NEWS_ITEM_COLUMNS, ("account", "item_id")),
     "hacker_news_user_items": TableSpec(
@@ -1741,6 +1754,25 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "muse_files_modified_idx",
         "muse_files",
         "CREATE INDEX IF NOT EXISTS muse_files_modified_idx ON @muse_files (modified_at DESC)",
+    ),
+    # Browser history. synced_at leads for the freshness probe; the visit
+    # adapter's same-page-within-30-minutes test reads (profile, url_id,
+    # visited_at).
+    IndexSpec(
+        "browser_history_visits_synced_idx",
+        "browser_history_visits",
+        "CREATE INDEX IF NOT EXISTS browser_history_visits_synced_idx ON @browser_history_visits (synced_at)",
+    ),
+    IndexSpec(
+        "browser_history_visits_url_idx",
+        "browser_history_visits",
+        "CREATE INDEX IF NOT EXISTS browser_history_visits_url_idx ON @browser_history_visits "
+        "(account, device, browser, profile, url_id, visited_at)",
+    ),
+    IndexSpec(
+        "browser_history_visits_visited_idx",
+        "browser_history_visits",
+        "CREATE INDEX IF NOT EXISTS browser_history_visits_visited_idx ON @browser_history_visits (visited_at DESC)",
     ),
     IndexSpec(
         "hacker_news_items_synced_idx",
@@ -2450,6 +2482,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "github_issues": {"raw_json"},
     "github_comments": {"raw_json"},
     "github_events": {"payload_json"},
+    "browser_history_visits": {"raw_json"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2621,6 +2654,8 @@ TIMESTAMP_COLUMNS = {
     "balance_at",
     "transacted_at",
     "acquired_at",
+    # browser_history
+    "visited_at",
     # hacker_news
     "fetched_at",
     "discovered_at",
@@ -2749,6 +2784,11 @@ INTEGER_COLUMNS = {
     "consecutive_failures",
     # Muse workspace files: 1 when the content is inline text.
     "is_text",
+    # browser_history
+    "transition_raw",
+    "is_redirect",
+    "is_synced",
+    "visit_duration_ms",
     # hacker_news
     "descendants",
     "is_dead",
@@ -3143,6 +3183,8 @@ _WHOOP_PRIVATE_TABLES = (
     "whoop_private_sync_state",
     "whoop_private_sessions",
 )
+
+_BROWSER_HISTORY_TABLES = ("browser_history_visits",)
 
 _HACKER_NEWS_TABLES = (
     "hacker_news_items",
@@ -10338,6 +10380,30 @@ class PostgresWarehouse:
 
 
     # --- Hacker News -------------------------------------------------------
+
+    # --- Browser history ---------------------------------------------------
+
+    def ensure_browser_history_tables(self) -> None:
+        """Provision base_browser_history.visits."""
+        self._ensure_table_group(list(_BROWSER_HISTORY_TABLES))
+
+    def insert_browser_history_visits(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert visits by (account, device, browser, profile, visit_id)."""
+        if not rows:
+            return
+        self._insert_rows(
+            "browser_history_visits",
+            [
+                {
+                    column: row.get(
+                        column, _default_python_value(column, table="browser_history_visits")
+                    )
+                    for column in BROWSER_HISTORY_VISIT_COLUMNS
+                }
+                for row in rows
+            ],
+            BROWSER_HISTORY_VISIT_COLUMNS,
+        )
 
     def ensure_hacker_news_tables(self) -> None:
         """Provision the Hacker News source: items, why-rows, profile, state, session."""

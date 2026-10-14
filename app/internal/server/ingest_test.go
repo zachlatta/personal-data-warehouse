@@ -224,6 +224,29 @@ func TestIngestAppleContactsBatchStoresExpectedObject(t *testing.T) {
 	}
 }
 
+func TestIngestBrowserHistoryBatchStoresExpectedObject(t *testing.T) {
+	svc, stores := ingestTestService()
+	body := []byte("gzipped-visit-batch")
+	exportedAt := "2026-10-14T12:34:56+00:00"
+	target := signedIngestTarget("/ingest/browser-history/batch", body, url.Values{"exported_at": {exportedAt}})
+
+	rec := postIngest(t, svc, target, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["browser_history"].lastFile
+	if put == nil {
+		t.Fatal("expected PutFile to be called")
+	}
+	wantKey := "browser-history/inbox/batches/2026/10/20261014T123456Z-" + sha256Hex(body) + ".jsonl.gz"
+	if put.ObjectKey != wantKey {
+		t.Fatalf("object key = %q, want %q", put.ObjectKey, wantKey)
+	}
+	if put.Kind != "browser_history_export_batch" {
+		t.Fatalf("kind = %q", put.Kind)
+	}
+}
+
 func TestIngestRejectsBadSignature(t *testing.T) {
 	svc, _ := ingestTestService()
 	body := []byte("x")

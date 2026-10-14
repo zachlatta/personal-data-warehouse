@@ -84,6 +84,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
+    wh.ensure_browser_history_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -167,7 +168,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # (a separate tool and source from Muse, Meta's hosted agent).
         # +4 base: the github source (base_github.commits/issues/comments/
         # events), with +1 ops (github_sync_state, per-stream search cursors).
-        "base": 80,
+        # +1 base: base_browser_history.visits, every Chrome/Brave/Safari
+        # visit from the Mac uploader.
+        "base": 81,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,

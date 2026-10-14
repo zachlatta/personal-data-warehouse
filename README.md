@@ -457,6 +457,16 @@ retried in place (bounded by `WHOOP_MAX_RATE_LIMIT_SLEEP_SECONDS`, default 120) 
 first backfill can progress without restarting from page one; long/daily limits fail the run for
 operator visibility instead of sleeping a Dagster worker for hours.
 
+## Browser History Sync
+
+`pdw ingest browser-history` (LaunchAgent `com.zachlatta.personal-data-warehouse.browser-history-upload`,
+every 15 minutes) copies each Chrome, Brave and Safari profile's history database with its
+WAL/journal to a temporary directory, reads visits above its per-profile upload mark, and posts them
+to `/ingest/browser-history/batch`. Dagster's `browser_history_drive_inbox_sensor` promotes them
+into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `browser_search`; source
+`browser_history`, tier `self`) carry page views and web searches only; see
+[docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-browser-history-upload-scheduler).
+
 ## Hacker News Sync
 
 Archives Zach's Hacker News activity — his stories and comments, everything he upvoted,

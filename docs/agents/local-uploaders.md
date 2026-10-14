@@ -350,3 +350,61 @@ To add a source:
    wins when renditions disagree.
 5. Nothing else: identity/dedup (incl. the burst guard and cross-source perceptual merge),
    thumbnails, enrichment, timeline, and search all follow automatically from the registry.
+
+## Local Browser History Upload Scheduler
+
+The Mac that Zach browses on runs the browser-history uploader through a user LaunchAgent:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.browser-history-upload`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.browser-history-upload.plist`
+- Wrapper script: `bin/browser-history-upload-launchd`; status helper `bin/browser-history-upload-status`
+- Run cadence: every 900 seconds with `RunAtLoad`
+- Command: `pdw ingest browser-history --mode incremental` (native Go,
+  `app/internal/uploaders/browserhistory`)
+- Logs: `~/Library/Logs/personal-data-warehouse/browser-history-upload.run.log` and `.heartbeat`;
+  the run heartbeat posts as pipeline `browser_history`
+
+It reads every profile of Chrome (`~/Library/Application Support/Google/Chrome/<profile>/History`),
+Brave (`…/BraveSoftware/Brave-Browser/<profile>/History`) and Safari (`~/Library/Safari/History.db`
+plus Safari 17 profiles under `Profiles/<uuid>/History.db`). Each database is **copied** with its
+`-wal`/`-journal` sidecars to a temp directory before it is opened: Chromium holds `History` under
+an exclusive lock while running, and nothing may write to a live browser store. Times convert from
+Chromium's microseconds since 1601 and Safari's seconds since 2001. The state file keeps one
+upload mark per (browser, profile) — the largest visit id shipped — and both browsers'
+visit ids are AUTOINCREMENT, so every newer visit (including ones sync delivered from another
+device) is above it; a database whose ids fall below the mark was recreated and is re-read
+from the start (the warehouse upserts by `(account, device, browser, profile, visit_id)`).
+History deleted in the browser is **not** deleted from the warehouse. A first run backfills
+everything the browsers still hold (Chrome keeps ~90 days, Safari ~a year).
+
+**Search terms.** Chromium's `keyword_search_terms` (omnibox searches) wins; otherwise the
+query of a known search engine's results URL (Google, Bing, DuckDuckGo, Brave Search, Kagi,
+Yahoo, Ecosia) fills `search_term`, which is how Safari searches are captured.
+
+**Timeline volume.** Every visit lands in `base_browser_history.visits`, but a visit per
+timeline row would put redirect hops, subframe loads, reloads and tab-switch revisits into the
+BM25 index and the embedding queue. The `browser_visit` adapter therefore emits only page views:
+not a redirect hop (`is_redirect = 0`), not `auto_subframe`/`manual_subframe`/`reload`, and not
+a revisit of the same `url_id` in the same profile within 30 minutes of a previous visit.
+`browser_search` emits the same filter for visits with a `search_term`, titled
+`Searched: <term>`. Both are `self` (Zach did it). `context` is the profile's UTC day, so
+`timeline.context()` on a hit shows what else was read around it.
+
+**Full Disk Access.** Chrome and Brave need none; Safari's `History.db` does. If the run log
+shows `Could not open …/Library/Safari/History.db … Grant Full Disk Access`, the Chromium
+profiles were still uploaded and the run exits 1 (so `/pipelines` reads `failing`): grant Full
+Disk Access to `/bin/zsh` and `~/.local/bin/pdw` (System Settings → Privacy & Security →
+Full Disk Access → `+`, ⌘⇧G to type the path), then
+`launchctl kickstart -k gui/$(id -u)/com.zachlatta.personal-data-warehouse.browser-history-upload`.
+
+Install or reinstall:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.browser-history-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.browser-history-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.browser-history-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.browser-history-upload
+```
+
+SQL starting points: `base_browser_history.visits`; timeline `source = 'browser_history'`
+(`kind` `visit` or `search`); search scope `sources => ARRAY['browser_history']`.

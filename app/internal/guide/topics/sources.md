@@ -114,6 +114,18 @@ branches); `base_github.events` his 90-day activity feed. Timeline source `githu
 @-mentioning him `direct`, a thread he was active in that month `cc`, bots `noise`. Prefer these
 rows over GitHub notification emails in Gmail, which are `noise`.
 
+## Web browsing (Chrome, Brave, Safari)
+
+`base_browser_history.visits` is one row per visit from the Mac's browsers, every profile:
+`browser` (`chrome`/`brave`/`safari`), `profile`/`profile_name`, `device`, `url`, `host`,
+`title`, `visited_at`, `transition` (Chromium's `typed`, `link`, `reload`, …; empty for
+Safari), `search_term` (set on a web search). `is_redirect`/`is_synced` are 0/1; a synced
+visit came from another device (Safari via iCloud includes the phone). Chrome keeps ~90
+days, Safari ~a year, so older history never existed here. Timeline source
+`browser_history`, search scope `browser_history`, all `self`: kind `search` for a search,
+`visit` for a page view. The timeline skips redirect hops, subframes, reloads and
+revisits of one page within 30 minutes; query `base_*` for every visit.
+
 ## Muse
 
 Muse is Meta's hosted personal agent, running on its own VM. Its chats are agent sessions

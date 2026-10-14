@@ -94,6 +94,11 @@ func (g Getenv) AppleContactsAccount() string {
 	return firstNonEmpty(g.Env("APPLE_CONTACTS_ACCOUNT"), g.AppleMessagesAccount())
 }
 
+// BrowserHistoryAccount: BROWSER_HISTORY_ACCOUNT, then the Messages chain.
+func (g Getenv) BrowserHistoryAccount() string {
+	return firstNonEmpty(g.Env("BROWSER_HISTORY_ACCOUNT"), g.AppleMessagesAccount())
+}
+
 // PhotosAccount: PHOTOS_ACCOUNT, then the Messages chain.
 func (g Getenv) PhotosAccount() string {
 	return firstNonEmpty(g.Env("PHOTOS_ACCOUNT"), g.AppleMessagesAccount())

@@ -83,6 +83,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
+    wh.ensure_browser_history_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()
@@ -1236,6 +1237,33 @@ def _seed_github(wh) -> None:
                                     "created_at": _gh_ts(1), "public": True, "payload": {}}, now=_NOW),
         ]
     )
+    # Browser history: two real page views of one page 2h apart, a redirect
+    # hop, a revisit inside 30 minutes, a reload and one web search. Only the
+    # two page views and the search are timeline events.
+    def _visit(visit_id, url_id, hours_ago, **overrides):
+        row = {
+            "account": "zach@example.com", "device": "testmac", "browser": "chrome",
+            "profile": "Default", "visit_id": visit_id, "profile_name": "Personal",
+            "url_id": url_id, "url": f"https://example.test/{url_id}", "host": "example.test",
+            "title": f"Page {url_id}", "visited_at": _NOW - timedelta(hours=hours_ago),
+            "transition": "link", "transition_raw": 0x30000000, "is_redirect": 0, "is_synced": 0,
+            "from_visit_id": "0", "visit_duration_ms": 1000, "search_term": "", "raw_json": {},
+            "exported_at": _NOW, "synced_at": _NOW, "sync_version": 1,
+        }
+        row.update(overrides)
+        return row
+
+    wh.insert_browser_history_visits(
+        [
+            _visit("1", "1", 4),
+            _visit("2", "2", 3.99, is_redirect=1),
+            _visit("3", "1", 3.8),
+            _visit("4", "3", 3.5, transition="reload"),
+            _visit("5", "4", 3, search_term="synthetic query", title="synthetic query - Search",
+                   url="https://www.google.com/search?q=synthetic+query", host="www.google.com"),
+            _visit("6", "1", 2),
+        ]
+    )
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -1281,6 +1309,8 @@ EXPECTED_SEEDED_PRIORITIES = {
     "github_issue": "noise",
     "github_comment": "self",
     "github_event": "self",
+    "browser_visit": "self",
+    "browser_search": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
@@ -1321,6 +1351,10 @@ EXPECTED_SEEDED_EVENTS = {
     "github_comment": 4,
     # Only the star: a push duplicates commit search.
     "github_event": 1,
+    # Visits 1 and 6 of one page; 2 (redirect), 3 (revisit within 30 min) and
+    # 4 (reload) stay in base_browser_history only.
+    "browser_visit": 2,
+    "browser_search": 1,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -1497,6 +1531,17 @@ def test_backfill_normalizes_every_source(warehouse):
     assert gh["zachlatta/demo|abc123"]["title"] == "Commit to zachlatta/demo: Fix the thing"
     assert gh["e1"]["title"] == "Starred org/cool"
     assert gh["1"]["metadata"]["subtype"] == "pull_request"
+    browser = {r["source_pk"]["visit_id"]: r for r in rows if r["source"] == "browser_history"}
+    assert set(browser) == {"1", "5", "6"}
+    assert browser["1"]["kind"] == "visit"
+    assert browser["1"]["title"] == "Page 1"
+    assert browser["1"]["snippet"] == "https://example.test/1"
+    assert browser["1"]["metadata"]["url"] == "https://example.test/1"
+    assert browser["1"]["source_table"] == "browser_history_visits"
+    assert browser["5"]["kind"] == "search"
+    assert browser["5"]["title"] == "Searched: synthetic query"
+    assert "synthetic query" in browser["5"]["search_text"]
+    assert browser["1"]["context"] == browser["5"]["context"]
 
     # Second run is a no-op: nothing new, no seq churn. Keyed on the real
     # primary key: event_id alone is only unique within an adapter, and the

@@ -311,6 +311,14 @@
       "comment": "Faithful hacker news source data: Zach's items and lists plus the full discussion under every story he touched; not a mirror of HN."
     },
     {
+      "name": "base_browser_history",
+      "layer": "base",
+      "domain": "browser_history",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful browser history source data: Chrome, Brave and Safari visits."
+    },
+    {
       "name": "derived_documents",
       "layer": "derived",
       "domain": "documents",
@@ -3307,6 +3315,18 @@
       "discoverable": false,
       "query_access": "denied",
       "secret": false
+    },
+    {
+      "id": "browser_history_visits",
+      "kind": "table",
+      "layer": "base",
+      "domain": "browser_history",
+      "schema": "base_browser_history",
+      "name": "visits",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for web browsing. One row per Chrome/Brave/Safari visit; search_term is set on web searches."
     },
     {
       "id": "hacker_news_items",

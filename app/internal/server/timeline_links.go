@@ -99,6 +99,14 @@ func timelineDeepLinkFor(row map[string]any, env timelineLinkEnv) *timelineDeepL
 			URL:   "https://drive.google.com/open?id=" + url.QueryEscape(fileID) + "&authuser=" + url.QueryEscape(linkString(pk, "account")),
 			Label: "Google Drive",
 		}
+	case sourceTable == "browser_history_visits":
+		// The visit's own page; only web URLs are worth a button (a
+		// chrome:// or file:// URL opens nothing on another device).
+		page := linkString(meta, "url")
+		if parsed, err := url.Parse(page); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil
+		}
+		return &timelineDeepLink{URL: page, Label: "Open page"}
 	case sourceTable == "contact_cards" || sourceTable == "apple_contact_cards":
 		return contactDeepLink(pk)
 	case sourceTable == "ai_conversation_events":

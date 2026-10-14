@@ -3147,3 +3147,49 @@ GITHUB_SYNC_STATE_COLUMNS = (
     "updated_at",
     "sync_version",
 )
+
+
+# --- Browser history --------------------------------------------------------
+#
+# One row per visit from a Mac's Chrome, Brave and Safari history databases
+# (every profile), shipped by `pdw ingest browser-history`. `visit_id` and
+# `url_id` are the browser's own local ids, unique per (device, browser,
+# profile) history database.
+BROWSER_HISTORY_VISIT_COLUMNS = (
+    "account",
+    "device",
+    # chrome / brave / safari
+    "browser",
+    # Chromium's profile directory ("Default", "Profile 1"); "Default" or a
+    # profile uuid for Safari.
+    "profile",
+    "visit_id",
+    # The name the person gave the profile, where the browser records one.
+    "profile_name",
+    "url_id",
+    # Truncated at 4,096 characters by the uploader.
+    "url",
+    # Lowercased host of an http(s) URL, '' otherwise.
+    "host",
+    "title",
+    "visited_at",
+    # Chromium's core page transition (link, typed, auto_bookmark,
+    # auto_subframe, manual_subframe, generated, auto_toplevel, form_submit,
+    # reload, keyword, keyword_generated); '' for Safari, which records none.
+    "transition",
+    "transition_raw",
+    # 1 when this visit was a redirect hop: the browser went on to another URL.
+    "is_redirect",
+    # 1 when another device recorded the visit and the browser's sync
+    # delivered it (Chrome sync, Safari via iCloud).
+    "is_synced",
+    "from_visit_id",
+    "visit_duration_ms",
+    # The query of a web search: Chromium's omnibox search term, else the
+    # query of a known search engine's results URL.
+    "search_term",
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)

@@ -408,6 +408,13 @@ func (c *Client) UploadAppleContactsBatch(gzipBytes []byte, exportedAt string) (
 	return c.post("/ingest/apple-contacts/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
 }
 
+// --- browser history ---------------------------------------------------------
+
+// UploadBrowserHistoryBatch posts a gzipped JSONL batch of browser visits.
+func (c *Client) UploadBrowserHistoryBatch(gzipBytes []byte, exportedAt string) (StoredObject, error) {
+	return c.post("/ingest/browser-history/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
+}
+
 // --- voice memos ------------------------------------------------------------
 
 // UploadVoiceMemoAudio lives in resumable.go: a recording streams to a Drive
