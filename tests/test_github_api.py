@@ -182,3 +182,15 @@ def test_config_needs_the_login_and_keeps_tokens_out_of_its_repr(monkeypatch) ->
     monkeypatch.delenv("GITHUB_PROXY_BASE_URL")
     with pytest.raises(ValueError, match="GITHUB_ACCOUNT"):
         load_settings(require_gmail=False, require_github=True)
+
+
+def test_fraction_left_is_the_scarcer_of_requests_and_time() -> None:
+    now = [0.0]
+    budget = RequestBudget(max_requests=10, max_seconds=100, clock=lambda: now[0])
+    assert budget.fraction_left() == 1.0
+    budget.take()
+    assert budget.fraction_left() == pytest.approx(0.9)
+    now[0] = 70.0
+    assert budget.fraction_left() == pytest.approx(0.3)
+    now[0] = 200.0
+    assert budget.fraction_left() == 0.0

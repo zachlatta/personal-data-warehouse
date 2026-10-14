@@ -128,9 +128,12 @@ class GitHubSyncRunner:
         self._clients = list(clients)
         self._account = account
         self._budget = budget
-        # Backfill may spend until this many requests remain; the rest is the
-        # thread walk's, so a long history never starves live conversations.
-        self._thread_reserve = int(budget.remaining() * (1.0 - backfill_share))
+        # Backfill may spend until this share of the run (requests OR time,
+        # whichever is scarcer) remains; the rest is the thread walk's, so a
+        # long history never starves conversations. Time is usually the
+        # scarcer: the first production run spent its ten minutes on 385
+        # requests and read no thread.
+        self._thread_reserve = 1.0 - backfill_share
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._log = logger or logging.getLogger(__name__)
         self._summary = GitHubSyncSummary(account=account)
@@ -280,7 +283,7 @@ class GitHubSyncRunner:
             cursor = self._run_start
         span = timedelta(seconds=int(row.get("backfill_span_seconds") or 0)) or INITIAL_SPAN
         base_query = stream.render(self._account)
-        while cursor > BACKFILL_FLOOR and self._budget.remaining() > self._thread_reserve:
+        while cursor > BACKFILL_FLOOR and self._budget.fraction_left() > self._thread_reserve:
             start = max(BACKFILL_FLOOR, cursor - span)
             end = cursor - timedelta(seconds=1)
             query = f"{base_query} {stream.created_qualifier}:{iso(start)}..{iso(end)}"

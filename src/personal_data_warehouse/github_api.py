@@ -99,12 +99,19 @@ class RequestBudget:
 
     def __init__(self, *, max_requests: int, max_seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
         self._max_requests = max(int(max_requests), 0)
+        self._max_seconds = max(float(max_seconds), 0.0)
         self._clock = clock
-        self._deadline = clock() + max(float(max_seconds), 0.0)
+        self._deadline = clock() + self._max_seconds
         self.used = 0
 
     def remaining(self) -> int:
         return max(self._max_requests - self.used, 0)
+
+    def fraction_left(self) -> float:
+        """The scarcer of requests and time left, as a share of the run's budget."""
+        requests = self.remaining() / self._max_requests if self._max_requests else 0.0
+        seconds = (self._deadline - self._clock()) / self._max_seconds if self._max_seconds else 0.0
+        return max(min(requests, seconds), 0.0)
 
     def take(self) -> None:
         if self.used >= self._max_requests or self._clock() >= self._deadline:

@@ -270,3 +270,24 @@ def test_a_thread_no_credential_can_see_is_marked_not_retried(warehouse) -> None
     run(warehouse, fake)
     assert warehouse._query("SELECT thread_status FROM @github_issues WHERE issue_id = '3'") == [("not_found",)]
     assert warehouse.github_threads_due(account=ACCOUNT, limit=10) == []
+
+
+def test_a_slow_backfill_leaves_the_threads_their_share_of_the_time(warehouse) -> None:
+    """Each request costs 10 s of a 100 s run: backfill must stop at 60% of the
+    time, not run into the deadline with the thread walk never started."""
+    fake = seeded()
+    clock = [0.0]
+    budget = RequestBudget(max_requests=10_000, max_seconds=100, clock=lambda: clock[0])
+    session = fake.session()
+
+    class SlowSession:
+        def get(self, *args, **kwargs):
+            clock[0] += 10.0
+            return session.get(*args, **kwargs)
+
+    client = GitHubClient(
+        GitHubCredential.proxy("k", base_url="https://proxy.example.test/gh"),
+        budget=budget, session=SlowSession(), sleep=lambda _s: None, clock=lambda: clock[0],
+    )
+    summary = GitHubSyncRunner(warehouse=warehouse, clients=[client], account=ACCOUNT, budget=budget, now=lambda: NOW).sync()
+    assert summary.threads_read >= 1
