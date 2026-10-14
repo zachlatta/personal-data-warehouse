@@ -31,9 +31,28 @@ var drillRelations = func() map[string]string {
 	return out
 }()
 
+// drillDroppedColumns are left out of every drill row: provider payloads and
+// markup that duplicate a readable column and run to 100 KB+ (one Gmail row
+// measured 2026-10-13: payload_json 116 KB, body_html 76 KB, against a
+// 5.9 KB body_markdown_clean). A column a relation lacks is a no-op.
+var drillDroppedColumns = []string{"raw_json", "payload_json", "body_html", "raw_metadata_json", "blocks_json", "body_markdown_full"}
+
+// drillExtraDropped are per-relation duplicates of the column to read.
+var drillExtraDropped = map[string][]string{
+	// body_markdown_clean is the body to read; body_text carries tracking URLs.
+	"base_gmail.messages": {"body_text", "body_markdown"},
+}
+
+// DrillValueMaxChars caps each value a drill statement returns.
+const DrillValueMaxChars = 20000
+
 // DrillSQL returns a statement that reads the authoritative row behind a
 // timeline event from its source_table and source_pk, or "" when either does
 // not resolve. sourcePK may be the decoded jsonb (map) or its JSON text.
+//
+// The row comes back as key/value pairs (one row per column) so one shape
+// fits every relation without a column list: provider payloads and duplicate
+// markup are dropped and each value is capped at DrillValueMaxChars.
 func DrillSQL(sourceTable string, sourcePK any) string {
 	relation, ok := drillRelations[strings.TrimSpace(sourceTable)]
 	if !ok {
@@ -42,6 +61,13 @@ func DrillSQL(sourceTable string, sourcePK any) string {
 	pk, ok := drillKey(sourcePK)
 	if !ok || len(pk) == 0 {
 		return ""
+	}
+	// An agent_session headline's key is (source, session_id): its row is the
+	// session, not every event in it (739 rows for one sampled session).
+	if relation == "marts_ai_conversations.events" {
+		if _, turn := pk["event_uuid"]; !turn {
+			relation = "marts_ai_conversations.sessions"
+		}
 	}
 	keys := make([]string, 0, len(pk))
 	for key := range pk {
@@ -57,9 +83,11 @@ func DrillSQL(sourceTable string, sourcePK any) string {
 		if !ok {
 			return ""
 		}
-		predicates = append(predicates, key+" = "+literal)
+		predicates = append(predicates, "t."+key+" = "+literal)
 	}
-	return "SELECT * FROM " + relation + " WHERE " + strings.Join(predicates, " AND ")
+	dropped := append(append([]string(nil), drillDroppedColumns...), drillExtraDropped[relation]...)
+	return fmt.Sprintf("SELECT kv.key, left(kv.value, %d) AS value FROM %s t, jsonb_each_text(to_jsonb(t) - '{%s}'::text[]) AS kv(key, value) WHERE %s",
+		DrillValueMaxChars, relation, strings.Join(dropped, ","), strings.Join(predicates, " AND "))
 }
 
 func drillKey(sourcePK any) (map[string]any, bool) {

@@ -83,7 +83,7 @@ func TestContextFullReturnsEachEventsWholeTextUpToACapAndItsDrill(t *testing.T) 
 	if row["text"] != "the whole turn" {
 		t.Fatalf("row = %#v", row)
 	}
-	if row["drill_sql"] != "SELECT * FROM marts_ai_conversations.events WHERE event_uuid = 'u54' AND session_id = 's1' AND source = 'codex'" {
+	if row["drill_sql"] != drillWant("marts_ai_conversations.events", "", "t.event_uuid = 'u54' AND t.session_id = 's1' AND t.source = 'codex'") {
 		t.Fatalf("drill_sql = %#v", row["drill_sql"])
 	}
 	if _, leaked := row["source_pk"]; leaked {
