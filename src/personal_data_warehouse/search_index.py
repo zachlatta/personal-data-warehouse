@@ -39,7 +39,6 @@ from personal_data_warehouse.postgres import (
     SEARCH_EMBEDDING_DEFAULT_MODEL,
     SEARCH_EMBEDDING_DIMENSIONS,
     PostgresWarehouse,
-    search_chunk_vectors_lock_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -828,13 +827,11 @@ class SearchEmbeddingRunner:
         limit = VECTOR_RECONCILE_BATCH_ROWS
         self._wh._command("BEGIN")
         try:
-            # The triggers' lock: a chunk deleted or re-texted while this
-            # reads would otherwise leave a stale row for a week. It holds
-            # off the chunk builder for the reconcile's few minutes, weekly.
-            self._wh._query(
-                "SELECT pg_advisory_xact_lock(%s)",
-                (search_chunk_vectors_lock_key(self._wh._schema),),
-            )
+            # Deliberately not the triggers' lock: holding it here stalled
+            # the chunk builder for the whole pass (6+ minutes in production
+            # on 2026-10-14). A row this races with a concurrent rebuild is
+            # repaired by the next pass, and fusion drops a ref whose event
+            # is gone.
             self._wh._command("SET LOCAL max_parallel_workers_per_gather = 0")
             self._wh._command("SET LOCAL enable_hashjoin = off")
             restored = self._wh._query(
@@ -859,13 +856,14 @@ class SearchEmbeddingRunner:
                 ") SELECT (SELECT count(*) FROM missing), (SELECT count(*) FROM written)",
                 (model, model, limit, model),
             )
+            # A vector row is stale when its chunk is gone. A changed text or
+            # a removed embedding is the triggers' job; probing for those too
+            # fetched a chunk heap row per vector (9.4M random reads).
             removed = self._wh._query(
                 "WITH stale AS ("
                 "  SELECT v.adapter, v.chunk_id FROM @search_chunk_vectors v"
                 "  WHERE v.model = %s AND NOT EXISTS ("
-                "    SELECT 1 FROM @search_chunks c JOIN @search_chunk_embeddings e"
-                "      ON e.text_sha256 = c.text_sha256 AND e.model = v.model"
-                "    WHERE c.chunk_id = v.chunk_id AND c.adapter = v.adapter)"
+                "    SELECT 1 FROM @search_chunks c WHERE c.chunk_id = v.chunk_id)"
                 "  LIMIT %s"
                 "), deleted AS ("
                 "  DELETE FROM @search_chunk_vectors v USING stale s"
