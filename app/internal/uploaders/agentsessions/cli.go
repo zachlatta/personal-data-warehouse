@@ -17,9 +17,10 @@ USAGE
   pdw ingest agent-sessions [--mode incremental|full] [--limit N] [--batch-size N]
                             [--state-file PATH] [--lock-file PATH]
 
-Tails ~/.claude/projects, ~/.codex/sessions, ~/.openclaw/agents/main/sessions
-and ~/.pi/agent/sessions (AGENT_SESSIONS_*_DIR override each; set one empty to
-disable that tool on this host), coalesces new lines into gzipped JSONL
+Tails ~/.claude/projects, ~/.codex/sessions, ~/.openclaw/agents/main/sessions,
+~/.pi/agent/sessions and Muse Code's ~/.local/share/muse/sessions
+(AGENT_SESSIONS_*_DIR override each; set one empty to disable that tool on
+this host), coalesces new lines into gzipped JSONL
 batches and posts them to the app's /ingest/agent-sessions/batch endpoint.
 
 FLAGS
