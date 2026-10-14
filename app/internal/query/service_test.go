@@ -945,3 +945,12 @@ func TestUndefinedFunctionHintNamesThePostgresSpellingOfAClickHouseFunction(t *t
 		}
 	}
 }
+
+// PostgreSQL caps a regex repeat count at 255; agents write .{0,300} to grab
+// context around a match (3 of 146 eval sessions after 2026-10-14's fixes).
+func TestRegexRepetitionHintNamesThe255Cap(t *testing.T) {
+	hint := schemaErrorHint(`ERROR: invalid regular expression: invalid repetition count(s) (SQLSTATE 2201B)`, `SELECT substring(t from '.{0,300}x') FROM a.b t`)
+	if !strings.Contains(hint, "255") || !strings.Contains(hint, "substr") {
+		t.Fatalf("hint = %q", hint)
+	}
+}

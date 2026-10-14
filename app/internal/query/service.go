@@ -1017,6 +1017,11 @@ func init() {
 var quotedIdentifierRe = regexp.MustCompile(`"([^"]+)"`)
 
 func schemaErrorHint(message, sql string) string {
+	if strings.Contains(message, "invalid repetition count") {
+		// PostgreSQL's regex engine caps {m,n} at 255 (RE_DUP_MAX); agents
+		// write .{0,300} to grab context around a match.
+		return "(hint: PostgreSQL regex repeat counts max out at 255 — use .{0,255}, or take context with substr(col, greatest(1, strpos(lower(col), 'needle') - 300), 600).)"
+	}
 	if hint := statementTimeoutHint(message); hint != "" {
 		return hint
 	}
