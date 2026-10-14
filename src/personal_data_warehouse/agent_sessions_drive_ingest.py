@@ -2,16 +2,17 @@
 
 Three transports feed the same row schema:
 
-* The CLI tools (Claude Code, Codex, OpenClaw, pi, Muse) write
+* The CLI tools (Claude Code, Codex, OpenClaw, pi, Muse, Argon) write
   append-only JSONL transcripts that a per-device uploader tails and batches
   into ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This
   module consumes those batches and normalizes each raw line into
   source-owned rows (``base_claude_code.events``, ``base_codex.events``,
-  ``base_openclaw.events``, ``base_pi.events``, or
-  ``base_muse_code.events``; lossless ``raw_json`` plus queryable columns),
+  ``base_openclaw.events``, ``base_pi.events``, ``base_muse_code.events``, or
+  ``base_argon.events``; lossless ``raw_json`` plus queryable columns),
   then promotes processed batch files into ``agent-sessions/library/``.
   Muse is Meta's Muse coding CLI -- a different tool from Muse,
-  Meta's hosted agent below, despite the shared name.
+  Meta's hosted agent below, despite the shared name. Argon is Google's
+  Antigravity CLI (``agy``) running Gemini 4 Argon.
 * Claude Desktop is polled server-side from claude.ai using a credential pushed
   from the local desktop app. It ships ``claude_desktop_event`` envelopes through
   the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
@@ -1387,6 +1388,158 @@ def _muse_code_blocks_text(blocks: Any) -> str:
     return "\n".join(text for text in texts if text)
 
 
+# --- Argon (Google's Antigravity CLI, `agy`, running Gemini 4 Argon) ---------
+#
+# Antigravity CLI keeps one untruncated append-only transcript per session at
+# ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl.
+# Each line is a step record ``{step_index, source, type, status, created_at,
+# ...}``. Per-session metadata (cwd, title, parent_session_id for subagents) is
+# read by the uploader from conversation_summaries.db and annotations/<id>.pbtxt
+# and shipped on ``session``. Shapes verified against agy 1.3.4 on 2026-10-13.
+
+ARGON_SOURCE = "argon"
+_ARGON_USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
+_ARGON_MODEL_SELECTION_RE = re.compile(
+    r"The user changed setting `Model Selection` from [^\n]+? to ([^.\n]+)"
+)
+_ARGON_HARNESS_PREAMBLE_RE = re.compile(
+    r"^(?:<system_instructions>.*?</system_instructions>\s*|\s*Start by reading the start-here skill:[^\n]*\n+)+",
+    re.DOTALL,
+)
+_ARGON_METADATA_TAG_RE = re.compile(
+    r"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>.*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>",
+    re.DOTALL,
+)
+
+
+def argon_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+    session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize one line of an Antigravity CLI ``transcript_full.jsonl``.
+
+    Steps have ``type`` in ``USER_INPUT`` (user prompt wrapped in
+    ``<USER_REQUEST>`` plus ``<ADDITIONAL_METADATA>`` and
+    ``<USER_SETTINGS_CHANGE>``), ``PLANNER_RESPONSE`` (assistant message,
+    tool-call batch, or thinking-only turn with token usage), ``GENERIC``
+    (tool execution output), ``CHECKPOINT`` (compaction summary), and
+    ``SYSTEM_MESSAGE`` (async task/subagent wakeup).
+
+    Never raises on an unexpected shape: this runs inside the one ingest pass
+    every agent-session provider shares.
+    """
+    parent = str(session.get("parent_session_id", "") or "")
+    step_type = str(line.get("type", "") or "")
+    row = _base_row(
+        source=ARGON_SOURCE,
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=_argon_event_uuid(line, session_id=session_id, seq=seq),
+        occurred_at=_muse_time(line.get("created_at")),
+        ingested_at=ingested_at,
+    )
+    row["event_type"] = step_type
+    row["cwd"] = str(session.get("cwd", "") or "")
+    row["git_branch"] = str(session.get("git_branch", "") or "")
+    row["repo_url"] = str(session.get("repo_url", "") or "")
+    row["session_title"] = str(session.get("title", "") or "")
+    row["model"] = str(session.get("model", "") or "")
+    if parent:
+        row["is_sidechain"] = 1
+        row["parent_uuid"] = parent
+        row["entrypoint"] = "subagent"
+
+    row["input_tokens"] = _int(line.get("input_tokens"))
+    row["output_tokens"] = _int(line.get("output_tokens"))
+    row["cache_read_tokens"] = _int(line.get("cache_read_tokens"))
+    row["cache_creation_tokens"] = _int(line.get("cache_creation_tokens"))
+
+    raw_content = _stringify(line.get("content"))
+    if step_type == "USER_INPUT":
+        if not row["model"]:
+            model_match = _ARGON_MODEL_SELECTION_RE.search(raw_content)
+            if model_match:
+                row["model"] = model_match.group(1).strip()
+        text = _argon_user_text(raw_content)
+        if text:
+            row["role"] = "user"
+            row["subtype"] = "message"
+            row["text"] = text
+    elif step_type == "PLANNER_RESPONSE":
+        row["role"] = "assistant"
+        calls = (
+            [call for call in line.get("tool_calls") or [] if isinstance(call, Mapping)]
+            if isinstance(line.get("tool_calls"), list)
+            else []
+        )
+        content = raw_content.strip()
+        if calls:
+            row["subtype"] = "tool_use"
+            row["tool_name"] = str(calls[0].get("name", "") or "")
+            if len(calls) == 1:
+                args = calls[0].get("args")
+                row["tool_input_json"] = raw_json(args if isinstance(args, Mapping) else {})
+            else:
+                row["tool_input_json"] = raw_json({"tool_calls": calls})
+            if not row["cwd"]:
+                for call in calls:
+                    args = call.get("args")
+                    if isinstance(args, Mapping) and args.get("Cwd"):
+                        row["cwd"] = str(args.get("Cwd") or "")
+                        break
+            if content:
+                row["text"] = content
+        elif content:
+            row["subtype"] = "message"
+            row["text"] = content
+        else:
+            # Reasoning stays in raw_json only, as for every other agent source.
+            row["subtype"] = "thinking"
+    elif step_type == "GENERIC":
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["text"] = raw_content
+        status = str(line.get("status", "") or "")
+        if raw_content or status:
+            row["tool_result_json"] = raw_json({"content": raw_content, "status": status})
+    elif step_type == "CHECKPOINT":
+        row["role"] = "meta"
+        row["subtype"] = "compaction"
+        row["text"] = raw_content
+    elif step_type == "SYSTEM_MESSAGE":
+        row["role"] = "system"
+        row["subtype"] = "system_message"
+        row["text"] = raw_content
+    return row
+
+
+def _argon_event_uuid(line: Mapping[str, Any], *, session_id: str, seq: int) -> str:
+    step_index = line.get("step_index")
+    if isinstance(step_index, float) and step_index.is_integer():
+        step_index = int(step_index)
+    if not isinstance(step_index, bool) and isinstance(step_index, int) and step_index >= 0:
+        return f"{session_id}#{step_index}"
+    return f"{session_id}#{seq}"
+
+
+def _argon_user_text(raw: str) -> str:
+    if not raw:
+        return ""
+    match = _ARGON_USER_REQUEST_RE.search(raw)
+    body = match.group(1) if match else _ARGON_METADATA_TAG_RE.sub("", raw)
+    cleaned = _ARGON_HARNESS_PREAMBLE_RE.sub("", body).strip()
+    return cleaned if cleaned else body.strip()
+
+
 def _openclaw_text(content: Any) -> str:
     return _join_text_blocks(content, text_types=("text",))
 
@@ -1491,11 +1644,13 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 # Builders that also take the per-transcript ``session`` metadata the uploader
-# read from outside the line itself (Muse: the session kind; Muse Code: a
-# subagent's parent).
+# read from outside the line itself (Muse: the session kind; Muse Code and
+# Argon: a subagent's parent, workspace cwd, and title).
 _SESSION_AWARE_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "muse": muse_event_row,
     MUSE_CODE_SOURCE: muse_code_event_row,
+    ARGON_SOURCE: argon_event_row,
+    "antigravity": argon_event_row,
 }
 
 

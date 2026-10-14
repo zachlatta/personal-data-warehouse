@@ -18,9 +18,9 @@ USAGE
                             [--state-file PATH] [--lock-file PATH]
 
 Tails ~/.claude/projects, ~/.codex/sessions, ~/.openclaw/agents/main/sessions,
-~/.pi/agent/sessions and Muse Code's ~/.local/share/muse/sessions
-(AGENT_SESSIONS_*_DIR override each; set one empty to disable that tool on
-this host), coalesces new lines into gzipped JSONL
+~/.pi/agent/sessions, Muse Code's ~/.local/share/muse/sessions and Argon's
+~/.gemini/antigravity-cli/brain (AGENT_SESSIONS_*_DIR override each; set one
+empty to disable that tool on this host), coalesces new lines into gzipped JSONL
 batches and posts them to the app's /ingest/agent-sessions/batch endpoint.
 
 FLAGS

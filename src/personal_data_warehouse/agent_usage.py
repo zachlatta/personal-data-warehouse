@@ -307,7 +307,7 @@ def _input_scope(raw: str, *, is_mcp: bool) -> tuple[bool, tuple[str, ...]]:
     for value in _walk_json(raw):
         if not isinstance(value, dict):
             continue
-        for key in ("command", "cmd"):
+        for key in ("command", "cmd", "CommandLine"):
             if isinstance(value.get(key), str):
                 command_texts.append(value[key])
     if not command_texts:
@@ -514,7 +514,7 @@ calls AS (
   FROM ev2
   WHERE (
        tool_name ILIKE '%%personal_data_warehouse%%'
-       OR (tool_name IN ('Bash', 'bash', 'shell', 'exec_command', 'container.exec', 'exec')
+       OR (tool_name IN ('Bash', 'bash', 'shell', 'exec_command', 'container.exec', 'exec', 'run_command')
            AND inp0 ~ '{invoked}')
        OR (source = 'codex' AND inp0 ~ '{invoked}')
   )

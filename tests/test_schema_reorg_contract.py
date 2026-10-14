@@ -170,7 +170,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # events), with +1 ops (github_sync_state, per-stream search cursors).
         # +1 base: base_browser_history.visits, every Chrome/Brave/Safari
         # visit from the Mac uploader.
-        "base": 81,
+        # +1 base: base_argon.events, Google Antigravity CLI (agy) transcripts.
+        "base": 82,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,

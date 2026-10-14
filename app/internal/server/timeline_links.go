@@ -246,7 +246,7 @@ func agentSessionDeepLink(pk map[string]any) *timelineDeepLink {
 	case "claude_desktop":
 		return &timelineDeepLink{URL: "https://claude.ai/chat/" + url.PathEscape(sessionID), Label: "Claude"}
 	}
-	// CLI transcripts (claude_code, codex, openclaw, pi, muse_code) live on disk on the
+	// CLI transcripts (claude_code, codex, openclaw, pi, muse_code, argon) live on disk on the
 	// machine that ran them, and a Muse chat has no URL the warehouse knows;
 	// either way there is nothing a URL can open.
 	return nil

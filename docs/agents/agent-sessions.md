@@ -5,11 +5,11 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 
 ## Local Agent Sessions Upload Scheduler
 
-Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi + Muse Code) so every device's
+Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi + Muse Code + Argon) so every device's
 sessions are queryable in the warehouse. The append-only transcripts are tailed and shipped,
 line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 
-> The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex/pi. The
+> The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex/pi/Muse Code/Argon. The
 > **openclaw VM** runs the same uploader for OpenClaw sessions via a systemd user timer — see
 > [OpenClaw Agent Sessions](#openclaw-agent-sessions-openclaw-vm) below.
 
@@ -43,12 +43,13 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessio
 ```
 
 The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`,
-`~/.openclaw/agents/main/sessions/<sessionId>.jsonl`, and
-`~/.pi/agent/sessions/**/*.jsonl`, and Muse Code's
+`~/.openclaw/agents/main/sessions/<sessionId>.jsonl`,
+`~/.pi/agent/sessions/**/*.jsonl`, Muse Code's
 `~/.local/share/muse/sessions/**/session.jsonl` (`$XDG_DATA_HOME/muse/sessions` when that is
-set; override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` /
+set), and Argon's (Google Antigravity CLI, `agy`)
+`~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` (override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` /
 `AGENT_SESSIONS_CODEX_SESSIONS_DIR` / `AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR` /
-`AGENT_SESSIONS_PI_SESSIONS_DIR` / `AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
+`AGENT_SESSIONS_PI_SESSIONS_DIR` / `AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR` / `AGENT_SESSIONS_ARGON_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
 tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
 binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
 trace and the `.json` sidecars next to each transcript.
@@ -156,7 +157,7 @@ Muse files) are still bounded by it; a file that needs more than a minute belong
 resumable path, not on a longer proxy timeout.
 
 Agent-session SQL starting points are the source-owned raw event tables
-`base_claude_code.events`, `base_codex.events`, `base_openclaw.events`, `base_pi.events`, `base_muse_code.events`, `base_claude_desktop.events`, and
+`base_claude_code.events`, `base_codex.events`, `base_openclaw.events`, `base_pi.events`, `base_muse_code.events`, `base_argon.events`, `base_claude_desktop.events`, and
 `base_chatgpt.events` (one row per transcript/conversation line; `device` tags the machine where
 applicable). Cross-source querying uses `marts_ai_conversations.events`, and per-session roll-ups
 (counts, token sums, title, cwd/git, first prompt) use `marts_ai_conversations.sessions`. Free-text
@@ -311,6 +312,35 @@ Each line is a runtime record `{id, sequence, recorded_at, payload_type, payload
   row.
 
 The `muse_code` pipeline has a 45-day data interval, borrowed from pi. Its detector is the
+`agent-sessions-upload` run heartbeat.
+
+### Argon (Google Antigravity CLI, `agy`)
+
+Argon (`agy`, source `argon`, `base_argon.events`) is Google's Antigravity CLI running
+Gemini 4 Argon. It keeps one untruncated append-only transcript per session at
+`~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl`
+(override with `AGENT_SESSIONS_ARGON_SESSIONS_DIR`). The sibling `transcript.jsonl`
+truncates text and double-encodes tool arguments, and `chunks/` holds per-step fragments,
+so the uploader reads only `transcript_full.jsonl`. Per-session metadata (`cwd` from
+`workspace_uris`, `title`, and `parent_conversation_id` for subagents) lives outside the
+lines in `~/.gemini/antigravity-cli/conversation_summaries.db` and
+`annotations/<session-id>.pbtxt`, which discovery reads and ships on `session`.
+
+Each line is `{step_index, source, type, status, created_at, ...}`; `event_uuid` is
+`<session_id>#<step_index>`. `argon_event_row` maps the step types as follows (shapes
+checked against `agy` 1.3.4 on 2026-10-13):
+
+- `USER_INPUT`: extracts `<USER_REQUEST>` with the harness's start-here preamble stripped
+  as a `user` row, and reads the model from `<USER_SETTINGS_CHANGE>` (`Model Selection`).
+- `PLANNER_RESPONSE`: an `assistant` row (`tool_use` when `tool_calls` is present,
+  `message` when `content` is present, or `thinking` when only `thinking` is present, with
+  reasoning kept in `raw_json` only) carrying `input_tokens`, `output_tokens` and
+  `cache_read_tokens`.
+- `GENERIC`: a `tool` / `tool_result` row carrying the tool execution output.
+- `CHECKPOINT`: a `meta` / `compaction` row carrying the compaction summary.
+- `SYSTEM_MESSAGE`: a `system` / `system_message` row for async task/subagent wakeups.
+
+The `argon` pipeline has a 45-day data interval, borrowed from pi. Its detector is the
 `agent-sessions-upload` run heartbeat.
 
 ## Muse (Meta's hosted personal agent)

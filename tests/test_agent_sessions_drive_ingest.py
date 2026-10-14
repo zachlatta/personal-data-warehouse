@@ -6,6 +6,7 @@ import json
 
 from personal_data_warehouse.agent_sessions_drive_ingest import (
     AgentSessionsDriveIngestRunner,
+    argon_event_row,
     claude_code_event_row,
     codex_event_row,
     has_batch_payloads,
@@ -1073,3 +1074,254 @@ def test_muse_code_recorded_at_survives_the_uploaders_float_round_trip() -> None
     assert _muse_code_row(line)["occurred_at"] == _MUSE_CODE_AT
     line["recorded_at"] = 1791941196347462.5
     assert _muse_code_row(line)["occurred_at"] == datetime(1970, 1, 1, tzinfo=UTC)
+
+
+# --- Argon (Google Antigravity CLI, `agy`) normalizer -----------------------
+#
+# Antigravity CLI keeps one untruncated append-only transcript per session at
+# ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl.
+# Each line is {step_index, source, type, status, created_at, ...}. Fixtures
+# below follow the agy 1.3.4 shapes verified on 2026-10-13.
+
+ARGON_SESSION = "d45f2004-492f-4a80-b387-74acbcae9a78"
+_ARGON_AT = datetime(2026, 10, 14, 2, 49, 46, 513447, tzinfo=UTC)
+
+
+def _argon_step(
+    step_type: str,
+    *,
+    step_index: int = 0,
+    source: str = "MODEL",
+    status: str = "DONE",
+    **extra: object,
+) -> dict:
+    return {
+        "step_index": step_index,
+        "source": source,
+        "type": step_type,
+        "status": status,
+        "created_at": "2026-10-14T02:49:46.513447Z",
+        **extra,
+    }
+
+
+def _argon_row(line: dict, *, seq: int = 0, session: dict | None = None) -> dict:
+    return argon_event_row(
+        line,
+        session_id=ARGON_SESSION,
+        account="a",
+        device="d",
+        seq=seq,
+        ingested_at=INGESTED_AT,
+        session=session or {},
+    )
+
+
+def test_argon_user_input_extracts_typed_prompt_and_model_selection() -> None:
+    row = _argon_row(
+        _argon_step(
+            "USER_INPUT",
+            step_index=0,
+            source="USER_EXPLICIT",
+            content=(
+                "<USER_REQUEST>\n"
+                'Start by reading the start-here skill: `pdw call skills__skill_read --data \'{"name":"start-here"}\'` '
+                "(skills are MCP-only; there is no sk CLI).\n\n"
+                "Add an argon ingester\n"
+                "</USER_REQUEST>\n"
+                "<ADDITIONAL_METADATA>\n"
+                "The current local time is: 2026-10-13T22:49:44-04:00.\n"
+                "</ADDITIONAL_METADATA>\n"
+                "<USER_SETTINGS_CHANGE>\n"
+                "The user changed setting `Model Selection` from None to Gemini 4 Argon (Medium). "
+                "No need to comment on this change if the user doesn't ask about it.\n"
+                "</USER_SETTINGS_CHANGE>"
+            ),
+        )
+    )
+    assert row["source"] == "argon"
+    assert row["event_uuid"] == f"{ARGON_SESSION}#0"
+    assert row["occurred_at"] == _ARGON_AT
+    assert (row["role"], row["subtype"], row["text"]) == ("user", "message", "Add an argon ingester")
+    assert row["model"] == "Gemini 4 Argon (Medium)"
+
+
+def test_argon_planner_response_message_thinking_and_usage() -> None:
+    message = _argon_row(
+        _argon_step(
+            "PLANNER_RESPONSE",
+            step_index=4,
+            content="All wired up and tested.",
+            input_tokens=15316,
+            cache_read_tokens=12400,
+            output_tokens=297,
+        ),
+        seq=4,
+    )
+    thinking = _argon_row(
+        _argon_step(
+            "PLANNER_RESPONSE",
+            step_index=5,
+            content="",
+            thinking="Let me check the catalog first.",
+            input_tokens=16000,
+            output_tokens=45,
+        ),
+        seq=5,
+    )
+    assert (message["role"], message["subtype"], message["text"]) == (
+        "assistant",
+        "message",
+        "All wired up and tested.",
+    )
+    assert (message["input_tokens"], message["output_tokens"], message["cache_read_tokens"]) == (15316, 297, 12400)
+    # Reasoning stays in raw_json only, as for every other agent source.
+    assert (thinking["role"], thinking["subtype"], thinking["text"]) == ("assistant", "thinking", "")
+    assert "Let me check the catalog first." in thinking["raw_json"]
+
+
+def test_argon_tool_calls_and_generic_tool_results() -> None:
+    single_call = _argon_row(
+        _argon_step(
+            "PLANNER_RESPONSE",
+            step_index=1,
+            thinking="Run pdw search.",
+            tool_calls=[
+                {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "pdw search budget --priorities self,direct,cc",
+                        "Cwd": "/work/repo",
+                        "WaitMsBeforeAsync": 5000,
+                    },
+                }
+            ],
+            input_tokens=12000,
+            output_tokens=80,
+        ),
+        seq=1,
+    )
+    multi_call = _argon_row(
+        _argon_step(
+            "PLANNER_RESPONSE",
+            step_index=2,
+            tool_calls=[
+                {"name": "view_file", "args": {"AbsolutePath": "/work/repo/a.go"}},
+                {"name": "view_file", "args": {"AbsolutePath": "/work/repo/b.go"}},
+            ],
+        ),
+        seq=2,
+    )
+    result = _argon_row(
+        _argon_step(
+            "GENERIC",
+            step_index=3,
+            content="The command exited with code 0.\nOutput:\n1. slack · direct · budget note",
+        ),
+        seq=3,
+    )
+    assert (single_call["role"], single_call["subtype"], single_call["tool_name"]) == (
+        "assistant",
+        "tool_use",
+        "run_command",
+    )
+    assert single_call["cwd"] == "/work/repo"
+    assert json.loads(single_call["tool_input_json"])["CommandLine"] == "pdw search budget --priorities self,direct,cc"
+    assert (multi_call["role"], multi_call["subtype"], multi_call["tool_name"]) == (
+        "assistant",
+        "tool_use",
+        "view_file",
+    )
+    calls = json.loads(multi_call["tool_input_json"])["tool_calls"]
+    assert [c["args"]["AbsolutePath"] for c in calls] == ["/work/repo/a.go", "/work/repo/b.go"]
+    assert (result["role"], result["subtype"]) == ("tool", "tool_result")
+    assert "budget note" in result["text"]
+    assert json.loads(result["tool_result_json"])["status"] == "DONE"
+
+
+def test_argon_checkpoint_and_system_message_steps() -> None:
+    checkpoint = _argon_row(
+        _argon_step(
+            "CHECKPOINT",
+            step_index=10,
+            source="SYSTEM",
+            content="# Resuming from a compaction\n\nSummary of progress.",
+        ),
+        seq=10,
+    )
+    sys_msg = _argon_row(
+        _argon_step(
+            "SYSTEM_MESSAGE",
+            step_index=11,
+            source="SYSTEM",
+            content="The following is a <SYSTEM_MESSAGE> not actually sent by the user.",
+        ),
+        seq=11,
+    )
+    assert (checkpoint["role"], checkpoint["subtype"]) == ("meta", "compaction")
+    assert "Resuming from a compaction" in checkpoint["text"]
+    assert (sys_msg["role"], sys_msg["subtype"]) == ("system", "system_message")
+    assert "SYSTEM_MESSAGE" in sys_msg["text"]
+
+
+def test_argon_session_metadata_and_subagent_sidechain() -> None:
+    step = _argon_step(
+        "USER_INPUT",
+        step_index=0,
+        source="USER_EXPLICIT",
+        content="<USER_REQUEST>\ninvestigate the flake\n</USER_REQUEST>",
+    )
+    sub = _argon_row(
+        step,
+        session={
+            "cwd": "/work/repo",
+            "title": "Investigate Flake",
+            "parent_session_id": "parent-session",
+        },
+    )
+    assert (sub["role"], sub["text"]) == ("user", "investigate the flake")
+    assert sub["cwd"] == "/work/repo"
+    assert sub["session_title"] == "Investigate Flake"
+    assert sub["is_sidechain"] == 1
+    assert sub["parent_uuid"] == "parent-session"
+    assert sub["entrypoint"] == "subagent"
+
+
+def test_argon_record_to_event_row_routes_the_tool_and_session() -> None:
+    record = envelope(
+        {
+            "tool": "argon",
+            "session_id": "sub-1",
+            "seq": 2,
+            "line": _argon_step(
+                "USER_INPUT",
+                step_index=0,
+                source="USER_EXPLICIT",
+                content="<USER_REQUEST>\ndo the subtask\n</USER_REQUEST>",
+            ),
+            "session": {"parent_session_id": "parent-1", "cwd": "/work/repo"},
+        },
+        tool="argon",
+    )
+    row = record_to_event_row(record, ingested_at=INGESTED_AT)
+    assert row["source"] == "argon"
+    assert row["session_id"] == "sub-1"
+    assert (row["role"], row["text"], row["parent_uuid"], row["cwd"]) == (
+        "user",
+        "do the subtask",
+        "parent-1",
+        "/work/repo",
+    )
+    assert (row["account"], row["device"]) == ("zach@example.com", "porygon")
+
+
+def test_argon_malformed_shapes_degrade_to_meta_rows() -> None:
+    for line in (
+        {},
+        {"type": "PLANNER_RESPONSE", "tool_calls": "nope"},
+        {"type": "USER_INPUT", "content": None},
+        {"created_at": "not-a-time", "step_index": "bad", "type": "SOMETHING_NEW"},
+    ):
+        row = _argon_row(line, seq=3)
+        assert row["source"] == "argon"
+        assert row["event_uuid"] == f"{ARGON_SESSION}#3"

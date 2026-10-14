@@ -34,6 +34,7 @@ func cliEnv(t *testing.T) (map[string]string, string) {
 		"AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR":  filepath.Join(root, "none-openclaw"),
 		"AGENT_SESSIONS_PI_SESSIONS_DIR":        filepath.Join(root, "none-pi"),
 		"AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR": filepath.Join(root, "none-muse-code"),
+		"AGENT_SESSIONS_ARGON_SESSIONS_DIR":     filepath.Join(root, "none-argon"),
 		"PDW_INGEST_PROJECT_DIR":                root,
 	}
 	return env, root

@@ -3833,6 +3833,122 @@ def test_muse_code_typed_turns_are_self_and_its_subagents_are_background(warehou
     assert priority_of("agent_session", "muse_code|sub") == "background"
 
 
+def test_argon_typed_turns_are_self_and_its_subagents_are_background(warehouse):
+    """Argon rows reach the timeline through the shared agent-session rules.
+
+    Even when Paseo's Antigravity adapter prepends the start-here skill preamble
+    to every session's opening <USER_REQUEST>, the normalizer strips the harness
+    wrapper so the session's first user turn is Zach's actual prompt rather than
+    a repeated 64-character prefix across sessions (which would misclassify
+    interactive sessions as background). Subagents carry parent_session_id and
+    stay background.
+    """
+    from personal_data_warehouse.agent_sessions_drive_ingest import argon_event_row
+
+    _ensure_all_source_tables(warehouse)
+    created_at = _NOW.isoformat()
+
+    def rows(session_id: str, steps: list[dict], session: dict) -> list[dict]:
+        return [
+            argon_event_row(
+                step, session_id=session_id, account="z@x.test", device="porygon",
+                seq=seq, ingested_at=_NOW, session=session,
+            )
+            for seq, step in enumerate(steps)
+        ]
+
+    # Seed five interactive sessions that all opened through Paseo's start-here
+    # wrapper; if the preamble were not stripped, the >= 4 prefix-repeat rule in
+    # _agent_session_adapter would demote all five to 'background'.
+    all_rows: list[dict] = []
+    for idx, prompt in enumerate(
+        (
+            "Add an argon ingester",
+            "Why is search slow",
+            "Check slack health",
+            "Inspect whoop workouts",
+            "Fix timeline links",
+        )
+    ):
+        sid = "chat" if idx == 0 else f"chat-{idx}"
+        all_rows.extend(
+            rows(
+                sid,
+                [
+                    {
+                        "step_index": 0,
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "status": "DONE",
+                        "created_at": created_at,
+                        "content": (
+                            "<USER_REQUEST>\n"
+                            "Start by reading the start-here skill: `pdw call skills__skill_read "
+                            '--data \'{"name":"start-here"}\'` (skills are MCP-only; there is no sk CLI).\n\n'
+                            f"{prompt}\n"
+                            "</USER_REQUEST>"
+                        ),
+                    },
+                    {
+                        "step_index": 1,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": created_at,
+                        "thinking": "Checking the codebase.",
+                        "content": f"Working on: {prompt}",
+                    },
+                ],
+                {"title": prompt, "model": "MODEL_PLACEHOLDER_M47", "cwd": "/Users/zrl/dev/pdw"},
+            )
+        )
+
+    all_rows.extend(
+        rows(
+            "sub",
+            [
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": created_at,
+                    "content": "<USER_REQUEST>\nSurvey the codebase and report back.\n</USER_REQUEST>",
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": created_at,
+                    "content": "Here is the report.",
+                },
+            ],
+            {"parent_session_id": "chat", "model": "MODEL_PLACEHOLDER_M47"},
+        )
+    )
+    warehouse.insert_agent_session_events(all_rows)
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def priority_of(adapter: str, event_id: str) -> str:
+        found = warehouse._query(
+            "SELECT priority FROM @timeline_events WHERE adapter = %s AND event_id = %s",
+            (adapter, event_id),
+        )
+        assert found, (adapter, event_id)
+        return found[0][0]
+
+    assert priority_of("agent_session", "argon|chat") == "self"
+    assert priority_of("agent_session_turn", "argon|chat|0") == "self"
+    assert priority_of("agent_session_turn", "argon|chat|1") == "background"
+    assert priority_of("agent_session", "argon|sub") == "background"
+
+
 def test_a_muse_loop_session_is_titled_by_its_loop_not_left_blank(warehouse):
     """A Muse loop session has no typed prompt and no title, so it read as a blank row.
 

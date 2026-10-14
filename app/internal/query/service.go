@@ -951,7 +951,7 @@ var columnRemaps = map[string]string{
 	"body": "timeline.events carries the preview in snippet and the indexed body in search_text; raw tables name it per source " +
 		"(base_slack.messages.text, base_gmail.messages.body_markdown_clean, base_whatsapp.messages.body_text, marts_ai_conversations.events.text)",
 	"content":    "agent-session and chat text is in text (marts_ai_conversations.events.text) or body_text (marts_messages.messages); timeline.events has snippet and search_text",
-	"provider":   "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse_code, muse), not provider",
+	"provider":   "agent-session relations name the tool in source (claude_code, codex, chatgpt, claude_desktop, openclaw, pi, muse_code, argon, muse), not provider",
 	"turn_index": "agent-session turns are ordered by seq within (source, session_id)",
 	// The week to 2026-10-10: operation_type in six sessions, content_text in five.
 	"operation_type": "ops.upstream_mutation_operations names the operation in operation (e.g. gmail.send_email) and the system in provider",

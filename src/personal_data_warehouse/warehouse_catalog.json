@@ -255,6 +255,14 @@
       "comment": "Faithful muse_code source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_argon",
+      "layer": "base",
+      "domain": "argon",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful argon (Google Antigravity CLI, agy) source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
+    },
+    {
       "name": "base_plaid",
       "layer": "base",
       "domain": "plaid",
@@ -396,7 +404,7 @@
       "domain": "ai_conversations",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable AI-conversation read interface across every provider (Claude Code, Codex, OpenClaw, pi, Muse Code, Claude Desktop, ChatGPT, Muse). Start with marts_ai_conversations.sessions for one row per session, then marts_ai_conversations.events for its turns."
+      "comment": "Stable AI-conversation read interface across every provider (Claude Code, Codex, OpenClaw, pi, Muse Code, Argon, Claude Desktop, ChatGPT, Muse). Start with marts_ai_conversations.sessions for one row per session, then marts_ai_conversations.events for its turns."
     },
     {
       "name": "marts_calendar",
@@ -1502,6 +1510,17 @@
       "layer": "base",
       "domain": "muse_code",
       "schema": "base_muse_code",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "argon_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "argon",
+      "schema": "base_argon",
       "name": "events",
       "discoverable": true,
       "query_access": "public",

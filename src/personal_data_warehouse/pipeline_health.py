@@ -860,6 +860,28 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "argon",
+        "Argon sessions",
+        cadence="uploader every 5 min",
+        transport="Mac LaunchAgent tails ~/.gemini/antigravity-cli/brain → /ingest/agent-sessions/batch",
+        data=45 * DAY,
+        basis=(
+            "no history yet: the source was added 2026-10-13, the day Zach"
+            " started using Google's Antigravity CLI (agy, running Gemini 4"
+            " Argon). Borrowed from pi, the other occasionally-used coding CLI"
+            " on the same uploader, whose longest real gap between uses was"
+            " 40d; DATA freshness is not this source's detector -- the uploader"
+            " heartbeat is"
+        ),
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("argon"),
+        note=(
+            "Argon is Google's Antigravity CLI (agy) running Gemini 4 Argon;"
+            " quiet means Zach is not using it, and the run heartbeat says the"
+            " uploader is alive"
+        ),
+    ),
+    _source(
         "muse",
         "Muse agent",
         cadence="hook every 5 min",
@@ -1515,6 +1537,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "openclaw_events": _data("openclaw", "ingested_at", "occurred_at"),
     "pi_events": _data("pi", "ingested_at", "occurred_at"),
     "muse_code_events": _data("muse_code", "ingested_at", "occurred_at"),
+    "argon_events": _data("argon", "ingested_at", "occurred_at"),
     "muse_events": _data("muse", "ingested_at", "occurred_at"),
     "muse_files": _data("muse", "ingested_at", "modified_at"),
     "claude_desktop_events": _data("claude_desktop", "ingested_at", "occurred_at"),

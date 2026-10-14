@@ -1,5 +1,5 @@
 // Package agentsessions uploads local AI agent CLI session transcripts
-// (Claude Code, Codex, OpenClaw, pi, Muse Code) through the app's ingest API. The
+// (Claude Code, Codex, OpenClaw, pi, Muse Code, Argon) through the app's ingest API. The
 // transcripts are append-only JSONL files, one per session, so the uploader
 // remembers a byte offset per file and ships only what is new. Newer OpenClaw
 // keeps its transcript in a SQLite store instead; see openclawstore.go.
@@ -24,6 +24,9 @@ const (
 	// MuseCodeTool is the Muse models' coding CLI (`muse`), a different tool
 	// from MuseTool despite the shared name; see musecode.go.
 	MuseCodeTool = "muse_code"
+	// ArgonTool is Google's Antigravity CLI (`agy`) running Gemini 4 Argon; see
+	// argon.go.
+	ArgonTool = "argon"
 	// MuseTool is Meta's hosted personal agent. Only `pdw ingest muse`, run on
 	// the Muse VM, sets Dirs.MuseAgents; see muse.go.
 	MuseTool = "muse"
@@ -58,6 +61,8 @@ type Dirs struct {
 	PiSessions    string
 	// MuseCodeSessions is the Muse coding CLI's sessions directory.
 	MuseCodeSessions string
+	// ArgonSessions is Google Antigravity CLI's brain directory.
+	ArgonSessions string
 	// MuseAgents is a Muse VM's ~/agents directory. Never read from the
 	// environment: only `pdw ingest muse` sets it.
 	MuseAgents string
@@ -84,6 +89,7 @@ func DirsFromEnv(getenv common.Getenv) Dirs {
 		OpenClawSessions: openClawSessions,
 		PiSessions:       resolve("AGENT_SESSIONS_PI_SESSIONS_DIR", "~/.pi/agent/sessions"),
 		MuseCodeSessions: resolve("AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR", defaultMuseCodeSessions(getenv)),
+		ArgonSessions:    resolve("AGENT_SESSIONS_ARGON_SESSIONS_DIR", "~/.gemini/antigravity-cli/brain"),
 	}
 }
 
@@ -110,6 +116,7 @@ func Discover(dirs Dirs) []SessionFile {
 	files = append(files, discoverOpenClaw(dirs.OpenClawSessions)...)
 	files = append(files, discoverPi(dirs.PiSessions)...)
 	files = append(files, discoverMuseCode(dirs.MuseCodeSessions)...)
+	files = append(files, discoverArgon(dirs.ArgonSessions)...)
 	files = append(files, discoverMuse(dirs.MuseAgents)...)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Tool != files[j].Tool {

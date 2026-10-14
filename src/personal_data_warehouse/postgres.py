@@ -964,6 +964,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "openclaw_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "pi_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "muse_code_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
+    "argon_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     "muse_events": TableSpec(AGENT_SESSION_EVENT_COLUMNS, ("source", "session_id", "event_uuid")),
     # The Muse agent's persistent workspace as it currently stands.
     "muse_files": TableSpec(MUSE_FILE_COLUMNS, ("account", "path")),
@@ -1225,6 +1226,7 @@ _AI_CONVERSATION_EVENT_TABLES = (
     "openclaw_events",
     "pi_events",
     "muse_code_events",
+    "argon_events",
     "muse_events",
 )
 
@@ -2385,6 +2387,7 @@ POSTGRES_INSERT_PAGE_SIZES = {
     "openclaw_events": 500,
     "pi_events": 500,
     "muse_code_events": 500,
+    "argon_events": 500,
     "muse_events": 500,
     # Text files ride inline, up to the uploader's inline cap each.
     "muse_files": 50,
@@ -3231,6 +3234,7 @@ _AI_EVENT_TABLE_BY_SOURCE = {
     "openclaw": "openclaw_events",
     "pi": "pi_events",
     "muse_code": "muse_code_events",
+    "argon": "argon_events",
     "muse": "muse_events",
 }
 

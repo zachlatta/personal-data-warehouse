@@ -140,7 +140,7 @@ Muse's connectors, phone data and database are not in PDW — only what is on it
 ## Prior agent sessions
 
 `marts_ai_conversations.sessions` (one row per session across Claude Code, Codex, Claude
-Desktop, ChatGPT, OpenClaw, pi, Muse Code and Muse) and `marts_ai_conversations.events` (one row per turn
+Desktop, ChatGPT, OpenClaw, pi, Muse Code, Argon and Muse) and `marts_ai_conversations.events` (one row per turn
 or tool call). Search scope `agent_session` with priorities `self,background`. Topic
 `agent-sessions`.
 
