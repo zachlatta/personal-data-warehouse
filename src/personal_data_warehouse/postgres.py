@@ -571,9 +571,10 @@ SEARCH_EMBEDDING_DEFAULT_MODEL = "text-embedding-3-small"
 #: The semantic leg's router: a scoped slice up to this many vector rows is
 #: scanned exactly; a larger one walks its partitions' HNSW graphs.
 SEARCH_VECTOR_EXACT_SLICE_ROWS = 1_000_000
-#: Parallel workers for that exact scan (each partition is created with this
-#: parallel_workers, and the function raises max_parallel_workers_per_gather
-#: to it for the statement).
+#: Worker cap for that exact scan. The function raises
+#: max_parallel_workers_per_gather to it and lowers the parallel size
+#: thresholds for its own statement: the slice is read through the small
+#: event_ts index, which on default thresholds sizes the scan at 3 workers.
 SEARCH_VECTOR_EXACT_SCAN_WORKERS = 8
 SEARCH_VECTOR_PARTITIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("search_chunk_vectors_gmail", ("gmail_email",)),
@@ -7259,9 +7260,12 @@ class PostgresWarehouse:
                 if adapters
                 else "DEFAULT"
             )
+            # No parallel_workers reloption: CREATE INDEX honours it too, and
+            # a parallel HNSW build asks for maintenance_work_mem of /dev/shm
+            # per build (2 GB here against the container's 1 GB). The exact
+            # scan raises its worker count for its own statement instead.
             self._command(
                 f"CREATE TABLE IF NOT EXISTS @{table} PARTITION OF @search_chunk_vectors {bound}"
-                f" WITH (parallel_workers = {SEARCH_VECTOR_EXACT_SCAN_WORKERS})"
             )
         # Row triggers keep the table in step with both inputs. A chunk row
         # takes every model's vector for its text; a new vector reaches every
@@ -16378,14 +16382,17 @@ class PostgresWarehouse:
                 """ + _semantic_partition_branches_sql() + r"""
                 -- Every exact slice is one scan: a flattened UNION ALL with no
                 -- per-partition LIMIT plans as a Parallel Append whose workers
-                -- share all the partitions. Per-partition exact branches ran
-                -- one after another: 1.4M rows since 2026-06-01 across all four
-                -- took ~800 ms that way, 325-370 ms as one scan on """ + str(SEARCH_VECTOR_EXACT_SCAN_WORKERS) + r""" workers
-                -- (contract C6: an idle 28-core host is the budget).
+                -- share all the partitions. 1.4M rows since 2026-06-01 across
+                -- all four took ~800 ms as per-partition branches, 550 ms as
+                -- one scan on the default 3 workers, and 383-430 ms on the 6
+                -- these thresholds plan (contract C6: an idle 28-core host is
+                -- the budget). The setup cost still keeps a small slice serial.
                 IF coalesce(array_length(exact_scans, 1), 0) > 0 THEN
                     PERFORM set_config(
                         'max_parallel_workers_per_gather', '""" + str(SEARCH_VECTOR_EXACT_SCAN_WORKERS) + r"""', true
                     );
+                    PERFORM set_config('min_parallel_index_scan_size', '8kB', true);
+                    PERFORM set_config('min_parallel_table_scan_size', '8kB', true);
                     branches := branches || format(
                         '(SELECT e.* FROM (%s) e ORDER BY e.distance LIMIT $5)',
                         array_to_string(exact_scans, ' UNION ALL ')

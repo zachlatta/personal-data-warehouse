@@ -2300,6 +2300,7 @@ def test_search_hybrid_semantic_routes_each_partition_by_its_slice() -> None:
         "'max_parallel_workers_per_gather', "
         f"'{postgres_module.SEARCH_VECTOR_EXACT_SCAN_WORKERS}', true"
     ) in semantic
+    assert "set_config('min_parallel_index_scan_size', '8kB', true)" in semantic
     ann = semantic[semantic.index("ann_branch constant text") :]
     assert "ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5" in ann
     assert "ORDER BY u.distance LIMIT $5" in semantic

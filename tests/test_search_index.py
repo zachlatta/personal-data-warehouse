@@ -1349,3 +1349,24 @@ def test_the_retired_global_graph_is_dropped_only_after_the_semantic_function_mo
     )
     assert created < dropped
     assert not warehouse._index_exists("search_chunk_embeddings_hnsw_idx")
+
+
+def test_vector_partitions_carry_no_parallel_workers_reloption(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """CREATE INDEX honours a table's parallel_workers, and a parallel HNSW
+    build asks for maintenance_work_mem of /dev/shm: with it set to 8, CI's
+    64 MB /dev/shm ran out under the suite and production's 2 GB builds
+    would exceed its 1 GB. Worker counts belong to the search statement."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    rows = warehouse._query(
+        "SELECT c.relname, c.reloptions FROM pg_inherits i"
+        " JOIN pg_class c ON c.oid = i.inhrelid"
+        " WHERE i.inhparent = %s::regclass",
+        (warehouse.sql_relation("search_chunk_vectors"),),
+    )
+    assert len(rows) == 4
+    assert all(not options for _, options in rows), rows
