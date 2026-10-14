@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import base64
 import os
 import re
@@ -84,6 +84,11 @@ DEFAULT_HACKER_NEWS_FULL_WALK_INTERVAL_SECONDS = 7 * 24 * 3600
 DEFAULT_HACKER_NEWS_LIVE_WINDOW_DAYS = 3
 DEFAULT_HACKER_NEWS_REFRESH_MIN_AGE_HOURS = 6
 DEFAULT_HACKER_NEWS_REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com"
+DEFAULT_GITHUB_POLL_INTERVAL_SECONDS = 900
+DEFAULT_GITHUB_MAX_REQUESTS_PER_RUN = 1500
+DEFAULT_GITHUB_MAX_RUN_SECONDS = 600
+DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_WHOOP_BASE_URL = "https://api.prod.whoop.com/developer"
 DEFAULT_WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 DEFAULT_WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
@@ -431,6 +436,29 @@ class WhoopConfig:
 
 
 @dataclass(frozen=True)
+class GitHubConfig:
+    """The GitHub source: the account's commits, issues, PRs, reviews and comments.
+
+    ``account`` is the GitHub LOGIN. Credentials, in order of preference:
+    ``tokens`` (``GITHUB_SOURCE_TOKENS``, comma-separated: a fine-grained token sees one
+    owner's private repositories, so two owners take two tokens), else a
+    read-only proxy (``GITHUB_PROXY_BASE_URL`` + ``GITHUB_PROXY_API_KEY``,
+    public data only), else anonymous api.github.com (60 requests an hour).
+    """
+
+    account: str
+    tokens: tuple[str, ...] = field(default=(), repr=False)
+    proxy_base_url: str = ""
+    proxy_api_key: str = field(default="", repr=False)
+    api_base_url: str = DEFAULT_GITHUB_API_BASE_URL
+    poll_interval_seconds: int = DEFAULT_GITHUB_POLL_INTERVAL_SECONDS
+    max_requests_per_run: int = DEFAULT_GITHUB_MAX_REQUESTS_PER_RUN
+    max_run_seconds: int = DEFAULT_GITHUB_MAX_RUN_SECONDS
+    request_timeout_seconds: int = DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class HackerNewsConfig:
     """The Hacker News source: public API items plus the account's lists.
 
@@ -621,6 +649,7 @@ class Settings:
     whoop: WhoopConfig | None = None
     whoop_private: WhoopPrivateConfig | None = None
     hacker_news: HackerNewsConfig | None = None
+    github: GitHubConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
     simplefin: SimpleFINConfig | None = None
@@ -734,6 +763,7 @@ def load_settings(
     require_whoop_client_secrets: bool = False,
     require_whoop_private: bool = False,
     require_hacker_news: bool = False,
+    require_github: bool = False,
     require_google_drive_source: bool = False,
     require_plaid: bool = False,
     require_simplefin: bool = False,
@@ -1657,6 +1687,39 @@ def load_settings(
             **hn_values,
         )
 
+    github_account = (os.getenv("GITHUB_ACCOUNT") or "").strip()
+    github: GitHubConfig | None = None
+    if require_github or github_account or os.getenv("GITHUB_ENABLED"):
+        if not github_account:
+            raise ValueError("GITHUB_ACCOUNT (the GitHub login) must be set for GitHub sync")
+        gh_ints = {
+            "poll_interval_seconds": ("GITHUB_POLL_INTERVAL_SECONDS", DEFAULT_GITHUB_POLL_INTERVAL_SECONDS, 60),
+            "max_requests_per_run": ("GITHUB_MAX_REQUESTS_PER_RUN", DEFAULT_GITHUB_MAX_REQUESTS_PER_RUN, 10),
+            "max_run_seconds": ("GITHUB_MAX_RUN_SECONDS", DEFAULT_GITHUB_MAX_RUN_SECONDS, 30),
+            "request_timeout_seconds": (
+                "GITHUB_REQUEST_TIMEOUT_SECONDS", DEFAULT_GITHUB_REQUEST_TIMEOUT_SECONDS, 1
+            ),
+        }
+        gh_values: dict[str, int] = {}
+        for field_name, (env_name, default, minimum) in gh_ints.items():
+            value = int(os.getenv(env_name, str(default)))
+            if value < minimum:
+                raise ValueError(f"{env_name} must be at least {minimum}")
+            gh_values[field_name] = value
+        proxy_base_url = (os.getenv("GITHUB_PROXY_BASE_URL") or "").strip()
+        proxy_api_key = (os.getenv("GITHUB_PROXY_API_KEY") or "").strip()
+        if bool(proxy_base_url) != bool(proxy_api_key):
+            raise ValueError("GITHUB_PROXY_BASE_URL and GITHUB_PROXY_API_KEY must be set together")
+        github = GitHubConfig(
+            account=github_account,
+            tokens=tuple(t.strip() for t in (os.getenv("GITHUB_SOURCE_TOKENS") or "").split(",") if t.strip()),
+            proxy_base_url=proxy_base_url,
+            proxy_api_key=proxy_api_key,
+            api_base_url=(os.getenv("GITHUB_API_BASE_URL") or "").strip() or DEFAULT_GITHUB_API_BASE_URL,
+            enabled=os.getenv("GITHUB_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+            **gh_values,
+        )
+
     whoop_private_account = (
         os.getenv("WHOOP_PRIVATE_ACCOUNT") or whoop_account or default_voice_memos_account
     ).strip()
@@ -2098,6 +2161,7 @@ def load_settings(
         whoop=whoop,
         whoop_private=whoop_private,
         hacker_news=hacker_news,
+        github=github,
         google_drive_source=google_drive_source,
         plaid=plaid,
         simplefin=simplefin,

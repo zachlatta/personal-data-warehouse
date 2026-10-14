@@ -170,7 +170,7 @@ Read the file for the area you are changing before you change it.
 | local Mac uploaders and their macOS permissions | [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md) |
 | reviewed writes (Notes, Contacts), the iOS app and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
 | access tokens beside `PDW_SECRET_TOKEN`, `pdw token`, the `cli_authorize` bootstrap | [docs/agents/access-tokens.md](docs/agents/access-tokens.md) |
-| WhatsApp, Hacker News, shared attachment enrichment | [docs/agents/other-sources.md](docs/agents/other-sources.md) |
+| WhatsApp, Hacker News, GitHub, shared attachment enrichment | [docs/agents/other-sources.md](docs/agents/other-sources.md) |
 
 ## The agent guide
 

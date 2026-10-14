@@ -192,3 +192,40 @@ version), and wire a Dagster asset/sensor that runs `FileAttachmentEnrichmentRun
 see `defs/gmail_attachment_enrichment.py` and `defs/whatsapp_media_enrichment.py`. The table
 rename migrates in place via `ensure_*` (`ALTER TABLE IF EXISTS … RENAME`), preserving
 existing rows.
+
+## GitHub (his acts, and the threads they live in)
+
+**Start at `base_github.issues`**, or at the timeline with `sources => ARRAY['github']`.
+The source is the GitHub REST API, polled by the `github_sync` Dagster asset every 15 minutes:
+
+| stream | search | what it finds |
+| --- | --- | --- |
+| `issues_involved` | `involves:<login> is:issue` | issues he opened, commented on, was mentioned or assigned in |
+| `prs_involved` | `involves:<login> is:pr` | the same for PRs |
+| `prs_reviewed` | `reviewed-by:<login> is:pr` | PRs he reviewed without commenting |
+| `commits_authored` | `author:<login>` (commit search) | his commits on default branches |
+
+Each stream runs twice a run: incrementally (`updated:>=` / `committer-date:>=` the watermark,
+an hour of overlap) and as a backfill walked newest to oldest in `created:` /
+`author-date:` windows that halve until GitHub's 1,000-result cap holds. Then every issue
+whose thread is unread or older than its `updated_at` has its comments, reviews and review
+comments read, by anyone. The `/users/<login>/events` feed adds the acts search cannot find
+(stars, forks, releases, new repositories); GitHub keeps only 90 days of it.
+
+**Walk state is per (stream, credential scope)** in `ops.github_sync_state`. The proxy
+credential sees public data only; a token in `GITHUB_SOURCE_TOKENS` gets its own
+`token:<hash>` scope and walks history from scratch, so private repositories backfill the
+day a token is added. A 401 marks that scope's rows `action_required`; the other credentials
+keep running. Commits authored under his name by agents are indistinguishable from his own
+(same identity, no trailer), so all commits are `self`.
+
+Tiers: his commits, issues, PRs, comments, reviews and feed acts are `self`; an issue or
+comment by a person on his issue or PR, @-mentioning him, filed in a repository he owns, or
+answering his inline review comment is `direct`; a person in a thread he commented in during
+the previous 30 days (or in his own repository) is `cc`; bots and the rest are `noise`.
+GitHub's notification emails in Gmail stay where they are; these rows are the record.
+
+**A backfill never pages.** Pushes fire on new `direct` timeline rows, and a new source's
+history lands as new rows, so the capture trigger skips any event older than three days
+(`notifications.py`). Without it, the first GitHub backfill would have paged for every old
+review on his PRs.

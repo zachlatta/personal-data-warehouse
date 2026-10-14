@@ -2200,6 +2200,179 @@ _HACKER_NEWS_ITEM = _simple_adapter(
     ),
 )
 
+# --- GitHub ---------------------------------------------------------------------
+# `account` is Zach's GitHub login. Logins are case-insensitive on GitHub, so
+# every comparison lowers both sides.
+_GH_SELF = "lower(t.author_login) = lower(t.account)"
+_GH_BOT = "(t.author_type = 'Bot' OR t.author_login LIKE '%%[bot]')"
+_GH_MENTIONS = "t.body ~* ('(^|[^a-z0-9-])@' || t.account || '($|[^a-z0-9-])')"
+_GH_OWNS_REPO = "lower(split_part(t.repo, '/', 1)) = lower(t.account)"
+
+_GITHUB_COMMIT = _simple_adapter(
+    name="github_commit",
+    source_table="github_commits",
+    source="github",
+    kind="commit",
+    from_sql="@github_commits t",
+    event_id="concat_ws('|', t.account, t.repo, t.sha)",
+    event_ts=_real_ts("t.authored_at", "t.committed_at", "t.synced_at"),
+    ingest_ts="t.synced_at",
+    actor="t.author_login",
+    title="concat('Commit to ', t.repo, ': ', split_part(t.message, E'\\n', 1))",
+    snippet=_snippet("t.message"),
+    context="t.repo",
+    source_pk="jsonb_build_object('account', t.account, 'repo', t.repo, 'sha', t.sha)",
+    metadata="jsonb_build_object('subtype', 'commit', 'url', t.html_url, 'sha', t.sha, 'repo', t.repo)",
+    search_text=_search_concat("t.repo", "t.message", "t.sha"),
+    # Commit search answers author:<login>, so this is his act; the guard only
+    # keeps a mis-attributed row from claiming to be.
+    priority=f"CASE WHEN lower(t.author_login) = lower(t.account) THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_NOISE} END",
+)
+
+_GITHUB_ISSUE = _simple_adapter(
+    name="github_issue",
+    source_table="github_issues",
+    source="github",
+    kind="issue",
+    from_sql="@github_issues t",
+    event_id="concat_ws('|', t.account, t.issue_id)",
+    event_ts=_real_ts("t.created_at", "t.updated_at", "t.synced_at"),
+    ingest_ts="t.synced_at",
+    actor="t.author_login",
+    title=(
+        "concat(CASE WHEN t.is_pull_request = 1 THEN 'PR ' ELSE 'Issue ' END, "
+        "t.repo, '#', t.issue_number, ': ', t.title)"
+    ),
+    snippet=_snippet("t.body"),
+    # repo#number is the conversation: the generic (source, context) walk
+    # returns the issue with every comment and review under it.
+    context="concat(t.repo, '#', t.issue_number)",
+    source_pk="jsonb_build_object('account', t.account, 'issue_id', t.issue_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'subtype', CASE WHEN t.is_pull_request = 1 THEN 'pull_request' ELSE 'issue' END, "
+        "'state', t.issue_state, "
+        f"'merged', t.merged_at > {_EPOCH}, "
+        "'url', t.html_url, 'repo', t.repo, 'number', t.issue_number, "
+        "'labels', to_jsonb(t.label_names))"
+    ),
+    search_text=_search_concat("t.title", "t.body", "concat(t.repo, '#', t.issue_number)", "t.author_login"),
+    # self: he opened it. direct: a person opened it AT him -- assigned him,
+    # mentioned him, or filed it in one of his own repositories. Everything
+    # else he is involved in only through a later comment, which is where his
+    # involvement shows up on the timeline, so the opening post is noise.
+    priority=(
+        "CASE "
+        f"WHEN {_GH_SELF} THEN {TIMELINE_PRIORITY_SELF} "
+        f"WHEN {_GH_BOT} THEN {TIMELINE_PRIORITY_NOISE} "
+        "WHEN lower(t.account) = ANY (SELECT lower(a) FROM unnest(t.assignee_logins) a) "
+        f"OR {_GH_MENTIONS} OR {_GH_OWNS_REPO} THEN {TIMELINE_PRIORITY_DIRECT} "
+        f"ELSE {TIMELINE_PRIORITY_NOISE} END"
+    ),
+)
+
+_GITHUB_COMMENT = _simple_adapter(
+    name="github_comment",
+    source_table="github_comments",
+    source="github",
+    kind="comment",
+    from_sql=(
+        "@github_comments t "
+        "LEFT JOIN @github_issues i ON i.account = t.account AND i.issue_id = t.issue_id"
+    ),
+    event_id="concat_ws('|', t.account, t.comment_kind, t.comment_id)",
+    event_ts=_real_ts("t.created_at", "t.updated_at", "t.synced_at"),
+    ingest_ts="t.synced_at",
+    actor="t.author_login",
+    title=(
+        "concat("
+        "CASE WHEN t.comment_kind = 'review' THEN "
+        "CASE t.review_state WHEN 'APPROVED' THEN 'Approved ' "
+        "WHEN 'CHANGES_REQUESTED' THEN 'Requested changes on ' ELSE 'Reviewed ' END "
+        "WHEN t.comment_kind = 'review_comment' THEN 'Review comment on ' "
+        "ELSE 'Comment on ' END, "
+        "t.repo, '#', t.issue_number, "
+        "CASE WHEN COALESCE(i.title, '') <> '' THEN concat(': ', i.title) ELSE '' END)"
+    ),
+    snippet=_snippet("CASE WHEN t.body <> '' THEN t.body ELSE lower(t.review_state) END"),
+    context="concat(t.repo, '#', t.issue_number)",
+    source_pk="jsonb_build_object('account', t.account, 'comment_kind', t.comment_kind, 'comment_id', t.comment_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'subtype', t.comment_kind, 'review_state', t.review_state, 'path', t.path, "
+        "'url', t.html_url, 'repo', t.repo, 'number', t.issue_number, "
+        "'is_pull_request', COALESCE(i.is_pull_request, 0) = 1)"
+    ),
+    search_text=_search_concat(
+        "COALESCE(i.title, '')", "t.body", "concat(t.repo, '#', t.issue_number)", "t.author_login"
+    ),
+    # A COMMENTED review with no body is only the envelope GitHub wraps
+    # inline review comments in; the comments themselves are their own rows.
+    where="NOT (t.comment_kind = 'review' AND t.body = '' AND t.review_state IN ('COMMENTED', 'PENDING'))",
+    # self: he wrote it. direct: someone answering HIM -- on his issue or PR,
+    # @-mentioning him, or replying to his inline review comment. cc: a
+    # person in a thread he was active in during the 30 days before, or in a
+    # repository he owns. noise: bots and the rest of a thread he touched once
+    # long ago (an old hackclub issue he commented on in 2017 is not his
+    # conversation today).
+    priority=(
+        "CASE "
+        f"WHEN {_GH_SELF} THEN {TIMELINE_PRIORITY_SELF} "
+        f"WHEN {_GH_BOT} THEN {TIMELINE_PRIORITY_NOISE} "
+        "WHEN lower(COALESCE(i.author_login, '')) = lower(t.account) "
+        f"OR {_GH_MENTIONS} "
+        "OR (t.in_reply_to_id <> '' AND EXISTS (SELECT 1 FROM @github_comments p "
+        "WHERE p.account = t.account AND p.comment_kind = t.comment_kind "
+        "AND p.comment_id = t.in_reply_to_id AND lower(p.author_login) = lower(t.account))) "
+        f"THEN {TIMELINE_PRIORITY_DIRECT} "
+        "WHEN EXISTS (SELECT 1 FROM @github_comments z "
+        "WHERE z.account = t.account AND z.repo = t.repo AND z.issue_number = t.issue_number "
+        "AND lower(z.author_login) = lower(t.account) "
+        "AND z.created_at BETWEEN t.created_at - interval '30 days' AND t.created_at) "
+        f"OR {_GH_OWNS_REPO} THEN {TIMELINE_PRIORITY_CC} "
+        f"ELSE {TIMELINE_PRIORITY_NOISE} END"
+    ),
+)
+
+# Only the acts nothing else records: commits, issues, PRs and comments arrive
+# through search with full history, so their feed events would be duplicates.
+_GITHUB_EVENT_TYPES_SQL = (
+    "(t.event_type IN ('WatchEvent', 'ForkEvent', 'ReleaseEvent', 'PublicEvent') "
+    "OR (t.event_type = 'CreateEvent' AND t.payload_json->'payload'->>'ref_type' = 'repository'))"
+)
+
+_GITHUB_EVENT = _simple_adapter(
+    name="github_event",
+    source_table="github_events",
+    source="github",
+    kind="activity",
+    from_sql="@github_events t",
+    event_id="concat_ws('|', t.account, t.event_id)",
+    event_ts=_real_ts("t.created_at", "t.synced_at"),
+    ingest_ts="t.synced_at",
+    actor="t.actor_login",
+    title=(
+        "CASE t.event_type "
+        "WHEN 'WatchEvent' THEN concat('Starred ', t.repo) "
+        "WHEN 'ForkEvent' THEN concat('Forked ', t.repo) "
+        "WHEN 'ReleaseEvent' THEN concat('Released ', t.repo, ' ', "
+        "COALESCE(NULLIF(t.payload_json->'payload'->'release'->>'name', ''), "
+        "t.payload_json->'payload'->'release'->>'tag_name', '')) "
+        "WHEN 'PublicEvent' THEN concat('Made ', t.repo, ' public') "
+        "ELSE concat('Created repository ', t.repo) END"
+    ),
+    snippet=_snippet(
+        "COALESCE(NULLIF(t.payload_json->'payload'->'release'->>'body', ''), "
+        "t.payload_json->'payload'->>'description', '')"
+    ),
+    context="t.repo",
+    source_pk="jsonb_build_object('account', t.account, 'event_id', t.event_id)",
+    metadata="jsonb_build_object('subtype', t.event_type, 'repo', t.repo, 'is_public', t.is_public = 1)",
+    search_text=_search_concat("t.repo", "t.event_type"),
+    where=_GITHUB_EVENT_TYPES_SQL,
+    priority=f"CASE WHEN lower(t.actor_login) = lower(t.account) THEN {TIMELINE_PRIORITY_SELF} ELSE {TIMELINE_PRIORITY_NOISE} END",
+)
+
 _MUTATION = _simple_adapter(
     name="mutation",
     source_table="upstream_mutations",
@@ -2840,6 +3013,10 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _WHOOP_PRIVATE_HEALTHSPAN,
     _WHOOP_PRIVATE_COACH,
     _HACKER_NEWS_ITEM,
+    _GITHUB_COMMIT,
+    _GITHUB_ISSUE,
+    _GITHUB_COMMENT,
+    _GITHUB_EVENT,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
@@ -3064,6 +3241,11 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         # context is the conversation id, so (source, context) IS the conversation.
         "whoop_private_coach",
         "hacker_news_item",
+        # context is repo#number: (source, context) IS the issue's conversation.
+        "github_commit",
+        "github_issue",
+        "github_comment",
+        "github_event",
         "finance_transaction",
         "finance_observation",
         "manual_finance_document",
@@ -3413,6 +3595,11 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "hacker_news_profile": _entity("the HN account's current karma and about text"),
     "hacker_news_sync_state": _state("per-list Hacker News walk state"),
     "hacker_news_sessions": _state("published news.ycombinator.com session cookie"),
+    "github_commits": _events(),
+    "github_issues": _events(),
+    "github_comments": _events(),
+    "github_events": _events("only stars, forks, releases, publicizing and repository creation reach the timeline; the rest duplicate search-sourced rows"),
+    "github_sync_state": _state("per-stream GitHub search cursors and thread walk"),
     "whoop_private_cycles": _detail(
         "whoop_cycles", "high-resolution copy of the public cycle (strain components, sleep need)"
     ),

@@ -175,6 +175,14 @@
       "comment": "Faithful codex source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_github",
+      "layer": "base",
+      "domain": "github",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful GitHub data: Zach's acts and their threads."
+    },
+    {
       "name": "base_gmail",
       "layer": "base",
       "domain": "gmail",
@@ -3243,6 +3251,62 @@
       "discoverable": false,
       "query_access": "denied",
       "secret": true
+    },
+    {
+      "id": "github_issues",
+      "kind": "table",
+      "layer": "base",
+      "domain": "github",
+      "schema": "base_github",
+      "name": "issues",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for GitHub. Issues and PRs (is_pull_request=1) Zach is involved in; account is his login, repo + issue_number name it; comments holds each thread by anyone (comment_kind issue_comment/review/review_comment)."
+    },
+    {
+      "id": "github_comments",
+      "kind": "table",
+      "layer": "base",
+      "domain": "github",
+      "schema": "base_github",
+      "name": "comments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "github_commits",
+      "kind": "table",
+      "layer": "base",
+      "domain": "github",
+      "schema": "base_github",
+      "name": "commits",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "github_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "github",
+      "schema": "base_github",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "github_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "github_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
     },
     {
       "id": "hacker_news_items",

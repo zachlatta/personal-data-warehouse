@@ -86,6 +86,12 @@ STATEMENTS = (
     """CREATE OR REPLACE FUNCTION @capture_timeline_notification() RETURNS trigger
     LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled = 1 FROM @notification_state WHERE id = 'timeline' FOR SHARE) THEN
+            -- A source's first backfill inserts its whole history; an event
+            -- days old is not news, so only recent ones page (the epoch means
+            -- "time unknown" and still does).
+            IF NEW.event_ts > 'epoch'::timestamptz AND NEW.event_ts < now() - interval '3 days' THEN
+                RETURN NEW;
+            END IF;
             -- A recurring invite lands as one row per expanded instance; page
             -- for the first instance seen and let the rest ride along.
             IF COALESCE(NEW.metadata->>'recurring_event_id', '') <> '' AND EXISTS (

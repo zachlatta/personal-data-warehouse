@@ -103,6 +103,17 @@ a whole thread; `body_text` is the decoded body, `text` the raw HTML. Timeline s
 `hacker_news`, search scope `hacker_news`: his items and anything he acted on are `self`,
 replies to him `direct`, the rest of a thread `noise`; `timeline.context()` returns the thread.
 
+## GitHub
+
+`base_github.issues` is one row per issue or PR (`is_pull_request = 1`) Zach is involved in
+(opened, commented, mentioned, assigned, reviewed); `account` is his login and `repo` +
+`issue_number` name it. `base_github.comments` is the whole thread by anyone (`comment_kind`
+`issue_comment`, `review`, `review_comment`); `base_github.commits` his authored commits (default
+branches); `base_github.events` his 90-day activity feed. Timeline source `github`, search scope
+`github`, `context` = `repo#number`: his acts are `self`, a person on his issue or PR or
+@-mentioning him `direct`, a thread he was active in that month `cc`, bots `noise`. Prefer these
+rows over GitHub notification emails in Gmail, which are `noise`.
+
 ## Muse
 
 Muse is Meta's hosted personal agent, running on its own VM. Its chats are agent sessions

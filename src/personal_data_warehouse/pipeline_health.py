@@ -946,6 +946,32 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "github",
+        "GitHub",
+        cadence="every 15 min",
+        transport=(
+            "Dagster github_sync → GitHub REST search (issues, PRs, commits), thread lists"
+            " (comments, reviews) and the /users/<login>/events feed"
+        ),
+        data=7 * DAY,
+        run=3 * HOUR,
+        basis=(
+            "Zach acts on GitHub most weeks and others reply on his PRs, so a week with no"
+            " new row is worth a look; run health is the per-stream state the poller"
+            " stamps every 15 minutes"
+        ),
+        state=StateSource(
+            table="github_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "action_required means GitHub rejected a token in GITHUB_SOURCE_TOKENS —"
+            " replace it on the Dagster deployment; the other credentials keep running"
+        ),
+    ),
+    _source(
         "hacker_news",
         "Hacker News",
         cadence="every 30 min",
@@ -1497,6 +1523,11 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # pipeline going quiet is a real outage even though base_whoop keeps
     # filling.
     # Hacker News
+    "github_commits": _data("github", "synced_at", "authored_at"),
+    "github_issues": _data("github", "synced_at", "created_at"),
+    "github_comments": _data("github", "synced_at", "created_at"),
+    "github_events": _data("github", "synced_at", "created_at"),
+    "github_sync_state": _state("github", "updated_at"),
     "hacker_news_items": _data("hacker_news", "synced_at", "posted_at"),
     "hacker_news_user_items": _data("hacker_news", "synced_at"),
     "hacker_news_profile": _support("hacker_news", "synced_at", note="profile snapshot"),

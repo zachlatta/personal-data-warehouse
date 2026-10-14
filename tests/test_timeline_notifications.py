@@ -123,3 +123,18 @@ def test_notification_marts_translate_every_absent_timestamp(warehouse, view, co
         wh._command("INSERT INTO @notification_deliveries (notification_id,device_id,transport,endpoint,created_at,updated_at) "
                     "VALUES ('test','test','expo','{}','epoch','epoch')")
     assert wh._query("SELECT " + ",".join(columns) + " FROM @" + view) == [(None,) * len(columns)]
+
+
+def test_a_backfilled_direct_event_from_long_ago_never_pages(warehouse):
+    """A new source's history lands as fresh INSERTs: years of replies to Zach's
+    GitHub PRs are `direct`, and none of them is news. Only recent events page;
+    an event with no known time (the epoch) still does."""
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    priority = "'direct'::" + wh.sql_relation("timeline_priority")
+    for event_id, ts in (("old", "now() - interval '30 days'"), ("fresh", "now() - interval '2 hours'")):
+        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, event_ts) "
+                    f"VALUES ('test', %s, {priority}, 'test', 'Hello', {ts})", (event_id,))
+    insert(wh, "untimed", "direct")
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [
+        ("fresh",), ("untimed",)]

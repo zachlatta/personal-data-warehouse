@@ -83,6 +83,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
+    wh.ensure_github_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -164,7 +165,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # with +1 ops (gmail_settings_sync_state).
         # +1 base: base_muse_code.events, the Muse coding CLI's transcripts
         # (a separate tool and source from Muse, Meta's hosted agent).
-        "base": 76,
+        # +4 base: the github source (base_github.commits/issues/comments/
+        # events), with +1 ops (github_sync_state, per-stream search cursors).
+        "base": 80,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,
@@ -230,7 +233,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-            "ops": 39,
+            "ops": 40,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

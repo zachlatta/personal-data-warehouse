@@ -3019,3 +3019,131 @@ HACKER_NEWS_SESSION_COLUMNS = (
     "status",
     "error",
 )
+
+
+# --- GitHub ------------------------------------------------------------------
+# `account` is the GitHub LOGIN the source follows (it keys every row and is
+# what the timeline compares an author to). Every id is GitHub's own, stored
+# as text like every other provider id here.
+
+#: One row per commit the account authored, as GitHub's commit search reports
+#: it. The same commit can live in a fork under another repo, so the key is
+#: (repo, sha).
+GITHUB_COMMIT_COLUMNS = (
+    "account",
+    "repo",
+    "sha",
+    "author_login",
+    "author_name",
+    "author_email",
+    "committer_login",
+    "authored_at",
+    "committed_at",
+    "message",
+    "html_url",
+    "is_private",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+#: Issues AND pull requests (GitHub models a PR as an issue) the account is
+#: involved in: opened, commented on, was mentioned in, assigned or reviewed.
+#: The thread_* columns are the comment walk's own state: a thread is re-read
+#: when the issue's updated_at moves past thread_updated_at.
+GITHUB_ISSUE_COLUMNS = (
+    "account",
+    "issue_id",
+    "repo",
+    "issue_number",
+    "is_pull_request",
+    "title",
+    "body",
+    # open / closed, as the API reports it; merged_at says a PR was merged.
+    "issue_state",
+    "state_reason",
+    "author_login",
+    # User / Bot / Organization, from the API's user.type.
+    "author_type",
+    "assignee_logins",
+    "label_names",
+    "comments_count",
+    "created_at",
+    "updated_at",
+    "closed_at",
+    "merged_at",
+    "html_url",
+    "raw_json",
+    "thread_synced_at",
+    "thread_updated_at",
+    # ok / not_found / error from the last comment walk.
+    "thread_status",
+    "synced_at",
+    "sync_version",
+)
+
+#: Every comment in an archived thread, whoever wrote it: issue/PR
+#: conversation comments, PR reviews and PR review (inline) comments. The
+#: three are separate id spaces on GitHub, so the kind is part of the key.
+GITHUB_COMMENT_COLUMNS = (
+    "account",
+    # issue_comment / review / review_comment
+    "comment_kind",
+    "comment_id",
+    "repo",
+    "issue_number",
+    "issue_id",
+    "author_login",
+    "author_type",
+    "body",
+    # A review's APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED.
+    "review_state",
+    # A review comment's file path and the comment it answers.
+    "path",
+    "in_reply_to_id",
+    "created_at",
+    "updated_at",
+    "html_url",
+    "raw_json",
+    "synced_at",
+    "sync_version",
+)
+
+#: The account's public (and, with its own token, private) activity feed from
+#: /users/<login>/events. GitHub keeps only 90 days / 300 events there, so this
+#: is the fast path for acts that have no search API: stars, forks, releases,
+#: repositories created.
+GITHUB_EVENT_COLUMNS = (
+    "account",
+    "event_id",
+    "event_type",
+    "repo",
+    "actor_login",
+    "created_at",
+    "is_public",
+    "payload_json",
+    "synced_at",
+    "sync_version",
+)
+
+#: One row per (account, stream). A stream is one search (or the events feed,
+#: or the thread walk) under one credential scope, so adding a token that can
+#: see private repositories starts that scope's backfill from scratch while
+#: the public one keeps its place.
+GITHUB_SYNC_STATE_COLUMNS = (
+    "account",
+    "stream",
+    "credential_scope",
+    "status",
+    "error",
+    "last_success_at",
+    # Backfill walks newest to oldest: everything before the cursor is still
+    # to walk; completed_at is stamped when the cursor passes the floor.
+    "backfill_cursor_at",
+    "backfill_span_seconds",
+    "backfill_completed_at",
+    "incremental_watermark_at",
+    "items_seen",
+    "updated_at",
+    "sync_version",
+)

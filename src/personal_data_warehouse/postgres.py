@@ -83,6 +83,11 @@ from personal_data_warehouse.schema import (
     SIMPLEFIN_TRANSACTION_COLUMNS,
     GOOGLE_DRIVE_FILE_COLUMNS,
     GOOGLE_DRIVE_FILE_TEXT_COLUMNS,
+    GITHUB_COMMENT_COLUMNS,
+    GITHUB_COMMIT_COLUMNS,
+    GITHUB_EVENT_COLUMNS,
+    GITHUB_ISSUE_COLUMNS,
+    GITHUB_SYNC_STATE_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
     HACKER_NEWS_SESSION_COLUMNS,
@@ -366,6 +371,13 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     # Stories and comments share one adapter; the subsource is the item type
     # (story / comment / job / poll) from metadata.
     ("hacker_news", ("hacker_news_item",), "COALESCE(t.metadata->>'item_type', t.kind)"),
+    # Commits, issues/PRs, comments/reviews and feed events; the subsource is
+    # the subtype (commit / issue / pull_request / review / WatchEvent ...).
+    (
+        "github",
+        ("github_commit", "github_issue", "github_comment", "github_event"),
+        "COALESCE(t.metadata->>'subtype', t.kind)",
+    ),
 )
 # The adapters the broad-search pool scans through the low-volume partial BM25
 # index, derived from the source map so a new source cannot be forgotten.
@@ -1076,6 +1088,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "hacker_news_sync_state": TableSpec(
         HACKER_NEWS_SYNC_STATE_COLUMNS, ("account", "list_name"), "updated_at"
     ),
+    "github_commits": TableSpec(GITHUB_COMMIT_COLUMNS, ("account", "repo", "sha")),
+    "github_issues": TableSpec(GITHUB_ISSUE_COLUMNS, ("account", "issue_id")),
+    "github_comments": TableSpec(GITHUB_COMMENT_COLUMNS, ("account", "comment_kind", "comment_id")),
+    "github_events": TableSpec(GITHUB_EVENT_COLUMNS, ("account", "event_id")),
+    "github_sync_state": TableSpec(GITHUB_SYNC_STATE_COLUMNS, ("account", "stream"), "updated_at"),
     # Owner-managed gateway configuration, encrypted by the Go app.
     "mcp_connections": TableSpec(("name", "payload", "updated_at"), ("name",), "updated_at"),
     # PK (account, session_key) is load-bearing: the app's publish endpoint
@@ -1756,6 +1773,56 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS hacker_news_profile_synced_idx ON @hacker_news_profile (synced_at)",
     ),
     IndexSpec(
+        "github_commits_synced_idx",
+        "github_commits",
+        "CREATE INDEX IF NOT EXISTS github_commits_synced_idx ON @github_commits (synced_at)",
+    ),
+    IndexSpec(
+        "github_commits_authored_idx",
+        "github_commits",
+        "CREATE INDEX IF NOT EXISTS github_commits_authored_idx ON @github_commits (account, authored_at DESC)",
+    ),
+    IndexSpec(
+        "github_issues_synced_idx",
+        "github_issues",
+        "CREATE INDEX IF NOT EXISTS github_issues_synced_idx ON @github_issues (synced_at)",
+    ),
+    IndexSpec(
+        "github_issues_repo_number_idx",
+        "github_issues",
+        "CREATE INDEX IF NOT EXISTS github_issues_repo_number_idx ON @github_issues (account, repo, issue_number)",
+    ),
+    IndexSpec(
+        "github_issues_thread_due_idx",
+        "github_issues",
+        "CREATE INDEX IF NOT EXISTS github_issues_thread_due_idx ON @github_issues (account, thread_synced_at, updated_at DESC)",
+    ),
+    IndexSpec(
+        "github_comments_synced_idx",
+        "github_comments",
+        "CREATE INDEX IF NOT EXISTS github_comments_synced_idx ON @github_comments (synced_at)",
+    ),
+    IndexSpec(
+        "github_comments_thread_idx",
+        "github_comments",
+        "CREATE INDEX IF NOT EXISTS github_comments_thread_idx ON @github_comments (account, repo, issue_number, created_at)",
+    ),
+    IndexSpec(
+        "github_comments_author_idx",
+        "github_comments",
+        "CREATE INDEX IF NOT EXISTS github_comments_author_idx ON @github_comments (account, author_login, created_at DESC)",
+    ),
+    IndexSpec(
+        "github_events_synced_idx",
+        "github_events",
+        "CREATE INDEX IF NOT EXISTS github_events_synced_idx ON @github_events (synced_at)",
+    ),
+    IndexSpec(
+        "github_events_created_idx",
+        "github_events",
+        "CREATE INDEX IF NOT EXISTS github_events_created_idx ON @github_events (account, created_at DESC)",
+    ),
+    IndexSpec(
         "whoop_private_cycles_synced_idx",
         "whoop_private_cycles",
         "CREATE INDEX IF NOT EXISTS whoop_private_cycles_synced_idx ON @whoop_private_cycles (synced_at)",
@@ -2302,6 +2369,9 @@ POSTGRES_INSERT_PAGE_SIZES = {
 
 
 ARRAY_COLUMNS = {
+    # github: an issue's assignees and labels.
+    "assignee_logins",
+    "label_names",
     # mart health: the base tables a view reads (logical ids) and the pipelines
     # they belong to, resolved from pg_depend. collation health: a unique
     # index's key columns.
@@ -2376,6 +2446,10 @@ JSONB_COLUMNS_BY_TABLE = {
     "whoop_private_heart_rate_samples": {"raw_json"},
     "whoop_private_journal_entries": {"raw_json"},
     "hacker_news_items": {"raw_json", "kids_json"},
+    "github_commits": {"raw_json"},
+    "github_issues": {"raw_json"},
+    "github_comments": {"raw_json"},
+    "github_events": {"payload_json"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2524,6 +2598,16 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # github
+    "authored_at",
+    "committed_at",
+    "closed_at",
+    "merged_at",
+    "thread_synced_at",
+    "thread_updated_at",
+    "backfill_cursor_at",
+    "backfill_completed_at",
+    "incremental_watermark_at",
     # WHOOP Advanced Labs: when the blood was drawn. WHOOP Coach: when the
     # conversation began (to the second, or the local day's start).
     "tested_at",
@@ -2652,6 +2736,12 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # github
+    "issue_number",
+    "is_pull_request",
+    "comments_count",
+    "is_public",
+    "backfill_span_seconds",
     # ops.gmail_settings_sync_state: what the last snapshot held.
     "label_count",
     "filter_count",
@@ -3059,6 +3149,14 @@ _HACKER_NEWS_TABLES = (
     "hacker_news_user_items",
     "hacker_news_profile",
     "hacker_news_sync_state",
+)
+
+_GITHUB_TABLES = (
+    "github_commits",
+    "github_issues",
+    "github_comments",
+    "github_events",
+    "github_sync_state",
 )
 
 _WHATSAPP_TABLES = (
@@ -10639,6 +10737,86 @@ class PostgresWarehouse:
             ),
         )
 
+    # --- GitHub ------------------------------------------------------------
+
+    def ensure_github_tables(self) -> None:
+        """Provision the GitHub source: commits, issues, comments, events, state."""
+        self._ensure_table_group(list(_GITHUB_TABLES))
+
+    def upsert_github_commits(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        self._insert_rows("github_commits", [dict(r) for r in rows], GITHUB_COMMIT_COLUMNS)
+
+    def upsert_github_issues(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert issues WITHOUT touching the thread walk's own columns.
+
+        Search pages re-read the same issue many times; only the walk may move
+        thread_synced_at / thread_updated_at, or a search would make every
+        thread look unread (or, worse, already read).
+        """
+        columns = tuple(c for c in GITHUB_ISSUE_COLUMNS if not c.startswith("thread_"))
+        self._insert_rows("github_issues", [dict(r) for r in rows], columns)
+
+    def upsert_github_comments(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        self._insert_rows("github_comments", [dict(r) for r in rows], GITHUB_COMMENT_COLUMNS)
+
+    def upsert_github_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        self._insert_rows("github_events", [dict(r) for r in rows], GITHUB_EVENT_COLUMNS)
+
+    def github_known_event_ids(self, *, account: str, event_ids: Sequence[str]) -> set[str]:
+        ids = [str(i) for i in event_ids]
+        if not ids:
+            return set()
+        rows = self._query(
+            "SELECT event_id FROM @github_events WHERE account = %s AND event_id = ANY(%s)",
+            (account, ids),
+        )
+        return {str(r[0]) for r in rows}
+
+    def github_threads_due(self, *, account: str, limit: int) -> list[dict[str, Any]]:
+        """Issues whose comment thread is unread or older than the issue.
+
+        Already-walked threads that moved come first (that is live activity),
+        then never-walked ones newest first, so a budget-bounded backfill
+        finishes recent conversations before old ones.
+        """
+        rows = self._query(
+            """
+            SELECT issue_id, repo, issue_number, is_pull_request, updated_at, thread_synced_at, thread_updated_at
+            FROM @github_issues
+            WHERE account = %s
+              AND (thread_synced_at <= '1970-01-01 00:00:00+00'::timestamptz OR updated_at > thread_updated_at)
+            ORDER BY (thread_synced_at > '1970-01-01 00:00:00+00'::timestamptz) DESC, updated_at DESC
+            LIMIT %s
+            """,
+            (account, int(limit)),
+        )
+        keys = ("issue_id", "repo", "issue_number", "is_pull_request", "updated_at", "thread_synced_at", "thread_updated_at")
+        return [dict(zip(keys, r, strict=True)) for r in rows]
+
+    def mark_github_thread(
+        self, *, account: str, issue_id: str, thread_updated_at: datetime, status: str, now: datetime
+    ) -> None:
+        self._command(
+            """
+            UPDATE @github_issues
+            SET thread_synced_at = %s, thread_updated_at = %s, thread_status = %s
+            WHERE account = %s AND issue_id = %s
+            """,
+            (now, thread_updated_at, status, account, issue_id),
+        )
+
+    def load_github_sync_state(self, *, account: str) -> dict[str, dict[str, Any]]:
+        columns = GITHUB_SYNC_STATE_COLUMNS
+        rows = self._query(
+            f"SELECT {', '.join(_identifier(c) for c in columns)} FROM @github_sync_state WHERE account = %s",
+            (account,),
+        )
+        return {str(row[1]): dict(zip(columns, row, strict=True)) for row in rows}
+
+    def save_github_sync_state(self, row: Mapping[str, Any]) -> None:
+        full = {c: row.get(c, _default_python_value(c, table="github_sync_state")) for c in GITHUB_SYNC_STATE_COLUMNS}
+        self._insert_rows("github_sync_state", [full], GITHUB_SYNC_STATE_COLUMNS)
+
     def load_slack_session(self, *, account: str, session_key: str = "default") -> dict[str, Any]:
         """The stored Slack client session, or an empty dict when none is published.
 
@@ -18202,6 +18380,12 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
 # timeline adapter re-walk old rows forever and hides genuine edit latency.
 # Compare every other mutable column before allowing the upsert.
 NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    # GitHub rows are re-read on every overlapping search page; an unchanged
+    # row must not bump its version (or re-walk its timeline row).
+    "github_commits": ("synced_at", "sync_version"),
+    "github_issues": ("synced_at", "sync_version"),
+    "github_comments": ("synced_at", "sync_version"),
+    "github_events": ("synced_at", "sync_version"),
     "slack_messages": ("synced_at", "sync_version"),
     "slack_files": ("synced_at", "sync_version"),
     "slack_message_reactions": ("synced_at", "sync_version"),

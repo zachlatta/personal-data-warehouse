@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
+from personal_data_warehouse.github_api import comment_row, commit_row, event_row, issue_row
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
 from personal_data_warehouse.relations import (
     AI_EVENT_SOURCE_RELATIONS,
@@ -81,6 +82,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
+    wh.ensure_github_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()
@@ -1155,6 +1157,85 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
         ]
     )
     wh.upsert_hacker_news_user_items(account="zachlatta", relation="upvoted", item_ids=["100"], now=_NOW)
+    _seed_github(wh)
+
+
+def _gh_ts(hours: int) -> str:
+    return (_NOW - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_github(wh) -> None:
+    """One GitHub row per classification branch (asserted in test_backfill_normalizes_every_source)."""
+    me = {"login": "zachlatta", "type": "User"}
+    friend = {"login": "a-friend", "type": "User"}
+    bot = {"login": "ci-helper[bot]", "type": "Bot"}
+    wh.upsert_github_commits(
+        [
+            commit_row(
+                "zachlatta",
+                {
+                    "sha": "abc123", "html_url": "https://example.test/c/abc123",
+                    "repository": {"full_name": "zachlatta/demo", "private": False},
+                    "author": me, "committer": me,
+                    "commit": {
+                        "message": "Fix the thing\n\nLonger body",
+                        "author": {"name": "Z", "email": "z@example.test", "date": _gh_ts(9)},
+                        "committer": {"date": _gh_ts(9)},
+                    },
+                },
+                now=_NOW,
+            )
+        ]
+    )
+    wh.upsert_github_issues(
+        [
+            # His PR (self); a stranger's issue that @-mentions him (direct);
+            # a stranger's issue elsewhere he later commented on (noise).
+            issue_row("zachlatta", {
+                "id": 1, "number": 7, "repository_url": "https://api.example.test/repos/org/app",
+                "title": "Add widgets", "body": "This adds widgets", "state": "open", "user": me,
+                "pull_request": {"merged_at": None}, "created_at": _gh_ts(20), "updated_at": _gh_ts(3),
+                "labels": [{"name": "feature"}], "comments": 2,
+            }, now=_NOW),
+            issue_row("zachlatta", {
+                "id": 2, "number": 8, "repository_url": "https://api.example.test/repos/org/app",
+                "title": "Crash on start", "body": "@zachlatta can you look?", "state": "open", "user": friend,
+                "created_at": _gh_ts(18), "updated_at": _gh_ts(4),
+            }, now=_NOW),
+            issue_row("zachlatta", {
+                "id": 3, "number": 9, "repository_url": "https://api.example.test/repos/other/lib",
+                "title": "Docs typo", "body": "fix docs", "state": "closed", "user": friend,
+                "created_at": _gh_ts(30), "updated_at": _gh_ts(5),
+            }, now=_NOW),
+        ]
+    )
+
+    def comment(kind, cid, repo, number, issue_id, user, body, hours, **extra):
+        item = {"id": cid, "user": user, "body": body, "html_url": f"https://example.test/{cid}", **extra}
+        item["submitted_at" if kind == "review" else "created_at"] = _gh_ts(hours)
+        return comment_row("zachlatta", kind, item, repo=repo, issue_number=number, issue_id=issue_id, now=_NOW)
+
+    wh.upsert_github_comments(
+        [
+            # On his PR: a friend's approval (direct) and a bot (noise), plus
+            # the empty COMMENTED envelope of an inline review (not an event).
+            comment("review", 50, "org/app", 7, "1", friend, "", 6, state="APPROVED"),
+            comment("issue_comment", 51, "org/app", 7, "1", bot, "Build passed", 7),
+            comment("review", 52, "org/app", 7, "1", friend, "", 6, state="COMMENTED"),
+            # On the docs issue: his comment (self), then a friend's reply a
+            # day later in a thread he is active in (cc).
+            comment("issue_comment", 53, "other/lib", 9, "3", me, "Happy to help", 28),
+            comment("issue_comment", 54, "other/lib", 9, "3", friend, "Thanks, merged", 4),
+        ]
+    )
+    wh.upsert_github_events(
+        [
+            event_row("zachlatta", {"id": "e1", "type": "WatchEvent", "actor": me, "repo": {"name": "org/cool"},
+                                    "created_at": _gh_ts(2), "public": True, "payload": {"action": "started"}}, now=_NOW),
+            event_row("zachlatta", {"id": "e2", "type": "PushEvent", "actor": me, "repo": {"name": "org/app"},
+                                    "created_at": _gh_ts(1), "public": True, "payload": {}}, now=_NOW),
+        ]
+    )
 
 
 # The seeded fixture rows exercise one classification branch per adapter:
@@ -1194,6 +1275,12 @@ EXPECTED_SEEDED_PRIORITIES = {
     # test_backfill_normalizes_every_source; this dict is built newest-first
     # and keeps the LAST row per adapter, which is the upvoted story (self).
     "hacker_news_item": "self",
+    # Oldest row per adapter: his commit, the old docs issue (noise), his own
+    # comment on it (self) and the star (self).
+    "github_commit": "self",
+    "github_issue": "noise",
+    "github_comment": "self",
+    "github_event": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
@@ -1228,6 +1315,12 @@ EXPECTED_SEEDED_EVENTS = {
     # The hidden tool turn is machinery, not conversation.
     "whoop_private_coach": 2,
     "hacker_news_item": 4,
+    "github_commit": 1,
+    "github_issue": 3,
+    # The empty COMMENTED review envelope is not an event.
+    "github_comment": 4,
+    # Only the star: a push duplicates commit search.
+    "github_event": 1,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -1383,6 +1476,27 @@ def test_backfill_normalizes_every_source(warehouse):
     assert hn["100"]["metadata"]["relations"] == ["upvoted"]
     assert hn["100"]["source_table"] == "hacker_news_items"
     assert hn["102"]["actor"] == "replier"
+
+    # GitHub: one row per classification branch.
+    gh = {r["event_id"].split("|", 1)[1]: r for r in rows if r["source"] == "github"}
+    assert {k: v["priority"] for k, v in gh.items()} == {
+        "zachlatta/demo|abc123": "self",  # his commit
+        "1": "self",  # his PR
+        "2": "direct",  # an issue that @-mentions him
+        "3": "noise",  # someone else's issue he only joined later
+        "review|50": "direct",  # an approval on his PR
+        "issue_comment|51": "noise",  # a bot on his PR
+        "issue_comment|53": "self",  # his own comment
+        "issue_comment|54": "cc",  # a reply in a thread he was active in
+        "e1": "self",  # a star
+    }
+    assert gh["1"]["context"] == "org/app#7"
+    assert gh["1"]["title"] == "PR org/app#7: Add widgets"
+    assert gh["review|50"]["title"] == "Approved org/app#7: Add widgets"
+    assert gh["review|50"]["context"] == "org/app#7"
+    assert gh["zachlatta/demo|abc123"]["title"] == "Commit to zachlatta/demo: Fix the thing"
+    assert gh["e1"]["title"] == "Starred org/cool"
+    assert gh["1"]["metadata"]["subtype"] == "pull_request"
 
     # Second run is a no-op: nothing new, no seq churn. Keyed on the real
     # primary key: event_id alone is only unique within an adapter, and the

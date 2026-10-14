@@ -474,6 +474,26 @@ Configure `HACKER_NEWS_ACCOUNT` (the HN username) on the Dagster deployment. Opt
 `HACKER_NEWS_REFRESH_MIN_AGE_HOURS` (6). Health: `marts_ops.pipeline_health` row `hacker_news`;
 per-list state in `ops.hacker_news_sync_state`.
 
+## GitHub Sync
+
+Archives Zach's GitHub activity — commits he authored, issues and PRs he opened, commented on,
+was mentioned or assigned in or reviewed, and every comment and review in those threads by
+anyone — into `base_github.commits` / `issues` / `comments` / `events`, with four timeline
+adapters (`github_commit`, `github_issue`, `github_comment`, `github_event`) and the search
+scope `github`. The Dagster `github_sync` poller runs every 15 minutes: the
+`/users/<login>/events` feed, incremental search (`updated:>=` / `committer-date:>=`), a backfill
+of the same searches walked newest to oldest in date windows that stay under GitHub's
+1,000-result cap, then the comment threads of every issue that moved.
+
+Configure `GITHUB_ACCOUNT` (the login) on the Dagster deployment and one credential:
+`GITHUB_SOURCE_TOKENS` (comma-separated read-only tokens; a fine-grained token sees one owner's
+private repositories, so two owners take two), or `GITHUB_PROXY_BASE_URL` +
+`GITHUB_PROXY_API_KEY` for a read-only proxy (public data only). Optional: `GITHUB_ENABLED`,
+`GITHUB_POLL_INTERVAL_SECONDS` (900), `GITHUB_MAX_REQUESTS_PER_RUN` (1500),
+`GITHUB_MAX_RUN_SECONDS` (600). Walk state is per (stream, credential) in
+`ops.github_sync_state`, so adding a token walks history again for what it can newly see.
+Health: `marts_ops.pipeline_health` row `github`.
+
 ## Google Drive Source Sync
 
 Mirrors your Google Drive *files* (metadata + extracted text) into the warehouse so they
