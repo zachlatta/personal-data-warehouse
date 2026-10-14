@@ -104,7 +104,7 @@ func contextTool(svc *query.Service) tool.Tool {
 			if in.After != nil {
 				after = *in.After
 			}
-			return svc.Context(ctx, query.ContextRequest{Ref: in.Ref, Before: before, After: after}), nil
+			return svc.Context(ctx, query.ContextRequest{Ref: in.Ref, Before: before, After: after, Full: in.Full}), nil
 		},
 		IsError: func(r query.ContextResponse) bool { return r.Error != "" },
 	}

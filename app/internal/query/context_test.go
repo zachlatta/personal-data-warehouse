@@ -52,3 +52,41 @@ func TestContextRefusesAnEmptyRefAndAnOversizedWindow(t *testing.T) {
 		t.Fatalf("a refused request must not reach Postgres: %#v", runner.statements)
 	}
 }
+
+// --full answers the question agents asked after every context read: the
+// whole text of these events. Without it they hand-built SQL against a
+// relation they guessed (agent_sessions.turns with turn_index: 14 sessions
+// in the 30 days to 2026-10-13).
+func TestContextFullReturnsEachEventsWholeTextUpToACapAndItsDrill(t *testing.T) {
+	runner := &fakeSearchRunner{
+		argsResults: map[string]RawResult{
+			contextFullSQL: {
+				Columns: []string{"adapter", "event_id", "priority", "event_ts", "actor", "title", "text", "text_chars", "source_table", "source_pk"},
+				Rows: []map[string]any{{
+					"adapter": "agent_session_turn", "event_id": "codex|s1|54", "priority": "background", "actor": "assistant",
+					"text": "the whole turn", "text_chars": int64(14), "source_table": "ai_conversation_events",
+					"source_pk": map[string]any{"source": "codex", "session_id": "s1", "event_uuid": "u54"},
+				}},
+			},
+		},
+	}
+	svc := NewService(runner, Options{})
+	resp := svc.Context(context.Background(), ContextRequest{Ref: "agent_session_turn:codex|s1|54", Before: 1, After: 1, Full: true})
+	if resp.Error != "" {
+		t.Fatalf("error: %s", resp.Error)
+	}
+	calls := runner.callsFor(contextFullSQL)
+	if len(calls) != 1 || calls[0][3] != ContextFullTextMaxChars {
+		t.Fatalf("calls = %#v", calls)
+	}
+	row := resp.Rows[0]
+	if row["text"] != "the whole turn" {
+		t.Fatalf("row = %#v", row)
+	}
+	if row["drill_sql"] != "SELECT * FROM marts_ai_conversations.events WHERE event_uuid = 'u54' AND session_id = 's1' AND source = 'codex'" {
+		t.Fatalf("drill_sql = %#v", row["drill_sql"])
+	}
+	if _, leaked := row["source_pk"]; leaked {
+		t.Fatalf("the drill replaces source_table/source_pk in the response: %#v", row)
+	}
+}

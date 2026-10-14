@@ -28,6 +28,8 @@ prints one line per event, oldest first.
 FLAGS
   -b, --before N   Events before the hit (default 5, max 50).
   -a, --after N    Events after the hit (default 5, max 50).
+  --full           Each event's whole text (up to 12,000 characters, then the
+                   statement that reads the rest) instead of a one-line preview.
   --refs           Append each event's own ref, for a further hop.
   --output FMT     text (default) or json.
 `
@@ -44,6 +46,7 @@ type contextToolInput struct {
 	Ref    string `json:"ref"`
 	Before int    `json:"before"`
 	After  int    `json:"after"`
+	Full   bool   `json:"full,omitempty"`
 }
 
 type contextToolResponse struct {
@@ -59,6 +62,11 @@ type contextRow struct {
 	Actor    string `json:"actor"`
 	Title    string `json:"title"`
 	Snippet  string `json:"snippet"`
+	// --full rows carry the whole text, its untruncated length and the
+	// statement that reads the source row.
+	Text      string `json:"text"`
+	TextChars int    `json:"text_chars"`
+	DrillSQL  string `json:"drill_sql"`
 }
 
 // runContext is the first-class spelling of `SELECT ... FROM
@@ -78,20 +86,9 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 	fs.IntVar(&after, "after", contextDefaultWindow, "events after the hit")
 	fs.IntVar(&after, "a", contextDefaultWindow, "alias for --after")
 	fs.BoolVar(&refs, "refs", false, "append each event's ref")
+	var full bool
+	fs.BoolVar(&full, "full", false, "each event's whole text")
 	fs.StringVar(&output, "output", "text", "text or json")
-	for _, arg := range args {
-		if arg == "--full" || arg == "-full" {
-			// search has --full, so agents reach for it here (twice in the
-			// week to 2026-10-10). The context tool returns each event's
-			// stored preview, which is at most 500 characters; the whole
-			// text is one hop away, and only the error can say where.
-			fmt.Fprintln(stderr, "pdw context: there is no --full -- each line is the event's stored preview (at most 500 characters). "+
-				"For the whole text, add --output json (or --refs) and drill into the source row: an agent turn is marts_ai_conversations.events.text "+
-				"(WHERE source = '<provider>' AND session_id = '<id>' AND seq = <n>, all three read off the ref), an email base_gmail.messages.body_markdown_clean; "+
-				"for anything else, timeline.events.source_table + source_pk name the row.")
-			return 2
-		}
-	}
 	ordered, err := flagsFirst(fs, args, "context")
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw context:", err)
@@ -122,7 +119,7 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stderr, "pdw context: --output must be text or json")
 		return 2
 	}
-	input, err := json.Marshal(contextToolInput{Ref: ref, Before: before, After: after})
+	input, err := json.Marshal(contextToolInput{Ref: ref, Before: before, After: after, Full: full})
 	if err != nil {
 		fmt.Fprintln(stderr, "pdw context:", err)
 		return 1
@@ -157,6 +154,10 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		return 0
 	}
 	fmt.Fprintf(stdout, "Context: %s (%d before, %d after) — %d events\n", ref, before, after, len(rows))
+	if full {
+		printContextFull(stdout, rows, refs)
+		return 0
+	}
 	for _, row := range rows {
 		line := strings.Join(nonemptySearchParts(shortSearchTime(row.EventTS), row.Priority, row.Actor), " · ")
 		title := strings.TrimSpace(row.Title)
@@ -180,4 +181,34 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stdout, line)
 	}
 	return 0
+}
+
+// printContextFull prints one block per event: a header line, then the whole
+// text as stored, then -- when the server capped it -- the statement that
+// reads the rest of that event's source row.
+func printContextFull(w io.Writer, rows []contextRow, refs bool) {
+	for _, row := range rows {
+		header := strings.Join(nonemptySearchParts(shortSearchTime(row.EventTS), row.Priority, row.Actor), " · ")
+		if title := strings.TrimSpace(row.Title); title != "" {
+			header += " — " + compactSearchLine(title, searchBriefTitleRunes)
+		}
+		if refs && row.Adapter != "" {
+			header += "  [" + row.Adapter + ":" + row.EventID + "]"
+		}
+		fmt.Fprintf(w, "\n## %s\n", header)
+		text := strings.TrimSpace(row.Text)
+		if text == "" {
+			text = strings.TrimSpace(row.Snippet)
+		}
+		fmt.Fprintln(w, text)
+		if shown := len([]rune(row.Text)); row.TextChars > shown {
+			rest := strings.TrimSpace(row.DrillSQL)
+			if rest == "" {
+				rest = "rerun with --refs and read the event's source row"
+			} else if !strings.ContainsAny(rest, "\"$`\\!") {
+				rest = "pdw sql \"" + rest + "\""
+			}
+			fmt.Fprintf(w, "[truncated at %d of %d characters; the rest: %s]\n", shown, row.TextChars, rest)
+		}
+	}
 }

@@ -1315,9 +1315,9 @@ var commandRedirects = map[string]string{
 	"fetch":      readHitRedirect,
 }
 
-const readHitRedirect = "read a search hit's conversation with `pdw context '<ref>'`. For its whole record, " +
-	"`pdw sql` on the row the ref names: timeline.events WHERE adapter = '<text before the first colon>' AND event_id = '<the rest>' " +
-	"gives source_table + source_pk (an agent turn's full text is marts_ai_conversations.events.text, an email's base_gmail.messages.body_markdown_clean). " +
+const readHitRedirect = "read a search hit's conversation with `pdw context '<ref>'`, and its whole text with " +
+	"`pdw context '<ref>' --full -b 0 -a 0`. Its whole source row is the `sql:` line `pdw search` prints under the hit " +
+	"(a ready statement built from the event's source_table + source_pk; source_table is a catalog id, not a relation). " +
 	"A stored file's bytes (attachment, recording, Drive file, Slack F… id) are `pdw call get_object --data '{\"storage_file_id\":\"…\"}'`"
 
 // callToolRedirects are the tools `call` refuses, because each already has a

@@ -129,3 +129,27 @@ func TestSQLHintOnlyForCSVAndAfterRows(t *testing.T) {
 		t.Fatalf("csv (text alias) should print rows then the hint on stderr: code=%d out=%q stderr=%q", code, out, errOut)
 	}
 }
+
+const drillSearchBody = `{"data":{"query":"Gusto","mode":"hybrid","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{"self":1},"total_rows":1,"guidance":"For an email, chat/channel, or agent-turn hit, read the conversation around it with timeline.context(ref, 5, 5) — a Gmail hit returns its thread. For a hit's whole authoritative row run its drill_sql verbatim.","rows":[{"source":"gmail","priority":"self","occurred_at":"2026-06-09T20:28:00Z","who":"zach@hackclub.com","title":"Re: Benefits Integration","text":"Hi Andrew","ref":"gmail_email:zach@hackclub.com|19eae12efa4ca3ca","drill_sql":"SELECT * FROM base_gmail.messages WHERE account = 'zach@hackclub.com' AND message_id = '19eae12efa4ca3ca'"}]}}`
+
+// A hit's whole record used to be a hand-built second query against a
+// relation the agent had to guess (base_gmail.messages.id, timeline.events.ref,
+// agent_sessions.turns: 50+ error sessions in the 30 days to 2026-10-13). The
+// CLI prints the server's ready statement under the ref, in both layouts, and
+// speaks its own command for the conversation instead of the SQL function.
+func TestSearchPrintsEachHitsDrillStatementAndTheCLIContextCommand(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, drillSearchBody) })
+	for _, args := range [][]string{{"search", "Gusto"}, {"search", "--full", "Gusto"}} {
+		out, errOut, code := runCLI(t, srv.URL, "", args...)
+		if code != 0 {
+			t.Fatalf("code=%d stderr=%q", code, errOut)
+		}
+		want := `   sql: pdw sql "SELECT * FROM base_gmail.messages WHERE account = 'zach@hackclub.com' AND message_id = '19eae12efa4ca3ca'"`
+		if !strings.Contains(out, want+"\n") {
+			t.Fatalf("%v: missing drill line %q in:\n%s", args, want, out)
+		}
+		if strings.Contains(out, "timeline.context(ref, 5, 5)") || !strings.Contains(out, "pdw context '<ref>'") {
+			t.Fatalf("%v: the CLI guidance must name pdw context, not the SQL function:\n%s", args, out)
+		}
+	}
+}

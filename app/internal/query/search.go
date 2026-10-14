@@ -35,9 +35,9 @@ const searchDefaultMaxResults = 10
 const (
 	searchHitGuidance = "For an email, chat/channel, or agent-turn hit, read the conversation " +
 		"around it with timeline.context(ref, 5, 5) — a Gmail hit returns its thread, a Slack hit " +
-		"its thread or channel, a message its chat. If the hit is still insufficient, use source_table and " +
-		"source_pk for a one-hop drill-down to the authoritative row; raise max_results explicitly " +
-		"only when you need more recall."
+		"its thread or channel, a message its chat. For a hit's whole authoritative row run its drill_sql " +
+		"verbatim (source_table is a catalog id, not a relation name, so do not build that query by hand); " +
+		"raise max_results explicitly only when you need more recall."
 	searchEmptyGuidance = "No hits is not proof of absence. Retry once with FEWER, more distinctive " +
 		"words -- a name, an id, a product, an amount, a subject-line phrase -- rather than more of " +
 		"them; use mode exact for an identifier or literal phrase, widen sources/since if scoped, " +
@@ -449,7 +449,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		s.logger.ErrorContext(ctx, "search failed", "query", resp.Query, "mode", resp.Mode, "sql", statement, "error", err, "duration", time.Since(started))
 		return resp
 	}
-	resp.ColumnNames = append([]string(nil), raw.Columns...)
+	resp.ColumnNames = addDrillSQL(append([]string(nil), raw.Columns...), raw.Rows)
 	resp.TotalRows = len(raw.Rows)
 	for _, row := range raw.Rows {
 		if priority := strings.TrimSpace(fmt.Sprint(row["priority"])); priority != "" && priority != "<nil>" {

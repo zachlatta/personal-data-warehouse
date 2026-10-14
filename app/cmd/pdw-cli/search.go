@@ -56,6 +56,7 @@ type cliSearchHit struct {
 	Title      string `json:"title"`
 	Text       string `json:"text"`
 	Ref        string `json:"ref"`
+	DrillSQL   string `json:"drill_sql"`
 }
 
 // searchUsage is this command's OWN help. `pdw search --help` used to
@@ -372,22 +373,41 @@ func printSearchText(w io.Writer, resp cliSearchResponse, full bool) {
 			if body := strings.TrimSpace(hit.Text); body != "" {
 				fmt.Fprintf(w, "   %s\n", compactSearchLine(body, searchFullPreviewRunes))
 			}
-			if hit.Ref != "" {
-				fmt.Fprintf(w, "   ref: %s\n", hit.Ref)
-			}
+			printSearchHitRefs(w, hit)
 			continue
 		}
 		fmt.Fprintf(w, "%d. %s\n", i+1, searchBriefLine(hit))
-		if hit.Ref != "" {
-			fmt.Fprintf(w, "   ref: %s\n", hit.Ref)
-		}
+		printSearchHitRefs(w, hit)
 	}
 	if resp.Hint != "" {
 		fmt.Fprintf(w, "\nHint: %s\n", resp.Hint)
 	}
 	if resp.Guidance != "" {
-		fmt.Fprintf(w, "\nNext: %s\n", resp.Guidance)
+		fmt.Fprintf(w, "\nNext: %s\n", cliSearchGuidance(resp.Guidance))
 	}
+}
+
+// printSearchHitRefs prints a hit's ref and, when the server resolved one,
+// the ready statement that reads its whole authoritative row. The statement
+// is wrapped as a pdw sql command when it survives shell double quotes as-is.
+func printSearchHitRefs(w io.Writer, hit cliSearchHit) {
+	if hit.Ref != "" {
+		fmt.Fprintf(w, "   ref: %s\n", hit.Ref)
+	}
+	if drill := strings.TrimSpace(hit.DrillSQL); drill != "" {
+		if strings.ContainsAny(drill, "\"$`\\!") {
+			fmt.Fprintf(w, "   sql: %s\n", drill)
+		} else {
+			fmt.Fprintf(w, "   sql: pdw sql \"%s\"\n", drill)
+		}
+	}
+}
+
+// cliSearchGuidance speaks the CLI's own commands: the server's guidance is
+// shared with MCP, which calls timeline.context and reads drill_sql fields.
+func cliSearchGuidance(guidance string) string {
+	guidance = strings.ReplaceAll(guidance, "timeline.context(ref, 5, 5)", "pdw context '<ref>' (--full for whole texts)")
+	return strings.ReplaceAll(guidance, "run its drill_sql verbatim", "run its sql: line verbatim")
 }
 
 func orderedPriorityCounts(counts map[string]int) []string {

@@ -86,6 +86,7 @@ type contextInput struct {
 	Ref    string `json:"ref" jsonschema:"a search hit's ref, e.g. gmail_email:<account>|<message_id> or slack_message:<account>|<team>|<conversation>|<ts>"`
 	Before *int   `json:"before,omitempty" jsonschema:"events before the hit, 0-50, default 5"`
 	After  *int   `json:"after,omitempty" jsonschema:"events after the hit, 0-50, default 5"`
+	Full   bool   `json:"full,omitempty" jsonschema:"return each event's whole text (up to 12,000 characters, with a drill_sql for the rest) instead of its short preview"`
 }
 
 type searchInput struct {
@@ -133,7 +134,7 @@ var searchDescription = "FIRST tool for any text, topic, person, phrase, or iden
 	"Every hit carries priority, ref, source_table and source_pk: the context tool reads the conversation around a hit by its ref; source_table/source_pk reach the raw row."
 
 const contextDescription = "The conversation around one search hit, by the hit's ref: a Gmail hit returns its thread, a Slack hit its thread (or its channel when it is not in one), an iMessage/WhatsApp hit the rest of that chat, an agent-session turn its neighbouring turns, and anything else the neighbouring events of its stream. " +
-	"before/after are events either side (0-50, default 5). Each row carries adapter, event_id (adapter:event_id is that event's own ref, for a further hop), priority, event_ts, actor, title and snippet, oldest first."
+	"before/after are events either side (0-50, default 5). Each row carries adapter, event_id (adapter:event_id is that event's own ref, for a further hop), priority, event_ts, actor, title and snippet, oldest first. full=true returns each event's whole text instead of the snippet (up to 12,000 characters, with text_chars and a drill_sql that reads the source row) -- use it rather than writing SQL to read an email body or an agent turn."
 
 const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
 
