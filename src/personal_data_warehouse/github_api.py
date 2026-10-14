@@ -22,6 +22,8 @@ new token that can see private repositories walks history from scratch.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -138,8 +140,14 @@ class GitHubClient:
     ) -> None:
         self.credential = credential
         self._budget = budget
+        self._owns_session = session is None
         self._session = session or requests.Session()
         self._timeout = timeout
+        # requests' timeout bounds each socket read, not the request: on
+        # 2026-10-14 a commit search through the proxy sat in poll() for three
+        # hours and held the run. Every request now has a wall-clock cap.
+        self._total_timeout = max(float(timeout) * 2, 1.0)
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="github-request")
         self._sleep = sleep
         self._clock = clock
         self._last_search = float("-inf")
@@ -159,8 +167,14 @@ class GitHubClient:
             "User-Agent": DEFAULT_USER_AGENT,
             **dict(self.credential.headers),
         }
+        future = self._pool.submit(
+            self._session.get, url, params=dict(params or {}), headers=headers, timeout=self._timeout
+        )
         try:
-            response = self._session.get(url, params=dict(params or {}), headers=headers, timeout=self._timeout)
+            response = future.result(timeout=self._total_timeout)
+        except FutureTimeoutError as exc:
+            self._abandon_request()
+            raise GitHubError(f"GitHub request for {path} exceeded {self._total_timeout:.0f}s") from exc
         except requests.RequestException as exc:
             raise GitHubError(f"GitHub request failed for {path}: {type(exc).__name__}") from exc
         status = int(response.status_code)
@@ -174,6 +188,19 @@ class GitHubClient:
         if status == 429 or (status == 403 and _is_rate_limited(response, message)):
             raise GitHubRateLimitError(f"GitHub rate limit for {self.scope} on {path}: {message}")
         raise GitHubError(f"GitHub {status} for {path}: {message}")
+
+    def _abandon_request(self) -> None:
+        """Drop a request that will not finish: close its socket, start clean."""
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best effort on a wedged socket
+                pass
+        if self._owns_session:
+            self._session = requests.Session()
+        self._pool.shutdown(wait=False)
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="github-request")
 
     def paginate(self, path: str, params: Mapping[str, Any] | None = None, *, max_pages: int = 50) -> Iterator[Mapping[str, Any]]:
         """Every item of a list endpoint, by page number (a proxy may rewrite Link headers)."""

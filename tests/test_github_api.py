@@ -194,3 +194,33 @@ def test_fraction_left_is_the_scarcer_of_requests_and_time() -> None:
     assert budget.fraction_left() == pytest.approx(0.3)
     now[0] = 200.0
     assert budget.fraction_left() == 0.0
+
+
+def test_a_request_that_never_finishes_is_abandoned_not_waited_on() -> None:
+    import threading
+
+    release = threading.Event()
+
+    class Wedged:
+        closed = False
+
+        def get(self, *args, **kwargs):
+            release.wait(5)
+            return FakeResponse(200, {})
+
+        def close(self):
+            self.closed = True
+            release.set()
+
+    session = Wedged()
+    client = GitHubClient(
+        GitHubCredential.proxy("k", base_url="https://proxy.example.test/gh"),
+        budget=RequestBudget(max_requests=5, max_seconds=60),
+        session=session,
+        timeout=0.1,
+    )
+    from personal_data_warehouse.github_api import GitHubError
+
+    with pytest.raises(GitHubError, match="exceeded"):
+        client.get_json("search/commits")
+    assert session.closed
