@@ -305,3 +305,27 @@ Traps the marts translate:
 
 Worked queries are in the agent guide (`pdw readme health`, "Healthspan").
 
+### Strength Trainer, day-keyed snapshots, and the document views
+
+Added 2026-10-14, at Zach's request ("build 1 to 3" in the zrl-bot WHOOP thread).
+
+- **Strength Trainer** (`weightlifting-service`, see
+  [`docs/whoop-private-api.md`](../whoop-private-api.md#strength-trainer)). Every workout
+  is asked once for `strength_workout`, by the same rule and per-run budget as
+  `cardio_details` (`WORKOUT_DOCUMENT_KINDS`): a strength log can be linked to a cardio
+  workout, so sport is not a filter. A 404 is stored as `{}` and never re-asked. PRs are
+  `strength_prs`, one per day.
+- **Snapshots keep history.** `health_tab`, `weekly_plan`, `achievements`
+  (`HEALTHSPAN:<day>`) and `strength_prs` are kept once per local day; `trend` once per
+  local month (`<metric>:<YYYY-MM>`), because a trend payload is ~130 KB and already holds
+  six months of points. Until then each was one row overwritten every run.
+  `_rekey_whoop_private_snapshot_documents` moved the old rows onto the new keys; the labs
+  `current` rows are cursors, not snapshots, and keep their key.
+- **Views over the documents**, so nobody walks the JSON: `marts_health.strength_sets`,
+  `strength_prs`, `strain_targets`, `health_monitor`, `stress_days`, `trend_points` and
+  `workout_routes` (`_ensure_whoop_document_marts_views`). They are views, not typed
+  tables: a restyle makes a column NULL instead of failing the sync, and every array goes
+  through a type guard so a reshaped payload yields no rows rather than an error.
+  `trend_points` infers each point's year from its snapshot date (labels are `TUE, OCT 13`)
+  and prefers the newest snapshot for a day. Measured on production 2026-10-14, the
+  heaviest (`stress_days`, ~356 x 1.6 MB payloads) reads in about a second.

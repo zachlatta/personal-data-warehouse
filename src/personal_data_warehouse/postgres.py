@@ -4760,6 +4760,39 @@ class PostgresWarehouse:
         # ensure_* path can be the one that builds it.
         self._ensure_health_marts_views()
 
+    #: Snapshot document kinds that until 2026-10-14 were kept as one row,
+    #: overwritten every run, and are now kept once per local day: (kind, the
+    #: old key's predicate, the new key). ``{key}`` is the old key and
+    #: ``{day}`` the stored row's collection day.
+    _WHOOP_PRIVATE_SNAPSHOT_REKEYS = (
+        ("health_tab", "o.doc_key = 'current'", "{day}"),
+        ("weekly_plan", "o.doc_key = 'current'", "{day}"),
+        ("achievements", "o.doc_key = 'HEALTHSPAN'", "'HEALTHSPAN:' || {day}"),
+        ("trend", "position(':' in o.doc_key) = 0", "{key} || ':' || substr({day}, 1, 7)"),
+    )
+
+    def _rekey_whoop_private_snapshot_documents(self) -> None:
+        """Move the one stored copy of each snapshot kind onto its day key.
+
+        Idempotent: once moved, no row matches the old predicate. A row whose
+        day key a newer run already wrote is a stale copy of that same day, so
+        it is deleted rather than kept beside it.
+        """
+        day = "to_char(o.collected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
+        for kind, old_key, template in self._WHOOP_PRIVATE_SNAPSHOT_REKEYS:
+            new_key = template.format(key="o.doc_key", day=day)
+            self._command(
+                f"""
+                UPDATE @whoop_private_documents o SET doc_key = {new_key}
+                WHERE o.kind = '{kind}' AND {old_key}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM @whoop_private_documents n
+                    WHERE n.account = o.account AND n.kind = o.kind AND n.doc_key = {new_key}
+                  )
+                """
+            )
+            self._command(f"DELETE FROM @whoop_private_documents o WHERE o.kind = '{kind}' AND {old_key}")
+
     def ensure_whoop_private_tables(self) -> None:
         """Provision the WHOOP private (app) API source.
 
@@ -4782,6 +4815,7 @@ class PostgresWarehouse:
             "ALTER TABLE @whoop_private_sync_state "
             "ADD COLUMN IF NOT EXISTS collection_signature text NOT NULL DEFAULT ''"
         )
+        self._rekey_whoop_private_snapshot_documents()
         # Retired 2026-08-26: continuous heart rate is collected at the same
         # six-second grain this table held, for every hour rather than only
         # inside a workout, so it was an exact second copy of those readings.
@@ -5142,6 +5176,257 @@ class PostgresWarehouse:
                 NULLIF(r.test_source, '') AS test_source,
                 NULLIF(r.synced_at, {epoch}) AS synced_at
             FROM @whoop_private_lab_results r
+            """,
+        )
+        self._ensure_whoop_document_marts_views()
+
+    def _ensure_whoop_document_marts_views(self) -> None:
+        """marts_health views over WHOOP's raw ``documents`` payloads.
+
+        These screens are kept as faithful ``raw_json`` (they are UI payloads
+        WHOOP restyles at will), and until 2026-10-14 an agent had to walk the
+        JSON itself to read a Strain Coach target or a Health Monitor band.
+        The views do that walk once, here. They are views rather than typed
+        tables on purpose: a restyle makes a column go NULL instead of failing
+        the sync, and the raw payload is still beside it to repair the path.
+
+        Every array is read through ``_jsonb_array`` so a payload whose array
+        has turned into an object or a null yields no rows rather than an
+        error that takes the whole view down.
+        """
+        self._ensure_table_group(["whoop_private_documents"])
+
+        def arr(expr: str) -> str:
+            return f"(CASE WHEN jsonb_typeof({expr}) = 'array' THEN {expr} ELSE '[]'::jsonb END)"
+
+        def num(expr: str) -> str:
+            # Display strings: '1,234', '+0.5', '97', '---'. Anything that is
+            # not a plain number is NULL, never an error.
+            cleaned = f"replace({expr}, ',', '')"
+            return (
+                f"(CASE WHEN {cleaned} ~ '^[+-]?[0-9]+(\\.[0-9]+)?$' "
+                f"THEN {cleaned}::double precision END)"
+            )
+
+        def hours(expr: str) -> str:
+            # 'H:MM' durations ('10:59' is 10 h 59 min).
+            return (
+                f"(CASE WHEN {expr} ~ '^[0-9]+:[0-5][0-9]$' THEN "
+                f"split_part({expr}, ':', 1)::double precision "
+                f"+ split_part({expr}, ':', 2)::double precision / 60 END)"
+            )
+
+        def range_bound(expr: str, index: int) -> str:
+            # PostgreSQL range notation, "['2026-07-29T23:08:12.879Z','...')".
+            return f"(regexp_match({expr}, '^[\\[(]''([^'']*)'',''([^'']*)''[\\])]$'))[{index}]::timestamptz"
+
+        def day_key(expr: str) -> str:
+            return f"(CASE WHEN {expr} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$' THEN {expr}::date END)"
+
+        self._ensure_view(
+            "marts_health_strength_sets",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_strength_sets AS
+            SELECT
+                d.account,
+                d.doc_key AS workout_id,
+                d.raw_json ->> 'weightlifting_workout_id' AS strength_workout_id,
+                NULLIF(d.raw_json ->> 'name', '') AS workout_name,
+                {range_bound("d.raw_json ->> 'during'", 1)} AS workout_start_at,
+                {range_bound("d.raw_json ->> 'during'", 2)} AS workout_end_at,
+                g.group_index::bigint AS group_index,
+                e.exercise_index::bigint AS exercise_index,
+                st.set_index::bigint AS set_index,
+                e.exercise -> 'exercise_details' ->> 'exercise_id' AS exercise_id,
+                e.exercise -> 'exercise_details' ->> 'name' AS exercise_name,
+                e.exercise -> 'exercise_details' ->> 'translated_muscle_groups' AS muscle_groups,
+                e.exercise -> 'exercise_details' ->> 'translated_equipment' AS equipment,
+                e.exercise -> 'exercise_details' ->> 'translated_movement_pattern' AS movement_pattern,
+                e.exercise -> 'exercise_details' ->> 'exercise_type' AS exercise_type,
+                (st.item ->> 'number_of_reps')::double precision AS reps,
+                (st.item ->> 'weight_kg')::double precision AS weight_kg,
+                round(((st.item ->> 'weight_kg')::numeric * 2.20462262), 1)::double precision AS weight_lb,
+                (st.item ->> 'time_in_seconds')::double precision AS time_seconds,
+                (st.item ->> 'msk_total_volume_kg')::double precision AS volume_kg,
+                {range_bound("st.item ->> 'during'", 1)} AS set_start_at,
+                {range_bound("st.item ->> 'during'", 2)} AS set_end_at,
+                ((st.item ->> 'complete')::boolean)::int::bigint AS is_complete,
+                (d.raw_json ->> 'total_effective_volume_kg')::double precision AS workout_volume_kg,
+                (d.raw_json ->> 'scaled_msk_strain_score')::double precision AS workout_muscular_strain,
+                (d.raw_json ->> 'total_strain_score')::double precision AS workout_strain,
+                d.synced_at
+            FROM @whoop_private_documents d
+            CROSS JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'workout_groups'")})
+                WITH ORDINALITY AS g(workout_group, group_index)
+            CROSS JOIN LATERAL jsonb_array_elements({arr("g.workout_group -> 'workout_exercises'")})
+                WITH ORDINALITY AS e(exercise, exercise_index)
+            CROSS JOIN LATERAL jsonb_array_elements({arr("e.exercise -> 'sets'")})
+                WITH ORDINALITY AS st(item, set_index)
+            WHERE d.kind = 'strength_workout'
+            """,
+        )
+        self._ensure_view(
+            "marts_health_strength_prs",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_strength_prs AS
+            SELECT
+                d.account,
+                {day_key("d.doc_key")} AS snapshot_day,
+                (d.doc_key = max(d.doc_key) OVER (PARTITION BY d.account))::int::bigint AS is_latest,
+                t.tile ->> 'exercise_id' AS exercise_id,
+                t.tile ->> 'name' AS exercise_name,
+                t.tile ->> 'translated_muscle_groups' AS muscle_groups,
+                {num("t.tile ->> 'volume_input_value'")} AS pr_value,
+                NULLIF(t.tile ->> 'volume_input_units', '') AS pr_units,
+                NULLIF(t.tile ->> 'volume_input_format', '') AS pr_format,
+                d.synced_at
+            FROM @whoop_private_documents d
+            CROSS JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'tiles'")}) AS t(tile)
+            WHERE d.kind = 'strength_prs'
+            """,
+        )
+        self._ensure_view(
+            "marts_health_strain_targets",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_strain_targets AS
+            SELECT
+                d.account,
+                {day_key("d.doc_key")} AS day,
+                {num("i.item -> 'content' ->> 'score_display'")} AS strain,
+                round(((i.item -> 'content' ->> 'score_target')::numeric * 21), 2)::double precision
+                    AS target_strain,
+                round(((i.item -> 'content' ->> 'lower_optimal_percentage')::numeric * 21), 2)::double precision
+                    AS optimal_low,
+                round(((i.item -> 'content' ->> 'higher_optimal_percentage')::numeric * 21), 2)::double precision
+                    AS optimal_high,
+                d.synced_at
+            FROM @whoop_private_documents d
+            CROSS JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'sections'")}) AS sec(section)
+            CROSS JOIN LATERAL jsonb_array_elements({arr("sec.section -> 'items'")}) AS i(item)
+            WHERE d.kind = 'strain_deep_dive'
+              AND i.item ->> 'type' = 'SCORE_GAUGE'
+              AND i.item -> 'content' ->> 'score_target' IS NOT NULL
+            """,
+        )
+        band = "i.item -> 'content' ->> 'key_metric_tile_trend_display'"
+        band_match = (
+            f"regexp_match({band}, '([+-]?[0-9]+(?:\\.[0-9]+)?)%?\\s*(?:-|to)\\s*([+-]?[0-9]+(?:\\.[0-9]+)?)')"
+        )
+        self._ensure_view(
+            "marts_health_health_monitor",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_health_monitor AS
+            SELECT
+                d.account,
+                {day_key("d.doc_key")} AS day,
+                i.item -> 'content' ->> 'id' AS metric,
+                i.item -> 'content' ->> 'key_metric_tile_title_display' AS metric_name,
+                {num("i.item -> 'content' ->> 'key_metric_tile_stat_value_display'")} AS value,
+                NULLIF(i.item -> 'content' ->> 'key_metric_tile_stat_value_display', '') AS value_display,
+                NULLIF(i.item -> 'content' ->> 'key_metric_tile_suffix_display', '') AS unit,
+                NULLIF({band}, '') AS baseline_display,
+                NULLIF(split_part({band}, ' ', 1), '') AS baseline_relation,
+                ({band_match})[1]::double precision AS baseline_low,
+                ({band_match})[2]::double precision AS baseline_high,
+                -- 'near 62', 'low < 32', 'elevated > 51': one number, no band.
+                CASE WHEN {band_match} IS NULL
+                     THEN (regexp_match({band}, '([+-]?[0-9]+(?:\\.[0-9]+)?)'))[1]::double precision
+                END AS baseline_value,
+                NULLIF(i.item -> 'content' ->> 'key_metric_tile_trend_type', '') AS status,
+                d.synced_at
+            FROM @whoop_private_documents d
+            CROSS JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'items'")}) AS i(item)
+            WHERE d.kind = 'health_monitor' AND i.item ->> 'type' = 'KEY_METRIC_TILE'
+            """,
+        )
+        self._ensure_view(
+            "marts_health_stress_days",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_stress_days AS
+            SELECT
+                d.account,
+                {day_key("d.doc_key")} AS day,
+                COALESCE(t.trend -> 'header' ->> 'title_display', 'TOTAL DAY') AS scope,
+                {num("d.raw_json -> 'gauge' ->> 'gauge_score_display'")} AS stress_score,
+                NULLIF(d.raw_json -> 'gauge' ->> 'gauge_subtext_display', '') AS stress_level,
+                NULLIF(d.raw_json ->> 'stress_state', '') AS stress_state,
+                {hours("t.trend -> 'trend_stats' -> 'low' ->> 'stat_display'")} AS low_hours,
+                {hours("t.trend -> 'trend_stats' -> 'medium' ->> 'stat_display'")} AS medium_hours,
+                {hours("t.trend -> 'trend_stats' -> 'high' ->> 'stat_display'")} AS high_hours,
+                NULLIF(d.raw_json -> 'stress_graph' ->> 'stress_graph_vow_display', '') AS summary,
+                d.synced_at
+            FROM @whoop_private_documents d
+            LEFT JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'trend_list'")}) AS t(trend) ON true
+            WHERE d.kind = 'stress' AND d.raw_json ? 'gauge'
+            """,
+        )
+        snapshot_day = "((d.collected_at AT TIME ZONE 'UTC')::date + 1)"
+        label = "split_part(p.point ->> 'primary_contextual_display', ', ', 2)"
+        point_day = (
+            f"to_date({label} || ' ' || extract(year FROM {snapshot_day})::int, 'MON DD YYYY')"
+        )
+        self._ensure_view(
+            "marts_health_trend_points",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_trend_points AS
+            WITH points AS (
+                SELECT
+                    d.account,
+                    split_part(d.doc_key, ':', 1) AS metric,
+                    pl.plot_index::bigint AS plot_index,
+                    pl.plot ->> 'type' AS plot_type,
+                    CASE WHEN {point_day} > {snapshot_day}
+                         THEN ({point_day} - interval '1 year')::date
+                         ELSE {point_day} END AS day,
+                    -- Durations (sleep stress) display as 'H:MM' and read as hours.
+                    COALESCE({num("p.point ->> 'value_display'")}, {hours("p.point ->> 'value_display'")})
+                        AS value,
+                    NULLIF(p.point ->> 'value_display', '') AS value_display,
+                    COALESCE(
+                        NULLIF(p.point ->> 'unit_display', ''),
+                        NULLIF(d.raw_json -> 'six_month_time_segment' -> 'metrics' -> 0 ->> 'metric_units_display', '')
+                    ) AS unit,
+                    d.collected_at AS snapshot_at
+                FROM @whoop_private_documents d
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    {arr("d.raw_json -> 'six_month_time_segment' -> 'graph' -> 'plots'")}
+                ) WITH ORDINALITY AS pl(plot, plot_index)
+                CROSS JOIN LATERAL (
+                    SELECT bar -> 'data_scrubber_details' AS point
+                    FROM jsonb_array_elements({arr("pl.plot -> 'plot' -> 'bar_groups'")}) AS bg(bar_group),
+                         jsonb_array_elements({arr("bg.bar_group -> 'bars'")}) AS b(bar)
+                    UNION ALL
+                    SELECT pt -> 'data_scrubber_details'
+                    FROM jsonb_array_elements({arr("pl.plot -> 'plot' -> 'segments'")}) AS sg(segment),
+                         jsonb_array_elements({arr("sg.segment -> 'points'")}) AS pts(pt)
+                ) p
+                WHERE d.kind = 'trend'
+                  AND jsonb_typeof(p.point) = 'object'
+                  AND p.point ->> 'primary_contextual_display' ~ '^[A-Z]{{3}}, [A-Z]{{3}} [0-9]{{1,2}}$'
+            )
+            -- Each monthly snapshot repeats six months of points; the newest
+            -- snapshot that has a day wins, because WHOOP restates recent days.
+            SELECT DISTINCT ON (account, metric, plot_index, day)
+                account, metric, plot_index, plot_type, day, value, value_display, unit, snapshot_at
+            FROM points
+            ORDER BY account, metric, plot_index, day, snapshot_at DESC
+            """,
+        )
+        self._ensure_view(
+            "marts_health_workout_routes",
+            f"""
+            CREATE OR REPLACE VIEW @marts_health_workout_routes AS
+            SELECT
+                d.account,
+                d.doc_key AS workout_id,
+                d.collected_at AS workout_start_at,
+                c.point_index::bigint AS point_index,
+                (c.point ->> 'latitude')::double precision AS latitude,
+                (c.point ->> 'longitude')::double precision AS longitude
+            FROM @whoop_private_documents d
+            CROSS JOIN LATERAL jsonb_array_elements({arr("d.raw_json -> 'map' -> 'gps_coordinates'")})
+                WITH ORDINALITY AS c(point, point_index)
+            WHERE d.kind = 'cardio_details'
             """,
         )
 
@@ -9850,10 +10135,13 @@ class PostgresWarehouse:
         )
         return {(str(row[0]), str(row[1])) for row in rows}
 
-    def whoop_private_workouts_without_cardio_details(
-        self, *, account: str, limit: int
+    def whoop_private_workouts_without_document(
+        self, *, account: str, kind: str, limit: int
     ) -> list[tuple[str, datetime]]:
-        """Stored workouts with no ``cardio_details`` document, newest first.
+        """Stored workouts with no per-workout document of ``kind``, newest first.
+
+        ``kind`` is ``cardio_details`` (the GPS route) or ``strength_workout``
+        (the Strength Trainer log).
 
         The documents table is the cursor here too: a workout that landed
         after it had fallen out of the run's newest-N window -- backdated,
@@ -9866,10 +10154,10 @@ class PostgresWarehouse:
         rows = self._query(
             "SELECT w.activity_id, w.start_at FROM @whoop_private_workouts w "
             "LEFT JOIN @whoop_private_documents d "
-            "ON d.account = w.account AND d.kind = 'cardio_details' AND d.doc_key = w.activity_id "
+            "ON d.account = w.account AND d.kind = %s AND d.doc_key = w.activity_id "
             "WHERE w.account = %s AND d.doc_key IS NULL AND w.start_at > %s "
             "ORDER BY w.start_at DESC LIMIT %s",
-            (account, datetime.fromtimestamp(0, tz=UTC), limit),
+            (kind, account, datetime.fromtimestamp(0, tz=UTC), limit),
         )
         return [(str(row[0]), row[1].astimezone(UTC)) for row in rows]
 

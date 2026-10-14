@@ -633,13 +633,21 @@ def test_workouts_without_a_cardio_details_document_are_listed_newest_first(
         ]
     )
 
-    listed = warehouse.whoop_private_workouts_without_cardio_details(account=ACCOUNT, limit=2)
+    listed = warehouse.whoop_private_workouts_without_document(
+        account=ACCOUNT, kind="cardio_details", limit=2
+    )
 
     assert listed == [
         ("newest-missing", synced_at - timedelta(days=2)),
         ("older-missing", synced_at - timedelta(days=30)),
     ]
-    assert warehouse.whoop_private_workouts_without_cardio_details(account=ACCOUNT, limit=0) == []
+    assert warehouse.whoop_private_workouts_without_document(
+        account=ACCOUNT, kind="cardio_details", limit=0
+    ) == []
+    # Each per-workout kind is its own cursor: a route does not cover a strength log.
+    assert ("covered", synced_at - timedelta(days=1)) in warehouse.whoop_private_workouts_without_document(
+        account=ACCOUNT, kind="strength_workout", limit=10
+    )
 
 
 def test_sync_state_round_trips_per_collection(warehouse: PostgresWarehouse) -> None:

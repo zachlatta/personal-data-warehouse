@@ -151,8 +151,14 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// driving my WHOOP Age up". Their first sentences were cut to a few words
 	// each (9962 -> 9458) before the cap moved; the detail lives after the
 	// first period, which only describe_table renders. 9500 is that and no more.
-	if guidance > 9500 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9500)", guidance)
+	//
+	// 9500 held until 2026-10-14, when seven marts_health views over the WHOOP
+	// documents landed (Strength Trainer sets and PRs, Strain Coach targets,
+	// Health Monitor, stress, trend points, GPS routes), the read interface
+	// that replaced walking raw JSON. Their first sentences are two or three
+	// words each (10204 -> 9625). 9700 is that and no more.
+	if guidance > 9700 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9700)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

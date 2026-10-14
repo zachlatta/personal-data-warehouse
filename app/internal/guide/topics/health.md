@@ -27,9 +27,8 @@ FROM marts_health.cycles ORDER BY start_at DESC LIMIT 7;
 - **Strain:** the displayed 0–21 score is `base_whoop.cycles.strain` /
   `base_whoop_private.cycles.scaled_strain`. In the private table `day_strain` is the raw
   unscaled value (max ~0.024) and `intensity_score` is 0 on every row — either reads as
-  zeros. The Strain Coach target and its optimal band, in
-  `base_whoop_private.documents` kind `strain_deep_dive`, are **gauge fractions:
-  multiply by 21**.
+  zeros. The Strain Coach target and its optimal band are WHOOP gauge fractions;
+  `marts_health.strain_targets` has them already multiplied into strain units.
 - **Sleep performance** is slept ÷ (baseline need + need from strain) and excludes
   accrued sleep debt; including the debt gives a lower number than the app shows.
 
@@ -52,22 +51,29 @@ is NULL for it.
 | `base_whoop_private.journal_entries` | the journal answers (on the timeline, `whoop_private`, priority `self`) |
 | `base_whoop_private.cycles`, `.sleeps`, `.recoveries`, `.workouts` | high-resolution copies: strain components, sleep debt, HRV/RHR components, zone durations, GPS summary |
 | `base_whoop_private.sports` | the sport catalog resolving a workout's `sport_id` |
-| `base_whoop_private.documents` | raw `jsonb` UI payloads keyed `(kind, doc_key)`: `trend` (VO2 max, weight, steps), `stress`, `cardio_details` (a workout's GPS route under `map`), `sleep_deep_dive`, `strain_deep_dive`, `behavior_impact`, `health_monitor` (per day: each vital against your own baseline band), and the raw screens behind the Healthspan, labs and coach tables below |
+| `base_whoop_private.documents` | raw `jsonb` UI payloads keyed `(kind, doc_key)`, behind the views below: `trend` (`<metric>:<YYYY-MM>`), `stress`, `cardio_details`, `strength_workout` (per workout; `{}` = nothing logged), `strength_prs`, `health_tab` and `weekly_plan` (one per day), `sleep_deep_dive`, `strain_deep_dive`, `behavior_impact`, `health_monitor`, and the raw screens behind Healthspan, labs and coach |
+
+Read these screens through their views, not the JSON:
+
+| view | what it holds |
+| --- | --- |
+| `marts_health.strength_sets` | Strength Trainer, one row per set: exercise, muscle groups, reps, `weight_kg`/`weight_lb`, volume, the workout's muscular strain; joins `workouts` on `workout_id` |
+| `marts_health.strength_prs` | personal records per exercise, daily snapshots (`is_latest`) |
+| `marts_health.strain_targets` | Strain Coach target and optimal band per day, in strain units, beside the strain reached |
+| `marts_health.health_monitor` | per day and vital: value and Zach's own baseline (`baseline_low`/`high`, or `baseline_value` for "near 62"); `status = 'CONCERN_RANGE'` is outside it |
+| `marts_health.stress_days` | Stress Monitor score and hours in low/medium/high stress, per day and scope |
+| `marts_health.trend_points` | one value per metric and day from WHOOP's trend charts (STEPS, CALORIES, HRV, VO2_MAX weekly, WEIGHT, WHOOP_AGE, ...) |
+| `marts_health.workout_routes` | GPS points per workout, in `point_index` order |
 
 ```sql
 -- the day's heart rate
 SELECT sample_at, heart_rate FROM base_whoop_private.heart_rate_samples
 WHERE sample_at >= now() - interval '1 day' ORDER BY sample_at;
 
--- the Strain Coach target, in strain units
-SELECT d.doc_key::date AS day,
-       round((i->'content'->>'score_target')::numeric * 21, 2) AS target,
-       i->'content'->>'score_display' AS achieved
-FROM base_whoop_private.documents d
-CROSS JOIN LATERAL jsonb_array_elements(d.raw_json->'sections') s
-CROSS JOIN LATERAL jsonb_array_elements(s->'items') i
-WHERE d.kind = 'strain_deep_dive' AND i->>'type' = 'SCORE_GAUGE'
-ORDER BY day DESC LIMIT 7;
+-- strength volume per exercise over the last 90 days
+SELECT exercise_name, count(*) AS sets, sum(reps * weight_lb) AS lb_moved, max(weight_lb)
+FROM marts_health.strength_sets
+WHERE workout_start_at >= now() - interval '90 days' GROUP BY 1 ORDER BY 3 DESC;
 ```
 
 `during`, `days` and `optimal_sleep_times` are Postgres range notation — read the bounds.
@@ -118,7 +124,8 @@ To answer "what should I change to lower my WHOOP Age": take the rows with
 `thirty_day_value` to see whether the 6-month value is already moving the right way. Then
 check what WHOOP itself said: `guidance_text` for each row, and the coach's weekly analysis
 (`coach_messages WHERE agent = 'healthspan-weekly-analysis'`). The behaviours behind a
-contributor are in the base tables. Strength time is `marts_health.workouts` by sport.
+contributor are in the base tables. Strength time is `marts_health.workouts` by sport
+(Strength Trainer, Weightlifting); what was lifted is `marts_health.strength_sets`.
 Zone time is `zone_durations_v2_json`. Sleep consistency and hours come from
 `marts_health.sleeps`. For labs that affect Healthspan, use `marts_health.lab_results WHERE
 is_latest = 1 AND status <> 'OPTIMAL'`. These are WHOOP's own models and wellness

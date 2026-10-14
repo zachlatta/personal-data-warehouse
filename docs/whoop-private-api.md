@@ -210,10 +210,25 @@ The service list already covers them. Trend keys that the Healthspan payload lin
 (`SLEEP_HOURS`, `STRENGTH_TRAINING_TIME`, `BODY_COMPOSITION_LEAN`) are not valid
 `progression-service` graph keys (400); `HR_ZONES_1_3` is.
 
+### Strength Trainer
+
+Found 2026-10-14 in the Android dex strings (`com.whoop.android` 5.472.0, from APKPure's
+XAPK): the service is `weightlifting-service`, which is why the 2026-08-23 probe of
+"strength" names found nothing.
+
+| path | what |
+| --- | --- |
+| `GET /weightlifting-service/v2/weightlifting-workout/{activityId}` | one workout's log: `workout_groups[].workout_exercises[]` with `exercise_details` and `sets[]` (`number_of_reps`, `weight_kg`, `msk_total_volume_kg`, `during`, `complete`), plus workout-level MSK and cardio strain. **404 when the workout has no log** (any walk or run) |
+| `GET /weightlifting-service/v3/prs` | personal records, `tiles[]` per exercise with `volume_input_value`/`_units` |
+| `GET /weightlifting-service/v3/workout-library`, `/v2/exercise` | the template library and the ~390 KB exercise catalog; not collected |
+
+`.../weightlifting-workout/activity` (405) and `/v3/workout-template` (405) are writes.
+
 ### Confirmed absent
 
-No endpoint exists for the Strength Trainer, the weekly Performance Assessment, blood
-pressure or hormonal insights (four service names probed, all 404). WHOOP Coach chat
+No endpoint exists for the weekly Performance Assessment, blood pressure or hormonal
+insights (service names probed, all 404). The Strength Trainer was on this list until
+2026-10-14; it exists (above). WHOOP Coach chat
 history was on this list until 2026-10-11; it exists (above). Two unresolved leads: `/sleep-service/v1/sleep-planner` and
 `/sleep-service/v1/sleep-need` answer **405** to both GET and POST, so the paths exist
 but want something else; `/notification-service/v1/notifications` answers **401**, so it

@@ -174,7 +174,9 @@ class WhoopPrivateClient:
 
     # ---- transport ------------------------------------------------------
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(
+        self, path: str, params: dict[str, Any] | None = None, *, not_found_ok: bool = False
+    ) -> Any:
         if self._session.access_token_expired(now=self._now()):
             self.refresh()
         response = self._request(path, params)
@@ -190,6 +192,8 @@ class WhoopPrivateClient:
                 )
         if response.status_code == 429:
             raise WhoopPrivateRateLimitedError(retry_after=self._retry_after(response))
+        if response.status_code == 404 and not_found_ok:
+            return None
         if response.status_code != 200:
             raise WhoopPrivateApiError(f"WHOOP private API {path} returned HTTP {response.status_code}")
         try:
@@ -392,3 +396,24 @@ class WhoopPrivateClient:
         """Every message in one coach conversation, in order. GET only: the
         ``ai-conversation-bff`` turn paths are POSTs that would write a turn."""
         return self.get_json(f"/ai-conversation-service/v2/conversation/{conversation_id}")
+
+    # ---- Strength Trainer ---------------------------------------------------
+    #
+    # Found 2026-10-14 in the Android app's string table (5.472.0) under
+    # ``weightlifting-service``; the 2026-08-23 probe guessed "strength" names
+    # and found nothing. See docs/whoop-private-api.md, "Strength Trainer".
+
+    def strength_workout(self, *, activity_id: str) -> Any:
+        """The Strength Trainer log for one workout, or ``None`` if it has none.
+
+        Exercises, sets, reps, weight (kg) and muscular-load (MSK) scores. A
+        workout with no logged exercises answers 404, which is the normal case
+        for a walk or a run, so it is not an error.
+        """
+        return self.get_json(
+            f"/weightlifting-service/v2/weightlifting-workout/{activity_id}", not_found_ok=True
+        )
+
+    def strength_prs(self) -> Any:
+        """Personal records per exercise (the Strength Trainer "PRs" screen)."""
+        return self.get_json("/weightlifting-service/v3/prs")

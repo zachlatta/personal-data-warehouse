@@ -1148,9 +1148,10 @@ class WhoopPrivateSyncRunner:
             self._warehouse.insert_whoop_private_sports(rows)
         return len(rows), "snapshot", synced_at
 
-    #: Document kinds keyed by a local day. ``trend`` and ``health_tab`` are
-    #: whole-series/current-state snapshots a single call already covers, and
-    #: ``cardio_details`` is keyed by activity, so none of them are here.
+    #: Document kinds keyed by a local day and backfilled. ``trend``,
+    #: ``health_tab`` and ``strength_prs`` are snapshots taken once a day from
+    #: the run's own date (WHOOP serves no past copy of them), and the
+    #: per-workout kinds are keyed by activity, so none of them are here.
     DAY_DOCUMENT_KINDS = (
         "stress",
         "sleep_deep_dive",
@@ -1211,8 +1212,23 @@ class WhoopPrivateSyncRunner:
             day -= timedelta(days=1)
         return wanted, stored
 
-    def _cardio_details_targets(self, *, config) -> list[tuple[str, datetime]]:
-        """Which workouts to ask for ``cardio_details`` (the GPS route) this run.
+    #: Per-workout document kinds, each asked once per workout and swept by the
+    #: same rule: ``cardio_details`` is the GPS route, ``strength_workout`` the
+    #: Strength Trainer log (exercises, sets, reps, weight). Every workout is
+    #: asked for both, because WHOOP lets a strength log be linked to a cardio
+    #: workout, so the sport does not say which ones carry one. A workout with
+    #: nothing to show answers an empty route or a 404, stored as ``{}`` so it
+    #: is never re-asked.
+    WORKOUT_DOCUMENT_KINDS = ("cardio_details", "strength_workout")
+
+    def _workout_document(self, *, client, kind: str, activity_id: str) -> Any:
+        if kind == "cardio_details":
+            return client.cardio_details(activity_id=activity_id)
+        payload = client.strength_workout(activity_id=activity_id)
+        return {} if payload is None else payload
+
+    def _workout_document_targets(self, *, config, kind: str) -> list[tuple[str, datetime]]:
+        """Which workouts to ask for a per-workout document of ``kind`` this run.
 
         The workouts this run just pulled come first, newest first, because an
         in-progress or edited workout's route changes. What is left of the
@@ -1233,8 +1249,8 @@ class WhoopPrivateSyncRunner:
             targets.append((activity_id, start))
         remaining = budget - len(targets)
         if remaining > 0:
-            for activity_id, start in self._warehouse.whoop_private_workouts_without_cardio_details(
-                account=config.account, limit=remaining + len(seen)
+            for activity_id, start in self._warehouse.whoop_private_workouts_without_document(
+                account=config.account, kind=kind, limit=remaining + len(seen)
             ):
                 if len(targets) >= budget:
                     break
@@ -1254,25 +1270,41 @@ class WhoopPrivateSyncRunner:
         account = config.account
         rows: list[dict[str, Any]] = []
 
+        # Trends, the Health tab and the Strength Trainer PRs are snapshots of
+        # account state rather than a day. Until 2026-10-14 one row per kind
+        # was overwritten every run, so a VO2 max older than the six-month
+        # chart was lost. Now the Health tab and PRs are kept once per local
+        # day, and each trend once per local MONTH (``<metric>:<YYYY-MM>``):
+        # a trend payload is ~130 KB and already carries six months of points,
+        # so a monthly copy loses nothing and keeps marts_health.trend_points
+        # cheap to read.
         for metric in config.trend_metrics:
             rows.append(
                 document_to_row(
                     account=account,
                     kind="trend",
-                    doc_key=metric,
+                    doc_key=f"{metric}:{recent[0][:7]}",
                     payload=client.trend(metric=metric, end_date=recent[0]),
                     collected_at=synced_at,
                     synced_at=synced_at,
                 )
             )
-        # WHOOP Age, Pace of Aging and the Health Monitor are account state
-        # rather than a day, so one row is kept current under a fixed key.
         rows.append(
             document_to_row(
                 account=account,
                 kind="health_tab",
-                doc_key="current",
+                doc_key=recent[0],
                 payload=client.health_tab(),
+                collected_at=synced_at,
+                synced_at=synced_at,
+            )
+        )
+        rows.append(
+            document_to_row(
+                account=account,
+                kind="strength_prs",
+                doc_key=recent[0],
+                payload=client.strength_prs(),
                 collected_at=synced_at,
                 synced_at=synced_at,
             )
@@ -1315,17 +1347,18 @@ class WhoopPrivateSyncRunner:
             if day_rows:
                 self._warehouse.insert_whoop_private_documents(day_rows)
                 written += len(day_rows)
-        for activity_id, start in self._cardio_details_targets(config=config):
-            rows.append(
-                document_to_row(
-                    account=account,
-                    kind="cardio_details",
-                    doc_key=activity_id,
-                    payload=client.cardio_details(activity_id=activity_id),
-                    collected_at=start,
-                    synced_at=synced_at,
+        for kind in self.WORKOUT_DOCUMENT_KINDS:
+            for activity_id, start in self._workout_document_targets(config=config, kind=kind):
+                rows.append(
+                    document_to_row(
+                        account=account,
+                        kind=kind,
+                        doc_key=activity_id,
+                        payload=self._workout_document(client=client, kind=kind, activity_id=activity_id),
+                        collected_at=start,
+                        synced_at=synced_at,
+                    )
                 )
-            )
         if rows:
             self._warehouse.insert_whoop_private_documents(rows)
         return written + len(rows), "snapshot", synced_at
@@ -1382,7 +1415,7 @@ class WhoopPrivateSyncRunner:
             document_to_row(
                 account=account,
                 kind="achievements",
-                doc_key="HEALTHSPAN",
+                doc_key=f"HEALTHSPAN:{today.isoformat()}",
                 payload=client.achievements_hub(tab="HEALTHSPAN"),
                 collected_at=synced_at,
                 synced_at=synced_at,
@@ -1392,7 +1425,7 @@ class WhoopPrivateSyncRunner:
             document_to_row(
                 account=account,
                 kind="weekly_plan",
-                doc_key="current",
+                doc_key=today.isoformat(),
                 payload=client.weekly_plan(),
                 collected_at=synced_at,
                 synced_at=synced_at,

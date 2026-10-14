@@ -99,9 +99,9 @@ class FakeWhoopPrivateWarehouse:
         # cursor IS the table, so this is what makes a resumed run resume.
         self.stored_documents: list[dict] = list(stored_documents or [])
         self.earliest_cycle_day = earliest_cycle_day
-        # Stored workouts with no cardio_details document yet, newest first.
-        self.workouts_without_cardio_details: list[tuple[str, datetime]] = []
-        self.cardio_details_lookups: list[dict] = []
+        # Stored workouts with no per-workout document yet, newest first, by kind.
+        self.workouts_without_document: dict[str, list[tuple[str, datetime]]] = {}
+        self.workout_document_lookups: list[dict] = []
         self.state_rows: list[dict] = []
         self.pruned: list[dict] = []
         self.rotations: list[dict] = []
@@ -193,9 +193,9 @@ class FakeWhoopPrivateWarehouse:
     def whoop_private_earliest_cycle_day(self, *, account):
         return self.earliest_cycle_day
 
-    def whoop_private_workouts_without_cardio_details(self, *, account, limit):
-        self.cardio_details_lookups.append({"account": account, "limit": limit})
-        return list(self.workouts_without_cardio_details[:limit])
+    def whoop_private_workouts_without_document(self, *, account, kind, limit):
+        self.workout_document_lookups.append({"account": account, "kind": kind, "limit": limit})
+        return list(self.workouts_without_document.get(kind, [])[:limit])
 
     def insert_whoop_private_healthspan_weeks(self, rows):
         self.healthspan_weeks.extend(rows)
@@ -521,6 +521,17 @@ class FakeWhoopPrivateClient:
     def coach_conversation(self, *, conversation_id):
         self._record("coach_conversation", conversation_id=conversation_id)
         return fixtures.coach_conversation(conversation_id)
+
+    #: activity_id -> Strength Trainer log; any other workout answers 404 (None).
+    strength_logs: dict = {}
+
+    def strength_workout(self, *, activity_id):
+        self._record("strength_workout", activity_id=activity_id)
+        return self.strength_logs.get(activity_id)
+
+    def strength_prs(self):
+        self._record("strength_prs")
+        return {"tiles": []}
 
     def health_tab(self):
         self._record("health_tab")
@@ -1018,8 +1029,14 @@ def test_tier_two_endpoints_land_in_documents_with_kind_and_key(monkeypatch) -> 
     _run(monkeypatch, warehouse=warehouse, client=client)
 
     kinds = {(row["kind"], row["doc_key"]) for row in warehouse.documents}
-    assert ("trend", "VO2_MAX") in kinds
-    assert ("trend", "STRESS_DURING_SLEEP") in kinds
+    today = NOW.date().isoformat()
+    # Snapshots are kept once per local day, so their history survives.
+    assert ("trend", f"VO2_MAX:{today[:7]}") in kinds
+    assert ("trend", f"STRESS_DURING_SLEEP:{today[:7]}") in kinds
+    assert ("health_tab", today) in kinds
+    assert ("strength_prs", today) in kinds
+    assert ("weekly_plan", today) in kinds
+    assert ("achievements", f"HEALTHSPAN:{today}") in kinds
     assert ("cardio_details", "workout-xyz") in kinds
     assert any(kind == "stress" for kind, _key in kinds)
     assert any(kind == "sleep_deep_dive" for kind, _key in kinds)
@@ -1033,7 +1050,7 @@ def test_a_stored_workout_with_no_cardio_details_document_is_asked_for_its_route
     # window used to be skipped forever: production held three of them.
     late_start = NOW - timedelta(days=60)
     warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
-    warehouse.workouts_without_cardio_details = [
+    warehouse.workouts_without_document["cardio_details"] = [
         ("workout-xyz", NOW - timedelta(hours=3)),  # also in this run: fetched once
         ("workout-late", late_start),
     ]
@@ -1050,7 +1067,7 @@ def test_a_stored_workout_with_no_cardio_details_document_is_asked_for_its_route
 
 def test_the_missing_route_sweep_shares_the_workout_request_budget(monkeypatch) -> None:
     warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
-    warehouse.workouts_without_cardio_details = [
+    warehouse.workouts_without_document["cardio_details"] = [
         (f"workout-old-{index}", NOW - timedelta(days=index)) for index in range(1, 10)
     ]
     client = FakeWhoopPrivateClient()
@@ -1318,7 +1335,7 @@ def test_behavior_insights_and_the_health_tab_land_in_documents(monkeypatch) -> 
     # behaviors to the day's recovery, which nothing else in the warehouse holds.
     assert ("behavior_impact", "2026-08-23") in kinds
     # The health tab is account-state, not a day, so it gets a fixed key.
-    assert ("health_tab", "current") in kinds
+    assert ("health_tab", "2026-08-23") in kinds
 
 
 def test_whoop_age_and_pace_of_aging_are_collected_trends(monkeypatch) -> None:
@@ -1328,7 +1345,7 @@ def test_whoop_age_and_pace_of_aging_are_collected_trends(monkeypatch) -> None:
 
     _run(monkeypatch, warehouse=warehouse, client=client)
 
-    trends = {row["doc_key"] for row in warehouse.documents if row["kind"] == "trend"}
+    trends = {row["doc_key"].split(":")[0] for row in warehouse.documents if row["kind"] == "trend"}
     assert {"WHOOP_AGE", "PACE_OF_AGING"} <= trends
 
 
@@ -1542,7 +1559,7 @@ def test_healthspan_walks_whoops_own_week_chain_to_the_first_week(monkeypatch) -
     raw = {(row["kind"], row["doc_key"]) for row in warehouse.documents}
     assert ("healthspan", "2026-07-26") in raw
     assert {("healthspan_bloodwork_insights", p) for p in ("SLEEP", "STRAIN", "FITNESS")} <= raw
-    assert ("achievements", "HEALTHSPAN") in raw
+    assert ("achievements", "HEALTHSPAN:2026-08-23") in raw
 
 
 def test_a_stored_healthspan_week_is_stepped_over_by_its_recorded_chain(monkeypatch) -> None:
@@ -1683,3 +1700,22 @@ def test_stored_coach_conversations_are_redated_from_the_list_every_run(monkeypa
     assert set(dated) == {"conv-today", "conv-oct6", "conv-2025"}
     # 21:15:00 on 2025-11-02 at -04:00 is 01:15 UTC the next day.
     assert dated["conv-2025"].started_at == datetime(2025, 11, 3, 1, 15, tzinfo=UTC)
+
+
+def test_every_workout_is_asked_for_its_strength_log_and_a_404_is_stored_empty(monkeypatch) -> None:
+    # A strength log can be linked to a cardio workout, so the sport does not
+    # say which workouts carry one; a workout with none answers 404.
+    warehouse = FakeWhoopPrivateWarehouse(session=_session_row())
+    warehouse.workouts_without_document["strength_workout"] = [("workout-lift", NOW - timedelta(days=5))]
+    client = FakeWhoopPrivateClient()
+    client.strength_logs = {"workout-lift": {"activity_id": "workout-lift", "workout_groups": []}}
+
+    _run(monkeypatch, warehouse=warehouse, client=client)
+
+    fetched = [params["activity_id"] for endpoint, params in client.calls if endpoint == "strength_workout"]
+    assert fetched == ["workout-xyz", "workout-lift"]
+    logs = {row["doc_key"]: row for row in warehouse.documents if row["kind"] == "strength_workout"}
+    assert logs["workout-xyz"]["raw_json"] == {}
+    assert logs["workout-lift"]["raw_json"]["activity_id"] == "workout-lift"
+    assert logs["workout-lift"]["collected_at"] == NOW - timedelta(days=5)
+    assert {"account": ACCOUNT, "kind": "strength_workout", "limit": 25} in warehouse.workout_document_lookups

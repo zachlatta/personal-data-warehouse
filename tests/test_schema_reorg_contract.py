@@ -202,7 +202,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # it -- so it needed its own read interface.
             # +3 marts: marts_health.healthspan_weeks/.healthspan_contributors/
             # .lab_results, the read interface over those four tables.
-            "marts": 57,
+            # +7 marts: marts_health.strength_sets/.strength_prs/.strain_targets/
+            # .health_monitor/.stress_days/.trend_points/.workout_routes, views
+            # over the WHOOP documents so nobody walks the raw JSON.
+            "marts": 64,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
