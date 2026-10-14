@@ -5,7 +5,7 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 
 ## Local Agent Sessions Upload Scheduler
 
-Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi) so every device's
+Captures AI agent CLI session transcripts (Claude Code + Codex + OpenClaw + pi + Muse Code) so every device's
 sessions are queryable in the warehouse. The append-only transcripts are tailed and shipped,
 line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 
@@ -44,9 +44,11 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.agent-sessio
 
 The uploader reads `~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/rollout-*.jsonl`,
 `~/.openclaw/agents/main/sessions/<sessionId>.jsonl`, and
-`~/.pi/agent/sessions/**/*.jsonl` (override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` /
+`~/.pi/agent/sessions/**/*.jsonl`, and Muse Code's
+`~/.local/share/muse/sessions/**/session.jsonl` (`$XDG_DATA_HOME/muse/sessions` when that is
+set; override with `AGENT_SESSIONS_CLAUDE_PROJECTS_DIR` /
 `AGENT_SESSIONS_CODEX_SESSIONS_DIR` / `AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR` /
-`AGENT_SESSIONS_PI_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
+`AGENT_SESSIONS_PI_SESSIONS_DIR` / `AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR`; set one to empty to disable that tool on a host). Each
 tool's directory that doesn't exist on a given machine is simply skipped, so the same uploader
 binary works everywhere. The OpenClaw scan ignores the `<sessionId>.trajectory.jsonl` runtime
 trace and the `.json` sidecars next to each transcript.
@@ -154,7 +156,7 @@ Muse files) are still bounded by it; a file that needs more than a minute belong
 resumable path, not on a longer proxy timeout.
 
 Agent-session SQL starting points are the source-owned raw event tables
-`base_claude_code.events`, `base_codex.events`, `base_openclaw.events`, `base_pi.events`, `base_claude_desktop.events`, and
+`base_claude_code.events`, `base_codex.events`, `base_openclaw.events`, `base_pi.events`, `base_muse_code.events`, `base_claude_desktop.events`, and
 `base_chatgpt.events` (one row per transcript/conversation line; `device` tags the machine where
 applicable). Cross-source querying uses `marts_ai_conversations.events`, and per-session roll-ups
 (counts, token sums, title, cwd/git, first prompt) use `marts_ai_conversations.sessions`. Free-text
@@ -276,6 +278,40 @@ uploads go through the app, end-to-end also depends on the **app** (`/ingest/age
 and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
 relying on the timer.
+
+### Muse Code (the Muse models' coding CLI)
+
+Muse Code (`muse`, source `muse_code`, `base_muse_code.events`) is a local coding CLI like
+pi. It is **not** Muse, Meta's hosted agent below, even though the two share a name and a
+model family. It keeps one append-only event log per session at
+`<data>/muse/sessions/YYYY/MM/DD/<session-id>/session.jsonl`. A subagent's log is nested at
+`<parent-id>/subagent/<child-id>/session.jsonl`. The session id is the directory name.
+`session.peer-history.jsonl` and the `.msp-view-v1/` index are derived views, so the
+uploader skips them. A subagent's own lines never name its parent, so the uploader reads
+the parent from the path and ships it on every line as `session.parent_session_id`.
+
+Each line is a runtime record `{id, sequence, recorded_at, payload_type, payload}`.
+`recorded_at` is epoch **microseconds**, and `id` is the row's `event_uuid`.
+`muse_code_event_row` maps the records as follows (shapes checked against 1.4.7 on
+2026-10-13):
+
+- `runtime.user_intent.accepted`: a `user` row holding `refill_blocks`, which is what Zach
+  typed. `model_messages` is the same turn with the harness's `<system_instructions>`
+  prepended.
+- `runtime.session` run events: `assistant_message_committed` is the reply.
+  `assistant_tool_calls_committed` and `tool_result_batch_committed` are one row per
+  parallel batch, paired by `turn_id`. `model_completed` carries usage and the model.
+  Reasoning is kept in `raw_json` only.
+- The run's `started` prompt repeats the user intent in a main session, so it stays
+  `meta`. In a subagent it is the brief from the parent, so it is the `user` row.
+- Automatic session names (`session.name.changed` with `source = 'automatic'`, such as
+  "round-conjunction") are not used as titles. The first prompt is a better title.
+- Everything else (tasks, approvals, reminders, `retained_frame` transactions, and
+  `retained_marker` placeholders for ephemeral records, which have no time) is a `meta`
+  row.
+
+The `muse_code` pipeline has a 45-day data interval, borrowed from pi. Its detector is the
+`agent-sessions-upload` run heartbeat.
 
 ## Muse (Meta's hosted personal agent)
 

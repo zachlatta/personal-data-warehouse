@@ -2,13 +2,16 @@
 
 Three transports feed the same row schema:
 
-* The CLI tools (Claude Code, Codex, OpenClaw, pi) write append-only JSONL
-  transcripts that a per-device uploader tails and batches into
-  ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This module
-  consumes those batches and normalizes each raw line into source-owned rows
-  (``base_claude_code.events``, ``base_codex.events``, ``base_openclaw.events``, or ``base_pi.events``; lossless
-  ``raw_json`` plus queryable columns), then promotes processed batch files into
-  ``agent-sessions/library/``.
+* The CLI tools (Claude Code, Codex, OpenClaw, pi, Muse) write
+  append-only JSONL transcripts that a per-device uploader tails and batches
+  into ``agent-sessions/inbox/batches/`` as gzipped JSONL envelopes. This
+  module consumes those batches and normalizes each raw line into
+  source-owned rows (``base_claude_code.events``, ``base_codex.events``,
+  ``base_openclaw.events``, ``base_pi.events``, or
+  ``base_muse_code.events``; lossless ``raw_json`` plus queryable columns),
+  then promotes processed batch files into ``agent-sessions/library/``.
+  Muse is Meta's Muse coding CLI -- a different tool from Muse,
+  Meta's hosted agent below, despite the shared name.
 * Claude Desktop is polled server-side from claude.ai using a credential pushed
   from the local desktop app. It ships ``claude_desktop_event`` envelopes through
   the same Drive inbox, and ``claude_desktop_event_row`` normalizes them into
@@ -35,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import gzip
 import json
 import os
@@ -283,16 +286,17 @@ def record_to_event_row(record: Mapping[str, Any], *, ingested_at: datetime) -> 
     line = line if isinstance(line, Mapping) else {}
     account = str(record.get("account", ""))
     device = str(record.get("device", ""))
-    if tool == "muse":
-        session = payload.get("session")
-        return muse_event_row(
+    session = payload.get("session")
+    session = session if isinstance(session, Mapping) else {}
+    if tool in _SESSION_AWARE_ROW_BUILDERS:
+        return _SESSION_AWARE_ROW_BUILDERS[tool](
             line,
             session_id=session_id,
             account=account,
             device=device,
             seq=seq,
             ingested_at=ingested_at,
-            session=session if isinstance(session, Mapping) else {},
+            session=session,
         )
     builder = _EVENT_ROW_BUILDERS.get(tool, claude_code_event_row)
     return builder(
@@ -1201,6 +1205,184 @@ def pi_event_row(
     return row
 
 
+# --- Muse Code (the Muse models' coding CLI) ---------------------------------
+#
+# Not Muse, Meta's hosted agent above: a separate local CLI (`muse`) whose
+# sessions live at <data>/muse/sessions/YYYY/MM/DD/<id>/session.jsonl. Each line
+# is a runtime record ``{id, sequence, recorded_at, payload_type, payload}``;
+# ``recorded_at`` is epoch MICROseconds. Two more line shapes carry no record of
+# their own: a ``retained_frame`` (a transaction wrapping child records as JSON
+# text) and a ``retained_marker`` standing in for an ephemeral record the log
+# chose not to keep. Shapes verified against Muse Code 1.4.7 on 2026-10-13.
+
+MUSE_CODE_SOURCE = "muse_code"
+_MUSE_CODE_RUN_PAYLOAD = "runtime.session"
+_MUSE_CODE_USER_INTENT = "runtime.user_intent.accepted"
+_MUSE_CODE_THINKING_KINDS = ("reasoning_committed", "reasoning_summary_committed")
+
+
+def muse_code_event_row(
+    line: Mapping[str, Any],
+    *,
+    session_id: str,
+    account: str,
+    device: str,
+    seq: int,
+    ingested_at: datetime,
+    session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize one line of a Muse Code ``session.jsonl``.
+
+    Conversation rides two payloads: ``runtime.user_intent.accepted`` holds what
+    Zach typed (``refill_blocks``; ``model_messages`` is the same turn with the
+    harness's instructions prepended), and ``runtime.session`` run events hold
+    the model's messages, tool-call batches, tool-result batches and per-call
+    usage. Every other record (tasks, approvals, reminders, metadata) is kept
+    as a ``meta`` row so ``raw_json`` stays lossless.
+
+    ``session`` is what the uploader read from the file's path: a subagent's
+    ``parent_session_id``. A subagent has no user intent -- its brief from the
+    parent arrives as the run's ``started`` prompt -- and every row of it is a
+    sidechain of that parent.
+
+    Never raises on an unexpected shape: this runs inside the one ingest pass
+    every agent-session provider shares.
+    """
+    parent = str(session.get("parent_session_id", "") or "")
+    payload = line.get("payload") if isinstance(line.get("payload"), Mapping) else {}
+    payload_type = str(line.get("payload_type", "") or "")
+    row = _base_row(
+        source=MUSE_CODE_SOURCE,
+        session_id=session_id,
+        account=account,
+        device=device,
+        seq=seq,
+        line=line,
+        event_uuid=_muse_code_event_uuid(line, session_id=session_id, seq=seq),
+        occurred_at=_muse_code_time(line),
+        ingested_at=ingested_at,
+    )
+    row["event_type"] = payload_type or str(line.get("retained_frame") or line.get("retained_marker") or "")
+    if parent:
+        row["is_sidechain"] = 1
+        row["parent_uuid"] = parent
+        row["entrypoint"] = "subagent"
+
+    if payload_type == "runtime.session.metadata":
+        record = nested_mapping(payload, "record")
+        row["cwd"] = str(record.get("workspace_root", "") or "")
+        row["model"] = str(record.get("model_id", "") or "")
+        row["cli_version"] = str(nested_mapping(record, "build").get("semver", "") or "")
+    elif payload_type == "session.workspace_branch.observed":
+        record = nested_mapping(payload, "record")
+        row["cwd"] = str(record.get("workspace_root", "") or "")
+        row["git_branch"] = str(nested_mapping(record, "reference").get("name", "") or "")
+        row["git_commit"] = str(record.get("commit", "") or "")
+    elif payload_type == "session.name.changed":
+        # Muse names every session automatically ("round-conjunction"); only a
+        # name someone chose is a better title than the first prompt.
+        if str(payload.get("source", "")) != "automatic":
+            row["session_title"] = str(payload.get("new_name", "") or "")
+    elif payload_type == _MUSE_CODE_USER_INTENT:
+        text = _muse_code_blocks_text(payload.get("refill_blocks"))
+        if text:
+            row["role"] = "user"
+            row["subtype"] = "message"
+            row["text"] = text
+            row["turn_id"] = str(payload.get("intent_id", "") or "")
+    elif payload_type == _MUSE_CODE_RUN_PAYLOAD and isinstance(payload.get("event"), Mapping):
+        _apply_muse_code_run_event(row, payload["event"], subagent=bool(parent))
+    return row
+
+
+def _apply_muse_code_run_event(row: dict[str, Any], event: Mapping[str, Any], *, subagent: bool) -> None:
+    kind = str(event.get("kind", "") or "")
+    row["event_type"] = kind
+    if kind == "started":
+        # In a main session the run prompt repeats the user intent (with the
+        # harness's instructions prepended); keeping it would double every turn.
+        if subagent:
+            row["role"] = "user"
+            row["subtype"] = "message"
+            row["text"] = _stringify(event.get("prompt"))
+    elif kind == "assistant_message_committed":
+        row["role"] = "assistant"
+        row["subtype"] = "message"
+        row["text"] = _stringify(event.get("text"))
+        row["turn_id"] = str(event.get("message_id", "") or "")
+    elif kind in _MUSE_CODE_THINKING_KINDS:
+        # Reasoning stays in raw_json only, as for every other agent source.
+        row["role"] = "assistant"
+        row["subtype"] = "thinking"
+    elif kind == "assistant_tool_calls_committed":
+        calls = [call for call in event.get("tool_calls") or [] if isinstance(call, Mapping)] if isinstance(
+            event.get("tool_calls"), list
+        ) else []
+        row["role"] = "assistant"
+        row["subtype"] = "tool_use"
+        row["tool_name"] = str(calls[0].get("name", "") or "") if calls else ""
+        row["tool_input_json"] = raw_json({"tool_calls": calls})
+        # A batch's calls and results share the batch id, as Codex pairs by turn_id.
+        row["turn_id"] = str(event.get("message_id", "") or "")
+    elif kind == "tool_result_batch_committed":
+        results = [result for result in event.get("results") or [] if isinstance(result, Mapping)] if isinstance(
+            event.get("results"), list
+        ) else []
+        row["role"] = "tool"
+        row["subtype"] = "tool_result"
+        row["text"] = "\n".join(text for text in (_stringify(result.get("text")) for result in results) if text)
+        row["tool_result_json"] = raw_json({"results": results})
+        row["turn_id"] = str(event.get("batch_id", "") or "")
+    elif kind == "model_completed":
+        row["model"] = str(event.get("model", "") or "")
+        usage = event.get("usage")
+        if isinstance(usage, Mapping):
+            row["input_tokens"] = _int(usage.get("input_tokens"))
+            row["output_tokens"] = _int(usage.get("output_tokens"))
+            row["cache_read_tokens"] = _int(usage.get("cache_read_tokens") or usage.get("cached_tokens"))
+            row["cache_creation_tokens"] = _int(usage.get("cache_write_tokens"))
+
+
+def _muse_code_event_uuid(line: Mapping[str, Any], *, session_id: str, seq: int) -> str:
+    if "retained_frame" in line:
+        key = line.get("transaction_id")
+    elif "retained_marker" in line:
+        key = nested_mapping(line, "position").get("id")
+    else:
+        key = line.get("id")
+    return str(key) if isinstance(key, str) and key else f"{session_id}#{seq}"
+
+
+def _muse_code_time(line: Mapping[str, Any]) -> datetime:
+    """``recorded_at`` (epoch microseconds); a frame takes its first child's.
+
+    A marker carries no time and an unreadable value is the epoch, the
+    warehouse's "absent".
+    """
+    value = line.get("recorded_at")
+    if "retained_frame" in line:
+        children = line.get("children")
+        first = children[0] if isinstance(children, list) and children else {}
+        try:
+            child = json.loads(str(first.get("record_json", ""))) if isinstance(first, Mapping) else {}
+        except ValueError:
+            child = {}
+        value = child.get("recorded_at") if isinstance(child, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return parse_datetime("")
+    try:
+        return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=value)
+    except OverflowError:
+        return parse_datetime("")
+
+
+def _muse_code_blocks_text(blocks: Any) -> str:
+    if not isinstance(blocks, list):
+        return ""
+    texts = (str(block.get("text", "") or "") for block in blocks if isinstance(block, Mapping) and block.get("kind") == "text")
+    return "\n".join(text for text in texts if text)
+
+
 def _openclaw_text(content: Any) -> str:
     return _join_text_blocks(content, text_types=("text",))
 
@@ -1302,6 +1484,14 @@ _EVENT_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "openclaw": openclaw_event_row,
     "pi": pi_event_row,
     "claude_desktop": claude_desktop_event_row,
+}
+
+# Builders that also take the per-transcript ``session`` metadata the uploader
+# read from outside the line itself (Muse: the session kind; Muse Code: a
+# subagent's parent).
+_SESSION_AWARE_ROW_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
+    "muse": muse_event_row,
+    MUSE_CODE_SOURCE: muse_code_event_row,
 }
 
 

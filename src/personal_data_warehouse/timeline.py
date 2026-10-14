@@ -3351,6 +3351,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "codex_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "openclaw_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "pi_events": _events("one session roll-up row plus one row per user/assistant turn"),
+    "muse_code_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "muse_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "muse_files": _events("one row per Muse workspace file at its latest content"),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),

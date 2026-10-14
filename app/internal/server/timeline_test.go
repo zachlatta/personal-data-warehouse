@@ -470,6 +470,7 @@ func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
 		{"codex", "agent_session"},
 		{"openclaw", "agent_session"},
 		{"pi", "agent_session"},
+		{"muse_code", "agent_session"},
 	} {
 		if !timelinePayloadHasSourceKind(first.Sources, pair[0], pair[1]) {
 			t.Fatalf("warming payload missing %s/%s: %s", pair[0], pair[1], body)

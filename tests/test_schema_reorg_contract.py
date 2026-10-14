@@ -162,7 +162,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 base: base_gmail.labels and base_gmail.filters, the snapshot a
         # reviewed gmail.*_label / gmail.*_filter mutation is checked against,
         # with +1 ops (gmail_settings_sync_state).
-        "base": 75,
+        # +1 base: base_muse_code.events, the Muse coding CLI's transcripts
+        # (a separate tool and source from Muse, Meta's hosted agent).
+        "base": 76,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         "derived": 23,

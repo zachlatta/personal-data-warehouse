@@ -288,6 +288,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "codex", kind: "agent_session"},
 	{source: "openclaw", kind: "agent_session"},
 	{source: "pi", kind: "agent_session"},
+	{source: "muse_code", kind: "agent_session"},
 	{source: "muse", kind: "agent_session"},
 	{source: "chatgpt", kind: "agent_turn"},
 	{source: "claude_code", kind: "agent_turn"},
@@ -295,6 +296,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "codex", kind: "agent_turn"},
 	{source: "openclaw", kind: "agent_turn"},
 	{source: "pi", kind: "agent_turn"},
+	{source: "muse_code", kind: "agent_turn"},
 	{source: "muse", kind: "agent_turn"},
 }
 

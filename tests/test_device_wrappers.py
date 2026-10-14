@@ -30,7 +30,7 @@ LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
 WRAPPERS: dict[str, tuple[str, str | None]] = {
-    "agent-sessions-upload-launchd": ('"$PDW" ingest agent-sessions --mode incremental', "claude_code,codex,pi"),
+    "agent-sessions-upload-launchd": ('"$PDW" ingest agent-sessions --mode incremental', "claude_code,codex,pi,muse_code"),
     "agent-sessions-upload-systemd": ('"$PDW" ingest agent-sessions --mode incremental', "openclaw"),
     "apple-contacts-upload-launchd": ('"$PDW" ingest apple-contacts --mode incremental', "apple_contacts"),
     "apple-messages-upload-launchd": ('"$PDW" ingest apple-messages --mode incremental', "apple_messages"),

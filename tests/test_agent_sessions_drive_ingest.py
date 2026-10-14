@@ -10,6 +10,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
     codex_event_row,
     has_batch_payloads,
     iter_batch_payloads,
+    muse_code_event_row,
     openclaw_event_row,
     pi_event_row,
     record_to_event_row,
@@ -794,3 +795,268 @@ def test_runner_stops_when_a_legacy_row_cannot_be_renormalized() -> None:
     ).sync()
     assert summary.codex_rows_renormalized == 0
     assert warehouse.limits and len(warehouse.limits) == 1
+
+
+# --- Muse normalizer ---------------------------------------------------
+#
+# Muse (the Muse models' coding CLI, not Meta's Muse agent)
+# keeps one append-only event log per session. Each line is a runtime record
+# {id, sequence, recorded_at (epoch MICROseconds), payload_type, payload};
+# conversational content rides payload_type 'runtime.session' run events and
+# 'runtime.user_intent.accepted'. Fixtures below follow the 1.4.7 shapes.
+
+MUSE_CODE_SESSION = "01a13804-ba3b-7ec0-9308-cb2d86d27ed3"
+# 1791941196347462 epoch microseconds.
+_MUSE_CODE_AT = datetime(2026, 10, 14, 1, 26, 36, 347462, tzinfo=UTC)
+
+
+def _muse_code_record(payload_type: str, payload: dict, *, seq: int = 1, record_id: str = "rec-1") -> dict:
+    return {
+        "schema_version": 1,
+        "id": record_id,
+        "stream": {"kind": "session", "id": MUSE_CODE_SESSION},
+        "sequence": seq,
+        "recorded_at": 1791941196347462,
+        "record_type": "event",
+        "durability": "durable",
+        "causation_id": None,
+        "payload_type": payload_type,
+        "payload_schema_version": 1,
+        "payload": payload,
+    }
+
+
+def _muse_code_row(line: dict, *, seq: int = 0, session: dict | None = None) -> dict:
+    return muse_code_event_row(
+        line,
+        session_id=MUSE_CODE_SESSION,
+        account="a",
+        device="d",
+        seq=seq,
+        ingested_at=INGESTED_AT,
+        session=session or {},
+    )
+
+
+def test_muse_code_metadata_row_carries_cwd_model_and_version() -> None:
+    row = _muse_code_row(
+        _muse_code_record(
+            "runtime.session.metadata",
+            {
+                "kind": "metadata",
+                "record": {
+                    "workspace_root": "/work/repo",
+                    "provider_id": "meta",
+                    "model_id": "muse-wonder-1.0",
+                    "build": {"sha": "abc", "semver": "1.4.7"},
+                },
+            },
+        )
+    )
+    assert row["source"] == "muse_code"
+    assert row["role"] == "meta"
+    assert row["cwd"] == "/work/repo"
+    assert row["model"] == "muse-wonder-1.0"
+    assert row["cli_version"] == "1.4.7"
+    assert row["event_uuid"] == "rec-1"
+    assert row["occurred_at"] == _MUSE_CODE_AT
+
+
+def test_muse_code_workspace_branch_row_carries_git_fields() -> None:
+    row = _muse_code_row(
+        _muse_code_record(
+            "session.workspace_branch.observed",
+            {
+                "kind": "workspace_branch",
+                "record": {
+                    "workspace_root": "/work/repo",
+                    "reference": {"kind": "branch", "name": "my-branch"},
+                    "vcs": "git",
+                    "commit": "0b9fd993d8a4",
+                },
+            },
+        )
+    )
+    assert (row["cwd"], row["git_branch"], row["git_commit"]) == ("/work/repo", "my-branch", "0b9fd993d8a4")
+
+
+def test_muse_code_user_intent_is_the_typed_text_not_the_model_message() -> None:
+    row = _muse_code_row(
+        _muse_code_record(
+            "runtime.user_intent.accepted",
+            {
+                "intent_id": "intent-1",
+                "surface": "main",
+                "semantic_kind": {"kind": "chat"},
+                "refill_blocks": [{"kind": "text", "text": "fix the parser"}],
+                "model_messages": [
+                    {"content": [{"kind": "text", "text": "<system_instructions> injected </system_instructions>fix the parser"}]}
+                ],
+            },
+        )
+    )
+    assert row["role"] == "user"
+    assert row["subtype"] == "message"
+    assert row["text"] == "fix the parser"
+
+
+def _muse_code_run_event(event: dict, *, record_id: str = "rec-1") -> dict:
+    return _muse_code_record(
+        "runtime.session",
+        {"kind": "run", "run_id": "run-1", "event": event},
+        record_id=record_id,
+    )
+
+
+def test_muse_code_assistant_message_is_text_and_reasoning_is_not() -> None:
+    message = _muse_code_row(
+        _muse_code_run_event(
+            {"kind": "assistant_message_committed", "message_id": "m1", "response_id": "r1", "text": "all done"}
+        )
+    )
+    reasoning = _muse_code_row(
+        _muse_code_run_event(
+            {"kind": "reasoning_summary_committed", "message_id": "m2", "text": "private summary"}
+        )
+    )
+    assert (message["role"], message["subtype"], message["text"]) == ("assistant", "message", "all done")
+    assert message["event_type"] == "assistant_message_committed"
+    # Reasoning stays in raw_json only, as for every other agent source.
+    assert (reasoning["role"], reasoning["subtype"], reasoning["text"]) == ("assistant", "thinking", "")
+    assert "private summary" in reasoning["raw_json"]
+
+
+def test_muse_code_tool_batches_pair_by_message_id() -> None:
+    call = _muse_code_row(
+        _muse_code_run_event(
+            {
+                "kind": "assistant_tool_calls_committed",
+                "message_id": "batch-1",
+                "response_id": "r1",
+                "tool_calls": [
+                    {"id": "fc1", "call_id": "call-1", "name": "bash", "args": '{"command":"ls"}'},
+                    {"id": "fc2", "call_id": "call-2", "name": "read_file", "args": '{"path":"README.md"}'},
+                ],
+            }
+        )
+    )
+    result = _muse_code_row(
+        _muse_code_run_event(
+            {
+                "kind": "tool_result_batch_committed",
+                "batch_id": "batch-1",
+                "results": [
+                    {"tool_call_index": 0, "tool_call_id": "call-1", "text": "file1.txt"},
+                    {"tool_call_index": 1, "tool_call_id": "call-2", "text": "# Title"},
+                ],
+            }
+        )
+    )
+    assert (call["role"], call["subtype"], call["tool_name"]) == ("assistant", "tool_use", "bash")
+    assert call["text"] == ""
+    calls = json.loads(call["tool_input_json"])["tool_calls"]
+    assert [c["name"] for c in calls] == ["bash", "read_file"]
+    assert calls[1]["args"] == '{"path":"README.md"}'
+    assert (result["role"], result["subtype"]) == ("tool", "tool_result")
+    assert result["text"] == "file1.txt\n# Title"
+    # One pairing key for the whole batch, as Codex pairs by turn_id.
+    assert call["turn_id"] == result["turn_id"] == "batch-1"
+
+
+def test_muse_code_model_completed_carries_usage_and_model() -> None:
+    row = _muse_code_row(
+        _muse_code_run_event(
+            {
+                "kind": "model_completed",
+                "usage": {
+                    "input_tokens": 42005,
+                    "output_tokens": 162,
+                    "cached_tokens": 38388,
+                    "cache_write_tokens": 7,
+                    "cache_read_tokens": 38388,
+                    "reasoning_tokens": 3,
+                },
+                "duration_ms": 5750,
+                "finish_reason": "tool_calls",
+                "model": "muse-wonder-1.0",
+            }
+        )
+    )
+    assert row["role"] == "meta"
+    assert row["model"] == "muse-wonder-1.0"
+    assert (row["input_tokens"], row["output_tokens"]) == (42005, 162)
+    assert (row["cache_read_tokens"], row["cache_creation_tokens"]) == (38388, 7)
+
+
+def test_muse_code_subagent_started_prompt_is_a_sidechain_user_row() -> None:
+    started = _muse_code_run_event({"kind": "started", "prompt": "investigate the flake"})
+    main = _muse_code_row(started)
+    sub = _muse_code_row(started, session={"parent_session_id": "parent-session"})
+    # In a main session the run prompt is the model message, already carried
+    # by runtime.user_intent.accepted; keeping it would double every turn.
+    assert (main["role"], main["text"], main["is_sidechain"]) == ("meta", "", 0)
+    # A subagent has no user_intent: its brief is the opening prompt, and the
+    # whole session is a sidechain of the parent the uploader named.
+    assert (sub["role"], sub["text"]) == ("user", "investigate the flake")
+    assert sub["is_sidechain"] == 1
+    assert sub["parent_uuid"] == "parent-session"
+    assert sub["entrypoint"] == "subagent"
+
+
+def test_muse_code_retained_frame_and_marker_lines_are_meta_never_errors() -> None:
+    child = json.dumps(_muse_code_record("runtime.session.permission_format_declared", {"format": "profile_v1"}))
+    frame = _muse_code_row(
+        {
+            "retained_frame": "session_permission_transaction",
+            "frame_schema_version": 1,
+            "outer_log_ordinal": 1,
+            "transaction_id": "txn-1",
+            "children": [{"child_index": 0, "record_json": child}],
+        },
+        seq=0,
+    )
+    marker = _muse_code_row(
+        {
+            "retained_marker": "omitted_live_only",
+            "schema_version": 1,
+            "stream": {"kind": "session", "id": MUSE_CODE_SESSION},
+            "position": {"id": "pos-1", "sequence": 77},
+            "omitted_record": {"record_type": "status", "payload_type": "runtime.session"},
+        },
+        seq=5,
+    )
+    assert (frame["role"], frame["event_uuid"], frame["occurred_at"]) == ("meta", "txn-1", _MUSE_CODE_AT)
+    assert (marker["role"], marker["event_uuid"]) == ("meta", "pos-1")
+    assert marker["occurred_at"] == datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def test_muse_code_record_to_event_row_routes_the_tool_and_session() -> None:
+    record = envelope(
+        {
+            "tool": "muse_code",
+            "session_id": "sub-1",
+            "seq": 2,
+            "line": _muse_code_run_event({"kind": "started", "prompt": "do the subtask"}),
+            "session": {"parent_session_id": "parent-1"},
+        },
+        tool="muse_code",
+    )
+    row = record_to_event_row(record, ingested_at=INGESTED_AT)
+    assert row["source"] == "muse_code"
+    assert row["session_id"] == "sub-1"
+    assert (row["role"], row["text"], row["parent_uuid"]) == ("user", "do the subtask", "parent-1")
+    assert (row["account"], row["device"]) == ("zach@example.com", "porygon")
+
+
+def test_muse_code_malformed_shapes_degrade_to_meta_rows() -> None:
+    # The normalizer runs inside the one ingest pass every provider shares:
+    # an unexpected Muse shape must never fail that pass.
+    for line in (
+        {},
+        {"payload_type": "runtime.session", "payload": "nope"},
+        {"payload_type": "runtime.user_intent.accepted", "payload": {"refill_blocks": "nope"}},
+        {"recorded_at": "not-a-time", "payload_type": "something.new", "payload": {}},
+    ):
+        row = _muse_code_row(line, seq=3)
+        assert row["source"] == "muse_code"
+        assert row["event_uuid"] == f"{MUSE_CODE_SESSION}#3"

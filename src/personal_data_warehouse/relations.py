@@ -84,7 +84,7 @@ ALL_CANONICAL_SCHEMAS: tuple[str, ...] = tuple(sorted(CATALOG.all_schemas()))
 # re-unifies them.
 AI_EVENT_SOURCE_RELATIONS: dict[str, str] = {
     source: f"{source}_events"
-    for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi", "muse")
+    for source in ("chatgpt", "claude_desktop", "claude_code", "codex", "openclaw", "pi", "muse_code", "muse")
 }
 
 # Raw voice tables, keyed by the ``source`` marts_voice_memos.recordings tags

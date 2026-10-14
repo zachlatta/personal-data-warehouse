@@ -1,7 +1,7 @@
 # Prior agent sessions
 
-PDW indexes every past AI agent session across seven providers — Claude Code, Codex, Claude
-Desktop, ChatGPT, OpenClaw, pi and Muse — from every machine, unified in
+PDW indexes every past AI agent session across eight providers — Claude Code, Codex, Claude
+Desktop, ChatGPT, OpenClaw, pi, Muse Code and Muse — from every machine, unified in
 `marts_ai_conversations`. It is the fleet's own transcript archive and the single most
 underused thing in the warehouse. Before re-deriving anything, ask it: *have we solved
 this before, and how? what did that agent conclude? how does the fleet really call tool
@@ -46,7 +46,8 @@ ORDER BY seq DESC LIMIT 5;
   `role`, `event_type`, `subtype`, `text`, `tool_name`, `tool_input_json`,
   `tool_result_json`, `is_sidechain`, `raw_json`, per-event token counts.
 - `base_claude_code.events`, `base_codex.events`, `base_claude_desktop.events`,
-  `base_chatgpt.events`, `base_openclaw.events`, `base_pi.events`, `base_muse.events` —
+  `base_chatgpt.events`, `base_openclaw.events`, `base_pi.events`, `base_muse_code.events`,
+  `base_muse.events` —
   the raw per-provider streams the mart unions.
 
 `entrypoint` separates interactive from automated work: `cli` and `codex-tui` are Zach at
@@ -64,6 +65,13 @@ row is titled for the loop (`Muse self-improvement run`, `Muse subagent`, ...). 
 session id in `parent_uuid`. `subtype = 'compaction'` rows carry Muse's own running
 summary of a long chat. Its reasoning is kept in `raw_json` only. The agent's memory,
 goal pages and generated files are `base_muse.files` (topic `sources`).
+
+**Muse Code** (source `muse_code`) is the Muse models' local coding CLI, a different tool
+from Muse. A user row is what Zach typed, without the harness instructions. A tool row
+holds a whole parallel batch: `tool_input_json` is `{"tool_calls": [...]}`, the result row's
+`text` joins every output, and both rows share `turn_id`. Tokens are on `meta` rows
+(`event_type = 'model_completed'`). Subagent sessions are `is_sidechain = 1` and
+`entrypoint = 'subagent'`, with the parent session id in `parent_uuid`.
 
 ## Pairing tool calls with results
 

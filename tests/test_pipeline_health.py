@@ -727,7 +727,7 @@ def test_every_remote_device_uploader_declares_a_run_heartbeat():
     """Every pipeline fed by a Mac/VM uploader reads ops.uploader_heartbeats."""
     for pipeline_id in (
         "apple_notes", "apple_messages", "apple_contacts", "apple_voice_memos",
-        "apple_photos", "claude_code", "codex", "openclaw", "pi",
+        "apple_photos", "claude_code", "codex", "openclaw", "pi", "muse_code",
     ):
         entry = pipeline(pipeline_id)
         assert entry.state is not None, pipeline_id

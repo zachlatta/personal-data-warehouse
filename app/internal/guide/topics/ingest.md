@@ -10,7 +10,7 @@ uploader's exec chain).
 | source | what it ships |
 | --- | --- |
 | `apple-messages`, `apple-notes`, `apple-contacts`, `apple-photos`, `voice-memos` | this Mac's Messages, Notes, Contacts, Photos and Voice Memos; normally run by a LaunchAgent every 5–30 minutes |
-| `agent-sessions` | Claude Code, Codex, pi and OpenClaw transcripts from this machine |
+| `agent-sessions` | Claude Code, Codex, pi, Muse Code and OpenClaw transcripts from this machine |
 | `muse` | run ON a Muse VM (Meta's hosted agent) by a Muse hook: its transcripts plus its workspace files (memory, goals, feed, podcasts, uploads) |
 | `claude-desktop` | this Mac's Claude Desktop session credential, so the server can poll claude.ai conversations |
 | `manual-finance <files-or-dir>` | bank, brokerage and mortgage statements, valuation screenshots, fund documents; the folder name `<institution>-<name>-<mask>/` IS the account. `--evidence-only` for tax returns and supporting records, which are searchable but never booked into the ledger |

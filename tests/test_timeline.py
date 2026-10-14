@@ -3603,6 +3603,77 @@ def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehous
     )
 
 
+def test_muse_code_typed_turns_are_self_and_its_subagents_are_background(warehouse):
+    """Muse Code rows reach the timeline through the shared agent-session rules.
+
+    The rows here come from the real normalizer, so this pins the whole path:
+    a user intent is a 'user' turn (self), the model's reply is background, and
+    a subagent -- whose brief from the parent is its only user row -- is a
+    sidechain-only session, which the existing rules file as background.
+    """
+    from personal_data_warehouse.agent_sessions_drive_ingest import muse_code_event_row
+
+    _ensure_all_source_tables(warehouse)
+    recorded_at = int(_NOW.timestamp() * 1_000_000)
+
+    def line(payload_type: str, payload: dict, record_id: str) -> dict:
+        return {"id": record_id, "recorded_at": recorded_at, "payload_type": payload_type, "payload": payload}
+
+    def run_event(event: dict, record_id: str) -> dict:
+        return line("runtime.session", {"kind": "run", "run_id": "r", "event": event}, record_id)
+
+    def rows(session_id: str, lines: list[dict], session: dict) -> list[dict]:
+        return [
+            muse_code_event_row(
+                item, session_id=session_id, account="z@x.test", device="porygon",
+                seq=seq, ingested_at=_NOW, session=session,
+            )
+            for seq, item in enumerate(lines)
+        ]
+
+    warehouse.insert_agent_session_events(
+        rows(
+            "chat",
+            [
+                line(
+                    "runtime.user_intent.accepted",
+                    {"intent_id": "i1", "refill_blocks": [{"kind": "text", "text": "why is the parser slow"}]},
+                    "c0",
+                ),
+                run_event({"kind": "assistant_message_committed", "message_id": "m1", "text": "It re-reads the file."}, "c1"),
+            ],
+            {},
+        )
+        + rows(
+            "sub",
+            [
+                run_event({"kind": "started", "prompt": "Profile the parser and report hot spots"}, "s0"),
+                run_event({"kind": "assistant_message_committed", "message_id": "m2", "text": "tokenize() dominates"}, "s1"),
+            ],
+            {"parent_session_id": "chat"},
+        )
+    )
+
+    engine = _engine(warehouse)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+
+    def priority_of(adapter: str, event_id: str) -> str:
+        found = warehouse._query(
+            "SELECT priority FROM @timeline_events WHERE adapter = %s AND event_id = %s",
+            (adapter, event_id),
+        )
+        assert found, (adapter, event_id)
+        return found[0][0]
+
+    assert priority_of("agent_session", "muse_code|chat") == "self"
+    assert priority_of("agent_session_turn", "muse_code|chat|0") == "self"
+    assert priority_of("agent_session_turn", "muse_code|chat|1") == "background"
+    assert priority_of("agent_session", "muse_code|sub") == "background"
+
+
 def test_a_muse_loop_session_is_titled_by_its_loop_not_left_blank(warehouse):
     """A Muse loop session has no typed prompt and no title, so it read as a blank row.
 

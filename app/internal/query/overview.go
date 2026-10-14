@@ -246,7 +246,7 @@ var overviewPreamble = `--
 --  2. JSON columns are text on the older sources and real jsonb on the newer ones, so there is
 --     no single rule. text on: base_slack, base_gmail, base_google_calendar, base_apple_*,
 --     base_whatsapp, and the agent-session event tables (base_claude_code, base_claude_desktop,
---     base_codex, base_chatgpt, base_openclaw, base_pi). jsonb on: base_plaid, base_whoop,
+--     base_codex, base_chatgpt, base_openclaw, base_pi, base_muse_code). jsonb on: base_plaid, base_whoop,
 --     base_google_drive, base_google_contacts, base_apple_contacts, base_apple_photos,
 --     base_manual_finance, base_alice_voice_recordings. On a text one, cast before
 --     -> / ->> / subscripting, else 42883. describe_table is authoritative — check, don't assume.

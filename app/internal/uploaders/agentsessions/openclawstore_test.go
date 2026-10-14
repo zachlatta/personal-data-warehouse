@@ -34,7 +34,7 @@ func newOpenClawStore(t *testing.T, root string) (*sql.DB, Dirs) {
 		if name == "AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR" {
 			return sessions
 		}
-		if name == "AGENT_SESSIONS_CLAUDE_PROJECTS_DIR" || name == "AGENT_SESSIONS_CODEX_SESSIONS_DIR" || name == "AGENT_SESSIONS_PI_SESSIONS_DIR" {
+		if name == "AGENT_SESSIONS_CLAUDE_PROJECTS_DIR" || name == "AGENT_SESSIONS_CODEX_SESSIONS_DIR" || name == "AGENT_SESSIONS_PI_SESSIONS_DIR" || name == "AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR" {
 			return filepath.Join(root, "absent")
 		}
 		return ""

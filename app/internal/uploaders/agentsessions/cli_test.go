@@ -27,13 +27,14 @@ func cliEnv(t *testing.T) (map[string]string, string) {
 		t.Fatal(err)
 	}
 	env := map[string]string{
-		"AGENT_SESSIONS_ACCOUNT":               "zach@example.com",
-		"AGENT_SESSIONS_DEVICE":                "test-device",
-		"AGENT_SESSIONS_CLAUDE_PROJECTS_DIR":   filepath.Join(root, "claude"),
-		"AGENT_SESSIONS_CODEX_SESSIONS_DIR":    filepath.Join(root, "none-codex"),
-		"AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR": filepath.Join(root, "none-openclaw"),
-		"AGENT_SESSIONS_PI_SESSIONS_DIR":       filepath.Join(root, "none-pi"),
-		"PDW_INGEST_PROJECT_DIR":               root,
+		"AGENT_SESSIONS_ACCOUNT":                "zach@example.com",
+		"AGENT_SESSIONS_DEVICE":                 "test-device",
+		"AGENT_SESSIONS_CLAUDE_PROJECTS_DIR":    filepath.Join(root, "claude"),
+		"AGENT_SESSIONS_CODEX_SESSIONS_DIR":     filepath.Join(root, "none-codex"),
+		"AGENT_SESSIONS_OPENCLAW_SESSIONS_DIR":  filepath.Join(root, "none-openclaw"),
+		"AGENT_SESSIONS_PI_SESSIONS_DIR":        filepath.Join(root, "none-pi"),
+		"AGENT_SESSIONS_MUSE_CODE_SESSIONS_DIR": filepath.Join(root, "none-muse-code"),
+		"PDW_INGEST_PROJECT_DIR":                root,
 	}
 	return env, root
 }

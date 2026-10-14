@@ -239,6 +239,14 @@
       "comment": "Faithful pi source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_muse_code",
+      "layer": "base",
+      "domain": "muse_code",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Faithful muse_code source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
+    },
+    {
       "name": "base_plaid",
       "layer": "base",
       "domain": "plaid",
@@ -372,7 +380,7 @@
       "domain": "ai_conversations",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Stable AI-conversation read interface across every provider (Claude Code, Codex, OpenClaw, pi, Claude Desktop, ChatGPT). Start with marts_ai_conversations.sessions for one row per session, then marts_ai_conversations.events for its turns."
+      "comment": "Stable AI-conversation read interface across every provider (Claude Code, Codex, OpenClaw, pi, Muse Code, Claude Desktop, ChatGPT, Muse). Start with marts_ai_conversations.sessions for one row per session, then marts_ai_conversations.events for its turns."
     },
     {
       "name": "marts_calendar",
@@ -1471,6 +1479,17 @@
         "schema": "pi",
         "name": "events"
       }
+    },
+    {
+      "id": "muse_code_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "muse_code",
+      "schema": "base_muse_code",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
     },
     {
       "id": "muse_events",
