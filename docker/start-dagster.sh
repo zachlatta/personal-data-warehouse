@@ -22,9 +22,10 @@ grpc_pid=""
 daemon_pid=""
 webserver_pid=""
 mutation_worker_pid=""
+voice_worker_pid=""
 
 shutdown() {
-  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid" "$mutation_worker_pid"; do
+  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid" "$mutation_worker_pid" "$voice_worker_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -43,6 +44,18 @@ case "${UPSTREAM_MUTATION_RESIDENT_WORKER_ENABLED:-1}" in
   *)
     uv run python -m personal_data_warehouse.upstream_mutation_worker &
     mutation_worker_pid="$!"
+    ;;
+esac
+
+# A voice memo should land in seconds: the app NOTIFYs when it stores a memo's
+# sidecar and this worker ingests, transcribes and lands it on the timeline
+# without waiting for a sensor tick and a run start. The sensors stay as the
+# floor, so a missed notification costs latency, never a recording.
+case "${VOICE_MEMO_LANDING_WORKER_ENABLED:-1}" in
+  0|false|False|no|No) ;;
+  *)
+    uv run python -m personal_data_warehouse.voice_memo_landing_worker &
+    voice_worker_pid="$!"
     ;;
 esac
 
@@ -97,6 +110,10 @@ while :; do
   fi
   if [ -n "$mutation_worker_pid" ] && ! kill -0 "$mutation_worker_pid" 2>/dev/null; then
     wait "$mutation_worker_pid"
+    exit $?
+  fi
+  if [ -n "$voice_worker_pid" ] && ! kill -0 "$voice_worker_pid" 2>/dev/null; then
+    wait "$voice_worker_pid"
     exit $?
   fi
   sleep 2

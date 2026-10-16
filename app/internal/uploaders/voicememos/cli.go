@@ -17,9 +17,39 @@ import (
 // DefaultRecordingsPath and DefaultExtensions live in scanner.go; these are
 // the CLI's remaining defaults (personal_data_warehouse_voice_memos.cli).
 const (
-	defaultMinFileAgeSeconds = 120
-	writebackQueryTimeout    = 30 * time.Second
+	// defaultMinFileAgeSeconds guards a file that is still being written.
+	// It was 120 s, which with the five-minute tick was ~5 of a short memo's
+	// ~8 minutes to land; Voice Memos' own local-vs-total duration check
+	// (IsPartiallyMaterialized) is what catches an iCloud download in flight.
+	defaultMinFileAgeSeconds = 5
+	// defaultIncrementalMaxRunSeconds is the incremental run's deadline.
+	defaultIncrementalMaxRunSeconds = 900
+	writebackQueryTimeout           = 30 * time.Second
 )
+
+// ExitCodeRunDeadline is the exit status of a run killed by its deadline
+// (timeout(1)'s convention), so the heartbeat reads it as a failed run.
+const ExitCodeRunDeadline = 124
+
+// exitProcess is os.Exit; a package var so the deadline is testable.
+var exitProcess = os.Exit
+
+// startRunDeadline exits the process when a run outlives limit. On
+// 2026-10-14 a run hung at "Scanning" for 10.9 hours, and launchd never
+// starts a job that is still running, so every memo waited behind it. A
+// hung syscall cannot be cancelled from Go, so the deadline exits rather
+// than cancels; the lock is an flock and dies with the process. A zero
+// limit is off. The returned func disarms it.
+func startRunDeadline(limit time.Duration, stderr io.Writer, exit func(int)) func() {
+	if limit <= 0 {
+		return func() {}
+	}
+	timer := time.AfterFunc(limit, func() {
+		fmt.Fprintf(stderr, "error: Voice Memos run exceeded its %s deadline; exiting so the next run can start\n", limit)
+		exit(ExitCodeRunDeadline)
+	})
+	return func() { timer.Stop() }
+}
 
 // Options are the parsed `pdw ingest voice-memos` flags.
 type Options struct {
@@ -28,6 +58,7 @@ type Options struct {
 	Mode               string
 	StateFile          string
 	MinFileAgeSeconds  int
+	MaxRunSeconds      int
 	LockFile           string
 	RecordingsPath     string
 	NetworkDiagnostics bool
@@ -87,6 +118,7 @@ func ParseArgs(args []string, helpOut io.Writer) (Options, error) {
 	fs.StringVar(&opts.Mode, "mode", "incremental", "Upload mode: incremental or full")
 	fs.StringVar(&opts.StateFile, "state-file", defaultState, "Incremental upload state path")
 	fs.IntVar(&opts.MinFileAgeSeconds, "min-file-age-seconds", defaultMinFileAgeSeconds, "Do not upload recordings modified more recently than this")
+	fs.IntVar(&opts.MaxRunSeconds, "max-run-seconds", -1, "Exit a run that takes longer than this; 0 disables (default 900 incremental, 0 full)")
 	fs.StringVar(&opts.LockFile, "lock-file", common.WithSuffix(defaultState, ".lock"), "Nonblocking lock path used to avoid overlapping cron runs")
 	fs.StringVar(&opts.RecordingsPath, "recordings-path", "", "Voice Memos recordings directory (default: VOICE_MEMOS_RECORDINGS_PATH or the system store)")
 	fs.BoolVar(&opts.NetworkDiagnostics, "network-diagnostics", false, "Print network guard diagnostics and exit")
@@ -107,6 +139,12 @@ func ParseArgs(args []string, helpOut io.Writer) (Options, error) {
 	if opts.Mode != "incremental" && opts.Mode != "full" {
 		return opts, fmt.Errorf("argument --mode: invalid choice: '%s' (choose from 'incremental', 'full')", opts.Mode)
 	}
+	if opts.MaxRunSeconds < 0 {
+		opts.MaxRunSeconds = 0
+		if opts.Mode == "incremental" {
+			opts.MaxRunSeconds = defaultIncrementalMaxRunSeconds
+		}
+	}
 	return opts, nil
 }
 
@@ -115,6 +153,7 @@ func Usage() string {
 	return `usage: pdw ingest voice-memos [-h] [--limit LIMIT] [--workers WORKERS]
                               [--mode {incremental,full}] [--state-file STATE_FILE]
                               [--min-file-age-seconds MIN_FILE_AGE_SECONDS]
+                              [--max-run-seconds MAX_RUN_SECONDS]
                               [--lock-file LOCK_FILE] [--recordings-path RECORDINGS_PATH]
                               [--network-diagnostics] [--no-writeback]
                               [--writeback-only] [--writeback-dry-run]
@@ -132,6 +171,8 @@ options:
                         Incremental upload state path
   --min-file-age-seconds MIN_FILE_AGE_SECONDS
                         Do not upload recordings modified more recently than this
+  --max-run-seconds MAX_RUN_SECONDS
+                        Exit a run that takes longer than this; 0 disables (default 900 incremental, 0 full)
   --lock-file LOCK_FILE
                         Nonblocking lock path used to avoid overlapping cron runs
   --recordings-path RECORDINGS_PATH
@@ -215,6 +256,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	var summary *Summary
 	var writebackSummary *WritebackSummary
+	stopDeadline := startRunDeadline(time.Duration(opts.MaxRunSeconds)*time.Second, stderr, exitProcess)
+	defer stopDeadline()
 	code := func() int {
 		defer lock.Release()
 		if runUpload {

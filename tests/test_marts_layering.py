@@ -859,6 +859,121 @@ def test_calendar_transcript_views_read_the_voice_memo_mart(
 # ---------------------------------------------------------------------------
 
 
+def _landed_memo(
+    wh: PostgresWarehouse,
+    recording_id: str,
+    *,
+    ended_ago: timedelta,
+    duration_seconds: float,
+    delivery_seconds: float,
+    landing_seconds: float | None,
+) -> None:
+    """An Apple memo that reached the Mac delivery_seconds after it ended and
+    had a transcript landing_seconds after that (None: not transcribed)."""
+    now = datetime.now(tz=UTC)
+    ended = now - ended_ago
+    recorded = ended - timedelta(seconds=duration_seconds)
+    arrived = ended + timedelta(seconds=delivery_seconds)
+    wh.insert_apple_voice_memos_files(
+        [
+            _row(
+                VOICE_MEMO_FILE_COLUMNS,
+                account="zach",
+                recording_id=recording_id,
+                filename=f"{recording_id}.m4a",
+                content_type="audio/mp4",
+                content_sha256=f"sha-{recording_id}",
+                size_bytes=1000,
+                recorded_at=recorded,
+                file_created_at=arrived,
+                raw_metadata_json=f'{{"recording": {{"duration_seconds": {duration_seconds}}}}}',
+                ingested_at=arrived,
+                sync_version=1,
+            )
+        ]
+    )
+    if landing_seconds is None:
+        return
+    wh.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id=recording_id,
+                content_sha256=f"sha-{recording_id}",
+                provider="assemblyai",
+                provider_transcript_id=f"tid-{recording_id}",
+                status="completed",
+                transcript_text="hello",
+                requested_at=arrived,
+                completed_at=arrived + timedelta(seconds=landing_seconds),
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def _landing(wh: PostgresWarehouse) -> dict:
+    rows = {row["source"]: row for row in _dicts(wh, "marts_ops_voice_memo_landing_health")}
+    return rows["apple_voice_memos"]
+
+
+def test_voice_memo_landing_health_splits_icloud_delivery_from_pdws_own_landing(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """A short memo should be a searchable transcript ~30 s after it reaches the Mac.
+
+    Measured 2026-10-16: end of recording to transcript p50 9 min, nearly all
+    of it schedule waits inside PDW. iCloud's phone-to-Mac delivery (p50 17 s,
+    p90 10 min for short memos) is Apple's and is reported beside PDW's part,
+    never folded into the status, so a slow iCloud day cannot hide a slow PDW.
+    """
+    warehouse.ensure_apple_voice_memos_tables()
+    _landed_memo(warehouse, "fast-1", ended_ago=timedelta(hours=2), duration_seconds=12, delivery_seconds=20, landing_seconds=25)
+    _landed_memo(warehouse, "fast-2", ended_ago=timedelta(hours=3), duration_seconds=30, delivery_seconds=600, landing_seconds=20)
+    # Recorded on the Mac itself: the file is born when recording STARTS, so
+    # PDW's clock starts at the end of the recording, not the file's birth.
+    _landed_memo(warehouse, "mac", ended_ago=timedelta(hours=4), duration_seconds=60, delivery_seconds=-60, landing_seconds=15)
+    # A long memo is reported, but the target is judged on short ones.
+    _landed_memo(warehouse, "long", ended_ago=timedelta(hours=5), duration_seconds=3600, delivery_seconds=120, landing_seconds=300)
+    # Older than the window.
+    _landed_memo(warehouse, "old", ended_ago=timedelta(days=9), duration_seconds=10, delivery_seconds=5, landing_seconds=9999)
+
+    row = _landing(warehouse)
+    assert row["recordings_7d"] == 4
+    assert row["short_recordings_7d"] == 3
+    assert float(row["pdw_landing_p50_seconds"]) == 20.0
+    assert float(row["device_delivery_p50_seconds"]) == 20.0
+    assert float(row["target_p50_seconds"]) == 30
+    assert row["status"] == "ok"
+
+    _landed_memo(warehouse, "slow-1", ended_ago=timedelta(hours=1), duration_seconds=10, delivery_seconds=5, landing_seconds=200)
+    _landed_memo(warehouse, "slow-2", ended_ago=timedelta(hours=1, minutes=5), duration_seconds=10, delivery_seconds=5, landing_seconds=210)
+    _landed_memo(warehouse, "slow-3", ended_ago=timedelta(hours=1, minutes=10), duration_seconds=10, delivery_seconds=5, landing_seconds=220)
+    row = _landing(warehouse)
+    assert float(row["pdw_landing_p50_seconds"]) > 30
+    assert row["status"] == "attention"
+
+
+def test_voice_memo_landing_health_counts_a_memo_still_waiting_for_its_transcript(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_apple_voice_memos_tables()
+    _landed_memo(warehouse, "ok", ended_ago=timedelta(hours=1), duration_seconds=12, delivery_seconds=20, landing_seconds=25)
+    _landed_memo(warehouse, "stuck", ended_ago=timedelta(minutes=30), duration_seconds=12, delivery_seconds=20, landing_seconds=None)
+
+    row = _landing(warehouse)
+    assert row["stuck_untranscribed"] == 1
+    assert row["status"] == "failing", "a short memo with no transcript after ten minutes is not slow, it is stuck"
+
+
+def test_voice_memo_landing_health_is_quiet_with_no_recent_short_memo(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_apple_voice_memos_tables()
+    _landed_memo(warehouse, "long", ended_ago=timedelta(hours=5), duration_seconds=3600, delivery_seconds=120, landing_seconds=300)
+    assert _landing(warehouse)["status"] == "quiet"
+
+
 def _seed_messages(wh: PostgresWarehouse) -> None:
     wh.ensure_apple_messages_tables()
     wh.ensure_whatsapp_tables()

@@ -18,8 +18,10 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 from personal_data_warehouse.apple_voice_memos_drive_ingest import (
     VoiceMemosDriveIngestRunner,
+    VoiceMemosDriveIngestSummary,
     has_metadata_payloads,
     iter_metadata_payloads,
 )
@@ -43,34 +45,61 @@ def _voice_memos_object_store(settings):
     )
 
 
+def ingest_voice_memos_inbox(*, settings, logger) -> VoiceMemosDriveIngestSummary | None:
+    """Promote the Drive inbox's Voice Memos into the warehouse, under the ingest lock.
+
+    The one ingest path: the asset below and the resident landing worker
+    (``voice_memo_landing_worker``) both call it. None when another run holds
+    the lock.
+    """
+    if settings.voice_memos is None:
+        raise RuntimeError("Voice Memos sync is not configured")
+    warehouse = warehouse_from_settings(settings)
+    try:
+        with exclusive_sync_lock(
+            name="apple_voice_memos_drive_ingest",
+            postgres_lock_id=VOICE_MEMOS_DRIVE_INGEST_POSTGRES_LOCK_ID,
+        ) as acquired:
+            if not acquired:
+                logger.warning("Skipping Voice Memos Drive ingest because another run is already active")
+                return None
+            object_store = _voice_memos_object_store(settings)
+            return VoiceMemosDriveIngestRunner(
+                warehouse=warehouse,
+                metadata_source=lambda: iter_metadata_payloads(object_store=object_store),
+                object_store=object_store,
+                logger=logger,
+            ).sync()
+    finally:
+        warehouse.close()
+
+
+def voice_memos_inbox_has_metadata(settings) -> bool:
+    if settings.voice_memos is None:
+        return False
+    return has_metadata_payloads(object_store=_voice_memos_object_store(settings), stage="inbox")
+
+
 @asset(
     group_name="apple_voice_memos",
     retry_policy=RetryPolicy(max_retries=3, delay=60),
 )
 def apple_voice_memos_drive_ingest(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False, require_voice_memos=True)
-    if settings.voice_memos is None:
-        raise RuntimeError("Voice Memos sync is not configured")
-    warehouse = warehouse_from_settings(settings)
-
-    with exclusive_sync_lock(
-        name="apple_voice_memos_drive_ingest",
-        postgres_lock_id=VOICE_MEMOS_DRIVE_INGEST_POSTGRES_LOCK_ID,
-    ) as acquired:
-        if not acquired:
-            context.log.warning("Skipping Voice Memos Drive ingest because another run is already active")
-            summary = None
-        else:
-            object_store = _voice_memos_object_store(settings)
-            summary = VoiceMemosDriveIngestRunner(
-                warehouse=warehouse,
-                metadata_source=lambda: iter_metadata_payloads(object_store=object_store),
-                object_store=object_store,
-                logger=context.log,
-            ).sync()
+    summary = ingest_voice_memos_inbox(settings=settings, logger=context.log)
+    # Land the new recordings on the timeline in this run rather than waiting
+    # for the five-minute timeline_sync tick.
+    fast_lane = {"enabled": False, "rows": 0}
+    if summary is not None and summary.rows_written:
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["voice_memos"],
+            logger=context.log,
+        )
 
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "metadata_seen": MetadataValue.int(summary.metadata_seen if summary else 0),
             "rows_written": MetadataValue.int(summary.rows_written if summary else 0),
             "recordings_promoted": MetadataValue.int(summary.recordings_promoted if summary else 0),
@@ -97,7 +126,7 @@ def apple_voice_memos_drive_inbox_sensor(context):
     settings = load_settings(require_gmail=False, require_voice_memos=True)
     if settings.voice_memos is None:
         raise RuntimeError("Voice Memos sync is not configured")
-    if not has_metadata_payloads(object_store=_voice_memos_object_store(settings), stage="inbox"):
+    if not voice_memos_inbox_has_metadata(settings):
         return SkipReason("No Voice Memos inbox metadata found in object storage.")
 
     return RunRequest(tags={"apple_voice_memos_trigger": "drive_inbox"})

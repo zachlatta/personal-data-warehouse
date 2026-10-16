@@ -604,3 +604,44 @@ def test_c10_reads_green_only_with_clean_pages_and_clean_backups(monkeypatch: py
 def test_c4_cannot_vouch_for_raw_data_while_pages_fail_checksums(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(contract_audit, "pdw_sql", _integrity_sql(checksum="failing"))
     assert contract_audit.c4_raw_data_queryable().status != contract_audit.GREEN
+
+
+def _s2_sql(*, landing: list[dict] | None) -> Callable[..., list[dict] | None]:
+    coverage = [
+        {"source": source, "recordings": 10, "untranscribed": 0, "untranscribable": 0, "unenriched": 0, "matched": 5}
+        for source in ("alice_voice_recordings", "apple_notes", "apple_voice_memos")
+    ]
+
+    def fake(intent: str, sql: str, **_kwargs) -> list[dict] | None:
+        return landing if "voice_memo_landing_health" in sql else coverage
+
+    return fake
+
+
+def _landing(status: str, p50: float | None) -> list[dict]:
+    return [{"source": "apple_voice_memos", "status": status, "pdw_landing_p50_seconds": p50,
+             "device_delivery_p50_seconds": 17.0, "end_to_transcript_p50_seconds": 40.0, "stuck_untranscribed": 0}]
+
+
+def test_s2_grades_how_fast_a_memo_lands_not_only_whether_it_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S2 read green on 2026-10-16 while a short memo took p50 9 min to transcribe.
+
+    Coverage alone cannot see speed, so the landing view's verdict is part of the grade.
+    """
+    monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=_landing("ok", 22.0)))
+    verdict = contract_audit.s2_voice()
+    assert verdict.status == contract_audit.GREEN, verdict.evidence
+    assert "22" in verdict.evidence
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=_landing("attention", 95.0)))
+    assert contract_audit.s2_voice().status == contract_audit.YELLOW
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=_landing("failing", 900.0)))
+    assert contract_audit.s2_voice().status == contract_audit.RED
+
+
+def test_s2_withholds_green_when_landing_speed_cannot_be_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=None))
+    verdict = contract_audit.s2_voice()
+    assert verdict.status == contract_audit.YELLOW
+    assert "voice_memo_landing_health" in verdict.evidence

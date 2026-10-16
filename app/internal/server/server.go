@@ -334,6 +334,14 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	if err != nil {
 		logger.Error("ingestion configured but failed to initialize; client uploads disabled", "error", err.Error())
 	} else if ingestEnabled {
+		if cfg.PostgresDatabaseURL != "" {
+			notify, nerr := postgresNotifier(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+			if nerr != nil {
+				logger.Warn("ingest notifications disabled", "error", nerr.Error())
+			} else {
+				ingestSvc.notify = notify
+			}
+		}
 		mux.Handle(ingestPathPrefix, ingestSvc.handler())
 		logger.Info("client upload ingestion enabled", "endpoints", len(ingestSvc.artifacts))
 	}

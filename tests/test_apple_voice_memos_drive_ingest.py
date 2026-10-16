@@ -236,3 +236,43 @@ def test_drive_ingest_runner_without_object_store_keeps_inbox_keys() -> None:
 
     assert summary.recordings_promoted == 0
     assert warehouse.rows[0]["storage_key"] == "apple-voice-memos/inbox/2026/03/2026-03-25-abc123.qta"
+
+
+class LibraryAudioObjectStore(FakeObjectStore):
+    """The audio was promoted to the library by an earlier sidecar."""
+
+    def find_object(self, *, kind, stage=None, properties=None):
+        if kind == "voice_memo_audio":
+            return self.audio_listing if stage == "library" else None
+        return super().find_object(kind=kind, stage=stage, properties=properties)
+
+
+def test_a_corrected_sidecar_finds_audio_already_in_the_library() -> None:
+    """A sidecar correcting recorded_at arrives after its audio was promoted.
+
+    On 2026-10-16 the uploader started reading recorded_at from the Voice Memos
+    store's ZDATE instead of the filename stamp read as UTC, and re-sent only
+    the sidecar of every landed memo. Its audio is in the library, not the
+    inbox; failing to find it there would fail the whole ingest run.
+    """
+    corrected = metadata_payload()
+    corrected["recording"]["recorded_at"] = "2026-03-25T22:50:19+00:00"
+    store = LibraryAudioObjectStore(
+        metadata_listings=[metadata_listing()],
+        audio_listing=audio_listing(),
+        json_by_id={"drive-metadata-file-id": corrected},
+    )
+    warehouse = FakeWarehouse()
+
+    summary = VoiceMemosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=lambda: iter_metadata_payloads(object_store=store),
+        object_store=store,
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 10, 16, 13, tzinfo=UTC),
+    ).sync()
+
+    assert summary.rows_written == 1
+    assert warehouse.rows[0]["recorded_at"] == datetime(2026, 3, 25, 22, 50, 19, tzinfo=UTC)
+    assert warehouse.rows[0]["storage_file_id"] == "drive-file-id"
+    assert ("drive-file-id", "apple-voice-memos/library/2026/03/2026-03-25-abc123.qta") in store.moved

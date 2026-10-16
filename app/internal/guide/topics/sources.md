@@ -68,6 +68,9 @@ and state the window and freshness.
   `participants`, `action_items` and the calendar match; `marts_voice_memos.transcript_segments`
   the speaker-labelled utterances. Search scope `voice_memos`/`transcripts`. Both name the
   speech model that produced the transcript in `transcript_model`.
+- `recorded_at` is when recording started, as an absolute time. Before 2026-10-16 Apple
+  memos stored the phone's local clock as UTC (4-5 h early); memos still on the Mac were
+  corrected, so an old memo that reads oddly early may be one that was not.
 - The speech model sometimes mishears one organisation name ("Hack Club" as "HackPad");
   search both spellings when completeness matters.
 

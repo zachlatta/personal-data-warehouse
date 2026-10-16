@@ -93,13 +93,19 @@ def find_audio_listing(
     recording = nested_mapping(payload, "recording")
     content_sha256 = str(recording.get("content_sha256", ""))
     if content_sha256:
-        listing = object_store.find_object(
-            kind=AUDIO_KIND,
-            stage=stage,
-            properties={"content_sha256": content_sha256},
-        )
-        if listing is not None:
-            return listing
+        # A sidecar can arrive after its audio was promoted: the uploader
+        # re-sends only the sidecar when a landed memo's recorded_at changes
+        # (2026-10-16, the move from the filename stamp read as UTC to the
+        # store's ZDATE), so an inbox sidecar may describe library audio.
+        stages = (stage, "library") if stage == "inbox" else (stage,)
+        for audio_stage in stages:
+            listing = object_store.find_object(
+                kind=AUDIO_KIND,
+                stage=audio_stage,
+                properties={"content_sha256": content_sha256},
+            )
+            if listing is not None:
+                return listing
     legacy_audio_file = nested_mapping(payload, "audio_file")
     if legacy_audio_file:
         return listing_from_stored_object(legacy_audio_file)

@@ -82,6 +82,10 @@ class VoiceMemosTranscriptionSummary:
     segments_written: int
 
 
+# How long after submitting a transcript to poll every second (see poll_transcript).
+ASSEMBLYAI_FAST_POLL_WINDOW_SECONDS = 30
+
+
 class AssemblyAIClient:
     def __init__(
         self,
@@ -93,8 +97,10 @@ class AssemblyAIClient:
         speaker_options: Mapping[str, int] | None = None,
         session=None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._monotonic = monotonic
         self._poll_interval_seconds = poll_interval_seconds
         self._timeout_seconds = timeout_seconds
         self._speaker_options = dict(speaker_options or DEFAULT_ASSEMBLYAI_SPEAKER_OPTIONS)
@@ -142,7 +148,8 @@ class AssemblyAIClient:
         return transcript_id
 
     def poll_transcript(self, *, transcript_id: str) -> Mapping[str, Any]:
-        deadline = time.monotonic() + self._timeout_seconds
+        started = self._monotonic()
+        deadline = started + self._timeout_seconds
         while True:
             response = self._session.get(
                 f"{self._base_url}/v2/transcript/{transcript_id}",
@@ -156,9 +163,13 @@ class AssemblyAIClient:
                 return payload
             if status == "error":
                 raise RuntimeError(str(payload.get("error", "AssemblyAI transcription failed")))
-            if time.monotonic() >= deadline:
+            now = self._monotonic()
+            if now >= deadline:
                 raise TimeoutError(f"Timed out waiting for AssemblyAI transcript {transcript_id}")
-            self._sleep(self._poll_interval_seconds)
+            # A short memo is done in ~7 s, so poll every second while it
+            # could be; a long one takes minutes and gets the configured interval.
+            fast = now - started < ASSEMBLYAI_FAST_POLL_WINDOW_SECONDS
+            self._sleep(min(1, self._poll_interval_seconds) if fast else self._poll_interval_seconds)
 
 
 def assemblyai_client_from_settings(settings) -> AssemblyAIClient:

@@ -211,6 +211,32 @@ def test_assemblyai_client_uploads_submits_and_polls(tmp_path) -> None:
     assert len(session.gets) == 2
 
 
+def test_assemblyai_polls_every_second_while_a_short_memo_could_be_done() -> None:
+    """A short memo is transcribed in ~7 s (measured 2026-10-16, p50 over 60 days).
+
+    Polling every 5 s from the start added up to 5 s to every one of them; a
+    long recording takes minutes, so after the first 30 s the configured
+    interval applies again and an hour-long memo is not polled 3,600 times.
+    """
+    session = FakeSession()
+    session.get_payloads = [{"id": "tx1", "status": "processing"}] * 40 + [
+        {"id": "tx1", "status": "completed", "text": "Hi.", "utterances": []}
+    ]
+    sleeps: list[float] = []
+    clock = [0.0]
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    client = AssemblyAIClient(
+        api_key="test-key", session=session, poll_interval_seconds=5, sleep=fake_sleep, monotonic=lambda: clock[0]
+    )
+    assert client.poll_transcript(transcript_id="tx1")["status"] == "completed"
+    assert sleeps[:30] == [1] * 30
+    assert set(sleeps[30:]) == {5}
+
+
 def test_a_long_recording_lifts_the_speaker_ceiling_to_assemblyais_long_audio_default() -> None:
     """A stage event has more speakers than a meeting, and the ceiling is hard.
 

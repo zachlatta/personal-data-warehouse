@@ -141,9 +141,10 @@ and "the data is right" have come apart:
   `test_blanket_freshness_polls_each_conversation_when_it_is_due`. See [Slack](docs/agents/slack.md).
 - **S2 — every voice source lands in `base_*`, unifies in `marts_voice_memos.recordings`, is
   transcribed by AssemblyAI, enriched by an agent that can query PDW, and matched to a
-  calendar event, with unmatched recordings kept in the same mart.** *Held up by*
-  `voice_memo_transcription` / `voice_memo_enrichment` state rows and C5's raw-read
-  registry. See [Voice recordings](docs/agents/voice.md).
+  calendar event, with unmatched recordings kept in the same mart; a short Apple memo is a
+  stored transcript p50 30 s after it reaches the Mac.** *Held up by*
+  `voice_memo_transcription` / `voice_memo_enrichment` state rows, C5's raw-read
+  registry and `marts_ops.voice_memo_landing_health`. See [Voice recordings](docs/agents/voice.md).
 - **S3 — finances from Plaid, SimpleFIN and manual documents cover expenses, investments,
   the mortgage, liabilities and private equity; multiple witnesses of one account are
   reconciled; receipts are linked to transactions.** *Held up by*

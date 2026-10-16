@@ -27,6 +27,13 @@ import (
 
 var testNow = time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
 
+// TestMain reads filename stamps as UTC so the fixtures and goldens mean the
+// same thing on every host; tests that are about the zone set their own.
+func TestMain(m *testing.M) {
+	filenameLocation = time.UTC
+	os.Exit(m.Run())
+}
+
 func fixedNow() time.Time { return testNow }
 
 func noKick(string, common.Logger) AppKick { return AppKick{Reason: "test"} }
@@ -73,7 +80,7 @@ func TestScanMatchesPythonGoldens(t *testing.T) {
 		recording.FileCreatedAt = common.ParseISO(want.Extra["file_created_at"].(string))
 		recording.FileModifiedAt = common.ParseISO(want.Extra["file_modified_at"].(string))
 		recording.RecordedAt = common.ParseISO(want.Extra["recorded_at"].(string))
-		if _, ok := RecordedAtFromFilename(candidate.RecordingID); ok && !recording.RecordedAt.Equal(candidate.RecordedAt) {
+		if _, ok := RecordedAtFromFilename(candidate.RecordingID, filenameLocation); ok && !recording.RecordedAt.Equal(candidate.RecordedAt) {
 			t.Errorf("%s recorded_at = %s, want %s", candidate.Filename, common.ISOFormat(candidate.RecordedAt), want.Extra["recorded_at"])
 		}
 		var goldenPayload map[string]any
@@ -113,11 +120,15 @@ func TestContentTypeAndRecordedAt(t *testing.T) {
 	if ContentTypeForExtension(".mp3") != "audio/mpeg" {
 		t.Fatalf("mp3 = %s", ContentTypeForExtension(".mp3"))
 	}
-	at, ok := RecordedAtFromFilename("20260430 110736-8BB8E57D")
+	at, ok := RecordedAtFromFilename("20260430 110736-8BB8E57D", time.UTC)
 	if !ok || !at.Equal(time.Date(2026, 4, 30, 11, 7, 36, 0, time.UTC)) {
 		t.Fatalf("recorded at = %v %v", at, ok)
 	}
-	if _, ok := RecordedAtFromFilename("badname"); ok {
+	eastern, _ := time.LoadLocation("America/New_York")
+	if at, _ := RecordedAtFromFilename("20260430 110736-8BB8E57D", eastern); !at.Equal(time.Date(2026, 4, 30, 15, 7, 36, 0, time.UTC)) {
+		t.Fatalf("an EDT wall clock = %v", at)
+	}
+	if _, ok := RecordedAtFromFilename("badname", time.UTC); ok {
 		t.Fatal("badname parsed")
 	}
 }
@@ -1058,7 +1069,7 @@ func TestParseArgsDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.Limit != 0 || opts.Workers != 0 || opts.Mode != "incremental" || opts.MinFileAgeSeconds != 120 || opts.WritebackLimit != 0 || opts.NoWriteback || opts.WritebackOnly || opts.WritebackDryRun || opts.NetworkDiagnostics {
+	if opts.Limit != 0 || opts.Workers != 0 || opts.Mode != "incremental" || opts.MinFileAgeSeconds != 5 || opts.MaxRunSeconds != 900 || opts.WritebackLimit != 0 || opts.NoWriteback || opts.WritebackOnly || opts.WritebackDryRun || opts.NetworkDiagnostics {
 		t.Fatalf("defaults = %+v", opts)
 	}
 	if opts.StateFile != DefaultStateFile() || opts.LockFile != strings.TrimSuffix(DefaultStateFile(), ".json")+".lock" {
@@ -1314,14 +1325,15 @@ func TestRunFullModeIgnoresTheMinimumFileAge(t *testing.T) {
 	server, _ := newFakeApp(t)
 	cfg := ingestclient.Config{BaseURL: server.URL, Token: "secret"}
 	root := t.TempDir()
-	writeRecordings(t, root, "20260427 100004-40DC0200.m4a") // just written: younger than 120s
+	writeRecordings(t, root, "20260427 100004-40DC0200.m4a") // just written: younger than the 120s gate below
 	work := t.TempDir()
 	env := map[string]string{"VOICE_MEMOS_ACCOUNT": "zach@example.com", "VOICE_MEMOS_RECORDINGS_PATH": root, "PDW_INGEST_PROJECT_DIR": work}
 	base := []string{"--state-file", filepath.Join(work, "state.json"), "--lock-file", filepath.Join(work, "state.lock"), "--no-writeback"}
-	if code, out, _ := runCLI(t, base, env, cfg); code != 0 || !strings.Contains(out, "Voice Memos upload complete: seen=1 selected=0 uploaded=0 skipped=0 deferred=1") {
+	// A gate past the settle budget is left for a later run rather than waited out.
+	if code, out, _ := runCLI(t, append(base, "--min-file-age-seconds", "120"), env, cfg); code != 0 || !strings.Contains(out, "Voice Memos upload complete: seen=1 selected=0 uploaded=0 skipped=0 deferred=1") {
 		t.Fatalf("incremental must defer a fresh file: %d %q", code, out)
 	}
-	if code, out, _ := runCLI(t, append(base, "--mode", "full"), env, cfg); code != 0 || !strings.Contains(out, "Voice Memos upload complete: seen=1 selected=1 uploaded=1 skipped=0 deferred=0") || !strings.Contains(out, "Uploading with 8 worker(s)") {
+	if code, out, _ := runCLI(t, append(base, "--mode", "full", "--min-file-age-seconds", "120"), env, cfg); code != 0 || !strings.Contains(out, "Voice Memos upload complete: seen=1 selected=1 uploaded=1 skipped=0 deferred=0") || !strings.Contains(out, "Uploading with 8 worker(s)") {
 		t.Fatalf("full mode must ignore the age rule: %d %q", code, out)
 	}
 }

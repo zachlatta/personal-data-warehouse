@@ -21,6 +21,44 @@ FROM marts_voice_memos.recordings
 WHERE transcript IS NOT NULL ORDER BY recorded_at DESC LIMIT 20;
 ```
 
+**A short memo is a stored transcript ~30 s after it reaches the Mac, and that is measured.**
+Measured 2026-10-16 over 30 days of Apple memos, end of recording to transcript was p50
+9 min, and almost none of it was work: a 120 s file-age gate and the uploader's five-minute
+tick, a 60 s inbox sensor and a Dagster run start, a 60 s transcription sensor and another
+run start, then the five-minute `timeline_sync`. AssemblyAI itself took 7 s on a short memo
+(18 s for 2-15 min, 41 s past 15 min). Now: the LaunchAgent fires on the store's WAL and the
+Recordings directory (10 s throttle), the run waits out a 5 s settle itself, the app NOTIFYs
+`pdw_voice_memo_landing` when it stores a sidecar, and the resident
+`voice_memo_landing_worker` in the Dagster container runs the same ingest and transcription
+functions the assets run (`ingest_voice_memos_inbox`, `transcribe_voice_recordings`), then the
+timeline fast lane. AssemblyAI is polled every second for the first 30 s. Every voice asset
+(ingest, transcription, enrichment) also lands what it wrote through the fast lane. The
+sensors stay as the floor and the inbox is the durable queue, so a lost notification costs
+latency, never a recording; `VOICE_MEMO_LANDING_WORKER_ENABLED=0` turns the worker off.
+`marts_ops.voice_memo_landing_health` judges PDW's part (Mac file to transcript, memos under
+two minutes) against a 30 s p50 and reports iCloud's phone-to-Mac delivery beside it, never
+in the status: that leg is Apple's (p50 17 s, p90 10 min for short memos, 36 min once for a
+20-minute memo). Semantic search still trails by the chunk (5 min) and embedding (10 min)
+schedules; keyword search reads the timeline row at once.
+
+**`recorded_at` is the store's ZDATE, not the filename.** The filename stamp
+(`20261015 205541-…`) is the recording device's wall clock in an unrecorded zone, and until
+2026-10-16 the uploader parsed it as UTC, so every Apple memo was stored 4-5 hours early (231
+of 262 calendar matches started ~4 h after the stored time; the file reached the Mac 4 h plus
+the memo's length after it). Calendar matching survived only because enrichment searched both
+readings, and that hedge assumed New York, so it broke on travel; it is gone. The uploader
+reads `ZCLOUDRECORDING.ZDATE` (seconds since 2001-01-01 UTC), falling back to the filename in
+the Mac's zone. The state file records the `recorded_at` each sidecar carried, and a landed
+memo whose value changed gets a corrected sidecar only (no audio, no re-hash), 150 per run.
+The app dedups a sidecar on (audio sha, `recorded_at`), not the audio sha alone, or the
+correction would be dropped as a duplicate, and the Drive reader finds a corrected sidecar's
+audio in the library. Memos no longer on the Mac keep the old, early time.
+
+**A hung upload run is killed after 15 minutes.** On 2026-10-14 a run hung at "Scanning" for
+10.9 hours, and launchd never starts a job that is still running, so two memos waited ~13
+hours. `--max-run-seconds` (default 900 incremental, off for `--mode full`) exits with 124,
+which the heartbeat reports as a failed run.
+
 **A provider rejection is the transcription pipeline's state, and it reads `failing`.**
 `derived_voice_memos.transcription_runs` records every AssemblyAI rejection as
 `status = 'error'` with the response text, and `voice_memo_transcription` declares it as its
@@ -261,7 +299,8 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist`
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.voice-memos-upload.plist`
 - Wrapper script: `bin/voice-memos-upload-launchd`
-- Run cadence: every 300 seconds with `RunAtLoad`
+- Run cadence: on every change to `CloudRecordings.db-wal` or the Recordings directory
+  (`WatchPaths`, 10 s `ThrottleInterval`), and every 300 seconds with `RunAtLoad` as the floor
 - Command: `pdw ingest voice-memos --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`

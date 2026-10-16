@@ -295,7 +295,9 @@ func e2eCases() []e2eCase {
 			name: "voice-memos/metadata", endpoint: "/ingest/voice-memos/metadata", body: meta,
 			extra:    url.Values{"recorded_at": {"2025-07-15T09:00:00"}, "audio_content_sha256": {audioSHA}},
 			wantName: "2025-07-15-" + audioSHA + ".json", wantMime: "application/json",
-			wantProps: map[string]string{"pdw_kind": "voice_memo_metadata", "audio_content_sha256": audioSHA},
+			// The dedup property carries (audio sha, recorded_at), so a
+			// corrected recorded_at lands instead of deduping onto the old one.
+			wantProps: map[string]string{"pdw_kind": "voice_memo_metadata", "audio_content_sha256": voiceMemoMetadataDedupSHA(audioSHA, time.Date(2025, 7, 15, 9, 0, 0, 0, time.UTC))},
 		},
 		{
 			name: "photos/metadata", endpoint: "/ingest/photos/metadata", body: photoMeta,

@@ -26,6 +26,7 @@ from personal_data_warehouse.defs.calendar_sync import calendar_event_sync
 from personal_data_warehouse.defs.apple_voice_memos_transcription import apple_voice_memos_transcription
 from personal_data_warehouse.schedule_guards import skip_if_job_active, skip_if_job_in_progress
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
+from personal_data_warehouse.timeline_fast_lane import land_sources_on_timeline
 from personal_data_warehouse.apple_voice_memos_enrichment import (
     AGENT_ENRICHMENT_PROMPT_VERSION,
     DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS,
@@ -94,8 +95,19 @@ def apple_voice_memos_enrichment(context, agent: AgentResource) -> MaterializeRe
                 max_error_attempts=apple_voice_memos_enrichment_max_error_attempts(),
             ).sync(limit=batch_size if batch_size > 0 else None)
 
+    # A title, summary and calendar match change the recording's timeline row;
+    # land them now rather than at the next five-minute timeline_sync tick.
+    fast_lane = {"enabled": False, "rows": 0}
+    if summary is not None and summary.recordings_enriched:
+        fast_lane = land_sources_on_timeline(
+            postgres_url=settings.postgres_database_url or "",
+            sources=["voice_memos"],
+            logger=context.log,
+        )
+
     return MaterializeResult(
         metadata={
+            "timeline_fast_lane": MetadataValue.json(fast_lane),
             "recordings_seen": MetadataValue.int(summary.recordings_seen if summary else 0),
             "recordings_enriched": MetadataValue.int(summary.recordings_enriched if summary else 0),
             "recordings_failed": MetadataValue.int(summary.recordings_failed if summary else 0),

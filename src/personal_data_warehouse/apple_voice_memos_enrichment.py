@@ -7,7 +7,6 @@ from difflib import SequenceMatcher
 import json
 import re
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo
 
 from personal_data_warehouse.agent_runner import (
     AgentRunRequest,
@@ -22,7 +21,6 @@ from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_K
 
 DEFAULT_AGENT_ENRICHMENT_PROVIDER = "agent_codex"
 AGENT_ENRICHMENT_PROMPT_VERSION = "apple-voice-memo-enrichment-agent-v11"
-DEFAULT_RECORDING_LOCAL_TIMEZONE = "America/New_York"
 DEFAULT_ENRICHMENT_MAX_ERROR_ATTEMPTS = 5
 LOCAL_TRANSCRIPT_ASSEMBLY_SENTINEL = "[LOCAL_TRANSCRIPT_ASSEMBLY]"
 LOCAL_TRANSCRIPT_ASSEMBLY_MIN_SOURCE_CHARS = 12_000
@@ -456,23 +454,21 @@ def current_provider_transcript_id(warehouse, recording: Mapping[str, Any]) -> s
 
 
 def load_calendar_candidates(warehouse, recording: Mapping[str, Any]) -> list[dict[str, Any]]:
+    # recorded_at is an absolute instant (the Voice Memos store's ZDATE since
+    # 2026-10-16; it had been the filename's wall clock read as UTC, and this
+    # search used to try both readings).
     recorded_at = recording["recorded_at"]
-    anchors = recording_time_interpretations(recorded_at)
-    starts = [anchor["utc"] for anchor in anchors]
-    earliest = min(starts).isoformat()
-    latest = max(starts).isoformat()
-    distance_sql = "LEAST(" + ", ".join(
-        f"ABS(EXTRACT(EPOCH FROM (start_at - {_sql_string(start.isoformat())}::timestamptz)))"
-        for start in starts
-    ) + ")"
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=UTC)
+    anchor = _sql_string(recorded_at.astimezone(UTC).isoformat())
     rows = warehouse._query(
         f"""
         SELECT event_id, summary, start_at, end_at, location, attendees_json
         FROM @calendar_events
-        WHERE start_at <= {_sql_string(latest)}::timestamptz + INTERVAL '3 hours'
-          AND end_at >= {_sql_string(earliest)}::timestamptz - INTERVAL '3 hours'
+        WHERE start_at <= {anchor}::timestamptz + INTERVAL '3 hours'
+          AND end_at >= {anchor}::timestamptz - INTERVAL '3 hours'
           AND is_deleted = 0
-        ORDER BY {distance_sql}
+        ORDER BY ABS(EXTRACT(EPOCH FROM (start_at - {anchor}::timestamptz)))
         LIMIT 12
         """
     )
@@ -493,33 +489,6 @@ def load_calendar_candidates(warehouse, recording: Mapping[str, Any]) -> list[di
             }
         )
     return candidates
-
-
-def recording_time_interpretations(recorded_at: datetime, *, local_timezone: str = DEFAULT_RECORDING_LOCAL_TIMEZONE) -> list[dict[str, Any]]:
-    if recorded_at.tzinfo is None:
-        recorded_at = recorded_at.replace(tzinfo=UTC)
-    recorded_utc = recorded_at.astimezone(UTC)
-    local_as_utc = recorded_at.replace(tzinfo=ZoneInfo(local_timezone)).astimezone(UTC)
-    interpretations = [
-        {
-            "label": "recorded_at_as_utc",
-            "utc": recorded_utc,
-            "explanation": "Timestamp interpreted literally as UTC.",
-        },
-        {
-            "label": f"recorded_at_as_{local_timezone}_wall_time",
-            "utc": local_as_utc,
-            "explanation": "Timestamp interpreted as local wall-clock time and converted to UTC.",
-        },
-    ]
-    unique: list[dict[str, Any]] = []
-    seen: set[datetime] = set()
-    for interpretation in interpretations:
-        if interpretation["utc"] in seen:
-            continue
-        seen.add(interpretation["utc"])
-        unique.append(interpretation)
-    return unique
 
 
 def load_transcript_segments(warehouse, recording: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2276,7 +2245,6 @@ def enrichment_user_prompt(*, input_file: str = AGENT_USER_PROMPT_INPUT_FILE) ->
                 "format": "JSON",
                 "contents": [
                     "recording metadata and transcript length fields",
-                    "recorded_at_interpretations",
                     "calendar_candidates with compact attendee identity hints",
                     "contact_alias_hints from human-edited contact nicknames when transcript names match",
                     "event_identity_hints with compact Slack/Gmail/Drive snippets for event-specific team and first-name resolution",
@@ -2334,9 +2302,6 @@ def enrichment_task_input(
                 "transcript_in_prompt_char_count": len(transcript),
                 "transcript_truncated": len(source_transcript) > len(transcript),
             },
-            "recorded_at_interpretations": recording_time_interpretations(recording.get("recorded_at"))
-            if isinstance(recording.get("recorded_at"), datetime)
-            else [],
             "calendar_candidates": [prompt_calendar_candidate(candidate) for candidate in calendar_candidates],
             "contact_alias_hints": [prompt_contact_alias_hint(hint) for hint in contact_alias_hints],
             "event_identity_hints": prompt_event_identity_hints(event_identity_hints or {}),
@@ -2370,7 +2335,7 @@ def enrichment_instructions() -> list[str]:
         "After resolving a contact alias, use the canonical name or appropriate given name in final summary, action items, evidence, transcript, speaker_map, and participants. Do not carry the raw alias string into final fields unless a provenance note explicitly requires the original wording.",
         "For technical/product terms that are unclear or unfamiliar, query Slack/Gmail for likely spelling variants and use the spelling supported by warehouse evidence.",
         "Correct ASR domain-term errors in transcript, for example Hack Club not Hat Club, Hackatime not Hackertime/Hacker Time, Stardance not Start Dance, OpenRouter, OpenAI, Anthropic, Congressional App Challenge, Challenger, Framework, Spindrift, and Pellegrino.",
-        "The source timestamp may be a local wall-clock time incorrectly tagged as UTC. Use recorded_at_interpretations and transcript evidence when matching calendar events.",
+        "recording.recorded_at is the recording's absolute start time. Match calendar events against it together with transcript evidence.",
         "Direct spoken names, greetings, introductions, and project names are strong evidence. If they conflict with a nearby calendar candidate, query for the spoken name/project before selecting the candidate.",
         "Pick the best calendar event if supported by transcript/time/context evidence.",
         "If no calendar event matches, set calendar_event_id to an empty string and calendar_confidence to 0, but still produce a useful title, start_at, end_at, summary, action_items, evidence, and transcript. Personal journal entries or ad-hoc voice notes are valid outputs.",

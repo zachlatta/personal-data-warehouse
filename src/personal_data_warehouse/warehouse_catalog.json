@@ -2573,6 +2573,18 @@
       "comment": "Per SimpleFIN account: bridge balance age, sync verdict (`action_required` = claim a new setup token), and which ledger account it reconciled onto (`shared_with_plaid = 0` at a Plaid institution = possible double count)."
     },
     {
+      "id": "marts_ops_voice_memo_landing_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "voice_memo_landing_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Voice landing speed. Per source, last 7 days. Apple: pdw_landing_* is Mac file to stored transcript (memos under 2 min, target_p50_seconds 30); device_delivery_* is iCloud's phone-to-Mac leg, reported only. status: ok, attention, failing (p50 over 5 min or stuck_untranscribed), quiet, unmeasured."
+    },
+    {
       "id": "marts_ops_slack_conversation_health",
       "kind": "view",
       "layer": "marts",

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -488,11 +489,81 @@ func TestIngestVoiceMemosAudioAndMetadataKeys(t *testing.T) {
 	if pj.ObjectKey != wantMetaKey {
 		t.Fatalf("metadata key = %q, want %q", pj.ObjectKey, wantMetaKey)
 	}
-	if pj.Kind != "voice_memo_metadata" || pj.SourceContentSHA256 != audioSHA || pj.SkipExistingCheck {
+	if pj.Kind != "voice_memo_metadata" || pj.SourceContentSHA256 != voiceMemoMetadataDedupSHA(audioSHA, time.Date(2025, 7, 15, 9, 0, 0, 0, time.UTC)) || pj.SkipExistingCheck {
 		t.Fatalf("metadata put = %+v", pj)
 	}
 	if string(pj.Payload) != string(meta) {
 		t.Fatalf("metadata payload = %q", pj.Payload)
+	}
+}
+
+// The sidecar is deduped by (audio sha, recorded_at), not the audio sha alone:
+// a re-run whose JSON differs only in uploaded_at must not duplicate it, but
+// a sidecar correcting recorded_at (2026-10-16: the filename stamp had been
+// read as UTC, 4-5 h early) must land, or the correction is silently dropped
+// as a duplicate of the wrong one.
+func TestVoiceMemoMetadataDedupsByAudioAndRecordedAt(t *testing.T) {
+	at := time.Date(2026, 10, 16, 0, 55, 41, 558818000, time.UTC)
+	same := voiceMemoMetadataDedupSHA("abc", at)
+	if same != voiceMemoMetadataDedupSHA("abc", at.In(time.FixedZone("EDT", -4*3600))) {
+		t.Fatal("the same instant in another zone must dedup")
+	}
+	if same == voiceMemoMetadataDedupSHA("abc", at.Add(4*time.Hour)) {
+		t.Fatal("a corrected recorded_at must not dedup onto the old sidecar")
+	}
+	if same == voiceMemoMetadataDedupSHA("abd", at) || len(same) != 64 {
+		t.Fatalf("dedup sha = %q", same)
+	}
+}
+
+// A stored sidecar wakes the resident landing worker, so a memo is ingested
+// and transcribed in seconds instead of at the next 60 s sensor tick.
+func TestVoiceMemoMetadataNotifiesTheLandingWorker(t *testing.T) {
+	svc, _ := ingestTestService()
+	var notified []string
+	svc.notify = func(_ context.Context, channel, payload string) error {
+		notified = append(notified, channel+"|"+payload)
+		return nil
+	}
+	meta := []byte(`{"schema_version":1}`)
+	target := signedIngestTarget("/ingest/voice-memos/metadata", meta, url.Values{
+		"recorded_at":          {"2026-10-16T00:55:41+00:00"},
+		"audio_content_sha256": {"abc"},
+	})
+	if rec := postIngest(t, svc, target, meta); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if len(notified) != 1 || !strings.HasPrefix(notified[0], voiceMemoLandingChannel+"|") {
+		t.Fatalf("notifications = %v", notified)
+	}
+
+	other := []byte(`{"schema_version":1}`)
+	otherTarget := signedIngestTarget("/ingest/photos/metadata", other, url.Values{
+		"captured_at":           {"2026-06-01T14:30:00"},
+		"file_content_sha256":   {"f"},
+		"metadata_dedup_sha256": {"d"},
+	})
+	if rec := postIngest(t, svc, otherTarget, other); rec.Code != http.StatusOK {
+		t.Fatalf("photo metadata status = %d", rec.Code)
+	}
+	if len(notified) != 1 {
+		t.Fatalf("only voice memos wake the voice worker: %v", notified)
+	}
+}
+
+// The notification only removes a wait; the sidecar is already stored and the
+// sensor will find it, so a failed NOTIFY must not fail the upload (which the
+// client would retry, re-sending the audio).
+func TestAFailedLandingNotificationDoesNotFailTheUpload(t *testing.T) {
+	svc, _ := ingestTestService()
+	svc.notify = func(context.Context, string, string) error { return errors.New("database down") }
+	meta := []byte(`{"schema_version":1}`)
+	target := signedIngestTarget("/ingest/voice-memos/metadata", meta, url.Values{
+		"recorded_at":          {"2026-10-16T00:55:41+00:00"},
+		"audio_content_sha256": {"abc"},
+	})
+	if rec := postIngest(t, svc, target, meta); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %q", rec.Code, rec.Body.String())
 	}
 }
 

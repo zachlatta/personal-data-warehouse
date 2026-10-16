@@ -19,11 +19,13 @@ DEFAULT_MUTATION_QUEUE_POLL_SECONDS = 30.0
 
 
 class PostgresMutationNotificationListener:
-    def __init__(self, database_url: str) -> None:
+    """A dedicated LISTEN connection; ``channel`` defaults to the mutation queue's."""
+
+    def __init__(self, database_url: str, channel: str = MUTATION_NOTIFICATION_CHANNEL) -> None:
         self._connection = psycopg2.connect(database_url)
         self._connection.autocommit = True
         with self._connection.cursor() as cursor:
-            cursor.execute(f'LISTEN "{MUTATION_NOTIFICATION_CHANNEL}"')
+            cursor.execute(f'LISTEN "{channel}"')
 
     def wait(self, timeout_seconds: float) -> bool:
         readable, _, _ = select.select([self._connection], [], [], timeout_seconds)

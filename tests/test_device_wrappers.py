@@ -181,3 +181,21 @@ def test_message_and_note_uploaders_also_fire_when_the_store_changes() -> None:
         assert plist["WatchPaths"] == [path], label
         assert plist["ThrottleInterval"] == 60, label
         assert plist["StartInterval"] == 300, label
+
+
+def test_voice_memos_uploader_fires_within_seconds_of_a_new_memo() -> None:
+    """A voice memo should land in ~30 s, so its uploader cannot wait for a tick.
+
+    Measured 2026-10-16, Mac-file-to-uploaded was p50 5.4 min: a 120 s file-age
+    gate plus the five-minute StartInterval. The store's WAL changes when a memo
+    arrives from iCloud and again when its audio finishes downloading, and the
+    directory changes when the file appears, so either fires a run. The run
+    itself waits out a few seconds of settle, which is why the throttle is
+    10 s rather than the 60 s a chatty message store needs.
+    """
+    recordings = "/Users/zrl/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+    with (LAUNCHD / "com.zachlatta.personal-data-warehouse.voice-memos-upload.plist").open("rb") as handle:
+        plist = plistlib.load(handle)
+    assert plist["WatchPaths"] == [f"{recordings}/CloudRecordings.db-wal", recordings]
+    assert plist["ThrottleInterval"] == 10
+    assert plist["StartInterval"] == 300

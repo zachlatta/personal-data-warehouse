@@ -17995,6 +17995,108 @@ class PostgresWarehouse:
         # to replace the mart, and this is the one place that always runs
         # afterwards.
         self._ensure_calendar_transcript_views()
+        self._ensure_voice_memo_landing_health_view()
+
+    def _ensure_voice_memo_landing_health_view(self) -> None:
+        """How fast a voice memo becomes a stored transcript (S2's speed half).
+
+        Measured 2026-10-16 over 30 days of Apple memos: recording end to
+        transcript p50 9 min, nearly all of it schedule waits inside PDW, and
+        nothing measured it. The clock is split where ownership splits:
+        iCloud's phone-to-Mac delivery is Apple's and is reported only; PDW's
+        part runs from the file reaching the Mac to the stored transcript and
+        is judged, on memos under two minutes, against a 30 s p50. A memo
+        recorded on the Mac is born when recording STARTS, so arrival is never
+        before the recording ended. transcribed_at is the run the mart serves,
+        so a re-transcription inside the window reads as slow; that is rare
+        and errs loud. Timestamps arrive NULL-translated from the mart; the
+        file's birth time is translated here.
+        """
+        self._ensure_view(
+            "marts_ops_voice_memo_landing_health",
+            """
+            CREATE OR REPLACE VIEW @marts_ops_voice_memo_landing_health AS
+            WITH memos AS (
+                SELECT
+                    r.source,
+                    COALESCE(r.duration_seconds, 0)::float8 AS duration_seconds,
+                    r.recorded_at + make_interval(secs => COALESCE(r.duration_seconds, 0)::float8) AS ended_at,
+                    CASE
+                        WHEN r.source = 'apple_voice_memos' THEN GREATEST(
+                            NULLIF(f.file_created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                            r.recorded_at + make_interval(secs => COALESCE(r.duration_seconds, 0)::float8)
+                        )
+                        ELSE r.ingested_at
+                    END AS arrived_at,
+                    r.transcribed_at,
+                    -- Never transcribable: a provider rejection, or a completed
+                    -- run with no words (silence). Not a stuck memo.
+                    EXISTS (
+                        SELECT 1 FROM @apple_voice_memos_transcription_runs run
+                        WHERE run.source = r.source AND run.account = r.account
+                          AND run.recording_id = r.recording_id
+                          AND run.status IN ('rejected', 'completed')
+                    ) AS attempted
+                FROM @marts_voice_memos_recordings r
+                LEFT JOIN @apple_voice_memos_files f
+                  ON r.source = 'apple_voice_memos'
+                 AND f.account = r.account
+                 AND f.recording_id = r.recording_id
+                WHERE r.is_deleted = 0
+                  AND r.size_bytes > 0
+                  AND r.recorded_at >= now() - interval '7 days'
+            ),
+            measured AS (
+                SELECT
+                    source,
+                    count(*) AS recordings_7d,
+                    count(*) FILTER (WHERE duration_seconds < 120) AS short_recordings_7d,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM arrived_at - ended_at)::float8)
+                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120) AS device_delivery_p50_seconds,
+                    percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM arrived_at - ended_at)::float8)
+                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120) AS device_delivery_p90_seconds,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - arrived_at)::float8)
+                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p50_seconds,
+                    percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - arrived_at)::float8)
+                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p90_seconds,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - ended_at)::float8)
+                        FILTER (WHERE transcribed_at IS NOT NULL) AS end_to_transcript_p50_seconds,
+                    percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - ended_at)::float8)
+                        FILTER (WHERE transcribed_at IS NOT NULL) AS end_to_transcript_p90_seconds,
+                    -- Stuck, not slow: no transcript ten minutes after arrival,
+                    -- plus a fifth of the recording's length for long audio.
+                    count(*) FILTER (
+                        WHERE transcribed_at IS NULL AND NOT attempted
+                          AND arrived_at < now() - interval '10 minutes' - make_interval(secs => duration_seconds * 0.2)
+                    ) AS stuck_untranscribed,
+                    max(ended_at) AS newest_recording_ended_at
+                FROM memos
+                GROUP BY source
+            )
+            SELECT
+                source,
+                recordings_7d,
+                short_recordings_7d,
+                round(device_delivery_p50_seconds::numeric, 1) AS device_delivery_p50_seconds,
+                round(device_delivery_p90_seconds::numeric, 1) AS device_delivery_p90_seconds,
+                round(pdw_landing_p50_seconds::numeric, 1) AS pdw_landing_p50_seconds,
+                round(pdw_landing_p90_seconds::numeric, 1) AS pdw_landing_p90_seconds,
+                round(end_to_transcript_p50_seconds::numeric, 1) AS end_to_transcript_p50_seconds,
+                round(end_to_transcript_p90_seconds::numeric, 1) AS end_to_transcript_p90_seconds,
+                30::numeric AS target_p50_seconds,
+                stuck_untranscribed,
+                newest_recording_ended_at,
+                CASE
+                    WHEN stuck_untranscribed > 0 THEN 'failing'
+                    WHEN source <> 'apple_voice_memos' THEN 'unmeasured'
+                    WHEN pdw_landing_p50_seconds IS NULL THEN 'quiet'
+                    WHEN pdw_landing_p50_seconds > 300 THEN 'failing'
+                    WHEN pdw_landing_p50_seconds > 30 THEN 'attention'
+                    ELSE 'ok'
+                END AS status
+            FROM measured
+            """,
+        )
 
     def _ensure_photo_marts_views(self) -> None:
         # marts_photos.files: every rendition from every photo source, one

@@ -30,6 +30,16 @@ type StateEntry struct {
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	FirstFailureAt      string `json:"first_failure_at"`
 	LastCheckedAt       string `json:"last_checked_at"`
+	// RecordedAt is the recorded_at the landed metadata sidecar carries. A
+	// complete entry whose value differs from what the scanner computes now
+	// gets a corrected sidecar (and only that) on the next run.
+	RecordedAt string `json:"recorded_at"`
+}
+
+// RecordedAtCurrent reports whether the landed sidecar's recorded_at is the
+// one the scanner computes for c today.
+func (e StateEntry) RecordedAtCurrent(c Candidate) bool {
+	return e.RecordedAt == common.ISOFormat(c.RecordedAt)
 }
 
 // Matches reports whether the file is unchanged since the entry was written.
@@ -88,7 +98,7 @@ func LoadState(path, account, recordingsPath string) *State {
 func (s *State) Save(path string) error {
 	entries := map[string]any{}
 	for key, entry := range s.Entries {
-		entries[key] = map[string]any{
+		fields := map[string]any{
 			"path":                 entry.Path,
 			"size_bytes":           entry.SizeBytes,
 			"mtime_ns":             entry.MtimeNS,
@@ -103,6 +113,10 @@ func (s *State) Save(path string) error {
 			"consecutive_failures": entry.ConsecutiveFailures,
 			"first_failure_at":     entry.FirstFailureAt,
 		}
+		if entry.RecordedAt != "" {
+			fields["recorded_at"] = entry.RecordedAt
+		}
+		entries[key] = fields
 	}
 	encoded, err := common.IndentedJSON(map[string]any{
 		"schema_version":  stateSchemaVersion,
@@ -136,9 +150,14 @@ func (s *State) EntryFor(c Candidate) (StateEntry, bool) {
 func (s *State) MarkSuccess(c Candidate, contentSHA256 string, audioUploaded, metadataUploaded bool, now time.Time) {
 	key := s.StateKey(c.Path)
 	timestamp := common.ISOFormat(now)
+	recordedAt := s.Entries[key].RecordedAt
+	if metadataUploaded {
+		recordedAt = common.ISOFormat(c.RecordedAt)
+	}
 	s.Entries[key] = StateEntry{
 		Path: key, SizeBytes: c.SizeBytes, MtimeNS: c.MtimeNS, BirthtimeNS: c.BirthtimeNS, ContentSHA256: contentSHA256,
 		AudioUploaded: audioUploaded, MetadataUploaded: metadataUploaded, LastSuccessAt: timestamp, LastCheckedAt: timestamp,
+		RecordedAt: recordedAt,
 	}
 }
 
@@ -160,6 +179,7 @@ func (s *State) MarkFailure(c Candidate, contentSHA256, errText string, now time
 		AudioUploaded: existing.AudioUploaded, MetadataUploaded: existing.MetadataUploaded, LastSuccessAt: existing.LastSuccessAt,
 		LastFailureAt: timestamp, LastError: errText, LastCheckedAt: timestamp,
 		ConsecutiveFailures: existing.ConsecutiveFailures + 1, FirstFailureAt: firstFailureAt,
+		RecordedAt: existing.RecordedAt,
 	}
 }
 

@@ -215,7 +215,10 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +7 marts: marts_health.strength_sets/.strength_prs/.strain_targets/
             # .health_monitor/.stress_days/.trend_points/.workout_routes, views
             # over the WHOOP documents so nobody walks the raw JSON.
-            "marts": 64,
+            # +1 marts: marts_ops.voice_memo_landing_health, S2's speed half: a
+            # short memo took p50 9 min to become a transcript while S2 read
+            # green, because coverage cannot see speed.
+            "marts": 65,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

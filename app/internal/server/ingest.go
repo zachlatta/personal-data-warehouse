@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -104,6 +106,43 @@ type ingestArtifact struct {
 	isJSON       bool
 	skipExisting bool
 	build        func(q url.Values, sha string, now time.Time) (ingestBuildResult, error)
+	// notifyChannel, when set, is a Postgres NOTIFY channel told about every
+	// stored object, to wake a resident worker instead of leaving the object
+	// for the next sensor tick.
+	notifyChannel string
+}
+
+// voiceMemoLandingChannel wakes the resident voice-memo landing worker
+// (personal_data_warehouse.voice_memo_landing_worker). The Drive inbox stays
+// the durable queue: the notification only removes the sensor's wait.
+const voiceMemoLandingChannel = "pdw_voice_memo_landing"
+
+// postgresNotifier sends NOTIFYs over a lazily opened pool. sql.Open does not
+// connect, so an unreachable database costs a warning per upload, never the
+// app's startup.
+func postgresNotifier(databaseURL string, timeout time.Duration) (func(ctx context.Context, channel, payload string) error, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(2)
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return func(ctx context.Context, channel, payload string) error {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		_, err := db.ExecContext(ctx, "SELECT pg_notify($1, $2)", channel, payload)
+		return err
+	}, nil
+}
+
+// voiceMemoMetadataDedupSHA is the sidecar's dedup identity: the audio it
+// describes plus the instant it says the audio was recorded. The audio sha
+// alone made a sidecar correcting recorded_at a duplicate of the wrong one.
+func voiceMemoMetadataDedupSHA(audioSHA string, recordedAt time.Time) string {
+	sum := sha256.Sum256([]byte(audioSHA + "|" + recordedAt.UTC().Format(time.RFC3339Nano)))
+	return hex.EncodeToString(sum[:])
 }
 
 // ingestService wires the configured per-source object stores to the artifact
@@ -116,6 +155,8 @@ type ingestService struct {
 	maxBytes  int64
 	now       func() time.Time
 	logger    *slog.Logger
+	// notify sends a Postgres NOTIFY; nil when the app has no database.
+	notify func(ctx context.Context, channel, payload string) error
 }
 
 // newIngestService builds the ingestion service from config. It returns
@@ -247,6 +288,12 @@ func (svc *ingestService) handler() http.Handler {
 			return
 		}
 		svc.logger.InfoContext(r.Context(), "ingest object stored", "endpoint", endpoint, "storage_key", stored.StorageKey, "bytes", len(body))
+		if artifact.notifyChannel != "" && svc.notify != nil {
+			// Best effort: the object is stored and the sensor will find it.
+			if err := svc.notify(r.Context(), artifact.notifyChannel, stored.StorageKey); err != nil {
+				svc.logger.WarnContext(r.Context(), "ingest notification failed", "endpoint", endpoint, "channel", artifact.notifyChannel, "error", err)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ingestResponse{
 			StorageBackend: stored.StorageBackend,
@@ -591,8 +638,10 @@ func ingestArtifacts() []ingestArtifact {
 			sourceSlug: "apple_voice_memos",
 			kind:       "voice_memo_metadata",
 			isJSON:     true,
-			// Deduped by audio_content_sha256 (stable) via SourceContentSHA256,
-			// so re-runs whose metadata json differs (uploaded_at) don't dup.
+			// Deduped by (audio sha, recorded_at) via SourceContentSHA256, so a
+			// re-run whose json differs only in uploaded_at does not dup, while
+			// a sidecar correcting recorded_at does land.
+			notifyChannel: voiceMemoLandingChannel,
 			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
 				// The sidecar shares the audio's basename, which is keyed by the
 				// AUDIO sha (not this JSON's sha).
@@ -606,7 +655,7 @@ func ingestArtifacts() []ingestArtifact {
 				}
 				key := fmt.Sprintf("apple-voice-memos/inbox/%04d/%02d/%s-%s.json",
 					recordedAt.Year(), int(recordedAt.Month()), recordedAt.Format("2006-01-02"), audioSHA)
-				return ingestBuildResult{objectKey: key, sourceContentSHA: audioSHA, appProperties: map[string]string{}}, nil
+				return ingestBuildResult{objectKey: key, sourceContentSHA: voiceMemoMetadataDedupSHA(audioSHA, recordedAt), appProperties: map[string]string{}}, nil
 			},
 		},
 		// --- photos: resumable file session + JSON metadata envelope ----------

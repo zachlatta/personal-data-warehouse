@@ -54,6 +54,8 @@ type Runner struct {
 	State             *State
 	MinFileAgeSeconds int
 	BeforeUploadCheck func() string
+	// Sleep defaults to time.Sleep; tests advance a fake clock instead.
+	Sleep func(time.Duration)
 	// EnsureApp defaults to EnsureVoiceMemosAppRunning against the process
 	// environment; tests inject a no-op.
 	EnsureApp AppKicker
@@ -94,6 +96,9 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.Logger == nil {
 		r.Logger = &common.RecordingLogger{}
 	}
+	if r.Sleep == nil {
+		r.Sleep = time.Sleep
+	}
 	root := common.ExpandUser(r.RecordingsPath)
 	// Before trusting what the store contains, make sure the store is still
 	// being fed: with voicememod and the app both quit, macOS stops pulling
@@ -111,6 +116,16 @@ func (r *Runner) Sync() (Summary, error) {
 		return Summary{}, err
 	}
 	if r.Mode == "incremental" {
+		// launchd fires this run seconds after the store changes, so a memo
+		// that just finished downloading is usually inside the settle. Wait
+		// it out once and rescan, rather than leave it for the next tick.
+		if wait := r.settleWait(candidates); wait > 0 {
+			r.Logger.Infof("Waiting %.1fs for just-arrived recordings to settle", wait.Seconds())
+			r.Sleep(wait)
+			if candidates, err = ScanCandidates(root, r.Extensions); err != nil {
+				return Summary{}, err
+			}
+		}
 		return r.syncIncremental(candidates)
 	}
 	return r.syncFull(candidates)
@@ -184,7 +199,7 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 		bytesSeen += c.SizeBytes
 	}
 	r.Logger.Infof("Found %d Voice Memos recordings totaling %s", len(candidates), common.FormatBytes(bytesSeen))
-	var selected []Candidate
+	var selected, corrections []Candidate
 	stateSkipped, ageDeferred, partialDeferred := 0, 0, 0
 	now := r.Now()
 	for _, c := range candidates {
@@ -198,13 +213,21 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 			continue
 		}
 		if r.isStateComplete(c) {
+			if !r.recordedAtCurrent(c) {
+				corrections = append(corrections, c)
+				continue
+			}
 			stateSkipped++
 			continue
 		}
 		selected = append(selected, c)
 	}
+	if len(corrections) > MaxRecordedAtCorrectionsPerRun {
+		stateSkipped += len(corrections) - MaxRecordedAtCorrectionsPerRun
+		corrections = corrections[:MaxRecordedAtCorrectionsPerRun]
+	}
 	deferred := ageDeferred + partialDeferred
-	r.Logger.Infof("Incremental selection: selected=%d skipped=%d deferred=%d", len(selected), stateSkipped, deferred)
+	r.Logger.Infof("Incremental selection: selected=%d skipped=%d deferred=%d recorded_at_corrections=%d", len(selected), stateSkipped, deferred, len(corrections))
 	completeBytes := func() int64 {
 		var total int64
 		for _, c := range candidates {
@@ -214,7 +237,7 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 		}
 		return total
 	}
-	if len(selected) == 0 {
+	if len(selected) == 0 && len(corrections) == 0 {
 		return Summary{
 			RecordingsSeen: len(candidates), RecordingsSkipped: stateSkipped, BytesSeen: bytesSeen,
 			BytesSkipped: completeBytes(), RecordingsDeferred: deferred,
@@ -243,8 +266,10 @@ func (r *Runner) syncIncremental(candidates []Candidate) (Summary, error) {
 	// state, so the next run resumes past them; the first error is returned
 	// once at the end so the run still exits non-zero.
 	results, errs := r.uploadAll(recordings)
-	var failures []error
-	summary := Summary{RecordingsSeen: len(candidates), RecordingsSkipped: stateSkipped, BytesSeen: bytesSeen, RecordingsSelected: len(selected), RecordingsDeferred: deferred}
+	// New memos first: they are what someone is waiting on.
+	correctionResults, correctionFailures := r.correctRecordedAt(corrections)
+	failures := correctionFailures
+	summary := Summary{RecordingsSeen: len(candidates), RecordingsSkipped: stateSkipped, BytesSeen: bytesSeen, RecordingsSelected: len(selected), RecordingsDeferred: deferred, MetadataUploaded: correctionResults}
 	for i, err := range errs {
 		if err != nil {
 			r.Logger.Warningf("Failed to upload %s: %s", recordings[i].Filename, err)
@@ -307,6 +332,103 @@ func (r *Runner) failureStreakError(recording Recording, err error) error {
 		return fmt.Errorf("%s: %w", recording.Filename, err)
 	}
 	return fmt.Errorf("%s has failed %d consecutive run(s) since %s: %w", recording.Filename, entry.ConsecutiveFailures, entry.FirstFailureAt, err)
+}
+
+// MaxSettleWait is the longest a run waits for a just-arrived recording to
+// pass the minimum file age; a file younger than that is left for a later run.
+const MaxSettleWait = 30 * time.Second
+
+// settleWait is how long until every new or changed recording that is only
+// held back by the minimum file age becomes eligible, or zero when there is
+// none or the wait would exceed MaxSettleWait.
+func (r *Runner) settleWait(candidates []Candidate) time.Duration {
+	if r.MinFileAgeSeconds <= 0 {
+		return 0
+	}
+	gate := time.Duration(r.MinFileAgeSeconds) * time.Second
+	if gate > MaxSettleWait {
+		return 0
+	}
+	now := r.Now()
+	var wait time.Duration
+	for _, c := range candidates {
+		age := now.Sub(c.FileModifiedAt)
+		if age >= gate || r.isStateComplete(c) {
+			continue
+		}
+		if remaining := gate - age; remaining > wait {
+			wait = remaining
+		}
+	}
+	if wait > MaxSettleWait {
+		return 0
+	}
+	return wait
+}
+
+// MaxRecordedAtCorrectionsPerRun bounds how many already-landed memos get a
+// corrected sidecar per run, so the one-time correction of the whole library
+// spreads over a few runs instead of holding one run for ten minutes.
+const MaxRecordedAtCorrectionsPerRun = 150
+
+// correctionWorkers is the parallelism for sidecar-only corrections: each is
+// one small POST, so the incremental default of one worker is needlessly slow.
+const correctionWorkers = 4
+
+func (r *Runner) recordedAtCurrent(c Candidate) bool {
+	if r.State == nil {
+		return true
+	}
+	entry, ok := r.State.EntryFor(c)
+	return ok && entry.RecordedAtCurrent(c)
+}
+
+// correctRecordedAt re-sends only the metadata sidecar of landed memos whose
+// recorded_at changed (the 2026-10-16 move from the filename stamp read as
+// UTC to the store's ZDATE). The audio is already in the warehouse and the
+// state's sha still matches the unchanged file, so nothing is re-hashed or
+// re-uploaded. It returns how many sidecars landed and one error per failure.
+func (r *Runner) correctRecordedAt(candidates []Candidate) (int, []error) {
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	r.Logger.Infof("Correcting recorded_at on %d already-landed Voice Memos (sidecar only)", len(candidates))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	landed := 0
+	var failures []error
+	semaphore := make(chan struct{}, correctionWorkers)
+	for _, c := range candidates {
+		r.stateMu.Lock()
+		entry, _ := r.State.EntryFor(c)
+		r.stateMu.Unlock()
+		recording := Recording{Candidate: c, Title: c.RecordingID, ContentType: ContentTypeForExtension(c.Extension), ContentSHA256: entry.ContentSHA256}
+		wg.Add(1)
+		semaphore <- struct{}{}
+		go func(recording Recording) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			payload := BuildMetadata(r.Account, recording, r.Now())
+			_, err := r.Client.UploadVoiceMemoMetadata(payload, common.ISOFormat(recording.RecordedAt), recording.ContentSHA256)
+			r.stateMu.Lock()
+			if err != nil {
+				r.State.MarkFailure(recording.Candidate, recording.ContentSHA256, err.Error(), r.Now())
+			} else {
+				r.State.MarkSuccess(recording.Candidate, recording.ContentSHA256, true, true, r.Now())
+			}
+			r.stateMu.Unlock()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				r.Logger.Warningf("Failed to correct recorded_at for %s: %s", recording.Filename, err)
+				failures = append(failures, fmt.Errorf("%s: %w", recording.Filename, err))
+				return
+			}
+			landed++
+		}(recording)
+	}
+	wg.Wait()
+	return landed, failures
 }
 
 func (r *Runner) isStateComplete(c Candidate) bool {

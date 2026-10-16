@@ -605,7 +605,7 @@ def s1_slack() -> Verdict:
 
 
 def s2_voice() -> Verdict:
-    title = "voice memos: every source transcribed, enriched, calendar-matched"
+    title = "voice memos: every source transcribed fast, enriched, calendar-matched"
     # A recording the provider will never accept (rejected: no spoken audio,
     # too short) and an empty upload (size_bytes = 0, which the candidate
     # query excludes) are not a backlog; counting them read S2 red forever
@@ -634,8 +634,24 @@ def s2_voice() -> Verdict:
     backlog = sum(int(r["untranscribed"] or 0) + int(r["unenriched"] or 0) for r in rows)
     sources = {r["source"] for r in rows}
     expected = {"apple_voice_memos", "alice_voice_recordings", "apple_notes"}
-    status = GREEN if backlog == 0 and expected <= sources else (YELLOW if backlog < 10 else RED)
-    return Verdict("S2", title, status, "; ".join(f"{r['source']}: {r['recordings']} rec, {r['untranscribed']} untranscribed ({r['untranscribable']} untranscribable), {r['unenriched']} unenriched, {r['matched']} matched" for r in rows))
+    coverage = GREEN if backlog == 0 and expected <= sources else (YELLOW if backlog < 10 else RED)
+    evidence = "; ".join(f"{r['source']}: {r['recordings']} rec, {r['untranscribed']} untranscribed ({r['untranscribable']} untranscribable), {r['unenriched']} unenriched, {r['matched']} matched" for r in rows)
+    # Coverage cannot see speed: S2 read green on 2026-10-16 while a short memo
+    # took p50 9 min to become a transcript. The landing view judges PDW's own
+    # part (Mac to transcript) against a 30 s p50; iCloud's is reported only.
+    landing = pdw_sql("voice landing speed", """
+        SELECT source, status, pdw_landing_p50_seconds, device_delivery_p50_seconds,
+               end_to_transcript_p50_seconds, stuck_untranscribed
+        FROM marts_ops.voice_memo_landing_health WHERE source = 'apple_voice_memos'""")
+    if not landing:
+        return Verdict("S2", title, worst([coverage, YELLOW]),
+                       f"{evidence}; could not read marts_ops.voice_memo_landing_health, speed verdict withheld")
+    row = landing[0]
+    speed = {"ok": GREEN, "quiet": GREEN, "attention": YELLOW}.get(row["status"], RED)
+    evidence += (f"; landing {row['status']}: PDW p50 {row['pdw_landing_p50_seconds']}s (target 30s), "
+                 f"iCloud p50 {row['device_delivery_p50_seconds']}s, end-to-transcript p50 "
+                 f"{row['end_to_transcript_p50_seconds']}s, {row['stuck_untranscribed']} stuck")
+    return Verdict("S2", title, worst([coverage, speed]), evidence)
 
 
 def s3_finance() -> Verdict:

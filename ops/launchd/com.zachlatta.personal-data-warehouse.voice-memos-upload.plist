@@ -14,6 +14,21 @@
     <key>StartInterval</key>
     <integer>300</integer>
 
+    <!-- Fire on change too: the store's WAL is written when a memo arrives
+         from iCloud and again when its audio finishes downloading, and the
+         directory changes when the file appears, so a memo is uploaded seconds
+         after it lands on this Mac instead of at the next five-minute tick.
+         The run waits out a few seconds of settle itself, so the throttle is
+         10 s; StartInterval stays as the floor. -->
+    <key>WatchPaths</key>
+    <array>
+      <string>/Users/zrl/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db-wal</string>
+      <string>/Users/zrl/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings</string>
+    </array>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
     <key>RunAtLoad</key>
     <true/>
 

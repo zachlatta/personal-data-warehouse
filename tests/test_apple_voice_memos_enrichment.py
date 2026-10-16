@@ -26,7 +26,6 @@ from personal_data_warehouse.apple_voice_memos_enrichment import (
     normalize_corrected_transcript_prefixes,
     parse_attendee_summaries,
     possible_identity_names_from_text,
-    recording_time_interpretations,
     validate_enrichment_result,
     withhold_low_confidence_resolved_speaker_names,
 )
@@ -861,7 +860,7 @@ def test_enrichment_task_input_includes_diarized_segments_and_recording_context(
     )
 
     assert '"speaker_label": "A"' in task_input
-    assert "recorded_at_interpretations" in task_input
+    assert "recorded_at_interpretations" not in task_input
     assert "diarized_segments" in task_input
     assert "contact_alias_hints" in task_input
     assert "Taylor Example" in task_input
@@ -1312,14 +1311,13 @@ def test_ensure_recording_level_fields_fills_no_calendar_outputs() -> None:
     assert any("No matching calendar event" in evidence for evidence in result["evidence"])
 
 
-def test_recording_time_interpretations_include_local_wall_clock_conversion() -> None:
-    interpretations = recording_time_interpretations(datetime(2026, 4, 23, 11, 10, tzinfo=UTC))
+def test_load_calendar_candidates_searches_around_the_absolute_recorded_at_only() -> None:
+    """recorded_at is the store's ZDATE, an absolute instant, since 2026-10-16.
 
-    assert interpretations[0]["utc"] == datetime(2026, 4, 23, 11, 10, tzinfo=UTC)
-    assert interpretations[1]["utc"] == datetime(2026, 4, 23, 15, 10, tzinfo=UTC)
-
-
-def test_load_calendar_candidates_searches_utc_and_local_wall_clock_anchors() -> None:
+    It used to be the filename's wall-clock stamp read as UTC, so the search
+    also tried that stamp as New York wall time. Searching the second anchor
+    now would offer events four hours away as if they fit.
+    """
     queries = []
 
     class Warehouse:
@@ -1330,7 +1328,7 @@ def test_load_calendar_candidates_searches_utc_and_local_wall_clock_anchors() ->
     load_calendar_candidates(Warehouse(), {"recorded_at": datetime(2026, 4, 23, 11, 10, tzinfo=UTC)})
 
     assert "2026-04-23T11:10:00+00:00" in queries[0]
-    assert "2026-04-23T15:10:00+00:00" in queries[0]
+    assert "2026-04-23T15:10:00+00:00" not in queries[0]
     assert "LIMIT 12" in queries[0]
 
 
