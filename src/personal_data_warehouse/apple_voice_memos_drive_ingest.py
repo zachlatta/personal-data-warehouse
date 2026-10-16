@@ -50,6 +50,7 @@ class VoiceMemosDriveIngestRunner:
         promote = self._object_store is not None
         row_metadata = [library_metadata_payload(payload) for payload in metadata] if promote else metadata
         rows = [metadata_to_row(payload, ingested_at=ingested_at) for payload in row_metadata]
+        self._keep_known_recording_ids(rows)
         self._warehouse.insert_apple_voice_memos_files(rows)
         promoted = 0
         if promote:
@@ -62,6 +63,33 @@ class VoiceMemosDriveIngestRunner:
             rows_written=len(rows),
             recordings_promoted=promoted,
         )
+
+
+    def _keep_known_recording_ids(self, rows: list[dict[str, Any]]) -> None:
+        """A sidecar for audio the warehouse already holds updates that recording.
+
+        Voice Memos sometimes renames a file, moving its stamp by hours, and the
+        recording id is the file's stem. The app used to dedup a renamed memo's
+        sidecar onto the old one by audio hash; once it deduped on (audio hash,
+        recorded_at), on 2026-10-16, three renamed memos landed as new
+        recordings, were transcribed again and queued for enrichment. Empty
+        audio is never an identity: every zero-byte file shares one hash.
+        """
+        lookup = getattr(self._warehouse, "load_apple_voice_memo_recording_ids_by_sha", None)
+        if lookup is None:
+            return
+        known = lookup([str(row["content_sha256"]) for row in rows if row["size_bytes"] > 0])
+        for row in rows:
+            if row["size_bytes"] <= 0:
+                continue
+            ids = known.get((str(row["account"]), str(row["content_sha256"])), [])
+            if ids and row["recording_id"] not in ids:
+                self._logger.info(
+                    "Voice Memo %s is renamed audio of %s; updating that recording",
+                    row["recording_id"],
+                    ids[0],
+                )
+                row["recording_id"] = ids[0]
 
 
 def iter_metadata_payloads(

@@ -12506,6 +12506,27 @@ class PostgresWarehouse:
     def insert_apple_voice_memos_files(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_voice_memos_files", rows, VOICE_MEMO_FILE_COLUMNS)
 
+    def load_apple_voice_memo_recording_ids_by_sha(
+        self, content_sha256s: list[str]
+    ) -> dict[tuple[str, str], list[str]]:
+        """Every recording id the warehouse holds per (account, audio sha)."""
+        shas = sorted({sha for sha in content_sha256s if sha})
+        if not shas:
+            return {}
+        rows = self._query(
+            """
+            SELECT account, content_sha256, recording_id
+            FROM @apple_voice_memos_files
+            WHERE content_sha256 = ANY(%s) AND is_deleted = 0 AND size_bytes > 0
+            ORDER BY recording_id
+            """,
+            (shas,),
+        )
+        found: dict[tuple[str, str], list[str]] = {}
+        for account, sha, recording_id in rows:
+            found.setdefault((str(account), str(sha)), []).append(str(recording_id))
+        return found
+
     def insert_alice_voice_recordings(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("alice_voice_recordings", rows, ALICE_VOICE_RECORDING_COLUMNS)
 

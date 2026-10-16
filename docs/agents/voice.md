@@ -53,6 +53,12 @@ memo whose value changed gets a corrected sidecar only (no audio, no re-hash), 1
 The app dedups a sidecar on (audio sha, `recorded_at`), not the audio sha alone, or the
 correction would be dropped as a duplicate, and the Drive reader finds a corrected sidecar's
 audio in the library. Memos no longer on the Mac keep the old, early time.
+Voice Memos also renames files now and then (the stamp moves by hours; one was named in
+Pacific time and renamed in Eastern), and the recording id is the stem. The old audio-hash
+dedup had silently absorbed those renames, so the first correction pass landed three renamed
+memos as new recordings, transcribed them again and queued them for enrichment; they were
+removed by hand the same day. The Drive reader now keeps the recording id the warehouse
+already holds for that audio (`_keep_known_recording_ids`), never for empty audio.
 
 **A hung upload run is killed after 15 minutes.** On 2026-10-14 a run hung at "Scanning" for
 10.9 hours, and launchd never starts a job that is still running, so two memos waited ~13

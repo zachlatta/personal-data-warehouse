@@ -24,9 +24,13 @@ class FakeLogger:
 
 
 class FakeWarehouse:
-    def __init__(self) -> None:
+    def __init__(self, existing_ids: dict[tuple[str, str], list[str]] | None = None) -> None:
         self.ensure_apple_voice_memos_tables_called = False
         self.rows: list[dict[str, object]] = []
+        self.existing_ids = dict(existing_ids or {})
+
+    def load_apple_voice_memo_recording_ids_by_sha(self, content_sha256s):
+        return {key: ids for key, ids in self.existing_ids.items() if key[1] in set(content_sha256s)}
 
     def ensure_apple_voice_memos_tables(self) -> None:
         self.ensure_apple_voice_memos_tables_called = True
@@ -276,3 +280,54 @@ def test_a_corrected_sidecar_finds_audio_already_in_the_library() -> None:
     assert warehouse.rows[0]["recorded_at"] == datetime(2026, 3, 25, 22, 50, 19, tzinfo=UTC)
     assert warehouse.rows[0]["storage_file_id"] == "drive-file-id"
     assert ("drive-file-id", "apple-voice-memos/library/2026/03/2026-03-25-abc123.qta") in store.moved
+
+
+def test_a_renamed_memos_sidecar_updates_the_recording_the_warehouse_already_holds() -> None:
+    """Voice Memos sometimes renames a file, moving its stamp by hours.
+
+    Until 2026-10-16 the app deduped a renamed memo's sidecar onto the old one
+    by audio hash, so the rename never reached the warehouse. Deduping on
+    (audio hash, recorded_at) let three renamed memos' corrected sidecars land
+    as NEW recordings, transcribed again and queued for enrichment beside the
+    originals. The audio is the identity: a sidecar for audio the warehouse
+    already holds updates that recording.
+    """
+    renamed = decorated_metadata_payload()
+    renamed["recording"]["recording_id"] = "20260325 155019-DAAC9394"
+    warehouse = FakeWarehouse(existing_ids={("zach@example.com", "abc123"): ["20260325 145019-DAAC9394"]})
+
+    VoiceMemosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=lambda: [renamed],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 10, 16, 13, tzinfo=UTC),
+    ).sync()
+
+    assert warehouse.rows[0]["recording_id"] == "20260325 145019-DAAC9394"
+
+
+def test_a_sidecar_naming_one_of_its_audios_recordings_keeps_its_own_id() -> None:
+    warehouse = FakeWarehouse(
+        existing_ids={("zach@example.com", "abc123"): ["20260325 145019", "20260325 145019-DAAC9394"]}
+    )
+    VoiceMemosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=lambda: [decorated_metadata_payload()],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 10, 16, 13, tzinfo=UTC),
+    ).sync()
+    assert warehouse.rows[0]["recording_id"] == "20260325 145019-DAAC9394"
+
+
+def test_empty_audio_is_never_an_identity() -> None:
+    # Every zero-byte file has the same hash; two empty memos are not one memo.
+    empty = decorated_metadata_payload()
+    empty["recording"]["size_bytes"] = 0
+    warehouse = FakeWarehouse(existing_ids={("zach@example.com", "abc123"): ["some-other-memo"]})
+    VoiceMemosDriveIngestRunner(
+        warehouse=warehouse,
+        metadata_source=lambda: [empty],
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 10, 16, 13, tzinfo=UTC),
+    ).sync()
+    assert warehouse.rows[0]["recording_id"] == "20260325 145019-DAAC9394"

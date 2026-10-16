@@ -914,6 +914,26 @@ def _landed_memo(
     )
 
 
+def test_recording_ids_by_audio_sha_skip_empty_and_deleted_audio(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_apple_voice_memos_tables()
+    rows = [
+        ("a", "sha-1", 10, 0),
+        ("b", "sha-1", 10, 0),
+        ("c", "sha-2", 0, 0),
+        ("d", "sha-3", 10, 1),
+    ]
+    warehouse.insert_apple_voice_memos_files(
+        [
+            _row(VOICE_MEMO_FILE_COLUMNS, account="zach", recording_id=rid, content_sha256=sha,
+                 size_bytes=size, is_deleted=deleted, recorded_at=TS, ingested_at=TS, sync_version=1)
+            for rid, sha, size, deleted in rows
+        ]
+    )
+    assert warehouse.load_apple_voice_memo_recording_ids_by_sha(["sha-1", "sha-2", "sha-3", ""]) == {
+        ("zach", "sha-1"): ["a", "b"],
+    }
+
+
 def _landing(wh: PostgresWarehouse) -> dict:
     rows = {row["source"]: row for row in _dicts(wh, "marts_ops_voice_memo_landing_health")}
     return rows["apple_voice_memos"]
