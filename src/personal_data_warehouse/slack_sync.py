@@ -960,7 +960,17 @@ class SlackSyncRunner:
                 reverse=True,
             )
             if group_limit is not None:
-                group_conversations = group_conversations[:group_limit]
+                if group[0] == "public_channel":
+                    # The public cap is for workspace chatter. A public channel
+                    # Zach is in is his conversation: his own channel ranked
+                    # 223rd of 14,562 by activity on 2026-10-17, so the cap of
+                    # 100 dropped it from every pass and the sweep reached it
+                    # nine hours late. Member channels are never capped.
+                    members = [c for c in group_conversations if _public_member(c)]
+                    others = [c for c in group_conversations if not _public_member(c)]
+                    group_conversations = members + others[:group_limit]
+                else:
+                    group_conversations = group_conversations[:group_limit]
             for conversation in group_conversations:
                 if not conversation.get("id"):
                     continue
@@ -1039,10 +1049,12 @@ class SlackSyncRunner:
         # ~210-250 polls, and ~95 of them went to public channels active in the
         # last two hours -- mostly chatter not aimed at Zach -- while due DMs
         # waited (2026-10-03). The public sweep covers what a pass misses.
+        # A public channel Zach is a member of is not that chatter, so it is
+        # scheduled with the DMs by how overdue it is.
         scheduled = []
         for entry in planned:
             conversation, group, oldest_ts = entry
-            public = 1 if group[0] == "public_channel" else 0
+            public = 1 if group[0] == "public_channel" and not _public_member(conversation) else 0
             if _hot(conversation, oldest_ts):
                 scheduled.append(((public, 0, _last_polled(conversation), type_rank[group]), entry))
                 continue
@@ -2670,6 +2682,10 @@ def conversation_type(conversation: Mapping[str, object]) -> str:
     if conversation.get("is_channel"):
         return "public_channel"
     return "unknown"
+
+
+def _public_member(conversation: Mapping[str, object]) -> bool:
+    return conversation_type(conversation) == "public_channel" and bool(conversation.get("is_member"))
 
 
 def conversation_may_have_activity_since(

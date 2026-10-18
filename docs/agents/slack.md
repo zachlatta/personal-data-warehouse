@@ -264,6 +264,15 @@ that wakes after more than a year of quiet: it can take up to twelve hours to la
 an event feed fixes that: an Events API subscription on the workspace app, which is
 Zach's to set up.
 
+**"Public channels go last" means public channels Zach is not in (2026-10-17).** The pass
+caps public candidates at the 100 most recently active (`SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT`)
+out of ~14,500, and Zach's own channel ranked 223rd that day, so no pass ever polled it: the
+sweep reached it nine hours after its previous poll, and a 168-reply thread he posted in was
+not in PDW. The median member public channel active in the last fortnight was 10.5 hours past
+its last poll. Public channels with `is_member` set (218 that day, ~58 polls a pass) are now
+never capped and are scheduled with the DMs, group DMs and private channels by how overdue
+they are. Only non-member public channels go last.
+
 **Read state rotates; it is not refreshed by activity.** `last_read` (what the inbox's
 unread state is computed from) arrives only through `conversations.info`, which the
 read-state pass calls for 25 conversations a run, both on its own five-minute schedule and

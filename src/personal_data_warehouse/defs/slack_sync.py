@@ -177,7 +177,9 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
     # SLACK_FRESHNESS_DUE_INTERVALS), so DMs, group DMs and private channels are
     # all candidates; the old 500/250/100 activity caps dropped the long tail
     # before scheduling could reach it, and a group DM quiet for weeks waited a
-    # day. Public channels keep a cap: the public sweep rotates the rest.
+    # day. Public channels Zach is not in keep a cap: the public sweep rotates
+    # the rest. Member public channels are never capped and are scheduled with
+    # the DMs (see SlackSyncRunner._sync_account_freshness_priority).
     limit_by_type = {
         "im": _int_env("SLACK_ASSET_DM_FRESHNESS_LIMIT", 10000),
         "mpim": _int_env("SLACK_ASSET_MPIM_FRESHNESS_LIMIT", 10000),

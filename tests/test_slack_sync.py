@@ -3624,7 +3624,7 @@ def test_freshness_polls_every_due_dm_before_any_public_channel(monkeypatch):
         }
     )
     warehouse.conversation_payloads = [
-        {"id": "C_PUBLIC_HOT", "name": "lounge", "is_channel": True, "is_member": True},
+        {"id": "C_PUBLIC_HOT", "name": "lounge", "is_channel": True, "is_member": False},
         {"id": "D_HOT", "user": "U1", "is_im": True},
         {"id": "D_WARM_DUE", "user": "U2", "is_im": True},
         {"id": "C_PRIVATE_HOT", "name": "team", "is_channel": True, "is_private": True, "is_member": True},
@@ -3651,6 +3651,76 @@ def test_freshness_polls_every_due_dm_before_any_public_channel(monkeypatch):
 
     polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
     assert polled == ["D_HOT", "C_PRIVATE_HOT", "D_WARM_DUE", "C_PUBLIC_HOT"]
+
+
+def test_freshness_schedules_member_public_channels_with_dms_not_behind_the_public_cap(monkeypatch):
+    """A public channel Zach is in is his conversation, not workspace chatter.
+
+    Measured 2026-10-17: his own channel ranked 223rd of 14,562 public channels
+    by recent activity, so the 100-channel public cap dropped it from every
+    freshness pass, and the public sweep reached it nine hours after its last
+    poll -- a 168-reply thread he posted in was not in PDW at all. The median
+    member public channel active in the last fortnight was 10.5 hours past its
+    last poll. Member public channels are now scheduled with DMs, group DMs and
+    private channels by how overdue they are, outside the public cap; only
+    non-member public channels go last, capped.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    t = 1_790_000_000
+    day = 86_400
+
+    def state(conversation_id, cursor, polled_minutes_ago):
+        return {
+            "account": "zrl", "team_id": "T1", "object_type": "conversation",
+            "object_id": conversation_id, "cursor_ts": f"{cursor:.6f}", "last_sync_type": "partial",
+            "status": "ok", "error": "", "updated_at": now - timedelta(minutes=polled_minutes_ago),
+        }
+
+    warehouse = FakeWarehouse(
+        states={
+            # Two busy channels he is not in, both more recently active than his own.
+            ("zrl", "T1", "conversation", "C_BUSY_A"): state("C_BUSY_A", t - 60, 30),
+            ("zrl", "T1", "conversation", "C_BUSY_B"): state("C_BUSY_B", t - 120, 30),
+            # His channel: warm (a day quiet at the top level), due 25 minutes ago.
+            ("zrl", "T1", "conversation", "C_MINE"): state("C_MINE", t - day, 40),
+            # A warm DM due 5 minutes ago.
+            ("zrl", "T1", "conversation", "D_WARM_DUE"): state("D_WARM_DUE", t - 3 * day, 20),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "C_BUSY_A", "name": "chatter-a", "is_channel": True, "is_member": False},
+        {"id": "C_BUSY_B", "name": "chatter-b", "is_channel": True, "is_member": False},
+        {"id": "C_MINE", "name": "my-channel", "is_channel": True, "is_member": True},
+        {"id": "D_WARM_DUE", "user": "U2", "is_im": True},
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty, empty, empty],
+        }
+    )
+    SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: now,
+        history_window=timedelta(hours=4), freshness_warm_window=timedelta(days=14),
+        freshness_window_by_type={
+            "im": timedelta(hours=4), "mpim": timedelta(hours=4),
+            "private_channel": timedelta(hours=3), "public_channel": timedelta(hours=2),
+        },
+        freshness_limit_by_type={"public_channel": 1},
+        sync_users=False, sync_members=False, use_existing_conversations=True,
+        freshness_priority=True, sync_thread_replies=False, sleep=lambda seconds: None,
+    ).sync_all()
+
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    # His channel is more overdue than the DM, so it goes first; the cap of one
+    # takes the busiest non-member channel, last.
+    assert polled == ["C_MINE", "D_WARM_DUE", "C_BUSY_A"]
 
 
 def test_freshness_due_intervals_fit_the_oauth_token_and_can_be_tightened(monkeypatch):
