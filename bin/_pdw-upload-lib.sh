@@ -155,13 +155,16 @@ pdw_export_app_credentials() {
 # pdw_run_error LOG_FILE -> the current run's last "error: ..." line (without
 # the prefix), or nothing. Only lines after the run's own "] starting " marker
 # count, so an earlier run's failure is never reported as this run's. `pdw`
-# prints its returned error last as "error: <text>"; the voice-memos uploader
-# makes that text name the stuck file and its failure streak.
+# prints its returned error last as "error: <text>" (the voice-memos uploader
+# makes that text name the stuck file and its failure streak); the native Go
+# uploaders print "pdw ingest <source>: <text>", kept whole so it names the
+# source.
 pdw_run_error() {
   [ -f "$1" ] || return 0
   tail -n 2000 "$1" | awk '
     /^\[[^]]*\] starting / { err = "" }
     /^error: / { err = substr($0, 8) }
+    /^pdw ingest [a-z][a-z-]*: / { err = $0 }
     END { if (err != "") print err }
   '
 }

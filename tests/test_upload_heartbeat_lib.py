@@ -353,6 +353,21 @@ def test_run_error_never_reports_an_earlier_runs_failure(tmp_path: Path):
     assert _run(f'pdw_run_error "{log}"').strip() == ""
 
 
+def test_run_error_reads_a_native_go_uploaders_error_line(tmp_path: Path):
+    """The Go uploaders print "pdw ingest <source>: <err>", not "error: ...";
+    browser_history read `failing` with an empty last_error for 173 runs
+    (2026-10-14 to 10-19) while every run logged why."""
+    log = tmp_path / "browser-history-upload.run.log"
+    log.write_text(
+        "[2026-10-19T03:42:54-04:00] starting browser history upload\n"
+        "Browser history upload complete: profiles=0 visits=0 searches=0 batches=0 deferred=false failed=0\n"
+        "pdw ingest browser-history: open /Users/x/Library/Application Support/Google/Chrome: operation not permitted\n"
+    )
+    assert _run(f'pdw_run_error "{log}"').strip() == (
+        "pdw ingest browser-history: open /Users/x/Library/Application Support/Google/Chrome: operation not permitted"
+    )
+
+
 def test_post_heartbeat_carries_the_runs_error_so_pipeline_health_can_name_it(tmp_path: Path):
     """Without --error, marts_ops.pipeline_health.last_error read NULL beside a
     failing row for the whole of a 37-run voice memo wedge."""
