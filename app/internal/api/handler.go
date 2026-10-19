@@ -124,7 +124,9 @@ func (h *handler) handleToolCall(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_input", "request body is not valid JSON for this tool: "+callErr.Error())
 			return
 		}
-		writeError(w, http.StatusBadGateway, "tool_error", callErr.Error())
+		// 500, not 502: Cloudflare replaces an origin 502's body with its own
+		// "error code: 502", and the reason is the whole point of the reply.
+		writeError(w, http.StatusInternalServerError, "tool_error", callErr.Error())
 		return
 	}
 	h.logger.InfoContext(r.Context(), "API tool result", "tool", name, "client", pdwauth.ClientNameFromContext(r.Context()), "is_error", isErr, "output", loggedOutput(t, out))

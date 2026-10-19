@@ -226,6 +226,11 @@ func (t *proxyTool) InputSchema() (*jsonschema.Schema, error) {
 	err = json.Unmarshal(raw, &schema)
 	return &schema, err
 }
+// upstreamCallBudget bounds one live call to a connected server. It stays
+// under Cloudflare's 100s origin timeout so the caller gets this error, which
+// names the budget, rather than Cloudflare's bare one.
+var upstreamCallBudget = 60 * time.Second
+
 func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, bool, error) {
 	if len(input) == 0 {
 		input = json.RawMessage(`{}`)
@@ -234,7 +239,7 @@ func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, boo
 	if err := json.Unmarshal(input, &object); err != nil || object == nil {
 		return nil, true, &tool.InvalidInputError{Message: "tool arguments must be a JSON object"}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, upstreamCallBudget)
 	defer cancel()
 	c, client, err := t.service.prepare(ctx, t.connection, func(c *record) error {
 		if !allowed(ctx, c) || c.URL != t.url || c.Generation != t.generation {
@@ -259,6 +264,9 @@ func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, boo
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: t.definition.Name, Arguments: input})
 	if err != nil {
 		t.service.status(ctx, c, "call_failed")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, true, fmt.Errorf("the %s connection did not answer within %s, PDW's budget for one live upstream call; it was not retried, as a write may already have occurred. A long read query will not finish on a rerun: narrow it (tighter filters, LIMIT, fewer joins) or split it", t.connection, upstreamCallBudget)
+		}
 		return nil, true, errors.New("upstream MCP call failed; it was not retried, as a write may already have occurred")
 	}
 	t.service.status(ctx, c, "connected")

@@ -165,12 +165,15 @@ func TestCallToolMalformedBodyReturns400(t *testing.T) {
 	}
 }
 
-func TestCallToolHandlerErrorReturns502(t *testing.T) {
+// A tool failure is a 500, not a 502: Cloudflare replaces an origin 502's
+// body with its own "error code: 502", so the week to 2026-10-19 saw 19
+// connected-tool failures reach agents with the reason stripped.
+func TestCallToolHandlerErrorReturns500WithItsReason(t *testing.T) {
 	h := newHandler(t, newFailingTool("broken", errBoom))
 	req := httptest.NewRequest(http.MethodPost, "/api/tools/broken", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	var resp struct {
@@ -301,7 +304,7 @@ func TestCallToolLogsErrorOnHandlerError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/tools/broken", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	logs := buf.String()

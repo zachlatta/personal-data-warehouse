@@ -113,6 +113,49 @@ func TestProxyPreservesResultsAndDoesNotForwardPDWCredentials(t *testing.T) {
 	}
 }
 
+func TestAnUpstreamCallPastTheBudgetSaysSo(t *testing.T) {
+	previous := upstreamCallBudget
+	upstreamCallBudget = 200 * time.Millisecond
+	defer func() { upstreamCallBudget = previous }()
+	upstream := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "1"}, nil)
+	upstream.AddTool(&mcp.Tool{Name: "query", Description: "Slow", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "late"}}}, nil
+	})
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return upstream }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	remote := httptest.NewTLSServer(handler)
+	defer remote.Close()
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", remote.Client())
+	ctx := context.Background()
+	if err := store.Update(ctx, "warehouse", func(c *record) error {
+		c.Name, c.URL, c.Enabled, c.AllClients = "warehouse", remote.URL, true, true
+		c.Token.AccessToken, c.Token.TokenType = "secret", "Bearer"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Refresh(ctx, "warehouse"); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := service.Tools(ctx)
+	if err != nil || len(ts) != 1 {
+		t.Fatalf("tools: %d %v", len(ts), err)
+	}
+	_, _, err = ts[0].Invoke(ctx, json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("a call past the budget succeeded")
+	}
+	for _, want := range []string{"warehouse", "did not answer within 200ms", "not retried", "narrow"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not say %q", err, want)
+		}
+	}
+}
+
 func TestAccessIsCheckedAtDiscoveryAndInvocation(t *testing.T) {
 	store := newMemoryStore()
 	service := New(store, "https://pdw.example", nil)
