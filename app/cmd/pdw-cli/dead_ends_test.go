@@ -58,6 +58,8 @@ const deadEndToolList = `{"data":[` +
 	`{"name":"tasks__query_tasks_sql","title":"","description":"","input_schema":{}},` +
 	`{"name":"tasks__create_task","title":"","description":"","input_schema":{}},` +
 	`{"name":"hack_club_data_warehouse__query","title":"","description":"","input_schema":{}},` +
+	`{"name":"zrl_bot_email_control__get_thread","title":"","description":"","input_schema":{}},` +
+	`{"name":"zrl_bot_email_control__search_messages","title":"","description":"","input_schema":{}},` +
 	`{"name":"search","title":"","description":"","input_schema":{}}]}`
 
 // `pdw describe` on an invented name: 20 calls in 18 sessions in the week to
@@ -68,9 +70,13 @@ func TestDescribeUnknownToolNamesItsConnectionsRealTools(t *testing.T) {
 		"skills__skill_create":                {"skills__skill_write", "skills__skill_edit"},
 		"tasks__query_tasks":                  {"tasks__query_tasks_sql"},
 		"hack_club_data_warehouse__run_query": {"hack_club_data_warehouse__query"},
-		"timeline.context":                    {"pdw context '<ref>'"},
-		"base_gmail.messages":                 {"pdw columns"},
-		"base_gmail":                          {"pdw columns"},
+		// A misremembered connection name: 9 calls in the week to 2026-10-19
+		// were answered only "`pdw list` lists every tool".
+		"zrl-bot__get_thread": {"no zrl-bot connection", "zrl_bot_email_control__get_thread"},
+		"hcdw__query":         {"hack_club_data_warehouse"},
+		"timeline.context":    {"pdw context '<ref>'"},
+		"base_gmail.messages": {"pdw columns"},
+		"base_gmail":          {"pdw columns"},
 	} {
 		_, errOut, code := runCLI(t, srv.URL, "", "describe", name)
 		if code == 0 {

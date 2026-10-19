@@ -73,7 +73,7 @@ COMMANDS
 ` + warehouse.TimelinePriorityHelpLines("                                                 ") + `
                                                  Run "pdw search --help" for the generated
                                                  scope-selection guide.
-                               --since TIME      Lower event-time bound (e.g. 2026-08-01)
+                               --since TIME      Lower event-time bound (2026-08-01, or 7d / 12h / 2w)
                                --output FMT      text (default) or json
   context REF [--before N] [--after N]
                              The conversation around a search hit's ref: a Gmail
@@ -877,33 +877,14 @@ func unknownToolHint(name string, tools []cliclient.ToolInfo) string {
 		return "describe is for tools; a relation's columns are `pdw columns <schema.table>` and the relation list is `pdw schema`"
 	}
 	if namespaced {
-		type candidate struct {
-			name     string
-			distance int
+		if hint := connectionToolsHint(connection, verb, tools); hint != "" {
+			return hint
 		}
-		var siblings []candidate
-		for _, t := range tools {
-			tc, tv, ok := strings.Cut(strings.ToLower(t.Name), "__")
-			if ok && tc == connection {
-				distance := levenshtein(verb, tv)
-				if strings.Contains(tv, verb) || strings.Contains(verb, tv) {
-					distance = 0
-				}
-				siblings = append(siblings, candidate{t.Name, distance})
-			}
+		if real := nearestConnection(connection, tools); real != "" {
+			return "there is no " + connection + " connection; " + connectionToolsHint(real, verb, tools)
 		}
-		if len(siblings) > 0 {
-			sort.SliceStable(siblings, func(i, j int) bool {
-				if siblings[i].distance != siblings[j].distance {
-					return siblings[i].distance < siblings[j].distance
-				}
-				return siblings[i].name < siblings[j].name
-			})
-			names := make([]string, 0, len(siblings))
-			for _, c := range siblings {
-				names = append(names, c.name)
-			}
-			return "the " + connection + " connection's tools, nearest first: " + strings.Join(names, ", ")
+		if names := connectionNames(tools); len(names) > 0 {
+			return "there is no " + connection + " connection; the connections are " + strings.Join(names, ", ") + " (`pdw list` lists every tool)"
 		}
 	}
 	best, bestDistance := "", 4
@@ -916,6 +897,78 @@ func unknownToolHint(name string, tools []cliclient.ToolInfo) string {
 		return fmt.Sprintf("did you mean %q? (`pdw list` lists every tool)", best)
 	}
 	return "`pdw list` lists every tool"
+}
+
+// connectionToolsHint lists one connection's tools nearest verb first, or ""
+// when the connection has none.
+func connectionToolsHint(connection, verb string, tools []cliclient.ToolInfo) string {
+	type candidate struct {
+		name     string
+		distance int
+	}
+	var siblings []candidate
+	for _, t := range tools {
+		tc, tv, ok := strings.Cut(strings.ToLower(t.Name), "__")
+		if ok && tc == connection {
+			distance := levenshtein(verb, tv)
+			if strings.Contains(tv, verb) || strings.Contains(verb, tv) {
+				distance = 0
+			}
+			siblings = append(siblings, candidate{t.Name, distance})
+		}
+	}
+	if len(siblings) == 0 {
+		return ""
+	}
+	sort.SliceStable(siblings, func(i, j int) bool {
+		if siblings[i].distance != siblings[j].distance {
+			return siblings[i].distance < siblings[j].distance
+		}
+		return siblings[i].name < siblings[j].name
+	})
+	names := make([]string, 0, len(siblings))
+	for _, c := range siblings {
+		names = append(names, c.name)
+	}
+	return "the " + connection + " connection's tools, nearest first: " + strings.Join(names, ", ")
+}
+
+// connectionNames is the sorted set of connection prefixes in the listing.
+func connectionNames(tools []cliclient.ToolInfo) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, t := range tools {
+		if c, _, ok := strings.Cut(strings.ToLower(t.Name), "__"); ok && !seen[c] {
+			seen[c] = true
+			names = append(names, c)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// nearestConnection resolves a misremembered connection name (zrl-bot,
+// hcdw, hack_club_warehouse) to the one real connection it most plausibly
+// means: a prefix or substring of it, its initials, or a near-typo. It
+// answers "" when no connection, or more than one, fits.
+func nearestConnection(guess string, tools []cliclient.ToolInfo) string {
+	guess = strings.ReplaceAll(guess, "-", "_")
+	var matches []string
+	for _, c := range connectionNames(tools) {
+		initials := ""
+		for _, part := range strings.Split(c, "_") {
+			if part != "" {
+				initials += part[:1]
+			}
+		}
+		if strings.Contains(c, guess) || guess == initials || levenshtein(guess, c) <= 2 {
+			matches = append(matches, c)
+		}
+	}
+	if len(matches) != 1 {
+		return ""
+	}
+	return matches[0]
 }
 
 // isWarehouseSchemaName reports whether name is a warehouse schema or layer
@@ -1127,6 +1180,12 @@ func renderCallOutput(raw json.RawMessage, format string, stdout, stderr io.Writ
 	}
 	if format == "structured" {
 		value, ok := result["structuredContent"]
+		if _, isMCP := result["content"]; !ok && !isMCP {
+			// A built-in tool answers with a plain object rather than an MCP
+			// result; that object is already the structured answer.
+			printCallJSON(stdout, raw)
+			return nil
+		}
 		if !ok || string(value) == "null" {
 			return fmt.Errorf("result has no structuredContent; use --output json")
 		}

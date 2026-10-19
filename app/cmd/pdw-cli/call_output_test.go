@@ -71,6 +71,9 @@ func TestCallOutputFormats(t *testing.T) {
 		{"legacy", `{"ok":true}`, "json", "{\n  \"ok\": true\n}\n", "", 0},
 		{"false", `{"isError":false,"content":[]}`, "text", "", "", 0},
 		{"missing content", `{"ok":true}`, "text", "{\"ok\":true}\n", "", 0},
+		// A built-in tool (get_object, propose_mutation) answers with a plain
+		// object: that object is the structured result.
+		{"plain object structured", `{"ok":true}`, "structured", "{\n  \"ok\": true\n}\n", "", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
