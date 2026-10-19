@@ -191,6 +191,48 @@ func TestSearchPassesMaxResultsSourcesAndSince(t *testing.T) {
 	}
 }
 
+// Agents write `--since 7d` far more often than a date (the week to
+// 2026-10-19: every relative since failed the hybrid lexical leg with
+// "invalid input syntax for type timestamp with time zone"), so a relative
+// window resolves against the clock before it reaches SQL.
+func TestSearchResolvesARelativeSinceAgainstTheClock(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	cases := map[string]string{
+		"7d":      "2026-10-12T12:00:00Z",
+		"30 days": "2026-09-19T12:00:00Z",
+		"12h":     "2026-10-19T00:00:00Z",
+		"2w":      "2026-10-05T12:00:00Z",
+		"1 week":  "2026-10-12T12:00:00Z",
+		"90min":   "2026-10-19T10:30:00Z",
+	}
+	for since, want := range cases {
+		runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+		svc := NewService(runner, Options{})
+		svc.now = func() time.Time { return now }
+
+		resp := svc.Search(context.Background(), SearchRequest{Query: "reunion", Mode: "keyword", Since: since})
+		if resp.Error != "" {
+			t.Fatalf("since %q: error: %s", since, resp.Error)
+		}
+		if got := runner.args[0][3]; got != want {
+			t.Fatalf("since %q: arg = %#v, want %q", since, got, want)
+		}
+	}
+}
+
+func TestSearchRejectsAnUnreadableSinceBeforeAnyLegRuns(t *testing.T) {
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+	svc := NewService(runner, Options{})
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "reunion", Mode: "keyword", Since: "last tuesday"})
+	if !strings.Contains(resp.Error, "since") || !strings.Contains(resp.Error, "7d") {
+		t.Fatalf("error = %q, want a since error naming the relative form", resp.Error)
+	}
+	if len(runner.args) != 0 {
+		t.Fatalf("ran %d statements for an unreadable since", len(runner.args))
+	}
+}
+
 func TestSearchHybridModeFansIndependentLegsOutThenFuses(t *testing.T) {
 	runner := &fakeSearchRunner{
 		fakeRunner: fakeRunner{results: hybridProbeResult(true)},

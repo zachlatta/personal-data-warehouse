@@ -40,7 +40,7 @@ than paging deeper.
   `whatsapp`, `calendar`, `drive`/`gdrive`, `contacts`, `notes`, `photos`,
   `voice_memos`/`transcripts`, `agent_session`/`agent_sessions`, `finance`, `whoop`,
   `slack_files`, `mutations`, `muse_file`. An unknown token errors with the valid set.
-- `since` — a lower bound on event time (`2026-03-01`). It is also the lever that makes
+- `since` — a lower bound on event time: a date (`2026-03-01`) or a trailing window (`7d`, `12h`, `2w`). It is also the lever that makes
   a scoped Google Drive search cheap: Drive documents are multi-megabyte and scoring 50
   of them costs seconds. **On a broad search it is the opposite**: a window of a few days
   on common words makes the ranked scan walk past every older match, and it times out

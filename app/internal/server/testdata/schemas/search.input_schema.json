@@ -24,7 +24,7 @@
       "type": "string"
     },
     "since": {
-      "description": "optional timestamptz lower bound on event time, e.g. 2026-03-01",
+      "description": "optional lower bound on event time: a date or timestamp (2026-03-01) or a trailing window (7d, 12h, 2w)",
       "type": "string"
     },
     "sources": {

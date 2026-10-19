@@ -87,7 +87,7 @@ FLAGS
 ` + warehouse.TimelinePriorityHelpLines("                         ") + `
                        Omitting it searches every tier. ` + warehouse.TimelinePriorities.Sentinel.Name + ` is also
                        accepted for diagnosis, but is not a sixth tier: ` + warehouse.TimelinePriorities.Sentinel.Meaning + `.
-  --since TIME         Lower event-time bound, e.g. 2026-08-01.
+  --since TIME         Lower event-time bound: 2026-08-01, or a window (7d, 12h, 2w).
   --output FMT         text (default) or json.
 
 An unknown flag anywhere on the line is an error, never part of the query.

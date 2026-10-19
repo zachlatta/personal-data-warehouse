@@ -277,6 +277,27 @@ func TestTypeMismatchOnJSONAndArrayColumnsSaysHowToCast(t *testing.T) {
 // The long tail of wrong names is mostly a real column with a word added or
 // dropped -- operation_type for operation, account_name for account + name,
 // value for point_value -- which is out of reach of Postgres' own suggestion.
+// A bare `id` was the most common unhinted column guess in the week to
+// 2026-10-19 (13 calls, mostly base_gmail.messages and base_slack.users),
+// and the key column is named for the relation.
+func TestABareIDGuessNamesTheRelationsOwnKeyColumn(t *testing.T) {
+	for _, c := range []struct {
+		relation string
+		columns  []string
+		want     string
+	}{
+		{"messages", []string{"account", "message_id", "thread_id"}, "message_id"},
+		{"users", []string{"account", "team_id", "user_id", "team_user_id"}, "user_id"},
+		{"entries", []string{"entry_id", "account"}, "entry_id"},
+		{"recordings", []string{"recording_id"}, "recording_id"},
+		{"net_worth", []string{"as_of", "total"}, ""},
+	} {
+		if got := relationKeyColumn(c.relation, c.columns); got != c.want {
+			t.Fatalf("relationKeyColumn(%q) = %q, want %q", c.relation, got, c.want)
+		}
+	}
+}
+
 func TestUndefinedColumnErrorNamesColumnsThatShareItsWords(t *testing.T) {
 	for _, c := range []struct {
 		missing string

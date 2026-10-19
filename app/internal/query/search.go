@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -388,7 +389,12 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	}
 	var since any
 	if trimmed := strings.TrimSpace(req.Since); trimmed != "" {
-		since = trimmed
+		resolved, err := resolveSearchSince(trimmed, s.now())
+		if err != nil {
+			resp.Error = err.Error()
+			return resp
+		}
+		since = resolved
 	}
 	var priorities any
 	if len(req.Priorities) > 0 {
@@ -763,4 +769,40 @@ func (s *Service) unknownSourceMessage(ctx context.Context, token string) string
 		valid = append(valid, fmt.Sprint(row["source"]))
 	}
 	return message + "; valid sources: " + strings.Join(valid, ", ")
+}
+
+// searchRelativeSince is a trailing window such as 7d, 12h, 2w, 90min or
+// "30 days". Agents write this form far more often than a date.
+var searchRelativeSince = regexp.MustCompile(`^(\d+)\s*(min|mins|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?)$`)
+
+// searchAbsoluteSince is left to Postgres to parse: a date or timestamp, or
+// one of its own special words.
+var searchAbsoluteSince = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}|today$|yesterday$|now$)`)
+
+// resolveSearchSince turns a relative since into an absolute UTC timestamp
+// against now and passes an absolute one through. Anything else is refused
+// up front: an unparseable bound used to reach every leg's timestamptz cast
+// and fail the search with a SQL error that named no flag.
+func resolveSearchSince(raw string, now time.Time) (string, error) {
+	lowered := strings.ToLower(raw)
+	if m := searchRelativeSince.FindStringSubmatch(lowered); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return "", fmt.Errorf("since %q: %w", raw, err)
+		}
+		unit := time.Hour
+		switch m[2][0] {
+		case 'm':
+			unit = time.Minute
+		case 'd':
+			unit = 24 * time.Hour
+		case 'w':
+			unit = 7 * 24 * time.Hour
+		}
+		return now.Add(-time.Duration(n) * unit).UTC().Format(time.RFC3339), nil
+	}
+	if searchAbsoluteSince.MatchString(lowered) {
+		return raw, nil
+	}
+	return "", fmt.Errorf("since must be a date or timestamp (2026-08-01, 2026-08-01T09:00:00-04:00) or a trailing window (7d, 12h, 2w, 90min); got %q", raw)
 }

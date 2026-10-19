@@ -93,7 +93,7 @@ type searchInput struct {
 	Query      string   `json:"query" jsonschema:"search text to run against the cross-source timeline corpus"`
 	MaxResults int      `json:"max_results,omitempty" jsonschema:"maximum hits to return, default 20; request more only for recall work"`
 	Sources    []string `json:"sources,omitempty" jsonschema:"optional source tokens or aliases (slack, gmail, apple_messages, drive, ...); an unknown token errors listing the valid set"`
-	Since      string   `json:"since,omitempty" jsonschema:"optional timestamptz lower bound on event time, e.g. 2026-03-01"`
+	Since      string   `json:"since,omitempty" jsonschema:"optional lower bound on event time: a date or timestamp (2026-03-01) or a trailing window (7d, 12h, 2w)"`
 	Mode       string   `json:"mode,omitempty" jsonschema:"hybrid (default: semantic+keyword; falls back to keyword when embeddings are unavailable), keyword (BM25 ranked), or exact (literal substring/phrase/id match)"`
 	Priorities []string `json:"priorities,omitempty" jsonschema:"optional values from the timeline priority contract; omit to search every tier; an unknown token errors listing the valid set"`
 }

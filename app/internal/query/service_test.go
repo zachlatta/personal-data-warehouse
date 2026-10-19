@@ -853,6 +853,10 @@ func TestRawTextScanHintFiresOnlyForRawPatternScansOutsideTheTimeline(t *testing
 		"SELECT * FROM timeline.search_text('malted', 20)":                                                                                  false,
 		"SELECT e.* FROM timeline.events e JOIN base_slack.messages m ON m.message_ts = e.source_pk->>'ts' WHERE e.search_text ILIKE '%x%'": false,
 		"SELECT * FROM marts_messages.messages WHERE body ILIKE '%x%'":                                                                      false,
+		// A pattern function that only formats the SELECT list scans nothing:
+		// 2026-10-19's week drew this hint on such queries dozens of times.
+		"select m.message_datetime, left(regexp_replace(m.text,'\\s+',' ','g'),250) t from base_slack.messages m where m.conversation_id='C1' limit 60": false,
+		"select left(regexp_replace(text,'\\s+',' ','g'),160) from base_slack.messages where text ilike '%liftoff%'":                                    true,
 	}
 	for sql, want := range cases {
 		got := rawTextScanHint(sql) != ""

@@ -67,6 +67,8 @@ type Service struct {
 	// /proc for that snapshot; tests replace both.
 	slowSearchThreshold time.Duration
 	readHostFile        func(string) ([]byte, error)
+	// now resolves a relative search since (7d); tests pin it.
+	now func() time.Time
 }
 
 type tableRef struct {
@@ -189,7 +191,7 @@ func NewService(runner Runner, opts Options) *Service {
 	}
 	return &Service{
 		runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder,
-		slowSearchThreshold: slowSearchThreshold, readHostFile: os.ReadFile,
+		slowSearchThreshold: slowSearchThreshold, readHostFile: os.ReadFile, now: time.Now,
 	}
 }
 
@@ -728,6 +730,11 @@ func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) st
 		for _, column := range similarColumns(missing, columns) {
 			similar = append(similar, ref.DisplayName()+"."+column)
 		}
+		if strings.EqualFold(missing, "id") {
+			if column := relationKeyColumn(ref.Name, columns); column != "" {
+				similar = append(similar, ref.DisplayName()+"."+column)
+			}
+		}
 		if len(columns) > maxHintColumns {
 			columns = append(columns[:maxHintColumns:maxHintColumns], "...")
 		}
@@ -740,6 +747,27 @@ func (s *Service) queryErrorMessage(ctx context.Context, message, sql string) st
 		out += " (did you mean " + strings.Join(similar, " / ") + "?)"
 	}
 	return out + " (" + strings.Join(parts, "; ") + ")"
+}
+
+// relationKeyColumn is the <singular>_id column a relation is keyed by
+// (messages -> message_id, entries -> entry_id), or "" when it has none.
+func relationKeyColumn(relation string, columns []string) string {
+	relation = strings.ToLower(relation)
+	candidates := []string{relation + "_id"}
+	switch {
+	case strings.HasSuffix(relation, "ies"):
+		candidates = append(candidates, strings.TrimSuffix(relation, "ies")+"y_id")
+	case strings.HasSuffix(relation, "s"):
+		candidates = append(candidates, strings.TrimSuffix(relation, "s")+"_id")
+	}
+	for _, column := range columns {
+		for _, candidate := range candidates {
+			if strings.EqualFold(column, candidate) {
+				return column
+			}
+		}
+	}
+	return ""
 }
 
 // similarColumns names the real columns that share the missing name's words:
@@ -821,7 +849,13 @@ func rawTextScanHint(sql string) string {
 	if strings.Contains(lower, "timeline.") {
 		return ""
 	}
-	if !rawBaseTableRef.MatchString(lower) || !rawTextScanOp.MatchString(lower) {
+	// Only a pattern match after the first FROM filters rows; one inside the
+	// SELECT list (left(regexp_replace(text, ...))) just formats the output.
+	predicates := lower
+	if loc := firstFromKeyword.FindStringIndex(lower); loc != nil {
+		predicates = lower[loc[0]:]
+	}
+	if !rawBaseTableRef.MatchString(lower) || !rawTextScanOp.MatchString(predicates) {
 		return ""
 	}
 	return "(hint: this pattern-matches text in a raw base_* table without going through the timeline. " +
@@ -870,6 +904,7 @@ func sqlUsageHint(sql string) string {
 
 var (
 	rawBaseTableRef           = regexp.MustCompile(`\bbase_[a-z0-9_]+\.[a-z0-9_]+`)
+	firstFromKeyword          = regexp.MustCompile(`\sfrom\s`)
 	rawTextScanOp             = regexp.MustCompile(`\bilike\b|\blike\b|\bsimilar to\b|~\*?|\bregexp_(?:matches|like|replace|count)\s*\(|\bposition\s*\(`)
 	timelineEventsRef         = regexp.MustCompile(`(?i)(?:"timeline"|timeline)\s*\.\s*(?:"events"|events\b)`)
 	timelinePriorityPredicate = regexp.MustCompile(`(?i)(?:[a-z_][a-z0-9_]*\s*\.\s*)?(?:"priority"|priority)\s*(?:=|<>|!=|\bin\s*\()`)
