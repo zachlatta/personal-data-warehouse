@@ -177,7 +177,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +5 derived: derived_search.chunk_vectors and its four adapter
         # partitions, the semantic leg's per-chunk vectors with their filter
         # columns (a scoped ANN scan joined per-sha vectors to chunks before).
-        "derived": 28,
+        # +2 derived: derived_voice_memos.continuity_judgments/.session_enrichments,
+        # back-to-back recordings an agent judged one event.
+        "derived": 30,
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
@@ -218,7 +220,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_ops.voice_memo_landing_health, S2's speed half: a
             # short memo took p50 9 min to become a transcript while S2 read
             # green, because coverage cannot see speed.
-            "marts": 65,
+            # +1 marts: marts_voice_memos.sessions, those recordings merged.
+            "marts": 66,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

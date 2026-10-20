@@ -1177,6 +1177,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     Pipeline(
+        id="voice_memo_continuity",
+        label="Voice memo continuity",
+        kind="enrichment",
+        cadence="hourly :47 + backlog sensor",
+        transport="Dagster voice_memo_continuity → agent container",
+        expected_data_interval=None,
+        expected_run_interval=None,
+        note="only runs when two recordings sit back to back; a quiet week writes nothing",
+        # One judgment row per recording pair, overwritten on retry: an agent
+        # failure lands as status='error' with the exception text.
+        state=StateSource(
+            table="voice_memo_continuity_judgments",
+            updated_column="created_at",
+            status_column="status",
+            error_column="error",
+            error_window=timedelta(days=7),
+        ),
+    ),
+    Pipeline(
         id="manual_finance_extraction",
         label="Manual finance extraction",
         kind="enrichment",
@@ -1522,6 +1541,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "apple_voice_memos_transcription_runs": _data("voice_memo_transcription", "requested_at"),
     "apple_voice_memos_transcript_segments": _support("voice_memo_transcription", "created_at"),
     "apple_voice_memos_enrichments": _data("voice_memo_enrichment", "created_at", "start_at"),
+    "voice_memo_continuity_judgments": _data("voice_memo_continuity", "created_at"),
+    "voice_memo_session_enrichments": _support("voice_memo_continuity", "created_at"),
     # Alice
     "alice_voice_recordings": _data("alice_voice_recordings", "ingested_at", "recorded_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),

@@ -1612,6 +1612,30 @@
       }
     },
     {
+      "id": "voice_memo_continuity_judgments",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "voice_memos",
+      "schema": "derived_voice_memos",
+      "name": "continuity_judgments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Pair verdicts. One agent judgment per pair of back-to-back recordings: did the later one carry on the same event (verdict, confidence, reason). Read marts_voice_memos.sessions."
+    },
+    {
+      "id": "voice_memo_session_enrichments",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "voice_memos",
+      "schema": "derived_voice_memos",
+      "name": "session_enrichments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Merged enrichments. One enrichment over a multi-recording session, keyed by the comma-joined member ids. Read marts_voice_memos.sessions."
+    },
+    {
       "id": "google_drive_file_texts",
       "kind": "table",
       "layer": "derived",
@@ -2144,6 +2168,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Speaker-labelled transcript utterances with their recording's title and a spoken_at wall-clock instant derived from the segment offset. Timestamps are NULL when the recording has no known date (the warehouse's 1970-01-01 sentinel), so spoken_at is NULL rather than an offset from 1970. Only apple_voice_memos produces transcript segments today; the source column is there so another voice source can join without changing callers."
+    },
+    {
+      "id": "marts_voice_memos_sessions",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "voice_memos",
+      "schema": "marts_voice_memos",
+      "name": "sessions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "One row per event. Back-to-back recordings an agent judged one event (a memo stopped and restarted) are merged: all transcripts in order, one title, summary, participants and action items. A lone recording is a session of one; recording_ids lists the members; merge_status is single, pending or merged."
     },
     {
       "id": "marts_finance_accounts",

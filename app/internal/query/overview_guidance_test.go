@@ -162,8 +162,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// sources landed the same day, each with one START HERE relation
 	// (base_github.issues, base_browser_history.visits) whose rendered line is
 	// a few words. 9750 is those two entry points and no more.
-	if guidance > 9750 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9750)", guidance)
+	//
+	// 9750 held until 2026-10-20, when marts_voice_memos.sessions landed (back-
+	// to-back recordings an agent judged one event, merged) with its two
+	// derived tables. Their first sentences are two or three words each
+	// (10094 -> 9816). 9850 is that and no more.
+	if guidance > 9850 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9850)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

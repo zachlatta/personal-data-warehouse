@@ -133,8 +133,11 @@ from personal_data_warehouse.schema import (
     SYNC_STATE_COLUMNS,
     TIMELINE_EVENT_COLUMNS,
     TIMELINE_SYNC_STATE_COLUMNS,
+    VOICE_MEMO_CONTINUITY_JUDGMENT_COLUMNS,
+    VOICE_MEMO_CONTINUITY_MIN_CONFIDENCE,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
+    VOICE_MEMO_SESSION_ENRICHMENT_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
     VOICE_MEMO_TRANSCRIPT_SEGMENT_COLUMNS,
     WHATSAPP_CHAT_COLUMNS,
@@ -916,6 +919,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "apple_voice_memos_enrichments": TableSpec(
         VOICE_MEMO_ENRICHMENT_COLUMNS,
         ("source", "account", "recording_id", "provider", "model", "prompt_version"),
+    ),
+    "voice_memo_continuity_judgments": TableSpec(
+        VOICE_MEMO_CONTINUITY_JUDGMENT_COLUMNS,
+        ("source", "account", "previous_recording_id", "recording_id"),
+    ),
+    "voice_memo_session_enrichments": TableSpec(
+        VOICE_MEMO_SESSION_ENRICHMENT_COLUMNS,
+        ("source", "account", "session_id", "member_recording_ids"),
     ),
     "alice_voice_recordings": TableSpec(
         ALICE_VOICE_RECORDING_COLUMNS,
@@ -3214,6 +3225,8 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    # voice memo continuity: seconds between one recording ending and the next starting.
+    "gap_seconds",
     # WHOOP Healthspan and Advanced Labs (whoop_private_healthspan.py).
     "whoop_age",
     "years_difference",
@@ -4972,6 +4985,8 @@ class PostgresWarehouse:
                 "apple_voice_memos_transcription_runs",
                 "apple_voice_memos_transcript_segments",
                 "apple_voice_memos_enrichments",
+                "voice_memo_continuity_judgments",
+                "voice_memo_session_enrichments",
                 "agent_runs",
                 "agent_run_events",
                 "agent_run_tool_calls",
@@ -12602,6 +12617,12 @@ class PostgresWarehouse:
     def insert_voice_memo_enrichments(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_enrichments(rows)
 
+    def insert_voice_memo_continuity_judgments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_continuity_judgments", rows, VOICE_MEMO_CONTINUITY_JUDGMENT_COLUMNS)
+
+    def insert_voice_memo_session_enrichments(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("voice_memo_session_enrichments", rows, VOICE_MEMO_SESSION_ENRICHMENT_COLUMNS)
+
     def insert_photo_source_files(self, table: str, rows: list[dict[str, Any]]) -> None:
         """Insert raw photo file rows into one source's files table.
 
@@ -17747,6 +17768,8 @@ class PostgresWarehouse:
                 "apple_voice_memos_transcription_runs",
                 "apple_voice_memos_transcript_segments",
                 "apple_voice_memos_enrichments",
+                "voice_memo_continuity_judgments",
+                "voice_memo_session_enrichments",
                 "alice_voice_recordings",
                 "apple_note_attachments",
                 "apple_note_revisions",
@@ -17972,6 +17995,7 @@ class PostgresWarehouse:
             """,
             dependents=(
                 "marts_voice_memos_transcript_segments",
+                "marts_voice_memos_sessions",
                 "clean_calendar_with_transcripts",
                 "clean_transcripts_no_calendar_match",
             ),
@@ -18011,12 +18035,138 @@ class PostgresWarehouse:
              AND run.provider_transcript_id = s.provider_transcript_id
             """,
         )
+        self._ensure_voice_memo_sessions_view()
         # The marts_calendar transcript views consume the mart, so they are
         # rebuilt here: the column-drift path above may have had to drop them
         # to replace the mart, and this is the one place that always runs
         # afterwards.
         self._ensure_calendar_transcript_views()
         self._ensure_voice_memo_landing_health_view()
+
+    def _ensure_voice_memo_sessions_view(self) -> None:
+        """marts_voice_memos.sessions: back-to-back recordings of one event, as one.
+
+        Zach stops a memo and starts another in the middle of one lecture,
+        meeting or thought, and every recording was its own island: two titles,
+        two summaries, half the action items each. A session is a run of
+        consecutive recordings of one source and account where the continuity
+        agent judged each one to carry on the previous one
+        (derived_voice_memos.continuity_judgments, verdict same_event). Time
+        only proposes a pair; the decision is the agent's reading of both
+        transcripts, so two unrelated task memos a minute apart stay apart.
+
+        Every recording belongs to exactly one session, so a single recording
+        is a session of one carrying its own enrichment. A merged session
+        reads the session enrichment written over all its members; until that
+        lands (merge_status 'pending') it falls back to the first member's
+        title and summary. The transcript is always every member's, in order.
+        The previous recording is the one before it among non-deleted rows, so
+        a judgment for a pair that a deletion has since separated is ignored.
+        """
+        self._ensure_view(
+            "marts_voice_memos_sessions",
+            f"""
+            CREATE OR REPLACE VIEW @marts_voice_memos_sessions AS
+            WITH ordered AS (
+                SELECT
+                    r.*,
+                    LAG(r.recording_id) OVER (
+                        PARTITION BY r.source, r.account
+                        ORDER BY r.recorded_at NULLS FIRST, r.recording_id
+                    ) AS previous_recording_id
+                FROM @marts_voice_memos_recordings r
+                WHERE r.is_deleted = 0
+            ),
+            linked AS (
+                SELECT
+                    o.*,
+                    COALESCE(
+                        j.verdict = 'same_event'
+                        AND j.confidence >= {VOICE_MEMO_CONTINUITY_MIN_CONFIDENCE},
+                        false
+                    ) AS continues_previous
+                FROM ordered o
+                LEFT JOIN @voice_memo_continuity_judgments j
+                  ON j.source = o.source
+                 AND j.account = o.account
+                 AND j.previous_recording_id = o.previous_recording_id
+                 AND j.recording_id = o.recording_id
+                 AND j.status = 'completed'
+            ),
+            numbered AS (
+                SELECT
+                    l.*,
+                    SUM(CASE WHEN l.continues_previous THEN 0 ELSE 1 END) OVER (
+                        PARTITION BY l.source, l.account
+                        ORDER BY l.recorded_at NULLS FIRST, l.recording_id
+                        ROWS UNBOUNDED PRECEDING
+                    ) AS session_seq
+                FROM linked l
+            ),
+            sessions AS (
+                SELECT
+                    n.source,
+                    n.account,
+                    array_agg(n.recording_id ORDER BY n.recorded_at NULLS FIRST, n.recording_id) AS recording_ids,
+                    count(*) AS recording_count,
+                    min(n.recorded_at) AS started_at,
+                    max(n.recorded_at + make_interval(secs => COALESCE(n.duration_seconds, 0)::float8)) AS ended_at,
+                    sum(n.duration_seconds) AS duration_seconds,
+                    (array_agg(n.title ORDER BY n.recorded_at NULLS FIRST, n.recording_id))[1] AS first_title,
+                    (array_agg(n.summary ORDER BY n.recorded_at NULLS FIRST, n.recording_id))[1] AS first_summary,
+                    (array_agg(n.participants_json ORDER BY n.recorded_at NULLS FIRST, n.recording_id))[1] AS first_participants_json,
+                    (array_agg(n.action_items_json ORDER BY n.recorded_at NULLS FIRST, n.recording_id))[1] AS first_action_items_json,
+                    (array_agg(n.calendar_event_id ORDER BY n.recorded_at NULLS FIRST, n.recording_id)
+                        FILTER (WHERE n.calendar_event_id IS NOT NULL))[1] AS calendar_event_id,
+                    string_agg(
+                        COALESCE(n.transcript, ''),
+                        E'\\n\\n[next recording]\\n\\n'
+                        ORDER BY n.recorded_at NULLS FIRST, n.recording_id
+                    ) AS transcript,
+                    max(n.enriched_at) AS members_enriched_at,
+                    count(*) FILTER (WHERE n.enriched_at IS NULL) AS members_unenriched
+                FROM numbered n
+                GROUP BY n.source, n.account, n.session_seq
+            )
+            SELECT
+                s.source,
+                s.account,
+                s.recording_ids[1] AS session_id,
+                s.recording_ids,
+                s.recording_count,
+                s.started_at,
+                s.ended_at,
+                s.duration_seconds,
+                CASE WHEN s.recording_count > 1 THEN COALESCE(NULLIF(se.title, ''), s.first_title) ELSE s.first_title END AS title,
+                CASE WHEN s.recording_count > 1 THEN COALESCE(NULLIF(se.summary, ''), s.first_summary) ELSE s.first_summary END AS summary,
+                s.transcript,
+                CASE WHEN s.recording_count > 1 THEN COALESCE(NULLIF(se.participants_json, ''), s.first_participants_json)
+                     ELSE s.first_participants_json END AS participants_json,
+                CASE WHEN s.recording_count > 1 THEN COALESCE(NULLIF(se.action_items_json, ''), s.first_action_items_json)
+                     ELSE s.first_action_items_json END AS action_items_json,
+                s.calendar_event_id,
+                CASE
+                    WHEN s.recording_count = 1 THEN 'single'
+                    WHEN se.created_at IS NULL THEN 'pending'
+                    ELSE 'merged'
+                END AS merge_status,
+                NULLIF(se.created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS merged_at,
+                s.members_enriched_at,
+                s.members_unenriched
+            FROM sessions s
+            LEFT JOIN LATERAL (
+                SELECT e.title, e.summary, e.participants_json, e.action_items_json, e.created_at
+                FROM @voice_memo_session_enrichments e
+                WHERE s.recording_count > 1
+                  AND e.source = s.source
+                  AND e.account = s.account
+                  AND e.member_recording_ids = array_to_string(s.recording_ids, ',')
+                  AND e.status = 'completed'
+                ORDER BY e.created_at DESC
+                LIMIT 1
+            ) se ON true
+            """,
+        )
 
     def _ensure_voice_memo_landing_health_view(self) -> None:
         """How fast a voice memo becomes a stored transcript (S2's speed half).

@@ -297,6 +297,27 @@ One timeline adapter (`voice_memo`, source `voice_memos`, kind `voice_memo`, pri
 says which one, and `source_pk` carries `{source, account, recording_id}`. Search scopes
 them together under `sources => ARRAY['transcript']`.
 
+**A memo stopped and restarted is one event: `marts_voice_memos.sessions`.** Added
+2026-10-20 at Zach's request ("if I stop a memo and then start another one, it'll cleanly be
+able to transition them over"; it must understand the content, not guess from timing). The
+`voice_memo_continuity` asset runs after enrichment (hourly :47 plus a two-minute backlog
+sensor; `VOICE_MEMO_CONTINUITY_ENABLED=0` turns it off). Step one: every pair of consecutive
+recordings of one source and account that sit within 30 minutes
+(`VOICE_MEMO_CONTINUITY_MAX_GAP_SECONDS`) goes to the fleet agent with the end of the first
+transcript, the start of the second and both summaries; it answers `same_event` or `separate`
+with a confidence and reason, stored per pair in `derived_voice_memos.continuity_judgments`
+and asked again when either transcript changes. Time only proposes: measured over 60 days,
+the window holds every real restart (a lecture split by 3 s, a demo session by 8 s) and
+dozens of unrelated task memos a minute apart. Step two: a run of recordings joined by
+`same_event` at confidence 0.7 or more is a session, and a session of two or more gets one
+enrichment written over all its members (`derived_voice_memos.session_enrichments`, keyed by
+the member list, redone when a member is re-enriched). A session that ended inside the window
+with nothing recorded after it waits, so three restarts merge once. The view gives every
+recording exactly one session (a lone recording is a session of one with its own
+enrichment); `merge_status` is `single`, `pending` (joined, merged record not written yet:
+the first member's title stands in) or `merged`. Each member recording keeps its own row in
+`marts_voice_memos.recordings` and on the timeline; sessions are not a timeline source yet.
+
 ## Local Voice Memos Upload Scheduler
 
 This Mac is intended to run the local Voice Memos uploader through a user LaunchAgent:

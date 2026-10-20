@@ -490,6 +490,57 @@ VOICE_MEMO_ENRICHMENT_COLUMNS = (
     "sync_version",
 )
 
+# A same_event judgment below this confidence does not join two recordings.
+VOICE_MEMO_CONTINUITY_MIN_CONFIDENCE = 0.7
+
+# One judgment per pair of back-to-back recordings of one source: did the later
+# recording carry on the same event as the earlier one? Keyed by the pair, so a
+# retry or a re-judgment after re-transcription overwrites the row.
+VOICE_MEMO_CONTINUITY_JUDGMENT_COLUMNS = (
+    "source",
+    "account",
+    "previous_recording_id",
+    "recording_id",
+    "previous_provider_transcript_id",
+    "provider_transcript_id",
+    "gap_seconds",
+    "provider",
+    "model",
+    "prompt_version",
+    "status",
+    "error",
+    "attempts",
+    "verdict",
+    "confidence",
+    "reason",
+    "raw_result_json",
+    "created_at",
+    "sync_version",
+)
+
+# One enrichment per multi-recording session: the title, summary, participants
+# and action items of the whole event, written over every member recording.
+VOICE_MEMO_SESSION_ENRICHMENT_COLUMNS = (
+    "source",
+    "account",
+    "session_id",
+    "member_recording_ids",
+    "provider",
+    "model",
+    "prompt_version",
+    "status",
+    "error",
+    "attempts",
+    "title",
+    "summary",
+    "participants_json",
+    "action_items_json",
+    "evidence_json",
+    "raw_result_json",
+    "created_at",
+    "sync_version",
+)
+
 APPLE_NOTE_COLUMNS = (
     "account",
     "note_id",

@@ -111,6 +111,7 @@ class ContainerAgentStructuredClient:
         logger=None,
         recording_id: str = "",
         prompt_version: str = "",
+        task_type: str = "apple_voice_memo_enrichment",
     ) -> Mapping[str, Any]:
         prompt = container_agent_prompt(
             system_prompt=system_prompt,
@@ -125,7 +126,7 @@ class ContainerAgentStructuredClient:
         request = AgentRunRequest(
             prompt=prompt,
             schema=schema,
-            task_type="apple_voice_memo_enrichment",
+            task_type=task_type,
             subject_id=recording_id,
             prompt_version=prompt_version,
             provider=self._provider,

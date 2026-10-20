@@ -613,6 +613,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "receipt_enrichment.py",
     "securities_ledger.py",
     "slack_file_fingerprints.py",
+    "voice_memo_continuity.py",
     "defs/apple_messages_attachment_enrichment.py",
     "defs/apple_messages_audio_transcription.py",
     "defs/apple_notes_attachment_enrichment.py",
@@ -625,6 +626,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "defs/photo_identity.py",
     "defs/receipt_enrichment.py",
     "defs/slack_file_fingerprints.py",
+    "defs/voice_memo_continuity.py",
     "defs/whatsapp_audio_transcription.py",
     "defs/whatsapp_media_enrichment.py",
 )

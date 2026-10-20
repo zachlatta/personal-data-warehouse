@@ -3564,6 +3564,14 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "apple_voice_memos_enrichments": _detail(
         "apple_voice_memos_files", "agent enrichment for every voice source"
     ),
+    # Read through marts_voice_memos.sessions; each member recording keeps its
+    # own timeline row through the voice adapter.
+    "voice_memo_continuity_judgments": _detail(
+        "apple_voice_memos_files", "whether a recording carries on the one before it"
+    ),
+    "voice_memo_session_enrichments": _detail(
+        "apple_voice_memos_files", "one enrichment over a run of back-to-back recordings"
+    ),
     # Alice Voice Recordings
     "alice_voice_recordings": _events(),
     "alice_voice_recording_artifacts": _detail(
