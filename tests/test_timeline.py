@@ -1159,10 +1159,33 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh.upsert_hacker_news_user_items(account="zachlatta", relation="upvoted", item_ids=["100"], now=_NOW)
     _seed_github(wh)
+    _seed_feed(wh)
 
 
 def _gh_ts(hours: int) -> str:
     return (_NOW - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_feed(wh) -> None:
+    # Feed tab: one card, and one of each kind of phone event on it. Only the
+    # open, the like and the dismiss are timeline events; the impression,
+    # the close and the session rows are telemetry.
+    wh._command(
+        "INSERT INTO @feed_items (item_id, source, item_key, title, body, url, site) "
+        "VALUES ('hn:1', 'hn', '1', 'A synthetic story', 'about synthetic things', "
+        "'https://example.test/story', 'example.test')"
+    )
+    for n, (event_type, metadata) in enumerate((
+        ("session_start", "{}"), ("impression", "{}"), ("open", '{"mode": "browser"}'),
+        ("close", "{}"), ("like", "{}"), ("dismiss", '{"reason": "less_like_this"}'),
+        ("session_end", "{}"),
+    )):
+        wh._command(
+            "INSERT INTO @feed_events (event_id, event_type, item_id, session_id, occurred_at, "
+            "received_at, metadata) VALUES (%s, %s, %s, 's1', %s, %s, %s::jsonb)",
+            (f"fe{n}", event_type, "" if event_type.startswith("session") else "hn:1",
+             _NOW - timedelta(hours=6) + timedelta(minutes=n), _NOW, metadata),
+        )
 
 
 def _seed_github(wh) -> None:
@@ -1311,6 +1334,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "github_event": "self",
     "browser_visit": "self",
     "browser_search": "self",
+    "feed_engagement": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
@@ -1355,6 +1379,8 @@ EXPECTED_SEEDED_EVENTS = {
     # 4 (reload) stay in base_browser_history only.
     "browser_visit": 2,
     "browser_search": 1,
+    # open + like + dismiss; impression, close and the session rows stay in base_feed.
+    "feed_engagement": 3,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -1542,6 +1568,13 @@ def test_backfill_normalizes_every_source(warehouse):
     assert browser["5"]["title"] == "Searched: synthetic query"
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
+    feed = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "feed"}
+    assert set(feed) == {"fe2", "fe4", "fe5"}
+    assert feed["fe4"]["title"] == "Liked: A synthetic story"
+    assert feed["fe2"]["title"] == "Opened: A synthetic story"
+    assert feed["fe5"]["metadata"]["reason"] == "less_like_this"
+    assert feed["fe4"]["context"] == "s1"
+    assert "synthetic things" in feed["fe4"]["search_text"]
 
     # Second run is a no-op: nothing new, no seq churn. Keyed on the real
     # primary key: event_id alone is only unique within an adapter, and the

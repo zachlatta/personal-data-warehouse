@@ -2211,6 +2211,41 @@ _BROWSER_SEARCH = _simple_adapter(
     **_BROWSER_COMMON,
 )
 
+# --- Feed tab (personal_data_warehouse/feed.py) ------------------------------
+#
+# base_feed.events is the phone's engagement log for the cards agents push.
+# Only the deliberate acts are timeline events -- opening a card, liking it,
+# dismissing it -- and they are `self`: Zach did them. Impressions, dwell and
+# sessions are telemetry (thousands a week) and are read through
+# marts_feed.item_engagement instead. The context is the feed session, so
+# timeline.context() on a like returns what else he opened in that sitting.
+_FEED_ENGAGEMENT = _simple_adapter(
+    name="feed_engagement",
+    source_table="feed_events",
+    source="feed",
+    kind="engagement",
+    from_sql="@feed_events t LEFT JOIN @feed_items i ON i.item_id = t.item_id",
+    event_id="t.event_id",
+    event_ts="t.occurred_at",
+    ingest_ts="t.received_at",
+    actor="'me'",
+    title=(
+        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'like' THEN 'Liked: ' "
+        "ELSE 'Dismissed: ' END, COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
+    ),
+    snippet=_snippet("concat_ws(' · ', NULLIF(i.source, ''), NULLIF(i.site, ''), NULLIF(i.url, ''))"),
+    context="t.session_id",
+    source_pk="jsonb_build_object('event_id', t.event_id)",
+    metadata=(
+        "jsonb_build_object('event_type', t.event_type, 'item_id', t.item_id, "
+        "'feed_source', i.source, 'url', i.url, 'reason', t.metadata->>'reason', "
+        "'mode', t.metadata->>'mode')"
+    ),
+    search_text=_search_concat("i.title", "left(i.body, 2000)", "i.site", "i.author", "i.source"),
+    where="t.event_type IN ('open', 'like', 'dismiss')",
+    priority=TIMELINE_PRIORITY_SELF,
+)
+
 _HACKER_NEWS_ITEM = _simple_adapter(
     name="hacker_news_item",
     source_table="hacker_news_items",
@@ -3093,6 +3128,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _GITHUB_EVENT,
     _BROWSER_VISIT,
     _BROWSER_SEARCH,
+    _FEED_ENGAGEMENT,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
@@ -3324,6 +3360,8 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "github_event",
         "browser_visit",
         "browser_search",
+        # context is the feed session.
+        "feed_engagement",
         "finance_transaction",
         "finance_observation",
         "manual_finance_document",
@@ -3677,6 +3715,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Hacker News: one events table; the why-rows and profile hang off it.
     # Browser history: one events table, two adapters (page views, searches).
     "browser_history_visits": _events(),
+    # Feed tab: agents' cards are entities; the phone's engagement log is the
+    # events table (open/like/dismiss reach the timeline, telemetry does not).
+    "feed_items": _entity(
+        "cards agents push to the Feed tab; reached through marts_feed.item_engagement, "
+        "and each open/like/dismiss on one is a feed_engagement timeline event"
+    ),
+    "feed_events": _events(),
     "hacker_news_items": _events(),
     "hacker_news_user_items": _detail(
         "hacker_news_items", "why an item is archived (submitted / favorited / upvoted / hidden)"
@@ -3841,6 +3886,8 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "upstream_mutation_request_events",
     "push_devices",
     "app_access_tokens",
+    # The Feed tab (feed.py): written by the Go app, declared in raw DDL.
+    "feed_items", "feed_events",
     "search_schema_state",
     # Partitioned (CREATE TABLE ... PARTITION BY), which TableSpec cannot
     # express; created by ensure_search_index_tables where pgvector exists.

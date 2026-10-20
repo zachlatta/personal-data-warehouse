@@ -389,6 +389,12 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("browser_visit", "browser_search"),
         "COALESCE(t.metadata->>'browser', t.kind)",
     ),
+    # Feed tab acts (open / like / dismiss); the subsource is the act.
+    (
+        "feed",
+        ("feed_engagement",),
+        "COALESCE(t.metadata->>'event_type', t.kind)",
+    ),
 )
 # The adapters the broad-search pool scans through the low-volume partial BM25
 # index, derived from the source map so a new source cannot be forgotten.
@@ -7174,6 +7180,9 @@ class PostgresWarehouse:
         from personal_data_warehouse.notifications import ensure_notification_tables
 
         ensure_notification_tables(self)
+        from personal_data_warehouse.feed import ensure_feed_tables
+
+        ensure_feed_tables(self)
         self._ensure_timeline_comments()
         self._ensure_search_views_if_possible()
 

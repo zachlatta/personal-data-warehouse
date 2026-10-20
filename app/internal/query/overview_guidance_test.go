@@ -167,8 +167,15 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// to-back recordings an agent judged one event, merged) with its two
 	// derived tables. Their first sentences are two or three words each
 	// (10094 -> 9816). 9850 is that and no more.
-	if guidance > 9850 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9850)", guidance)
+	//
+	// 9850 held until later on 2026-10-20, when the Feed tab module landed with four
+	// relations (base_feed.items/events, marts_feed.item_engagement and
+	// source_engagement) whose rendered lines were cut to two or three words
+	// each, plus the marts_feed schema line that names its entry relation
+	// (test_every_marts_schema_names_its_entry_point_relation): 9816 -> 9959.
+	// 9960 is those five lines and no more.
+	if guidance > 9960 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9960)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

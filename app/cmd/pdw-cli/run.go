@@ -112,6 +112,11 @@ COMMANDS
                              (marts_finance, marts, base_). For finding a
                              relation you do not know, not a first step:
                              search needs none of it.
+  feed push|list|update|remove|rank|stats|events
+                             Push cards into the PDW app's Feed tab (one from
+                             flags, many as JSON on stdin) and read how they
+                             land: impressions, dwell, opens, read time, likes,
+                             dismissals. See "pdw feed --help".
   ingest <source> [flags]    Run a local data-warehouse uploader (built into
                              this binary). Sources: agent-sessions,
                              apple-contacts, apple-messages, apple-notes,
@@ -370,6 +375,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		return runSchema(client, rest, stdout, stderr)
 	case "token":
 		return runToken(client, rest, stdout, stderr)
+	case "feed":
+		return runFeed(client, rest, stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "pdw: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)
@@ -1423,6 +1430,7 @@ var commandHelp = map[string]string{
 	"search":  searchUsage,
 	"context": contextUsage,
 	"token":   tokenUsage,
+	"feed":    feedUsage,
 }
 
 // hasHelpArg reports whether a help flag appears before a "--" terminator.

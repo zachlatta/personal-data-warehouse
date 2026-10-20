@@ -171,7 +171,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 base: base_browser_history.visits, every Chrome/Brave/Safari
         # visit from the Mac uploader.
         # +1 base: base_argon.events, Google Antigravity CLI (agy) transcripts.
-        "base": 82,
+        # +2 base: base_feed.items/.events, the Feed tab's cards and the
+        # phone's engagement log (docs/feed.md).
+        "base": 84,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter
@@ -221,7 +223,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # short memo took p50 9 min to become a transcript while S2 read
             # green, because coverage cannot see speed.
             # +1 marts: marts_voice_memos.sessions, those recordings merged.
-            "marts": 66,
+            # +2 marts: marts_feed.item_engagement/.source_engagement, the
+            # Feed tab's per-card and per-source engagement.
+            "marts": 68,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

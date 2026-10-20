@@ -1,6 +1,8 @@
 import { Tabs } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 
+import { feedTabOptions } from '@/features/feed';
+
 export default function TabsLayout() {
   return (
     <Tabs screenOptions={{ tabBarActiveTintColor: '#208AEF' }}>
@@ -11,6 +13,7 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => <SymbolView name="clock" tintColor={color} size={size} />,
         }}
       />
+      <Tabs.Screen name="feed" options={feedTabOptions} />
       <Tabs.Screen
         name="search"
         options={{

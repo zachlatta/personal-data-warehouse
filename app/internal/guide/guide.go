@@ -67,6 +67,7 @@ var topics = []Topic{
 	{Name: "health", Summary: "WHOOP's two sources, the unit traps, cycles, sleep, strain and the private-API documents"},
 	{Name: "slack", Summary: "Zach's Slack identity, what is and is not synced, coverage history, huddles"},
 	{Name: "mutations", Summary: "proposing a reviewed write to Gmail, Calendar, Contacts, Slack or Apple Notes"},
+	{Name: "feed", Summary: "Feed tab cards"},
 	{Name: "ops", Summary: "is the data current: pipeline, mart, adapter, search and backup health"},
 	{Name: "ingest", Summary: "local uploaders and credential publishers (`pdw ingest`, `pdw slack|chatgpt|whoop publish-session`)", CLIOnly: true},
 }

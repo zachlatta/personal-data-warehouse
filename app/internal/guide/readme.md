@@ -66,6 +66,7 @@ default CSV output, so `--output json` stays parseable through `2>&1`.
 | Bytes of a stored attachment, photo, recording or Slack file | `get_object` `{"storage_file_id": "<id>"}` |
 | A reviewed write | `propose_mutation_help` `{}`, then `propose_mutation` (topic `mutations`) |
 | A push notification to Zach's phone | `notify` |
+| Zach's phone Feed tab | `feed_push`, `feed_stats` (topic `feed`) |
 | The `pdw` CLI in your own shell (a sandbox, VM or container) | `cli_authorize`, then run the one-line command it returns; the CLI's token lasts 24 h and reaches the warehouse tools only |
 
 `query` takes an array so several statements can share one call; each needs a `question`,

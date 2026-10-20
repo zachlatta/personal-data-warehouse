@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/feed"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/hackernewssession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
@@ -425,6 +427,8 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			logger.Info("uploader heartbeat ingestion enabled", "endpoint", uploaderHeartbeatEndpoint)
 		}
 	}
+	// The Feed tab (docs/feed.md): an optional module, off with PDW_FEED_ENABLED=0.
+	extra = append(extra, feed.Register(mux, feed.Options{DatabaseURL: cfg.PostgresDatabaseURL, Timeout: cfg.QueryTimeout, Auth: authSvc.RequireStaticBearer(), Getenv: os.Getenv, Logger: logger})...)
 	registry, _ := buildRegistry(runner, queryOpts, mutationSvc, slog.Default(), extra...)
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	var proxy *mcpproxy.Service

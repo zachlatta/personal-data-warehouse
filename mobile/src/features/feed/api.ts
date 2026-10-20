@@ -1,0 +1,57 @@
+import type { AppConfig } from '@/lib/config';
+
+import type { FeedEvent } from './event-queue';
+
+export type FeedItem = {
+  item_id: string;
+  source: string;
+  key: string;
+  title: string;
+  body?: string;
+  url?: string;
+  image_url?: string;
+  author?: string;
+  site?: string;
+  tags: string[];
+  score: number;
+  published_at?: string;
+  created_at: string;
+  engagement: { impressions: number; liked: boolean; opens: number };
+};
+
+export type FeedPage = { items: FeedItem[]; generated_at: string };
+
+export class FeedApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function feedRequest<T>(config: AppConfig, path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Bearer ${config.clientName}:${config.token}`);
+  headers.set('Accept', 'application/json');
+  headers.set('X-PDW-Client', config.clientName);
+  if (init.body) headers.set('Content-Type', 'application/json');
+  const response = await fetch(`${config.baseUrl}${path}`, { ...init, headers });
+  const text = await response.text();
+  if (!response.ok) {
+    let message = text.trim() || `HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.error === 'string') message = parsed.error;
+    } catch {}
+    throw new FeedApiError(response.status, message);
+  }
+  return (text ? JSON.parse(text) : null) as T;
+}
+
+export function fetchFeed(config: AppConfig, limit = 200): Promise<FeedPage> {
+  return feedRequest<FeedPage>(config, `/api/feed?limit=${limit}`);
+}
+
+export async function postFeedEvents(config: AppConfig, device: string, events: FeedEvent[]): Promise<void> {
+  await feedRequest(config, '/api/feed/events', { method: 'POST', body: JSON.stringify({ device, events }) });
+}

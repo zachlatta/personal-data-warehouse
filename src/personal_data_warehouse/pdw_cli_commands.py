@@ -21,6 +21,8 @@ PDW_CLI_ADMIN_SUBCOMMANDS: tuple[str, ...] = (
     "readme", "help",
     "ingest", "login", "logout", "config", "token", "version", "update",
     "chatgpt", "slack", "whoop", "hn", "heartbeat", "mutations",
+    # Writes to the Feed tab (docs/feed.md), not a question to the warehouse.
+    "feed",
 )
 
 #: Flag spellings run() accepts in place of a subcommand (help and version).

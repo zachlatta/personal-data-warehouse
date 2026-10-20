@@ -1,0 +1,608 @@
+package feed
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
+)
+
+// epoch is how the warehouse stores "absent" timestamps (AGENTS.md).
+var epoch = time.Unix(0, 0).UTC()
+
+// Store reads and writes base_feed and reads marts_feed. The tables and
+// views are created by the Python ensure path (feed.py), never here.
+type Store struct {
+	DB      *sql.DB
+	Timeout time.Duration
+	Now     func() time.Time
+	// Expand is overridden only by integration tests with isolated schemas.
+	Expand func(string) string
+}
+
+func NewStore(databaseURL string, timeout time.Duration) (*Store, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return &Store{DB: db, Timeout: timeout, Now: time.Now}, nil
+}
+
+func (s *Store) q(query string) string {
+	if s.Expand != nil {
+		return s.Expand(query)
+	}
+	return warehouse.ExpandRelations(query)
+}
+
+func (s *Store) now() time.Time {
+	if s.Now == nil {
+		return time.Now().UTC()
+	}
+	return s.Now().UTC()
+}
+
+func (s *Store) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, s.Timeout)
+}
+
+func orEpoch(t time.Time) time.Time {
+	if t.IsZero() {
+		return epoch
+	}
+	return t
+}
+
+func fromEpoch(t time.Time) *time.Time {
+	if t.IsZero() || !t.After(epoch) {
+		return nil
+	}
+	utc := t.UTC()
+	return &utc
+}
+
+func tagsLiteral(tags []string) string {
+	// A text[] literal: every element double-quoted with \ and " escaped.
+	parts := make([]string, len(tags))
+	for i, tag := range tags {
+		parts[i] = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(tag) + `"`
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// PushResult is one card's outcome.
+type PushResult struct {
+	ItemID string `json:"item_id"`
+	Status string `json:"status"` // created | updated
+}
+
+// Push upserts cards by (source, key). Re-pushing a removed card revives it;
+// a score left out keeps the stored one.
+func (s *Store) Push(ctx context.Context, items []normalized, pushedBy string) ([]PushResult, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement := s.q(`
+		INSERT INTO @feed_items AS f (item_id, source, item_key, title, body, url, image_url, author, site,
+			tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], COALESCE($11::float8, 0), $12, $13, $14::jsonb, $15, $16, $16)
+		ON CONFLICT (item_id) DO UPDATE SET
+			title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, image_url = EXCLUDED.image_url,
+			author = EXCLUDED.author, site = EXCLUDED.site, tags = EXCLUDED.tags,
+			score = COALESCE($11::float8, f.score), published_at = EXCLUDED.published_at,
+			expires_at = EXCLUDED.expires_at, metadata = EXCLUDED.metadata, pushed_by = EXCLUDED.pushed_by,
+			updated_at = EXCLUDED.updated_at, removed_at = 'epoch', removed_reason = ''
+		RETURNING (xmax = 0)`)
+	now := s.now()
+	results := make([]PushResult, 0, len(items))
+	for _, item := range items {
+		metadata, err := json.Marshal(item.Metadata)
+		if err != nil {
+			return nil, invalid("item %s: metadata is not JSON-encodable", item.ItemID)
+		}
+		if len(metadata) > maxMetadataLen {
+			return nil, invalid("item %s: metadata is larger than %d bytes", item.ItemID, maxMetadataLen)
+		}
+		var inserted bool
+		err = tx.QueryRowContext(ctx, statement, item.ItemID, item.Source, item.Key, item.Title, item.Body,
+			item.URL, item.ImageURL, item.Author, item.Site, tagsLiteral(item.Tags), item.Score,
+			orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), pushedBy, now).Scan(&inserted)
+		if err != nil {
+			return nil, fmt.Errorf("push %s: %w", item.ItemID, err)
+		}
+		status := "updated"
+		if inserted {
+			status = "created"
+		}
+		results = append(results, PushResult{ItemID: item.ItemID, Status: status})
+	}
+	return results, tx.Commit()
+}
+
+// Update is a partial edit of one card; nil fields are left alone.
+type Update struct {
+	ItemID      string         `json:"item_id" jsonschema:"the card to change (source:key, from push or list)"`
+	Title       *string        `json:"title,omitempty"`
+	Body        *string        `json:"body,omitempty"`
+	URL         *string        `json:"url,omitempty"`
+	ImageURL    *string        `json:"image_url,omitempty"`
+	Author      *string        `json:"author,omitempty"`
+	Site        *string        `json:"site,omitempty"`
+	Tags        []string       `json:"tags,omitempty"`
+	Score       *float64       `json:"score,omitempty"`
+	PublishedAt *string        `json:"published_at,omitempty"`
+	ExpiresAt   *string        `json:"expires_at,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, a duration from now (7d), or empty to never expire"`
+	Metadata    map[string]any `json:"metadata,omitempty" jsonschema:"replaces the card's metadata"`
+}
+
+var ErrNotFound = errors.New("no such feed item")
+
+func (s *Store) Update(ctx context.Context, u Update) error {
+	now := s.now()
+	sets := []string{}
+	args := []any{}
+	add := func(column string, value any) {
+		args = append(args, value)
+		sets = append(sets, fmt.Sprintf("%s = $%d", column, len(args)))
+	}
+	text := func(column string, value *string, maxChars int) error {
+		if value == nil {
+			return nil
+		}
+		if maxChars > 0 && len([]rune(*value)) > maxChars {
+			return invalid("%s is longer than %d characters", column, maxChars)
+		}
+		add(column, strings.TrimSpace(*value))
+		return nil
+	}
+	for _, field := range []struct {
+		column string
+		value  *string
+		max    int
+	}{{"title", u.Title, maxTitleChars}, {"body", u.Body, maxBodyChars}, {"author", u.Author, 0}, {"site", u.Site, 0}} {
+		if err := text(field.column, field.value, field.max); err != nil {
+			return err
+		}
+	}
+	if u.URL != nil {
+		value, err := checkURL("url", *u.URL, false)
+		if err != nil {
+			return err
+		}
+		add("url", value)
+	}
+	if u.ImageURL != nil {
+		value, err := checkURL("image_url", *u.ImageURL, true)
+		if err != nil {
+			return err
+		}
+		add("image_url", value)
+	}
+	if u.Tags != nil {
+		tags, err := normalizeTags(u.Tags)
+		if err != nil {
+			return err
+		}
+		args = append(args, tagsLiteral(tags))
+		sets = append(sets, fmt.Sprintf("tags = $%d::text[]", len(args)))
+	}
+	if u.Score != nil {
+		add("score", *u.Score)
+	}
+	if u.PublishedAt != nil {
+		t, err := ParseTime("published_at", *u.PublishedAt, now, false)
+		if err != nil {
+			return err
+		}
+		add("published_at", orEpoch(t))
+	}
+	if u.ExpiresAt != nil {
+		t, err := ParseTime("expires_at", *u.ExpiresAt, now, true)
+		if err != nil {
+			return err
+		}
+		add("expires_at", orEpoch(t))
+	}
+	if u.Metadata != nil {
+		raw, err := json.Marshal(u.Metadata)
+		if err != nil || len(raw) > maxMetadataLen {
+			return invalid("metadata must be JSON under %d bytes", maxMetadataLen)
+		}
+		args = append(args, string(raw))
+		sets = append(sets, fmt.Sprintf("metadata = $%d::jsonb", len(args)))
+	}
+	if len(sets) == 0 {
+		return invalid("nothing to update: pass at least one field besides item_id")
+	}
+	add("updated_at", now)
+	args = append(args, u.ItemID)
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	res, err := s.DB.ExecContext(ctx, s.q("UPDATE @feed_items SET "+strings.Join(sets, ", ")+
+		fmt.Sprintf(" WHERE item_id = $%d", len(args))), args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// Remove hides cards (by id, or every card of a source). It is a soft
+// delete: the engagement already recorded keeps its card.
+func (s *Store) Remove(ctx context.Context, ids []string, source, reason string) (int64, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	res, err := s.DB.ExecContext(ctx, s.q(`
+		UPDATE @feed_items SET removed_at = $1, removed_reason = $2, updated_at = $1
+		WHERE removed_at = 'epoch' AND (item_id = ANY($3::text[]) OR ($4 <> '' AND source = $4))`),
+		s.now(), reason, tagsLiteral(ids), source)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// SetScores writes rank weights in one transaction; it fails if any id is unknown.
+func (s *Store) SetScores(ctx context.Context, scores map[string]float64) error {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement := s.q("UPDATE @feed_items SET score = $1, updated_at = $2 WHERE item_id = $3")
+	now := s.now()
+	for id, score := range scores {
+		res, err := tx.ExecContext(ctx, statement, score, now, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return invalid("unknown item_id %q", id)
+		}
+	}
+	return tx.Commit()
+}
+
+// ListOptions selects cards for an agent; the phone's feed is Feed().
+type ListOptions struct {
+	Source           string
+	ItemIDs          []string
+	IncludeRemoved   bool
+	IncludeDismissed bool
+	Limit            int
+}
+
+const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.image_url, i.author, i.site,
+	to_jsonb(i.tags), i.score, i.published_at, i.expires_at, i.metadata, i.pushed_by, i.created_at, i.updated_at,
+	i.removed_at, i.removed_reason,
+	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
+	COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.liked, 0), COALESCE(e.dismissed, 0),
+	COALESCE(e.dismiss_reason, ''), e.first_seen_at`
+
+func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
+	where := []string{"TRUE"}
+	args := []any{}
+	if opts.Source != "" {
+		args = append(args, opts.Source)
+		where = append(where, fmt.Sprintf("i.source = $%d", len(args)))
+	}
+	if len(opts.ItemIDs) > 0 {
+		args = append(args, tagsLiteral(opts.ItemIDs))
+		where = append(where, fmt.Sprintf("i.item_id = ANY($%d::text[])", len(args)))
+	}
+	if !opts.IncludeRemoved {
+		where = append(where, "i.removed_at = 'epoch'")
+	}
+	if !opts.IncludeDismissed {
+		where = append(where, "COALESCE(e.dismissed, 0) = 0")
+	}
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	args = append(args, limit)
+	return s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE `+strings.Join(where, " AND ")+fmt.Sprintf(`
+		ORDER BY i.created_at DESC, i.item_id LIMIT $%d`, len(args)), args...)
+}
+
+// Feed is what the phone shows: live, unexpired, undismissed cards, ranked.
+func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	// Read a wider pool than is shown so ranking has room to work.
+	items, err := s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
+		  AND COALESCE(e.dismissed, 0) = 0
+		ORDER BY i.score DESC, i.created_at DESC LIMIT $2`, s.now(), limit*3)
+	if err != nil {
+		return nil, err
+	}
+	ranked := Rank(items)
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	return ranked, nil
+}
+
+func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.DB.QueryContext(ctx, s.q(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Item{}
+	for rows.Next() {
+		var (
+			item                        Item
+			tags                        []byte
+			metadata                    []byte
+			published, expires, removed time.Time
+			liked, dismissed            int64
+			firstSeen                   sql.NullTime
+		)
+		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &item.ImageURL,
+			&item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
+			&item.CreatedAt, &item.UpdatedAt, &removed, &item.RemovedReason,
+			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
+			&item.Engagement.Opens, &item.Engagement.ReadMS, &item.Engagement.Expands, &liked, &dismissed,
+			&item.Engagement.DismissReason, &firstSeen); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(tags, &item.Tags)
+		if item.Tags == nil {
+			item.Tags = []string{}
+		}
+		if len(metadata) > 0 {
+			_ = json.Unmarshal(metadata, &item.Metadata)
+		}
+		item.PublishedAt, item.ExpiresAt, item.RemovedAt = fromEpoch(published), fromEpoch(expires), fromEpoch(removed)
+		item.CreatedAt, item.UpdatedAt = item.CreatedAt.UTC(), item.UpdatedAt.UTC()
+		item.Engagement.Liked, item.Engagement.Dismissed = liked == 1, dismissed == 1
+		if firstSeen.Valid {
+			item.Engagement.FirstSeenAt = fromEpoch(firstSeen.Time)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// RecordEvents stores validated events; a repeated event_id is a duplicate,
+// not an error, so the phone can retry a batch blindly.
+func (s *Store) RecordEvents(ctx context.Context, events []Event, clientName, device string) (accepted, duplicates int, err error) {
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement := s.q(`
+		INSERT INTO @feed_events (event_id, event_type, item_id, session_id, occurred_at, received_at,
+			dwell_ms, visible_fraction, position, client_name, device, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
+		ON CONFLICT (event_id) DO NOTHING`)
+	now := s.now()
+	for _, e := range events {
+		metadata := []byte("{}")
+		if e.Metadata != nil {
+			if metadata, err = json.Marshal(e.Metadata); err != nil || len(metadata) > maxMetadataLen {
+				return 0, 0, invalid("event %s: metadata must be JSON under %d bytes", e.EventID, maxMetadataLen)
+			}
+		}
+		position := int64(-1)
+		if e.Position != nil {
+			position = *e.Position
+		}
+		res, err := tx.ExecContext(ctx, statement, e.EventID, e.Type, e.ItemID, e.SessionID, e.OccurredAt.UTC(), now,
+			e.DwellMS, e.VisibleFraction, position, clientName, device, string(metadata))
+		if err != nil {
+			return 0, 0, fmt.Errorf("record event %s: %w", e.EventID, err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			accepted++
+		} else {
+			duplicates++
+		}
+	}
+	return accepted, duplicates, tx.Commit()
+}
+
+// EventQuery selects raw engagement events.
+type EventQuery struct {
+	ItemID string
+	Source string
+	Types  []string
+	Since  time.Time
+	Limit  int
+}
+
+func (s *Store) Events(ctx context.Context, q EventQuery) ([]Event, error) {
+	where := []string{"TRUE"}
+	args := []any{}
+	if q.ItemID != "" {
+		args = append(args, q.ItemID)
+		where = append(where, fmt.Sprintf("e.item_id = $%d", len(args)))
+	}
+	if q.Source != "" {
+		args = append(args, q.Source)
+		where = append(where, fmt.Sprintf("i.source = $%d", len(args)))
+	}
+	if len(q.Types) > 0 {
+		args = append(args, tagsLiteral(q.Types))
+		where = append(where, fmt.Sprintf("e.event_type = ANY($%d::text[])", len(args)))
+	}
+	if !q.Since.IsZero() {
+		args = append(args, q.Since)
+		where = append(where, fmt.Sprintf("e.occurred_at >= $%d", len(args)))
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit)
+	ctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.DB.QueryContext(ctx, s.q(`
+		SELECT e.event_id, e.event_type, e.item_id, e.session_id, e.occurred_at, e.received_at, e.dwell_ms,
+		       e.visible_fraction, e.position, e.client_name, e.device, e.metadata
+		FROM @feed_events e LEFT JOIN @feed_items i ON i.item_id = e.item_id
+		WHERE `+strings.Join(where, " AND ")+fmt.Sprintf(`
+		ORDER BY e.occurred_at DESC, e.event_id LIMIT $%d`, len(args))), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	events := []Event{}
+	for rows.Next() {
+		var (
+			e        Event
+			position int64
+			metadata []byte
+		)
+		if err := rows.Scan(&e.EventID, &e.Type, &e.ItemID, &e.SessionID, &e.OccurredAt, &e.ReceivedAt, &e.DwellMS,
+			&e.VisibleFraction, &position, &e.ClientName, &e.Device, &metadata); err != nil {
+			return nil, err
+		}
+		e.OccurredAt, e.ReceivedAt = e.OccurredAt.UTC(), e.ReceivedAt.UTC()
+		if position >= 0 {
+			e.Position = &position
+		}
+		if len(metadata) > 0 && string(metadata) != "{}" {
+			_ = json.Unmarshal(metadata, &e.Metadata)
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// SourceStats is a row of marts_feed.source_engagement.
+type SourceStats struct {
+	Source         string     `json:"source"`
+	Items          int64      `json:"items"`
+	LiveItems      int64      `json:"live_items"`
+	ItemsSeen      int64      `json:"items_seen"`
+	Impressions    int64      `json:"impressions"`
+	DwellMS        int64      `json:"dwell_ms"`
+	ItemsOpened    int64      `json:"items_opened"`
+	ReadMS         int64      `json:"read_ms"`
+	ItemsLiked     int64      `json:"items_liked"`
+	ItemsDismissed int64      `json:"items_dismissed"`
+	OpenRate       *float64   `json:"open_rate"`
+	LikeRate       *float64   `json:"like_rate"`
+	DismissRate    *float64   `json:"dismiss_rate"`
+	LastPushedAt   *time.Time `json:"last_pushed_at,omitempty"`
+	LastEventAt    *time.Time `json:"last_event_at,omitempty"`
+}
+
+// Stats is the agent's read of how the feed is landing.
+type Stats struct {
+	Sources      []SourceStats    `json:"sources"`
+	EventsByType map[string]int64 `json:"events_by_type"`
+	Since        time.Time        `json:"since"`
+	Sessions     int64            `json:"sessions"`
+	TopItems     []Item           `json:"top_items"`
+	Ignored      []Item           `json:"ignored"`
+}
+
+func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stats, error) {
+	out := Stats{Sources: []SourceStats{}, EventsByType: map[string]int64{}, Since: since}
+	qctx, cancel := s.ctx(ctx)
+	defer cancel()
+	rows, err := s.DB.QueryContext(qctx, s.q(`
+		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_liked,
+		       items_dismissed, open_rate::float8, like_rate::float8, dismiss_rate::float8, last_pushed_at, last_event_at
+		FROM @marts_feed_source_engagement WHERE ($1 = '' OR source = $1) ORDER BY items DESC, source`), source)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var (
+			row              SourceStats
+			pushed, lastSeen sql.NullTime
+		)
+		if err := rows.Scan(&row.Source, &row.Items, &row.LiveItems, &row.ItemsSeen, &row.Impressions, &row.DwellMS,
+			&row.ItemsOpened, &row.ReadMS, &row.ItemsLiked, &row.ItemsDismissed, &row.OpenRate, &row.LikeRate,
+			&row.DismissRate, &pushed, &lastSeen); err != nil {
+			rows.Close()
+			return out, err
+		}
+		if pushed.Valid {
+			row.LastPushedAt = fromEpoch(pushed.Time)
+		}
+		if lastSeen.Valid {
+			row.LastEventAt = fromEpoch(lastSeen.Time)
+		}
+		out.Sources = append(out.Sources, row)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	typeRows, err := s.DB.QueryContext(qctx, s.q(`
+		SELECT e.event_type, count(*), count(DISTINCT e.session_id) FILTER (WHERE e.event_type = 'session_start')
+		FROM @feed_events e LEFT JOIN @feed_items i ON i.item_id = e.item_id
+		WHERE e.occurred_at >= $1 AND ($2 = '' OR i.source = $2)
+		GROUP BY e.event_type`), since, source)
+	if err != nil {
+		return out, err
+	}
+	for typeRows.Next() {
+		var (
+			kind    string
+			n, sess int64
+		)
+		if err := typeRows.Scan(&kind, &n, &sess); err != nil {
+			typeRows.Close()
+			return out, err
+		}
+		out.EventsByType[kind] = n
+		out.Sessions += sess
+	}
+	typeRows.Close()
+	if err := typeRows.Err(); err != nil {
+		return out, err
+	}
+	sourceFilter := ""
+	args := []any{}
+	if source != "" {
+		args = append(args, source)
+		sourceFilter = " AND i.source = $1"
+	}
+	if out.TopItems, err = s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE e.engaged = 1`+sourceFilter+`
+		ORDER BY e.liked DESC, e.read_ms + e.dwell_ms DESC LIMIT 10`, args...); err != nil {
+		return out, err
+	}
+	// Seen at least twice and never opened, expanded, liked or dismissed:
+	// what the feed keeps showing that is not landing.
+	out.Ignored, err = s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE e.impressions >= 2 AND e.engaged = 0 AND e.dismissed = 0`+sourceFilter+`
+		ORDER BY e.impressions DESC LIMIT 10`, args...)
+	return out, err
+}

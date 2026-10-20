@@ -35,6 +35,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
 | Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
+| Put cards in Zach's Feed tab, read his engagement | `pdw feed push\|list\|stats` (topic `feed`) |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 
 Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context` (each is refused with the real one).
@@ -53,6 +54,7 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 | A reviewed write | `propose_mutation_help`, then `propose_mutation` (topic `mutations`) |
 | Connected upstream MCP servers (skills, tasks, other warehouses) | `connections` to list, `connection_call` to invoke (topic `connections`) |
 | A push notification to Zach's phone | `notify` |
+| Put cards in Zach's Feed tab, read his engagement | `feed_push`, `feed_stats` (topic `feed`) |
 | The `pdw` CLI in your own shell (a sandbox, VM or container) | `cli_authorize`, then run the one-line command it returns; the CLI's token lasts 24 h |
 {{- end}}
 

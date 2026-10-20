@@ -15,6 +15,7 @@ Keychain (`expo-secure-store`).
 | Mutations (needs review / past) | `GET /api/mutations/requests[?status=…]` |
 | Review one request: approve, deny, skip an email (and take the skip back), edit an email | `GET /api/mutations/requests/{id}`, `POST …/approve`, `POST …/reject`, `POST …/mutations/{mid}/remove`, `POST …/mutations/{mid}/restore`, `POST …/mutations/{mid}/update-email` |
 | Alerts: the global on/off switch for timeline notifications and the ledger of every one sent (delivered / opened / skipped / failed, paged by `next_cursor`) | `GET /api/notifications[?limit=&before=]`, `POST /api/notifications/settings` |
+| Feed: full-width cards agents push with `pdw feed push`; every impression (dwell, visible fraction), open, read time, like and dismissal is logged (docs/feed.md) | `GET /api/feed`, `POST /api/feed/events` |
 | Settings: push registration, test push, disconnect | `POST /api/push/register`, `POST /api/push/test` |
 
 Push goes through the Expo push service: the app registers its

@@ -661,6 +661,18 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("browser_history"),
     ),
     _source(
+        "feed",
+        "Feed tab",
+        cadence="on demand",
+        transport="agents: pdw feed push / feed_* tools → app; iOS Feed tab → /api/feed/events → base_feed",
+        data=None,
+        basis=(
+            "no expectation: items arrive when an agent writes the feed and events"
+            " only when Zach opens the tab, so a quiet week is not an outage"
+        ),
+        note="optional module (docs/feed.md); PDW_FEED_ENABLED=0 turns the app side off",
+    ),
+    _source(
         "google_drive",
         "Google Drive",
         cadence="every 30 min",
@@ -1494,6 +1506,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "contact_sync_state": _state("google_contacts", "updated_at"),
     "apple_contact_cards": _data("apple_contacts", "synced_at", "source_updated_at"),
     "browser_history_visits": _data("browser_history", "synced_at", "visited_at"),
+    "feed_items": _support("feed", "updated_at", "created_at", "cards agents push"),
+    "feed_events": _data("feed", "received_at", "occurred_at"),
     # Google Drive
     "google_drive_files": _data("google_drive", "ingested_at", "modified_time"),
     "google_drive_sync_state": _state("google_drive", "updated_at"),
