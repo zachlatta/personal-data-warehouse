@@ -14,13 +14,8 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen name="feed" options={feedTabOptions} />
-      <Tabs.Screen
-        name="search"
-        options={{
-          title: 'Search',
-          tabBarIcon: ({ color, size }) => <SymbolView name="magnifyingglass" tintColor={color} size={size} />,
-        }}
-      />
+      {/* Off the tab bar but still routable: Settings opens Alerts, and pushes keep coming. */}
+      <Tabs.Screen name="search" options={{ title: 'Search', href: null }} />
       <Tabs.Screen
         name="mutations"
         options={{
@@ -28,13 +23,7 @@ export default function TabsLayout() {
           tabBarIcon: ({ color, size }) => <SymbolView name="checkmark.seal" tintColor={color} size={size} />,
         }}
       />
-      <Tabs.Screen
-        name="notifications"
-        options={{
-          title: 'Alerts',
-          tabBarIcon: ({ color, size }) => <SymbolView name="bell" tintColor={color} size={size} />,
-        }}
-      />
+      <Tabs.Screen name="notifications" options={{ title: 'Alerts', href: null }} />
       <Tabs.Screen
         name="settings"
         options={{

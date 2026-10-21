@@ -91,7 +91,7 @@ export default function SettingsScreen() {
           <ThemedText type="smallBold" themeColor="textSecondary">
             Timeline notifications
           </ThemedText>
-          <ThemedText type="small">The on/off switch and the ledger of everything sent live in the Alerts tab.</ThemedText>
+          <ThemedText type="small">The on/off switch and the ledger of everything sent live in Alerts.</ThemedText>
           <View style={styles.rowButtons}>
             <Pressable onPress={() => router.navigate('/notifications')} style={styles.secondary}>
               <ThemedText type="smallBold">Open Alerts</ThemedText>
