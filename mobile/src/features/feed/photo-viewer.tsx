@@ -46,6 +46,7 @@ type PhotoViewerProps = {
   onClose: () => void;
   onPage?: (index: number) => void;
   onShare?: (index: number) => void;
+  onZoom?: (index: number) => void;
 };
 
 // X's photo viewer: full screen on black, swipe between the post's photos,
@@ -60,7 +61,7 @@ export function PhotoViewer(props: PhotoViewerProps) {
   );
 }
 
-function PhotoViewerScreen({ photos, start, onClose, onPage, onShare }: PhotoViewerProps) {
+function PhotoViewerScreen({ photos, start, onClose, onPage, onShare, onZoom }: PhotoViewerProps) {
   const { width, height } = useWindowDimensions();
   const insets = useModalInsets();
   const [page, setPage] = useState(start);
@@ -98,7 +99,7 @@ function PhotoViewerScreen({ photos, start, onClose, onPage, onShare }: PhotoVie
         contentOffset={{ x: start * width, y: 0 }}
         onMomentumScrollEnd={onEnd}>
         {photos.map((m, i) => (
-          <ZoomablePhoto key={i} media={m} width={width} height={height} onTap={() => setChrome((c) => !c)} />
+          <ZoomablePhoto key={i} media={m} width={width} height={height} onTap={() => setChrome((c) => !c)} onZoom={() => onZoom?.(i)} />
         ))}
       </ScrollView>
       {chrome ? (
@@ -131,7 +132,19 @@ function PhotoViewerScreen({ photos, start, onClose, onPage, onShare }: PhotoVie
 
 // One page: an iOS zoom view around the photo. A single tap hides the
 // controls; a double tap zooms in to 2.5x or back out.
-function ZoomablePhoto({ media, width, height, onTap }: { media: FeedMedia; width: number; height: number; onTap: () => void }) {
+function ZoomablePhoto({
+  media,
+  width,
+  height,
+  onTap,
+  onZoom,
+}: {
+  media: FeedMedia;
+  width: number;
+  height: number;
+  onTap: () => void;
+  onZoom?: () => void;
+}) {
   const scroller = useRef<ScrollView>(null);
   const zoomed = useRef(false);
   const lastTap = useRef(0);
@@ -166,7 +179,9 @@ function ZoomablePhoto({ media, width, height, onTap }: { media: FeedMedia; widt
       showsHorizontalScrollIndicator={false}
       showsVerticalScrollIndicator={false}
       onScroll={(e) => {
-        zoomed.current = e.nativeEvent.zoomScale > 1.01;
+        const now = e.nativeEvent.zoomScale > 1.01;
+        if (now && !zoomed.current) onZoom?.();
+        zoomed.current = now;
       }}
       scrollEventThrottle={100}>
       <Pressable style={{ width, height }} onPress={(e) => tap(e.nativeEvent.locationX, e.nativeEvent.locationY)}>

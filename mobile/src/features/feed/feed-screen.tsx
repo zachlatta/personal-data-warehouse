@@ -33,6 +33,7 @@ import {
   feedItems,
   flushFeedEvents,
   recordFeedEvent,
+  recordUi,
   startFeedSession,
 } from './engagement';
 import { FeedCard } from './feed-card';
@@ -40,6 +41,7 @@ import type { CardLink } from './links';
 import { sourceBubbles } from './rich';
 import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
+import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { mailtoUrl, shareDraft } from './share';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
@@ -48,6 +50,27 @@ const STALE_MS = 10 * 60_000;
 const UNDO_MS = 5_000;
 // The rail's Saved bubble: his read-later queue instead of one source.
 const SAVED = '\u0000saved';
+// A drag let go with no fling has ended if no coast began by then.
+const SETTLE_MS = 80;
+
+// The served order, kept under the server's 16 KB metadata cap (one
+// oversized event would get its whole batch refused).
+const SERVED_BYTES = 12_000;
+function servedIds(items: FeedItem[]): { item_ids: string[]; item_ids_truncated: boolean } {
+  const ids: string[] = [];
+  let bytes = 0;
+  for (const item of items) {
+    bytes += item.item_id.length + 3;
+    if (bytes > SERVED_BYTES) break;
+    ids.push(item.item_id);
+  }
+  return { item_ids: ids, item_ids_truncated: ids.length < items.length };
+}
+
+// What the list is showing, as the log names it.
+function viewName(only: string | null): string {
+  return only === SAVED ? 'saved' : only ? `source:${only}` : 'all';
+}
 
 type Undo = { text: string; undo: () => void; timer: ReturnType<typeof setTimeout> };
 
@@ -71,6 +94,10 @@ export default function FeedScreen() {
   }, [items, only, savedIds]);
 
   const tracker = useRef(new ViewabilityTracker());
+  const gestures = useRef(new ScrollGestureTracker());
+  const settleTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const view = useRef('all');
+  const endLogged = useRef(false);
   const heights = useRef(new Map<string, number>());
   const viewport = useRef({ top: 0, height: 0 });
   const ids = useRef<string[]>([]);
@@ -81,7 +108,9 @@ export default function FeedScreen() {
 
   useLayoutEffect(() => {
     ids.current = shown.map((i) => i.item_id);
-  }, [shown]);
+    view.current = viewName(only);
+    endLogged.current = false;
+  }, [shown, only]);
 
   const recordImpressions = useCallback((ended: Impression[]) => {
     for (const imp of ended) {
@@ -91,7 +120,7 @@ export default function FeedScreen() {
         position: imp.position,
         dwell_ms: imp.dwellMs,
         visible_fraction: imp.maxFraction,
-        metadata: { visible_ms: imp.visibleMs },
+        metadata: { visible_ms: imp.visibleMs, ended_at: new Date(imp.endedAt).toISOString(), height: heights.current.get(imp.itemId) ?? 0, view: view.current },
       });
     }
   }, []);
@@ -106,13 +135,28 @@ export default function FeedScreen() {
     recordImpressions(tracker.current.flush(Date.now()));
   }, [recordImpressions]);
 
-  const load = useCallback(async () => {
+  // trigger: first (the tab's first load), stale (back after STALE_MS) or
+  // pull (pull to refresh). The load event logs exactly what was served, in
+  // order, so a later query can tell what he was shown but never reached.
+  const load = useCallback(async (trigger: 'first' | 'stale' | 'pull') => {
     setRefreshing(true);
+    const startedAt = Date.now();
     try {
       // Send taps first, so the queue the server answers with includes them.
       await flushFeedEvents(true).catch(() => {});
       const page = await fetchFeed(config);
       pause();
+      recordFeedEvent('load', {
+        at: startedAt,
+        dwell_ms: Date.now() - startedAt,
+        metadata: {
+          trigger,
+          ok: true,
+          cards: page.items.length,
+          saved: (page.saved ?? []).length,
+          ...servedIds(page.items),
+        },
+      });
       for (const item of page.items) feedItems.set(item.item_id, item);
       loadSaved(page.saved ?? []);
       setItems(page.items);
@@ -120,6 +164,11 @@ export default function FeedScreen() {
       setDisabled(false);
       loadedAt.current = Date.now();
     } catch (e) {
+      recordFeedEvent('load', {
+        at: startedAt,
+        dwell_ms: Date.now() - startedAt,
+        metadata: { trigger, ok: false, status: e instanceof FeedApiError ? e.status : 0, error: e instanceof Error ? e.message.slice(0, 300) : String(e) },
+      });
       if (e instanceof FeedApiError && e.status === 404) setDisabled(true);
       else setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -141,13 +190,13 @@ export default function FeedScreen() {
   useFocusEffect(
     useCallback(() => {
       focused.current = true;
-      if (AppState.currentState === 'active') startFeedSession(ids.current.length);
-      if (Date.now() - loadedAt.current > STALE_MS) void load();
+      if (AppState.currentState === 'active') startFeedSession(ids.current.length, 'focus');
+      if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
       else measure();
       return () => {
         focused.current = false;
         pause();
-        endFeedSession();
+        endFeedSession('blur');
       };
     }, [load, measure, pause]),
   );
@@ -156,12 +205,12 @@ export default function FeedScreen() {
     const sub = AppState.addEventListener('change', (state) => {
       if (!focused.current) return;
       if (state === 'active') {
-        startFeedSession(ids.current.length);
-        if (Date.now() - loadedAt.current > STALE_MS) void load();
+        startFeedSession(ids.current.length, 'foreground');
+        if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
         else measure();
       } else {
         pause();
-        endFeedSession();
+        endFeedSession('background');
         void flushFeedEvents(true);
       }
     });
@@ -175,6 +224,54 @@ export default function FeedScreen() {
     },
     [measure],
   );
+
+  // The card at the top of the screen at a scroll offset, so a scroll event
+  // says which cards it moved between.
+  const cardAt = useCallback((y: number) => {
+    const layouts = layoutsFromHeights(ids.current, heights.current, headerHeight.current);
+    for (const l of layouts.values()) if (l.y + l.height > y) return l.position;
+    return -1;
+  }, []);
+
+  const recordScroll = useCallback(
+    (g: ReturnType<ScrollGestureTracker['settle']>) => {
+      if (!g) return;
+      recordFeedEvent('scroll', {
+        at: g.startedAt,
+        dwell_ms: g.durationMs,
+        metadata: scrollMetadata(g, {
+          from_card: cardAt(g.fromY),
+          to_card: cardAt(g.toY),
+          viewport: Math.round(viewport.current.height),
+          view: view.current,
+        }),
+      });
+    },
+    [cardAt],
+  );
+
+  const scrollHandlers = useMemo(
+    () => ({
+      onScrollBeginDrag: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+        clearTimeout(settleTimer.current);
+        recordScroll(gestures.current.beginDrag(Date.now(), e.nativeEvent.contentOffset.y));
+      },
+      onScrollEndDrag: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+        gestures.current.endDrag(Date.now(), e.nativeEvent.contentOffset.y, e.nativeEvent.velocity?.y ?? 0);
+        settleTimer.current = setTimeout(() => recordScroll(gestures.current.settle()), SETTLE_MS);
+      },
+      onMomentumScrollBegin: () => {
+        clearTimeout(settleTimer.current);
+        gestures.current.momentumBegin();
+      },
+      onMomentumScrollEnd: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+        recordScroll(gestures.current.momentumEnd(Date.now(), e.nativeEvent.contentOffset.y));
+      },
+    }),
+    [recordScroll],
+  );
+
+  useEffect(() => () => clearTimeout(settleTimer.current), []);
 
   const onCardLayout = useCallback(
     (itemId: string, height: number) => {
@@ -228,7 +325,7 @@ export default function FeedScreen() {
   // its watch time is recorded like reading time.
   const onMedia = useCallback(
     async (item: FeedItem, a: MediaAction) => {
-      recordFeedEvent('media', { item_id: item.item_id, position: position(item), metadata: { action: a.action, index: a.index } });
+      recordFeedEvent('media', { item_id: item.item_id, position: position(item), dwell_ms: a.dwellMs, metadata: { action: a.action, index: a.index } });
       if (a.action !== 'play' || !a.url) return;
       pause();
       const startedAt = Date.now();
@@ -249,6 +346,7 @@ export default function FeedScreen() {
       await Linking.openURL(mailtoUrl(shareDraft(item, preview)));
     } catch {
       Alert.alert('Could not open a mail app', 'No mail app is set up on this phone.');
+      recordUi('share_failed', { item_id: item.item_id, position: position(item) });
       return;
     }
     recordFeedEvent('share', { item_id: item.item_id, position: position(item), metadata: { via: 'mailto', url: item.url ?? '' } });
@@ -300,6 +398,7 @@ export default function FeedScreen() {
 
   const runUndo = useCallback(() => {
     if (!undo) return;
+    recordUi('undo', { metadata: { what: undo.text } });
     clearTimeout(undo.timer);
     undo.undo();
     setUndo(null);
@@ -310,7 +409,15 @@ export default function FeedScreen() {
       const from = item.site || item.source;
       const saveLabel = savedIds.includes(item.item_id) ? 'Remove from Saved' : 'Save for later';
       const options = [saveLabel, 'Not interested', `Less from ${from}`, 'Cancel'];
+      const openedAt = Date.now();
+      recordUi('menu_open', { item_id: item.item_id, position: position(item) });
       const pick = (i: number) => {
+        recordUi('menu_pick', {
+          item_id: item.item_id,
+          position: position(item),
+          dwell_ms: Date.now() - openedAt,
+          metadata: { choice: ['save', 'not_interested', 'less_like_this', 'cancel'][i] ?? 'cancel' },
+        });
         if (i === 0) onSave(item, 'menu');
         if (i === 1) dismiss(item, 'not_interested');
         if (i === 2) dismiss(item, 'less_like_this');
@@ -322,12 +429,17 @@ export default function FeedScreen() {
           { text: options[0], onPress: () => pick(0) },
           { text: options[1], onPress: () => pick(1) },
           { text: options[2], onPress: () => pick(2) },
-          { text: 'Cancel', style: 'cancel' },
+          { text: 'Cancel', style: 'cancel', onPress: () => pick(3) },
         ]);
       }
     },
     [dismiss, onSave, savedIds],
   );
+
+  // A swipe begun, whether or not it went far enough to save or share.
+  const onSwipeStart = useCallback((item: FeedItem, toward: 'save' | 'share') => {
+    recordUi('swipe_start', { item_id: item.item_id, position: position(item), metadata: { toward } });
+  }, []);
 
   const renderItem = useCallback(
     ({ item }: { item: FeedItem }) => (
@@ -342,9 +454,10 @@ export default function FeedScreen() {
         onExpand={onExpand}
         onMenu={onMenu}
         onShare={onShare}
+        onSwipeStart={onSwipeStart}
       />
     ),
-    [savedIds, onSave, onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare],
+    [savedIds, onSave, onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare, onSwipeStart],
   );
 
   if (!loaded) {
@@ -363,12 +476,28 @@ export default function FeedScreen() {
         keyExtractor={(item) => item.item_id}
         renderItem={renderItem}
         onScroll={onScroll}
+        {...scrollHandlers}
+        onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
+        onEndReachedThreshold={0.2}
+        onEndReached={() => {
+          if (endLogged.current || !shown.length) return;
+          endLogged.current = true;
+          recordUi('end_reached', { metadata: { cards: shown.length, view: view.current } });
+        }}
         scrollEventThrottle={16}
         onLayout={(e) => {
           viewport.current = { ...viewport.current, height: e.nativeEvent.layout.height };
           measure();
         }}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void load()} />}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => {
+              recordUi('refresh', { metadata: { view: view.current } });
+              void load('pull');
+            }}
+          />
+        }
         windowSize={11}
         initialNumToRender={6}
         ListHeaderComponent={
@@ -384,7 +513,9 @@ export default function FeedScreen() {
                     style={[styles.bubble, only !== null && only !== SAVED && styles.bubbleDim]}
                     onPress={() => {
                       pause();
-                      setOnly(only === SAVED ? null : SAVED);
+                      const next = only === SAVED ? null : SAVED;
+                      recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), saved: savedIds.length } });
+                      setOnly(next);
                     }}
                     accessibilityLabel={`Saved for later, ${savedIds.length}`}>
                     <View style={[styles.savedBubble, only === SAVED && styles.savedBubbleOn]}>
@@ -408,7 +539,9 @@ export default function FeedScreen() {
                       style={[styles.bubble, !active && only !== null && styles.bubbleDim]}
                       onPress={() => {
                         pause();
-                        setOnly(b.source && !active ? b.source : null);
+                        const next = b.source && !active ? b.source : null;
+                        recordUi('filter', { metadata: { from: viewName(only), to: viewName(next), unseen: b.unseen, total: b.total } });
+                        setOnly(next);
                       }}
                       accessibilityLabel={b.source ? `Only ${b.label}` : 'Everything'}>
                       <SourceAvatar name={b.source ? b.label : '*'} size={58} ring={b.unseen > 0 || active} />

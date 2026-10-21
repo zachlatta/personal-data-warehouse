@@ -16,7 +16,10 @@ export type FeedEventType =
   | 'share'
   | 'media'
   | 'save'
-  | 'unsave';
+  | 'unsave'
+  | 'ui'
+  | 'scroll'
+  | 'load';
 
 export type FeedEvent = {
   event_id: string;

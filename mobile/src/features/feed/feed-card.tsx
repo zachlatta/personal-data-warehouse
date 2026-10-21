@@ -48,6 +48,7 @@ type Props = {
   onExpand: (item: FeedItem) => void;
   onMenu: (item: FeedItem) => void;
   onShare: (item: FeedItem, preview: string) => void;
+  onSwipeStart?: (item: FeedItem, toward: 'save' | 'share') => void;
 };
 
 function ShareAction() {
@@ -99,7 +100,7 @@ function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
   );
 }
 
-function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare }: Props) {
+function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare, onSwipeStart }: Props) {
   const theme = useTheme();
   const swipeable = useRef<SwipeableMethods>(null);
   const [expanded, setExpanded] = useState(false);
@@ -253,6 +254,7 @@ function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia
       overshootLeft={false}
       renderRightActions={() => <ShareAction />}
       renderLeftActions={() => <SaveAction saved={saved} />}
+      onSwipeableOpenStartDrag={(direction) => onSwipeStart?.(item, direction === SwipeDirection.RIGHT ? 'save' : 'share')}
       onSwipeableOpen={(direction) => {
         swipeable.current?.close();
         // The direction the card moved: right reveals the left (save) action.

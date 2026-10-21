@@ -1,6 +1,6 @@
 import { Image } from 'expo-image';
 import { SymbolView } from 'expo-symbols';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View, useWindowDimensions, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
@@ -26,18 +26,28 @@ export const ACCENT = '#1D9BF0';
 
 // What the views report up so engagement can count it: a swipe to another
 // photo, a tap to play a video, a photo opened full screen (view), a swipe
-// to another photo there (view_swipe), one photo shared from it (share).
-// index is the photo's place in the card's media.
-export type MediaAction = { action: 'swipe' | 'play' | 'view' | 'view_swipe' | 'share'; index: number; url?: string };
+// to another photo there (view_swipe), one photo shared from it (share), a
+// zoom into a photo there (zoom), and the viewer closed (view_close, with
+// dwellMs = time in the viewer). index is the photo's place in the card's
+// media.
+export type MediaAction = {
+  action: 'swipe' | 'play' | 'view' | 'view_swipe' | 'share' | 'zoom' | 'view_close';
+  index: number;
+  url?: string;
+  dwellMs?: number;
+};
 
 // Opens a tapped photo in the full-screen viewer and reports what he does
 // there; index in and out is the photo's place in media.
 function usePhotoViewer(media: FeedMedia[], onMedia: (a: MediaAction) => void) {
   const [open, setOpen] = useState<{ photos: FeedMedia[]; start: number }>();
+  // When the viewer opened and the page on screen, for view_close.
+  const viewing = useRef({ at: 0, page: 0 });
   const mediaIndex = (page: number) => (open ? media.indexOf(open.photos[page]) : page);
   const show = (tapped: number) => {
     const v = viewerPhotos(media, tapped);
     if (!v.photos.length) return;
+    viewing.current = { at: Date.now(), page: v.start };
     setOpen(v);
     onMedia({ action: 'view', index: tapped });
   };
@@ -45,8 +55,15 @@ function usePhotoViewer(media: FeedMedia[], onMedia: (a: MediaAction) => void) {
     <PhotoViewer
       photos={open.photos}
       start={open.start}
-      onClose={() => setOpen(undefined)}
-      onPage={(page) => onMedia({ action: 'view_swipe', index: mediaIndex(page) })}
+      onClose={() => {
+        onMedia({ action: 'view_close', index: mediaIndex(viewing.current.page), dwellMs: Date.now() - viewing.current.at });
+        setOpen(undefined);
+      }}
+      onPage={(page) => {
+        viewing.current.page = page;
+        onMedia({ action: 'view_swipe', index: mediaIndex(page) });
+      }}
+      onZoom={(page) => onMedia({ action: 'zoom', index: mediaIndex(page) })}
       onShare={(page) => onMedia({ action: 'share', index: mediaIndex(page) })}
     />
   ) : null;

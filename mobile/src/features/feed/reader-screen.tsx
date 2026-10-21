@@ -12,6 +12,7 @@ import { formatWhen } from '@/lib/format';
 
 import { cardMedia } from './feed-card';
 import { feedItems, recordFeedEvent } from './engagement';
+import { ScrollGestureTracker, scrollMetadata, type ScrollGesture } from './scroll-gestures';
 import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
 import type { FeedEmbed } from './rich';
@@ -75,13 +76,13 @@ function DetailPost({
   );
 }
 
-function Spans({ spans }: { spans: Span[] }) {
+function Spans({ spans, onLink }: { spans: Span[]; onLink: (url: string) => void }) {
   return (
     <>
       {spans.map((span, i) => (
         <ThemedText
           key={i}
-          onPress={span.url ? () => void WebBrowser.openBrowserAsync(span.url as string).catch(() => Linking.openURL(span.url as string)) : undefined}
+          onPress={span.url ? () => onLink(span.url as string) : undefined}
           style={[
             span.bold && styles.bold,
             span.italic && styles.italic,
@@ -104,6 +105,9 @@ export default function FeedReaderScreen() {
   const theme = useTheme();
   const item = feedItems.get(params.id);
   const depth = useRef(0);
+  const gestures = useRef(new ScrollGestureTracker());
+  const settleTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const contentHeight = useRef(0);
   const position = params.position ? Number(params.position) : undefined;
   const saved = useSavedIds().includes(params.id);
 
@@ -130,6 +134,34 @@ export default function FeedReaderScreen() {
   };
 
   const itemId = item?.item_id;
+  // Each scroll gesture in the detail view, like the feed's, with how far
+  // down the page it ended.
+  const recordScroll = (g: ScrollGesture | null) => {
+    if (!g || !itemId) return;
+    recordFeedEvent('scroll', {
+      item_id: itemId,
+      position,
+      at: g.startedAt,
+      dwell_ms: g.durationMs,
+      metadata: scrollMetadata(g, { in: 'detail', content_height: Math.round(contentHeight.current) }),
+    });
+  };
+  const scrollHandlers = {
+    onScrollBeginDrag: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      clearTimeout(settleTimer.current);
+      recordScroll(gestures.current.beginDrag(Date.now(), e.nativeEvent.contentOffset.y));
+    },
+    onScrollEndDrag: (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      gestures.current.endDrag(Date.now(), e.nativeEvent.contentOffset.y, e.nativeEvent.velocity?.y ?? 0);
+      settleTimer.current = setTimeout(() => recordScroll(gestures.current.settle()), 80);
+    },
+    onMomentumScrollBegin: () => {
+      clearTimeout(settleTimer.current);
+      gestures.current.momentumBegin();
+    },
+    onMomentumScrollEnd: (e: NativeSyntheticEvent<NativeScrollEvent>) =>
+      recordScroll(gestures.current.momentumEnd(Date.now(), e.nativeEvent.contentOffset.y)),
+  };
   const browse = useCallback(
     async (url: string, linkIndex: number, via = 'detail') => {
       if (!itemId) return;
@@ -148,7 +180,7 @@ export default function FeedReaderScreen() {
   const onMedia = useCallback(
     async (a: MediaAction) => {
       if (!itemId) return;
-      recordFeedEvent('media', { item_id: itemId, position, metadata: { action: a.action, index: a.index, in: 'detail' } });
+      recordFeedEvent('media', { item_id: itemId, position, dwell_ms: a.dwellMs, metadata: { action: a.action, index: a.index, in: 'detail' } });
       if (a.action !== 'play' || !a.url) return;
       const startedAt = Date.now();
       await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
@@ -166,6 +198,7 @@ export default function FeedReaderScreen() {
   }
 
   const onPostLink = (url: string) => void browse(url, -1, 'post_link');
+  const onBodyLink = (url: string) => void browse(url, -1, 'body_link');
 
   const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
   const media = cardMedia(item);
@@ -191,8 +224,10 @@ export default function FeedReaderScreen() {
       <ScrollView
         contentContainerStyle={styles.content}
         onScroll={onScroll}
+        {...scrollHandlers}
         scrollEventThrottle={100}
         onContentSizeChange={(_, h) => {
+          contentHeight.current = h;
           if (h > 0) depth.current = Math.max(depth.current, Math.min(1, 700 / h));
         }}>
         {embed ? (
@@ -225,26 +260,26 @@ export default function FeedReaderScreen() {
                 <Fragment key={i}>
                   {block.kind === 'heading' ? (
                     <ThemedText style={[styles.heading, block.level <= 2 && styles.headingBig]}>
-                      <Spans spans={block.spans} />
+                      <Spans spans={block.spans} onLink={onBodyLink} />
                     </ThemedText>
                   ) : block.kind === 'bullet' ? (
                     <View style={styles.bulletRow}>
                       <ThemedText style={styles.paragraph}>{block.ordered ? `${block.ordered}.` : '•'}</ThemedText>
                       <ThemedText style={[styles.paragraph, styles.flex]}>
-                        <Spans spans={block.spans} />
+                        <Spans spans={block.spans} onLink={onBodyLink} />
                       </ThemedText>
                     </View>
                   ) : block.kind === 'quote' ? (
                     <View style={[styles.quote, { borderLeftColor: theme.backgroundSelected }]}>
                       <ThemedText style={[styles.paragraph, { color: theme.textSecondary }]}>
-                        <Spans spans={block.spans} />
+                        <Spans spans={block.spans} onLink={onBodyLink} />
                       </ThemedText>
                     </View>
                   ) : block.kind === 'code' ? (
                     <ThemedText style={[styles.codeBlock, { backgroundColor: theme.backgroundElement }]}>{block.text}</ThemedText>
                   ) : (
                     <ThemedText style={styles.paragraph}>
-                      <Spans spans={block.spans} />
+                      <Spans spans={block.spans} onLink={onBodyLink} />
                     </ThemedText>
                   )}
                 </Fragment>
