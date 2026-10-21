@@ -8,7 +8,8 @@ are declared, so a fresh warehouse has them before the app's first request.
 Removing the feature: docs/feed.md lists every file and registration line.
 """
 
-TABLES = ("feed_items", "feed_events")
+TABLES = ("feed_items", "feed_events", "feed_item_versions")
+FUNCTIONS = ("feed_item_version", "feed_item_versions_immutable")
 VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement")
 
 #: Event types the phone records. The Go validator holds the same list
@@ -41,6 +42,11 @@ ENGAGEMENT_SCORE_SQL = (
     " - CASE WHEN e.dismiss_state = 'dismiss' THEN 5 ELSE 0 END)::numeric, 2)::float8"
 )
 
+#: Version actions. The Go store names the action of each mutation through
+#: the transaction-local `pdw.feed_action` setting; a write that does not
+#: (plain SQL) is classified by the trigger from what changed.
+VERSION_ACTIONS = ("baseline", "create", "update", "rank", "remove", "restore", "delete")
+
 
 def ensure_feed_tables(warehouse):
     for statement in STATEMENTS:
@@ -51,7 +57,7 @@ def ensure_feed_tables(warehouse):
         "marts_feed_item_engagement", ITEM_ENGAGEMENT_VIEW, dependents=("marts_feed_source_engagement",)
     )
     warehouse._ensure_view("marts_feed_source_engagement", SOURCE_ENGAGEMENT_VIEW)
-    for logical in (*TABLES, *VIEWS):
+    for logical in (*TABLES, *VIEWS, *FUNCTIONS):
         warehouse._apply_catalog_grant(logical)
 
 
@@ -101,6 +107,93 @@ STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS feed_events_received_idx ON @feed_events (received_at)",
     "CREATE INDEX IF NOT EXISTS feed_events_occurred_idx ON @feed_events (occurred_at DESC)",
     "CREATE INDEX IF NOT EXISTS feed_events_item_idx ON @feed_events (item_id, event_type, occurred_at)",
+    # Card history. Every insert, update and delete of a card writes one
+    # immutable row here from a trigger, so no write path (the Go module, a
+    # superuser's SQL) can change a card without leaving its past behind. A
+    # delete is a tombstone whose snapshot is the card as it was; `pdw feed
+    # restore` brings back any version.
+    """CREATE TABLE IF NOT EXISTS @feed_item_versions (
+        item_id text NOT NULL,
+        version bigint NOT NULL,
+        action text NOT NULL,
+        actor text NOT NULL DEFAULT '',
+        agent text NOT NULL DEFAULT '',
+        reason text NOT NULL DEFAULT '',
+        restored_from bigint NOT NULL DEFAULT 0,
+        changed_fields text[] NOT NULL DEFAULT '{}',
+        diff jsonb NOT NULL DEFAULT '{}',
+        snapshot jsonb NOT NULL,
+        changed_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (item_id, version)
+    )""",
+    "CREATE INDEX IF NOT EXISTS feed_item_versions_changed_idx ON @feed_item_versions (changed_at)",
+    """CREATE OR REPLACE FUNCTION @feed_item_version() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    DECLARE
+        old_row jsonb;
+        new_row jsonb;
+        diff jsonb := '{}'::jsonb;
+        fields text[] := '{}';
+        field text;
+        act text;
+        target text;
+        next_version bigint;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN target := OLD.item_id; ELSE target := NEW.item_id; END IF;
+        IF TG_OP <> 'INSERT' THEN old_row := to_jsonb(OLD); END IF;
+        IF TG_OP <> 'DELETE' THEN new_row := to_jsonb(NEW); END IF;
+        IF TG_OP = 'UPDATE' THEN
+            FOR field IN SELECT key FROM jsonb_each(new_row) WHERE key <> 'updated_at' LOOP
+                IF new_row->field IS DISTINCT FROM old_row->field THEN
+                    diff := diff || jsonb_build_object(field,
+                        jsonb_build_object('from', old_row->field, 'to', new_row->field));
+                    fields := fields || field;
+                END IF;
+            END LOOP;
+            -- A write that changed nothing a reader can see is not a version.
+            IF cardinality(fields) = 0 THEN RETURN NULL; END IF;
+        END IF;
+        act := NULLIF(current_setting('pdw.feed_action', true), '');
+        IF act IS NULL THEN
+            act := CASE
+                WHEN TG_OP = 'INSERT' THEN 'create'
+                WHEN TG_OP = 'DELETE' THEN 'delete'
+                WHEN OLD.removed_at = 'epoch' AND NEW.removed_at <> 'epoch' THEN 'remove'
+                WHEN OLD.removed_at <> 'epoch' AND NEW.removed_at = 'epoch' THEN 'restore'
+                WHEN fields <@ ARRAY['score'] THEN 'rank'
+                ELSE 'update'
+            END;
+        END IF;
+        SELECT COALESCE(max(version), 0) + 1 INTO next_version
+        FROM @feed_item_versions WHERE item_id = target;
+        INSERT INTO @feed_item_versions (item_id, version, action, actor, agent, reason,
+            restored_from, changed_fields, diff, snapshot, changed_at)
+        VALUES (target, next_version, act,
+            COALESCE(NULLIF(current_setting('pdw.feed_actor', true), ''), session_user),
+            COALESCE(current_setting('pdw.feed_agent', true), ''),
+            COALESCE(current_setting('pdw.feed_reason', true), ''),
+            COALESCE(NULLIF(current_setting('pdw.feed_restored_from', true), '')::bigint, 0),
+            fields, diff, COALESCE(new_row, old_row), clock_timestamp());
+        RETURN NULL;
+    END $$""",
+    """CREATE OR REPLACE FUNCTION @feed_item_versions_immutable() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+        RAISE EXCEPTION 'base_feed.item_versions is append-only: a card''s past versions are never changed or deleted';
+    END $$""",
+    """CREATE OR REPLACE TRIGGER feed_item_versions_append_only
+        BEFORE UPDATE OR DELETE ON @feed_item_versions
+        FOR EACH ROW EXECUTE FUNCTION @feed_item_versions_immutable()""",
+    """CREATE OR REPLACE TRIGGER feed_item_versions_no_truncate
+        BEFORE TRUNCATE ON @feed_item_versions
+        FOR EACH STATEMENT EXECUTE FUNCTION @feed_item_versions_immutable()""",
+    """CREATE OR REPLACE TRIGGER feed_items_versioned
+        AFTER INSERT OR UPDATE OR DELETE ON @feed_items
+        FOR EACH ROW EXECUTE FUNCTION @feed_item_version()""",
+    # Cards that existed before versioning get their current state as v1.
+    """INSERT INTO @feed_item_versions (item_id, version, action, actor, snapshot, changed_at)
+        SELECT i.item_id, 1, 'baseline', 'versioning', to_jsonb(i), i.updated_at
+        FROM @feed_items i
+        WHERE NOT EXISTS (SELECT 1 FROM @feed_item_versions v WHERE v.item_id = i.item_id)""",
 )
 
 # Booleans are bigint 0/1 and the epoch becomes NULL, as everywhere in

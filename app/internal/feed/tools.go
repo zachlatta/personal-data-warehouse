@@ -23,26 +23,67 @@ func toolError(err error) error {
 	return err
 }
 
+// provenance is what every mutating tool records on the versions it writes.
+func provenance(ctx context.Context, agent, reason string) Mutation {
+	return Mutation{Actor: pdwauth.ClientNameFromContext(ctx), Agent: strings.TrimSpace(agent), Reason: strings.TrimSpace(reason)}
+}
+
 type pushInput struct {
 	Source string     `json:"source,omitempty" jsonschema:"default source for every item that does not name its own"`
 	Items  []PushItem `json:"items" jsonschema:"cards to add or update (at most 500); each is idempotent on (source, key)"`
+	Agent  string     `json:"agent,omitempty" jsonschema:"which agent is acting, recorded on each version"`
+	Reason string     `json:"reason,omitempty"`
 }
 
 type pushOutput struct {
-	Created int          `json:"created"`
-	Updated int          `json:"updated"`
-	Items   []PushResult `json:"items"`
+	Created   int          `json:"created"`
+	Updated   int          `json:"updated"`
+	Unchanged int          `json:"unchanged"`
+	Items     []PushResult `json:"items"`
 }
 
 type updateOutput struct {
-	ItemID string `json:"item_id"`
-	Status string `json:"status"`
+	Updated int64 `json:"updated"`
+}
+
+type getInput struct {
+	ItemID  string `json:"item_id" jsonschema:"the card (source:key)"`
+	Version int64  `json:"version,omitempty" jsonschema:"read the card as it was at this version instead of now"`
+}
+
+type restoreInput struct {
+	ItemID  string   `json:"item_id,omitempty"`
+	ItemIDs []string `json:"item_ids,omitempty"`
+	Source  string   `json:"source,omitempty" jsonschema:"restore every removed card of this source"`
+	Version int64    `json:"version,omitempty" jsonschema:"also put back the content of this version (one card only); omit to just undo the removal"`
+	Agent   string   `json:"agent,omitempty"`
+	Reason  string   `json:"reason,omitempty"`
+}
+
+type restoreOutput struct {
+	Restored int             `json:"restored"`
+	Items    []RestoreResult `json:"items"`
+}
+
+type historyInput struct {
+	ItemID    string `json:"item_id,omitempty" jsonschema:"one card's versions; omit for recent changes across the feed"`
+	Source    string `json:"source,omitempty"`
+	Since     string `json:"since,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, or a duration back from now (7d)"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"default 50, at most 1000"`
+	Snapshots bool   `json:"snapshots,omitempty" jsonschema:"include each version's full card snapshot"`
+}
+
+type historyOutput struct {
+	Count    int       `json:"count"`
+	Versions []Version `json:"versions"`
 }
 
 type removeInput struct {
 	ItemIDs []string `json:"item_ids,omitempty" jsonschema:"cards to hide"`
+	ItemID  string   `json:"item_id,omitempty"`
 	Source  string   `json:"source,omitempty" jsonschema:"hide every live card of this source"`
 	Reason  string   `json:"reason,omitempty"`
+	Agent   string   `json:"agent,omitempty"`
 }
 
 type removeOutput struct {
@@ -52,6 +93,8 @@ type removeOutput struct {
 type rankInput struct {
 	Order  []string           `json:"order,omitempty" jsonschema:"item ids best first; they get scores len(order) down to 1"`
 	Scores map[string]float64 `json:"scores,omitempty" jsonschema:"item id to score; higher shows first"`
+	Agent  string             `json:"agent,omitempty"`
+	Reason string             `json:"reason,omitempty"`
 }
 
 type rankOutput struct {
@@ -115,7 +158,7 @@ func Tools(store *Store) []tool.Tool {
 				"on one card, [{url, title}], e.g. the paper, the repo and the discussion), body (markdown), " +
 				"https image_url, author, site, tags, score (higher shows first), published_at, expires_at (RFC3339 or 48h/7d). " +
 				"Every impression, dwell, open (per link), read time and dismissal is recorded; there is no like button, interest is " +
-				"measured (engagement_score): read it back with feed_stats. CLI: pdw feed push.",
+				"measured (engagement_score): read it back with feed_stats. CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
 			Handle: func(ctx context.Context, in pushInput) (pushOutput, error) {
 				if len(in.Items) == 0 {
 					return pushOutput{}, &tool.InvalidInputError{Message: "items is empty: pass at least one card"}
@@ -137,54 +180,115 @@ func Tools(store *Store) []tool.Tool {
 					seen[item.ItemID] = i
 					batch = append(batch, item)
 				}
-				results, err := store.Push(ctx, batch, pdwauth.ClientNameFromContext(ctx))
+				results, err := store.Push(ctx, batch, provenance(ctx, in.Agent, in.Reason))
 				if err != nil {
 					return pushOutput{}, toolError(err)
 				}
 				out := pushOutput{Items: results}
 				for _, r := range results {
-					if r.Status == "created" {
+					switch r.Status {
+					case "created":
 						out.Created++
-					} else {
+					case "unchanged":
+						out.Unchanged++
+					default:
 						out.Updated++
 					}
 				}
 				return out, nil
 			},
 		},
-		&tool.Typed[Update, updateOutput]{
-			NameStr:        "feed_update",
-			TitleStr:       "Edit a Feed Card",
-			DescriptionStr: "Change fields of one Feed tab card by item_id; fields left out are kept. CLI: pdw feed update.",
-			Handle: func(ctx context.Context, in Update) (updateOutput, error) {
+		&tool.Typed[getInput, GetResult]{
+			NameStr:        "feed_get",
+			TitleStr:       "Get a Feed Card",
+			DescriptionStr: "One Feed tab card in full: every field, its engagement, and its current version number, whether live, removed or dismissed. With version, the card as it was at that version (a full snapshot). A card deleted outright answers with its last snapshot and deleted=true. CLI: pdw feed get.",
+			Handle: func(ctx context.Context, in getInput) (GetResult, error) {
 				if strings.TrimSpace(in.ItemID) == "" {
-					return updateOutput{}, &tool.InvalidInputError{Message: "item_id is required"}
+					return GetResult{}, &tool.InvalidInputError{Message: "item_id is required"}
 				}
-				if err := store.Update(ctx, in); err != nil {
-					if errors.Is(err, ErrNotFound) {
-						return updateOutput{}, &tool.InvalidInputError{Message: fmt.Sprintf("no feed item %q (pdw feed list shows ids)", in.ItemID)}
-					}
-					return updateOutput{}, toolError(err)
+				out, err := store.Get(ctx, strings.TrimSpace(in.ItemID), in.Version)
+				if errors.Is(err, ErrNotFound) {
+					return out, &tool.InvalidInputError{Message: fmt.Sprintf("no feed card %q, now or in its history (pdw feed list --all shows ids)", in.ItemID)}
 				}
-				return updateOutput{ItemID: in.ItemID, Status: "updated"}, nil
+				return out, toolError(err)
+			},
+		},
+		&tool.Typed[Update, updateOutput]{
+			NameStr:  "feed_update",
+			TitleStr: "Edit Feed Cards",
+			DescriptionStr: "Edit Feed tab cards: one (item_id), several (item_ids) or every live card of a source. Any field can be set " +
+				"(title, body, url, image_url, author, site, tags, score, published_at, expires_at, metadata); clear lists fields to empty. " +
+				"Fields left out are kept. Every change writes a new version; the old one stays in feed_history. CLI: pdw feed update (alias edit).",
+			Handle: func(ctx context.Context, in Update) (updateOutput, error) {
+				n, err := store.Update(ctx, in, provenance(ctx, in.Agent, in.Reason))
+				if errors.Is(err, ErrNotFound) {
+					return updateOutput{}, &tool.InvalidInputError{Message: "a named card does not exist (pdw feed list --all shows ids; a deleted card comes back with feed_restore)"}
+				}
+				return updateOutput{Updated: n}, toolError(err)
 			},
 		},
 		&tool.Typed[removeInput, removeOutput]{
 			NameStr:        "feed_remove",
 			TitleStr:       "Remove Feed Cards",
-			DescriptionStr: "Hide Feed tab cards by item_ids, or every card of a source. Engagement already recorded is kept; re-pushing a card brings it back. CLI: pdw feed remove.",
+			DescriptionStr: "Remove Feed tab cards by item_id(s), or every live card of a source. Removal is soft: the card leaves the phone, its engagement and every version are kept, and feed_restore brings it back. CLI: pdw feed remove (alias delete).",
 			Handle: func(ctx context.Context, in removeInput) (removeOutput, error) {
-				if len(in.ItemIDs) == 0 && strings.TrimSpace(in.Source) == "" {
-					return removeOutput{}, &tool.InvalidInputError{Message: "pass item_ids or a source"}
+				ids := in.ItemIDs
+				if strings.TrimSpace(in.ItemID) != "" {
+					ids = append(ids, strings.TrimSpace(in.ItemID))
 				}
-				n, err := store.Remove(ctx, in.ItemIDs, strings.TrimSpace(in.Source), in.Reason)
+				if len(ids) == 0 && strings.TrimSpace(in.Source) == "" {
+					return removeOutput{}, &tool.InvalidInputError{Message: "pass item_id(s) or a source"}
+				}
+				n, err := store.Remove(ctx, ids, strings.TrimSpace(in.Source), provenance(ctx, in.Agent, in.Reason))
 				return removeOutput{Removed: n}, toolError(err)
+			},
+		},
+		&tool.Typed[restoreInput, restoreOutput]{
+			NameStr:        "feed_restore",
+			TitleStr:       "Restore Feed Cards",
+			DescriptionStr: "Bring back removed (or deleted) Feed tab cards: by item_id(s) or every removed card of a source. With version (one card), also put back that version's content. The restore is a new version; nothing in between is lost. CLI: pdw feed restore.",
+			Handle: func(ctx context.Context, in restoreInput) (restoreOutput, error) {
+				ids := in.ItemIDs
+				if strings.TrimSpace(in.ItemID) != "" {
+					ids = append(ids, strings.TrimSpace(in.ItemID))
+				}
+				results, err := store.Restore(ctx, ids, strings.TrimSpace(in.Source), in.Version, provenance(ctx, in.Agent, in.Reason))
+				if errors.Is(err, ErrNotFound) {
+					return restoreOutput{}, &tool.InvalidInputError{Message: "a named card has no history to restore from"}
+				}
+				out := restoreOutput{Items: results}
+				for _, r := range results {
+					if r.Status == "restored" {
+						out.Restored++
+					}
+				}
+				return out, toolError(err)
+			},
+		},
+		&tool.Typed[historyInput, historyOutput]{
+			NameStr:        "feed_history",
+			TitleStr:       "Feed Card History",
+			DescriptionStr: "Every version of a Feed tab card, newest first: action (create, update, rank, remove, restore, delete), who (client and agent), when, why, the fields that changed with from/to values, and optionally the full snapshot. Without item_id: recent changes across the feed or one source. Versions are immutable. CLI: pdw feed history.",
+			Handle: func(ctx context.Context, in historyInput) (historyOutput, error) {
+				if in.Limit > 1000 {
+					return historyOutput{}, &tool.InvalidInputError{Message: "limit is at most 1000"}
+				}
+				since, err := sinceTime(in.Since, store.now(), 0)
+				if err != nil {
+					return historyOutput{}, toolError(err)
+				}
+				versions, err := store.History(ctx, HistoryQuery{ItemID: strings.TrimSpace(in.ItemID), Source: strings.TrimSpace(in.Source),
+					Since: since, Limit: in.Limit, Snapshots: in.Snapshots})
+				if err != nil {
+					return historyOutput{}, err
+				}
+				return historyOutput{Count: len(versions), Versions: versions}, nil
 			},
 		},
 		&tool.Typed[rankInput, rankOutput]{
 			NameStr:        "feed_rank",
 			TitleStr:       "Rank Feed Cards",
-			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has seen still sink below unseen ones (those he scrolled past without engaging furthest), and sources are interleaved. CLI: pdw feed rank.",
+			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has seen still sink below unseen ones (those he scrolled past without engaging furthest), and sources are interleaved. Each change is a rank version. CLI: pdw feed rank.",
 			Handle: func(ctx context.Context, in rankInput) (rankOutput, error) {
 				scores := map[string]float64{}
 				for i, id := range in.Order {
@@ -196,7 +300,7 @@ func Tools(store *Store) []tool.Tool {
 				if len(scores) == 0 {
 					return rankOutput{}, &tool.InvalidInputError{Message: "pass order or scores"}
 				}
-				if err := store.SetScores(ctx, scores); err != nil {
+				if err := store.SetScores(ctx, scores, provenance(ctx, in.Agent, in.Reason)); err != nil {
 					return rankOutput{}, toolError(err)
 				}
 				return rankOutput{Ranked: len(scores)}, nil

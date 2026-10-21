@@ -65,7 +65,9 @@ type Item struct {
 	UpdatedAt     time.Time      `json:"updated_at"`
 	RemovedAt     *time.Time     `json:"removed_at,omitempty"`
 	RemovedReason string         `json:"removed_reason,omitempty"`
-	Engagement    Engagement     `json:"engagement"`
+	// Version is the card's latest row in base_feed.item_versions.
+	Version    int64      `json:"version"`
+	Engagement Engagement `json:"engagement"`
 }
 
 // Link is one more place a card points to (the paper, the repo, the

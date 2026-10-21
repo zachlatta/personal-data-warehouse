@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,50 +22,72 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
 )
 
-var feedUsage = `pdw feed - push cards into the PDW app's Feed tab and read how they land.
+var feedUsage = `pdw feed - full control of the PDW app's Feed tab, with every past version kept.
 
 USAGE
-  pdw feed push [flags]                 One card from flags, or many as JSON on
-                                        stdin / --file (an array, {"source":..,
-                                        "items":[..]}, one object, or JSON Lines).
-  pdw feed list [flags]                 Cards with their engagement.
-  pdw feed update ITEM_ID [flags]       Change fields of one card.
-  pdw feed remove ITEM_ID... | --source S [--reason R]
+  pdw feed push [flags]                 Add or update cards (alias add): one from flags,
+                                        or many as JSON on stdin / --file (an array,
+                                        {"source":..,"items":[..]}, one object, or JSON Lines).
+  pdw feed get ITEM_ID [--version N]    One card in full, now or as it was at version N.
+  pdw feed update ITEM_ID... [flags]    Edit cards (alias edit); --source S edits every
+                                        live card of a source. --clear FIELDS empties fields.
+  pdw feed remove ITEM_ID... | --source S
+                                        Soft-remove cards (alias delete); restorable.
+  pdw feed restore ITEM_ID [--version N] | --source S
+                                        Bring cards back; --version also restores that
+                                        version's content.
+  pdw feed history [ITEM_ID] [--source S] [--since 7d] [--full]
+                                        Every version, newest first, with what changed.
   pdw feed rank ITEM_ID...              Order cards best first (or --score ID=N).
+  pdw feed list [flags]                 Cards with their engagement and version.
   pdw feed stats [--source S] [--since 7d]
   pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
 
-A card is idempotent on (source, key); the key defaults to the url, so
-re-pushing a link updates its card instead of duplicating it.
+Every create, edit, rank, removal, restore and deletion writes an immutable version
+(who, which agent, when, why, the diff and a full snapshot) to base_feed.item_versions.
+Nothing is ever lost: removal is soft, and restore can return to any version.
+A card is idempotent on (source, key); the key defaults to the url, so re-pushing a
+link updates its card, and a re-push that changes nothing writes no version.
 
-PUSH / UPDATE FLAGS
+CARD FLAGS (push, update)
   --source NAME     The agent or feed name (lowercase; required for push).
   --title TEXT      Headline.
   --body TEXT       Markdown; the card shows the first lines, the reader all.
   --url URL         The link a tap opens (defaults to the first --link).
-  --link LINK       More links on the card: URL or "Title|URL". Repeatable
+  --link LINK       More links on the card (update: replaces them): URL or "Title|URL". Repeatable
                     (at most 10): the paper, the repo, the discussion.
   --image URL       https image shown full width.
-  --author TEXT, --site TEXT, --key KEY
-  --tag TAG         Repeatable or comma-separated.
+  --author TEXT, --site TEXT, --key KEY (push only)
+  --tag TAG         Repeatable or comma-separated; replaces the tags.
   --score N         Rank weight, higher first.
   --published TIME  RFC3339 or YYYY-MM-DD.
   --expires TIME    RFC3339, YYYY-MM-DD or a duration (48h, 7d).
-  --file PATH       Read cards as JSON from a file (- for stdin).
+  --metadata JSON   update: replace the card's metadata object.
+  --clear FIELDS    update: empty title, body, url, image_url, author, site, tags,
+                    published_at, expires_at or metadata.
+  --file PATH       push: read cards as JSON from a file (- for stdin).
 
-LIST / EVENTS FLAGS
-  --source NAME     Only this source.
+PROVENANCE FLAGS (push, update, remove, restore, rank)
+  --agent NAME      Which agent acted (default $PDW_AGENT_NAME, else $PASEO_AGENT_ID).
+  --reason TEXT     Why; kept on the version.
+
+READ FLAGS
   --view VIEW       list: recent (default) or feed (exactly what the phone shows).
   --all             list: include removed and dismissed cards.
-  -n, --limit N     Rows (list default 50, events default 100).
+  --full            history: include each version's full snapshot.
+  -n, --limit N     Rows.
   --type TYPES      events: session_start, session_end, impression, open, close,
                     expand, dismiss, undismiss.
   --item ID, --since TIME (2026-10-01, or 7d / 12h)
   --output FMT      text (default) or json.
 
 EXAMPLES
-  pdw feed push --source hn --title "Show HN: ..." --url https://news.ycombinator.com/item?id=1
-  jq -c '{source:"muse-picks", items:.}' picks.json | pdw feed push
+  pdw feed add --source hn --title "Show HN: ..." --url https://news.ycombinator.com/item?id=1
+  jq -c '{source:"muse-picks", items:.}' picks.json | pdw feed push --agent muse-picks
+  pdw feed edit hn:1 --title "Better title" --clear image_url --reason "broken image"
+  pdw feed history hn:1
+  pdw feed restore hn:1 --version 2
+  pdw feed remove --source hn --reason "stale batch"
   pdw feed stats --since 7d
   pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, engagement_score FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
 `
@@ -158,12 +181,18 @@ func (c *feedCardFlags) set(fs *flag.FlagSet) (map[string]any, error) {
 	return out, nil
 }
 
-func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+// feedAliases are the other words agents reach for.
+var feedAliases = map[string]string{"add": "push", "edit": "update", "delete": "remove", "rm": "remove", "show": "get", "log": "history"}
+
+func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, feedUsage)
 		return 2
 	}
 	sub, rest := args[0], args[1:]
+	if canonical, ok := feedAliases[sub]; ok {
+		sub = canonical
+	}
 	fail := func(err error) int {
 		fmt.Fprintf(stderr, "pdw feed %s: %v\n", sub, err)
 		return 2
@@ -172,6 +201,29 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	fs.SetOutput(io.Discard)
 	var output string
 	fs.StringVar(&output, "output", "text", "text or json")
+	// Provenance for every version a mutation writes: which agent, and why.
+	// The agent defaults to $PDW_AGENT_NAME, else the Paseo agent id.
+	var agent, reason string
+	mutating := map[string]bool{"push": true, "update": true, "remove": true, "restore": true, "rank": true}[sub]
+	if mutating {
+		fs.StringVar(&agent, "agent", "", "acting agent")
+		fs.StringVar(&reason, "reason", "", "why")
+	}
+	withProvenance := func(input map[string]any) map[string]any {
+		if agent == "" && getenv != nil {
+			agent = getenv("PDW_AGENT_NAME")
+			if agent == "" {
+				agent = getenv("PASEO_AGENT_ID")
+			}
+		}
+		if agent != "" {
+			input["agent"] = agent
+		}
+		if reason != "" {
+			input["reason"] = reason
+		}
+		return input
+	}
 	parse := func() error {
 		ordered, err := flagsFirst(fs, rest, "feed "+sub)
 		if err != nil {
@@ -255,34 +307,90 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 			}
 			input["items"] = items
 		}
-		return call("feed_push", input)
-	case "update":
-		var card feedCardFlags
-		card.bind(fs)
+		return call("feed_push", withProvenance(input))
+	case "get":
+		var version int64
+		fs.Int64Var(&version, "version", 0, "version")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
 		if fs.NArg() != 1 {
-			return fail(errors.New("exactly one ITEM_ID is required (pdw feed list shows ids)"))
+			return fail(errors.New("exactly one ITEM_ID is required (pdw feed list --all shows ids)"))
+		}
+		return call("feed_get", map[string]any{"item_id": fs.Arg(0), "version": version})
+	case "update":
+		var card feedCardFlags
+		card.bind(fs)
+		var clear stringList
+		var metadata string
+		fs.Var(&clear, "clear", "fields to empty")
+		fs.StringVar(&metadata, "metadata", "", "JSON object")
+		if err := parse(); err != nil {
+			return fail(err)
 		}
 		fields, err := card.set(fs)
 		if err != nil {
 			return fail(err)
 		}
 		delete(fields, "key")
-		fields["item_id"] = fs.Arg(0)
-		return call("feed_update", fields)
+		if card.source != "" {
+			fields["source"] = card.source
+		}
+		if fs.NArg() == 0 && card.source == "" {
+			return fail(errors.New("give ITEM_IDs, or --source S to edit every live card of a source"))
+		}
+		if fs.NArg() > 0 {
+			fields["item_ids"] = fs.Args()
+		}
+		if len(clear) > 0 {
+			fields["clear"] = []string(clear)
+		}
+		if metadata != "" {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(metadata), &m); err != nil || m == nil {
+				return fail(errors.New("--metadata must be a JSON object"))
+			}
+			fields["metadata"] = m
+		}
+		return call("feed_update", withProvenance(fields))
 	case "remove":
-		var source, reason string
+		var source string
 		fs.StringVar(&source, "source", "", "every card of this source")
-		fs.StringVar(&reason, "reason", "", "why")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
 		if fs.NArg() == 0 && source == "" {
 			return fail(errors.New("give ITEM_IDs or --source"))
 		}
-		return call("feed_remove", map[string]any{"item_ids": fs.Args(), "source": source, "reason": reason})
+		return call("feed_remove", withProvenance(map[string]any{"item_ids": fs.Args(), "source": source}))
+	case "restore":
+		var source string
+		var version int64
+		fs.StringVar(&source, "source", "", "every removed card of this source")
+		fs.Int64Var(&version, "version", 0, "version")
+		if err := parse(); err != nil {
+			return fail(err)
+		}
+		if fs.NArg() == 0 && source == "" {
+			return fail(errors.New("give ITEM_IDs or --source"))
+		}
+		return call("feed_restore", withProvenance(map[string]any{"item_ids": fs.Args(), "source": source, "version": version}))
+	case "history":
+		var source, since string
+		var limit int
+		var full bool
+		fs.StringVar(&source, "source", "", "source")
+		fs.StringVar(&since, "since", "", "window")
+		fs.IntVar(&limit, "limit", 0, "rows")
+		fs.IntVar(&limit, "n", 0, "rows")
+		fs.BoolVar(&full, "full", false, "snapshots")
+		if err := parse(); err != nil {
+			return fail(err)
+		}
+		if fs.NArg() > 1 {
+			return fail(errors.New("at most one ITEM_ID"))
+		}
+		return call("feed_history", map[string]any{"item_id": fs.Arg(0), "source": source, "since": since, "limit": limit, "snapshots": full})
 	case "rank":
 		var scores stringList
 		fs.Var(&scores, "score", "ID=N")
@@ -308,7 +416,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		if len(input) == 0 {
 			return fail(errors.New("give ITEM_IDs best first, or --score ITEM_ID=N"))
 		}
-		return call("feed_rank", input)
+		return call("feed_rank", withProvenance(input))
 	case "list":
 		var source, view string
 		var all bool
@@ -347,7 +455,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return call("feed_events", map[string]any{"item_id": item, "source": source, "types": []string(types),
 			"since": since, "limit": limit})
 	default:
-		fmt.Fprintf(stderr, "pdw feed: unknown subcommand %q (push, list, update, remove, rank, stats, events)\n", sub)
+		fmt.Fprintf(stderr, "pdw feed: unknown subcommand %q (push, get, update, remove, restore, history, rank, list, stats, events)\n", sub)
 		return 2
 	}
 }
@@ -484,10 +592,111 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			}
 			fmt.Fprintln(w, line)
 		}
+	case "update":
+		fmt.Fprintf(w, "updated %d\n", int(num(out, "updated")))
+	case "remove":
+		fmt.Fprintf(w, "removed %d (restorable: pdw feed restore)\n", int(num(out, "removed")))
+	case "rank":
+		fmt.Fprintf(w, "ranked %d\n", int(num(out, "ranked")))
+	case "restore":
+		fmt.Fprintf(w, "restored %d\n", int(num(out, "restored")))
+		for _, it := range asList(out["items"]) {
+			line := fmt.Sprintf("  %-12s %s", str(it, "status"), str(it, "item_id"))
+			if v := num(it, "version"); v > 0 {
+				line += fmt.Sprintf(" -> v%d", int(v))
+			}
+			if v := num(it, "from_version"); v > 0 {
+				line += fmt.Sprintf(" (content of v%d)", int(v))
+			}
+			fmt.Fprintln(w, line)
+		}
+	case "get":
+		if it, ok := out["item"].(map[string]any); ok {
+			fmt.Fprintf(w, "%s  v%d of %d", str(it, "item_id"), int(num(it, "version")), int(num(out, "versions")))
+			if str(it, "removed_at") != "" {
+				fmt.Fprintf(w, "  REMOVED %s %s", str(it, "removed_at"), str(it, "removed_reason"))
+			}
+			fmt.Fprintln(w)
+			printCardFields(w, it)
+			if e, ok := it["engagement"].(map[string]any); ok {
+				fmt.Fprintf(w, "engagement: seen=%d dwell=%s opens=%d read=%s liked=%v dismissed=%v\n", int(num(e, "impressions")),
+					secs(num(e, "dwell_ms")), int(num(e, "opens")), secs(num(e, "read_ms")), e["liked"], e["dismissed"])
+			}
+			return
+		}
+		if v, ok := out["version"].(map[string]any); ok {
+			label := ""
+			if b, _ := out["deleted"].(bool); b {
+				label = "  DELETED (pdw feed restore brings it back)"
+			}
+			fmt.Fprintf(w, "%s  as of v%d (%s by %s, %s)%s\n", str(v, "item_id"), int(num(v, "version")), str(v, "action"),
+				str(v, "actor"), str(v, "changed_at"), label)
+			if snap, ok := v["snapshot"].(map[string]any); ok {
+				printCardFields(w, snap)
+			}
+		}
+	case "history":
+		versions := asList(out["versions"])
+		if len(versions) == 0 {
+			fmt.Fprintln(w, "no versions")
+		}
+		for _, v := range versions {
+			who := str(v, "actor")
+			if a := str(v, "agent"); a != "" {
+				who += " / " + a
+			}
+			line := fmt.Sprintf("%s v%d  %-8s %s  by %s", str(v, "item_id"), int(num(v, "version")), str(v, "action"), str(v, "changed_at"), who)
+			if r := num(v, "restored_from"); r > 0 {
+				line += fmt.Sprintf("  (from v%d)", int(r))
+			}
+			if r := str(v, "reason"); r != "" {
+				line += "  reason: " + r
+			}
+			fmt.Fprintln(w, line)
+			if diff, ok := v["diff"].(map[string]any); ok {
+				keys := make([]string, 0, len(diff))
+				for k := range diff {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					change, _ := diff[k].(map[string]any)
+					fmt.Fprintf(w, "    %s: %s -> %s\n", k, short(change["from"]), short(change["to"]))
+				}
+			}
+		}
 	default:
 		pretty, _ := json.Marshal(out)
 		fmt.Fprintln(w, string(pretty))
 	}
+}
+
+func printCardFields(w io.Writer, card map[string]any) {
+	for _, k := range []string{"source", "key", "item_key", "title", "url", "image_url", "author", "site", "tags", "score", "published_at", "expires_at", "metadata", "body"} {
+		v, ok := card[k]
+		if !ok || v == nil || v == "" || v == "1970-01-01T00:00:00+00:00" {
+			continue
+		}
+		fmt.Fprintf(w, "%s: %s\n", k, short(v))
+	}
+}
+
+// short renders a diff or field value on one line.
+func short(v any) string {
+	var text string
+	switch x := v.(type) {
+	case nil:
+		return "(none)"
+	case string:
+		text = strconv.Quote(x)
+	default:
+		raw, _ := json.Marshal(x)
+		text = string(raw)
+	}
+	if r := []rune(text); len(r) > 160 {
+		text = string(r[:157]) + "..."
+	}
+	return text
 }
 
 func asList(v any) []map[string]any {

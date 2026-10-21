@@ -18,7 +18,8 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
 
 - **`source`** names the agent or feed (lowercase). Every card is idempotent on
   (source, key) and the key defaults to the url, so re-pushing a link updates its card;
-  a re-push replaces the content and keeps the score unless one is given.
+  a re-push replaces the content, keeps the score unless one is given, and writes nothing
+  when nothing changed.
 - A card needs a title, a body or a url. `body` is markdown (the card shows the first
   lines, the reader all of it); `image_url` must be https; `site` defaults to the url's host.
 - **More links per card:** `links` (at most 10, each `url` + optional `title`) show as rows
@@ -27,8 +28,31 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   shows unseen cards first, then seen ones he engaged with, then ones he scrolled past, and
   never shows one source
   three times in a row while another waits. `expires_at` takes RFC3339 or `48h` / `7d`.
-- {{if .CLI}}`pdw feed update ID`, `pdw feed remove ID...` or `--source S`{{else}}`feed_update`, `feed_remove` (ids or a whole source){{end}}. Removing hides a card and keeps
-  its engagement; a dismissal by Zach hides it for good.
+- Say who you are: {{if .CLI}}`--agent NAME` (default `$PDW_AGENT_NAME`, else the Paseo agent id) and `--reason`{{else}}`agent` and `reason`{{end}} are kept on every version you write.
+
+## Managing cards: every change is a version
+
+Every create, edit, rank, removal, restore and deletion writes an immutable row to
+`base_feed.item_versions` (version, action, client, agent, reason, changed fields with
+from/to, full snapshot). Nothing is ever lost, so edit and remove freely.
+
+{{if .CLI}}| You want | Run |
+| --- | --- |
+| One card in full, or as it was | `pdw feed get ID [--version N]` |
+| Edit (any field; empty some) | `pdw feed edit ID... --title T --clear image_url,tags` |
+| Edit every live card of a source | `pdw feed edit --source S --expires 2d` |
+| Remove (soft) | `pdw feed remove ID...` or `--source S` |
+| Bring back, optionally an older version | `pdw feed restore ID [--version N]` or `--source S` |
+| What changed, and who did it | `pdw feed history [ID] [--source S] [--full]` |{{else}}| You want | Call |
+| --- | --- |
+| One card in full, or as it was | `feed_get` `{"item_id", "version"}` |
+| Edit (any field; empty some) | `feed_update` `{"item_id" or "item_ids" or "source", fields..., "clear": [...]}` |
+| Remove (soft) | `feed_remove` `{"item_ids"}` or `{"source"}` |
+| Bring back, optionally an older version | `feed_restore` `{"item_id", "version"}` or `{"source"}` |
+| What changed, and who did it | `feed_history` `{"item_id", "source", "snapshots"}` |{{end}}
+
+A dismissal by Zach is engagement, not a version: it hides the card from his feed for good,
+whatever an agent does to it.
 
 ## Reading engagement
 

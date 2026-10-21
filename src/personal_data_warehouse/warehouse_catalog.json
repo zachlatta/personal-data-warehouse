@@ -3491,6 +3491,18 @@
       "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss."
     },
     {
+      "id": "feed_item_versions",
+      "kind": "table",
+      "layer": "base",
+      "domain": "feed",
+      "schema": "base_feed",
+      "name": "item_versions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Card history. One immutable row per create, edit, rank, remove, restore or delete of a card: version, action, actor, agent, reason, changed fields, diff and full snapshot. Written by a trigger on base_feed.items; never updated or deleted."
+    },
+    {
       "id": "hacker_news_items",
       "kind": "table",
       "layer": "base",
@@ -3808,6 +3820,28 @@
       "domain": "internal",
       "schema": "internal",
       "name": "capture_timeline_notification",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "feed_item_versions_immutable",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "feed_item_versions_immutable",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "feed_item_version",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "feed_item_version",
       "discoverable": false,
       "query_access": "denied",
       "secret": false

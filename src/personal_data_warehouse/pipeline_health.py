@@ -1508,6 +1508,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "browser_history_visits": _data("browser_history", "synced_at", "visited_at"),
     "feed_items": _support("feed", "updated_at", "created_at", "cards agents push"),
     "feed_events": _data("feed", "received_at", "occurred_at"),
+    "feed_item_versions": _support("feed", "changed_at", None, "card history written by a trigger"),
     # Google Drive
     "google_drive_files": _data("google_drive", "ingested_at", "modified_time"),
     "google_drive_sync_state": _state("google_drive", "updated_at"),

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_data_warehouse.feed import EVENT_TYPES, TABLES, TIMELINE_EVENT_TYPES, VIEWS
+from personal_data_warehouse.feed import EVENT_TYPES, FUNCTIONS, TABLES, TIMELINE_EVENT_TYPES, VIEWS
 from personal_data_warehouse.postgres import PostgresWarehouse
 from tests.conftest import cleanup_test_warehouse, make_test_schema
 
@@ -134,7 +134,7 @@ def test_item_engagement_reports_an_absent_timestamp_as_null_not_the_epoch(wareh
 @pytestmark_db
 def test_go_feed_module_against_the_same_provisioned_schema(warehouse):
     wh = warehouse
-    names = (*TABLES, *VIEWS)
+    names = (*TABLES, *VIEWS, *FUNCTIONS)
     env = dict(
         os.environ,
         PDW_FEED_TEST_URL=os.environ["POSTGRES_DATABASE_URL"],
@@ -146,3 +146,73 @@ def test_go_feed_module_against_the_same_provisioned_schema(warehouse):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "--- SKIP" not in result.stdout, result.stdout
+
+
+def _versions(wh, item_id="hn:1"):
+    return wh._query(
+        "SELECT version, action, actor, agent, reason, restored_from, changed_fields, diff, snapshot "
+        "FROM @feed_item_versions WHERE item_id = %s ORDER BY version", (item_id,))
+
+
+@pytestmark_db
+def test_every_change_to_a_card_writes_an_immutable_version(warehouse):
+    wh = warehouse
+    _item(wh, title="First")
+    wh._command("UPDATE @feed_items SET title = 'Second', updated_at = now() WHERE item_id = 'hn:1'")
+    wh._command("UPDATE @feed_items SET updated_at = now() + interval '1 minute' WHERE item_id = 'hn:1'")
+    wh._command("UPDATE @feed_items SET score = 3 WHERE item_id = 'hn:1'")
+    wh._command("UPDATE @feed_items SET removed_at = now(), removed_reason = 'stale' WHERE item_id = 'hn:1'")
+    wh._command("UPDATE @feed_items SET removed_at = 'epoch', removed_reason = '' WHERE item_id = 'hn:1'")
+    wh._command("DELETE FROM @feed_items WHERE item_id = 'hn:1'")
+    versions = _versions(wh)
+    # The updated_at-only write changed nothing a reader can see: no version.
+    assert [(v, a) for v, a, *_ in versions] == [
+        (1, "create"), (2, "update"), (3, "rank"), (4, "remove"), (5, "restore"), (6, "delete")]
+    _, _, _, _, _, _, fields, diff, snapshot = versions[1]
+    assert fields == ["title"]
+    assert diff == {"title": {"from": "First", "to": "Second"}}
+    assert snapshot["title"] == "Second"
+    # The tombstone keeps the card as it was, so it can be restored.
+    assert versions[-1][8]["title"] == "Second" and versions[-1][8]["score"] == 3
+    with pytest.raises(Exception, match="append-only"):
+        wh._command("UPDATE @feed_item_versions SET action = 'x'")
+    with pytest.raises(Exception, match="append-only"):
+        wh._command("DELETE FROM @feed_item_versions")
+    with pytest.raises(Exception, match="append-only"):
+        wh._command("TRUNCATE @feed_item_versions")
+    assert len(_versions(wh)) == 6
+
+
+@pytestmark_db
+def test_a_version_records_who_which_agent_and_why_from_the_transaction(warehouse):
+    wh = warehouse
+    _item(wh)
+    wh._command(
+        "DO $$ BEGIN "
+        "PERFORM set_config('pdw.feed_actor', 'porygon', true); "
+        "PERFORM set_config('pdw.feed_agent', 'muse-picks', true); "
+        "PERFORM set_config('pdw.feed_reason', 'fix typo', true); "
+        "PERFORM set_config('pdw.feed_action', 'restore', true); "
+        "PERFORM set_config('pdw.feed_restored_from', '1', true); "
+        "UPDATE @feed_items SET title = 'Fixed' WHERE item_id = 'hn:1'; END $$")
+    _, action, actor, agent, reason, restored_from, *_ = _versions(wh)[-1]
+    assert (action, actor, agent, reason, restored_from) == ("restore", "porygon", "muse-picks", "fix typo", 1)
+    # Settings are transaction-local: the next write is classified afresh.
+    wh._command("UPDATE @feed_items SET body = 'b' WHERE item_id = 'hn:1'")
+    _, action, _, agent, reason, restored_from, *_ = _versions(wh)[-1]
+    assert (action, agent, reason, restored_from) == ("update", "", "", 0)
+
+
+@pytestmark_db
+def test_cards_from_before_versioning_get_a_baseline_version(warehouse):
+    wh = warehouse
+    wh._command("ALTER TABLE @feed_items DISABLE TRIGGER feed_items_versioned")
+    _item(wh, title="Old")
+    wh._command("ALTER TABLE @feed_items ENABLE TRIGGER feed_items_versioned")
+    assert _versions(wh) == []
+    from personal_data_warehouse.feed import ensure_feed_tables
+    ensure_feed_tables(wh)
+    ensure_feed_tables(wh)
+    [(version, action, actor, *_rest)] = _versions(wh)
+    assert (version, action, actor) == (1, "baseline", "versioning")
+    assert _rest[-1]["title"] == "Old"

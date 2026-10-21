@@ -187,7 +187,7 @@ func TestRegisterMountsNothingWhenDisabled(t *testing.T) {
 	for _, tl := range enabled {
 		names = append(names, tl.Name())
 	}
-	if strings.Join(names, ",") != "feed_push,feed_update,feed_remove,feed_rank,feed_list,feed_stats,feed_events" {
+	if strings.Join(names, ",") != "feed_push,feed_get,feed_update,feed_remove,feed_restore,feed_history,feed_rank,feed_list,feed_stats,feed_events" {
 		t.Fatalf("tools: %v", names)
 	}
 }

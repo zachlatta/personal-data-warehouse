@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -86,7 +87,16 @@ func TestFeedSubcommandsMapToTheirTools(t *testing.T) {
 		want string
 	}{
 		{[]string{"list", "--source", "hn", "-n", "5"}, "feed_list", `"limit":5`},
-		{[]string{"update", "hn:1", "--score", "3"}, "feed_update", `"item_id":"hn:1"`},
+		{[]string{"update", "hn:1", "--score", "3"}, "feed_update", `"item_ids":["hn:1"]`},
+		{[]string{"edit", "--source", "hn", "--clear", "image_url,tags", "--reason", "broken"}, "feed_update", `"clear":["image_url","tags"],"reason":"broken","source":"hn"`},
+		{[]string{"update", "hn:1", "--title", "", "--metadata", `{"a":1}`}, "feed_update", `"metadata":{"a":1},"title":""`},
+		{[]string{"add", "--source", "x", "--title", "t"}, "feed_push", `"source":"x"`},
+		{[]string{"get", "hn:1", "--version", "2"}, "feed_get", `"version":2`},
+		{[]string{"delete", "hn:1"}, "feed_remove", `"item_ids":["hn:1"]`},
+		{[]string{"restore", "hn:1", "--version", "3"}, "feed_restore", `"version":3`},
+		{[]string{"restore", "--source", "hn"}, "feed_restore", `"source":"hn"`},
+		{[]string{"history", "hn:1", "--full"}, "feed_history", `"snapshots":true`},
+		{[]string{"history", "--source", "hn", "-n", "5"}, "feed_history", `"limit":5`},
 		{[]string{"remove", "hn:1", "hn:2", "--reason", "stale"}, "feed_remove", `"item_ids":["hn:1","hn:2"]`},
 		{[]string{"rank", "hn:2", "hn:1"}, "feed_rank", `"order":["hn:2","hn:1"]`},
 		{[]string{"rank", "--score", "hn:1=0.5"}, "feed_rank", `"scores":{"hn:1":0.5}`},
@@ -118,7 +128,54 @@ func TestFeedArgumentErrorsNeverReachTheServer(t *testing.T) {
 
 func TestFeedHelpIsItsOwn(t *testing.T) {
 	out, _, code := runCLI(t, "http://127.0.0.1:1", "", "feed", "--help")
-	if code != 0 || !strings.HasPrefix(out, "pdw feed - push cards") {
+	if code != 0 || !strings.HasPrefix(out, "pdw feed - full control") {
 		t.Fatalf("code=%d out=%.80q", code, out)
+	}
+}
+
+func TestFeedMutationsCarryTheAgentFromTheEnvironment(t *testing.T) {
+	srv := feedStub(t, `{"removed":1}`)
+	var outBuf, errBuf bytes.Buffer
+	env := map[string]string{"PDW_API_URL": srv.URL, "PDW_SECRET_TOKEN": cliTestToken, "PDW_CLIENT_NAME": "t", "PASEO_AGENT_ID": "agent-123"}
+	code := run([]string{"feed", "remove", "hn:1", "--reason", "stale"}, strings.NewReader(""), &outBuf, &errBuf, func(k string) string { return env[k] })
+	if code != 0 || !strings.Contains(string(srv.lastBody), `"agent":"agent-123"`) || !strings.Contains(string(srv.lastBody), `"reason":"stale"`) {
+		t.Fatalf("code=%d body=%s stderr=%s", code, srv.lastBody, errBuf.String())
+	}
+	env["PDW_AGENT_NAME"] = "muse-picks"
+	run([]string{"feed", "rank", "hn:1", "--agent", "explicit"}, strings.NewReader(""), &outBuf, &errBuf, func(k string) string { return env[k] })
+	if !strings.Contains(string(srv.lastBody), `"agent":"explicit"`) {
+		t.Fatalf("an explicit --agent wins: %s", srv.lastBody)
+	}
+	run([]string{"feed", "get", "hn:1"}, strings.NewReader(""), &outBuf, &errBuf, func(k string) string { return env[k] })
+	if strings.Contains(string(srv.lastBody), "agent") {
+		t.Fatalf("a read sends no provenance: %s", srv.lastBody)
+	}
+}
+
+func TestFeedHistoryPrintsEachVersionWithItsDiff(t *testing.T) {
+	srv := feedStub(t, `{"count":2,"versions":[`+
+		`{"item_id":"hn:1","version":2,"action":"update","actor":"porygon","agent":"picker","reason":"typo","changed_fields":["title"],"diff":{"title":{"from":"Old","to":"New"}},"changed_at":"2026-10-20T12:00:00Z"},`+
+		`{"item_id":"hn:1","version":1,"action":"create","actor":"porygon","changed_fields":[],"changed_at":"2026-10-20T11:00:00Z"}]}`)
+	out, stderr, code := runCLI(t, srv.URL, "", "feed", "history", "hn:1")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	for _, want := range []string{"hn:1 v2  update", "by porygon / picker", "reason: typo", `title: "Old" -> "New"`, "hn:1 v1  create"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestFeedGetShowsARemovedCardAndADeletedOnesSnapshot(t *testing.T) {
+	srv := feedStub(t, `{"item":{"item_id":"hn:1","source":"hn","key":"1","title":"T","tags":[],"score":2,"version":4,"removed_at":"2026-10-20T12:00:00Z","removed_reason":"stale","engagement":{"impressions":3}},"versions":4}`)
+	out, _, code := runCLI(t, srv.URL, "", "feed", "show", "hn:1")
+	if code != 0 || !strings.Contains(out, "hn:1  v4 of 4  REMOVED") || !strings.Contains(out, `title: "T"`) || !strings.Contains(out, "seen=3") {
+		t.Fatalf("code=%d out=%s", code, out)
+	}
+	srv = feedStub(t, `{"deleted":true,"versions":3,"version":{"item_id":"hn:2","version":3,"action":"delete","actor":"postgres","changed_at":"2026-10-20T12:00:00Z","snapshot":{"item_key":"2","title":"Gone"}}}`)
+	out, _, _ = runCLI(t, srv.URL, "", "feed", "get", "hn:2")
+	if !strings.Contains(out, "DELETED") || !strings.Contains(out, `title: "Gone"`) {
+		t.Fatalf("out=%s", out)
 	}
 }

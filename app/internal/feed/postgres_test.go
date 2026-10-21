@@ -60,6 +60,13 @@ func callErr(t *testing.T, tools []tool.Tool, name string, input any) error {
 // Invoked by tests/test_feed.py against a schema the Python ensure path
 // provisioned, so the Go module and feed.py cannot drift apart.
 func TestPostgresFeedEndToEnd(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	feedEndToEnd(t, store, tools, now)
+}
+
+func postgresStore(t *testing.T) (*Store, time.Time) {
+	t.Helper()
 	databaseURL := os.Getenv("PDW_FEED_TEST_URL")
 	if databaseURL == "" {
 		t.Skip("run through tests/test_feed.py for managed Postgres")
@@ -74,14 +81,18 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	}
 	store.Expand = func(q string) string {
 		// Longest names first: @feed_items must not eat @feed_items_x.
-		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "feed_items", "feed_events"} {
+		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "feed_item_versions", "feed_items", "feed_events"} {
 			q = strings.ReplaceAll(q, "@"+name, relations[name])
 		}
 		return q
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	store.Now = func() time.Time { return now }
-	tools := Tools(store)
+	return store, now
+}
+
+func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) {
+	t.Helper()
 
 	// Push: a batch, idempotent on (source, key).
 	pushed := call(t, tools, "feed_push", map[string]any{"source": "hn", "items": []map[string]any{
@@ -221,4 +232,124 @@ func titles(out map[string]any) string {
 		parts = append(parts, item.(map[string]any)["title"].(string))
 	}
 	return strings.Join(parts, ",")
+}
+
+// Runs after the end-to-end test on the same schema, under its own source.
+func TestPostgresFeedVersioning(t *testing.T) {
+	store, _ := postgresStore(t)
+	tools := Tools(store)
+	id := "ver:a"
+	history := func() []any {
+		t.Helper()
+		return call(t, tools, "feed_history", map[string]any{"item_id": id})["versions"].([]any)
+	}
+	versionOf := func(v any) map[string]any { return v.(map[string]any) }
+
+	call(t, tools, "feed_push", map[string]any{"source": "ver", "agent": "picker", "items": []map[string]any{
+		{"key": "a", "title": "One", "body": "first body", "url": "https://example.com/a", "tags": []string{"x"}},
+		{"key": "b", "title": "Two"},
+	}})
+	unchanged := call(t, tools, "feed_push", map[string]any{"source": "ver", "items": []map[string]any{
+		{"key": "a", "title": "One", "body": "first body", "url": "https://example.com/a", "tags": []string{"x"}},
+	}})
+	if unchanged["unchanged"] != float64(1) || len(history()) != 1 {
+		t.Fatalf("a re-push that changes nothing must write no version: %v %v", unchanged, history())
+	}
+
+	// Edit every field kind, clear some, and see each step in the history.
+	call(t, tools, "feed_update", map[string]any{"item_id": id, "title": "One, edited", "reason": "typo", "agent": "editor"})
+	call(t, tools, "feed_update", map[string]any{"item_id": id, "clear": []string{"body", "tags", "url"}})
+	if err := callErr(t, tools, "feed_update", map[string]any{"item_id": id, "title": "x", "clear": []string{"title"}}); err == nil {
+		t.Fatal("setting and clearing one field must be refused")
+	}
+	if err := callErr(t, tools, "feed_update", map[string]any{"item_id": "ver:nope", "title": "x"}); err == nil {
+		t.Fatal("editing an unknown card must fail")
+	}
+	call(t, tools, "feed_rank", map[string]any{"scores": map[string]float64{id: 5}, "reason": "top pick"})
+	call(t, tools, "feed_remove", map[string]any{"item_id": id, "reason": "stale"})
+	versions := history()
+	actions := []string{}
+	for _, v := range versions {
+		actions = append(actions, versionOf(v)["action"].(string))
+	}
+	if strings.Join(actions, ",") != "remove,rank,update,update,create" {
+		t.Fatalf("history newest first: %v", actions)
+	}
+	edit := versionOf(versions[3])
+	if edit["agent"] != "editor" || edit["reason"] != "typo" || edit["actor"] == "" {
+		t.Fatalf("provenance: %v", edit)
+	}
+	if diff := edit["diff"].(map[string]any)["title"].(map[string]any); diff["from"] != "One" || diff["to"] != "One, edited" {
+		t.Fatalf("diff: %v", edit["diff"])
+	}
+	cleared := versionOf(versions[2])["changed_fields"].([]any)
+	if len(cleared) != 3 {
+		t.Fatalf("clear changed: %v", cleared)
+	}
+	if versionOf(versions[4])["agent"] != "picker" {
+		t.Fatalf("push agent: %v", versions[4])
+	}
+
+	// get: now (removed, still readable) and as it was at version 1.
+	now := call(t, tools, "feed_get", map[string]any{"item_id": id})
+	item := now["item"].(map[string]any)
+	if item["removed_at"] == nil || item["body"] != nil || item["version"] != float64(5) || now["versions"] != float64(5) {
+		t.Fatalf("get now: %v", now)
+	}
+	v1 := call(t, tools, "feed_get", map[string]any{"item_id": id, "version": 1})["version"].(map[string]any)["snapshot"].(map[string]any)
+	if v1["title"] != "One" || v1["body"] != "first body" {
+		t.Fatalf("get v1: %v", v1)
+	}
+
+	// restore: undo the removal (content stays), then put version 1 back.
+	restored := call(t, tools, "feed_restore", map[string]any{"item_id": id})
+	if restored["restored"] != float64(1) {
+		t.Fatalf("restore: %v", restored)
+	}
+	got := call(t, tools, "feed_get", map[string]any{"item_id": id})["item"].(map[string]any)
+	if got["removed_at"] != nil || got["title"] != "One, edited" {
+		t.Fatalf("after restore: %v", got)
+	}
+	call(t, tools, "feed_restore", map[string]any{"item_id": id, "version": 1, "reason": "liked the original"})
+	got = call(t, tools, "feed_get", map[string]any{"item_id": id})["item"].(map[string]any)
+	if got["title"] != "One" || got["body"] != "first body" || got["score"] != float64(0) || got["version"] != float64(7) {
+		t.Fatalf("after restore to v1: %v", got)
+	}
+	latest := versionOf(history()[0])
+	if latest["action"] != "restore" || latest["restored_from"] != float64(1) || latest["reason"] != "liked the original" {
+		t.Fatalf("restore version: %v", latest)
+	}
+	if len(history()) != 7 {
+		t.Fatalf("every version persists: %d", len(history()))
+	}
+
+	// Bulk by source: edit, remove, restore.
+	bulk := call(t, tools, "feed_update", map[string]any{"source": "ver", "expires_at": "2d"})
+	if bulk["updated"] != float64(2) {
+		t.Fatalf("bulk update: %v", bulk)
+	}
+	if n := call(t, tools, "feed_remove", map[string]any{"source": "ver"})["removed"]; n != float64(2) {
+		t.Fatalf("bulk remove: %v", n)
+	}
+	if n := call(t, tools, "feed_restore", map[string]any{"source": "ver"})["restored"]; n != float64(2) {
+		t.Fatalf("bulk restore: %v", n)
+	}
+
+	// A card deleted outright (plain SQL) is a tombstone that restores.
+	if _, err := store.DB.Exec(store.q("DELETE FROM @feed_items WHERE item_id = 'ver:b'")); err != nil {
+		t.Fatal(err)
+	}
+	gone := call(t, tools, "feed_get", map[string]any{"item_id": "ver:b"})
+	if gone["deleted"] != true || gone["version"].(map[string]any)["action"] != "delete" {
+		t.Fatalf("deleted card: %v", gone)
+	}
+	call(t, tools, "feed_restore", map[string]any{"item_id": "ver:b"})
+	back := call(t, tools, "feed_get", map[string]any{"item_id": "ver:b"})["item"].(map[string]any)
+	if back["title"] != "Two" || back["removed_at"] != nil {
+		t.Fatalf("restored from tombstone: %v", back)
+	}
+	recent := call(t, tools, "feed_history", map[string]any{"source": "ver", "limit": 3})
+	if recent["count"] != float64(3) {
+		t.Fatalf("source history: %v", recent)
+	}
 }

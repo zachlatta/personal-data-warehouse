@@ -172,8 +172,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # visit from the Mac uploader.
         # +1 base: base_argon.events, Google Antigravity CLI (agy) transcripts.
         # +2 base: base_feed.items/.events, the Feed tab's cards and the
-        # phone's engagement log (docs/feed.md).
-        "base": 84,
+        # phone's engagement log (docs/feed.md), +1 base_feed.item_versions,
+        # every past version of a card.
+        "base": 85,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter
@@ -259,7 +260,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         "private": 14,  # encrypted MCP connections, HN session
         # +2 internal: the row-trigger functions that keep
         # derived_search.chunk_vectors in step with chunks and embeddings.
-        "internal": 5,
+        # +2 internal: the Feed tab's card-versioning trigger and the guard
+        # that keeps base_feed.item_versions append-only.
+        "internal": 7,
     }
 
 

@@ -3723,6 +3723,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "and each open/like/dismiss on one is a feed_engagement timeline event"
     ),
     "feed_events": _events(),
+    "feed_item_versions": _entity(
+        "every past version of a feed card (create, edit, rank, removal, restore); "
+        "agents' card management, not a real-world event; read with pdw feed history"
+    ),
     "hacker_news_items": _events(),
     "hacker_news_user_items": _detail(
         "hacker_news_items", "why an item is archived (submitted / favorited / upvoted / hidden)"
@@ -3888,7 +3892,7 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "push_devices",
     "app_access_tokens",
     # The Feed tab (feed.py): written by the Go app, declared in raw DDL.
-    "feed_items", "feed_events",
+    "feed_items", "feed_events", "feed_item_versions",
     "search_schema_state",
     # Partitioned (CREATE TABLE ... PARTITION BY), which TableSpec cannot
     # express; created by ensure_search_index_tables where pgvector exists.

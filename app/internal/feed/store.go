@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -88,226 +87,6 @@ func linksJSON(links []Link) (string, error) {
 	return string(raw), err
 }
 
-// PushResult is one card's outcome.
-type PushResult struct {
-	ItemID string `json:"item_id"`
-	Status string `json:"status"` // created | updated
-}
-
-// Push upserts cards by (source, key). Re-pushing a removed card revives it;
-// a score left out keeps the stored one.
-func (s *Store) Push(ctx context.Context, items []normalized, pushedBy string) ([]PushResult, error) {
-	ctx, cancel := s.ctx(ctx)
-	defer cancel()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	statement := s.q(`
-		INSERT INTO @feed_items AS f (item_id, source, item_key, title, body, url, image_url, author, site,
-			tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at, links)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], COALESCE($11::float8, 0), $12, $13, $14::jsonb, $15, $16, $16,
-			$17::jsonb)
-		ON CONFLICT (item_id) DO UPDATE SET
-			title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, links = EXCLUDED.links,
-			image_url = EXCLUDED.image_url,
-			author = EXCLUDED.author, site = EXCLUDED.site, tags = EXCLUDED.tags,
-			score = COALESCE($11::float8, f.score), published_at = EXCLUDED.published_at,
-			expires_at = EXCLUDED.expires_at, metadata = EXCLUDED.metadata, pushed_by = EXCLUDED.pushed_by,
-			updated_at = EXCLUDED.updated_at, removed_at = 'epoch', removed_reason = ''
-		RETURNING (xmax = 0)`)
-	now := s.now()
-	results := make([]PushResult, 0, len(items))
-	for _, item := range items {
-		metadata, err := json.Marshal(item.Metadata)
-		if err != nil {
-			return nil, invalid("item %s: metadata is not JSON-encodable", item.ItemID)
-		}
-		if len(metadata) > maxMetadataLen {
-			return nil, invalid("item %s: metadata is larger than %d bytes", item.ItemID, maxMetadataLen)
-		}
-		links, err := linksJSON(item.Links)
-		if err != nil {
-			return nil, err
-		}
-		var inserted bool
-		err = tx.QueryRowContext(ctx, statement, item.ItemID, item.Source, item.Key, item.Title, item.Body,
-			item.URL, item.ImageURL, item.Author, item.Site, tagsLiteral(item.Tags), item.Score,
-			orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), pushedBy, now, links).Scan(&inserted)
-		if err != nil {
-			return nil, fmt.Errorf("push %s: %w", item.ItemID, err)
-		}
-		status := "updated"
-		if inserted {
-			status = "created"
-		}
-		results = append(results, PushResult{ItemID: item.ItemID, Status: status})
-	}
-	return results, tx.Commit()
-}
-
-// Update is a partial edit of one card; nil fields are left alone.
-type Update struct {
-	ItemID      string         `json:"item_id" jsonschema:"the card to change (source:key, from push or list)"`
-	Title       *string        `json:"title,omitempty"`
-	Body        *string        `json:"body,omitempty"`
-	URL         *string        `json:"url,omitempty"`
-	Links       *[]Link        `json:"links,omitempty" jsonschema:"replaces the card's extra links ([] clears them)"`
-	ImageURL    *string        `json:"image_url,omitempty"`
-	Author      *string        `json:"author,omitempty"`
-	Site        *string        `json:"site,omitempty"`
-	Tags        []string       `json:"tags,omitempty"`
-	Score       *float64       `json:"score,omitempty"`
-	PublishedAt *string        `json:"published_at,omitempty"`
-	ExpiresAt   *string        `json:"expires_at,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, a duration from now (7d), or empty to never expire"`
-	Metadata    map[string]any `json:"metadata,omitempty" jsonschema:"replaces the card's metadata"`
-}
-
-var ErrNotFound = errors.New("no such feed item")
-
-func (s *Store) Update(ctx context.Context, u Update) error {
-	now := s.now()
-	sets := []string{}
-	args := []any{}
-	add := func(column string, value any) {
-		args = append(args, value)
-		sets = append(sets, fmt.Sprintf("%s = $%d", column, len(args)))
-	}
-	text := func(column string, value *string, maxChars int) error {
-		if value == nil {
-			return nil
-		}
-		if maxChars > 0 && len([]rune(*value)) > maxChars {
-			return invalid("%s is longer than %d characters", column, maxChars)
-		}
-		add(column, strings.TrimSpace(*value))
-		return nil
-	}
-	for _, field := range []struct {
-		column string
-		value  *string
-		max    int
-	}{{"title", u.Title, maxTitleChars}, {"body", u.Body, maxBodyChars}, {"author", u.Author, 0}, {"site", u.Site, 0}} {
-		if err := text(field.column, field.value, field.max); err != nil {
-			return err
-		}
-	}
-	if u.URL != nil {
-		value, err := checkURL("url", *u.URL, false)
-		if err != nil {
-			return err
-		}
-		add("url", value)
-	}
-	if u.Links != nil {
-		links, err := normalizeLinks(*u.Links, "")
-		if err != nil {
-			return err
-		}
-		raw, err := linksJSON(links)
-		if err != nil {
-			return err
-		}
-		args = append(args, raw)
-		sets = append(sets, fmt.Sprintf("links = $%d::jsonb", len(args)))
-	}
-	if u.ImageURL != nil {
-		value, err := checkURL("image_url", *u.ImageURL, true)
-		if err != nil {
-			return err
-		}
-		add("image_url", value)
-	}
-	if u.Tags != nil {
-		tags, err := normalizeTags(u.Tags)
-		if err != nil {
-			return err
-		}
-		args = append(args, tagsLiteral(tags))
-		sets = append(sets, fmt.Sprintf("tags = $%d::text[]", len(args)))
-	}
-	if u.Score != nil {
-		add("score", *u.Score)
-	}
-	if u.PublishedAt != nil {
-		t, err := ParseTime("published_at", *u.PublishedAt, now, false)
-		if err != nil {
-			return err
-		}
-		add("published_at", orEpoch(t))
-	}
-	if u.ExpiresAt != nil {
-		t, err := ParseTime("expires_at", *u.ExpiresAt, now, true)
-		if err != nil {
-			return err
-		}
-		add("expires_at", orEpoch(t))
-	}
-	if u.Metadata != nil {
-		raw, err := json.Marshal(u.Metadata)
-		if err != nil || len(raw) > maxMetadataLen {
-			return invalid("metadata must be JSON under %d bytes", maxMetadataLen)
-		}
-		args = append(args, string(raw))
-		sets = append(sets, fmt.Sprintf("metadata = $%d::jsonb", len(args)))
-	}
-	if len(sets) == 0 {
-		return invalid("nothing to update: pass at least one field besides item_id")
-	}
-	add("updated_at", now)
-	args = append(args, u.ItemID)
-	ctx, cancel := s.ctx(ctx)
-	defer cancel()
-	res, err := s.DB.ExecContext(ctx, s.q("UPDATE @feed_items SET "+strings.Join(sets, ", ")+
-		fmt.Sprintf(" WHERE item_id = $%d", len(args))), args...)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// Remove hides cards (by id, or every card of a source). It is a soft
-// delete: the engagement already recorded keeps its card.
-func (s *Store) Remove(ctx context.Context, ids []string, source, reason string) (int64, error) {
-	ctx, cancel := s.ctx(ctx)
-	defer cancel()
-	res, err := s.DB.ExecContext(ctx, s.q(`
-		UPDATE @feed_items SET removed_at = $1, removed_reason = $2, updated_at = $1
-		WHERE removed_at = 'epoch' AND (item_id = ANY($3::text[]) OR ($4 <> '' AND source = $4))`),
-		s.now(), reason, tagsLiteral(ids), source)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// SetScores writes rank weights in one transaction; it fails if any id is unknown.
-func (s *Store) SetScores(ctx context.Context, scores map[string]float64) error {
-	ctx, cancel := s.ctx(ctx)
-	defer cancel()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	statement := s.q("UPDATE @feed_items SET score = $1, updated_at = $2 WHERE item_id = $3")
-	now := s.now()
-	for id, score := range scores {
-		res, err := tx.ExecContext(ctx, statement, score, now, id)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return invalid("unknown item_id %q", id)
-		}
-	}
-	return tx.Commit()
-}
-
 // ListOptions selects cards for an agent; the phone's feed is Feed().
 type ListOptions struct {
 	Source           string
@@ -322,7 +101,8 @@ const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.
 	i.removed_at, i.removed_reason,
 	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
 	COALESCE(e.links_opened, 0), COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.dismissed, 0),
-	COALESCE(e.dismiss_reason, ''), COALESCE(e.engaged, 0), COALESCE(e.engagement_score, 0), e.first_seen_at`
+	COALESCE(e.dismiss_reason, ''), COALESCE(e.engaged, 0), COALESCE(e.engagement_score, 0), e.first_seen_at,
+	COALESCE((SELECT max(v.version) FROM @feed_item_versions v WHERE v.item_id = i.item_id), 0)`
 
 func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 	where := []string{"TRUE"}
@@ -396,7 +176,7 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 			&item.CreatedAt, &item.UpdatedAt, &removed, &item.RemovedReason,
 			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
 			&item.Engagement.Opens, &item.Engagement.LinksOpened, &item.Engagement.ReadMS, &item.Engagement.Expands,
-			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen); err != nil {
+			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen, &item.Version); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(links, &item.Links)

@@ -376,7 +376,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	case "token":
 		return runToken(client, rest, stdout, stderr)
 	case "feed":
-		return runFeed(client, rest, stdin, stdout, stderr)
+		return runFeed(client, rest, stdin, stdout, stderr, getenv)
 	default:
 		fmt.Fprintf(stderr, "pdw: unknown command %q\n", cmd)
 		fmt.Fprint(stderr, usage)
