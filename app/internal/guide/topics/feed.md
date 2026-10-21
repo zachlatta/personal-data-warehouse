@@ -86,7 +86,7 @@ In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressio
 `metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
 or `video`; a `media` event is a carousel swipe or video play with `metadata.index`). An impression is one stretch of a card at
 least half on screen, with how long and how much of it was visible. A `share` is a swipe that
-opened a Superhuman draft to send the card to someone. Opens, shares and dismissals
+opened a mail draft to send the card to someone. Opens, shares and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo

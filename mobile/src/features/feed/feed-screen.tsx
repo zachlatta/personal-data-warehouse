@@ -38,7 +38,7 @@ import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
 import { sourceBubbles } from './rich';
 import { SourceAvatar, type MediaAction } from './rich-views';
-import { shareDraft, shareUrls } from './share';
+import { mailtoUrl, shareDraft } from './share';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
@@ -231,19 +231,16 @@ export default function FeedScreen() {
     [measure, pause],
   );
 
-  // A swipe opens a Superhuman draft of the card for him to address. An
-  // unhandled scheme rejects, so each url falls through to the next.
+  // A swipe opens a draft of the card in the default mail app for him to
+  // address.
   const onShare = useCallback(async (item: FeedItem, preview: string) => {
-    const urls = shareUrls(shareDraft(item, preview));
-    for (const url of urls) {
-      try {
-        await Linking.openURL(url);
-        const via = url.startsWith('mailto:') ? 'mailto' : 'superhuman';
-        recordFeedEvent('share', { item_id: item.item_id, position: position(item), metadata: { via, url: item.url ?? '' } });
-        return;
-      } catch {}
+    try {
+      await Linking.openURL(mailtoUrl(shareDraft(item, preview)));
+    } catch {
+      Alert.alert('Could not open a mail app', 'No mail app is set up on this phone.');
+      return;
     }
-    Alert.alert('Could not open a mail app', 'Superhuman and Mail are not available.');
+    recordFeedEvent('share', { item_id: item.item_id, position: position(item), metadata: { via: 'mailto', url: item.url ?? '' } });
   }, []);
 
   const onExpand = useCallback((item: FeedItem) => {

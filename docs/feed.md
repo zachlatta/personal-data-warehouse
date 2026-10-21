@@ -54,8 +54,8 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
   `close` (`dwell_ms` = time spent after the open; the detail view adds `scroll_depth`), `expand`
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
-  `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left to email the
-  card from Superhuman, or tapped a share button; `metadata.via` = `superhuman` or `mailto`),
+  `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left or tapped a share button to email
+  the card from the default mail app; `metadata.via` = `mailto`, `superhuman` before 2026-10-21),
   `media` (`metadata.action`: `swipe` a carousel, `play` a video, `view` a photo opened full
   screen, `view_swipe` to another photo there, `share` one photo from it; `index` is the
   photo's place in the card's media; the detail view adds `metadata.in` = `detail`).

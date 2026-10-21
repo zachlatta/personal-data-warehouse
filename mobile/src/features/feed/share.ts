@@ -1,9 +1,9 @@
-// Sharing a card by email: a swipe opens a new Superhuman draft with the
-// card's title as the subject and its link and summary as the body, and he
-// picks who it goes to. Superhuman's router takes /compose/<mailto url> (its
-// web bundle, 2026-10); the app answers both its own superhuman:// scheme and
-// mail.superhuman.com universal links. The plain mailto is the last resort,
-// for a phone without Superhuman.
+// Sharing a card by email: a swipe opens a new draft in the phone's default
+// mail app (Superhuman when it is the default) with the card's title as the
+// subject and its link and summary as the body, and he picks who it goes to.
+// A mailto is the only form a mail app fills in: Superhuman's mobile app opens
+// superhuman:///compose/<mailto> and its universal link as an empty draft
+// (2026-10-20), although its web router reads the mailto's fields.
 
 export type Shareable = { title?: string; url?: string; body?: string };
 
@@ -32,11 +32,4 @@ export function shareDraft(item: Shareable, preview = ''): ShareDraft {
 
 export function mailtoUrl(draft: ShareDraft): string {
   return `mailto:?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`;
-}
-
-// The urls to try in order: the Superhuman app's scheme, its universal link,
-// then the phone's default mail app.
-export function shareUrls(draft: ShareDraft): string[] {
-  const compose = `/compose/${encodeURIComponent(mailtoUrl(draft))}`;
-  return [`superhuman://${compose}`, `https://mail.superhuman.com${compose}`, mailtoUrl(draft)];
 }
