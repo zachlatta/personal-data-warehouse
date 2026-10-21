@@ -193,7 +193,8 @@ export function MediaCarousel({
   const width = screen - inset * 2;
   const [page, setPage] = useState(0);
   const [reported] = useState(() => new Set<number>([0]));
-  const height = width / mediaAspect(media[0], 1);
+  // A link preview (og:image) with no size is 1.91:1; a known photo keeps its shape.
+  const height = width / mediaAspect(media[0], 1.91);
   const onEnd = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     const next = Math.round(e.nativeEvent.contentOffset.x / width);
     setPage(next);
