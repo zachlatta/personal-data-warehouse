@@ -24,7 +24,7 @@ import (
 // holds the same list (feed.py EVENT_TYPES); tests/test_feed.py pins the two.
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
-	"dismiss", "undismiss", "share", "media",
+	"dismiss", "undismiss", "share", "media", "save", "unsave",
 }
 
 const (
@@ -95,6 +95,9 @@ type Engagement struct {
 	Engaged       bool       `json:"engaged"`
 	Score         float64    `json:"engagement_score"`
 	FirstSeenAt   *time.Time `json:"first_seen_at,omitempty"`
+	// Saved is his read-later queue: the latest of save and unsave.
+	Saved   bool       `json:"saved"`
+	SavedAt *time.Time `json:"saved_at,omitempty"`
 }
 
 // PushItem is one card as an agent sends it. Only a source (here or on the

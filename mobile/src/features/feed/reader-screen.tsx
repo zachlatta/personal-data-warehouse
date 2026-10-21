@@ -27,6 +27,7 @@ import {
   SourceAvatar,
   type MediaAction,
 } from './rich-views';
+import { toggleSaved, useSavedIds } from './saved';
 
 function fullDate(iso: string | undefined): string {
   if (!iso) return '';
@@ -104,6 +105,7 @@ export default function FeedReaderScreen() {
   const item = feedItems.get(params.id);
   const depth = useRef(0);
   const position = params.position ? Number(params.position) : undefined;
+  const saved = useSavedIds().includes(params.id);
 
   useFocusEffect(
     useCallback(() => {
@@ -173,7 +175,19 @@ export default function FeedReaderScreen() {
 
   return (
     <ThemedView style={styles.fill}>
-      <Stack.Screen options={{ title: embed ? 'Post' : name }} />
+      <Stack.Screen
+        options={{
+          title: embed ? 'Post' : name,
+          headerRight: () => (
+            <Pressable
+              hitSlop={12}
+              onPress={() => toggleSaved(item, { position, via: 'detail' })}
+              accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
+              <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
+            </Pressable>
+          ),
+        }}
+      />
       <ScrollView
         contentContainerStyle={styles.content}
         onScroll={onScroll}

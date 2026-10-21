@@ -2215,7 +2215,7 @@ _BROWSER_SEARCH = _simple_adapter(
 #
 # base_feed.events is the phone's engagement log for the cards agents push.
 # Only the deliberate acts are timeline events -- opening a card, sharing it,
-# dismissing it -- and they are `self`: Zach did them. Impressions, dwell and
+# saving it for later, dismissing it -- and they are `self`: Zach did them. Impressions, dwell and
 # sessions are telemetry (thousands a week) and are read through
 # marts_feed.item_engagement instead. The context is the feed session, so
 # timeline.context() on a like returns what else he opened in that sitting.
@@ -2230,7 +2230,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
     ingest_ts="t.received_at",
     actor="'me'",
     title=(
-        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'share' THEN 'Shared: ' ELSE 'Dismissed: ' END, "
+        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'share' THEN 'Shared: ' WHEN 'save' THEN 'Saved for later: ' ELSE 'Dismissed: ' END, "
         "COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
     ),
     snippet=_snippet("concat_ws(' · ', NULLIF(i.source, ''), NULLIF(i.site, ''), NULLIF(i.url, ''))"),
@@ -2243,7 +2243,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
         "'mode', t.metadata->>'mode')"
     ),
     search_text=_search_concat("i.title", "left(i.body, 2000)", "i.site", "i.author", "i.source"),
-    where="t.event_type IN ('open', 'dismiss', 'share')",
+    where="t.event_type IN ('open', 'dismiss', 'share', 'save')",
     priority=TIMELINE_PRIORITY_SELF,
 )
 
@@ -3717,10 +3717,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Browser history: one events table, two adapters (page views, searches).
     "browser_history_visits": _events(),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
-    # events table (open/like/dismiss reach the timeline, telemetry does not).
+    # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(
         "cards agents push to the Feed tab; reached through marts_feed.item_engagement, "
-        "and each open/like/dismiss on one is a feed_engagement timeline event"
+        "and each open/share/save/dismiss on one is a feed_engagement timeline event"
     ),
     "feed_events": _events(),
     "feed_item_versions": _entity(

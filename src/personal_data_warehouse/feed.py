@@ -16,12 +16,12 @@ VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement")
 #: (app/internal/feed/feed.go EventTypes); tests/test_feed.py pins the two.
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
-    "dismiss", "undismiss", "share", "media",
+    "dismiss", "undismiss", "share", "media", "save", "unsave",
 )
 
 #: The deliberate acts that reach timeline.events (tier self). Impressions,
 #: dwell and sessions are telemetry and stay in base_feed.events.
-TIMELINE_EVENT_TYPES = ("open", "dismiss", "share")
+TIMELINE_EVENT_TYPES = ("open", "dismiss", "share", "save")
 
 #: An impression shorter than this is a scroll-past rather than a look.
 SCROLL_PAST_MS = 1000
@@ -33,11 +33,12 @@ ENGAGED_DWELL_MS = 5000
 #: engagement_score, the one number agents rank his interest by. There is no
 #: like button: interest is measured. Each term is capped so one long sitting
 #: on a card cannot drown everything else; a dismissal is a strong negative.
-#: opens 2 each (at most 3 counted), expands 1, shared 3, a minute looking at
-#: the card 6, ten minutes reading 10, dismissed -5.
+#: opens 2 each (at most 3 counted), expands 1, shared 3, saved for later 3,
+#: a minute looking at the card 6, ten minutes reading 10, dismissed -5.
 ENGAGEMENT_SCORE_SQL = (
     "round((2 * LEAST(COALESCE(e.opens, 0), 3) + LEAST(COALESCE(e.expands, 0), 1)"
     " + 3 * LEAST(COALESCE(e.shares, 0), 1)"
+    " + CASE WHEN e.save_state = 'save' THEN 3 ELSE 0 END"
     " + LEAST(COALESCE(e.dwell_ms, 0), 60000) / 10000.0"
     " + LEAST(COALESCE(e.read_ms, 0), 600000) / 60000.0"
     " - CASE WHEN e.dismiss_state = 'dismiss' THEN 5 ELSE 0 END)::numeric, 2)::float8"
@@ -206,8 +207,10 @@ STATEMENTS = (
 # Booleans are bigint 0/1 and the epoch becomes NULL, as everywhere in
 # marts_*. dismissed is the item's CURRENT state: the latest of dismiss and
 # undismiss. engaged: he opened it (any link), tapped More, shared it, or
-# looked at the card for ENGAGED_DWELL_MS. shares is last because CREATE OR
-# REPLACE VIEW can only add columns at the end. link_opens counts opens per link url.
+# looked at the card for ENGAGED_DWELL_MS. saved is the CURRENT state of his
+# read-later queue (the latest of save and unsave), saved_at when it last went
+# in. shares, saved and saved_at are last because CREATE OR REPLACE VIEW can
+# only add columns at the end. link_opens counts opens per link url.
 ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
     WITH e AS (
         SELECT item_id,
@@ -224,6 +227,9 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
                 FILTER (WHERE event_type IN ('dismiss', 'undismiss')))[1] AS dismiss_state,
             (array_agg(metadata->>'reason' ORDER BY occurred_at DESC, received_at DESC)
                 FILTER (WHERE event_type = 'dismiss'))[1] AS dismiss_reason,
+            (array_agg(event_type ORDER BY occurred_at DESC, received_at DESC)
+                FILTER (WHERE event_type IN ('save', 'unsave')))[1] AS save_state,
+            max(occurred_at) FILTER (WHERE event_type = 'save') AS saved_at,
             count(DISTINCT metadata->>'url') FILTER (WHERE event_type = 'open' AND metadata->>'url' <> '')
                 AS links_opened,
             min(occurred_at) FILTER (WHERE event_type = 'impression') AS first_seen_at,
@@ -251,12 +257,14 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
            CASE WHEN e.dismiss_state = 'dismiss' THEN COALESCE(e.dismiss_reason, '') ELSE '' END
                AS dismiss_reason,
            CASE WHEN COALESCE(e.opens, 0) > 0 OR COALESCE(e.expands, 0) > 0 OR COALESCE(e.shares, 0) > 0
-                     OR COALESCE(e.dwell_ms, 0) >= {ENGAGED_DWELL_MS}
+                     OR e.save_state = 'save' OR COALESCE(e.dwell_ms, 0) >= {ENGAGED_DWELL_MS}
                 THEN 1 ELSE 0 END AS engaged,
            CASE WHEN e.item_id IS NULL THEN 0::float8 ELSE {ENGAGEMENT_SCORE_SQL} END AS engagement_score,
            e.first_seen_at,
            e.last_event_at,
-           COALESCE(e.shares, 0) AS shares
+           COALESCE(e.shares, 0) AS shares,
+           CASE WHEN e.save_state = 'save' THEN 1 ELSE 0 END AS saved,
+           CASE WHEN e.save_state = 'save' THEN e.saved_at END AS saved_at
     FROM @feed_items i
     LEFT JOIN e ON e.item_id = i.item_id"""
 
@@ -279,6 +287,7 @@ SOURCE_ENGAGEMENT_VIEW = """CREATE OR REPLACE VIEW @marts_feed_source_engagement
                  / NULLIF(count(*) FILTER (WHERE impressions > 0), 0), 3) AS dismiss_rate,
            round((avg(engagement_score) FILTER (WHERE impressions > 0))::numeric, 2) AS avg_engagement_score,
            max(created_at) AS last_pushed_at,
-           max(last_event_at) AS last_event_at
+           max(last_event_at) AS last_event_at,
+           count(*) FILTER (WHERE saved = 1) AS items_saved
     FROM @marts_feed_item_engagement
     GROUP BY source"""

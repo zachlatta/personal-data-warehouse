@@ -2,7 +2,9 @@ package feed
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -105,6 +107,7 @@ const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.
 	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
 	COALESCE(e.links_opened, 0), COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.dismissed, 0),
 	COALESCE(e.dismiss_reason, ''), COALESCE(e.engaged, 0), COALESCE(e.engagement_score, 0), e.first_seen_at,
+	COALESCE(e.saved, 0), e.saved_at,
 	COALESCE((SELECT max(v.version) FROM @feed_item_versions v WHERE v.item_id = i.item_id), 0)`
 
 func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
@@ -156,6 +159,64 @@ func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	return ranked, nil
 }
 
+// Saved is his read-later queue, most recently saved first. A saved card
+// stays in it after it expires or an agent removes it from the feed: only he
+// takes it out (unsave), or a dismissal.
+func (s *Store) Saved(ctx context.Context, limit int) ([]Item, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	return s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE e.saved = 1 AND e.dismissed = 0
+		ORDER BY e.saved_at DESC, i.item_id LIMIT $1`, limit)
+}
+
+// SetSaved puts cards in or takes them out of the read-later queue by
+// recording save or unsave events, the same events the phone writes, so an
+// agent saving on his behalf ("save that for me") and a tap on the phone
+// are one history. Every id must name a card.
+func (s *Store) SetSaved(ctx context.Context, ids []string, save bool, m Mutation) (int, error) {
+	if len(ids) == 0 {
+		return 0, invalid("pass item_id(s)")
+	}
+	known, err := s.List(ctx, ListOptions{ItemIDs: ids, IncludeRemoved: true, IncludeDismissed: true, Limit: len(ids)})
+	if err != nil {
+		return 0, err
+	}
+	found := map[string]bool{}
+	for _, item := range known {
+		found[item.ItemID] = true
+	}
+	kind := "unsave"
+	if save {
+		kind = "save"
+	}
+	now := s.now()
+	events := make([]Event, 0, len(ids))
+	for _, id := range ids {
+		if !found[id] {
+			return 0, fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		metadata := map[string]any{"via": "agent"}
+		if m.Agent != "" {
+			metadata["agent"] = m.Agent
+		}
+		if m.Reason != "" {
+			metadata["reason"] = m.Reason
+		}
+		events = append(events, Event{EventID: newEventID(now), Type: kind, ItemID: id, OccurredAt: now, Metadata: metadata})
+	}
+	accepted, _, err := s.RecordEvents(ctx, events, m.Actor, "agent")
+	return accepted, err
+}
+
+func newEventID(now time.Time) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("agent-%d-%s", now.UnixMilli(), hex.EncodeToString(b[:]))
+}
+
 func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()
@@ -171,15 +232,16 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 			tags, links, media, embed   []byte
 			metadata                    []byte
 			published, expires, removed time.Time
-			dismissed, engaged          int64
-			firstSeen                   sql.NullTime
+			dismissed, engaged, saved   int64
+			firstSeen, savedAt          sql.NullTime
 		)
 		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &links,
 			&item.ImageURL, &media, &embed, &item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
 			&item.CreatedAt, &item.UpdatedAt, &removed, &item.RemovedReason,
 			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
 			&item.Engagement.Opens, &item.Engagement.LinksOpened, &item.Engagement.ReadMS, &item.Engagement.Expands,
-			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen, &item.Version); err != nil {
+			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen,
+			&saved, &savedAt, &item.Version); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(media, &item.Media)
@@ -203,6 +265,10 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 		item.Engagement.Dismissed, item.Engagement.Engaged = dismissed == 1, engaged == 1
 		if firstSeen.Valid {
 			item.Engagement.FirstSeenAt = fromEpoch(firstSeen.Time)
+		}
+		item.Engagement.Saved = saved == 1
+		if savedAt.Valid {
+			item.Engagement.SavedAt = fromEpoch(savedAt.Time)
 		}
 		items = append(items, item)
 	}
@@ -330,6 +396,7 @@ type SourceStats struct {
 	ReadMS         int64      `json:"read_ms"`
 	ItemsEngaged   int64      `json:"items_engaged"`
 	ItemsDismissed int64      `json:"items_dismissed"`
+	ItemsSaved     int64      `json:"items_saved"`
 	OpenRate       *float64   `json:"open_rate"`
 	EngagedRate    *float64   `json:"engaged_rate"`
 	DismissRate    *float64   `json:"dismiss_rate"`
@@ -355,7 +422,7 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	rows, err := s.DB.QueryContext(qctx, s.q(`
 		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_engaged,
 		       items_dismissed, open_rate::float8, engaged_rate::float8, dismiss_rate::float8,
-		       avg_engagement_score::float8, last_pushed_at, last_event_at
+		       avg_engagement_score::float8, last_pushed_at, last_event_at, items_saved
 		FROM @marts_feed_source_engagement WHERE ($1 = '' OR source = $1) ORDER BY items DESC, source`), source)
 	if err != nil {
 		return out, err
@@ -367,7 +434,7 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		)
 		if err := rows.Scan(&row.Source, &row.Items, &row.LiveItems, &row.ItemsSeen, &row.Impressions, &row.DwellMS,
 			&row.ItemsOpened, &row.ReadMS, &row.ItemsEngaged, &row.ItemsDismissed, &row.OpenRate, &row.EngagedRate,
-			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen); err != nil {
+			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen, &row.ItemsSaved); err != nil {
 			rows.Close()
 			return out, err
 		}

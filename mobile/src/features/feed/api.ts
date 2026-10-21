@@ -21,10 +21,11 @@ export type FeedItem = {
   score: number;
   published_at?: string;
   created_at: string;
-  engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number };
+  engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number; saved?: boolean };
 };
 
-export type FeedPage = { items: FeedItem[]; generated_at: string };
+// saved is his read-later queue, newest saved first (absent on an older server).
+export type FeedPage = { items: FeedItem[]; saved?: FeedItem[]; generated_at: string };
 
 export class FeedApiError extends Error {
   status: number;

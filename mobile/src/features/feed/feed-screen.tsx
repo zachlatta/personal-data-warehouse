@@ -1,4 +1,5 @@
 import { useFocusEffect, useRouter } from 'expo-router';
+import { SymbolView } from 'expo-symbols';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -37,15 +38,18 @@ import {
 import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
 import { sourceBubbles } from './rich';
-import { SourceAvatar, type MediaAction } from './rich-views';
+import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
+import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { mailtoUrl, shareDraft } from './share';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
 const STALE_MS = 10 * 60_000;
 const UNDO_MS = 5_000;
+// The rail's Saved bubble: his read-later queue instead of one source.
+const SAVED = '\u0000saved';
 
-type Undo = { item: FeedItem; index: number; timer: ReturnType<typeof setTimeout> };
+type Undo = { text: string; undo: () => void; timer: ReturnType<typeof setTimeout> };
 
 export default function FeedScreen() {
   const config = useConfig();
@@ -60,7 +64,11 @@ export default function FeedScreen() {
   // The rail across the top narrows the feed to one source.
   const [only, setOnly] = useState<string | null>(null);
   const bubbles = useMemo(() => sourceBubbles(items), [items]);
-  const shown = useMemo(() => (only ? items.filter((i) => i.source === only) : items), [items, only]);
+  const savedIds = useSavedIds();
+  const shown = useMemo(() => {
+    if (only === SAVED) return savedIds.map((id) => feedItems.get(id)).filter((i): i is FeedItem => !!i);
+    return only ? items.filter((i) => i.source === only) : items;
+  }, [items, only, savedIds]);
 
   const tracker = useRef(new ViewabilityTracker());
   const heights = useRef(new Map<string, number>());
@@ -101,9 +109,12 @@ export default function FeedScreen() {
   const load = useCallback(async () => {
     setRefreshing(true);
     try {
+      // Send taps first, so the queue the server answers with includes them.
+      await flushFeedEvents(true).catch(() => {});
       const page = await fetchFeed(config);
       pause();
       for (const item of page.items) feedItems.set(item.item_id, item);
+      loadSaved(page.saved ?? []);
       setItems(page.items);
       setError(null);
       setDisabled(false);
@@ -247,58 +258,83 @@ export default function FeedScreen() {
     recordFeedEvent('expand', { item_id: item.item_id, position: position(item) });
   }, []);
 
+  const showUndo = useCallback((text: string, undoIt: () => void) => {
+    setUndo((prev) => {
+      if (prev) clearTimeout(prev.timer);
+      return { text, undo: undoIt, timer: setTimeout(() => setUndo(null), UNDO_MS) };
+    });
+  }, []);
+
   const dismiss = useCallback(
     (item: FeedItem, reason: string) => {
       const index = position(item);
       recordFeedEvent('dismiss', { item_id: item.item_id, position: index, metadata: { reason, source: item.source, site: item.site ?? '' } });
       LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       setItems((prev) => prev.filter((i) => i.item_id !== item.item_id));
-      setUndo((prev) => {
-        if (prev) clearTimeout(prev.timer);
-        return { item, index, timer: setTimeout(() => setUndo(null), UNDO_MS) };
+      showUndo('Hidden', () => {
+        recordFeedEvent('undismiss', { item_id: item.item_id, position: index });
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        setItems((prev) => {
+          const next = [...prev];
+          next.splice(Math.min(index, next.length), 0, item);
+          return next;
+        });
       });
     },
-    [],
+    [showUndo],
   );
 
-  const undoDismiss = useCallback(() => {
+  // The bookmark, a swipe right or the menu: in or out of the read-later
+  // queue (the Saved bubble).
+  const onSave = useCallback(
+    (item: FeedItem, via: string) => {
+      if (only === SAVED) LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      const saved = toggleSaved(item, { position: position(item), via });
+      showUndo(saved ? 'Saved for later' : 'Removed from Saved', () => {
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        toggleSaved(item, { position: position(item), via: 'undo' });
+      });
+    },
+    [only, showUndo],
+  );
+
+  const runUndo = useCallback(() => {
     if (!undo) return;
     clearTimeout(undo.timer);
-    recordFeedEvent('undismiss', { item_id: undo.item.item_id, position: undo.index });
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    setItems((prev) => {
-      const next = [...prev];
-      next.splice(Math.min(undo.index, next.length), 0, undo.item);
-      return next;
-    });
+    undo.undo();
     setUndo(null);
   }, [undo]);
 
   const onMenu = useCallback(
     (item: FeedItem) => {
       const from = item.site || item.source;
-      const options = ['Not interested', `Less from ${from}`, 'Cancel'];
+      const saveLabel = savedIds.includes(item.item_id) ? 'Remove from Saved' : 'Save for later';
+      const options = [saveLabel, 'Not interested', `Less from ${from}`, 'Cancel'];
       const pick = (i: number) => {
-        if (i === 0) dismiss(item, 'not_interested');
-        if (i === 1) dismiss(item, 'less_like_this');
+        if (i === 0) onSave(item, 'menu');
+        if (i === 1) dismiss(item, 'not_interested');
+        if (i === 2) dismiss(item, 'less_like_this');
       };
       if (Platform.OS === 'ios') {
-        ActionSheetIOS.showActionSheetWithOptions({ options, cancelButtonIndex: 2, destructiveButtonIndex: 0, title: item.title || undefined }, pick);
+        ActionSheetIOS.showActionSheetWithOptions({ options, cancelButtonIndex: 3, destructiveButtonIndex: 1, title: item.title || undefined }, pick);
       } else {
-        Alert.alert('Hide this card?', undefined, [
+        Alert.alert(item.title || 'This card', undefined, [
           { text: options[0], onPress: () => pick(0) },
           { text: options[1], onPress: () => pick(1) },
+          { text: options[2], onPress: () => pick(2) },
           { text: 'Cancel', style: 'cancel' },
         ]);
       }
     },
-    [dismiss],
+    [dismiss, onSave, savedIds],
   );
 
   const renderItem = useCallback(
     ({ item }: { item: FeedItem }) => (
       <FeedCard
         item={item}
+        saved={savedIds.includes(item.item_id)}
+        onSave={onSave}
         onLayout={onCardLayout}
         onOpen={onOpen}
         onBrowse={onBrowse}
@@ -308,7 +344,7 @@ export default function FeedScreen() {
         onShare={onShare}
       />
     ),
-    [onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare],
+    [savedIds, onSave, onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare],
   );
 
   if (!loaded) {
@@ -323,6 +359,7 @@ export default function FeedScreen() {
     <ThemedView style={styles.fill}>
       <FlatList
         data={shown}
+        extraData={savedIds}
         keyExtractor={(item) => item.item_id}
         renderItem={renderItem}
         onScroll={onScroll}
@@ -340,8 +377,29 @@ export default function FeedScreen() {
               headerHeight.current = e.nativeEvent.layout.height;
               measure();
             }}>
-            {bubbles.length > 1 ? (
+            {bubbles.length > 1 || savedIds.length > 0 || only === SAVED ? (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail}>
+                {savedIds.length > 0 || only === SAVED ? (
+                  <Pressable
+                    style={[styles.bubble, only !== null && only !== SAVED && styles.bubbleDim]}
+                    onPress={() => {
+                      pause();
+                      setOnly(only === SAVED ? null : SAVED);
+                    }}
+                    accessibilityLabel={`Saved for later, ${savedIds.length}`}>
+                    <View style={[styles.savedBubble, only === SAVED && styles.savedBubbleOn]}>
+                      <SymbolView name="bookmark.fill" tintColor="#fff" size={24} />
+                      {savedIds.length ? (
+                        <View style={styles.savedCount}>
+                          <ThemedText style={styles.savedCountText}>{savedIds.length}</ThemedText>
+                        </View>
+                      ) : null}
+                    </View>
+                    <ThemedText style={[styles.bubbleLabel, only === SAVED && styles.bubbleLabelOn]} numberOfLines={1}>
+                      Saved
+                    </ThemedText>
+                  </Pressable>
+                ) : null}
                 {[{ source: '', label: 'All', unseen: 0, total: items.length }, ...bubbles].map((b) => {
                   const active = (only ?? '') === b.source;
                   return (
@@ -370,6 +428,14 @@ export default function FeedScreen() {
           </View>
         }
         ListEmptyComponent={
+          only === SAVED ? (
+            <View style={styles.empty}>
+              <ThemedText style={styles.emptyTitle}>Nothing saved</ThemedText>
+              <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
+                Tap the bookmark on a card, or swipe it right, to keep it here until you get to it.
+              </ThemedText>
+            </View>
+          ) : (
           <View style={styles.empty}>
             <ThemedText style={styles.emptyTitle}>{disabled ? 'The feed is turned off' : 'Nothing here yet'}</ThemedText>
             <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
@@ -378,9 +444,10 @@ export default function FeedScreen() {
                 : 'Agents add cards with `pdw feed push`. Pull down to refresh.'}
             </ThemedText>
           </View>
+          )
         }
         ListFooterComponent={
-          items.length ? (
+          shown.length ? (
             <ThemedText style={[styles.footer, { color: theme.textSecondary }]}>That is everything for now.</ThemedText>
           ) : null
         }
@@ -388,9 +455,9 @@ export default function FeedScreen() {
       {undo ? (
         <View style={[styles.undo, { backgroundColor: theme.text }]}>
           <ThemedText style={[styles.undoText, { color: theme.background }]} numberOfLines={1}>
-            Hidden
+            {undo.text}
           </ThemedText>
-          <Pressable hitSlop={10} onPress={undoDismiss}>
+          <Pressable hitSlop={10} onPress={runUndo}>
             <ThemedText style={styles.undoAction}>Undo</ThemedText>
           </Pressable>
         </View>
@@ -407,6 +474,21 @@ const styles = StyleSheet.create({
   bubbleDim: { opacity: 0.45 },
   bubbleLabel: { fontSize: 12, lineHeight: 15, maxWidth: 70 },
   bubbleLabelOn: { fontWeight: '700' },
+  savedBubble: { width: 58, height: 58, borderRadius: 29, backgroundColor: '#FF9500', alignItems: 'center', justifyContent: 'center' },
+  savedBubbleOn: { borderWidth: 3, borderColor: ACCENT },
+  savedCount: {
+    position: 'absolute',
+    top: -2,
+    right: -2,
+    minWidth: 20,
+    height: 20,
+    borderRadius: 10,
+    paddingHorizontal: 5,
+    backgroundColor: ACCENT,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  savedCountText: { color: '#fff', fontSize: 12, fontWeight: '700', lineHeight: 15 },
   banner: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10 },
   bannerText: { fontSize: 14 },
   empty: { padding: Spacing.five, alignItems: 'center', gap: Spacing.two },

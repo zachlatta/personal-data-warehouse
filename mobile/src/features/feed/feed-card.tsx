@@ -1,7 +1,7 @@
 import { SymbolView } from 'expo-symbols';
 import { memo, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
-import ReanimatedSwipeable, { type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
+import ReanimatedSwipeable, { SwipeDirection, type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -35,9 +35,12 @@ const POST_LINES = 8;
 // - a link card (source row, headline, a few lines, the extra links).
 // A tap anywhere opens the detail view (a photo in a post opens full
 // screen); the compass opens the page itself.
-// Swiping left shares (not on a carousel, whose swipe pages the photos).
+// Swiping left shares and swiping right saves it for later (not on a
+// carousel, whose swipe pages the photos); the bookmark does the same.
 type Props = {
   item: FeedItem;
+  saved: boolean;
+  onSave: (item: FeedItem, via: string) => void;
   onLayout: (itemId: string, height: number) => void;
   onOpen: (item: FeedItem) => void;
   onBrowse: (item: FeedItem, link?: CardLink) => void;
@@ -52,6 +55,15 @@ function ShareAction() {
     <View style={styles.share}>
       <SymbolView name="paperplane" tintColor="#fff" size={22} />
       <ThemedText style={styles.shareLabel}>Share</ThemedText>
+    </View>
+  );
+}
+
+function SaveAction({ saved }: { saved: boolean }) {
+  return (
+    <View style={[styles.share, styles.save]}>
+      <SymbolView name={saved ? 'bookmark.slash' : 'bookmark.fill'} tintColor="#fff" size={22} />
+      <ThemedText style={styles.shareLabel}>{saved ? 'Unsave' : 'Save'}</ThemedText>
     </View>
   );
 }
@@ -87,7 +99,7 @@ function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
   );
 }
 
-function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare }: Props) {
+function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare }: Props) {
   const theme = useTheme();
   const swipeable = useRef<SwipeableMethods>(null);
   const [expanded, setExpanded] = useState(false);
@@ -104,6 +116,7 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
     onExpand(item);
   };
   const share = () => onShare(item, embed?.text || preview);
+  const save = () => onSave(item, 'button');
   const browseUrl = (url: string) => onBrowse(item, { url, label: url, site: '', index: -1 });
   const reportMedia = (a: MediaAction) => onMedia(item, a);
   const lines = (n: number) => {
@@ -159,7 +172,7 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
             {embed.thread?.length ? (
               <ThemedText style={[styles.thread, { color: ACCENT }]}>Show this thread ({embed.thread.length + 1} posts)</ThemedText>
             ) : null}
-            <PostMetrics embed={embed} onShare={share} />
+            <PostMetrics embed={embed} onShare={share} onSave={save} saved={saved} />
           </View>
         </View>
       </Pressable>
@@ -215,6 +228,9 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
           <Pressable hitSlop={10} onPress={share} accessibilityLabel="Share" style={styles.action}>
             <SymbolView name="paperplane" tintColor={theme.text} size={21} />
           </Pressable>
+          <Pressable hitSlop={10} onPress={save} accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'} style={styles.action}>
+            <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={21} />
+          </Pressable>
           <View style={styles.flex} />
           {item.tags.length ? (
             <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
@@ -232,11 +248,16 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
       enabled={!carousel}
       friction={1.5}
       rightThreshold={60}
+      leftThreshold={60}
       overshootRight={false}
+      overshootLeft={false}
       renderRightActions={() => <ShareAction />}
-      onSwipeableOpen={() => {
+      renderLeftActions={() => <SaveAction saved={saved} />}
+      onSwipeableOpen={(direction) => {
         swipeable.current?.close();
-        share();
+        // The direction the card moved: right reveals the left (save) action.
+        if (direction === SwipeDirection.RIGHT) onSave(item, 'swipe');
+        else share();
       }}>
       <View
         style={[styles.wrap, { borderBottomColor: theme.backgroundElement, backgroundColor: theme.background }]}
@@ -283,4 +304,5 @@ const styles = StyleSheet.create({
   thread: { fontSize: 14, marginTop: Spacing.two },
   share: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one, backgroundColor: ACCENT },
   shareLabel: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  save: { backgroundColor: '#FF9500' },
 });

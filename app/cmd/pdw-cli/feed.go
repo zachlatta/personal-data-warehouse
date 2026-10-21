@@ -39,6 +39,8 @@ USAGE
   pdw feed history [ITEM_ID] [--source S] [--since 7d] [--full]
                                         Every version, newest first, with what changed.
   pdw feed rank ITEM_ID...              Order cards best first (or --score ID=N).
+  pdw feed save ITEM_ID...              Put cards in Zach's read-later queue (the phone's
+                                        Saved view), only when he asks; unsave takes them out.
   pdw feed list [flags]                 Cards with their engagement and version.
   pdw feed stats [--source S] [--since 7d]
   pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
@@ -75,12 +77,13 @@ PROVENANCE FLAGS (push, update, remove, restore, rank)
   --reason TEXT     Why; kept on the version.
 
 READ FLAGS
-  --view VIEW       list: recent (default) or feed (exactly what the phone shows).
+  --view VIEW       list: recent (default), feed (exactly what the phone shows) or
+                    saved (his read-later queue, newest saved first).
   --all             list: include removed and dismissed cards.
   --full            history: include each version's full snapshot.
   -n, --limit N     Rows.
   --type TYPES      events: session_start, session_end, impression, open, close,
-                    expand, dismiss, undismiss, share, media.
+                    expand, dismiss, undismiss, share, media, save, unsave.
   --item ID, --since TIME (2026-10-01, or 7d / 12h)
   --output FMT      text (default) or json.
 
@@ -92,6 +95,8 @@ EXAMPLES
   pdw feed history hn:1
   pdw feed restore hn:1 --version 2
   pdw feed remove --source hn --reason "stale batch"
+  pdw feed save picks:https://www.youtube.com/watch?v=LKrwhjOI8Nc --reason "Zach asked"
+  pdw feed list --view saved
   pdw feed stats --since 7d
   pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, engagement_score FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
 `
@@ -230,7 +235,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 	// Provenance for every version a mutation writes: which agent, and why.
 	// The agent defaults to $PDW_AGENT_NAME, else the Paseo agent id.
 	var agent, reason string
-	mutating := map[string]bool{"push": true, "update": true, "remove": true, "restore": true, "rank": true}[sub]
+	mutating := map[string]bool{"push": true, "update": true, "remove": true, "restore": true, "rank": true, "save": true, "unsave": true}[sub]
 	if mutating {
 		fs.StringVar(&agent, "agent", "", "acting agent")
 		fs.StringVar(&reason, "reason", "", "why")
@@ -443,12 +448,20 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 			return fail(errors.New("give ITEM_IDs best first, or --score ITEM_ID=N"))
 		}
 		return call("feed_rank", withProvenance(input))
+	case "save", "unsave":
+		if err := parse(); err != nil {
+			return fail(err)
+		}
+		if fs.NArg() == 0 {
+			return fail(errors.New("give ITEM_IDs"))
+		}
+		return call("feed_save", withProvenance(map[string]any{"item_ids": fs.Args(), "unsave": sub == "unsave"}))
 	case "list":
 		var source, view string
 		var all bool
 		var limit int
 		fs.StringVar(&source, "source", "", "source")
-		fs.StringVar(&view, "view", "", "recent or feed")
+		fs.StringVar(&view, "view", "", "recent, feed or saved")
 		fs.BoolVar(&all, "all", false, "include removed and dismissed")
 		fs.IntVar(&limit, "limit", 0, "rows")
 		fs.IntVar(&limit, "n", 0, "rows")
@@ -481,7 +494,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return call("feed_events", map[string]any{"item_id": item, "source": source, "types": []string(types),
 			"since": since, "limit": limit})
 	default:
-		fmt.Fprintf(stderr, "pdw feed: unknown subcommand %q (push, get, update, remove, restore, history, rank, list, stats, events)\n", sub)
+		fmt.Fprintf(stderr, "pdw feed: unknown subcommand %q (push, get, update, remove, restore, history, rank, save, unsave, list, stats, events)\n", sub)
 		return 2
 	}
 }
@@ -559,6 +572,9 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			if b, _ := e["dismissed"].(bool); b {
 				flags += " dismissed"
 			}
+			if b, _ := e["saved"].(bool); b {
+				flags += " saved"
+			}
 			if str(it, "removed_at") != "" {
 				flags += " removed"
 			}
@@ -573,7 +589,7 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		fmt.Fprintf(w, "since %s: %d sessions\n", str(out, "since"), int(num(out, "sessions")))
 		if byType, ok := out["events_by_type"].(map[string]any); ok && len(byType) > 0 {
 			parts := []string{}
-			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "share", "session_start", "session_end"} {
+			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "share", "save", "unsave", "session_start", "session_end"} {
 				if n, ok := byType[kind].(float64); ok {
 					parts = append(parts, fmt.Sprintf("%s=%d", kind, int(n)))
 				}
@@ -624,6 +640,8 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		fmt.Fprintf(w, "removed %d (restorable: pdw feed restore)\n", int(num(out, "removed")))
 	case "rank":
 		fmt.Fprintf(w, "ranked %d\n", int(num(out, "ranked")))
+	case "save", "unsave":
+		fmt.Fprintf(w, "saved %d, unsaved %d (pdw feed list --view saved)\n", int(num(out, "saved")), int(num(out, "unsaved")))
 	case "restore":
 		fmt.Fprintf(w, "restored %d\n", int(num(out, "restored")))
 		for _, it := range asList(out["items"]) {

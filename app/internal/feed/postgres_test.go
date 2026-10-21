@@ -395,3 +395,68 @@ func TestPostgresFeedVersioning(t *testing.T) {
 		t.Fatalf("source history: %v", recent)
 	}
 }
+
+// The read-later queue: a card goes in from the phone or from an agent he
+// asked, stays after it leaves the feed, and comes out on unsave.
+func TestPostgresFeedSavedQueue(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "saveq", "items": []map[string]any{
+		{"title": "Watch later", "url": "https://example.com/watch"},
+		{"title": "Changed my mind", "url": "https://example.com/meh"},
+	}})
+	watch, meh := "saveq:https://example.com/watch", "saveq:https://example.com/meh"
+	saved := func() []string {
+		ids := []string{}
+		for _, item := range call(t, tools, "feed_list", map[string]any{"view": "saved"})["items"].([]any) {
+			ids = append(ids, item.(map[string]any)["item_id"].(string))
+		}
+		return ids
+	}
+	if got := saved(); len(got) != 0 {
+		t.Fatalf("nothing is saved yet: %v", got)
+	}
+	if out := call(t, tools, "feed_save", map[string]any{"item_id": watch, "agent": "voice-memo", "reason": "Zach asked"}); out["saved"] != float64(1) {
+		t.Fatalf("feed_save: %v", out)
+	}
+	if err := callErr(t, tools, "feed_save", map[string]any{"item_ids": []string{"saveq:nope"}}); err == nil {
+		t.Fatal("saving an unknown card must fail")
+	}
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		{"event_id": "sq1", "type": "save", "item_id": meh, "occurred_at": now.Add(time.Second)},
+		{"event_id": "sq2", "type": "unsave", "item_id": meh, "occurred_at": now.Add(2 * time.Second)},
+	}})
+	if rec := httptest.NewRecorder(); func() bool {
+		mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+		return rec.Code != 200
+	}() {
+		t.Fatalf("POST save events: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.Join(saved(), ","); got != watch {
+		t.Fatalf("saved view: %s", got)
+	}
+	item := call(t, tools, "feed_list", map[string]any{"item_ids": []string{watch}})["items"].([]any)[0].(map[string]any)
+	if e := item["engagement"].(map[string]any); e["saved"] != true || e["saved_at"] == nil || e["engaged"] != true || e["engagement_score"] != float64(3) {
+		t.Fatalf("a saved card's engagement: %v", e)
+	}
+	events := call(t, tools, "feed_events", map[string]any{"item_id": watch, "types": []string{"save"}})["events"].([]any)
+	if meta := events[0].(map[string]any)["metadata"].(map[string]any); meta["via"] != "agent" || meta["agent"] != "voice-memo" {
+		t.Fatalf("an agent's save says so: %v", meta)
+	}
+
+	// The phone gets the queue with the feed, and it outlives a removal.
+	call(t, tools, "feed_remove", map[string]any{"item_id": watch, "reason": "stale"})
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, httptest.NewRequest("GET", APIPath, nil))
+	var page feedResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &page); err != nil || len(page.Saved) != 1 || page.Saved[0].ItemID != watch {
+		t.Fatalf("GET feed saved: %d %s", res.Code, res.Body.String())
+	}
+	store.Now = func() time.Time { return now.Add(time.Minute) }
+	call(t, tools, "feed_save", map[string]any{"item_id": watch, "unsave": true})
+	if got := saved(); len(got) != 0 {
+		t.Fatalf("unsave empties the queue: %v", got)
+	}
+}

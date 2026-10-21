@@ -1180,7 +1180,7 @@ def _seed_feed(wh) -> None:
         ("session_start", "{}"), ("impression", "{}"), ("open", '{"mode": "browser"}'),
         ("close", "{}"),
         ("open", '{"mode": "browser", "url": "https://example.test/discussion", "link_index": 1}'), ("dismiss", '{"reason": "less_like_this"}'),
-        ("session_end", "{}"),
+        ("save", "{}"), ("session_end", "{}"),
     )):
         wh._command(
             "INSERT INTO @feed_events (event_id, event_type, item_id, session_id, occurred_at, "
@@ -1382,7 +1382,7 @@ EXPECTED_SEEDED_EVENTS = {
     "browser_visit": 2,
     "browser_search": 1,
     # two opens + dismiss; impression, close and the session rows stay in base_feed.
-    "feed_engagement": 3,
+    "feed_engagement": 4,
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
@@ -1571,7 +1571,8 @@ def test_backfill_normalizes_every_source(warehouse):
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
     feed = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "feed"}
-    assert set(feed) == {"fe2", "fe4", "fe5"}
+    assert set(feed) == {"fe2", "fe4", "fe5", "fe6"}
+    assert feed["fe6"]["title"] == "Saved for later: A synthetic story"
     assert feed["fe4"]["title"] == "Opened: A synthetic story"
     assert feed["fe4"]["metadata"]["url"] == "https://example.test/discussion"
     assert feed["fe2"]["metadata"]["url"] == "https://example.test/story"

@@ -104,7 +104,7 @@ type rankOutput struct {
 type listInput struct {
 	Source           string   `json:"source,omitempty"`
 	ItemIDs          []string `json:"item_ids,omitempty"`
-	View             string   `json:"view,omitempty" jsonschema:"recent (default, newest pushed first) or feed (exactly what the phone shows, ranked)"`
+	View             string   `json:"view,omitempty" jsonschema:"recent (default, newest pushed first), feed (exactly what the phone shows, ranked) or saved (his read-later queue, newest saved first)"`
 	IncludeRemoved   bool     `json:"include_removed,omitempty"`
 	IncludeDismissed bool     `json:"include_dismissed,omitempty"`
 	Limit            int      `json:"limit,omitempty" jsonschema:"default 50, at most 500"`
@@ -115,6 +115,19 @@ type listOutput struct {
 	Items []Item `json:"items"`
 }
 
+type saveInput struct {
+	ItemID  string   `json:"item_id,omitempty"`
+	ItemIDs []string `json:"item_ids,omitempty"`
+	Unsave  bool     `json:"unsave,omitempty" jsonschema:"take the cards out of the queue instead"`
+	Agent   string   `json:"agent,omitempty"`
+	Reason  string   `json:"reason,omitempty" jsonschema:"why, e.g. Zach asked in a voice memo"`
+}
+
+type saveOutput struct {
+	Saved   int `json:"saved"`
+	Unsaved int `json:"unsaved"`
+}
+
 type statsInput struct {
 	Source string `json:"source,omitempty"`
 	Since  string `json:"since,omitempty" jsonschema:"window for events_by_type and sessions: RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
@@ -123,7 +136,7 @@ type statsInput struct {
 type eventsInput struct {
 	ItemID string   `json:"item_id,omitempty"`
 	Source string   `json:"source,omitempty"`
-	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, dismiss, undismiss, share"`
+	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, dismiss, undismiss, share, media, save, unsave"`
 	Since  string   `json:"since,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, or a duration back from now (7d)"`
 	Limit  int      `json:"limit,omitempty" jsonschema:"default 100, at most 1000"`
 }
@@ -312,7 +325,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[listInput, listOutput]{
 			NameStr:        "feed_list",
 			TitleStr:       "List Feed Cards",
-			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked. CLI: pdw feed list.",
+			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked; view=saved is his read-later queue. CLI: pdw feed list.",
 			Handle: func(ctx context.Context, in listInput) (listOutput, error) {
 				if in.Limit > 500 {
 					return listOutput{}, &tool.InvalidInputError{Message: "limit is at most 500"}
@@ -327,13 +340,37 @@ func Tools(store *Store) []tool.Tool {
 						IncludeRemoved: in.IncludeRemoved, IncludeDismissed: in.IncludeDismissed, Limit: in.Limit})
 				case "feed":
 					items, err = store.Feed(ctx, in.Limit)
+				case "saved":
+					items, err = store.Saved(ctx, in.Limit)
 				default:
-					return listOutput{}, &tool.InvalidInputError{Message: "view must be recent or feed"}
+					return listOutput{}, &tool.InvalidInputError{Message: "view must be recent, feed or saved"}
 				}
 				if err != nil {
 					return listOutput{}, err
 				}
 				return listOutput{Count: len(items), Items: items}, nil
+			},
+		},
+		&tool.Typed[saveInput, saveOutput]{
+			NameStr:  "feed_save",
+			TitleStr: "Save Feed Cards for Later",
+			DescriptionStr: "Put Feed tab cards in Zach's read-later queue (the Saved view on the phone, where he bookmarks what he must read or " +
+				"watch later), or take them out with unsave. Only when he asks (\"save that for me\"): the queue is his. It records the same " +
+				"save/unsave events his taps do. A saved card stays in the queue after it expires or is removed. List it with feed_list " +
+				"view=saved. CLI: pdw feed save (pdw feed unsave).",
+			Handle: func(ctx context.Context, in saveInput) (saveOutput, error) {
+				ids := in.ItemIDs
+				if strings.TrimSpace(in.ItemID) != "" {
+					ids = append(ids, strings.TrimSpace(in.ItemID))
+				}
+				n, err := store.SetSaved(ctx, ids, !in.Unsave, provenance(ctx, in.Agent, in.Reason))
+				if errors.Is(err, ErrNotFound) {
+					return saveOutput{}, &tool.InvalidInputError{Message: err.Error() + " (pdw feed list --all shows ids)"}
+				}
+				if in.Unsave {
+					return saveOutput{Unsaved: n}, toolError(err)
+				}
+				return saveOutput{Saved: n}, toolError(err)
 			},
 		},
 		&tool.Typed[statsInput, Stats]{
@@ -353,7 +390,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[eventsInput, eventsOutput]{
 			NameStr:        "feed_events",
 			TitleStr:       "Feed Engagement Events",
-			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, dismiss/undismiss with reason, share (swiped to email it), sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
+			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, dismiss/undismiss with reason, share (swiped to email it), save/unsave (read later), sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
 			Handle: func(ctx context.Context, in eventsInput) (eventsOutput, error) {
 				if in.Limit > 1000 {
 					return eventsOutput{}, &tool.InvalidInputError{Message: "limit is at most 1000"}

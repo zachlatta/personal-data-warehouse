@@ -314,7 +314,17 @@ export function QuotePost({ embed, onPress, onLink, onMedia }: { embed: FeedEmbe
 
 // Replies, reposts, likes and views as X shows them. They are the post's
 // numbers on X, not buttons: the feed measures, it does not ask.
-export function PostMetrics({ embed, onShare }: { embed: FeedEmbed; onShare?: () => void }) {
+export function PostMetrics({
+  embed,
+  onShare,
+  onSave,
+  saved,
+}: {
+  embed: FeedEmbed;
+  onShare?: () => void;
+  onSave?: () => void;
+  saved?: boolean;
+}) {
   const theme = useTheme();
   const cells: [string, number | undefined][] = [
     ['bubble.left', embed.replies],
@@ -330,6 +340,11 @@ export function PostMetrics({ embed, onShare }: { embed: FeedEmbed; onShare?: ()
           <ThemedText style={[styles.metricText, { color: theme.textSecondary }]}>{compactCount(n)}</ThemedText>
         </View>
       ))}
+      {onSave ? (
+        <Pressable hitSlop={10} onPress={onSave} accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
+          <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={16} />
+        </Pressable>
+      ) : null}
       {onShare ? (
         <Pressable hitSlop={10} onPress={onShare} accessibilityLabel="Share">
           <SymbolView name="square.and.arrow.up" tintColor={theme.textSecondary} size={16} />

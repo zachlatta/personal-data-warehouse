@@ -101,6 +101,9 @@ func TestFeedSubcommandsMapToTheirTools(t *testing.T) {
 		{[]string{"rank", "hn:2", "hn:1"}, "feed_rank", `"order":["hn:2","hn:1"]`},
 		{[]string{"rank", "--score", "hn:1=0.5"}, "feed_rank", `"scores":{"hn:1":0.5}`},
 		{[]string{"stats", "--since", "7d"}, "feed_stats", `"since":"7d"`},
+		{[]string{"save", "hn:1", "--reason", "Zach asked"}, "feed_save", `"item_ids":["hn:1"],"reason":"Zach asked","unsave":false`},
+		{[]string{"unsave", "hn:1"}, "feed_save", `"unsave":true`},
+		{[]string{"list", "--view", "saved"}, "feed_list", `"view":"saved"`},
 		{[]string{"events", "--type", "like,open", "--item", "hn:1"}, "feed_events", `"types":["like","open"]`},
 	} {
 		srv := feedStub(t, `{}`)
@@ -117,6 +120,7 @@ func TestFeedArgumentErrorsNeverReachTheServer(t *testing.T) {
 		{"feed", "push", "--source", "x", "--bogus"},
 		{"feed", "update"},
 		{"feed", "remove"},
+		{"feed", "save"},
 		{"feed", "rank", "--score", "nonumber"},
 		{"feed", "frobnicate"},
 	} {

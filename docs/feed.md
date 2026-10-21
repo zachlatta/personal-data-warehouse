@@ -63,17 +63,32 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   the full-screen viewer: swipe between photos, pinch or double-tap to zoom, and the share
   button downloads that one photo (X photos at `name=orig`) to the iOS share sheet.
   A `close` with `metadata.mode` `video` is watch time.
+  `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,
+  `swipe`, `menu`, `detail`, `undo`, or `agent` when `feed_save` did it for him).
+- **Saved for later** (added 2026-10-21 from Zach's voice memo: "some kind of way to mark
+  something as ... an important thing for me to read or consume, like add to my queue"):
+  the bookmark on a card (the card's action row, an X post's metrics row, the detail
+  view's header, the `...` menu) or a swipe right saves it, with Undo. The rail then leads
+  with an orange **Saved** bubble (with a count) that shows the queue, newest saved first.
+  The queue is the latest of `save` and `unsave` per card (`marts_feed.item_engagement`
+  `saved`, `saved_at`). `GET /api/feed` returns it as `saved` beside `items`; a saved card
+  stays in it after it expires or an agent removes it, and leaves only on unsave or a
+  dismissal. Agents read it with `pdw feed list --view saved` and save for him only when he
+  asks (`pdw feed save ID`, `feed_save`). A save counts as engaged and adds 3 to
+  `engagement_score`, and is a `feed_engagement` timeline event. The phone keeps its own
+  taps pending for 2 minutes (`saved-queue.ts`) so a reload that beats the event upload
+  does not undo them on screen.
 - **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
   request ("we should just have it measure engagement"). `engaged` = opened (any link,
   or the detail view), tapped More, swiped photos or played a video (`media` events count
   with expands), shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
   time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
-  dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
+  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
   seen and engaged, then seen and scrolled past (`feed.go` `Rank`).
 - **Analytics**: `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
-- **C1/C2**: opens, shares and dismissals are `feed_engagement` timeline events at tier
+- **C1/C2**: opens, shares, saves and dismissals are `feed_engagement` timeline events at tier
   `self` (Zach did them). Impressions, closes, expands and sessions are telemetry and stay in
   `base_feed.events`; cards are entities reached through the marts view.
 - **C7**: pipeline `feed` with no freshness expectation (it is quiet when nobody pushes or
@@ -88,9 +103,9 @@ when offline. A batch the server refuses as malformed (400) is dropped rather th
 `pdw feed push` (alias `add`), `get ID [--version N]`, `update` (alias `edit`; ids,
 or `--source S` for every live card; `--clear` empties fields), `remove` (alias `delete`;
 soft), `restore ID [--version N]` or `--source S`, `history [ID] [--source S] [--full]`,
-`rank`, `list`, `stats`, `events`. Mutations take `--agent` (default `$PDW_AGENT_NAME`,
+`rank`, `save` / `unsave`, `list` (`--view saved` is the queue), `stats`, `events`. Mutations take `--agent` (default `$PDW_AGENT_NAME`,
 else `$PASEO_AGENT_ID`) and `--reason`. MCP: `feed_push`, `feed_get`, `feed_update`,
-`feed_remove`, `feed_restore`, `feed_history`, `feed_rank`, `feed_list`, `feed_stats`,
+`feed_remove`, `feed_restore`, `feed_history`, `feed_rank`, `feed_list`, `feed_save`, `feed_stats`,
 `feed_events`. No scheduled agent writes the feed yet; Zach asked to hold off.
 
 ## Turning it off

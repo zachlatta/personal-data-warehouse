@@ -14,7 +14,9 @@ export type FeedEventType =
   | 'dismiss'
   | 'undismiss'
   | 'share'
-  | 'media';
+  | 'media'
+  | 'save'
+  | 'unsave';
 
 export type FeedEvent = {
   event_id: string;

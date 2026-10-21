@@ -112,10 +112,10 @@ COMMANDS
                              (marts_finance, marts, base_). For finding a
                              relation you do not know, not a first step:
                              search needs none of it.
-  feed push|list|update|remove|rank|stats|events
+  feed push|list|update|remove|rank|save|stats|events
                              Push cards into the PDW app's Feed tab (one from
                              flags, many as JSON on stdin) and read how they
-                             land: impressions, dwell, opens, read time, likes,
+                             land: impressions, dwell, opens, read time, saves,
                              dismissals. See "pdw feed --help".
   ingest <source> [flags]    Run a local data-warehouse uploader (built into
                              this binary). Sources: agent-sessions,

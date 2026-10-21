@@ -65,12 +65,21 @@ from/to, full snapshot). Nothing is ever lost, so edit and remove freely.
 A dismissal by Zach is engagement, not a version: it hides the card from his feed for good,
 whatever an agent does to it.
 
+## Saved for later: his read-later queue
+
+Zach bookmarks (or swipes right on) cards he must read or watch later; they collect in the
+**Saved** bubble at the front of the phone's source rail, newest first, and stay there after
+they expire or are removed until he unsaves them. Read the queue with {{if .CLI}}`pdw feed list --view saved`{{else}}`feed_list` `{"view": "saved"}`{{end}}
+(`saved`, `saved_at` on each card's engagement). Save for him only when he asks ("save that
+for me"): {{if .CLI}}`pdw feed save ID... --reason "..."` (`pdw feed unsave` takes it out){{else}}`feed_save` `{"item_ids": [...], "reason": "..."}` (`"unsave": true` takes it out){{end}}.
+Push the card first if it is not in the feed.
+
 ## Reading engagement
 
 There is no like button: interest is measured. A card is `engaged` when he opened it (any
 link), opened its detail view, tapped More, swiped its photos or played its video, shared it,
-or kept it on screen for 5 s; `engagement_score` adds opens
-(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
+saved it, or kept it on screen for 5 s; `engagement_score` adds opens
+(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), saved for later (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
 minutes), and takes 5 off a dismissal. Rank his interests by it.
 
 {{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
@@ -80,13 +89,13 @@ the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
-`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`),
+`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
 `metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
 or `video`; a `media` event is a carousel swipe or video play with `metadata.index`). An impression is one stretch of a card at
 least half on screen, with how long and how much of it was visible. A `share` is a swipe that
-opened a mail draft to send the card to someone. Opens, shares and dismissals
+opened a mail draft to send the card to someone. Opens, shares, saves and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo

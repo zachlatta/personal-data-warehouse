@@ -53,7 +53,10 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 type feedResponse struct {
-	Items       []Item    `json:"items"`
+	Items []Item `json:"items"`
+	// Saved is his read-later queue, newest saved first; its cards can also
+	// be in Items, and stay here after they leave the feed.
+	Saved       []Item    `json:"saved"`
 	GeneratedAt time.Time `json:"generated_at"`
 }
 
@@ -72,12 +75,19 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	for i := range items {
-		// The phone never shows these; keep the payload to what a card needs.
-		items[i].Metadata = nil
-		items[i].PushedBy = ""
+	saved, err := h.store.Saved(r.Context(), 500)
+	if err != nil {
+		h.fail(w, r, err)
+		return
 	}
-	writeJSON(w, http.StatusOK, feedResponse{Items: items, GeneratedAt: h.store.now()})
+	for _, list := range [][]Item{items, saved} {
+		for i := range list {
+			// The phone never shows these; keep the payload to what a card needs.
+			list[i].Metadata = nil
+			list[i].PushedBy = ""
+		}
+	}
+	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
 }
 
 type eventsRequest struct {
