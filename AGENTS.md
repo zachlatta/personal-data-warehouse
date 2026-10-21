@@ -25,6 +25,11 @@ Development practices:
   silently skipped its own schema's index pass and a different index test failed every run.
   Full suite on porygon 2026-09-20: 1,228s → 483s (fsync off) → 261s (native arm64) → ~125s
   (4 workers).
+* **The Go app deploys before the Python ensure path migrates a view.** A Go query that reads a
+  new `marts_*` column returns 500 ("column ... does not exist") until the next ensure run
+  rebuilds the view, about a minute after the push on 2026-10-20 (the Feed `saved` column).
+  For a surface people are using, land the view change first, or have the Go read tolerate
+  its absence.
 * **`uv run pytest` does not run `go test ./...`, and CI does.** Anything under `app/` — and
   anything that *generates* into it, which in practice means
   `src/personal_data_warehouse/warehouse_catalog.json` — is verified locally only by the Python
