@@ -139,9 +139,14 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 }
 
 // Feed is what the phone shows: live, unexpired, undismissed cards he has not
-// seen yet, ranked. A card leaves the feed at its first impression (Zach,
-// 2026-10-20: "after I've seen a post, don't show it to me again"); the
-// ones he saved stay in Saved.
+// seen yet, ranked, then, so the feed never runs dry, seen cards he passed
+// over. A card leaves the fresh part at its first impression (Zach,
+// 2026-10-20: "after I've seen a post, don't show it to me again"), but an
+// empty feed is worse (Zach, 2026-10-21: "doesn't do the thing where it says
+// that the feed is empty anymore ... just have it always have more stuff"):
+// when the unseen cards run out, the rest of the page is cards he saw without
+// engaging (no open, share, save or 5 s on screen), least seen and longest
+// ago first, marked Resurfaced. Cards he engaged with or saved never come back.
 func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
@@ -156,10 +161,21 @@ func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 		return nil, err
 	}
 	ranked := Rank(items)
-	if len(ranked) > limit {
-		ranked = ranked[:limit]
+	if len(ranked) >= limit {
+		return ranked[:limit], nil
 	}
-	return ranked, nil
+	again, err := s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
+		  AND e.impressions > 0 AND e.dismissed = 0 AND e.engaged = 0 AND e.saved = 0
+		ORDER BY e.impressions, e.last_event_at, i.score DESC, i.item_id LIMIT $2`, s.now(), limit-len(ranked))
+	if err != nil {
+		return nil, err
+	}
+	for i := range again {
+		again[i].Resurfaced = true
+	}
+	return append(ranked, again...), nil
 }
 
 // Saved is his read-later queue, most recently saved first. A saved card

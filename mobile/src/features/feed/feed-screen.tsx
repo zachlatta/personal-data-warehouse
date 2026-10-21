@@ -570,19 +570,20 @@ export default function FeedScreen() {
             </View>
           ) : (
           <View style={styles.empty}>
-            <ThemedText style={styles.emptyTitle}>{disabled ? 'The feed is turned off' : 'You are all caught up'}</ThemedText>
-            <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
-              {disabled
-                ? 'This PDW server does not have the Feed module on (PDW_FEED_ENABLED).'
-                : 'Cards you have seen do not come back. New ones arrive every hour; pull down to refresh.'}
-            </ThemedText>
+            {disabled ? (
+              <>
+                <ThemedText style={styles.emptyTitle}>The feed is turned off</ThemedText>
+                <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
+                  This PDW server does not have the Feed module on (PDW_FEED_ENABLED).
+                </ThemedText>
+              </>
+            ) : (
+              // Only before the first card is ever pushed: once there are cards
+              // the server resurfaces seen ones instead of an empty feed.
+              <ActivityIndicator />
+            )}
           </View>
           )
-        }
-        ListFooterComponent={
-          shown.length ? (
-            <ThemedText style={[styles.footer, { color: theme.textSecondary }]}>That is everything for now.</ThemedText>
-          ) : null
         }
       />
       {undo ? (
@@ -627,7 +628,6 @@ const styles = StyleSheet.create({
   empty: { padding: Spacing.five, alignItems: 'center', gap: Spacing.two },
   emptyTitle: { fontSize: 18, fontWeight: '600' },
   emptyBody: { fontSize: 15, textAlign: 'center' },
-  footer: { textAlign: 'center', padding: Spacing.five, fontSize: 14 },
   undo: {
     position: 'absolute',
     left: Spacing.three,

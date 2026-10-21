@@ -304,7 +304,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[rankInput, rankOutput]{
 			NameStr:        "feed_rank",
 			TitleStr:       "Rank Feed Cards",
-			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Only cards Zach has not seen yet are shown (a card leaves the feed at its first impression), and sources are interleaved. Each change is a rank version. CLI: pdw feed rank.",
+			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has not seen yet are shown first (a card leaves that part at its first impression), sources interleaved; after them come seen cards he passed over, flagged resurfaced, so the feed is never empty. Each change is a rank version. CLI: pdw feed rank.",
 			Handle: func(ctx context.Context, in rankInput) (rankOutput, error) {
 				scores := map[string]float64{}
 				for i, id := range in.Order {
@@ -325,7 +325,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[listInput, listOutput]{
 			NameStr:        "feed_list",
 			TitleStr:       "List Feed Cards",
-			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked (unseen cards only); view=saved is his read-later queue. CLI: pdw feed list.",
+			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked (unseen cards, then resurfaced seen-but-skipped ones); view=saved is his read-later queue. CLI: pdw feed list.",
 			Handle: func(ctx context.Context, in listInput) (listOutput, error) {
 				if in.Limit > 500 {
 					return listOutput{}, &tool.InvalidInputError{Message: "limit is at most 500"}

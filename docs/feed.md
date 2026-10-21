@@ -11,7 +11,8 @@ Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
 agent ── pdw feed push / feed_push ──▶ app (app/internal/feed) ──▶ base_feed.items
 agent ── pdw feed get / edit / remove / restore / history ──▶ the same tools
                          every change ──trigger──▶ base_feed.item_versions (append-only)
-phone ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved)
+phone ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved),
+                           then resurfaced seen-but-skipped cards so it is never empty
 phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement / sessions
                                                   └──▶ timeline.events (open / dismiss, tier self)
 ```
@@ -112,9 +113,13 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   or the detail view), tapped More, swiped photos or played a video (`media` events count
   with expands), shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
   time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
-  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows only unseen cards: a
-  card leaves the feed at its first impression (Zach, 2026-10-20: "after I've seen a post,
-  don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved.
+  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows unseen cards first: a
+  card leaves that part at its first impression (Zach, 2026-10-20: "after I've seen a post,
+  don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved. The feed is
+  never empty (Zach, 2026-10-21: "just have it always have more stuff"): when the unseen
+  cards run out, the page continues with seen cards he passed over (not engaged, saved or
+  dismissed), least seen and longest ago first, flagged `resurfaced` ("Seen before" on the
+  card). The "all caught up" screen and the end-of-feed footer are gone.
 - **Analytics**: `marts_feed.sessions` (per sitting, above), `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.

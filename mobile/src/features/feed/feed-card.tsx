@@ -78,7 +78,11 @@ function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
   const theme = useTheme();
   const name = item.site || item.source;
   const age = shortAge(item.published_at ?? item.created_at);
-  const sub = [item.author, item.site && item.source !== item.site ? item.source : ''].filter(Boolean).join(' · ');
+  // A resurfaced card is one he saw and passed over, back because the
+  // unseen ones ran out (server Store.Feed).
+  const sub = [item.resurfaced ? 'Seen before' : '', item.author, item.site && item.source !== item.site ? item.source : '']
+    .filter(Boolean)
+    .join(' · ');
   return (
     <View style={styles.sourceRow}>
       <SourceAvatar name={name} url={item.url} size={34} />

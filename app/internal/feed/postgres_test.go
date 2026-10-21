@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -459,4 +460,71 @@ func TestPostgresFeedSavedQueue(t *testing.T) {
 	if got := saved(); len(got) != 0 {
 		t.Fatalf("unsave empties the queue: %v", got)
 	}
+}
+
+// The feed never runs dry (Zach, 2026-10-21): after the unseen cards come
+// seen ones he passed over, least seen first, marked resurfaced; cards he
+// engaged with, saved or dismissed never come back.
+func TestPostgresFeedResurfacesSeenCardsWhenUnseenRunOut(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	ids := map[string]string{}
+	items := []map[string]any{}
+	for _, name := range []string{"fresh", "glanced", "twice", "read", "saved", "dismissed"} {
+		url := "https://example.com/resurface/" + name
+		ids[name] = "resurf:" + url
+		items = append(items, map[string]any{"title": name, "url": url})
+	}
+	call(t, tools, "feed_push", map[string]any{"source": "resurf", "items": items})
+	at := func(d time.Duration) time.Time { return now.Add(d) }
+	events := []map[string]any{
+		{"event_id": "rs1", "type": "impression", "item_id": ids["glanced"], "occurred_at": at(time.Second), "dwell_ms": 400},
+		{"event_id": "rs2", "type": "impression", "item_id": ids["twice"], "occurred_at": at(-time.Hour), "dwell_ms": 400},
+		{"event_id": "rs3", "type": "impression", "item_id": ids["twice"], "occurred_at": at(-time.Minute), "dwell_ms": 400},
+		{"event_id": "rs4", "type": "impression", "item_id": ids["read"], "occurred_at": at(time.Second), "dwell_ms": 400},
+		{"event_id": "rs5", "type": "open", "item_id": ids["read"], "occurred_at": at(time.Second)},
+		{"event_id": "rs6", "type": "impression", "item_id": ids["saved"], "occurred_at": at(time.Second), "dwell_ms": 400},
+		{"event_id": "rs7", "type": "save", "item_id": ids["saved"], "occurred_at": at(time.Second)},
+		{"event_id": "rs8", "type": "impression", "item_id": ids["dismissed"], "occurred_at": at(time.Second), "dwell_ms": 400},
+		{"event_id": "rs9", "type": "dismiss", "item_id": ids["dismissed"], "occurred_at": at(time.Second)},
+	}
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": events})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, httptest.NewRequest("GET", APIPath, nil))
+	var page feedResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &page); err != nil || res.Code != 200 {
+		t.Fatalf("GET feed: %d %s", res.Code, res.Body.String())
+	}
+	got, resurfacing := []string{}, false
+	for _, item := range page.Items {
+		if item.Resurfaced {
+			resurfacing = true
+		} else if resurfacing {
+			t.Fatalf("an unseen card came after a resurfaced one: %s", item.ItemID)
+		}
+		if item.Source == "resurf" {
+			got = append(got, fmt.Sprintf("%s:%v", item.Title, item.Resurfaced))
+		}
+	}
+	if strings.Join(got, ",") != "fresh:false,glanced:true,twice:true" {
+		t.Fatalf("resurfaced feed: %v", got)
+	}
+	if !strings.Contains(res.Body.String(), `"resurfaced":true`) {
+		t.Fatalf("the phone is told which cards are resurfaced: %s", res.Body.String())
+	}
+
+	// A full page of unseen cards resurfaces nothing.
+	page1, err := store.Feed(context.Background(), 1)
+	if err != nil || len(page1) != 1 || page1[0].Resurfaced {
+		t.Fatalf("limit 1: %v %v", page1, err)
+	}
+	call(t, tools, "feed_remove", map[string]any{"source": "resurf", "reason": "test"})
 }

@@ -22,6 +22,8 @@ export type FeedItem = {
   published_at?: string;
   created_at: string;
   engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number; saved?: boolean };
+  // A seen card shown again after every unseen one, so the feed never runs dry.
+  resurfaced?: boolean;
 };
 
 // saved is his read-later queue, newest saved first (absent on an older server).

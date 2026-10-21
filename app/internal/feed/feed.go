@@ -78,6 +78,9 @@ type Item struct {
 	// Version is the card's latest row in base_feed.item_versions.
 	Version    int64      `json:"version"`
 	Engagement Engagement `json:"engagement"`
+	// Resurfaced marks a seen card the feed shows again because the unseen
+	// ones ran out (Store.Feed).
+	Resurfaced bool `json:"resurfaced,omitempty"`
 }
 
 // Link is one more place a card points to (the paper, the repo, the
@@ -412,7 +415,8 @@ func ValidateEvent(e *Event, now time.Time) error {
 // Rank orders live cards the way the phone shows them, after the Feeeed
 // model: no unread count, so nothing is a backlog to clear. Higher score
 // first, then newer; and no source runs three in a row while another is
-// waiting. Seen cards never reach it: Feed leaves them out.
+// waiting. Seen cards never reach it: Feed puts the ones it resurfaces after
+// every unseen card.
 func Rank(items []Item) []Item {
 	ordered := append([]Item(nil), items...)
 	sort.SliceStable(ordered, func(i, j int) bool {
