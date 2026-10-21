@@ -3,19 +3,35 @@ import { Image } from 'expo-image';
 import * as Sharing from 'expo-sharing';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Modal, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
 
 import { ThemedText } from '@/components/themed-text';
+import { useModalInsets } from '@/hooks/use-modal-insets';
 import { useTheme } from '@/hooks/use-theme';
 import { attachmentPreviewKind, prepareAttachment } from '@/lib/email-attachment';
 import type { GmailEmailAttachment } from '@/lib/mutation-review';
 
-function AttachmentViewer({ attachment, onClose }: { attachment: GmailEmailAttachment; onClose: () => void }) {
+type ViewerProps = { attachment: GmailEmailAttachment; onClose: () => void };
+
+// The Modal is its own window, so it carries its own SafeAreaProvider: without
+// it the header sat under the status bar.
+function AttachmentViewer(props: ViewerProps) {
+  const [sharing, setSharing] = useState(false);
+  return (
+    <Modal animationType="slide" presentationStyle="fullScreen" onRequestClose={() => { if (!sharing) props.onClose(); }}>
+      <SafeAreaProvider>
+        <AttachmentViewerScreen {...props} sharing={sharing} setSharing={setSharing} />
+      </SafeAreaProvider>
+    </Modal>
+  );
+}
+
+function AttachmentViewerScreen({ attachment, onClose, sharing, setSharing }: ViewerProps & { sharing: boolean; setSharing: (sharing: boolean) => void }) {
   const theme = useTheme();
+  const insets = useModalInsets();
   const [file, setFile] = useState<{ uri: string; previewUri: string; text?: string }>();
   const [error, setError] = useState('');
-  const [sharing, setSharing] = useState(false);
   const kind = attachmentPreviewKind(attachment.content_type, Platform.OS);
 
   useEffect(() => {
@@ -65,30 +81,28 @@ function AttachmentViewer({ attachment, onClose }: { attachment: GmailEmailAttac
   };
 
   return (
-    <Modal animationType="slide" presentationStyle="fullScreen" onRequestClose={() => { if (!sharing) onClose(); }}>
-      <SafeAreaView style={[styles.screen, { backgroundColor: theme.background }]}>
-        <View style={styles.header}>
-          <Pressable accessibilityRole="button" onPress={onClose} disabled={sharing} style={styles.button}><ThemedText style={styles.link}>Done</ThemedText></Pressable>
-          <ThemedText type="smallBold" numberOfLines={2} style={styles.title}>{attachment.filename || 'Attachment'}</ThemedText>
-          <Pressable accessibilityRole="button" onPress={() => void share()} disabled={!file || sharing} style={styles.button}><ThemedText style={styles.link}>{sharing ? 'Sharing…' : 'Share / Save'}</ThemedText></Pressable>
-        </View>
-        {error ? <ThemedText accessibilityRole="alert" style={styles.error}>{error}</ThemedText> : null}
-        {!file && !error ? <ActivityIndicator accessibilityLabel="Loading attachment" /> : null}
-        {file && kind === 'image' ? <Image source={{ uri: file.uri }} contentFit="contain" style={styles.screen} onError={() => setError('Could not preview this image. Use Share / Save to open it in another app.')} /> : null}
-        {file && kind === 'text' ? <ScrollView contentContainerStyle={styles.text}><ThemedText selectable>{file.text}</ThemedText></ScrollView> : null}
-        {file && kind === 'pdf' && !error ? <WebView
-          source={{ uri: file.previewUri }}
-          style={styles.screen}
-          javaScriptEnabled={false}
-          domStorageEnabled={false}
-          incognito
-          originWhitelist={['*']}
-          onShouldStartLoadWithRequest={(request) => request.url === file.previewUri}
-          onError={() => setError('Could not preview this PDF. Use Share / Save to open it in another app.')}
-        /> : null}
-        {file && kind === 'external' ? <ThemedText style={styles.text}>Use Share / Save to view this file in another app or save it to Files.</ThemedText> : null}
-      </SafeAreaView>
-    </Modal>
+    <View style={[styles.screen, { backgroundColor: theme.background, paddingTop: insets.top, paddingBottom: insets.bottom, paddingLeft: insets.left, paddingRight: insets.right }]}>
+      <View style={styles.header}>
+        <Pressable accessibilityRole="button" onPress={onClose} disabled={sharing} style={styles.button}><ThemedText style={styles.link}>Done</ThemedText></Pressable>
+        <ThemedText type="smallBold" numberOfLines={2} style={styles.title}>{attachment.filename || 'Attachment'}</ThemedText>
+        <Pressable accessibilityRole="button" onPress={() => void share()} disabled={!file || sharing} style={styles.button}><ThemedText style={styles.link}>{sharing ? 'Sharing…' : 'Share / Save'}</ThemedText></Pressable>
+      </View>
+      {error ? <ThemedText accessibilityRole="alert" style={styles.error}>{error}</ThemedText> : null}
+      {!file && !error ? <ActivityIndicator accessibilityLabel="Loading attachment" /> : null}
+      {file && kind === 'image' ? <Image source={{ uri: file.uri }} contentFit="contain" style={styles.screen} onError={() => setError('Could not preview this image. Use Share / Save to open it in another app.')} /> : null}
+      {file && kind === 'text' ? <ScrollView contentContainerStyle={styles.text}><ThemedText selectable>{file.text}</ThemedText></ScrollView> : null}
+      {file && kind === 'pdf' && !error ? <WebView
+        source={{ uri: file.previewUri }}
+        style={styles.screen}
+        javaScriptEnabled={false}
+        domStorageEnabled={false}
+        incognito
+        originWhitelist={['*']}
+        onShouldStartLoadWithRequest={(request) => request.url === file.previewUri}
+        onError={() => setError('Could not preview this PDF. Use Share / Save to open it in another app.')}
+      /> : null}
+      {file && kind === 'external' ? <ThemedText style={styles.text}>Use Share / Save to view this file in another app or save it to Files.</ThemedText> : null}
+    </View>
   );
 }
 

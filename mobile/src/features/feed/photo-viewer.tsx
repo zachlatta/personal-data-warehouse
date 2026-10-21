@@ -15,9 +15,10 @@ import {
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
+import { useModalInsets } from '@/hooks/use-modal-insets';
 
 import { fullSizeUrl, photoFilename, type FeedMedia } from './rich';
 
@@ -39,22 +40,29 @@ async function sharePhoto(media: FeedMedia, index: number) {
   await Sharing.shareAsync(file.uri, { dialogTitle: media.alt || 'Photo' });
 }
 
-// X's photo viewer: full screen on black, swipe between the post's photos,
-// pinch or double-tap to zoom, and share the one on screen.
-export function PhotoViewer({
-  photos,
-  start,
-  onClose,
-  onPage,
-  onShare,
-}: {
+type PhotoViewerProps = {
   photos: FeedMedia[];
   start: number;
   onClose: () => void;
   onPage?: (index: number) => void;
   onShare?: (index: number) => void;
-}) {
+};
+
+// X's photo viewer: full screen on black, swipe between the post's photos,
+// pinch or double-tap to zoom, and share the one on screen.
+export function PhotoViewer(props: PhotoViewerProps) {
+  return (
+    <Modal visible animationType="fade" presentationStyle="overFullScreen" transparent statusBarTranslucent onRequestClose={props.onClose}>
+      <SafeAreaProvider>
+        <PhotoViewerScreen {...props} />
+      </SafeAreaProvider>
+    </Modal>
+  );
+}
+
+function PhotoViewerScreen({ photos, start, onClose, onPage, onShare }: PhotoViewerProps) {
   const { width, height } = useWindowDimensions();
+  const insets = useModalInsets();
   const [page, setPage] = useState(start);
   const [sharing, setSharing] = useState(false);
   const [chrome, setChrome] = useState(true);
@@ -79,47 +87,45 @@ export function PhotoViewer({
     }
   };
 
+  // Touches bubble up the React tree, not the screen: claim any the viewer
+  // does not handle so they never reach the card behind it.
   return (
-    <Modal visible animationType="fade" presentationStyle="overFullScreen" transparent statusBarTranslucent onRequestClose={onClose}>
-      {/* Touches bubble up the React tree, not the screen: claim any the
-          viewer does not handle so they never reach the card behind it. */}
-      <View style={styles.screen} onStartShouldSetResponder={() => true}>
-        <ScrollView
-          horizontal
-          pagingEnabled
-          showsHorizontalScrollIndicator={false}
-          contentOffset={{ x: start * width, y: 0 }}
-          onMomentumScrollEnd={onEnd}>
-          {photos.map((m, i) => (
-            <ZoomablePhoto key={i} media={m} width={width} height={height} onTap={() => setChrome((c) => !c)} />
-          ))}
-        </ScrollView>
-        {chrome ? (
-          <SafeAreaView style={styles.bar} pointerEvents="box-none">
-            <Pressable hitSlop={12} onPress={onClose} accessibilityLabel="Close" style={styles.button}>
-              <SymbolView name="xmark" tintColor="#fff" size={18} />
-            </Pressable>
-            {photos.length > 1 ? (
-              <ThemedText style={styles.counter}>
-                {page + 1}/{photos.length}
-              </ThemedText>
-            ) : (
-              <View />
-            )}
-            <Pressable hitSlop={12} onPress={() => void share()} disabled={sharing} accessibilityLabel="Share photo" style={styles.button}>
-              {sharing ? <ActivityIndicator color="#fff" /> : <SymbolView name="square.and.arrow.up" tintColor="#fff" size={18} />}
-            </Pressable>
-          </SafeAreaView>
-        ) : null}
-        {chrome && photos[page]?.alt ? (
-          <SafeAreaView edges={['bottom']} style={styles.altWrap} pointerEvents="none">
-            <ThemedText style={styles.alt} numberOfLines={4}>
-              {photos[page].alt}
+    <View style={styles.screen} onStartShouldSetResponder={() => true}>
+      <ScrollView
+        horizontal
+        pagingEnabled
+        showsHorizontalScrollIndicator={false}
+        contentOffset={{ x: start * width, y: 0 }}
+        onMomentumScrollEnd={onEnd}>
+        {photos.map((m, i) => (
+          <ZoomablePhoto key={i} media={m} width={width} height={height} onTap={() => setChrome((c) => !c)} />
+        ))}
+      </ScrollView>
+      {chrome ? (
+        <View style={[styles.bar, { paddingTop: insets.top, paddingLeft: 12 + insets.left, paddingRight: 12 + insets.right }]} pointerEvents="box-none">
+          <Pressable hitSlop={12} onPress={onClose} accessibilityLabel="Close" style={styles.button}>
+            <SymbolView name="xmark" tintColor="#fff" size={18} />
+          </Pressable>
+          {photos.length > 1 ? (
+            <ThemedText style={styles.counter}>
+              {page + 1}/{photos.length}
             </ThemedText>
-          </SafeAreaView>
-        ) : null}
-      </View>
-    </Modal>
+          ) : (
+            <View />
+          )}
+          <Pressable hitSlop={12} onPress={() => void share()} disabled={sharing} accessibilityLabel="Share photo" style={styles.button}>
+            {sharing ? <ActivityIndicator color="#fff" /> : <SymbolView name="square.and.arrow.up" tintColor="#fff" size={18} />}
+          </Pressable>
+        </View>
+      ) : null}
+      {chrome && photos[page]?.alt ? (
+        <View style={[styles.altWrap, { paddingBottom: 12 + insets.bottom }]} pointerEvents="none">
+          <ThemedText style={styles.alt} numberOfLines={4}>
+            {photos[page].alt}
+          </ThemedText>
+        </View>
+      ) : null}
+    </View>
   );
 }
 
