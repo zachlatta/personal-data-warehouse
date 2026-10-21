@@ -41,17 +41,18 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
   `close` (`dwell_ms` = time spent after the open; reader adds `scroll_depth`), `expand`
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
-  `less_like_this`) / `undismiss` (the 5-second Undo).
+  `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left to email the
+  card from Superhuman; `metadata.via` = `superhuman` or `mailto`).
 - **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
   request ("we should just have it measure engagement"). `engaged` = opened (any link),
-  tapped More, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More +
+  tapped More, shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
   time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
   dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
   seen and engaged, then seen and scrolled past (`feed.go` `Rank`).
 - **Analytics**: `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
-- **C1/C2**: opens and dismissals are `feed_engagement` timeline events at tier
+- **C1/C2**: opens, shares and dismissals are `feed_engagement` timeline events at tier
   `self` (Zach did them). Impressions, closes, expands and sessions are telemetry and stay in
   `base_feed.events`; cards are entities reached through the marts view.
 - **C7**: pipeline `feed` with no freshness expectation (it is quiet when nobody pushes or

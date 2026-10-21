@@ -76,15 +76,18 @@ def test_item_engagement_rolls_up_the_phone_events(warehouse):
     _event(wh, "h", "dismiss", item_id="hn:2", minutes=8, metadata='{"reason": "less_like_this"}')
     # Never tapped, but he sat on the card for six seconds: that is engagement.
     _event(wh, "j", "impression", item_id="hn:3", minutes=9, dwell_ms=6000, fraction=1.0)
+    # Swiped to email it to someone: a share counts once, for 3.
+    _event(wh, "k", "share", item_id="hn:3", minutes=10, metadata='{"via": "superhuman"}')
+    _event(wh, "l", "share", item_id="hn:3", minutes=11, metadata='{"via": "superhuman"}')
     rows = wh._query(
         "SELECT item_id, impressions, dwell_ms, max_visible_fraction, scroll_pasts, opens, links_opened, read_ms, "
-        "dismissed, dismiss_reason, engaged, engagement_score FROM @marts_feed_item_engagement ORDER BY item_id"
+        "dismissed, dismiss_reason, engaged, engagement_score, shares FROM @marts_feed_item_engagement ORDER BY item_id"
     )
     assert rows == [
         # 2 opens x2 + expand 1 + 5.4 s / 10 + 1.5 min read = 7.04
-        ("hn:1", 2, 5400, 1.0, 1, 2, 2, 90000, 0, "", 1, 7.04),
-        ("hn:2", 0, 0, 0.0, 0, 0, 0, 0, 1, "less_like_this", 0, -5.0),
-        ("hn:3", 1, 6000, 1.0, 0, 0, 0, 0, 0, "", 1, 0.6),
+        ("hn:1", 2, 5400, 1.0, 1, 2, 2, 90000, 0, "", 1, 7.04, 0),
+        ("hn:2", 0, 0, 0.0, 0, 0, 0, 0, 1, "less_like_this", 0, -5.0, 0),
+        ("hn:3", 1, 6000, 1.0, 0, 0, 0, 0, 0, "", 1, 3.6, 2),
     ]
     _event(wh, "i", "undismiss", item_id="hn:2", minutes=9)
     assert wh._query("SELECT dismissed, engagement_score FROM @marts_feed_item_engagement WHERE item_id = 'hn:2'") == [

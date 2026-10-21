@@ -2214,7 +2214,7 @@ _BROWSER_SEARCH = _simple_adapter(
 # --- Feed tab (personal_data_warehouse/feed.py) ------------------------------
 #
 # base_feed.events is the phone's engagement log for the cards agents push.
-# Only the deliberate acts are timeline events -- opening a card, liking it,
+# Only the deliberate acts are timeline events -- opening a card, sharing it,
 # dismissing it -- and they are `self`: Zach did them. Impressions, dwell and
 # sessions are telemetry (thousands a week) and are read through
 # marts_feed.item_engagement instead. The context is the feed session, so
@@ -2230,7 +2230,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
     ingest_ts="t.received_at",
     actor="'me'",
     title=(
-        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' ELSE 'Dismissed: ' END, "
+        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'share' THEN 'Shared: ' ELSE 'Dismissed: ' END, "
         "COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
     ),
     snippet=_snippet("concat_ws(' · ', NULLIF(i.source, ''), NULLIF(i.site, ''), NULLIF(i.url, ''))"),
@@ -2243,7 +2243,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
         "'mode', t.metadata->>'mode')"
     ),
     search_text=_search_concat("i.title", "left(i.body, 2000)", "i.site", "i.author", "i.source"),
-    where="t.event_type IN ('open', 'dismiss')",
+    where="t.event_type IN ('open', 'dismiss', 'share')",
     priority=TIMELINE_PRIORITY_SELF,
 )
 

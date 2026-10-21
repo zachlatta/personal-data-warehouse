@@ -1,7 +1,8 @@
 import { Image } from 'expo-image';
 import { SymbolView } from 'expo-symbols';
-import { memo, useMemo, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import ReanimatedSwipeable, { type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -16,6 +17,7 @@ const PREVIEW_LINES = 4;
 const LINK_COLOR = '#208AEF';
 
 // There is no like button: what he looks at, opens and reads is measured.
+// Swiping a card left shares it: onShare opens an email draft of it.
 type Props = {
   item: FeedItem;
   onLayout: (itemId: string, height: number) => void;
@@ -24,10 +26,21 @@ type Props = {
   onOpenLink: (item: FeedItem, link: CardLink) => void;
   onExpand: (item: FeedItem) => void;
   onMenu: (item: FeedItem) => void;
+  onShare: (item: FeedItem, preview: string) => void;
 };
 
-function FeedCardImpl({ item, onLayout, onOpen, onRead, onOpenLink, onExpand, onMenu }: Props) {
+function ShareAction() {
+  return (
+    <View style={styles.share}>
+      <SymbolView name="envelope" tintColor="#fff" size={22} />
+      <ThemedText style={styles.shareLabel}>Share</ThemedText>
+    </View>
+  );
+}
+
+function FeedCardImpl({ item, onLayout, onOpen, onRead, onOpenLink, onExpand, onMenu, onShare }: Props) {
   const theme = useTheme();
+  const swipeable = useRef<SwipeableMethods>(null);
   const [expanded, setExpanded] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const preview = useMemo(() => (item.body ? plainText(item.body) : ''), [item.body]);
@@ -38,90 +51,101 @@ function FeedCardImpl({ item, onLayout, onOpen, onRead, onOpenLink, onExpand, on
     .join(' · ');
 
   return (
-    <View
-      style={[styles.wrap, { borderBottomColor: theme.backgroundElement }]}
-      onLayout={(e: LayoutChangeEvent) => onLayout(item.item_id, e.nativeEvent.layout.height)}>
-      <Pressable onPress={() => onOpen(item)} style={({ pressed }) => [pressed && { opacity: 0.85 }]}>
-        <View style={styles.header}>
-          <ThemedText style={[styles.byline, { color: theme.textSecondary }]} numberOfLines={1}>
-            {byline}
-          </ThemedText>
-        </View>
-        {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
-        {item.image_url ? (
-          <Image
-            source={{ uri: item.image_url }}
-            style={[styles.image, { backgroundColor: theme.backgroundElement }]}
-            contentFit="cover"
-            transition={200}
-            recyclingKey={item.item_id}
-            accessibilityIgnoresInvertColors
-          />
-        ) : null}
-        {preview ? (
-          <ThemedText
-            style={[styles.body, { color: theme.textSecondary }]}
-            numberOfLines={expanded ? undefined : PREVIEW_LINES}
-            onTextLayout={(e) => {
-              if (!expanded && e.nativeEvent.lines.length >= PREVIEW_LINES) setTruncated(true);
+    <ReanimatedSwipeable
+      ref={swipeable}
+      friction={1.5}
+      rightThreshold={60}
+      overshootRight={false}
+      renderRightActions={() => <ShareAction />}
+      onSwipeableOpen={() => {
+        swipeable.current?.close();
+        onShare(item, preview);
+      }}>
+      <View
+        style={[styles.wrap, { borderBottomColor: theme.backgroundElement, backgroundColor: theme.background }]}
+        onLayout={(e: LayoutChangeEvent) => onLayout(item.item_id, e.nativeEvent.layout.height)}>
+        <Pressable onPress={() => onOpen(item)} style={({ pressed }) => [pressed && { opacity: 0.85 }]}>
+          <View style={styles.header}>
+            <ThemedText style={[styles.byline, { color: theme.textSecondary }]} numberOfLines={1}>
+              {byline}
+            </ThemedText>
+          </View>
+          {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
+          {item.image_url ? (
+            <Image
+              source={{ uri: item.image_url }}
+              style={[styles.image, { backgroundColor: theme.backgroundElement }]}
+              contentFit="cover"
+              transition={200}
+              recyclingKey={item.item_id}
+              accessibilityIgnoresInvertColors
+            />
+          ) : null}
+          {preview ? (
+            <ThemedText
+              style={[styles.body, { color: theme.textSecondary }]}
+              numberOfLines={expanded ? undefined : PREVIEW_LINES}
+              onTextLayout={(e) => {
+                if (!expanded && e.nativeEvent.lines.length >= PREVIEW_LINES) setTruncated(true);
+              }}>
+              {preview}
+            </ThemedText>
+          ) : null}
+        </Pressable>
+        {truncated && !expanded ? (
+          <Pressable
+            hitSlop={8}
+            onPress={() => {
+              setExpanded(true);
+              onExpand(item);
             }}>
-            {preview}
-          </ThemedText>
+            <ThemedText style={styles.more}>More</ThemedText>
+          </Pressable>
         ) : null}
-      </Pressable>
-      {truncated && !expanded ? (
-        <Pressable
-          hitSlop={8}
-          onPress={() => {
-            setExpanded(true);
-            onExpand(item);
-          }}>
-          <ThemedText style={styles.more}>More</ThemedText>
-        </Pressable>
-      ) : null}
-      {extraLinks.length ? (
-        <View style={[styles.links, { borderColor: theme.backgroundElement }]}>
-          {extraLinks.map((link) => (
-            <Pressable
-              key={link.index}
-              onPress={() => onOpenLink(item, link)}
-              accessibilityLabel={`Open ${link.label}`}
-              style={({ pressed }) => [styles.linkRow, { borderTopColor: theme.backgroundElement }, pressed && { opacity: 0.6 }]}>
-              <SymbolView name="link" tintColor={LINK_COLOR} size={15} />
-              <ThemedText style={styles.linkLabel} numberOfLines={1}>
-                {link.label}
-              </ThemedText>
-              {link.label !== link.site ? (
-                <ThemedText style={[styles.linkSite, { color: theme.textSecondary }]} numberOfLines={1}>
-                  {link.site}
+        {extraLinks.length ? (
+          <View style={[styles.links, { borderColor: theme.backgroundElement }]}>
+            {extraLinks.map((link) => (
+              <Pressable
+                key={link.index}
+                onPress={() => onOpenLink(item, link)}
+                accessibilityLabel={`Open ${link.label}`}
+                style={({ pressed }) => [styles.linkRow, { borderTopColor: theme.backgroundElement }, pressed && { opacity: 0.6 }]}>
+                <SymbolView name="link" tintColor={LINK_COLOR} size={15} />
+                <ThemedText style={styles.linkLabel} numberOfLines={1}>
+                  {link.label}
                 </ThemedText>
-              ) : null}
+                {link.label !== link.site ? (
+                  <ThemedText style={[styles.linkSite, { color: theme.textSecondary }]} numberOfLines={1}>
+                    {link.site}
+                  </ThemedText>
+                ) : null}
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+        <View style={styles.actions}>
+          {item.url ? (
+            <Pressable hitSlop={10} onPress={() => onOpen(item)} accessibilityLabel="Open link" style={styles.action}>
+              <SymbolView name="safari" tintColor={theme.textSecondary} size={21} />
             </Pressable>
-          ))}
+          ) : null}
+          {item.body ? (
+            <Pressable hitSlop={10} onPress={() => onRead(item)} accessibilityLabel="Read" style={styles.action}>
+              <SymbolView name="doc.text" tintColor={theme.textSecondary} size={20} />
+            </Pressable>
+          ) : null}
+          <View style={{ flex: 1 }} />
+          {item.tags.length ? (
+            <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
+              {item.tags.slice(0, 3).map((t) => `#${t}`).join(' ')}
+            </ThemedText>
+          ) : null}
+          <Pressable hitSlop={10} onPress={() => onMenu(item)} accessibilityLabel="Dismiss" style={styles.action}>
+            <SymbolView name="xmark" tintColor={theme.textSecondary} size={17} />
+          </Pressable>
         </View>
-      ) : null}
-      <View style={styles.actions}>
-        {item.url ? (
-          <Pressable hitSlop={10} onPress={() => onOpen(item)} accessibilityLabel="Open link" style={styles.action}>
-            <SymbolView name="safari" tintColor={theme.textSecondary} size={21} />
-          </Pressable>
-        ) : null}
-        {item.body ? (
-          <Pressable hitSlop={10} onPress={() => onRead(item)} accessibilityLabel="Read" style={styles.action}>
-            <SymbolView name="doc.text" tintColor={theme.textSecondary} size={20} />
-          </Pressable>
-        ) : null}
-        <View style={{ flex: 1 }} />
-        {item.tags.length ? (
-          <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
-            {item.tags.slice(0, 3).map((t) => `#${t}`).join(' ')}
-          </ThemedText>
-        ) : null}
-        <Pressable hitSlop={10} onPress={() => onMenu(item)} accessibilityLabel="Dismiss" style={styles.action}>
-          <SymbolView name="xmark" tintColor={theme.textSecondary} size={17} />
-        </Pressable>
       </View>
-    </View>
+    </ReanimatedSwipeable>
   );
 }
 
@@ -142,4 +166,6 @@ const styles = StyleSheet.create({
   actions: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Spacing.two, paddingVertical: Spacing.two, gap: Spacing.one },
   action: { padding: Spacing.two },
   tags: { fontSize: 13, maxWidth: 170, marginRight: Spacing.one },
+  share: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one, backgroundColor: LINK_COLOR },
+  shareLabel: { color: '#fff', fontSize: 13, fontWeight: '600' },
 });

@@ -77,7 +77,7 @@ READ FLAGS
   --full            history: include each version's full snapshot.
   -n, --limit N     Rows.
   --type TYPES      events: session_start, session_end, impression, open, close,
-                    expand, dismiss, undismiss.
+                    expand, dismiss, undismiss, share.
   --item ID, --since TIME (2026-10-01, or 7d / 12h)
   --output FMT      text (default) or json.
 
@@ -547,7 +547,7 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		fmt.Fprintf(w, "since %s: %d sessions\n", str(out, "since"), int(num(out, "sessions")))
 		if byType, ok := out["events_by_type"].(map[string]any); ok && len(byType) > 0 {
 			parts := []string{}
-			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "session_start", "session_end"} {
+			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "share", "session_start", "session_end"} {
 				if n, ok := byType[kind].(float64); ok {
 					parts = append(parts, fmt.Sprintf("%s=%d", kind, int(n)))
 				}

@@ -3488,7 +3488,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss."
+      "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss, share."
     },
     {
       "id": "feed_item_versions",
@@ -3878,7 +3878,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, read time, dismissed, engaged, engagement_score. Epoch times are NULL."
+      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, read time, dismissed, shares, engaged, engagement_score. Epoch times are NULL."
     },
     {
       "id": "marts_feed_source_engagement",

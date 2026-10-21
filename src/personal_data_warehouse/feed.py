@@ -16,12 +16,12 @@ VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement")
 #: (app/internal/feed/feed.go EventTypes); tests/test_feed.py pins the two.
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
-    "dismiss", "undismiss",
+    "dismiss", "undismiss", "share",
 )
 
 #: The deliberate acts that reach timeline.events (tier self). Impressions,
 #: dwell and sessions are telemetry and stay in base_feed.events.
-TIMELINE_EVENT_TYPES = ("open", "dismiss")
+TIMELINE_EVENT_TYPES = ("open", "dismiss", "share")
 
 #: An impression shorter than this is a scroll-past rather than a look.
 SCROLL_PAST_MS = 1000
@@ -33,10 +33,11 @@ ENGAGED_DWELL_MS = 5000
 #: engagement_score, the one number agents rank his interest by. There is no
 #: like button: interest is measured. Each term is capped so one long sitting
 #: on a card cannot drown everything else; a dismissal is a strong negative.
-#: opens 2 each (at most 3 counted), expands 1, a minute looking at the card
-#: 6, ten minutes reading 10, dismissed -5.
+#: opens 2 each (at most 3 counted), expands 1, shared 3, a minute looking at
+#: the card 6, ten minutes reading 10, dismissed -5.
 ENGAGEMENT_SCORE_SQL = (
     "round((2 * LEAST(COALESCE(e.opens, 0), 3) + LEAST(COALESCE(e.expands, 0), 1)"
+    " + 3 * LEAST(COALESCE(e.shares, 0), 1)"
     " + LEAST(COALESCE(e.dwell_ms, 0), 60000) / 10000.0"
     " + LEAST(COALESCE(e.read_ms, 0), 600000) / 60000.0"
     " - CASE WHEN e.dismiss_state = 'dismiss' THEN 5 ELSE 0 END)::numeric, 2)::float8"
@@ -198,8 +199,9 @@ STATEMENTS = (
 
 # Booleans are bigint 0/1 and the epoch becomes NULL, as everywhere in
 # marts_*. dismissed is the item's CURRENT state: the latest of dismiss and
-# undismiss. engaged: he opened it (any link), tapped More, or looked at the
-# card for ENGAGED_DWELL_MS. link_opens counts opens per link url.
+# undismiss. engaged: he opened it (any link), tapped More, shared it, or
+# looked at the card for ENGAGED_DWELL_MS. shares is last because CREATE OR
+# REPLACE VIEW can only add columns at the end. link_opens counts opens per link url.
 ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
     WITH e AS (
         SELECT item_id,
@@ -210,6 +212,7 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
             count(*) FILTER (WHERE event_type = 'open') AS opens,
             COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'close'), 0) AS read_ms,
             count(*) FILTER (WHERE event_type = 'expand') AS expands,
+            count(*) FILTER (WHERE event_type = 'share') AS shares,
             (array_agg(event_type ORDER BY occurred_at DESC, received_at DESC)
                 FILTER (WHERE event_type IN ('dismiss', 'undismiss')))[1] AS dismiss_state,
             (array_agg(metadata->>'reason' ORDER BY occurred_at DESC, received_at DESC)
@@ -240,12 +243,13 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
            CASE WHEN e.dismiss_state = 'dismiss' THEN 1 ELSE 0 END AS dismissed,
            CASE WHEN e.dismiss_state = 'dismiss' THEN COALESCE(e.dismiss_reason, '') ELSE '' END
                AS dismiss_reason,
-           CASE WHEN COALESCE(e.opens, 0) > 0 OR COALESCE(e.expands, 0) > 0
+           CASE WHEN COALESCE(e.opens, 0) > 0 OR COALESCE(e.expands, 0) > 0 OR COALESCE(e.shares, 0) > 0
                      OR COALESCE(e.dwell_ms, 0) >= {ENGAGED_DWELL_MS}
                 THEN 1 ELSE 0 END AS engaged,
            CASE WHEN e.item_id IS NULL THEN 0::float8 ELSE {ENGAGEMENT_SCORE_SQL} END AS engagement_score,
            e.first_seen_at,
-           e.last_event_at
+           e.last_event_at,
+           COALESCE(e.shares, 0) AS shares
     FROM @feed_items i
     LEFT JOIN e ON e.item_id = i.item_id"""
 

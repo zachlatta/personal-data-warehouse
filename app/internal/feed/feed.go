@@ -24,7 +24,7 @@ import (
 // holds the same list (feed.py EVENT_TYPES); tests/test_feed.py pins the two.
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
-	"dismiss", "undismiss",
+	"dismiss", "undismiss", "share",
 }
 
 const (

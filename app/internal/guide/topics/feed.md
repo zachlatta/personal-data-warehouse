@@ -57,8 +57,8 @@ whatever an agent does to it.
 ## Reading engagement
 
 There is no like button: interest is measured. A card is `engaged` when he opened it (any
-link), tapped More, or kept it on screen for 5 s; `engagement_score` adds opens (2 each, up
-to 3), More (1), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
+link), tapped More, shared it, or kept it on screen for 5 s; `engagement_score` adds opens
+(2 each, up to 3), More (1), a share (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
 minutes), and takes 5 off a dismissal. Rank his interests by it.
 
 {{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
@@ -68,11 +68,12 @@ the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
-`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`),
+`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
 `metadata.url` and `link_index` say which link). An impression is one stretch of a card at
-least half on screen, with how long and how much of it was visible. Opens and dismissals
+least half on screen, with how long and how much of it was visible. A `share` is a swipe that
+opened a Superhuman draft to send the card to someone. Opens, shares and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo

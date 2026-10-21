@@ -12,7 +12,8 @@ export type FeedEventType =
   | 'close'
   | 'expand'
   | 'dismiss'
-  | 'undismiss';
+  | 'undismiss'
+  | 'share';
 
 export type FeedEvent = {
   event_id: string;

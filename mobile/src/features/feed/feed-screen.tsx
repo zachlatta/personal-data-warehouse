@@ -8,6 +8,7 @@ import {
   AppState,
   FlatList,
   LayoutAnimation,
+  Linking,
   Platform,
   Pressable,
   RefreshControl,
@@ -34,6 +35,7 @@ import {
 } from './engagement';
 import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
+import { shareDraft, shareUrls } from './share';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
@@ -210,6 +212,21 @@ export default function FeedScreen() {
     [openInBrowser],
   );
 
+  // A swipe opens a Superhuman draft of the card for him to address. An
+  // unhandled scheme rejects, so each url falls through to the next.
+  const onShare = useCallback(async (item: FeedItem, preview: string) => {
+    const urls = shareUrls(shareDraft(item, preview));
+    for (const url of urls) {
+      try {
+        await Linking.openURL(url);
+        const via = url.startsWith('mailto:') ? 'mailto' : 'superhuman';
+        recordFeedEvent('share', { item_id: item.item_id, position: position(item), metadata: { via, url: item.url ?? '' } });
+        return;
+      } catch {}
+    }
+    Alert.alert('Could not open a mail app', 'Superhuman and Mail are not available.');
+  }, []);
+
   const onExpand = useCallback((item: FeedItem) => {
     recordFeedEvent('expand', { item_id: item.item_id, position: position(item) });
   }, []);
@@ -272,9 +289,10 @@ export default function FeedScreen() {
         onOpenLink={onOpenLink}
         onExpand={onExpand}
         onMenu={onMenu}
+        onShare={onShare}
       />
     ),
-    [onCardLayout, onOpen, onRead, onOpenLink, onExpand, onMenu],
+    [onCardLayout, onOpen, onRead, onOpenLink, onExpand, onMenu, onShare],
   );
 
   if (!loaded) {

@@ -123,7 +123,7 @@ type statsInput struct {
 type eventsInput struct {
 	ItemID string   `json:"item_id,omitempty"`
 	Source string   `json:"source,omitempty"`
-	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, dismiss, undismiss"`
+	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, dismiss, undismiss, share"`
 	Since  string   `json:"since,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, or a duration back from now (7d)"`
 	Limit  int      `json:"limit,omitempty" jsonschema:"default 100, at most 1000"`
 }
@@ -350,7 +350,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[eventsInput, eventsOutput]{
 			NameStr:        "feed_events",
 			TitleStr:       "Feed Engagement Events",
-			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, dismiss/undismiss with reason, sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
+			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, dismiss/undismiss with reason, share (swiped to email it), sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
 			Handle: func(ctx context.Context, in eventsInput) (eventsOutput, error) {
 				if in.Limit > 1000 {
 					return eventsOutput{}, &tool.InvalidInputError{Message: "limit is at most 1000"}
