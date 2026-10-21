@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compactCount, mediaAspect, mediaGrid, postSegments, shortAge, sourceBubbles, videoLength } from './rich.ts';
+import {
+  compactCount,
+  fullSizeUrl,
+  mediaAspect,
+  mediaGrid,
+  photoFilename,
+  postSegments,
+  shortAge,
+  sourceBubbles,
+  videoLength,
+  viewerPhotos,
+} from './rich.ts';
 
 test('counts print the way X prints them', () => {
   assert.equal(compactCount(undefined), '');
@@ -74,4 +85,25 @@ test('the source rail puts sources with unseen cards first', () => {
       { source: 'hn', label: 'hn', total: 1, unseen: 0 },
     ],
   );
+});
+
+test('the viewer pages through photos only and opens at the tapped one', () => {
+  const a = { type: 'image', url: 'a' };
+  const v = { type: 'video', url: 'v' };
+  const b = { type: 'image', url: 'b' };
+  assert.deepEqual(viewerPhotos([a, v, b], 2), { photos: [a, b], start: 1 });
+  assert.deepEqual(viewerPhotos([a, v, b], 0), { photos: [a, b], start: 0 });
+  assert.deepEqual(viewerPhotos([v], 0), { photos: [], start: 0 });
+});
+
+test('X photos open and share at their original size', () => {
+  assert.equal(fullSizeUrl('https://pbs.twimg.com/media/Gx1.jpg'), 'https://pbs.twimg.com/media/Gx1.jpg?name=orig');
+  assert.equal(fullSizeUrl('https://pbs.twimg.com/media/Gx1?format=png&name=small'), 'https://pbs.twimg.com/media/Gx1?format=png&name=orig');
+  assert.equal(fullSizeUrl('https://example.com/a.jpg?w=200'), 'https://example.com/a.jpg?w=200');
+});
+
+test('a shared photo keeps its file type', () => {
+  assert.equal(photoFilename('https://pbs.twimg.com/media/Gx1.png?name=orig', 0), 'photo-1.png');
+  assert.equal(photoFilename('https://pbs.twimg.com/media/Gx1?format=webp&name=orig', 2), 'photo-3.webp');
+  assert.equal(photoFilename('https://example.com/og', 1), 'photo-2.jpg');
 });

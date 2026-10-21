@@ -7,6 +7,7 @@ import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
+import { PhotoViewer } from './photo-viewer';
 import {
   avatarColor,
   compactCount,
@@ -16,6 +17,7 @@ import {
   postSegments,
   shortAge,
   videoLength,
+  viewerPhotos,
   type FeedEmbed,
   type FeedMedia,
 } from './rich';
@@ -23,8 +25,33 @@ import {
 export const ACCENT = '#1D9BF0';
 
 // What the views report up so engagement can count it: a swipe to another
-// photo, a tap to play a video, a tap on a link inside a post.
-export type MediaAction = { action: 'swipe' | 'play'; index: number; url?: string };
+// photo, a tap to play a video, a photo opened full screen (view), a swipe
+// to another photo there (view_swipe), one photo shared from it (share).
+// index is the photo's place in the card's media.
+export type MediaAction = { action: 'swipe' | 'play' | 'view' | 'view_swipe' | 'share'; index: number; url?: string };
+
+// Opens a tapped photo in the full-screen viewer and reports what he does
+// there; index in and out is the photo's place in media.
+function usePhotoViewer(media: FeedMedia[], onMedia: (a: MediaAction) => void) {
+  const [open, setOpen] = useState<{ photos: FeedMedia[]; start: number }>();
+  const mediaIndex = (page: number) => (open ? media.indexOf(open.photos[page]) : page);
+  const show = (tapped: number) => {
+    const v = viewerPhotos(media, tapped);
+    if (!v.photos.length) return;
+    setOpen(v);
+    onMedia({ action: 'view', index: tapped });
+  };
+  const viewer = open ? (
+    <PhotoViewer
+      photos={open.photos}
+      start={open.start}
+      onClose={() => setOpen(undefined)}
+      onPage={(page) => onMedia({ action: 'view_swipe', index: mediaIndex(page) })}
+      onShare={(page) => onMedia({ action: 'share', index: mediaIndex(page) })}
+    />
+  ) : null;
+  return { show, viewer };
+}
 
 // A round avatar: the site's icon over a colored letter, so a missing icon
 // still reads as that source.
@@ -134,35 +161,35 @@ function Still({ media, recyclingKey }: { media: FeedMedia; recyclingKey?: strin
 }
 
 // X's media block: 1 to 4 photos or videos in a rounded grid. A tap on a
-// photo opens the detail view; a tap on a video plays it.
+// photo opens it full screen, as X does; a tap on a video plays it.
 export function MediaGrid({
   media,
-  onPress,
   onMedia,
   recyclingKey,
 }: {
   media: FeedMedia[];
-  onPress?: () => void;
   onMedia: (a: MediaAction) => void;
   recyclingKey?: string;
 }) {
   const theme = useTheme();
+  const photos = usePhotoViewer(media, onMedia);
   const rows = mediaGrid(media.length);
   if (!rows.length) return null;
   const aspect = media.length === 1 ? mediaAspect(media[0], 16 / 9) : 16 / 9;
   const press = (i: number) => {
     const m = media[i];
     if (m.type !== 'image') onMedia({ action: 'play', index: i, url: m.url });
-    else onPress?.();
+    else photos.show(i);
   };
   return (
     <View style={[styles.grid, { aspectRatio: aspect, borderColor: theme.backgroundSelected }]}>
+      {photos.viewer}
       {rows.map((row, r) => (
         <View key={r} style={styles.gridRow}>
           {row.map((col, c) => (
             <View key={c} style={styles.gridCol}>
               {col.map((i) => (
-                <Pressable key={i} style={styles.gridCell} onPress={() => press(i)}>
+                <Pressable key={i} style={styles.gridCell} onPress={() => press(i)} accessibilityRole={media[i].type === 'image' ? 'imagebutton' : 'button'}>
                   <Still media={media[i]} recyclingKey={recyclingKey ? `${recyclingKey}:${i}` : undefined} />
                 </Pressable>
               ))}
@@ -175,7 +202,8 @@ export function MediaGrid({
 }
 
 // Instagram's carousel: full-bleed pages, a 1/5 counter and dots. A swipe
-// to a new page is reported once per page.
+// to a new page is reported once per page. A tap on a photo calls onPress
+// (the feed opens the detail view) or, with none, opens it full screen.
 export function MediaCarousel({
   media,
   onPress,
@@ -193,6 +221,13 @@ export function MediaCarousel({
   const width = screen - inset * 2;
   const [page, setPage] = useState(0);
   const [reported] = useState(() => new Set<number>([0]));
+  const photos = usePhotoViewer(media, onMedia);
+  const press = (i: number) => {
+    const m = media[i];
+    if (m.type !== 'image') onMedia({ action: 'play', index: i, url: m.url });
+    else if (onPress) onPress();
+    else photos.show(i);
+  };
   // A link preview (og:image) with no size is 1.91:1; a known photo keeps its shape.
   const height = width / mediaAspect(media[0], 1.91);
   const onEnd = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -204,21 +239,22 @@ export function MediaCarousel({
     }
   };
   if (media.length === 1) {
-    const m = media[0];
     return (
-      <Pressable style={{ width, height }} onPress={() => (m.type === 'image' ? onPress?.() : onMedia({ action: 'play', index: 0, url: m.url }))}>
-        <Still media={m} recyclingKey={recyclingKey} />
+      <Pressable style={{ width, height }} onPress={() => press(0)}>
+        <Still media={media[0]} recyclingKey={recyclingKey} />
+        {photos.viewer}
       </Pressable>
     );
   }
   return (
     <View>
+      {photos.viewer}
       <ScrollView horizontal pagingEnabled showsHorizontalScrollIndicator={false} onMomentumScrollEnd={onEnd} style={{ width, height }}>
         {media.map((m, i) => (
           <Pressable
             key={i}
             style={{ width, height }}
-            onPress={() => (m.type === 'image' ? onPress?.() : onMedia({ action: 'play', index: i, url: m.url }))}>
+            onPress={() => press(i)}>
             <Still media={m} recyclingKey={recyclingKey ? `${recyclingKey}:${i}` : undefined} />
           </Pressable>
         ))}
@@ -269,7 +305,7 @@ export function QuotePost({ embed, onPress, onLink, onMedia }: { embed: FeedEmbe
       {embed.text ? <PostText text={embed.text} style={styles.quoteText} numberOfLines={6} onLink={onLink} /> : null}
       {embed.media?.length ? (
         <View style={styles.quoteMedia}>
-          <MediaGrid media={embed.media} onPress={onPress} onMedia={onMedia} />
+          <MediaGrid media={embed.media} onMedia={onMedia} />
         </View>
       ) : null}
     </Pressable>

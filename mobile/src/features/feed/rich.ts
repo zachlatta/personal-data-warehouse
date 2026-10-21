@@ -148,3 +148,26 @@ export function sourceBubbles(
   }
   return [...by.values()].sort((a, b) => Number(b.unseen > 0) - Number(a.unseen > 0));
 }
+
+// The photos a full-screen viewer pages through (videos play instead), and
+// which page a tap on media[tapped] opens at.
+export function viewerPhotos(media: FeedMedia[], tapped: number): { photos: FeedMedia[]; start: number } {
+  const photos = media.filter((m) => m.type === 'image');
+  return { photos, start: Math.max(0, photos.indexOf(media[tapped])) };
+}
+
+// X serves a downsized photo unless asked for the original (name=orig).
+export function fullSizeUrl(url: string): string {
+  const match = /^https:\/\/pbs\.twimg\.com\/media\/[^?#]+/.exec(url);
+  if (!match) return url;
+  const params = new URLSearchParams(url.slice(match[0].length + 1));
+  params.set('name', 'orig');
+  return `${match[0]}?${params.toString()}`;
+}
+
+// A name for one shared photo: its own extension (or X's format=), else jpg.
+export function photoFilename(url: string, index: number): string {
+  const path = url.split(/[?#]/)[0];
+  const ext = /\.(jpe?g|png|gif|webp|heic)$/i.exec(path)?.[1] ?? /[?&]format=(jpe?g|png|gif|webp)/i.exec(url)?.[1] ?? 'jpg';
+  return `photo-${index + 1}.${ext.toLowerCase()}`;
+}

@@ -33,7 +33,8 @@ const POST_LINES = 8;
 // - a media card, laid out like Instagram (source row, full-bleed photo or
 //   swipeable carousel, then the headline and a short caption);
 // - a link card (source row, headline, a few lines, the extra links).
-// A tap anywhere opens the detail view; the compass opens the page itself.
+// A tap anywhere opens the detail view (a photo in a post opens full
+// screen); the compass opens the page itself.
 // Swiping left shares (not on a carousel, whose swipe pages the photos).
 type Props = {
   item: FeedItem;
@@ -151,7 +152,7 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
             ) : null}
             {embed.media?.length ? (
               <View style={styles.postMedia}>
-                <MediaGrid media={embed.media} onPress={open} onMedia={reportMedia} recyclingKey={item.item_id} />
+                <MediaGrid media={embed.media} onMedia={reportMedia} recyclingKey={item.item_id} />
               </View>
             ) : null}
             {embed.quote ? <QuotePost embed={embed.quote} onPress={open} onLink={browseUrl} onMedia={reportMedia} /> : null}

@@ -56,7 +56,12 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
   `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left to email the
   card from Superhuman, or tapped a share button; `metadata.via` = `superhuman` or `mailto`),
-  `media` (a carousel swipe or video play: `metadata.action` `swipe` or `play`, `index`).
+  `media` (`metadata.action`: `swipe` a carousel, `play` a video, `view` a photo opened full
+  screen, `view_swipe` to another photo there, `share` one photo from it; `index` is the
+  photo's place in the card's media; the detail view adds `metadata.in` = `detail`).
+  A tap on a photo in an X post (feed or detail) or in the detail view's carousel opens
+  the full-screen viewer: swipe between photos, pinch or double-tap to zoom, and the share
+  button downloads that one photo (X photos at `name=orig`) to the iOS share sheet.
   A `close` with `metadata.mode` `video` is watch time.
 - **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
   request ("we should just have it measure engagement"). `engaged` = opened (any link,
