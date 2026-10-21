@@ -25,6 +25,14 @@ import (
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
 	"dismiss", "undismiss", "share", "media", "save", "unsave",
+	"ui", "scroll", "load",
+}
+
+// cardlessEventTypes may come without an item_id: a sitting, a feed load,
+// a scroll of the feed, or a tap on the feed itself (the source rail, pull
+// to refresh, Undo).
+var cardlessEventTypes = map[string]bool{
+	"session_start": true, "session_end": true, "ui": true, "scroll": true, "load": true,
 }
 
 const (
@@ -383,7 +391,7 @@ func ValidateEvent(e *Event, now time.Time) error {
 	if !validEventType(e.Type) {
 		return invalid("event %s: type %q is not one of %s", e.EventID, e.Type, strings.Join(EventTypes, ", "))
 	}
-	if e.ItemID == "" && e.Type != "session_start" && e.Type != "session_end" {
+	if e.ItemID == "" && !cardlessEventTypes[e.Type] {
 		return invalid("event %s: %s needs an item_id", e.EventID, e.Type)
 	}
 	if e.OccurredAt.IsZero() {

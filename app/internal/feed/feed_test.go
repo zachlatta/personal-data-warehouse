@@ -107,9 +107,13 @@ func TestValidateEvent(t *testing.T) {
 	if err := ValidateEvent(&ok, testNow); err != nil {
 		t.Fatal(err)
 	}
-	session := Event{EventID: "s1", Type: "session_start", OccurredAt: testNow}
-	if err := ValidateEvent(&session, testNow); err != nil {
-		t.Fatal(err)
+	// A sitting and the feed-level events (a load, a scroll of the feed, a
+	// tap on the source rail) come without a card.
+	for _, kind := range []string{"session_start", "session_end", "ui", "scroll", "load"} {
+		cardless := Event{EventID: "s1", Type: kind, OccurredAt: testNow}
+		if err := ValidateEvent(&cardless, testNow); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
 	}
 	for want, e := range map[string]Event{
 		"event_id is required": {Type: "open", ItemID: "x", OccurredAt: testNow},

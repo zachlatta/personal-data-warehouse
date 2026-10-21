@@ -226,7 +226,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_voice_memos.sessions, those recordings merged.
             # +2 marts: marts_feed.item_engagement/.source_engagement, the
             # Feed tab's per-card and per-source engagement.
-            "marts": 68,
+            # +1 marts: marts_feed.sessions, one row per sitting in the feed.
+            "marts": 69,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

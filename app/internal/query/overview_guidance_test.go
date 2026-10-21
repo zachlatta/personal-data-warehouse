@@ -178,8 +178,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 9960 held until later the same evening, when base_feed.item_versions
 	// (every past version of a card; its rendered line is "Card history.")
 	// landed with feed versioning: 9979. 9980 is that line and no more.
-	if guidance > 9980 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 9980)", guidance)
+	//
+	// 9980 held until 2026-10-21, when marts_feed.sessions (one row per
+	// sitting: when and why he opened the feed, how he moved through it)
+	// landed; its rendered line is "Per sitting.": 9998. 10000 is that line
+	// and no more.
+	if guidance > 10000 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10000)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

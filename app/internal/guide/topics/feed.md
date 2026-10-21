@@ -98,5 +98,17 @@ least half on screen, with how long and how much of it was visible. A `share` is
 opened a mail draft to send the card to someone. Opens, shares, saves and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
+How he uses the feed itself (Zach asked on 2026-10-20 to log everything and query it later):
+`marts_feed.sessions` is one row per sitting (`started_at`, `duration_ms`, `trigger`
+launch / foreground / focus, `end_reason`, `cards_seen`, `deepest_position`, `scrolls`,
+`scroll_distance`, `opens`, `taps`, `loads`). In `base_feed.events`, `session_start`
+carries app version, OTA update, OS and time zone; `load` is what the server served, in
+order (`metadata.item_ids`) and how fast; `scroll` is one gesture (`from_y`, `to_y`,
+`direction`, `release_velocity`, `from_card`, `to_card`, `metadata.in` = `detail` inside
+a card); `ui` is any other tap, named by `metadata.action` (`filter`, `refresh`,
+`menu_open`, `menu_pick`, `undo`, `swipe_start`, `scroll_to_top`, `end_reached`,
+`share_failed`). Impressions carry `metadata.view` (`all`, `saved`, `source:<s>`) and the
+card's `height`.
+
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo
 schedule (desk `work/2026-10-20-feed-curation/`); push there only through that job.

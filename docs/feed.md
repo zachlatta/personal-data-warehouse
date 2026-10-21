@@ -12,7 +12,7 @@ agent ── pdw feed push / feed_push ──▶ app (app/internal/feed) ──�
 agent ── pdw feed get / edit / remove / restore / history ──▶ the same tools
                          every change ──trigger──▶ base_feed.item_versions (append-only)
 phone ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved)
-phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement
+phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement / sessions
                                                   └──▶ timeline.events (open / dismiss, tier self)
 ```
 
@@ -65,6 +65,35 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   A `close` with `metadata.mode` `video` is watch time.
   `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,
   `swipe`, `menu`, `detail`, `undo`, or `agent` when `feed_save` did it for him).
+- **Everything else he does** (added 2026-10-21 from Zach's voice memo: "collect
+  everything ... a surveillance state of me that you can query later to understand how I'm
+  using it"). Three more event types, which need no card:
+  - `load`: one fetch of the feed. `dwell_ms` = how long it took; `metadata.trigger`
+    (`first`, `stale` = back after 10 minutes, `pull`), `ok`, `cards`, `saved`, and
+    `item_ids`, the served order (cut at 12 KB, `item_ids_truncated`), so a query can
+    tell what he was shown but never scrolled to.
+  - `scroll`: one gesture, finger down to the list at rest (`scroll-gestures.ts`).
+    `dwell_ms` = its length; `metadata`: `from_y`, `to_y`, `distance`, `direction`,
+    `drag_ms`, `release_velocity` (points/ms), `momentum`, `from_card` / `to_card`
+    (position at the top of the screen), `viewport`, `view`. In a card's detail view it
+    has the card's `item_id` and `metadata.in` = `detail`, `content_height`.
+  - `ui`: any other tap, named by `metadata.action`: `filter` (the source rail; `from`,
+    `to`), `refresh` (pull to refresh), `menu_open` / `menu_pick` (`choice`, including
+    `cancel`; `dwell_ms` = time the menu was up), `undo`, `swipe_start` (`toward` save or
+    share, whether or not it went far enough), `scroll_to_top` (status bar tap),
+    `end_reached` (scrolled to "That is everything"), `share_failed`.
+  - `session_start` adds `metadata.trigger` (`launch` = first sitting since the app
+    started, `foreground`, `focus` = back from another tab or a card's detail view),
+    `gap_ms` since the last sitting, `since_app_start_ms`, `app_version`, `update_id`,
+    `channel`, `os`, `color_scheme`, `tz`; `session_end` adds `reason` (`background`,
+    `blur`). Impressions add `metadata.view` (`all`, `saved`, `source:<s>`), `height`
+    and `ended_at`. `media` adds `zoom` and `view_close` (`dwell_ms` = time in the photo
+    viewer). A link tapped in a card's summary is now an `open` (`via` `body_link`).
+  - `marts_feed.sessions` rolls these up per sitting: `started_at`, `ended_at`,
+    `duration_ms`, `trigger`, `end_reason`, `device`, `app_version`, `update_id`,
+    `cards_seen`, `impressions`, `card_dwell_ms`, `deepest_position`, `scrolls`,
+    `scroll_distance`, `opens`, `expands`, `shares`, `saves`, `dismisses`, `taps`, `loads`,
+    `events`. A detail view takes the Feed off screen, so its events have no sitting.
 - **Saved for later** (added 2026-10-21 from Zach's voice memo: "some kind of way to mark
   something as ... an important thing for me to read or consume, like add to my queue"):
   the bookmark on a card (the card's action row, an X post's metrics row, the detail
@@ -86,7 +115,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows only unseen cards: a
   card leaves the feed at its first impression (Zach, 2026-10-20: "after I've seen a post,
   don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved.
-- **Analytics**: `marts_feed.item_engagement` (per card, current dismissed state, engaged,
+- **Analytics**: `marts_feed.sessions` (per sitting, above), `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
 - **C1/C2**: opens, shares, saves and dismissals are `feed_engagement` timeline events at tier
@@ -123,7 +152,7 @@ Delete these files and directories:
 - `app/internal/feed/` (store, HTTP API, tools, rich cards and X embeds, tests)
 - `app/cmd/pdw-cli/feed.go`, `app/cmd/pdw-cli/feed_test.go`
 - `app/internal/guide/topics/feed.md`
-- `mobile/src/features/feed/`, `mobile/src/app/(tabs)/feed.tsx`, `mobile/src/app/feed/`
+- `mobile/src/features/feed/` (including `scroll-gestures.ts`), `mobile/src/app/(tabs)/feed.tsx`, `mobile/src/app/feed/`
 - `src/personal_data_warehouse/feed.py`, `tests/test_feed.py`, this file
 
 Then remove one registration in each of these places:
@@ -140,7 +169,7 @@ Then remove one registration in each of these places:
 | module `personal_data_warehouse.timeline` | `_FEED_ENGAGEMENT` and its entries in `TIMELINE_ADAPTERS`, `TIMELINE_CONTEXT_GENERIC_ADAPTERS`, `TIMELINE_TABLE_COVERAGE`, `RAW_DDL_TABLES` |
 | `src/personal_data_warehouse/pipeline_health.py` | the `feed` pipeline and the three `TABLE_PIPELINES` rows |
 | `src/personal_data_warehouse/pdw_cli_commands.py` | `"feed"` |
-| `src/personal_data_warehouse/warehouse_catalog.json` | `base_feed`, `marts_feed`, the five `feed_*` / `marts_feed_*` relations and the two `feed_item_version*` functions; then run `uv run python scripts/generate_go_warehouse_catalog.py` |
+| `src/personal_data_warehouse/warehouse_catalog.json` | `base_feed`, `marts_feed`, the six `feed_*` / `marts_feed_*` relations and the two `feed_item_version*` functions; then run `uv run python scripts/generate_go_warehouse_catalog.py` |
 | `tests/test_timeline.py` | `_seed_feed` and the `feed_engagement` expectations |
 | `app/internal/query/overview_guidance_test.go` | the cap note for the feed relations (lower the cap back) |
 | `tests/test_schema_reorg_contract.py` | the feed lines in the per-layer object counts (base, marts, internal) |

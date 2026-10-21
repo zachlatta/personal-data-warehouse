@@ -3893,6 +3893,18 @@
       "comment": "Per source. Cards pushed and seen, open, engaged, dismiss rates."
     },
     {
+      "id": "marts_feed_sessions",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "feed",
+      "schema": "marts_feed",
+      "name": "sessions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Per sitting. When and why he opened the feed (trigger), how long, cards seen, scrolls, opens, taps."
+    },
+    {
       "id": "marts_notifications",
       "kind": "view",
       "layer": "marts",

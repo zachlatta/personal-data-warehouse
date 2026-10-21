@@ -10,13 +10,14 @@ Removing the feature: docs/feed.md lists every file and registration line.
 
 TABLES = ("feed_items", "feed_events", "feed_item_versions")
 FUNCTIONS = ("feed_item_version", "feed_item_versions_immutable")
-VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement")
+VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement", "marts_feed_sessions")
 
 #: Event types the phone records. The Go validator holds the same list
 #: (app/internal/feed/feed.go EventTypes); tests/test_feed.py pins the two.
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
     "dismiss", "undismiss", "share", "media", "save", "unsave",
+    "ui", "scroll", "load",
 )
 
 #: The deliberate acts that reach timeline.events (tier self). Impressions,
@@ -59,6 +60,7 @@ def ensure_feed_tables(warehouse):
         "marts_feed_item_engagement", ITEM_ENGAGEMENT_VIEW, dependents=("marts_feed_source_engagement",)
     )
     warehouse._ensure_view("marts_feed_source_engagement", SOURCE_ENGAGEMENT_VIEW)
+    warehouse._ensure_view("marts_feed_sessions", SESSIONS_VIEW)
     for logical in (*TABLES, *VIEWS, *FUNCTIONS):
         warehouse._apply_catalog_grant(logical)
 
@@ -291,3 +293,40 @@ SOURCE_ENGAGEMENT_VIEW = """CREATE OR REPLACE VIEW @marts_feed_source_engagement
            count(*) FILTER (WHERE saved = 1) AS items_saved
     FROM @marts_feed_item_engagement
     GROUP BY source"""
+
+# One row per sitting: the Feed on screen with the app in front, from
+# session_start to session_end. trigger is why it began (launch, foreground,
+# focus; NULL before 2026-10-21), end_reason why it ended (background, blur).
+# Every event the phone stamped with the sitting's id is counted, so this is
+# how he uses the feed: how often and when he opens it, for how long, how
+# far he scrolls, what he taps. Events in a card's detail view carry no
+# sitting (the Feed is off screen then); they are on the card's row in
+# item_engagement. An unfinished sitting has NULL ended_at and duration.
+SESSIONS_VIEW = """CREATE OR REPLACE VIEW @marts_feed_sessions AS
+    SELECT session_id,
+           min(occurred_at) FILTER (WHERE event_type = 'session_start') AS started_at,
+           max(occurred_at) FILTER (WHERE event_type = 'session_end') AS ended_at,
+           max(dwell_ms) FILTER (WHERE event_type = 'session_end') AS duration_ms,
+           (array_agg(metadata->>'trigger') FILTER (WHERE event_type = 'session_start'))[1] AS trigger,
+           (array_agg(metadata->>'reason') FILTER (WHERE event_type = 'session_end'))[1] AS end_reason,
+           max(device) AS device,
+           (array_agg(metadata->>'app_version') FILTER (WHERE event_type = 'session_start'))[1] AS app_version,
+           (array_agg(metadata->>'update_id') FILTER (WHERE event_type = 'session_start'))[1] AS update_id,
+           count(DISTINCT item_id) FILTER (WHERE event_type = 'impression') AS cards_seen,
+           count(*) FILTER (WHERE event_type = 'impression') AS impressions,
+           COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'impression'), 0) AS card_dwell_ms,
+           max(position) FILTER (WHERE event_type = 'impression') AS deepest_position,
+           count(*) FILTER (WHERE event_type = 'scroll') AS scrolls,
+           COALESCE(sum(abs((metadata->>'distance')::numeric)) FILTER (WHERE event_type = 'scroll'), 0)::bigint
+               AS scroll_distance,
+           count(*) FILTER (WHERE event_type = 'open') AS opens,
+           count(*) FILTER (WHERE event_type IN ('expand', 'media')) AS expands,
+           count(*) FILTER (WHERE event_type = 'share') AS shares,
+           count(*) FILTER (WHERE event_type = 'save') AS saves,
+           count(*) FILTER (WHERE event_type = 'dismiss') AS dismisses,
+           count(*) FILTER (WHERE event_type = 'ui') AS taps,
+           count(*) FILTER (WHERE event_type = 'load') AS loads,
+           count(*) AS events
+    FROM @feed_events
+    WHERE session_id <> ''
+    GROUP BY session_id"""

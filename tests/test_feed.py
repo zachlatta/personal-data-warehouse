@@ -101,6 +101,29 @@ def test_item_engagement_rolls_up_the_phone_events(warehouse):
 
 
 @pytestmark_db
+def test_sessions_roll_up_one_sitting_and_ui_scroll_load_need_no_card(warehouse):
+    wh = warehouse
+    _item(wh)
+    # The sitting's own events and the feed-level ones (a load, a scroll,
+    # a tap on the source rail) carry no card.
+    _event(wh, "s0", "session_start", item_id="", metadata='{"trigger": "launch", "app_version": "1.0.0", "update_id": "u1"}')
+    _event(wh, "s1", "load", item_id="", minutes=0, dwell_ms=300, metadata='{"trigger": "first", "cards": 2}')
+    _event(wh, "s2", "impression", minutes=1, dwell_ms=2000, fraction=1.0)
+    _event(wh, "s3", "scroll", item_id="", minutes=2, dwell_ms=900, metadata='{"distance": 1200}')
+    _event(wh, "s4", "scroll", item_id="", minutes=3, dwell_ms=400, metadata='{"distance": -300}')
+    _event(wh, "s5", "ui", item_id="", minutes=4, metadata='{"action": "filter", "to": "saved"}')
+    _event(wh, "s6", "open", minutes=5, metadata='{"mode": "browser"}')
+    _event(wh, "s7", "session_end", item_id="", minutes=6, dwell_ms=360000, metadata='{"reason": "background"}')
+    rows = wh._query(
+        "SELECT trigger, end_reason, duration_ms, app_version, update_id, cards_seen, impressions, card_dwell_ms, "
+        "scrolls, scroll_distance, opens, taps, loads, events, started_at < ended_at FROM @marts_feed_sessions"
+    )
+    assert rows == [("launch", "background", 360000, "1.0.0", "u1", 1, 1, 2000, 2, 1500, 1, 1, 1, 8, True)]
+    # Feed-level events do not make a card row of their own.
+    assert wh._query("SELECT count(*) FROM @marts_feed_item_engagement") == [(1,)]
+
+
+@pytestmark_db
 def test_saved_is_the_latest_of_save_and_unsave_and_scores_like_a_share(warehouse):
     wh = warehouse
     _item(wh)
