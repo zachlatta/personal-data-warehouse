@@ -56,7 +56,6 @@ func Register(mux *http.ServeMux, opts Options) []tool.Tool {
 		logger.Error("feed store failed to initialize; feed disabled", "error", err.Error())
 		return nil
 	}
-	store.ResolveX = ResolveXPost
 	(&handler{store: store, logger: logger}).register(mux, opts.Auth)
 	logger.Info("feed module enabled", "api", APIPath)
 	return Tools(store)

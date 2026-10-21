@@ -112,22 +112,6 @@ def test_a_card_carries_more_links_and_the_view_counts_them(warehouse):
 
 
 @pytestmark_db
-def test_a_card_carries_media_and_an_embedded_post_and_media_taps_engage(warehouse):
-    wh = warehouse
-    _item(wh, media='[{"type": "image", "url": "https://a.test/1.jpg"}]',
-          embed='{"type": "x_post", "author_handle": "someone", "text": "hi"}')
-    _item(wh, "hn:2")
-    _event(wh, "m", "media", metadata='{"action": "swipe", "index": 1}')
-    assert wh._query(
-        "SELECT item_id, jsonb_array_length(media), embed->>'type' FROM @feed_items ORDER BY item_id"
-    ) == [("hn:1", 1, "x_post"), ("hn:2", 0, None)]
-    assert wh._query("SELECT item_id, expands, engaged FROM @marts_feed_item_engagement ORDER BY item_id") == [
-        ("hn:1", 1, 1),
-        ("hn:2", 0, 0),
-    ]
-
-
-@pytestmark_db
 def test_ensure_upgrades_the_views_that_still_carry_likes(warehouse):
     wh = warehouse
     # The first shape of the views had a liked column, which CREATE OR REPLACE

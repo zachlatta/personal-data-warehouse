@@ -24,7 +24,7 @@ import (
 // holds the same list (feed.py EVENT_TYPES); tests/test_feed.py pins the two.
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
-	"dismiss", "undismiss", "share", "media",
+	"dismiss", "undismiss", "share",
 }
 
 const (
@@ -53,8 +53,6 @@ type Item struct {
 	URL           string         `json:"url,omitempty"`
 	Links         []Link         `json:"links"`
 	ImageURL      string         `json:"image_url,omitempty"`
-	Media         []Media        `json:"media"`
-	Embed         *Embed         `json:"embed,omitempty"`
 	Author        string         `json:"author,omitempty"`
 	Site          string         `json:"site,omitempty"`
 	Tags          []string       `json:"tags"`
@@ -107,8 +105,6 @@ type PushItem struct {
 	URL         string         `json:"url,omitempty" jsonschema:"http(s) link a tap opens; defaults to the first of links"`
 	Links       []Link         `json:"links,omitempty" jsonschema:"more links on the card (at most 10), each {url, title}: the paper, the repo, the discussion"`
 	ImageURL    string         `json:"image_url,omitempty" jsonschema:"https image shown full width on the card"`
-	Media       []Media        `json:"media,omitempty" jsonschema:"photos and videos shown as a swipeable carousel (at most 10), each {type: image|video|gif, url, thumbnail_url}"`
-	Embed       *Embed         `json:"embed,omitempty" jsonschema:"a post shown inside the card; leave it out for an X post url, which is read and embedded automatically"`
 	Author      string         `json:"author,omitempty"`
 	Site        string         `json:"site,omitempty" jsonschema:"publication name; defaults to the url's host"`
 	Tags        []string       `json:"tags,omitempty"`
@@ -122,8 +118,6 @@ type PushItem struct {
 type normalized struct {
 	ItemID, Source, Key, Title, Body, URL, ImageURL, Author, Site string
 	Links                                                         []Link
-	Media                                                         []Media
-	Embed                                                         *Embed
 	Tags                                                          []string
 	Score                                                         *float64
 	PublishedAt, ExpiresAt                                        time.Time
@@ -294,12 +288,6 @@ func normalizePush(in PushItem, defaultSource string, now time.Time) (normalized
 		return normalized{}, err
 	}
 	if out.Links, err = normalizeLinks(in.Links, out.URL); err != nil {
-		return normalized{}, err
-	}
-	if out.Media, err = normalizeMedia("media", in.Media); err != nil {
-		return normalized{}, err
-	}
-	if out.Embed, err = normalizeEmbed(in.Embed, 0); err != nil {
 		return normalized{}, err
 	}
 	if out.URL == "" && len(out.Links) > 0 {

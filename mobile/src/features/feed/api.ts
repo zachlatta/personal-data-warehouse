@@ -2,7 +2,6 @@ import type { AppConfig } from '@/lib/config';
 
 import type { FeedEvent } from './event-queue';
 import type { FeedLink } from './links';
-import type { FeedEmbed, FeedMedia } from './rich';
 
 export type FeedItem = {
   item_id: string;
@@ -13,8 +12,6 @@ export type FeedItem = {
   url?: string;
   links?: FeedLink[];
   image_url?: string;
-  media?: FeedMedia[];
-  embed?: FeedEmbed;
   author?: string;
   site?: string;
   tags: string[];

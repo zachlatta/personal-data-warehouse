@@ -1,3 +1,4 @@
+import { Image } from 'expo-image';
 import { SymbolView } from 'expo-symbols';
 import { memo, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
@@ -6,41 +7,23 @@ import ReanimatedSwipeable, { type SwipeableMethods } from 'react-native-gesture
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { formatWhen } from '@/lib/format';
 
 import type { FeedItem } from './api';
 import { cardLinks, type CardLink } from './links';
 import { plainText } from './markdown';
-import { shortAge, type FeedMedia } from './rich';
-import {
-  ACCENT,
-  MediaCarousel,
-  MediaGrid,
-  PostAvatar,
-  PostByline,
-  PostMetrics,
-  PostText,
-  QuotePost,
-  SourceAvatar,
-  type MediaAction,
-} from './rich-views';
 
-const PREVIEW_LINES = 3;
-const POST_LINES = 8;
+const PREVIEW_LINES = 4;
+const LINK_COLOR = '#208AEF';
 
-// Three shapes of card, after the feeds he scrolls most:
-// - an embedded X post, laid out like X (avatar, name, text, media grid,
-//   quoted post, counts), read in place rather than opened in X;
-// - a media card, laid out like Instagram (source row, full-bleed photo or
-//   swipeable carousel, then the headline and a short caption);
-// - a link card (source row, headline, a few lines, the extra links).
-// A tap anywhere opens the detail view; the compass opens the page itself.
-// Swiping left shares (not on a carousel, whose swipe pages the photos).
+// There is no like button: what he looks at, opens and reads is measured.
+// Swiping a card left shares it: onShare opens an email draft of it.
 type Props = {
   item: FeedItem;
   onLayout: (itemId: string, height: number) => void;
   onOpen: (item: FeedItem) => void;
-  onBrowse: (item: FeedItem, link?: CardLink) => void;
-  onMedia: (item: FeedItem, action: MediaAction) => void;
+  onRead: (item: FeedItem) => void;
+  onOpenLink: (item: FeedItem, link: CardLink) => void;
   onExpand: (item: FeedItem) => void;
   onMenu: (item: FeedItem) => void;
   onShare: (item: FeedItem, preview: string) => void;
@@ -49,198 +32,118 @@ type Props = {
 function ShareAction() {
   return (
     <View style={styles.share}>
-      <SymbolView name="paperplane" tintColor="#fff" size={22} />
+      <SymbolView name="envelope" tintColor="#fff" size={22} />
       <ThemedText style={styles.shareLabel}>Share</ThemedText>
     </View>
   );
 }
 
-export function cardMedia(item: FeedItem): FeedMedia[] {
-  if (item.media?.length) return item.media;
-  return item.image_url ? [{ type: 'image', url: item.image_url }] : [];
-}
-
-function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
-  const theme = useTheme();
-  const name = item.site || item.source;
-  const age = shortAge(item.published_at ?? item.created_at);
-  const sub = [item.author, item.site && item.source !== item.site ? item.source : ''].filter(Boolean).join(' · ');
-  return (
-    <View style={styles.sourceRow}>
-      <SourceAvatar name={name} url={item.url} size={34} />
-      <View style={styles.sourceText}>
-        <ThemedText style={styles.sourceName} numberOfLines={1}>
-          {name}
-          <ThemedText style={[styles.sourceAge, { color: theme.textSecondary }]}>{age ? `  ${age}` : ''}</ThemedText>
-        </ThemedText>
-        {sub ? (
-          <ThemedText style={[styles.sourceSub, { color: theme.textSecondary }]} numberOfLines={1}>
-            {sub}
-          </ThemedText>
-        ) : null}
-      </View>
-      <Pressable hitSlop={12} onPress={onMenu} accessibilityLabel="Hide" style={styles.menu}>
-        <SymbolView name="ellipsis" tintColor={theme.text} size={18} />
-      </Pressable>
-    </View>
-  );
-}
-
-function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare }: Props) {
+function FeedCardImpl({ item, onLayout, onOpen, onRead, onOpenLink, onExpand, onMenu, onShare }: Props) {
   const theme = useTheme();
   const swipeable = useRef<SwipeableMethods>(null);
   const [expanded, setExpanded] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const preview = useMemo(() => (item.body ? plainText(item.body) : ''), [item.body]);
+  // The main url is the card itself; the rows list the extra links.
   const extraLinks = useMemo(() => cardLinks(item).filter((link) => link.index > 0), [item]);
-  const media = useMemo(() => cardMedia(item), [item]);
-  const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
-  const carousel = !embed && media.length > 1;
-
-  const open = () => onOpen(item);
-  const more = () => {
-    setExpanded(true);
-    onExpand(item);
-  };
-  const share = () => onShare(item, embed?.text || preview);
-  const browseUrl = (url: string) => onBrowse(item, { url, label: url, site: '', index: -1 });
-  const reportMedia = (a: MediaAction) => onMedia(item, a);
-  const lines = (n: number) => {
-    if (!expanded && n >= (embed ? POST_LINES : PREVIEW_LINES)) setTruncated(true);
-  };
-
-  let content: React.ReactNode;
-  if (embed) {
-    content = (
-      <Pressable onPress={open} style={({ pressed }) => [styles.post, pressed && styles.pressed]}>
-        {item.title ? (
-          <View style={styles.context}>
-            <SymbolView name="sparkles" tintColor={theme.textSecondary} size={13} />
-            <ThemedText style={[styles.contextText, { color: theme.textSecondary }]} numberOfLines={2}>
-              {item.title}
-            </ThemedText>
-          </View>
-        ) : null}
-        <View style={styles.postRow}>
-          <PostAvatar embed={embed} />
-          <View style={styles.postMain}>
-            <View style={styles.postHead}>
-              <PostByline embed={embed} />
-              <Pressable hitSlop={12} onPress={() => onMenu(item)} accessibilityLabel="Hide">
-                <SymbolView name="ellipsis" tintColor={theme.textSecondary} size={16} />
-              </Pressable>
-            </View>
-            {embed.replying_to ? (
-              <ThemedText style={[styles.replying, { color: theme.textSecondary }]}>
-                Replying to <ThemedText style={{ color: ACCENT }}>@{embed.replying_to}</ThemedText>
-              </ThemedText>
-            ) : null}
-            {embed.text ? (
-              <PostText
-                text={embed.text}
-                style={styles.postText}
-                numberOfLines={expanded ? undefined : POST_LINES}
-                onLink={browseUrl}
-                onTextLayout={lines}
-              />
-            ) : null}
-            {truncated && !expanded ? (
-              <Pressable hitSlop={8} onPress={more}>
-                <ThemedText style={styles.showMore}>Show more</ThemedText>
-              </Pressable>
-            ) : null}
-            {embed.media?.length ? (
-              <View style={styles.postMedia}>
-                <MediaGrid media={embed.media} onPress={open} onMedia={reportMedia} recyclingKey={item.item_id} />
-              </View>
-            ) : null}
-            {embed.quote ? <QuotePost embed={embed.quote} onPress={open} onLink={browseUrl} onMedia={reportMedia} /> : null}
-            {embed.thread?.length ? (
-              <ThemedText style={[styles.thread, { color: ACCENT }]}>Show this thread ({embed.thread.length + 1} posts)</ThemedText>
-            ) : null}
-            <PostMetrics embed={embed} onShare={share} />
-          </View>
-        </View>
-      </Pressable>
-    );
-  } else {
-    content = (
-      <>
-        <SourceRow item={item} onMenu={() => onMenu(item)} />
-        {media.length ? (
-          <MediaCarousel media={media} onPress={open} onMedia={reportMedia} recyclingKey={item.item_id} />
-        ) : null}
-        <Pressable onPress={open} style={({ pressed }) => [styles.textBlock, pressed && styles.pressed]}>
-          {item.title ? <ThemedText style={[styles.title, media.length ? styles.titleUnderMedia : null]}>{item.title}</ThemedText> : null}
-          {preview ? (
-            <ThemedText
-              style={[styles.body, { color: theme.textSecondary }]}
-              numberOfLines={expanded ? undefined : PREVIEW_LINES}
-              onTextLayout={(e) => lines(e.nativeEvent.lines.length)}>
-              {preview}
-            </ThemedText>
-          ) : null}
-        </Pressable>
-        {truncated && !expanded ? (
-          <Pressable hitSlop={8} onPress={more}>
-            <ThemedText style={styles.more}>more</ThemedText>
-          </Pressable>
-        ) : null}
-        {extraLinks.length ? (
-          <View style={styles.chips}>
-            {extraLinks.map((link) => (
-              <Pressable
-                key={link.index}
-                onPress={() => onBrowse(item, link)}
-                accessibilityLabel={`Open ${link.label}`}
-                style={({ pressed }) => [styles.chip, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
-                <SymbolView name="link" tintColor={ACCENT} size={13} />
-                <ThemedText style={styles.chipText} numberOfLines={1}>
-                  {link.label}
-                </ThemedText>
-              </Pressable>
-            ))}
-          </View>
-        ) : null}
-        <View style={styles.actions}>
-          {item.url ? (
-            <Pressable hitSlop={10} onPress={() => onBrowse(item)} accessibilityLabel="Open page" style={styles.action}>
-              <SymbolView name="safari" tintColor={theme.text} size={22} />
-            </Pressable>
-          ) : null}
-          <Pressable hitSlop={10} onPress={open} accessibilityLabel="Details" style={styles.action}>
-            <SymbolView name="text.alignleft" tintColor={theme.text} size={21} />
-          </Pressable>
-          <Pressable hitSlop={10} onPress={share} accessibilityLabel="Share" style={styles.action}>
-            <SymbolView name="paperplane" tintColor={theme.text} size={21} />
-          </Pressable>
-          <View style={styles.flex} />
-          {item.tags.length ? (
-            <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
-              {item.tags.slice(0, 3).map((t) => `#${t}`).join(' ')}
-            </ThemedText>
-          ) : null}
-        </View>
-      </>
-    );
-  }
+  const byline = [item.site || item.source, item.author, formatWhen(item.published_at ?? item.created_at)]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <ReanimatedSwipeable
       ref={swipeable}
-      enabled={!carousel}
       friction={1.5}
       rightThreshold={60}
       overshootRight={false}
       renderRightActions={() => <ShareAction />}
       onSwipeableOpen={() => {
         swipeable.current?.close();
-        share();
+        onShare(item, preview);
       }}>
       <View
         style={[styles.wrap, { borderBottomColor: theme.backgroundElement, backgroundColor: theme.background }]}
         onLayout={(e: LayoutChangeEvent) => onLayout(item.item_id, e.nativeEvent.layout.height)}>
-        {content}
+        <Pressable onPress={() => onOpen(item)} style={({ pressed }) => [pressed && { opacity: 0.85 }]}>
+          <View style={styles.header}>
+            <ThemedText style={[styles.byline, { color: theme.textSecondary }]} numberOfLines={1}>
+              {byline}
+            </ThemedText>
+          </View>
+          {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
+          {item.image_url ? (
+            <Image
+              source={{ uri: item.image_url }}
+              style={[styles.image, { backgroundColor: theme.backgroundElement }]}
+              contentFit="cover"
+              transition={200}
+              recyclingKey={item.item_id}
+              accessibilityIgnoresInvertColors
+            />
+          ) : null}
+          {preview ? (
+            <ThemedText
+              style={[styles.body, { color: theme.textSecondary }]}
+              numberOfLines={expanded ? undefined : PREVIEW_LINES}
+              onTextLayout={(e) => {
+                if (!expanded && e.nativeEvent.lines.length >= PREVIEW_LINES) setTruncated(true);
+              }}>
+              {preview}
+            </ThemedText>
+          ) : null}
+        </Pressable>
+        {truncated && !expanded ? (
+          <Pressable
+            hitSlop={8}
+            onPress={() => {
+              setExpanded(true);
+              onExpand(item);
+            }}>
+            <ThemedText style={styles.more}>More</ThemedText>
+          </Pressable>
+        ) : null}
+        {extraLinks.length ? (
+          <View style={[styles.links, { borderColor: theme.backgroundElement }]}>
+            {extraLinks.map((link) => (
+              <Pressable
+                key={link.index}
+                onPress={() => onOpenLink(item, link)}
+                accessibilityLabel={`Open ${link.label}`}
+                style={({ pressed }) => [styles.linkRow, { borderTopColor: theme.backgroundElement }, pressed && { opacity: 0.6 }]}>
+                <SymbolView name="link" tintColor={LINK_COLOR} size={15} />
+                <ThemedText style={styles.linkLabel} numberOfLines={1}>
+                  {link.label}
+                </ThemedText>
+                {link.label !== link.site ? (
+                  <ThemedText style={[styles.linkSite, { color: theme.textSecondary }]} numberOfLines={1}>
+                    {link.site}
+                  </ThemedText>
+                ) : null}
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+        <View style={styles.actions}>
+          {item.url ? (
+            <Pressable hitSlop={10} onPress={() => onOpen(item)} accessibilityLabel="Open link" style={styles.action}>
+              <SymbolView name="safari" tintColor={theme.textSecondary} size={21} />
+            </Pressable>
+          ) : null}
+          {item.body ? (
+            <Pressable hitSlop={10} onPress={() => onRead(item)} accessibilityLabel="Read" style={styles.action}>
+              <SymbolView name="doc.text" tintColor={theme.textSecondary} size={20} />
+            </Pressable>
+          ) : null}
+          <View style={{ flex: 1 }} />
+          {item.tags.length ? (
+            <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
+              {item.tags.slice(0, 3).map((t) => `#${t}`).join(' ')}
+            </ThemedText>
+          ) : null}
+          <Pressable hitSlop={10} onPress={() => onMenu(item)} accessibilityLabel="Dismiss" style={styles.action}>
+            <SymbolView name="xmark" tintColor={theme.textSecondary} size={17} />
+          </Pressable>
+        </View>
       </View>
     </ReanimatedSwipeable>
   );
@@ -249,37 +152,20 @@ function FeedCardImpl({ item, onLayout, onOpen, onBrowse, onMedia, onExpand, onM
 export const FeedCard = memo(FeedCardImpl);
 
 const styles = StyleSheet.create({
-  wrap: { paddingTop: Spacing.two, paddingBottom: Spacing.one, borderBottomWidth: 6 },
-  flex: { flex: 1 },
-  pressed: { opacity: 0.8 },
-  sourceRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: Spacing.three, paddingBottom: Spacing.two },
-  sourceText: { flex: 1 },
-  sourceName: { fontSize: 14, fontWeight: '700', lineHeight: 18 },
-  sourceAge: { fontSize: 13, fontWeight: '400' },
-  sourceSub: { fontSize: 12, lineHeight: 16 },
-  menu: { padding: 4 },
-  textBlock: { paddingHorizontal: Spacing.three },
-  title: { fontSize: 18, lineHeight: 24, fontWeight: '700' },
-  titleUnderMedia: { fontSize: 16, lineHeight: 21, marginTop: Spacing.two },
-  body: { fontSize: 15, lineHeight: 21, marginTop: 4 },
-  more: { paddingHorizontal: Spacing.three, paddingTop: 2, fontSize: 15, fontWeight: '600', color: '#8E8E93' },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingHorizontal: Spacing.three, paddingTop: Spacing.two },
-  chip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, maxWidth: '100%' },
-  chipText: { fontSize: 13, fontWeight: '600', color: ACCENT, flexShrink: 1, lineHeight: 17 },
-  actions: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Spacing.two, paddingTop: Spacing.one, gap: 2 },
+  wrap: { paddingTop: Spacing.three, borderBottomWidth: 8 },
+  header: { paddingHorizontal: Spacing.three, marginBottom: Spacing.one },
+  byline: { fontSize: 13, lineHeight: 17 },
+  title: { paddingHorizontal: Spacing.three, fontSize: 19, lineHeight: 25, fontWeight: '700', marginBottom: Spacing.two },
+  image: { width: '100%', aspectRatio: 1.91, marginBottom: Spacing.two },
+  body: { paddingHorizontal: Spacing.three, fontSize: 15, lineHeight: 21 },
+  more: { paddingHorizontal: Spacing.three, paddingTop: Spacing.one, fontSize: 15, color: LINK_COLOR, fontWeight: '600' },
+  links: { marginTop: Spacing.two, marginHorizontal: Spacing.three, borderWidth: 1, borderRadius: 10, overflow: 'hidden' },
+  linkRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: 10, borderTopWidth: StyleSheet.hairlineWidth },
+  linkLabel: { flexShrink: 1, fontSize: 15, fontWeight: '600', color: LINK_COLOR },
+  linkSite: { flexShrink: 2, fontSize: 13 },
+  actions: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Spacing.two, paddingVertical: Spacing.two, gap: Spacing.one },
   action: { padding: Spacing.two },
-  tags: { fontSize: 13, maxWidth: 170, marginRight: Spacing.two },
-  post: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.two },
-  context: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingLeft: 26, paddingBottom: 6 },
-  contextText: { fontSize: 13, fontWeight: '600', flexShrink: 1, lineHeight: 17 },
-  postRow: { flexDirection: 'row', gap: 10 },
-  postMain: { flex: 1 },
-  postHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  replying: { fontSize: 14, lineHeight: 19 },
-  postText: { fontSize: 15, lineHeight: 20, marginTop: 2 },
-  showMore: { fontSize: 15, color: ACCENT, marginTop: 2 },
-  postMedia: { marginTop: Spacing.two },
-  thread: { fontSize: 14, marginTop: Spacing.two },
-  share: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one, backgroundColor: ACCENT },
+  tags: { fontSize: 13, maxWidth: 170, marginRight: Spacing.one },
+  share: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one, backgroundColor: LINK_COLOR },
   shareLabel: { color: '#fff', fontSize: 13, fontWeight: '600' },
 });

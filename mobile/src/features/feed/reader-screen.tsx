@@ -1,4 +1,4 @@
-import { SymbolView } from 'expo-symbols';
+import { Image } from 'expo-image';
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { Fragment, useCallback, useRef } from 'react';
@@ -10,69 +10,9 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
-import { cardMedia } from './feed-card';
 import { feedItems, recordFeedEvent } from './engagement';
 import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
-import type { FeedEmbed } from './rich';
-import {
-  ACCENT,
-  MediaCarousel,
-  MediaGrid,
-  PostAvatar,
-  PostByline,
-  PostMetrics,
-  PostText,
-  QuotePost,
-  SourceAvatar,
-  type MediaAction,
-} from './rich-views';
-
-function fullDate(iso: string | undefined): string {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  return `${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} · ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
-}
-
-// One post of the detail view; thread posts hang off a line from the avatar.
-function DetailPost({
-  embed,
-  first,
-  more,
-  onLink,
-  onMedia,
-}: {
-  embed: FeedEmbed;
-  first: boolean;
-  more: boolean;
-  onLink: (url: string) => void;
-  onMedia: (a: MediaAction) => void;
-}) {
-  const theme = useTheme();
-  return (
-    <View style={styles.postRow}>
-      <View style={styles.postGutter}>
-        <PostAvatar embed={embed} size={first ? 44 : 40} />
-        {more ? <View style={[styles.threadLine, { backgroundColor: theme.backgroundSelected }]} /> : null}
-      </View>
-      <View style={styles.postMain}>
-        <PostByline embed={embed} big={first} />
-        {embed.text ? <PostText text={embed.text} style={first ? styles.postTextBig : styles.postText} onLink={onLink} /> : null}
-        {embed.media?.length ? (
-          <View style={styles.postMedia}>
-            <MediaGrid media={embed.media} onMedia={onMedia} />
-          </View>
-        ) : null}
-        {embed.quote ? <QuotePost embed={embed.quote} onLink={onLink} onMedia={onMedia} /> : null}
-        {first ? (
-          <ThemedText style={[styles.postDate, { color: theme.textSecondary }]}>{fullDate(embed.created_at)}</ThemedText>
-        ) : null}
-        {first ? <PostMetrics embed={embed} /> : null}
-      </View>
-    </View>
-  );
-}
 
 function Spans({ spans }: { spans: Span[] }) {
   return (
@@ -94,10 +34,8 @@ function Spans({ spans }: { spans: Span[] }) {
   );
 }
 
-// The detail view a tap on a card opens: the whole X post and its thread,
-// every photo, the full summary and all of the card's links. Time here is
-// the card's reading time (an open, then a close carrying dwell_ms and how
-// far down it was read).
+// The in-app reader for a card's body. Time here is the card's reading time
+// (an open, then a close carrying dwell_ms and how far down it was read).
 export default function FeedReaderScreen() {
   const params = useLocalSearchParams<{ id: string; position?: string }>();
   const theme = useTheme();
@@ -110,12 +48,12 @@ export default function FeedReaderScreen() {
       if (!item) return undefined;
       const startedAt = Date.now();
       depth.current = 0;
-      recordFeedEvent('open', { item_id: item.item_id, position, metadata: { mode: 'detail' } });
+      recordFeedEvent('open', { item_id: item.item_id, position, metadata: { mode: 'reader' } });
       return () => {
         recordFeedEvent('close', {
           item_id: item.item_id,
           dwell_ms: Date.now() - startedAt,
-          metadata: { mode: 'detail', scroll_depth: Math.round(depth.current * 100) / 100 },
+          metadata: { mode: 'reader', scroll_depth: Math.round(depth.current * 100) / 100 },
         });
       };
     }, [item, position]),
@@ -127,34 +65,6 @@ export default function FeedReaderScreen() {
     depth.current = Math.max(depth.current, Math.min(1, seen));
   };
 
-  const itemId = item?.item_id;
-  const browse = useCallback(
-    async (url: string, linkIndex: number, via = 'detail') => {
-      if (!itemId) return;
-      const which = { mode: 'browser', via, url, link_index: linkIndex };
-      const startedAt = Date.now();
-      recordFeedEvent('open', { item_id: itemId, position, metadata: which });
-      try {
-        await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: ACCENT });
-      } catch {
-        await Linking.openURL(url);
-      }
-      recordFeedEvent('close', { item_id: itemId, dwell_ms: Date.now() - startedAt, metadata: which });
-    },
-    [itemId, position],
-  );
-  const onMedia = useCallback(
-    async (a: MediaAction) => {
-      if (!itemId) return;
-      recordFeedEvent('media', { item_id: itemId, position, metadata: { action: a.action, index: a.index, in: 'detail' } });
-      if (a.action !== 'play' || !a.url) return;
-      const startedAt = Date.now();
-      await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
-      recordFeedEvent('close', { item_id: itemId, dwell_ms: Date.now() - startedAt, metadata: { mode: 'video', index: a.index } });
-    },
-    [itemId, position],
-  );
-
   if (!item) {
     return (
       <ThemedView style={styles.center}>
@@ -162,18 +72,11 @@ export default function FeedReaderScreen() {
       </ThemedView>
     );
   }
-
-  const onPostLink = (url: string) => void browse(url, -1, 'post_link');
-
-  const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
-  const media = cardMedia(item);
-  const links = cardLinks(item);
-  const name = item.site || item.source;
-  const posts = embed ? [embed, ...(embed.thread ?? [])] : [];
+  const byline = [item.site || item.source, item.author, formatWhen(item.published_at ?? item.created_at)].filter(Boolean).join(' · ');
 
   return (
     <ThemedView style={styles.fill}>
-      <Stack.Screen options={{ title: embed ? 'Post' : name }} />
+      <Stack.Screen options={{ title: item.site || item.source }} />
       <ScrollView
         contentContainerStyle={styles.content}
         onScroll={onScroll}
@@ -181,94 +84,55 @@ export default function FeedReaderScreen() {
         onContentSizeChange={(_, h) => {
           if (h > 0) depth.current = Math.max(depth.current, Math.min(1, 700 / h));
         }}>
-        {embed ? (
-          <View style={styles.pad}>
-            {item.title ? (
-              <ThemedText style={[styles.context, { color: theme.textSecondary }]}>{item.title}</ThemedText>
-            ) : null}
-            {posts.map((post, i) => (
-              <DetailPost key={post.id || i} embed={post} first={i === 0} more={i < posts.length - 1} onLink={onPostLink} onMedia={onMedia} />
-            ))}
-          </View>
-        ) : (
-          <>
-            <View style={[styles.pad, styles.sourceRow]}>
-              <SourceAvatar name={name} url={item.url} size={40} />
-              <View style={styles.flex}>
-                <ThemedText style={styles.sourceName}>{name}</ThemedText>
-                <ThemedText style={[styles.byline, { color: theme.textSecondary }]}>
-                  {[item.author, formatWhen(item.published_at ?? item.created_at)].filter(Boolean).join(' · ')}
+        <ThemedText style={[styles.byline, { color: theme.textSecondary }]}>{byline}</ThemedText>
+        {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
+        {item.image_url ? (
+          <Image source={{ uri: item.image_url }} style={[styles.image, { backgroundColor: theme.backgroundElement }]} contentFit="cover" transition={200} />
+        ) : null}
+        {parseMarkdown(item.body ?? '').map((block, i) => (
+          <Fragment key={i}>
+            {block.kind === 'heading' ? (
+              <ThemedText style={[styles.heading, block.level <= 2 && styles.headingBig]}>
+                <Spans spans={block.spans} />
+              </ThemedText>
+            ) : block.kind === 'bullet' ? (
+              <View style={styles.bulletRow}>
+                <ThemedText style={styles.paragraph}>{block.ordered ? `${block.ordered}.` : '•'}</ThemedText>
+                <ThemedText style={[styles.paragraph, styles.flex]}>
+                  <Spans spans={block.spans} />
                 </ThemedText>
               </View>
-            </View>
-            {media.length ? <MediaCarousel media={media} onMedia={onMedia} recyclingKey={item.item_id} /> : null}
-            <View style={[styles.pad, styles.gap]}>
-              {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
-              {item.tags.length ? (
-                <ThemedText style={[styles.byline, { color: ACCENT }]}>{item.tags.map((t) => `#${t}`).join('  ')}</ThemedText>
-              ) : null}
-              {parseMarkdown(item.body ?? '').map((block, i) => (
-                <Fragment key={i}>
-                  {block.kind === 'heading' ? (
-                    <ThemedText style={[styles.heading, block.level <= 2 && styles.headingBig]}>
-                      <Spans spans={block.spans} />
-                    </ThemedText>
-                  ) : block.kind === 'bullet' ? (
-                    <View style={styles.bulletRow}>
-                      <ThemedText style={styles.paragraph}>{block.ordered ? `${block.ordered}.` : '•'}</ThemedText>
-                      <ThemedText style={[styles.paragraph, styles.flex]}>
-                        <Spans spans={block.spans} />
-                      </ThemedText>
-                    </View>
-                  ) : block.kind === 'quote' ? (
-                    <View style={[styles.quote, { borderLeftColor: theme.backgroundSelected }]}>
-                      <ThemedText style={[styles.paragraph, { color: theme.textSecondary }]}>
-                        <Spans spans={block.spans} />
-                      </ThemedText>
-                    </View>
-                  ) : block.kind === 'code' ? (
-                    <ThemedText style={[styles.codeBlock, { backgroundColor: theme.backgroundElement }]}>{block.text}</ThemedText>
-                  ) : (
-                    <ThemedText style={styles.paragraph}>
-                      <Spans spans={block.spans} />
-                    </ThemedText>
-                  )}
-                </Fragment>
-              ))}
-            </View>
-          </>
-        )}
-        {links.length ? (
-          <View style={[styles.pad, styles.links]}>
-            {links.map((link) => (
-              <Pressable
-                key={link.index}
-                style={({ pressed }) => [
-                  styles.linkRow,
-                  link.index === 0 ? { backgroundColor: ACCENT } : { backgroundColor: theme.backgroundElement },
-                  pressed && { opacity: 0.7 },
-                ]}
-                onPress={() => void browse(link.url, link.index)}>
-                {link.index === 0 ? (
-                  <SymbolView name={embed ? 'arrow.up.right.square' : 'safari'} tintColor="#fff" size={20} />
-                ) : (
-                  <SourceAvatar name={link.site || link.label} url={link.url} size={26} />
-                )}
-                <View style={styles.flex}>
-                  <ThemedText style={[styles.linkLabel, link.index === 0 && { color: '#fff' }]} numberOfLines={1}>
-                    {link.index === 0 ? (embed ? 'Open on X' : `Open ${link.label || 'link'}`) : link.label}
-                  </ThemedText>
-                  {link.index > 0 && link.site !== link.label ? (
-                    <ThemedText style={[styles.linkSite, { color: theme.textSecondary }]} numberOfLines={1}>
-                      {link.site}
-                    </ThemedText>
-                  ) : null}
-                </View>
-                <SymbolView name="chevron.right" tintColor={link.index === 0 ? '#fff' : theme.textSecondary} size={14} />
-              </Pressable>
-            ))}
-          </View>
-        ) : null}
+            ) : block.kind === 'quote' ? (
+              <View style={[styles.quote, { borderLeftColor: theme.backgroundSelected }]}>
+                <ThemedText style={[styles.paragraph, { color: theme.textSecondary }]}>
+                  <Spans spans={block.spans} />
+                </ThemedText>
+              </View>
+            ) : block.kind === 'code' ? (
+              <ThemedText style={[styles.codeBlock, { backgroundColor: theme.backgroundElement }]}>{block.text}</ThemedText>
+            ) : (
+              <ThemedText style={styles.paragraph}>
+                <Spans spans={block.spans} />
+              </ThemedText>
+            )}
+          </Fragment>
+        ))}
+        {cardLinks(item).map((link) => (
+          <Pressable
+            key={link.index}
+            style={[styles.button, link.index > 0 && styles.buttonNext, { backgroundColor: theme.backgroundElement }]}
+            onPress={async () => {
+              const which = { mode: 'browser', via: 'reader', url: link.url, link_index: link.index };
+              const startedAt = Date.now();
+              recordFeedEvent('open', { item_id: item.item_id, position, metadata: which });
+              await WebBrowser.openBrowserAsync(link.url, { dismissButtonStyle: 'close' });
+              recordFeedEvent('close', { item_id: item.item_id, dwell_ms: Date.now() - startedAt, metadata: which });
+            }}>
+            <ThemedText style={styles.buttonText} numberOfLines={1}>
+              {link.index === 0 ? `Open ${link.label || 'link'}` : link.label}
+            </ThemedText>
+          </Pressable>
+        ))}
       </ScrollView>
     </ThemedView>
   );
@@ -278,26 +142,10 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   flex: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
-  content: { paddingTop: Spacing.three, paddingBottom: Spacing.six, gap: Spacing.three },
-  pad: { paddingHorizontal: Spacing.three },
-  gap: { gap: Spacing.three },
-  sourceRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  sourceName: { fontSize: 15, fontWeight: '700' },
-  context: { fontSize: 14, fontWeight: '600', marginBottom: Spacing.two },
-  postRow: { flexDirection: 'row', gap: 10 },
-  postGutter: { alignItems: 'center' },
-  threadLine: { width: 2, flex: 1, marginTop: 4, marginBottom: -Spacing.two, borderRadius: 1 },
-  postMain: { flex: 1, paddingBottom: Spacing.three },
-  postText: { fontSize: 16, lineHeight: 22, marginTop: 2 },
-  postTextBig: { fontSize: 19, lineHeight: 26, marginTop: 4 },
-  postMedia: { marginTop: Spacing.two },
-  postDate: { fontSize: 14, marginTop: Spacing.three },
-  links: { gap: Spacing.two },
-  linkRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: 12, borderRadius: 12 },
-  linkLabel: { fontSize: 15, fontWeight: '600', color: ACCENT },
-  linkSite: { fontSize: 12 },
+  content: { padding: Spacing.three, paddingBottom: Spacing.six, gap: Spacing.three },
   byline: { fontSize: 13 },
   title: { fontSize: 26, lineHeight: 32, fontWeight: '700' },
+  image: { width: '100%', aspectRatio: 1.91, borderRadius: 10 },
   heading: { fontSize: 18, lineHeight: 24, fontWeight: '700', marginTop: Spacing.two },
   headingBig: { fontSize: 21, lineHeight: 27 },
   paragraph: { fontSize: 17, lineHeight: 26 },
@@ -308,4 +156,7 @@ const styles = StyleSheet.create({
   italic: { fontStyle: 'italic' },
   code: { fontFamily: 'Menlo', fontSize: 15 },
   link: { color: '#208AEF' },
+  button: { marginTop: Spacing.three, padding: Spacing.three, borderRadius: 12, alignItems: 'center' },
+  buttonNext: { marginTop: 0 },
+  buttonText: { fontSize: 16, fontWeight: '600', color: '#208AEF' },
 });

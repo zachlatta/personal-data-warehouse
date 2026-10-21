@@ -67,21 +67,21 @@ func (s *Store) Push(ctx context.Context, items []normalized, m Mutation) ([]Pus
 	err := s.mutate(ctx, m, func(ctx context.Context, tx *sql.Tx) error {
 		statement := s.q(`
 			INSERT INTO @feed_items AS f (item_id, source, item_key, title, body, url, image_url, author, site,
-				tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at, links, media, embed)
+				tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at, links)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], COALESCE($11::float8, 0), $12, $13, $14::jsonb, $15, $16, $16,
-				$17::jsonb, $18::jsonb, $19::jsonb)
+				$17::jsonb)
 			ON CONFLICT (item_id) DO UPDATE SET
 				title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, links = EXCLUDED.links,
-				image_url = EXCLUDED.image_url, media = EXCLUDED.media, embed = EXCLUDED.embed,
+				image_url = EXCLUDED.image_url,
 				author = EXCLUDED.author, site = EXCLUDED.site, tags = EXCLUDED.tags,
 				score = COALESCE($11::float8, f.score), published_at = EXCLUDED.published_at,
 				expires_at = EXCLUDED.expires_at, metadata = EXCLUDED.metadata, pushed_by = EXCLUDED.pushed_by,
 				updated_at = EXCLUDED.updated_at, removed_at = 'epoch', removed_reason = ''
-			WHERE (f.title, f.body, f.url, f.links, f.image_url, f.media, f.embed, f.author, f.site, f.tags, f.published_at,
-			       f.expires_at, f.metadata, f.removed_at)
-			      IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.body, EXCLUDED.url, EXCLUDED.links, EXCLUDED.image_url, EXCLUDED.media,
-			       EXCLUDED.embed, EXCLUDED.author, EXCLUDED.site, EXCLUDED.tags, EXCLUDED.published_at, EXCLUDED.expires_at,
-			       EXCLUDED.metadata, 'epoch'::timestamptz)
+			WHERE (f.title, f.body, f.url, f.links, f.image_url, f.author, f.site, f.tags, f.published_at, f.expires_at,
+			       f.metadata, f.removed_at)
+			      IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.body, EXCLUDED.url, EXCLUDED.links, EXCLUDED.image_url, EXCLUDED.author,
+			       EXCLUDED.site, EXCLUDED.tags, EXCLUDED.published_at, EXCLUDED.expires_at, EXCLUDED.metadata,
+			       'epoch'::timestamptz)
 			   OR ($11::float8 IS NOT NULL AND $11::float8 IS DISTINCT FROM f.score)
 			RETURNING (xmax = 0)`)
 		now := s.now()
@@ -97,18 +97,10 @@ func (s *Store) Push(ctx context.Context, items []normalized, m Mutation) ([]Pus
 			if err != nil {
 				return err
 			}
-			media, err := mediaJSON(item.Media)
-			if err != nil {
-				return err
-			}
-			embed, err := embedJSON(item.Embed)
-			if err != nil {
-				return invalid("item %s: %s", item.ItemID, err.Error())
-			}
 			var inserted bool
 			err = tx.QueryRowContext(ctx, statement, item.ItemID, item.Source, item.Key, item.Title, item.Body,
 				item.URL, item.ImageURL, item.Author, item.Site, tagsLiteral(item.Tags), item.Score,
-				orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), m.Actor, now, links, media, embed).Scan(&inserted)
+				orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), m.Actor, now, links).Scan(&inserted)
 			status := "updated"
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
@@ -136,8 +128,6 @@ type Update struct {
 	URL         *string        `json:"url,omitempty"`
 	Links       *[]Link        `json:"links,omitempty" jsonschema:"replaces the card's extra links ([] clears them)"`
 	ImageURL    *string        `json:"image_url,omitempty"`
-	Media       *[]Media       `json:"media,omitempty" jsonschema:"replaces the card's photos and videos ([] clears them)"`
-	Embed       *Embed         `json:"embed,omitempty" jsonschema:"replaces the embedded post"`
 	Author      *string        `json:"author,omitempty"`
 	Site        *string        `json:"site,omitempty"`
 	Tags        []string       `json:"tags,omitempty" jsonschema:"replaces the tags"`
@@ -145,14 +135,13 @@ type Update struct {
 	PublishedAt *string        `json:"published_at,omitempty"`
 	ExpiresAt   *string        `json:"expires_at,omitempty" jsonschema:"RFC3339, YYYY-MM-DD or a duration from now (7d)"`
 	Metadata    map[string]any `json:"metadata,omitempty" jsonschema:"replaces the card's metadata"`
-	Clear       []string       `json:"clear,omitempty" jsonschema:"fields to empty: title, body, url, links, image_url, media, embed, author, site, tags, published_at, expires_at, metadata"`
+	Clear       []string       `json:"clear,omitempty" jsonschema:"fields to empty: title, body, url, links, image_url, author, site, tags, published_at, expires_at, metadata"`
 	Agent       string         `json:"agent,omitempty" jsonschema:"which agent is acting, recorded on the version"`
 	Reason      string         `json:"reason,omitempty" jsonschema:"why, recorded on the version"`
 }
 
 var clearable = map[string]string{
 	"title": "title = ''", "body": "body = ''", "url": "url = ''", "links": "links = '[]'", "image_url": "image_url = ''",
-	"media": "media = '[]'", "embed": "embed = '{}'",
 	"author": "author = ''", "site": "site = ''", "tags": "tags = '{}'",
 	"published_at": "published_at = 'epoch'", "expires_at": "expires_at = 'epoch'", "metadata": "metadata = '{}'",
 }
@@ -218,28 +207,6 @@ func (s *Store) Update(ctx context.Context, u Update, m Mutation) (int64, error)
 		}
 		add("links", "::jsonb", raw)
 	}
-	if u.Media != nil {
-		media, err := normalizeMedia("media", *u.Media)
-		if err != nil {
-			return 0, err
-		}
-		raw, err := mediaJSON(media)
-		if err != nil {
-			return 0, err
-		}
-		add("media", "::jsonb", raw)
-	}
-	if u.Embed != nil {
-		embed, err := normalizeEmbed(u.Embed, 0)
-		if err != nil {
-			return 0, err
-		}
-		raw, err := embedJSON(embed)
-		if err != nil {
-			return 0, err
-		}
-		add("embed", "::jsonb", raw)
-	}
 	if u.Tags != nil {
 		tags, err := normalizeTags(u.Tags)
 		if err != nil {
@@ -270,7 +237,7 @@ func (s *Store) Update(ctx context.Context, u Update, m Mutation) (int64, error)
 	for _, field := range u.Clear {
 		expr, ok := clearable[field]
 		if !ok {
-			return 0, invalid("cannot clear %q; clearable: title, body, url, links, image_url, media, embed, author, site, tags, published_at, expires_at, metadata", field)
+			return 0, invalid("cannot clear %q; clearable: title, body, url, links, image_url, author, site, tags, published_at, expires_at, metadata", field)
 		}
 		if given[field] {
 			return 0, invalid("%s is both set and cleared", field)
@@ -361,10 +328,7 @@ type RestoreResult struct {
 
 // The card fields a restore writes back from a snapshot. Identity
 // (item_id, source, item_key) never changes, and created_at is history.
-const contentColumns = "title, body, url, links, image_url, media, embed, author, site, tags, score, published_at, expires_at, metadata"
-
-// Columns added after versioning began are absent from older snapshots.
-var snapshotDefaults = map[string]string{"media": "'[]'::jsonb", "embed": "'{}'::jsonb"}
+const contentColumns = "title, body, url, links, image_url, author, site, tags, score, published_at, expires_at, metadata"
 
 // Restore brings cards back. With version 0 it undoes a removal (or a hard
 // delete, from the tombstone's snapshot) and keeps the content; with a
@@ -475,10 +439,6 @@ func (s *Store) restored(ctx context.Context, tx *sql.Tx, id string, from int64)
 func prefixed(prefix, columns string) string {
 	parts := strings.Split(columns, ", ")
 	for i := range parts {
-		if fallback, ok := snapshotDefaults[parts[i]]; ok {
-			parts[i] = "COALESCE(" + prefix + parts[i] + ", " + fallback + ")"
-			continue
-		}
 		parts[i] = prefix + parts[i]
 	}
 	return strings.Join(parts, ", ")

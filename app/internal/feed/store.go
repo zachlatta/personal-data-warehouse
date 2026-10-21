@@ -24,9 +24,6 @@ type Store struct {
 	Now     func() time.Time
 	// Expand is overridden only by integration tests with isolated schemas.
 	Expand func(string) string
-	// ResolveX reads an X post for a pushed x.com url (xpost.go); nil
-	// leaves X links as plain cards. Register sets ResolveXPost.
-	ResolveX XResolver
 }
 
 func NewStore(databaseURL string, timeout time.Duration) (*Store, error) {
@@ -99,7 +96,7 @@ type ListOptions struct {
 	Limit            int
 }
 
-const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.links, i.image_url, i.media, i.embed, i.author, i.site,
+const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.links, i.image_url, i.author, i.site,
 	to_jsonb(i.tags), i.score, i.published_at, i.expires_at, i.metadata, i.pushed_by, i.created_at, i.updated_at,
 	i.removed_at, i.removed_reason,
 	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
@@ -168,25 +165,20 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 	for rows.Next() {
 		var (
 			item                        Item
-			tags, links, media, embed   []byte
+			tags, links                 []byte
 			metadata                    []byte
 			published, expires, removed time.Time
 			dismissed, engaged          int64
 			firstSeen                   sql.NullTime
 		)
 		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &links,
-			&item.ImageURL, &media, &embed, &item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
+			&item.ImageURL, &item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
 			&item.CreatedAt, &item.UpdatedAt, &removed, &item.RemovedReason,
 			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
 			&item.Engagement.Opens, &item.Engagement.LinksOpened, &item.Engagement.ReadMS, &item.Engagement.Expands,
 			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen, &item.Version); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(media, &item.Media)
-		if item.Media == nil {
-			item.Media = []Media{}
-		}
-		item.Embed = decodeEmbed(embed)
 		_ = json.Unmarshal(links, &item.Links)
 		if item.Links == nil {
 			item.Links = []Link{}
