@@ -217,10 +217,10 @@ func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) 
 		}
 	}
 
-	// Dismissed cards leave the feed; engagement reads back.
+	// Seen and dismissed cards leave the feed; engagement reads back.
 	feed = call(t, tools, "feed_list", map[string]any{"view": "feed"})
-	if got := titles(feed); got != "Agent card,Second, better" {
-		t.Fatalf("dismissed card still in the feed: %s", got)
+	if got := titles(feed); got != "Agent card" {
+		t.Fatalf("a seen card is still in the feed: %s", got)
 	}
 	second := call(t, tools, "feed_list", map[string]any{"item_ids": []string{"hn:https://example.com/2"}})["items"].([]any)[0].(map[string]any)
 	engagement := second["engagement"].(map[string]any)
@@ -250,7 +250,7 @@ func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) 
 	if removed["removed"] != float64(1) {
 		t.Fatalf("remove: %v", removed)
 	}
-	if got := titles(call(t, tools, "feed_list", map[string]any{"view": "feed"})); got != "Second, better" {
+	if got := titles(call(t, tools, "feed_list", map[string]any{"view": "feed"})); got != "" {
 		t.Fatalf("after remove: %s", got)
 	}
 	call(t, tools, "feed_push", map[string]any{"items": []map[string]any{{"source": "muse", "title": "Agent card", "body": "**why** it matters"}}})

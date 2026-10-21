@@ -403,17 +403,12 @@ func ValidateEvent(e *Event, now time.Time) error {
 
 // Rank orders live cards the way the phone shows them, after the Feeeed
 // model: no unread count, so nothing is a backlog to clear. Higher score
-// first, then newer; cards he has seen sink below unseen ones, and the
-// ones he scrolled past without engaging sink furthest; and no source runs
-// three in a row while another is waiting.
+// first, then newer; and no source runs three in a row while another is
+// waiting. Seen cards never reach it: Feed leaves them out.
 func Rank(items []Item) []Item {
 	ordered := append([]Item(nil), items...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		a, b := ordered[i], ordered[j]
-		sa, sb := staleRank(a), staleRank(b)
-		if sa != sb {
-			return sa < sb
-		}
 		if a.Score != b.Score {
 			return a.Score > b.Score
 		}
@@ -428,7 +423,7 @@ func Rank(items []Item) []Item {
 		pick := 0
 		if n := len(out); n >= 2 && out[n-1].Source == out[n-2].Source {
 			for i, candidate := range ordered {
-				if candidate.Source != out[n-1].Source && staleRank(candidate) == staleRank(ordered[0]) {
+				if candidate.Source != out[n-1].Source {
 					pick = i
 					break
 				}
@@ -438,17 +433,6 @@ func Rank(items []Item) []Item {
 		ordered = append(ordered[:pick], ordered[pick+1:]...)
 	}
 	return out
-}
-
-func staleRank(item Item) int {
-	switch {
-	case item.Engagement.Impressions == 0:
-		return 0
-	case item.Engagement.Engaged:
-		return 1
-	default:
-		return 2
-	}
 }
 
 func freshness(item Item) time.Time {

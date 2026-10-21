@@ -138,7 +138,10 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 		ORDER BY i.created_at DESC, i.item_id LIMIT $%d`, len(args)), args...)
 }
 
-// Feed is what the phone shows: live, unexpired, undismissed cards, ranked.
+// Feed is what the phone shows: live, unexpired, undismissed cards he has not
+// seen yet, ranked. A card leaves the feed at its first impression (Zach,
+// 2026-10-20: "after I've seen a post, don't show it to me again"); the
+// ones he saved stay in Saved.
 func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
@@ -147,7 +150,7 @@ func (s *Store) Feed(ctx context.Context, limit int) ([]Item, error) {
 	items, err := s.query(ctx, `SELECT `+itemColumns+`
 		FROM @feed_items i LEFT JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
 		WHERE i.removed_at = 'epoch' AND (i.expires_at = 'epoch' OR i.expires_at > $1)
-		  AND COALESCE(e.dismissed, 0) = 0
+		  AND COALESCE(e.dismissed, 0) = 0 AND COALESCE(e.impressions, 0) = 0
 		ORDER BY i.score DESC, i.created_at DESC LIMIT $2`, s.now(), limit*3)
 	if err != nil {
 		return nil, err

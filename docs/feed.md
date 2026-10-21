@@ -11,7 +11,7 @@ Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
 agent ── pdw feed push / feed_push ──▶ app (app/internal/feed) ──▶ base_feed.items
 agent ── pdw feed get / edit / remove / restore / history ──▶ the same tools
                          every change ──trigger──▶ base_feed.item_versions (append-only)
-phone ── GET /api/feed ◀── ranked live cards (score, freshness, seen cards sink, sources interleaved)
+phone ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved)
 phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement
                                                   └──▶ timeline.events (open / dismiss, tier self)
 ```
@@ -83,8 +83,9 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   or the detail view), tapped More, swiped photos or played a video (`media` events count
   with expands), shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
   time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
-  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
-  seen and engaged, then seen and scrolled past (`feed.go` `Rank`).
+  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows only unseen cards: a
+  card leaves the feed at its first impression (Zach, 2026-10-20: "after I've seen a post,
+  don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved.
 - **Analytics**: `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.

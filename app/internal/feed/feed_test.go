@@ -139,16 +139,13 @@ func ids(items []Item) string {
 	return strings.Join(out, ",")
 }
 
-func TestRankPutsScoreThenFreshnessFirstAndSinksSeenCards(t *testing.T) {
+func TestRankPutsScoreThenFreshnessFirst(t *testing.T) {
 	got := Rank([]Item{
 		card("old", "a", 0, 10, 0, false),
 		card("new", "b", 0, 1, 0, false),
 		card("top", "c", 5, 20, 0, false),
-		card("seen", "d", 9, 1, 3, false),
-		card("engaged", "e", 1, 30, 3, true),
 	})
-	// Unseen first; then what he engaged with; what he scrolled past last.
-	if ids(got) != "top,new,old,engaged,seen" {
+	if ids(got) != "top,new,old" {
 		t.Fatalf("got %s", ids(got))
 	}
 }

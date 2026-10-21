@@ -36,8 +36,8 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   (whole post or summary, every photo, all links); `url` is what "Open" there and the
   card's compass button go to.
 - `score` ranks (higher first; {{if .CLI}}`pdw feed rank ID...`{{else}}`feed_rank`{{end}} sets many at once). The phone
-  shows unseen cards first, then seen ones he engaged with, then ones he scrolled past, and
-  never shows one source
+  shows only cards he has not seen: a card leaves the feed at its first impression (half of
+  it on screen), so every hourly batch must be new cards. It never shows one source
   three times in a row while another waits. `expires_at` takes RFC3339 or `48h` / `7d`.
 - Say who you are: {{if .CLI}}`--agent NAME` (default `$PDW_AGENT_NAME`, else the Paseo agent id) and `--reason`{{else}}`agent` and `reason`{{end}} are kept on every version you write.
 

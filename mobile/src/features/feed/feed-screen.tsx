@@ -437,11 +437,11 @@ export default function FeedScreen() {
             </View>
           ) : (
           <View style={styles.empty}>
-            <ThemedText style={styles.emptyTitle}>{disabled ? 'The feed is turned off' : 'Nothing here yet'}</ThemedText>
+            <ThemedText style={styles.emptyTitle}>{disabled ? 'The feed is turned off' : 'You are all caught up'}</ThemedText>
             <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
               {disabled
                 ? 'This PDW server does not have the Feed module on (PDW_FEED_ENABLED).'
-                : 'Agents add cards with `pdw feed push`. Pull down to refresh.'}
+                : 'Cards you have seen do not come back. New ones arrive every hour; pull down to refresh.'}
             </ThemedText>
           </View>
           )
