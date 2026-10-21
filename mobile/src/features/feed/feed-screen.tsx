@@ -1,6 +1,6 @@
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActionSheetIOS,
   ActivityIndicator,
@@ -12,6 +12,7 @@ import {
   Platform,
   Pressable,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   View,
   type NativeScrollEvent,
@@ -35,6 +36,8 @@ import {
 } from './engagement';
 import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
+import { sourceBubbles } from './rich';
+import { SourceAvatar, type MediaAction } from './rich-views';
 import { shareDraft, shareUrls } from './share';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
@@ -54,6 +57,10 @@ export default function FeedScreen() {
   const [error, setError] = useState<string | null>(null);
   const [disabled, setDisabled] = useState(false);
   const [undo, setUndo] = useState<Undo | null>(null);
+  // The rail across the top narrows the feed to one source.
+  const [only, setOnly] = useState<string | null>(null);
+  const bubbles = useMemo(() => sourceBubbles(items), [items]);
+  const shown = useMemo(() => (only ? items.filter((i) => i.source === only) : items), [items, only]);
 
   const tracker = useRef(new ViewabilityTracker());
   const heights = useRef(new Map<string, number>());
@@ -65,8 +72,8 @@ export default function FeedScreen() {
   const headerHeight = useRef(0);
 
   useLayoutEffect(() => {
-    ids.current = items.map((i) => i.item_id);
-  }, [items]);
+    ids.current = shown.map((i) => i.item_id);
+  }, [shown]);
 
   const recordImpressions = useCallback((ended: Impression[]) => {
     for (const imp of ended) {
@@ -99,7 +106,6 @@ export default function FeedScreen() {
       for (const item of page.items) feedItems.set(item.item_id, item);
       setItems(page.items);
       setError(null);
-      headerHeight.current = 0;
       setDisabled(false);
       loadedAt.current = Date.now();
     } catch (e) {
@@ -119,7 +125,7 @@ export default function FeedScreen() {
   useEffect(() => {
     const t = setTimeout(measure, 50);
     return () => clearTimeout(t);
-  }, [items, measure]);
+  }, [shown, measure]);
 
   useFocusEffect(
     useCallback(() => {
@@ -194,22 +200,35 @@ export default function FeedScreen() {
     [measure, pause],
   );
 
+  // A tap opens the card's detail view (the whole post, every photo, the
+  // summary and all its links); the compass goes straight to the page.
   const onOpen = useCallback(
-    (item: FeedItem) => {
-      if (item.url) void openInBrowser(item, 'card');
-      else router.push({ pathname: '/feed/[id]', params: { id: item.item_id, position: String(position(item)) } });
-    },
-    [openInBrowser, router],
-  );
-
-  const onRead = useCallback(
     (item: FeedItem) => router.push({ pathname: '/feed/[id]', params: { id: item.item_id, position: String(position(item)) } }),
     [router],
   );
 
-  const onOpenLink = useCallback(
-    (item: FeedItem, link: CardLink) => void openInBrowser(item, 'link', link),
+  // A link inside a post (index -1) or one of the card's links.
+  const onBrowse = useCallback(
+    (item: FeedItem, link?: CardLink) => void openInBrowser(item, link ? (link.index < 0 ? 'post_link' : 'link') : 'card', link),
     [openInBrowser],
+  );
+
+  // A carousel swipe or a video play. A video plays in the system player;
+  // its watch time is recorded like reading time.
+  const onMedia = useCallback(
+    async (item: FeedItem, a: MediaAction) => {
+      recordFeedEvent('media', { item_id: item.item_id, position: position(item), metadata: { action: a.action, index: a.index } });
+      if (a.action !== 'play' || !a.url) return;
+      pause();
+      const startedAt = Date.now();
+      try {
+        await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
+      } finally {
+        recordFeedEvent('close', { item_id: item.item_id, dwell_ms: Date.now() - startedAt, metadata: { mode: 'video', index: a.index } });
+        measure();
+      }
+    },
+    [measure, pause],
   );
 
   // A swipe opens a Superhuman draft of the card for him to address. An
@@ -285,14 +304,14 @@ export default function FeedScreen() {
         item={item}
         onLayout={onCardLayout}
         onOpen={onOpen}
-        onRead={onRead}
-        onOpenLink={onOpenLink}
+        onBrowse={onBrowse}
+        onMedia={onMedia}
         onExpand={onExpand}
         onMenu={onMenu}
         onShare={onShare}
       />
     ),
-    [onCardLayout, onOpen, onRead, onOpenLink, onExpand, onMenu, onShare],
+    [onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare],
   );
 
   if (!loaded) {
@@ -306,7 +325,7 @@ export default function FeedScreen() {
   return (
     <ThemedView style={styles.fill}>
       <FlatList
-        data={items}
+        data={shown}
         keyExtractor={(item) => item.item_id}
         renderItem={renderItem}
         onScroll={onScroll}
@@ -319,17 +338,39 @@ export default function FeedScreen() {
         windowSize={11}
         initialNumToRender={6}
         ListHeaderComponent={
-          error ? (
-            <View
-              style={[styles.banner, { backgroundColor: theme.backgroundElement }]}
-              onLayout={(e) => {
-                const { height, y } = e.nativeEvent.layout;
-                headerHeight.current = height + y * 2;
-                measure();
-              }}>
-              <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
-            </View>
-          ) : null
+          <View
+            onLayout={(e) => {
+              headerHeight.current = e.nativeEvent.layout.height;
+              measure();
+            }}>
+            {bubbles.length > 1 ? (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail}>
+                {[{ source: '', label: 'All', unseen: 0, total: items.length }, ...bubbles].map((b) => {
+                  const active = (only ?? '') === b.source;
+                  return (
+                    <Pressable
+                      key={b.source || '*'}
+                      style={[styles.bubble, !active && only !== null && styles.bubbleDim]}
+                      onPress={() => {
+                        pause();
+                        setOnly(b.source && !active ? b.source : null);
+                      }}
+                      accessibilityLabel={b.source ? `Only ${b.label}` : 'Everything'}>
+                      <SourceAvatar name={b.source ? b.label : '*'} size={58} ring={b.unseen > 0 || active} />
+                      <ThemedText style={[styles.bubbleLabel, active && styles.bubbleLabelOn]} numberOfLines={1}>
+                        {b.label}
+                      </ThemedText>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
+            {error ? (
+              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
+              </View>
+            ) : null}
+          </View>
         }
         ListEmptyComponent={
           <View style={styles.empty}>
@@ -364,6 +405,11 @@ export default function FeedScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  rail: { paddingHorizontal: Spacing.two, paddingTop: Spacing.two, paddingBottom: Spacing.two, gap: Spacing.two },
+  bubble: { width: 70, alignItems: 'center', gap: 4 },
+  bubbleDim: { opacity: 0.45 },
+  bubbleLabel: { fontSize: 12, lineHeight: 15, maxWidth: 70 },
+  bubbleLabelOn: { fontWeight: '700' },
   banner: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10 },
   bannerText: { fontSize: 14 },
   empty: { padding: Spacing.five, alignItems: 'center', gap: Spacing.two },

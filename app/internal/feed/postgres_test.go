@@ -65,6 +65,48 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	feedEndToEnd(t, store, tools, now)
 }
 
+// Rich cards against the provisioned schema: a media carousel and an
+// embedded X post round-trip whole, and an x.com url pushed bare is embedded
+// through the resolver.
+func TestPostgresFeedRichCards(t *testing.T) {
+	store, _ := postgresStore(t)
+	tools := Tools(store)
+	// Rich cards: a media carousel and an embedded X post, read back whole;
+	// an x.com url pushed bare is embedded through the resolver.
+	store.ResolveX = func(_ context.Context, u string) (*Embed, error) {
+		return &Embed{Post: Post{Type: EmbedTypeXPost, URL: u, AuthorName: "Ada", AuthorHandle: "ada", Text: "posted",
+			CreatedAt: "2026-10-20T12:00:00Z", Media: []Media{{Type: "image", URL: "https://pbs.twimg.com/a.jpg"}}}}, nil
+	}
+	call(t, tools, "feed_push", map[string]any{"source": "x", "items": []map[string]any{
+		{"url": "https://x.com/ada/status/123456789"},
+		{"title": "Gallery", "media": []map[string]any{{"url": "https://example.com/a.jpg"}, {"type": "video", "url": "https://example.com/v.mp4", "thumbnail_url": "https://example.com/v.jpg"}}},
+	}})
+	store.ResolveX = nil
+	rich := call(t, tools, "feed_list", map[string]any{"source": "x"})["items"].([]any)
+	byTitle := map[string]map[string]any{}
+	for _, raw := range rich {
+		item := raw.(map[string]any)
+		byTitle[item["title"].(string)] = item
+	}
+	xCard := byTitle[""]
+	if xCard == nil || xCard["embed"].(map[string]any)["author_handle"] != "ada" || xCard["author"] != "Ada" || xCard["site"] != "X" {
+		t.Fatalf("embedded X post: %v", rich)
+	}
+	if media := byTitle["Gallery"]["media"].([]any); len(media) != 2 || media[0].(map[string]any)["type"] != "image" ||
+		media[1].(map[string]any)["thumbnail_url"] != "https://example.com/v.jpg" {
+		t.Fatalf("media: %v", media)
+	}
+	call(t, tools, "feed_update", map[string]any{"item_id": "x:https://x.com/ada/status/123456789", "clear": []string{"embed"}})
+	cleared := call(t, tools, "feed_list", map[string]any{"item_ids": []string{"x:https://x.com/ada/status/123456789"}})["items"].([]any)[0].(map[string]any)
+	if _, has := cleared["embed"]; has {
+		t.Fatalf("clearing embed: %v", cleared)
+	}
+
+	if _, err := store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'x'")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func postgresStore(t *testing.T) (*Store, time.Time) {
 	t.Helper()
 	databaseURL := os.Getenv("PDW_FEED_TEST_URL")

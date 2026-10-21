@@ -22,8 +22,19 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   when nothing changed.
 - A card needs a title, a body or a url. `body` is markdown (the card shows the first
   lines, the reader all of it); `image_url` must be https; `site` defaults to the url's host.
+- **X posts are embedded, not linked.** Push an `x.com/<user>/status/<id>` url (no title
+  needed) and the server reads the post (fxtwitter) and stores it in `embed`: the card shows
+  the author, text, photos, video and quoted post the way X does, and a tap opens the whole
+  thread. A `title` on such a card shows above it as the reason it is there ("Karpathy on
+  ..."). Re-push to refresh its counts. A post that cannot be read stays a plain link card.
+- **Photos and video:** `media` (at most 10, each `{type: image|video|gif, url,
+  thumbnail_url}`, https) shows full-bleed as a swipeable carousel, Instagram style;
+  {{if .CLI}}`--media URL` (repeatable; `.mp4` is a video){{else}}a lone `image_url` is a one-photo carousel{{end}}. Cards with a picture get looked at
+  longer: give one whenever the source has a real image (an og:image, a figure, a photo).
 - **More links per card:** `links` (at most 10, each `url` + optional `title`) show as rows
-  under the body: the paper, the repo, the discussion. `url` stays the card's main tap.
+  under the body: the paper, the repo, the discussion. A tap on a card opens its detail view
+  (whole post or summary, every photo, all links); `url` is what "Open" there and the
+  card's compass button go to.
 - `score` ranks (higher first; {{if .CLI}}`pdw feed rank ID...`{{else}}`feed_rank`{{end}} sets many at once). The phone
   shows unseen cards first, then seen ones he engaged with, then ones he scrolled past, and
   never shows one source
@@ -57,8 +68,9 @@ whatever an agent does to it.
 ## Reading engagement
 
 There is no like button: interest is measured. A card is `engaged` when he opened it (any
-link), tapped More, shared it, or kept it on screen for 5 s; `engagement_score` adds opens
-(2 each, up to 3), More (1), a share (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
+link), opened its detail view, tapped More, swiped its photos or played its video, shared it,
+or kept it on screen for 5 s; `engagement_score` adds opens
+(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
 minutes), and takes 5 off a dismissal. Rank his interests by it.
 
 {{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
@@ -71,7 +83,8 @@ In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressio
 `expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
-`metadata.url` and `link_index` say which link). An impression is one stretch of a card at
+`metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
+or `video`; a `media` event is a carousel swipe or video play with `metadata.index`). An impression is one stretch of a card at
 least half on screen, with how long and how much of it was visible. A `share` is a swipe that
 opened a Superhuman draft to send the card to someone. Opens, shares and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
