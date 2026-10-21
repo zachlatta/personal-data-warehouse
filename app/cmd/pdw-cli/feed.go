@@ -57,13 +57,16 @@ CARD FLAGS (push, update)
   --link LINK       More links on the card (update: replaces them): URL or "Title|URL". Repeatable
                     (at most 10): the paper, the repo, the discussion.
   --image URL       https image shown full width.
+  --media URL       Photos or videos (.mp4) shown as a swipeable carousel (update: replaces them).
+                    Repeatable, at most 10. A --url that is an x.com post is embedded on its
+                    own: the post's text, author, photos, video and quoted post show in the card.
   --author TEXT, --site TEXT, --key KEY (push only)
   --tag TAG         Repeatable or comma-separated; replaces the tags.
   --score N         Rank weight, higher first.
   --published TIME  RFC3339 or YYYY-MM-DD.
   --expires TIME    RFC3339, YYYY-MM-DD or a duration (48h, 7d).
   --metadata JSON   update: replace the card's metadata object.
-  --clear FIELDS    update: empty title, body, url, image_url, author, site, tags,
+  --clear FIELDS    update: empty title, body, url, links, image_url, media, embed, author, site, tags,
                     published_at, expires_at or metadata.
   --file PATH       push: read cards as JSON from a file (- for stdin).
 
@@ -77,12 +80,13 @@ READ FLAGS
   --full            history: include each version's full snapshot.
   -n, --limit N     Rows.
   --type TYPES      events: session_start, session_end, impression, open, close,
-                    expand, dismiss, undismiss, share.
+                    expand, dismiss, undismiss, share, media.
   --item ID, --since TIME (2026-10-01, or 7d / 12h)
   --output FMT      text (default) or json.
 
 EXAMPLES
   pdw feed add --source hn --title "Show HN: ..." --url https://news.ycombinator.com/item?id=1
+  pdw feed add --source x-picks --url https://x.com/karpathy/status/1885026028428681698
   jq -c '{source:"muse-picks", items:.}' picks.json | pdw feed push --agent muse-picks
   pdw feed edit hn:1 --title "Better title" --clear image_url --reason "broken image"
   pdw feed history hn:1
@@ -108,6 +112,24 @@ type feedCardFlags struct {
 	source, title, body, url, image, author, site, key, published, expires, score, file string
 	tags                                                                                stringList
 	links                                                                               linkList
+	media                                                                               mediaList
+}
+
+// mediaList is a repeatable --media URL; an .mp4 is a video.
+type mediaList []map[string]any
+
+func (l *mediaList) String() string { return fmt.Sprint(*l) }
+func (l *mediaList) Set(v string) error {
+	link := strings.TrimSpace(v)
+	if link == "" {
+		return fmt.Errorf("--media needs a url")
+	}
+	kind := "image"
+	if path := strings.ToLower(strings.SplitN(link, "?", 2)[0]); strings.HasSuffix(path, ".mp4") || strings.HasSuffix(path, ".mov") {
+		kind = "video"
+	}
+	*l = append(*l, map[string]any{"type": kind, "url": link})
+	return nil
 }
 
 // linkList is a repeatable --link: "URL" or "Title|URL".
@@ -146,6 +168,7 @@ func (c *feedCardFlags) bind(fs *flag.FlagSet) {
 	fs.Var(&c.tags, "tag", "tag")
 	fs.Var(&c.tags, "tags", "alias for --tag")
 	fs.Var(&c.links, "link", "more links: URL or Title|URL (repeatable)")
+	fs.Var(&c.media, "media", "photo or video url for the carousel (repeatable)")
 }
 
 // set returns the card fields given on the command line, by JSON name.
@@ -170,6 +193,9 @@ func (c *feedCardFlags) set(fs *flag.FlagSet) (map[string]any, error) {
 	}
 	if given["link"] {
 		out["links"] = []map[string]any(c.links)
+	}
+	if given["media"] {
+		out["media"] = []map[string]any(c.media)
 	}
 	if given["score"] {
 		score, err := strconv.ParseFloat(c.score, 64)

@@ -20,6 +20,19 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   `source:key` and the key defaults to the url. Removal is soft (`removed_at`). `links`
   (jsonb, at most 10 `{url, title, site}`) are more links on one card, shown as rows under
   the body; `url` stays the main tap target and, if absent, is the first link.
+- **Rich cards** (added 2026-10-20 from Zach's screen recordings of his PDW, Instagram and
+  X feeds: "make my feed as maximally interesting and engaging as possible"): `media`
+  (jsonb, at most 10 `{type: image|video|gif, url, thumbnail_url, width, height, alt}`) is a
+  full-bleed swipeable carousel; `embed` (jsonb, `{}` = none) is a post shown natively in
+  the card. The one embed type is `x_post` (author, avatar, verified, text, created_at,
+  replies/reposts/likes/views, media, quote, the author's own thread). The push path fills
+  it for any card whose url is an x.com/twitter.com status (`xpost.go`, from
+  `api.fxtwitter.com`, 8 s timeout, 8 at a time); a post it cannot read stays a plain card
+  and the push still succeeds. The phone draws three card shapes: X post, media
+  (Instagram), link. A tap opens the detail view (whole thread or summary, every photo, all
+  links); the compass opens the page; a video plays in the system player. A rail of source
+  bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
+  source.
 - **Versions** (`base_feed.item_versions`, added 2026-10-20 at Zach's request that "if
   something is edited or deleted the past versions persist"): an `AFTER INSERT OR UPDATE OR
   DELETE` trigger on `base_feed.items` (`internal.feed_item_version`) writes one row per
@@ -37,15 +50,18 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   retried batch is counted once. Types: `session_start`, `session_end` (dwell = sitting
   length; metadata: cards seen, deepest position, acts), `impression` (one stretch of a card
   at least 50% on screen: `dwell_ms` at or above 50%, `visible_fraction` = peak, `position`,
-  `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` browser or reader;
+  `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` detail, browser, or reader before 2026-10-20;
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
-  `close` (`dwell_ms` = time spent after the open; reader adds `scroll_depth`), `expand`
+  `close` (`dwell_ms` = time spent after the open; the detail view adds `scroll_depth`), `expand`
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
   `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left to email the
-  card from Superhuman; `metadata.via` = `superhuman` or `mailto`).
+  card from Superhuman, or tapped a share button; `metadata.via` = `superhuman` or `mailto`),
+  `media` (a carousel swipe or video play: `metadata.action` `swipe` or `play`, `index`).
+  A `close` with `metadata.mode` `video` is watch time.
 - **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
-  request ("we should just have it measure engagement"). `engaged` = opened (any link),
-  tapped More, shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
+  request ("we should just have it measure engagement"). `engaged` = opened (any link,
+  or the detail view), tapped More, swiped photos or played a video (`media` events count
+  with expands), shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
   time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
   dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
   seen and engaged, then seen and scrolled past (`feed.go` `Rank`).
@@ -83,7 +99,7 @@ else `$PASEO_AGENT_ID`) and `--reason`. MCP: `feed_push`, `feed_get`, `feed_upda
 
 Delete these files and directories:
 
-- `app/internal/feed/` (store, HTTP API, tools, tests)
+- `app/internal/feed/` (store, HTTP API, tools, rich cards and X embeds, tests)
 - `app/cmd/pdw-cli/feed.go`, `app/cmd/pdw-cli/feed_test.go`
 - `app/internal/guide/topics/feed.md`
 - `mobile/src/features/feed/`, `mobile/src/app/(tabs)/feed.tsx`, `mobile/src/app/feed/`

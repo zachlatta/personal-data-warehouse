@@ -155,8 +155,10 @@ func Tools(store *Store) []tool.Tool {
 			DescriptionStr: "Add or update cards in the Feed tab of Zach's PDW iOS app (full-width cards he scrolls like a social feed). " +
 				"Each item needs a source (the agent or feed name, here or per item) and a title, body or url; re-pushing the same " +
 				"(source, key) updates the card instead of duplicating it, and the key defaults to the url. Optional: links (more links " +
-				"on one card, [{url, title}], e.g. the paper, the repo and the discussion), body (markdown), " +
+				"on one card, [{url, title}], e.g. the paper, the repo and the discussion), body (markdown), media (photos and " +
+				"videos shown as a swipeable carousel), " +
 				"https image_url, author, site, tags, score (higher shows first), published_at, expires_at (RFC3339 or 48h/7d). " +
+				"An x.com post url is embedded: the post's text, author, photos, video and quoted post show inside the card, not as a link. " +
 				"Every impression, dwell, open (per link), read time and dismissal is recorded; there is no like button, interest is " +
 				"measured (engagement_score): read it back with feed_stats. CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
 			Handle: func(ctx context.Context, in pushInput) (pushOutput, error) {
@@ -166,6 +168,7 @@ func Tools(store *Store) []tool.Tool {
 				if len(in.Items) > MaxPushItems {
 					return pushOutput{}, &tool.InvalidInputError{Message: fmt.Sprintf("at most %d items per push", MaxPushItems)}
 				}
+				embedXPosts(ctx, store.ResolveX, in.Items)
 				now := store.now()
 				batch := make([]normalized, 0, len(in.Items))
 				seen := map[string]int{}

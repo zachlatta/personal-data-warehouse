@@ -16,7 +16,7 @@ VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement")
 #: (app/internal/feed/feed.go EventTypes); tests/test_feed.py pins the two.
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
-    "dismiss", "undismiss", "share",
+    "dismiss", "undismiss", "share", "media",
 )
 
 #: The deliberate acts that reach timeline.events (tier self). Impressions,
@@ -84,10 +84,16 @@ STATEMENTS = (
         removed_at timestamptz NOT NULL DEFAULT 'epoch',
         removed_reason text NOT NULL DEFAULT '',
         links jsonb NOT NULL DEFAULT '[]',
+        media jsonb NOT NULL DEFAULT '[]',
+        embed jsonb NOT NULL DEFAULT '{}',
         UNIQUE (source, item_key)
     )""",
     # More links on one card: [{"url", "title", "site"}], shown under the body.
     "ALTER TABLE @feed_items ADD COLUMN IF NOT EXISTS links jsonb NOT NULL DEFAULT '[]'",
+    # A swipeable photo/video carousel: [{"type", "url", "thumbnail_url", ...}].
+    "ALTER TABLE @feed_items ADD COLUMN IF NOT EXISTS media jsonb NOT NULL DEFAULT '[]'",
+    # A post shown inside the card (an X post: author, text, media, quote).
+    "ALTER TABLE @feed_items ADD COLUMN IF NOT EXISTS embed jsonb NOT NULL DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS feed_items_updated_idx ON @feed_items (updated_at)",
     "CREATE INDEX IF NOT EXISTS feed_items_live_idx ON @feed_items (score DESC, created_at DESC) "
     "WHERE removed_at = 'epoch'",
@@ -211,7 +217,8 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
             count(*) FILTER (WHERE event_type = 'impression' AND dwell_ms < {SCROLL_PAST_MS}) AS scroll_pasts,
             count(*) FILTER (WHERE event_type = 'open') AS opens,
             COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'close'), 0) AS read_ms,
-            count(*) FILTER (WHERE event_type = 'expand') AS expands,
+            -- Tapping More, swiping a photo carousel or playing a video.
+            count(*) FILTER (WHERE event_type IN ('expand', 'media')) AS expands,
             count(*) FILTER (WHERE event_type = 'share') AS shares,
             (array_agg(event_type ORDER BY occurred_at DESC, received_at DESC)
                 FILTER (WHERE event_type IN ('dismiss', 'undismiss')))[1] AS dismiss_state,
