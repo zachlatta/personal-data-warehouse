@@ -34,6 +34,15 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   links); the compass opens the page; a video plays in the system player. A rail of source
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.
+- **Card context** (added 2026-10-21 after reviewing the recordings): `GET /api/feed`
+  sends the phone only `metadata.taste`, `hn_points` and `hn_comments`. A card shows
+  `taste` as a small line above it (like X's "reposted" line or Instagram's "Suggested for
+  you"); a Muse card shows "Muse Wonder · <kind>" from its leading `*kind*` line instead
+  of Muse as the author, and its "**For you:**" text as the summary; a Hacker News card
+  shows points and comments as a counts row (tap: the discussion) instead of the
+  "80 points · 14 comments on Hacker News · discussion" line (`mobile/.../card-context.ts`).
+  A reload that brings new cards while he is scrolled down shows X's "N new" pill; a tap
+  on an X post's author opens their profile.
 - **Versions** (`base_feed.item_versions`, added 2026-10-20 at Zach's request that "if
   something is edited or deleted the past versions persist"): an `AFTER INSERT OR UPDATE OR
   DELETE` trigger on `base_feed.items` (`internal.feed_item_version`) writes one row per
@@ -82,7 +91,10 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     `to`), `refresh` (pull to refresh), `menu_open` / `menu_pick` (`choice`, including
     `cancel`; `dwell_ms` = time the menu was up), `undo`, `swipe_start` (`toward` save or
     share, whether or not it went far enough), `scroll_to_top` (status bar tap),
-    `end_reached` (scrolled to "That is everything"), `share_failed`.
+    `end_reached` (scrolled to "That is everything"), `share_failed`, `new_pill_shown` /
+    `new_pill` (X's "new posts" pill: a reload brought `count` cards while he was scrolled
+    down; `new_pill` = he tapped it, from `from_y`). A tap on an X post's author or a Hacker
+    News counts row is an `open` (`via` `post_link`) with the profile or discussion `metadata.url`.
   - `session_start` adds `metadata.trigger` (`launch` = first sitting since the app
     started, `foreground`, `focus` = back from another tab or a card's detail view),
     `gap_ms` since the last sitting, `since_app_start_ms`, `app_version`, `update_id`,

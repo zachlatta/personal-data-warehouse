@@ -82,12 +82,29 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, list := range [][]Item{items, saved} {
 		for i := range list {
-			// The phone never shows these; keep the payload to what a card needs.
-			list[i].Metadata = nil
+			// Keep the payload to what a card needs.
+			list[i].Metadata = phoneMetadata(list[i].Metadata)
 			list[i].PushedBy = ""
 		}
 	}
 	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
+}
+
+// phoneCardKeys are the metadata keys a card shows: the interest a pick
+// was made for (its context line) and Hacker News counts (its counts row).
+var phoneCardKeys = []string{"taste", "hn_points", "hn_comments"}
+
+func phoneMetadata(metadata map[string]any) map[string]any {
+	var out map[string]any
+	for _, key := range phoneCardKeys {
+		if value, ok := metadata[key]; ok {
+			if out == nil {
+				out = map[string]any{}
+			}
+			out[key] = value
+		}
+	}
+	return out
 }
 
 type eventsRequest struct {

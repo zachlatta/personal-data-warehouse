@@ -8,9 +8,10 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 import type { FeedItem } from './api';
+import { cardContext, profileUrl, type CardContext } from './card-context';
 import { cardLinks, type CardLink } from './links';
 import { plainText } from './markdown';
-import { shortAge, type FeedMedia } from './rich';
+import { compactCount, shortAge, type FeedMedia } from './rich';
 import {
   ACCENT,
   MediaCarousel,
@@ -74,13 +75,13 @@ export function cardMedia(item: FeedItem): FeedMedia[] {
   return item.image_url ? [{ type: 'image', url: item.image_url }] : [];
 }
 
-function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
+function SourceRow({ item, author, onMenu }: { item: FeedItem; author?: string; onMenu: () => void }) {
   const theme = useTheme();
   const name = item.site || item.source;
   const age = shortAge(item.published_at ?? item.created_at);
   // A resurfaced card is one he saw and passed over, back because the
   // unseen ones ran out (server Store.Feed).
-  const sub = [item.resurfaced ? 'Seen before' : '', item.author, item.site && item.source !== item.site ? item.source : '']
+  const sub = [item.resurfaced ? 'Seen before' : '', author, item.site && item.source !== item.site ? item.source : '']
     .filter(Boolean)
     .join(' · ');
   return (
@@ -104,12 +105,44 @@ function SourceRow({ item, onMenu }: { item: FeedItem; onMenu: () => void }) {
   );
 }
 
+// The line above a card saying why it is here, like X's "reposted" line.
+function ContextLine({ label, inset }: { label: string; inset: number }) {
+  const theme = useTheme();
+  return (
+    <View style={[styles.context, { paddingLeft: inset }]}>
+      <SymbolView name="sparkles" tintColor={theme.textSecondary} size={13} />
+      <ThemedText style={[styles.contextText, { color: theme.textSecondary }]} numberOfLines={2}>
+        {label}
+      </ThemedText>
+    </View>
+  );
+}
+
+// Points and comments as counts, like X's row; a tap opens the discussion.
+function HnCounts({ hn, onPress }: { hn: NonNullable<CardContext['hn']>; onPress?: () => void }) {
+  const theme = useTheme();
+  return (
+    <Pressable
+      hitSlop={8}
+      disabled={!onPress}
+      onPress={onPress}
+      accessibilityLabel={`${hn.points} points, ${hn.comments} comments on Hacker News`}
+      style={({ pressed }) => [styles.hn, pressed && styles.pressed]}>
+      <SymbolView name="arrowtriangle.up.fill" tintColor="#FF6600" size={13} />
+      <ThemedText style={[styles.hnText, { color: theme.textSecondary }]}>{compactCount(hn.points) || '0'}</ThemedText>
+      <SymbolView name="bubble.right" tintColor={theme.textSecondary} size={14} />
+      <ThemedText style={[styles.hnText, { color: theme.textSecondary }]}>{compactCount(hn.comments) || '0'}</ThemedText>
+    </Pressable>
+  );
+}
+
 function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare, onSwipeStart }: Props) {
   const theme = useTheme();
   const swipeable = useRef<SwipeableMethods>(null);
   const [expanded, setExpanded] = useState(false);
   const [truncated, setTruncated] = useState(false);
-  const preview = useMemo(() => (item.body ? plainText(item.body) : ''), [item.body]);
+  const ctx = useMemo(() => cardContext(item), [item]);
+  const preview = useMemo(() => (ctx.preview ? plainText(ctx.preview) : ''), [ctx.preview]);
   const extraLinks = useMemo(() => cardLinks(item).filter((link) => link.index > 0), [item]);
   const media = useMemo(() => cardMedia(item), [item]);
   const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
@@ -124,6 +157,10 @@ function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia
   const save = () => onSave(item, 'button');
   const browseUrl = (url: string) => onBrowse(item, { url, label: url, site: '', index: -1 });
   const reportMedia = (a: MediaAction) => onMedia(item, a);
+  const profile = embed ? profileUrl(embed) : '';
+  const openProfile = profile ? () => onBrowse(item, { url: profile, label: `@${embed?.author_handle}`, site: 'x.com', index: -1 }) : undefined;
+  const hn = ctx.hn;
+  const openHn = hn?.url ? () => onBrowse(item, { url: hn.url, label: 'Hacker News discussion', site: 'news.ycombinator.com', index: -1 }) : undefined;
   const lines = (n: number) => {
     if (!expanded && n >= (embed ? POST_LINES : PREVIEW_LINES)) setTruncated(true);
   };
@@ -141,10 +178,14 @@ function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia
           </View>
         ) : null}
         <View style={styles.postRow}>
-          <PostAvatar embed={embed} />
+          <Pressable onPress={openProfile} disabled={!openProfile} accessibilityLabel={`Open @${embed.author_handle} on X`}>
+            <PostAvatar embed={embed} />
+          </Pressable>
           <View style={styles.postMain}>
             <View style={styles.postHead}>
-              <PostByline embed={embed} />
+              <Pressable onPress={openProfile} disabled={!openProfile} style={styles.flexShrink}>
+                <PostByline embed={embed} />
+              </Pressable>
               <Pressable hitSlop={12} onPress={() => onMenu(item)} accessibilityLabel="Hide">
                 <SymbolView name="ellipsis" tintColor={theme.textSecondary} size={16} />
               </Pressable>
@@ -185,7 +226,8 @@ function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia
   } else {
     content = (
       <>
-        <SourceRow item={item} onMenu={() => onMenu(item)} />
+        {ctx.label ? <ContextLine label={ctx.label} inset={Spacing.three} /> : null}
+        <SourceRow item={item} author={ctx.author} onMenu={() => onMenu(item)} />
         {media.length ? (
           <MediaCarousel media={media} onPress={open} onMedia={reportMedia} recyclingKey={item.item_id} />
         ) : null}
@@ -237,7 +279,8 @@ function FeedCardImpl({ item, saved, onSave, onLayout, onOpen, onBrowse, onMedia
             <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={21} />
           </Pressable>
           <View style={styles.flex} />
-          {item.tags.length ? (
+          {hn ? <HnCounts hn={hn} onPress={openHn} /> : null}
+          {!hn && item.tags.length ? (
             <ThemedText style={[styles.tags, { color: theme.textSecondary }]} numberOfLines={1}>
               {item.tags.slice(0, 3).map((t) => `#${t}`).join(' ')}
             </ThemedText>
@@ -279,6 +322,7 @@ export const FeedCard = memo(FeedCardImpl);
 const styles = StyleSheet.create({
   wrap: { paddingTop: Spacing.two, paddingBottom: Spacing.one, borderBottomWidth: 6 },
   flex: { flex: 1 },
+  flexShrink: { flexShrink: 1 },
   pressed: { opacity: 0.8 },
   sourceRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: Spacing.three, paddingBottom: Spacing.two },
   sourceText: { flex: 1 },
@@ -311,4 +355,6 @@ const styles = StyleSheet.create({
   share: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one, backgroundColor: ACCENT },
   shareLabel: { color: '#fff', fontSize: 13, fontWeight: '600' },
   save: { backgroundColor: '#FF9500' },
+  hn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingVertical: Spacing.one, marginRight: Spacing.two },
+  hnText: { fontSize: 13, fontWeight: '600', marginRight: 6 },
 });

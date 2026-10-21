@@ -27,6 +27,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { useConfig } from '@/lib/session';
 
 import { fetchFeed, FeedApiError, type FeedItem } from './api';
+import { newArrivals } from './card-context';
 import {
   connectFeedLogger,
   endFeedSession,
@@ -52,6 +53,9 @@ const UNDO_MS = 5_000;
 const SAVED = '\u0000saved';
 // A drag let go with no fling has ended if no coast began by then.
 const SETTLE_MS = 80;
+// The new-cards pill shows only when he is this far down, and goes at the top.
+const PILL_FROM_Y = 400;
+const PILL_GONE_Y = 120;
 
 // The served order, kept under the server's 16 KB metadata cap (one
 // oversized event would get its whole batch refused).
@@ -84,6 +88,10 @@ export default function FeedScreen() {
   const [error, setError] = useState<string | null>(null);
   const [disabled, setDisabled] = useState(false);
   const [undo, setUndo] = useState<Undo | null>(null);
+  // Cards a reload brought that were not in the list, for X's "new posts" pill.
+  const [arrivals, setArrivals] = useState<FeedItem[]>([]);
+  const list = useRef<FlatList<FeedItem>>(null);
+  const loadedIds = useRef<string[]>([]);
   // The rail across the top narrows the feed to one source.
   const [only, setOnly] = useState<string | null>(null);
   const bubbles = useMemo(() => sourceBubbles(items), [items]);
@@ -159,6 +167,10 @@ export default function FeedScreen() {
       });
       for (const item of page.items) feedItems.set(item.item_id, item);
       loadSaved(page.saved ?? []);
+      const fresh = trigger === 'stale' && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
+      setArrivals(fresh);
+      if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
+      loadedIds.current = page.items.map((i) => i.item_id);
       setItems(page.items);
       setError(null);
       setDisabled(false);
@@ -220,6 +232,7 @@ export default function FeedScreen() {
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       viewport.current = { top: e.nativeEvent.contentOffset.y, height: e.nativeEvent.layoutMeasurement.height };
+      if (viewport.current.top < PILL_GONE_Y) setArrivals((a) => (a.length ? [] : a));
       measure();
     },
     [measure],
@@ -471,6 +484,7 @@ export default function FeedScreen() {
   return (
     <ThemedView style={styles.fill}>
       <FlatList
+        ref={list}
         data={shown}
         extraData={savedIds}
         keyExtractor={(item) => item.item_id}
@@ -586,6 +600,24 @@ export default function FeedScreen() {
           )
         }
       />
+      {arrivals.length && only === null ? (
+        <Pressable
+          style={({ pressed }) => [styles.pill, pressed && styles.pillPressed]}
+          onPress={() => {
+            recordUi('new_pill', { metadata: { count: arrivals.length, from_y: Math.round(viewport.current.top) } });
+            setArrivals([]);
+            list.current?.scrollToOffset({ offset: 0, animated: true });
+          }}
+          accessibilityLabel={`${arrivals.length} new cards, scroll to top`}>
+          <SymbolView name="arrow.up" tintColor="#fff" size={14} />
+          {[...new Set(arrivals.map((i) => i.site || i.source))].slice(0, 3).map((name, n) => (
+            <View key={name} style={[styles.pillFace, n > 0 && styles.pillFaceOverlap]}>
+              <SourceAvatar name={name} url={arrivals.find((i) => (i.site || i.source) === name)?.url} size={22} />
+            </View>
+          ))}
+          <ThemedText style={styles.pillText}>{arrivals.length} new</ThemedText>
+        </Pressable>
+      ) : null}
       {undo ? (
         <View style={[styles.undo, { backgroundColor: theme.text }]}>
           <ThemedText style={[styles.undoText, { color: theme.background }]} numberOfLines={1}>
@@ -641,5 +673,26 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   undoText: { fontSize: 15, flex: 1 },
+  pill: {
+    position: 'absolute',
+    top: Spacing.two,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingLeft: 12,
+    paddingRight: 14,
+    paddingVertical: 6,
+    borderRadius: 20,
+    backgroundColor: ACCENT,
+    shadowColor: '#000',
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  pillPressed: { opacity: 0.85 },
+  pillFace: { borderRadius: 13, borderWidth: 2, borderColor: ACCENT },
+  pillFaceOverlap: { marginLeft: -12 },
+  pillText: { color: '#fff', fontSize: 14, fontWeight: '700', lineHeight: 18 },
   undoAction: { fontSize: 15, fontWeight: '700', color: '#208AEF' },
 });
