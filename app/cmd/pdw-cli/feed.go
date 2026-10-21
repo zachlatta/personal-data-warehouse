@@ -32,7 +32,7 @@ USAGE
   pdw feed remove ITEM_ID... | --source S [--reason R]
   pdw feed rank ITEM_ID...              Order cards best first (or --score ID=N).
   pdw feed stats [--source S] [--since 7d]
-  pdw feed events [--item ID] [--type like,open] [--since 7d] [-n 100]
+  pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
 
 A card is idempotent on (source, key); the key defaults to the url, so
 re-pushing a link updates its card instead of duplicating it.
@@ -41,7 +41,9 @@ PUSH / UPDATE FLAGS
   --source NAME     The agent or feed name (lowercase; required for push).
   --title TEXT      Headline.
   --body TEXT       Markdown; the card shows the first lines, the reader all.
-  --url URL         The link a tap opens.
+  --url URL         The link a tap opens (defaults to the first --link).
+  --link LINK       More links on the card: URL or "Title|URL". Repeatable
+                    (at most 10): the paper, the repo, the discussion.
   --image URL       https image shown full width.
   --author TEXT, --site TEXT, --key KEY
   --tag TAG         Repeatable or comma-separated.
@@ -56,7 +58,7 @@ LIST / EVENTS FLAGS
   --all             list: include removed and dismissed cards.
   -n, --limit N     Rows (list default 50, events default 100).
   --type TYPES      events: session_start, session_end, impression, open, close,
-                    expand, like, unlike, dismiss, undismiss.
+                    expand, dismiss, undismiss.
   --item ID, --since TIME (2026-10-01, or 7d / 12h)
   --output FMT      text (default) or json.
 
@@ -64,7 +66,7 @@ EXAMPLES
   pdw feed push --source hn --title "Show HN: ..." --url https://news.ycombinator.com/item?id=1
   jq -c '{source:"muse-picks", items:.}' picks.json | pdw feed push
   pdw feed stats --since 7d
-  pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, liked FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
+  pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, engagement_score FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
 `
 
 type stringList []string
@@ -82,6 +84,27 @@ func (s *stringList) Set(v string) error {
 type feedCardFlags struct {
 	source, title, body, url, image, author, site, key, published, expires, score, file string
 	tags                                                                                stringList
+	links                                                                               linkList
+}
+
+// linkList is a repeatable --link: "URL" or "Title|URL".
+type linkList []map[string]any
+
+func (l *linkList) String() string { return fmt.Sprint(*l) }
+func (l *linkList) Set(v string) error {
+	title, link := "", strings.TrimSpace(v)
+	if i := strings.Index(link, "|"); i >= 0 {
+		title, link = strings.TrimSpace(link[:i]), strings.TrimSpace(link[i+1:])
+	}
+	if link == "" {
+		return fmt.Errorf("--link %q has no url", v)
+	}
+	entry := map[string]any{"url": link}
+	if title != "" {
+		entry["title"] = title
+	}
+	*l = append(*l, entry)
+	return nil
 }
 
 func (c *feedCardFlags) bind(fs *flag.FlagSet) {
@@ -99,6 +122,7 @@ func (c *feedCardFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.score, "score", "", "score")
 	fs.Var(&c.tags, "tag", "tag")
 	fs.Var(&c.tags, "tags", "alias for --tag")
+	fs.Var(&c.links, "link", "more links: URL or Title|URL (repeatable)")
 }
 
 // set returns the card fields given on the command line, by JSON name.
@@ -120,6 +144,9 @@ func (c *feedCardFlags) set(fs *flag.FlagSet) (map[string]any, error) {
 	}
 	if given["tag"] || given["tags"] {
 		out["tags"] = []string(c.tags)
+	}
+	if given["link"] {
+		out["links"] = []map[string]any(c.links)
 	}
 	if given["score"] {
 		score, err := strconv.ParseFloat(c.score, 64)
@@ -392,8 +419,8 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		for _, it := range items {
 			e, _ := it["engagement"].(map[string]any)
 			flags := ""
-			if b, _ := e["liked"].(bool); b {
-				flags += " liked"
+			if b, _ := e["engaged"].(bool); b {
+				flags += " engaged"
 			}
 			if b, _ := e["dismissed"].(bool); b {
 				flags += " dismissed"
@@ -401,14 +428,18 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			if str(it, "removed_at") != "" {
 				flags += " removed"
 			}
-			fmt.Fprintf(w, "%s  score=%g  seen=%d dwell=%s opens=%d read=%s%s\n    %s\n", str(it, "item_id"), num(it, "score"),
-				int(num(e, "impressions")), secs(num(e, "dwell_ms")), int(num(e, "opens")), secs(num(e, "read_ms")), flags, str(it, "title"))
+			fmt.Fprintf(w, "%s  score=%g  seen=%d dwell=%s opens=%d read=%s engagement=%g%s\n    %s\n", str(it, "item_id"), num(it, "score"),
+				int(num(e, "impressions")), secs(num(e, "dwell_ms")), int(num(e, "opens")), secs(num(e, "read_ms")),
+				num(e, "engagement_score"), flags, str(it, "title"))
+			for _, link := range asList(it["links"]) {
+				fmt.Fprintf(w, "    + %s %s\n", str(link, "title"), str(link, "url"))
+			}
 		}
 	case "stats":
 		fmt.Fprintf(w, "since %s: %d sessions\n", str(out, "since"), int(num(out, "sessions")))
 		if byType, ok := out["events_by_type"].(map[string]any); ok && len(byType) > 0 {
 			parts := []string{}
-			for _, kind := range []string{"impression", "open", "close", "expand", "like", "unlike", "dismiss", "undismiss", "session_start", "session_end"} {
+			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "session_start", "session_end"} {
 				if n, ok := byType[kind].(float64); ok {
 					parts = append(parts, fmt.Sprintf("%s=%d", kind, int(n)))
 				}
@@ -417,9 +448,10 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		}
 		fmt.Fprintln(w, "per source (all time):")
 		for _, s := range asList(out["sources"]) {
-			fmt.Fprintf(w, "  %-20s items=%d seen=%d opened=%d liked=%d dismissed=%d dwell=%s read=%s\n", str(s, "source"),
-				int(num(s, "items")), int(num(s, "items_seen")), int(num(s, "items_opened")), int(num(s, "items_liked")),
-				int(num(s, "items_dismissed")), secs(num(s, "dwell_ms")), secs(num(s, "read_ms")))
+			fmt.Fprintf(w, "  %-20s items=%d seen=%d engaged=%d opened=%d dismissed=%d avg_engagement=%g dwell=%s read=%s\n",
+				str(s, "source"), int(num(s, "items")), int(num(s, "items_seen")), int(num(s, "items_engaged")),
+				int(num(s, "items_opened")), int(num(s, "items_dismissed")), num(s, "avg_engagement_score"),
+				secs(num(s, "dwell_ms")), secs(num(s, "read_ms")))
 		}
 		for _, section := range []struct{ key, label string }{{"top_items", "most engaged"}, {"ignored", "seen twice+, no engagement"}} {
 			items := asList(out[section.key])
@@ -429,7 +461,8 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			fmt.Fprintln(w, section.label+":")
 			for _, it := range items {
 				e, _ := it["engagement"].(map[string]any)
-				fmt.Fprintf(w, "  %s  seen=%d read=%s  %s\n", str(it, "item_id"), int(num(e, "impressions")), secs(num(e, "read_ms")), str(it, "title"))
+				fmt.Fprintf(w, "  %s  seen=%d dwell=%s read=%s engagement=%g  %s\n", str(it, "item_id"), int(num(e, "impressions")),
+					secs(num(e, "dwell_ms")), secs(num(e, "read_ms")), num(e, "engagement_score"), str(it, "title"))
 			}
 		}
 	case "events":

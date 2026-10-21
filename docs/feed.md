@@ -11,23 +11,32 @@ Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
 agent ── pdw feed push / feed_push ──▶ app (app/internal/feed) ──▶ base_feed.items
 phone ── GET /api/feed ◀── ranked live cards (score, freshness, seen cards sink, sources interleaved)
 phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement
-                                                  └──▶ timeline.events (open / like / dismiss, tier self)
+                                                  └──▶ timeline.events (open / dismiss, tier self)
 ```
 
 - **Items** (`base_feed.items`) are idempotent on `(source, item_key)`; `item_id` is
-  `source:key` and the key defaults to the url. Removal is soft (`removed_at`).
+  `source:key` and the key defaults to the url. Removal is soft (`removed_at`). `links`
+  (jsonb, at most 10 `{url, title, site}`) are more links on one card, shown as rows under
+  the body; `url` stays the main tap target and, if absent, is the first link.
 - **Events** (`base_feed.events`) are written by the phone with device-generated ids, so a
   retried batch is counted once. Types: `session_start`, `session_end` (dwell = sitting
   length; metadata: cards seen, deepest position, acts), `impression` (one stretch of a card
   at least 50% on screen: `dwell_ms` at or above 50%, `visible_fraction` = peak, `position`,
-  `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` browser or reader),
+  `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` browser or reader;
+  a browser open carries `metadata.url` and `link_index`, 0 = the main url),
   `close` (`dwell_ms` = time spent after the open; reader adds `scroll_depth`), `expand`
-  (tapped "More"), `like` / `unlike`, `dismiss` (`metadata.reason`: `not_interested` or
+  (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
   `less_like_this`) / `undismiss` (the 5-second Undo).
-- **Analytics**: `marts_feed.item_engagement` (per card, current liked/dismissed state;
-  `scroll_pasts` = impressions under 1 s) and `marts_feed.source_engagement` (per source
-  rates). `pdw feed stats` reads them.
-- **C1/C2**: opens, likes and dismissals are `feed_engagement` timeline events at tier
+- **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
+  request ("we should just have it measure engagement"). `engaged` = opened (any link),
+  tapped More, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More +
+  time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
+  dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone ranks unseen cards first, then
+  seen and engaged, then seen and scrolled past (`feed.go` `Rank`).
+- **Analytics**: `marts_feed.item_engagement` (per card, current dismissed state, engaged,
+  engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
+  `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
+- **C1/C2**: opens and dismissals are `feed_engagement` timeline events at tier
   `self` (Zach did them). Impressions, closes, expands and sessions are telemetry and stay in
   `base_feed.events`; cards are entities reached through the marts view.
 - **C7**: pipeline `feed` with no freshness expectation (it is quiet when nobody pushes or

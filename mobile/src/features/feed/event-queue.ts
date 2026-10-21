@@ -11,8 +11,6 @@ export type FeedEventType =
   | 'open'
   | 'close'
   | 'expand'
-  | 'like'
-  | 'unlike'
   | 'dismiss'
   | 'undismiss';
 

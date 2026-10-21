@@ -24,7 +24,7 @@ import (
 // holds the same list (feed.py EVENT_TYPES); tests/test_feed.py pins the two.
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
-	"like", "unlike", "dismiss", "undismiss",
+	"dismiss", "undismiss",
 }
 
 const (
@@ -37,6 +37,8 @@ const (
 	maxTags        = 20
 	maxTagChars    = 64
 	maxMetadataLen = 16384
+	maxLinks       = 10
+	maxLinkTitle   = 200
 )
 
 var sourceRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
@@ -49,6 +51,7 @@ type Item struct {
 	Title         string         `json:"title"`
 	Body          string         `json:"body,omitempty"`
 	URL           string         `json:"url,omitempty"`
+	Links         []Link         `json:"links"`
 	ImageURL      string         `json:"image_url,omitempty"`
 	Author        string         `json:"author,omitempty"`
 	Site          string         `json:"site,omitempty"`
@@ -65,17 +68,28 @@ type Item struct {
 	Engagement    Engagement     `json:"engagement"`
 }
 
-// Engagement is an item's row in marts_feed.item_engagement.
+// Link is one more place a card points to (the paper, the repo, the
+// discussion), shown under the body; URL stays the card's main tap target.
+type Link struct {
+	URL   string `json:"url" jsonschema:"http(s) link"`
+	Title string `json:"title,omitempty" jsonschema:"label shown for the link, e.g. Paper, Repo, HN discussion"`
+	Site  string `json:"site,omitempty" jsonschema:"defaults to the url's host"`
+}
+
+// Engagement is an item's row in marts_feed.item_engagement. There is no
+// like: interest is measured (Engaged, Score), not asked for.
 type Engagement struct {
 	Impressions   int64      `json:"impressions"`
 	DwellMS       int64      `json:"dwell_ms"`
 	ScrollPasts   int64      `json:"scroll_pasts"`
 	Opens         int64      `json:"opens"`
+	LinksOpened   int64      `json:"links_opened"`
 	ReadMS        int64      `json:"read_ms"`
 	Expands       int64      `json:"expands"`
-	Liked         bool       `json:"liked"`
 	Dismissed     bool       `json:"dismissed"`
 	DismissReason string     `json:"dismiss_reason,omitempty"`
+	Engaged       bool       `json:"engaged"`
+	Score         float64    `json:"engagement_score"`
 	FirstSeenAt   *time.Time `json:"first_seen_at,omitempty"`
 }
 
@@ -86,7 +100,8 @@ type PushItem struct {
 	Key         string         `json:"key,omitempty" jsonschema:"idempotency key, unique within the source; re-pushing a key updates that card. Defaults to the url, else a hash of title and body"`
 	Title       string         `json:"title,omitempty" jsonschema:"headline shown on the card"`
 	Body        string         `json:"body,omitempty" jsonschema:"markdown text: the card shows the first lines, the reader the whole"`
-	URL         string         `json:"url,omitempty" jsonschema:"http(s) link a tap opens"`
+	URL         string         `json:"url,omitempty" jsonschema:"http(s) link a tap opens; defaults to the first of links"`
+	Links       []Link         `json:"links,omitempty" jsonschema:"more links on the card (at most 10), each {url, title}: the paper, the repo, the discussion"`
 	ImageURL    string         `json:"image_url,omitempty" jsonschema:"https image shown full width on the card"`
 	Author      string         `json:"author,omitempty"`
 	Site        string         `json:"site,omitempty" jsonschema:"publication name; defaults to the url's host"`
@@ -100,6 +115,7 @@ type PushItem struct {
 // normalized is a validated PushItem ready to store.
 type normalized struct {
 	ItemID, Source, Key, Title, Body, URL, ImageURL, Author, Site string
+	Links                                                         []Link
 	Tags                                                          []string
 	Score                                                         *float64
 	PublishedAt, ExpiresAt                                        time.Time
@@ -198,6 +214,39 @@ func hostOf(raw string) string {
 	return strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
 }
 
+// normalizeLinks validates a card's extra links and drops repeats of the
+// main url and of each other.
+func normalizeLinks(links []Link, mainURL string) ([]Link, error) {
+	if len(links) > maxLinks {
+		return nil, invalid("at most %d links", maxLinks)
+	}
+	out := []Link{}
+	seen := map[string]bool{mainURL: mainURL != ""}
+	for i, link := range links {
+		value, err := checkURL(fmt.Sprintf("links[%d].url", i), link.URL, false)
+		if err != nil {
+			return nil, err
+		}
+		if value == "" {
+			return nil, invalid("links[%d] needs a url", i)
+		}
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		title := strings.TrimSpace(link.Title)
+		if len([]rune(title)) > maxLinkTitle {
+			return nil, invalid("links[%d].title is longer than %d characters", i, maxLinkTitle)
+		}
+		site := strings.TrimSpace(link.Site)
+		if site == "" {
+			site = hostOf(value)
+		}
+		out = append(out, Link{URL: value, Title: title, Site: site})
+	}
+	return out, nil
+}
+
 func normalizeTags(tags []string) ([]string, error) {
 	if len(tags) > maxTags {
 		return nil, invalid("at most %d tags", maxTags)
@@ -235,6 +284,12 @@ func normalizePush(in PushItem, defaultSource string, now time.Time) (normalized
 	}
 	if out.ImageURL, err = checkURL("image_url", in.ImageURL, true); err != nil {
 		return normalized{}, err
+	}
+	if out.Links, err = normalizeLinks(in.Links, out.URL); err != nil {
+		return normalized{}, err
+	}
+	if out.URL == "" && len(out.Links) > 0 {
+		out.URL, out.Links = out.Links[0].URL, out.Links[1:]
 	}
 	if out.Title == "" && out.Body == "" && out.URL == "" {
 		return normalized{}, invalid("a card needs a title, a body or a url")
@@ -331,8 +386,9 @@ func ValidateEvent(e *Event, now time.Time) error {
 
 // Rank orders live cards the way the phone shows them, after the Feeeed
 // model: no unread count, so nothing is a backlog to clear. Higher score
-// first, then newer; cards already seen and not liked sink below unseen
-// ones; and no source runs three in a row while another is waiting.
+// first, then newer; cards he has seen sink below unseen ones, and the
+// ones he scrolled past without engaging sink furthest; and no source runs
+// three in a row while another is waiting.
 func Rank(items []Item) []Item {
 	ordered := append([]Item(nil), items...)
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -368,10 +424,14 @@ func Rank(items []Item) []Item {
 }
 
 func staleRank(item Item) int {
-	if item.Engagement.Impressions > 0 && !item.Engagement.Liked {
+	switch {
+	case item.Engagement.Impressions == 0:
+		return 0
+	case item.Engagement.Engaged:
 		return 1
+	default:
+		return 2
 	}
-	return 0
 }
 
 func freshness(item Item) time.Time {

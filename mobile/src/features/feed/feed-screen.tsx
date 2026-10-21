@@ -33,6 +33,7 @@ import {
   startFeedSession,
 } from './engagement';
 import { FeedCard } from './feed-card';
+import type { CardLink } from './links';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
@@ -50,7 +51,6 @@ export default function FeedScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [disabled, setDisabled] = useState(false);
-  const [liked, setLiked] = useState<Record<string, boolean>>({});
   const [undo, setUndo] = useState<Undo | null>(null);
 
   const tracker = useRef(new ViewabilityTracker());
@@ -96,7 +96,6 @@ export default function FeedScreen() {
       pause();
       for (const item of page.items) feedItems.set(item.item_id, item);
       setItems(page.items);
-      setLiked(Object.fromEntries(page.items.map((i) => [i.item_id, i.engagement.liked])));
       setError(null);
       headerHeight.current = 0;
       setDisabled(false);
@@ -169,19 +168,23 @@ export default function FeedScreen() {
 
   const position = (item: FeedItem) => ids.current.indexOf(item.item_id);
 
+  // Opens the card's main url, or one of its extra links: the open and close
+  // record which (url, link_index) so engagement is per link.
   const openInBrowser = useCallback(
-    async (item: FeedItem, via: string) => {
-      if (!item.url) return;
+    async (item: FeedItem, via: string, link?: CardLink) => {
+      const url = link?.url ?? item.url;
+      if (!url) return;
+      const which = { url, link_index: link?.index ?? 0 };
       pause();
       const startedAt = Date.now();
-      recordFeedEvent('open', { item_id: item.item_id, position: position(item), metadata: { mode: 'browser', via } });
+      recordFeedEvent('open', { item_id: item.item_id, position: position(item), metadata: { mode: 'browser', via, ...which } });
       try {
-        await WebBrowser.openBrowserAsync(item.url, { dismissButtonStyle: 'close', controlsColor: '#208AEF' });
+        await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: '#208AEF' });
       } finally {
         recordFeedEvent('close', {
           item_id: item.item_id,
           dwell_ms: Date.now() - startedAt,
-          metadata: { mode: 'browser', via },
+          metadata: { mode: 'browser', via, ...which },
         });
         measure();
       }
@@ -202,13 +205,10 @@ export default function FeedScreen() {
     [router],
   );
 
-  const onLike = useCallback((item: FeedItem) => {
-    setLiked((prev) => {
-      const next = !prev[item.item_id];
-      recordFeedEvent(next ? 'like' : 'unlike', { item_id: item.item_id, position: position(item) });
-      return { ...prev, [item.item_id]: next };
-    });
-  }, []);
+  const onOpenLink = useCallback(
+    (item: FeedItem, link: CardLink) => void openInBrowser(item, 'link', link),
+    [openInBrowser],
+  );
 
   const onExpand = useCallback((item: FeedItem) => {
     recordFeedEvent('expand', { item_id: item.item_id, position: position(item) });
@@ -266,16 +266,15 @@ export default function FeedScreen() {
     ({ item }: { item: FeedItem }) => (
       <FeedCard
         item={item}
-        liked={!!liked[item.item_id]}
         onLayout={onCardLayout}
         onOpen={onOpen}
         onRead={onRead}
-        onLike={onLike}
+        onOpenLink={onOpenLink}
         onExpand={onExpand}
         onMenu={onMenu}
       />
     ),
-    [liked, onCardLayout, onOpen, onRead, onLike, onExpand, onMenu],
+    [onCardLayout, onOpen, onRead, onOpenLink, onExpand, onMenu],
   );
 
   if (!loaded) {

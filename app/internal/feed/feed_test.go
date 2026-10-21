@@ -54,6 +54,36 @@ func TestNormalizePushRefusesWhatThePhoneWouldDropSilently(t *testing.T) {
 	}
 }
 
+func TestNormalizePushKeepsMoreLinksPerCard(t *testing.T) {
+	item, err := normalizePush(PushItem{Source: "picks", Title: "T", URL: "https://example.com/post", Links: []Link{
+		{URL: "https://arxiv.org/abs/1", Title: " Paper "}, {URL: "https://example.com/post"}, {URL: "https://arxiv.org/abs/1"},
+		{URL: "https://news.ycombinator.com/item?id=2", Title: "HN", Site: "Hacker News"},
+	}}, "", testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Link{{URL: "https://arxiv.org/abs/1", Title: "Paper", Site: "arxiv.org"},
+		{URL: "https://news.ycombinator.com/item?id=2", Title: "HN", Site: "Hacker News"}}
+	if len(item.Links) != 2 || item.Links[0] != want[0] || item.Links[1] != want[1] {
+		t.Fatalf("links: %+v", item.Links)
+	}
+	// With no url, the first link is the card's main link (and its key).
+	promoted, err := normalizePush(PushItem{Source: "picks", Title: "T", Links: []Link{{URL: "https://a.test/1"}, {URL: "https://b.test/2"}}}, "", testNow)
+	if err != nil || promoted.URL != "https://a.test/1" || promoted.Key != "https://a.test/1" || len(promoted.Links) != 1 {
+		t.Fatalf("promoted: %+v %v", promoted, err)
+	}
+	for want, links := range map[string][]Link{
+		"at most 10 links":         make([]Link, 11),
+		"links[0] needs a url":     {{Title: "x"}},
+		"links[0].url must be":     {{URL: "ftp://a.test/f"}},
+		"links[0].title is longer": {{URL: "https://a.test", Title: strings.Repeat("x", 201)}},
+	} {
+		if _, err := normalizePush(PushItem{Source: "a", Title: "x", Links: links}, "", testNow); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: got %v", want, err)
+		}
+	}
+}
+
 func TestParseTimeAcceptsDatesAndRelativeExpiry(t *testing.T) {
 	for raw, want := range map[string]time.Time{
 		"2026-10-21T09:00:00-04:00": time.Date(2026, 10, 21, 13, 0, 0, 0, time.UTC),
@@ -82,11 +112,11 @@ func TestValidateEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for want, e := range map[string]Event{
-		"event_id is required": {Type: "like", ItemID: "x", OccurredAt: testNow},
-		"is not one of":        {EventID: "a", Type: "view", ItemID: "x", OccurredAt: testNow},
-		"needs an item_id":     {EventID: "a", Type: "like", OccurredAt: testNow},
-		"occurred_at":          {EventID: "a", Type: "like", ItemID: "x"},
-		"in the future":        {EventID: "a", Type: "like", ItemID: "x", OccurredAt: testNow.Add(48 * time.Hour)},
+		"event_id is required": {Type: "open", ItemID: "x", OccurredAt: testNow},
+		"is not one of":        {EventID: "a", Type: "like", ItemID: "x", OccurredAt: testNow},
+		"needs an item_id":     {EventID: "a", Type: "open", OccurredAt: testNow},
+		"occurred_at":          {EventID: "a", Type: "open", ItemID: "x"},
+		"in the future":        {EventID: "a", Type: "open", ItemID: "x", OccurredAt: testNow.Add(48 * time.Hour)},
 		"dwell_ms":             {EventID: "a", Type: "impression", ItemID: "x", OccurredAt: testNow, DwellMS: -1},
 		"visible_fraction":     {EventID: "a", Type: "impression", ItemID: "x", OccurredAt: testNow, VisibleFraction: 1.5},
 	} {
@@ -96,9 +126,9 @@ func TestValidateEvent(t *testing.T) {
 	}
 }
 
-func card(id, source string, score float64, ageHours int, impressions int64, liked bool) Item {
+func card(id, source string, score float64, ageHours int, impressions int64, engaged bool) Item {
 	return Item{ItemID: id, Source: source, Score: score, CreatedAt: testNow.Add(-time.Duration(ageHours) * time.Hour),
-		Engagement: Engagement{Impressions: impressions, Liked: liked}}
+		Engagement: Engagement{Impressions: impressions, Engaged: engaged}}
 }
 
 func ids(items []Item) string {
@@ -115,9 +145,10 @@ func TestRankPutsScoreThenFreshnessFirstAndSinksSeenCards(t *testing.T) {
 		card("new", "b", 0, 1, 0, false),
 		card("top", "c", 5, 20, 0, false),
 		card("seen", "d", 9, 1, 3, false),
-		card("liked", "e", 1, 30, 3, true),
+		card("engaged", "e", 1, 30, 3, true),
 	})
-	if ids(got) != "top,liked,new,old,seen" {
+	// Unseen first; then what he engaged with; what he scrolled past last.
+	if ids(got) != "top,new,old,engaged,seen" {
 		t.Fatalf("got %s", ids(got))
 	}
 }

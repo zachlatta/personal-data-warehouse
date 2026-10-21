@@ -9,27 +9,30 @@ import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
 import type { FeedItem } from './api';
+import { cardLinks, type CardLink } from './links';
 import { plainText } from './markdown';
 
 const PREVIEW_LINES = 4;
-const LIKE_COLOR = '#E5484D';
+const LINK_COLOR = '#208AEF';
 
+// There is no like button: what he looks at, opens and reads is measured.
 type Props = {
   item: FeedItem;
-  liked: boolean;
   onLayout: (itemId: string, height: number) => void;
   onOpen: (item: FeedItem) => void;
   onRead: (item: FeedItem) => void;
-  onLike: (item: FeedItem) => void;
+  onOpenLink: (item: FeedItem, link: CardLink) => void;
   onExpand: (item: FeedItem) => void;
   onMenu: (item: FeedItem) => void;
 };
 
-function FeedCardImpl({ item, liked, onLayout, onOpen, onRead, onLike, onExpand, onMenu }: Props) {
+function FeedCardImpl({ item, onLayout, onOpen, onRead, onOpenLink, onExpand, onMenu }: Props) {
   const theme = useTheme();
   const [expanded, setExpanded] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const preview = useMemo(() => (item.body ? plainText(item.body) : ''), [item.body]);
+  // The main url is the card itself; the rows list the extra links.
+  const extraLinks = useMemo(() => cardLinks(item).filter((link) => link.index > 0), [item]);
   const byline = [item.site || item.source, item.author, formatWhen(item.published_at ?? item.created_at)]
     .filter(Boolean)
     .join(' · ');
@@ -76,10 +79,28 @@ function FeedCardImpl({ item, liked, onLayout, onOpen, onRead, onLike, onExpand,
           <ThemedText style={styles.more}>More</ThemedText>
         </Pressable>
       ) : null}
+      {extraLinks.length ? (
+        <View style={[styles.links, { borderColor: theme.backgroundElement }]}>
+          {extraLinks.map((link) => (
+            <Pressable
+              key={link.index}
+              onPress={() => onOpenLink(item, link)}
+              accessibilityLabel={`Open ${link.label}`}
+              style={({ pressed }) => [styles.linkRow, { borderTopColor: theme.backgroundElement }, pressed && { opacity: 0.6 }]}>
+              <SymbolView name="link" tintColor={LINK_COLOR} size={15} />
+              <ThemedText style={styles.linkLabel} numberOfLines={1}>
+                {link.label}
+              </ThemedText>
+              {link.label !== link.site ? (
+                <ThemedText style={[styles.linkSite, { color: theme.textSecondary }]} numberOfLines={1}>
+                  {link.site}
+                </ThemedText>
+              ) : null}
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
       <View style={styles.actions}>
-        <Pressable hitSlop={10} onPress={() => onLike(item)} accessibilityLabel={liked ? 'Unlike' : 'Like'} style={styles.action}>
-          <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_COLOR : theme.textSecondary} size={22} />
-        </Pressable>
         {item.url ? (
           <Pressable hitSlop={10} onPress={() => onOpen(item)} accessibilityLabel="Open link" style={styles.action}>
             <SymbolView name="safari" tintColor={theme.textSecondary} size={21} />
@@ -113,7 +134,11 @@ const styles = StyleSheet.create({
   title: { paddingHorizontal: Spacing.three, fontSize: 19, lineHeight: 25, fontWeight: '700', marginBottom: Spacing.two },
   image: { width: '100%', aspectRatio: 1.91, marginBottom: Spacing.two },
   body: { paddingHorizontal: Spacing.three, fontSize: 15, lineHeight: 21 },
-  more: { paddingHorizontal: Spacing.three, paddingTop: Spacing.one, fontSize: 15, color: '#208AEF', fontWeight: '600' },
+  more: { paddingHorizontal: Spacing.three, paddingTop: Spacing.one, fontSize: 15, color: LINK_COLOR, fontWeight: '600' },
+  links: { marginTop: Spacing.two, marginHorizontal: Spacing.three, borderWidth: 1, borderRadius: 10, overflow: 'hidden' },
+  linkRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: 10, borderTopWidth: StyleSheet.hairlineWidth },
+  linkLabel: { flexShrink: 1, fontSize: 15, fontWeight: '600', color: LINK_COLOR },
+  linkSite: { flexShrink: 2, fontSize: 13 },
   actions: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Spacing.two, paddingVertical: Spacing.two, gap: Spacing.one },
   action: { padding: Spacing.two },
   tags: { fontSize: 13, maxWidth: 170, marginRight: Spacing.one },

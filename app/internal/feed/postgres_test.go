@@ -86,7 +86,8 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	// Push: a batch, idempotent on (source, key).
 	pushed := call(t, tools, "feed_push", map[string]any{"source": "hn", "items": []map[string]any{
 		{"title": "First", "url": "https://example.com/1", "score": 2, "tags": []string{"ai", "ai", "x\"y"}},
-		{"title": "Second", "url": "https://example.com/2", "image_url": "https://example.com/2.jpg"},
+		{"title": "Second", "url": "https://example.com/2", "image_url": "https://example.com/2.jpg",
+			"links": []map[string]any{{"url": "https://example.com/2-paper", "title": "Paper"}, {"url": "https://example.com/2"}}},
 		{"source": "muse", "title": "Agent card", "body": "**why** it matters", "expires_at": "7d"},
 	}})
 	if pushed["created"] != float64(3) || pushed["updated"] != float64(0) {
@@ -109,6 +110,11 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	if err := callErr(t, tools, "feed_push", map[string]any{"items": []map[string]any{{"title": "no source"}}}); err == nil ||
 		!strings.Contains(err.Error(), "source is required") {
 		t.Fatalf("missing source: %v", err)
+	}
+
+	links := call(t, tools, "feed_list", map[string]any{"item_ids": []string{"hn:https://example.com/2"}})["items"].([]any)[0].(map[string]any)["links"].([]any)
+	if len(links) != 1 || links[0].(map[string]any)["title"] != "Paper" || links[0].(map[string]any)["site"] != "example.com" {
+		t.Fatalf("links (the main url is not repeated): %v", links)
 	}
 
 	// Update, rank, remove.
@@ -137,7 +143,7 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 		{"event_id": "e3", "type": "impression", "item_id": "hn:https://example.com/2", "session_id": "s1", "occurred_at": now, "dwell_ms": 4000, "visible_fraction": 0.9},
 		{"event_id": "e4", "type": "open", "item_id": "hn:https://example.com/2", "session_id": "s1", "occurred_at": now, "metadata": map[string]any{"mode": "reader"}},
 		{"event_id": "e5", "type": "close", "item_id": "hn:https://example.com/2", "session_id": "s1", "occurred_at": now, "dwell_ms": 60000},
-		{"event_id": "e6", "type": "like", "item_id": "hn:https://example.com/2", "session_id": "s1", "occurred_at": now},
+		{"event_id": "e6", "type": "open", "item_id": "hn:https://example.com/2", "session_id": "s1", "occurred_at": now, "metadata": map[string]any{"mode": "browser", "url": "https://example.com/2-paper", "link_index": 1}},
 		{"event_id": "e7", "type": "dismiss", "item_id": "hn:https://example.com/1", "session_id": "s1", "occurred_at": now, "metadata": map[string]any{"reason": "less_like_this"}},
 	}}
 	post := func(body any) *httptest.ResponseRecorder {
@@ -152,8 +158,10 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	if rec := post(events); !strings.Contains(rec.Body.String(), `"duplicates":7`) {
 		t.Fatalf("a retried batch must be all duplicates: %s", rec.Body.String())
 	}
-	if rec := post(map[string]any{"events": []map[string]any{{"event_id": "bad", "type": "stare", "item_id": "x", "occurred_at": now}}}); rec.Code != 400 {
-		t.Fatalf("an unknown type must be a 400: %d %s", rec.Code, rec.Body.String())
+	for _, kind := range []string{"stare", "like"} {
+		if rec := post(map[string]any{"events": []map[string]any{{"event_id": "bad", "type": kind, "item_id": "x", "occurred_at": now}}}); rec.Code != 400 {
+			t.Fatalf("type %s must be a 400: %d %s", kind, rec.Code, rec.Body.String())
+		}
 	}
 
 	// Dismissed cards leave the feed; engagement reads back.
@@ -163,7 +171,9 @@ func TestPostgresFeedEndToEnd(t *testing.T) {
 	}
 	second := call(t, tools, "feed_list", map[string]any{"item_ids": []string{"hn:https://example.com/2"}})["items"].([]any)[0].(map[string]any)
 	engagement := second["engagement"].(map[string]any)
-	if engagement["opens"] != float64(1) || engagement["read_ms"] != float64(60000) || engagement["liked"] != true || engagement["dwell_ms"] != float64(4000) {
+	// 2 opens x2 + 0.4 for 4 s on screen + 1 for a minute reading = 5.4
+	if engagement["opens"] != float64(2) || engagement["links_opened"] != float64(1) || engagement["read_ms"] != float64(60000) ||
+		engagement["engaged"] != true || engagement["dwell_ms"] != float64(4000) || engagement["engagement_score"] != 5.4 {
 		t.Fatalf("engagement: %v", engagement)
 	}
 	stats := call(t, tools, "feed_stats", map[string]any{"since": "1d"})

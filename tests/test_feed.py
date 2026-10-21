@@ -66,28 +66,61 @@ def test_item_engagement_rolls_up_the_phone_events(warehouse):
     wh = warehouse
     _item(wh)
     _item(wh, "hn:2")
+    _item(wh, "hn:3")
     _event(wh, "a", "impression", minutes=1, dwell_ms=400, fraction=0.6)
     _event(wh, "b", "impression", minutes=2, dwell_ms=5000, fraction=1.0)
-    _event(wh, "c", "open", minutes=3, metadata='{"mode": "reader"}')
+    _event(wh, "c", "open", minutes=3, metadata='{"mode": "reader", "url": "https://a.test/1"}')
     _event(wh, "d", "close", minutes=4, dwell_ms=90000)
-    _event(wh, "e", "like", minutes=5)
-    _event(wh, "f", "unlike", minutes=6)
-    _event(wh, "g", "like", minutes=7)
+    _event(wh, "e", "open", minutes=5, metadata='{"mode": "browser", "url": "https://b.test/2", "link_index": 1}')
+    _event(wh, "f", "expand", minutes=6)
     _event(wh, "h", "dismiss", item_id="hn:2", minutes=8, metadata='{"reason": "less_like_this"}')
+    # Never tapped, but he sat on the card for six seconds: that is engagement.
+    _event(wh, "j", "impression", item_id="hn:3", minutes=9, dwell_ms=6000, fraction=1.0)
     rows = wh._query(
-        "SELECT item_id, impressions, dwell_ms, max_visible_fraction, scroll_pasts, opens, read_ms, "
-        "liked, dismissed, dismiss_reason, engaged FROM @marts_feed_item_engagement ORDER BY item_id"
+        "SELECT item_id, impressions, dwell_ms, max_visible_fraction, scroll_pasts, opens, links_opened, read_ms, "
+        "dismissed, dismiss_reason, engaged, engagement_score FROM @marts_feed_item_engagement ORDER BY item_id"
     )
     assert rows == [
-        ("hn:1", 2, 5400, 1.0, 1, 1, 90000, 1, 0, "", 1),
-        ("hn:2", 0, 0, 0.0, 0, 0, 0, 0, 1, "less_like_this", 0),
+        # 2 opens x2 + expand 1 + 5.4 s / 10 + 1.5 min read = 7.04
+        ("hn:1", 2, 5400, 1.0, 1, 2, 2, 90000, 0, "", 1, 7.04),
+        ("hn:2", 0, 0, 0.0, 0, 0, 0, 0, 1, "less_like_this", 0, -5.0),
+        ("hn:3", 1, 6000, 1.0, 0, 0, 0, 0, 0, "", 1, 0.6),
     ]
     _event(wh, "i", "undismiss", item_id="hn:2", minutes=9)
-    assert wh._query("SELECT dismissed FROM @marts_feed_item_engagement WHERE item_id = 'hn:2'") == [(0,)]
-    [(items, seen, liked, open_rate)] = wh._query(
-        "SELECT items, items_seen, items_liked, open_rate FROM @marts_feed_source_engagement WHERE source = 'hn'"
+    assert wh._query("SELECT dismissed, engagement_score FROM @marts_feed_item_engagement WHERE item_id = 'hn:2'") == [
+        (0, 0.0)
+    ]
+    [(items, seen, engaged, open_rate, engaged_rate)] = wh._query(
+        "SELECT items, items_seen, items_engaged, open_rate, engaged_rate FROM @marts_feed_source_engagement "
+        "WHERE source = 'hn'"
     )
-    assert (items, seen, liked, float(open_rate)) == (2, 1, 1, 1.0)
+    assert (items, seen, engaged, float(open_rate), float(engaged_rate)) == (3, 2, 2, 0.5, 1.0)
+
+
+@pytestmark_db
+def test_a_card_carries_more_links_and_the_view_counts_them(warehouse):
+    wh = warehouse
+    _item(wh, links='[{"url": "https://a.test/1", "title": "Paper"}, {"url": "https://b.test/2", "title": "HN"}]')
+    _item(wh, "hn:2")
+    assert wh._query("SELECT item_id, link_count FROM @marts_feed_item_engagement ORDER BY item_id") == [
+        ("hn:1", 2),
+        ("hn:2", 0),
+    ]
+
+
+@pytestmark_db
+def test_ensure_upgrades_the_views_that_still_carry_likes(warehouse):
+    wh = warehouse
+    # The first shape of the views had a liked column, which CREATE OR REPLACE
+    # cannot drop; ensure must recreate both views rather than wedge.
+    wh._command("DROP VIEW @marts_feed_source_engagement")
+    wh._command("DROP VIEW @marts_feed_item_engagement")
+    wh._command("CREATE VIEW @marts_feed_item_engagement AS SELECT item_id, 0 AS liked FROM @feed_items")
+    wh._command("CREATE VIEW @marts_feed_source_engagement AS SELECT count(liked) AS items_liked "
+                "FROM @marts_feed_item_engagement")
+    wh.ensure_timeline_tables()
+    _item(wh)
+    assert wh._query("SELECT engaged, engagement_score FROM @marts_feed_item_engagement") == [(0, 0.0)]
 
 
 @pytestmark_db

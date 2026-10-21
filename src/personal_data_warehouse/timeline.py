@@ -2230,19 +2230,20 @@ _FEED_ENGAGEMENT = _simple_adapter(
     ingest_ts="t.received_at",
     actor="'me'",
     title=(
-        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'like' THEN 'Liked: ' "
-        "ELSE 'Dismissed: ' END, COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
+        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' ELSE 'Dismissed: ' END, "
+        "COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
     ),
     snippet=_snippet("concat_ws(' · ', NULLIF(i.source, ''), NULLIF(i.site, ''), NULLIF(i.url, ''))"),
     context="t.session_id",
     source_pk="jsonb_build_object('event_id', t.event_id)",
     metadata=(
         "jsonb_build_object('event_type', t.event_type, 'item_id', t.item_id, "
-        "'feed_source', i.source, 'url', i.url, 'reason', t.metadata->>'reason', "
+        "'feed_source', i.source, 'url', COALESCE(NULLIF(t.metadata->>'url', ''), i.url), "
+        "'reason', t.metadata->>'reason', "
         "'mode', t.metadata->>'mode')"
     ),
     search_text=_search_concat("i.title", "left(i.body, 2000)", "i.site", "i.author", "i.source"),
-    where="t.event_type IN ('open', 'like', 'dismiss')",
+    where="t.event_type IN ('open', 'dismiss')",
     priority=TIMELINE_PRIORITY_SELF,
 )
 

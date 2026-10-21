@@ -3488,7 +3488,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, like/unlike, dismiss/undismiss."
+      "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss."
     },
     {
       "id": "hacker_news_items",
@@ -3844,7 +3844,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, reading time, liked and dismissed (current state). Epoch timestamps become NULL."
+      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, read time, dismissed, engaged, engagement_score. Epoch times are NULL."
     },
     {
       "id": "marts_feed_source_engagement",
@@ -3856,7 +3856,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Per source. Cards pushed and seen, open, like and dismiss rates."
+      "comment": "Per source. Cards pushed and seen, open, engaged, dismiss rates."
     },
     {
       "id": "marts_notifications",

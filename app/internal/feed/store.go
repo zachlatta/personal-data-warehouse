@@ -80,6 +80,14 @@ func tagsLiteral(tags []string) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
+func linksJSON(links []Link) (string, error) {
+	if links == nil {
+		links = []Link{}
+	}
+	raw, err := json.Marshal(links)
+	return string(raw), err
+}
+
 // PushResult is one card's outcome.
 type PushResult struct {
 	ItemID string `json:"item_id"`
@@ -98,10 +106,12 @@ func (s *Store) Push(ctx context.Context, items []normalized, pushedBy string) (
 	defer func() { _ = tx.Rollback() }()
 	statement := s.q(`
 		INSERT INTO @feed_items AS f (item_id, source, item_key, title, body, url, image_url, author, site,
-			tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], COALESCE($11::float8, 0), $12, $13, $14::jsonb, $15, $16, $16)
+			tags, score, published_at, expires_at, metadata, pushed_by, created_at, updated_at, links)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], COALESCE($11::float8, 0), $12, $13, $14::jsonb, $15, $16, $16,
+			$17::jsonb)
 		ON CONFLICT (item_id) DO UPDATE SET
-			title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, image_url = EXCLUDED.image_url,
+			title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, links = EXCLUDED.links,
+			image_url = EXCLUDED.image_url,
 			author = EXCLUDED.author, site = EXCLUDED.site, tags = EXCLUDED.tags,
 			score = COALESCE($11::float8, f.score), published_at = EXCLUDED.published_at,
 			expires_at = EXCLUDED.expires_at, metadata = EXCLUDED.metadata, pushed_by = EXCLUDED.pushed_by,
@@ -117,10 +127,14 @@ func (s *Store) Push(ctx context.Context, items []normalized, pushedBy string) (
 		if len(metadata) > maxMetadataLen {
 			return nil, invalid("item %s: metadata is larger than %d bytes", item.ItemID, maxMetadataLen)
 		}
+		links, err := linksJSON(item.Links)
+		if err != nil {
+			return nil, err
+		}
 		var inserted bool
 		err = tx.QueryRowContext(ctx, statement, item.ItemID, item.Source, item.Key, item.Title, item.Body,
 			item.URL, item.ImageURL, item.Author, item.Site, tagsLiteral(item.Tags), item.Score,
-			orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), pushedBy, now).Scan(&inserted)
+			orEpoch(item.PublishedAt), orEpoch(item.ExpiresAt), string(metadata), pushedBy, now, links).Scan(&inserted)
 		if err != nil {
 			return nil, fmt.Errorf("push %s: %w", item.ItemID, err)
 		}
@@ -139,6 +153,7 @@ type Update struct {
 	Title       *string        `json:"title,omitempty"`
 	Body        *string        `json:"body,omitempty"`
 	URL         *string        `json:"url,omitempty"`
+	Links       *[]Link        `json:"links,omitempty" jsonschema:"replaces the card's extra links ([] clears them)"`
 	ImageURL    *string        `json:"image_url,omitempty"`
 	Author      *string        `json:"author,omitempty"`
 	Site        *string        `json:"site,omitempty"`
@@ -184,6 +199,18 @@ func (s *Store) Update(ctx context.Context, u Update) error {
 			return err
 		}
 		add("url", value)
+	}
+	if u.Links != nil {
+		links, err := normalizeLinks(*u.Links, "")
+		if err != nil {
+			return err
+		}
+		raw, err := linksJSON(links)
+		if err != nil {
+			return err
+		}
+		args = append(args, raw)
+		sets = append(sets, fmt.Sprintf("links = $%d::jsonb", len(args)))
 	}
 	if u.ImageURL != nil {
 		value, err := checkURL("image_url", *u.ImageURL, true)
@@ -290,12 +317,12 @@ type ListOptions struct {
 	Limit            int
 }
 
-const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.image_url, i.author, i.site,
+const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.links, i.image_url, i.author, i.site,
 	to_jsonb(i.tags), i.score, i.published_at, i.expires_at, i.metadata, i.pushed_by, i.created_at, i.updated_at,
 	i.removed_at, i.removed_reason,
 	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
-	COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.liked, 0), COALESCE(e.dismissed, 0),
-	COALESCE(e.dismiss_reason, ''), e.first_seen_at`
+	COALESCE(e.links_opened, 0), COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.dismissed, 0),
+	COALESCE(e.dismiss_reason, ''), COALESCE(e.engaged, 0), COALESCE(e.engagement_score, 0), e.first_seen_at`
 
 func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 	where := []string{"TRUE"}
@@ -358,19 +385,23 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 	for rows.Next() {
 		var (
 			item                        Item
-			tags                        []byte
+			tags, links                 []byte
 			metadata                    []byte
 			published, expires, removed time.Time
-			liked, dismissed            int64
+			dismissed, engaged          int64
 			firstSeen                   sql.NullTime
 		)
-		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &item.ImageURL,
-			&item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
+		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &links,
+			&item.ImageURL, &item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
 			&item.CreatedAt, &item.UpdatedAt, &removed, &item.RemovedReason,
 			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
-			&item.Engagement.Opens, &item.Engagement.ReadMS, &item.Engagement.Expands, &liked, &dismissed,
-			&item.Engagement.DismissReason, &firstSeen); err != nil {
+			&item.Engagement.Opens, &item.Engagement.LinksOpened, &item.Engagement.ReadMS, &item.Engagement.Expands,
+			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen); err != nil {
 			return nil, err
+		}
+		_ = json.Unmarshal(links, &item.Links)
+		if item.Links == nil {
+			item.Links = []Link{}
 		}
 		_ = json.Unmarshal(tags, &item.Tags)
 		if item.Tags == nil {
@@ -381,7 +412,7 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 		}
 		item.PublishedAt, item.ExpiresAt, item.RemovedAt = fromEpoch(published), fromEpoch(expires), fromEpoch(removed)
 		item.CreatedAt, item.UpdatedAt = item.CreatedAt.UTC(), item.UpdatedAt.UTC()
-		item.Engagement.Liked, item.Engagement.Dismissed = liked == 1, dismissed == 1
+		item.Engagement.Dismissed, item.Engagement.Engaged = dismissed == 1, engaged == 1
 		if firstSeen.Valid {
 			item.Engagement.FirstSeenAt = fromEpoch(firstSeen.Time)
 		}
@@ -509,11 +540,12 @@ type SourceStats struct {
 	DwellMS        int64      `json:"dwell_ms"`
 	ItemsOpened    int64      `json:"items_opened"`
 	ReadMS         int64      `json:"read_ms"`
-	ItemsLiked     int64      `json:"items_liked"`
+	ItemsEngaged   int64      `json:"items_engaged"`
 	ItemsDismissed int64      `json:"items_dismissed"`
 	OpenRate       *float64   `json:"open_rate"`
-	LikeRate       *float64   `json:"like_rate"`
+	EngagedRate    *float64   `json:"engaged_rate"`
 	DismissRate    *float64   `json:"dismiss_rate"`
+	AvgScore       *float64   `json:"avg_engagement_score"`
 	LastPushedAt   *time.Time `json:"last_pushed_at,omitempty"`
 	LastEventAt    *time.Time `json:"last_event_at,omitempty"`
 }
@@ -533,8 +565,9 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	qctx, cancel := s.ctx(ctx)
 	defer cancel()
 	rows, err := s.DB.QueryContext(qctx, s.q(`
-		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_liked,
-		       items_dismissed, open_rate::float8, like_rate::float8, dismiss_rate::float8, last_pushed_at, last_event_at
+		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_engaged,
+		       items_dismissed, open_rate::float8, engaged_rate::float8, dismiss_rate::float8,
+		       avg_engagement_score::float8, last_pushed_at, last_event_at
 		FROM @marts_feed_source_engagement WHERE ($1 = '' OR source = $1) ORDER BY items DESC, source`), source)
 	if err != nil {
 		return out, err
@@ -545,8 +578,8 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 			pushed, lastSeen sql.NullTime
 		)
 		if err := rows.Scan(&row.Source, &row.Items, &row.LiveItems, &row.ItemsSeen, &row.Impressions, &row.DwellMS,
-			&row.ItemsOpened, &row.ReadMS, &row.ItemsLiked, &row.ItemsDismissed, &row.OpenRate, &row.LikeRate,
-			&row.DismissRate, &pushed, &lastSeen); err != nil {
+			&row.ItemsOpened, &row.ReadMS, &row.ItemsEngaged, &row.ItemsDismissed, &row.OpenRate, &row.EngagedRate,
+			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen); err != nil {
 			rows.Close()
 			return out, err
 		}
@@ -595,10 +628,10 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	if out.TopItems, err = s.query(ctx, `SELECT `+itemColumns+`
 		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
 		WHERE e.engaged = 1`+sourceFilter+`
-		ORDER BY e.liked DESC, e.read_ms + e.dwell_ms DESC LIMIT 10`, args...); err != nil {
+		ORDER BY e.engagement_score DESC, e.read_ms + e.dwell_ms DESC LIMIT 10`, args...); err != nil {
 		return out, err
 	}
-	// Seen at least twice and never opened, expanded, liked or dismissed:
+	// Seen at least twice and never opened, expanded, read or dismissed:
 	// what the feed keeps showing that is not landing.
 	out.Ignored, err = s.query(ctx, `SELECT `+itemColumns+`
 		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id

@@ -18,7 +18,8 @@ func feedStub(t *testing.T, response string) *stubServer {
 func TestFeedPushFromFlagsCallsFeedPush(t *testing.T) {
 	srv := feedStub(t, `{"created":1,"updated":0,"items":[{"item_id":"hn:https://x.test/1","status":"created"}]}`)
 	out, stderr, code := runCLI(t, srv.URL, "", "feed", "push", "--source", "hn", "--title", "Hi", "--url", "https://x.test/1",
-		"--tag", "ai,news", "--tag", "go", "--score", "2.5", "--expires", "7d")
+		"--tag", "ai,news", "--tag", "go", "--score", "2.5", "--expires", "7d",
+		"--link", "Paper|https://arxiv.org/abs/1", "--link", "https://news.ycombinator.com/item?id=2")
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr)
 	}
@@ -36,6 +37,12 @@ func TestFeedPushFromFlagsCallsFeedPush(t *testing.T) {
 	if body.Source != "hn" || item["title"] != "Hi" || item["score"] != 2.5 || item["expires_at"] != "7d" ||
 		len(item["tags"].([]any)) != 3 {
 		t.Fatalf("body: %s", srv.lastBody)
+	}
+	links := item["links"].([]any)
+	if len(links) != 2 || links[0].(map[string]any)["title"] != "Paper" ||
+		links[0].(map[string]any)["url"] != "https://arxiv.org/abs/1" ||
+		links[1].(map[string]any)["url"] != "https://news.ycombinator.com/item?id=2" {
+		t.Fatalf("links: %s", srv.lastBody)
 	}
 	if _, sent := item["body"]; sent {
 		t.Fatalf("an unset flag must not be sent: %s", srv.lastBody)

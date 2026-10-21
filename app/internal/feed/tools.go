@@ -80,7 +80,7 @@ type statsInput struct {
 type eventsInput struct {
 	ItemID string   `json:"item_id,omitempty"`
 	Source string   `json:"source,omitempty"`
-	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, like, unlike, dismiss, undismiss"`
+	Types  []string `json:"types,omitempty" jsonschema:"event types: session_start, session_end, impression, open, close, expand, dismiss, undismiss"`
 	Since  string   `json:"since,omitempty" jsonschema:"RFC3339, YYYY-MM-DD, or a duration back from now (7d)"`
 	Limit  int      `json:"limit,omitempty" jsonschema:"default 100, at most 1000"`
 }
@@ -111,9 +111,11 @@ func Tools(store *Store) []tool.Tool {
 			TitleStr: "Push Cards to the Feed Tab",
 			DescriptionStr: "Add or update cards in the Feed tab of Zach's PDW iOS app (full-width cards he scrolls like a social feed). " +
 				"Each item needs a source (the agent or feed name, here or per item) and a title, body or url; re-pushing the same " +
-				"(source, key) updates the card instead of duplicating it, and the key defaults to the url. Optional: body (markdown), " +
+				"(source, key) updates the card instead of duplicating it, and the key defaults to the url. Optional: links (more links " +
+				"on one card, [{url, title}], e.g. the paper, the repo and the discussion), body (markdown), " +
 				"https image_url, author, site, tags, score (higher shows first), published_at, expires_at (RFC3339 or 48h/7d). " +
-				"Every impression, open, read time, like and dismissal is recorded: read them back with feed_stats. CLI: pdw feed push.",
+				"Every impression, dwell, open (per link), read time and dismissal is recorded; there is no like button, interest is " +
+				"measured (engagement_score): read it back with feed_stats. CLI: pdw feed push.",
 			Handle: func(ctx context.Context, in pushInput) (pushOutput, error) {
 				if len(in.Items) == 0 {
 					return pushOutput{}, &tool.InvalidInputError{Message: "items is empty: pass at least one card"}
@@ -182,7 +184,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[rankInput, rankOutput]{
 			NameStr:        "feed_rank",
 			TitleStr:       "Rank Feed Cards",
-			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has seen and not liked still sink below unseen ones, and sources are interleaved. CLI: pdw feed rank.",
+			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has seen still sink below unseen ones (those he scrolled past without engaging furthest), and sources are interleaved. CLI: pdw feed rank.",
 			Handle: func(ctx context.Context, in rankInput) (rankOutput, error) {
 				scores := map[string]float64{}
 				for i, id := range in.Order {
@@ -203,7 +205,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[listInput, listOutput]{
 			NameStr:        "feed_list",
 			TitleStr:       "List Feed Cards",
-			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, liked, dismissed). view=feed returns exactly what the phone shows, ranked. CLI: pdw feed list.",
+			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked. CLI: pdw feed list.",
 			Handle: func(ctx context.Context, in listInput) (listOutput, error) {
 				if in.Limit > 500 {
 					return listOutput{}, &tool.InvalidInputError{Message: "limit is at most 500"}
@@ -230,7 +232,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[statsInput, Stats]{
 			NameStr:  "feed_stats",
 			TitleStr: "Feed Engagement Stats",
-			DescriptionStr: "How the Feed tab is landing: per source (items, seen, open/like/dismiss rates, dwell and read time, from " +
+			DescriptionStr: "How the Feed tab is landing: per source (items, seen, engaged/open/dismiss rates, average engagement_score, dwell and read time, from " +
 				"marts_feed.source_engagement), event counts by type and sessions since a window (default 7d), the most engaged cards, " +
 				"and cards seen twice or more without any engagement. Use it before writing the next batch. CLI: pdw feed stats.",
 			Handle: func(ctx context.Context, in statsInput) (Stats, error) {
@@ -244,7 +246,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[eventsInput, eventsOutput]{
 			NameStr:        "feed_events",
 			TitleStr:       "Feed Engagement Events",
-			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, like/unlike, dismiss/undismiss with reason, sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
+			DescriptionStr: "Raw Feed tab engagement events, newest first: impressions with dwell_ms and visible_fraction, opens, close (read time), expand, dismiss/undismiss with reason, sessions. Filter by item_id, source, types, since. CLI: pdw feed events.",
 			Handle: func(ctx context.Context, in eventsInput) (eventsOutput, error) {
 				if in.Limit > 1000 {
 					return eventsOutput{}, &tool.InvalidInputError{Message: "limit is at most 1000"}

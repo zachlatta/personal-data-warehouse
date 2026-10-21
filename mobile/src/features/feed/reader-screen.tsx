@@ -11,6 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
 import { feedItems, recordFeedEvent } from './engagement';
+import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
 
 function Spans({ spans }: { spans: Span[] }) {
@@ -116,18 +117,22 @@ export default function FeedReaderScreen() {
             )}
           </Fragment>
         ))}
-        {item.url ? (
+        {cardLinks(item).map((link) => (
           <Pressable
-            style={[styles.button, { backgroundColor: theme.backgroundElement }]}
+            key={link.index}
+            style={[styles.button, link.index > 0 && styles.buttonNext, { backgroundColor: theme.backgroundElement }]}
             onPress={async () => {
+              const which = { mode: 'browser', via: 'reader', url: link.url, link_index: link.index };
               const startedAt = Date.now();
-              recordFeedEvent('open', { item_id: item.item_id, position, metadata: { mode: 'browser', via: 'reader' } });
-              await WebBrowser.openBrowserAsync(item.url as string, { dismissButtonStyle: 'close' });
-              recordFeedEvent('close', { item_id: item.item_id, dwell_ms: Date.now() - startedAt, metadata: { mode: 'browser', via: 'reader' } });
+              recordFeedEvent('open', { item_id: item.item_id, position, metadata: which });
+              await WebBrowser.openBrowserAsync(link.url, { dismissButtonStyle: 'close' });
+              recordFeedEvent('close', { item_id: item.item_id, dwell_ms: Date.now() - startedAt, metadata: which });
             }}>
-            <ThemedText style={styles.buttonText}>Open {item.site || 'link'}</ThemedText>
+            <ThemedText style={styles.buttonText} numberOfLines={1}>
+              {link.index === 0 ? `Open ${link.label || 'link'}` : link.label}
+            </ThemedText>
           </Pressable>
-        ) : null}
+        ))}
       </ScrollView>
     </ThemedView>
   );
@@ -152,5 +157,6 @@ const styles = StyleSheet.create({
   code: { fontFamily: 'Menlo', fontSize: 15 },
   link: { color: '#208AEF' },
   button: { marginTop: Spacing.three, padding: Spacing.three, borderRadius: 12, alignItems: 'center' },
+  buttonNext: { marginTop: 0 },
   buttonText: { fontSize: 16, fontWeight: '600', color: '#208AEF' },
 });

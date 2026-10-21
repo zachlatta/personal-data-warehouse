@@ -1,6 +1,7 @@
 import type { AppConfig } from '@/lib/config';
 
 import type { FeedEvent } from './event-queue';
+import type { FeedLink } from './links';
 
 export type FeedItem = {
   item_id: string;
@@ -9,6 +10,7 @@ export type FeedItem = {
   title: string;
   body?: string;
   url?: string;
+  links?: FeedLink[];
   image_url?: string;
   author?: string;
   site?: string;
@@ -16,7 +18,7 @@ export type FeedItem = {
   score: number;
   published_at?: string;
   created_at: string;
-  engagement: { impressions: number; liked: boolean; opens: number };
+  engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number };
 };
 
 export type FeedPage = { items: FeedItem[]; generated_at: string };

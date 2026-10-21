@@ -1168,8 +1168,9 @@ def _gh_ts(hours: int) -> str:
 
 def _seed_feed(wh) -> None:
     # Feed tab: one card, and one of each kind of phone event on it. Only the
-    # open, the like and the dismiss are timeline events; the impression,
-    # the close and the session rows are telemetry.
+    # opens (the card's url, then one of its extra links) and the dismiss are
+    # timeline events; the impression, the close and the session rows are
+    # telemetry.
     wh._command(
         "INSERT INTO @feed_items (item_id, source, item_key, title, body, url, site) "
         "VALUES ('hn:1', 'hn', '1', 'A synthetic story', 'about synthetic things', "
@@ -1177,7 +1178,8 @@ def _seed_feed(wh) -> None:
     )
     for n, (event_type, metadata) in enumerate((
         ("session_start", "{}"), ("impression", "{}"), ("open", '{"mode": "browser"}'),
-        ("close", "{}"), ("like", "{}"), ("dismiss", '{"reason": "less_like_this"}'),
+        ("close", "{}"),
+        ("open", '{"mode": "browser", "url": "https://example.test/discussion", "link_index": 1}'), ("dismiss", '{"reason": "less_like_this"}'),
         ("session_end", "{}"),
     )):
         wh._command(
@@ -1379,7 +1381,7 @@ EXPECTED_SEEDED_EVENTS = {
     # 4 (reload) stay in base_browser_history only.
     "browser_visit": 2,
     "browser_search": 1,
-    # open + like + dismiss; impression, close and the session rows stay in base_feed.
+    # two opens + dismiss; impression, close and the session rows stay in base_feed.
     "feed_engagement": 3,
     "finance_transaction": 1,
     "finance_observation": 1,
@@ -1570,7 +1572,9 @@ def test_backfill_normalizes_every_source(warehouse):
     assert browser["1"]["context"] == browser["5"]["context"]
     feed = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "feed"}
     assert set(feed) == {"fe2", "fe4", "fe5"}
-    assert feed["fe4"]["title"] == "Liked: A synthetic story"
+    assert feed["fe4"]["title"] == "Opened: A synthetic story"
+    assert feed["fe4"]["metadata"]["url"] == "https://example.test/discussion"
+    assert feed["fe2"]["metadata"]["url"] == "https://example.test/story"
     assert feed["fe2"]["title"] == "Opened: A synthetic story"
     assert feed["fe5"]["metadata"]["reason"] == "less_like_this"
     assert feed["fe4"]["context"] == "s1"

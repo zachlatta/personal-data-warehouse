@@ -57,18 +57,18 @@ test('a batch the server refuses as malformed is dropped, not retried forever', 
 test('an unauthorized answer keeps the events for after re-login', async () => {
   const { storage } = memory();
   const q = new EventQueue(storage, async () => { throw Object.assign(new Error('no'), { status: 401 }); });
-  q.enqueue(ev(1, 'like'));
+  q.enqueue(ev(1, 'open'));
   await q.flush();
   assert.equal(q.size, 1);
 });
 
 test('past the cap the oldest impression goes first, never a deliberate act', () => {
-  const stored = JSON.stringify([ev('like', 'like'), ...Array.from({ length: MAX_QUEUED - 1 }, (_, i) => ev(i))]);
+  const stored = JSON.stringify([ev('first', 'open'), ...Array.from({ length: MAX_QUEUED - 1 }, (_, i) => ev(i))]);
   const q = new EventQueue({ load: () => stored, save() {} }, async () => {});
   q.enqueue(ev('new', 'dismiss'));
   const ids = q.pending().map((e) => e.event_id);
   assert.equal(ids.length, MAX_QUEUED);
-  assert.equal(ids[0], 'elike');
+  assert.equal(ids[0], 'efirst');
   assert.ok(!ids.includes('e0'));
 });
 
