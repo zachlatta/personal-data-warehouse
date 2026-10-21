@@ -51,5 +51,5 @@ In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressio
 least half on screen, with how long and how much of it was visible. Opens and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
-Zach's curated picks are source `picks`, rewritten daily by the `feed-curator` Paseo
-schedule from his engagement; push there only through that job.
+Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo
+schedule (desk `work/2026-10-20-feed-curation/`); push there only through that job.
