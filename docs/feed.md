@@ -90,7 +90,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   - `ui`: any other tap, named by `metadata.action`: `filter` (the source rail; `from`,
     `to`), `refresh` (pull to refresh), `menu_open` / `menu_pick` (`choice`, including
     `cancel`; `dwell_ms` = time the menu was up), `undo`, `swipe_start` (`toward` save or
-    share, whether or not it went far enough), `scroll_to_top` (status bar tap),
+    share, whether or not it went far enough), `scroll_to_top` (status bar tap), `tab_to_top` (Feed tapped in the tab bar while on it, from `from_y`),
     `end_reached` (scrolled to "That is everything"), `share_failed`, `new_pill_shown` /
     `new_pill` (X's "new posts" pill: a reload brought `count` cards while he was scrolled
     down; `new_pill` = he tapped it, from `from_y`). A tap on an X post's author or a Hacker

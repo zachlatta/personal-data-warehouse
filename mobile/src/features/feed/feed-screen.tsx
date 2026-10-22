@@ -1,4 +1,4 @@
-import { useFocusEffect, useRouter } from 'expo-router';
+import { useFocusEffect, useNavigation, useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -236,6 +236,20 @@ export default function FeedScreen() {
       measure();
     },
     [measure],
+  );
+
+  // Tapping Feed in the tab bar while already on it, so a double tap from
+  // anywhere, scrolls back to the top, as X and Instagram do.
+  const navigation = useNavigation<{ addListener(type: 'tabPress', cb: () => void): () => void; isFocused(): boolean }>();
+  useEffect(
+    () =>
+      navigation.addListener('tabPress', () => {
+        if (!navigation.isFocused() || viewport.current.top <= 0) return;
+        recordUi('tab_to_top', { metadata: { from_y: Math.round(viewport.current.top), view: view.current } });
+        setArrivals([]);
+        list.current?.scrollToOffset({ offset: 0, animated: true });
+      }),
+    [navigation],
   );
 
   // The card at the top of the screen at a scroll offset, so a scroll event
