@@ -405,6 +405,7 @@ def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()
@@ -730,7 +731,7 @@ def test_every_remote_device_uploader_declares_a_run_heartbeat():
     for pipeline_id in (
         "apple_notes", "apple_messages", "apple_contacts", "apple_voice_memos",
         "apple_photos", "claude_code", "codex", "openclaw", "pi", "muse_code",
-        "browser_history", "argon",
+        "browser_history", "argon", "screen_timelapse",
     ):
         entry = pipeline(pipeline_id)
         assert entry.state is not None, pipeline_id

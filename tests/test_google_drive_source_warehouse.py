@@ -55,6 +55,7 @@ def _ensure_all_table_groups(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()

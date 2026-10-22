@@ -3247,3 +3247,47 @@ BROWSER_HISTORY_VISIT_COLUMNS = (
     "synced_at",
     "sync_version",
 )
+
+
+# --- Screen timelapse ---------------------------------------------------------
+#
+# A periodic image of a device's whole screen and, when the capture loop could
+# read one, the accessibility tree of the same moment, shipped file by file by
+# `pdw ingest screen-timelapse` and stored raw: the bytes are in the object
+# store, a row is the file's place and time. Neither table depends on the
+# other: a tree and the screenshots of its moment share (device, captured_at),
+# because the capture loop stamps both files with the same instant, and that
+# equality is the whole link -- a moment can have either without the other.
+SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS = (
+    # The device whose screen this is (crobat, joltik), not the host that ran
+    # the capture: the iPhone is imaged by whichever Mac shares its network.
+    "device",
+    "captured_at",
+    # 1-based; a Mac with two displays writes two screenshots per moment.
+    "display_index",
+    "source_filename",
+    "content_sha256",
+    "mime_type",
+    "size_bytes",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "ingested_at",
+)
+
+SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS = (
+    "device",
+    "captured_at",
+    "source_filename",
+    "content_sha256",
+    # application/gzip for the Mac's tree, application/json for the phone's:
+    # each is stored exactly as its capture loop wrote it.
+    "mime_type",
+    "size_bytes",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "ingested_at",
+)

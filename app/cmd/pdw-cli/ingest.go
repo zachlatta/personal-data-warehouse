@@ -16,6 +16,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/muse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/photos"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/plaid"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/screentimelapse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/voicememos"
 )
 
@@ -37,16 +38,17 @@ type localCommand func(args []string, stdin io.Reader, stdout, stderr io.Writer,
 // (claudedesktop.go) and runIngestWithConfig dispatches it before this table.
 // (Its actual conversation polling runs serverside in Dagster.)
 var ingestSources = map[string]localCommand{
-	"agent-sessions":  agentsessions.Run,
-	"apple-contacts":  applecontacts.Run,
-	"apple-messages":  applemessages.Run,
-	"apple-notes":     applenotes.Run,
-	"apple-photos":    photos.Run,
-	"browser-history": browserhistory.Run,
-	"manual-finance":  manualfinance.Run,
-	"muse":            muse.Run,
-	"plaid":           plaid.Run,
-	"voice-memos":     voicememos.Run,
+	"agent-sessions":   agentsessions.Run,
+	"apple-contacts":   applecontacts.Run,
+	"apple-messages":   applemessages.Run,
+	"apple-notes":      applenotes.Run,
+	"apple-photos":     photos.Run,
+	"browser-history":  browserhistory.Run,
+	"manual-finance":   manualfinance.Run,
+	"muse":             muse.Run,
+	"plaid":            plaid.Run,
+	"screen-timelapse": screentimelapse.Run,
+	"voice-memos":      voicememos.Run,
 }
 
 // resolveIngestSource returns the uploader for a source, or ok=false when the
@@ -80,6 +82,7 @@ source's own flags.
 
 SOURCES
   voice-memos      Upload local macOS Voice Memos recordings
+  screen-timelapse Upload the periodic whole-screen captures (Mac and phone)
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
   apple-contacts   Upload local Apple/iCloud Contacts

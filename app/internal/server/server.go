@@ -346,6 +346,25 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		}
 		mux.Handle(ingestPathPrefix, ingestSvc.handler())
 		logger.Info("client upload ingestion enabled", "endpoints", len(ingestSvc.artifacts))
+		// The screen timelapse writes its row with its bytes, so it needs both
+		// the Drive store and Postgres. The exact path wins over the subtree.
+		if store, ok := ingestSvc.stores[screenTimelapseSource]; ok && cfg.PostgresDatabaseURL != "" {
+			rows, rerr := newScreenTimelapseRowStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+			if rerr != nil {
+				logger.Error("screen timelapse row store failed to initialize; screen timelapse ingestion disabled", "error", rerr.Error())
+			} else {
+				mux.Handle(screenTimelapseFileEndpoint, (&screenTimelapseIngestService{
+					store:    store,
+					rows:     rows,
+					signer:   authSvc,
+					maxBytes: cfg.IngestMaxObjectBytes,
+					timeout:  cfg.QueryTimeout,
+					now:      time.Now,
+					logger:   logger,
+				}).handler())
+				logger.Info("screen timelapse ingestion enabled", "endpoint", screenTimelapseFileEndpoint)
+			}
+		}
 	}
 	// The ChatGPT session-publish endpoint writes to Postgres (not object
 	// storage), so it is independent of Drive ingestion. The exact path wins

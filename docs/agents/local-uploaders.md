@@ -408,3 +408,70 @@ launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.browser-hist
 
 SQL starting points: `base_browser_history.visits`; timeline `source = 'browser_history'`
 (`kind` `visit` or `search`); search scope `sources => ARRAY['browser_history']`.
+
+## Local Screen Timelapse Upload Scheduler
+
+The screen timelapse is a periodic image of a device's whole screen, about once a minute while
+it is unlocked and in use, plus the accessibility tree of the same moment when the capture loop
+could read one. The **capture** belongs to the sysadmin repository
+(`scripts/periodic-screenshot-*` for the Mac, `crobat/phone-capture/` for the iPhone); this
+repository only **uploads** what those loops wrote:
+
+- LaunchAgent label: `com.zachlatta.personal-data-warehouse.screen-timelapse-upload`
+- Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.screen-timelapse-upload.plist`
+- Wrapper script: `bin/screen-timelapse-upload-launchd`; status helper `bin/screen-timelapse-upload-status`
+- Run cadence: every 300 seconds with `RunAtLoad`
+- Command: `pdw ingest screen-timelapse` (native Go, `app/internal/uploaders/screentimelapse`)
+- Logs: `~/Library/Logs/personal-data-warehouse/screen-timelapse-upload.run.log` and `.heartbeat`;
+  the run heartbeat posts as pipeline `screen_timelapse`
+
+**Which folder is which device.** `SCREEN_TIMELAPSE_SOURCES` in the repo `.env` is a list of
+`device=folder` pairs; the device is the screen's, never the uploading host's, because the Mac
+that images the phone uploads the phone's frames too. On crobat:
+`SCREEN_TIMELAPSE_SOURCES=crobat=~/Pictures/Screenshots/periodic,joltik=~/Pictures/PhoneScreenshots/joltik`.
+On porygon (it images the phone on the office network): `joltik=~/Pictures/PhoneScreenshots/joltik`.
+Unset, it is `<short hostname>=~/Pictures/Screenshots/periodic`.
+
+**What a file is.** The name is all the metadata (`app/internal/timelapsefiles`):
+`periodic-screenshot-<stamp>-display-<n>.heic` (a pre-2026-05-23 single-display frame has no
+`-display-<n>`), `periodic-screenshot-<stamp>.ax.json.gz`, `phone-screenshot-<stamp>.png` and
+`phone-ax-<stamp>.json`. The stamp is the capture host's local wall time with no zone; the
+uploader resolves it in the host's zone, and in the repeated fall-back hour picks the instant
+nearest the file's mtime (birth time reads 1969 on these files). A screenshot and the tree of
+its moment share the stamp, so they share `(device, captured_at)`, which is the whole link
+between the two tables. Anything else in the folder (`.tmp`, a not-yet-gzipped `.ax.json`) is
+ignored, and a file younger than two minutes waits for the next run.
+
+**One request per file, and no inbox.** Each file goes to `/ingest/screen-timelapse/file`
+exactly as written (no re-encoding, no scrubbing: the pixels carry the same text the tree
+does). The app stores the bytes under `screen-timelapse/library/<device>/<UTC day>/` and writes
+the file's row before it answers, so nothing has to promote it; it also provisions the two
+tables itself (identical to the Python `TableSpec`, pinned by
+`tests/test_screen_timelapse_store.py`). Dedup is the row: a resend of a moment whose row has
+the same sha is answered from Postgres without touching Drive, and a new file is stored with the
+Drive per-upload dedup search skipped. A store that succeeds with a failed row write answers an
+error and the file is sent again (worst case an orphaned Drive object, never a row without
+bytes).
+
+**Ledger and backlog.** The state file remembers each acknowledged file's path, size and mtime;
+a changed file is sent again and replaces its row. A run sends at most 300 files, newest first,
+so a first run's backlog (months of frames) drains behind the live minute over successive runs.
+A run stops at its first failed upload and exits 1, so `/pipelines` reads `failing`. The usual
+network guard applies (`SCREEN_TIMELAPSE_UPLOAD_*`, falling back to the voice-memos settings):
+nothing uploads while tethered to a phone or on in-flight Wi-Fi.
+
+`pdw ingest screen-timelapse --dry-run` lists what would be sent and records nothing.
+
+Install or reinstall:
+
+```bash
+cp ops/launchd/com.zachlatta.personal-data-warehouse.screen-timelapse-upload.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-timelapse-upload 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.screen-timelapse-upload.plist
+launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-timelapse-upload
+```
+
+SQL starting points: `base_screen_timelapse.screenshots` and
+`base_screen_timelapse.accessibility_trees` (join on `device, captured_at`); timeline
+`source = 'screen_timelapse'`, kind `screen_capture`, one `noise` event per moment (display 1)
+with no search text until an enrichment step reads the frames.

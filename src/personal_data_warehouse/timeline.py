@@ -2739,6 +2739,49 @@ _MUSE_FILE = _simple_adapter(
 )
 
 
+# The screen timelapse (base_screen_timelapse.screenshots): a periodic image of
+# a device's whole screen. One event per capture MOMENT -- a Mac with two
+# displays writes two screenshots of one instant, and display 1 always exists
+# -- so "what was on the screen at 3pm" is one row per minute per device. The
+# frames are raw pixels, so the rows carry no search text: they are on the
+# timeline to be reached by time and device, and become searchable when an
+# enrichment step reads them. `noise`: passive telemetry about Zach, the tier
+# his own health telemetry is in, and what it shows (the message he typed,
+# the page he read) is already on the timeline as the event itself.
+_SCREEN_CAPTURE = _simple_adapter(
+    name="screen_capture",
+    source_table="screen_timelapse_screenshots",
+    source="screen_timelapse",
+    kind="screen_capture",
+    from_sql="@screen_timelapse_screenshots t",
+    where="t.display_index = 1",
+    event_id=(
+        "concat_ws('|', t.device, "
+        "to_char(t.captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))"
+    ),
+    event_ts="t.captured_at",
+    ingest_ts="t.ingested_at",
+    actor="'me'",
+    title="concat(t.device, ' screen')",
+    # A device's day is the "conversation": the frames before and after.
+    context="concat_ws('|', t.device, to_char(t.captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'))",
+    source_pk=(
+        "jsonb_build_object('device', t.device, 'captured_at', t.captured_at, "
+        "'display_index', t.display_index)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'device', t.device, "
+        "'source_filename', t.source_filename, "
+        "'mime_type', t.mime_type, "
+        "'size_bytes', t.size_bytes, "
+        "'storage_file_id', t.storage_file_id)"
+    ),
+    search_text="''",
+    priority=TIMELINE_PRIORITY_NOISE,
+)
+
+
 # An opening prompt another program wrote. Every orchestrator (paseo
 # subagents, runbook fan-outs, the daily run-sheet job, /command invocations)
 # writes a role brief -- "You are auditing ...", "Research task, web only",
@@ -3134,6 +3177,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
     _MUSE_FILE,
+    _SCREEN_CAPTURE,
     _MUTATION,
     _MUTATION_REQUEST,
     _ENRICHMENT_RUN,
@@ -3369,6 +3413,8 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         # context is the file's directory, which IS the grouping: the
         # neighbours of a memory note are the other notes beside it.
         "muse_file",
+        # context is the device's day: the frames around a frame.
+        "screen_capture",
         "mutation",
         "mutation_request",
         "enrichment_run",
@@ -3662,6 +3708,13 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "argon_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "muse_events": _events("one session roll-up row plus one row per user/assistant turn"),
     "muse_files": _events("one row per Muse workspace file at its latest content"),
+    # Screen timelapse: one event per capture moment; a tree is the detail of
+    # the moment it was read at.
+    "screen_timelapse_screenshots": _events("one event per capture moment (display 1)"),
+    "screen_timelapse_accessibility_trees": _detail(
+        "screen_timelapse_screenshots",
+        "the accessibility tree of a captured moment; join to screenshots on (device, captured_at)",
+    ),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),

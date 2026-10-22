@@ -84,6 +84,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
     wh.ensure_finance_tables()
@@ -1290,6 +1291,34 @@ def _seed_github(wh) -> None:
         ]
     )
 
+    # Screen timelapse: crobat's two displays at one moment, the moment's
+    # tree, and one phone frame with no tree at all.
+    for device, display, hours_ago, name in (
+        ("crobat", 1, 1.5, "periodic-screenshot-2026-06-23_10-30-00-display-1.heic"),
+        ("crobat", 2, 1.5, "periodic-screenshot-2026-06-23_10-30-00-display-2.heic"),
+        ("joltik", 1, 1.25, "phone-screenshot-2026-06-23_10-45-00.png"),
+    ):
+        wh._command(
+            """
+            INSERT INTO @screen_timelapse_screenshots (device, captured_at, display_index,
+                source_filename, content_sha256, mime_type, size_bytes, storage_backend,
+                storage_key, storage_file_id, ingested_at)
+            VALUES (%s, %s, %s, %s, %s, 'image/heic', 480000, 'google_drive', %s, %s, %s)
+            """,
+            (device, _NOW - timedelta(hours=hours_ago), display, name, f"sha-{device}-{display}",
+             f"screen-timelapse/library/{name}", f"fid-{device}-{display}", _NOW),
+        )
+    wh._command(
+        """
+        INSERT INTO @screen_timelapse_accessibility_trees (device, captured_at, source_filename,
+            content_sha256, mime_type, size_bytes, storage_backend, storage_key, storage_file_id,
+            ingested_at)
+        VALUES ('crobat', %s, 'periodic-screenshot-2026-06-23_10-30-00.ax.json.gz', 'sha-tree',
+            'application/gzip', 40000, 'google_drive', 'k', 'fid-tree', %s)
+        """,
+        (_NOW - timedelta(hours=1.5), _NOW),
+    )
+
 
 # The seeded fixture rows exercise one classification branch per adapter:
 # gmail addressed directly to the account (2), a member-channel slack message
@@ -1336,6 +1365,9 @@ EXPECTED_SEEDED_PRIORITIES = {
     "github_event": "self",
     "browser_visit": "self",
     "browser_search": "self",
+    # A frame of Zach's own screen is telemetry about him, the tier his own
+    # health telemetry is in.
+    "screen_capture": "noise",
     "feed_engagement": "self",
     "finance_transaction": "self",
     "finance_observation": "background",
@@ -1381,6 +1413,8 @@ EXPECTED_SEEDED_EVENTS = {
     # 4 (reload) stay in base_browser_history only.
     "browser_visit": 2,
     "browser_search": 1,
+    # One per capture moment: crobat's second display is the same moment.
+    "screen_capture": 2,
     # two opens + dismiss; impression, close and the session rows stay in base_feed.
     "feed_engagement": 4,
     "finance_transaction": 1,
@@ -1570,6 +1604,16 @@ def test_backfill_normalizes_every_source(warehouse):
     assert browser["5"]["title"] == "Searched: synthetic query"
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
+    screens = {r["source_pk"]["device"]: r for r in rows if r["source"] == "screen_timelapse"}
+    assert set(screens) == {"crobat", "joltik"}
+    assert screens["crobat"]["kind"] == "screen_capture"
+    assert screens["crobat"]["title"] == "crobat screen"
+    assert screens["crobat"]["source_table"] == "screen_timelapse_screenshots"
+    assert screens["crobat"]["source_pk"]["display_index"] == 1
+    assert screens["crobat"]["metadata"]["storage_file_id"] == "fid-crobat-1"
+    # Raw frames carry no text yet, so they stay out of search until the
+    # enrichment step gives them some.
+    assert screens["crobat"]["search_text"] == ""
     feed = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "feed"}
     assert set(feed) == {"fe2", "fe4", "fe5", "fe6"}
     assert feed["fe6"]["title"] == "Saved for later: A synthetic story"

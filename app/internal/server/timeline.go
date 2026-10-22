@@ -281,6 +281,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "github", kind: "activity"},
 	{source: "browser_history", kind: "visit"},
 	{source: "browser_history", kind: "search"},
+	{source: "screen_timelapse", kind: "screen_capture"},
 	{source: "feed", kind: "engagement"},
 	{source: "mutations", kind: "mutation"},
 	{source: "mutations", kind: "mutation_request"},

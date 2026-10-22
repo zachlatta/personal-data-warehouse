@@ -183,8 +183,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// sitting: when and why he opened the feed, how he moved through it)
 	// landed; its rendered line is "Per sitting.": 9998. 10000 is that line
 	// and no more.
-	if guidance > 10000 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10000)", guidance)
+	//
+	// 10000 held until 2026-10-22, when the screen timelapse source landed:
+	// the base_screen_timelapse schema line ("Screen timelapse.") and its two
+	// raw tables ("START HERE for screens.", "Accessibility trees."): 10055.
+	// 10060 is those three lines and no more.
+	if guidance > 10060 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10060)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

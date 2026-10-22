@@ -467,6 +467,18 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 `browser_history`, tier `self`) carry page views and web searches only; see
 [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-browser-history-upload-scheduler).
 
+## Screen Timelapse Sync
+
+`pdw ingest screen-timelapse` (LaunchAgent `com.zachlatta.personal-data-warehouse.screen-timelapse-upload`,
+every 5 minutes) sends the periodic whole-screen captures the capture loops in the sysadmin
+repository write -- one image per display about once a minute, plus the accessibility tree of the
+same moment when there is one -- to `/ingest/screen-timelapse/file`, one file per request, newest
+first. The app stores the bytes in the object store and writes the row into
+`base_screen_timelapse.screenshots` or `base_screen_timelapse.accessibility_trees` in the same
+request. One timeline adapter (`screen_capture`, source `screen_timelapse`, tier `noise`) carries one
+event per capture moment; see
+[docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-screen-timelapse-upload-scheduler).
+
 ## Hacker News Sync
 
 Archives Zach's Hacker News activity — his stories and comments, everything he upvoted,

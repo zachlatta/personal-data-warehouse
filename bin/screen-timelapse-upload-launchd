@@ -1,0 +1,53 @@
+#!/bin/zsh
+set -u
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# The uploader is native Go inside the signed pdw binary: `pdw ingest ...` reads
+# the source on this Mac and posts it to the app's ingest endpoints itself. No uv
+# and no Python anywhere in the exec chain (launchd -> zsh -> pdw). That chain
+# used to keep pdw OUT on purpose, because every pdw self-update replaced the
+# binary and macOS revoked the Full Disk Access keyed to it; release binaries
+# are now signed with a stable identity, so the grant survives updates. Grant
+# Full Disk Access to ~/.local/bin/pdw once per Mac (AGENTS.md "pdw CLI Full
+# Disk Access vs self-updates").
+# Sourced up here, not just before the heartbeat: pdw_export_app_credentials
+# has to run BEFORE the uploader so an operator-less environment still carries
+# the URL/token pdw would otherwise read from its config file.
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+# `.env` for the uploader's own settings (SCREEN_TIMELAPSE_SOURCES: which folder holds
+# which device's captures, and the Tailscale-direct origin)
+# is read from PDW_INGEST_PROJECT_DIR; pin it so launchd's cwd does not matter.
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
+LOG_DIR="$HOME/Library/Logs/personal-data-warehouse"
+LOG_FILE="$LOG_DIR/screen-timelapse-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/screen-timelapse-upload.heartbeat"
+
+mkdir -p "$LOG_DIR"
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting screen timelapse upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >> "$LOG_FILE"
+elif ! cd "$REPO_DIR"; then
+  exit_code=1
+  echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
+else
+  "$PDW" ingest screen-timelapse >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+pdw_post_heartbeat "screen_timelapse" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+echo "[$finished_at_iso] finished screen timelapse upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

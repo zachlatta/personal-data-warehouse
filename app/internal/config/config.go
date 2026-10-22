@@ -142,6 +142,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"browser_history":   "BROWSER_HISTORY",
 	"photos":            "PHOTOS",
 	"manual_finance":    "MANUAL_FINANCE",
+	"screen_timelapse":  "SCREEN_TIMELAPSE",
 }
 
 // IngestEnabled reports whether the app can accept client uploads: it needs the

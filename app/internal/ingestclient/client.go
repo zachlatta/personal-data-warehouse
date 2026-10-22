@@ -415,6 +415,44 @@ func (c *Client) UploadBrowserHistoryBatch(gzipBytes []byte, exportedAt string) 
 	return c.post("/ingest/browser-history/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
 }
 
+// --- screen timelapse --------------------------------------------------------
+
+// ScreenTimelapseFile names one capture file: the device whose screen it is,
+// its name exactly as the capture loop wrote it, and the instant its local
+// stamp resolves to in the capture host's zone.
+type ScreenTimelapseFile struct {
+	Device         string
+	SourceFilename string
+	CapturedAt     string
+	ContentType    string
+}
+
+// ScreenTimelapseStored is the app's answer: where the bytes are, and whether
+// the warehouse already held this file (nothing was uploaded).
+type ScreenTimelapseStored struct {
+	StoredObject
+	Skipped bool
+}
+
+// UploadScreenTimelapseFile posts one screenshot or accessibility tree. The
+// app stores the bytes and writes the file's row before it answers.
+func (c *Client) UploadScreenTimelapseFile(content []byte, f ScreenTimelapseFile) (ScreenTimelapseStored, error) {
+	contentType := f.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	payload, err := c.SignedPost("/ingest/screen-timelapse/file", content, contentType, map[string]string{
+		"device":          f.Device,
+		"source_filename": f.SourceFilename,
+		"captured_at":     f.CapturedAt,
+	})
+	if err != nil {
+		return ScreenTimelapseStored{}, err
+	}
+	skipped, _ := payload["skipped"].(bool)
+	return ScreenTimelapseStored{StoredObject: storedObjectFromPayload(payload), Skipped: skipped}, nil
+}
+
 // --- voice memos ------------------------------------------------------------
 
 // UploadVoiceMemoAudio lives in resumable.go: a recording streams to a Drive

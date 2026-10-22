@@ -327,6 +327,14 @@
       "comment": "Faithful browser history source data: Chrome, Brave and Safari visits."
     },
     {
+      "name": "base_screen_timelapse",
+      "layer": "base",
+      "domain": "screen_timelapse",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Screen timelapse. A periodic image of each device's whole screen and the accessibility tree of the same moment, stored raw in the object store."
+    },
+    {
       "name": "base_feed",
       "layer": "base",
       "domain": "feed",
@@ -3465,6 +3473,30 @@
       "query_access": "public",
       "secret": false,
       "comment": "START HERE for web browsing. One row per Chrome/Brave/Safari visit; search_term is set on web searches."
+    },
+    {
+      "id": "screen_timelapse_screenshots",
+      "kind": "table",
+      "layer": "base",
+      "domain": "screen_timelapse",
+      "schema": "base_screen_timelapse",
+      "name": "screenshots",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for screens. One row per periodic whole-screen image per device and display; fetch the pixels with get_object(storage_file_id)."
+    },
+    {
+      "id": "screen_timelapse_accessibility_trees",
+      "kind": "table",
+      "layer": "base",
+      "domain": "screen_timelapse",
+      "schema": "base_screen_timelapse",
+      "name": "accessibility_trees",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Accessibility trees. The tree captured with a screenshot, when there was one; join to screenshots on (device, captured_at). The tree itself is the stored object (get_object)."
     },
     {
       "id": "feed_items",

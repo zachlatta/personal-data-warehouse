@@ -90,6 +90,8 @@ from personal_data_warehouse.schema import (
     GITHUB_SYNC_STATE_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
     BROWSER_HISTORY_VISIT_COLUMNS,
+    SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
+    SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
     HACKER_NEWS_SESSION_COLUMNS,
     HACKER_NEWS_SYNC_STATE_COLUMNS,
@@ -388,6 +390,13 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         "browser_history",
         ("browser_visit", "browser_search"),
         "COALESCE(t.metadata->>'browser', t.kind)",
+    ),
+    # Periodic whole-screen frames; the subsource is the device. They carry no
+    # search text until an enrichment step reads them.
+    (
+        "screen_timelapse",
+        ("screen_capture",),
+        "COALESCE(t.metadata->>'device', t.kind)",
     ),
     # Feed tab acts (open / like / dismiss); the subsource is the act.
     (
@@ -1145,6 +1154,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         BROWSER_HISTORY_VISIT_COLUMNS,
         ("account", "device", "browser", "profile", "visit_id"),
     ),
+    # Screen timelapse: one row per capture file, written by the app's
+    # /ingest/screen-timelapse/file endpoint as it stores the bytes.
+    "screen_timelapse_screenshots": TableSpec(
+        SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
+        ("device", "captured_at", "display_index"),
+    ),
+    "screen_timelapse_accessibility_trees": TableSpec(
+        SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
+        ("device", "captured_at"),
+    ),
     # Hacker News. `account` is the HN username.
     "hacker_news_items": TableSpec(HACKER_NEWS_ITEM_COLUMNS, ("account", "item_id")),
     "hacker_news_user_items": TableSpec(
@@ -1827,6 +1846,28 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "browser_history_visits_visited_idx",
         "browser_history_visits",
         "CREATE INDEX IF NOT EXISTS browser_history_visits_visited_idx ON @browser_history_visits (visited_at DESC)",
+    ),
+    # Screen timelapse. ingested_at leads for the freshness probe and the
+    # timeline adapter's incremental pass; captured_at serves its backfill
+    # (the primary key leads with device, which is also what joins a tree to
+    # the screenshots of its moment).
+    IndexSpec(
+        "screen_timelapse_screenshots_ingested_idx",
+        "screen_timelapse_screenshots",
+        "CREATE INDEX IF NOT EXISTS screen_timelapse_screenshots_ingested_idx "
+        "ON @screen_timelapse_screenshots (ingested_at)",
+    ),
+    IndexSpec(
+        "screen_timelapse_screenshots_captured_idx",
+        "screen_timelapse_screenshots",
+        "CREATE INDEX IF NOT EXISTS screen_timelapse_screenshots_captured_idx "
+        "ON @screen_timelapse_screenshots (captured_at DESC)",
+    ),
+    IndexSpec(
+        "screen_timelapse_accessibility_trees_ingested_idx",
+        "screen_timelapse_accessibility_trees",
+        "CREATE INDEX IF NOT EXISTS screen_timelapse_accessibility_trees_ingested_idx "
+        "ON @screen_timelapse_accessibility_trees (ingested_at)",
     ),
     IndexSpec(
         "hacker_news_items_synced_idx",
@@ -2958,6 +2999,8 @@ INTEGER_COLUMNS = {
     "consecutive_failures",
     # Muse workspace files: 1 when the content is inline text.
     "is_text",
+    # screen_timelapse
+    "display_index",
     # browser_history
     "transition_raw",
     "is_redirect",
@@ -3361,6 +3404,11 @@ _WHOOP_PRIVATE_TABLES = (
 )
 
 _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
+
+_SCREEN_TIMELAPSE_TABLES = (
+    "screen_timelapse_screenshots",
+    "screen_timelapse_accessibility_trees",
+)
 
 _HACKER_NEWS_TABLES = (
     "hacker_news_items",
@@ -10687,6 +10735,15 @@ class PostgresWarehouse:
     # --- Hacker News -------------------------------------------------------
 
     # --- Browser history ---------------------------------------------------
+
+    def ensure_screen_timelapse_tables(self) -> None:
+        """Provision base_screen_timelapse.screenshots and .accessibility_trees.
+
+        Their rows are written by the Go app as it stores each file, so this
+        is the only Python on the write path: the tables must exist before the
+        first upload, and an upload that finds them missing is retried.
+        """
+        self._ensure_table_group(list(_SCREEN_TIMELAPSE_TABLES))
 
     def ensure_browser_history_tables(self) -> None:
         """Provision base_browser_history.visits."""

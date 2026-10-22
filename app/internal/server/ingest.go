@@ -84,6 +84,10 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	"photos": {source: "photos", blobKind: "photo_file", metadataKind: "photo_metadata"},
 	// Manually uploaded finance documents (statements, valuations, exports).
 	"manual_finance": {source: "manual_finance", blobKind: "manual_finance_document", metadataKind: "manual_finance_metadata"},
+	// Periodic whole-screen images and accessibility trees. Its one endpoint
+	// (screen_timelapse_ingest.go) writes the row with the bytes, so nothing
+	// reads this store by kind; the rows carry the pointers.
+	"screen_timelapse": {source: "screen_timelapse", blobKind: "screen_timelapse_screenshot", metadataKind: "screen_timelapse_accessibility_tree"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's

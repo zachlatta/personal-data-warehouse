@@ -85,6 +85,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_screen_timelapse_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -174,7 +175,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 base: base_feed.items/.events, the Feed tab's cards and the
         # phone's engagement log (docs/feed.md), +1 base_feed.item_versions,
         # every past version of a card.
-        "base": 85,
+        # +2 base: base_screen_timelapse.screenshots/.accessibility_trees, the
+        # periodic whole-screen captures and their accessibility trees.
+        "base": 87,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

@@ -661,6 +661,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("browser_history"),
     ),
     _source(
+        "screen_timelapse",
+        "Screen timelapse",
+        cadence="capture every minute while in use; uploader every 5 min",
+        transport=(
+            "capture loop → Mac LaunchAgent → /ingest/screen-timelapse/file"
+            " → Drive + the row, in one request"
+        ),
+        data=2 * DAY,
+        basis=(
+            "the loop captures only while the screen is unlocked and in use, so a"
+            " Mac in daily use writes frames every day; 2 days (late at 4) leaves"
+            " room for a weekend away. The run heartbeat in ops.uploader_heartbeats"
+            " catches the uploader failing on a day the screen was in use"
+        ),
+        note="run heartbeat posted by bin/screen-timelapse-upload-launchd",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("screen_timelapse"),
+    ),
+    _source(
         "feed",
         "Feed tab",
         cadence="on demand",
@@ -1506,6 +1525,10 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "contact_sync_state": _state("google_contacts", "updated_at"),
     "apple_contact_cards": _data("apple_contacts", "synced_at", "source_updated_at"),
     "browser_history_visits": _data("browser_history", "synced_at", "visited_at"),
+    "screen_timelapse_screenshots": _data("screen_timelapse", "ingested_at", "captured_at"),
+    "screen_timelapse_accessibility_trees": _data(
+        "screen_timelapse", "ingested_at", "captured_at"
+    ),
     "feed_items": _support("feed", "updated_at", "created_at", "cards agents push"),
     "feed_events": _data("feed", "received_at", "occurred_at"),
     "feed_item_versions": _support("feed", "changed_at", None, "card history written by a trigger"),
