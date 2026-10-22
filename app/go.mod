@@ -1,13 +1,13 @@
 module github.com/zachlatta/personal-data-warehouse/app
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/google/jsonschema-go v0.4.2
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/modelcontextprotocol/go-sdk v1.5.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/oauth2 v0.35.0
 	golang.org/x/sync v0.23.0
 	modernc.org/sqlite v1.58.0
