@@ -589,7 +589,7 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		fmt.Fprintf(w, "since %s: %d sessions\n", str(out, "since"), int(num(out, "sessions")))
 		if byType, ok := out["events_by_type"].(map[string]any); ok && len(byType) > 0 {
 			parts := []string{}
-			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "share", "save", "unsave", "session_start", "session_end"} {
+			for _, kind := range []string{"impression", "open", "close", "expand", "dismiss", "undismiss", "share", "save", "unsave", "like", "unlike", "session_start", "session_end"} {
 				if n, ok := byType[kind].(float64); ok {
 					parts = append(parts, fmt.Sprintf("%s=%d", kind, int(n)))
 				}

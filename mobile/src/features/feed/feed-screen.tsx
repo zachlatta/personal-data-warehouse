@@ -41,6 +41,7 @@ import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
 import { sourceBubbles } from './rich';
 import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
+import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { mailtoUrl, shareDraft } from './share';
@@ -96,6 +97,7 @@ export default function FeedScreen() {
   const [only, setOnly] = useState<string | null>(null);
   const bubbles = useMemo(() => sourceBubbles(items), [items]);
   const savedIds = useSavedIds();
+  const likedIds = useLikedIds();
   const shown = useMemo(() => {
     if (only === SAVED) return savedIds.map((id) => feedItems.get(id)).filter((i): i is FeedItem => !!i);
     return only ? items.filter((i) => i.source === only) : items;
@@ -167,6 +169,7 @@ export default function FeedScreen() {
       });
       for (const item of page.items) feedItems.set(item.item_id, item);
       loadSaved(page.saved ?? []);
+      loadLiked([...page.items, ...(page.saved ?? [])]);
       const fresh = trigger === 'stale' && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
       setArrivals(fresh);
       if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
@@ -342,18 +345,30 @@ export default function FeedScreen() {
     [router],
   );
 
-  // A link inside a post (index -1) or one of the card's links.
+  // A link inside a post or the card's text (index -1, via says which) or
+  // one of the card's links.
   const onBrowse = useCallback(
-    (item: FeedItem, link?: CardLink) => void openInBrowser(item, link ? (link.index < 0 ? 'post_link' : 'link') : 'card', link),
+    (item: FeedItem, link?: CardLink, via?: string) =>
+      void openInBrowser(item, via ?? (link ? (link.index < 0 ? 'post_link' : 'link') : 'card'), link),
     [openInBrowser],
   );
 
-  // A carousel swipe or a video play. A video plays in the system player;
-  // its watch time is recorded like reading time.
+  // A carousel swipe or a video play. A video plays in the card (inline);
+  // one among photos in an X post still plays in the system player. Watch
+  // time is recorded like reading time: a close with mode video.
   const onMedia = useCallback(
     async (item: FeedItem, a: MediaAction) => {
-      recordFeedEvent('media', { item_id: item.item_id, position: position(item), dwell_ms: a.dwellMs, metadata: { action: a.action, index: a.index } });
-      if (a.action !== 'play' || !a.url) return;
+      if (a.action === 'stop') {
+        recordFeedEvent('close', { item_id: item.item_id, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true } });
+        return;
+      }
+      recordFeedEvent('media', {
+        item_id: item.item_id,
+        position: position(item),
+        dwell_ms: a.dwellMs,
+        metadata: { action: a.action, index: a.index, ...(a.inline ? { inline: true } : {}) },
+      });
+      if (a.action !== 'play' || !a.url || a.inline) return;
       pause();
       const startedAt = Date.now();
       try {
@@ -366,8 +381,8 @@ export default function FeedScreen() {
     [measure, pause],
   );
 
-  // A swipe opens a draft of the card in the default mail app for him to
-  // address.
+  // The paper plane opens a draft of the card in the default mail app for
+  // him to address.
   const onShare = useCallback(async (item: FeedItem, preview: string) => {
     try {
       await Linking.openURL(mailtoUrl(shareDraft(item, preview)));
@@ -431,11 +446,17 @@ export default function FeedScreen() {
     setUndo(null);
   }, [undo]);
 
+  // The heart on a card, an X post's heart, the detail view or the menu.
+  const onLike = useCallback((item: FeedItem, via: string) => {
+    toggleLiked(item, { position: position(item), via });
+  }, []);
+
   const onMenu = useCallback(
     (item: FeedItem) => {
       const from = item.site || item.source;
       const saveLabel = savedIds.includes(item.item_id) ? 'Remove from Saved' : 'Save for later';
-      const options = [saveLabel, 'Not interested', `Less from ${from}`, 'Cancel'];
+      const likeLabel = likedIds.includes(item.item_id) ? 'Unlike' : 'Like';
+      const options = [saveLabel, 'Not interested', `Less from ${from}`, likeLabel, 'Cancel'];
       const openedAt = Date.now();
       recordUi('menu_open', { item_id: item.item_id, position: position(item) });
       const pick = (i: number) => {
@@ -443,28 +464,30 @@ export default function FeedScreen() {
           item_id: item.item_id,
           position: position(item),
           dwell_ms: Date.now() - openedAt,
-          metadata: { choice: ['save', 'not_interested', 'less_like_this', 'cancel'][i] ?? 'cancel' },
+          metadata: { choice: ['save', 'not_interested', 'less_like_this', 'like', 'cancel'][i] ?? 'cancel' },
         });
         if (i === 0) onSave(item, 'menu');
         if (i === 1) dismiss(item, 'not_interested');
         if (i === 2) dismiss(item, 'less_like_this');
+        if (i === 3) onLike(item, 'menu');
       };
       if (Platform.OS === 'ios') {
-        ActionSheetIOS.showActionSheetWithOptions({ options, cancelButtonIndex: 3, destructiveButtonIndex: 1, title: item.title || undefined }, pick);
+        ActionSheetIOS.showActionSheetWithOptions({ options, cancelButtonIndex: 4, destructiveButtonIndex: 1, title: item.title || undefined }, pick);
       } else {
         Alert.alert(item.title || 'This card', undefined, [
           { text: options[0], onPress: () => pick(0) },
           { text: options[1], onPress: () => pick(1) },
           { text: options[2], onPress: () => pick(2) },
-          { text: 'Cancel', style: 'cancel', onPress: () => pick(3) },
+          { text: options[3], onPress: () => pick(3) },
+          { text: 'Cancel', style: 'cancel', onPress: () => pick(4) },
         ]);
       }
     },
-    [dismiss, onSave, savedIds],
+    [dismiss, onSave, onLike, savedIds, likedIds],
   );
 
-  // A swipe begun, whether or not it went far enough to save or share.
-  const onSwipeStart = useCallback((item: FeedItem, toward: 'save' | 'share') => {
+  // A swipe begun, whether or not it went far enough to save or hide.
+  const onSwipeStart = useCallback((item: FeedItem, toward: 'save' | 'dismiss') => {
     recordUi('swipe_start', { item_id: item.item_id, position: position(item), metadata: { toward } });
   }, []);
 
@@ -473,7 +496,10 @@ export default function FeedScreen() {
       <FeedCard
         item={item}
         saved={savedIds.includes(item.item_id)}
+        liked={likedIds.includes(item.item_id)}
         onSave={onSave}
+        onLike={onLike}
+        onDismiss={dismiss}
         onLayout={onCardLayout}
         onOpen={onOpen}
         onBrowse={onBrowse}
@@ -484,7 +510,7 @@ export default function FeedScreen() {
         onSwipeStart={onSwipeStart}
       />
     ),
-    [savedIds, onSave, onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare, onSwipeStart],
+    [savedIds, likedIds, onSave, onLike, dismiss, onCardLayout, onOpen, onBrowse, onMedia, onExpand, onMenu, onShare, onSwipeStart],
   );
 
   if (!loaded) {
@@ -500,7 +526,7 @@ export default function FeedScreen() {
       <FlatList
         ref={list}
         data={shown}
-        extraData={savedIds}
+        extraData={[savedIds, likedIds]}
         keyExtractor={(item) => item.item_id}
         renderItem={renderItem}
         onScroll={onScroll}

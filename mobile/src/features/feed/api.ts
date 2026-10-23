@@ -23,7 +23,7 @@ export type FeedItem = {
   created_at: string;
   // Whatever the pushing agent kept (why it was picked, taste, hn_points).
   metadata?: Record<string, unknown>;
-  engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number; saved?: boolean };
+  engagement: { impressions: number; opens: number; engaged: boolean; engagement_score: number; saved?: boolean; liked?: boolean };
   // A seen card shown again after every unseen one, so the feed never runs dry.
   resurfaced?: boolean;
 };

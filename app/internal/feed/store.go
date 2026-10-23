@@ -107,7 +107,7 @@ const itemColumns = `i.item_id, i.source, i.item_key, i.title, i.body, i.url, i.
 	COALESCE(e.impressions, 0), COALESCE(e.dwell_ms, 0), COALESCE(e.scroll_pasts, 0), COALESCE(e.opens, 0),
 	COALESCE(e.links_opened, 0), COALESCE(e.read_ms, 0), COALESCE(e.expands, 0), COALESCE(e.dismissed, 0),
 	COALESCE(e.dismiss_reason, ''), COALESCE(e.engaged, 0), COALESCE(e.engagement_score, 0), e.first_seen_at,
-	COALESCE(e.saved, 0), e.saved_at,
+	COALESCE(e.saved, 0), e.saved_at, COALESCE(e.liked, 0), e.liked_at,
 	COALESCE((SELECT max(v.version) FROM @feed_item_versions v WHERE v.item_id = i.item_id), 0)`
 
 func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
@@ -252,7 +252,8 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 			metadata                    []byte
 			published, expires, removed time.Time
 			dismissed, engaged, saved   int64
-			firstSeen, savedAt          sql.NullTime
+			liked                       int64
+			firstSeen, savedAt, likedAt sql.NullTime
 		)
 		if err := rows.Scan(&item.ItemID, &item.Source, &item.Key, &item.Title, &item.Body, &item.URL, &links,
 			&item.ImageURL, &media, &embed, &item.Author, &item.Site, &tags, &item.Score, &published, &expires, &metadata, &item.PushedBy,
@@ -260,7 +261,7 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 			&item.Engagement.Impressions, &item.Engagement.DwellMS, &item.Engagement.ScrollPasts,
 			&item.Engagement.Opens, &item.Engagement.LinksOpened, &item.Engagement.ReadMS, &item.Engagement.Expands,
 			&dismissed, &item.Engagement.DismissReason, &engaged, &item.Engagement.Score, &firstSeen,
-			&saved, &savedAt, &item.Version); err != nil {
+			&saved, &savedAt, &liked, &likedAt, &item.Version); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(media, &item.Media)
@@ -288,6 +289,10 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 		item.Engagement.Saved = saved == 1
 		if savedAt.Valid {
 			item.Engagement.SavedAt = fromEpoch(savedAt.Time)
+		}
+		item.Engagement.Liked = liked == 1
+		if likedAt.Valid {
+			item.Engagement.LikedAt = fromEpoch(likedAt.Time)
 		}
 		items = append(items, item)
 	}
@@ -416,6 +421,7 @@ type SourceStats struct {
 	ItemsEngaged   int64      `json:"items_engaged"`
 	ItemsDismissed int64      `json:"items_dismissed"`
 	ItemsSaved     int64      `json:"items_saved"`
+	ItemsLiked     int64      `json:"items_liked"`
 	OpenRate       *float64   `json:"open_rate"`
 	EngagedRate    *float64   `json:"engaged_rate"`
 	DismissRate    *float64   `json:"dismiss_rate"`
@@ -441,7 +447,7 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	rows, err := s.DB.QueryContext(qctx, s.q(`
 		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_engaged,
 		       items_dismissed, open_rate::float8, engaged_rate::float8, dismiss_rate::float8,
-		       avg_engagement_score::float8, last_pushed_at, last_event_at, items_saved
+		       avg_engagement_score::float8, last_pushed_at, last_event_at, items_saved, items_liked
 		FROM @marts_feed_source_engagement WHERE ($1 = '' OR source = $1) ORDER BY items DESC, source`), source)
 	if err != nil {
 		return out, err
@@ -453,7 +459,7 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		)
 		if err := rows.Scan(&row.Source, &row.Items, &row.LiveItems, &row.ItemsSeen, &row.Impressions, &row.DwellMS,
 			&row.ItemsOpened, &row.ReadMS, &row.ItemsEngaged, &row.ItemsDismissed, &row.OpenRate, &row.EngagedRate,
-			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen, &row.ItemsSaved); err != nil {
+			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen, &row.ItemsSaved, &row.ItemsLiked); err != nil {
 			rows.Close()
 			return out, err
 		}

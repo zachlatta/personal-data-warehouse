@@ -19,7 +19,9 @@ export type FeedEventType =
   | 'unsave'
   | 'ui'
   | 'scroll'
-  | 'load';
+  | 'load'
+  | 'like'
+  | 'unlike';
 
 export type FeedEvent = {
   event_id: string;

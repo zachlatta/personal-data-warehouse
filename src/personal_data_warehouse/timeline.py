@@ -2230,7 +2230,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
     ingest_ts="t.received_at",
     actor="'me'",
     title=(
-        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'share' THEN 'Shared: ' WHEN 'save' THEN 'Saved for later: ' ELSE 'Dismissed: ' END, "
+        "concat(CASE t.event_type WHEN 'open' THEN 'Opened: ' WHEN 'share' THEN 'Shared: ' WHEN 'save' THEN 'Saved for later: ' WHEN 'like' THEN 'Liked: ' ELSE 'Dismissed: ' END, "
         "COALESCE(NULLIF(i.title, ''), i.url, t.item_id))"
     ),
     snippet=_snippet("concat_ws(' · ', NULLIF(i.source, ''), NULLIF(i.site, ''), NULLIF(i.url, ''))"),
@@ -2243,7 +2243,7 @@ _FEED_ENGAGEMENT = _simple_adapter(
         "'mode', t.metadata->>'mode')"
     ),
     search_text=_search_concat("i.title", "left(i.body, 2000)", "i.site", "i.author", "i.source"),
-    where="t.event_type IN ('open', 'dismiss', 'share', 'save')",
+    where="t.event_type IN ('open', 'dismiss', 'share', 'save', 'like')",
     priority=TIMELINE_PRIORITY_SELF,
 )
 

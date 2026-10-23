@@ -18,6 +18,7 @@ import { parseMarkdown, type Span } from './markdown';
 import type { FeedEmbed } from './rich';
 import {
   ACCENT,
+  LIKE_RED,
   MediaCarousel,
   MediaGrid,
   PostAvatar,
@@ -28,7 +29,10 @@ import {
   SourceAvatar,
   type MediaAction,
 } from './rich-views';
+import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
+import { cardVideo } from './video';
+import { InlineVideo } from './video-player';
 
 function fullDate(iso: string | undefined): string {
   if (!iso) return '';
@@ -42,12 +46,14 @@ function DetailPost({
   embed,
   first,
   more,
+  playerKey,
   onLink,
   onMedia,
 }: {
   embed: FeedEmbed;
   first: boolean;
   more: boolean;
+  playerKey: string;
   onLink: (url: string) => void;
   onMedia: (a: MediaAction) => void;
 }) {
@@ -63,10 +69,10 @@ function DetailPost({
         {embed.text ? <PostText text={embed.text} style={first ? styles.postTextBig : styles.postText} onLink={onLink} /> : null}
         {embed.media?.length ? (
           <View style={styles.postMedia}>
-            <MediaGrid media={embed.media} onMedia={onMedia} />
+            <MediaGrid media={embed.media} onMedia={onMedia} playerKey={playerKey} />
           </View>
         ) : null}
-        {embed.quote ? <QuotePost embed={embed.quote} onLink={onLink} onMedia={onMedia} /> : null}
+        {embed.quote ? <QuotePost embed={embed.quote} onLink={onLink} onMedia={onMedia} playerKey={`${playerKey}:quote`} /> : null}
         {first ? (
           <ThemedText style={[styles.postDate, { color: theme.textSecondary }]}>{fullDate(embed.created_at)}</ThemedText>
         ) : null}
@@ -110,6 +116,7 @@ export default function FeedReaderScreen() {
   const contentHeight = useRef(0);
   const position = params.position ? Number(params.position) : undefined;
   const saved = useSavedIds().includes(params.id);
+  const liked = useLikedIds().includes(params.id);
 
   useFocusEffect(
     useCallback(() => {
@@ -180,8 +187,17 @@ export default function FeedReaderScreen() {
   const onMedia = useCallback(
     async (a: MediaAction) => {
       if (!itemId) return;
-      recordFeedEvent('media', { item_id: itemId, position, dwell_ms: a.dwellMs, metadata: { action: a.action, index: a.index, in: 'detail' } });
-      if (a.action !== 'play' || !a.url) return;
+      if (a.action === 'stop') {
+        recordFeedEvent('close', { item_id: itemId, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true, in: 'detail' } });
+        return;
+      }
+      recordFeedEvent('media', {
+        item_id: itemId,
+        position,
+        dwell_ms: a.dwellMs,
+        metadata: { action: a.action, index: a.index, in: 'detail', ...(a.inline ? { inline: true } : {}) },
+      });
+      if (a.action !== 'play' || !a.url || a.inline) return;
       const startedAt = Date.now();
       await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
       recordFeedEvent('close', { item_id: itemId, dwell_ms: Date.now() - startedAt, metadata: { mode: 'video', index: a.index } });
@@ -202,6 +218,7 @@ export default function FeedReaderScreen() {
 
   const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
   const media = cardMedia(item);
+  const video = embed ? null : cardVideo(item);
   const links = cardLinks(item);
   const name = item.site || item.source;
   const posts = embed ? [embed, ...(embed.thread ?? [])] : [];
@@ -212,12 +229,20 @@ export default function FeedReaderScreen() {
         options={{
           title: embed ? 'Post' : name,
           headerRight: () => (
-            <Pressable
-              hitSlop={12}
-              onPress={() => toggleSaved(item, { position, via: 'detail' })}
-              accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
-              <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
-            </Pressable>
+            <View style={styles.headerButtons}>
+              <Pressable
+                hitSlop={12}
+                onPress={() => toggleLiked(item, { position, via: 'detail' })}
+                accessibilityLabel={liked ? 'Unlike' : 'Like'}>
+                <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.text} size={22} />
+              </Pressable>
+              <Pressable
+                hitSlop={12}
+                onPress={() => toggleSaved(item, { position, via: 'detail' })}
+                accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
+                <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
+              </Pressable>
+            </View>
           ),
         }}
       />
@@ -236,7 +261,15 @@ export default function FeedReaderScreen() {
               <ThemedText style={[styles.context, { color: theme.textSecondary }]}>{item.title}</ThemedText>
             ) : null}
             {posts.map((post, i) => (
-              <DetailPost key={post.id || i} embed={post} first={i === 0} more={i < posts.length - 1} onLink={onPostLink} onMedia={onMedia} />
+              <DetailPost
+                key={post.id || i}
+                embed={post}
+                first={i === 0}
+                more={i < posts.length - 1}
+                playerKey={`detail:${item.item_id}:${i}`}
+                onLink={onPostLink}
+                onMedia={onMedia}
+              />
             ))}
           </View>
         ) : (
@@ -250,7 +283,19 @@ export default function FeedReaderScreen() {
                 </ThemedText>
               </View>
             </View>
-            {media.length ? <MediaCarousel media={media} onMedia={onMedia} recyclingKey={item.item_id} /> : null}
+            {video ? (
+              <InlineVideo
+                source={video}
+                playerKey={`detail:${item.item_id}`}
+                aspect={video.kind === 'file' ? 1 : 16 / 9}
+                radius={0}
+                durationSec={media.find((m) => m.type !== 'image')?.duration_sec}
+                onPlay={() => void onMedia({ action: 'play', index: 0, inline: true })}
+                onStop={(ms) => void onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+              />
+            ) : media.length ? (
+              <MediaCarousel media={media} onMedia={onMedia} recyclingKey={`detail:${item.item_id}`} />
+            ) : null}
             <View style={[styles.pad, styles.gap]}>
               {item.title ? <ThemedText style={styles.title}>{item.title}</ThemedText> : null}
               {item.tags.length ? (
@@ -326,6 +371,7 @@ export default function FeedReaderScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   flex: { flex: 1 },
+  headerButtons: { flexDirection: 'row', alignItems: 'center', gap: 18 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
   content: { paddingTop: Spacing.three, paddingBottom: Spacing.six, gap: Spacing.three },
   pad: { paddingHorizontal: Spacing.three },

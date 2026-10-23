@@ -29,9 +29,19 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   replies/reposts/likes/views, media, quote, the author's own thread). The push path fills
   it for any card whose url is an x.com/twitter.com status (`xpost.go`, from
   `api.fxtwitter.com`, 8 s timeout, 8 at a time); a post it cannot read stays a plain card
-  and the push still succeeds. The phone draws three card shapes: X post, media
-  (Instagram), link. A tap opens the detail view (whole thread or summary, every photo, all
-  links); the compass opens the page; a video plays in the system player. A rail of source
+  and the push still succeeds. Since 2026-10-23 (voice memo: "look at the Muse feed
+  structure ... I like how the Muse feed is displayed") every card is one row laid out like
+  Muse's feed: the source icon in a left column; beside it the headline with its age and a
+  `...` menu, a few lines of text with links in blue, the picture inset with rounded
+  corners, and an action row led by the heart (like), then Details, open page, share and
+  save. An X post keeps X's own row (its heart is the like button). A tap opens the detail
+  view (whole thread or summary, every photo, all links); the compass opens the page.
+  **Videos play in the card** (same memo: "embed videos if possible"; `video.ts`,
+  `video-player.tsx`): a card whose url is a YouTube or Vimeo video, or whose one media item
+  is a video (an X post's mp4), shows a poster and plays in place in a WebView (YouTube's
+  embedded player, or a plain `<video>` sent with no referrer because video.twimg.com
+  refuses a foreign one). One video plays at a time; leaving the screen stops it. A video
+  among several photos still plays in the system player. A rail of source
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.
 - **Card context** (added 2026-10-21 after reviewing the recordings): `GET /api/feed`
@@ -63,8 +73,9 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` detail, browser, or reader before 2026-10-20;
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
   `close` (`dwell_ms` = time spent after the open; the detail view adds `scroll_depth`), `expand`
-  (tapped "More"), `dismiss` (`metadata.reason`: `not_interested` or
-  `less_like_this`) / `undismiss` (the 5-second Undo), `share` (swiped left or tapped a share button to email
+  (tapped "More"), `dismiss` (`metadata.reason`: `not_interested`,
+  `less_like_this`, or `swipe` = swiped left, since 2026-10-23) / `undismiss` (the 5-second Undo),
+  `like` / `unlike` (the heart; `metadata.via` `button`, `menu` or `detail`), `share` (tapped the paper plane or share button, or swiped left before 2026-10-23, to email
   the card from the default mail app; `metadata.via` = `mailto`, `superhuman` before 2026-10-21),
   `media` (`metadata.action`: `swipe` a carousel, `play` a video, `view` a photo opened full
   screen, `view_swipe` to another photo there, `share` one photo from it; `index` is the
@@ -72,7 +83,8 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   A tap on a photo in an X post (feed or detail) or in the detail view's carousel opens
   the full-screen viewer: swipe between photos, pinch or double-tap to zoom, and the share
   button downloads that one photo (X photos at `name=orig`) to the iOS share sheet.
-  A `close` with `metadata.mode` `video` is watch time.
+  A `close` with `metadata.mode` `video` is watch time; `metadata.inline` = it played in
+  the card (a `media` `play` with `inline` starts it).
   `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,
   `swipe`, `menu`, `detail`, `undo`, or `agent` when `feed_save` did it for him).
 - **Everything else he does** (added 2026-10-21 from Zach's voice memo: "collect
@@ -89,7 +101,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     has the card's `item_id` and `metadata.in` = `detail`, `content_height`.
   - `ui`: any other tap, named by `metadata.action`: `filter` (the source rail; `from`,
     `to`), `refresh` (pull to refresh), `menu_open` / `menu_pick` (`choice`, including
-    `cancel`; `dwell_ms` = time the menu was up), `undo`, `swipe_start` (`toward` save or
+    `cancel`; `dwell_ms` = time the menu was up), `undo`, `swipe_start` (`toward` save, dismiss since 2026-10-23, or
     share, whether or not it went far enough), `scroll_to_top` (status bar tap), `tab_to_top` (Feed tapped in the tab bar while on it, from `from_y`),
     `end_reached` (scrolled to "That is everything"), `share_failed`, `new_pill_shown` /
     `new_pill` (X's "new posts" pill: a reload brought `count` cards while he was scrolled
@@ -106,7 +118,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     `duration_ms`, `trigger`, `end_reason`, `device`, `app_version`, `update_id`,
     `cards_seen`, `impressions`, `card_dwell_ms`, `deepest_position`, `scrolls`,
     `scroll_distance`, `opens`, `expands`, `shares`, `saves`, `dismisses`, `taps`, `loads`,
-    `events`. A detail view takes the Feed off screen, so its events have no sitting.
+    `events`, `likes`. A detail view takes the Feed off screen, so its events have no sitting.
 - **Saved for later** (added 2026-10-21 from Zach's voice memo: "some kind of way to mark
   something as ... an important thing for me to read or consume, like add to my queue"):
   the bookmark on a card (the card's action row, an X post's metrics row, the detail
@@ -120,12 +132,17 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   `engagement_score`, and is a `feed_engagement` timeline event. The phone keeps its own
   taps pending for 2 minutes (`saved-queue.ts`) so a reload that beats the event upload
   does not undo them on screen.
-- **No likes; engagement is measured.** The like button was removed on 2026-10-20 at Zach's
-  request ("we should just have it measure engagement"). `engaged` = opened (any link,
-  or the detail view), tapped More, swiped photos or played a video (`media` events count
-  with expands), shared, or 5 s on screen; `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share +
-  time on the card (up to 6 for a minute) + reading time (up to 10 for ten minutes) - 5 if
-  dismissed, + 3 while saved for later (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows unseen cards first: a
+- **Likes, on top of measured engagement.** The like button was removed on 2026-10-20 ("we
+  should just have it measure engagement") and brought back on 2026-10-23 (voice memo:
+  "add the like button back so I can mark which things I like"). The heart on every card's
+  action row (and the detail view's header) records `like` / `unlike`; the current state is
+  `liked`, `liked_at` on `marts_feed.item_engagement`, `items_liked` per source, `likes`
+  per sitting, and a like is a `feed_engagement` timeline event ("Liked: ..."). `engaged` =
+  opened (any link, or the detail view), tapped More, swiped photos or played a video
+  (`media` events count with expands), shared, saved, liked, or 5 s on screen;
+  `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share + 3 while saved +
+  5 while liked + time on the card (up to 6 for a minute) + reading time (up to 10 for ten
+  minutes) - 5 if dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows unseen cards first: a
   card leaves that part at its first impression (Zach, 2026-10-20: "after I've seen a post,
   don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved. The feed is
   never empty (Zach, 2026-10-21: "just have it always have more stuff"): when the unseen
@@ -135,7 +152,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
 - **Analytics**: `marts_feed.sessions` (per sitting, above), `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
-- **C1/C2**: opens, shares, saves and dismissals are `feed_engagement` timeline events at tier
+- **C1/C2**: opens, shares, saves, likes and dismissals are `feed_engagement` timeline events at tier
   `self` (Zach did them). Impressions, closes, expands and sessions are telemetry and stay in
   `base_feed.events`; cards are entities reached through the marts view.
 - **C7**: pipeline `feed` with no freshness expectation (it is quiet when nobody pushes or

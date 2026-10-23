@@ -8,6 +8,8 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 import { PhotoViewer } from './photo-viewer';
+import { mediaVideo } from './video';
+import { InlineVideo } from './video-player';
 import {
   avatarColor,
   compactCount,
@@ -23,16 +25,19 @@ import {
 } from './rich';
 
 export const ACCENT = '#1D9BF0';
+export const LIKE_RED = '#F91880';
 
 // What the views report up so engagement can count it: a swipe to another
-// photo, a tap to play a video, a photo opened full screen (view), a swipe
+// photo, a tap to play a video (inline when it plays in the card, and stop
+// with dwellMs = watch time when it ends), a photo opened full screen (view), a swipe
 // to another photo there (view_swipe), one photo shared from it (share), a
 // zoom into a photo there (zoom), and the viewer closed (view_close, with
 // dwellMs = time in the viewer). index is the photo's place in the card's
 // media.
 export type MediaAction = {
-  action: 'swipe' | 'play' | 'view' | 'view_swipe' | 'share' | 'zoom' | 'view_close';
+  action: 'swipe' | 'play' | 'stop' | 'view' | 'view_swipe' | 'share' | 'zoom' | 'view_close';
   index: number;
+  inline?: boolean;
   url?: string;
   dwellMs?: number;
 };
@@ -178,19 +183,37 @@ function Still({ media, recyclingKey }: { media: FeedMedia; recyclingKey?: strin
 }
 
 // X's media block: 1 to 4 photos or videos in a rounded grid. A tap on a
-// photo opens it full screen, as X does; a tap on a video plays it.
+// photo opens it full screen, as X does; a lone video plays in place, one
+// among photos in the system player. playerKey names the inline player
+// (unique per screen), defaulting to recyclingKey.
 export function MediaGrid({
   media,
   onMedia,
   recyclingKey,
+  playerKey,
 }: {
   media: FeedMedia[];
   onMedia: (a: MediaAction) => void;
   recyclingKey?: string;
+  playerKey?: string;
 }) {
   const theme = useTheme();
   const photos = usePhotoViewer(media, onMedia);
   const rows = mediaGrid(media.length);
+  const lone = media.length === 1 ? mediaVideo(media[0]) : null;
+  if (lone) {
+    return (
+      <InlineVideo
+        source={lone}
+        playerKey={playerKey ?? recyclingKey ?? media[0].url}
+        aspect={mediaAspect(media[0], 16 / 9)}
+        durationSec={media[0].duration_sec}
+        radius={16}
+        onPlay={() => onMedia({ action: 'play', index: 0, inline: true })}
+        onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+      />
+    );
+  }
   if (!rows.length) return null;
   const aspect = media.length === 1 ? mediaAspect(media[0], 16 / 9) : 16 / 9;
   const press = (i: number) => {
@@ -227,15 +250,20 @@ export function MediaCarousel({
   onMedia,
   recyclingKey,
   inset = 0,
+  width: fixed,
+  radius = 0,
 }: {
   media: FeedMedia[];
   onPress?: () => void;
   onMedia: (a: MediaAction) => void;
   recyclingKey?: string;
   inset?: number;
+  // A set width (a card's text column) instead of the screen less inset.
+  width?: number;
+  radius?: number;
 }) {
   const { width: screen } = useWindowDimensions();
-  const width = screen - inset * 2;
+  const width = fixed ?? screen - inset * 2;
   const [page, setPage] = useState(0);
   const [reported] = useState(() => new Set<number>([0]));
   const photos = usePhotoViewer(media, onMedia);
@@ -255,9 +283,25 @@ export function MediaCarousel({
       onMedia({ action: 'swipe', index: next });
     }
   };
+  const lone = media.length === 1 ? mediaVideo(media[0]) : null;
+  if (lone) {
+    return (
+      <View style={{ width }}>
+        <InlineVideo
+          source={lone}
+          playerKey={recyclingKey ?? media[0].url}
+          aspect={mediaAspect(media[0], 16 / 9)}
+          durationSec={media[0].duration_sec}
+          radius={radius}
+          onPlay={() => onMedia({ action: 'play', index: 0, inline: true })}
+          onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+        />
+      </View>
+    );
+  }
   if (media.length === 1) {
     return (
-      <Pressable style={{ width, height }} onPress={() => press(0)}>
+      <Pressable style={{ width, height, borderRadius: radius, overflow: 'hidden' }} onPress={() => press(0)}>
         <Still media={media[0]} recyclingKey={recyclingKey} />
         {photos.viewer}
       </Pressable>
@@ -266,7 +310,12 @@ export function MediaCarousel({
   return (
     <View>
       {photos.viewer}
-      <ScrollView horizontal pagingEnabled showsHorizontalScrollIndicator={false} onMomentumScrollEnd={onEnd} style={{ width, height }}>
+      <ScrollView
+        horizontal
+        pagingEnabled
+        showsHorizontalScrollIndicator={false}
+        onMomentumScrollEnd={onEnd}
+        style={{ width, height, borderRadius: radius, overflow: 'hidden' }}>
         {media.map((m, i) => (
           <Pressable
             key={i}
@@ -311,7 +360,19 @@ export function PostByline({ embed, big = false }: { embed: FeedEmbed; big?: boo
   );
 }
 
-export function QuotePost({ embed, onPress, onLink, onMedia }: { embed: FeedEmbed; onPress?: () => void; onLink: (url: string) => void; onMedia: (a: MediaAction) => void }) {
+export function QuotePost({
+  embed,
+  onPress,
+  onLink,
+  onMedia,
+  playerKey,
+}: {
+  embed: FeedEmbed;
+  onPress?: () => void;
+  onLink: (url: string) => void;
+  onMedia: (a: MediaAction) => void;
+  playerKey?: string;
+}) {
   const theme = useTheme();
   return (
     <Pressable onPress={onPress} style={[styles.quote, { borderColor: theme.backgroundSelected }]}>
@@ -322,25 +383,30 @@ export function QuotePost({ embed, onPress, onLink, onMedia }: { embed: FeedEmbe
       {embed.text ? <PostText text={embed.text} style={styles.quoteText} numberOfLines={6} onLink={onLink} /> : null}
       {embed.media?.length ? (
         <View style={styles.quoteMedia}>
-          <MediaGrid media={embed.media} onMedia={onMedia} />
+          <MediaGrid media={embed.media} onMedia={onMedia} playerKey={playerKey} />
         </View>
       ) : null}
     </Pressable>
   );
 }
 
-// Replies, reposts, likes and views as X shows them. They are the post's
-// numbers on X, not buttons: the feed measures, it does not ask.
+// Replies, reposts, likes and views as X shows them: the post's numbers on
+// X. The heart is also his like button, as on X (onLike); the rest are
+// counts, not buttons.
 export function PostMetrics({
   embed,
   onShare,
   onSave,
   saved,
+  onLike,
+  liked = false,
 }: {
   embed: FeedEmbed;
   onShare?: () => void;
   onSave?: () => void;
   saved?: boolean;
+  onLike?: () => void;
+  liked?: boolean;
 }) {
   const theme = useTheme();
   const cells: [string, number | undefined][] = [
@@ -351,12 +417,19 @@ export function PostMetrics({
   ];
   return (
     <View style={styles.metrics}>
-      {cells.map(([icon, n]) => (
-        <View key={icon} style={styles.metric}>
-          <SymbolView name={icon as never} tintColor={theme.textSecondary} size={16} />
-          <ThemedText style={[styles.metricText, { color: theme.textSecondary }]}>{compactCount(n)}</ThemedText>
-        </View>
-      ))}
+      {cells.map(([icon, n]) =>
+        icon === 'heart' && onLike ? (
+          <Pressable key={icon} hitSlop={10} onPress={onLike} style={styles.metric} accessibilityLabel={liked ? 'Unlike' : 'Like'} accessibilityState={{ selected: liked }}>
+            <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={16} />
+            <ThemedText style={[styles.metricText, { color: liked ? LIKE_RED : theme.textSecondary }]}>{compactCount(n)}</ThemedText>
+          </Pressable>
+        ) : (
+          <View key={icon} style={styles.metric}>
+            <SymbolView name={icon as never} tintColor={theme.textSecondary} size={16} />
+            <ThemedText style={[styles.metricText, { color: theme.textSecondary }]}>{compactCount(n)}</ThemedText>
+          </View>
+        ),
+      )}
       {onSave ? (
         <Pressable hitSlop={10} onPress={onSave} accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
           <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={16} />

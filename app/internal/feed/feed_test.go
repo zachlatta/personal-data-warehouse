@@ -117,7 +117,7 @@ func TestValidateEvent(t *testing.T) {
 	}
 	for want, e := range map[string]Event{
 		"event_id is required": {Type: "open", ItemID: "x", OccurredAt: testNow},
-		"is not one of":        {EventID: "a", Type: "like", ItemID: "x", OccurredAt: testNow},
+		"is not one of":        {EventID: "a", Type: "upvote", ItemID: "x", OccurredAt: testNow},
 		"needs an item_id":     {EventID: "a", Type: "open", OccurredAt: testNow},
 		"occurred_at":          {EventID: "a", Type: "open", ItemID: "x"},
 		"in the future":        {EventID: "a", Type: "open", ItemID: "x", OccurredAt: testNow.Add(48 * time.Hour)},

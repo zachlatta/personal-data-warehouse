@@ -28,7 +28,8 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   thread. A `title` on such a card shows above it as the reason it is there ("Karpathy on
   ..."). Re-push to refresh its counts. A post that cannot be read stays a plain link card.
 - **Photos and video:** `media` (at most 10, each `{type: image|video|gif, url,
-  thumbnail_url}`, https) shows full-bleed as a swipeable carousel, Instagram style;
+  thumbnail_url}`, https) shows inset as a swipeable carousel; a lone video, or a card whose
+  url is a YouTube or Vimeo video, plays inside the card (push the video's own url);
   {{if .CLI}}`--media URL` (repeatable; `.mp4` is a video){{else}}a lone `image_url` is a one-photo carousel{{end}}. Cards with a picture get looked at
   longer: give one whenever the source has a real image (an og:image, a figure, a photo).
 - **More links per card:** `links` (at most 10, each `url` + optional `title`) show as rows
@@ -78,11 +79,12 @@ Push the card first if it is not in the feed.
 
 ## Reading engagement
 
-There is no like button: interest is measured. A card is `engaged` when he opened it (any
+Interest is mostly measured; the heart is the one thing he says outright (`liked`,
+`liked_at`; the latest of `like` and `unlike`). A card is `engaged` when he opened it (any
 link), opened its detail view, tapped More, swiped its photos or played its video, shared it,
-saved it, or kept it on screen for 5 s; `engagement_score` adds opens
-(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), saved for later (3), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
-minutes), and takes 5 off a dismissal. Rank his interests by it.
+saved it, liked it, or kept it on screen for 5 s; `engagement_score` adds opens
+(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), saved for later (3), liked (5), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
+minutes), and takes 5 off a dismissal (a swipe left or the `...` menu). Rank his interests by it.
 
 {{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
 engaged and dismiss rates, average engagement_score, dwell and read time; event counts; the
@@ -91,13 +93,13 @@ the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
-`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`),
+`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`, `liked`, `liked_at`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
 `metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
 or `video`; a `media` event is a carousel swipe or video play with `metadata.index`). An impression is one stretch of a card at
-least half on screen, with how long and how much of it was visible. A `share` is a swipe that
-opened a mail draft to send the card to someone. Opens, shares, saves and dismissals
+least half on screen, with how long and how much of it was visible. A `share` is the paper plane that
+opened a mail draft to send the card to someone. Opens, shares, saves, likes and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
 How he uses the feed itself (Zach asked on 2026-10-20 to log everything and query it later):

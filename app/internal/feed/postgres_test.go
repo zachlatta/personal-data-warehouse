@@ -212,7 +212,7 @@ func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) 
 	if rec := post(events); !strings.Contains(rec.Body.String(), `"duplicates":7`) {
 		t.Fatalf("a retried batch must be all duplicates: %s", rec.Body.String())
 	}
-	for _, kind := range []string{"stare", "like"} {
+	for _, kind := range []string{"stare", "upvote"} {
 		if rec := post(map[string]any{"events": []map[string]any{{"event_id": "bad", "type": kind, "item_id": "x", "occurred_at": now}}}); rec.Code != 400 {
 			t.Fatalf("type %s must be a 400: %d %s", kind, rec.Code, rec.Body.String())
 		}
@@ -441,6 +441,22 @@ func TestPostgresFeedSavedQueue(t *testing.T) {
 	item := call(t, tools, "feed_list", map[string]any{"item_ids": []string{watch}})["items"].([]any)[0].(map[string]any)
 	if e := item["engagement"].(map[string]any); e["saved"] != true || e["saved_at"] == nil || e["engaged"] != true || e["engagement_score"] != float64(3) {
 		t.Fatalf("a saved card's engagement: %v", e)
+	}
+	// The heart: the latest of like and unlike, and it scores 5.
+	raw, _ = json.Marshal(map[string]any{"events": []map[string]any{
+		{"event_id": "lk1", "type": "like", "item_id": meh, "occurred_at": now.Add(3 * time.Second)},
+		{"event_id": "lk2", "type": "unlike", "item_id": meh, "occurred_at": now.Add(4 * time.Second)},
+		{"event_id": "lk3", "type": "like", "item_id": meh, "occurred_at": now.Add(5 * time.Second)},
+	}})
+	if rec := httptest.NewRecorder(); func() bool {
+		mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+		return rec.Code != 200
+	}() {
+		t.Fatalf("POST like events: %d %s", rec.Code, rec.Body.String())
+	}
+	liked := call(t, tools, "feed_list", map[string]any{"item_ids": []string{meh}})["items"].([]any)[0].(map[string]any)
+	if e := liked["engagement"].(map[string]any); e["liked"] != true || e["liked_at"] == nil || e["engaged"] != true || e["engagement_score"] != float64(5) {
+		t.Fatalf("a liked card's engagement: %v", e)
 	}
 	events := call(t, tools, "feed_events", map[string]any{"item_id": watch, "types": []string{"save"}})["events"].([]any)
 	if meta := events[0].(map[string]any)["metadata"].(map[string]any); meta["via"] != "agent" || meta["agent"] != "voice-memo" {

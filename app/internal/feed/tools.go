@@ -172,8 +172,8 @@ func Tools(store *Store) []tool.Tool {
 				"videos shown as a swipeable carousel), " +
 				"https image_url, author, site, tags, score (higher shows first), published_at, expires_at (RFC3339 or 48h/7d). " +
 				"An x.com post url is embedded: the post's text, author, photos, video and quoted post show inside the card, not as a link. " +
-				"Every impression, dwell, open (per link), read time and dismissal is recorded; there is no like button, interest is " +
-				"measured (engagement_score): read it back with feed_stats. CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
+				"Every impression, dwell, open (per link), read time, like and dismissal is recorded; interest is mostly " +
+				"measured (engagement_score, with his likes weighted most): read it back with feed_stats. CLI: pdw feed push (alias add). Every create and change is kept as a version (feed_history).",
 			Handle: func(ctx context.Context, in pushInput) (pushOutput, error) {
 				if len(in.Items) == 0 {
 					return pushOutput{}, &tool.InvalidInputError{Message: "items is empty: pass at least one card"}

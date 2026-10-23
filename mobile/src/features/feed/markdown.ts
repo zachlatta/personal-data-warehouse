@@ -81,3 +81,15 @@ export function plainText(markdown: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+// A card's preview as one run of text that keeps its links (blue, tappable,
+// as Muse's feed shows them) and bold, with blocks joined by spaces.
+export function previewSpans(markdown: string): Span[] {
+  const out: Span[] = [];
+  for (const block of parseMarkdown(markdown)) {
+    if (out.length) out.push({ text: ' ' });
+    if (block.kind === 'code') out.push({ text: block.text });
+    else for (const span of block.spans) out.push(span.url ? { text: span.text, url: span.url } : span.bold ? { text: span.text, bold: true } : { text: span.text });
+  }
+  return out;
+}

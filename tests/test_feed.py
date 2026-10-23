@@ -140,6 +140,22 @@ def test_saved_is_the_latest_of_save_and_unsave_and_scores_like_a_share(warehous
 
 
 @pytestmark_db
+def test_liked_is_the_latest_of_like_and_unlike_and_scores_most(warehouse):
+    wh = warehouse
+    _item(wh)
+    _item(wh, "hn:2")
+    _event(wh, "l1", "like", minutes=1)
+    _event(wh, "l2", "like", item_id="hn:2", minutes=2)
+    _event(wh, "l3", "unlike", item_id="hn:2", minutes=3)
+    rows = wh._query(
+        "SELECT item_id, liked, liked_at IS NOT NULL, engaged, engagement_score FROM @marts_feed_item_engagement "
+        "ORDER BY item_id"
+    )
+    assert rows == [("hn:1", 1, True, 1, 5.0), ("hn:2", 0, False, 0, 0.0)]
+    assert wh._query("SELECT items_liked FROM @marts_feed_source_engagement") == [(1,)]
+
+
+@pytestmark_db
 def test_a_card_carries_more_links_and_the_view_counts_them(warehouse):
     wh = warehouse
     _item(wh, links='[{"url": "https://a.test/1", "title": "Paper"}, {"url": "https://b.test/2", "title": "HN"}]')

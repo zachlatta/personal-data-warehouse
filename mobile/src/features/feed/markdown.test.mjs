@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseInline, parseMarkdown, plainText } from './markdown.ts';
+import { parseInline, parseMarkdown, plainText, previewSpans } from './markdown.ts';
 
 test('inline bold, italics, code and links', () => {
   assert.deepEqual(parseInline('a **b** _c_ `d` [e](https://x.test)'), [
@@ -20,4 +20,17 @@ test('blocks: headings, bullets, quotes, code and wrapped paragraphs', () => {
 
 test('the card preview is the text without markup', () => {
   assert.equal(plainText('## Why\n\n**Bold** move, see [here](https://x.test).\n- one'), 'Why Bold move, see here. one');
+});
+
+test('a preview keeps its links and bold in one run of text', () => {
+  assert.deepEqual(previewSpans('Read **the paper** at [arXiv](https://arxiv.org/abs/1).\n\n- one *point*'), [
+    { text: 'Read ' },
+    { text: 'the paper', bold: true },
+    { text: ' at ' },
+    { text: 'arXiv', url: 'https://arxiv.org/abs/1' },
+    { text: '.' },
+    { text: ' ' },
+    { text: 'one ' },
+    { text: 'point' },
+  ]);
 });

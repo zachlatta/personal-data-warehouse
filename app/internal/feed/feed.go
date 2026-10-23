@@ -25,7 +25,7 @@ import (
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
 	"dismiss", "undismiss", "share", "media", "save", "unsave",
-	"ui", "scroll", "load",
+	"ui", "scroll", "load", "like", "unlike",
 }
 
 // cardlessEventTypes may come without an item_id: a sitting, a feed load,
@@ -91,8 +91,8 @@ type Link struct {
 	Site  string `json:"site,omitempty" jsonschema:"defaults to the url's host"`
 }
 
-// Engagement is an item's row in marts_feed.item_engagement. There is no
-// like: interest is measured (Engaged, Score), not asked for.
+// Engagement is an item's row in marts_feed.item_engagement. Interest is
+// mostly measured (Engaged, Score); Liked is the heart he taps.
 type Engagement struct {
 	Impressions   int64      `json:"impressions"`
 	DwellMS       int64      `json:"dwell_ms"`
@@ -109,6 +109,9 @@ type Engagement struct {
 	// Saved is his read-later queue: the latest of save and unsave.
 	Saved   bool       `json:"saved"`
 	SavedAt *time.Time `json:"saved_at,omitempty"`
+	// Liked is the heart: the latest of like and unlike.
+	Liked   bool       `json:"liked"`
+	LikedAt *time.Time `json:"liked_at,omitempty"`
 }
 
 // PushItem is one card as an agent sends it. Only a source (here or on the
