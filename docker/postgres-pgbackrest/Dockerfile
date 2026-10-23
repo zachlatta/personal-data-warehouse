@@ -1,4 +1,4 @@
-ARG POSTGRES_IMAGE=postgres:18.4-bookworm
+ARG POSTGRES_IMAGE=postgres:18.6-bookworm
 FROM ${POSTGRES_IMAGE}
 
 LABEL org.opencontainers.image.title="personal-data-warehouse-postgres-pgbackrest"

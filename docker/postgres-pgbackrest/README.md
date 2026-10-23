@@ -4,8 +4,8 @@ This directory builds the custom Postgres image for the Coolify database
 container. It keeps Dagster and the application in their existing image; this
 image only runs Postgres plus pgBackRest.
 
-The image currently tracks PostgreSQL `18.4` via the official
-`postgres:18.4-bookworm` image. PostgreSQL 18 changed the official Docker
+The image currently tracks PostgreSQL `18.6` via the official
+`postgres:18.6-bookworm` image. PostgreSQL 18 changed the official Docker
 image layout: mount persistent storage at `/var/lib/postgresql`, not directly at
 `/var/lib/postgresql/data`. The default `PGDATA` is
 `/var/lib/postgresql/18/docker`.
@@ -39,15 +39,15 @@ its trigram indexes.
 ## Build
 
 ```bash
-docker build -t personal-data-warehouse-postgres-pgbackrest:18.4 docker/postgres-pgbackrest
+docker build -t personal-data-warehouse-postgres-pgbackrest:18.6 docker/postgres-pgbackrest
 ```
 
 To override the base image:
 
 ```bash
 docker build \
-  --build-arg POSTGRES_IMAGE=postgres:18.4-bookworm \
-  -t personal-data-warehouse-postgres-pgbackrest:18.4 \
+  --build-arg POSTGRES_IMAGE=postgres:18.6-bookworm \
+  -t personal-data-warehouse-postgres-pgbackrest:18.6 \
   docker/postgres-pgbackrest
 ```
 
@@ -245,7 +245,7 @@ For a local smoke test without S3 configuration, explicitly disable pgBackRest:
 docker run --rm \
   -e POSTGRES_PASSWORD=postgres \
   -e PDW_PGBACKREST_ENABLED=false \
-  personal-data-warehouse-postgres-pgbackrest:18.4
+  personal-data-warehouse-postgres-pgbackrest:18.6
 ```
 
 ## Restore
@@ -257,7 +257,7 @@ environment variables:
 docker run --rm \
   -v pdw-postgres-restored:/var/lib/postgresql \
   --env-file .env.restore \
-  personal-data-warehouse-postgres-pgbackrest:18.4 \
+  personal-data-warehouse-postgres-pgbackrest:18.6 \
   pdw-pgbackrest-restore
 ```
 
@@ -267,7 +267,7 @@ Point-in-time restore example:
 docker run --rm \
   -v pdw-postgres-restored:/var/lib/postgresql \
   --env-file .env.restore \
-  personal-data-warehouse-postgres-pgbackrest:18.4 \
+  personal-data-warehouse-postgres-pgbackrest:18.6 \
   pdw-pgbackrest-restore --type=time --target="2026-05-23 12:00:00+00"
 ```
 
