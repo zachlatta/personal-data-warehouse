@@ -1,9 +1,9 @@
-# Reviewed writes, the iOS app and push
+# Reviewed writes, the phone app and push
 
 Moved out of AGENTS.md on 2026-10-01 so the file every session loads holds only the
 contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md).
 
-## iOS app and push notifications
+## Phone app (Android and iOS) and push notifications
 
 `mobile/` is an Expo app over the app's own HTTP API — the timeline, the mutation
 review queue, and push notifications; see `mobile/README.md`. Three server pieces
@@ -222,8 +222,8 @@ a reply, domain from `base_slack.teams`), Gmail as Superhuman's `/<account>/thre
 Calendar's base64 `eid`, Drive `open?id=`, Google Contacts, ChatGPT/claude.ai conversations,
 `wa.me` for a 1:1 WhatsApp chat, `imessage:`/`sms:` for a 1:1 iMessage chat, and the
 Notes `showNote?identifier=` scheme. `app_url` is the native scheme a phone tries first
-and falls back from — the iOS app never calls `canOpenURL`, which would need every scheme
-declared in the native Info.plist. A source with no honest URL (health, photos, voice memos,
+and falls back from — the phone app never calls `canOpenURL`, which on iOS would need
+every scheme declared in the native Info.plist. A source with no honest URL (health, photos, voice memos,
 a group chat, a CLI agent transcript) gets **no** link rather than a guessed one.
 `/api/timeline/item` also inlines `context` — `timeline.context(ref, 15, 15)`, the same
 function agents call — with `is_anchor` on the row asked about; both UIs render it as a

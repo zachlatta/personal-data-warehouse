@@ -113,6 +113,11 @@ func (n Notification) Validate() error {
 	return nil
 }
 
+// AndroidChannelID is the notification channel the app creates at high
+// importance (mobile/src/lib/push.ts), so an alert pops up as a banner rather
+// than arriving silently in Expo's default-importance fallback channel.
+const AndroidChannelID = "default"
+
 // message builds the Expo message for one device.
 func (n Notification) message(token string) (Message, error) {
 	if err := n.Validate(); err != nil {
@@ -129,6 +134,7 @@ func (n Notification) message(token string) (Message, error) {
 		CollapseID:        n.CollapseID,
 		InterruptionLevel: n.InterruptionLevel,
 		Badge:             n.Badge,
+		ChannelID:         AndroidChannelID,
 	}
 	if n.Sound != "none" {
 		m.Sound = "default"

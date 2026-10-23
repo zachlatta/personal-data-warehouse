@@ -1,11 +1,11 @@
 import { Image } from 'expo-image';
 import { useFocusEffect } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { useTheme } from '@/hooks/use-theme';
 
@@ -121,7 +121,7 @@ export function InlineVideo({
       )}
       <View style={styles.center} pointerEvents="none">
         <View style={styles.play}>
-          <SymbolView name="play.fill" tintColor="#fff" size={24} />
+          <Icon name="play.fill" tintColor="#fff" size={24} />
         </View>
       </View>
       {length || LABEL[source.kind] ? (

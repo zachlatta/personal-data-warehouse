@@ -1,10 +1,10 @@
 import * as WebBrowser from 'expo-web-browser';
 import { useMemo, useState } from 'react';
-import { Linking, Pressable, StyleSheet, View } from 'react-native';
+import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 
 import { ThemedText } from '@/components/themed-text';
-import { EMAIL_BODY_COLLAPSED_HEIGHT, EMAIL_SIZER_SCRIPT, emailHtmlDocument, emailNavigation } from '@/lib/email-html';
+import { EMAIL_BODY_COLLAPSED_HEIGHT, EMAIL_SIZER_SCRIPT, emailHtmlDocument, emailNavigation, emailWebViewPlatformProps } from '@/lib/email-html';
 
 async function openOutside(url: string) {
   try {
@@ -54,8 +54,7 @@ export function EmailHtmlBody({ html }: { html: string }) {
           scrollEnabled={false}
           bounces={false}
           javaScriptCanOpenWindowsAutomatically={false}
-          allowsLinkPreview={false}
-          dataDetectorTypes="none"
+          {...emailWebViewPlatformProps(Platform.OS)}
           cacheEnabled
           incognito
           style={styles.web}

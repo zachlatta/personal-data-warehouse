@@ -1,16 +1,13 @@
 import { useFocusEffect, useNavigation, useRouter } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActionSheetIOS,
   ActivityIndicator,
   Alert,
   AppState,
   FlatList,
   LayoutAnimation,
   Linking,
-  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -20,6 +17,8 @@ import {
   type NativeSyntheticEvent,
 } from 'react-native';
 
+import { ActionSheet, showActionSheet, type ActionSheetRequest } from '@/components/action-sheet';
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
@@ -89,6 +88,7 @@ export default function FeedScreen() {
   const [error, setError] = useState<string | null>(null);
   const [disabled, setDisabled] = useState(false);
   const [undo, setUndo] = useState<Undo | null>(null);
+  const [sheet, setSheet] = useState<ActionSheetRequest | null>(null);
   // Cards a reload brought that were not in the list, for X's "new posts" pill.
   const [arrivals, setArrivals] = useState<FeedItem[]>([]);
   const list = useRef<FlatList<FeedItem>>(null);
@@ -471,17 +471,7 @@ export default function FeedScreen() {
         if (i === 2) dismiss(item, 'less_like_this');
         if (i === 3) onLike(item, 'menu');
       };
-      if (Platform.OS === 'ios') {
-        ActionSheetIOS.showActionSheetWithOptions({ options, cancelButtonIndex: 4, destructiveButtonIndex: 1, title: item.title || undefined }, pick);
-      } else {
-        Alert.alert(item.title || 'This card', undefined, [
-          { text: options[0], onPress: () => pick(0) },
-          { text: options[1], onPress: () => pick(1) },
-          { text: options[2], onPress: () => pick(2) },
-          { text: options[3], onPress: () => pick(3) },
-          { text: 'Cancel', style: 'cancel', onPress: () => pick(4) },
-        ]);
-      }
+      showActionSheet({ options, destructiveIndex: 1, title: item.title || undefined, pick }, setSheet);
     },
     [dismiss, onSave, onLike, savedIds, likedIds],
   );
@@ -573,7 +563,7 @@ export default function FeedScreen() {
                     }}
                     accessibilityLabel={`Saved for later, ${savedIds.length}`}>
                     <View style={[styles.savedBubble, only === SAVED && styles.savedBubbleOn]}>
-                      <SymbolView name="bookmark.fill" tintColor="#fff" size={24} />
+                      <Icon name="bookmark.fill" tintColor="#fff" size={24} />
                       {savedIds.length ? (
                         <View style={styles.savedCount}>
                           <ThemedText style={styles.savedCountText}>{savedIds.length}</ThemedText>
@@ -649,7 +639,7 @@ export default function FeedScreen() {
             list.current?.scrollToOffset({ offset: 0, animated: true });
           }}
           accessibilityLabel={`${arrivals.length} new cards, scroll to top`}>
-          <SymbolView name="arrow.up" tintColor="#fff" size={14} />
+          <Icon name="arrow.up" tintColor="#fff" size={14} />
           {[...new Set(arrivals.map((i) => i.site || i.source))].slice(0, 3).map((name, n) => (
             <View key={name} style={[styles.pillFace, n > 0 && styles.pillFaceOverlap]}>
               <SourceAvatar name={name} url={arrivals.find((i) => (i.site || i.source) === name)?.url} size={22} />
@@ -668,6 +658,7 @@ export default function FeedScreen() {
           </Pressable>
         </View>
       ) : null}
+      <ActionSheet request={sheet} onClose={() => setSheet(null)} />
     </ThemedView>
   );
 }

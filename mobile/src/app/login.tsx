@@ -8,13 +8,14 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { probe } from '@/lib/api';
 import { DEFAULT_BASE_URL, normalizeBaseUrl, normalizeClientName } from '@/lib/config';
+import { defaultClientName, secureStoreName } from '@/lib/platform-copy';
 import { useSession } from '@/lib/session';
 
 export default function LoginScreen() {
   const theme = useTheme();
   const { signIn } = useSession();
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
-  const [clientName, setClientName] = useState('iphone');
+  const [clientName, setClientName] = useState(defaultClientName(Platform.OS));
   const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -49,7 +50,7 @@ export default function LoginScreen() {
             <ThemedText type="title">PDW</ThemedText>
             <ThemedText themeColor="textSecondary">
               Same credentials as <ThemedText type="code">pdw login</ThemedText>: the app URL, a client name, and PDW_SECRET_TOKEN. The
-              token is kept in the iOS Keychain.
+              token is kept in {secureStoreName(Platform.OS)}.
             </ThemedText>
 
             <ThemedText type="smallBold">Server URL</ThemedText>

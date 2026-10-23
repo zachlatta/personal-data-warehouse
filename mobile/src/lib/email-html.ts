@@ -131,3 +131,9 @@ export function emailNavigation(url: string): 'load' | 'open' | 'block' {
   if (value.startsWith('https://') || value.startsWith('http://') || value.startsWith('mailto:') || value.startsWith('tel:')) return 'open';
   return 'block';
 }
+
+// Props the email WebView takes only on iOS. Android's WebView cannot parse
+// dataDetectorTypes as a string and aborts the whole app on it.
+export function emailWebViewPlatformProps(platform: string): { dataDetectorTypes?: 'none'; allowsLinkPreview?: boolean } {
+  return platform === 'ios' ? { dataDetectorTypes: 'none', allowsLinkPreview: false } : {};
+}

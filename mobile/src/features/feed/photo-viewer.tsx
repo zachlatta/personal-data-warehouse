@@ -1,7 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import { Image } from 'expo-image';
 import * as Sharing from 'expo-sharing';
-import { SymbolView } from 'expo-symbols';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -17,6 +16,7 @@ import {
 } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { useModalInsets } from '@/hooks/use-modal-insets';
 
@@ -105,7 +105,7 @@ function PhotoViewerScreen({ photos, start, onClose, onPage, onShare, onZoom }: 
       {chrome ? (
         <View style={[styles.bar, { paddingTop: insets.top, paddingLeft: 12 + insets.left, paddingRight: 12 + insets.right }]} pointerEvents="box-none">
           <Pressable hitSlop={12} onPress={onClose} accessibilityLabel="Close" style={styles.button}>
-            <SymbolView name="xmark" tintColor="#fff" size={18} />
+            <Icon name="xmark" tintColor="#fff" size={18} />
           </Pressable>
           {photos.length > 1 ? (
             <ThemedText style={styles.counter}>
@@ -115,7 +115,7 @@ function PhotoViewerScreen({ photos, start, onClose, onPage, onShare, onZoom }: 
             <View />
           )}
           <Pressable hitSlop={12} onPress={() => void share()} disabled={sharing} accessibilityLabel="Share photo" style={styles.button}>
-            {sharing ? <ActivityIndicator color="#fff" /> : <SymbolView name="square.and.arrow.up" tintColor="#fff" size={18} />}
+            {sharing ? <ActivityIndicator color="#fff" /> : <Icon name="square.and.arrow.up" tintColor="#fff" size={18} />}
           </Pressable>
         </View>
       ) : null}

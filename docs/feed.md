@@ -1,6 +1,6 @@
 # The Feed tab
 
-A card feed in the PDW iOS app that agents fill through `pdw feed` (or the `feed_*` MCP
+A card feed in the PDW phone app that agents fill through `pdw feed` (or the `feed_*` MCP
 tools), with detailed engagement logging into the warehouse. Built 2026-10-20 from Zach's
 request for a Muse-style feed he owns, measured the way a social feed measures its readers.
 Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
@@ -82,7 +82,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   photo's place in the card's media; the detail view adds `metadata.in` = `detail`).
   A tap on a photo in an X post (feed or detail) or in the detail view's carousel opens
   the full-screen viewer: swipe between photos, pinch or double-tap to zoom, and the share
-  button downloads that one photo (X photos at `name=orig`) to the iOS share sheet.
+  button downloads that one photo (X photos at `name=orig`) to the share sheet.
   A `close` with `metadata.mode` `video` is watch time; `metadata.inline` = it played in
   the card (a `media` `play` with `inline` starts it).
   `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,

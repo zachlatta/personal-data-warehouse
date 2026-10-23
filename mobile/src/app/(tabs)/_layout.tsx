@@ -1,6 +1,6 @@
 import { Tabs } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 
+import { Icon } from '@/components/icon';
 import { feedTabOptions } from '@/features/feed';
 
 export default function TabsLayout() {
@@ -10,7 +10,7 @@ export default function TabsLayout() {
         name="index"
         options={{
           title: 'Timeline',
-          tabBarIcon: ({ color, size }) => <SymbolView name="clock" tintColor={color} size={size} />,
+          tabBarIcon: ({ color, size }) => <Icon name="clock" tintColor={color} size={size} />,
         }}
       />
       <Tabs.Screen name="feed" options={feedTabOptions} />
@@ -20,7 +20,7 @@ export default function TabsLayout() {
         name="mutations"
         options={{
           title: 'Mutations',
-          tabBarIcon: ({ color, size }) => <SymbolView name="checkmark.seal" tintColor={color} size={size} />,
+          tabBarIcon: ({ color, size }) => <Icon name="checkmark.seal" tintColor={color} size={size} />,
         }}
       />
       <Tabs.Screen name="notifications" options={{ title: 'Alerts', href: null }} />
@@ -28,7 +28,7 @@ export default function TabsLayout() {
         name="settings"
         options={{
           title: 'Settings',
-          tabBarIcon: ({ color, size }) => <SymbolView name="gearshape" tintColor={color} size={size} />,
+          tabBarIcon: ({ color, size }) => <Icon name="gearshape" tintColor={color} size={size} />,
         }}
       />
     </Tabs>

@@ -60,7 +60,7 @@ when convenient.
 
 The mutation proposal tools and the review UI at `/mutation-review` are always on: the review
 UI is the web app (`internal/webapp`, also serving `/timeline` and `/search`), a static SPA over
-the same JSON API the iOS app uses, authenticated with `PDW_SECRET_TOKEN` like every API client.
+the same JSON API the phone app uses, authenticated with `PDW_SECRET_TOKEN` like every API client.
 The old `PDW_MUTATION_UI_PASSWORD` / `PDW_MUTATION_UI_SESSION_SECRET` /
 `PDW_MUTATION_UI_SESSION_TTL_SECONDS` settings are ignored and logged as deprecated.
 

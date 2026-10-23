@@ -1,13 +1,14 @@
-# PDW iOS app
+# PDW phone app (Android and iOS)
 
 An Expo (React Native) app over the warehouse's own HTTP API: the unified
 timeline, the mutation review queue, and push notifications when a new
-mutation request needs a decision.
+mutation request needs a decision. Android is the phone Zach carries since
+2026-10-23; iOS still builds from the same code.
 
 The app talks to the same Go app the `pdw` CLI does and authenticates the same
 way — a static bearer `"<client_name>:<PDW_SECRET_TOKEN>"` — so signing in is
-pasting the app URL and the secret token once. The token lives in the iOS
-Keychain (`expo-secure-store`).
+pasting the app URL and the secret token once. The token lives in the Android
+Keystore or the iOS Keychain (`expo-secure-store`).
 
 | screen | endpoint |
 | --- | --- |
@@ -115,7 +116,8 @@ curl -X POST "$PDW_API_URL/api/push/send" -H "Authorization: Bearer cli:$PDW_SEC
 Two pieces of the app make that work, and both are worth knowing when
 something looks plain:
 
-- **Images need the Notification Service Extension**, the
+- **Images on iOS need the Notification Service Extension** (Android shows
+  `richContent.image` itself), the
   `targets/notification-service` Swift target that `@bacons/apple-targets`
   adds at prebuild. iOS runs it for any push with `mutableContent`; it reads
   the Expo payload's `body._richContent.image`, downloads it and attaches it.
@@ -131,6 +133,38 @@ something looks plain:
   review API in the background without opening the app; `open` (and a plain
   tap) opens `data.route`; a `reply` action's text arrives as `userText`.
 
+## Android
+
+The same screens, with four things that differ from iOS and are easy to
+break from a Mac that only ever runs the iOS simulator:
+
+- **Icons go through `<Icon>`** (`src/components/icon.tsx`), never
+  `SymbolView` directly. `SymbolView` draws nothing on Android for a bare SF
+  Symbol name, so every icon in the app was invisible there; `src/lib/icons.ts`
+  maps each SF Symbol to the Material Symbol Android shows, and
+  `icons.test.mjs` fails on a direct `expo-symbols` import or a Material name
+  the font lacks. The Material font has no filled variants, so a filled state
+  (a liked heart) reads through its colour.
+- **A menu of more than three choices is `showActionSheet`**
+  (`src/components/action-sheet.tsx`): `ActionSheetIOS` on iOS, a bottom
+  sheet on Android, where `Alert` silently drops every button past the third.
+- **iOS-only native props can crash Android outright.** `dataDetectorTypes="none"`
+  on the email WebView aborted the whole app on Android (a Fabric
+  `castValue` assertion) the moment a review showed an HTML email. Pass such
+  props only on iOS (`emailWebViewPlatformProps`).
+- **Push needs FCM.** Expo delivers to Android through Firebase Cloud
+  Messaging: `google-services.json` from a Firebase project with the
+  `com.zachlatta.pdw` Android app, named by `android.googleServicesFile` in
+  `app.json`, and that project's FCM V1 service-account key uploaded with
+  `eas credentials -p android`. Every alert goes to the `default` channel the
+  app creates at high importance (`ANDROID_CHANNEL_ID` here,
+  `AndroidChannelID` in `app/internal/push`); without it an alert lands
+  silently in Expo's default-importance fallback channel.
+
+The preview profile builds an installable APK (`eas build -p android
+--profile preview`); CI queues one whenever the Android fingerprint moves,
+exactly as for iOS.
+
 ## Run it
 
 ```bash
@@ -138,8 +172,16 @@ cd mobile
 npm install
 npx expo start --ios          # Expo Go on the simulator; push is unsupported there
 npx expo run:ios --device     # dev build on a phone (needs the Apple team in Xcode)
+npx expo run:android          # dev build on an emulator or a USB/adb phone
 npm run typecheck && npm run lint && npm test
 ```
+
+An Android emulator on an Apple-silicon Mac: `brew install --cask zulu@17
+android-commandlinetools`, then `sdkmanager "platform-tools" "emulator"
+"platforms;android-36" "system-images;android-36;google_apis_playstore;arm64-v8a"`
+and `avdmanager create avd`. With Metro on a fixed port, `adb reverse
+tcp:<port> tcp:<port>` before every launch: the mapping is dropped whenever
+the app process dies, and the dev client then reports a connection refused.
 
 EAS project: `pdw` under the `zlatta` account (`extra.eas.projectId` in
 `app.json`); bundle id `com.zachlatta.pdw`. For a real device build, run

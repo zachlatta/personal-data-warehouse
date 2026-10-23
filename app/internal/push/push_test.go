@@ -312,6 +312,20 @@ func TestNotificationDefaultsAreTheOldPlainAlert(t *testing.T) {
 	}
 }
 
+// Android shows an alert as a heads-up banner only on a high-importance
+// channel; the app creates "default" that way (mobile/src/lib/push.ts). With
+// no channelId Expo delivers to a "Miscellaneous" channel of default
+// importance, which lands silently in the shade.
+func TestEveryNotificationGoesToTheAppsAndroidChannel(t *testing.T) {
+	m, err := Notification{Title: "t"}.message("ExponentPushToken[abc]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ChannelID != AndroidChannelID || AndroidChannelID != "default" {
+		t.Fatalf("channel = %q, want %q", m.ChannelID, "default")
+	}
+}
+
 func TestNotificationRejectsWhatExpoWouldSilentlyDrop(t *testing.T) {
 	cases := map[string]Notification{
 		"empty":                  {},

@@ -31,12 +31,33 @@ function projectId(): string | undefined {
   return fromEas ?? (Constants.easConfig?.projectId as string | undefined);
 }
 
-// Ask iOS for permission, get the Expo push token, and tell the warehouse
-// about it. A simulator has no APNs, so this reports `unsupported` there
-// rather than failing; the rest of the app does not depend on it.
+// The channel every alert is sent to (AndroidChannelID in app/internal/push).
+// Android shows a banner only for a high-importance channel; without one an
+// alert lands silently in Expo's default-importance fallback.
+export const ANDROID_CHANNEL_ID = 'default';
+
+async function ensureAndroidChannel(): Promise<void> {
+  if (Platform.OS !== 'android') return;
+  await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
+    name: 'Alerts',
+    importance: Notifications.AndroidImportance.HIGH,
+    showBadge: true,
+  });
+}
+
+// Ask for permission, get the Expo push token, and tell the warehouse about
+// it. A simulator or emulator cannot receive remote pushes, so this reports
+// `unsupported` there rather than failing; the rest of the app does not
+// depend on it. On Android the channel is created first: Android 13 shows the
+// permission prompt only once the app has a channel.
 export async function registerForPush(config: AppConfig): Promise<PushStatus> {
+  try {
+    await ensureAndroidChannel();
+  } catch (error) {
+    console.warn('notification channel not created', error);
+  }
   if (!Device.isDevice) {
-    return { state: 'unsupported', reason: 'Push notifications need a physical device (simulators have no APNs).' };
+    return { state: 'unsupported', reason: 'Push notifications need a physical device (simulators and emulators cannot receive them).' };
   }
   try {
     let { status } = await Notifications.getPermissionsAsync();

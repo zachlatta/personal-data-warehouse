@@ -240,7 +240,7 @@ Notes:
 
 The Go app serves a browser single-page app at `/timeline`, `/search` and `/mutation-review`
 (`app/internal/webapp`, static ES modules embedded in the binary — no build step, no CDN). It
-renders nothing server-side: every view reads the **same bearer-protected JSON API the iOS app
+renders nothing server-side: every view reads the **same bearer-protected JSON API the phone app
 uses** (`/api/timeline*`, `/api/mutations/*`, `POST /api/tools/search`), so the web and the phone
 cannot disagree about what a request or an event looks like. Sign in by pasting
 `PDW_SECRET_TOKEN` once; the browser keeps it in localStorage and sends it as

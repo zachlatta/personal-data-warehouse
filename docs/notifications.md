@@ -7,7 +7,7 @@ the experiment was on, Hacker News thread chatter (then `cc`) produced 17,908 pu
 at 7% and 100 iMessages at 18%. `cc` is for reading, not paging. A recurring calendar invite
 pages once per series, not once per expanded instance (one weekly team sync produced 53 pushes).
 /notifications (the **alerts** tab) is
-the control panel and recent delivery/open ledger; the iPhone app's Alerts tab
+the control panel and recent delivery/open ledger; the phone app's Alerts tab
 has the same global on/off switch and pages through the whole ledger. /pipelines shows the live notification health verdict.
 
 This is an experiment, not yet a lossless or instant replacement for native
@@ -16,7 +16,7 @@ sources that matter. The implementation does not change other apps' OS settings.
 
 ## Try it
 
-1. Open the PDW iPhone app, apply the latest update in Settings, and allow
+1. Open the PDW phone app, apply the latest update in Settings, and allow
    notifications. Use **Send test push** to verify that installation's push setup.
    That existing manual test is not part of the timeline ledger.
 2. On each computer, open /notifications in your usual browser and choose

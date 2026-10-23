@@ -7,6 +7,7 @@ import {
   emailBodyForDisplay,
   emailHtmlDocument,
   emailNavigation,
+  emailWebViewPlatformProps,
   looksLikeHtml,
   sanitizeEmailHtml,
 } from './email-html.ts';
@@ -100,4 +101,11 @@ test('the email itself loads in place; a tapped link opens outside it; nothing e
   assert.equal(emailNavigation('javascript:alert(1)'), 'block');
   assert.equal(emailNavigation('file:///etc/passwd'), 'block');
   assert.equal(emailNavigation('superhuman://x'), 'block');
+});
+
+// Android's WebView cannot parse dataDetectorTypes as a string: opening an
+// email aborted the whole app (Fabric RawValue castValue assertion).
+test('the iOS-only WebView props are never handed to Android', () => {
+  assert.deepEqual(emailWebViewPlatformProps('ios'), { dataDetectorTypes: 'none', allowsLinkPreview: false });
+  assert.deepEqual(emailWebViewPlatformProps('android'), {});
 });

@@ -1,6 +1,6 @@
 # Feed: cards on Zach's phone, and what he does with them
 
-The PDW iOS app has a **Feed** tab: full-width cards Zach scrolls like a social feed, with no
+The PDW phone app has a **Feed** tab: full-width cards Zach scrolls like a social feed, with no
 unread count. Agents fill it; the phone records everything he does with each card. It is
 for things worth his attention that are not messages to him: links, stories, briefings,
 finds. Do not put a reply someone is waiting on here (that is {{if .CLI}}`pdw call notify`{{else}}`notify`{{end}} or a mutation).

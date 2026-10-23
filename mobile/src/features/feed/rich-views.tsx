@@ -1,11 +1,12 @@
 import { Image } from 'expo-image';
-import { SymbolView } from 'expo-symbols';
 import { useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View, useWindowDimensions, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import type { IconName } from '@/lib/icons';
 
 import { PhotoViewer } from './photo-viewer';
 import { mediaVideo } from './video';
@@ -147,7 +148,7 @@ function VideoBadge({ media }: { media: FeedMedia }) {
     <>
       <View style={styles.playWrap} pointerEvents="none">
         <View style={styles.play}>
-          <SymbolView name="play.fill" tintColor="#fff" size={22} />
+          <Icon name="play.fill" tintColor="#fff" size={22} />
         </View>
       </View>
       {length || media.type === 'gif' ? (
@@ -340,7 +341,7 @@ export function MediaCarousel({
 }
 
 function Verified() {
-  return <SymbolView name="checkmark.seal.fill" tintColor={ACCENT} size={15} />;
+  return <Icon name="checkmark.seal.fill" tintColor={ACCENT} size={15} />;
 }
 
 // Name, badge, @handle and age on one line, like an X post header.
@@ -409,7 +410,7 @@ export function PostMetrics({
   liked?: boolean;
 }) {
   const theme = useTheme();
-  const cells: [string, number | undefined][] = [
+  const cells: [IconName, number | undefined][] = [
     ['bubble.left', embed.replies],
     ['arrow.2.squarepath', embed.reposts],
     ['heart', embed.likes],
@@ -420,24 +421,24 @@ export function PostMetrics({
       {cells.map(([icon, n]) =>
         icon === 'heart' && onLike ? (
           <Pressable key={icon} hitSlop={10} onPress={onLike} style={styles.metric} accessibilityLabel={liked ? 'Unlike' : 'Like'} accessibilityState={{ selected: liked }}>
-            <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={16} />
+            <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={16} />
             <ThemedText style={[styles.metricText, { color: liked ? LIKE_RED : theme.textSecondary }]}>{compactCount(n)}</ThemedText>
           </Pressable>
         ) : (
           <View key={icon} style={styles.metric}>
-            <SymbolView name={icon as never} tintColor={theme.textSecondary} size={16} />
+            <Icon name={icon} tintColor={theme.textSecondary} size={16} />
             <ThemedText style={[styles.metricText, { color: theme.textSecondary }]}>{compactCount(n)}</ThemedText>
           </View>
         ),
       )}
       {onSave ? (
         <Pressable hitSlop={10} onPress={onSave} accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
-          <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={16} />
+          <Icon name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={16} />
         </Pressable>
       ) : null}
       {onShare ? (
         <Pressable hitSlop={10} onPress={onShare} accessibilityLabel="Share">
-          <SymbolView name="square.and.arrow.up" tintColor={theme.textSecondary} size={16} />
+          <Icon name="square.and.arrow.up" tintColor={theme.textSecondary} size={16} />
         </Pressable>
       ) : null}
     </View>

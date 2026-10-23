@@ -175,7 +175,7 @@ Read the file for the area you are changing before you change it.
 | WHOOP and the health mart | [docs/agents/health-sources.md](docs/agents/health-sources.md) |
 | agent sessions, Claude Desktop, ChatGPT, Muse, the app's ingest path | [docs/agents/agent-sessions.md](docs/agents/agent-sessions.md) |
 | local Mac uploaders and their macOS permissions | [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md) |
-| reviewed writes (Notes, Contacts), the iOS app and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
+| reviewed writes (Notes, Contacts), the phone app (Android and iOS) and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
 | access tokens beside `PDW_SECRET_TOKEN`, `pdw token`, the `cli_authorize` bootstrap | [docs/agents/access-tokens.md](docs/agents/access-tokens.md) |
 | the Feed tab: `pdw feed`, engagement logging, how to remove it | [docs/feed.md](docs/feed.md) |
 | WhatsApp, Hacker News, GitHub, shared attachment enrichment | [docs/agents/other-sources.md](docs/agents/other-sources.md) |

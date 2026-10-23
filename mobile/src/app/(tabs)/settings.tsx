@@ -1,13 +1,14 @@
 import Constants from 'expo-constants';
 import { useState } from 'react';
 import { useRouter } from 'expo-router';
-import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { sendTestPush } from '@/lib/api';
+import { notificationSettingsName, secureStoreName } from '@/lib/platform-copy';
 import { useConfig, useSession } from '@/lib/session';
 import { applyUpdateNow, describeInstalledUpdate, type UpdateState } from '@/lib/updates';
 
@@ -17,7 +18,7 @@ function describePush(push: ReturnType<typeof useSession>['push']): string {
     case 'registered':
       return `Registered (${push.token})`;
     case 'denied':
-      return 'Permission denied — enable notifications for PDW in iOS Settings.';
+      return `Permission denied — enable notifications for PDW in ${notificationSettingsName(Platform.OS)}.`;
     case 'unsupported':
       return push.reason;
     case 'error':
@@ -63,7 +64,7 @@ export default function SettingsScreen() {
           </ThemedText>
           <ThemedText selectable>{config.baseUrl}</ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
-            client {config.clientName} · token stored in Keychain
+            client {config.clientName} · token stored in {secureStoreName(Platform.OS)}
           </ThemedText>
         </View>
         <View style={card}>

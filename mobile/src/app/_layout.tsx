@@ -1,6 +1,7 @@
 import { DarkTheme, DefaultTheme, ThemeProvider, useRouter, Stack } from 'expo-router';
 import * as Notifications from 'expo-notifications';
 import * as SplashScreen from 'expo-splash-screen';
+import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef } from 'react';
 import { Alert, AppState, useColorScheme } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -108,6 +109,9 @@ export default function RootLayout() {
         <SessionProvider>
           <Root />
         </SessionProvider>
+        {/* Android draws edge to edge: without this the status bar kept
+            light icons over the light theme and the clock disappeared. */}
+        <StatusBar style="auto" />
       </ThemeProvider>
     </GestureHandlerRootView>
   );

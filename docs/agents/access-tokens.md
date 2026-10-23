@@ -1,6 +1,6 @@
 # Access tokens and `cli_authorize`
 
-PDW's HTTP surfaces (`/api/tools`, the web app, the iOS app, push, mutation review,
+PDW's HTTP surfaces (`/api/tools`, the web app, the phone app, push, mutation review,
 connections) authenticate with a static bearer, `Authorization: Bearer <client>:<token>`.
 Until 2026-10 the only token was `PDW_SECRET_TOKEN`, the one secret that also signs
 uploads, OAuth codes and MCP access tokens, and encrypts `private.mcp_connections`. Every
@@ -35,7 +35,7 @@ Answers to the open questions in the original tasks:
 - **Migrating existing clients:** nothing breaks. The master secret is still accepted
   everywhere, because it must exist anyway: it is the HMAC key for ingest uploads and
   OAuth. A client moves off it by running `pdw token create --name <client>` and then
-  `pdw login` with the printed token (or pasting that token into the iOS app or web
+  `pdw login` with the printed token (or pasting that token into the phone app or web
   page). Uploaders that sign ingest bodies (`pdw ingest`, `pdw heartbeat`, the
   `publish-session` commands) keep the master secret, because an upload signature is an
   HMAC over that key.

@@ -1,9 +1,9 @@
-import { SymbolView } from 'expo-symbols';
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { Fragment, useCallback, useRef } from 'react';
 import { Linking, Pressable, ScrollView, StyleSheet, View, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
@@ -234,13 +234,13 @@ export default function FeedReaderScreen() {
                 hitSlop={12}
                 onPress={() => toggleLiked(item, { position, via: 'detail' })}
                 accessibilityLabel={liked ? 'Unlike' : 'Like'}>
-                <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.text} size={22} />
+                <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.text} size={22} />
               </Pressable>
               <Pressable
                 hitSlop={12}
                 onPress={() => toggleSaved(item, { position, via: 'detail' })}
                 accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
-                <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
+                <Icon name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
               </Pressable>
             </View>
           ),
@@ -344,7 +344,7 @@ export default function FeedReaderScreen() {
                 ]}
                 onPress={() => void browse(link.url, link.index)}>
                 {link.index === 0 ? (
-                  <SymbolView name={embed ? 'arrow.up.right.square' : 'safari'} tintColor="#fff" size={20} />
+                  <Icon name={embed ? 'arrow.up.right.square' : 'safari'} tintColor="#fff" size={20} />
                 ) : (
                   <SourceAvatar name={link.site || link.label} url={link.url} size={26} />
                 )}
@@ -358,7 +358,7 @@ export default function FeedReaderScreen() {
                     </ThemedText>
                   ) : null}
                 </View>
-                <SymbolView name="chevron.right" tintColor={link.index === 0 ? '#fff' : theme.textSecondary} size={14} />
+                <Icon name="chevron.right" tintColor={link.index === 0 ? '#fff' : theme.textSecondary} size={14} />
               </Pressable>
             ))}
           </View>

@@ -1,8 +1,8 @@
-import { SymbolView } from 'expo-symbols';
 import { memo, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View, useWindowDimensions, type LayoutChangeEvent } from 'react-native';
 import ReanimatedSwipeable, { SwipeDirection, type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -62,7 +62,7 @@ type Props = {
 function HideAction() {
   return (
     <View style={[styles.swipe, styles.hide]}>
-      <SymbolView name="eye.slash.fill" tintColor="#fff" size={22} />
+      <Icon name="eye.slash.fill" tintColor="#fff" size={22} />
       <ThemedText style={styles.swipeLabel}>Hide</ThemedText>
     </View>
   );
@@ -71,7 +71,7 @@ function HideAction() {
 function SaveAction({ saved }: { saved: boolean }) {
   return (
     <View style={[styles.swipe, styles.save]}>
-      <SymbolView name={saved ? 'bookmark.slash' : 'bookmark.fill'} tintColor="#fff" size={22} />
+      <Icon name={saved ? 'bookmark.slash' : 'bookmark.fill'} tintColor="#fff" size={22} />
       <ThemedText style={styles.swipeLabel}>{saved ? 'Unsave' : 'Save'}</ThemedText>
     </View>
   );
@@ -87,7 +87,7 @@ export function LikeButton({ liked, onPress, size = 20 }: { liked: boolean; onPr
   const theme = useTheme();
   return (
     <Pressable hitSlop={10} onPress={onPress} accessibilityLabel={liked ? 'Unlike' : 'Like'} accessibilityState={{ selected: liked }} style={styles.action}>
-      <SymbolView name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={size} />
+      <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={size} />
     </Pressable>
   );
 }
@@ -97,7 +97,7 @@ function ContextLine({ label, inset }: { label: string; inset: number }) {
   const theme = useTheme();
   return (
     <View style={[styles.context, { paddingLeft: inset }]}>
-      <SymbolView name="sparkles" tintColor={theme.textSecondary} size={13} />
+      <Icon name="sparkles" tintColor={theme.textSecondary} size={13} />
       <ThemedText style={[styles.contextText, { color: theme.textSecondary }]} numberOfLines={2}>
         {label}
       </ThemedText>
@@ -115,9 +115,9 @@ function HnCounts({ hn, onPress }: { hn: NonNullable<CardContext['hn']>; onPress
       onPress={onPress}
       accessibilityLabel={`${hn.points} points, ${hn.comments} comments on Hacker News`}
       style={({ pressed }) => [styles.hn, pressed && styles.pressed]}>
-      <SymbolView name="arrowtriangle.up.fill" tintColor="#FF6600" size={13} />
+      <Icon name="arrowtriangle.up.fill" tintColor="#FF6600" size={13} />
       <ThemedText style={[styles.hnText, { color: theme.textSecondary }]}>{compactCount(hn.points) || '0'}</ThemedText>
-      <SymbolView name="bubble.right" tintColor={theme.textSecondary} size={14} />
+      <Icon name="bubble.right" tintColor={theme.textSecondary} size={14} />
       <ThemedText style={[styles.hnText, { color: theme.textSecondary }]}>{compactCount(hn.comments) || '0'}</ThemedText>
     </Pressable>
   );
@@ -189,7 +189,7 @@ function FeedCardImpl({
                 <PostByline embed={embed} />
               </Pressable>
               <Pressable hitSlop={12} onPress={() => onMenu(item)} accessibilityLabel="More">
-                <SymbolView name="ellipsis" tintColor={theme.textSecondary} size={16} />
+                <Icon name="ellipsis" tintColor={theme.textSecondary} size={16} />
               </Pressable>
             </View>
             {embed.replying_to ? (
@@ -251,7 +251,7 @@ function FeedCardImpl({
                 <View style={styles.meta}>
                   {age ? <ThemedText style={[styles.age, { color: theme.textSecondary }]}>{age}</ThemedText> : null}
                   <Pressable hitSlop={12} onPress={() => onMenu(item)} accessibilityLabel="More">
-                    <SymbolView name="ellipsis" tintColor={theme.textSecondary} size={16} />
+                    <Icon name="ellipsis" tintColor={theme.textSecondary} size={16} />
                   </Pressable>
                 </View>
               </View>
@@ -310,7 +310,7 @@ function FeedCardImpl({
                     onPress={() => onBrowse(item, link)}
                     accessibilityLabel={`Open ${link.label}`}
                     style={({ pressed }) => [styles.chip, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
-                    <SymbolView name="link" tintColor={ACCENT} size={13} />
+                    <Icon name="link" tintColor={ACCENT} size={13} />
                     <ThemedText style={styles.chipText} numberOfLines={1}>
                       {link.label}
                     </ThemedText>
@@ -321,19 +321,19 @@ function FeedCardImpl({
             <View style={styles.actions}>
               <LikeButton liked={liked} onPress={like} />
               <Pressable hitSlop={10} onPress={open} accessibilityLabel="Details" style={[styles.action, styles.details]}>
-                <SymbolView name="text.bubble" tintColor={theme.textSecondary} size={19} />
+                <Icon name="text.bubble" tintColor={theme.textSecondary} size={19} />
                 <ThemedText style={[styles.actionText, { color: theme.textSecondary }]}>Details</ThemedText>
               </Pressable>
               {item.url ? (
                 <Pressable hitSlop={10} onPress={() => onBrowse(item)} accessibilityLabel="Open page" style={styles.action}>
-                  <SymbolView name="safari" tintColor={theme.textSecondary} size={19} />
+                  <Icon name="safari" tintColor={theme.textSecondary} size={19} />
                 </Pressable>
               ) : null}
               <Pressable hitSlop={10} onPress={share} accessibilityLabel="Share" style={styles.action}>
-                <SymbolView name="paperplane" tintColor={theme.textSecondary} size={19} />
+                <Icon name="paperplane" tintColor={theme.textSecondary} size={19} />
               </Pressable>
               <Pressable hitSlop={10} onPress={save} accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'} style={styles.action}>
-                <SymbolView name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={19} />
+                <Icon name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.textSecondary} size={19} />
               </Pressable>
               <View style={styles.flex} />
               {hn ? <HnCounts hn={hn} onPress={openHn} /> : null}
