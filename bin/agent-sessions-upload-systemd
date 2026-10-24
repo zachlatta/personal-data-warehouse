@@ -45,7 +45,11 @@ finished_at_iso="$(date -Iseconds)"
 duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
-pdw_post_heartbeat "openclaw" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+# The heartbeat names the pipelines this host feeds. The openclaw VM uploads only
+# OpenClaw sessions (the default); a Linux dev box that runs Claude Code, Codex
+# or pi (mew-dev) sets AGENT_SESSIONS_HEARTBEAT_PIPELINES in its unit, or its
+# runs would be reported as openclaw's.
+pdw_post_heartbeat "${AGENT_SESSIONS_HEARTBEAT_PIPELINES:-openclaw}" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
 echo "[$finished_at_iso] finished agent sessions upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
 
 exit "$exit_code"

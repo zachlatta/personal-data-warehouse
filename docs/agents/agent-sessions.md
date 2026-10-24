@@ -250,6 +250,8 @@ a **systemd user timer** (zrl has `Linger=yes`, so user units run without an act
 - Systemd unit: `personal-data-warehouse-agent-sessions-upload.{service,timer}` (user scope).
 - Checked-in templates: `ops/systemd/personal-data-warehouse-agent-sessions-upload.{service,timer}`.
 - Wrapper: `bin/agent-sessions-upload-systemd`; status helper: `bin/agent-sessions-upload-status-systemd`.
+  Its heartbeat reports the `openclaw` pipeline unless the unit sets
+  `AGENT_SESSIONS_HEARTBEAT_PIPELINES` (comma-separated pipeline names).
 - Run cadence: every 300s (`OnUnitActiveSec=300s`, `Persistent=true`), mirroring the macOS cadence.
 - Run log: `~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log`;
   heartbeat: `~/.local/state/personal-data-warehouse/agent-sessions-upload.heartbeat`.
@@ -279,6 +281,17 @@ uploads go through the app, end-to-end also depends on the **app** (`/ingest/age
 and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
 relying on the timer.
+
+### mew-dev (Linux dev VM)
+
+`mew-dev` (libvirt guest on `mew`, a Paseo host since 2026-10-24) runs the same systemd user
+timer for its Claude Code and Codex sessions. Differences from openclaw: the `.env` keeps the
+Claude/Codex/pi scans on (it only sets `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.com` and
+`PDW_INGEST_TAILSCALE_HOST=mew-coolify`), and a drop-in
+(`~/.config/systemd/user/personal-data-warehouse-agent-sessions-upload.service.d/`) sets
+`AGENT_SESSIONS_HEARTBEAT_PIPELINES=claude_code,codex,pi` and loads `PDW_SECRET_TOKEN` from a
+0600 `EnvironmentFile`, so the interactive `pdw` CLI there keeps its own issued token. `device`
+resolves to `mew-dev`.
 
 ### Muse Code (the Muse models' coding CLI)
 
