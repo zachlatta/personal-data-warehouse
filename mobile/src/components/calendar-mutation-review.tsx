@@ -13,11 +13,11 @@ import {
   type CalendarReviewEvent,
 } from '@/lib/mutation-review';
 
-const CALENDAR_BLUE = '#2563EB';
+const CALENDAR_BLUE = '#36A0DA';
 const CALENDAR_BLUE_LIGHT = '#60A5FA';
-const CLEAR_GREEN = '#16A34A';
-const CONFLICT_RED = '#DC2626';
-const WARNING_AMBER = '#D97706';
+const CLEAR_GREEN = '#4FAFA3';
+const CONFLICT_RED = '#E5636D';
+const WARNING_AMBER = '#E0A05C';
 const TIME_GUTTER = 54;
 
 function calendarTile(review: ReturnType<typeof calendarMutationReview>): { month: string; day: string } {
@@ -67,7 +67,7 @@ function attendeeInitials(attendee: CalendarReviewAttendee): string {
 }
 
 function attendeeColor(attendee: CalendarReviewAttendee): string {
-  const palette = ['#2563EB', '#7C3AED', '#DB2777', '#C2410C', '#0F766E', '#4D7C0F'];
+  const palette = ['#36A0DA', '#9A7FD1', '#D180A6', '#E0A05C', '#4FAFA3', '#8FBF6A'];
   const seed = attendee.email || attendee.displayName;
   let hash = 0;
   for (const character of seed) hash = (hash + (character.codePointAt(0) ?? 0)) % palette.length;
@@ -78,7 +78,7 @@ function responseColor(status: string): string {
   if (status === 'accepted') return CLEAR_GREEN;
   if (status === 'declined') return CONFLICT_RED;
   if (status === 'tentative') return WARNING_AMBER;
-  return '#6B7280';
+  return '#8A8784';
 }
 
 function openURL(url: string) {
@@ -434,12 +434,12 @@ const styles = StyleSheet.create({
   allDaySection: { flexDirection: 'row', gap: 5, paddingHorizontal: 6, paddingBottom: 8 },
   allDayLabel: { width: TIME_GUTTER - 8, textAlign: 'right', fontSize: 9, lineHeight: 15 },
   allDayRows: { flex: 1, gap: 4 },
-  allDayEvent: { minHeight: 34, borderRadius: 7, borderLeftWidth: 3, borderLeftColor: '#6B7280', paddingHorizontal: 8, paddingVertical: 5, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 6 },
+  allDayEvent: { minHeight: 34, borderRadius: 7, borderLeftWidth: 3, borderLeftColor: '#8A8784', paddingHorizontal: 8, paddingVertical: 5, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 6 },
   allDayProposed: { backgroundColor: CALENDAR_BLUE, borderLeftColor: CALENDAR_BLUE_LIGHT },
   allDayConflict: { borderLeftColor: CONFLICT_RED },
   inlineTags: { flexDirection: 'row', gap: 4 },
   proposedTag: { overflow: 'hidden', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: '#FFFFFF33', color: '#FFFFFF', fontSize: 8, lineHeight: 11, fontWeight: '800' },
-  conflictTag: { overflow: 'hidden', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: '#DC262622', color: '#FCA5A5', fontSize: 8, lineHeight: 11, fontWeight: '800' },
+  conflictTag: { overflow: 'hidden', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: '#E5636D22', color: '#FCA5A5', fontSize: 8, lineHeight: 11, fontWeight: '800' },
   whiteText: { color: '#FFFFFF' },
   timeGrid: { position: 'relative', marginRight: 7 },
   hourLine: { position: 'absolute', left: 0, right: 0, borderTopWidth: StyleSheet.hairlineWidth },
@@ -470,7 +470,7 @@ const styles = StyleSheet.create({
   avatarText: { color: '#FFFFFF', fontSize: 12, lineHeight: 15, fontWeight: '800' },
   attendeeCopy: { flex: 1, minWidth: 0 },
   attendeeTags: { maxWidth: 115, flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 3 },
-  neutralTag: { overflow: 'hidden', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: '#6B728022', color: '#9CA3AF', fontSize: 7, lineHeight: 10, fontWeight: '800' },
+  neutralTag: { overflow: 'hidden', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, backgroundColor: '#8A878422', color: '#9CA3AF', fontSize: 7, lineHeight: 10, fontWeight: '800' },
   responseTag: { overflow: 'hidden', borderRadius: 4, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 4, paddingVertical: 1, fontSize: 8, lineHeight: 11, fontWeight: '700' },
   description: { gap: 2, paddingVertical: 3 },
   detailRow: { minHeight: 48, flexDirection: 'row', alignItems: 'center', gap: 9 },

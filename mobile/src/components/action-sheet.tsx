@@ -83,6 +83,6 @@ const styles = StyleSheet.create({
   title: { fontSize: 13, paddingHorizontal: Spacing.four, paddingVertical: Spacing.two },
   option: { paddingHorizontal: Spacing.four, paddingVertical: Spacing.three },
   optionText: { fontSize: 16 },
-  destructive: { color: '#E5484D' },
+  destructive: { color: '#E5636D' },
   divider: { height: StyleSheet.hairlineWidth, marginVertical: Spacing.one },
 });

@@ -49,7 +49,7 @@ export function Avatar({
       style={[
         frame,
         styles.fallback,
-        { backgroundColor: highlight ? '#D97706' : theme.backgroundElement },
+        { backgroundColor: highlight ? '#E0A05C' : theme.backgroundElement },
         highlight && styles.highlight,
         style,
       ]}>
@@ -60,6 +60,6 @@ export function Avatar({
 
 const styles = StyleSheet.create({
   fallback: { alignItems: 'center', justifyContent: 'center' },
-  highlight: { borderWidth: 2, borderColor: '#D97706' },
+  highlight: { borderWidth: 2, borderColor: '#E0A05C' },
   highlightText: { color: '#FFFFFF' },
 });

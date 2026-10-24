@@ -10,9 +10,9 @@ import type { Mutation } from '@/lib/api';
 import { pretty } from '@/lib/format';
 import { contactMutationReview, type ContactFieldChange, type ContactOperationReview, type ContactReviewPoint } from '@/lib/mutation-review';
 
-export const CONTACT_CREATE = '#16A34A';
-export const CONTACT_UPDATE = '#2563EB';
-export const CONTACT_DELETE = '#DC2626';
+export const CONTACT_CREATE = '#4FAFA3';
+export const CONTACT_UPDATE = '#36A0DA';
+export const CONTACT_DELETE = '#E5636D';
 const CREATE = CONTACT_CREATE;
 const UPDATE = CONTACT_UPDATE;
 const DELETE = CONTACT_DELETE;
@@ -185,21 +185,21 @@ const styles = StyleSheet.create({
   eyebrow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   verb: { letterSpacing: 0.8, fontSize: 11 },
   name: { fontSize: 19, lineHeight: 24 },
-  warning: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: DELETE, backgroundColor: '#DC26261A', padding: 10 },
-  warningText: { color: '#D0342C' },
+  warning: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: DELETE, backgroundColor: '#E5636D1A', padding: 10 },
+  warningText: { color: '#E5636D' },
   points: { borderRadius: 10, overflow: 'hidden' },
   point: { minHeight: 40, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 12, paddingVertical: 8 },
   pressed: { opacity: 0.6 },
   pointGlyph: { width: 16, textAlign: 'center' },
   pointValue: { flex: 1, minWidth: 0 },
-  pointMuted: { color: '#8B8F98', textDecorationLine: 'line-through' },
+  pointMuted: { color: '#8A8784', textDecorationLine: 'line-through' },
   typeChip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
-  typeChipText: { color: '#8B8F98', fontSize: 9, fontWeight: '700', letterSpacing: 0.5 },
+  typeChipText: { color: '#8A8784', fontSize: 9, fontWeight: '700', letterSpacing: 0.5 },
   note: { borderLeftWidth: 3, paddingLeft: 10, gap: 2 },
   noteTitle: { letterSpacing: 0.8, fontSize: 11 },
   change: { paddingTop: Spacing.two, marginTop: Spacing.two, borderTopWidth: StyleSheet.hairlineWidth, gap: 2 },
   changeHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
-  before: { color: '#8B8F98', textDecorationLine: 'line-through' },
+  before: { color: '#8A8784', textDecorationLine: 'line-through' },
   after: { color: CREATE },
   clearedTag: { color: DELETE, letterSpacing: 0.8, fontSize: 11 },
   clearedValue: { color: DELETE, fontStyle: 'italic' },

@@ -10,14 +10,15 @@ import { fetchNotificationLedger, setNotificationsEnabled, type NotificationEven
 import { formatWhen, humanSource } from '@/lib/format';
 import { notificationOutcome, summarizeNotifications, type NotificationOutcome } from '@/lib/notifications';
 import { useConfig } from '@/lib/session';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 const PAGE = 50;
 
 const TONE_COLORS: Record<NotificationOutcome['tone'], string> = {
-  good: '#16A34A',
-  neutral: '#2563EB',
-  muted: '#6B7280',
-  bad: '#DC2626',
+  good: '#4FAFA3',
+  neutral: '#36A0DA',
+  muted: '#8A8784',
+  bad: '#E5636D',
 };
 
 function OutcomePill({ outcome }: { outcome: NotificationOutcome }) {
@@ -38,6 +39,7 @@ function deliveryLine(event: NotificationEvent): string {
 }
 
 export default function NotificationsScreen() {
+  const tabSpace = useTabBarSpace();
   const config = useConfig();
   const theme = useTheme();
   const [ledger, setLedger] = useState<NotificationLedger | null>(null);
@@ -144,6 +146,7 @@ export default function NotificationsScreen() {
   return (
     <ThemedView style={styles.container}>
       <FlatList
+        contentContainerStyle={{ paddingBottom: tabSpace }}
         data={ledger?.events ?? []}
         keyExtractor={(item) => item.id}
         refreshControl={<RefreshControl refreshing={refreshing && !loadingMore} onRefresh={load} />}
@@ -232,6 +235,6 @@ const styles = StyleSheet.create({
   empty: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.three },
   more: { margin: Spacing.three, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: '#36A0DA' },
   disabled: { opacity: 0.6 },
-  errorBox: { padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
-  errorText: { color: '#D0342C' },
+  errorBox: { padding: Spacing.three, borderRadius: 10, backgroundColor: '#E5636D22' },
+  errorText: { color: '#E5636D' },
 });

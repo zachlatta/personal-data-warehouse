@@ -11,7 +11,7 @@ import type { Mutation } from '@/lib/api';
 import { pretty } from '@/lib/format';
 import { appleContactPointExists, appleContactsReview, type AppleContactCard, type AppleContactsReview } from '@/lib/mutation-review';
 
-const MERGE = '#7C3AED';
+const MERGE = '#9A7FD1';
 
 function opColor(op: AppleContactsReview['op']): string {
   return op === 'create' ? CONTACT_CREATE : op === 'update' ? CONTACT_UPDATE : MERGE;
@@ -156,9 +156,9 @@ const styles = StyleSheet.create({
   verb: { letterSpacing: 0.8, fontSize: 11 },
   name: { fontSize: 19, lineHeight: 24 },
   sectionTitle: { letterSpacing: 0.8, fontSize: 11, marginBottom: 4 },
-  warning: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: CONTACT_DELETE, backgroundColor: '#DC26261A', padding: 10, gap: 2 },
-  warningText: { color: '#D0342C' },
-  destructive: { borderLeftColor: '#D97706', backgroundColor: '#D977061A' },
+  warning: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: CONTACT_DELETE, backgroundColor: '#E5636D1A', padding: 10, gap: 2 },
+  warningText: { color: '#E5636D' },
+  destructive: { borderLeftColor: '#E0A05C', backgroundColor: '#E0A05C1A' },
   destructiveText: { color: '#B45309' },
   points: { borderRadius: 10, overflow: 'hidden' },
   note: { borderLeftWidth: 3, paddingLeft: 10, gap: 2 },

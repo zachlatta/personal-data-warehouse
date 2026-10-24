@@ -27,6 +27,7 @@ import {
 } from './rich-views';
 import { cardVideo, videoAspect } from './video';
 import { InlineVideo } from './video-player';
+import { confirm } from '@/lib/haptics';
 
 const PREVIEW_LINES = 4;
 const POST_LINES = 8;
@@ -342,6 +343,7 @@ function FeedCardImpl({
       renderLeftActions={() => <SaveAction saved={saved} />}
       onSwipeableOpenStartDrag={(direction) => onSwipeStart?.(item, direction === SwipeDirection.RIGHT ? 'save' : 'dismiss')}
       onSwipeableOpen={(direction) => {
+        confirm();
         swipeable.current?.close();
         // The direction the card moved: right reveals the left (save) action.
         if (direction === SwipeDirection.RIGHT) onSave(item, 'swipe');
@@ -390,8 +392,9 @@ const styles = StyleSheet.create({
   thread: { fontSize: 14, marginTop: Spacing.two },
   swipe: { width: 96, alignItems: 'center', justifyContent: 'center', gap: Spacing.one },
   swipeLabel: { color: '#fff', fontSize: 13, fontWeight: '600' },
-  hide: { backgroundColor: '#FF3B30' },
-  save: { backgroundColor: '#FF9500' },
+  // Superhuman's swipe colours: done teal for hide, star amber for save.
+  hide: { backgroundColor: '#4FAFA3' },
+  save: { backgroundColor: '#E0A05C' },
   hn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingVertical: Spacing.one },
   hnText: { fontSize: 13, fontWeight: '600', marginRight: 6 },
 });

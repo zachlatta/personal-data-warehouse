@@ -11,7 +11,6 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getTimelineContext,
-  getTimelineItem,
   TIMELINE_CONTEXT_MAX_WINDOW,
   type TimelineContextPage,
   type TimelineItem,
@@ -19,6 +18,7 @@ import {
 } from '@/lib/api';
 import { cleanSnippet, dayLabel, formatWhen, humanSource, pretty } from '@/lib/format';
 import { useConfig } from '@/lib/session';
+import { loadTimelineItem, peekTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
 
 const HIDDEN_SOURCE_KEYS = new Set(['raw_json', 'raw', 'body_html', 'search_text']);
 const CONTEXT_STEP = 15;
@@ -125,6 +125,9 @@ export default function TimelineItemScreen() {
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
+  // The row the list showed paints the header at once; the full detail
+  // (body, conversation, source row) fills in when it arrives.
+  const [seed] = useState(() => (adapter && eventId ? peekTimelineItem(adapter, eventId) : null));
   const [detail, setDetail] = useState<TimelineItemDetail | null>(null);
   const [context, setContext] = useState<TimelineContextPage | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
@@ -133,8 +136,9 @@ export default function TimelineItemScreen() {
   useEffect(() => {
     if (!adapter || !eventId) return;
     // Each push mounts a fresh screen, so there is no stale detail to clear.
-    getTimelineItem(config, adapter, eventId)
+    loadTimelineItem(config, adapter, eventId)
       .then((d) => {
+        if (d.context) rememberTimelineItems(d.context.items);
         setDetail(d);
         setContext(d.context ?? null);
       })
@@ -162,24 +166,24 @@ export default function TimelineItemScreen() {
     [router],
   );
 
-  if (error && !detail) {
+  if (error && !detail && !seed) {
     return (
       <ThemedView style={styles.center}>
-        <ThemedText style={{ color: '#D0342C' }}>{error}</ThemedText>
+        <ThemedText style={{ color: '#E5636D' }}>{error}</ThemedText>
       </ThemedView>
     );
   }
-  if (!detail) {
+  if (!detail && !seed) {
     return (
       <ThemedView style={styles.center}>
         <ActivityIndicator />
       </ThemedView>
     );
   }
-  const item = detail.item;
-  const sourceRow = (detail.source_row ?? null) as Record<string, unknown> | null;
-  const media = detail.item_media ?? null;
-  const children = Object.entries(detail.children ?? {}).filter(([, rows]) => Array.isArray(rows) ? rows.length > 0 : true);
+  const item = detail?.item ?? (seed as TimelineItem);
+  const sourceRow = (detail?.source_row ?? null) as Record<string, unknown> | null;
+  const media = detail?.item_media ?? null;
+  const children = Object.entries(detail?.children ?? {}).filter(([, rows]) => Array.isArray(rows) ? rows.length > 0 : true);
   const rows = sourceRow
     ? Object.entries(sourceRow).filter(([key, value]) => !isHiddenKey(key) && value !== null && value !== '' && value !== undefined)
     : [];
@@ -214,26 +218,27 @@ export default function TimelineItemScreen() {
         {media?.media_kind === 'image' && media.media_url ? <Image source={{ uri: media.media_url }} style={styles.image} contentFit="contain" /> : null}
         {item.snippet ? <ThemedText selectable style={styles.body}>{cleanSnippet(item.snippet)}</ThemedText> : null}
         {error ? (
-          <ThemedText type="small" style={{ color: '#D0342C' }}>
+          <ThemedText type="small" style={{ color: '#E5636D' }}>
             {error}
           </ThemedText>
         ) : null}
+        {!detail && !error ? <ActivityIndicator style={styles.pending} /> : null}
         {context && context.items.length > 1 ? <ConversationCard page={context} loading={contextLoading} onWiden={widen} onOpen={openItem} /> : null}
-        {detail.context_error ? (
-          <ThemedText type="small" style={{ color: '#D0342C' }}>
-            {detail.context_error}
+        {detail?.context_error ? (
+          <ThemedText type="small" style={{ color: '#E5636D' }}>
+            {detail?.context_error}
           </ThemedText>
         ) : null}
-        {detail.source_row_error ? (
-          <ThemedText type="small" style={{ color: '#D0342C' }}>
-            {detail.source_row_error}
+        {detail?.source_row_error ? (
+          <ThemedText type="small" style={{ color: '#E5636D' }}>
+            {detail?.source_row_error}
           </ThemedText>
         ) : null}
         {children.map(([name, childRows]) => (
           <View key={name} style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
             <ThemedText type="smallBold" themeColor="textSecondary" style={styles.cardTitle}>
               {name.replace(/_/g, ' ')}
-              {Array.isArray(childRows) ? ` (${childRows.length}${detail.children_meta?.[name]?.has_more ? '+' : ''})` : ''}
+              {Array.isArray(childRows) ? ` (${childRows.length}${detail?.children_meta?.[name]?.has_more ? '+' : ''})` : ''}
             </ThemedText>
             {Array.isArray(childRows) ? (
               childRows.slice(0, 50).map((row, index) => (
@@ -242,7 +247,7 @@ export default function TimelineItemScreen() {
                 </ThemedText>
               ))
             ) : (
-              <ThemedText type="small" style={{ color: '#D0342C' }}>
+              <ThemedText type="small" style={{ color: '#E5636D' }}>
                 {childRows.error}
               </ThemedText>
             )}
@@ -280,6 +285,7 @@ const styles = StyleSheet.create({
   sender: { flexShrink: 1, fontSize: 15, lineHeight: 20, fontWeight: '600' },
   body: { fontSize: 16, lineHeight: 23 },
   image: { width: '100%', height: 280, borderRadius: 12 },
+  pending: { alignSelf: 'flex-start' },
   card: { borderRadius: 12, padding: Spacing.three, gap: Spacing.two },
   cardTitle: { marginBottom: Spacing.one },
   field: { gap: 2 },

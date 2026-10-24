@@ -11,6 +11,7 @@ import { sendTestPush } from '@/lib/api';
 import { notificationSettingsName, secureStoreName } from '@/lib/platform-copy';
 import { useConfig, useSession } from '@/lib/session';
 import { applyUpdateNow, describeInstalledUpdate, type UpdateState } from '@/lib/updates';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 function describePush(push: ReturnType<typeof useSession>['push']): string {
   if (!push) return 'Registering…';
@@ -27,6 +28,7 @@ function describePush(push: ReturnType<typeof useSession>['push']): string {
 }
 
 export default function SettingsScreen() {
+  const tabSpace = useTabBarSpace();
   const theme = useTheme();
   const config = useConfig();
   const router = useRouter();
@@ -57,7 +59,7 @@ export default function SettingsScreen() {
   const card = [styles.card, { backgroundColor: theme.backgroundElement }];
   return (
     <ThemedView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.content}>
+      <ScrollView contentContainerStyle={[styles.content, { paddingBottom: tabSpace }]}>
         <View style={card}>
           <ThemedText type="smallBold" themeColor="textSecondary">
             Server

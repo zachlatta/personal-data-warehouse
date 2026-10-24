@@ -182,7 +182,7 @@ export function SlackSendMessageCard({
               autoCapitalize="sentences"
               autoCorrect
               maxLength={SLACK_TEXT_MAX}
-              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#D97706' : '#6B728044' }]}
+              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#E0A05C' : '#8A878444' }]}
             />
             <View style={styles.composeMeta}>
               <ThemedText type="small" themeColor="textSecondary">Slack formatting: *bold*, _italic_, {'<@U…>'} mentions.</ThemedText>
@@ -228,32 +228,32 @@ export function SlackSendMessageCard({
 const styles = StyleSheet.create({
   card: { marginHorizontal: Spacing.three, borderRadius: 12, padding: 10, gap: Spacing.two },
   header: { flexDirection: 'row', alignItems: 'center', gap: 9 },
-  kindIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#D977061A' },
+  kindIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#E0A05C1A' },
   headerCopy: { flex: 1, minWidth: 0, gap: 2 },
   titleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   title: { flexShrink: 1 },
-  chip: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728066', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
-  chipText: { color: '#8B8F98', fontSize: 8, fontWeight: '700', letterSpacing: 0.5 },
-  accent: { color: '#D97706', letterSpacing: 0.8 },
-  action: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: '#D97706', padding: 10, gap: Spacing.one },
-  warning: { borderWidth: 1, borderColor: '#D0342C66', borderRadius: 10, padding: 10 },
+  chip: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#8A878466', borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1 },
+  chipText: { color: '#8A8784', fontSize: 8, fontWeight: '700', letterSpacing: 0.5 },
+  accent: { color: '#E0A05C', letterSpacing: 0.8 },
+  action: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: '#E0A05C', padding: 10, gap: Spacing.one },
+  warning: { borderWidth: 1, borderColor: '#E5636D66', borderRadius: 10, padding: 10 },
   context: { gap: Spacing.one },
   contextHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   transcript: { gap: Spacing.one },
-  message: { flexDirection: 'row', gap: 10, borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728044', alignItems: 'flex-start' },
-  messageParent: { borderColor: '#D97706', borderLeftWidth: 4, paddingLeft: 9 },
+  message: { flexDirection: 'row', gap: 10, borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#8A878444', alignItems: 'flex-start' },
+  messageParent: { borderColor: '#E0A05C', borderLeftWidth: 4, paddingLeft: 9 },
   messagePressed: { opacity: 0.7 },
   messageCopy: { flex: 1, minWidth: 0, gap: 3 },
   messageHeader: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: Spacing.one },
-  parentTag: { alignSelf: 'flex-start', marginTop: 3, color: '#D97706', fontSize: 11, letterSpacing: 0.8 },
+  parentTag: { alignSelf: 'flex-start', marginTop: 3, color: '#E0A05C', fontSize: 11, letterSpacing: 0.8 },
   compose: { gap: Spacing.one },
-  bubble: { borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728044' },
+  bubble: { borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#8A878444' },
   input: { minHeight: 110, borderRadius: 10, padding: 12, borderWidth: 1, fontSize: 16, lineHeight: 22, textAlignVertical: 'top' },
   composeMeta: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
   composeActions: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: Spacing.two },
-  saveButton: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, backgroundColor: '#D97706' },
+  saveButton: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, backgroundColor: '#E0A05C' },
   saveButtonDisabled: { opacity: 0.45 },
   saveButtonText: { color: '#fff' },
   target: { gap: 2 },
-  error: { color: '#D0342C' },
+  error: { color: '#E5636D' },
 });

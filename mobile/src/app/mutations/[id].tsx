@@ -53,6 +53,7 @@ import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rem
 import { nextPendingRequestId, pendingReviewCount } from '@/lib/review-queue';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
+import { confirm } from '@/lib/haptics';
 
 // The fields that make a mutation reviewable at a glance, per operation. Any
 // other payload key still renders below, so nothing is hidden — only ordered.
@@ -371,6 +372,7 @@ export default function MutationRequestScreen() {
   // and an Undo inside the window cancels it before anything is sent, then
   // reopens the request.
   const decide = async (target: MutationRequest, note: string, send: () => Promise<MutationRequest>) => {
+    confirm();
     decisions.hold({
       requestId: target.id,
       note: `${note} · ${target.title}`,
@@ -709,31 +711,31 @@ const styles = StyleSheet.create({
   batchContent: { paddingBottom: Spacing.five * 2 },
   overview: { padding: Spacing.three, gap: Spacing.two },
   overviewFlush: { padding: 0 },
-  hero: { flexDirection: 'row', gap: 12, borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#D9770644' },
+  hero: { flexDirection: 'row', gap: 12, borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#E0A05C44' },
   heroCopy: { flex: 1, minWidth: 0, gap: 4 },
   heroEyebrow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 7 },
   requestTitle: { fontSize: 21, lineHeight: 26 },
   requestReason: { lineHeight: 18 },
   metricGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two },
   metricCard: { width: '48%', minHeight: 62, flexGrow: 1, flexDirection: 'row', alignItems: 'center', gap: 9, borderRadius: 12, padding: 10 },
-  metricIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#D977061A' },
+  metricIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#E0A05C1A' },
   metricCopy: { flex: 1, minWidth: 0 },
   metricCount: { fontSize: 19, lineHeight: 22 },
   guardrailGrid: { gap: Spacing.two },
   guardrailCard: { gap: 4, borderRadius: 12, padding: 11, borderLeftWidth: 4 },
-  includedCard: { borderLeftColor: '#D97706' },
-  preservedCard: { borderLeftColor: '#16A34A' },
-  preservedTitle: { color: '#16A34A', letterSpacing: 0.8 },
+  includedCard: { borderLeftColor: '#E0A05C' },
+  preservedCard: { borderLeftColor: '#4FAFA3' },
+  preservedTitle: { color: '#4FAFA3', letterSpacing: 0.8 },
   scopeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two, marginTop: Spacing.one },
   scopeChip: { minHeight: 34, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 17 },
-  scopeChipActive: { backgroundColor: '#D97706' },
+  scopeChipActive: { backgroundColor: '#E0A05C' },
   scopeChipActiveText: { color: '#FFFFFF' },
   dayHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.three, paddingVertical: 6, borderBottomWidth: StyleSheet.hairlineWidth },
   filterBlock: { gap: Spacing.two, marginTop: Spacing.one },
   filterTitleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   filterInput: { minHeight: 44, borderRadius: 11, paddingHorizontal: Spacing.three, fontSize: 15 },
   filterEmpty: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.four, textAlign: 'center' },
-  batchSectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 54, paddingHorizontal: Spacing.three, paddingVertical: 7, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#6B728044' },
+  batchSectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 54, paddingHorizontal: Spacing.three, paddingVertical: 7, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#8A878444' },
   batchSectionIcon: { width: 32, height: 32, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
   batchSectionCopy: { flex: 1, minWidth: 0 },
   batchCount: { minWidth: 32, minHeight: 24, paddingHorizontal: 8, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
@@ -751,7 +753,7 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   input: { borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 12, fontSize: 16 },
-  error: { color: '#D0342C' },
-  link: { color: '#2563EB' },
-  slackAccent: { color: '#D97706', letterSpacing: 0.8 },
+  error: { color: '#E5636D' },
+  link: { color: '#36A0DA' },
+  slackAccent: { color: '#E0A05C', letterSpacing: 0.8 },
 });

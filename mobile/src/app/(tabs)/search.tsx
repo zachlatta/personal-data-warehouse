@@ -11,9 +11,11 @@ import { useTheme } from '@/hooks/use-theme';
 import { effectiveMobileSearchPriorities, MOBILE_DEFAULT_SEARCH_PRIORITIES, PRIORITIES, search, splitRef, type Priority, type SearchHit, type SearchMode, type SearchResult } from '@/lib/api';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 const MODES: SearchMode[] = ['hybrid', 'keyword', 'exact'];
 export default function SearchScreen() {
+  const tabSpace = useTabBarSpace();
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
@@ -105,6 +107,7 @@ export default function SearchScreen() {
       ) : null}
       {busy ? <ActivityIndicator style={styles.spinner} /> : null}
       <FlatList
+        contentContainerStyle={{ paddingBottom: tabSpace }}
         data={result?.rows ?? []}
         keyExtractor={(hit, index) => `${hit.ref}|${index}`}
         keyboardShouldPersistTaps="handled"
@@ -144,5 +147,5 @@ const styles = StyleSheet.create({
   spinner: { paddingVertical: Spacing.two },
   empty: { textAlign: 'center', padding: Spacing.five },
   footer: { textAlign: 'center', padding: Spacing.three },
-  error: { color: '#D0342C', paddingHorizontal: Spacing.three },
+  error: { color: '#E5636D', paddingHorizontal: Spacing.three },
 });

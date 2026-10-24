@@ -77,5 +77,5 @@ const styles = StyleSheet.create({
   frame: { marginTop: 8, borderRadius: 10, overflow: 'hidden', backgroundColor: '#FFFFFF' },
   web: { backgroundColor: '#FFFFFF' },
   more: { minHeight: 40, alignItems: 'center', justifyContent: 'center', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#E5E7EB', backgroundColor: '#F9FAFB' },
-  moreText: { color: '#2563EB' },
+  moreText: { color: '#36A0DA' },
 });

@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { Palette } from '@/constants/theme';
+import { TAB_PILL_HEIGHT } from '@/hooks/use-tab-bar-space';
 import { useTheme } from '@/hooks/use-theme';
 
 // Superhuman's bottom navigation: one rounded pill floating above the page,
@@ -23,8 +24,10 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
   };
 
   return (
-    <View style={[styles.wrap, { paddingBottom: Math.max(insets.bottom, 10), backgroundColor: theme.background }]}>
-      <View style={[styles.pill, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
+    // Floats over the page (position absolute, no backdrop), so the list
+    // scrolls under it as in Superhuman; screens pad by useTabBarSpace().
+    <View pointerEvents="box-none" style={[styles.wrap, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+      <View style={[styles.pill, styles.shadow, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
         {tabs.map((route) => {
           const { options } = descriptors[route.key];
           const focused = route.key === focusedKey;
@@ -54,7 +57,7 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
           accessibilityLabel="Settings"
           accessibilityState={{ selected: account.key === focusedKey }}
           onPress={() => press(account.key, account.name)}
-          style={[styles.avatar, { backgroundColor: theme.surface, borderColor: account.key === focusedKey ? theme.text : theme.surfaceBorder }]}>
+          style={[styles.avatar, styles.shadow, { backgroundColor: theme.surface, borderColor: account.key === focusedKey ? theme.text : theme.surfaceBorder }]}>
           <ThemedText style={styles.avatarText}>Z</ThemedText>
         </Pressable>
       ) : null}
@@ -63,11 +66,13 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
 }
 
 const styles = StyleSheet.create({
-  wrap: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingTop: 8 },
-  pill: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', height: 52, borderRadius: 26, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 5 },
+  wrap: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingTop: 8 },
+  // A soft lift so the pill reads above the rows scrolling beneath it.
+  shadow: { elevation: 8, shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
+  pill: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', height: TAB_PILL_HEIGHT, borderRadius: TAB_PILL_HEIGHT / 2, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 5 },
   item: { flex: 1, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center' },
   badge: { position: 'absolute', top: 2, left: '50%', marginLeft: 4, minWidth: 20, height: 20, borderRadius: 10, borderWidth: 2, paddingHorizontal: 4, alignItems: 'center', justifyContent: 'center' },
   badgeText: { color: '#FFFFFF', fontSize: 11, lineHeight: 14, fontWeight: '700' },
-  avatar: { width: 52, height: 52, borderRadius: 26, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  avatar: { width: TAB_PILL_HEIGHT, height: TAB_PILL_HEIGHT, borderRadius: TAB_PILL_HEIGHT / 2, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   avatarText: { fontSize: 18, fontWeight: '600' },
 });

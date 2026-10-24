@@ -13,8 +13,8 @@ import { emailBodyForDisplay } from '@/lib/email-html';
 import { cleanSnippet, formatWhen, truncate } from '@/lib/format';
 import { gmailThreadToggle, type GmailBatchSummary, type GmailThreadReview } from '@/lib/mutation-review';
 
-const ACCENT = '#2563EB';
-const DANGER = '#DC2626';
+const ACCENT = '#36A0DA';
+const DANGER = '#E5636D';
 
 function timeOfDay(iso: string): string {
   const date = new Date(iso);
@@ -23,7 +23,7 @@ function timeOfDay(iso: string): string {
 }
 
 function Chip({ label, tone = 'muted' }: { label: string; tone?: 'muted' | 'accent' | 'danger' }) {
-  const color = tone === 'accent' ? ACCENT : tone === 'danger' ? DANGER : '#8B8F98';
+  const color = tone === 'accent' ? ACCENT : tone === 'danger' ? DANGER : '#8A8784';
   return (
     <View style={[styles.chip, { borderColor: `${color}66` }]}>
       <ThemedText style={[styles.chipText, { color }]}>{label}</ThemedText>
@@ -300,7 +300,7 @@ export function GmailOverview({
 
 const styles = StyleSheet.create({
   overview: { padding: Spacing.three, gap: Spacing.two },
-  hero: { borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#2563EB33' },
+  hero: { borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#36A0DA33' },
   heroCopy: { flex: 1, minWidth: 0, gap: 4 },
   heroEyebrow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 7 },
   requestTitle: { fontSize: 24, lineHeight: 30 },
@@ -310,7 +310,7 @@ const styles = StyleSheet.create({
   scopeChipActive: { backgroundColor: ACCENT },
   scopeChipActiveText: { color: '#FFFFFF' },
   filterInput: { minHeight: 44, borderRadius: 11, paddingHorizontal: Spacing.three, fontSize: 15 },
-  error: { color: '#D0342C' },
+  error: { color: '#E5636D' },
   row: { borderBottomWidth: StyleSheet.hairlineWidth },
   dim: { opacity: 0.5 },
   rowHead: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, minHeight: 64, paddingHorizontal: Spacing.three, paddingVertical: 10 },
@@ -322,14 +322,14 @@ const styles = StyleSheet.create({
   // Aligned under the row's text: padding (16) + avatar (40) + gap (10).
   rowFoot: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: -4, paddingLeft: 66, paddingRight: Spacing.three, paddingBottom: 10 },
   toggle: { flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 30, paddingLeft: 6, paddingRight: 10, borderRadius: 15, borderWidth: 1 },
-  toggleOn: { borderColor: '#2563EB', backgroundColor: '#2563EB1A' },
-  toggleOff: { borderColor: '#D97706', backgroundColor: '#D977061F' },
+  toggleOn: { borderColor: '#36A0DA', backgroundColor: '#36A0DA1A' },
+  toggleOff: { borderColor: '#E0A05C', backgroundColor: '#E0A05C1F' },
   toggleBox: { width: 18, height: 18, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
-  toggleBoxOn: { backgroundColor: '#2563EB' },
-  toggleBoxOff: { borderWidth: 1.5, borderColor: '#D97706' },
+  toggleBoxOn: { backgroundColor: '#36A0DA' },
+  toggleBoxOff: { borderWidth: 1.5, borderColor: '#E0A05C' },
   toggleTick: { color: '#FFFFFF', fontSize: 12, lineHeight: 14, fontWeight: '800' },
   toggleOnText: { color: '#36A0DA' },
-  toggleOffText: { color: '#D97706' },
+  toggleOffText: { color: '#E0A05C' },
   pressed: { opacity: 0.6 },
   chip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 },
   chipText: { fontSize: 9, fontWeight: '700', letterSpacing: 0.6 },

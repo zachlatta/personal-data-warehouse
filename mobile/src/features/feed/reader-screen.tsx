@@ -2,6 +2,7 @@ import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { Fragment, useCallback, useRef } from 'react';
 import { Linking, Pressable, ScrollView, StyleSheet, View, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
@@ -112,6 +113,7 @@ function Spans({ spans, onLink }: { spans: Span[]; onLink: (url: string) => void
 // far down it was read). dwell_ms is active time: time with the app in the
 // background, or the screen untouched past a minute, does not count.
 export default function FeedReaderScreen() {
+  const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ id: string; position?: string }>();
   const theme = useTheme();
   const item = feedItems.get(params.id);
@@ -246,6 +248,7 @@ export default function FeedReaderScreen() {
   const media = cardMedia(item);
   const video = embed ? null : cardVideo(item);
   const links = cardLinks(item);
+  const primary = links.find((link) => link.index === 0);
   const name = item.site || item.source;
   const posts = embed ? [embed, ...(embed.thread ?? [])] : [];
   const article = articleUrl(item, !!video);
@@ -367,9 +370,9 @@ export default function FeedReaderScreen() {
             ) : null}
           </>
         )}
-        {links.length ? (
+        {links.length > 1 ? (
           <View style={[styles.pad, styles.links]}>
-            {links.map((link) => (
+            {links.filter((link) => link.index > 0).map((link) => (
               <Pressable
                 key={link.index}
                 style={({ pressed }) => [
@@ -399,6 +402,21 @@ export default function FeedReaderScreen() {
           </View>
         ) : null}
       </ScrollView>
+      {primary ? (
+        // Superhuman keeps the main action in a pill floating at the thumb,
+        // not at the end of the page: one tap from anywhere in the post.
+        <View pointerEvents="box-none" style={[styles.floatWrap, { bottom: Math.max(insets.bottom, 10) + 6 }]}>
+          <Pressable
+            accessibilityRole="link"
+            style={({ pressed }) => [styles.floatPill, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }, pressed && { opacity: 0.8 }]}
+            onPress={() => void browse(primary.url, primary.index)}>
+            <Icon name={embed ? 'arrow.up.right.square' : 'safari'} tintColor={ACCENT} size={19} />
+            <ThemedText style={styles.floatLabel} numberOfLines={1}>
+              {embed ? 'Open on X' : `Open ${primary.label || 'link'}`}
+            </ThemedText>
+          </Pressable>
+        </View>
+      ) : null}
     </ThemedView>
   );
 }
@@ -408,7 +426,10 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   headerButtons: { flexDirection: 'row', alignItems: 'center', gap: 18 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
-  content: { paddingTop: Spacing.three, paddingBottom: Spacing.six, gap: Spacing.three },
+  content: { paddingTop: Spacing.three, paddingBottom: 120, gap: Spacing.three },
+  floatWrap: { position: 'absolute', left: 0, right: 0, alignItems: 'center' },
+  floatPill: { flexDirection: 'row', alignItems: 'center', gap: 8, height: 50, maxWidth: '86%', paddingHorizontal: 22, borderRadius: 25, borderWidth: StyleSheet.hairlineWidth, elevation: 8, shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
+  floatLabel: { fontSize: 16, fontWeight: '600', flexShrink: 1 },
   pad: { paddingHorizontal: Spacing.three },
   gap: { gap: Spacing.three },
   sourceRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },

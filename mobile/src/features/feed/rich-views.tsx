@@ -26,7 +26,7 @@ import {
   type FeedMedia,
 } from './rich';
 
-export const ACCENT = '#1D9BF0';
+export const ACCENT = '#36A0DA';
 export const LIKE_RED = '#F91880';
 
 // What the views report up so engagement can count it: a swipe to another

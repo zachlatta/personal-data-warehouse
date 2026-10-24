@@ -18,6 +18,7 @@ export function InboxRow({
   labels,
   accessory,
   onPress,
+  onPressIn,
 }: {
   dot?: string;
   sender: string;
@@ -28,11 +29,13 @@ export function InboxRow({
   labels?: { text: string; color?: string }[];
   accessory?: ReactNode;
   onPress: () => void;
+  onPressIn?: () => void;
 }) {
   const theme = useTheme();
   return (
     <Pressable
       onPress={onPress}
+      onPressIn={onPressIn}
       android_ripple={{ color: theme.separator }}
       style={({ pressed }) => [styles.row, { borderBottomColor: theme.separator }, pressed && { backgroundColor: theme.backgroundElement }]}>
       <View style={styles.gutter}>{dot ? <View style={[styles.dot, { backgroundColor: dot }]} /> : null}</View>

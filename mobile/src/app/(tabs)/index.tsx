@@ -11,6 +11,8 @@ import { Spacing } from '@/constants/theme';
 import { listTimeline, PRIORITIES, type Priority, type TimelineItem } from '@/lib/api';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
+import { prefetchTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 // Attention tiers by default: noise is 82% of the corpus and is exactly what a
 // glance at the timeline should not open with.
@@ -34,15 +36,25 @@ type Action =
   | { type: 'page'; generation: number; reset: boolean; items: TimelineItem[]; cursor?: string; hasMore: boolean }
   | { type: 'error'; generation: number; message: string };
 
+// The last first page per tier set, for this process: switching tiers or
+// coming back paints rows at once and refreshes underneath, instead of an
+// empty list and a spinner.
+const firstPages = new Map<string, TimelineItem[]>();
+const tierKey = (tiers: Priority[]) => tiers.join(',');
+
 function reducer(state: State, action: Action): State {
   switch (action.type) {
-    case 'reset':
-      return { ...state, tiers: action.tiers ?? state.tiers, items: [], cursor: undefined, hasMore: true, generation: state.generation + 1, fetching: 'reset', error: null };
+    case 'reset': {
+      const tiers = action.tiers ?? state.tiers;
+      const items = firstPages.get(tierKey(tiers)) ?? (tierKey(tiers) === tierKey(state.tiers) ? state.items : []);
+      return { ...state, tiers, items, cursor: undefined, hasMore: true, generation: state.generation + 1, fetching: 'reset', error: null };
+    }
     case 'more':
       if (state.fetching !== 'none' || !state.hasMore || !state.cursor) return state;
       return { ...state, generation: state.generation + 1, fetching: 'more', error: null };
     case 'page':
       if (action.generation !== state.generation) return state;
+      if (action.reset) firstPages.set(tierKey(state.tiers), action.items);
       return { ...state, items: action.reset ? action.items : [...state.items, ...action.items], cursor: action.cursor, hasMore: action.hasMore, fetching: 'none' };
     case 'error':
       if (action.generation !== state.generation) return state;
@@ -51,9 +63,10 @@ function reducer(state: State, action: Action): State {
 }
 
 export default function TimelineScreen() {
+  const tabSpace = useTabBarSpace();
   const config = useConfig();
   const router = useRouter();
-  const [state, dispatch] = useReducer(reducer, { tiers: DEFAULT_TIERS, items: [], hasMore: true, generation: 1, fetching: 'reset', error: null });
+  const [state, dispatch] = useReducer(reducer, { tiers: DEFAULT_TIERS, items: firstPages.get(tierKey(DEFAULT_TIERS)) ?? [], hasMore: true, generation: 1, fetching: 'reset', error: null });
   const { tiers, items, cursor, generation, fetching, error } = state;
 
   // One fetch per generation. The reducer decides what a generation means
@@ -66,6 +79,7 @@ export default function TimelineScreen() {
     // holds events years out that would otherwise open the list.
     listTimeline(config, { priorities: tiers, before: reset ? undefined : cursor, jump: reset ? new Date().toISOString() : undefined, limit: PAGE })
       .then((page) => {
+        rememberTimelineItems(page.items);
         if (!cancelled) dispatch({ type: 'page', generation, reset, items: page.items, cursor: page.next_cursor, hasMore: page.has_more });
       })
       .catch((e) => {
@@ -92,6 +106,7 @@ export default function TimelineScreen() {
         </Pressable>
       ) : null}
       <FlatList
+        contentContainerStyle={{ paddingBottom: tabSpace }}
         data={items}
         keyExtractor={(item) => `${item.adapter}|${item.event_id}`}
         renderItem={({ item }) => {
@@ -105,6 +120,7 @@ export default function TimelineScreen() {
               preview={item.snippet && (item.title || item.context) ? truncate(item.snippet, 200) : undefined}
               labels={[{ text: humanSource(item.source) }]}
               accessory={<OpenInSourceButton link={item.open} compact />}
+              onPressIn={() => prefetchTimelineItem(config, item.adapter, item.event_id)}
               onPress={() =>
                 router.push({
                   pathname: '/timeline/[adapter]/[eventId]',
@@ -136,6 +152,6 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   footer: { paddingVertical: Spacing.three },
   empty: { textAlign: 'center', padding: Spacing.five },
-  errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
-  errorText: { color: '#D0342C' },
+  errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#E5636D22' },
+  errorText: { color: '#E5636D' },
 });

@@ -14,8 +14,10 @@ import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-c
 import { formatWhen } from '@/lib/format';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 export default function MutationsScreen() {
+  const tabSpace = useTabBarSpace();
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
@@ -62,19 +64,19 @@ export default function MutationsScreen() {
   const pending = requests.filter((r) => r.status === 'pending_review' && !decided.includes(r.id));
   const past = requests.filter((r) => r.status !== 'pending_review');
   const sections = [
-    { title: `Needs review (${pending.length})`, data: pending, empty: 'Nothing waiting on you.' },
+    { title: pending.length ? `Needs review (${pending.length})` : 'Needs review', data: pending, empty: 'All caught up. Nothing is waiting on you.' },
     { title: 'Past requests', data: past, empty: 'No approved or denied requests yet.' },
   ];
 
   return (
     <ThemedView style={styles.container}>
-      <UndoBar onOpen={(undone) => router.push({ pathname: '/mutations/[id]', params: { id: undone.requestId } })} />
       {error ? (
         <Pressable onPress={load} style={styles.errorBox}>
           <ThemedText style={styles.errorText}>{error} — tap to retry</ThemedText>
         </Pressable>
       ) : null}
       <SectionList
+        contentContainerStyle={{ paddingBottom: tabSpace }}
         sections={sections}
         keyExtractor={(item) => item.id}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} />}
@@ -107,6 +109,8 @@ export default function MutationsScreen() {
           />
         )}
       />
+      {/* After the list, so the toast draws above the rows it floats over. */}
+      <UndoBar bottom={tabSpace + 8} onOpen={(undone) => router.push({ pathname: '/mutations/[id]', params: { id: undone.requestId } })} />
     </ThemedView>
   );
 }
@@ -115,6 +119,6 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   sectionHeader: { paddingLeft: 26, paddingRight: Spacing.three, paddingTop: Spacing.three, paddingBottom: 6 },
   empty: { paddingLeft: 26, paddingRight: Spacing.three, paddingVertical: Spacing.three },
-  errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
-  errorText: { color: '#D0342C' },
+  errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#E5636D22' },
+  errorText: { color: '#E5636D' },
 });

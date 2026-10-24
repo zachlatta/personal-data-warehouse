@@ -20,8 +20,8 @@ import {
   type GmailEmailVariant,
 } from '@/lib/mutation-review';
 
-const ACCENT = '#2563EB';
-const DANGER = '#DC2626';
+const ACCENT = '#36A0DA';
+const DANGER = '#E5636D';
 
 type DeliveryMode = 'send' | 'draft';
 
@@ -379,5 +379,5 @@ const styles = StyleSheet.create({
   linkButton: { minHeight: 44, justifyContent: 'center' },
   link: { color: '#36A0DA' },
   danger: { color: DANGER },
-  error: { color: '#D0342C' },
+  error: { color: '#E5636D' },
 });

@@ -47,6 +47,7 @@ import { sourceBubbles } from './rich';
 import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
 import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
+import { readFeedCache, writeFeedCache } from './feed-cache';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { mailtoUrl, shareDraft } from './share';
 import { autoplayStep } from './autoplay';
@@ -54,6 +55,7 @@ import { openTrackedBrowser } from './tracked-browser';
 import { autoplayKey } from './video';
 import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
 import { layoutsFromHeights, ViewabilityTracker, visibleFraction, type Impression } from './viewability';
+import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 // Reload on return to the tab after this long away.
 const STALE_MS = 10 * 60_000;
@@ -92,11 +94,24 @@ function viewName(only: string | null, searching = false): string {
 type Undo = { text: string; undo: () => void; timer: ReturnType<typeof setTimeout> };
 
 export default function FeedScreen() {
+  const tabSpace = useTabBarSpace();
   const config = useConfig();
   const theme = useTheme();
   const router = useRouter();
-  const [items, setItems] = useState<FeedItem[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  // A cold start paints the last page from disk at once; the network
+  // load then replaces it (loadedAt stays 0, so the first focus fetches).
+  const [cached] = useState(() => {
+    const page = readFeedCache();
+    if (page) {
+      for (const item of [...page.items, ...(page.saved ?? [])]) feedItems.set(item.item_id, item);
+      loadSaved(page.saved ?? []);
+      loadLiked([...page.items, ...(page.saved ?? [])]);
+    }
+    return page;
+  });
+  const [items, setItems] = useState<FeedItem[]>(() => cached?.items ?? []);
+  const [loaded, setLoaded] = useState(!!cached);
+  const savedPage = useRef<FeedItem[]>(cached?.saved ?? []);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [disabled, setDisabled] = useState(false);
@@ -105,7 +120,7 @@ export default function FeedScreen() {
   // Cards a reload brought that were not in the list, for X's "new posts" pill.
   const [arrivals, setArrivals] = useState<FeedItem[]>([]);
   const list = useRef<FlatList<FeedItem>>(null);
-  const loadedIds = useRef<string[]>([]);
+  const loadedIds = useRef<string[]>(cached?.items.map((i) => i.item_id) ?? []);
   // The rail across the top narrows the feed to one source.
   const [only, setOnly] = useState<string | null>(null);
   const bubbles = useMemo(() => sourceBubbles(items), [items]);
@@ -121,7 +136,7 @@ export default function FeedScreen() {
   const [searchError, setSearchError] = useState<string | null>(null);
   const searchGeneration = useRef(0);
   // The last page the server sent, so search results can merge their likes in.
-  const pageItems = useRef<FeedItem[]>([]);
+  const pageItems = useRef<FeedItem[]>(cached ? [...cached.items, ...(cached.saved ?? [])] : []);
   const shown = useMemo(() => {
     if (searching) return results ?? [];
     if (only === SAVED) return savedIds.map((id) => feedItems.get(id)).filter((i): i is FeedItem => !!i);
@@ -210,10 +225,11 @@ export default function FeedScreen() {
         },
       });
       for (const item of page.items) feedItems.set(item.item_id, item);
+      savedPage.current = page.saved ?? [];
       loadSaved(page.saved ?? []);
       pageItems.current = [...page.items, ...(page.saved ?? [])];
       loadLiked(pageItems.current);
-      const fresh = trigger === 'stale' && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
+      const fresh = (trigger === 'stale' || loadedIds.current.length > 0) && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
       setArrivals(fresh);
       if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
       loadedIds.current = page.items.map((i) => i.item_id);
@@ -238,6 +254,12 @@ export default function FeedScreen() {
   useEffect(() => {
     connectFeedLogger(config);
   }, [config]);
+
+  // Keep the disk copy in step with what is on screen, hides included, so a
+  // hidden card does not come back on the next cold start.
+  useEffect(() => {
+    if (loadedAt.current) writeFeedCache({ items, saved: savedPage.current, generated_at: new Date().toISOString() });
+  }, [items]);
 
   // Re-measure once new cards have laid out.
   useEffect(() => {
@@ -658,6 +680,7 @@ export default function FeedScreen() {
       ) : null}
       <FlatList
         ref={list}
+        contentContainerStyle={{ paddingBottom: tabSpace }}
         data={shown}
         extraData={[savedIds, likedIds]}
         keyExtractor={(item) => item.item_id}
@@ -812,7 +835,7 @@ export default function FeedScreen() {
         </Pressable>
       ) : null}
       {undo ? (
-        <View style={[styles.undo, { backgroundColor: theme.text }]}>
+        <View style={[styles.undo, { bottom: tabSpace + 8, backgroundColor: theme.text }]}>
           <ThemedText style={[styles.undoText, { color: theme.background }]} numberOfLines={1}>
             {undo.text}
           </ThemedText>
@@ -834,7 +857,7 @@ const styles = StyleSheet.create({
   bubbleDim: { opacity: 0.45 },
   bubbleLabel: { fontSize: 12, lineHeight: 15, maxWidth: 70 },
   bubbleLabelOn: { fontWeight: '700' },
-  savedBubble: { width: 58, height: 58, borderRadius: 29, backgroundColor: '#FF9500', alignItems: 'center', justifyContent: 'center' },
+  savedBubble: { width: 58, height: 58, borderRadius: 29, backgroundColor: '#E0A05C', alignItems: 'center', justifyContent: 'center' },
   savedBubbleOn: { borderWidth: 3, borderColor: ACCENT },
   savedCount: {
     position: 'absolute',

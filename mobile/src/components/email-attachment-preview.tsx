@@ -129,6 +129,6 @@ const styles = StyleSheet.create({
   attachment: { minHeight: 48, justifyContent: 'center', gap: 4 },
   list: { gap: 6 },
   link: { color: '#36A0DA' },
-  error: { color: '#D0342C', padding: 16 },
+  error: { color: '#E5636D', padding: 16 },
   text: { padding: 16 },
 });

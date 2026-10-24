@@ -41,6 +41,13 @@ export const Palette = {
   star: '#E0A05C',
   organize: '#BBA6E5',
   brand: '#714CB6',
+  // Text and icon roles, used across review screens instead of system
+  // reds, ambers and blues so every screen reads as one app.
+  danger: '#E5636D',
+  warning: '#E0A05C',
+  success: '#4FAFA3',
+  neutral: '#8A8784',
+  link: '#36A0DA',
 } as const;
 
 export type ThemeColor = keyof typeof Colors.light & keyof typeof Colors.dark;

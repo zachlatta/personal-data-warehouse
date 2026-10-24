@@ -92,5 +92,5 @@ const styles = StyleSheet.create({
   button: { backgroundColor: '#36A0DA', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: Spacing.two },
   buttonDisabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
-  error: { color: '#D0342C' },
+  error: { color: '#E5636D' },
 });

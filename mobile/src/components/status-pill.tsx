@@ -16,7 +16,7 @@ export const STATUS_COLORS: Record<string, string> = {
 };
 
 export function StatusPill({ status }: { status: string }) {
-  const color = STATUS_COLORS[status] ?? '#6B7280';
+  const color = STATUS_COLORS[status] ?? '#8A8784';
   return (
     <View style={[styles.pill, { backgroundColor: `${color}2E` }]}>
       <ThemedText style={[styles.pillText, { color }]}>{status.replace(/_/g, ' ')}</ThemedText>
