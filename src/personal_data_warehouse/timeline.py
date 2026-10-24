@@ -2401,8 +2401,9 @@ _ANDROID_NOTIFICATION_ACTION = _simple_adapter(
         # raw_json numbers arrive as 1.0; jsonb compares them by value.
         "OR (t.event_type = 'expansion' AND t.raw_json->'user_action' = '1'::jsonb "
         "AND t.raw_json->'expanded' = '1'::jsonb))) "
+        # A group's summary goes with its last child: not a separate act.
         "OR (t.event_source <> 'system_log' AND t.event_type = 'removed' "
-        "AND t.removal_reason IN (2, 3, 18))"
+        "AND t.removal_reason IN (2, 3, 18) AND t.is_group_summary = 0)"
     ),
     **_ANDROID_NOTIFICATION_ACT_COMMON,
 )

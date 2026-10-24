@@ -1333,6 +1333,8 @@ def _seed_github(wh) -> None:
             _notification("n8", "k-promo", 2.5, event_type="removed", package_name="com.example.shop",
                           app_label="Shop", category="", title="Sale today", messages=[],
                           content_sha256="sha-sale", removal_reason=2, removal_reason_name="cancel"),
+            _notification("n9", "k-summary", 2.45, event_type="removed", is_group_summary=1,
+                          content_sha256="sha-summary", removal_reason=2, removal_reason_name="cancel"),
             # Android's events log: the tap behind n7 (which n7 then only
             # repeats), a button, an expansion Zach made and one he did not,
             # and the notification coming on screen. Only the key is logged.
