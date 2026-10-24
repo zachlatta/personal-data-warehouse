@@ -25,7 +25,7 @@ import (
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
 	"dismiss", "undismiss", "share", "media", "save", "unsave",
-	"ui", "scroll", "load", "like", "unlike",
+	"ui", "scroll", "load", "like", "unlike", "web",
 }
 
 // cardlessEventTypes may come without an item_id: a sitting, a feed load,

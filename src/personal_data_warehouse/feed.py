@@ -17,7 +17,7 @@ VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement", "marts_fe
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
     "dismiss", "undismiss", "share", "media", "save", "unsave",
-    "ui", "scroll", "load", "like", "unlike",
+    "ui", "scroll", "load", "like", "unlike", "web",
 )
 
 #: The deliberate acts that reach timeline.events (tier self). Impressions,
