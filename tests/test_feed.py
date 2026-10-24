@@ -53,11 +53,15 @@ def _item(wh, item_id="hn:1", source="hn", **extra):
     wh._command(f"INSERT INTO @feed_items ({names}) VALUES ({marks})", tuple(columns.values()))
 
 
-def _event(wh, event_id, event_type, item_id="hn:1", minutes=0, dwell_ms=0, fraction=0.0, metadata="{}"):
+def _event(
+    wh, event_id, event_type, item_id="hn:1", minutes=0, dwell_ms=0, fraction=0.0, metadata="{}",
+    session_id="s", client_name="", device="",
+):
     wh._command(
         "INSERT INTO @feed_events (event_id, event_type, item_id, session_id, occurred_at, dwell_ms, "
-        "visible_fraction, metadata) VALUES (%s, %s, %s, 's', now() - make_interval(mins => %s), %s, %s, %s::jsonb)",
-        (event_id, event_type, item_id, 60 - minutes, dwell_ms, fraction, metadata),
+        "visible_fraction, metadata, client_name, device) "
+        "VALUES (%s, %s, %s, %s, now() - make_interval(mins => %s), %s, %s, %s::jsonb, %s, %s)",
+        (event_id, event_type, item_id, session_id, 60 - minutes, dwell_ms, fraction, metadata, client_name, device),
     )
 
 
@@ -121,6 +125,35 @@ def test_sessions_roll_up_one_sitting_and_ui_scroll_load_need_no_card(warehouse)
     assert rows == [("launch", "background", 360000, "1.0.0", "u1", 1, 1, 2000, 2, 1500, 1, 1, 1, 8, True)]
     # Feed-level events do not make a card row of their own.
     assert wh._query("SELECT count(*) FROM @marts_feed_item_engagement") == [(1,)]
+
+
+@pytestmark_db
+def test_an_emulator_testing_the_app_is_not_zach(warehouse):
+    wh = warehouse
+    _item(wh)
+    _item(wh, "hn:2")
+    # An agent checks a phone build on the Android emulator: it scrolls the
+    # real feed and lingers on cards. None of that is Zach, and a card the
+    # emulator saw must stay unseen for him.
+    emulator = {"session_id": "emu", "client_name": "android-emulator", "device": "sdk_gphone64_arm64"}
+    _event(wh, "e0", "session_start", item_id="", **emulator)
+    _event(wh, "e1", "impression", minutes=1, dwell_ms=30000, fraction=1.0, **emulator)
+    _event(wh, "e2", "open", minutes=2, metadata='{"mode": "detail"}', **emulator)
+    _event(wh, "e3", "session_end", item_id="", minutes=3, dwell_ms=70000, **emulator)
+    _event(wh, "e4", "impression", item_id="hn:2", minutes=1, dwell_ms=9000, fraction=1.0,
+           session_id="sim", client_name="iphone-simulator", device="iPhone 16 Pro")
+    # His phone, and a save an agent made for him when he asked, still count.
+    phone = {"session_id": "p", "client_name": "pixel11pro", "device": "Pixel 11 Pro"}
+    _event(wh, "p0", "session_start", item_id="", minutes=4, **phone)
+    _event(wh, "p1", "impression", item_id="hn:2", minutes=5, dwell_ms=2000, fraction=1.0, **phone)
+    _event(wh, "p2", "session_end", item_id="", minutes=6, dwell_ms=4000, **phone)
+    _event(wh, "a1", "save", minutes=7, session_id="", client_name="porygon", device="agent", metadata='{"via": "agent"}')
+    rows = wh._query(
+        "SELECT item_id, impressions, dwell_ms, opens, saved, first_seen_at IS NULL FROM @marts_feed_item_engagement "
+        "ORDER BY item_id"
+    )
+    assert rows == [("hn:1", 0, 0, 0, 1, True), ("hn:2", 1, 2000, 0, 0, False)]
+    assert wh._query("SELECT session_id, device FROM @marts_feed_sessions") == [("p", "Pixel 11 Pro")]
 
 
 @pytestmark_db

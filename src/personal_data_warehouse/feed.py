@@ -24,6 +24,17 @@ EVENT_TYPES = (
 #: dwell and sessions are telemetry and stay in base_feed.events.
 TIMELINE_EVENT_TYPES = ("open", "dismiss", "share", "save", "like")
 
+#: Events from a phone build under test, not from Zach: the Android emulator
+#: (client android-emulator, device sdk_gphone*) or an iOS simulator. An agent
+#: checking a build scrolls the real feed, and on 2026-10-24 its impressions
+#: marked 15 cards as seen, so they left his unseen feed. The marts leave these
+#: out; base_feed.events keeps them. A save an agent makes for him (device
+#: agent) is his and still counts.
+TEST_CLIENT_SQL = (
+    "(client_name ILIKE '%emulator%' OR client_name ILIKE '%simulator%'"
+    " OR device ILIKE 'sdk_gphone%')"
+)
+
 #: An impression shorter than this is a scroll-past rather than a look.
 SCROLL_PAST_MS = 1000
 
@@ -244,7 +255,7 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
             min(occurred_at) FILTER (WHERE event_type = 'impression') AS first_seen_at,
             max(occurred_at) AS last_event_at
         FROM @feed_events
-        WHERE item_id <> ''
+        WHERE item_id <> '' AND NOT {TEST_CLIENT_SQL}
         GROUP BY item_id
     )
     SELECT i.item_id, i.source, i.title, i.url, i.site, i.author, i.tags, i.score,
@@ -313,7 +324,7 @@ SOURCE_ENGAGEMENT_VIEW = """CREATE OR REPLACE VIEW @marts_feed_source_engagement
 # far he scrolls, what he taps. Events in a card's detail view carry no
 # sitting (the Feed is off screen then); they are on the card's row in
 # item_engagement. An unfinished sitting has NULL ended_at and duration.
-SESSIONS_VIEW = """CREATE OR REPLACE VIEW @marts_feed_sessions AS
+SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
     SELECT session_id,
            min(occurred_at) FILTER (WHERE event_type = 'session_start') AS started_at,
            max(occurred_at) FILTER (WHERE event_type = 'session_end') AS ended_at,
@@ -340,5 +351,5 @@ SESSIONS_VIEW = """CREATE OR REPLACE VIEW @marts_feed_sessions AS
            count(*) AS events,
            count(*) FILTER (WHERE event_type = 'like') AS likes
     FROM @feed_events
-    WHERE session_id <> ''
+    WHERE session_id <> '' AND NOT {TEST_CLIENT_SQL}
     GROUP BY session_id"""

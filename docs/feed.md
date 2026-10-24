@@ -200,6 +200,10 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
 - **Analytics**: `marts_feed.sessions` (per sitting, above), `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
+  The marts count only Zach's phones: events from a build under test (client `android-emulator`,
+  device `sdk_gphone*`, or a `*simulator*` client) are kept in `base_feed.events` but left out
+  (`TEST_CLIENT_SQL` in `feed.py`). On 2026-10-24 an agent checking video autoplay on the emulator
+  scrolled the live feed, and its impressions marked 15 cards as seen, so they left his unseen feed.
 - **C1/C2**: opens, shares, saves, likes and dismissals are `feed_engagement` timeline events at tier
   `self` (Zach did them). Impressions, closes, expands and sessions are telemetry and stay in
   `base_feed.events`; cards are entities reached through the marts view.
