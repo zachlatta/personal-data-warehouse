@@ -140,13 +140,18 @@ revisits of one page within 30 minutes; query `base_*` for every visit.
 `base_android_notifications.events` is one row per notification event on the Android phone
 (`device` `pichu`, from 2026-10-24): `event_type` `posted` (new, or an update whose text
 changed), `removed` (with `removal_reason_name`: `click` is a tap, `cancel` a swipe,
-`app_cancel` the app) or `active` (already showing when the listener connected). Columns:
+`app_cancel` the app) or `active` (already showing when the listener connected). Rows with
+`event_source` `system_log` are what happened on screen, keyed by `notification_key`:
+`visibility`, `expansion`, `clicked`, `action_clicked`, `alert`, `canceled`, `heads_up`, plus
+`shade_opened`/`shade_closed`, `screen`, `status_bar`; `exposure_ms` is time seen, details in
+`raw_json`. `interruption_filter` is Do Not Disturb. Columns:
 `package_name`, `app_label`, `title`, `text`, `big_text`, `messages` (jsonb thread:
 sender, text), `category` (`msg`, `email`, `call`, …), `channel_name`, `is_ongoing`,
 `posted_at`, `notification_key` (one notification across its events). Timeline source
 `android_notifications`: kind `notification` is each notification's first appearance with
 each text (a one-to-one message or call `direct`, a group conversation `cc`, ongoing
-`background`, the rest `noise`); kind `opened` is a tap, `self`. SMS and RCS texts reach PDW
+`background`, the rest `noise`); kind `opened` is a tap and `notification_action` a button,
+expansion, swipe or snooze, both `self`. SMS and RCS texts reach PDW
 only here. Android redacts one-time codes and other sensitive notifications for this listener.
 
 ## Screen timelapse (what was on a screen)

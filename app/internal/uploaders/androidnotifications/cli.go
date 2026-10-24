@@ -14,7 +14,9 @@ import (
 const Usage = `pdw ingest android-notifications - upload the notifications the phone receives.
 
 USAGE
-  pdw ingest android-notifications [--spool-dir DIR] [--device NAME] [--account EMAIL]
+  pdw ingest android-notifications tail-system-log --spool-dir DIR   (see its --help)
+  pdw ingest android-notifications [--spool-dir DIR] [--system-log-spool-dir DIR]
+                                   [--device NAME] [--account EMAIL]
                                    [--limit N] [--max-run-seconds N] [--dry-run]
                                    [--lock-file PATH]
 
@@ -24,12 +26,19 @@ posted or visibly updated, removed (with Android's reason: a tap, a swipe,
 the app), or already showing when it connected -- and this sends them, oldest
 first, as gzipped batches to the app's /ingest/android-notifications/batch
 endpoint, deleting each file once its batch is stored. A file that is not a
-listener event is moved to the spool's rejected/ directory. A run stops at
+listener event is moved to the spool's rejected/ directory. The system-log
+spool (written by tail-system-log: shown, hidden, expanded, tapped, action
+pressed, alerted, and the shade, screen and lock state) is sent in the same
+run, merged by time. A run stops at
 the first failed upload and exits non-zero; what was not sent stays.
 
 FLAGS
   --spool-dir DIR        The listener's spool
                          (default /data/data/com.zachlatta.pdw.notifications/files/spool).
+  --system-log-spool-dir DIR
+                         tail-system-log's spool, sent with the listener's
+                         (default ANDROID_NOTIFICATIONS_SYSTEM_LOG_SPOOL_DIR;
+                         none when unset).
   --device NAME          The phone's name in the warehouse (default
                          ANDROID_NOTIFICATIONS_DEVICE, else the hostname).
   --account EMAIL        Account the events are keyed by (default
@@ -42,7 +51,8 @@ FLAGS
                          (default: the state directory).
 
 ENVIRONMENT
-  ANDROID_NOTIFICATIONS_SPOOL_DIR, ANDROID_NOTIFICATIONS_DEVICE,
+  ANDROID_NOTIFICATIONS_SPOOL_DIR, ANDROID_NOTIFICATIONS_SYSTEM_LOG_SPOOL_DIR,
+  ANDROID_NOTIFICATIONS_DEVICE,
   ANDROID_NOTIFICATIONS_ACCOUNT
   PDW_API_URL, PDW_SECRET_TOKEN   (or pdw's own config file)
 `
@@ -59,8 +69,12 @@ var exitProcess = os.Exit
 
 // Run is the `pdw ingest android-notifications` entry point.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string, cfg ingestclient.Config) int {
+	if len(args) > 0 && args[0] == "tail-system-log" {
+		return RunTail(args[1:], stdout, stderr)
+	}
 	fs := common.NewFlagSet("pdw ingest android-notifications")
 	spoolDir := fs.String("spool-dir", "", "")
+	systemLogSpoolDir := fs.String("system-log-spool-dir", "", "")
 	device := fs.String("device", "", "")
 	account := fs.String("account", "", "")
 	lockFile := fs.String("lock-file", common.DefaultStateFile("android-notifications-upload.lock"), "")
@@ -83,6 +97,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	cfg = cfg.WithEnvFallback(env)
 	dir := common.FirstNonEmpty(*spoolDir, env.Env("ANDROID_NOTIFICATIONS_SPOOL_DIR"), DefaultSpoolDir)
+	systemLogDir := common.FirstNonEmpty(*systemLogSpoolDir, env.Env("ANDROID_NOTIFICATIONS_SYSTEM_LOG_SPOOL_DIR"))
 	deviceName := common.FirstNonEmpty(*device, env.Env("ANDROID_NOTIFICATIONS_DEVICE"), common.LocalDeviceName())
 	accountName := common.FirstNonEmpty(*account, env.Env("ANDROID_NOTIFICATIONS_ACCOUNT"))
 	if accountName == "" {
@@ -121,6 +136,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	summary, err := (&Runner{
 		SpoolDir:          dir,
+		ExtraSpoolDirs:    []string{systemLogDir},
 		Account:           accountName,
 		Device:            deviceName,
 		Client:            client,

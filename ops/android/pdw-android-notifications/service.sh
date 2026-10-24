@@ -16,6 +16,12 @@
 # - The loop below starts a run when one is due (at most one every
 #   $MIN_GAP seconds, so a burst of notifications is one batch) or five
 #   minutes have passed, holding its own wakelock for the run.
+# - `pdw ingest android-notifications tail-system-log` follows Android's
+#   events log for as long as the phone is up and writes what the listener
+#   cannot see -- a notification shown or hidden, expanded, tapped, a button
+#   pressed, buzzed or muted, and the shade, heads-up, screen and lock state --
+#   into $SYSLOG_SPOOL, which the same runs send. It resumes from its cursor
+#   after a restart (the log is a 256 KiB ring, so it must stay running).
 # - Notification access is re-granted at start: an app update or a settings
 #   reset can drop it, and nothing else would notice.
 #
@@ -30,6 +36,7 @@ STATE=/data/misc_ce/0/pdw-android-notifications
 PKG=com.zachlatta.pdw.notifications
 LISTENER=$PKG/$PKG.SpoolListenerService
 SPOOL=/data/data/$PKG/files/spool
+SYSLOG_SPOOL=$STATE/system-log-spool
 LOG=$STATE/logs/service.log
 WAKE=pdw_android_notifications_run
 FLOOR=300
@@ -61,12 +68,30 @@ else
   note "started, but the listener has NO notification access (cmd notification allow_listener failed)"
 fi
 
-# The spool appears with the listener's first event; until then watch its
-# parent so the first file is still noticed.
+mkdir -p "$SYSLOG_SPOOL" "$STATE/home" "$STATE/tmp"
+
+tail_system_log() {
+  while :; do
+    # Magisk starts services with HOME=/ and no TMPDIR; pdw needs both.
+    HOME="$STATE/home" TMPDIR="$STATE/tmp" XDG_CONFIG_HOME="$STATE/config" \
+      "$MODDIR/bin/pdw" ingest android-notifications tail-system-log --spool-dir "$SYSLOG_SPOOL" \
+      >> "$STATE/logs/system-log-tail.log" 2>&1
+    note "system-log tail exited ($?); restarting in 5s"
+    if [ "$(stat -c %s "$STATE/logs/system-log-tail.log")" -gt 262144 ]; then
+      mv -f "$STATE/logs/system-log-tail.log" "$STATE/logs/system-log-tail.log.1"
+    fi
+    sleep 5
+  done
+}
+tail_system_log &
+echo $! > "$STATE/system-log-tail.pid"
+
+# The listener's spool appears with its first event; until then wait so the
+# first file is still noticed.
 watch() {
   while :; do
     if [ -d "$SPOOL" ]; then
-      inotifyd "$MODDIR/bin/android-notifications-upload-wake" "$SPOOL:y"
+      inotifyd "$MODDIR/bin/android-notifications-upload-wake" "$SPOOL:y" "$SYSLOG_SPOOL:y"
     else
       sleep 30
       continue

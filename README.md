@@ -472,15 +472,18 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 
 ## Android Notification Sync
 
-Every notification the Android phone (`pichu`) posts or removes reaches
+Every notification the Android phone (`pichu`) posts or removes, and what happens to it on
+screen (shown, expanded, tapped, a button, alerted), reaches
 `base_android_notifications.events`. The PDW notification listener
 (`ops/android/pdw-notification-listener`, an APK with notification access and no UI) writes one
 JSON file per event into its spool; `pdw ingest android-notifications`, run as root on the phone by
 the `pdw-android-notifications` Magisk service, posts the spool to
 `/ingest/android-notifications/batch` within seconds and deletes what was stored. Dagster's
-`android_notifications_drive_inbox_sensor` promotes the batches. Two timeline adapters
-(`android_notification`, `android_notification_opened`; source `android_notifications`) carry each
-notification's first appearance with each content and the taps that opened one; see
+`android_notifications_drive_inbox_sensor` promotes the batches. The same service runs
+`pdw ingest android-notifications tail-system-log`, which follows Android's events log for the
+on-screen states. Three timeline adapters (`android_notification`, `android_notification_opened`,
+`android_notification_action`; source `android_notifications`) carry each notification's first
+appearance with each content, the taps that opened one, and the other things Zach did to one; see
 [docs/agents/other-sources.md](docs/agents/other-sources.md#android-notifications).
 
 ## Screen Timelapse Sync

@@ -1309,7 +1309,7 @@ def _seed_github(wh) -> None:
             "flags": 0, "visibility": 0, "title": "Alex Example", "text": "lunch?", "sub_text": "",
             "big_text": "", "info_text": "", "summary_text": "", "conversation_title": "",
             "text_lines": [], "messages": [{"sender": "Alex Example", "text": "lunch?", "time_ms": 0}],
-            "people": [], "actions": [], "removal_reason": 0, "removal_reason_name": "",
+            "people": [], "actions": ["Reply", "Mark read"], "removal_reason": 0, "removal_reason_name": "",
             "content_sha256": "sha-lunch", "raw_json": {}, "exported_at": _NOW, "synced_at": _NOW,
             "sync_version": 1,
         }
@@ -1333,6 +1333,21 @@ def _seed_github(wh) -> None:
             _notification("n8", "k-promo", 2.5, event_type="removed", package_name="com.example.shop",
                           app_label="Shop", category="", title="Sale today", messages=[],
                           content_sha256="sha-sale", removal_reason=2, removal_reason_name="cancel"),
+            # Android's events log: the tap behind n7 (which n7 then only
+            # repeats), a button, an expansion Zach made and one he did not,
+            # and the notification coming on screen. Only the key is logged.
+            *(
+                _notification(event_id, "k-chat", hours_ago, event_type=kind, event_source="system_log",
+                              app_label="", title="", text="", messages=[], category="",
+                              content_sha256="", raw_json=raw, action_index=index)
+                for event_id, hours_ago, kind, raw, index in (
+                    ("s1", 2.6 + 1 / 3600, "clicked", {}, 0),
+                    ("s2", 2.55, "action_clicked", {}, 1),
+                    ("s3", 2.54, "expansion", {"user_action": 1, "expanded": 1}, 0),
+                    ("s4", 2.53, "expansion", {"user_action": 0, "expanded": 1}, 0),
+                    ("s5", 2.52, "visibility", {"visible": 1}, 0),
+                )
+            ),
         ]
     )
 
@@ -1413,6 +1428,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     # The oldest seeded notification is the one-to-one message.
     "android_notification": "direct",
     "android_notification_opened": "self",
+    "android_notification_action": "self",
     # A frame of Zach's own screen is telemetry about him, the tier his own
     # health telemetry is in.
     "screen_capture": "noise",
@@ -1464,8 +1480,11 @@ EXPECTED_SEEDED_EVENTS = {
     # The message, its update, the media and the promotion; the re-post of the
     # same text and the group summary stay in base_android_notifications.
     "android_notification": 4,
-    # The tap, not the swipe.
+    # The tap, once: the system log's click, not the listener's removal
+    # that repeats it.
     "android_notification_opened": 1,
+    # The swipe, the button and the expansion Zach made.
+    "android_notification_action": 3,
     # One per capture moment: crobat's second display is the same moment.
     "screen_capture": 2,
     # two opens + dismiss; impression, close and the session rows stay in base_feed.
@@ -1658,7 +1677,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
     notifications = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "android_notifications"}
-    assert set(notifications) == {"n1", "n3", "n5", "n6", "n7"}
+    assert set(notifications) == {"n1", "n3", "n5", "n6", "n8", "s1", "s2", "s3"}
     assert notifications["n1"]["kind"] == "notification"
     assert notifications["n1"]["title"] == "Chat: Alex Example"
     assert notifications["n1"]["actor"] == "Alex Example"
@@ -1667,9 +1686,15 @@ def test_backfill_normalizes_every_source(warehouse):
     assert "[]" not in notifications["n6"]["search_text"]
     assert notifications["n5"]["priority"] == "background"
     assert notifications["n6"]["priority"] == "noise"
-    assert notifications["n7"]["kind"] == "opened"
-    assert notifications["n7"]["title"] == "Opened: Chat: Alex Example"
-    assert notifications["n7"]["priority"] == "self"
+    assert notifications["s1"]["kind"] == "opened"
+    assert notifications["s1"]["title"] == "Opened: Chat: Alex Example"
+    assert notifications["s1"]["priority"] == "self"
+    assert "lunch at noon?" in notifications["s1"]["search_text"]
+    assert notifications["s2"]["title"] == 'Pressed "Mark read" on: Chat: Alex Example'
+    assert notifications["s3"]["title"] == "Expanded: Chat: Alex Example"
+    assert notifications["n8"]["title"] == "Dismissed: Shop: Sale today"
+    assert notifications["n8"]["kind"] == "notification_action"
+    assert notifications["s2"]["metadata"]["event_source"] == "system_log"
     assert notifications["n1"]["source_table"] == "android_notification_events"
     screens = {r["source_pk"]["device"]: r for r in rows if r["source"] == "screen_timelapse"}
     assert set(screens) == {"crobat", "joltik"}

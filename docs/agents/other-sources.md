@@ -232,8 +232,9 @@ review on his PRs.
 
 ## Android notifications
 
-Every notification the Android phone (`pichu`, the rooted Pixel) posts or removes lands in
-`base_android_notifications.events`, from 2026-10-24.
+Every notification the Android phone (`pichu`, the rooted Pixel) posts or removes, and every
+state it passes through on screen (shown, expanded, tapped, a button, alerted, dismissed),
+lands in `base_android_notifications.events`, from 2026-10-24.
 
 - **The listener.** `ops/android/pdw-notification-listener` is a tiny APK
   (`com.zachlatta.pdw.notifications`, no UI, no network permission) with one
@@ -252,6 +253,33 @@ Every notification the Android phone (`pichu`, the rooted Pixel) posts or remove
   listener's `content_sha256` and every string extra (icons and parcels by type name only).
   Android 15+ redacts one-time codes and other sensitive notifications from listeners that are
   not system apps, so those arrive redacted.
+  From listener version 2 (2026-10-24) each event also carries how Android ranked it
+  (`rank`, `matches_interruption_filter` (0 = Do Not Disturb silenced it),
+  `last_audibly_alerted_ms`, `suppressed_visual_effects`, `user_sentiment`, smart reply and
+  action counts) and its channel's behavior (`channel_importance`, `channel_sound`,
+  `channel_vibrates`, `channel_bypass_dnd`, lock-screen visibility), and the listener records
+  `interruption_filter` events (Do Not Disturb changed, and its state on connect). All in
+  `raw_json`.
+- **The system-log tail.** A listener hears posted and removed, nothing in between. Android's
+  system server and System UI log the rest to the `events` log buffer, and
+  `pdw ingest android-notifications tail-system-log` (Go, `systemlog.go`) follows it with
+  `logcat -b events -v epoch,uid -s <tags>` for as long as the phone is up, writing one event
+  per line into `/data/misc_ce/0/pdw-android-notifications/system-log-spool` with
+  `event_source` `system_log` and id `syslog-<sha of the line>`: `visibility` (on screen
+  `visible` 1 / off 0), `expansion` (`expanded`, `user_action` 1 when Zach did it), `clicked`,
+  `action_clicked` (`action_index` into the notification's `actions`), `alert` (`buzz`, `beep`,
+  `blink`, `politeness`, `mute_reason`), `canceled` (reason plus lifespan and exposure),
+  `heads_up`, `autogrouped`/`unautogrouped`, `adjusted` (the assistant changed it),
+  `cancel_prevented`, `summary_converted`, and the phone around them: `shade_opened`
+  (`items`), `shade_closed`, `screen` (`screen_state`), `status_bar` (`keyguard_showing`).
+  Keyed rows carry `notification_key` (Android's `user|package|id|tag|uid`, the listener's key)
+  and the timings `lifespan_ms`, `freshness_ms`, `exposure_ms`, `notification_rank` as columns.
+  A silent re-alert with the same state (a timer re-posting every second) and a repeated
+  screen or status-bar state are dropped; a real alert is always kept. The buffer is a 256 KiB
+  ring that a chatty app fills in about an hour, which is why it is tailed, not dumped; a
+  restart resumes from `system-log.cursor`, and a re-read line gets the same id. Tags checked
+  against `/system/etc/event-log-tags` on Android 17; `sysui_multi_action` (MetricsLogger
+  numbers) is not decoded.
 - **The uploader.** `pdw ingest android-notifications`, run as root by the
   `pdw-android-notifications` Magisk service (`ops/android/pdw-android-notifications/service.sh`,
   wrapper `bin/android-notifications-upload-android`, deployed with the APK by the sysadmin
@@ -268,9 +296,14 @@ Every notification the Android phone (`pichu`, the rooted Pixel) posts or remove
   first appearance with each `content_sha256` on the timeline (re-posts of the same text, group
   summaries and empty shells stay in `base_*`), tiered by SQL: ongoing `background`, a
   `msg`/`call` notification `direct` (`cc` for a group conversation), the rest `noise`. The
-  `android_notification_opened` adapter is a `removed` event with reason 1 (a tap): `self`.
+  `android_notification_opened` adapter is a tap: a system-log `clicked`, or a listener
+  `removed` with reason 1 when no `clicked` row precedes it within 10 s (before the tail ran).
+  `android_notification_action` is the rest of what Zach did: an action button pressed, an
+  expansion he made, a swipe (reason 2), "Clear all" (3), a snooze (18). Both are `self` and
+  take the text from the listener's latest row for the key (a system-log row has none).
+  Shown/hidden, alerts, the shade and the screen stay in `base_*`.
 
 On the phone (`ssh pichu`): logs in `/data/misc_ce/0/pdw-android-notifications/logs/`,
-`touch /data/misc_ce/0/pdw-android-notifications/paused` stops uploads (the spool keeps
-filling), and a manual run is
+`touch /data/misc_ce/0/pdw-android-notifications/paused` stops uploads (the spools keep
+filling), the tail's log is `logs/system-log-tail.log`, and a manual run is
 `sh /data/adb/modules/pdw-android-notifications/bin/android-notifications-upload-android`.

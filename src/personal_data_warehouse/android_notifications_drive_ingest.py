@@ -60,7 +60,17 @@ _FLAG_FIELDS = (
     "is_conversation",
     "is_group_conversation",
 )
-_INT_FIELDS = ("notification_id", "importance", "flags", "visibility", "removal_reason")
+_INT_FIELDS = (
+    "notification_id",
+    "importance",
+    "flags",
+    "visibility",
+    "removal_reason",
+    "lifespan_ms",
+    "freshness_ms",
+    "exposure_ms",
+    "action_index",
+)
 _LIST_FIELDS = ("text_lines", "messages", "people", "actions")
 
 
@@ -179,6 +189,9 @@ def record_to_event_row(envelope: Mapping[str, Any]) -> dict[str, Any]:
         row[field] = int(bool(record.get(field)))
     for field in _INT_FIELDS:
         row[field] = int_value(record.get(field))
+    # The listener's events predate the field: they are the listener's.
+    row["event_source"] = str(record.get("event_source") or "listener")
+    row["notification_rank"] = int_value(record.get("rank"))
     for field in _LIST_FIELDS:
         value = record.get(field)
         row[field] = list(value) if isinstance(value, list) else []

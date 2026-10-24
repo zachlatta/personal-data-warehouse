@@ -2306,20 +2306,104 @@ _ANDROID_NOTIFICATION = _simple_adapter(
     **_ANDROID_NOTIFICATION_COMMON,
 )
 
+# What Zach did to a notification. Android's events log (event_source
+# `system_log`) records a tap (`clicked`), an action button (`action_clicked`)
+# and an expansion he made; the listener records the swipe (`removed`, reason
+# 2 `cancel`), "Clear all" (3) and a snooze (18). A tap that also removed the
+# notification is logged by both (a `clicked`, then a `removed` with reason 1
+# a moment later): the `clicked` row is the event, and a reason-1 removal
+# stands in only when no `clicked` row precedes it -- before the system-log
+# tail ran, or while it was down. A system-log row carries only the
+# notification's key, so the text comes from the listener's latest row for
+# that notification (`n`), which is the row itself for a listener event.
+_ANDROID_NOTIFICATION_LATEST_CONTENT = """@android_notification_events t
+    LEFT JOIN LATERAL (
+        SELECT p.app_label, p.title, p.text, p.big_text, p.sub_text, p.summary_text,
+            p.conversation_title, p.messages, p.text_lines, p.actions, p.category,
+            p.channel_id, p.channel_name, p.importance, p.is_ongoing
+        FROM @android_notification_events p
+        WHERE p.account = t.account AND p.device = t.device
+          AND p.notification_key = t.notification_key
+          AND p.event_source <> 'system_log'
+          AND p.event_at <= t.event_at + interval '5 seconds'
+        ORDER BY p.event_at DESC
+        LIMIT 1
+    ) n ON TRUE"""
+_ANDROID_NOTIFICATION_ACT_LABEL = (
+    "concat_ws(': ', COALESCE(NULLIF(n.app_label, ''), t.package_name), "
+    "COALESCE(NULLIF(n.title, ''), NULLIF(n.conversation_title, ''), left(n.text, 200)))"
+)
+_ANDROID_NOTIFICATION_ACT_TEXT = tuple(
+    expression.replace("t.", "n.") for expression in _ANDROID_NOTIFICATION_TEXT
+)
+_ANDROID_NOTIFICATION_ACT_COMMON = dict(
+    _ANDROID_NOTIFICATION_COMMON,
+    from_sql=_ANDROID_NOTIFICATION_LATEST_CONTENT,
+    actor="'me'",
+    snippet=_snippet("COALESCE(NULLIF(n.big_text, ''), n.text)"),
+    search_text=_search_concat(*_ANDROID_NOTIFICATION_ACT_TEXT),
+    priority=TIMELINE_PRIORITY_SELF,
+    metadata=(
+        "jsonb_build_object("
+        "'device', t.device, "
+        "'event_type', t.event_type, "
+        "'event_source', t.event_source, "
+        "'package_name', t.package_name, "
+        "'app_label', n.app_label, "
+        "'channel_id', n.channel_id, "
+        "'channel_name', n.channel_name, "
+        "'category', n.category, "
+        "'notification_key', t.notification_key, "
+        "'conversation_title', n.conversation_title, "
+        "'importance', n.importance, "
+        "'removal_reason_name', t.removal_reason_name, "
+        "'lifespan_ms', t.lifespan_ms, "
+        "'exposure_ms', t.exposure_ms)"
+    ),
+    # The listener's row for a notification can land after the system-log
+    # row that names it; a refresh picks up the text then.
+    refresh_hours=2.0,
+)
+
 _ANDROID_NOTIFICATION_OPENED = _simple_adapter(
     name="android_notification_opened",
     kind="opened",
     event_ts="t.event_at",
-    actor="'me'",
-    title=(
-        "concat('Opened: ', concat_ws(': ', NULLIF(t.app_label, ''), "
-        "COALESCE(NULLIF(t.title, ''), NULLIF(t.conversation_title, ''), left(t.text, 200))))"
+    title=f"concat('Opened: ', {_ANDROID_NOTIFICATION_ACT_LABEL})",
+    where=(
+        "(t.event_type = 'clicked' AND t.event_source = 'system_log') "
+        "OR (t.event_type = 'removed' AND t.removal_reason = 1 "
+        "AND t.event_source <> 'system_log' "
+        "AND NOT EXISTS (SELECT 1 FROM @android_notification_events c "
+        "WHERE c.account = t.account AND c.device = t.device "
+        "AND c.notification_key = t.notification_key AND c.event_type = 'clicked' "
+        "AND c.event_at BETWEEN t.event_at - interval '10 seconds' AND t.event_at))"
     ),
-    snippet=_snippet("COALESCE(NULLIF(t.big_text, ''), t.text)"),
-    search_text=_search_concat(*_ANDROID_NOTIFICATION_TEXT),
-    where="t.event_type = 'removed' AND t.removal_reason = 1",
-    priority=TIMELINE_PRIORITY_SELF,
-    **_ANDROID_NOTIFICATION_COMMON,
+    **_ANDROID_NOTIFICATION_ACT_COMMON,
+)
+
+_ANDROID_NOTIFICATION_ACTION = _simple_adapter(
+    name="android_notification_action",
+    kind="notification_action",
+    event_ts="t.event_at",
+    title=(
+        "concat(CASE "
+        "WHEN t.event_type = 'action_clicked' THEN concat('Pressed ', "
+        "COALESCE('\"' || (n.actions->>(t.action_index::int)) || '\"', 'a button'), ' on: ') "
+        "WHEN t.event_type = 'expansion' THEN 'Expanded: ' "
+        "WHEN t.removal_reason = 18 THEN 'Snoozed: ' "
+        "WHEN t.removal_reason = 3 THEN 'Cleared all: ' "
+        "ELSE 'Dismissed: ' END, "
+        f"{_ANDROID_NOTIFICATION_ACT_LABEL})"
+    ),
+    where=(
+        "(t.event_source = 'system_log' AND (t.event_type = 'action_clicked' "
+        "OR (t.event_type = 'expansion' AND (t.raw_json->>'user_action') = '1' "
+        "AND (t.raw_json->>'expanded') = '1'))) "
+        "OR (t.event_source <> 'system_log' AND t.event_type = 'removed' "
+        "AND t.removal_reason IN (2, 3, 18))"
+    ),
+    **_ANDROID_NOTIFICATION_ACT_COMMON,
 )
 
 # --- Feed tab (personal_data_warehouse/feed.py) ------------------------------
@@ -3285,6 +3369,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _BROWSER_SEARCH,
     _ANDROID_NOTIFICATION,
     _ANDROID_NOTIFICATION_OPENED,
+    _ANDROID_NOTIFICATION_ACTION,
     _FEED_ENGAGEMENT,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
@@ -3521,6 +3606,7 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         # context is the app's day on the device: its other notifications.
         "android_notification",
         "android_notification_opened",
+        "android_notification_action",
         # context is the feed session.
         "feed_engagement",
         "finance_transaction",

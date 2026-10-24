@@ -9,6 +9,13 @@
 // each file once its batch is stored. The spool is the ledger: a file that is
 // still there has not been sent, and the warehouse upserts by the listener's
 // event id, so a batch re-sent after a crash never duplicates.
+//
+// A second spool, written by `pdw ingest android-notifications
+// tail-system-log` (systemlog.go), holds what the listener API cannot see:
+// Android's own log of what happened to each notification on screen -- shown
+// and hidden, expanded, tapped, an action button pressed, whether it buzzed or
+// rang -- and the shade, heads-up, screen and lock state around it. The same
+// run sends both, merged oldest first.
 package androidnotifications
 
 import (
@@ -52,7 +59,9 @@ type Summary struct {
 
 // Runner sends the spool.
 type Runner struct {
-	SpoolDir          string
+	SpoolDir string
+	// ExtraSpoolDirs are sent with SpoolDir (the system-log spool).
+	ExtraSpoolDirs    []string
 	Account           string
 	Device            string
 	Client            Uploader
@@ -75,10 +84,21 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.BatchSize <= 0 {
 		r.BatchSize = DefaultBatchSize
 	}
-	names, err := spoolFiles(r.SpoolDir)
-	if err != nil {
-		return Summary{}, err
+	var names []spoolFile
+	for _, dir := range append([]string{r.SpoolDir}, r.ExtraSpoolDirs...) {
+		if dir == "" {
+			continue
+		}
+		found, err := spoolFiles(dir)
+		if err != nil {
+			return Summary{}, err
+		}
+		for _, name := range found {
+			names = append(names, spoolFile{dir: dir, name: name})
+		}
 	}
+	// Every spool names its files by the event's epoch milliseconds first.
+	sort.SliceStable(names, func(i, j int) bool { return names[i].name < names[j].name })
 	summary := Summary{Pending: len(names)}
 	if r.Limit > 0 && len(names) > r.Limit {
 		names = names[:r.Limit]
@@ -98,13 +118,13 @@ func (r *Runner) Sync() (Summary, error) {
 		exportedAt := r.Now()
 		var records []map[string]any
 		var sent []string
-		for _, name := range names[start:end] {
-			path := filepath.Join(r.SpoolDir, name)
+		for _, file := range names[start:end] {
+			path := filepath.Join(file.dir, file.name)
 			event, err := readEvent(path)
 			if err != nil {
-				r.Logger.Warningf("Setting aside spool file %s: %v", name, err)
+				r.Logger.Warningf("Setting aside spool file %s: %v", path, err)
 				if !r.DryRun {
-					if err := reject(r.SpoolDir, name); err != nil {
+					if err := reject(file.dir, file.name); err != nil {
 						return summary, err
 					}
 				}
@@ -154,6 +174,8 @@ func Envelope(account string, exportedAt time.Time, device string, event map[str
 		"record":         event,
 	}
 }
+
+type spoolFile struct{ dir, name string }
 
 // spoolFiles lists the finished event files, oldest first (their names start
 // with the event's epoch milliseconds, zero-padded). The listener writes into

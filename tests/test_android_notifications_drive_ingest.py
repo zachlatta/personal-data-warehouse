@@ -181,6 +181,35 @@ def test_a_removal_carries_its_reason_and_a_missing_post_time_falls_back() -> No
     assert row["posted_at"] == row["event_at"]
 
 
+def test_a_system_log_event_keeps_its_timings_and_a_listener_event_is_the_listener() -> None:
+    assert record_to_event_row(envelope())["event_source"] == "listener"
+    row = record_to_event_row(
+        envelope(
+            {
+                "event_id": "syslog-abc",
+                "event_type": "action_clicked",
+                "event_source": "system_log",
+                "event_at_ms": 1792866657101,
+                "notification_key": "0|com.example.chat|7|null|10123",
+                "package_name": "com.example.chat",
+                "notification_id": 7,
+                "user_id": 0,
+                "action_index": 1,
+                "lifespan_ms": 5000,
+                "freshness_ms": 4000,
+                "exposure_ms": 3000,
+                "rank": 2,
+                "count": 4,
+            }
+        )
+    )
+    assert row["event_source"] == "system_log"
+    assert (row["lifespan_ms"], row["freshness_ms"], row["exposure_ms"]) == (5000, 4000, 3000)
+    assert (row["notification_rank"], row["action_index"]) == (2, 1)
+    assert row["posted_at"] == row["event_at"]
+    assert row["raw_json"]["count"] == 4
+
+
 def test_drive_ingest_writes_and_promotes_each_batch_oldest_first_up_to_the_cap() -> None:
     store = FakeObjectStore(
         listings=[

@@ -3294,13 +3294,24 @@ BROWSER_HISTORY_VISIT_COLUMNS = (
 # for the event. A notification is one `notification_key` (Android's own
 # key: user, package, id, tag); its events are `posted` (new, or an update
 # whose visible content changed), `removed`, and `active` (already showing
-# when the listener connected).
+# when the listener connected). Android's own events log adds what happened to
+# it on screen (`pdw ingest android-notifications tail-system-log`, ids
+# `syslog-*`): `visibility`, `expansion`, `clicked`, `action_clicked`,
+# `alert`, `canceled`, `heads_up`, `autogrouped`, `unautogrouped`,
+# `adjusted`, `cancel_prevented`, `summary_converted`, and the phone around
+# them: `shade_opened`, `shade_closed`, `screen`, `status_bar`. The listener
+# adds `interruption_filter` (Do Not Disturb changed). Each event's own fields
+# (visible, expanded, user_action, buzz, beep, mute_reason, items, ...) are in
+# raw_json.
 ANDROID_NOTIFICATION_EVENT_COLUMNS = (
     "account",
     "device",
     "event_id",
-    # posted / removed / active
+    # posted / removed / active from the listener; the system-log and
+    # interruption_filter types above.
     "event_type",
+    # listener or system_log.
+    "event_source",
     # When the listener saw the event.
     "event_at",
     "notification_key",
@@ -3348,6 +3359,16 @@ ANDROID_NOTIFICATION_EVENT_COLUMNS = (
     # cancel, cancel_all, app_cancel, ...); 0 and '' otherwise.
     "removal_reason",
     "removal_reason_name",
+    # System-log events: how long the notification had existed (lifespan),
+    # since its last update (freshness) and been on screen (exposure), in
+    # milliseconds; its position in the shade (0 is the top); for
+    # `action_clicked`, the index into `actions` of the button pressed. 0
+    # otherwise (-1 when Android logged none).
+    "lifespan_ms",
+    "freshness_ms",
+    "exposure_ms",
+    "notification_rank",
+    "action_index",
     # The listener's sha of the visible content; equal shas are the same text.
     "content_sha256",
     # The listener's whole event, including every string extra.

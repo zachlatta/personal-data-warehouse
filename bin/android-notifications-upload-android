@@ -14,8 +14,9 @@
 # State lives in $STATE_DIR (root 0700, credential-encrypted storage, for the
 # reason bin/google-recorder-upload-android gives): pdw's own config file
 # under config/pdw/, a .env (ANDROID_NOTIFICATIONS_DEVICE,
-# ANDROID_NOTIFICATIONS_ACCOUNT), the run lock and logs/. The listener's
-# spool is the upload ledger.
+# ANDROID_NOTIFICATIONS_ACCOUNT), the run lock, logs/ and system-log-spool/
+# (the service's system-log tail writes it). The two spools are the upload
+# ledger.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,7 +50,8 @@ if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
-  "$PDW" ingest android-notifications --lock-file "$STATE_DIR/android-notifications-upload.lock" >> "$LOG_FILE" 2>&1
+  "$PDW" ingest android-notifications --lock-file "$STATE_DIR/android-notifications-upload.lock" \
+    --system-log-spool-dir "$STATE_DIR/system-log-spool" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

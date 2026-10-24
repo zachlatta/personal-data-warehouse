@@ -398,7 +398,7 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     # subsource is the app's package.
     (
         "android_notifications",
-        ("android_notification", "android_notification_opened"),
+        ("android_notification", "android_notification_opened", "android_notification_action"),
         "COALESCE(t.metadata->>'package_name', t.kind)",
     ),
     # Periodic whole-screen frames; the subsource is the device. They carry no
@@ -1901,6 +1901,13 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS android_notification_events_posted_at_idx "
         "ON @android_notification_events (posted_at DESC)",
     ),
+    # The action adapters' latest-content probe and the tap dedupe.
+    IndexSpec(
+        "android_notification_events_key_idx",
+        "android_notification_events",
+        "CREATE INDEX IF NOT EXISTS android_notification_events_key_idx "
+        "ON @android_notification_events (account, device, notification_key, event_at)",
+    ),
     IndexSpec(
         "android_notification_events_content_idx",
         "android_notification_events",
@@ -3101,6 +3108,11 @@ INTEGER_COLUMNS = {
     "flags",
     "visibility",
     "removal_reason",
+    "lifespan_ms",
+    "freshness_ms",
+    "exposure_ms",
+    "notification_rank",
+    "action_index",
     # browser_history
     "transition_raw",
     "is_redirect",

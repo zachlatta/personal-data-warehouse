@@ -6,8 +6,8 @@
      with `cmd notification allow_listener`. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.zachlatta.pdw.notifications"
-    android:versionCode="1"
-    android:versionName="1">
+    android:versionCode="2"
+    android:versionName="2">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
 

@@ -32,7 +32,13 @@ import java.util.UUID;
  * (a new notification or an update whose visible content changed), "removed"
  * (with Android's reason, so a tap is told apart from a swipe), and "active"
  * (what was already showing when the listener connected, so nothing posted
- * while it was not running is lost). The root uploader
+ * while it was not running is lost), and "interruption_filter" (Do Not
+ * Disturb turned on, off or changed; also recorded on connect). Each
+ * notification event carries how Android ranked it: whether it could make a
+ * sound, when it last did, whether Do Not Disturb let it through. What
+ * happens to a notification on screen (shown, expanded, tapped, a button
+ * pressed) is not visible to a listener; the uploader's tail-system-log reads
+ * it from Android's events log. The root uploader
  * (pdw ingest android-notifications) sends the files and deletes them.
  *
  * Each file is written to a temporary name and renamed into place, so the
@@ -40,7 +46,7 @@ import java.util.UUID;
  */
 public class SpoolListenerService extends NotificationListenerService {
     private static final String TAG = "PdwNotifications";
-    static final int LISTENER_VERSION = 1;
+    static final int LISTENER_VERSION = 2;
     private static final int MAX_TEXT = 8000;
 
     private HandlerThread thread;
@@ -78,7 +84,9 @@ public class SpoolListenerService extends NotificationListenerService {
             return;
         }
         final RankingMap ranking = getCurrentRanking();
+        final int filter = getCurrentInterruptionFilter();
         handler.post(() -> {
+            recordInterruptionFilter(filter, true);
             for (StatusBarNotification sbn : active) {
                 record("active", sbn, ranking, -1);
             }
@@ -93,6 +101,29 @@ public class SpoolListenerService extends NotificationListenerService {
     @Override
     public void onNotificationRemoved(StatusBarNotification sbn, RankingMap rankingMap, int reason) {
         handler.post(() -> record("removed", sbn, rankingMap, reason));
+    }
+
+    @Override
+    public void onInterruptionFilterChanged(int interruptionFilter) {
+        handler.post(() -> recordInterruptionFilter(interruptionFilter, false));
+    }
+
+    private void recordInterruptionFilter(int filter, boolean onConnect) {
+        try {
+            JSONObject e = new JSONObject();
+            long now = System.currentTimeMillis();
+            e.put("event_id", UUID.randomUUID().toString());
+            e.put("event_type", "interruption_filter");
+            e.put("event_at_ms", now);
+            e.put("listener_version", LISTENER_VERSION);
+            e.put("interruption_filter", filter);
+            e.put("interruption_filter_name", filterName(filter));
+            e.put("on_connect", onConnect);
+            e.put("content_sha256", "");
+            write(e);
+        } catch (Exception ex) {
+            Log.w(TAG, "could not record an interruption filter change", ex);
+        }
     }
 
     private void record(String type, StatusBarNotification sbn, RankingMap rankingMap, int reason) {
@@ -192,7 +223,32 @@ public class SpoolListenerService extends NotificationListenerService {
             e.put("channel_name", channel != null && channel.getName() != null ? text(channel.getName()) : "");
             e.put("is_ambient", ranking.isAmbient());
             e.put("is_conversation", ranking.isConversation());
+            e.put("rank", ranking.getRank());
+            e.put("matches_interruption_filter", ranking.matchesInterruptionFilter());
+            e.put("suppressed_visual_effects", ranking.getSuppressedVisualEffects());
+            e.put("last_audibly_alerted_ms", ranking.getLastAudiblyAlertedMillis());
+            e.put("user_sentiment", ranking.getUserSentiment());
+            e.put("can_bubble", ranking.canBubble());
+            e.put("can_show_badge", ranking.canShowBadge());
+            e.put("is_suspended", ranking.isSuspended());
+            e.put("smart_reply_count", ranking.getSmartReplies() != null ? ranking.getSmartReplies().size() : 0);
+            e.put("smart_action_count", ranking.getSmartActions() != null ? ranking.getSmartActions().size() : 0);
+            if (channel != null) {
+                e.put("channel_importance", channel.getImportance());
+                e.put("channel_sound", channel.getSound() != null ? channel.getSound().toString() : "");
+                e.put("channel_vibrates", channel.shouldVibrate());
+                e.put("channel_lights", channel.shouldShowLights());
+                e.put("channel_bypass_dnd", channel.canBypassDnd());
+                e.put("channel_lockscreen_visibility", channel.getLockscreenVisibility());
+                e.put("channel_show_badge", channel.canShowBadge());
+                e.put("channel_group", nz(channel.getGroup()));
+            }
         }
+        e.put("only_alert_once", (n.flags & Notification.FLAG_ONLY_ALERT_ONCE) != 0);
+        e.put("has_full_screen_intent", n.fullScreenIntent != null);
+        e.put("has_content_intent", n.contentIntent != null);
+        e.put("has_delete_intent", n.deleteIntent != null);
+        e.put("timeout_ms", n.getTimeoutAfter());
 
         if (reason >= 0) {
             e.put("removal_reason", reason);
@@ -321,6 +377,16 @@ public class SpoolListenerService extends NotificationListenerService {
             return text(pm.getApplicationLabel(info));
         } catch (Exception e) {
             return "";
+        }
+    }
+
+    private static String filterName(int filter) {
+        switch (filter) {
+            case INTERRUPTION_FILTER_ALL: return "all";
+            case INTERRUPTION_FILTER_PRIORITY: return "priority";
+            case INTERRUPTION_FILTER_NONE: return "none";
+            case INTERRUPTION_FILTER_ALARMS: return "alarms";
+            default: return "unknown";
         }
     }
 
