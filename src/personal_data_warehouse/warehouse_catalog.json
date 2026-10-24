@@ -1822,6 +1822,17 @@
       }
     },
     {
+      "id": "audio_transcripts",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "enrichment",
+      "schema": "derived_enrichment",
+      "name": "audio_transcripts",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "photo_assets",
       "kind": "table",
       "layer": "derived",

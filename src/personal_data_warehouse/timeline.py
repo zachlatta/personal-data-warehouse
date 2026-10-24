@@ -3964,6 +3964,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "apple_photos_files": _detail("photo_assets", "raw Apple Photos renditions in the photo's detail view"),
     "photo_asset_files": _detail("photo_assets", "identity links + dedup audit (match_method/match_score)"),
     "media_fingerprints": _state("perceptual-hash cache keyed by content sha"),
+    "audio_transcripts": _state("transcription provider results keyed by audio sha; read through each pass's own rows"),
     # WhatsApp
     "whatsapp_messages": _events(),
     "whatsapp_chats": _entity("chat dimension joined into message events"),

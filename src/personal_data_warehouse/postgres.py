@@ -44,6 +44,7 @@ from personal_data_warehouse.schema import (
     ATTACHMENT_COLUMNS,
     ATTACHMENT_ENRICHMENT_COLUMNS,
     APPLE_NOTE_ATTACHMENT_COLUMNS,
+    AUDIO_TRANSCRIPT_COLUMNS,
     APPLE_NOTE_COLUMNS,
     APPLE_NOTE_REVISION_COLUMNS,
     APPLE_MESSAGE_ATTACHMENT_COLUMNS,
@@ -1027,6 +1028,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ("source", "account", "source_native_id", "content_sha256"),
     ),
     "media_fingerprints": TableSpec(MEDIA_FINGERPRINT_COLUMNS, ("content_sha256", "hash_version")),
+    # One provider transcript per audio sha: the dedup layer every transcribing
+    # pass shares (audio_transcripts.ContentAddressedTranscriber).
+    "audio_transcripts": TableSpec(AUDIO_TRANSCRIPT_COLUMNS, ("content_sha256", "provider")),
     # One row per Slack file, NOT per (file, conversation) share: the same
     # upload cross-posted into five channels is one set of bytes and one
     # download. The perceptual hash lives in media_fingerprints, keyed by
@@ -3854,9 +3858,38 @@ class PostgresWarehouse:
         Used by the source-agnostic attachment enrichment runner so it can write
         results without depending on any one source's ensure_* path.
         """
-        self._ensure_table_group(["file_attachment_enrichments"])
+        self._ensure_table_group(["file_attachment_enrichments", "audio_transcripts"])
         self._ensure_file_attachment_enrichment_columns()
         self._ensure_search_views_if_possible()
+
+    def ensure_audio_transcript_tables(self) -> None:
+        """The per-sha transcript table, seeded once from the voice runs before it.
+
+        Voice recordings were transcribed for months before this table existed,
+        and their runs carry the provider's full result with the audio sha. A
+        fresh table is filled from them so a copy of an old memo is a hit on
+        day one, not one more paid transcription. The seed runs only while the
+        table is empty (a one-time filter Postgres evaluates before the scan),
+        so the every-minute landing path does not re-read every result.
+        """
+        self._ensure_table_group(["audio_transcripts", "apple_voice_memos_transcription_runs"])
+        self._command(
+            """
+            INSERT INTO @audio_transcripts
+                (content_sha256, provider, provider_transcript_id, model, transcript_text,
+                 raw_result_json, created_at, sync_version)
+            SELECT DISTINCT ON (content_sha256, provider)
+                content_sha256, provider, provider_transcript_id, model, transcript_text,
+                raw_result_json, completed_at, sync_version
+            FROM @apple_voice_memos_transcription_runs
+            WHERE NOT EXISTS (SELECT 1 FROM @audio_transcripts)
+              AND status = 'completed'
+              AND content_sha256 <> ''
+              AND raw_result_json NOT IN ('', '{}')
+            ORDER BY content_sha256, provider, completed_at DESC
+            ON CONFLICT (content_sha256, provider) DO NOTHING
+            """
+        )
 
     def ensure_calendar_tables(self) -> None:
         self._ensure_table_group(["calendar_events", "calendar_sync_state"])
@@ -5215,6 +5248,7 @@ class PostgresWarehouse:
             [
                 "apple_voice_memos_files",
                 "apple_voice_memos_transcription_runs",
+                "audio_transcripts",
                 "apple_voice_memos_transcript_segments",
                 "apple_voice_memos_enrichments",
                 "voice_memo_continuity_judgments",
@@ -13046,6 +13080,19 @@ class PostgresWarehouse:
     def insert_media_fingerprints(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("media_fingerprints", rows, MEDIA_FINGERPRINT_COLUMNS)
 
+    def insert_audio_transcripts(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("audio_transcripts", rows, AUDIO_TRANSCRIPT_COLUMNS)
+
+    def load_audio_transcript(self, *, content_sha256: str, provider: str) -> dict[str, Any] | None:
+        """The provider's stored result for these bytes, or None if never transcribed."""
+        rows = self._query(
+            "SELECT raw_result_json FROM @audio_transcripts WHERE content_sha256 = %s AND provider = %s",
+            (content_sha256, provider),
+        )
+        if not rows:
+            return None
+        return json.loads(str(rows[0][0]))
+
     def insert_apple_notes(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("apple_notes", rows, APPLE_NOTE_COLUMNS)
 
@@ -18243,7 +18290,7 @@ class PostgresWarehouse:
             "marts_voice_memos_recordings",
             """
             CREATE OR REPLACE VIEW @marts_voice_memos_recordings AS
-            WITH recordings AS (
+            WITH source_recordings AS (
                 -- The conformed shape every voice source is mapped onto. Each
                 -- source answers the same questions or says NULL; nothing here
                 -- is a plausible-looking default.
@@ -18325,19 +18372,6 @@ class PostgresWarehouse:
                     g.is_deleted,
                     NULLIF(g.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
                 FROM @google_recorder_recordings g
-                -- The Pixel's Recorder library also holds Zach's iPhone memos,
-                -- copied over in the 2026-10-23 phone migration: 226 files
-                -- byte-identical to rows already in apple_voice_memos_files.
-                -- They were transcribed a second time (about 100 hours of
-                -- paid audio) and would show up twice on the timeline. The
-                -- iPhone row is the original; a Pixel row with the same bytes
-                -- is the same recording, not a new one.
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM @apple_voice_memos_files f
-                    WHERE f.content_sha256 = g.content_sha256
-                      AND g.content_sha256 <> ''
-                )
                 UNION ALL
                 SELECT * FROM (
                 -- Audio recorded or saved inside Apple Notes (call recordings,
@@ -18397,6 +18431,35 @@ class PostgresWarehouse:
                   )
                 ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.revision_id DESC
                 ) AS note_audio
+            ),
+            recordings AS (
+                -- One recording per set of bytes, whichever source it arrived
+                -- through. A phone migration copies one phone's memos into the
+                -- next phone's recorder app, a memo is saved into a note, a
+                -- file is duplicated: the same audio under a new source, id
+                -- and filename is the same recording, not a new one, and must
+                -- not land twice on the timeline or be enriched twice. The
+                -- first copy ingested is the original and keeps its identity
+                -- (and the transcript and enrichment keyed to it). A row with
+                -- no hash cannot be matched and stands alone. Paid
+                -- transcription is deduplicated by the same bytes one layer
+                -- down, in derived_enrichment.audio_transcripts.
+                SELECT DISTINCT ON (
+                    CASE
+                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        ELSE source || '/' || account || '/' || recording_id
+                    END
+                ) *
+                FROM source_recordings
+                ORDER BY
+                    CASE
+                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        ELSE source || '/' || account || '/' || recording_id
+                    END,
+                    ingested_at ASC NULLS LAST,
+                    source,
+                    account,
+                    recording_id
             ),
             latest_enrichment AS (
                 -- THE definition of "the enrichment that counts" for a

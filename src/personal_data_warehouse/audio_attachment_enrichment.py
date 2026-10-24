@@ -19,7 +19,8 @@ and the columns the generic candidate query reads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -35,7 +36,8 @@ from personal_data_warehouse.agent_runner import (
     agent_run_row,
     agent_run_tool_call_rows,
 )
-from personal_data_warehouse.apple_voice_memos_transcription import clean_transcript_text
+from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_PROVIDER, clean_transcript_text
+from personal_data_warehouse.audio_transcripts import ContentAddressedTranscriber
 from personal_data_warehouse.file_attachment_enrichment import (
     COMPLETED_STATUSES,
     ENRICHMENT_TABLE,
@@ -162,7 +164,14 @@ class AudioAttachmentTranscriptionRunner:
         self._warehouse = warehouse
         self._agent = agent
         self._object_store_factory = object_store_factory
-        self._transcription_client = transcription_client
+        # The same voice message forwarded into another chat, or re-run after an
+        # agent model or prompt change, is the same bytes: transcribe once per sha.
+        self._transcriber = ContentAddressedTranscriber(
+            warehouse=warehouse,
+            client=transcription_client,
+            provider=ASSEMBLYAI_PROVIDER,
+            now=now or (lambda: datetime.now(tz=UTC)),
+        )
         self._logger = logger
         self._provider = provider
         self._model = model
@@ -225,14 +234,12 @@ class AudioAttachmentTranscriptionRunner:
         )
 
     def _enrich_candidate(self, candidate: Mapping[str, Any]) -> str:
-        content = self._object_store(str(candidate.get("account", ""))).get_object(
-            attachment_storage_ref(candidate)
-        )
         mime_type = str(candidate.get("mime_type", ""))
-        with tempfile.TemporaryDirectory(prefix="audio-attachment-") as directory:
-            path = Path(directory) / _safe_audio_filename(str(candidate.get("filename", "")))
-            path.write_bytes(content)
-            transcription_result = self._transcription_client.transcribe_file(path=path, content_type=mime_type)
+        transcription_result = self._transcriber.transcribe(
+            content_sha256=str(candidate.get("content_sha256", "")),
+            audio_file=lambda: self._audio_file(candidate),
+            content_type=mime_type,
+        ).result
         transcription_model = str(transcription_result.get("speech_model_used") or "")
         raw_transcript = clean_transcript_text(str(transcription_result.get("text", "") or ""))
 
@@ -291,6 +298,16 @@ class AudioAttachmentTranscriptionRunner:
             ]
         )
         return status
+
+    @contextmanager
+    def _audio_file(self, candidate: Mapping[str, Any]) -> Iterator[Path]:
+        content = self._object_store(str(candidate.get("account", ""))).get_object(
+            attachment_storage_ref(candidate)
+        )
+        with tempfile.TemporaryDirectory(prefix="audio-attachment-") as directory:
+            path = Path(directory) / _safe_audio_filename(str(candidate.get("filename", "")))
+            path.write_bytes(content)
+            yield path
 
     def _record_failure(
         self, candidate: Mapping[str, Any], *, error: str, status: str = STATUS_ERROR

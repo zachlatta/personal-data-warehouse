@@ -47,9 +47,21 @@ class FakeWarehouse:
         self.agent_runs: list[dict] = []
         self.agent_run_events: list[dict] = []
         self.agent_run_tool_calls: list[dict] = []
+        self.audio_transcripts: dict[tuple[str, str], dict] = {}
 
     def ensure_file_attachment_enrichment_tables(self) -> None:
         pass
+
+    def ensure_audio_transcript_tables(self) -> None:
+        pass
+
+    def load_audio_transcript(self, *, content_sha256: str, provider: str):
+        row = self.audio_transcripts.get((content_sha256, provider))
+        return json.loads(row["raw_result_json"]) if row else None
+
+    def insert_audio_transcripts(self, rows) -> None:
+        for row in rows:
+            self.audio_transcripts[(row["content_sha256"], row["provider"])] = row
 
     def ensure_agent_tables(self) -> None:
         pass
@@ -330,6 +342,39 @@ def test_runner_marks_non_useful_transcript_from_agent() -> None:
     row = warehouse.enrichment_rows[0]
     assert row["text_extraction_status"] == STATUS_NOT_USEFUL
     assert row["text"] == ""
+
+
+def test_runner_reuses_the_transcript_of_bytes_already_transcribed() -> None:
+    """The same voice message forwarded into another chat, or re-run after an
+    agent model change, is the same bytes: AssemblyAI is not paid again and the
+    blob is not even downloaded. Only the agent cleanup runs."""
+    content = b"fake m4a bytes"
+    first = FakeWarehouse([candidate_row(content)])
+    transcription = FakeTranscriptionClient(text="hey are we still on for dinner tonight")
+    make_runner(first, FakeAgent(useful_output()), FakeObjectStore(content), transcription).sync(limit=10)
+    assert len(transcription.calls) == 1
+
+    second = FakeWarehouse([candidate_row(content, filename="renamed.m4a")])
+    second.audio_transcripts = dict(first.audio_transcripts)
+    store = FakeObjectStore(content)
+    agent = FakeAgent(useful_output())
+    summary = make_runner(second, agent, store, transcription, source=WHATSAPP_AUDIO_SOURCE).sync(limit=10)
+
+    assert summary.attachments_enriched == 1
+    assert len(transcription.calls) == 1
+    assert store.get_calls == []
+    assert "hey are we still" in json.loads(agent.requests[0].prompt)["transcript"]["raw_text"]
+    assert second.enrichment_rows[0]["transcription_model"] == "universal-3-5-pro"
+
+
+def test_runner_does_not_store_a_failed_transcription_for_the_hash() -> None:
+    content = b"fake bytes"
+    warehouse = FakeWarehouse([candidate_row(content)])
+    transcription = FakeTranscriptionClient(error=RuntimeError("assemblyai upload failed"))
+
+    make_runner(warehouse, FakeAgent(useful_output()), FakeObjectStore(content), transcription).sync(limit=None)
+
+    assert warehouse.audio_transcripts == {}
 
 
 def test_runner_records_error_row_when_transcription_fails() -> None:

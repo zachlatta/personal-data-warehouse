@@ -22,6 +22,22 @@ FROM marts_voice_memos.recordings
 WHERE transcript IS NOT NULL ORDER BY recorded_at DESC LIMIT 20;
 ```
 
+**The bytes are the identity, at both layers.** A recording is one row in the mart per
+`content_sha256`, whichever source it arrived through: the copy ingested first keeps its
+identity and a later copy with the same bytes (a phone migration that copies one phone's
+memos into the next phone's recorder app, a memo saved into a note, a duplicated file) is
+dropped from the mart, so it is never enriched again or landed twice. Below that, paid
+transcription goes through `audio_transcripts.ContentAddressedTranscriber`: before audio is
+downloaded or sent to AssemblyAI, `derived_enrichment.audio_transcripts` is checked for a
+result keyed by (`content_sha256`, provider), and a hit is reused under any source, id,
+filename or prompt version. The voice runner and the chat voice-message runners share it,
+so a voice memo also forwarded in a chat is paid for once. Each pass still writes its own
+run, segment or enrichment rows from the result. Until 2026-10-24 each pass keyed "already
+transcribed" by its own ids: the Pixel's copies of the iPhone memos were transcribed
+again under `google_recorder` ids, and an agent model change re-transcribed every chat
+voice message although only the cleanup step had changed. Only byte-identical audio
+matches; a transcoded copy is new bytes and is transcribed again.
+
 **A short memo is a stored transcript ~30 s after it reaches the Mac, and that is measured.**
 Measured 2026-10-16 over 30 days of Apple memos, end of recording to transcript was p50
 9 min, and almost none of it was work: a 120 s file-age gate and the uploader's five-minute

@@ -487,6 +487,50 @@ def test_voice_memo_mart_drops_a_pixel_copy_of_an_iphone_memo(
     ]
 
 
+def test_voice_memo_mart_keeps_the_first_copy_of_identical_audio_whatever_its_source(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Identity is the bytes, not a source pairing: when the copy ingested
+    first came through the Pixel, the later iPhone file with the same bytes is
+    the duplicate. A recording with no hash is never collapsed."""
+    _seed_voice_memos(warehouse)
+    earlier = TS - timedelta(days=1)
+    warehouse.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id=recording_id,
+                device="pichu",
+                title="Pixel recording",
+                recorded_at=TS,
+                duration_seconds=60,
+                filename=f"{recording_id}.m4a",
+                extension=".m4a",
+                content_type="audio/mp4",
+                size_bytes=1000,
+                content_sha256=sha,
+                storage_backend="google_drive",
+                storage_file_id=f"drive-{recording_id}",
+                raw_metadata_json="{}",
+                ingested_at=earlier,
+                sync_version=1,
+            )
+            for recording_id, sha in (("pixel-first-copy-of-rec-2", "sha-2"), ("pixel-unhashed", ""))
+        ]
+    )
+    rows = _dicts(warehouse, "marts_voice_memos_recordings", "source, recording_id")
+
+    assert [(row["source"], row["recording_id"]) for row in rows] == [
+        ("alice_voice_recordings", "alice-1"),
+        ("apple_voice_memos", "rec-1"),
+        ("google_recorder", "pixel-1"),
+        ("google_recorder", "pixel-first-copy-of-rec-2"),
+        ("google_recorder", "pixel-unhashed"),
+    ]
+
+
 def test_voice_memo_mart_carries_a_pixel_recording_like_any_other(
     warehouse: PostgresWarehouse,
 ) -> None:

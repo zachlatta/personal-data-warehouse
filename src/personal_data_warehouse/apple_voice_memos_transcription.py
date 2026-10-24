@@ -13,6 +13,7 @@ from typing import Any
 
 import requests
 
+from personal_data_warehouse.audio_transcripts import ContentAddressedTranscriber
 from personal_data_warehouse.objectstore import ObjectStore
 from personal_data_warehouse.schema import voice_memo_transcription_failure_status
 
@@ -281,10 +282,15 @@ class VoiceMemosTranscriptionRunner:
     ) -> None:
         self._warehouse = warehouse
         self._audio_source = audio_source
-        self._transcription_client = transcription_client
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
         self._provider = provider
+        # A recording whose bytes were already transcribed -- by this pass under
+        # another source or id, or by a chat voice-message pass -- reuses that
+        # result instead of paying for the audio again.
+        self._transcriber = ContentAddressedTranscriber(
+            warehouse=warehouse, client=transcription_client, provider=provider, now=self._now
+        )
 
     def sync(self, *, limit: int) -> VoiceMemosTranscriptionSummary:
         self._warehouse.ensure_apple_voice_memos_tables()
@@ -297,12 +303,13 @@ class VoiceMemosTranscriptionRunner:
             self._logger.info("[%s/%s] transcribing %s", index, len(recordings), recording_id)
             requested_at = self._now()
             try:
-                with self._audio_source.audio_file(recording) as path:
-                    result = self._transcription_client.transcribe_file(
-                        path=path,
-                        content_type=str(recording.get("content_type", "")),
-                        duration_seconds=recording_duration_seconds(recording),
-                    )
+                outcome = self._transcriber.transcribe(
+                    content_sha256=str(recording.get("content_sha256", "")),
+                    audio_file=lambda recording=recording: self._audio_source.audio_file(recording),
+                    content_type=str(recording.get("content_type", "")),
+                    duration_seconds=recording_duration_seconds(recording),
+                )
+                result = outcome.result
                 completed_at = self._now()
                 self._warehouse.insert_apple_voice_memos_transcription_runs(
                     [transcription_run_row(recording, result, requested_at=requested_at, completed_at=completed_at)]
@@ -319,9 +326,10 @@ class VoiceMemosTranscriptionRunner:
                 transcribed += 1
                 segments_written += len(segment_rows)
                 self._logger.info(
-                    "[%s/%s] transcribed %s: %s segments",
+                    "[%s/%s] %s %s: %s segments",
                     index,
                     len(recordings),
+                    "reused the transcript of identical audio for" if outcome.reused else "transcribed",
                     recording_id,
                     len(segment_rows),
                 )

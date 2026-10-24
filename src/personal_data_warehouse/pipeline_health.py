@@ -1659,6 +1659,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "apple_voice_memos_files": _data("apple_voice_memos", "ingested_at", "recorded_at"),
     "apple_voice_memos_transcription_runs": _data("voice_memo_transcription", "requested_at"),
     "apple_voice_memos_transcript_segments": _support("voice_memo_transcription", "created_at"),
+    "audio_transcripts": _support(
+        "voice_memo_transcription", "created_at", note="per-sha transcript store every transcribing pass shares"
+    ),
     "apple_voice_memos_enrichments": _data("voice_memo_enrichment", "created_at", "start_at"),
     "voice_memo_continuity_judgments": _data("voice_memo_continuity", "created_at"),
     "voice_memo_session_enrichments": _support("voice_memo_continuity", "created_at"),

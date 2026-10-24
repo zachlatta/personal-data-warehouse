@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 
 import pytest
@@ -87,9 +88,21 @@ class FakeWarehouse:
         self.run_rows = []
         self.segment_rows = []
         self.segment_replacements = []
+        self.audio_transcripts: dict[tuple[str, str], dict] = {}
 
     def ensure_apple_voice_memos_tables(self) -> None:
         self.ensure_called = True
+
+    def ensure_audio_transcript_tables(self) -> None:
+        pass
+
+    def load_audio_transcript(self, *, content_sha256: str, provider: str):
+        row = self.audio_transcripts.get((content_sha256, provider))
+        return json.loads(row["raw_result_json"]) if row else None
+
+    def insert_audio_transcripts(self, rows) -> None:
+        for row in rows:
+            self.audio_transcripts[(row["content_sha256"], row["provider"])] = row
 
     def load_untranscribed_voice_recordings(self, *, provider: str, limit: int):
         assert provider == ASSEMBLYAI_PROVIDER
@@ -368,6 +381,71 @@ def test_transcription_runner_writes_run_and_segments() -> None:
             "provider_transcript_id": "tx1",
         }
     ]
+
+
+def test_a_copy_of_audio_already_transcribed_is_not_sent_again() -> None:
+    """The phone migration case: the same bytes under another source, id and
+    filename. The stored result is reused, the audio is never downloaded, and
+    the copy still gets its own run row and segments."""
+    warehouse = FakeWarehouse()
+    client = FakeTranscriptionClient()
+    runner = VoiceMemosTranscriptionRunner(
+        warehouse=warehouse,
+        audio_source=FakeAudioSource(),
+        transcription_client=client,
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 4, 27, tzinfo=UTC),
+    )
+    runner.sync(limit=1)
+    assert len(client.calls) == 1
+
+    class NoDownloads:
+        def audio_file(self, recording):
+            raise AssertionError("a reused transcript must not download the audio")
+
+    warehouse.recordings = [
+        {
+            "source": "google_recorder",
+            "account": "zach@example.com",
+            "recording_id": "pixel-copy",
+            "filename": "Recording 7.m4a",
+            "content_type": "audio/mp4",
+            "content_sha256": "audio-hash",
+        }
+    ]
+    logger = FakeLogger()
+    summary = VoiceMemosTranscriptionRunner(
+        warehouse=warehouse,
+        audio_source=NoDownloads(),
+        transcription_client=client,
+        logger=logger,
+        now=lambda: datetime(2026, 4, 28, tzinfo=UTC),
+    ).sync(limit=1)
+
+    assert len(client.calls) == 1
+    assert summary.recordings_transcribed == 1
+    copy_run = warehouse.run_rows[-1]
+    assert (copy_run["source"], copy_run["recording_id"]) == ("google_recorder", "pixel-copy")
+    assert copy_run["provider_transcript_id"] == "tx1"
+    assert copy_run["status"] == "completed"
+    assert warehouse.segment_replacements[-1]["recording_id"] == "pixel-copy"
+    assert any("reused the transcript of identical audio" in message for message in logger.messages)
+
+
+def test_a_recording_without_a_hash_is_transcribed_and_not_stored() -> None:
+    warehouse = FakeWarehouse()
+    warehouse.recordings[0]["content_sha256"] = ""
+    client = FakeTranscriptionClient()
+
+    VoiceMemosTranscriptionRunner(
+        warehouse=warehouse,
+        audio_source=FakeAudioSource(),
+        transcription_client=client,
+        logger=FakeLogger(),
+    ).sync(limit=1)
+
+    assert len(client.calls) == 1
+    assert warehouse.audio_transcripts == {}
 
 
 def test_the_enrichment_agent_is_told_hackpad_probably_means_hack_club() -> None:

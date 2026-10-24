@@ -193,7 +193,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # back-to-back recordings an agent judged one event.
         # +1 derived: derived_screen_timelapse.descriptions, an agent's reading
         # of each screen frame.
-        "derived": 31,
+        "derived": 32,
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
@@ -308,6 +308,7 @@ def test_catalog_records_the_target_physical_locations() -> None:
         "slack_account_state_item_rows": ("derived_slack", "inbox_items"),
         "file_attachment_enrichments": ("derived_enrichment", "file_attachment_enrichments"),
         "media_fingerprints": ("derived_enrichment", "media_fingerprints"),
+        "audio_transcripts": ("derived_enrichment", "audio_transcripts"),
         "photo_assets": ("derived_photos", "assets"),
         "photo_asset_files": ("derived_photos", "asset_files"),
         "finance_observations": ("derived_finance", "observations"),

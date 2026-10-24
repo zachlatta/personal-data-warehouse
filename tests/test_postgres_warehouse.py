@@ -5807,6 +5807,55 @@ def test_postgres_voice_memo_ensure_can_skip_runtime_content_hash_backfill(wareh
     assert warehouse._query("SELECT content_sha256 FROM @apple_voice_memos_transcription_runs") == [("audio-hash",)]
 
 
+def test_postgres_audio_transcripts_seed_once_from_completed_voice_runs(warehouse: PostgresWarehouse) -> None:
+    """Months of voice transcripts predate the per-sha table: a fresh table is
+    filled from them, once, so a copy of an old memo is a hit immediately."""
+    now = datetime(2026, 10, 24, 12, tzinfo=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+
+    def run(recording_id: str, sha: str, status: str, result: dict) -> dict:
+        return _default_row(
+            VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+            source="apple_voice_memos",
+            account="zach@example.test",
+            recording_id=recording_id,
+            provider="assemblyai",
+            provider_transcript_id=str(result.get("id", "")),
+            content_sha256=sha,
+            status=status,
+            raw_result_json=json.dumps(result),
+            requested_at=now,
+            completed_at=now,
+            sync_version=1,
+        )
+
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            run("rec-1", "sha-done", "completed", {"id": "tx-1", "status": "completed", "text": "hello"}),
+            run("rec-2", "sha-failed", "error", {}),
+            run("rec-3", "", "completed", {"id": "tx-3", "status": "completed", "text": "no hash"}),
+        ]
+    )
+
+    warehouse.ensure_audio_transcript_tables()
+
+    assert warehouse.load_audio_transcript(content_sha256="sha-done", provider="assemblyai") == {
+        "id": "tx-1",
+        "status": "completed",
+        "text": "hello",
+    }
+    assert warehouse.load_audio_transcript(content_sha256="sha-failed", provider="assemblyai") is None
+    assert warehouse._query("SELECT count(*) FROM @audio_transcripts") == [(1,)]
+
+    # Once the table holds anything the seed is skipped; new results arrive
+    # through the transcriber, not by re-reading every run.
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [run("rec-4", "sha-later", "completed", {"id": "tx-4", "status": "completed", "text": "later"})]
+    )
+    warehouse.ensure_audio_transcript_tables()
+    assert warehouse.load_audio_transcript(content_sha256="sha-later", provider="assemblyai") is None
+
+
 def test_postgres_apple_notes_revision_history_keeps_latest_state(warehouse: PostgresWarehouse) -> None:
     older = datetime(2026, 5, 21, 12, tzinfo=UTC)
     newer = datetime(2026, 5, 21, 13, tzinfo=UTC)

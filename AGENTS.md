@@ -512,6 +512,13 @@ someone notices a gap in an answer).
     `TestEveryRelationTheGuideNamesExistsInTheCatalog` for the guide) and may not be a
     pre-reorg name (`test_no_module_names_a_pre_reorg_physical_relation`).
 
+**Paid or quota-bound enrichment is keyed by the bytes, not the source.** A new source
+often carries copies of data PDW already has (a phone migration, a forward, a re-upload).
+Any pass that pays per call decides "already done" by `content_sha256` (or a perceptual
+hash where a near-copy is the same thing), never by source, id, filename or prompt
+version: AssemblyAI goes through `audio_transcripts.ContentAddressedTranscriber`. See
+[voice.md](docs/agents/voice.md).
+
 Photo sources have five *additional* registry edits on top of this list — see
 [Adding a photo source](docs/agents/local-uploaders.md#adding-a-photo-source-google_photos-takeout-import-manual-imports-).
 

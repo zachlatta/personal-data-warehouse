@@ -1462,6 +1462,21 @@ MEDIA_FINGERPRINT_COLUMNS = (
     "sync_version",
 )
 
+# A transcription provider's full result for a piece of audio
+# (derived_enrichment.audio_transcripts), keyed by the audio's bytes so every
+# pass that transcribes -- voice recordings, chat voice messages -- pays for
+# one sha once, under any filename, source or prompt version.
+AUDIO_TRANSCRIPT_COLUMNS = (
+    "content_sha256",
+    "provider",
+    "provider_transcript_id",
+    "model",
+    "transcript_text",
+    "raw_result_json",
+    "created_at",
+    "sync_version",
+)
+
 # Slack file -> content sha link (derived_slack.file_fingerprints).
 #
 # base_slack.files cannot carry a content sha: a sha is only knowable after
