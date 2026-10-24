@@ -15,7 +15,11 @@ ENV DAGSTER_HOME=/app/.dagster \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
+# Install Debian's security updates on every build: Coolify reuses a cached
+# base image, and the PDW image ran an 8-month-old OpenSSL and gnutls on
+# 2026-10-24 (sysadmin porygon/2026-10-24-security-followup.md).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates curl docker.io poppler-utils libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 

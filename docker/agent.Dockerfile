@@ -14,7 +14,11 @@ FROM node:22-bookworm-slim
 
 ENV PYTHONUNBUFFERED=1
 
+# Install Debian's security updates on every build: Coolify reuses a cached
+# base image, and the PDW image ran an 8-month-old OpenSSL and gnutls on
+# 2026-10-24 (sysadmin porygon/2026-10-24-security-followup.md).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates git python3 bash jq ripgrep curl \
     && npm install -g @openai/codex @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/*
