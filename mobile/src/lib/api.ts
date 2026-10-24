@@ -199,8 +199,9 @@ export type MutationRequest = {
   partial?: boolean;
 };
 
-export async function listMutationRequests(config: AppConfig, statuses?: MutationRequestStatus[]): Promise<MutationRequest[]> {
-  const query = statuses?.length ? `?status=${statuses.join(',')}` : '';
+export async function listMutationRequests(config: AppConfig, statuses?: MutationRequestStatus[], limit?: number): Promise<MutationRequest[]> {
+  const params = [statuses?.length ? `status=${statuses.join(',')}` : '', limit ? `limit=${limit}` : ''].filter(Boolean);
+  const query = params.length ? `?${params.join('&')}` : '';
   const body = await request<{ requests: MutationRequest[] }>(config, `/api/mutations/requests${query}`);
   return body.requests;
 }

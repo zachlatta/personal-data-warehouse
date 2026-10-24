@@ -9,6 +9,41 @@ import type { MutationRequest } from './api';
 
 let requests = new Map<string, MutationRequest>();
 let list: MutationRequest[] | null = null;
+// Every request known to be waiting on review, for the tab badge. The list
+// above is one page of all statuses, so it can miss older pending requests;
+// this set is filled by a pending-only read and kept current by every other
+// read, so an approval anywhere takes the badge down at once.
+let pending: Set<string> | null = null;
+const listeners = new Set<() => void>();
+
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+function track(request: Pick<MutationRequest, 'id' | 'status'>): void {
+  if (!pending || (request.status === 'pending_review') === pending.has(request.id)) return;
+  // A new set on every change: the badge's store compares by identity.
+  pending = new Set(pending);
+  if (request.status === 'pending_review') pending.add(request.id);
+  else pending.delete(request.id);
+}
+
+export function subscribeMutationRequests(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+// The ids of every request waiting on review, from the server's pending-only
+// list; requests seen since then move in or out of it by their status.
+export function rememberPendingMutationRequests(items: MutationRequest[]): void {
+  pending = new Set(items.filter((item) => item.status === 'pending_review').map((item) => item.id));
+  notify();
+}
+
+// null until the first pending-only read lands.
+export function peekPendingMutationRequestIds(): ReadonlySet<string> | null {
+  return pending;
+}
 
 export function rememberMutationRequest(request: MutationRequest): MutationRequest {
   const known = requests.get(request.id);
@@ -21,11 +56,15 @@ export function rememberMutationRequest(request: MutationRequest): MutationReque
     if (index >= 0) list[index] = row as MutationRequest;
     else list = [row as MutationRequest, ...list];
   }
+  track(request);
+  notify();
   return request;
 }
 
 export function rememberMutationRequests(items: MutationRequest[]): MutationRequest[] {
   list = items.slice();
+  items.forEach(track);
+  notify();
   return items;
 }
 
@@ -40,6 +79,8 @@ export function peekMutationRequests(): MutationRequest[] | null {
 export function forgetMutationRequests(): void {
   requests = new Map();
   list = null;
+  pending = null;
+  notify();
 }
 
 // The request a mutation alert carries, if the alert carries one for the id

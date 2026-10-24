@@ -2,12 +2,14 @@ import type { BottomTabBarProps } from 'expo-router/tabs';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Palette } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 // Superhuman's bottom navigation: one rounded pill floating above the page,
 // icons only, the current tab sitting in a lighter pill of its own, and the
 // account (here Settings) as a round avatar at the far end. A route given
-// `href: null` stays routable and off the bar.
+// `href: null` stays routable and off the bar. A tab's `tabBarBadge` shows as
+// a count on the icon's top right (Mutations: requests waiting on review).
 export function PillTabBar({ state, descriptors, navigation, insets }: BottomTabBarProps) {
   const theme = useTheme();
   const routes = state.routes.filter((route) => StyleSheet.flatten(descriptors[route.key].options.tabBarItemStyle)?.display !== 'none');
@@ -32,11 +34,16 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
               key={route.key}
               accessibilityRole="tab"
               accessibilityState={{ selected: focused }}
-              accessibilityLabel={options.title ?? route.name}
+              accessibilityLabel={options.tabBarBadge != null ? `${options.title ?? route.name}, ${options.tabBarBadge} waiting` : (options.title ?? route.name)}
               onPress={() => press(route.key, route.name)}
               onLongPress={() => navigation.emit({ type: 'tabLongPress', target: route.key })}
               style={[styles.item, focused && { backgroundColor: theme.backgroundSelected }]}>
               {options.tabBarIcon?.({ focused, color, size: 22 })}
+              {options.tabBarBadge != null ? (
+                <View style={[styles.badge, { backgroundColor: Palette.destructive, borderColor: theme.surface }]}>
+                  <ThemedText style={styles.badgeText}>{options.tabBarBadge}</ThemedText>
+                </View>
+              ) : null}
             </Pressable>
           );
         })}
@@ -59,6 +66,8 @@ const styles = StyleSheet.create({
   wrap: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingTop: 8 },
   pill: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', height: 52, borderRadius: 26, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 5 },
   item: { flex: 1, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center' },
+  badge: { position: 'absolute', top: 2, left: '50%', marginLeft: 4, minWidth: 20, height: 20, borderRadius: 10, borderWidth: 2, paddingHorizontal: 4, alignItems: 'center', justifyContent: 'center' },
+  badgeText: { color: '#FFFFFF', fontSize: 11, lineHeight: 14, fontWeight: '700' },
   avatar: { width: 52, height: 52, borderRadius: 26, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   avatarText: { fontSize: 18, fontWeight: '600' },
 });
