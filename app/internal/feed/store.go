@@ -191,6 +191,44 @@ func (s *Store) Saved(ctx context.Context, limit int) ([]Item, error) {
 		ORDER BY e.saved_at DESC, i.item_id LIMIT $1`, limit)
 }
 
+// Search is his feed history (Zach, voice memo 2026-10-24: "let me
+// interactively search through all my past entries so I can easily find
+// stuff that has been surfaced for me before"): every card he was shown,
+// opened, saved or liked, including ones since dismissed, removed or
+// expired. Every word in query must appear in the card's title, text,
+// author, site, url, tags or embedded post; cards matching every word in
+// the title come first, then the most recently seen. An empty query lists
+// the whole history, most recently seen first.
+func (s *Store) Search(ctx context.Context, query string, limit int) ([]Item, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	words := strings.Fields(query)
+	if len(words) > 10 {
+		words = words[:10]
+	}
+	args := []any{}
+	matchAll, titleAll := []string{"TRUE"}, []string{}
+	escape := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	for _, word := range words {
+		args = append(args, "%"+escape.Replace(word)+"%")
+		matchAll = append(matchAll, fmt.Sprintf("concat_ws(' ', i.title, i.body, i.author, i.site, i.url, array_to_string(i.tags, ' '),"+
+			" i.embed->>'text', i.embed->>'author_name', i.embed->>'author_handle', i.embed->'quote'->>'text') ILIKE $%d", len(args)))
+		titleAll = append(titleAll, fmt.Sprintf("i.title ILIKE $%d", len(args)))
+	}
+	order := ""
+	if len(titleAll) > 0 {
+		order = "(" + strings.Join(titleAll, " AND ") + ") DESC, "
+	}
+	args = append(args, limit)
+	return s.query(ctx, `SELECT `+itemColumns+`
+		FROM @feed_items i JOIN @marts_feed_item_engagement e ON e.item_id = i.item_id
+		WHERE (e.impressions > 0 OR e.opens > 0 OR e.saved = 1 OR e.liked = 1)
+		  AND `+strings.Join(matchAll, " AND ")+`
+		ORDER BY `+order+`e.last_event_at DESC NULLS LAST, i.created_at DESC, i.item_id
+		LIMIT `+fmt.Sprintf("$%d", len(args)), args...)
+}
+
 // SetSaved puts cards in or takes them out of the read-later queue by
 // recording save or unsave events, the same events the phone writes, so an
 // agent saving on his behalf ("save that for me") and a tap on the phone

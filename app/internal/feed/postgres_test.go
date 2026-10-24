@@ -544,3 +544,66 @@ func TestPostgresFeedResurfacesSeenCardsWhenUnseenRunOut(t *testing.T) {
 	}
 	call(t, tools, "feed_remove", map[string]any{"source": "resurf", "reason": "test"})
 }
+
+// The search box (Zach, voice memo 2026-10-24): every card he was shown,
+// opened, saved or liked, dismissed and removed ones too; every word must
+// match somewhere on the card, title matches first, then the most recently
+// seen. Cards he never saw are not history.
+func TestPostgresFeedSearchesEverythingHeWasShown(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "hist", "items": []map[string]any{
+		{"title": "Rust compilers explained", "url": "https://example.com/hist/rust"},
+		{"title": "Gardening", "body": "Why rust kills tomato compilers", "url": "https://example.com/hist/garden"},
+		{"title": "Rust, never seen", "url": "https://example.com/hist/unseen"},
+		{"title": "Hidden rust compilers", "url": "https://example.com/hist/hidden"},
+		{"title": "100% literal", "url": "https://example.com/hist/pct"},
+	}})
+	id := func(name string) string { return "hist:https://example.com/hist/" + name }
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		{"event_id": "hs1", "type": "impression", "item_id": id("rust"), "occurred_at": now.Add(-time.Hour), "dwell_ms": 400},
+		{"event_id": "hs2", "type": "impression", "item_id": id("garden"), "occurred_at": now.Add(-time.Minute), "dwell_ms": 400},
+		{"event_id": "hs3", "type": "impression", "item_id": id("hidden"), "occurred_at": now.Add(-2 * time.Hour), "dwell_ms": 400},
+		{"event_id": "hs4", "type": "dismiss", "item_id": id("hidden"), "occurred_at": now.Add(-2 * time.Hour)},
+		{"event_id": "hs5", "type": "save", "item_id": id("pct"), "occurred_at": now.Add(-3 * time.Hour)},
+	}})
+	if rec := httptest.NewRecorder(); func() bool {
+		mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+		return rec.Code != 200
+	}() {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+	call(t, tools, "feed_remove", map[string]any{"item_id": id("rust"), "reason": "stale"})
+
+	search := func(q string) []string {
+		t.Helper()
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, httptest.NewRequest("GET", APIPath+"/search?q="+url.QueryEscape(q), nil))
+		var page searchResponse
+		if err := json.Unmarshal(res.Body.Bytes(), &page); err != nil || res.Code != 200 {
+			t.Fatalf("GET search %q: %d %s", q, res.Code, res.Body.String())
+		}
+		got := []string{}
+		for _, item := range page.Items {
+			if item.Source == "hist" {
+				got = append(got, strings.TrimPrefix(item.ItemID, id("")))
+			}
+		}
+		return got
+	}
+	if got := strings.Join(search("RUST compilers"), ","); got != "rust,hidden,garden" {
+		t.Fatalf("title matches first, newest seen first, then body matches: %s", got)
+	}
+	if got := strings.Join(search(""), ","); got != "garden,rust,hidden,pct" {
+		t.Fatalf("an empty query is the whole history, newest seen first: %s", got)
+	}
+	if got := strings.Join(search("100%"), ","); got != "pct" {
+		t.Fatalf("%% is a literal: %s", got)
+	}
+	if got := search("tomato nowhere"); len(got) != 0 {
+		t.Fatalf("every word must match: %v", got)
+	}
+	call(t, tools, "feed_remove", map[string]any{"source": "hist", "reason": "test"})
+}

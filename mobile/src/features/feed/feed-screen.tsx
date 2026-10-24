@@ -1,17 +1,19 @@
 import { useFocusEffect, useNavigation, useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
   Alert,
   AppState,
   FlatList,
   LayoutAnimation,
+  Keyboard,
   Linking,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
+  TextInput,
   View,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
@@ -25,7 +27,7 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useConfig } from '@/lib/session';
 
-import { fetchFeed, FeedApiError, type FeedItem } from './api';
+import { fetchFeed, FeedApiError, searchFeed, type FeedItem } from './api';
 import { newArrivals } from './card-context';
 import {
   activeNow,
@@ -78,8 +80,12 @@ function servedIds(items: FeedItem[]): { item_ids: string[]; item_ids_truncated:
   return { item_ids: ids, item_ids_truncated: ids.length < items.length };
 }
 
+// Wait this long after the last keystroke before searching.
+const SEARCH_DEBOUNCE_MS = 250;
+
 // What the list is showing, as the log names it.
-function viewName(only: string | null): string {
+function viewName(only: string | null, searching = false): string {
+  if (searching) return 'search';
   return only === SAVED ? 'saved' : only ? `source:${only}` : 'all';
 }
 
@@ -105,10 +111,22 @@ export default function FeedScreen() {
   const bubbles = useMemo(() => sourceBubbles(items), [items]);
   const savedIds = useSavedIds();
   const likedIds = useLikedIds();
+  // The search box (Zach, voice memo 2026-10-24: "let me interactively
+  // search through all my past entries"): while it is open the list is the
+  // cards from his whole feed history that match what he has typed.
+  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<FeedItem[] | null>(null);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const searchGeneration = useRef(0);
+  // The last page the server sent, so search results can merge their likes in.
+  const pageItems = useRef<FeedItem[]>([]);
   const shown = useMemo(() => {
+    if (searching) return results ?? [];
     if (only === SAVED) return savedIds.map((id) => feedItems.get(id)).filter((i): i is FeedItem => !!i);
     return only ? items.filter((i) => i.source === only) : items;
-  }, [items, only, savedIds]);
+  }, [items, only, savedIds, searching, results]);
 
   const tracker = useRef(new ViewabilityTracker());
   const gestures = useRef(new ScrollGestureTracker());
@@ -135,9 +153,9 @@ export default function FeedScreen() {
         return key ? [[i.item_id, key] as const] : [];
       }),
     );
-    view.current = viewName(only);
+    view.current = viewName(only, searching);
     endLogged.current = false;
-  }, [shown, only]);
+  }, [shown, only, searching]);
 
   const recordImpressions = useCallback((ended: Impression[]) => {
     for (const imp of ended) {
@@ -193,7 +211,8 @@ export default function FeedScreen() {
       });
       for (const item of page.items) feedItems.set(item.item_id, item);
       loadSaved(page.saved ?? []);
-      loadLiked([...page.items, ...(page.saved ?? [])]);
+      pageItems.current = [...page.items, ...(page.saved ?? [])];
+      loadLiked(pageItems.current);
       const fresh = trigger === 'stale' && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
       setArrivals(fresh);
       if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
@@ -256,6 +275,74 @@ export default function FeedScreen() {
     return () => sub.remove();
   }, [load, measure, pause]);
 
+  // Search as he types, a beat after the last keystroke; an empty box lists
+  // his whole history, newest seen first.
+  useEffect(() => {
+    if (!searching) return;
+    const gen = ++searchGeneration.current;
+    const q = query.trim();
+    const t = setTimeout(async () => {
+      const startedAt = Date.now();
+      try {
+        const page = await searchFeed(config, q);
+        if (gen !== searchGeneration.current) return;
+        pause();
+        for (const item of page.items) feedItems.set(item.item_id, item);
+        loadLiked([...pageItems.current, ...page.items]);
+        setResults(page.items);
+        setSearchError(null);
+        recordUi('search', { dwell_ms: Date.now() - startedAt, metadata: { query: q.slice(0, 200), results: page.items.length } });
+      } catch (e) {
+        if (gen === searchGeneration.current) setSearchError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (gen === searchGeneration.current) setSearchBusy(false);
+      }
+    }, q ? SEARCH_DEBOUNCE_MS : 0);
+    return () => clearTimeout(t);
+  }, [config, pause, query, searching]);
+
+  const openSearch = useCallback(() => {
+    pause();
+    recordUi('search_open', { metadata: { from: viewName(only) } });
+    setSearching(true);
+    setSearchBusy(true);
+    list.current?.scrollToOffset({ offset: 0, animated: false });
+  }, [only, pause]);
+
+  const closeSearch = useCallback(() => {
+    pause();
+    Keyboard.dismiss();
+    recordUi('search_close', { metadata: { query: query.trim().slice(0, 200), results: results?.length ?? 0 } });
+    searchGeneration.current++;
+    setSearching(false);
+    setQuery('');
+    setResults(null);
+    setSearchBusy(false);
+    setSearchError(null);
+  }, [pause, query, results]);
+
+  const navigation = useNavigation<{
+    addListener(type: 'tabPress', cb: () => void): () => void;
+    isFocused(): boolean;
+    setOptions(options: { headerRight?: () => ReactNode }): void;
+  }>();
+
+  // The magnifying glass in the header, like the Timeline's.
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={searching ? 'Close search' : 'Search past cards'}
+          hitSlop={6}
+          onPress={searching ? closeSearch : openSearch}
+          style={[styles.headerButton, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
+          <Icon name={searching ? 'xmark' : 'magnifyingglass'} tintColor={theme.text} size={20} />
+        </Pressable>
+      ),
+    });
+  }, [navigation, searching, openSearch, closeSearch, theme]);
+
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       markActive();
@@ -268,7 +355,6 @@ export default function FeedScreen() {
 
   // Tapping Feed in the tab bar while already on it, so a double tap from
   // anywhere, scrolls back to the top, as X and Instagram do.
-  const navigation = useNavigation<{ addListener(type: 'tabPress', cb: () => void): () => void; isFocused(): boolean }>();
   useEffect(
     () =>
       navigation.addListener('tabPress', () => {
@@ -440,18 +526,23 @@ export default function FeedScreen() {
       const index = position(item);
       recordFeedEvent('dismiss', { item_id: item.item_id, position: index, metadata: { reason, source: item.source, site: item.site ?? '' } });
       LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      const inFeed = items.findIndex((i) => i.item_id === item.item_id);
+      const inResults = results?.findIndex((i) => i.item_id === item.item_id) ?? -1;
+      const putBack = (list: FeedItem[], at: number) => {
+        const next = [...list];
+        next.splice(Math.min(at, next.length), 0, item);
+        return next;
+      };
       setItems((prev) => prev.filter((i) => i.item_id !== item.item_id));
+      setResults((prev) => prev && prev.filter((i) => i.item_id !== item.item_id));
       showUndo('Hidden', () => {
         recordFeedEvent('undismiss', { item_id: item.item_id, position: index });
         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-        setItems((prev) => {
-          const next = [...prev];
-          next.splice(Math.min(index, next.length), 0, item);
-          return next;
-        });
+        if (inFeed >= 0) setItems((prev) => putBack(prev, inFeed));
+        if (inResults >= 0) setResults((prev) => prev && putBack(prev, inResults));
       });
     },
-    [showUndo],
+    [items, results, showUndo],
   );
 
   // The bookmark, a swipe right or the menu: in or out of the read-later
@@ -544,6 +635,27 @@ export default function FeedScreen() {
   return (
     <ThemedView style={styles.fill} onTouchStart={markActive}>
       <VideoWarmup />
+      {searching ? (
+        <View style={styles.searchRow}>
+          <TextInput
+            style={[styles.searchInput, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder, color: theme.text }]}
+            placeholder="Search everything you've seen"
+            placeholderTextColor={theme.textSecondary}
+            value={query}
+            onChangeText={(text) => {
+              setQuery(text);
+              setSearchBusy(true);
+            }}
+            onSubmitEditing={() => Keyboard.dismiss()}
+            autoFocus
+            returnKeyType="search"
+            autoCapitalize="none"
+            autoCorrect={false}
+            clearButtonMode="while-editing"
+          />
+          {searchBusy ? <ActivityIndicator style={styles.searchSpinner} /> : null}
+        </View>
+      ) : null}
       <FlatList
         ref={list}
         data={shown}
@@ -552,6 +664,8 @@ export default function FeedScreen() {
         renderItem={renderItem}
         onScroll={onScroll}
         {...scrollHandlers}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
         onScrollToTop={() => recordUi('scroll_to_top', { metadata: { view: view.current } })}
         onEndReachedThreshold={0.2}
         onEndReached={() => {
@@ -565,7 +679,7 @@ export default function FeedScreen() {
           measure();
         }}
         refreshControl={
-          <RefreshControl
+          searching ? undefined : <RefreshControl
             refreshing={refreshing}
             onRefresh={() => {
               recordUi('refresh', { metadata: { view: view.current } });
@@ -581,7 +695,7 @@ export default function FeedScreen() {
               headerHeight.current = e.nativeEvent.layout.height;
               measure();
             }}>
-            {bubbles.length > 1 || savedIds.length > 0 || only === SAVED ? (
+            {searching ? null : bubbles.length > 1 || savedIds.length > 0 || only === SAVED ? (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail}>
                 {savedIds.length > 0 || only === SAVED ? (
                   <Pressable
@@ -628,7 +742,12 @@ export default function FeedScreen() {
                 })}
               </ScrollView>
             ) : null}
-            {error ? (
+            {searching && searchError ? (
+              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                <ThemedText style={styles.bannerText}>Could not search: {searchError}</ThemedText>
+              </View>
+            ) : null}
+            {error && !searching ? (
               <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
                 <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
               </View>
@@ -636,7 +755,20 @@ export default function FeedScreen() {
           </View>
         }
         ListEmptyComponent={
-          only === SAVED ? (
+          searching ? (
+            <View style={styles.empty}>
+              {results === null ? (
+                <ActivityIndicator />
+              ) : searchError ? null : (
+                <>
+                  <ThemedText style={styles.emptyTitle}>{query.trim() ? 'No matches' : 'Nothing seen yet'}</ThemedText>
+                  <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
+                    {query.trim() ? 'No card you have seen has all of those words.' : 'Cards show up here once you have seen them in the feed.'}
+                  </ThemedText>
+                </>
+              )}
+            </View>
+          ) : only === SAVED ? (
             <View style={styles.empty}>
               <ThemedText style={styles.emptyTitle}>Nothing saved</ThemedText>
               <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
@@ -661,7 +793,7 @@ export default function FeedScreen() {
           )
         }
       />
-      {arrivals.length && only === null ? (
+      {arrivals.length && only === null && !searching ? (
         <Pressable
           style={({ pressed }) => [styles.pill, pressed && styles.pillPressed]}
           onPress={() => {
@@ -756,5 +888,9 @@ const styles = StyleSheet.create({
   pillFace: { borderRadius: 13, borderWidth: 2, borderColor: ACCENT },
   pillFaceOverlap: { marginLeft: -12 },
   pillText: { color: '#fff', fontSize: 14, fontWeight: '700', lineHeight: 18 },
+  headerButton: { width: 40, height: 40, borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, alignItems: 'center', justifyContent: 'center', marginRight: 14 },
+  searchRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
+  searchInput: { flex: 1, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 18, paddingVertical: 10, fontSize: 16 },
+  searchSpinner: { position: 'absolute', right: Spacing.three + 40 },
   undoAction: { fontSize: 15, fontWeight: '700', color: '#36A0DA' },
 });

@@ -63,6 +63,13 @@ export function fetchFeed(config: AppConfig, limit = 200): Promise<FeedPage> {
   return feedRequest<FeedPage>(config, `/api/feed?limit=${limit}`);
 }
 
+// His feed history: every card he was shown, opened, saved or liked that
+// has every word of q, title matches first, then newest seen. An empty q is
+// the whole history.
+export function searchFeed(config: AppConfig, q: string, limit = 100): Promise<{ query: string; items: FeedItem[] }> {
+  return feedRequest(config, `/api/feed/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+}
+
 export async function postFeedEvents(config: AppConfig, device: string, events: FeedEvent[]): Promise<void> {
   await feedRequest(config, '/api/feed/events', { method: 'POST', body: JSON.stringify({ device, events }) });
 }

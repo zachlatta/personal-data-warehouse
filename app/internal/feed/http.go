@@ -27,6 +27,7 @@ func (h *handler) register(mux *http.ServeMux, auth func(http.Handler) http.Hand
 	mux.Handle("GET "+APIPath, auth(bounded(h.feed)))
 	mux.Handle("POST "+APIPath+"/events", auth(bounded(h.events)))
 	mux.Handle("GET "+APIPath+"/article", auth(bounded(h.article)))
+	mux.Handle("GET "+APIPath+"/search", auth(bounded(h.search)))
 }
 
 func bounded(next http.HandlerFunc) http.Handler {
@@ -82,14 +83,49 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	for _, list := range [][]Item{items, saved} {
+	forPhone(items, saved)
+	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
+}
+
+// forPhone keeps the payload to what a card needs.
+func forPhone(lists ...[]Item) {
+	for _, list := range lists {
 		for i := range list {
-			// Keep the payload to what a card needs.
 			list[i].Metadata = phoneMetadata(list[i].Metadata)
 			list[i].PushedBy = ""
 		}
 	}
-	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
+}
+
+type searchResponse struct {
+	Query string `json:"query"`
+	Items []Item `json:"items"`
+}
+
+// search is the feed screen's search box: GET ?q=words&limit=n over every
+// card he has been shown (Store.Search).
+func (h *handler) search(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 || n > 500 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be 1 to 500"})
+			return
+		}
+		limit = n
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(query) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "q must be at most 200 characters"})
+		return
+	}
+	items, err := h.store.Search(r.Context(), query, limit)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	forPhone(items)
+	writeJSON(w, http.StatusOK, searchResponse{Query: query, Items: items})
 }
 
 // phoneCardKeys are the metadata keys a card shows: Hacker News counts (its

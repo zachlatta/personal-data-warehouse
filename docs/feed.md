@@ -49,6 +49,17 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   among several photos still plays in the system player. A rail of source
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.
+- **Search past cards** (added 2026-10-24 from Zach's voice memo: "let me interactively
+  search through all my past entries so I can easily find stuff that has been surfaced for
+  me before"). The magnifying glass at the top right of the Feed opens a search box; the
+  list becomes his feed history, searched as he types (250 ms after the last key):
+  `GET /api/feed/search?q=...&limit=` (`Store.Search`) returns every card he was shown,
+  opened, saved or liked, including ones since dismissed, removed or expired. Every word
+  must appear (case-insensitive substring) in the title, text, author, site, url, tags or
+  embedded X post; cards with every word in the title come first, then the most recently
+  seen. An empty box lists the whole history. Results are ordinary cards (open, save, like,
+  hide all work); impressions there log `view: search`, and each search logs a `ui` event
+  `search` with the query and result count.
 - **The whole article in the detail view** (added 2026-10-24 from Zach's voice memo: "embed
   the entire article content directly inline instead of me having to tap out ... with the
   images and all that stuff right there"). A card that is not an X post or a video shows,
