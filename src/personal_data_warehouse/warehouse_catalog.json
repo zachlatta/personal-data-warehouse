@@ -215,6 +215,14 @@
       "comment": "Faithful google drive source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_google_recorder",
+      "layer": "base",
+      "domain": "google_recorder",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Pixel voice memos. Google Recorder recordings uploaded from the phone itself, with Recorder's own title, time and place."
+    },
+    {
       "name": "base_manual_finance",
       "layer": "base",
       "domain": "manual_finance",
@@ -1118,6 +1126,18 @@
         "schema": "alice_voice_recordings",
         "name": "artifacts"
       }
+    },
+    {
+      "id": "google_recorder_recordings",
+      "kind": "table",
+      "layer": "base",
+      "domain": "google_recorder",
+      "schema": "base_google_recorder",
+      "name": "recordings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Pixel recordings. One row per Google Recorder recording; transcripts and summaries are in marts_voice_memos.recordings."
     },
     {
       "id": "whoop_profiles",

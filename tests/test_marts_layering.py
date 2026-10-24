@@ -44,6 +44,7 @@ from personal_data_warehouse.schema import (
     APPLE_MESSAGE_HANDLE_COLUMNS,
     CALENDAR_EVENT_COLUMNS,
     CONTACT_CARD_COLUMNS,
+    GOOGLE_RECORDER_RECORDING_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -403,6 +404,32 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
             )
         ]
     )
+    wh.ensure_google_recorder_tables()
+    wh.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id="pixel-1",
+                device="pixel11pro",
+                title="Oct 23 at 5:56 PM",
+                recorded_at=TS,
+                duration_seconds=4.35,
+                location_name="Springfield Park",
+                filename="pixel-1.m4a",
+                extension=".m4a",
+                content_type="audio/mp4",
+                size_bytes=29742,
+                content_sha256="sha-pixel-1",
+                storage_backend="google_drive",
+                storage_file_id="drive-pixel-1",
+                raw_metadata_json="{}",
+                ingested_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
 
 
 def test_voice_memo_mart_is_one_row_per_recording_across_both_sources(
@@ -415,7 +442,31 @@ def test_voice_memo_mart_is_one_row_per_recording_across_both_sources(
         ("alice_voice_recordings", "alice-1"),
         ("apple_voice_memos", "rec-1"),
         ("apple_voice_memos", "rec-2"),
+        ("google_recorder", "pixel-1"),
     ]
+
+
+def test_voice_memo_mart_carries_a_pixel_recording_like_any_other(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Google Recorder on the Pixel is the fourth voice source, and the mart is
+    what transcription and enrichment read, so a Pixel memo is transcribed and
+    enriched by the existing passes the moment its row lands."""
+    _seed_voice_memos(warehouse)
+    pixel = next(
+        row
+        for row in _dicts(warehouse, "marts_voice_memos_recordings")
+        if row["source"] == "google_recorder"
+    )
+    assert pixel["title"] == "Oct 23 at 5:56 PM"
+    assert pixel["recorded_at"] == TS
+    # Recorder stores milliseconds; the mart keeps the fraction.
+    assert float(pixel["duration_seconds"]) == 4.35
+    assert pixel["storage_file_id"] == "drive-pixel-1"
+    assert pixel["size_bytes"] == 29742
+    assert pixel["is_deleted"] == 0
+    assert pixel["recording_url"] is None
+    assert pixel["transcript"] is None
 
 
 def test_voice_memo_mart_resolves_the_latest_completed_enrichment_once(
@@ -934,9 +985,100 @@ def test_recording_ids_by_audio_sha_skip_empty_and_deleted_audio(warehouse: Post
     }
 
 
-def _landing(wh: PostgresWarehouse) -> dict:
+def _landing(wh: PostgresWarehouse, source: str = "apple_voice_memos") -> dict:
     rows = {row["source"]: row for row in _dicts(wh, "marts_ops_voice_memo_landing_health")}
-    return rows["apple_voice_memos"]
+    return rows[source]
+
+
+def _landed_pixel_memo(
+    wh: PostgresWarehouse,
+    recording_id: str,
+    *,
+    ended_ago: timedelta,
+    duration_seconds: float,
+    upload_seconds: float,
+    transcript_seconds: float | None,
+) -> None:
+    """A Pixel Recorder memo whose row landed upload_seconds after it ended and
+    whose transcript was stored transcript_seconds after it ended."""
+    now = datetime.now(tz=UTC)
+    ended = now - ended_ago
+    recorded = ended - timedelta(seconds=duration_seconds)
+    wh.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id=recording_id,
+                filename=f"{recording_id}.m4a",
+                content_type="audio/mp4",
+                content_sha256=f"sha-{recording_id}",
+                size_bytes=1000,
+                recorded_at=recorded,
+                duration_seconds=duration_seconds,
+                raw_metadata_json="{}",
+                ingested_at=ended + timedelta(seconds=upload_seconds),
+                sync_version=1,
+            )
+        ]
+    )
+    if transcript_seconds is None:
+        return
+    wh.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="google_recorder",
+                account="zach",
+                recording_id=recording_id,
+                content_sha256=f"sha-{recording_id}",
+                provider="assemblyai",
+                provider_transcript_id=f"tid-{recording_id}",
+                status="completed",
+                transcript_text="hello",
+                requested_at=ended + timedelta(seconds=upload_seconds),
+                completed_at=ended + timedelta(seconds=transcript_seconds),
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def test_voice_memo_landing_health_judges_a_pixel_memo_from_the_end_of_the_recording(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """On the Pixel the uploader is PDW's own, on the phone itself: no third
+    party carries the file anywhere, so every second from the end of the
+    recording to the stored transcript is PDW's and is judged against the
+    same 30 s p50. There is no device-delivery leg to report beside it."""
+    warehouse.ensure_google_recorder_tables()
+    _landed_pixel_memo(warehouse, "p-1", ended_ago=timedelta(hours=1), duration_seconds=8, upload_seconds=9, transcript_seconds=22)
+    _landed_pixel_memo(warehouse, "p-2", ended_ago=timedelta(hours=2), duration_seconds=40, upload_seconds=12, transcript_seconds=26)
+    _landed_pixel_memo(warehouse, "p-3", ended_ago=timedelta(hours=3), duration_seconds=4.35, upload_seconds=6, transcript_seconds=18)
+
+    row = _landing(warehouse, "google_recorder")
+    assert row["short_recordings_7d"] == 3
+    assert float(row["pdw_landing_p50_seconds"]) == 22.0
+    assert float(row["end_to_transcript_p50_seconds"]) == 22.0
+    assert row["device_delivery_p50_seconds"] is None
+    assert row["status"] == "ok"
+
+    _landed_pixel_memo(warehouse, "p-slow-1", ended_ago=timedelta(minutes=50), duration_seconds=8, upload_seconds=200, transcript_seconds=240)
+    _landed_pixel_memo(warehouse, "p-slow-2", ended_ago=timedelta(minutes=40), duration_seconds=8, upload_seconds=200, transcript_seconds=250)
+    _landed_pixel_memo(warehouse, "p-slow-3", ended_ago=timedelta(minutes=30), duration_seconds=8, upload_seconds=200, transcript_seconds=260)
+    assert _landing(warehouse, "google_recorder")["status"] == "attention"
+
+
+def test_voice_memo_landing_health_counts_a_pixel_memo_with_no_transcript_as_stuck(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_google_recorder_tables()
+    _landed_pixel_memo(warehouse, "p-ok", ended_ago=timedelta(hours=1), duration_seconds=8, upload_seconds=9, transcript_seconds=22)
+    _landed_pixel_memo(warehouse, "p-stuck", ended_ago=timedelta(minutes=30), duration_seconds=8, upload_seconds=9, transcript_seconds=None)
+    row = _landing(warehouse, "google_recorder")
+    assert row["stuck_untranscribed"] == 1
+    assert row["status"] == "failing"
 
 
 def test_voice_memo_landing_health_splits_icloud_delivery_from_pdws_own_landing(
@@ -1339,6 +1481,21 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
             )
         ]
     )
+    warehouse.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id="pixel-undated",
+                filename="undated.m4a",
+                content_sha256="sha-6",
+                raw_metadata_json="{}",
+                # recorded_at and ingested_at left at the epoch default
+                sync_version=1,
+            )
+        ]
+    )
     warehouse.insert_apple_voice_memos_transcript_segments(
         [
             _row(
@@ -1377,6 +1534,7 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
     for key in (
         ("apple_voice_memos", "rec-undated"),
         ("alice_voice_recordings", "alice-undated"),
+        ("google_recorder", "pixel-undated"),
     ):
         assert rows[key]["recorded_at"] is None, key
     undated = rows[("apple_voice_memos", "rec-undated")]
@@ -1385,6 +1543,7 @@ def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
     # An Alice recording has no enrichment at all, so its enriched_at is NULL
     # for the other reason — and a sentinel ingested_at is NULL too.
     assert rows[("alice_voice_recordings", "alice-undated")]["ingested_at"] == TS
+    assert rows[("google_recorder", "pixel-undated")]["ingested_at"] is None
     assert rows[("alice_voice_recordings", "alice-1")]["enriched_at"] is None
     assert rows[("apple_voice_memos", "rec-1")]["recorded_at"] == TS
 

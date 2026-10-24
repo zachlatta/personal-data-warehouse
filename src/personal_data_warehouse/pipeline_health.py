@@ -773,6 +773,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("apple_voice_memos"),
     ),
     _source(
+        "google_recorder",
+        "Google Recorder (Pixel)",
+        cadence="uploader on every Recorder change, every 5 min as the floor",
+        transport=(
+            "pixel11pro Magisk service → pdw ingest google-recorder"
+            " → /ingest/google-recorder/* → Drive inbox → Dagster"
+        ),
+        data=7 * DAY,
+        basis=(
+            "the Pixel replaced the iPhone on 2026-10-23, so Apple Voice Memos'"
+            " measured habit carries over: 145 gaps, p95 3.86d, max 6.56d. The run"
+            " heartbeat is the tight detector: it fails when the phone cannot read"
+            " Recorder's database or reach the app"
+        ),
+        note="run heartbeat posted by bin/google-recorder-upload-android on the phone",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("google_recorder"),
+    ),
+    _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
@@ -1583,6 +1602,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "voice_memo_session_enrichments": _support("voice_memo_continuity", "created_at"),
     # Alice
     "alice_voice_recordings": _data("alice_voice_recordings", "ingested_at", "recorded_at"),
+    "google_recorder_recordings": _data("google_recorder", "ingested_at", "recorded_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

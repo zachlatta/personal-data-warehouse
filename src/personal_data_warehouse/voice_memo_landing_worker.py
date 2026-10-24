@@ -5,7 +5,8 @@ transcript was p50 9 min and almost none of it was work: a 60 s inbox sensor
 and a Dagster run start, another 60 s transcription sensor and run start, then
 the five-minute ``timeline_sync``. AssemblyAI itself took 7 s on a short memo.
 
-The app NOTIFYs ``pdw_voice_memo_landing`` when it stores a voice-memo sidecar.
+The app NOTIFYs ``pdw_voice_memo_landing`` when it stores a voice-memo sidecar
+from the Mac or a Google Recorder sidecar from the Pixel.
 This worker, supervised in the Dagster container beside the mutation worker,
 wakes on it and runs the same ingest and transcription functions the Dagster
 assets run (one path, two triggers), then lands the recordings on the timeline
@@ -28,6 +29,10 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.defs.apple_voice_memos_drive_ingest import (
     ingest_voice_memos_inbox,
     voice_memos_inbox_has_metadata,
+)
+from personal_data_warehouse.defs.google_recorder_drive_ingest import (
+    google_recorder_inbox_has_metadata,
+    ingest_google_recorder_inbox,
 )
 from personal_data_warehouse.defs.apple_voice_memos_transcription import (
     transcribe_voice_recordings,
@@ -82,11 +87,18 @@ class VoiceMemoLandingProcessor:
         return value
 
     def _ingest(self) -> int:
-        # Checked first so an idle wake costs one Drive list, not a run.
-        if not voice_memos_inbox_has_metadata(self.settings):
-            return 0
-        summary = ingest_voice_memos_inbox(settings=self.settings, logger=logger)
-        return summary.rows_written if summary is not None else 0
+        # Each inbox is checked first so an idle wake costs one Drive list per
+        # source, not a run.
+        written = 0
+        for has_metadata, ingest in (
+            (voice_memos_inbox_has_metadata, ingest_voice_memos_inbox),
+            (google_recorder_inbox_has_metadata, ingest_google_recorder_inbox),
+        ):
+            if not has_metadata(self.settings):
+                continue
+            summary = ingest(settings=self.settings, logger=logger)
+            written += summary.rows_written if summary is not None else 0
+        return written
 
     def _transcribe(self) -> int:
         if self.settings.voice_memos is None or self.settings.assemblyai is None:

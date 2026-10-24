@@ -465,6 +465,18 @@ func (c *Client) UploadVoiceMemoMetadata(payload map[string]any, recordedAt, aud
 	})
 }
 
+// --- google recorder (Pixel) -------------------------------------------------
+
+// UploadGoogleRecorderMetadata posts a Pixel recording's JSON sidecar.
+// metadataDedupSHA256 is the sha over the sidecar without its upload time, so
+// a re-send of an unchanged sidecar dedups and a renamed recording lands.
+func (c *Client) UploadGoogleRecorderMetadata(payload map[string]any, recordedAt, audioContentSHA256, metadataDedupSHA256 string) (StoredObject, error) {
+	return c.postJSON("/ingest/google-recorder/metadata", payload, map[string]string{
+		"recorded_at": recordedAt, "audio_content_sha256": audioContentSHA256,
+		"metadata_dedup_sha256": metadataDedupSHA256,
+	})
+}
+
 // --- photos -----------------------------------------------------------------
 
 // UploadPhotoMetadata posts a photo's metadata envelope.

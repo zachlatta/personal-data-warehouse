@@ -54,6 +54,7 @@ func resumableFileArtifacts() []resumableFileArtifact {
 	return []resumableFileArtifact{
 		{endpoint: "/ingest/photos/file/resumable", sourceSlug: "photos", kind: "photo_file", timeField: "captured_at", keyPrefix: "photos/inbox"},
 		{endpoint: "/ingest/voice-memos/audio/resumable", sourceSlug: "apple_voice_memos", kind: "voice_memo_audio", timeField: "recorded_at", keyPrefix: "apple-voice-memos/inbox"},
+		{endpoint: "/ingest/google-recorder/audio/resumable", sourceSlug: "google_recorder", kind: "google_recorder_audio", timeField: "recorded_at", keyPrefix: "google-recorder/inbox"},
 	}
 }
 
@@ -88,6 +89,8 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	// (screen_timelapse_ingest.go) writes the row with the bytes, so nothing
 	// reads this store by kind; the rows carry the pointers.
 	"screen_timelapse": {source: "screen_timelapse", blobKind: "screen_timelapse_screenshot", metadataKind: "screen_timelapse_accessibility_tree"},
+	// Google Recorder on the Pixel, sent by the phone's own uploader.
+	"google_recorder": {source: "google_recorder", blobKind: "google_recorder_audio", metadataKind: "google_recorder_metadata"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's
@@ -660,6 +663,38 @@ func ingestArtifacts() []ingestArtifact {
 				key := fmt.Sprintf("apple-voice-memos/inbox/%04d/%02d/%s-%s.json",
 					recordedAt.Year(), int(recordedAt.Month()), recordedAt.Format("2006-01-02"), audioSHA)
 				return ingestBuildResult{objectKey: key, sourceContentSHA: voiceMemoMetadataDedupSHA(audioSHA, recordedAt), appProperties: map[string]string{}}, nil
+			},
+		},
+		// --- Google Recorder (Pixel): resumable audio session + JSON sidecar --
+		// The audio is a resumableFileArtifact (resumableFileArtifacts).
+		{
+			endpoint:   "/ingest/google-recorder/metadata",
+			sourceSlug: "google_recorder",
+			kind:       "google_recorder_metadata",
+			isJSON:     true,
+			// Deduped by the client's sha over the sidecar without its upload
+			// time: a rename in Recorder keeps the audio and changes the title,
+			// and must land, while a re-send of an unchanged sidecar must not.
+			notifyChannel: voiceMemoLandingChannel,
+			build: func(q url.Values, sha string, now time.Time) (ingestBuildResult, error) {
+				audioSHA, err := required(q, "audio_content_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				dedupSHA, err := required(q, "metadata_dedup_sha256")
+				if err != nil {
+					return ingestBuildResult{}, err
+				}
+				if !sha256HexPattern.MatchString(dedupSHA) {
+					return ingestBuildResult{}, fmt.Errorf("metadata_dedup_sha256 must be a hex sha256")
+				}
+				recordedAt, err := parseTimestamp(q.Get("recorded_at"))
+				if err != nil {
+					return ingestBuildResult{}, fmt.Errorf("invalid recorded_at: %w", err)
+				}
+				key := fmt.Sprintf("google-recorder/inbox/%04d/%02d/%s-%s.json",
+					recordedAt.Year(), int(recordedAt.Month()), recordedAt.Format("2006-01-02"), safeObjectKeyPart(audioSHA))
+				return ingestBuildResult{objectKey: key, sourceContentSHA: dedupSHA, appProperties: map[string]string{}}, nil
 			},
 		},
 		// --- photos: resumable file session + JSON metadata envelope ----------

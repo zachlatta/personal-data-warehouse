@@ -10,6 +10,7 @@ uploader's exec chain).
 | source | what it ships |
 | --- | --- |
 | `apple-messages`, `apple-notes`, `apple-contacts`, `apple-photos`, `voice-memos` | this Mac's Messages, Notes, Contacts, Photos and Voice Memos; normally run by a LaunchAgent every 5–30 minutes |
+| `google-recorder` | Google Recorder's recordings, run as root ON the Pixel by a Magisk service seconds after Recorder saves one (every 5 minutes as the floor); not a Mac command |
 | `browser-history` | this Mac's Chrome, Brave and Safari history (every profile); LaunchAgent every 15 minutes; Safari needs Full Disk Access |
 | `screen-timelapse` | the periodic whole-screen captures (and accessibility trees) of this Mac and of the phone it images, one file per request; `SCREEN_TIMELAPSE_SOURCES` says which folder is which device; LaunchAgent every 5 minutes |
 | `agent-sessions` | Claude Code, Codex, pi, Muse Code, Argon and OpenClaw transcripts from this machine |

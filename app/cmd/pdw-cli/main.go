@@ -11,8 +11,12 @@ package main
 
 import (
 	"os"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/dnsfallback"
 )
 
 func main() {
+	// Android (the Pixel's uploader) has no /etc/resolv.conf; elsewhere a no-op.
+	dnsfallback.Install()
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv))
 }

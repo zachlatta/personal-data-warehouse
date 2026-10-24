@@ -548,6 +548,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_apple_messages_tables()
     warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
     warehouse.ensure_alice_voice_recordings_tables()
+    warehouse.ensure_google_recorder_tables()
     warehouse.ensure_whatsapp_tables()
     warehouse.ensure_whatsapp_client_session_table()
     warehouse.ensure_photos_tables()

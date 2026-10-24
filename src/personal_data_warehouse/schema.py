@@ -290,6 +290,43 @@ ALICE_VOICE_RECORDING_COLUMNS = (
 )
 
 
+# Google Recorder, the Pixel's voice recorder. The phone's own uploader reads
+# Recorder's recording_database (as root) and sends each finished recording
+# with a sidecar; recording_id is Recorder's uuid, account is the Google
+# account Recorder files the recording under, device the phone it came from.
+# recorded_at is Recorder's created_time, epoch milliseconds in UTC, so there
+# is no zone to guess. duration_seconds keeps Recorder's milliseconds as a
+# fraction. The coordinates and every other Recorder field ride in
+# raw_metadata_json; location_name is '' when Recorder knew no place.
+GOOGLE_RECORDER_RECORDING_COLUMNS = (
+    "account",
+    "recording_id",
+    "device",
+    "title",
+    "recorded_at",
+    "duration_seconds",
+    "location_name",
+    "filename",
+    "extension",
+    "content_type",
+    "size_bytes",
+    "content_sha256",
+    "file_modified_at",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    "metadata_storage_key",
+    "metadata_storage_file_id",
+    "metadata_storage_url",
+    "metadata_content_sha256",
+    "is_deleted",
+    "raw_metadata_json",
+    "ingested_at",
+    "sync_version",
+)
+
+
 ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS = (
     "account",
     "recording_id",

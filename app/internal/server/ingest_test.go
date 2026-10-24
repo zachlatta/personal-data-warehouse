@@ -567,6 +567,78 @@ func TestAFailedLandingNotificationDoesNotFailTheUpload(t *testing.T) {
 	}
 }
 
+// Google Recorder on the Pixel: the phone's own uploader sends each finished
+// recording as a resumable audio session plus a JSON sidecar, filed under
+// google-recorder/inbox in the recorder source's store, and the sidecar wakes
+// the voice landing worker exactly as a Mac memo's does.
+func TestIngestGoogleRecorderAudioAndMetadataKeys(t *testing.T) {
+	svc, stores := ingestTestService()
+	var notified []string
+	svc.notify = func(_ context.Context, channel, payload string) error {
+		notified = append(notified, channel)
+		return nil
+	}
+	audio := []byte("pixel-audio")
+	audioSHA := sha256Hex(audio)
+	startBody, _ := json.Marshal(map[string]any{
+		"recorded_at":    "2026-10-23T21:56:24.803Z",
+		"extension":      ".m4a",
+		"content_type":   "audio/mp4",
+		"content_sha256": audioSHA,
+		"size_bytes":     len(audio),
+	})
+	target := signedIngestTarget("/ingest/google-recorder/audio/resumable", startBody, nil)
+	rec := postIngest(t, svc, target, startBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("audio start status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["google_recorder"].lastResumable
+	wantAudioKey := "google-recorder/inbox/2026/10/2026-10-23-" + audioSHA + ".m4a"
+	if put.ObjectKey != wantAudioKey || put.Kind != "google_recorder_audio" || put.ContentType != "audio/mp4" {
+		t.Fatalf("audio put = %+v", put)
+	}
+	if stores["apple_voice_memos"].lastResumable != nil {
+		t.Fatal("a Pixel recording must not land in the Apple Voice Memos store")
+	}
+
+	meta := []byte(`{"schema_version":1,"source":"google_recorder"}`)
+	dedup := strings.Repeat("d", 64)
+	target = signedIngestTarget("/ingest/google-recorder/metadata", meta, url.Values{
+		"recorded_at":           {"2026-10-23T21:56:24.803Z"},
+		"audio_content_sha256":  {audioSHA},
+		"metadata_dedup_sha256": {dedup},
+	})
+	if rec := postIngest(t, svc, target, meta); rec.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	pj := stores["google_recorder"].lastJSON
+	wantMetaKey := "google-recorder/inbox/2026/10/2026-10-23-" + audioSHA + ".json"
+	if pj.ObjectKey != wantMetaKey || pj.Kind != "google_recorder_metadata" {
+		t.Fatalf("metadata put = %+v", pj)
+	}
+	// Deduped by the client's hash of the sidecar without its upload time, so
+	// a rename in Recorder (same audio, new title) lands as a new sidecar while
+	// a re-send of an unchanged one does not.
+	if pj.SourceContentSHA256 != dedup {
+		t.Fatalf("metadata dedup = %q, want %q", pj.SourceContentSHA256, dedup)
+	}
+	if len(notified) != 1 || notified[0] != voiceMemoLandingChannel {
+		t.Fatalf("notifications = %v", notified)
+	}
+
+	for name, params := range map[string]url.Values{
+		"no dedup sha": {"recorded_at": {"2026-10-23T21:56:24Z"}, "audio_content_sha256": {audioSHA}},
+		"bad dedup sha": {"recorded_at": {"2026-10-23T21:56:24Z"}, "audio_content_sha256": {audioSHA},
+			"metadata_dedup_sha256": {"../x"}},
+		"no audio sha": {"recorded_at": {"2026-10-23T21:56:24Z"}, "metadata_dedup_sha256": {dedup}},
+	} {
+		bad := signedIngestTarget("/ingest/google-recorder/metadata", meta, params)
+		if rec := postIngest(t, svc, bad, meta); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", name, rec.Code)
+		}
+	}
+}
+
 func TestIngestPhotosResumableFileAndMetadataKeys(t *testing.T) {
 	svc, stores := ingestTestService()
 	photo := []byte("heic-bytes")

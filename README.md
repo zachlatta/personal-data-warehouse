@@ -19,6 +19,9 @@ Current ingestion path:
 - Voice Memos use a two-stage path: a local macOS uploader posts audio files and JSON metadata
   to the app's `/ingest/...` endpoints; the app writes Google Drive inbox objects, then Dagster
   ingests those metadata into Postgres.
+- Google Recorder recordings from the Pixel use the same shape from the phone itself: a Magisk
+  service runs `pdw ingest google-recorder` as root seconds after Recorder saves a recording,
+  and Dagster promotes them into `base_google_recorder.recordings`.
 - Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
   SQLite store, posts immutable note revision payloads to the app, and Dagster ingests the
   app-written Drive objects.
@@ -1052,6 +1055,18 @@ from the backend context and stores them in warehouse columns. Drive `appPropert
 for short indexing fields such as `pdw_stage`, `pdw_kind`, and content hashes. Dagster only scans
 `pdw_stage=inbox`, then promotes processed files to `apple-voice-memos/library/YYYY/MM/`.
 A future S3 backend can keep the same metadata format and swap only the object-store implementation.
+
+## Google Recorder Sync (Pixel)
+
+New voice memos are Google Recorder recordings on the Pixel (from 2026-10-23). The phone is
+rooted, and the `pdw-google-recorder` Magisk module runs `pdw ingest google-recorder` there as
+root: it reads a copy of Recorder's `recording_database` and posts each finished recording's
+`.m4a` and a JSON sidecar (Recorder's uuid, title, UTC start time, duration and place) to
+`/ingest/google-recorder/*`. The app writes Drive inbox objects under `google-recorder/inbox/`;
+`google_recorder_drive_ingest` (and the resident voice landing worker, which the sidecar
+wakes) promotes them into `base_google_recorder.recordings`, and transcription, enrichment and
+the timeline pick them up through `marts_voice_memos.recordings`. Details, the module layout
+and the on-phone commands are in [docs/agents/voice.md](docs/agents/voice.md#google-recorder-on-the-pixel).
 
 ## Apple Notes Sync
 

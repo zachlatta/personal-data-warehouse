@@ -18,11 +18,12 @@ import (
 )
 
 const (
-	photoResumableEndpoint     = "/ingest/photos/file/resumable"
-	voiceMemoResumableEndpoint = "/ingest/voice-memos/audio/resumable"
-	resumableStatusCode        = 308
-	resumableRetryAttempts     = 5
-	resumableSessionRestart    = 3
+	photoResumableEndpoint          = "/ingest/photos/file/resumable"
+	voiceMemoResumableEndpoint      = "/ingest/voice-memos/audio/resumable"
+	googleRecorderResumableEndpoint = "/ingest/google-recorder/audio/resumable"
+	resumableStatusCode             = 308
+	resumableRetryAttempts          = 5
+	resumableSessionRestart         = 3
 )
 
 var errResumableSessionExpired = errors.New("resumable session expired")
@@ -39,6 +40,12 @@ func (c *Client) UploadPhotoFile(path, capturedAt, extension, contentType, conte
 // minute to send: a 2 h 42 m, 625 MiB recording failed every run for a day.
 func (c *Client) UploadVoiceMemoAudio(path, recordedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
 	return c.uploadResumableFile(voiceMemoResumableEndpoint, "voice memo", "recorded_at", recordedAt, path, extension, contentType, contentSHA256)
+}
+
+// UploadGoogleRecorderAudio uploads a Pixel Recorder recording through a
+// resumable Drive session, for the same reason as UploadVoiceMemoAudio.
+func (c *Client) UploadGoogleRecorderAudio(path, recordedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(googleRecorderResumableEndpoint, "google recorder recording", "recorded_at", recordedAt, path, extension, contentType, contentSHA256)
 }
 
 // uploadResumableFile uploads a file through a resumable Drive session. Only

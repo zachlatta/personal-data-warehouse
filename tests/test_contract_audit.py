@@ -609,7 +609,7 @@ def test_c4_cannot_vouch_for_raw_data_while_pages_fail_checksums(monkeypatch: py
 def _s2_sql(*, landing: list[dict] | None) -> Callable[..., list[dict] | None]:
     coverage = [
         {"source": source, "recordings": 10, "untranscribed": 0, "untranscribable": 0, "unenriched": 0, "matched": 5}
-        for source in ("alice_voice_recordings", "apple_notes", "apple_voice_memos")
+        for source in ("alice_voice_recordings", "apple_notes", "apple_voice_memos", "google_recorder")
     ]
 
     def fake(intent: str, sql: str, **_kwargs) -> list[dict] | None:
@@ -618,9 +618,13 @@ def _s2_sql(*, landing: list[dict] | None) -> Callable[..., list[dict] | None]:
     return fake
 
 
-def _landing(status: str, p50: float | None) -> list[dict]:
-    return [{"source": "apple_voice_memos", "status": status, "pdw_landing_p50_seconds": p50,
-             "device_delivery_p50_seconds": 17.0, "end_to_transcript_p50_seconds": 40.0, "stuck_untranscribed": 0}]
+def _landing(status: str, p50: float | None, *, pixel_status: str = "ok") -> list[dict]:
+    return [
+        {"source": "apple_voice_memos", "status": status, "pdw_landing_p50_seconds": p50,
+         "device_delivery_p50_seconds": 17.0, "end_to_transcript_p50_seconds": 40.0, "stuck_untranscribed": 0},
+        {"source": "google_recorder", "status": pixel_status, "pdw_landing_p50_seconds": 21.0,
+         "device_delivery_p50_seconds": None, "end_to_transcript_p50_seconds": 21.0, "stuck_untranscribed": 0},
+    ]
 
 
 def test_s2_grades_how_fast_a_memo_lands_not_only_whether_it_does(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -638,6 +642,28 @@ def test_s2_grades_how_fast_a_memo_lands_not_only_whether_it_does(monkeypatch: p
 
     monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=_landing("failing", 900.0)))
     assert contract_audit.s2_voice().status == contract_audit.RED
+
+
+def test_s2_grades_the_pixels_landing_speed_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Pixel's Recorder is the phone Zach carries from 2026-10-23, so a slow
+    or stuck Pixel memo must be able to colour S2 even while Apple is fine."""
+    monkeypatch.setattr(contract_audit, "pdw_sql", _s2_sql(landing=_landing("ok", 22.0, pixel_status="failing")))
+    verdict = contract_audit.s2_voice()
+    assert verdict.status == contract_audit.RED
+    assert "google_recorder" in verdict.evidence
+
+
+def test_s2_wants_every_voice_source_including_the_pixel(monkeypatch: pytest.MonkeyPatch) -> None:
+    coverage = [
+        {"source": source, "recordings": 10, "untranscribed": 0, "untranscribable": 0, "unenriched": 0, "matched": 5}
+        for source in ("alice_voice_recordings", "apple_notes", "apple_voice_memos")
+    ]
+    monkeypatch.setattr(
+        contract_audit,
+        "pdw_sql",
+        lambda intent, sql, **_k: _landing("ok", 22.0) if "voice_memo_landing_health" in sql else coverage,
+    )
+    assert contract_audit.s2_voice().status != contract_audit.GREEN
 
 
 def test_s2_withholds_green_when_landing_speed_cannot_be_read(monkeypatch: pytest.MonkeyPatch) -> None:

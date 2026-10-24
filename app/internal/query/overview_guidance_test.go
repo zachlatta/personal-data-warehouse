@@ -188,8 +188,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// the base_screen_timelapse schema line ("Screen timelapse.") and its two
 	// raw tables ("START HERE for screens.", "Accessibility trees."): 10055.
 	// 10060 is those three lines and no more.
-	if guidance > 10060 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10060)", guidance)
+	//
+	// 2026-10-23: Google Recorder on the Pixel, the phone that replaced the
+	// iPhone, added the base_google_recorder schema line ("Pixel voice
+	// memos.") and its raw table ("Pixel recordings."): 10079. 10080 is those
+	// two lines and no more.
+	if guidance > 10080 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10080)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

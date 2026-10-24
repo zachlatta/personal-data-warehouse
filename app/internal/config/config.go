@@ -139,6 +139,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"apple_messages":    "APPLE_MESSAGES",
 	"apple_voice_memos": "VOICE_MEMOS",
 	"apple_notes":       "APPLE_NOTES",
+	"google_recorder":   "GOOGLE_RECORDER",
 	"browser_history":   "BROWSER_HISTORY",
 	"photos":            "PHOTOS",
 	"manual_finance":    "MANUAL_FINANCE",

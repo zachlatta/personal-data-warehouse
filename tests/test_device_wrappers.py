@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BIN = REPO_ROOT / "bin"
 LAUNCHD = REPO_ROOT / "ops" / "launchd"
 SYSTEMD = REPO_ROOT / "ops" / "systemd"
+ANDROID_MODULE = REPO_ROOT / "ops" / "android" / "pdw-google-recorder"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -38,6 +39,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "screen-timelapse-upload-launchd": ('"$PDW" ingest screen-timelapse', "screen_timelapse"),
     "apple-notes-upload-launchd": ('"$PDW" ingest apple-notes --mode incremental', "apple_notes"),
     "voice-memos-upload-launchd": ('"$PDW" ingest voice-memos --mode incremental', "apple_voice_memos"),
+    "google-recorder-upload-android": ('"$PDW" ingest google-recorder', "google_recorder"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
@@ -97,7 +99,9 @@ def test_uploader_wrapper_posts_its_heartbeat_through_pdw_heartbeat(name: str) -
 
 
 def test_no_wrapper_is_missing_from_the_contract() -> None:
-    present = sorted(p.name for p in BIN.iterdir() if p.name.endswith(("-launchd", "-systemd")) and "-status" not in p.name)
+    present = sorted(
+        p.name for p in BIN.iterdir() if p.name.endswith(("-launchd", "-systemd", "-android")) and "-status" not in p.name
+    )
     assert present == sorted(WRAPPERS)
 
 
@@ -201,3 +205,43 @@ def test_voice_memos_uploader_fires_within_seconds_of_a_new_memo() -> None:
     assert plist["WatchPaths"] == [f"{recordings}/CloudRecordings.db-wal", recordings]
     assert plist["ThrottleInterval"] == 10
     assert plist["StartInterval"] == 300
+
+
+# The Pixel's Google Recorder uploader runs under Magisk, not launchd: Android's
+# /system/bin/sh (mksh), no checkout on the phone, and the phone suspends
+# within seconds of the screen going off.
+_BASHISMS = re.compile(r"(?m)^[^#\n]*(\[\[\s|\bfunction\b|\$\{[A-Za-z_]+\[|\bsource\b|<<<|\bdeclare\b)")
+
+
+def test_the_android_scripts_are_plain_sh_for_android() -> None:
+    scripts = [BIN / "google-recorder-upload-android", BIN / LIB, *sorted(ANDROID_MODULE.iterdir())]
+    for script in scripts:
+        text = script.read_text()
+        if script.name != LIB:
+            assert text.startswith("#!/system/bin/sh\n"), script.name
+            assert script.stat().st_mode & 0o111, f"{script.name} must be executable"
+        offenders = [m.group(0).strip() for m in _BASHISMS.finditer(text)]
+        assert offenders == [], f"{script.name} uses shell features mksh lacks: {offenders}"
+
+
+def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:
+    service = (ANDROID_MODULE / "service.sh").read_text()
+    wake = (ANDROID_MODULE / "google-recorder-upload-wake").read_text()
+    assert '"$MODDIR/bin/google-recorder-upload-android"' in service
+    assert 'inotifyd "$MODDIR/bin/google-recorder-upload-wake" "$REC/databases:c" "$REC/files/recordings:' in service
+    # A run is bounded both by the uploader's own deadline and by the service.
+    assert "timeout 960" in service
+    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    # The handler's marker and wakelock are what the loop waits on.
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert f": > {state}/due" in wake
+    assert "/sys/power/wake_lock" in wake
+
+
+def test_the_android_wrapper_keeps_its_state_out_of_recorders_directory() -> None:
+    text = _wrapper("google-recorder-upload-android")
+    # Credential-encrypted storage: the token is the master secret and the
+    # bootloader is unlocked, so it must not sit in /data/adb.
+    assert 'STATE_DIR="${PDW_GOOGLE_RECORDER_STATE_DIR:-/data/misc_ce/0/pdw-google-recorder}"' in text
+    assert '--state-file "$STATE_DIR/google-recorder-upload-state.sqlite"' in text
+    assert 'export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"' in text

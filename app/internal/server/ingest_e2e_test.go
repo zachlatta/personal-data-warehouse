@@ -245,6 +245,7 @@ func e2eCases() []e2eCase {
 	noteAtt := []byte("note-attachment")
 	revision := []byte(`{"schema_version":1,"source":"apple_notes"}`)
 	audioSHA := sha(audio)
+	recorderDedupSHA := strings.Repeat("e", 64)
 	photoMeta := []byte(`{"schema_version":1,"source":"apple_photos"}`)
 	photoSHA := sha([]byte("heic-bytes"))
 	photoDedupSHA := sha([]byte("apple_photos|z@x.test|UUID-1|original|" + photoSHA))
@@ -298,6 +299,18 @@ func e2eCases() []e2eCase {
 			// The dedup property carries (audio sha, recorded_at), so a
 			// corrected recorded_at lands instead of deduping onto the old one.
 			wantProps: map[string]string{"pdw_kind": "voice_memo_metadata", "audio_content_sha256": voiceMemoMetadataDedupSHA(audioSHA, time.Date(2025, 7, 15, 9, 0, 0, 0, time.UTC))},
+		},
+		{
+			name: "google-recorder/metadata", endpoint: "/ingest/google-recorder/metadata", body: meta,
+			extra: url.Values{
+				"recorded_at":           {"2026-10-23T21:56:24.803Z"},
+				"audio_content_sha256":  {audioSHA},
+				"metadata_dedup_sha256": {recorderDedupSHA},
+			},
+			wantName: "2026-10-23-" + audioSHA + ".json", wantMime: "application/json",
+			// The store files a sidecar's dedup sha under its one historical
+			// property name, whatever the source.
+			wantProps: map[string]string{"pdw_kind": "google_recorder_metadata", "pdw_source": "google_recorder", "audio_content_sha256": recorderDedupSHA},
 		},
 		{
 			name: "photos/metadata", endpoint: "/ingest/photos/metadata", body: photoMeta,
@@ -485,6 +498,7 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 	statementDedupSHA := manualfinance.ProvenanceDedupSHA256("manual", "z@x.test", statementSHA, statementSHA)
 	audio := []byte("audio-bytes")
 	audioSHA := sha256Hex(audio)
+	recorderDedupSHA := strings.Repeat("e", 64)
 	photoPath := filepath.Join(t.TempDir(), "photo.heic")
 	if err := os.WriteFile(photoPath, photo, 0o600); err != nil {
 		t.Fatal(err)
@@ -530,6 +544,12 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		{"voice-memos/metadata", func() (ingestclient.StoredObject, error) {
 			return client.UploadVoiceMemoMetadata(map[string]any{"schema_version": 1}, "2025-07-15T09:00:00", audioSHA)
 		}},
+		{"google-recorder/audio", func() (ingestclient.StoredObject, error) {
+			return client.UploadGoogleRecorderAudio(audioPath, "2026-10-23T21:56:24.803Z", ".m4a", "audio/mp4", audioSHA)
+		}},
+		{"google-recorder/metadata", func() (ingestclient.StoredObject, error) {
+			return client.UploadGoogleRecorderMetadata(map[string]any{"schema_version": 1}, "2026-10-23T21:56:24.803Z", audioSHA, recorderDedupSHA)
+		}},
 		{"apple-notes/body", func() (ingestclient.StoredObject, error) {
 			return client.UploadAppleNotesBody([]byte("<html>x</html>"), "N1", "R1", "2026-01-02T03:04:05+00:00")
 		}},
@@ -560,8 +580,9 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		name, kind string
 		media      []byte
 	}{
-		"photos/file":       {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
-		"voice-memos/audio": {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
+		"photos/file":           {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
+		"voice-memos/audio":     {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
+		"google-recorder/audio": {"2026-10-23-" + audioSHA + ".m4a", "google_recorder_audio", audio},
 	}
 	if len(steps) != len(ingestArtifacts())+len(resumable) {
 		t.Fatalf("e2e client drives %d endpoints but %d artifacts (+%d resumable files) are registered", len(steps), len(ingestArtifacts()), len(resumable))

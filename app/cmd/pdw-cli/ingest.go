@@ -12,6 +12,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applemessages"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applenotes"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/browserhistory"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/googlerecorder"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/manualfinance"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/muse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/photos"
@@ -44,6 +45,7 @@ var ingestSources = map[string]localCommand{
 	"apple-notes":      applenotes.Run,
 	"apple-photos":     photos.Run,
 	"browser-history":  browserhistory.Run,
+	"google-recorder":  googlerecorder.Run,
 	"manual-finance":   manualfinance.Run,
 	"muse":             muse.Run,
 	"plaid":            plaid.Run,
@@ -82,6 +84,7 @@ source's own flags.
 
 SOURCES
   voice-memos      Upload local macOS Voice Memos recordings
+  google-recorder  Upload Google Recorder's recordings (run as root on the Pixel)
   screen-timelapse Upload the periodic whole-screen captures (Mac and phone)
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)

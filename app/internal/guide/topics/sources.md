@@ -64,13 +64,16 @@ and state the window and freshness.
 ## Voice recordings and transcripts
 
 - `marts_voice_memos.recordings` — one row per recording from every voice source (Apple
-  Voice Memos, a second recorder, Notes audio) with `title`, `summary`, `transcript`,
+  Voice Memos, Google Recorder on the Pixel from 2026-10-23, a second recorder, Notes
+  audio) with `title`, `summary`, `transcript`,
   `participants`, `action_items` and the calendar match; `marts_voice_memos.transcript_segments`
   the speaker-labelled utterances. Search scope `voice_memos`/`transcripts`. Both name the
   speech model that produced the transcript in `transcript_model`.
 - `marts_voice_memos.sessions` — one row per event: back-to-back recordings that an agent
   judged to be one event (a memo stopped and restarted) merged into one title, summary,
   transcript and action-item list; `recording_ids` lists the members.
+- `base_google_recorder.recordings` — the Pixel's Recorder rows, with Recorder's own place
+  name in `location_name`; read transcripts through the mart (`source = 'google_recorder'`).
 - `recorded_at` is when recording started, as an absolute time. Before 2026-10-16 Apple
   memos stored the phone's local clock as UTC (4-5 h early); memos still on the Mac were
   corrected, so an old memo that reads oddly early may be one that was not.

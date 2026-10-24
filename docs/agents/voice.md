@@ -5,7 +5,8 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 
 ## Voice recordings (a multi-source domain, one pipeline)
 
-Voice has **three** sources — `base_apple_voice_memos.files` (the Mac uploader),
+Voice has **four** sources — `base_apple_voice_memos.files` (the Mac uploader),
+`base_google_recorder.recordings` (Google Recorder on the Pixel, from 2026-10-23),
 `base_alice_voice_recordings.recordings`, and the audio rows of
 `base_apple_notes.attachments` (call recordings, voicemails and the Notes app's own
 recorder; collapsed to one recording per attachment on its newest revision) — and exactly
@@ -317,6 +318,63 @@ recording exactly one session (a lone recording is a session of one with its own
 enrichment); `merge_status` is `single`, `pending` (joined, merged record not written yet:
 the first member's title stands in) or `merged`. Each member recording keeps its own row in
 `marts_voice_memos.recordings` and on the timeline; sessions are not a timeline source yet.
+
+## Google Recorder on the Pixel
+
+Zach carries a Pixel from 2026-10-23, so new memos are Google Recorder recordings (a
+press and hold of the power button starts and stops one; sysadmin
+`pixel11pro/2026-10-23-power-button-voice-memo.md`). Recorder keeps its recordings and
+its `recording_database` in its private data directory, and the phone is rooted, so the
+uploader runs **on the phone, as root**: `pdw ingest google-recorder`, the release
+linux/arm64 build, started by the `pdw-google-recorder` Magisk module
+(`ops/android/pdw-google-recorder/service.sh`, wrapper `bin/google-recorder-upload-android`,
+deployed by the sysadmin repo's `scripts/install-pixel-recorder-upload`). Nothing waits on
+a Mac or on iCloud: from the end of a recording every second is PDW's, and
+`marts_ops.voice_memo_landing_health` judges `google_recorder` from the end of the
+recording against the same 30 s p50.
+
+- **What it sends.** Each recording whose `recording_state` is 3 (finished), as the
+  `.m4a` Recorder wrote plus a sidecar: Recorder's uuid (`recording_id`), title,
+  `created_time` (epoch milliseconds, UTC, so there is no zone to guess, unlike the Apple
+  filename stamp), duration in ms, place name and coordinates, account and device. The app
+  files both under `google-recorder/inbox/` (`/ingest/google-recorder/audio/resumable`,
+  `/ingest/google-recorder/metadata`, which NOTIFYs the voice landing worker), and
+  `google_recorder_drive_inbox_sensor` / the landing worker promote them into
+  `base_google_recorder.recordings`. From there the mart, transcription, enrichment,
+  continuity and the timeline treat it like every other source.
+- **It never opens Recorder's live database.** Recorder holds it in WAL mode under its
+  own uid; a root reader that created the `-shm` or `-wal` beside it would leave a file
+  Recorder cannot write. The uploader copies the database and its WAL (not the `-shm`)
+  to its own scratch directory, runs `quick_check` on the copy and reads that.
+- **A rename sends a new sidecar; an edit sends the new audio.** The ledger
+  (`/data/misc_ce/0/pdw-google-recorder/google-recorder-upload-state.sqlite`) keeps, per uuid,
+  the audio sha, the file stat it was taken at and the sidecar's dedup sha (the sidecar
+  without `uploaded_at`), and the app dedups on the same shas. The row's `sync_version` is
+  the sidecar's upload time, so the newest sidecar wins. A recording deleted in Recorder
+  is NOT tombstoned yet: its row stays.
+- **Triggered, and awake.** `inotifyd` watches Recorder's `databases/` and
+  `files/recordings/`; each write marks a run due and takes a 60 s auto-expiring kernel
+  wakelock, because a memo stopped with the screen off is otherwise followed by suspend
+  within a second or two and the upload would wait for the next wake. Runs are at least
+  10 s apart (Recorder writes while it records) and every 5 minutes as the floor; each
+  run holds its own wakelock and is cut at 960 s. The heartbeat (`google_recorder` in
+  `ops.uploader_heartbeats`) is posted on a failure, on a run that sent something, and
+  otherwise at most every four minutes. It uploads on any network: a memo is ~22 MB an
+  hour, and the screen timelapse's Wi-Fi-only rule exists for frames, not memos.
+- **DNS.** Android has no `/etc/resolv.conf`, so Go's resolver asked `[::1]:53` and every
+  lookup failed; `internal/dnsfallback` gives pdw a resolver that asks 1.1.1.1, 8.8.8.8 and
+  MagicDNS in turn when that file is missing (`PDW_DNS_SERVERS` overrides).
+- **The state directory is credential-encrypted** (`/data/misc_ce/0/pdw-google-recorder`):
+  its `config/pdw/config.json` holds the warehouse master secret (ingest uploads are
+  HMAC-signed with it), and with the bootloader unlocked `/data/adb` is readable before
+  the PIN is entered. Before the first unlock after a reboot neither it nor Recorder's
+  storage exists, and the service waits for both. An OTA that drops root stops the uploader with
+  everything else that needs root (sysadmin `pixel11pro/README.md`).
+
+On the phone (`ssh pixel11pro`): logs and heartbeat in
+`/data/misc_ce/0/pdw-google-recorder/logs/`, `touch /data/misc_ce/0/pdw-google-recorder/paused` to
+stop uploads, and a manual run is
+`sh /data/adb/modules/pdw-google-recorder/bin/google-recorder-upload-android`.
 
 ## Local Voice Memos Upload Scheduler
 

@@ -3663,6 +3663,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "alice_voice_recordings", "provider audio/download artifacts behind the recording"
     ),
     "alice_voice_recordings_sync_state": _state("alice poll heartbeat, status and error"),
+    # Google Recorder on the Pixel: on the timeline through the voice adapter.
+    "google_recorder_recordings": _events(),
     # Apple Notes: every note has revision rows (the note row is the current
     # state; the revisions are the edit activity).
     "apple_notes": _entity("current note state; edits surface via apple_note_revisions"),

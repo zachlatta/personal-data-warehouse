@@ -177,7 +177,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # every past version of a card.
         # +2 base: base_screen_timelapse.screenshots/.accessibility_trees, the
         # periodic whole-screen captures and their accessibility trees.
-        "base": 87,
+        # +1 base: base_google_recorder.recordings, the Pixel's voice memos.
+        "base": 88,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

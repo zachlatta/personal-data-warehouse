@@ -1,0 +1,11 @@
+#!/system/bin/sh
+# inotifyd handler for the pdw-google-recorder service: Recorder wrote to its
+# database directory or to a recording ($1 event, $2 directory, $3 file).
+# Marks an upload run due and keeps the phone awake for a minute so the
+# service's loop gets to it before the phone suspends (see service.sh).
+case "${3:-}" in
+  *-shm | *-journal) exit 0 ;;
+esac
+: > /data/misc_ce/0/pdw-google-recorder/due
+echo "pdw_google_recorder_due 60000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

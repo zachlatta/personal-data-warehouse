@@ -148,7 +148,7 @@ and "the data is right" have come apart:
   transcribed by AssemblyAI, enriched by an agent that can query PDW, and matched to a
   calendar event, with unmatched recordings kept in the same mart, and back-to-back recordings
   of one event joined into one session by an agent reading both; a short Apple memo is a
-  stored transcript p50 30 s after it reaches the Mac.** *Held up by*
+  stored transcript p50 30 s after it reaches the Mac, a Pixel memo 30 s after it ends.** *Held up by*
   `voice_memo_transcription` / `voice_memo_enrichment` state rows, C5's raw-read
   registry and `marts_ops.voice_memo_landing_health`. See [Voice recordings](docs/agents/voice.md).
 - **S3 — finances from Plaid, SimpleFIN and manual documents cover expenses, investments,
@@ -170,7 +170,7 @@ Read the file for the area you are changing before you change it.
 | search, hybrid retrieval, landing latency, the performance contract and its incidents | [docs/agents/search.md](docs/agents/search.md) |
 | pipeline freshness and health, collation drift and index corruption | [docs/agents/pipeline-health.md](docs/agents/pipeline-health.md) |
 | Slack: polling, discovery, coverage, huddles, sending, file bytes | [docs/agents/slack.md](docs/agents/slack.md) |
-| voice recordings and the Voice Memos uploader | [docs/agents/voice.md](docs/agents/voice.md) |
+| voice recordings, the Voice Memos uploader and the Pixel's Google Recorder uploader | [docs/agents/voice.md](docs/agents/voice.md) |
 | finance: Plaid, SimpleFIN, the ledger, manual documents, securities | [docs/agents/finance.md](docs/agents/finance.md) |
 | WHOOP and the health mart | [docs/agents/health-sources.md](docs/agents/health-sources.md) |
 | agent sessions, Claude Desktop, ChatGPT, Muse, the app's ingest path | [docs/agents/agent-sessions.md](docs/agents/agent-sessions.md) |

@@ -31,6 +31,7 @@ from personal_data_warehouse.schema import (
     ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
     ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
     ALICE_VOICE_RECORDING_COLUMNS,
+    GOOGLE_RECORDER_RECORDING_COLUMNS,
     AGENT_RUN_COLUMNS,
     AGENT_RUN_EVENT_COLUMNS,
     AGENT_RUN_TOOL_CALL_COLUMNS,
@@ -441,11 +442,14 @@ SEARCH_SOURCE_ALIASES: dict[str, str] = {
     "email": "gmail",
     "emails": "gmail",
     "gdrive": "google_drive",
+    "google_recorder": "transcript",
     "imessages": "imessage",
     "mutation_requests": "mutation_request",
     "mutations": "mutation",
     "notes": "note",
     "photos": "photo",
+    "pixel_recorder": "transcript",
+    "recorder": "transcript",
     "slack_files": "slack_file",
     "transcripts": "transcript",
     "voice_memo": "transcript",
@@ -955,6 +959,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
         ("account",),
         "updated_at",
+    ),
+    "google_recorder_recordings": TableSpec(
+        GOOGLE_RECORDER_RECORDING_COLUMNS,
+        ("account", "recording_id"),
     ),
     "apple_notes": TableSpec(APPLE_NOTE_COLUMNS, ("account", "note_id")),
     "apple_note_revisions": TableSpec(APPLE_NOTE_REVISION_COLUMNS, ("account", "note_id", "revision_id")),
@@ -1505,6 +1513,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "alice_voice_recordings_recorded_idx",
         "alice_voice_recordings",
         "CREATE INDEX IF NOT EXISTS alice_voice_recordings_recorded_idx ON @alice_voice_recordings (recorded_at DESC)",
+    ),
+    IndexSpec(
+        "google_recorder_recordings_recorded_idx",
+        "google_recorder_recordings",
+        "CREATE INDEX IF NOT EXISTS google_recorder_recordings_recorded_idx ON @google_recorder_recordings (recorded_at DESC)",
     ),
     IndexSpec(
         "alice_voice_recording_artifacts_recording_idx",
@@ -2357,6 +2370,11 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX IF NOT EXISTS alice_voice_recordings_ingested_at_idx ON @alice_voice_recordings (ingested_at)",
     ),
     IndexSpec(
+        "google_recorder_recordings_ingested_at_idx",
+        "google_recorder_recordings",
+        "CREATE INDEX IF NOT EXISTS google_recorder_recordings_ingested_at_idx ON @google_recorder_recordings (ingested_at)",
+    ),
+    IndexSpec(
         "whatsapp_messages_ingested_at_idx",
         "whatsapp_messages",
         "CREATE INDEX IF NOT EXISTS whatsapp_messages_ingested_at_idx ON @whatsapp_messages (ingested_at)",
@@ -2728,6 +2746,7 @@ JSONB_COLUMNS_BY_TABLE = {
     },
     "alice_voice_recordings": {"raw_metadata_json"},
     "alice_voice_recording_artifacts": {"raw_metadata_json"},
+    "google_recorder_recordings": {"raw_metadata_json"},
 }
 
 JSONB_ARRAY_COLUMNS_BY_TABLE = {
@@ -2774,6 +2793,9 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
 # check runs first in _postgres_type/_default_sql.
 NUMERIC_COLUMNS_BY_TABLE = {
     "finance_observations": {"value"},
+    # Recorder stores milliseconds; the global duration_seconds is a bigint,
+    # which would round a 4.35 s memo to 4.
+    "google_recorder_recordings": {"duration_seconds"},
     "finance_transactions": {"amount"},
     # Share counts and prices are exact NUMERIC for the same reason money is:
     # a fractional-share position accumulated over hundreds of buys must not
@@ -5064,6 +5086,13 @@ class PostgresWarehouse:
                 "alice_voice_recordings_sync_state",
             ]
         )
+        self._ensure_voice_memos_mart_views()
+        self._ensure_search_views_if_possible()
+
+    def ensure_google_recorder_tables(self) -> None:
+        # The table is also in the voice mart's own group, so any voice
+        # source's ensure path provisions it; this is the reader's entry point.
+        self._ensure_table_group(["google_recorder_recordings"])
         self._ensure_voice_memos_mart_views()
         self._ensure_search_views_if_possible()
 
@@ -12611,6 +12640,9 @@ class PostgresWarehouse:
     def insert_alice_voice_recordings(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("alice_voice_recordings", rows, ALICE_VOICE_RECORDING_COLUMNS)
 
+    def insert_google_recorder_recordings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("google_recorder_recordings", rows, GOOGLE_RECORDER_RECORDING_COLUMNS)
+
     def insert_alice_voice_recording_artifacts(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows(
             "alice_voice_recording_artifacts",
@@ -17837,6 +17869,7 @@ class PostgresWarehouse:
                 "voice_memo_continuity_judgments",
                 "voice_memo_session_enrichments",
                 "alice_voice_recordings",
+                "google_recorder_recordings",
                 "apple_note_attachments",
                 "apple_note_revisions",
             ]
@@ -17908,6 +17941,29 @@ class PostgresWarehouse:
                     0::bigint AS is_deleted,
                     NULLIF(r.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
                 FROM @alice_voice_recordings r
+                UNION ALL
+                -- Google Recorder on the Pixel (from 2026-10-23, the phone
+                -- Zach carries). recorded_at is Recorder's own UTC
+                -- created_time and duration_seconds keeps its milliseconds.
+                SELECT
+                    'google_recorder'::text AS source,
+                    g.account,
+                    g.recording_id,
+                    NULLIF(g.recorded_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS recorded_at,
+                    NULLIF(g.duration_seconds, 0) AS duration_seconds,
+                    g.title,
+                    g.filename,
+                    g.content_type,
+                    g.size_bytes,
+                    g.content_sha256,
+                    g.storage_backend,
+                    g.storage_key,
+                    g.storage_file_id,
+                    g.storage_url,
+                    NULL::text AS recording_url,
+                    g.is_deleted,
+                    NULLIF(g.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
+                FROM @google_recorder_recordings g
                 UNION ALL
                 SELECT * FROM (
                 -- Audio recorded or saved inside Apple Notes (call recordings,
@@ -18244,7 +18300,9 @@ class PostgresWarehouse:
         part runs from the file reaching the Mac to the stored transcript and
         is judged, on memos under two minutes, against a 30 s p50. A memo
         recorded on the Mac is born when recording STARTS, so arrival is never
-        before the recording ended. transcribed_at is the run the mart serves,
+        before the recording ended. On the Pixel the uploader is PDW's own and
+        runs on the phone, so nothing but PDW carries a Google Recorder memo:
+        its clock starts when the recording ends and there is no delivery leg. transcribed_at is the run the mart serves,
         so a re-transcription inside the window reads as slow; that is rare
         and errs loud. Timestamps arrive NULL-translated from the mart; the
         file's birth time is translated here.
@@ -18263,6 +18321,8 @@ class PostgresWarehouse:
                             NULLIF(f.file_created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00'),
                             r.recorded_at + make_interval(secs => COALESCE(r.duration_seconds, 0)::float8)
                         )
+                        WHEN r.source = 'google_recorder'
+                            THEN r.recorded_at + make_interval(secs => COALESCE(r.duration_seconds, 0)::float8)
                         ELSE r.ingested_at
                     END AS arrived_at,
                     r.transcribed_at,
@@ -18293,9 +18353,9 @@ class PostgresWarehouse:
                     percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM arrived_at - ended_at)::float8)
                         FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120) AS device_delivery_p90_seconds,
                     percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - arrived_at)::float8)
-                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p50_seconds,
+                        FILTER (WHERE source IN ('apple_voice_memos', 'google_recorder') AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p50_seconds,
                     percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - arrived_at)::float8)
-                        FILTER (WHERE source = 'apple_voice_memos' AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p90_seconds,
+                        FILTER (WHERE source IN ('apple_voice_memos', 'google_recorder') AND duration_seconds < 120 AND transcribed_at IS NOT NULL) AS pdw_landing_p90_seconds,
                     percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - ended_at)::float8)
                         FILTER (WHERE transcribed_at IS NOT NULL) AS end_to_transcript_p50_seconds,
                     percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM transcribed_at - ended_at)::float8)
@@ -18325,7 +18385,7 @@ class PostgresWarehouse:
                 newest_recording_ended_at,
                 CASE
                     WHEN stuck_untranscribed > 0 THEN 'failing'
-                    WHEN source <> 'apple_voice_memos' THEN 'unmeasured'
+                    WHEN source NOT IN ('apple_voice_memos', 'google_recorder') THEN 'unmeasured'
                     WHEN pdw_landing_p50_seconds IS NULL THEN 'quiet'
                     WHEN pdw_landing_p50_seconds > 300 THEN 'failing'
                     WHEN pdw_landing_p50_seconds > 30 THEN 'attention'

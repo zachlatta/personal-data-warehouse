@@ -90,8 +90,12 @@ def test_the_processor_skips_ingest_and_transcription_when_nothing_is_waiting(mo
         lambda **_k: SimpleNamespace(postgres_database_url=URL, voice_memos=object(), assemblyai=object()),
     )
     monkeypatch.setattr(worker, "voice_memos_inbox_has_metadata", lambda _settings: False)
+    monkeypatch.setattr(worker, "google_recorder_inbox_has_metadata", lambda _settings: False)
     monkeypatch.setattr(worker, "voice_recordings_await_transcription", lambda _settings: False)
     monkeypatch.setattr(worker, "ingest_voice_memos_inbox", lambda **_k: (_ for _ in ()).throw(AssertionError("ingest ran")))
+    monkeypatch.setattr(
+        worker, "ingest_google_recorder_inbox", lambda **_k: (_ for _ in ()).throw(AssertionError("recorder ingest ran"))
+    )
     monkeypatch.setattr(
         worker, "transcribe_voice_recordings", lambda **_k: (_ for _ in ()).throw(AssertionError("transcription ran"))
     )
@@ -106,6 +110,7 @@ def test_the_processor_runs_the_dagster_assets_own_code(monkeypatch) -> None:
     settings = SimpleNamespace(postgres_database_url=URL, voice_memos=object(), assemblyai=object())
     monkeypatch.setattr(worker, "load_settings", lambda **_k: settings)
     monkeypatch.setattr(worker, "voice_memos_inbox_has_metadata", lambda _settings: True)
+    monkeypatch.setattr(worker, "google_recorder_inbox_has_metadata", lambda _settings: False)
     monkeypatch.setattr(worker, "voice_recordings_await_transcription", lambda _settings: True)
     seen: dict[str, object] = {}
 
@@ -127,6 +132,40 @@ def test_the_processor_runs_the_dagster_assets_own_code(monkeypatch) -> None:
 
     assert worker.VoiceMemoLandingProcessor().process_pending() is True
     assert seen == {"ingest": settings, "transcribe": settings, "timeline": (URL, ["voice_memos"])}
+
+
+def test_the_processor_lands_a_pixel_recording_the_same_way(monkeypatch) -> None:
+    """The phone's Recorder sidecars wake the same worker (the app notifies the
+    same channel), so the Pixel inbox is drained beside the Mac's."""
+    settings = SimpleNamespace(postgres_database_url=URL, voice_memos=object(), assemblyai=object())
+    monkeypatch.setattr(worker, "load_settings", lambda **_k: settings)
+    monkeypatch.setattr(worker, "voice_memos_inbox_has_metadata", lambda _settings: False)
+    monkeypatch.setattr(worker, "google_recorder_inbox_has_metadata", lambda _settings: True)
+    monkeypatch.setattr(worker, "voice_recordings_await_transcription", lambda _settings: True)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        worker, "ingest_voice_memos_inbox", lambda **_k: (_ for _ in ()).throw(AssertionError("empty Mac inbox read"))
+    )
+    monkeypatch.setattr(
+        worker,
+        "ingest_google_recorder_inbox",
+        lambda *, settings, logger: seen.append("recorder") or SimpleNamespace(rows_written=1),
+    )
+    monkeypatch.setattr(
+        worker,
+        "transcribe_voice_recordings",
+        lambda *, settings, logger, limit: seen.append("transcribe") or SimpleNamespace(recordings_transcribed=1),
+    )
+    monkeypatch.setattr(worker, "land_sources_on_timeline", lambda **_k: seen.append("timeline") or {"rows": 1})
+
+    assert worker.VoiceMemoLandingProcessor().process_pending() is True
+    assert seen == ["recorder", "transcribe", "timeline"]
+
+
+def test_the_app_wakes_the_worker_for_recorder_sidecars_too() -> None:
+    app_ingest = (Path(__file__).resolve().parents[1] / "app/internal/server/ingest.go").read_text()
+    recorder = app_ingest.split('"/ingest/google-recorder/metadata"', 1)[1].split("endpoint:", 1)[0]
+    assert "notifyChannel: voiceMemoLandingChannel" in recorder
 
 
 def test_the_worker_listens_on_the_channel_the_app_notifies() -> None:
