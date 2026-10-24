@@ -1,5 +1,6 @@
 import type { AppConfig } from '@/lib/config';
 
+import type { FeedArticle } from './article';
 import type { FeedEvent } from './event-queue';
 import type { FeedLink } from './links';
 import type { FeedEmbed, FeedMedia } from './rich';
@@ -64,4 +65,10 @@ export function fetchFeed(config: AppConfig, limit = 200): Promise<FeedPage> {
 
 export async function postFeedEvents(config: AppConfig, device: string, events: FeedEvent[]): Promise<void> {
   await feedRequest(config, '/api/feed/events', { method: 'POST', body: JSON.stringify({ device, events }) });
+}
+
+// The readable article at a card's url, for its detail view. A page with no
+// article answers 422 (FeedApiError).
+export function fetchArticle(config: AppConfig, url: string): Promise<FeedArticle> {
+  return feedRequest<FeedArticle>(config, `/api/feed/article?url=${encodeURIComponent(url)}`);
 }

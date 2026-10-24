@@ -10,8 +10,10 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
+import { articleUrl } from './article';
+import { ArticleView, type ArticleOutcome } from './article-view';
 import { cardMedia } from './feed-card';
-import { feedItems, markActive, recordFeedEvent, startTimer } from './engagement';
+import { feedItems, markActive, recordFeedEvent, recordUi, startTimer } from './engagement';
 import { ScrollGestureTracker, scrollMetadata, type ScrollGesture } from './scroll-gestures';
 import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
@@ -103,7 +105,8 @@ function Spans({ spans, onLink }: { spans: Span[]; onLink: (url: string) => void
 }
 
 // The detail view a tap on a card opens: the whole X post and its thread,
-// every photo, the full summary and all of the card's links. Time here is
+// every photo, the full summary, the whole article inline (article-view)
+// and all of the card's links. Time here is
 // the card's reading time (an open, then a close carrying dwell_ms and how
 // far down it was read). dwell_ms is active time: time with the app in the
 // background, or the screen untouched past a minute, does not count.
@@ -227,6 +230,15 @@ export default function FeedReaderScreen() {
 
   const onPostLink = (url: string) => void browse(url, -1, 'post_link');
   const onBodyLink = (url: string) => void browse(url, -1, 'body_link');
+  const onArticleLink = (url: string) => void browse(url, -1, 'article_link');
+  // Whether the inline article loaded, its length and how long it took.
+  const onArticle = (o: ArticleOutcome) =>
+    recordUi('article', {
+      item_id: item.item_id,
+      position,
+      dwell_ms: o.ms,
+      metadata: o.ok ? { ok: true, words: o.words } : { ok: false, error: o.error.slice(0, 300) },
+    });
 
   const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
   const media = cardMedia(item);
@@ -234,6 +246,7 @@ export default function FeedReaderScreen() {
   const links = cardLinks(item);
   const name = item.site || item.source;
   const posts = embed ? [embed, ...(embed.thread ?? [])] : [];
+  const article = articleUrl(item, !!video);
 
   return (
     <ThemedView style={styles.fill} onTouchStart={markActive}>
@@ -342,6 +355,14 @@ export default function FeedReaderScreen() {
                 </Fragment>
               ))}
             </View>
+            {article ? (
+              <ArticleView
+                url={article}
+                shownImages={media.flatMap((m) => [m.url, m.thumbnail_url ?? ''].filter(Boolean))}
+                onLink={onArticleLink}
+                onOutcome={onArticle}
+              />
+            ) : null}
           </>
         )}
         {links.length ? (

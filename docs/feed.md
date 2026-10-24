@@ -44,6 +44,22 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   among several photos still plays in the system player. A rail of source
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.
+- **The whole article in the detail view** (added 2026-10-24 from Zach's voice memo: "embed
+  the entire article content directly inline instead of me having to tap out ... with the
+  images and all that stuff right there"). A card that is not an X post or a video shows,
+  under its summary, the full article at its url: `GET /api/feed/article?url=...`
+  (`article.go`) fetches the page with a desktop Safari agent (12 s timeout, 8 MiB cap,
+  public addresses only: loopback, private, link-local and CGNAT addresses are refused after
+  DNS), keeps the readable part with Mozilla's Readability algorithm
+  (`codeberg.org/readeck/go-readability/v2`), strips scripts, styles, forms, frames (an
+  iframe becomes a link), event handlers, inline styles and non-http(s) links, and answers
+  `{url, title, byline, site, image_url, published_at, language, html, words}`; a page under
+  80 words (a login wall, an app, a PDF) is a 422 and the phone says to open the page. Reads
+  are cached in memory for 6 hours (failures 10 minutes), and concurrent reads share one
+  fetch. The phone (`article.ts`, `article-view.tsx`) shows it in a WebView as tall as its
+  content, in the app's colors and type, under a nonce-only CSP; it hides the article's copy
+  of the photo the card already shows, and adds the page's lead image when the card has
+  none. Every link tap goes to the in-app browser like any other link.
 - **Card context** (added 2026-10-21 after reviewing the recordings): `GET /api/feed`
   sends the phone only `hn_points` and `hn_comments`. No card has a line above it saying
   why it is here: the `taste` line (and an X post's title in that spot) came out on
@@ -122,7 +138,9 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     `channel`, `os`, `color_scheme`, `tz`; `session_end` adds `reason` (`background`,
     `blur`). Impressions add `metadata.view` (`all`, `saved`, `source:<s>`), `height`
     and `ended_at`. `media` adds `zoom` and `view_close` (`dwell_ms` = time in the photo
-    viewer). A link tapped in a card's summary is now an `open` (`via` `body_link`).
+    viewer). A link tapped in a card's summary is now an `open` (`via` `body_link`); one
+    tapped in the inline article, `via` `article_link`. `ui` `article` is the inline
+    article's load: `dwell_ms` = how long it took, `metadata.ok`, `words` or `error`.
   - `marts_feed.sessions` rolls these up per sitting: `started_at`, `ended_at`,
     `duration_ms`, `trigger`, `end_reason`, `device`, `app_version`, `update_id`,
     `cards_seen`, `impressions`, `card_dwell_ms`, `deepest_position`, `scrolls`,

@@ -18,13 +18,15 @@ import (
 const APIPath = "/api/feed"
 
 type handler struct {
-	store  *Store
-	logger *slog.Logger
+	store    *Store
+	articles *ArticleReader
+	logger   *slog.Logger
 }
 
 func (h *handler) register(mux *http.ServeMux, auth func(http.Handler) http.Handler) {
 	mux.Handle("GET "+APIPath, auth(bounded(h.feed)))
 	mux.Handle("POST "+APIPath+"/events", auth(bounded(h.events)))
+	mux.Handle("GET "+APIPath+"/article", auth(bounded(h.article)))
 }
 
 func bounded(next http.HandlerFunc) http.Handler {
@@ -147,4 +149,21 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, eventsResponse{Accepted: accepted, Duplicates: duplicates})
+}
+
+// article is the readable text of a card's page, for the detail view. A
+// page with no article (or one that will not load) is a 422 the phone
+// shows as "open the page" instead.
+func (h *handler) article(w http.ResponseWriter, r *http.Request) {
+	a, err := h.articles.Read(r.Context(), r.URL.Query().Get("url"))
+	var invalidErr *ValidationError
+	switch {
+	case errors.As(err, &invalidErr):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": invalidErr.Message})
+	case err != nil:
+		h.logger.InfoContext(r.Context(), "feed article unreadable", "url", r.URL.Query().Get("url"), "error", err.Error())
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusOK, a)
+	}
 }

@@ -57,7 +57,7 @@ func Register(mux *http.ServeMux, opts Options) []tool.Tool {
 		return nil
 	}
 	store.ResolveX = ResolveXPost
-	(&handler{store: store, logger: logger}).register(mux, opts.Auth)
+	(&handler{store: store, articles: NewArticleReader(), logger: logger}).register(mux, opts.Auth)
 	logger.Info("feed module enabled", "api", APIPath)
 	return Tools(store)
 }
