@@ -33,6 +33,7 @@ import {
 } from './rich-views';
 import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
+import { openTrackedBrowser } from './tracked-browser';
 import { cardVideo } from './video';
 import { InlineVideo } from './video-player';
 
@@ -184,15 +185,16 @@ export default function FeedReaderScreen() {
       if (!itemId) return;
       const which = { mode: 'browser', via, url, link_index: linkIndex };
       recordFeedEvent('open', { item_id: itemId, position, metadata: which });
-      const stop = startTimer(true);
+      const stop = startTimer();
+      let seen = { pages: 0, final_url: url, external: false };
       try {
-        await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: ACCENT });
+        seen = await openTrackedBrowser(url, { item_id: itemId, position, via, link_index: linkIndex });
       } catch {
         await Linking.openURL(url);
       }
       const { dwell_ms, wall_ms } = stop();
       nested.current += dwell_ms;
-      recordFeedEvent('close', { item_id: itemId, dwell_ms, metadata: { ...which, wall_ms } });
+      recordFeedEvent('close', { item_id: itemId, dwell_ms, metadata: { ...which, wall_ms, ...seen } });
     },
     [itemId, position],
   );

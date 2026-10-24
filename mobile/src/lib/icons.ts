@@ -16,6 +16,7 @@ export const MATERIAL_ICON = {
   'chart.bar': 'bar_chart',
   'checkmark.seal': 'verified',
   'checkmark.seal.fill': 'verified',
+  'chevron.left': 'chevron_left',
   'chevron.right': 'chevron_right',
   clock: 'schedule',
   ellipsis: 'more_horiz',

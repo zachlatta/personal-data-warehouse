@@ -21,7 +21,8 @@ export type FeedEventType =
   | 'scroll'
   | 'load'
   | 'like'
-  | 'unlike';
+  | 'unlike'
+  | 'web';
 
 export type FeedEvent = {
   event_id: string;

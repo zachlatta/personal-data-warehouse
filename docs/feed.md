@@ -86,7 +86,8 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   retried batch is counted once. **Every duration is active time** (since 2026-10-24, from Zach:
   "Don't count inactive time as spending time on it"; `mobile/src/features/feed/active-time.ts`):
   time counts while the app is in front and he touched it in the last minute, or while a
-  video plays or the in-app browser is up. Time in another app, with the phone locked or
+  video plays (in the feed's own browser since 2026-10-24: a touch, scroll or key on the page
+  in the last minute, or a video or audio playing there). Time in another app, with the phone locked or
   with the screen untouched past a minute counts nothing. A `close` and `session_end` keep
   the clock time in `metadata.wall_ms`; a detail view's `close` subtracts the link and
   video time opened from it (`metadata.nested_ms`), which have closes of their own. Before
@@ -112,6 +113,26 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   the card (a `media` `play` with `inline` starts it).
   `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,
   `swipe`, `menu`, `detail`, `undo`, or `agent` when `feed_save` did it for him).
+- **What he does inside a page** (`web`, since 2026-10-24, from Zach: "It'd be better if it
+  measured everything I was doing inside the open web view, so that way it can see if I'm
+  actually interacting and what I'm actually doing"). Links open in the feed's own browser
+  (`mobile/src/features/feed/tracked-browser.tsx`, a WebView), not the system browser, and
+  a script in each page (`web-tracker.ts`) reports what he does. Every `web` event has the
+  card's `item_id` and `metadata.action`, `via`, `link_index` and `url` (the page):
+  - `page`: one per page he visited, when he leaves it. `dwell_ms` = active time on it;
+    `metadata`: `title`, `description`, `site_name`, `words`, `page_index` (0 = the link
+    he opened, then each page he went on to), `from_url`, `max_scroll_pct`, `scrolls`,
+    `taps`, `links_tapped`, `selections`, `copies`, `fields`, `media_plays`, `headings`
+    (the headings he scrolled past, in order) and `read`: the paragraphs he stopped on,
+    each with its active time (`ms`, two seconds or more, longest first, at most 20).
+  - `tap` (`tag`, `text`, `href` when a link), `select` (selected text), `copy`, `media`
+    (`media_action` play, pause, ended; `kind`, `src`, `t`, `duration`), `field` (a form
+    field got focus: `field_type` only; what he types is never read), `open_external` (he
+    sent the page to the system browser with the compass, or the page opened an app link).
+  - The browser `close` adds `pages`, `final_url` and `external` (true = the system browser
+    showed it, so nothing inside was seen). Instagram, X, TikTok, Threads and Facebook links
+    still open in the system browser, which hands them to the app he is signed in to.
+  - Query: `SELECT occurred_at, item_id, dwell_ms, metadata->>'url', metadata->>'max_scroll_pct', metadata->'read' FROM base_feed.events WHERE event_type = 'web' AND metadata->>'action' = 'page' ORDER BY occurred_at DESC LIMIT 20`.
 - **Everything else he does** (added 2026-10-21 from Zach's voice memo: "collect
   everything ... a surveillance state of me that you can query later to understand how I'm
   using it"). Three more event types, which need no card:

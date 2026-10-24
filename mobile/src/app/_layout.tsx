@@ -10,6 +10,7 @@ import { handleNotificationResponse, seedFromNotification, syncNotificationCateg
 import { decisions } from '@/lib/undo-decision';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
+import { TrackedBrowserHost } from '@/features/feed/tracked-browser';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -108,6 +109,7 @@ export default function RootLayout() {
       <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
         <SessionProvider>
           <Root />
+          <TrackedBrowserHost />
         </SessionProvider>
         {/* Android draws edge to edge: without this the status bar kept
             light icons over the light theme and the clock disappeared. */}

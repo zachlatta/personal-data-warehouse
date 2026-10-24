@@ -47,6 +47,7 @@ import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { mailtoUrl, shareDraft } from './share';
+import { openTrackedBrowser } from './tracked-browser';
 import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
@@ -327,15 +328,18 @@ export default function FeedScreen() {
       const which = { url, link_index: link?.index ?? 0 };
       pause();
       recordFeedEvent('open', { item_id: item.item_id, position: position(item), metadata: { mode: 'browser', via, ...which } });
-      const stop = startTimer(true);
+      // The feed's own browser: what he does on the page is recorded
+      // (tracked-browser.tsx), and its time is active time.
+      const stop = startTimer();
+      let seen = { pages: 0, final_url: url, external: false };
       try {
-        await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: '#208AEF' });
+        seen = await openTrackedBrowser(url, { item_id: item.item_id, position: position(item), via, link_index: which.link_index });
       } finally {
         const { dwell_ms, wall_ms } = stop();
         recordFeedEvent('close', {
           item_id: item.item_id,
           dwell_ms,
-          metadata: { mode: 'browser', via, ...which, wall_ms },
+          metadata: { mode: 'browser', via, ...which, wall_ms, ...seen },
         });
         measure();
       }
