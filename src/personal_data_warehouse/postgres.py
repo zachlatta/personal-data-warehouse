@@ -10971,6 +10971,9 @@ class PostgresWarehouse:
     def ensure_android_notifications_tables(self) -> None:
         """Provision base_android_notifications.events."""
         self._ensure_table_group(list(_ANDROID_NOTIFICATIONS_TABLES))
+        # event_source and the system-log timings joined the table after it
+        # was live (2026-10-24); the table is small, so adding is cheap.
+        self._reconcile_table_columns("android_notification_events")
 
     def insert_android_notification_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert listener events by (account, device, event_id)."""

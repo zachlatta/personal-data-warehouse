@@ -267,6 +267,16 @@ def test_events_round_trip_through_the_warehouse_and_upsert(warehouse) -> None:
     assert row["synced_at"] == datetime(2026, 10, 24, 17, 45, tzinfo=UTC)
 
 
+def test_ensure_adds_columns_a_live_table_predates(warehouse) -> None:
+    warehouse.ensure_android_notifications_tables()
+    warehouse._command(
+        f"ALTER TABLE {warehouse.sql_relation('android_notification_events')} "
+        "DROP COLUMN event_source, DROP COLUMN exposure_ms"
+    )
+    warehouse.ensure_android_notifications_tables()
+    assert {"event_source", "exposure_ms"} <= warehouse._present_columns("android_notification_events")
+
+
 class FakeSettings:
     android_notifications = type(
         "AndroidNotifications", (), {"google_drive_folder_id": "folder", "google_drive_account": "owner@example.test"}
