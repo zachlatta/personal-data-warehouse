@@ -2,7 +2,7 @@ import { Image } from 'expo-image';
 import { useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
 import { Icon } from '@/components/icon';
@@ -11,7 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 
 import { startTimer } from './engagement';
 import { videoLength } from './rich';
-import { EMBED_BASE_URL, playerHtml, type VideoSource } from './video';
+import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, type VideoSource } from './video';
 
 // One video plays at a time: starting another stops the last, as in X and
 // Instagram. The playing player's key, shared by the feed and detail view.
@@ -55,7 +55,13 @@ function subscribe(l: () => void) {
   return () => listeners.delete(l);
 }
 
-const LABEL: Record<VideoSource['kind'], string> = { youtube: 'YouTube', vimeo: 'Vimeo', file: '' };
+// TikTok's player shows a "Watch this video on TikTok" gate instead of the
+// video to Android's WebView (the "; wv" in its user agent), so it is told
+// it runs in Chrome. iOS's WebView plays it as is.
+const TIKTOK_ANDROID_UA =
+  'Mozilla/5.0 (Linux; Android 16; Pixel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36';
+
+const LABEL: Record<VideoSource['kind'], string> = { youtube: 'YouTube', vimeo: 'Vimeo', tiktok: 'TikTok', instagram: 'Instagram', file: '' };
 
 // A video that plays inside the card: the poster with a play button, then,
 // on a tap or when the feed autoplays it, the site's own player (YouTube,
@@ -102,7 +108,10 @@ export function InlineVideo({
   }, [active]);
   // Muted is fixed when the player starts: an autoplay stays muted until he
   // turns the sound on in the player.
-  const html = useMemo(() => (active ? playerHtml(source, { muted: autoplayed }) : ''), [active, source]);
+  const html = useMemo(() => (active && source.kind !== 'instagram' ? playerHtml(source, { muted: autoplayed }) : ''), [active, source]);
+  // Instagram's embed cannot sit in a frame, so it is the page itself.
+  const igPage = source.kind === 'instagram' ? instagramEmbedUrl(source) : '';
+  const igScript = useMemo(() => (active && igPage ? instagramPlayerScript({ muted: autoplayed }) : undefined), [active, igPage]);
 
   // Off screen (a detail view opened, another tab) stops it.
   useFocusEffect(
@@ -131,7 +140,9 @@ export function InlineVideo({
           </View>
         ) : null}
         <WebView
-          source={{ html, baseUrl: EMBED_BASE_URL }}
+          source={igPage ? { uri: igPage } : { html, baseUrl: EMBED_BASE_URL }}
+          injectedJavaScript={igScript}
+          userAgent={source.kind === 'tiktok' && Platform.OS === 'android' ? TIKTOK_ANDROID_UA : undefined}
           originWhitelist={['*']}
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
@@ -141,14 +152,15 @@ export function InlineVideo({
           bounces={false}
           style={styles.clear}
           containerStyle={styles.clear}
-          // A file says when it draws; a YouTube or Vimeo page draws its own
-          // poster as soon as it loads.
+          // A file or Instagram says when it draws; a YouTube, Vimeo or
+          // TikTok page draws its own poster as soon as it loads.
           onMessage={(e) => e.nativeEvent.data === 'playing' && setDrawn(true)}
-          onLoadEnd={() => source.kind !== 'file' && setDrawn(true)}
+          onLoadEnd={() => source.kind !== 'file' && source.kind !== 'instagram' && setDrawn(true)}
           onShouldStartLoadWithRequest={(req) => {
             // The player page and everything inside it load here; a tap
             // that leaves the player (the YouTube logo) opens the browser.
             if (!req.isTopFrame || req.url === 'about:blank' || req.url.startsWith(EMBED_BASE_URL)) return true;
+            if (igPage && req.url.split('?')[0] === igPage) return true;
             void WebBrowser.openBrowserAsync(req.url, { dismissButtonStyle: 'close' });
             return false;
           }}

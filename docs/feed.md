@@ -40,7 +40,12 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   `video-player.tsx`): a card whose url is a YouTube or Vimeo video, or whose one media item
   is a video (an X post's mp4), shows a poster and plays in place in a WebView (YouTube's
   embedded player, or a plain `<video>` sent with no referrer because video.twimg.com
-  refuses a foreign one). One video plays at a time; leaving the screen stops it. A video
+  refuses a foreign one). TikTok videos and Instagram reels play the same way, upright
+  (4:5), since 2026-10-24 (voice memo: "video content ... stuff from X ... Instagram, other
+  things"): TikTok's player in a frame (on Android told it runs in Chrome, or it shows a
+  "watch on TikTok" gate), Instagram's embed page loaded as the page itself (it refuses
+  frames) with a script that fills the frame with its video. An Instagram `/p/` link stays a
+  photo card. One video plays at a time; leaving the screen stops it. A video
   among several photos still plays in the system player. A rail of source
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.

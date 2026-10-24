@@ -34,7 +34,7 @@ import {
 import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
 import { openTrackedBrowser } from './tracked-browser';
-import { cardVideo } from './video';
+import { cardVideo, videoAspect } from './video';
 import { InlineVideo } from './video-player';
 
 function fullDate(iso: string | undefined): string {
@@ -314,7 +314,7 @@ export default function FeedReaderScreen() {
               <InlineVideo
                 source={video}
                 playerKey={`detail:${item.item_id}`}
-                aspect={video.kind === 'file' ? 1 : 16 / 9}
+                aspect={videoAspect(video)}
                 radius={0}
                 durationSec={media.find((m) => m.type !== 'image')?.duration_sec}
                 onPlay={() => void onMedia({ action: 'play', index: 0, inline: true })}

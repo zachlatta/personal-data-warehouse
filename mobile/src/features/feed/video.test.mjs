@@ -88,3 +88,29 @@ test('an autoplayed player is muted', async () => {
   assert.doesNotMatch(playerHtml(file), /<video[^>]* muted/);
   assert.match(playerHtml({ kind: 'youtube', id: 'dQw4w9WgXcQ', poster: '', url: '' }, { muted: true }), /mute=1/);
 });
+
+test('TikTok videos and Instagram reels play in their own embeds; Instagram photo posts do not', async () => {
+  const { tikTokId, instagramPost, instagramEmbedUrl, instagramPlayerScript, videoAspect } = await import('./video.ts');
+  assert.equal(tikTokId('https://www.tiktok.com/@someone/video/6718335390845095173?lang=en'), '6718335390845095173');
+  assert.equal(tikTokId('https://www.tiktok.com/embed/v2/6718335390845095173'), '6718335390845095173');
+  assert.equal(tikTokId('https://www.tiktok.com/@someone'), '');
+  assert.equal(tikTokId('https://vm.tiktok.com/ZMabc123/'), '');
+  assert.deepEqual(instagramPost('https://www.instagram.com/reel/Dad3owVysaa/?igsh=x'), { code: 'Dad3owVysaa', path: 'reel' });
+  assert.deepEqual(instagramPost('https://www.instagram.com/someone/reels/Dad3owVysaa/'), { code: 'Dad3owVysaa', path: 'reel' });
+  assert.deepEqual(instagramPost('https://instagram.com/p/Dad3owVysaa'), { code: 'Dad3owVysaa', path: 'p' });
+  assert.equal(instagramPost('https://www.instagram.com/someone/'), null);
+
+  const tt = videoSource('https://www.tiktok.com/@someone/video/6718335390845095173', 'https://e.com/t.jpg');
+  assert.equal(tt?.kind, 'tiktok');
+  assert.match(playerHtml(tt, { muted: true }), /tiktok\.com\/player\/v1\/6718335390845095173\?autoplay=1&muted=1/);
+  const reel = videoSource('https://www.instagram.com/reel/Dad3owVysaa/');
+  assert.equal(reel?.kind, 'instagram');
+  assert.equal(instagramEmbedUrl(reel), 'https://www.instagram.com/reel/Dad3owVysaa/embed/');
+  assert.equal(videoSource('https://www.instagram.com/p/Dad3owVysaa/'), null);
+  assert.equal(cardVideo({ url: 'https://www.instagram.com/reel/Dad3owVysaa/', image_url: 'https://e.com/r.jpg' })?.poster, 'https://e.com/r.jpg');
+  assert.match(instagramPlayerScript({ muted: true }), /v\.muted=true/);
+  assert.match(instagramPlayerScript(), /v\.muted=false/);
+  assert.equal(videoAspect(reel), 4 / 5);
+  assert.equal(videoAspect(tt), 4 / 5);
+  assert.equal(videoAspect(videoSource('https://youtu.be/dQw4w9WgXcQ')), 16 / 9);
+});

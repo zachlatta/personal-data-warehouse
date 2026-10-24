@@ -1,7 +1,7 @@
 // Videos play in the card (Zach, voice memo 2026-10-23: "embed videos if
-// possible"), not in a browser sheet. A YouTube or Vimeo page plays in that
-// site's own embedded player; a video file (an X post's mp4) in a plain
-// <video>. Both run in a WebView, which the installed app already has, so
+// possible"), not in a browser sheet. A YouTube, Vimeo, TikTok or Instagram
+// page plays in that site's own embedded player; a video file (an X post's
+// mp4) in a plain <video>. Both run in a WebView, which the installed app already has, so
 // this ships as an over-the-air update.
 
 import type { FeedEmbed, FeedMedia } from './rich';
@@ -9,6 +9,8 @@ import type { FeedEmbed, FeedMedia } from './rich';
 export type VideoSource =
   | { kind: 'youtube'; id: string; start?: number; poster: string; url: string }
   | { kind: 'vimeo'; id: string; poster?: string; url: string }
+  | { kind: 'tiktok'; id: string; poster?: string; url: string }
+  | { kind: 'instagram'; code: string; path: 'p' | 'reel' | 'tv'; poster?: string; url: string }
   | { kind: 'file'; url: string; poster?: string };
 
 const YT_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -56,6 +58,26 @@ export function vimeoId(url: string | undefined): string {
   return '';
 }
 
+// tiktok.com/@someone/video/<id>, or the embed and player urls.
+export function tikTokId(url: string | undefined): string {
+  const u = url ? parse(url) : null;
+  if (!u) return '';
+  const host = u.hostname.toLowerCase().replace(/^(www|m)\./, '');
+  if (host !== 'tiktok.com') return '';
+  return /^\/(?:@[^/]+\/video|embed(?:\/v2)?|player\/v1)\/(\d{15,21})(?:\/|$)/.exec(u.pathname)?.[1] ?? '';
+}
+
+// instagram.com/reel/<code>, /p/<code>, /tv/<code> (also under a user's name).
+export function instagramPost(url: string | undefined): { code: string; path: 'p' | 'reel' | 'tv' } | null {
+  const u = url ? parse(url) : null;
+  if (!u) return null;
+  const host = u.hostname.toLowerCase().replace(/^(www|m)\./, '');
+  if (host !== 'instagram.com') return null;
+  const m = /^\/(?:[A-Za-z0-9._]+\/)?(p|reels?|tv)\/([A-Za-z0-9_-]{5,})(?:\/|$)/.exec(u.pathname);
+  if (!m) return null;
+  return { code: m[2], path: m[1] === 'p' ? 'p' : m[1] === 'tv' ? 'tv' : 'reel' };
+}
+
 const FILE = /\.(mp4|m4v|mov|webm|m3u8)(?:[?#]|$)/i;
 
 /** The player for a page or file url, or null when it is not a video. */
@@ -74,6 +96,11 @@ export function videoSource(url: string | undefined, poster?: string): VideoSour
   }
   const vimeo = vimeoId(url);
   if (vimeo) return { kind: 'vimeo', id: vimeo, poster, url };
+  const tiktok = tikTokId(url);
+  if (tiktok) return { kind: 'tiktok', id: tiktok, poster, url };
+  // A /p/ link is usually photos, so only reels (and old IGTV) are players.
+  const ig = instagramPost(url);
+  if (ig && ig.path !== 'p') return { kind: 'instagram', ...ig, poster, url };
   if (FILE.test(url) || /^https:\/\/video\.twimg\.com\//.test(url)) return { kind: 'file', url, poster };
   return null;
 }
@@ -86,7 +113,7 @@ export function mediaVideo(media: FeedMedia | undefined): VideoSource | null {
 
 /**
  * The video a card plays in place of its picture: its own page when that
- * is a YouTube or Vimeo video (the og:image becomes the poster), else its
+ * is a video page (the og:image becomes the poster), else its
  * one video. A carousel of several keeps its pages.
  */
 export function cardVideo(item: { url?: string; media?: FeedMedia[]; image_url?: string }): VideoSource | null {
@@ -120,6 +147,40 @@ export function autoplayKey(item: {
   return cardVideo(item) ? item.item_id : null;
 }
 
+/** The player's shape: phone video upright like Instagram's feed, files square, the rest 16:9. */
+export function videoAspect(src: VideoSource): number {
+  if (src.kind === 'file') return 1;
+  if (src.kind === 'tiktok' || src.kind === 'instagram') return 4 / 5;
+  return 16 / 9;
+}
+
+/**
+ * Instagram's embed page refuses to load in a frame (X-Frame-Options: DENY),
+ * so the WebView loads it as the page itself; this is that page's url.
+ */
+export function instagramEmbedUrl(src: { code: string; path: 'p' | 'reel' | 'tv' }): string {
+  return `https://www.instagram.com/${src.path}/${src.code}/embed/`;
+}
+
+/**
+ * Script run in Instagram's embed page: once its video exists, fill the
+ * frame with it (Instagram's header and footer hidden), give it controls for
+ * the sound, play it, and say "playing" once it draws. A photo post has no
+ * video and stays as Instagram shows it.
+ */
+export function instagramPlayerScript({ muted = false }: { muted?: boolean } = {}): string {
+  return (
+    '(function(){var n=0;var t=setInterval(function(){var v=document.querySelector("video");' +
+    'if(!v){if(++n>40){clearInterval(t);window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")}return}' +
+    'clearInterval(t);document.documentElement.style.background="#000";document.body.style.background="#000";' +
+    'v.style.cssText="position:fixed;inset:0;width:100%;height:100%;object-fit:cover;z-index:2147483647;background:#000";' +
+    'v.setAttribute("playsinline","");v.controls=true;v.loop=true;' +
+    `v.muted=${muted ? 'true' : 'false'};` +
+    'v.addEventListener("playing",function(){window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});' +
+    'var p=v.play();p&&p.catch(function(){v.muted=true;v.play()})},250)})();true;'
+  );
+}
+
 function escapeAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
@@ -147,6 +208,13 @@ export function playerHtml(src: VideoSource, { muted = false }: { muted?: boolea
     player =
       `<iframe src="https://www.youtube.com/embed/${src.id}?${q}" referrerpolicy="strict-origin-when-cross-origin" ` +
       'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>';
+  } else if (src.kind === 'tiktok') {
+    player =
+      `<iframe src="https://www.tiktok.com/player/v1/${src.id}?autoplay=1&muted=${muted ? 1 : 0}&loop=1&rel=0&description=0&music_info=0" ` +
+      'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>';
+  } else if (src.kind === 'instagram') {
+    // Never loaded: the WebView opens instagramEmbedUrl instead.
+    player = '';
   } else if (src.kind === 'vimeo') {
     player =
       `<iframe src="https://player.vimeo.com/video/${src.id}?autoplay=1&playsinline=1${muted ? '&muted=1' : ''}" ` +
