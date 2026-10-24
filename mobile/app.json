@@ -25,7 +25,39 @@
         "backgroundImage": "./assets/images/android-icon-background.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.zachlatta.pdw"
+      "package": "com.zachlatta.pdw",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "personal-data-warehouse.zachlatta.com",
+              "pathPrefix": "/timeline"
+            },
+            {
+              "scheme": "https",
+              "host": "personal-data-warehouse.zachlatta.com",
+              "pathPrefix": "/mutation-review"
+            },
+            {
+              "scheme": "https",
+              "host": "personal-data-warehouse.zachlatta.com",
+              "pathPrefix": "/search"
+            },
+            {
+              "scheme": "https",
+              "host": "personal-data-warehouse.zachlatta.com",
+              "pathPrefix": "/notifications"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
     },
     "web": {
       "output": "static",

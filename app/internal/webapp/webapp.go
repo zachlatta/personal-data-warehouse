@@ -61,8 +61,10 @@ func New() (http.Handler, error) {
 	}, nil
 }
 
-// Register mounts the shell on every SPA route and the assets on AssetPrefix.
+// Register mounts the shell on every SPA route, the assets on AssetPrefix,
+// and the Android App Links file that lets the phone app open those routes.
 func Register(mux *http.ServeMux, h http.Handler) {
+	mux.HandleFunc(AssetLinksPath, serveAssetLinks)
 	mux.Handle(AssetPrefix, h)
 	for _, route := range Routes {
 		mux.Handle(route, h)

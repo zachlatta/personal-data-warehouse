@@ -1,6 +1,7 @@
 package webapp
 
 import (
+	"encoding/json"
 	"io"
 	"io/fs"
 	"net/http"
@@ -232,4 +233,38 @@ func TestJavaScriptUnitTests(t *testing.T) {
 
 func jsString(value string) string {
 	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+// Android opens PDW links in the phone app only if this file, fetched without
+// auth, names the app's package and a signing key in the documented shape.
+func TestAssetLinksNameTheAndroidApp(t *testing.T) {
+	srv := newServer(t)
+	resp, body := get(t, srv.URL+AssetLinksPath)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("content type %q", resp.Header.Get("Content-Type"))
+	}
+	var links []struct {
+		Relation []string `json:"relation"`
+		Target   struct {
+			Namespace    string   `json:"namespace"`
+			PackageName  string   `json:"package_name"`
+			Fingerprints []string `json:"sha256_cert_fingerprints"`
+		} `json:"target"`
+	}
+	if err := json.Unmarshal([]byte(body), &links); err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 1 || links[0].Relation[0] != "delegate_permission/common.handle_all_urls" ||
+		links[0].Target.Namespace != "android_app" || links[0].Target.PackageName != "com.zachlatta.pdw" ||
+		len(links[0].Target.Fingerprints) == 0 {
+		t.Fatalf("unexpected asset links: %s", body)
+	}
+	for _, fp := range links[0].Target.Fingerprints {
+		if len(fp) != 95 || strings.ToUpper(fp) != fp {
+			t.Fatalf("fingerprint %q is not upper-case colon-separated SHA-256", fp)
+		}
+	}
 }

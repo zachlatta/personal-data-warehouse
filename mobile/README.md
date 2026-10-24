@@ -161,6 +161,16 @@ break from a Mac that only ever runs the iOS simulator:
   `AndroidChannelID` in `app/internal/push`); without it an alert lands
   silently in Expo's default-importance fallback channel.
 
+- **PDW web links open in the app** (Android App Links). The intent filter in
+  `app.json` claims `https://personal-data-warehouse.zachlatta.com` under
+  `/timeline`, `/mutation-review`, `/search` and `/notifications`;
+  `src/app/+native-intent.tsx` maps each web path to its screen
+  (`src/lib/app-links.ts`). Android trusts the claim only while the server's
+  `/.well-known/assetlinks.json` lists the signing key's SHA-256
+  (`app/internal/webapp/applinks.go`): a build signed with another key needs its
+  digest added there. Check a phone with
+  `adb shell pm get-app-links com.zachlatta.pdw` (`verified`).
+
 The preview profile builds an installable APK (`eas build -p android
 --profile preview`); CI queues one whenever the Android fingerprint moves,
 exactly as for iOS.
