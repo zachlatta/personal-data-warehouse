@@ -151,6 +151,9 @@ _SNIFF_MIN_BYTES = 12
 # ISO base-media (`....ftyp<brand>`) covers HEIC stills and MP4/QuickTime video
 # with the same box header, so the brand decides which it is.
 _HEIF_BRANDS = frozenset({b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"})
+# AVIF shares the box header too. The Pixel's screen timelapse frames are AVIF,
+# and read as video/mp4 they were refused as unsupported.
+_AVIF_BRANDS = frozenset({b"avif", b"avis"})
 _QUICKTIME_BRANDS = frozenset({b"qt  "})
 
 
@@ -184,6 +187,8 @@ def sniff_content_type(content: bytes) -> str:
         brand = content[8:12]
         if brand in _HEIF_BRANDS:
             return "image/heic"
+        if brand in _AVIF_BRANDS:
+            return "image/avif"
         if brand in _QUICKTIME_BRANDS:
             return "video/quicktime"
         return "video/mp4"
@@ -888,12 +893,12 @@ def prepare_attachment_image(*, content: bytes, mime_type: str, filename: str) -
     return normalized_model_image(content), f"{AGENT_ATTACHMENT_INPUT_BASENAME}.jpg"
 
 
-def normalized_model_image(content: bytes) -> bytes:
+def normalized_model_image(content: bytes, *, max_edge: int = MODEL_IMAGE_MAX_EDGE) -> bytes:
     try:
         with Image.open(BytesIO(content)) as original:
             rendered = ImageOps.exif_transpose(original)
             width, height = rendered.size
-            scale = min(MODEL_IMAGE_MAX_EDGE / max(width, height), 1)
+            scale = min(max_edge / max(width, height), 1)
             if scale < 1:
                 rendered = rendered.resize(
                     (max(1, int(width * scale)), max(1, int(height * scale))),

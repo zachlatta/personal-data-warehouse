@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -118,6 +120,45 @@ func TestScreenTimelapseIngestStoresATreeAsItsOwnRow(t *testing.T) {
 	row, ok := rows.rows[screenRowKey(timelapsefiles.AccessibilityTree, "joltik", time.Date(2026, 10, 19, 2, 39, 13, 0, time.UTC), 0)]
 	if !ok || row.Kind != timelapsefiles.AccessibilityTree {
 		t.Fatalf("rows = %+v", rows.rows)
+	}
+	// The tree is readable with SQL, not only as a stored object.
+	if row.ContentText != `[{"caption":"x"}]` {
+		t.Fatalf("content_text = %q", row.ContentText)
+	}
+}
+
+func TestScreenTimelapseIngestStoresAGzippedTreeAsText(t *testing.T) {
+	rows := &fakeScreenTimelapseRows{}
+	svc, store := screenTimelapseTestService(rows)
+	var gz bytes.Buffer
+	writer := gzip.NewWriter(&gz)
+	_, _ = writer.Write([]byte("{\"frontmost_app\":{\"name\":\"Mail\"},\"odd\":\"a\x00b\xffc\"}"))
+	_ = writer.Close()
+	rec := postScreenTimelapse(t, svc, gz.Bytes(), screenParams("crobat", "periodic-screenshot-2026-10-22_14-00-54.ax.json.gz", "2026-10-22T18:00:54Z"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	// The object store keeps the bytes exactly as the capture loop wrote them.
+	if !bytes.Equal(store.lastFile.Content, gz.Bytes()) {
+		t.Fatal("the stored object must be the gzip as uploaded")
+	}
+	row := rows.rows[screenRowKey(timelapsefiles.AccessibilityTree, "crobat", time.Date(2026, 10, 22, 18, 0, 54, 0, time.UTC), 0)]
+	if row.ContentText != "{\"frontmost_app\":{\"name\":\"Mail\"},\"odd\":\"a\uFFFDb\uFFFDc\"}" {
+		t.Fatalf("content_text = %q", row.ContentText)
+	}
+}
+
+func TestScreenTimelapseIngestStoresATreeWhoseGzipIsBrokenWithoutText(t *testing.T) {
+	rows := &fakeScreenTimelapseRows{}
+	svc, store := screenTimelapseTestService(rows)
+	body := []byte{0x1f, 0x8b, 0x08, 0x00, 0x01}
+	rec := postScreenTimelapse(t, svc, body, screenParams("crobat", "periodic-screenshot-2026-10-22_14-00-54.ax.json.gz", "2026-10-22T18:00:54Z"))
+	if rec.Code != http.StatusOK || store.lastFile == nil {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	row := rows.rows[screenRowKey(timelapsefiles.AccessibilityTree, "crobat", time.Date(2026, 10, 22, 18, 0, 54, 0, time.UTC), 0)]
+	if row.ContentText != "" || row.SHA256 != sha256Hex(body) {
+		t.Fatalf("row = %+v", row)
 	}
 }
 
@@ -252,7 +293,7 @@ func TestScreenTimelapseRowStoreIntegration(t *testing.T) {
 		for _, sha := range []string{"sha-a", "sha-b"} {
 			for _, row := range []screenTimelapseRow{
 				{Kind: timelapsefiles.Screenshot, Device: "crobat", CapturedAt: at, DisplayIndex: 1, SourceFilename: "s.heic", SHA256: sha, MimeType: "image/heic", SizeBytes: 10, Stored: objectstore.StoredObject{StorageBackend: "google_drive", StorageKey: "k", StorageFileID: "f-" + sha}, IngestedAt: at},
-				{Kind: timelapsefiles.AccessibilityTree, Device: "crobat", CapturedAt: at, SourceFilename: "t.ax.json.gz", SHA256: sha, MimeType: "application/gzip", SizeBytes: 5, Stored: objectstore.StoredObject{StorageBackend: "google_drive", StorageKey: "k", StorageFileID: "f-" + sha}, IngestedAt: at},
+				{Kind: timelapsefiles.AccessibilityTree, Device: "crobat", CapturedAt: at, SourceFilename: "t.ax.json.gz", SHA256: sha, MimeType: "application/gzip", SizeBytes: 5, ContentText: "tree " + sha, Stored: objectstore.StoredObject{StorageBackend: "google_drive", StorageKey: "k", StorageFileID: "f-" + sha}, IngestedAt: at},
 			} {
 				if err := store.upsert(ctx, row); err != nil {
 					t.Fatalf("%s upsert %s: %v", schema, row.Kind, err)
@@ -266,6 +307,10 @@ func TestScreenTimelapseRowStoreIntegration(t *testing.T) {
 		var n int
 		if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM `+store.screenshots).Scan(&n); err != nil || n != 1 {
 			t.Fatalf("%s: a re-sent moment must replace its row, have %d (%v)", schema, n, err)
+		}
+		var text string
+		if err := store.db.QueryRowContext(ctx, `SELECT content_text FROM `+store.trees).Scan(&text); err != nil || text != "tree sha-b" {
+			t.Fatalf("%s: a re-sent tree must replace its text, have %q (%v)", schema, text, err)
 		}
 		_ = store.Close()
 	}

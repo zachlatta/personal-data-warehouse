@@ -186,7 +186,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # columns (a scoped ANN scan joined per-sha vectors to chunks before).
         # +2 derived: derived_voice_memos.continuity_judgments/.session_enrichments,
         # back-to-back recordings an agent judged one event.
-        "derived": 30,
+        # +1 derived: derived_screen_timelapse.descriptions, an agent's reading
+        # of each screen frame.
+        "derived": 31,
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.
@@ -231,7 +233,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +2 marts: marts_feed.item_engagement/.source_engagement, the
             # Feed tab's per-card and per-source engagement.
             # +1 marts: marts_feed.sessions, one row per sitting in the feed.
-            "marts": 69,
+            # +1 marts: marts_screen_timelapse.active_screens, the frames where
+            # a device was in use and what was on them.
+            "marts": 70,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

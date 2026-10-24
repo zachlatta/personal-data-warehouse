@@ -399,6 +399,14 @@
       "comment": "Derived search-retrieval layer: chunked documents and their vector embeddings behind timeline.search_hybrid(). Chunks reference timeline.events anchors (adapter/event_id)."
     },
     {
+      "name": "derived_screen_timelapse",
+      "layer": "derived",
+      "domain": "screen_timelapse",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Agent readings of screen timelapse frames, one row per frame and prompt version; the marts_screen_timelapse schema serves the frames in use."
+    },
+    {
       "name": "derived_slack",
       "layer": "derived",
       "domain": "slack",
@@ -501,6 +509,14 @@
       "discoverable": true,
       "query_access": "public",
       "comment": "Stable receipts read interface. Start with marts_receipts.transaction_receipts, which links a receipt document to the finance transaction it settles."
+    },
+    {
+      "name": "marts_screen_timelapse",
+      "layer": "marts",
+      "domain": "screen_timelapse",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Screens in use; start with marts_screen_timelapse.active_screens."
     },
     {
       "name": "marts_slack",
@@ -2226,6 +2242,30 @@
       "comment": "One row per event. Back-to-back recordings an agent judged one event (a memo stopped and restarted) are merged: all transcripts in order, one title, summary, participants and action items. A lone recording is a session of one; recording_ids lists the members; merge_status is single, pending or merged."
     },
     {
+      "id": "screen_timelapse_descriptions",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "screen_timelapse",
+      "schema": "derived_screen_timelapse",
+      "name": "descriptions",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Frame readings. One agent reading per screenshot and prompt version: screen_state (active, locked, off), app, summary, screen_text, and whether it came from the accessibility tree or the pixels. Read marts_screen_timelapse.active_screens."
+    },
+    {
+      "id": "marts_screen_timelapse_active_screens",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "screen_timelapse",
+      "schema": "marts_screen_timelapse",
+      "name": "active_screens",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Screens in use. One row per frame an agent judged active (black, locked and unread frames are absent): app, window_title, summary, screen_text, evidence, and the frame's storage_file_id for get_object."
+    },
+    {
       "id": "marts_finance_accounts",
       "kind": "view",
       "layer": "marts",
@@ -3516,7 +3556,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Accessibility trees. The tree captured with a screenshot, when there was one; join to screenshots on (device, captured_at). The tree itself is the stored object (get_object)."
+      "comment": "Accessibility trees. The tree captured with a screenshot, when there was one; join to screenshots on (device, captured_at). The tree's text is in content_text; the stored object (get_object) is the bytes as written."
     },
     {
       "id": "feed_items",

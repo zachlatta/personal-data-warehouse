@@ -3717,6 +3717,11 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "screen_timelapse_screenshots",
         "the accessibility tree of a captured moment; join to screenshots on (device, captured_at)",
     ),
+    # Read through marts_screen_timelapse.active_screens.
+    "screen_timelapse_descriptions": _detail(
+        "screen_timelapse_screenshots",
+        "an agent's reading of a frame: was the device in use, and what was on the screen",
+    ),
     "chatgpt_sessions": _state("chatgpt.com web-session credential"),
     "chatgpt_conversation_sync": _state("per-conversation poll watermark"),
     "claude_desktop_credentials": _state("claude.ai session credential"),

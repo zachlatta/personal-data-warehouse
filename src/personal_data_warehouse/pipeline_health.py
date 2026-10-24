@@ -1227,6 +1227,28 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     Pipeline(
+        id="screen_timelapse_enrichment",
+        label="Screen timelapse descriptions",
+        kind="enrichment",
+        cadence="hourly :17 + backlog sensor",
+        transport="Dagster screen_timelapse_enrichment → agent container",
+        expected_data_interval=None,
+        expected_run_interval=None,
+        note=(
+            "reads frames from the last SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS (24 by"
+            " default); a day with no screen in use writes nothing"
+        ),
+        # One reading per frame and prompt version, overwritten on retry: an
+        # agent failure lands as status='error' with the exception text.
+        state=StateSource(
+            table="screen_timelapse_descriptions",
+            updated_column="created_at",
+            status_column="status",
+            error_column="error",
+            error_window=timedelta(days=7),
+        ),
+    ),
+    Pipeline(
         id="voice_memo_continuity",
         label="Voice memo continuity",
         kind="enrichment",
@@ -1548,6 +1570,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "screen_timelapse_accessibility_trees": _data(
         "screen_timelapse", "ingested_at", "captured_at"
     ),
+    "screen_timelapse_descriptions": _data("screen_timelapse_enrichment", "created_at", "captured_at"),
     "feed_items": _support("feed", "updated_at", "created_at", "cards agents push"),
     "feed_events": _data("feed", "received_at", "occurred_at"),
     "feed_item_versions": _support("feed", "changed_at", None, "card history written by a trigger"),

@@ -611,6 +611,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "photo_identity.py",
     "photo_context.py",
     "receipt_enrichment.py",
+    "screen_timelapse_enrichment.py",
     "securities_ledger.py",
     "slack_file_fingerprints.py",
     "voice_memo_continuity.py",
@@ -625,6 +626,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "defs/photo_enrichment.py",
     "defs/photo_identity.py",
     "defs/receipt_enrichment.py",
+    "defs/screen_timelapse_enrichment.py",
     "defs/slack_file_fingerprints.py",
     "defs/voice_memo_continuity.py",
     "defs/whatsapp_audio_transcription.py",
@@ -672,6 +674,13 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         # this was taken"), not a scan over photos. The photo pass itself
         # already reads marts_photos.canonical_renditions.
         "calendar_events": "context hints: what was scheduled when the photo was taken",
+    },
+    "screen_timelapse_enrichment.py": {
+        # Every device's frames and trees land in these two tables (the
+        # device is a column), so there is no second screen source for an
+        # intermediate layer to conform. If one is ever added, revisit this.
+        "screen_timelapse_screenshots": "single-source domain: every device's frames share one table",
+        "screen_timelapse_accessibility_trees": "single-source domain: the tree of each frame's moment",
     },
     "receipt_enrichment.py": {
         # Not a candidate scan: the agent cites a Gmail message id as evidence

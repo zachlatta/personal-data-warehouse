@@ -1,15 +1,19 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"path"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,7 +42,8 @@ const screenTimelapseSource = "screen_timelapse"
 var screenTimelapseDevicePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // screenTimelapseRow is one file's row in base_screen_timelapse.screenshots or
-// .accessibility_trees (DisplayIndex is unused for a tree).
+// .accessibility_trees (DisplayIndex and ContentText are a tree's and a
+// screenshot's only, respectively unused).
 type screenTimelapseRow struct {
 	Kind           timelapsefiles.Kind
 	Device         string
@@ -48,8 +53,37 @@ type screenTimelapseRow struct {
 	SHA256         string
 	MimeType       string
 	SizeBytes      int64
+	ContentText    string
 	Stored         objectstore.StoredObject
 	IngestedAt     time.Time
+}
+
+// screenTimelapseTreeTextMaxBytes bounds a tree's inline copy. Measured
+// 2026-10-24 a tree is 19-133 KB of text; the bound only stops a gzip bomb.
+const screenTimelapseTreeTextMaxBytes = 8 << 20
+
+// screenTimelapseTreeText is an accessibility tree as text, so it can be read
+// with SQL beside the stored object: the Mac's and the Pixel's are gzipped,
+// the iPhone's is plain JSON. Postgres text holds neither NUL nor invalid
+// UTF-8, so those are replaced (as Python's decode(errors="replace") does).
+// Undecodable gzip yields "" and the stored bytes stay the record.
+func screenTimelapseTreeText(body []byte) (string, error) {
+	content := body
+	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		defer reader.Close()
+		content, err = io.ReadAll(io.LimitReader(reader, screenTimelapseTreeTextMaxBytes))
+		if err != nil {
+			return "", err
+		}
+	} else if len(content) > screenTimelapseTreeTextMaxBytes {
+		content = content[:screenTimelapseTreeTextMaxBytes]
+	}
+	text := strings.ToValidUTF8(string(content), "\uFFFD")
+	return strings.ReplaceAll(text, "\x00", "\uFFFD"), nil
 }
 
 type screenTimelapseRowWriter interface {
@@ -137,6 +171,13 @@ func (svc *screenTimelapseIngestService) handler() http.Handler {
 		}
 		row.Stored = stored
 		row.IngestedAt = svc.now().UTC()
+		if row.Kind == timelapsefiles.AccessibilityTree {
+			text, err := screenTimelapseTreeText(body)
+			if err != nil {
+				svc.logger.WarnContext(r.Context(), "screen timelapse tree is not readable text; storing the bytes only", "source_filename", row.SourceFilename, "error", err)
+			}
+			row.ContentText = text
+		}
 		if err := svc.rows.upsert(ctx, row); err != nil {
 			// The bytes are stored but the row is not: answer an error so the
 			// client sends the file again (an orphaned Drive object, never a
@@ -283,8 +324,11 @@ func screenTimelapseDDL(schema, screenshots, trees string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + trees + ` (
 	device text NOT NULL DEFAULT '',
 	captured_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,` + screenTimelapseFileColumnsDDL + `
+	content_text text NOT NULL DEFAULT '',
 	PRIMARY KEY (device, captured_at)
 )`,
+		// The tree's inline text arrived after the table did (2026-10-24).
+		`ALTER TABLE ` + trees + ` ADD COLUMN IF NOT EXISTS content_text text NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS screen_timelapse_screenshots_ingested_idx ON ` + screenshots + ` (ingested_at)`,
 		`CREATE INDEX IF NOT EXISTS screen_timelapse_screenshots_captured_idx ON ` + screenshots + ` (captured_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS screen_timelapse_accessibility_trees_ingested_idx ON ` + trees + ` (ingested_at)`,
@@ -350,10 +394,10 @@ func (s *screenTimelapseRowStore) upsert(ctx context.Context, row screenTimelaps
 			storage_backend, storage_key, storage_file_id, storage_url, ingested_at`
 	var err error
 	if row.Kind == timelapsefiles.AccessibilityTree {
-		_, err = s.db.ExecContext(ctx, `INSERT INTO `+s.trees+` (device, captured_at, `+fileNames+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			ON CONFLICT (device, captured_at) DO UPDATE SET `+updates,
-			append([]any{row.Device, row.CapturedAt}, fileColumns...)...)
+		_, err = s.db.ExecContext(ctx, `INSERT INTO `+s.trees+` (device, captured_at, `+fileNames+`, content_text)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (device, captured_at) DO UPDATE SET `+updates+`, content_text = EXCLUDED.content_text`,
+			append(append([]any{row.Device, row.CapturedAt}, fileColumns...), row.ContentText)...)
 	} else {
 		_, err = s.db.ExecContext(ctx, `INSERT INTO `+s.screenshots+` (device, captured_at, display_index, `+fileNames+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)

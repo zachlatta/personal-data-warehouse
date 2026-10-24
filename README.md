@@ -480,8 +480,11 @@ first. The Android phone (`pichu`) captures itself; porygon pulls its frames whi
 on Wi-Fi and encodes them to AVIF before this uploader sends them. The app stores the bytes in the
 object store and writes the row into
 `base_screen_timelapse.screenshots` or `base_screen_timelapse.accessibility_trees` in the same
-request. One timeline adapter (`screen_capture`, source `screen_timelapse`, tier `noise`) carries one
-event per capture moment; see
+request; a tree's text is also written inline in `content_text`. One timeline adapter
+(`screen_capture`, source `screen_timelapse`, tier `noise`) carries one event per capture moment.
+The Dagster asset `screen_timelapse_enrichment` has an agent read each recent frame (the tree
+first, the pixels when the tree is not enough) and decide whether the device was in use;
+`marts_screen_timelapse.active_screens` is the frames where it was, with what was on screen. See
 [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-screen-timelapse-upload-scheduler).
 
 ## Hacker News Sync

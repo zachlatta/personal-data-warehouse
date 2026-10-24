@@ -488,7 +488,33 @@ mtime, and deletes it on the phone. This uploader then sends that folder like an
 phone runs no `pdw`: Go on Android reads `time.Local` as UTC and needs cgo for DNS. Setup,
 switches and rollback: `pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
-SQL starting points: `base_screen_timelapse.screenshots` and
-`base_screen_timelapse.accessibility_trees` (join on `device, captured_at`); timeline
-`source = 'screen_timelapse'`, kind `screen_capture`, one `noise` event per moment (display 1)
-with no search text until an enrichment step reads the frames.
+**The tree is also text in the warehouse.** The app writes each tree's text, decompressed, into
+`base_screen_timelapse.accessibility_trees.content_text` in the same request (NUL and invalid
+UTF-8 replaced, capped at 8 MiB; an undecodable gzip leaves it empty and the bytes stay the
+record). Trees stored before 2026-10-24 are filled from the object store by the enrichment
+asset below, 500 a run, newest first.
+
+**What was on the screen.** The Dagster asset `screen_timelapse_enrichment`
+(`src/personal_data_warehouse/screen_timelapse_enrichment.py`; hourly at :17 plus a backlog
+sensor every 2 minutes, 30 agent runs a run) has an agent read each frame captured in the last
+`SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS` (24 by default, newest first) and write one row
+per frame and prompt version to `derived_screen_timelapse.descriptions`: `screen_state`
+(`active`, `locked`, `off`), `app`, `window_title`, `summary`, `screen_text`, and `evidence`,
+which says whether the answer came from the accessibility tree, the screenshot, or both. The
+agent reads the tree first and opens the screenshot only when the tree does not say what is on
+screen: on the first samples a Mac tree named the DataGrip query and its error, while the
+Pixel's tree of an open Superhuman email held the buttons and the sender but none of the email.
+A frame without a tree whose bytes match a frame already read reuses that answer (`is_reused`),
+so an asleep iPhone's identical black frame costs one run, not one a minute. A tree that lands
+after its frame was read, or a new `SCREEN_DESCRIPTION_PROMPT_VERSION`, reads the frame again;
+the older answer stays in the table and in the mart until the new one completes. Model and
+effort: the fleet model at `low` effort unless `SCREEN_TIMELAPSE_ENRICHMENT_MODEL` /
+`SCREEN_TIMELAPSE_ENRICHMENT_REASONING_EFFORT` say otherwise; `SCREEN_TIMELAPSE_ENRICHMENT_ENABLED=0`
+pauses it. To backfill history, raise the lookback.
+
+SQL starting points: `marts_screen_timelapse.active_screens` (one row per frame an agent judged
+in use, with `storage_file_id` for `get_object` and `accessibility_tree_storage_file_id`),
+`base_screen_timelapse.screenshots` and `base_screen_timelapse.accessibility_trees` (join on
+`device, captured_at`); timeline `source = 'screen_timelapse'`, kind `screen_capture`, one
+`noise` event per moment (display 1) with no search text yet: the descriptions do not reach the
+timeline.

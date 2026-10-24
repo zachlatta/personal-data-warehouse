@@ -92,6 +92,7 @@ from personal_data_warehouse.schema import (
     HACKER_NEWS_ITEM_COLUMNS,
     BROWSER_HISTORY_VISIT_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
+    SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
     HACKER_NEWS_SESSION_COLUMNS,
@@ -1172,6 +1173,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
         ("device", "captured_at"),
     ),
+    # Agent readings of those screenshots (screen_timelapse_enrichment.py).
+    "screen_timelapse_descriptions": TableSpec(
+        SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
+        ("device", "captured_at", "display_index", "prompt_version"),
+    ),
     # Hacker News. `account` is the HN username.
     "hacker_news_items": TableSpec(HACKER_NEWS_ITEM_COLUMNS, ("account", "item_id")),
     "hacker_news_user_items": TableSpec(
@@ -1881,6 +1887,20 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "screen_timelapse_accessibility_trees",
         "CREATE INDEX IF NOT EXISTS screen_timelapse_accessibility_trees_ingested_idx "
         "ON @screen_timelapse_accessibility_trees (ingested_at)",
+    ),
+    # created_at leads for the freshness probe; content_sha256 is how a frame
+    # without a tree finds the answer already given for the same bytes.
+    IndexSpec(
+        "screen_timelapse_descriptions_created_idx",
+        "screen_timelapse_descriptions",
+        "CREATE INDEX IF NOT EXISTS screen_timelapse_descriptions_created_idx "
+        "ON @screen_timelapse_descriptions (created_at)",
+    ),
+    IndexSpec(
+        "screen_timelapse_descriptions_content_idx",
+        "screen_timelapse_descriptions",
+        "CREATE INDEX IF NOT EXISTS screen_timelapse_descriptions_content_idx "
+        "ON @screen_timelapse_descriptions (content_sha256, prompt_version)",
     ),
     IndexSpec(
         "hacker_news_items_synced_idx",
@@ -3023,6 +3043,7 @@ INTEGER_COLUMNS = {
     "is_text",
     # screen_timelapse
     "display_index",
+    "is_reused",
     # browser_history
     "transition_raw",
     "is_redirect",
@@ -10766,13 +10787,93 @@ class PostgresWarehouse:
     # --- Browser history ---------------------------------------------------
 
     def ensure_screen_timelapse_tables(self) -> None:
-        """Provision base_screen_timelapse.screenshots and .accessibility_trees.
+        """Provision the screen timelapse: raw frames, their readings, the mart.
 
-        Their rows are written by the Go app as it stores each file, so this
-        is the only Python on the write path: the tables must exist before the
-        first upload, and an upload that finds them missing is retried.
+        base_screen_timelapse.screenshots and .accessibility_trees are written
+        by the Go app as it stores each file, so this is the only Python on
+        that write path: the tables must exist before the first upload, and an
+        upload that finds them missing is retried. The descriptions table and
+        marts_screen_timelapse.active_screens are built here too, so the one
+        ensure path the domain has leaves the whole domain.
         """
         self._ensure_table_group(list(_SCREEN_TIMELAPSE_TABLES))
+        # content_text joined the tree table after it was live (2026-10-24);
+        # the app adds it the same way, whichever side reaches it first.
+        self._reconcile_table_columns("screen_timelapse_accessibility_trees")
+        self._ensure_table_group(["screen_timelapse_descriptions"])
+        self._ensure_screen_timelapse_active_screens_view()
+
+    def _ensure_screen_timelapse_active_screens_view(self) -> None:
+        """marts_screen_timelapse.active_screens: the frames where a device was in use.
+
+        One row per screenshot whose newest completed agent reading says the
+        screen was active, with what was on it and the storage reference that
+        fetches the frame (get_object(storage_file_id)). A black frame from an
+        asleep phone, a lock screen, a login window and a frame not read yet
+        are all absent. The newest reading wins whatever its prompt version,
+        so a new prompt replaces answers as it reaches each frame rather than
+        emptying the mart first. accessibility_tree_storage_file_id is NULL
+        when the moment has no tree.
+        """
+        self._ensure_view(
+            "marts_screen_timelapse_active_screens",
+            """
+            CREATE OR REPLACE VIEW @marts_screen_timelapse_active_screens AS
+            SELECT
+                s.device,
+                s.captured_at,
+                s.display_index,
+                d.app,
+                d.window_title,
+                d.summary,
+                d.screen_text,
+                d.evidence,
+                s.content_sha256,
+                s.mime_type,
+                s.size_bytes,
+                s.storage_backend,
+                s.storage_key,
+                s.storage_file_id,
+                s.storage_url,
+                t.storage_file_id AS accessibility_tree_storage_file_id,
+                d.model,
+                d.prompt_version,
+                d.created_at AS described_at
+            FROM @screen_timelapse_screenshots s
+            JOIN LATERAL (
+                SELECT *
+                FROM @screen_timelapse_descriptions r
+                WHERE r.device = s.device
+                  AND r.captured_at = s.captured_at
+                  AND r.display_index = s.display_index
+                  AND r.status = 'completed'
+                ORDER BY r.created_at DESC, r.sync_version DESC
+                LIMIT 1
+            ) d ON true
+            LEFT JOIN @screen_timelapse_accessibility_trees t
+              ON t.device = s.device
+             AND t.captured_at = s.captured_at
+            WHERE d.screen_state = 'active'
+            """,
+        )
+
+    def insert_screen_timelapse_descriptions(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert agent readings by (device, captured_at, display_index, prompt_version)."""
+        if not rows:
+            return
+        self._insert_rows(
+            "screen_timelapse_descriptions",
+            [
+                {
+                    column: row.get(
+                        column, _default_python_value(column, table="screen_timelapse_descriptions")
+                    )
+                    for column in SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS
+                }
+                for row in rows
+            ],
+            SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
+        )
 
     def ensure_browser_history_tables(self) -> None:
         """Provision base_browser_history.visits."""

@@ -145,9 +145,14 @@ iPhone before it). `base_screen_timelapse.screenshots` is one row per image: `de
 `storage_file_id`. `base_screen_timelapse.accessibility_trees` is the accessibility tree of
 the same moment, when the loop could read one; join on `(device, captured_at)`, and expect
 moments with only one of the two. Both are raw: the pixels and the tree are the stored
-object, so read one with `get_object`. Timeline source `screen_timelapse`, kind
-`screen_capture`, one `noise` event per moment with no search text yet: reach it by device
-and time (`pdw context` on a frame shows the frames around it), not by search.
+object, so read one with `get_object`; a tree's text is also inline in `content_text`.
+`marts_screen_timelapse.active_screens` is what was on screen: one row per frame an agent
+judged in use (black, locked and not-yet-read frames are absent) with `app`, `window_title`,
+`summary`, `screen_text`, `evidence` (accessibility tree, screenshot or both) and the frame's
+`storage_file_id`. Only frames from the last day are read so far. Timeline source
+`screen_timelapse`, kind `screen_capture`, one `noise` event per moment with no search text
+yet: reach it by device and time (`pdw context` on a frame shows the frames around it), not
+by search.
 
 ## Muse
 

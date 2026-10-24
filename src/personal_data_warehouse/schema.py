@@ -3327,4 +3327,44 @@ SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS = (
     "storage_file_id",
     "storage_url",
     "ingested_at",
+    # The tree itself as text (decompressed), so it reads with SQL beside the
+    # stored object. Written by the app at ingest; trees stored before
+    # 2026-10-24 are filled from the object store by the enrichment asset.
+    "content_text",
+)
+
+# One agent reading of one screenshot per prompt version: was the device in
+# use, and what was on the screen. Keyed by the screenshot plus the prompt
+# version, so a new prompt writes beside the old answer instead of over it.
+SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS = (
+    "device",
+    "captured_at",
+    "display_index",
+    "prompt_version",
+    # What the agent read: the frame's bytes, and the tree of its moment (''
+    # when there was none). A frame whose tree lands later is read again.
+    "content_sha256",
+    "accessibility_tree_sha256",
+    "provider",
+    "model",
+    "status",
+    "error",
+    "attempts",
+    # active (in use), locked (lock screen, login window, screensaver) or off
+    # (a black or blank frame).
+    "screen_state",
+    # accessibility_tree, screenshot or both: what the description came from.
+    "evidence",
+    "app",
+    "window_title",
+    "summary",
+    "screen_text",
+    "uncertainties_json",
+    # 1 when the answer was copied from a byte-identical frame without a tree
+    # (an asleep iPhone writes the same black frame every minute).
+    "is_reused",
+    "agent_run_id",
+    "raw_result_json",
+    "created_at",
+    "sync_version",
 )
