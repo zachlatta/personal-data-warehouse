@@ -1,6 +1,6 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View, useColorScheme } from 'react-native';
+import { ActivityIndicator, Alert, KeyboardAvoidingView, Pressable, ScrollView, SectionList, StyleSheet, TextInput, View, useColorScheme } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -303,6 +303,8 @@ export default function MutationRequestScreen() {
   // KeyboardAvoidingView measures itself relative to its parent; under a
   // native header it needs the header's height as an offset, or the keyboard
   // covers the action bar (it did, on every edit in the 2026-09-29 recording).
+  // Android pads too: the app is edge-to-edge, so the window no longer
+  // resizes for the keyboard and the end of a long draft sat under it.
   const containerRef = useRef<View>(null);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const colorScheme = useColorScheme();
@@ -577,7 +579,7 @@ export default function MutationRequestScreen() {
         ref={containerRef}
         style={styles.reviewBody}
         onLayout={() => containerRef.current?.measureInWindow((_x, y) => setKeyboardOffset((prev) => (prev === y ? prev : y)))}>
-      <KeyboardAvoidingView style={styles.reviewBody} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={keyboardOffset}>
+      <KeyboardAvoidingView style={styles.reviewBody} behavior="padding" keyboardVerticalOffset={keyboardOffset}>
         {gmailBatch ? (
           <SectionList
             {...scroll.handlers}
