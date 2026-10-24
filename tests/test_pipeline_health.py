@@ -406,6 +406,7 @@ def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
+    wh.ensure_android_messages_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()

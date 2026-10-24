@@ -28,6 +28,7 @@ LAUNCHD = REPO_ROOT / "ops" / "launchd"
 SYSTEMD = REPO_ROOT / "ops" / "systemd"
 ANDROID_MODULE = REPO_ROOT / "ops" / "android" / "pdw-google-recorder"
 NOTIFICATIONS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-notifications"
+MESSAGES_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-messages"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -42,6 +43,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "voice-memos-upload-launchd": ('"$PDW" ingest voice-memos --mode incremental', "apple_voice_memos"),
     "google-recorder-upload-android": ('"$PDW" ingest google-recorder', "google_recorder"),
     "android-notifications-upload-android": ('"$PDW" ingest android-notifications', "android_notifications"),
+    "android-messages-upload-android": ('"$PDW" ingest android-messages', "android_messages"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
@@ -219,9 +221,11 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
     scripts = [
         BIN / "google-recorder-upload-android",
         BIN / "android-notifications-upload-android",
+        BIN / "android-messages-upload-android",
         BIN / LIB,
         *sorted(ANDROID_MODULE.iterdir()),
         *sorted(NOTIFICATIONS_MODULE.iterdir()),
+        *sorted(MESSAGES_MODULE.iterdir()),
     ]
     for script in scripts:
         text = script.read_text()
@@ -270,3 +274,19 @@ def test_the_notification_service_sends_the_spool_on_every_finished_event_and_ho
     text = _wrapper("android-notifications-upload-android")
     assert 'STATE_DIR="${PDW_ANDROID_NOTIFICATIONS_STATE_DIR:-/data/misc_ce/0/pdw-android-notifications}"' in text
     assert state == "/data/misc_ce/0/pdw-android-notifications"
+
+
+def test_the_messages_service_runs_on_every_messages_write_and_holds_the_phone_awake() -> None:
+    service = (MESSAGES_MODULE / "service.sh").read_text()
+    wake = (MESSAGES_MODULE / "android-messages-upload-wake").read_text()
+    assert '"$MODDIR/bin/android-messages-upload-android"' in service
+    assert 'inotifyd "$MODDIR/bin/android-messages-upload-wake" "$DBDIR/bugle_db-wal:c"' in service
+    assert "timeout 660" in service
+    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert f": > {state}/due" in wake
+    assert "/sys/power/wake_lock" in wake
+    text = _wrapper("android-messages-upload-android")
+    assert 'STATE_DIR="${PDW_ANDROID_MESSAGES_STATE_DIR:-/data/misc_ce/0/pdw-android-messages}"' in text
+    assert '--state-file "$STATE_DIR/android-messages-upload.json"' in text
+    assert state == "/data/misc_ce/0/pdw-android-messages"

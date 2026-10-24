@@ -558,6 +558,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_github_tables()
     warehouse.ensure_browser_history_tables()
     warehouse.ensure_android_notifications_tables()
+    warehouse.ensure_android_messages_tables()
     warehouse.ensure_screen_timelapse_tables()
     warehouse.ensure_agent_sessions_tables()
     warehouse.ensure_plaid_tables()

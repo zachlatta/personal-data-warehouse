@@ -284,6 +284,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "android_notifications", kind: "notification"},
 	{source: "android_notifications", kind: "opened"},
 	{source: "android_notifications", kind: "notification_action"},
+	{source: "android_messages", kind: "message"},
 	{source: "screen_timelapse", kind: "screen_capture"},
 	{source: "feed", kind: "engagement"},
 	{source: "mutations", kind: "mutation"},

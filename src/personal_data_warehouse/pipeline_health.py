@@ -812,6 +812,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("android_notifications"),
     ),
     _source(
+        "android_messages",
+        "Android messages (Pixel SMS, MMS, RCS)",
+        cadence="uploader within ~2 min of each text, every 5 min as the floor",
+        transport=(
+            "pichu Google Messages bugle_db → Magisk service → pdw ingest"
+            " android-messages → /ingest/android-messages/batch → Drive inbox → Dagster"
+        ),
+        data=DAY,
+        basis=(
+            "Zach's phone sends or receives texts every day (84 in the first day"
+            " after the switch on 2026-10-23), so a day without one is the"
+            " uploader stopped. The run heartbeat is the tight detector: it fails"
+            " when the phone cannot reach the app"
+        ),
+        note="run heartbeat posted by bin/android-messages-upload-android on the phone",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_messages"),
+    ),
+    _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
@@ -1648,6 +1667,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "google_recorder_recordings": _data("google_recorder", "ingested_at", "recorded_at"),
     # Android notifications
     "android_notification_events": _data("android_notifications", "synced_at", "event_at"),
+    # Android messages
+    "android_messages": _data("android_messages", "synced_at", "message_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

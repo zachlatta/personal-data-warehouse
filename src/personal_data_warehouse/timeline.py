@@ -2211,6 +2211,75 @@ _BROWSER_SEARCH = _simple_adapter(
     **_BROWSER_COMMON,
 )
 
+# --- Android messages -------------------------------------------------------
+#
+# base_android_messages.messages holds every SMS, MMS and RCS message on the
+# Android phone since the switch from the iPhone (the history before it is
+# apple_message). Conversation events with no text (encryption turned on,
+# someone joined) stay in base_*. Tiers follow apple_message's simple cases:
+# what Zach sent is `self`; a sender that is not a phone number (a short code,
+# an RCS business) or a toll-free number is `noise`; a conversation of ten or
+# more people is `cc`; everyone else reached him `direct`.
+_ANDROID_MESSAGE_SNIPPET = (
+    "CASE WHEN t.body_text <> '' THEN t.body_text "
+    "WHEN t.attachment_count = 1 THEN '[attachment: ' || COALESCE("
+    "(SELECT p->>'content_type' FROM jsonb_array_elements(t.parts) p "
+    "WHERE NOT (p->>'content_type' LIKE 'text/%%') LIMIT 1), 'attachment') || ']' "
+    "WHEN t.attachment_count > 1 THEN '[' || t.attachment_count::text || ' attachments]' "
+    "ELSE '' END"
+)
+_ANDROID_MESSAGE_ACTOR = (
+    "CASE WHEN t.is_from_me = 1 THEN 'me' "
+    "ELSE COALESCE(NULLIF(t.sender_name, ''), t.sender_address) END"
+)
+_ANDROID_MESSAGE = _simple_adapter(
+    name="android_message",
+    source_table="android_messages",
+    source="android_messages",
+    kind="message",
+    from_sql="@android_messages t",
+    event_id="concat_ws('|', t.account, t.device, t.message_key)",
+    event_ts="t.message_at",
+    ingest_ts="t.synced_at",
+    actor=_ANDROID_MESSAGE_ACTOR,
+    title="t.subject",
+    snippet=_snippet(_ANDROID_MESSAGE_SNIPPET),
+    # The conversation's identity (its RCS group id or its people), not its
+    # name: two chats can share a name.
+    context="COALESCE(NULLIF(t.chat_key, ''), t.sender_address)",
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'device', t.device, 'message_key', t.message_key)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'device', t.device, "
+        "'protocol', t.protocol_name, "
+        "'chat_key', t.chat_key, "
+        "'chat_name', t.chat_name, "
+        "'from_me', t.is_from_me <> 0, "
+        "'group', t.is_group <> 0, "
+        "'message_kind', t.message_kind, "
+        "'attachment_count', t.attachment_count)"
+    ),
+    search_text=_search_concat(
+        "t.subject",
+        "t.body_text",
+        "COALESCE(NULLIF(t.chat_name, ''), NULLIF(t.chat_key, ''))",
+        _ANDROID_MESSAGE_ACTOR,
+        "t.sender_address",
+        "NULLIF(left(jsonb_path_query_array(t.parts, '$[*].file_name')::text, 1000), '[]')",
+    ),
+    where="t.message_kind <> 'system'",
+    priority=(
+        f"CASE WHEN t.is_from_me = 1 THEN {TIMELINE_PRIORITY_SELF} "
+        "WHEN t.sender_address NOT LIKE '+%%' "
+        "  OR t.sender_address ~ '^\\+1(800|833|844|855|866|877|888)' "
+        f"THEN {TIMELINE_PRIORITY_NOISE} "
+        f"WHEN t.participant_count >= 10 THEN {TIMELINE_PRIORITY_CC} "
+        f"ELSE {TIMELINE_PRIORITY_DIRECT} END"
+    ),
+)
+
 # --- Android notifications -------------------------------------------------
 #
 # base_android_notifications.events holds every listener event; the timeline
@@ -3369,6 +3438,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _GITHUB_EVENT,
     _BROWSER_VISIT,
     _BROWSER_SEARCH,
+    _ANDROID_MESSAGE,
     _ANDROID_NOTIFICATION,
     _ANDROID_NOTIFICATION_OPENED,
     _ANDROID_NOTIFICATION_ACTION,
@@ -3605,6 +3675,8 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "github_event",
         "browser_visit",
         "browser_search",
+        # context is the conversation: (source, context) IS the chat.
+        "android_message",
         # context is the app's day on the device: its other notifications.
         "android_notification",
         "android_notification_opened",
@@ -3983,6 +4055,8 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Android notifications: one events table, two adapters (a notification's
     # first appearance with each content, and a tap that opened one).
     "android_notification_events": _events(),
+    # Android messages: one events table, one adapter (system rows stay in base).
+    "android_messages": _events(),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(

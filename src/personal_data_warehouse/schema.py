@@ -3379,6 +3379,67 @@ ANDROID_NOTIFICATION_EVENT_COLUMNS = (
 )
 
 
+# --- Android messages --------------------------------------------------------
+#
+# One row per SMS, MMS or RCS message on an Android phone since it took over
+# Zach's line, read from Google Messages' own database (bugle_db) by
+# `pdw ingest android-messages`. Messages from before the switch (the iPhone
+# history imported into Messages) are never sent: PDW has them from the Mac
+# in base_apple_messages. `message_key` survives a Messages data reset: the
+# RCS message id, else the message's row in Android's telephony store
+# (content://sms/N, content://mms/N), else Messages' own row id.
+ANDROID_MESSAGE_COLUMNS = (
+    "account",
+    "device",
+    "message_key",
+    # Google Messages' row id (restarts if its data is cleared).
+    "bugle_id",
+    # The conversation: an RCS group's id, else the other participants'
+    # addresses, sorted and comma-joined.
+    "chat_key",
+    "chat_name",
+    # The other people in the conversation ([{address, name}]).
+    "participants",
+    "participant_count",
+    "is_group",
+    # 0 SMS, 1 MMS, 3 RCS (Messages' message_protocol); its name in protocol_name.
+    "protocol",
+    "protocol_name",
+    # Messages' message_status: below 100 Zach sent it (1 sent, 2 delivered,
+    # 8 failed, ...), 100-199 received, 200 and up a conversation event with
+    # no text (encryption on, a participant joined).
+    "bugle_status",
+    "is_from_me",
+    # text / attachment / system
+    "message_kind",
+    "sender_address",
+    "sender_name",
+    "self_address",
+    # The SIM it came in on (the carrier's name).
+    "sim_name",
+    "message_at",
+    # When the sender sent it; the epoch when Messages does not know.
+    "sent_at",
+    "subject",
+    # The text parts, joined.
+    "body_text",
+    # Every part: [{part_id, content_type, text, file_name, width, height,
+    # duration_ms, file_size_bytes}]. The attachment files are not uploaded.
+    "parts",
+    "attachment_count",
+    "is_read",
+    "is_seen",
+    "is_hidden",
+    "telephony_uri",
+    "rcs_message_id",
+    # The uploader's whole record.
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+
 # --- Screen timelapse ---------------------------------------------------------
 #
 # A periodic image of a device's whole screen and, when the capture loop could

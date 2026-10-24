@@ -1,0 +1,8 @@
+#!/system/bin/sh
+# inotifyd handler for the pdw-android-messages service: Google Messages
+# wrote to its database's log. Marks an upload run due and keeps the phone
+# awake for half a minute so the service's loop gets to it before the phone
+# suspends (see service.sh).
+: > /data/misc_ce/0/pdw-android-messages/due
+echo "pdw_android_messages_due 30000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

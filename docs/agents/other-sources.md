@@ -1,4 +1,4 @@
-# WhatsApp, Hacker News, Android notifications and shared attachment enrichment
+# WhatsApp, Hacker News, Android messages and notifications, and shared attachment enrichment
 
 Moved out of AGENTS.md on 2026-10-01 so the file every session loads holds only the
 contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md).
@@ -229,6 +229,42 @@ GitHub's notification emails in Gmail stay where they are; these rows are the re
 history lands as new rows, so the capture trigger skips any event older than three days
 (`notifications.py`). Without it, the first GitHub backfill would have paged for every old
 review on his PRs.
+
+## Android messages
+
+Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over Zach's line,
+2026-10-23 16:00 EDT, lands in `base_android_messages.messages`. Texts before that are
+`base_apple_messages` (the iPhone relayed SMS and RCS to the Mac's `chat.db` until 15:56 that day).
+
+- **Where the texts are.** Google Messages keeps every message in its own SQLite database,
+  `/data/data/com.google.android.apps.messaging/databases/bugle_db`. Android's telephony store
+  (`mmssms.db`) has SMS and MMS only: RCS chats exist nowhere else. `bugle_db` also holds the
+  whole iPhone history (176k messages back to 2016) imported into Messages at the switch.
+- **The uploader.** `pdw ingest android-messages` (`app/internal/uploaders/androidmessages`)
+  runs as root on the phone, opens `bugle_db` read-only, and sends each message received at or
+  after `--since` (`ANDROID_MESSAGES_SINCE`, required) with its parts (text, attachment type,
+  name and size; not the files), sender, conversation and roster. `--since` is what keeps the
+  imported iPhone history on the phone: older rows are never read. A JSON ledger beside the
+  lock remembers the highest row sent and a hash per recent message; each run reads the new rows
+  plus the last three days and sends only what changed (status, read state, parts). It refuses
+  to open the database when its `-wal`/`-shm` files are absent: root creating them would lock
+  Messages out of its own database.
+- **The trigger.** The `pdw-android-messages` Magisk service (`ops/android/pdw-android-messages`)
+  watches `bugle_db-wal` with `inotifyd`, so a run starts within 30 s of Messages writing (at
+  most one per 30 s), and every 5 minutes as the floor. Heartbeat `android_messages`. Deployed by
+  sysadmin `scripts/install-pixel-messages-upload`.
+- **Keys.** `message_key` is `rcs:<id>`, else the telephony row (`content://sms/N`,
+  `content://mms/N`; Messages mirrors RCS there too), else `bugle:<row>`: Messages' own row ids
+  restart if its data is cleared, the telephony rows do not. `chat_key` is an RCS group's id,
+  else the other participants' addresses, sorted.
+- **Derived fields** (`android_messages_drive_ingest.py`): `message_status` below 100 is
+  outgoing (`is_from_me`), 100-199 incoming, 200+ a conversation event with no parts
+  (`message_kind` `system`, kept out of the timeline). `protocol` 0 SMS, 1 MMS, 3 RCS.
+- **Downstream.** Timeline adapter `android_message` (kind `message`; `self` when sent, `noise`
+  for short codes, RCS businesses and toll-free numbers, `cc` in a conversation of 10+, else
+  `direct`); `marts_messages.messages` source `android_messages`.
+- **Not yet.** Reactions (`message_reactions`) and edits (`message_edits`) are in `bugle_db`
+  but not sent; attachment files stay on the phone.
 
 ## Android notifications
 

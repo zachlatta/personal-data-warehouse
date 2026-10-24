@@ -142,6 +142,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"google_recorder":       "GOOGLE_RECORDER",
 	"browser_history":       "BROWSER_HISTORY",
 	"android_notifications": "ANDROID_NOTIFICATIONS",
+	"android_messages":      "ANDROID_MESSAGES",
 	"photos":                "PHOTOS",
 	"manual_finance":        "MANUAL_FINANCE",
 	"screen_timelapse":      "SCREEN_TIMELAPSE",

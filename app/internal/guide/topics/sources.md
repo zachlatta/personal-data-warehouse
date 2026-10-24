@@ -135,6 +135,16 @@ days, Safari ~a year, so older history never existed here. Timeline source
 `visit` for a page view. The timeline skips redirect hops, subframes, reloads and
 revisits of one page within 30 minutes; query `base_*` for every visit.
 
+## Texts on the Android phone
+
+`base_android_messages.messages` is one row per SMS, MMS or RCS message on the Android phone
+(`device` `pichu`) from the switch on 2026-10-23 16:00 EDT; earlier texts are
+`base_apple_messages`. Columns: `message_at`, `is_from_me`, `sender_address`, `sender_name`,
+`chat_key` (the conversation), `chat_name`, `is_group`, `body_text`, `parts` (jsonb, with
+attachment type and name; files are not uploaded), `protocol_name` (`sms`, `mms`, `rcs`),
+`message_kind` (`text`, `attachment`, `system`). `marts_messages.messages` includes them
+(source `android_messages`). Timeline source `android_messages`, kind `message`.
+
 ## Phone notifications (Android)
 
 `base_android_notifications.events` is one row per notification event on the Android phone
@@ -151,8 +161,8 @@ sender, text), `category` (`msg`, `email`, `call`, …), `channel_name`, `is_ong
 `android_notifications`: kind `notification` is each notification's first appearance with
 each text (a one-to-one message or call `direct`, a group conversation `cc`, ongoing
 `background`, the rest `noise`); kind `opened` is a tap and `notification_action` a button,
-expansion, swipe or snooze, both `self`. SMS and RCS texts reach PDW
-only here. Android redacts one-time codes and other sensitive notifications for this listener.
+expansion, swipe or snooze, both `self`. Texts themselves are
+`base_android_messages`. Android redacts one-time codes and other sensitive notifications for this listener.
 
 ## Screen timelapse (what was on a screen)
 

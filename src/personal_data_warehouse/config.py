@@ -326,6 +326,14 @@ class AndroidNotificationsConfig:
 
 
 @dataclass(frozen=True)
+class AndroidMessagesConfig:
+    """Where the phone's message uploader's batches land (via the app)."""
+
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class BrowserHistoryConfig:
     """Where the Mac browser-history uploader's batches land (via the app)."""
 
@@ -658,6 +666,7 @@ class Settings:
     apple_contacts: AppleContactsConfig | None = None
     browser_history: BrowserHistoryConfig | None = None
     android_notifications: AndroidNotificationsConfig | None = None
+    android_messages: AndroidMessagesConfig | None = None
     photos: PhotosConfig | None = None
     manual_finance: ManualFinanceConfig | None = None
     whatsapp: WhatsAppConfig | None = None
@@ -734,6 +743,8 @@ class Settings:
             configured_domains.add(email_domain(self.browser_history.google_drive_account))
         if self.android_notifications is not None:
             configured_domains.add(email_domain(self.android_notifications.google_drive_account))
+        if self.android_messages is not None:
+            configured_domains.add(email_domain(self.android_messages.google_drive_account))
         if self.whatsapp is not None:
             configured_domains.add(email_domain(self.whatsapp.google_drive_account))
         if self.agent_sessions is not None:
@@ -777,6 +788,7 @@ def load_settings(
     require_apple_contacts: bool = False,
     require_browser_history: bool = False,
     require_android_notifications: bool = False,
+    require_android_messages: bool = False,
     require_photos: bool = False,
     require_manual_finance: bool = False,
     require_whatsapp: bool = False,
@@ -1267,6 +1279,32 @@ def load_settings(
         android_notifications = AndroidNotificationsConfig(
             google_drive_account=android_notifications_google_drive_account,
             google_drive_folder_id=android_notifications_google_drive_folder_id,
+        )
+
+    # Android messages: the same shared ingest folder and account as browser
+    # history; the app files the phone's batches there.
+    android_messages_google_drive_account = (
+        os.getenv("ANDROID_MESSAGES_GOOGLE_DRIVE_ACCOUNT") or browser_history_google_drive_account
+    ).strip()
+    android_messages_google_drive_folder_id = (
+        os.getenv("ANDROID_MESSAGES_GOOGLE_DRIVE_FOLDER_ID") or browser_history_google_drive_folder_id
+    ).strip()
+    android_messages: AndroidMessagesConfig | None = None
+    if require_android_messages or os.getenv("ANDROID_MESSAGES_GOOGLE_DRIVE_FOLDER_ID"):
+        if not android_messages_google_drive_account:
+            raise ValueError(
+                "ANDROID_MESSAGES_GOOGLE_DRIVE_ACCOUNT, BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT "
+                "or GMAIL_ACCOUNTS must be set for Android message sync"
+            )
+        if not android_messages_google_drive_folder_id:
+            raise ValueError(
+                "ANDROID_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID, "
+                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, "
+                "or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        android_messages = AndroidMessagesConfig(
+            google_drive_account=android_messages_google_drive_account,
+            google_drive_folder_id=android_messages_google_drive_folder_id,
         )
 
     photos_account = (
@@ -2180,6 +2218,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_notifications:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if android_messages:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if whatsapp and whatsapp.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
@@ -2236,6 +2276,7 @@ def load_settings(
         apple_contacts=apple_contacts,
         browser_history=browser_history,
         android_notifications=android_notifications,
+        android_messages=android_messages,
         photos=photos,
         manual_finance=manual_finance,
         whatsapp=whatsapp,

@@ -85,6 +85,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
+    wh.ensure_android_messages_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -1353,6 +1354,38 @@ def _seed_github(wh) -> None:
         ]
     )
 
+    # Android messages: a text from a person (the oldest), Zach's reply, a
+    # short-code text and an RCS conversation event with no text.
+    def _android_message(key, hours_ago, **overrides):
+        row = {
+            "account": "zach@example.com", "device": "testphone", "message_key": key, "bugle_id": 1,
+            "chat_key": "+15550000002", "chat_name": "Alex Example",
+            "participants": [{"address": "+15550000002", "name": "Alex Example"}],
+            "participant_count": 1, "is_group": 0, "protocol": 0, "protocol_name": "sms",
+            "bugle_status": 100, "is_from_me": 0, "message_kind": "text",
+            "sender_address": "+15550000002", "sender_name": "Alex Example",
+            "self_address": "+15550000001", "sim_name": "Example Carrier",
+            "message_at": _NOW - timedelta(hours=hours_ago), "sent_at": _NOW - timedelta(hours=hours_ago),
+            "subject": "", "body_text": "lunch?",
+            "parts": [{"content_type": "text/plain", "text": "lunch?"}], "attachment_count": 0,
+            "is_read": 1, "is_seen": 1, "is_hidden": 0, "telephony_uri": key, "rcs_message_id": "",
+            "raw_json": {}, "exported_at": _NOW, "synced_at": _NOW, "sync_version": 1,
+        }
+        row.update(overrides)
+        return row
+
+    wh.insert_android_messages(
+        [
+            _android_message("content://sms/1", 4),
+            _android_message("content://sms/2", 3.9, is_from_me=1, bugle_status=2, body_text="sure",
+                             sender_address="+15550000001", sender_name=""),
+            _android_message("content://sms/3", 3.8, chat_key="12345", chat_name="12345",
+                             sender_address="12345", sender_name="", body_text="Your code is 000000"),
+            _android_message("content://mms/4", 3.7, protocol=3, protocol_name="rcs", bugle_status=233,
+                             message_kind="system", body_text="", parts=[]),
+        ]
+    )
+
     # Screen timelapse: crobat's two displays at one moment, the moment's
     # tree, and one phone frame with no tree at all.
     for device, display, hours_ago, name in (
@@ -1430,6 +1463,8 @@ EXPECTED_SEEDED_PRIORITIES = {
     # The oldest seeded notification is the one-to-one message.
     "android_notification": "direct",
     "android_notification_opened": "self",
+    # The oldest seeded text is from a person.
+    "android_message": "direct",
     "android_notification_action": "self",
     # A frame of Zach's own screen is telemetry about him, the tier his own
     # health telemetry is in.
@@ -1485,6 +1520,8 @@ EXPECTED_SEEDED_EVENTS = {
     # The tap, once: the system log's click, not the listener's removal
     # that repeats it.
     "android_notification_opened": 1,
+    # The text, the reply and the short code; the conversation event stays in base.
+    "android_message": 3,
     # The swipe, the button and the expansion Zach made.
     "android_notification_action": 3,
     # One per capture moment: crobat's second display is the same moment.

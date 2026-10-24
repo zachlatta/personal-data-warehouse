@@ -271,6 +271,29 @@ func TestIngestAndroidNotificationsBatchStoresExpectedObject(t *testing.T) {
 	}
 }
 
+func TestIngestAndroidMessagesBatchStoresExpectedObject(t *testing.T) {
+	svc, stores := ingestTestService()
+	body := []byte("gzipped-message-batch")
+	exportedAt := "2026-10-24T20:40:00+00:00"
+	target := signedIngestTarget("/ingest/android-messages/batch", body, url.Values{"exported_at": {exportedAt}})
+
+	rec := postIngest(t, svc, target, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["android_messages"].lastFile
+	if put == nil {
+		t.Fatal("expected PutFile to be called")
+	}
+	wantKey := "android-messages/inbox/batches/2026/10/20261024T204000Z-" + sha256Hex(body) + ".jsonl.gz"
+	if put.ObjectKey != wantKey {
+		t.Fatalf("object key = %q, want %q", put.ObjectKey, wantKey)
+	}
+	if put.Kind != "android_message_export_batch" {
+		t.Fatalf("kind = %q", put.Kind)
+	}
+}
+
 func TestIngestRejectsBadSignature(t *testing.T) {
 	svc, _ := ingestTestService()
 	body := []byte("x")

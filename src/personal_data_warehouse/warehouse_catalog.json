@@ -335,6 +335,14 @@
       "comment": "Faithful browser history source data: Chrome, Brave and Safari visits."
     },
     {
+      "name": "base_android_messages",
+      "layer": "base",
+      "domain": "android_messages",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Android texts. Every SMS, MMS and RCS message on the Android phone since the switch from the iPhone, from Google Messages."
+    },
+    {
       "name": "base_android_notifications",
       "layer": "base",
       "domain": "android_notifications",
@@ -2087,7 +2095,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Start here for chat messages. One row per message across iMessage/SMS (base_apple_messages) and WhatsApp (base_whatsapp), conformed onto one column set so no caller has to hand-roll the cross-source UNION. chat_kind is the conformed vocabulary (direct/group/status/...); source_message_kind keeps the provider's own token. is_from_me and is_deleted are bigint 0/1, this warehouse's boolean. EVERY timestamp here is NULL when absent: the base tables are NOT NULL and store 'never' as 1970-01-01 (83% of recent messages have a sentinel date_delivered), so the sentinel is translated once here and ORDER BY, MIN() and IS NULL mean what they say. Tombstoned rows are included — filter is_deleted = 0 for live messages only."
+      "comment": "Start here for chat messages. One row per message across iMessage/SMS (base_apple_messages), Android texts (base_android_messages) and WhatsApp (base_whatsapp), conformed onto one column set so no caller has to hand-roll the cross-source UNION. chat_kind is the conformed vocabulary (direct/group/status/...); source_message_kind keeps the provider's own token. is_from_me and is_deleted are bigint 0/1, this warehouse's boolean. EVERY timestamp here is NULL when absent: the base tables are NOT NULL and store 'never' as 1970-01-01 (83% of recent messages have a sentinel date_delivered), so the sentinel is translated once here and ORDER BY, MIN() and IS NULL mean what they say. Tombstoned rows are included — filter is_deleted = 0 for live messages only."
     },
     {
       "id": "ai_conversation_events",
@@ -3541,6 +3549,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "START HERE for web browsing. One row per Chrome/Brave/Safari visit; search_term is set on web searches."
+    },
+    {
+      "id": "android_messages",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_messages",
+      "schema": "base_android_messages",
+      "name": "messages",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Android texts. One row per SMS/MMS/RCS message on the phone since the switch on 2026-10-23; earlier texts are base_apple_messages, and marts_messages.messages unifies both."
     },
     {
       "id": "android_notification_events",

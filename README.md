@@ -470,6 +470,18 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 `browser_history`, tier `self`) carry page views and web searches only; see
 [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-browser-history-upload-scheduler).
 
+## Android Message Sync
+
+Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over Zach's line
+(2026-10-23 16:00 EDT) reaches `base_android_messages.messages`. `pdw ingest android-messages`, run
+as root on the phone by the `pdw-android-messages` Magisk service, reads Google Messages' own
+database (`bugle_db`, the only store holding RCS) read-only and posts new and changed messages to
+`/ingest/android-messages/batch`. `--since` is required, so the iPhone history imported into
+Messages (already in `base_apple_messages` from the Mac) never leaves the phone. Dagster's
+`android_messages_drive_inbox_sensor` promotes the batches; timeline adapter `android_message`
+(source `android_messages`) and `marts_messages.messages` carry them; see
+[docs/agents/other-sources.md](docs/agents/other-sources.md#android-messages).
+
 ## Android Notification Sync
 
 Every notification the Android phone (`pichu`) posts or removes, and what happens to it on

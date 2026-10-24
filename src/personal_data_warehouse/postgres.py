@@ -92,6 +92,7 @@ from personal_data_warehouse.schema import (
     HACKER_NEWS_ITEM_COLUMNS,
     BROWSER_HISTORY_VISIT_COLUMNS,
     ANDROID_NOTIFICATION_EVENT_COLUMNS,
+    ANDROID_MESSAGE_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
@@ -393,6 +394,13 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         "browser_history",
         ("browser_visit", "browser_search"),
         "COALESCE(t.metadata->>'browser', t.kind)",
+    ),
+    # Texts on the Android phone since the switch; the subsource is the
+    # protocol (sms, mms, rcs).
+    (
+        "android_messages",
+        ("android_message",),
+        "COALESCE(t.metadata->>'protocol', t.kind)",
     ),
     # Notifications the Android phone received, and the ones Zach opened; the
     # subsource is the app's package.
@@ -1171,6 +1179,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         BROWSER_HISTORY_VISIT_COLUMNS,
         ("account", "device", "browser", "profile", "visit_id"),
     ),
+    # Android messages: one row per SMS/MMS/RCS message since the switch.
+    "android_messages": TableSpec(
+        ANDROID_MESSAGE_COLUMNS,
+        ("account", "device", "message_key"),
+    ),
     # Android notifications: one row per listener event, keyed by its uuid.
     "android_notification_events": TableSpec(
         ANDROID_NOTIFICATION_EVENT_COLUMNS,
@@ -1878,6 +1891,19 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "browser_history_visits_visited_idx",
         "browser_history_visits",
         "CREATE INDEX IF NOT EXISTS browser_history_visits_visited_idx ON @browser_history_visits (visited_at DESC)",
+    ),
+    # Android messages. synced_at leads for the freshness probe and the
+    # timeline adapter's incremental pass; message_at serves its backfill and
+    # the messages mart.
+    IndexSpec(
+        "android_messages_synced_idx",
+        "android_messages",
+        "CREATE INDEX IF NOT EXISTS android_messages_synced_idx ON @android_messages (synced_at)",
+    ),
+    IndexSpec(
+        "android_messages_message_at_idx",
+        "android_messages",
+        "CREATE INDEX IF NOT EXISTS android_messages_message_at_idx ON @android_messages (message_at DESC)",
     ),
     # Android notifications. synced_at leads for the freshness probe and the
     # adapters' incremental pass, posted_at and event_at serve their backfills, and the
@@ -2784,6 +2810,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "github_events": {"payload_json"},
     "browser_history_visits": {"raw_json"},
     "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
+    "android_messages": {"raw_json", "participants", "parts"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2846,6 +2873,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
     },
     "plaid_transactions": {"category_json"},
     "android_notification_events": {"text_lines", "messages", "people", "actions"},
+    "android_messages": {"participants", "parts"},
     "manual_finance_extractions": {
         "transactions_json",
         "balances_json",
@@ -2964,6 +2992,8 @@ TIMESTAMP_COLUMNS = {
     "visited_at",
     # android_notifications
     "event_at",
+    # android_messages
+    "sent_at",
     "notification_when_at",
     # hacker_news
     "fetched_at",
@@ -3081,6 +3111,14 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # android_messages
+    "bugle_id",
+    "participant_count",
+    "protocol",
+    "bugle_status",
+    "attachment_count",
+    "is_seen",
+    "is_hidden",
     # github
     "issue_number",
     "is_pull_request",
@@ -3518,6 +3556,8 @@ _WHOOP_PRIVATE_TABLES = (
 _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
 
 _ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
+
+_ANDROID_MESSAGES_TABLES = ("android_messages",)
 
 _SCREEN_TIMELAPSE_TABLES = (
     "screen_timelapse_screenshots",
@@ -10993,6 +11033,27 @@ class PostgresWarehouse:
             ANDROID_NOTIFICATION_EVENT_COLUMNS,
         )
 
+    def ensure_android_messages_tables(self) -> None:
+        """Provision base_android_messages.messages and the messages mart over it."""
+        self._ensure_table_group(list(_ANDROID_MESSAGES_TABLES))
+        self._ensure_messages_mart_view_if_possible()
+
+    def insert_android_messages(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert messages by (account, device, message_key)."""
+        if not rows:
+            return
+        self._insert_rows(
+            "android_messages",
+            [
+                {
+                    column: row.get(column, _default_python_value(column, table="android_messages"))
+                    for column in ANDROID_MESSAGE_COLUMNS
+                }
+                for row in rows
+            ],
+            ANDROID_MESSAGE_COLUMNS,
+        )
+
     def ensure_hacker_news_tables(self) -> None:
         """Provision the Hacker News source: items, why-rows, profile, state, session."""
         self._ensure_table_group(list(_HACKER_NEWS_TABLES))
@@ -17791,6 +17852,43 @@ class PostgresWarehouse:
             for name in ("clean_apple_messages", "clean_whatsapp_messages")
         ):
             return
+        # The Android phone's texts join once their table exists. Its rows
+        # start at the switch from the iPhone, where the Apple rows' SMS and
+        # RCS stop, so the two never hold the same message.
+        android_branch = ""
+        if self._relation_exists("android_messages"):
+            android_branch = """
+            UNION ALL
+            SELECT
+                'android_messages'::text AS source,
+                a.account,
+                a.chat_key AS chat_id,
+                COALESCE(
+                    NULLIF(a.chat_name, ''),
+                    NULLIF(a.sender_name, ''),
+                    NULLIF(a.chat_key, ''),
+                    a.protocol_name
+                ) AS chat_name,
+                CASE WHEN a.is_group = 1 THEN 'group' ELSE 'direct' END AS chat_kind,
+                a.message_key AS message_id,
+                CASE WHEN a.is_from_me = 1 THEN a.self_address ELSE a.sender_address END AS sender_address,
+                CASE
+                    WHEN a.is_from_me = 1 THEN 'me'
+                    ELSE COALESCE(NULLIF(a.sender_name, ''), a.sender_address)
+                END AS sender_name,
+                a.is_from_me,
+                a.body_text,
+                a.message_kind,
+                a.protocol_name AS source_message_kind,
+                NULL::text AS media_type,
+                upper(a.protocol_name) AS service,
+                NULL::text AS reply_to_message_id,
+                NULLIF(a.message_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS message_at,
+                NULL::timestamptz AS edited_at,
+                NULL::timestamptz AS read_at,
+                NULL::timestamptz AS delivered_at,
+                0::bigint AS is_deleted
+            FROM @android_messages a"""
         # chat_kind is one vocabulary across sources: WhatsApp calls a DM
         # 'user' and Apple encodes it as chat.style = 45, and an agent asking
         # for direct messages must not have to know either. Apple's own kinds
@@ -17890,7 +17988,8 @@ class PostgresWarehouse:
                 NULL::timestamptz AS delivered_at,
                 w.is_deleted
             FROM @clean_whatsapp_messages w
-            """,
+            """
+            + android_branch,
         )
 
     def _ensure_files_mart_views(self) -> None:

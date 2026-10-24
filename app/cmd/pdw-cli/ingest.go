@@ -8,6 +8,7 @@ import (
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/agentsessions"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidmessages"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidnotifications"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applecontacts"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applemessages"
@@ -47,6 +48,7 @@ var ingestSources = map[string]localCommand{
 	"apple-photos":          photos.Run,
 	"browser-history":       browserhistory.Run,
 	"android-notifications": androidnotifications.Run,
+	"android-messages":      androidmessages.Run,
 	"google-recorder":       googlerecorder.Run,
 	"manual-finance":        manualfinance.Run,
 	"muse":                  muse.Run,
@@ -88,6 +90,7 @@ SOURCES
   voice-memos      Upload local macOS Voice Memos recordings
   google-recorder  Upload Google Recorder's recordings (run as root on the Pixel)
   android-notifications  Upload the notifications the Pixel receives (run as root on it)
+  android-messages Upload the texts (SMS, MMS, RCS) the Pixel sends and receives (run as root on it)
   screen-timelapse Upload the periodic whole-screen captures (Mac and phone)
   apple-notes      Upload local Apple Notes
   apple-messages   Upload local Apple Messages (iMessage/SMS/RCS)
