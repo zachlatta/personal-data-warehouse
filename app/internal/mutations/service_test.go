@@ -36,6 +36,9 @@ func (s *recordingStore) UpdateGmailEmailMutation(context.Context, string, strin
 func (s *recordingStore) UpdateSlackMessageMutation(context.Context, string, string, UpdateSlackMessageMutationInput, string) (Mutation, error) {
 	return Mutation{}, nil
 }
+func (s *recordingStore) UpdateTextMessageMutation(context.Context, string, string, UpdateTextMessageMutationInput, string) (Mutation, error) {
+	return Mutation{}, nil
+}
 
 func (s *recordingStore) RestoreMutation(context.Context, string, string, string) (Mutation, error) {
 	return Mutation{}, nil

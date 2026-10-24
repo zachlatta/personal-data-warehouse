@@ -42,6 +42,7 @@ type Config struct {
 	AppleNotesAccounts      []string
 	AppleContactsAccounts   []string
 	AppleMessagesAccounts   []string
+	AndroidMessagesAccounts []string
 	// ExpoAccessToken authenticates sends to the Expo push service. Optional:
 	// Expo accepts unauthenticated sends unless the project enables enhanced
 	// push security, in which case this is required.
@@ -182,7 +183,10 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		AppleNotesAccounts:    parseCSV(firstNonEmpty(getenv("APPLE_NOTES_ACCOUNTS"), getenv("APPLE_NOTES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
 		AppleContactsAccounts: parseCSV(firstNonEmpty(getenv("APPLE_CONTACTS_ACCOUNTS"), getenv("APPLE_CONTACTS_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
 		AppleMessagesAccounts: parseCSV(firstNonEmpty(getenv("APPLE_MESSAGES_ACCOUNTS"), getenv("APPLE_MESSAGES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
-		ExpoAccessToken:       strings.TrimSpace(getenv("PDW_EXPO_ACCESS_TOKEN")),
+		// Texts are sent from the same account the iPhone's were, so an unset
+		// ANDROID_MESSAGES_ACCOUNTS falls back to the Apple Messages setting.
+		AndroidMessagesAccounts: parseCSV(firstNonEmpty(getenv("ANDROID_MESSAGES_ACCOUNTS"), getenv("ANDROID_MESSAGES_ACCOUNT"), getenv("APPLE_MESSAGES_ACCOUNTS"), getenv("APPLE_MESSAGES_ACCOUNT"), getenv("GMAIL_ACCOUNTS"))),
+		ExpoAccessToken:         strings.TrimSpace(getenv("PDW_EXPO_ACCESS_TOKEN")),
 	}
 
 	var missing []string

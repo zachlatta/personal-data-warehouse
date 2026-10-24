@@ -69,6 +69,9 @@ func (s fakeMutationStore) UpdateGmailEmailMutation(context.Context, string, str
 func (s fakeMutationStore) UpdateSlackMessageMutation(context.Context, string, string, mutations.UpdateSlackMessageMutationInput, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
 }
+func (s fakeMutationStore) UpdateTextMessageMutation(context.Context, string, string, mutations.UpdateTextMessageMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
 
 func (s fakeMutationStore) RestoreMutation(context.Context, string, string, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
@@ -116,6 +119,9 @@ func (s *recordingMutationStore) UpdateGmailEmailMutation(context.Context, strin
 	return mutations.Mutation{}, mutations.ErrNotFound
 }
 func (s *recordingMutationStore) UpdateSlackMessageMutation(context.Context, string, string, mutations.UpdateSlackMessageMutationInput, string) (mutations.Mutation, error) {
+	return mutations.Mutation{}, mutations.ErrNotFound
+}
+func (s *recordingMutationStore) UpdateTextMessageMutation(context.Context, string, string, mutations.UpdateTextMessageMutationInput, string) (mutations.Mutation, error) {
 	return mutations.Mutation{}, mutations.ErrNotFound
 }
 

@@ -3,7 +3,7 @@
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
 Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
-(a message sent as him, or his read state), Apple Notes, or a text message (iMessage/SMS); use a direct connector only for
+(a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
 something PDW has no mutation type for, and say why.
 
 ## The two calls
@@ -19,7 +19,7 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `gmail.create_label`, `gmail.update_label`, `gmail.delete_label`, `calendar.create_event`, `calendar.update_event`,
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
-`apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `apple_messages.send_message`,
+`apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
 `apple_messages.mark_read`. The help call is
 authoritative when this list and it disagree.
 
@@ -95,15 +95,18 @@ authoritative when this list and it disagree.
   to the surviving card (`redirected_from` in the result), so batching merges and updates
   from one snapshot is safe. Like Notes these run on a Mac and iCloud syncs the change to
   every device.
-- **Texts as Zach:** `apple_messages.send_message` sends one iMessage/SMS from Messages
-  on his Mac to ONE `recipient`: an E.164 phone (`+13105550123`) or an iMessage email,
-  taken from `marts_contacts.contact_points` or `base_apple_messages.handles.address` —
-  never a number guessed from a name, and confirm the number belongs to the person
-  (a message where it gives the name) before proposing. `text` is plain, at most 4,000
-  characters; `service` defaults to `auto` (the existing conversation, iMessage if none).
-  The review shows the handle, the contact card(s) it is on, the latest messages with it,
-  and warns on a stranger or a first text. No group chats. One approval sends one
-  message: the executor checks chat.db for the same text since approval before sending.
+- **Texts as Zach:** `android_messages.send_message` sends one text from Google Messages
+  on his Pixel (RCS, or SMS when the recipient has none; Messages decides) to ONE
+  `recipient`: an E.164 phone (`+13105550123`), taken from `marts_contacts.contact_points`
+  or a one-to-one `chat_key` in `base_android_messages.messages` / a handle in
+  `base_apple_messages.handles` — never a number guessed from a name, and confirm the
+  number belongs to the person before proposing. Emails (old iMessage handles) are
+  refused. `text` is plain, at most 4,000 characters. The review shows the number, the
+  contact card(s) it is on, the latest messages with it from either phone, warns on a
+  stranger or a first text, and lets Zach edit the words before he approves. No group
+  chats. One approval sends one message: the phone checks Messages' database for the same
+  text since approval before sending. `apple_messages.send_message` is retired (he left
+  the iPhone on 2026-10-23).
 - **Mark texts read:** `apple_messages.mark_read` marks ONE one-to-one conversation read;
   `chat` is its `base_apple_messages.chats.chat_identifier` (E.164 phone, email, or short
   code like `72975`). No group chats. The Mac opens the conversation in Messages, so it

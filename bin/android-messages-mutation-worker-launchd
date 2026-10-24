@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -eu
+
+REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# Resident local mutation worker for approved text-message sends from the Pixel:
+# native Go in the pdw binary (`pdw mutations android-messages`). For each approved
+# android_messages.send_message it runs `pdw mutations android-messages-device send` on
+# the phone over its root SSH login (host ANDROID_MESSAGES_SSH_HOST, default pichu),
+# which sends through Google Messages and checks bugle_db so one approval sends one text.
+
+. "$REPO_DIR/bin/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+export PDW_INGEST_PROJECT_DIR="$REPO_DIR"
+mkdir -p "$HOME/Library/Logs/personal-data-warehouse"
+
+if [ -z "$PDW" ]; then
+  echo "no pdw binary found (install a release to ~/.local/bin/pdw or set PDW_BIN)" >&2
+  exit 1
+fi
+cd "$REPO_DIR"
+exec "$PDW" mutations android-messages

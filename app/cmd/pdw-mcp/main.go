@@ -50,14 +50,15 @@ func main() {
 		os.Exit(1)
 	}
 	mutationSvc := mutations.NewService(mutationStore, mutations.Config{
-		BaseURL:               cfg.BaseURL,
-		GmailAccounts:         cfg.GmailAccounts,
-		ContactGoogleAccounts: cfg.ContactGoogleAccounts,
-		CalendarAccounts:      cfg.CalendarAccounts,
-		AppleNotesAccounts:    cfg.AppleNotesAccounts,
-		AppleContactsAccounts: cfg.AppleContactsAccounts,
-		AppleMessagesAccounts: cfg.AppleMessagesAccounts,
-		SlackAccounts:         cfg.SlackMutationAccounts,
+		BaseURL:                 cfg.BaseURL,
+		GmailAccounts:           cfg.GmailAccounts,
+		ContactGoogleAccounts:   cfg.ContactGoogleAccounts,
+		CalendarAccounts:        cfg.CalendarAccounts,
+		AppleNotesAccounts:      cfg.AppleNotesAccounts,
+		AppleContactsAccounts:   cfg.AppleContactsAccounts,
+		AppleMessagesAccounts:   cfg.AppleMessagesAccounts,
+		AndroidMessagesAccounts: cfg.AndroidMessagesAccounts,
+		SlackAccounts:           cfg.SlackMutationAccounts,
 	})
 	logger.Info("mutation review enabled", "path", mutations.ReviewPath, "api", mutations.APIPath)
 	notificationSvc, err := server.NewTimelineNotifications(cfg, os.Getenv("PDW_WEB_PUSH_PUBLIC_KEY"), os.Getenv("PDW_WEB_PUSH_PRIVATE_KEY"), cfg.BaseURL)

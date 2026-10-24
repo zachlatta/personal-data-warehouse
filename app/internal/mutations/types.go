@@ -29,6 +29,8 @@ const (
 	AppleMessagesProvider               = "apple_messages"
 	AppleMessagesSendMessageOperation   = "apple_messages.send_message"
 	AppleMessagesMarkReadOperation      = "apple_messages.mark_read"
+	AndroidMessagesProvider             = "android_messages"
+	AndroidMessagesSendMessageOperation = "android_messages.send_message"
 	SlackProvider                       = "slack"
 	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
 	SlackSendMessageOperation           = "slack.send_message"
@@ -49,8 +51,11 @@ type Config struct {
 	AppleNotesAccounts    []string
 	AppleContactsAccounts []string
 	AppleMessagesAccounts []string
-	SlackAccounts         []string
-	Now                   func() time.Time
+	// AndroidMessagesAccounts are the accounts android_messages.send_message
+	// accepts (base_android_messages.messages.account).
+	AndroidMessagesAccounts []string
+	SlackAccounts           []string
+	Now                     func() time.Time
 	// RequestCreated is called after a request lands in pending_review — the
 	// hook the push notifier hangs off. It must not block: the proposal has
 	// already been stored, and a slow provider must not slow the proposer.
@@ -72,6 +77,7 @@ type Store interface {
 	GetRequest(ctx context.Context, id string, page MutationPage) (Request, error)
 	UpdateGmailEmailMutation(ctx context.Context, requestID string, mutationID string, input UpdateGmailEmailMutationInput, actor string) (Mutation, error)
 	UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error)
+	UpdateTextMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateTextMessageMutationInput, actor string) (Mutation, error)
 	RemoveMutation(ctx context.Context, requestID string, mutationID string, actor string) (Mutation, error)
 	// RestoreMutation puts a mutation RemoveMutation dropped back into its
 	// still-pending request, so dropping one thread from a batch is undoable.
@@ -145,6 +151,13 @@ type UpdateGmailEmailMutationInput struct {
 // editable, because they were validated at proposal time against the
 // warehouse; a wrong recipient is a request to deny, not to redirect.
 type UpdateSlackMessageMutationInput struct {
+	Text string
+}
+
+// UpdateTextMessageMutationInput is what a reviewer may change on a text
+// (android_messages.send_message) before approving it: the words. The
+// recipient is fixed at proposal time, like a Slack send's.
+type UpdateTextMessageMutationInput struct {
 	Text string
 }
 

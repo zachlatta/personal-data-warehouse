@@ -621,34 +621,49 @@ test("requestApproveCount counts what approval runs across every page", () => {
   assert.equal(V.requestApproveCount({ mutation_count: 4, mutations: [] }), 4);
 });
 
-// --- apple messages ----------------------------------------------------------------
+// --- text messages -----------------------------------------------------------------
 
-test("appleMessagesView shows the exact handle, the contact it belongs to, and the words that run", () => {
+test("textMessageView shows the exact number, the contact it belongs to, and the words that run", () => {
   const mutation = {
-    provider: "apple_messages", operation: "apple_messages.send_message", account: "you@example.com",
-    payload: { recipient: "+13105550123", text: "edited words", service: "auto" },
+    provider: "android_messages", operation: "android_messages.send_message", account: "you@example.com",
+    payload: { recipient: "+13105550123", text: "edited words" },
     preview: { text_message: {
-      recipient: "+13105550123", text: "original words", recipient_names: ["Ada Lovelace"], warnings: [],
+      recipient: "+13105550123", text: "original words", recipient_names: ["Ada Lovelace"], warnings: [], edited: true,
+      effect: "Sends this text as Zach from Google Messages on his Pixel.",
       recent_messages: [
         { message_at: "2026-10-10T12:00:00Z", is_from_me: false, text: "newest" },
         { message_at: "2026-10-09T12:00:00Z", is_from_me: true, text: "older" },
       ],
     } },
   };
-  assert.equal(V.isAppleMessagesMutation(mutation), true);
-  const view = V.appleMessagesView(mutation);
+  assert.equal(V.isTextMessageMutation(mutation), true);
+  const view = V.textMessageView(mutation);
   assert.equal(view.heading, "Text Ada Lovelace");
   assert.equal(view.recipient, "+13105550123");
   assert.equal(view.text, "edited words");
+  assert.equal(view.android, true);
+  assert.equal(view.editable, true);
+  assert.equal(view.edited, true);
+  assert.match(view.effect, /Pixel/);
   assert.deepEqual(view.recent.map((m) => m.text), ["older", "newest"]);
   assert.equal(view.recent[0].actor, "You");
   assert.equal(view.recent[1].actor, "Ada Lovelace");
   assert.deepEqual(view.warnings, []);
 });
 
-test("appleMessagesView warns when the recipient was never checked", () => {
-  const view = V.appleMessagesView({ provider: "apple_messages", payload: { recipient: "+13105550199", text: "hi" }, preview: {} });
+test("textMessageView reports a Pixel send by its protocol", () => {
+  const view = V.textMessageView({ provider: "android_messages", operation: "android_messages.send_message", status: "succeeded",
+    payload: { recipient: "+13105550123", text: "hi" }, preview: { text_message: { warnings: [] } },
+    result: { bugle_id: 324832, protocol: "rcs", state: "delivered" } });
+  assert.equal(view.sent, true);
+  assert.equal(view.sentService, "RCS");
+});
+
+test("textMessageView keeps old Mac sends readable but not editable", () => {
+  const view = V.textMessageView({ provider: "apple_messages", operation: "apple_messages.send_message", payload: { recipient: "+13105550199", text: "hi" }, preview: {}, result: { message_guid: "G", service: "iMessage" } });
   assert.equal(view.heading, "Text +13105550199");
+  assert.equal(view.editable, false);
+  assert.equal(view.sent, true);
   assert.equal(view.warnings.length, 1);
   assert.match(view.warnings[0], /not checked/);
 });
@@ -666,7 +681,7 @@ test("appleMessagesMarkReadView names the conversation and lists what is unread"
     } },
   };
   assert.equal(V.isAppleMessagesMarkReadMutation(mutation), true);
-  assert.equal(V.isAppleMessagesMutation(mutation), false);
+  assert.equal(V.isTextMessageMutation(mutation), false);
   const view = V.appleMessagesMarkReadView(mutation);
   assert.equal(view.heading, "Mark texts from Ada Lovelace read");
   assert.equal(view.unreadCount, 2);

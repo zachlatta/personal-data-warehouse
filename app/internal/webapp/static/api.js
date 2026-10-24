@@ -117,6 +117,10 @@ export const mutations = {
   async updateSlackMessage(requestId, mutationId, input) {
     return (await request(requestPath(requestId, "mutations", mutationId, "update-slack-message"), { method: "POST", body: input })).mutation;
   },
+  // input: { text } -- the words of a pending android_messages.send_message
+  async updateTextMessage(requestId, mutationId, input) {
+    return (await request(requestPath(requestId, "mutations", mutationId, "update-text-message"), { method: "POST", body: input })).mutation;
+  },
 };
 
 // --- search (the app's hybrid search tool, POST /api/tools/search) ----------

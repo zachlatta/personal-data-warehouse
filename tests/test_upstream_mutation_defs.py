@@ -944,10 +944,13 @@ def test_process_upstream_mutation_batch_routes_slack_send_to_slack_executor() -
 
 
 def test_the_cloud_worker_never_claims_a_text_message_send() -> None:
-    # A text is sent by Messages.app on Zach's Mac (`pdw mutations apple-messages`). If the
-    # cloud worker claimed one it would fail it as unknown-provider and hide it from the Mac.
+    # A text is sent by Google Messages on Zach's Pixel (`pdw mutations android-messages` on
+    # porygon, over SSH); mark-read still runs in Messages.app on the Mac. If the cloud
+    # worker claimed one it would fail it as unknown-provider and hide it from the local
+    # worker.
     from personal_data_warehouse.defs.upstream_mutations import LOCAL_ONLY_MUTATION_PROVIDERS
 
+    assert "android_messages" in LOCAL_ONLY_MUTATION_PROVIDERS
     assert "apple_messages" in LOCAL_ONLY_MUTATION_PROVIDERS
     assert {"apple_notes", "apple_contacts"} <= set(LOCAL_ONLY_MUTATION_PROVIDERS)
 

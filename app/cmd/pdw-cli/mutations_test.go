@@ -20,8 +20,8 @@ func withFakeMutationWorker(t *testing.T, provider string, code int) *capturedLo
 	return cap
 }
 
-func TestMutationsTableIsTheThreeLocalOnlyProviders(t *testing.T) {
-	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"apple-contacts", "apple-messages", "apple-notes"}) {
+func TestMutationsTableIsTheLocalOnlyProviders(t *testing.T) {
+	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"android-messages", "android-messages-device", "apple-contacts", "apple-messages", "apple-notes"}) {
 		t.Fatalf("providers = %v", got)
 	}
 	if !sort.StringsAreSorted(mutationWorkerNames()) {
@@ -75,7 +75,9 @@ func TestRealMutationWorkersAnswerHelpAndRefuseUnknownFlags(t *testing.T) {
 		if code := run([]string{"--help"}, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, nil), resolveLocalConfig(isolatedEnv(t, nil), "", "")); code != 0 {
 			t.Fatalf("%s --help exit=%d", name, code)
 		}
-		if !strings.Contains(out.String(), "--once") {
+		// The phone half of android-messages is a one-shot command, not a
+		// queue worker.
+		if name != "android-messages-device" && !strings.Contains(out.String(), "--once") {
 			t.Fatalf("%s help lacks --once: %s", name, out.String())
 		}
 		if code := run([]string{"--bogus"}, strings.NewReader(""), &out, &errBuf, isolatedEnv(t, nil), resolveLocalConfig(isolatedEnv(t, nil), "", "")); code != 2 {

@@ -157,9 +157,13 @@ export const APPLE_MESSAGES_MARK_READ = "apple_messages.mark_read";
 export function isAppleMessagesMarkReadMutation(m) {
   return m.operation === APPLE_MESSAGES_MARK_READ;
 }
-export function isAppleMessagesMutation(m) {
+export const ANDROID_MESSAGES_SEND = "android_messages.send_message";
+// isTextMessageMutation is a text to send: android_messages.send_message from
+// the Pixel, or a historical apple_messages.send_message from the Mac.
+export function isTextMessageMutation(m) {
   if (isAppleMessagesMarkReadMutation(m)) return false;
-  return m.provider === "apple_messages" || m.operation === "apple_messages.send_message";
+  return m.provider === "android_messages" || m.operation === ANDROID_MESSAGES_SEND ||
+    m.provider === "apple_messages" || m.operation === "apple_messages.send_message";
 }
 export function isSlackMarkReadMutation(m) {
   return m.provider === "slack" && m.operation === SLACK_MARK_CONVERSATION_READ;
@@ -1334,15 +1338,17 @@ export function checkAttachmentLimits(attachments) {
   }
 }
 
-// appleMessagesView is a text message as a reviewer must read it: the exact
-// handle it goes to, who the contact book says that is, the words (from the
-// payload, which is what runs), the latest messages with that handle, and the
+// textMessageView is a text message as a reviewer must read it: the exact
+// number it goes to, who the contact book says that is, the words (from the
+// payload, which is what runs), the latest messages with that number, and the
 // warnings for a stranger or a first text. `resolved` is false when the read
-// path could not consult the warehouse, which is its own warning.
-export function appleMessagesView(mutation) {
+// path could not consult the warehouse, which is its own warning. Only a
+// Pixel send (android_messages) is editable; Mac sends are history.
+export function textMessageView(mutation) {
   const payload = asMap(mutation.payload);
   const preview = asMap(asMap(mutation.preview).text_message);
   const result = asMap(mutation.result);
+  const android = mutation.provider === "android_messages" || mutation.operation === ANDROID_MESSAGES_SEND;
   const recipient = trimStr(payload.recipient) || trimStr(preview.recipient);
   const names = stringSlice(preview.recipient_names);
   const resolved = "warnings" in preview;
@@ -1358,16 +1364,22 @@ export function appleMessagesView(mutation) {
   })).reverse();
   return {
     heading: names.length ? "Text " + names.join(" / ") : "Text " + recipient,
+    android,
+    editable: android,
     recipient,
     recipientName: names.join(" / "),
     service,
-    serviceLabel: service === "auto" ? "existing conversation (iMessage if none)" : service,
+    serviceLabel: android ? "RCS, or SMS when they have no RCS (Google Messages decides)" : (service === "auto" ? "existing conversation (iMessage if none)" : service),
+    from: android ? "Google Messages on the Pixel" : "Messages on the Mac",
     text: str(payload.text) || str(preview.text),
+    edited: preview.edited === true,
     recent,
     warnings,
-    effect: "Sends this text as Zach from Messages on his Mac to " + recipient + ". It cannot be unsent once delivered.",
-    sent: trimStr(result.message_guid) !== "",
-    sentService: trimStr(result.service),
+    effect: trimStr(preview.effect) || (android
+      ? "Sends this text as Zach from Google Messages on his Pixel to " + recipient + ". It cannot be unsent once delivered."
+      : "Sends this text as Zach from Messages on his Mac to " + recipient + ". It cannot be unsent once delivered."),
+    sent: trimStr(result.message_guid) !== "" || Number(result.bugle_id) > 0,
+    sentService: (trimStr(result.protocol) || trimStr(result.service)).toUpperCase(),
     alreadySent: result.already_sent === true,
   };
 }

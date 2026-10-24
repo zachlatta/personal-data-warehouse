@@ -16,9 +16,10 @@ import { GmailEmailComposeCard } from '@/components/gmail-email-compose-review';
 import { GmailSettingsCard } from '@/components/gmail-settings-review';
 import { SlackMarkReadCard } from '@/components/slack-read-review';
 import { SlackSendMessageCard } from '@/components/slack-send-review';
+import { TextMessageCard } from '@/components/text-message-review';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { StatusPill } from '@/components/status-pill';
-import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput } from '@/lib/api';
+import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, updateTextMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput, type UpdateTextMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
   MUTATION_PAGE_SIZE,
@@ -34,6 +35,7 @@ import {
   isGmailThreadMutation,
   isSlackMarkReadMutation,
   isSlackSendMessageMutation,
+  isTextMessageSendMutation,
   mergeMutationPage,
   mutationReviewContext,
   pendingApproveLabel,
@@ -84,13 +86,14 @@ const HEADLINE_KEYS = ['recipient', 'chat', 'text', 'service', 'to', 'cc', 'bcc'
 
 // An edit on screen that approval has to save first: approval runs the stored
 // version, never the screen's.
-type PendingEdit = { kind: 'email'; input: UpdateEmailMutationInput } | { kind: 'slack'; input: UpdateSlackMessageMutationInput };
+type PendingEdit = { kind: 'email'; input: UpdateEmailMutationInput } | { kind: 'slack'; input: UpdateSlackMessageMutationInput } | { kind: 'text'; input: UpdateTextMessageMutationInput };
 
-function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
+function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, onSaveTextMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onSaveTextMessage?: (input: UpdateTextMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
   const theme = useTheme();
   if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
   if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} />;
+  if (isTextMessageSendMutation(mutation)) return <TextMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveTextMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'text', input } : null)} requestReason={requestReason} locked={locked} />;
   if (isGmailSettingsMutation(mutation)) return <GmailSettingsCard mutation={mutation} requestReason={requestReason} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
@@ -406,6 +409,7 @@ export default function MutationRequestScreen() {
       try {
         for (const [mutationId, edit] of edits) {
           if (edit.kind === 'email') await updateEmailMutation(config, request.id, mutationId, edit.input);
+          else if (edit.kind === 'text') await updateTextMessageMutation(config, request.id, mutationId, edit.input);
           else await updateSlackMessageMutation(config, request.id, mutationId, edit.input);
         }
         current = rememberMutationRequest(await getMutationRequest(config, request.id));
@@ -464,6 +468,16 @@ export default function MutationRequestScreen() {
     setBusy(true);
     try {
       await updateSlackMessageMutation(config, request.id, mutation.id, input);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveTextMessage = async (mutation: Mutation, input: UpdateTextMessageMutationInput) => {
+    if (!request) return;
+    setBusy(true);
+    try {
+      await updateTextMessageMutation(config, request.id, mutation.id, input);
       await load();
     } finally {
       setBusy(false);
@@ -598,7 +612,8 @@ export default function MutationRequestScreen() {
                   <ThemedText type="subtitle">Other actions · {otherMutations.length}</ThemedText>
                   <ThemedText type="small" themeColor="textSecondary">Approval includes these actions too.</ThemedText>
                   {otherMutations.map((mutation) => (
-                    <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
+                    <MutationCard key={mutation.id} mutation={mutation} pending={pending} busy={busy} onRemove={() => remove(mutation)} onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
+                onSaveTextMessage={(input) => saveTextMessage(mutation, input)} onPendingChange={(edit) => markPending(mutation.id, edit)} requestReason={request.reason} locked={scroll.locked} />
                   ))}
                 </View>
               ) : null}
@@ -663,6 +678,7 @@ export default function MutationRequestScreen() {
                 busy={busy}
                 onRemove={() => remove(mutation)}
                 onSaveSlackMessage={(input) => saveSlackMessage(mutation, input)}
+                onSaveTextMessage={(input) => saveTextMessage(mutation, input)}
                 onPendingChange={(edit) => markPending(mutation.id, edit)}
                 locked={scroll.locked}
                 requestReason={request.reason}

@@ -559,26 +559,25 @@ func MutationHelp() MutationHelpDocument {
 					"The executor requires the Slack web session Zach pastes into `pdw slack publish-session`, verifies the stored user/workspace identity, and refuses a target that is not already synced exactly.",
 			},
 			{
-				Type:        AppleMessagesSendMessageOperation,
-				Summary:     "Send a text (iMessage or SMS) as Zach to one phone number or iMessage email address. Executed on Zach's Mac through Messages.app, not in the cloud.",
-				RequiresEnv: "APPLE_MESSAGES_ACCOUNTS",
+				Type:        AndroidMessagesSendMessageOperation,
+				Summary:     "Send a text (RCS, or SMS when the recipient has no RCS) as Zach to one phone number, from Google Messages on his Pixel. Executed on the phone, not in the cloud.",
+				RequiresEnv: "ANDROID_MESSAGES_ACCOUNTS",
 				Fields: []MutationHelpArg{
-					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AppleMessagesSendMessageOperation},
-					{Name: "account", JSONType: "string", Required: true, Description: "configured Apple Messages account label (base_apple_messages.messages.account)"},
-					{Name: "recipient", JSONType: "string", Required: true, Description: "ONE phone number in E.164 form (+13105550123; a bare 10-digit number is read as +1) or one iMessage email address. Take it from marts_contacts.contact_points or base_apple_messages.handles.address, never from a name alone."},
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + AndroidMessagesSendMessageOperation},
+					{Name: "account", JSONType: "string", Required: true, Description: "configured Android Messages account label (base_android_messages.messages.account)"},
+					{Name: "recipient", JSONType: "string", Required: true, Description: "ONE phone number in E.164 form (+13105550123; a bare 10-digit number is read as +1). Take it from marts_contacts.contact_points or the chat_key of a one-to-one base_android_messages conversation, never from a name alone. Email addresses (old iMessage handles) are refused."},
 					{Name: "text", JSONType: "string", Required: true, Description: "the message, plain text, at most 4000 characters"},
-					{Name: "service", JSONType: "string", Required: false, Description: `"auto" (default: reply in the conversation Zach already has with this handle, whatever its service; iMessage when there is none), "iMessage", or "SMS"`},
 				},
 				Example: map[string]any{
-					"type":      AppleMessagesSendMessageOperation,
+					"type":      AndroidMessagesSendMessageOperation,
 					"account":   "you@example.com",
 					"recipient": "+13105550123",
 					"text":      "Running 10 minutes late, sorry!",
 				},
-				ExtraNotes: "Nothing is sent until a human approves the request; the review shows the exact handle, the contact card(s) it belongs to, and the latest messages exchanged with it, and warns when the handle is on no card or has never been texted. " +
-					"Executed by the resident apple-messages worker on the Mac that syncs Apple Messages, so it normally sends within seconds of approval. " +
-					"One approval sends one message: before every attempt the executor looks in the Mac's chat.db for an outgoing message with the same text to the same handle since approval, and records an already-sent match as success instead of sending again. " +
-					"The result JSON carries the sent message's guid and service. Group chats are not supported: one recipient per mutation.",
+				ExtraNotes: "Nothing is sent until a human approves the request; the review shows the exact number, the contact card(s) it belongs to, and the latest messages exchanged with it on the Pixel or the iPhone before it, and warns when the number is on no card or has never been texted. The reviewer can edit the words before approving; approval sends the stored (edited) text. " +
+					"Executed by the resident android-messages worker on porygon, which asks the Pixel to send through Google Messages' own background send service (no screen, works while the phone is locked), so it normally sends within seconds of approval; Messages picks RCS or SMS for the conversation itself. " +
+					"One approval sends one message: before every attempt the phone looks in Google Messages' database for an outgoing message with the same text to the same number since approval, and records an already-sent match as success instead of sending again. " +
+					"The result JSON carries the sent message's protocol (rcs/sms) and status. Group chats are not supported: one recipient per mutation. apple_messages.send_message is retired.",
 			},
 			{
 				Type:        AppleMessagesMarkReadOperation,

@@ -95,6 +95,7 @@ func NewService(store Store, cfg Config) *Service {
 	cfg.AppleNotesAccounts = normalizeAccountList(cfg.AppleNotesAccounts)
 	cfg.AppleContactsAccounts = normalizeAccountList(cfg.AppleContactsAccounts)
 	cfg.AppleMessagesAccounts = normalizeAccountList(cfg.AppleMessagesAccounts)
+	cfg.AndroidMessagesAccounts = normalizeAccountList(cfg.AndroidMessagesAccounts)
 	cfg.SlackAccounts = normalizeAccountList(cfg.SlackAccounts)
 	return &Service{store: store, cfg: cfg}
 }
@@ -370,10 +371,12 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 	case AppleMessagesSendMessageOperation:
-		if err := validateConfiguredAccount(account, s.cfg.AppleMessagesAccounts, "APPLE_MESSAGES_ACCOUNTS"); err != nil {
+		return fmt.Errorf("mutation %d: apple_messages.send_message is retired (Zach texts from his Pixel now); propose %s with the same recipient and text", index, AndroidMessagesSendMessageOperation)
+	case AndroidMessagesSendMessageOperation:
+		if err := validateConfiguredAccount(account, s.cfg.AndroidMessagesAccounts, "ANDROID_MESSAGES_ACCOUNTS"); err != nil {
 			return err
 		}
-		if err := validateAppleMessagesSendMessage(mutation); err != nil {
+		if err := validateAndroidMessagesSendMessage(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 	case AppleMessagesMarkReadOperation:
@@ -410,7 +413,7 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
 	default:
-		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, gmail.create_filter, gmail.replace_filter, gmail.delete_filter, gmail.create_label, gmail.update_label, gmail.delete_label, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, apple_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, or slack.send_message", index, mutationType)
+		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, gmail.create_filter, gmail.replace_filter, gmail.delete_filter, gmail.create_label, gmail.update_label, gmail.delete_label, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, android_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, or slack.send_message", index, mutationType)
 	}
 	return nil
 }

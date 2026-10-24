@@ -63,6 +63,12 @@ type apiUpdateSlackMessageBody struct {
 	Text string `json:"text"`
 }
 
+// apiUpdateTextMessageBody is the reviewer's edit of a text
+// (android_messages.send_message): the words only.
+type apiUpdateTextMessageBody struct {
+	Text string `json:"text"`
+}
+
 func (s *Service) apiListRequests(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		apiError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -178,6 +184,18 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		mutation, err := s.store.UpdateSlackMessageMutation(r.Context(), requestID, parts[2], UpdateSlackMessageMutationInput{Text: body.Text}, actor)
+		if err != nil {
+			apiStoreError(w, err)
+			return
+		}
+		apiJSON(w, http.StatusOK, map[string]any{"mutation": mutationJSON(mutation)})
+	case len(parts) == 4 && parts[1] == "mutations" && parts[3] == "update-text-message" && r.Method == http.MethodPost:
+		var body apiUpdateTextMessageBody
+		if err := decodeOptionalJSON(r, &body); err != nil {
+			apiError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		mutation, err := s.store.UpdateTextMessageMutation(r.Context(), requestID, parts[2], UpdateTextMessageMutationInput{Text: body.Text}, actor)
 		if err != nil {
 			apiStoreError(w, err)
 			return

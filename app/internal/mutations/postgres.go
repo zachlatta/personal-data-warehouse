@@ -340,7 +340,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string, page Mutation
 	mutations = s.hydrateCalendarDayPreviews(ctx, mutations)
 	mutations = s.hydrateSlackPreviewLinks(ctx, mutations)
 	mutations = s.hydrateAppleContactsCardPreviews(ctx, mutations)
-	mutations = s.hydrateAppleMessagesPreviews(ctx, mutations)
+	mutations = s.hydrateAndroidMessagesPreviews(ctx, mutations)
 	mutations = s.hydrateAppleMessagesMarkReadPreviews(ctx, mutations)
 	mutations = s.hydrateGmailSettingsPreviews(ctx, mutations)
 	request.Mutations = mutations
@@ -1947,20 +1947,20 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 					"contact": appleContactsPreview(mutation),
 				},
 			})
-		case AppleMessagesSendMessageOperation:
-			if err := validateAppleMessagesSendMessage(mutation); err != nil {
+		case AndroidMessagesSendMessageOperation:
+			if err := validateAndroidMessagesSendMessage(mutation); err != nil {
 				return nil, fmt.Errorf("mutation %d %w", index, err)
 			}
-			payload := appleMessagesPayload(mutation)
+			payload := androidMessagesPayload(mutation)
 			out = append(out, storedMutation{
-				Provider:  AppleMessagesProvider,
-				Operation: AppleMessagesSendMessageOperation,
+				Provider:  AndroidMessagesProvider,
+				Operation: AndroidMessagesSendMessageOperation,
 				Account:   account,
-				Title:     optionalTitle(mutation.Title, appleMessagesTitle(mutation)),
+				Title:     optionalTitle(mutation.Title, androidMessagesTitle(mutation)),
 				Reason:    reason,
 				Payload:   payload,
 				Preview: map[string]any{
-					"text_message": appleMessagesPreview(payload),
+					"text_message": androidMessagesPreview(payload),
 				},
 			})
 		case AppleMessagesMarkReadOperation:
@@ -3322,6 +3322,21 @@ func decodeJSONSlice(data []byte) []any {
 // send. Like the Gmail edit it bumps the revision so a stale client sees the
 // change, and records the edit on both the mutation and the request.
 func (s *PostgresStore) UpdateSlackMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateSlackMessageMutationInput, actor string) (Mutation, error) {
+	return s.updateMessageText(ctx, requestID, mutationID, actor, isSlackSendMessageMutation, func(mutation Mutation) (map[string]any, map[string]any, string, error) {
+		return updatedSlackMessagePayload(mutation, input)
+	})
+}
+
+// UpdateTextMessageMutation applies a reviewer's edit of the words of a
+// pending text (android_messages.send_message), exactly like a Slack edit:
+// approval then sends what is stored, never what was on screen.
+func (s *PostgresStore) UpdateTextMessageMutation(ctx context.Context, requestID string, mutationID string, input UpdateTextMessageMutationInput, actor string) (Mutation, error) {
+	return s.updateMessageText(ctx, requestID, mutationID, actor, isAndroidMessagesSendMutation, func(mutation Mutation) (map[string]any, map[string]any, string, error) {
+		return updatedTextMessagePayload(mutation, input)
+	})
+}
+
+func (s *PostgresStore) updateMessageText(ctx context.Context, requestID string, mutationID string, actor string, editable func(Mutation) bool, apply func(Mutation) (map[string]any, map[string]any, string, error)) (Mutation, error) {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	if err := s.EnsureTables(ctx); err != nil {
@@ -3354,10 +3369,10 @@ func (s *PostgresStore) UpdateSlackMessageMutation(ctx context.Context, requestI
 	if mutation.Status != "pending_review" {
 		return Mutation{}, fmt.Errorf("cannot edit mutation with status %s", mutation.Status)
 	}
-	if !isSlackSendMessageMutation(mutation) {
+	if !editable(mutation) {
 		return Mutation{}, fmt.Errorf("cannot edit mutation with operation %s", mutation.Operation)
 	}
-	payload, preview, title, err := updatedSlackMessagePayload(mutation, input)
+	payload, preview, title, err := apply(mutation)
 	if err != nil {
 		return Mutation{}, err
 	}

@@ -48,6 +48,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
     "apple-messages-mutation-worker-launchd": ('exec "$PDW" mutations apple-messages', None),
+    "android-messages-mutation-worker-launchd": ('exec "$PDW" mutations android-messages', None),
     "chatgpt-auth-launchd": ('"$PDW" chatgpt publish-session --non-interactive', None),
     "claude-desktop-auth-launchd": ('"$PDW" ingest claude-desktop', None),
 }
@@ -65,6 +66,7 @@ LAUNCH_AGENTS: dict[str, tuple[str, bool]] = {
     "apple-notes-mutation-worker": ("apple-notes-mutation-worker-launchd", True),
     "apple-contacts-mutation-worker": ("apple-contacts-mutation-worker-launchd", True),
     "apple-messages-mutation-worker": ("apple-messages-mutation-worker-launchd", True),
+    "android-messages-mutation-worker": ("android-messages-mutation-worker-launchd", True),
     "chatgpt-auth": ("chatgpt-auth-launchd", False),
     "claude-desktop-auth": ("claude-desktop-auth-launchd", False),
 }

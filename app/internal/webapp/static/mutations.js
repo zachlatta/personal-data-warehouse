@@ -1018,18 +1018,17 @@ function renderSlackSendMessage(request, mutation, actions) {
   return article;
 }
 
-function renderAppleMessages(mutation) {
-  const view = V.appleMessagesView(mutation);
+function renderTextMessage(request, mutation, actions) {
+  const view = V.textMessageView(mutation);
+  const pending = request && request.status === "pending_review" && mutation.status === "pending_review";
   const article = h("article", "mut text-message");
   article.appendChild(mutationHead("Messages", mutation.title || view.heading, mutation.status));
   const action = h("div", "slack-action");
   action.appendChild(h("strong", "", "What will happen"));
   action.appendChild(h("p", "", view.effect));
-  action.appendChild(dl([["To", view.recipient], ["Contact", view.recipientName || "not on any contact card"], ["Service", view.serviceLabel], ["From", mutation.account]]));
+  action.appendChild(dl([["To", view.recipient], ["Contact", view.recipientName || "not on any contact card"], ["Sent as", view.serviceLabel], ["From", view.from]]));
   article.appendChild(action);
   for (const warning of view.warnings) article.appendChild(h("p", "bad slack-warning", warning));
-  article.appendChild(h("div", "eyebrow", "Message"));
-  article.appendChild(pre(view.text));
   if (view.recent.length) {
     const context = h("section", "slack-context");
     context.appendChild(h("h4", "", "Latest messages with " + (view.recipientName || view.recipient)));
@@ -1042,7 +1041,51 @@ function renderAppleMessages(mutation) {
     }
     article.appendChild(context);
   }
+
+  const compose = h("section", "slack-compose");
+  const composeHead = h("div", "slack-context-head");
+  composeHead.appendChild(h("h4", "", view.sent ? "Message sent" : "Message"));
+  if (view.edited) composeHead.appendChild(h("span", "m", "edited in review"));
+  compose.appendChild(composeHead);
+  if (pending && view.editable) {
+    // The words are editable until approval. Saving stores them on the
+    // server; approval sends what is stored, never what is on screen.
+    const form = h("form", "slack-compose-form");
+    const editor = h("textarea", "slack-compose-text");
+    editor.value = view.text;
+    editor.rows = Math.min(14, Math.max(4, view.text.split("\n").length + 1));
+    editor.spellcheck = true;
+    editor.maxLength = 4000;
+    form.appendChild(editor);
+    const meta = h("div", "slack-compose-meta");
+    const counter = h("span", "m", editor.value.length + " / 4000");
+    editor.addEventListener("input", () => { counter.textContent = editor.value.length + " / 4000"; });
+    meta.appendChild(h("span", "m", "Plain text. Save before approving."));
+    meta.appendChild(counter);
+    form.appendChild(meta);
+    const errorNode = h("div", "bad");
+    form.appendChild(errorNode);
+    async function submit() {
+      errorNode.textContent = "";
+      const text = editor.value.trim();
+      if (!text) { errorNode.textContent = "The message cannot be empty."; return; }
+      try {
+        await mutations.updateTextMessage(request.id, mutation.id, { text });
+        mutationsChanged();
+        actions.reload();
+      } catch (err) { errorNode.textContent = errorText(err); }
+    }
+    const buttons = h("div", "cactions");
+    buttons.appendChild(button("Save message changes", "primary", submit));
+    form.appendChild(buttons);
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); submit(); });
+    compose.appendChild(form);
+  } else {
+    compose.appendChild(pre(view.text));
+  }
+  article.appendChild(compose);
   if (view.sent) article.appendChild(h("p", "m", (view.alreadySent ? "Already sent earlier" : "Sent") + (view.sentService ? " over " + view.sentService : "")));
+  if (mutation.reason && mutation.reason !== (request && request.reason)) article.appendChild(h("p", "mreason", mutation.reason));
   if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
   return article;
 }
@@ -1147,7 +1190,7 @@ function renderMutation(request, mutation, actions) {
   if (V.isAppleNotesMutation(mutation)) return renderAppleNotes(mutation);
   if (V.isAppleContactsMutation(mutation)) return renderAppleContacts(mutation);
   if (V.isAppleMessagesMarkReadMutation(mutation)) return renderAppleMessagesMarkRead(mutation);
-  if (V.isAppleMessagesMutation(mutation)) return renderAppleMessages(mutation);
+  if (V.isTextMessageMutation(mutation)) return renderTextMessage(request, mutation, actions);
   if (V.isSlackMarkReadMutation(mutation)) return renderSlackMarkRead(request, mutation);
   if (V.isSlackSendMessageMutation(mutation)) return renderSlackSendMessage(request, mutation, actions);
   return renderGeneric(mutation);

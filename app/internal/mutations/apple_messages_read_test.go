@@ -27,7 +27,7 @@ func TestNormalizeAppleMessagesChat(t *testing.T) {
 }
 
 func TestProposeAppleMessagesMarkReadStoresTheConversation(t *testing.T) {
-	service, store := appleMessagesService(t)
+	service, store := androidMessagesService(t)
 	if _, err := service.ProposeMutation(context.Background(), ProposeMutationInput{
 		Title: "Clear login codes", Reason: "Zach asked",
 		Mutations: []map[string]any{
@@ -64,7 +64,7 @@ func TestProposeAppleMessagesMarkReadRefusesGroupsAndUnconfiguredAccounts(t *tes
 		{map[string]any{"account": "you@example.com"}, "must include chat"},
 		{map[string]any{"account": "other@example.com", "chat": "72975"}, "APPLE_MESSAGES_ACCOUNTS"},
 	} {
-		service, store := appleMessagesService(t)
+		service, store := androidMessagesService(t)
 		tc.entry["type"] = AppleMessagesMarkReadOperation
 		_, err := service.ProposeMutation(context.Background(), ProposeMutationInput{Title: "t", Reason: "r", Mutations: []map[string]any{tc.entry}})
 		if err == nil || !strings.Contains(err.Error(), tc.want) || len(store.createCalls) != 0 {

@@ -429,59 +429,53 @@ pauses the local worker; `pdw ingest apple-contacts --mutations-only` / `--no-mu
 split the two stages. The app needs `APPLE_CONTACTS_ACCOUNTS` (falls back to
 `GMAIL_ACCOUNTS`) to accept proposals for the account.
 
-## Sending text messages (apple_messages mutations)
+## Sending text messages (android_messages.send_message)
 
-`apple_messages.send_message` sends one iMessage or SMS as Zach, in the Apple Notes /
-Contacts shape: iMessage and SMS have no server API, so the proposal and review halves live
-with every other mutation type (`app/internal/mutations/apple_messages.go`) and the executor
-is local — `app/internal/mutationworkers/applemessages` driving Messages.app over AppleScript,
-claimed by `pdw mutations apple-messages` (resident LaunchAgent
-`com.zachlatta.personal-data-warehouse.apple-messages-mutation-worker`, through
-`bin/apple-messages-mutation-worker-launchd`) on the Mac that already uploads Apple Messages
-(porygon). `apple_messages` is in `LOCAL_ONLY_MUTATION_PROVIDERS`, so the cloud worker never
-claims it.
+`android_messages.send_message` sends one text as Zach from Google Messages on his Pixel
+(device `pichu`; he switched from the iPhone on 2026-10-23, and `apple_messages.send_message`
+is retired: the proposal API refuses it and the Mac worker fails any old approved row
+terminal with nothing sent). SMS and RCS have no server API, so the proposal, review and edit
+halves live with every other type (`app/internal/mutations/android_messages.go`) and the
+executor is local, in two halves (`app/internal/mutationworkers/androidmessages`):
 
-- **The proposal names one handle exactly.** `recipient` is normalized to E.164 (a bare
-  ten-digit number is read as `+1`, anything else must carry its country code) or a
-  lowercased email, and anything else — a name, a seven-digit number — is refused at
-  proposal time, because a wrong normalization is a text to a stranger. `text` is plain,
-  at most 4,000 characters; `service` is `auto` (default), `iMessage` or `SMS`. No group
-  chats: one recipient per mutation.
-- **The review names the person, on the read path.** `hydrateAppleMessagesPreviews` reads
-  the contact card(s) whose `marts_contacts.contact_points.normalized_value` is the handle
-  and the six newest messages with that handle from `base_apple_messages`, and warns when
-  the handle is on no card or has never been texted.
-- **One approval sends one message.** Messages has no idempotency key and a text cannot be
-  unsent, so before every attempt the executor reads chat.db (live, read-only) for an
-  outgoing message with the same text to the same handle since `approved_at` (minus a
-  minute) and records a hit as `succeeded` with `already_sent: true`. The body is matched
-  after decoding `attributedBody` (the uploader's typedstream decoder), never on
-  `message.text` alone: on this macOS every AppleScript send is stored with `text` NULL,
-  and the first production test (2026-10-11, delivered fine) read `verified: false`
-  because a `text = ?` match could not see it — the same blindness would have let a
-  retry send twice. An unreadable chat.db
-  is `failed_retryable` with nothing sent; a timeout is retryable only because of that
-  check; nothing is reclaimed from a stale `executing` claim. After sending, the executor
-  waits up to 15 s for the row Messages writes and records its `message_guid`, `service`
-  and delivery flags; a row Messages marks with an `error` is `failed_terminal` (retrying
-  would put a second copy beside the failed one).
-- **Where it sends.** `auto` sends in the most recently active one-to-one chat with the
-  handle (`chat id "<chat.guid>"`), on whatever service that conversation uses, and only
-  addresses `participant <handle>` of the iMessage account when there is none (or when the
-  chat id does not resolve, which sends nothing). `SMS` needs the Mac to be paired with
-  Zach's iPhone for Text Message Forwarding.
-- **`APPLE_MESSAGES_SEND_ALLOWED_RECIPIENTS`** (comma-separated handles, read from the
-  worker's environment or the repo `.env`) restricts sends to those handles and fails
-  anything else terminal before Messages is asked; a list naming nobody valid fails closed.
-  It is the testing guard; unset means unrestricted. `APPLE_MESSAGES_MUTATIONS_ENABLED=0`
-  pauses the worker.
-- **Automation → Messages** is a TCC grant separate from Notes and Contacts, attributed to
-  `~/.local/bin/pdw` through the same `launchd → /bin/zsh → pdw → osascript` chain. A
-  missing grant reads `blocked_missing_credentials`. Never probe it with a shell-run
-  `osascript` on headless porygon: the prompt wedges tccd (see the Notes section above).
-- The app needs `APPLE_MESSAGES_ACCOUNTS` (falls back to `APPLE_MESSAGES_ACCOUNT`, then
-  `GMAIL_ACCOUNTS`) to accept proposals for the account, which is
-  `base_apple_messages.messages.account`.
+- **porygon:** `pdw mutations android-messages`, the resident queue worker (LaunchAgent
+  `com.zachlatta.personal-data-warehouse.android-messages-mutation-worker`, through
+  `bin/android-messages-mutation-worker-launchd`). For each approved row it runs the phone
+  half over the root SSH login (`ssh pichu`; override `ANDROID_MESSAGES_SSH_HOST`) with a
+  JSON request on stdin. `android_messages` is in `LOCAL_ONLY_MUTATION_PROVIDERS`, so the
+  cloud worker never claims it.
+- **the Pixel:** `pdw mutations android-messages-device send`, run by the pdw binary of the
+  `pdw-android-messages` Magisk module (`ANDROID_MESSAGES_DEVICE_PDW`, default
+  `/data/adb/modules/pdw-android-messages/bin/pdw`, which self-updates from releases). It
+  starts Messages' own no-UI send service as root: `am startservice -a
+  android.intent.action.RESPOND_VIA_MESSAGE -d smsto:<number> --es android.intent.extra.TEXT
+  <text> -n com.google.android.apps.messaging/.shared.NoConfirmationSmsSendService` (the
+  dialer's "reply with a message" path). No screen, works while the phone is locked, and
+  Messages picks RCS or SMS for the conversation itself. Tested 2026-10-24 to Zach's own
+  number: RCS, delivered in about 3 s. `... android-messages-device find --recipient
+  --text --since` is a read-only check.
+
+- **One approval sends one message.** Before sending, the phone reads `bugle_db`
+  (read-only, never when its `-wal`/`-shm` are absent) for an outgoing message
+  (`message_status` < 100) with the same trimmed text in the one-to-one conversation with
+  the number (`conversations.participant_normalized_destination`, or its only participant)
+  since `approved_at` minus a minute; a hit is `succeeded` with `already_sent: true`. After
+  sending it polls up to 30 s: status 1/2 is sent/delivered (`verified: true`), 8/9 failed
+  (`failed_terminal`: the failed copy sits in the conversation), still sending is
+  `succeeded`, `verified: false` (Messages keeps retrying itself). An unreachable phone or a
+  dropped SSH session is `failed_retryable`, safe because of the check. Nothing is
+  reclaimed from a stale `executing` claim.
+- **Edit before sending.** `POST .../mutations/<id>/update-text-message {text}` (web review
+  textarea; phone app `TextMessageCard`) replaces the words of a pending text, bumps the
+  revision and marks `preview.text_message.edited`. The number is not editable. The phone
+  app saves an unsaved edit before Send.
+- **Review.** `hydrateAndroidMessagesPreviews` names the contact card(s) for the number and
+  shows the six newest messages with it from `base_android_messages` (1:1 `chat_key`) and
+  `base_apple_messages` (handle), warning on a stranger or a first text.
+- **`ANDROID_MESSAGES_SEND_ALLOWED_RECIPIENTS`** (porygon env or repo `.env`) restricts sends
+  for testing; `ANDROID_MESSAGES_MUTATIONS_ENABLED=0` pauses the worker. The app needs
+  `ANDROID_MESSAGES_ACCOUNTS` (falls back to the Apple Messages setting, then
+  `GMAIL_ACCOUNTS`); the account is `base_android_messages.messages.account`.
 
 ## Marking texts read (apple_messages.mark_read)
 

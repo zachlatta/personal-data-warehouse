@@ -89,6 +89,59 @@ export function isSlackSendMessageMutation(mutation: MutationLike): boolean {
   return mutation.provider === 'slack' && mutation.operation === 'slack.send_message';
 }
 
+// A text from the Pixel (android_messages.send_message). Old
+// apple_messages.send_message rows fall through to the generic card.
+export function isTextMessageSendMutation(mutation: MutationLike): boolean {
+  return mutation.provider === 'android_messages' && mutation.operation === 'android_messages.send_message';
+}
+
+export type TextMessageRecent = { at: string; isFromMe: boolean; actor: string; service: string; text: string };
+
+export type TextMessageReview = {
+  heading: string;
+  recipient: string;
+  recipientName: string;
+  text: string;
+  edited: boolean;
+  effect: string;
+  recent: TextMessageRecent[];
+  warnings: string[];
+  sent: { protocol: string; alreadySent: boolean; state: string } | null;
+};
+
+// textMessageReview is a text as a reviewer must read it: the exact number,
+// who the contact book says that is, the words from the payload (what runs),
+// the latest messages with that number oldest first, and the warnings for a
+// stranger, a first text, or a preview the server could not check.
+export function textMessageReview(mutation: MutationLike): TextMessageReview {
+  const payload = asRecord(mutation.payload);
+  const preview = asRecord(asRecord(mutation.preview).text_message);
+  const result = asRecord(mutation.result);
+  const recipient = text(payload.recipient) || text(preview.recipient);
+  const names = Array.isArray(preview.recipient_names) ? preview.recipient_names.map((name) => text(name)).filter(Boolean) : [];
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings.map((warning) => text(warning)).filter(Boolean) : [];
+  if (!('warnings' in preview)) warnings.push('The number was not checked against the warehouse. Verify it before approving.');
+  const recent = (Array.isArray(preview.recent_messages) ? preview.recent_messages : []).map((item) => {
+    const message = asRecord(item);
+    const fromMe = message.is_from_me === true;
+    return { at: text(message.message_at), isFromMe: fromMe, actor: fromMe ? 'You' : (names[0] || recipient), service: text(message.service), text: text(message.text) };
+  }).reverse();
+  const sent = Number(result.bugle_id) > 0 || result.already_sent === true
+    ? { protocol: text(result.protocol).toUpperCase(), alreadySent: result.already_sent === true, state: text(result.state) }
+    : null;
+  return {
+    heading: names.length ? `Text ${names.join(' / ')}` : `Text ${recipient}`,
+    recipient,
+    recipientName: names.join(' / '),
+    text: text(payload.text) || text(preview.text),
+    edited: preview.edited === true,
+    effect: text(preview.effect) || `Sends this text as Zach from Google Messages on his Pixel to ${recipient}. It cannot be unsent once delivered.`,
+    recent,
+    warnings,
+    sent,
+  };
+}
+
 export type SlackSendContextMessage = {
   messageTs: string;
   sentAt: string;
@@ -2017,6 +2070,16 @@ export function requestDecision(request: RequestLike): RequestDecision {
       deniedLabel: 'Not sent',
     };
   }
+  if (!partial && live.length === 1 && isTextMessageSendMutation(live[0])) {
+    const review = textMessageReview(live[0]);
+    return {
+      running,
+      approveLabel: 'Send',
+      denyLabel: 'Don\u2019t send',
+      doneLabel: `Sent to ${review.recipientName || review.recipient}`,
+      deniedLabel: 'Not sent',
+    };
+  }
   if (mutations.every(isGmailThreadMutation)) {
     const summary = gmailBatchSummary(mutations, gmailThreadReviews(mutations));
     if (summary.verb === 'Review') return generic();
@@ -2058,6 +2121,7 @@ export function requestKindLabel(mutations: MutationLike[] | undefined): string 
     return reply ? 'Email reply' : 'New email';
   }
   if (all.every(isSlackSendMessageMutation)) return 'Slack message';
+  if (all.every(isTextMessageSendMutation)) return all.length > 1 ? 'Text messages' : 'Text message';
   if (all.every(isSlackMarkReadMutation)) return 'Slack mark read';
   if (all.every(isCalendarCreateMutation)) return 'Calendar event';
   if (all.every(isGmailThreadMutation)) return 'Gmail';

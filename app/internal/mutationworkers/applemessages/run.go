@@ -9,10 +9,8 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/queue"
 )
 
-// Spec is the Apple Messages worker. Nothing is reclaimed from a stale
-// `executing` claim: a send may be mid-flight in Messages, and the chat.db
-// check cannot see a message that has not been written yet, so a stuck send
-// waits for a human exactly like gmail.send_email.
+// Spec is the Apple Messages worker (mark_read only). Nothing is reclaimed
+// from a stale `executing` claim.
 var Spec = queue.Spec{
 	DisplayName: "Apple Messages",
 	Command:     "apple-messages",
@@ -29,7 +27,6 @@ var Spec = queue.Spec{
 func newWorkerExecutor(runner applescript.Runner, store Store, getenv func(string) string) *Executor {
 	return NewExecutor(runner, store).
 		WithReadiness(func() error { return applescript.Launch(MessagesBundleID) }).
-		WithAllowedRecipients(AllowedRecipientsFromEnv(getenv)).
 		WithScreenLock(ScreenLocked)
 }
 

@@ -39,6 +39,8 @@ import {
   mergeMutationPage,
   withMutationStatus,
   requestKindLabel,
+  isTextMessageSendMutation,
+  textMessageReview,
   requestStatusTitle,
   mutationReviewContext,
   requestLifecycle,
@@ -1291,4 +1293,39 @@ test('gmailSettingsReview reads label changes', () => {
     payload: { name: 'pdw-test', color: { background_color: '#16a766', text_color: '#ffffff' } }, preview: { gmail_label: { warnings: [] } } });
   assert.equal(create.heading, 'New Gmail label "pdw-test"');
   assert.deepEqual(create.color, { background: '#16a766', text: '#ffffff' });
+});
+
+test('a Pixel text is reviewed as a message: the number, the person, the words that run', () => {
+  const mutation = {
+    id: 'm1', provider: 'android_messages', operation: 'android_messages.send_message', status: 'pending_review',
+    payload: { recipient: '+13105550123', text: 'edited words' },
+    preview: { text_message: {
+      recipient: '+13105550123', text: 'original words', recipient_names: ['Ada Lovelace'], warnings: [], edited: true,
+      recent_messages: [
+        { message_at: '2026-10-24T12:00:00Z', is_from_me: false, text: 'newest' },
+        { message_at: '2026-10-23T12:00:00Z', is_from_me: true, text: 'older' },
+      ],
+    } },
+  };
+  assert.equal(isTextMessageSendMutation(mutation), true);
+  const review = textMessageReview(mutation);
+  assert.equal(review.heading, 'Text Ada Lovelace');
+  assert.equal(review.text, 'edited words');
+  assert.equal(review.edited, true);
+  assert.deepEqual(review.recent.map((m) => m.text), ['older', 'newest']);
+  assert.equal(review.recent[1].actor, 'Ada Lovelace');
+  assert.deepEqual(review.warnings, []);
+  assert.equal(review.sent, null);
+  assert.equal(requestKindLabel([mutation]), 'Text message');
+  const decision = requestDecision({ status: 'pending_review', mutation_count: 1, mutations: [mutation] });
+  assert.equal(decision.approveLabel, 'Send');
+  assert.equal(decision.doneLabel, 'Sent to Ada Lovelace');
+});
+
+test('an unchecked Pixel text warns, and a sent one names its protocol', () => {
+  const review = textMessageReview({ provider: 'android_messages', operation: 'android_messages.send_message', status: 'succeeded',
+    payload: { recipient: '+13105550199', text: 'hi' }, preview: {}, result: { bugle_id: 7, protocol: 'rcs', state: 'delivered' } });
+  assert.equal(review.warnings.length, 1);
+  assert.deepEqual(review.sent, { protocol: 'RCS', alreadySent: false, state: 'delivered' });
+  assert.equal(isTextMessageSendMutation({ provider: 'apple_messages', operation: 'apple_messages.send_message' }), false);
 });

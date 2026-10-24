@@ -25,11 +25,6 @@ var appleMessagesGroupPattern = regexp.MustCompile(`^chat[0-9]+$`)
 
 const appleMessagesUnreadPreviewLimit = 10
 
-func isAppleMessagesSendMutation(mutation Mutation) bool {
-	return mutation.Operation == AppleMessagesSendMessageOperation ||
-		(mutation.Provider == AppleMessagesProvider && mutation.Operation == "")
-}
-
 func isAppleMessagesMarkReadMutation(mutation Mutation) bool {
 	return mutation.Operation == AppleMessagesMarkReadOperation
 }

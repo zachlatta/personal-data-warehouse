@@ -279,6 +279,19 @@ export async function updateSlackMessageMutation(config: AppConfig, requestId: s
   return body.mutation;
 }
 
+// The reviewer's edit of a text (android_messages.send_message): the words
+// only. The number was validated at proposal time and stays fixed.
+export type UpdateTextMessageMutationInput = { text: string };
+
+export async function updateTextMessageMutation(config: AppConfig, requestId: string, mutationId: string, input: UpdateTextMessageMutationInput): Promise<Mutation> {
+  const body = await request<{ mutation: Mutation }>(
+    config,
+    `/api/mutations/requests/${encodeURIComponent(requestId)}/mutations/${encodeURIComponent(mutationId)}/update-text-message`,
+    { method: 'POST', body: JSON.stringify(input) },
+  );
+  return body.mutation;
+}
+
 // --- push -------------------------------------------------------------------
 
 export type PushDevice = {
