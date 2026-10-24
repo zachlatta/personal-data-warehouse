@@ -185,6 +185,11 @@ func screenTimelapseRowFromRequest(q map[string][]string, sha string, size int64
 	if err != nil {
 		return screenTimelapseRow{}, fmt.Errorf("invalid captured_at: %w", err)
 	}
+	if _, zoned := file.Offset(); zoned {
+		if want := file.CapturedAt(time.UTC, capturedAt); !capturedAt.Equal(want) {
+			return screenTimelapseRow{}, fmt.Errorf("captured_at %s is not the stamp of %s (%s)", capturedAt.Format(time.RFC3339), filename, want.Format(time.RFC3339))
+		}
+	}
 	stampAsUTC := file.CapturedAt(time.UTC, capturedAt)
 	if offset := capturedAt.Sub(stampAsUTC); offset > 26*time.Hour || offset < -26*time.Hour {
 		return screenTimelapseRow{}, fmt.Errorf("captured_at %s is not the stamp %s in any timezone", capturedAt.Format(time.RFC3339), file.LocalStamp)

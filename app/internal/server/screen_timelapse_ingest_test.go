@@ -121,6 +121,29 @@ func TestScreenTimelapseIngestStoresATreeAsItsOwnRow(t *testing.T) {
 	}
 }
 
+func TestScreenTimelapseIngestStoresAPixelFrameAndTree(t *testing.T) {
+	rows := &fakeScreenTimelapseRows{}
+	svc, store := screenTimelapseTestService(rows)
+	at := time.Date(2026, 10, 24, 1, 9, 0, 0, time.UTC)
+	rec := postScreenTimelapse(t, svc, []byte("avif-bytes"), screenParams("pixel11pro", "phone-screenshot-2026-10-23_21-09-00-0400.avif", "2026-10-24T01:09:00Z"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if store.lastFile == nil || store.lastFile.ContentType != "image/avif" {
+		t.Fatalf("put = %+v", store.lastFile)
+	}
+	if row, ok := rows.rows[screenRowKey(timelapsefiles.Screenshot, "pixel11pro", at, 1)]; !ok || row.MimeType != "image/avif" {
+		t.Fatalf("rows = %+v", rows.rows)
+	}
+	rec = postScreenTimelapse(t, svc, []byte("gzip-bytes"), screenParams("pixel11pro", "phone-ax-2026-10-23_21-09-00-0400.xml.gz", "2026-10-24T01:09:00Z"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tree status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if row, ok := rows.rows[screenRowKey(timelapsefiles.AccessibilityTree, "pixel11pro", at, 0)]; !ok || row.MimeType != "application/gzip" {
+		t.Fatalf("rows = %+v", rows.rows)
+	}
+}
+
 func TestScreenTimelapseIngestAnswersAResendFromTheRowWithoutTouchingStorage(t *testing.T) {
 	rows := &fakeScreenTimelapseRows{}
 	svc, store := screenTimelapseTestService(rows)
@@ -169,6 +192,8 @@ func TestScreenTimelapseIngestRefusesWhatItCannotPlace(t *testing.T) {
 		// The client resolves the stamp in its own zone; an instant more than
 		// a day away from the stamp is a bug, not a timezone.
 		"captured_at far from the stamp": screenParams("joltik", "phone-screenshot-2026-10-18_22-39-13.png", "2026-10-25T02:39:13Z"),
+		// A stamp that carries its offset names exactly one instant.
+		"captured_at off an offset stamp": screenParams("pixel11pro", "phone-screenshot-2026-10-23_21-09-00-0400.avif", "2026-10-23T21:09:00Z"),
 	}
 	for name, params := range cases {
 		rows := &fakeScreenTimelapseRows{}

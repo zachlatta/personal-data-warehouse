@@ -135,8 +135,9 @@ revisits of one page within 30 minutes; query `base_*` for every visit.
 ## Screen timelapse (what was on a screen)
 
 A periodic image of a device's whole screen, about once a minute while it is unlocked and
-in use: `device` `crobat` (the Mac) and `joltik` (the iPhone, captured only while it shares
-a network with a Mac). `base_screen_timelapse.screenshots` is one row per image: `device`,
+in use: `device` `crobat` (the Mac), `pixel11pro` (the Android phone, from 2026-10-23;
+AVIF frames, sent when it is on Wi-Fi, so they can land hours late) and `joltik` (the
+iPhone before it). `base_screen_timelapse.screenshots` is one row per image: `device`,
 `captured_at`, `display_index` (a two-display Mac writes two per moment), `mime_type`,
 `storage_file_id`. `base_screen_timelapse.accessibility_trees` is the accessibility tree of
 the same moment, when the loop could read one; join on `(device, captured_at)`, and expect

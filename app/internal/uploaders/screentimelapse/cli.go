@@ -40,6 +40,7 @@ ENVIRONMENT
                              hostname = ~/Pictures/Screenshots/periodic).
                              crobat: crobat=~/Pictures/Screenshots/periodic,
                              joltik=~/Pictures/PhoneScreenshots/joltik
+                             porygon: pixel11pro=~/Pictures/PhoneScreenshots/pixel11pro
   PDW_INGEST_PROJECT_DIR     Directory whose .env is loaded (default: current directory).
 `
 

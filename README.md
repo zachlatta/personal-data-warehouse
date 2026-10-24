@@ -473,7 +473,9 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 every 5 minutes) sends the periodic whole-screen captures the capture loops in the sysadmin
 repository write -- one image per display about once a minute, plus the accessibility tree of the
 same moment when there is one -- to `/ingest/screen-timelapse/file`, one file per request, newest
-first. The app stores the bytes in the object store and writes the row into
+first. The Android phone (`pixel11pro`) captures itself; porygon pulls its frames while the phone is
+on Wi-Fi and encodes them to AVIF before this uploader sends them. The app stores the bytes in the
+object store and writes the row into
 `base_screen_timelapse.screenshots` or `base_screen_timelapse.accessibility_trees` in the same
 request. One timeline adapter (`screen_capture`, source `screen_timelapse`, tier `noise`) carries one
 event per capture moment; see

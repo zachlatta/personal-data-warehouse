@@ -414,8 +414,9 @@ SQL starting points: `base_browser_history.visits`; timeline `source = 'browser_
 The screen timelapse is a periodic image of a device's whole screen, about once a minute while
 it is unlocked and in use, plus the accessibility tree of the same moment when the capture loop
 could read one. The **capture** belongs to the sysadmin repository
-(`scripts/periodic-screenshot-*` for the Mac, `crobat/phone-capture/` for the iPhone); this
-repository only **uploads** what those loops wrote:
+(`scripts/periodic-screenshot-*` for the Mac, `crobat/phone-capture/` for the iPhone,
+`scripts/pixel-screen-timelapse-*` for the Android phone); this repository only **uploads**
+what those loops wrote:
 
 - LaunchAgent label: `com.zachlatta.personal-data-warehouse.screen-timelapse-upload`
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.screen-timelapse-upload.plist`
@@ -429,15 +430,21 @@ repository only **uploads** what those loops wrote:
 `device=folder` pairs; the device is the screen's, never the uploading host's, because the Mac
 that images the phone uploads the phone's frames too. On crobat:
 `SCREEN_TIMELAPSE_SOURCES=crobat=~/Pictures/Screenshots/periodic,joltik=~/Pictures/PhoneScreenshots/joltik`.
-On porygon (it images the phone on the office network): `joltik=~/Pictures/PhoneScreenshots/joltik`.
+On porygon (it imaged the iPhone on the office network, and pulls the Android phone's frames):
+`joltik=~/Pictures/PhoneScreenshots/joltik,pixel11pro=~/Pictures/PhoneScreenshots/pixel11pro`.
 Unset, it is `<short hostname>=~/Pictures/Screenshots/periodic`.
 
 **What a file is.** The name is all the metadata (`app/internal/timelapsefiles`):
 `periodic-screenshot-<stamp>-display-<n>.heic` (a pre-2026-05-23 single-display frame has no
 `-display-<n>`), `periodic-screenshot-<stamp>.ax.json.gz`, `phone-screenshot-<stamp>.png` and
-`phone-ax-<stamp>.json`. The stamp is the capture host's local wall time with no zone; the
-uploader resolves it in the host's zone, and in the repeated fall-back hour picks the instant
-nearest the file's mtime (birth time reads 1969 on these files). A screenshot and the tree of
+`phone-ax-<stamp>.json` for the iPhone, and `phone-screenshot-<stamp>.avif` and
+`phone-ax-<stamp>.xml.gz` (gzipped `uiautomator dump`) for the Android phone. The stamp is the
+capture host's local wall time; the uploader resolves it in the host's zone, and in the repeated
+fall-back hour picks the instant nearest the file's mtime (birth time reads 1969 on these files).
+A stamp may end in its UTC offset (`2026-10-23_21-09-00-0400`), and then it names exactly that
+instant whatever the uploader's zone: the Android phone writes one because porygon uploads its
+frames, and the phone travels while porygon does not. The app refuses a `captured_at` that
+disagrees with an offset stamp. A screenshot and the tree of
 its moment share the stamp, so they share `(device, captured_at)`, which is the whole link
 between the two tables. Anything else in the folder (`.tmp`, a not-yet-gzipped `.ax.json`) is
 ignored, and a file younger than two minutes waits for the next run.
@@ -470,6 +477,16 @@ launchctl bootout gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-time
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.screen-timelapse-upload.plist
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-timelapse-upload
 ```
+
+**The Android phone (`pixel11pro`) captures itself.** A root Magisk module on the phone writes a
+PNG and the tree about once a minute while the screen is on and past the keyguard; porygon's
+`com.zrl.pixel-screen-timelapse-pull` (every 2 minutes) copies them over Tailscale SSH **only while
+the phone's default network is Wi-Fi**, encodes each PNG to AVIF (`avifenc -q 60 -s 6`: a
+328 KB frame became 61 KB with the text visually identical, against 132 KB for lossy WebP and
+82 KB for lossless), places it in `~/Pictures/PhoneScreenshots/pixel11pro` with the phone's
+mtime, and deletes it on the phone. This uploader then sends that folder like any other. The
+phone runs no `pdw`: Go on Android reads `time.Local` as UTC and needs cgo for DNS. Setup,
+switches and rollback: `pixel11pro/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
 SQL starting points: `base_screen_timelapse.screenshots` and
 `base_screen_timelapse.accessibility_trees` (join on `device, captured_at`); timeline
