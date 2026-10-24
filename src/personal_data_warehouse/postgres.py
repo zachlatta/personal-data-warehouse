@@ -18260,6 +18260,19 @@ class PostgresWarehouse:
                     g.is_deleted,
                     NULLIF(g.ingested_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS ingested_at
                 FROM @google_recorder_recordings g
+                -- The Pixel's Recorder library also holds Zach's iPhone memos,
+                -- copied over in the 2026-10-23 phone migration: 226 files
+                -- byte-identical to rows already in apple_voice_memos_files.
+                -- They were transcribed a second time (about 100 hours of
+                -- paid audio) and would show up twice on the timeline. The
+                -- iPhone row is the original; a Pixel row with the same bytes
+                -- is the same recording, not a new one.
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM @apple_voice_memos_files f
+                    WHERE f.content_sha256 = g.content_sha256
+                      AND g.content_sha256 <> ''
+                )
                 UNION ALL
                 SELECT * FROM (
                 -- Audio recorded or saved inside Apple Notes (call recordings,

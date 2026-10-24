@@ -446,6 +446,47 @@ def test_voice_memo_mart_is_one_row_per_recording_across_both_sources(
     ]
 
 
+def test_voice_memo_mart_drops_a_pixel_copy_of_an_iphone_memo(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The Pixel's Recorder library holds the iPhone memos copied over in the
+    phone migration. A Pixel file with the same bytes as an iPhone memo is the
+    same recording: it must not be transcribed again or land twice."""
+    _seed_voice_memos(warehouse)
+    warehouse.insert_google_recorder_recordings(
+        [
+            _row(
+                GOOGLE_RECORDER_RECORDING_COLUMNS,
+                table="google_recorder_recordings",
+                account="zach",
+                recording_id="pixel-copy-of-rec-1",
+                device="pichu",
+                title="Copied from the iPhone",
+                recorded_at=TS,
+                duration_seconds=60,
+                filename="rec-1.m4a",
+                extension=".m4a",
+                content_type="audio/mp4",
+                size_bytes=1000,
+                content_sha256="sha-1",
+                storage_backend="google_drive",
+                storage_file_id="drive-pixel-copy",
+                raw_metadata_json="{}",
+                ingested_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    rows = _dicts(warehouse, "marts_voice_memos_recordings", "source, recording_id")
+
+    assert [(row["source"], row["recording_id"]) for row in rows] == [
+        ("alice_voice_recordings", "alice-1"),
+        ("apple_voice_memos", "rec-1"),
+        ("apple_voice_memos", "rec-2"),
+        ("google_recorder", "pixel-1"),
+    ]
+
+
 def test_voice_memo_mart_carries_a_pixel_recording_like_any_other(
     warehouse: PostgresWarehouse,
 ) -> None:
