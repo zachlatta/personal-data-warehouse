@@ -4,7 +4,7 @@
 // <video>. Both run in a WebView, which the installed app already has, so
 // this ships as an over-the-air update.
 
-import type { FeedMedia } from './rich';
+import type { FeedEmbed, FeedMedia } from './rich';
 
 export type VideoSource =
   | { kind: 'youtube'; id: string; start?: number; poster: string; url: string }
@@ -98,6 +98,28 @@ export function cardVideo(item: { url?: string; media?: FeedMedia[]; image_url?:
   return null;
 }
 
+/**
+ * The player key a feed card's video plays under, or null when the card has
+ * none to play in place. These match the keys feed-card gives its players: the
+ * card's own video or an X post's lone video is the item id; a quoted post's
+ * lone video is item id + ":quote".
+ */
+export function autoplayKey(item: {
+  item_id: string;
+  url?: string;
+  media?: FeedMedia[];
+  image_url?: string;
+  embed?: FeedEmbed;
+}): string | null {
+  const embed = item.embed?.type === 'x_post' ? item.embed : undefined;
+  if (embed) {
+    if (embed.media?.length === 1 && mediaVideo(embed.media[0])) return item.item_id;
+    if (embed.quote?.media?.length === 1 && mediaVideo(embed.quote.media[0])) return `${item.item_id}:quote`;
+    return null;
+  }
+  return cardVideo(item) ? item.item_id : null;
+}
+
 function escapeAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
@@ -109,26 +131,32 @@ export const EMBED_BASE_URL = 'https://pdw.zachlatta.com/';
 
 /** The page the WebView loads to play a source, starting at once. */
 // X's video host (video.twimg.com) refuses a request with a foreign
-// referrer (403), so a file plays with none.
-export function playerHtml(src: VideoSource): string {
+// referrer (403), so a file plays with none. muted is the autoplay a
+// scroll starts, as X and Instagram do: sound off until he turns it on.
+// The page is transparent until the video draws, so the app's poster and
+// spinner show through while it loads, and it posts "playing" once it does.
+export function playerHtml(src: VideoSource, { muted = false }: { muted?: boolean } = {}): string {
   const head =
     '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">' +
     (src.kind === 'file' ? '<meta name="referrer" content="no-referrer">' : '') +
-    '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}iframe,video{position:fixed;inset:0;width:100%;height:100%;border:0}</style>' +
+    '<style>html,body{margin:0;height:100%;background:transparent;overflow:hidden}iframe,video{position:fixed;inset:0;width:100%;height:100%;border:0}</style>' +
     '</head><body>';
   let player: string;
   if (src.kind === 'youtube') {
-    const q = `autoplay=1&playsinline=1&rel=0&modestbranding=1${src.start ? `&start=${src.start}` : ''}`;
+    const q = `autoplay=1&playsinline=1&rel=0&modestbranding=1${muted ? '&mute=1' : ''}${src.start ? `&start=${src.start}` : ''}`;
     player =
       `<iframe src="https://www.youtube.com/embed/${src.id}?${q}" referrerpolicy="strict-origin-when-cross-origin" ` +
       'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>';
   } else if (src.kind === 'vimeo') {
     player =
-      `<iframe src="https://player.vimeo.com/video/${src.id}?autoplay=1&playsinline=1" ` +
+      `<iframe src="https://player.vimeo.com/video/${src.id}?autoplay=1&playsinline=1${muted ? '&muted=1' : ''}" ` +
       'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>';
   } else {
     const poster = src.poster ? ` poster="${escapeAttr(src.poster)}"` : '';
-    player = `<video src="${escapeAttr(src.url)}"${poster} controls autoplay playsinline></video>`;
+    player =
+      `<video src="${escapeAttr(src.url)}"${poster} controls autoplay playsinline preload="auto"${muted ? ' muted' : ''}></video>` +
+      '<script>var v=document.querySelector("video");v.addEventListener("playing",function(){v.style.background="#000";' +
+      'window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});</script>';
   }
   return `${head}${player}</body></html>`;
 }

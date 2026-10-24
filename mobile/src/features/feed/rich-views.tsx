@@ -40,6 +40,8 @@ export type MediaAction = {
   action: 'swipe' | 'play' | 'stop' | 'view' | 'view_swipe' | 'share' | 'zoom' | 'view_close';
   index: number;
   inline?: boolean;
+  // A play the feed started because the card scrolled into view.
+  auto?: boolean;
   url?: string;
   dwellMs?: number;
 };
@@ -211,7 +213,7 @@ export function MediaGrid({
         aspect={mediaAspect(media[0], 16 / 9)}
         durationSec={media[0].duration_sec}
         radius={16}
-        onPlay={() => onMedia({ action: 'play', index: 0, inline: true })}
+        onPlay={(auto) => onMedia({ action: 'play', index: 0, inline: true, auto })}
         onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
       />
     );
@@ -295,7 +297,7 @@ export function MediaCarousel({
           aspect={mediaAspect(media[0], 16 / 9)}
           durationSec={media[0].duration_sec}
           radius={radius}
-          onPlay={() => onMedia({ action: 'play', index: 0, inline: true })}
+          onPlay={(auto) => onMedia({ action: 'play', index: 0, inline: true, auto })}
           onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
         />
       </View>

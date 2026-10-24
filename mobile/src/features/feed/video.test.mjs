@@ -65,8 +65,26 @@ test('the player page autoplays inline and escapes a file url', () => {
   assert.match(yt, /start=90/);
   assert.match(yt, /referrerpolicy="strict-origin-when-cross-origin"/);
   const file = playerHtml({ kind: 'file', url: 'https://e.com/a.mp4?x=1&y="2"' });
-  assert.match(file, /<video src="https:\/\/e\.com\/a\.mp4\?x=1&amp;y=&quot;2&quot;" controls autoplay playsinline>/);
+  assert.match(file, /<video src="https:\/\/e\.com\/a\.mp4\?x=1&amp;y=&quot;2&quot;" controls autoplay playsinline preload="auto">/);
   // X's video host refuses a foreign referrer; YouTube needs one.
   assert.match(file, /<meta name="referrer" content="no-referrer">/);
   assert.doesNotMatch(yt, /no-referrer/);
+});
+
+test('autoplayKey matches the key the card gives its player', async () => {
+  const { autoplayKey } = await import('./video.ts');
+  const clip = { type: 'video', url: 'https://video.twimg.com/amplify_video/1/vid/avc1/1280x720/x.mp4?tag=29' };
+  assert.equal(autoplayKey({ item_id: 'x1', embed: { type: 'x_post', media: [clip] } }), 'x1');
+  assert.equal(autoplayKey({ item_id: 'x2', embed: { type: 'x_post', media: [], quote: { type: 'x_post', media: [clip] } } }), 'x2:quote');
+  assert.equal(autoplayKey({ item_id: 'x3', embed: { type: 'x_post', media: [clip, clip] } }), null);
+  assert.equal(autoplayKey({ item_id: 'y1', url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }), 'y1');
+  assert.equal(autoplayKey({ item_id: 'p1', url: 'https://example.com/post', image_url: 'https://example.com/a.jpg' }), null);
+});
+
+test('an autoplayed player is muted', async () => {
+  const { playerHtml } = await import('./video.ts');
+  const file = { kind: 'file', url: 'https://video.twimg.com/a.mp4' };
+  assert.match(playerHtml(file, { muted: true }), /<video[^>]* muted/);
+  assert.doesNotMatch(playerHtml(file), /<video[^>]* muted/);
+  assert.match(playerHtml({ kind: 'youtube', id: 'dQw4w9WgXcQ', poster: '', url: '' }, { muted: true }), /mute=1/);
 });

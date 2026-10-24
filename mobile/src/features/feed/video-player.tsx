@@ -1,8 +1,8 @@
 import { Image } from 'expo-image';
 import { useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
 import { Icon } from '@/components/icon';
@@ -15,12 +15,40 @@ import { EMBED_BASE_URL, playerHtml, type VideoSource } from './video';
 
 // One video plays at a time: starting another stops the last, as in X and
 // Instagram. The playing player's key, shared by the feed and detail view.
+// autoplayed: the feed started it on a scroll (muted), not a tap.
 let playing: string | null = null;
+let autoplayed = false;
 const listeners = new Set<() => void>();
-function setPlaying(key: string | null) {
+function setPlaying(key: string | null, auto = false) {
   if (playing === key) return;
   playing = key;
+  autoplayed = auto;
   for (const l of listeners) l();
+}
+
+/** The key of the video playing now, if any. */
+export function playingVideo(): string | null {
+  return playing;
+}
+
+/**
+ * Plays a video because its card scrolled into view (Zach, voice memo
+ * 2026-10-24: "I want videos to start autoplaying when I pass them, just
+ * like on the better feeds"), muted; null stops whatever plays.
+ */
+export function autoplayVideo(key: string | null) {
+  setPlaying(key, key !== null);
+}
+
+// Android's WebView engine starts cold, which made the first video take
+// seconds to begin. The feed mounts this empty one up front so that cost is
+// paid before a video needs it.
+export function VideoWarmup() {
+  return (
+    <View style={styles.warmup} pointerEvents="none">
+      <WebView source={{ html: '<html></html>' }} style={styles.warmup} />
+    </View>
+  );
 }
 function subscribe(l: () => void) {
   listeners.add(l);
@@ -30,8 +58,9 @@ function subscribe(l: () => void) {
 const LABEL: Record<VideoSource['kind'], string> = { youtube: 'YouTube', vimeo: 'Vimeo', file: '' };
 
 // A video that plays inside the card: the poster with a play button, then,
-// on a tap, the site's own player (YouTube, Vimeo) or the file itself, in
-// place. onPlay fires on the tap; onStop with the watch time (active time:
+// on a tap or when the feed autoplays it, the site's own player (YouTube,
+// Vimeo) or the file itself, in place, over the poster and a spinner until it
+// draws. onPlay fires when it starts (auto when the feed started it); onStop with the watch time (active time:
 // not while the app is in the background) when it stops
 // (another video started, the card scrolled away or the screen changed).
 export function InlineVideo({
@@ -48,21 +77,32 @@ export function InlineVideo({
   aspect?: number;
   durationSec?: number;
   radius?: number;
-  onPlay: () => void;
+  onPlay: (auto: boolean) => void;
   onStop: (watchedMs: number) => void;
 }) {
   const theme = useTheme();
   const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
+  const [drawn, setDrawn] = useState(false);
   const stopRef = useRef(onStop);
+  const playRef = useRef(onPlay);
   useEffect(() => {
     stopRef.current = onStop;
-  }, [onStop]);
+    playRef.current = onPlay;
+  }, [onStop, onPlay]);
 
+  // A tap reports its play itself; an autoplay is reported here.
   useEffect(() => {
     if (!active) return undefined;
+    if (autoplayed) playRef.current(true);
     const stop = startTimer(true);
-    return () => stopRef.current(stop().dwell_ms);
+    return () => {
+      setDrawn(false);
+      stopRef.current(stop().dwell_ms);
+    };
   }, [active]);
+  // Muted is fixed when the player starts: an autoplay stays muted until he
+  // turns the sound on in the player.
+  const html = useMemo(() => (active ? playerHtml(source, { muted: autoplayed }) : ''), [active, source]);
 
   // Off screen (a detail view opened, another tab) stops it.
   useFocusEffect(
@@ -84,8 +124,14 @@ export function InlineVideo({
   if (active) {
     return (
       <View style={[frame, styles.black]}>
+        {source.poster ? <Image source={{ uri: source.poster }} style={StyleSheet.absoluteFill} contentFit="cover" recyclingKey={playerKey} /> : null}
+        {!drawn ? (
+          <View style={styles.center} pointerEvents="none">
+            <ActivityIndicator color="#fff" size="large" />
+          </View>
+        ) : null}
         <WebView
-          source={{ html: playerHtml(source), baseUrl: EMBED_BASE_URL }}
+          source={{ html, baseUrl: EMBED_BASE_URL }}
           originWhitelist={['*']}
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
@@ -93,7 +139,12 @@ export function InlineVideo({
           allowsPictureInPictureMediaPlayback
           scrollEnabled={false}
           bounces={false}
-          style={styles.black}
+          style={styles.clear}
+          containerStyle={styles.clear}
+          // A file says when it draws; a YouTube or Vimeo page draws its own
+          // poster as soon as it loads.
+          onMessage={(e) => e.nativeEvent.data === 'playing' && setDrawn(true)}
+          onLoadEnd={() => source.kind !== 'file' && setDrawn(true)}
           onShouldStartLoadWithRequest={(req) => {
             // The player page and everything inside it load here; a tap
             // that leaves the player (the YouTube logo) opens the browser.
@@ -111,7 +162,7 @@ export function InlineVideo({
       style={frame}
       onPress={() => {
         setPlaying(playerKey);
-        onPlay();
+        onPlay(false);
       }}
       accessibilityRole="button"
       accessibilityLabel="Play video">
@@ -137,6 +188,8 @@ export function InlineVideo({
 const styles = StyleSheet.create({
   frame: { width: '100%', overflow: 'hidden' },
   black: { flex: 1, backgroundColor: '#000' },
+  clear: { flex: 1, backgroundColor: 'transparent' },
+  warmup: { position: 'absolute', width: 1, height: 1, opacity: 0 },
   center: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' },
   play: { width: 56, height: 56, borderRadius: 28, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', paddingLeft: 3 },
   badge: { position: 'absolute', left: 8, bottom: 8, backgroundColor: 'rgba(0,0,0,0.7)', borderRadius: 4, paddingHorizontal: 6, paddingVertical: 1 },

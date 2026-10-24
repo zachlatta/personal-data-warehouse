@@ -47,8 +47,11 @@ import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { mailtoUrl, shareDraft } from './share';
+import { autoplayStep } from './autoplay';
 import { openTrackedBrowser } from './tracked-browser';
-import { layoutsFromHeights, ViewabilityTracker, type Impression } from './viewability';
+import { autoplayKey } from './video';
+import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
+import { layoutsFromHeights, ViewabilityTracker, visibleFraction, type Impression } from './viewability';
 
 // Reload on return to the tab after this long away.
 const STALE_MS = 10 * 60_000;
@@ -115,6 +118,10 @@ export default function FeedScreen() {
   const heights = useRef(new Map<string, number>());
   const viewport = useRef({ top: 0, height: 0 });
   const ids = useRef<string[]>([]);
+  // Cards with a video to autoplay (item id -> player key), and the one
+  // that has the focus.
+  const videoKeys = useRef(new Map<string, string>());
+  const videoFocus = useRef<string | null>(null);
   const focused = useRef(false);
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
@@ -122,6 +129,12 @@ export default function FeedScreen() {
 
   useLayoutEffect(() => {
     ids.current = shown.map((i) => i.item_id);
+    videoKeys.current = new Map(
+      shown.flatMap((i) => {
+        const key = autoplayKey(i);
+        return key ? [[i.item_id, key] as const] : [];
+      }),
+    );
     view.current = viewName(only);
     endLogged.current = false;
   }, [shown, only]);
@@ -143,10 +156,17 @@ export default function FeedScreen() {
     if (!focused.current || AppState.currentState !== 'active' || viewport.current.height === 0) return;
     const layouts = layoutsFromHeights(ids.current, heights.current, headerHeight.current);
     recordImpressions(tracker.current.update(Date.now(), viewport.current, layouts, activeNow()));
+    const fractions = new Map([...layouts].map(([id, l]) => [id, visibleFraction(l, viewport.current)]));
+    const step = autoplayStep(fractions, videoKeys.current, videoFocus.current, playingVideo());
+    videoFocus.current = step.focused;
+    if (step.play !== undefined) autoplayVideo(step.play);
   }, [recordImpressions]);
 
+  // Leaving the screen stops the video (InlineVideo does); coming back
+  // starts the one in view again.
   const pause = useCallback(() => {
     recordImpressions(tracker.current.flush(Date.now(), activeNow()));
+    videoFocus.current = null;
   }, [recordImpressions]);
 
   // trigger: first (the tab's first load), stale (back after STALE_MS) or
@@ -375,7 +395,7 @@ export default function FeedScreen() {
         item_id: item.item_id,
         position: position(item),
         dwell_ms: a.dwellMs,
-        metadata: { action: a.action, index: a.index, ...(a.inline ? { inline: true } : {}) },
+        metadata: { action: a.action, index: a.index, ...(a.inline ? { inline: true } : {}), ...(a.auto ? { autoplay: true } : {}) },
       });
       if (a.action !== 'play' || !a.url || a.inline) return;
       pause();
@@ -523,6 +543,7 @@ export default function FeedScreen() {
 
   return (
     <ThemedView style={styles.fill} onTouchStart={markActive}>
+      <VideoWarmup />
       <FlatList
         ref={list}
         data={shown}

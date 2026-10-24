@@ -278,7 +278,7 @@ function FeedCardImpl({
                   playerKey={item.item_id}
                   aspect={video.kind === 'file' ? 1 : 16 / 9}
                   durationSec={media.find((m) => m.type !== 'image')?.duration_sec}
-                  onPlay={() => reportMedia({ action: 'play', index: 0, inline: true })}
+                  onPlay={(auto) => reportMedia({ action: 'play', index: 0, inline: true, auto })}
                   onStop={(ms) => reportMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
                 />
               </View>
