@@ -178,7 +178,7 @@ Read the file for the area you are changing before you change it.
 | reviewed writes (Notes, Contacts), the phone app (Android and iOS) and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
 | access tokens beside `PDW_SECRET_TOKEN`, `pdw token`, the `cli_authorize` bootstrap | [docs/agents/access-tokens.md](docs/agents/access-tokens.md) |
 | the Feed tab: `pdw feed`, engagement logging, how to remove it | [docs/feed.md](docs/feed.md) |
-| WhatsApp, Hacker News, GitHub, shared attachment enrichment | [docs/agents/other-sources.md](docs/agents/other-sources.md) |
+| WhatsApp, Hacker News, GitHub, Android notifications, shared attachment enrichment | [docs/agents/other-sources.md](docs/agents/other-sources.md) |
 
 ## The agent guide
 

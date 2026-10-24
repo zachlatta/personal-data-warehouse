@@ -192,6 +192,7 @@ def test_search_text_includes_agent_session_branches(warehouse) -> None:
     warehouse.ensure_hacker_news_tables()
     warehouse.ensure_github_tables()
     warehouse.ensure_browser_history_tables()
+    warehouse.ensure_android_notifications_tables()
     warehouse.ensure_screen_timelapse_tables()
     warehouse.ensure_simplefin_tables()
     warehouse.ensure_finance_tables()

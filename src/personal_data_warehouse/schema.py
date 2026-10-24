@@ -3286,6 +3286,78 @@ BROWSER_HISTORY_VISIT_COLUMNS = (
 )
 
 
+# --- Android notifications -------------------------------------------------
+#
+# One row per notification event on an Android phone, written by the PDW
+# notification listener (ops/android/pdw-notification-listener) and shipped
+# by `pdw ingest android-notifications`. `event_id` is the listener's uuid
+# for the event. A notification is one `notification_key` (Android's own
+# key: user, package, id, tag); its events are `posted` (new, or an update
+# whose visible content changed), `removed`, and `active` (already showing
+# when the listener connected).
+ANDROID_NOTIFICATION_EVENT_COLUMNS = (
+    "account",
+    "device",
+    "event_id",
+    # posted / removed / active
+    "event_type",
+    # When the listener saw the event.
+    "event_at",
+    "notification_key",
+    "package_name",
+    # The app's name on the phone ("Messages"), '' when it has none.
+    "app_label",
+    "notification_id",
+    "notification_tag",
+    # Android user (0 is the owner).
+    "user_id",
+    # StatusBarNotification.getPostTime: when Android posted this version.
+    "posted_at",
+    # Notification.when: the time the app put on it (a message's time).
+    "notification_when_at",
+    "channel_id",
+    "channel_name",
+    # Android's category (msg, email, call, alarm, event, transport, ...).
+    "category",
+    "group_key",
+    "sort_key",
+    # The channel's importance when it arrived (0 none ... 4 high).
+    "importance",
+    "is_group_summary",
+    # 1 for an ongoing notification (media, VPN, a foreground service).
+    "is_ongoing",
+    "is_clearable",
+    "is_conversation",
+    "is_group_conversation",
+    "flags",
+    "visibility",
+    "title",
+    "text",
+    "sub_text",
+    "big_text",
+    "info_text",
+    "summary_text",
+    "conversation_title",
+    # Inbox-style lines, a messaging-style thread ({sender, text, time_ms}),
+    # the people named, and the action button labels.
+    "text_lines",
+    "messages",
+    "people",
+    "actions",
+    # For a `removed` event: Android's reason code and its name (click,
+    # cancel, cancel_all, app_cancel, ...); 0 and '' otherwise.
+    "removal_reason",
+    "removal_reason_name",
+    # The listener's sha of the visible content; equal shas are the same text.
+    "content_sha256",
+    # The listener's whole event, including every string extra.
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+
 # --- Screen timelapse ---------------------------------------------------------
 #
 # A periodic image of a device's whole screen and, when the capture loop could

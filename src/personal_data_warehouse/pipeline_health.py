@@ -792,6 +792,26 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("google_recorder"),
     ),
     _source(
+        "android_notifications",
+        "Android notifications (Pixel)",
+        cadence="uploader within ~30 s of each notification, every 5 min as the floor",
+        transport=(
+            "pichu notification listener → spool → Magisk service → pdw ingest"
+            " android-notifications → /ingest/android-notifications/batch → Drive inbox → Dagster"
+        ),
+        data=DAY,
+        basis=(
+            "a phone in daily use receives notifications every few hours at the"
+            " least (the first capture on 2026-10-24 found 13 already showing),"
+            " so a day without one is the phone off or the listener disconnected."
+            " The run heartbeat is the tight detector: it fails when the phone"
+            " cannot reach the app"
+        ),
+        note="run heartbeat posted by bin/android-notifications-upload-android on the phone",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_notifications"),
+    ),
+    _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
@@ -1626,6 +1646,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # Alice
     "alice_voice_recordings": _data("alice_voice_recordings", "ingested_at", "recorded_at"),
     "google_recorder_recordings": _data("google_recorder", "ingested_at", "recorded_at"),
+    # Android notifications
+    "android_notification_events": _data("android_notifications", "synced_at", "event_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

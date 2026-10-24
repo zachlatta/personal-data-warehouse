@@ -470,6 +470,19 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 `browser_history`, tier `self`) carry page views and web searches only; see
 [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md#local-browser-history-upload-scheduler).
 
+## Android Notification Sync
+
+Every notification the Android phone (`pichu`) posts or removes reaches
+`base_android_notifications.events`. The PDW notification listener
+(`ops/android/pdw-notification-listener`, an APK with notification access and no UI) writes one
+JSON file per event into its spool; `pdw ingest android-notifications`, run as root on the phone by
+the `pdw-android-notifications` Magisk service, posts the spool to
+`/ingest/android-notifications/batch` within seconds and deletes what was stored. Dagster's
+`android_notifications_drive_inbox_sensor` promotes the batches. Two timeline adapters
+(`android_notification`, `android_notification_opened`; source `android_notifications`) carry each
+notification's first appearance with each content and the taps that opened one; see
+[docs/agents/other-sources.md](docs/agents/other-sources.md#android-notifications).
+
 ## Screen Timelapse Sync
 
 `pdw ingest screen-timelapse` (LaunchAgent `com.zachlatta.personal-data-warehouse.screen-timelapse-upload`,

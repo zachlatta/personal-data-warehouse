@@ -198,8 +198,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// in the frames where a device was in use, added the marts_screen_timelapse
 	// schema line naming it and two relation lines ("Screens in use.", "Frame
 	// readings."): 10193. 10200 is those three lines and no more.
-	if guidance > 10200 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10200)", guidance)
+	//
+	// 2026-10-24: Android notifications from the Pixel added the
+	// base_android_notifications schema line ("Phone notifications.") and its
+	// raw table ("START HERE for phone notifications."): 10235. 10240 is those
+	// two lines and no more.
+	if guidance > 10240 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10240)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

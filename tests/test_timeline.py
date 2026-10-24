@@ -84,6 +84,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_hacker_news_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
+    wh.ensure_android_notifications_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -1291,6 +1292,50 @@ def _seed_github(wh) -> None:
         ]
     )
 
+    # Android notifications: a message and its update, a re-post of the same
+    # text, a group summary, a media notification, a promotion, the tap that
+    # opened the message and the swipe that dismissed the promotion.
+    def _notification(event_id, key, hours_ago, **overrides):
+        row = {
+            "account": "zach@example.com", "device": "testphone", "event_id": event_id,
+            "event_type": "posted", "event_at": _NOW - timedelta(hours=hours_ago),
+            "notification_key": key, "package_name": "com.example.chat", "app_label": "Chat",
+            "notification_id": 1, "notification_tag": "", "user_id": "0",
+            "posted_at": _NOW - timedelta(hours=hours_ago),
+            "notification_when_at": _NOW - timedelta(hours=hours_ago),
+            "channel_id": "messages", "channel_name": "Messages", "category": "msg",
+            "group_key": "", "sort_key": "", "importance": 4, "is_group_summary": 0,
+            "is_ongoing": 0, "is_clearable": 1, "is_conversation": 1, "is_group_conversation": 0,
+            "flags": 0, "visibility": 0, "title": "Alex Example", "text": "lunch?", "sub_text": "",
+            "big_text": "", "info_text": "", "summary_text": "", "conversation_title": "",
+            "text_lines": [], "messages": [{"sender": "Alex Example", "text": "lunch?", "time_ms": 0}],
+            "people": [], "actions": [], "removal_reason": 0, "removal_reason_name": "",
+            "content_sha256": "sha-lunch", "raw_json": {}, "exported_at": _NOW, "synced_at": _NOW,
+            "sync_version": 1,
+        }
+        row.update(overrides)
+        return row
+
+    wh.insert_android_notification_events(
+        [
+            _notification("n1", "k-chat", 3),
+            _notification("n2", "k-chat", 2.95),
+            _notification("n3", "k-chat", 2.9, text="lunch at noon?", content_sha256="sha-noon"),
+            _notification("n4", "k-summary", 2.9, is_group_summary=1, content_sha256="sha-summary"),
+            _notification("n5", "k-media", 2.8, package_name="com.example.music", app_label="Music",
+                          category="transport", is_ongoing=1, title="Some Song", text="Some Artist",
+                          messages=[], content_sha256="sha-song"),
+            _notification("n6", "k-promo", 2.7, package_name="com.example.shop", app_label="Shop",
+                          category="", title="Sale today", text="Everything 20% off", messages=[],
+                          content_sha256="sha-sale"),
+            _notification("n7", "k-chat", 2.6, event_type="removed", text="lunch at noon?",
+                          content_sha256="sha-noon", removal_reason=1, removal_reason_name="click"),
+            _notification("n8", "k-promo", 2.5, event_type="removed", package_name="com.example.shop",
+                          app_label="Shop", category="", title="Sale today", messages=[],
+                          content_sha256="sha-sale", removal_reason=2, removal_reason_name="cancel"),
+        ]
+    )
+
     # Screen timelapse: crobat's two displays at one moment, the moment's
     # tree, and one phone frame with no tree at all.
     for device, display, hours_ago, name in (
@@ -1365,6 +1410,9 @@ EXPECTED_SEEDED_PRIORITIES = {
     "github_event": "self",
     "browser_visit": "self",
     "browser_search": "self",
+    # The oldest seeded notification is the one-to-one message.
+    "android_notification": "direct",
+    "android_notification_opened": "self",
     # A frame of Zach's own screen is telemetry about him, the tier his own
     # health telemetry is in.
     "screen_capture": "noise",
@@ -1413,6 +1461,11 @@ EXPECTED_SEEDED_EVENTS = {
     # 4 (reload) stay in base_browser_history only.
     "browser_visit": 2,
     "browser_search": 1,
+    # The message, its update, the media and the promotion; the re-post of the
+    # same text and the group summary stay in base_android_notifications.
+    "android_notification": 4,
+    # The tap, not the swipe.
+    "android_notification_opened": 1,
     # One per capture moment: crobat's second display is the same moment.
     "screen_capture": 2,
     # two opens + dismiss; impression, close and the session rows stay in base_feed.
@@ -1604,6 +1657,19 @@ def test_backfill_normalizes_every_source(warehouse):
     assert browser["5"]["title"] == "Searched: synthetic query"
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
+    notifications = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "android_notifications"}
+    assert set(notifications) == {"n1", "n3", "n5", "n6", "n7"}
+    assert notifications["n1"]["kind"] == "notification"
+    assert notifications["n1"]["title"] == "Chat: Alex Example"
+    assert notifications["n1"]["actor"] == "Alex Example"
+    assert notifications["n1"]["priority"] == "direct"
+    assert "lunch at noon?" in notifications["n3"]["search_text"]
+    assert notifications["n5"]["priority"] == "background"
+    assert notifications["n6"]["priority"] == "noise"
+    assert notifications["n7"]["kind"] == "opened"
+    assert notifications["n7"]["title"] == "Opened: Chat: Alex Example"
+    assert notifications["n7"]["priority"] == "self"
+    assert notifications["n1"]["source_table"] == "android_notification_events"
     screens = {r["source_pk"]["device"]: r for r in rows if r["source"] == "screen_timelapse"}
     assert set(screens) == {"crobat", "joltik"}
     assert screens["crobat"]["kind"] == "screen_capture"

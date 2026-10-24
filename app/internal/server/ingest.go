@@ -91,6 +91,8 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	"screen_timelapse": {source: "screen_timelapse", blobKind: "screen_timelapse_screenshot", metadataKind: "screen_timelapse_accessibility_tree"},
 	// Google Recorder on the Pixel, sent by the phone's own uploader.
 	"google_recorder": {source: "google_recorder", blobKind: "google_recorder_audio", metadataKind: "google_recorder_metadata"},
+	// Every notification the Pixel posts or removes, from the phone's uploader.
+	"android_notifications": {source: "android_notifications", blobKind: "android_notification_blob", metadataKind: "android_notification_export_batch"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's
@@ -588,6 +590,7 @@ func ingestArtifacts() []ingestArtifact {
 		batch("/ingest/apple-contacts/batch", "apple_contacts", "apple-contacts/inbox", "apple_contact_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
 		batch("/ingest/browser-history/batch", "browser_history", "browser-history/inbox", "browser_history_export_batch"),
+		batch("/ingest/android-notifications/batch", "android_notifications", "android-notifications/inbox", "android_notification_export_batch"),
 		// --- muse: a workspace file whose bytes do not ride inline in a batch
 		{
 			endpoint: "/ingest/muse/file",

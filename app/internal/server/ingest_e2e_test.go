@@ -281,6 +281,12 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "browser_history_export_batch", "pdw_stage": "inbox", "pdw_source": "browser_history", "batch_sha256": sha(batchBody)},
 		},
 		{
+			name: "android-notifications/batch", endpoint: "/ingest/android-notifications/batch", body: batchBody,
+			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
+			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
+			wantProps: map[string]string{"pdw_kind": "android_notification_export_batch", "pdw_stage": "inbox", "pdw_source": "android_notifications", "batch_sha256": sha(batchBody)},
+		},
+		{
 			name: "apple-messages/batch", endpoint: "/ingest/apple-messages/batch", body: batchBody,
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
 			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
@@ -518,6 +524,9 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		}},
 		{"apple-contacts/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadAppleContactsBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"android-notifications/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadAndroidNotificationsBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
 		}},
 		{"browser-history/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadBrowserHistoryBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")

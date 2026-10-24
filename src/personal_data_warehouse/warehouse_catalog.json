@@ -335,6 +335,14 @@
       "comment": "Faithful browser history source data: Chrome, Brave and Safari visits."
     },
     {
+      "name": "base_android_notifications",
+      "layer": "base",
+      "domain": "android_notifications",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Phone notifications. Every notification the Android phone posts or removes, from the PDW notification listener."
+    },
+    {
       "name": "base_screen_timelapse",
       "layer": "base",
       "domain": "screen_timelapse",
@@ -3533,6 +3541,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "START HERE for web browsing. One row per Chrome/Brave/Safari visit; search_term is set on web searches."
+    },
+    {
+      "id": "android_notification_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_notifications",
+      "schema": "base_android_notifications",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for phone notifications. One row per posted, removed or already-showing notification; removal_reason_name 'click' is a tap."
     },
     {
       "id": "screen_timelapse_screenshots",

@@ -134,16 +134,17 @@ func (c Config) ObjectStoreEnabled() bool {
 // ingestSourceEnvInfix maps each ingestion source slug to the infix used in its
 // per-source folder override env var (PDW_INGEST_<INFIX>_FOLDER_ID).
 var ingestSourceEnvInfix = map[string]string{
-	"agent_sessions":    "AGENT_SESSIONS",
-	"apple_contacts":    "APPLE_CONTACTS",
-	"apple_messages":    "APPLE_MESSAGES",
-	"apple_voice_memos": "VOICE_MEMOS",
-	"apple_notes":       "APPLE_NOTES",
-	"google_recorder":   "GOOGLE_RECORDER",
-	"browser_history":   "BROWSER_HISTORY",
-	"photos":            "PHOTOS",
-	"manual_finance":    "MANUAL_FINANCE",
-	"screen_timelapse":  "SCREEN_TIMELAPSE",
+	"agent_sessions":        "AGENT_SESSIONS",
+	"apple_contacts":        "APPLE_CONTACTS",
+	"apple_messages":        "APPLE_MESSAGES",
+	"apple_voice_memos":     "VOICE_MEMOS",
+	"apple_notes":           "APPLE_NOTES",
+	"google_recorder":       "GOOGLE_RECORDER",
+	"browser_history":       "BROWSER_HISTORY",
+	"android_notifications": "ANDROID_NOTIFICATIONS",
+	"photos":                "PHOTOS",
+	"manual_finance":        "MANUAL_FINANCE",
+	"screen_timelapse":      "SCREEN_TIMELAPSE",
 }
 
 // IngestEnabled reports whether the app can accept client uploads: it needs the

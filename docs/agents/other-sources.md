@@ -1,4 +1,4 @@
-# WhatsApp, Hacker News and shared attachment enrichment
+# WhatsApp, Hacker News, Android notifications and shared attachment enrichment
 
 Moved out of AGENTS.md on 2026-10-01 so the file every session loads holds only the
 contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md).
@@ -229,3 +229,48 @@ GitHub's notification emails in Gmail stay where they are; these rows are the re
 history lands as new rows, so the capture trigger skips any event older than three days
 (`notifications.py`). Without it, the first GitHub backfill would have paged for every old
 review on his PRs.
+
+## Android notifications
+
+Every notification the Android phone (`pichu`, the rooted Pixel) posts or removes lands in
+`base_android_notifications.events`, from 2026-10-24.
+
+- **The listener.** `ops/android/pdw-notification-listener` is a tiny APK
+  (`com.zachlatta.pdw.notifications`, no UI, no network permission) with one
+  `NotificationListenerService`. Built without Gradle by its `build.sh` (javac, d8, aapt2,
+  apksigner against platform 36; the signing key lives on the build host at
+  `~/.local/share/pdw-notification-listener/signing.p12`). The installer grants it access with
+  `cmd notification allow_listener`, so the Android "restricted setting" for sideloaded apps
+  never comes up, and the service re-grants it at every start.
+- **What it records.** One JSON file per event in its private `files/spool/` (written under
+  `.tmp/` and renamed, so a reader never sees half a file): `posted` for a new notification or
+  an update whose visible content changed (an update that changes nothing visible, such as a
+  progress tick, is dropped by an in-memory sha per key), `removed` with Android's reason code
+  and name, and `active` for what was showing when the listener connected, so a restart loses
+  nothing. Each event carries the title, text, big text, inbox lines, the messaging-style thread
+  (sender, text, time), people, action labels, channel, category, importance, flags, the
+  listener's `content_sha256` and every string extra (icons and parcels by type name only).
+  Android 15+ redacts one-time codes and other sensitive notifications from listeners that are
+  not system apps, so those arrive redacted.
+- **The uploader.** `pdw ingest android-notifications`, run as root by the
+  `pdw-android-notifications` Magisk service (`ops/android/pdw-android-notifications/service.sh`,
+  wrapper `bin/android-notifications-upload-android`, deployed with the APK by the sysadmin
+  repository's `scripts/install-pixel-notification-upload`). `inotifyd` watches the spool for
+  renamed-in files and takes a 30 s wakelock; runs are at least 15 s apart and every 5 minutes
+  as the floor. A run sends the spool oldest first in batches of 500 to
+  `/ingest/android-notifications/batch` and deletes each file once its batch is stored, so the
+  spool is the ledger; a file that is not an event goes to `spool/rejected/`. The heartbeat is
+  `android_notifications` in `ops.uploader_heartbeats`. State (pdw config with the master
+  secret, `.env`, lock, logs) is in credential-encrypted `/data/misc_ce/0/pdw-android-notifications`.
+- **The warehouse.** `android_notifications_drive_inbox_sensor` /
+  `android_notifications_drive_ingest` promote batches into the table, upserting by
+  `(account, device, event_id)`. The `android_notification` adapter puts each notification's
+  first appearance with each `content_sha256` on the timeline (re-posts of the same text, group
+  summaries and empty shells stay in `base_*`), tiered by SQL: ongoing `background`, a
+  `msg`/`call` notification `direct` (`cc` for a group conversation), the rest `noise`. The
+  `android_notification_opened` adapter is a `removed` event with reason 1 (a tap): `self`.
+
+On the phone (`ssh pichu`): logs in `/data/misc_ce/0/pdw-android-notifications/logs/`,
+`touch /data/misc_ce/0/pdw-android-notifications/paused` stops uploads (the spool keeps
+filling), and a manual run is
+`sh /data/adb/modules/pdw-android-notifications/bin/android-notifications-upload-android`.

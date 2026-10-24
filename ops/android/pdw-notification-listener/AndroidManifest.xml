@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The PDW notification listener: records every notification the phone
+     posts and removes into a spool that the root uploader
+     (pdw ingest android-notifications) sends to the warehouse. It has no UI
+     and no network access; notification access is granted by the installer
+     with `cmd notification allow_listener`. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zachlatta.pdw.notifications"
+    android:versionCode="1"
+    android:versionName="1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+
+    <!-- App labels for every package that posts a notification. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:label="PDW notifications"
+        android:allowBackup="false"
+        android:hasCode="true">
+        <service
+            android:name=".SpoolListenerService"
+            android:exported="true"
+            android:label="PDW notifications"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

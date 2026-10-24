@@ -1,0 +1,12 @@
+#!/system/bin/sh
+# inotifyd handler for the pdw-android-notifications service: the listener
+# moved a finished event into its spool ($1 event, $2 directory, $3 file).
+# Marks an upload run due and keeps the phone awake for half a minute so the
+# service's loop gets to it before the phone suspends (see service.sh).
+case "${3:-}" in
+  *.json) ;;
+  *) exit 0 ;;
+esac
+: > /data/misc_ce/0/pdw-android-notifications/due
+echo "pdw_android_notifications_due 30000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

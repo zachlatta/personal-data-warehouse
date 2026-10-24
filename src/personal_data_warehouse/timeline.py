@@ -2211,6 +2211,116 @@ _BROWSER_SEARCH = _simple_adapter(
     **_BROWSER_COMMON,
 )
 
+# --- Android notifications -------------------------------------------------
+#
+# base_android_notifications.events holds every listener event; the timeline
+# carries two kinds of them. `notification` is the first time each distinct
+# content of a notification appeared (posted, or already showing when the
+# listener connected): an update that changes the text is a new event, a
+# re-post of the same text is not, and group summaries ("3 new messages") and
+# empty shells stay in base_*. `opened` is a notification Zach tapped
+# (Android's removal reason 1, REASON_CLICK), and is `self`.
+#
+# A notification's tier: an ongoing one (media, VPN, a foreground service) is
+# `background` machinery; a message or call from one person is `direct`, from
+# a group conversation `cc`; everything else -- app alerts, promotions,
+# reminders -- is `noise`. A message notification often mirrors a row another
+# source already has (Slack, Gmail, WhatsApp); SMS and RCS reach PDW only here.
+_ANDROID_NOTIFICATION_KEY = (
+    "p.account = t.account AND p.device = t.device AND p.notification_key = t.notification_key"
+)
+_ANDROID_NOTIFICATION_FIRST_APPEARANCE = (
+    "t.event_type IN ('posted', 'active') AND t.is_group_summary = 0 "
+    "AND (t.title <> '' OR t.text <> '' OR t.big_text <> '' OR t.messages <> '[]'::jsonb) "
+    "AND NOT EXISTS (SELECT 1 FROM @android_notification_events p "
+    f"WHERE {_ANDROID_NOTIFICATION_KEY} AND p.content_sha256 = t.content_sha256 "
+    "AND p.event_type IN ('posted', 'active') "
+    "AND (p.event_at, p.event_id) < (t.event_at, t.event_id))"
+)
+_ANDROID_NOTIFICATION_COMMON = dict(
+    source_table="android_notification_events",
+    source="android_notifications",
+    from_sql="@android_notification_events t",
+    event_id="concat_ws('|', t.account, t.device, t.event_id)",
+    ingest_ts="t.synced_at",
+    # An app's day of notifications is the "conversation": timeline.context()
+    # on a hit returns what else that app sent around it.
+    context=(
+        "concat_ws('|', t.device, t.package_name, "
+        "to_char(t.posted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'))"
+    ),
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'device', t.device, 'event_id', t.event_id)"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'device', t.device, "
+        "'event_type', t.event_type, "
+        "'package_name', t.package_name, "
+        "'app_label', t.app_label, "
+        "'channel_id', t.channel_id, "
+        "'channel_name', t.channel_name, "
+        "'category', t.category, "
+        "'notification_key', t.notification_key, "
+        "'conversation_title', t.conversation_title, "
+        "'is_ongoing', t.is_ongoing <> 0, "
+        "'importance', t.importance, "
+        "'removal_reason_name', t.removal_reason_name)"
+    ),
+)
+_ANDROID_NOTIFICATION_TEXT = (
+    "t.app_label",
+    "t.title",
+    "t.text",
+    "t.big_text",
+    "t.sub_text",
+    "t.summary_text",
+    "t.conversation_title",
+    "left(jsonb_path_query_array(t.messages, '$[*].text')::text, 4000)",
+    "left(t.text_lines::text, 2000)",
+)
+
+_ANDROID_NOTIFICATION = _simple_adapter(
+    name="android_notification",
+    kind="notification",
+    event_ts="t.posted_at",
+    actor=(
+        "CASE WHEN t.category IN ('msg', 'call', 'missed_call', 'email') AND t.title <> '' "
+        "THEN t.title ELSE t.app_label END"
+    ),
+    title=(
+        "concat_ws(': ', NULLIF(t.app_label, ''), "
+        "COALESCE(NULLIF(t.title, ''), NULLIF(t.conversation_title, ''), left(t.text, 200)))"
+    ),
+    snippet=_snippet("COALESCE(NULLIF(t.big_text, ''), t.text)"),
+    search_text=_search_concat(*_ANDROID_NOTIFICATION_TEXT),
+    where=_ANDROID_NOTIFICATION_FIRST_APPEARANCE,
+    priority=(
+        f"CASE WHEN t.is_ongoing <> 0 THEN {TIMELINE_PRIORITY_BACKGROUND} "
+        "WHEN t.category IN ('msg', 'call', 'missed_call') AND t.is_group_conversation <> 0 "
+        f"THEN {TIMELINE_PRIORITY_CC} "
+        f"WHEN t.category IN ('msg', 'call', 'missed_call') THEN {TIMELINE_PRIORITY_DIRECT} "
+        f"ELSE {TIMELINE_PRIORITY_NOISE} END"
+    ),
+    **_ANDROID_NOTIFICATION_COMMON,
+)
+
+_ANDROID_NOTIFICATION_OPENED = _simple_adapter(
+    name="android_notification_opened",
+    kind="opened",
+    event_ts="t.event_at",
+    actor="'me'",
+    title=(
+        "concat('Opened: ', concat_ws(': ', NULLIF(t.app_label, ''), "
+        "COALESCE(NULLIF(t.title, ''), NULLIF(t.conversation_title, ''), left(t.text, 200))))"
+    ),
+    snippet=_snippet("COALESCE(NULLIF(t.big_text, ''), t.text)"),
+    search_text=_search_concat(*_ANDROID_NOTIFICATION_TEXT),
+    where="t.event_type = 'removed' AND t.removal_reason = 1",
+    priority=TIMELINE_PRIORITY_SELF,
+    **_ANDROID_NOTIFICATION_COMMON,
+)
+
 # --- Feed tab (personal_data_warehouse/feed.py) ------------------------------
 #
 # base_feed.events is the phone's engagement log for the cards agents push.
@@ -3172,6 +3282,8 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _GITHUB_EVENT,
     _BROWSER_VISIT,
     _BROWSER_SEARCH,
+    _ANDROID_NOTIFICATION,
+    _ANDROID_NOTIFICATION_OPENED,
     _FEED_ENGAGEMENT,
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
@@ -3405,6 +3517,9 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "github_event",
         "browser_visit",
         "browser_search",
+        # context is the app's day on the device: its other notifications.
+        "android_notification",
+        "android_notification_opened",
         # context is the feed session.
         "feed_engagement",
         "finance_transaction",
@@ -3776,6 +3891,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Hacker News: one events table; the why-rows and profile hang off it.
     # Browser history: one events table, two adapters (page views, searches).
     "browser_history_visits": _events(),
+    # Android notifications: one events table, two adapters (a notification's
+    # first appearance with each content, and a tap that opened one).
+    "android_notification_events": _events(),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(

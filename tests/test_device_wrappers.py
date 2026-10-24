@@ -27,6 +27,7 @@ BIN = REPO_ROOT / "bin"
 LAUNCHD = REPO_ROOT / "ops" / "launchd"
 SYSTEMD = REPO_ROOT / "ops" / "systemd"
 ANDROID_MODULE = REPO_ROOT / "ops" / "android" / "pdw-google-recorder"
+NOTIFICATIONS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-notifications"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -40,6 +41,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "apple-notes-upload-launchd": ('"$PDW" ingest apple-notes --mode incremental', "apple_notes"),
     "voice-memos-upload-launchd": ('"$PDW" ingest voice-memos --mode incremental', "apple_voice_memos"),
     "google-recorder-upload-android": ('"$PDW" ingest google-recorder', "google_recorder"),
+    "android-notifications-upload-android": ('"$PDW" ingest android-notifications', "android_notifications"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
@@ -214,7 +216,13 @@ _BASHISMS = re.compile(r"(?m)^[^#\n]*(\[\[\s|\bfunction\b|\$\{[A-Za-z_]+\[|\bsou
 
 
 def test_the_android_scripts_are_plain_sh_for_android() -> None:
-    scripts = [BIN / "google-recorder-upload-android", BIN / LIB, *sorted(ANDROID_MODULE.iterdir())]
+    scripts = [
+        BIN / "google-recorder-upload-android",
+        BIN / "android-notifications-upload-android",
+        BIN / LIB,
+        *sorted(ANDROID_MODULE.iterdir()),
+        *sorted(NOTIFICATIONS_MODULE.iterdir()),
+    ]
     for script in scripts:
         text = script.read_text()
         if script.name != LIB:
@@ -245,3 +253,20 @@ def test_the_android_wrapper_keeps_its_state_out_of_recorders_directory() -> Non
     assert 'STATE_DIR="${PDW_GOOGLE_RECORDER_STATE_DIR:-/data/misc_ce/0/pdw-google-recorder}"' in text
     assert '--state-file "$STATE_DIR/google-recorder-upload-state.sqlite"' in text
     assert 'export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"' in text
+
+
+def test_the_notification_service_sends_the_spool_on_every_finished_event_and_holds_the_phone_awake() -> None:
+    service = (NOTIFICATIONS_MODULE / "service.sh").read_text()
+    wake = (NOTIFICATIONS_MODULE / "android-notifications-upload-wake").read_text()
+    assert '"$MODDIR/bin/android-notifications-upload-android"' in service
+    # The listener renames each finished event into the spool: moved_to.
+    assert 'inotifyd "$MODDIR/bin/android-notifications-upload-wake" "$SPOOL:y"' in service
+    assert 'cmd notification allow_listener "$LISTENER"' in service
+    assert "timeout 660" in service
+    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert f": > {state}/due" in wake
+    assert "/sys/power/wake_lock" in wake
+    text = _wrapper("android-notifications-upload-android")
+    assert 'STATE_DIR="${PDW_ANDROID_NOTIFICATIONS_STATE_DIR:-/data/misc_ce/0/pdw-android-notifications}"' in text
+    assert state == "/data/misc_ce/0/pdw-android-notifications"

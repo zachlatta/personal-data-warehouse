@@ -91,6 +91,7 @@ from personal_data_warehouse.schema import (
     GITHUB_SYNC_STATE_COLUMNS,
     HACKER_NEWS_ITEM_COLUMNS,
     BROWSER_HISTORY_VISIT_COLUMNS,
+    ANDROID_NOTIFICATION_EVENT_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
@@ -392,6 +393,13 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         "browser_history",
         ("browser_visit", "browser_search"),
         "COALESCE(t.metadata->>'browser', t.kind)",
+    ),
+    # Notifications the Android phone received, and the ones Zach opened; the
+    # subsource is the app's package.
+    (
+        "android_notifications",
+        ("android_notification", "android_notification_opened"),
+        "COALESCE(t.metadata->>'package_name', t.kind)",
     ),
     # Periodic whole-screen frames; the subsource is the device. They carry no
     # search text until an enrichment step reads them.
@@ -1163,6 +1171,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         BROWSER_HISTORY_VISIT_COLUMNS,
         ("account", "device", "browser", "profile", "visit_id"),
     ),
+    # Android notifications: one row per listener event, keyed by its uuid.
+    "android_notification_events": TableSpec(
+        ANDROID_NOTIFICATION_EVENT_COLUMNS,
+        ("account", "device", "event_id"),
+    ),
     # Screen timelapse: one row per capture file, written by the app's
     # /ingest/screen-timelapse/file endpoint as it stores the bytes.
     "screen_timelapse_screenshots": TableSpec(
@@ -1865,6 +1878,34 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "browser_history_visits_visited_idx",
         "browser_history_visits",
         "CREATE INDEX IF NOT EXISTS browser_history_visits_visited_idx ON @browser_history_visits (visited_at DESC)",
+    ),
+    # Android notifications. synced_at leads for the freshness probe and the
+    # adapters' incremental pass, posted_at and event_at serve their backfills, and the
+    # first-appearance test reads (device, notification_key, content_sha256,
+    # event_at).
+    IndexSpec(
+        "android_notification_events_synced_idx",
+        "android_notification_events",
+        "CREATE INDEX IF NOT EXISTS android_notification_events_synced_idx "
+        "ON @android_notification_events (synced_at)",
+    ),
+    IndexSpec(
+        "android_notification_events_event_at_idx",
+        "android_notification_events",
+        "CREATE INDEX IF NOT EXISTS android_notification_events_event_at_idx "
+        "ON @android_notification_events (event_at DESC)",
+    ),
+    IndexSpec(
+        "android_notification_events_posted_at_idx",
+        "android_notification_events",
+        "CREATE INDEX IF NOT EXISTS android_notification_events_posted_at_idx "
+        "ON @android_notification_events (posted_at DESC)",
+    ),
+    IndexSpec(
+        "android_notification_events_content_idx",
+        "android_notification_events",
+        "CREATE INDEX IF NOT EXISTS android_notification_events_content_idx "
+        "ON @android_notification_events (account, device, notification_key, content_sha256, event_at)",
     ),
     # Screen timelapse. ingested_at leads for the freshness probe and the
     # timeline adapter's incremental pass; captured_at serves its backfill
@@ -2735,6 +2776,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "github_comments": {"raw_json"},
     "github_events": {"payload_json"},
     "browser_history_visits": {"raw_json"},
+    "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2796,6 +2838,7 @@ JSONB_ARRAY_COLUMNS_BY_TABLE = {
         "owners_json",
     },
     "plaid_transactions": {"category_json"},
+    "android_notification_events": {"text_lines", "messages", "people", "actions"},
     "manual_finance_extractions": {
         "transactions_json",
         "balances_json",
@@ -2912,6 +2955,9 @@ TIMESTAMP_COLUMNS = {
     "acquired_at",
     # browser_history
     "visited_at",
+    # android_notifications
+    "event_at",
+    "notification_when_at",
     # hacker_news
     "fetched_at",
     "discovered_at",
@@ -3044,6 +3090,17 @@ INTEGER_COLUMNS = {
     # screen_timelapse
     "display_index",
     "is_reused",
+    # android_notifications
+    "notification_id",
+    "importance",
+    "is_group_summary",
+    "is_ongoing",
+    "is_clearable",
+    "is_conversation",
+    "is_group_conversation",
+    "flags",
+    "visibility",
+    "removal_reason",
     # browser_history
     "transition_raw",
     "is_redirect",
@@ -3447,6 +3504,8 @@ _WHOOP_PRIVATE_TABLES = (
 )
 
 _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
+
+_ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
 
 _SCREEN_TIMELAPSE_TABLES = (
     "screen_timelapse_screenshots",
@@ -10895,6 +10954,28 @@ class PostgresWarehouse:
                 for row in rows
             ],
             BROWSER_HISTORY_VISIT_COLUMNS,
+        )
+
+    def ensure_android_notifications_tables(self) -> None:
+        """Provision base_android_notifications.events."""
+        self._ensure_table_group(list(_ANDROID_NOTIFICATIONS_TABLES))
+
+    def insert_android_notification_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert listener events by (account, device, event_id)."""
+        if not rows:
+            return
+        self._insert_rows(
+            "android_notification_events",
+            [
+                {
+                    column: row.get(
+                        column, _default_python_value(column, table="android_notification_events")
+                    )
+                    for column in ANDROID_NOTIFICATION_EVENT_COLUMNS
+                }
+                for row in rows
+            ],
+            ANDROID_NOTIFICATION_EVENT_COLUMNS,
         )
 
     def ensure_hacker_news_tables(self) -> None:
