@@ -62,3 +62,14 @@ test('flush ends every open stretch and starts clean', () => {
   assert.deepEqual(t.flush(3000), []);
   assert.deepEqual(t.inView(), []);
 });
+
+test('dwell is active time: a card left on an untouched screen stops accruing', () => {
+  const t = new ViewabilityTracker();
+  const layouts = layoutsFromHeights(['a'], new Map([['a', 400]]), 0);
+  // Wall 0 to 10 minutes on screen, but only 70 s of it active.
+  t.update(0, screen(0), layouts, 0);
+  const [a] = t.flush(600_000, 70_000);
+  assert.equal(a.dwellMs, 70_000);
+  assert.equal(a.visibleMs, 70_000);
+  assert.equal(a.endedAt - a.startedAt, 600_000);
+});

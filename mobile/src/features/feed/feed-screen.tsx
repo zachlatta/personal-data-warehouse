@@ -28,13 +28,16 @@ import { useConfig } from '@/lib/session';
 import { fetchFeed, FeedApiError, type FeedItem } from './api';
 import { newArrivals } from './card-context';
 import {
+  activeNow,
   connectFeedLogger,
   endFeedSession,
   feedItems,
   flushFeedEvents,
+  markActive,
   recordFeedEvent,
   recordUi,
   startFeedSession,
+  startTimer,
 } from './engagement';
 import { FeedCard } from './feed-card';
 import type { CardLink } from './links';
@@ -138,11 +141,11 @@ export default function FeedScreen() {
   const measure = useCallback(() => {
     if (!focused.current || AppState.currentState !== 'active' || viewport.current.height === 0) return;
     const layouts = layoutsFromHeights(ids.current, heights.current, headerHeight.current);
-    recordImpressions(tracker.current.update(Date.now(), viewport.current, layouts));
+    recordImpressions(tracker.current.update(Date.now(), viewport.current, layouts, activeNow()));
   }, [recordImpressions]);
 
   const pause = useCallback(() => {
-    recordImpressions(tracker.current.flush(Date.now()));
+    recordImpressions(tracker.current.flush(Date.now(), activeNow()));
   }, [recordImpressions]);
 
   // trigger: first (the tab's first load), stale (back after STALE_MS) or
@@ -234,6 +237,7 @@ export default function FeedScreen() {
 
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      markActive();
       viewport.current = { top: e.nativeEvent.contentOffset.y, height: e.nativeEvent.layoutMeasurement.height };
       if (viewport.current.top < PILL_GONE_Y) setArrivals((a) => (a.length ? [] : a));
       measure();
@@ -322,15 +326,16 @@ export default function FeedScreen() {
       if (!url) return;
       const which = { url, link_index: link?.index ?? 0 };
       pause();
-      const startedAt = Date.now();
       recordFeedEvent('open', { item_id: item.item_id, position: position(item), metadata: { mode: 'browser', via, ...which } });
+      const stop = startTimer(true);
       try {
         await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: '#208AEF' });
       } finally {
+        const { dwell_ms, wall_ms } = stop();
         recordFeedEvent('close', {
           item_id: item.item_id,
-          dwell_ms: Date.now() - startedAt,
-          metadata: { mode: 'browser', via, ...which },
+          dwell_ms,
+          metadata: { mode: 'browser', via, ...which, wall_ms },
         });
         measure();
       }
@@ -370,11 +375,12 @@ export default function FeedScreen() {
       });
       if (a.action !== 'play' || !a.url || a.inline) return;
       pause();
-      const startedAt = Date.now();
+      const stop = startTimer(true);
       try {
         await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
       } finally {
-        recordFeedEvent('close', { item_id: item.item_id, dwell_ms: Date.now() - startedAt, metadata: { mode: 'video', index: a.index } });
+        const { dwell_ms, wall_ms } = stop();
+        recordFeedEvent('close', { item_id: item.item_id, dwell_ms, metadata: { mode: 'video', index: a.index, wall_ms } });
         measure();
       }
     },
@@ -512,7 +518,7 @@ export default function FeedScreen() {
   }
 
   return (
-    <ThemedView style={styles.fill}>
+    <ThemedView style={styles.fill} onTouchStart={markActive}>
       <FlatList
         ref={list}
         data={shown}

@@ -4,11 +4,12 @@
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Updates from 'expo-updates';
-import { Appearance } from 'react-native';
+import { AppState, Appearance } from 'react-native';
 import { File, Paths } from 'expo-file-system';
 
 import type { AppConfig } from '@/lib/config';
 
+import { ActiveClock, stopwatch } from './active-time';
 import { postFeedEvents, type FeedItem } from './api';
 import { EventQueue, newEventId, type FeedEvent, type FeedEventType } from './event-queue';
 
@@ -18,7 +19,52 @@ const FLUSH_AT_SIZE = 40;
 let config: AppConfig | null = null;
 let queue: EventQueue | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
-let session: { id: string; startedAt: number; seen: Set<string>; maxPosition: number; acts: Record<string, number> } | null = null;
+let session: {
+  id: string;
+  startedAt: number;
+  stop: () => { dwell_ms: number; wall_ms: number };
+  seen: Set<string>;
+  maxPosition: number;
+  acts: Record<string, number>;
+} | null = null;
+
+// Every time the app reports (dwell, reading, watch time) is active time:
+// the app in front and in use, not just open (active-time.ts).
+export const activeClock = new ActiveClock(Date.now(), AppState.currentState === 'active');
+AppState.addEventListener('change', (state) => activeClock.setForeground(state === 'active', Date.now()));
+
+/** A touch anywhere on a feed screen keeps the active clock running. */
+export function markActive() {
+  activeClock.touch(Date.now());
+}
+
+/** The active clock's reading now, for the viewability tracker. */
+export function activeNow(): number {
+  return activeClock.read(Date.now());
+}
+
+/**
+ * Starts timing one stretch; stop() returns dwell_ms (active time) and
+ * wall_ms (for the close's metadata). busy: something he does not touch
+ * (the in-app browser, a video) is on screen, so its time counts while the
+ * app is in front.
+ */
+export function startTimer(busy = false) {
+  const now = Date.now();
+  if (busy) activeClock.setBusy(true, now);
+  const sw = stopwatch(activeClock, now);
+  let done = false;
+  return () => {
+    const end = Date.now();
+    if (busy && !done) activeClock.setBusy(false, end);
+    done = true;
+    const { activeMs, wallMs } = sw.stop(end);
+    return { dwell_ms: activeMs, wall_ms: wallMs };
+  };
+}
+
+// Events that are not a touch: recorded after the fact or by the app itself.
+const PASSIVE: ReadonlySet<FeedEventType> = new Set<FeedEventType>(['impression', 'load', 'session_start', 'session_end', 'close']);
 
 // Cards the feed last loaded, so the reader can open one by id.
 export const feedItems = new Map<string, FeedItem>();
@@ -56,6 +102,7 @@ type Fields = Omit<FeedEvent, 'event_id' | 'type' | 'session_id' | 'occurred_at'
 export function recordFeedEvent(type: FeedEventType, fields: Fields = {}) {
   const { at, ...rest } = fields;
   const when = at ?? Date.now();
+  if (!PASSIVE.has(type)) markActive();
   if (session) {
     if (type === 'impression' && rest.item_id) session.seen.add(rest.item_id);
     else if (type !== 'impression' && type !== 'session_start') session.acts[type] = (session.acts[type] ?? 0) + 1;
@@ -111,7 +158,7 @@ export function startFeedSession(cards: number, trigger: 'foreground' | 'focus')
   const now = Date.now();
   const why = launched ? trigger : 'launch';
   launched = true;
-  session = { id: newEventId(now), startedAt: now, seen: new Set(), maxPosition: -1, acts: {} };
+  session = { id: newEventId(now), startedAt: now, stop: startTimer(), seen: new Set(), maxPosition: -1, acts: {} };
   recordFeedEvent('session_start', {
     metadata: {
       cards,
@@ -129,8 +176,8 @@ export function endFeedSession(reason: 'background' | 'blur') {
   const ended = session;
   lastSessionEndedAt = Date.now();
   recordFeedEvent('session_end', {
-    dwell_ms: lastSessionEndedAt - ended.startedAt,
-    metadata: { reason, cards_seen: ended.seen.size, deepest_position: ended.maxPosition, ...ended.acts },
+    dwell_ms: ended.stop().dwell_ms,
+    metadata: { wall_ms: lastSessionEndedAt - ended.startedAt, reason, cards_seen: ended.seen.size, deepest_position: ended.maxPosition, ...ended.acts },
   });
   session = null;
   void outbox().flush(true);

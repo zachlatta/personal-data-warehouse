@@ -11,7 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
 import { cardMedia } from './feed-card';
-import { feedItems, recordFeedEvent } from './engagement';
+import { feedItems, markActive, recordFeedEvent, startTimer } from './engagement';
 import { ScrollGestureTracker, scrollMetadata, type ScrollGesture } from './scroll-gestures';
 import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
@@ -105,12 +105,16 @@ function Spans({ spans, onLink }: { spans: Span[]; onLink: (url: string) => void
 // The detail view a tap on a card opens: the whole X post and its thread,
 // every photo, the full summary and all of the card's links. Time here is
 // the card's reading time (an open, then a close carrying dwell_ms and how
-// far down it was read).
+// far down it was read). dwell_ms is active time: time with the app in the
+// background, or the screen untouched past a minute, does not count.
 export default function FeedReaderScreen() {
   const params = useLocalSearchParams<{ id: string; position?: string }>();
   const theme = useTheme();
   const item = feedItems.get(params.id);
   const depth = useRef(0);
+  // Watch and link time from this view, recorded as closes of their own and
+  // taken out of the view's reading time so it is not counted twice.
+  const nested = useRef(0);
   const gestures = useRef(new ScrollGestureTracker());
   const settleTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const contentHeight = useRef(0);
@@ -121,20 +125,23 @@ export default function FeedReaderScreen() {
   useFocusEffect(
     useCallback(() => {
       if (!item) return undefined;
-      const startedAt = Date.now();
       depth.current = 0;
+      nested.current = 0;
       recordFeedEvent('open', { item_id: item.item_id, position, metadata: { mode: 'detail' } });
+      const stop = startTimer();
       return () => {
+        const { dwell_ms, wall_ms } = stop();
         recordFeedEvent('close', {
           item_id: item.item_id,
-          dwell_ms: Date.now() - startedAt,
-          metadata: { mode: 'detail', scroll_depth: Math.round(depth.current * 100) / 100 },
+          dwell_ms: Math.max(0, dwell_ms - nested.current),
+          metadata: { mode: 'detail', scroll_depth: Math.round(depth.current * 100) / 100, wall_ms, nested_ms: nested.current },
         });
       };
     }, [item, position]),
   );
 
   const onScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    markActive();
     const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
     const seen = contentSize.height <= 0 ? 1 : (contentOffset.y + layoutMeasurement.height) / contentSize.height;
     depth.current = Math.max(depth.current, Math.min(1, seen));
@@ -173,14 +180,16 @@ export default function FeedReaderScreen() {
     async (url: string, linkIndex: number, via = 'detail') => {
       if (!itemId) return;
       const which = { mode: 'browser', via, url, link_index: linkIndex };
-      const startedAt = Date.now();
       recordFeedEvent('open', { item_id: itemId, position, metadata: which });
+      const stop = startTimer(true);
       try {
         await WebBrowser.openBrowserAsync(url, { dismissButtonStyle: 'close', controlsColor: ACCENT });
       } catch {
         await Linking.openURL(url);
       }
-      recordFeedEvent('close', { item_id: itemId, dwell_ms: Date.now() - startedAt, metadata: which });
+      const { dwell_ms, wall_ms } = stop();
+      nested.current += dwell_ms;
+      recordFeedEvent('close', { item_id: itemId, dwell_ms, metadata: { ...which, wall_ms } });
     },
     [itemId, position],
   );
@@ -188,6 +197,7 @@ export default function FeedReaderScreen() {
     async (a: MediaAction) => {
       if (!itemId) return;
       if (a.action === 'stop') {
+        nested.current += a.dwellMs ?? 0;
         recordFeedEvent('close', { item_id: itemId, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true, in: 'detail' } });
         return;
       }
@@ -198,9 +208,11 @@ export default function FeedReaderScreen() {
         metadata: { action: a.action, index: a.index, in: 'detail', ...(a.inline ? { inline: true } : {}) },
       });
       if (a.action !== 'play' || !a.url || a.inline) return;
-      const startedAt = Date.now();
+      const stop = startTimer(true);
       await WebBrowser.openBrowserAsync(a.url, { dismissButtonStyle: 'close' });
-      recordFeedEvent('close', { item_id: itemId, dwell_ms: Date.now() - startedAt, metadata: { mode: 'video', index: a.index } });
+      const { dwell_ms, wall_ms } = stop();
+      nested.current += dwell_ms;
+      recordFeedEvent('close', { item_id: itemId, dwell_ms, metadata: { mode: 'video', index: a.index, wall_ms } });
     },
     [itemId, position],
   );
@@ -224,7 +236,7 @@ export default function FeedReaderScreen() {
   const posts = embed ? [embed, ...(embed.thread ?? [])] : [];
 
   return (
-    <ThemedView style={styles.fill}>
+    <ThemedView style={styles.fill} onTouchStart={markActive}>
       <Stack.Screen
         options={{
           title: embed ? 'Post' : name,

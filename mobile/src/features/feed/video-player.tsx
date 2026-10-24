@@ -9,6 +9,7 @@ import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { useTheme } from '@/hooks/use-theme';
 
+import { startTimer } from './engagement';
 import { videoLength } from './rich';
 import { EMBED_BASE_URL, playerHtml, type VideoSource } from './video';
 
@@ -30,7 +31,8 @@ const LABEL: Record<VideoSource['kind'], string> = { youtube: 'YouTube', vimeo: 
 
 // A video that plays inside the card: the poster with a play button, then,
 // on a tap, the site's own player (YouTube, Vimeo) or the file itself, in
-// place. onPlay fires on the tap; onStop with the watch time when it stops
+// place. onPlay fires on the tap; onStop with the watch time (active time:
+// not while the app is in the background) when it stops
 // (another video started, the card scrolled away or the screen changed).
 export function InlineVideo({
   source,
@@ -51,7 +53,6 @@ export function InlineVideo({
 }) {
   const theme = useTheme();
   const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
-  const startedAt = useRef(0);
   const stopRef = useRef(onStop);
   useEffect(() => {
     stopRef.current = onStop;
@@ -59,8 +60,8 @@ export function InlineVideo({
 
   useEffect(() => {
     if (!active) return undefined;
-    startedAt.current = Date.now();
-    return () => stopRef.current(Date.now() - startedAt.current);
+    const stop = startTimer(true);
+    return () => stopRef.current(stop().dwell_ms);
   }, [active]);
 
   // Off screen (a detail view opened, another tab) stops it.

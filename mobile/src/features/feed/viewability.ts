@@ -8,7 +8,10 @@
 // those as scroll_pasts).
 //
 // State only changes when the list scrolls, lays out, or the screen
-// loses focus, so time accrues exactly between those calls: no timer.
+// loses focus, so time accrues exactly between those calls: no timer. Dwell
+// and visible time are active time (active-time.ts): callers pass the active
+// clock's reading as activeNow, so a card left on an untouched screen stops
+// accruing after a minute. startedAt and endedAt stay wall time.
 
 export type CardLayout = { y: number; height: number; position: number };
 export type Viewport = { top: number; height: number };
@@ -28,7 +31,7 @@ export type Impression = {
 type Episode = {
   position: number;
   startedAt: number;
-  lastAt: number;
+  lastActive: number;
   fraction: number;
   dwellMs: number;
   visibleMs: number;
@@ -52,11 +55,11 @@ export class ViewabilityTracker {
     this.threshold = threshold;
   }
 
-  private accrue(episode: Episode, now: number) {
-    const elapsed = Math.max(0, now - episode.lastAt);
+  private accrue(episode: Episode, activeNow: number) {
+    const elapsed = Math.max(0, activeNow - episode.lastActive);
     if (episode.fraction >= this.threshold) episode.dwellMs += elapsed;
     if (episode.fraction > 0) episode.visibleMs += elapsed;
-    episode.lastAt = now;
+    episode.lastActive = activeNow;
   }
 
   private finish(itemId: string, episode: Episode, now: number): Impression | null {
@@ -74,10 +77,10 @@ export class ViewabilityTracker {
   }
 
   /** Feed the current layout; returns the impressions that just ended. */
-  update(now: number, viewport: Viewport, layouts: Map<string, CardLayout>): Impression[] {
+  update(now: number, viewport: Viewport, layouts: Map<string, CardLayout>, activeNow = now): Impression[] {
     const ended: Impression[] = [];
     for (const [itemId, episode] of this.episodes) {
-      this.accrue(episode, now);
+      this.accrue(episode, activeNow);
       const layout = layouts.get(itemId);
       const fraction = layout ? visibleFraction(layout, viewport) : 0;
       if (fraction <= 0) {
@@ -95,7 +98,7 @@ export class ViewabilityTracker {
       this.episodes.set(itemId, {
         position: layout.position,
         startedAt: now,
-        lastAt: now,
+        lastActive: activeNow,
         fraction,
         dwellMs: 0,
         visibleMs: 0,
@@ -106,10 +109,10 @@ export class ViewabilityTracker {
   }
 
   /** End every open stretch (the screen lost focus, a card was opened). */
-  flush(now: number): Impression[] {
+  flush(now: number, activeNow = now): Impression[] {
     const ended: Impression[] = [];
     for (const [itemId, episode] of [...this.episodes]) {
-      this.accrue(episode, now);
+      this.accrue(episode, activeNow);
       const impression = this.finish(itemId, episode, now);
       if (impression) ended.push(impression);
     }

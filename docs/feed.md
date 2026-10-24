@@ -67,12 +67,21 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   DELETE and TRUNCATE on the versions table. A hard DELETE of a card leaves a `delete`
   tombstone whose snapshot is the card as it was, and `restore` recreates it from that.
 - **Events** (`base_feed.events`) are written by the phone with device-generated ids, so a
-  retried batch is counted once. Types: `session_start`, `session_end` (dwell = sitting
+  retried batch is counted once. **Every duration is active time** (since 2026-10-24, from Zach:
+  "Don't count inactive time as spending time on it"; `mobile/src/features/feed/active-time.ts`):
+  time counts while the app is in front and he touched it in the last minute, or while a
+  video plays or the in-app browser is up. Time in another app, with the phone locked or
+  with the screen untouched past a minute counts nothing. A `close` and `session_end` keep
+  the clock time in `metadata.wall_ms`; a detail view's `close` subtracts the link and
+  video time opened from it (`metadata.nested_ms`), which have closes of their own. Before
+  2026-10-24 durations were clock time and a detail view also counted its links: the
+  plasma-arc speaker card's 14 minutes on 2026-10-23 was the detail view left open while
+  he was in Instagram. Types: `session_start`, `session_end` (dwell = sitting
   length; metadata: cards seen, deepest position, acts), `impression` (one stretch of a card
   at least 50% on screen: `dwell_ms` at or above 50%, `visible_fraction` = peak, `position`,
   `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` detail, browser, or reader before 2026-10-20;
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
-  `close` (`dwell_ms` = time spent after the open; the detail view adds `scroll_depth`), `expand`
+  `close` (`dwell_ms` = active time after the open; the detail view adds `scroll_depth` and `nested_ms`), `expand`
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested`,
   `less_like_this`, or `swipe` = swiped left, since 2026-10-23) / `undismiss` (the 5-second Undo),
   `like` / `unlike` (the heart; `metadata.via` `button`, `menu` or `detail`), `share` (tapped the paper plane or share button, or swiped left before 2026-10-23, to email

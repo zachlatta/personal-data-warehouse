@@ -8,6 +8,7 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { IconName } from '@/lib/icons';
 
+import { startTimer } from './engagement';
 import { PhotoViewer } from './photo-viewer';
 import { mediaVideo } from './video';
 import { InlineVideo } from './video-player';
@@ -48,12 +49,12 @@ export type MediaAction = {
 function usePhotoViewer(media: FeedMedia[], onMedia: (a: MediaAction) => void) {
   const [open, setOpen] = useState<{ photos: FeedMedia[]; start: number }>();
   // When the viewer opened and the page on screen, for view_close.
-  const viewing = useRef({ at: 0, page: 0 });
+  const viewing = useRef<{ stop?: () => { dwell_ms: number }; page: number }>({ page: 0 });
   const mediaIndex = (page: number) => (open ? media.indexOf(open.photos[page]) : page);
   const show = (tapped: number) => {
     const v = viewerPhotos(media, tapped);
     if (!v.photos.length) return;
-    viewing.current = { at: Date.now(), page: v.start };
+    viewing.current = { stop: startTimer(), page: v.start };
     setOpen(v);
     onMedia({ action: 'view', index: tapped });
   };
@@ -62,7 +63,7 @@ function usePhotoViewer(media: FeedMedia[], onMedia: (a: MediaAction) => void) {
       photos={open.photos}
       start={open.start}
       onClose={() => {
-        onMedia({ action: 'view_close', index: mediaIndex(viewing.current.page), dwellMs: Date.now() - viewing.current.at });
+        onMedia({ action: 'view_close', index: mediaIndex(viewing.current.page), dwellMs: viewing.current.stop?.().dwell_ms ?? 0 });
         setOpen(undefined);
       }}
       onPage={(page) => {

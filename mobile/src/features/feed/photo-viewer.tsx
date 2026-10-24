@@ -20,6 +20,7 @@ import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { useModalInsets } from '@/hooks/use-modal-insets';
 
+import { markActive } from './engagement';
 import { fullSizeUrl, photoFilename, type FeedMedia } from './rich';
 
 // Downloads one photo at full size into the cache and opens the share sheet
@@ -54,9 +55,12 @@ type PhotoViewerProps = {
 export function PhotoViewer(props: PhotoViewerProps) {
   return (
     <Modal visible animationType="fade" presentationStyle="overFullScreen" transparent statusBarTranslucent onRequestClose={props.onClose}>
-      <SafeAreaProvider>
-        <PhotoViewerScreen {...props} />
-      </SafeAreaProvider>
+      {/* A touch here keeps the active clock running (active-time.ts). */}
+      <View style={{ flex: 1 }} onTouchStart={markActive}>
+        <SafeAreaProvider>
+          <PhotoViewerScreen {...props} />
+        </SafeAreaProvider>
+      </View>
     </Modal>
   );
 }
