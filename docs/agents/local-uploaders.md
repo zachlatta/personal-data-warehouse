@@ -431,7 +431,7 @@ what those loops wrote:
 that images the phone uploads the phone's frames too. On crobat:
 `SCREEN_TIMELAPSE_SOURCES=crobat=~/Pictures/Screenshots/periodic,joltik=~/Pictures/PhoneScreenshots/joltik`.
 On porygon (it imaged the iPhone on the office network, and pulls the Android phone's frames):
-`joltik=~/Pictures/PhoneScreenshots/joltik,pixel11pro=~/Pictures/PhoneScreenshots/pixel11pro`.
+`joltik=~/Pictures/PhoneScreenshots/joltik,pichu=~/Pictures/PhoneScreenshots/pichu`.
 Unset, it is `<short hostname>=~/Pictures/Screenshots/periodic`.
 
 **What a file is.** The name is all the metadata (`app/internal/timelapsefiles`):
@@ -478,15 +478,15 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-d
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-timelapse-upload
 ```
 
-**The Android phone (`pixel11pro`) captures itself.** A root Magisk module on the phone writes a
+**The Android phone (`pichu`) captures itself.** A root Magisk module on the phone writes a
 PNG and the tree about once a minute while the screen is on and past the keyguard; porygon's
 `com.zrl.pixel-screen-timelapse-pull` (every 2 minutes) copies them over Tailscale SSH **only while
 the phone's default network is Wi-Fi**, encodes each PNG to AVIF (`avifenc -q 60 -s 6`: a
 328 KB frame became 61 KB with the text visually identical, against 132 KB for lossy WebP and
-82 KB for lossless), places it in `~/Pictures/PhoneScreenshots/pixel11pro` with the phone's
+82 KB for lossless), places it in `~/Pictures/PhoneScreenshots/pichu` with the phone's
 mtime, and deletes it on the phone. This uploader then sends that folder like any other. The
 phone runs no `pdw`: Go on Android reads `time.Local` as UTC and needs cgo for DNS. Setup,
-switches and rollback: `pixel11pro/2026-10-23-screen-timelapse.md` in the sysadmin repository.
+switches and rollback: `pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
 SQL starting points: `base_screen_timelapse.screenshots` and
 `base_screen_timelapse.accessibility_trees` (join on `device, captured_at`); timeline

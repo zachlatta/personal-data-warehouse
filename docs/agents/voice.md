@@ -323,7 +323,7 @@ the first member's title stands in) or `merged`. Each member recording keeps its
 
 Zach carries a Pixel from 2026-10-23, so new memos are Google Recorder recordings (a
 press and hold of the power button starts and stops one; sysadmin
-`pixel11pro/2026-10-23-power-button-voice-memo.md`). Recorder keeps its recordings and
+`pichu/2026-10-23-power-button-voice-memo.md`). Recorder keeps its recordings and
 its `recording_database` in its private data directory, and the phone is rooted, so the
 uploader runs **on the phone, as root**: `pdw ingest google-recorder`, the release
 linux/arm64 build, started by the `pdw-google-recorder` Magisk module
@@ -377,9 +377,9 @@ recording against the same 30 s p50.
   HMAC-signed with it), and with the bootloader unlocked `/data/adb` is readable before
   the PIN is entered. Before the first unlock after a reboot neither it nor Recorder's
   storage exists, and the service waits for both. An OTA that drops root stops the uploader with
-  everything else that needs root (sysadmin `pixel11pro/README.md`).
+  everything else that needs root (sysadmin `pichu/README.md`).
 
-On the phone (`ssh pixel11pro`): logs and heartbeat in
+On the phone (`ssh pichu`): logs and heartbeat in
 `/data/misc_ce/0/pdw-google-recorder/logs/`, `touch /data/misc_ce/0/pdw-google-recorder/paused` to
 stop uploads, and a manual run is
 `sh /data/adb/modules/pdw-google-recorder/bin/google-recorder-upload-android`.

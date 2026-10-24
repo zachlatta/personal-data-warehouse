@@ -138,7 +138,7 @@ revisits of one page within 30 minutes; query `base_*` for every visit.
 ## Screen timelapse (what was on a screen)
 
 A periodic image of a device's whole screen, about once a minute while it is unlocked and
-in use: `device` `crobat` (the Mac), `pixel11pro` (the Android phone, from 2026-10-23;
+in use: `device` `crobat` (the Mac), `pichu` (the Android phone, from 2026-10-23;
 AVIF frames, sent when it is on Wi-Fi, so they can land hours late) and `joltik` (the
 iPhone before it). `base_screen_timelapse.screenshots` is one row per image: `device`,
 `captured_at`, `display_index` (a two-display Mac writes two per moment), `mime_type`,

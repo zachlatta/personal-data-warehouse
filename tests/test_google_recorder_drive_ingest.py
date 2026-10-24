@@ -99,7 +99,7 @@ def sidecar(**recording_overrides) -> dict[str, object]:
         "schema_version": 1,
         "source": "google_recorder",
         "account": "zach@example.com",
-        "device": "pixel11pro",
+        "device": "pichu",
         "uploaded_at": "2026-10-23T21:56:40Z",
         "recording": recording,
     }
@@ -151,7 +151,7 @@ def test_a_sidecar_maps_to_one_row_with_the_recorders_own_fields() -> None:
     assert set(row) == set(GOOGLE_RECORDER_RECORDING_COLUMNS)
     assert row["account"] == "zach@example.com"
     assert row["recording_id"] == "0e3f45d8-690c-4e95-b145-01a0312704cf"
-    assert row["device"] == "pixel11pro"
+    assert row["device"] == "pichu"
     assert row["title"] == "Oct 23 at 5:56 PM"
     # Recorder's created_time is epoch milliseconds in UTC: no zone guessing.
     assert row["recorded_at"] == datetime(2026, 10, 23, 21, 56, 24, 803000, tzinfo=UTC)

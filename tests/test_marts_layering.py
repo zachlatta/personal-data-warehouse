@@ -412,7 +412,7 @@ def _seed_voice_memos(wh: PostgresWarehouse) -> None:
                 table="google_recorder_recordings",
                 account="zach",
                 recording_id="pixel-1",
-                device="pixel11pro",
+                device="pichu",
                 title="Oct 23 at 5:56 PM",
                 recorded_at=TS,
                 duration_seconds=4.35,

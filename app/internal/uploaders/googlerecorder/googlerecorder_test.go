@@ -149,7 +149,7 @@ func (u *fakeUploader) UploadGoogleRecorderMetadata(payload map[string]any, reco
 func (f *fixture) runner(client Uploader, state *State) *Runner {
 	return &Runner{
 		RecorderDir: f.dir,
-		Device:      "pixel11pro",
+		Device:      "pichu",
 		Client:      client,
 		State:       state,
 		Logger:      f.logs,
@@ -248,7 +248,7 @@ func TestASyncSendsAFinishedRecordingAndItsSidecar(t *testing.T) {
 		t.Fatalf("audio sha = %q", client.audio[0])
 	}
 	payload := client.metadata[0]
-	if payload["source"] != "google_recorder" || payload["account"] != "zach@example.com" || payload["device"] != "pixel11pro" {
+	if payload["source"] != "google_recorder" || payload["account"] != "zach@example.com" || payload["device"] != "pichu" {
 		t.Fatalf("payload = %v", payload)
 	}
 	recording := payload["recording"].(map[string]any)

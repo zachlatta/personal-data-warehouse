@@ -777,7 +777,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         "Google Recorder (Pixel)",
         cadence="uploader on every Recorder change, every 5 min as the floor",
         transport=(
-            "pixel11pro Magisk service → pdw ingest google-recorder"
+            "pichu Magisk service → pdw ingest google-recorder"
             " → /ingest/google-recorder/* → Drive inbox → Dagster"
         ),
         data=7 * DAY,

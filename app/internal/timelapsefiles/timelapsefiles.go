@@ -1,7 +1,7 @@
 // Package timelapsefiles is the filename grammar of the screen timelapse: the
 // periodic whole-screen images and accessibility trees the capture loops in the
 // sysadmin repository write, once a minute, on crobat (the Mac), for joltik
-// (the iPhone, imaged by whichever Mac shares its network) and on pixel11pro
+// (the iPhone, imaged by whichever Mac shares its network) and on pichu
 // (the Android phone, which captures its own screen).
 //
 // A capture's name is all the metadata it carries: who wrote it, when, which
