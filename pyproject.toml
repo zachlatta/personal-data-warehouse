@@ -3,8 +3,8 @@ name = "personal_data_warehouse"
 requires-python = ">=3.10,<3.15"
 version = "0.1.0"
 dependencies = [
-    "dagster==1.12.22",
-    "dagster-postgres>=0.28.22",
+    "dagster==1.13.26",
+    "dagster-postgres>=0.29.26",
     "google-api-python-client>=2.169.0",
     "google-auth-oauthlib>=1.2.2",
     "markdownify>=1.2.2",
