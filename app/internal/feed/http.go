@@ -90,9 +90,10 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
 }
 
-// phoneCardKeys are the metadata keys a card shows: the interest a pick
-// was made for (its context line) and Hacker News counts (its counts row).
-var phoneCardKeys = []string{"taste", "hn_points", "hn_comments"}
+// phoneCardKeys are the metadata keys a card shows: Hacker News counts (its
+// counts row). Not the interest a pick was made for: Zach did not want a
+// line saying why a card is here (2026-10-24).
+var phoneCardKeys = []string{"hn_points", "hn_comments"}
 
 func phoneMetadata(metadata map[string]any) map[string]any {
 	var out map[string]any

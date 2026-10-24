@@ -45,11 +45,11 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   bubbles at the top (ringed while a source has unseen cards) narrows the feed to one
   source.
 - **Card context** (added 2026-10-21 after reviewing the recordings): `GET /api/feed`
-  sends the phone only `metadata.taste`, `hn_points` and `hn_comments`. A card shows
-  `taste` as a small line above it (like X's "reposted" line or Instagram's "Suggested for
-  you"); a Muse card shows "Muse Wonder · <kind>" from its leading `*kind*` line instead
-  of Muse as the author, and its "**For you:**" text as the summary; a Hacker News card
-  shows points and comments as a counts row (tap: the discussion) instead of the
+  sends the phone only `hn_points` and `hn_comments`. No card has a line above it saying
+  why it is here: the `taste` line (and an X post's title in that spot) came out on
+  2026-10-24 because Zach did not want it. A Muse card drops its leading `*kind*` line
+  and shows its "**For you:**" text as the summary, without Muse as the author; a Hacker
+  News card shows points and comments as a counts row (tap: the discussion) instead of the
   "80 points · 14 comments on Hacker News · discussion" line (`mobile/.../card-context.ts`).
   A reload that brings new cards while he is scrolled down shows X's "N new" pill; a tap
   on an X post's author opens their profile.

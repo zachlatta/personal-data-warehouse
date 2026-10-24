@@ -197,7 +197,7 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 
 func TestPhoneMetadataKeepsOnlyWhatACardShows(t *testing.T) {
 	got := phoneMetadata(map[string]any{"taste": "History", "why": "he read it", "hn_points": 80.0, "hn_comments": 14.0, "hn_id": 5.0, "by": "agent"})
-	if len(got) != 3 || got["taste"] != "History" || got["hn_points"] != 80.0 || got["hn_comments"] != 14.0 {
+	if len(got) != 2 || got["hn_points"] != 80.0 || got["hn_comments"] != 14.0 {
 		t.Fatalf("got %+v", got)
 	}
 	if got := phoneMetadata(map[string]any{"why": "x"}); got != nil {

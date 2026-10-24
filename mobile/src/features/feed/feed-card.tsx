@@ -92,19 +92,6 @@ export function LikeButton({ liked, onPress, size = 20 }: { liked: boolean; onPr
   );
 }
 
-// The line above a card saying why it is here, like X's "reposted" line.
-function ContextLine({ label, inset }: { label: string; inset: number }) {
-  const theme = useTheme();
-  return (
-    <View style={[styles.context, { paddingLeft: inset }]}>
-      <Icon name="sparkles" tintColor={theme.textSecondary} size={13} />
-      <ThemedText style={[styles.contextText, { color: theme.textSecondary }]} numberOfLines={2}>
-        {label}
-      </ThemedText>
-    </View>
-  );
-}
-
 // Points and comments as counts, like X's row; a tap opens the discussion.
 function HnCounts({ hn, onPress }: { hn: NonNullable<CardContext['hn']>; onPress?: () => void }) {
   const theme = useTheme();
@@ -178,7 +165,6 @@ function FeedCardImpl({
   if (embed) {
     content = (
       <Pressable onPress={open} style={({ pressed }) => [styles.pad, pressed && styles.pressed]}>
-        {item.title ? <ContextLine label={item.title} inset={AVATAR + GAP - 18} /> : null}
         <View style={styles.row}>
           <Pressable onPress={openProfile} disabled={!openProfile} accessibilityLabel={`Open @${embed.author_handle} on X`}>
             <PostAvatar embed={embed} size={AVATAR + 4} />
@@ -237,7 +223,6 @@ function FeedCardImpl({
       .join(' · ');
     content = (
       <View style={styles.pad}>
-        {ctx.label ? <ContextLine label={ctx.label} inset={AVATAR + GAP - 18} /> : null}
         <View style={styles.row}>
           <Pressable onPress={item.url ? () => onBrowse(item) : open} accessibilityLabel={`Open ${name}`} style={styles.avatar}>
             <SourceAvatar name={name} url={item.url} size={AVATAR} />
@@ -399,8 +384,6 @@ const styles = StyleSheet.create({
   action: { padding: Spacing.two, flexDirection: 'row', alignItems: 'center' },
   details: { gap: 5 },
   actionText: { fontSize: 13, fontWeight: '600', lineHeight: 17 },
-  context: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingBottom: 6 },
-  contextText: { fontSize: 13, fontWeight: '600', flexShrink: 1, lineHeight: 17 },
   replying: { fontSize: 14, lineHeight: 19 },
   postText: { fontSize: 15, lineHeight: 20, marginTop: 2 },
   showMore: { fontSize: 15, color: ACCENT, marginTop: 2 },

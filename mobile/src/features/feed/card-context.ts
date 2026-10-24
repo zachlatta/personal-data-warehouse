@@ -5,15 +5,14 @@
 // PDW recording showed the gaps: Hacker News cards whose only text was
 // "80 points · 14 comments on Hacker News · discussion", and Muse cards
 // that listed Muse as the author and opened with "*Essay* **For you:**".
+// No line above the card saying why it is here: Zach did not want the
+// interest a pick was made for shown on it (voice memo, 2026-10-24).
 
 import type { FeedEmbed } from './rich';
 
 export type HnStats = { points: number; comments: number; url: string };
 
 export type CardContext = {
-  // The line above the card (the curator, the kind of piece, the interest
-  // it was picked for); '' for none.
-  label: string;
   // The body without what the label and counts now show (markdown).
   preview: string;
   // The author line, without a curator posing as the author.
@@ -21,7 +20,7 @@ export type CardContext = {
   hn?: HnStats;
 };
 
-type ContextInput = { source: string; body?: string; author?: string; metadata?: Record<string, unknown> };
+type ContextInput = { source: string; body?: string; author?: string };
 
 const HN_LINE = /^\s*\**(\d[\d,]*) points\**\s*·\s*(\d[\d,]*) comments? on Hacker News\s*·\s*(?:\[discussion\]\(([^)\s]+)\)|discussion)\s*$/im;
 const MUSE_KIND = /^\s*\*([^*\n]+)\*\s*(?:\n|$)/;
@@ -32,13 +31,8 @@ function count(text: string): number {
   return Number(text.replace(/,/g, ''));
 }
 
-function text(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
 export function cardContext(item: ContextInput): CardContext {
   let preview = item.body ?? '';
-  let label = '';
   let author = item.author;
   let hn: HnStats | undefined;
 
@@ -51,14 +45,11 @@ export function cardContext(item: ContextInput): CardContext {
   if (item.source === 'muse-wonder' || item.author === MUSE_NAME) {
     const kind = preview.match(MUSE_KIND);
     if (kind) preview = preview.slice(kind[0].length);
-    label = [MUSE_NAME, kind?.[1].trim()].filter(Boolean).join(' · ');
     preview = preview.replace(FOR_YOU, '');
     if (author === MUSE_NAME) author = '';
-  } else {
-    label = text(item.metadata?.taste);
   }
 
-  const out: CardContext = { label, preview: preview.trim() };
+  const out: CardContext = { preview: preview.trim() };
   if (author !== undefined) out.author = author;
   if (hn) out.hn = hn;
   return out;

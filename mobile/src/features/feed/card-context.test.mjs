@@ -23,26 +23,24 @@ test('a counts line with no discussion link still counts', () => {
   assert.deepEqual(c.hn, { points: 301, comments: 154, url: '' });
 });
 
-test('a Muse card names Muse and its kind above the card and keeps the reason as the text', () => {
+test('a Muse card drops its kind and keeps the reason as the text', () => {
   const c = cardContext({
     source: 'muse-wonder',
     author: 'Muse Wonder',
     body: "*Institution · Support it*\n\n**For you:** The web's memory, asking plainly for help.",
   });
-  assert.equal(c.label, 'Muse Wonder · Institution · Support it');
   assert.equal(c.preview, "The web's memory, asking plainly for help.");
   assert.equal(c.author, '');
 });
 
-test('a pick names the interest it was picked for', () => {
-  const c = cardContext({ source: 'picks', body: 'A historian of the Renaissance.', metadata: { taste: 'History and how places work', why: 'he read it' } });
-  assert.equal(c.label, 'History and how places work');
-  assert.equal(c.preview, 'A historian of the Renaissance.');
+test('a pick does not say why it is here', () => {
+  const c = cardContext({ source: 'picks', body: 'A historian of the Renaissance.' });
+  assert.deepEqual(c, { preview: 'A historian of the Renaissance.' });
 });
 
-test('a plain card has no label and keeps its author', () => {
+test('a plain card keeps its author', () => {
   const c = cardContext({ source: 'rss', body: 'Hello', author: 'Ann' });
-  assert.deepEqual(c, { label: '', preview: 'Hello', author: 'Ann' });
+  assert.deepEqual(c, { preview: 'Hello', author: 'Ann' });
 });
 
 test('new arrivals are cards the last list did not have, none on the first load', () => {
