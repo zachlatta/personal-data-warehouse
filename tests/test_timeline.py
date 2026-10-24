@@ -1343,7 +1343,7 @@ def _seed_github(wh) -> None:
                 for event_id, hours_ago, kind, raw, index in (
                     ("s1", 2.6 + 1 / 3600, "clicked", {}, 0),
                     ("s2", 2.55, "action_clicked", {}, 1),
-                    ("s3", 2.54, "expansion", {"user_action": 1, "expanded": 1}, 0),
+                    ("s3", 2.54, "expansion", {"user_action": 1.0, "expanded": 1.0}, 0),
                     ("s4", 2.53, "expansion", {"user_action": 0, "expanded": 1}, 0),
                     ("s5", 2.52, "visibility", {"visible": 1}, 0),
                 )
