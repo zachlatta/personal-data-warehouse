@@ -361,9 +361,17 @@ recording against the same 30 s p50.
   `ops.uploader_heartbeats`) is posted on a failure, on a run that sent something, and
   otherwise at most every four minutes. It uploads on any network: a memo is ~22 MB an
   hour, and the screen timelapse's Wi-Fi-only rule exists for frames, not memos.
-- **DNS.** Android has no `/etc/resolv.conf`, so Go's resolver asked `[::1]:53` and every
-  lookup failed; `internal/dnsfallback` gives pdw a resolver that asks 1.1.1.1, 8.8.8.8 and
-  MagicDNS in turn when that file is missing (`PDW_DNS_SERVERS` overrides).
+- **DNS and TLS roots.** Android has no `/etc/resolv.conf`, so Go's resolver asked
+  `[::1]:53` and every lookup failed; and Android 14+ keeps its trusted roots in the
+  Conscrypt APEX, which Go's Linux certificate list does not name, so every request then
+  failed "certificate signed by unknown authority". `internal/androidnet` (called first
+  in pdw's `main`, a no-op elsewhere) asks 1.1.1.1, 8.8.8.8 and MagicDNS in turn when
+  that file is missing (`PDW_DNS_SERVERS` overrides) and sets `SSL_CERT_DIR` to
+  `/apex/com.android.conscrypt/cacerts` and `/system/etc/security/cacerts`.
+- **The upload guard is the app preflight only** (`common.PreflightGuard`). The Mac
+  uploaders' tethering policy blocks cellular, which is the phone's normal network, and
+  Android's policy routing leaves `/proc/net/route` with no default route, so the full
+  guard deferred every run.
 - **The state directory is credential-encrypted** (`/data/misc_ce/0/pdw-google-recorder`):
   its `config/pdw/config.json` holds the warehouse master secret (ingest uploads are
   HMAC-signed with it), and with the bootloader unlocked `/data/adb` is readable before

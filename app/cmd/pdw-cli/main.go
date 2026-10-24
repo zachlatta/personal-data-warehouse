@@ -12,11 +12,11 @@ package main
 import (
 	"os"
 
-	"github.com/zachlatta/personal-data-warehouse/app/internal/dnsfallback"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/androidnet"
 )
 
 func main() {
-	// Android (the Pixel's uploader) has no /etc/resolv.conf; elsewhere a no-op.
-	dnsfallback.Install()
+	// Android (the Pixel's uploader): DNS and TLS roots; elsewhere a no-op.
+	androidnet.Install()
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv))
 }

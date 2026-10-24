@@ -141,6 +141,22 @@ func UploadGuard(getenv Getenv, prefix, baseURL string) func() string {
 	return BeforeUploadCheck(policy, baseURL, PreflightTimeout(getenv, prefix))
 }
 
+// PreflightGuard is UploadGuard without the network policy, for an uploader
+// that runs on the phone itself: the policy keeps a Mac tethered to a phone
+// from pushing gigabytes, and on the phone cellular is simply the network.
+func PreflightGuard(getenv Getenv, prefix, baseURL string) func() string {
+	if OverrideBeforeUploadCheck != nil {
+		return OverrideBeforeUploadCheck
+	}
+	timeout := PreflightTimeout(getenv, prefix)
+	return func() string {
+		if decision := PreflightAppIngest(baseURL, timeout); !decision.Allowed {
+			return decision.Reason
+		}
+		return ""
+	}
+}
+
 // AcquireRunLock takes the uploader's nonblocking lock. When another run
 // holds it the skip line is printed and done is true with exit 0 -- an
 // overlapping LaunchAgent tick is not a failure.

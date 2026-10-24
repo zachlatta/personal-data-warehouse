@@ -1,4 +1,4 @@
-package dnsfallback
+package androidnet
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 
 func missing(string) (os.FileInfo, error) { return nil, fs.ErrNotExist }
 func present(string) (os.FileInfo, error) { return nil, nil }
-func noEnv(string) string                { return "" }
+func noEnv(string) string                 { return "" }
 
 // Android has no /etc/resolv.conf, so Go's own resolver asks [::1]:53 and
 // every lookup fails ("connection refused"): measured on the Pixel 11 Pro on
@@ -58,5 +58,43 @@ func TestEachQueryAttemptAsksTheNextServer(t *testing.T) {
 		if asked[i] != want[i] {
 			t.Fatalf("asked = %v, want %v", asked, want)
 		}
+	}
+}
+
+// Android 14 and later keep the trusted roots in the Conscrypt APEX, and Go's
+// list of Linux certificate directories names neither it nor the older
+// /system/etc/security/cacerts: with DNS fixed, every request from the Pixel
+// failed "x509: certificate signed by unknown authority" (2026-10-23).
+func TestAnAndroidHostTrustsAndroidsOwnRoots(t *testing.T) {
+	dirs := map[string]bool{"/apex/com.android.conscrypt/cacerts": true, "/system/etc/security/cacerts": true}
+	stat := func(path string) (os.FileInfo, error) {
+		if dirs[path] {
+			return nil, nil
+		}
+		return nil, fs.ErrNotExist
+	}
+	set := map[string]string{}
+	setenv := func(k, v string) error { set[k] = v; return nil }
+
+	certDirs(stat, noEnv, setenv)
+	if set["SSL_CERT_DIR"] != "/apex/com.android.conscrypt/cacerts:/system/etc/security/cacerts" {
+		t.Fatalf("SSL_CERT_DIR = %q", set["SSL_CERT_DIR"])
+	}
+
+	set = map[string]string{}
+	certDirs(stat, func(k string) string {
+		if k == "SSL_CERT_DIR" {
+			return "/mine"
+		}
+		return ""
+	}, setenv)
+	if _, changed := set["SSL_CERT_DIR"]; changed {
+		t.Fatal("an operator's SSL_CERT_DIR wins")
+	}
+
+	set = map[string]string{}
+	certDirs(missing, noEnv, setenv)
+	if len(set) != 0 {
+		t.Fatalf("a host without Android's roots is left alone: %v", set)
 	}
 }

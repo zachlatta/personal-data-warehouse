@@ -126,7 +126,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
-		guard = common.UploadGuard(env, "GOOGLE_RECORDER", cfg.BaseURL)
+		// Not UploadGuard: its tethering policy is about a Mac on a phone's
+		// hotspot, and this runs on the phone (see common.PreflightGuard).
+		guard = common.PreflightGuard(env, "GOOGLE_RECORDER", cfg.BaseURL)
 	}
 	state, err := OpenState(statePath)
 	if err != nil {

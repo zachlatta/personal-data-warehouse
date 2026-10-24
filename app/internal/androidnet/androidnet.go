@@ -1,11 +1,18 @@
-// Package dnsfallback lets a pdw binary resolve names on Android.
+// Package androidnet lets a pdw binary reach the network on Android.
 //
 // pdw runs on the rooted Pixel (`pdw ingest google-recorder`, `pdw heartbeat`)
-// as the release linux/arm64 build. Go's own resolver reads /etc/resolv.conf,
-// which Android does not have -- Android resolves through netd -- so it falls
-// back to asking localhost and every lookup fails with "connection refused".
-// When that file is missing, Install points Go's resolver at real servers.
-package dnsfallback
+// as the release linux/arm64 build, and Go's Linux defaults do not fit
+// Android in two places:
+//
+//   - DNS. Go's resolver reads /etc/resolv.conf, which Android does not have
+//     (it resolves through netd), so it asks localhost and every lookup fails
+//     with "connection refused". When that file is missing, Go's resolver is
+//     pointed at real servers.
+//   - TLS roots. Android 14 and later keep the trusted roots in the Conscrypt
+//     APEX, and Go's Linux certificate directories name neither it nor the
+//     older /system/etc/security/cacerts, so every request failed "x509:
+//     certificate signed by unknown authority". SSL_CERT_DIR is set to them.
+package androidnet
 
 import (
 	"context"
@@ -22,13 +29,37 @@ import (
 // up even on a network that blocks outside DNS.
 var DefaultServers = []string{"1.1.1.1:53", "8.8.8.8:53", "100.100.100.100:53"}
 
+// androidCertDirs are Android's trusted-root directories, newest first.
+var androidCertDirs = []string{"/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"}
+
 const resolvConf = "/etc/resolv.conf"
 
-// Install replaces net.DefaultResolver on a Linux-kernel host with no
-// /etc/resolv.conf, and reports whether it did. Everywhere else it does
-// nothing, so it is safe to call first thing in main.
+// Install applies both fixes on a Linux-kernel host that needs them and
+// reports whether it replaced the resolver. Everywhere else it does nothing,
+// so it is safe to call first thing in main.
 func Install() bool {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		return false
+	}
+	certDirs(os.Stat, os.Getenv, os.Setenv)
 	return install(os.Stat, runtime.GOOS, os.Getenv)
+}
+
+// certDirs sets SSL_CERT_DIR to Android's root directories when they exist
+// and the operator has not set it.
+func certDirs(stat func(string) (os.FileInfo, error), getenv func(string) string, setenv func(string, string) error) {
+	if getenv("SSL_CERT_DIR") != "" {
+		return
+	}
+	var found []string
+	for _, dir := range androidCertDirs {
+		if _, err := stat(dir); err == nil {
+			found = append(found, dir)
+		}
+	}
+	if len(found) > 0 {
+		_ = setenv("SSL_CERT_DIR", strings.Join(found, ":"))
+	}
 }
 
 func install(stat func(string) (os.FileInfo, error), goos string, getenv func(string) string) bool {
