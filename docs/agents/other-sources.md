@@ -242,11 +242,18 @@ Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over
   whole iPhone history (176k messages back to 2016) imported into Messages at the switch.
 - **The uploader.** `pdw ingest android-messages` (`app/internal/uploaders/androidmessages`)
   runs as root on the phone, opens `bugle_db` read-only, and sends each message received at or
-  after `--since` (`ANDROID_MESSAGES_SINCE`, required) with its parts (text, attachment type,
-  name and size; not the files), sender, conversation and roster. `--since` is what keeps the
+  after `--since` (`ANDROID_MESSAGES_SINCE`, required) with its parts, sender, conversation and
+  roster, and what Messages' side tables say about it (`extras.go`): `reaction` (a reaction is
+  its own message row; `message_reactions` names its target and emoji), `reactions_data` (the
+  tally on the reacted-to message), `edit` / `edit_of` (`message_edits`), `reply`
+  (`message_replies`), `caption`, `is_starred`, `is_self_mention`, `link_preview`,
+  `read_reports` (per-recipient delivery and read times) and `annotations` (Messages' own
+  detections: links, one-time codes). Its protobuf blobs are kept as hex plus a generic
+  field-number decode. A message the phone points to (a reaction's target) can predate
+  `--since`; only its key is read. `--since` is what keeps the
   imported iPhone history on the phone: older rows are never read. A JSON ledger beside the
   lock remembers the highest row sent and a hash per recent message; each run reads the new rows
-  plus the last three days and sends only what changed (status, read state, parts). It refuses
+  plus the last three days and sends only what changed (status, read state, parts, reactions). It refuses
   to open the database when its `-wal`/`-shm` files are absent: root creating them would lock
   Messages out of its own database.
 - **The trigger.** The `pdw-android-messages` Magisk service (`ops/android/pdw-android-messages`)
@@ -263,8 +270,22 @@ Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over
 - **Downstream.** Timeline adapter `android_message` (kind `message`; `self` when sent, `noise`
   for short codes, RCS businesses and toll-free numbers, `cc` in a conversation of 10+, else
   `direct`); `marts_messages.messages` source `android_messages`.
-- **Not yet.** Reactions (`message_reactions`) and edits (`message_edits`) are in `bugle_db`
-  but not sent; attachment files stay on the phone.
+- **Files** (`attachments.go`). Every non-text part's bytes are sent once through
+  `/ingest/android-messages/attachment/resumable` (RCS files run to 100 MB, past the raw-body
+  cap) into `android-messages/library/attachments/YYYY/MM/<date>-<sha><ext>`. An RCS file is a
+  `file://` path in Messages' storage; an MMS part is `content://mms/part/N`, read with the
+  phone's `content read` unless Messages' cache (`local_cache_path`) has a copy. The ledger keeps
+  each sent part's pointer by `part_key` (`<message_key>#<n>`), so a file is read once; the part
+  in the record carries `file_status` (`stored`, `missing`: not downloaded or gone, `pending`:
+  over the run's 300 MB budget, `no_file`) and the `storage_*` pointer. Rows in
+  `base_android_messages.attachments` and `marts_files.attachments` (source `android_messages`).
+- **Columns from the extras.** `is_reaction`, `reaction_emoji`, `reacted_message_key`,
+  `reply_to_message_key`, `edited_at`, `edited_to_message_key`, `edit_of_message_key`, `caption`,
+  `is_starred`, `link_url`, `receipt_delivered_at`, `receipt_read_at`; the rest is in
+  `raw_json`. `message_kind` is `reaction` for a reaction. The mart's `reply_to_message_id`,
+  `edited_at`, `read_at` and `delivered_at` come from these.
+- **Not sent.** Deleted messages (gone from `bugle_db`) and Messages' drafts, scheduled sends
+  and encryption state.
 
 ## Android notifications
 

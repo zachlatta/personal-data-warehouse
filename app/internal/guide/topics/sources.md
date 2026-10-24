@@ -54,7 +54,7 @@ and state the window and freshness.
 - `marts_photos.photos` — one row per deduplicated logical photo with its AI caption;
   `marts_photos.files` every rendition; `base_apple_photos.files` raw. Search scope `photos`.
 - `marts_files.attachments` — one conformed row per attachment from Gmail, WhatsApp,
-  iMessage, Apple Notes and Slack, with `content_sha256`, `is_stored` and the
+  iMessage, Android texts, Apple Notes and Slack, with `content_sha256`, `is_stored` and the
   `storage_*` columns; enrichment text in `derived_enrichment.file_attachment_enrichments`.
   Bytes: {{if .CLI}}`pdw call get_object --data '{"storage_file_id": "<id>"}'`{{else}}`get_object` with the `storage_file_id`{{end}} (a Slack `F…` file id works directly).
   Fetch the returned `download_url` with `curl`, `requests` or `wget`, not Python's
@@ -140,10 +140,13 @@ revisits of one page within 30 minutes; query `base_*` for every visit.
 `base_android_messages.messages` is one row per SMS, MMS or RCS message on the Android phone
 (`device` `pichu`) from the switch on 2026-10-23 16:00 EDT; earlier texts are
 `base_apple_messages`. Columns: `message_at`, `is_from_me`, `sender_address`, `sender_name`,
-`chat_key` (the conversation), `chat_name`, `is_group`, `body_text`, `parts` (jsonb, with
-attachment type and name; files are not uploaded), `protocol_name` (`sms`, `mms`, `rcs`),
-`message_kind` (`text`, `attachment`, `system`). `marts_messages.messages` includes them
-(source `android_messages`). Timeline source `android_messages`, kind `message`.
+`chat_key` (the conversation), `chat_name`, `is_group`, `body_text`, `parts` (jsonb),
+`protocol_name` (`sms`, `mms`, `rcs`), `message_kind` (`text`, `attachment`, `reaction`,
+`system`), `reaction_emoji` + `reacted_message_key`, `reply_to_message_key`, `edited_at`,
+`receipt_read_at`, `link_url`; the rest of Messages' detail (read receipts per recipient,
+reaction tallies, link previews) is in `raw_json`. Files are `base_android_messages.attachments`
+(`file_status`, `storage_file_id`) and `marts_files.attachments`. `marts_messages.messages`
+includes the texts (source `android_messages`). Timeline source `android_messages`, kind `message`.
 
 ## Phone notifications (Android)
 

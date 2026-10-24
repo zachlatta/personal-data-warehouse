@@ -475,8 +475,10 @@ into `base_browser_history.visits`. Two timeline adapters (`browser_visit`, `bro
 Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over Zach's line
 (2026-10-23 16:00 EDT) reaches `base_android_messages.messages`. `pdw ingest android-messages`, run
 as root on the phone by the `pdw-android-messages` Magisk service, reads Google Messages' own
-database (`bugle_db`, the only store holding RCS) read-only and posts new and changed messages to
-`/ingest/android-messages/batch`. `--since` is required, so the iPhone history imported into
+database (`bugle_db`, the only store holding RCS) read-only and posts new and changed messages,
+with their reactions, edits, replies, link previews and read receipts, to
+`/ingest/android-messages/batch`, and each attachment's file once to
+`/ingest/android-messages/attachment/resumable` (`base_android_messages.attachments`). `--since` is required, so the iPhone history imported into
 Messages (already in `base_apple_messages` from the Mac) never leaves the phone. Dagster's
 `android_messages_drive_inbox_sensor` promotes the batches; timeline adapter `android_message`
 (source `android_messages`) and `marts_messages.messages` carry them; see

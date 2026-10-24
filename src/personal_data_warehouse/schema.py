@@ -3424,7 +3424,9 @@ ANDROID_MESSAGE_COLUMNS = (
     # The text parts, joined.
     "body_text",
     # Every part: [{part_id, content_type, text, file_name, width, height,
-    # duration_ms, file_size_bytes}]. The attachment files are not uploaded.
+    # duration_ms, file_size_bytes, ...}]. A file part also carries part_key,
+    # file_status and, once its file is uploaded, content_sha256 and the
+    # storage_* pointer (one row each in base_android_messages.attachments).
     "parts",
     "attachment_count",
     "is_read",
@@ -3432,10 +3434,70 @@ ANDROID_MESSAGE_COLUMNS = (
     "is_hidden",
     "telephony_uri",
     "rcs_message_id",
-    # The uploader's whole record.
+    # A reaction is its own message: its emoji and the message_key it reacts
+    # to (which can be a text from before the switch, not in this table).
+    "is_reaction",
+    "reaction_emoji",
+    "reacted_message_key",
+    # The message this one answers (an RCS reply), by message_key.
+    "reply_to_message_key",
+    # An edit: edited_at and the message_key of the version that replaced
+    # this one; on the replacement, edit_of_message_key names the original.
+    "edited_at",
+    "edited_to_message_key",
+    "edit_of_message_key",
+    "caption",
+    "is_starred",
+    # The first link's preview URL (the whole preview is raw_json.link_preview).
+    "link_url",
+    # From the recipients' delivery and read receipts on what Zach sent: the
+    # latest delivery and read time across recipients (the epoch when none).
+    "receipt_delivered_at",
+    "receipt_read_at",
+    # The uploader's whole record (reactions_data, annotations, read_reports
+    # and the rest of Messages' side tables included).
     "raw_json",
     "exported_at",
     "synced_at",
+    "sync_version",
+)
+
+
+# One row per file a text carried (photo, video, voice message, contact card,
+# sticker), from the parts of base_android_messages.messages. The bytes are
+# in the object store once the phone has uploaded them (file_status
+# 'stored'); 'missing' is a file Messages has not downloaded or no longer
+# has, 'pending' one the phone will send on a later run.
+ANDROID_MESSAGE_ATTACHMENT_COLUMNS = (
+    "account",
+    "device",
+    # The message's key and the part's place in it ("<message_key>#<n>").
+    "part_key",
+    "message_key",
+    "chat_key",
+    "is_from_me",
+    "message_at",
+    "bugle_part_id",
+    "content_type",
+    "filename",
+    # Messages' own size for the file (-1 when it does not know); the stored
+    # object's size is stored_size_bytes.
+    "size_bytes",
+    "stored_size_bytes",
+    "width",
+    "height",
+    "duration_ms",
+    "file_status",
+    "is_missing",
+    "content_sha256",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    # The part as the uploader sent it.
+    "raw_json",
+    "exported_at",
+    "ingested_at",
     "sync_version",
 )
 

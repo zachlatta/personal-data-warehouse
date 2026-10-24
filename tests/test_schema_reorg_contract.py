@@ -182,7 +182,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 base: base_google_recorder.recordings, the Pixel's voice memos.
         # +1 base: base_android_notifications.events, the Pixel's notifications.
         # +1 base: base_android_messages.messages, the Pixel's texts.
-        "base": 90,
+        # +1 base: base_android_messages.attachments, the files they carry.
+        "base": 91,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

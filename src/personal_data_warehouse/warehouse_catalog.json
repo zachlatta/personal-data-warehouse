@@ -3563,6 +3563,18 @@
       "comment": "Android texts. One row per SMS/MMS/RCS message on the phone since the switch on 2026-10-23; earlier texts are base_apple_messages, and marts_messages.messages unifies both."
     },
     {
+      "id": "android_message_attachments",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_messages",
+      "schema": "base_android_messages",
+      "name": "attachments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Android text files. One row per file (photo, video, voice message, contact card) an Android text carried, with its stored pointer; marts_files.attachments unifies them with other sources."
+    },
+    {
       "id": "android_notification_events",
       "kind": "table",
       "layer": "base",

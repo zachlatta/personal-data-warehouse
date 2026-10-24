@@ -93,6 +93,7 @@ from personal_data_warehouse.schema import (
     BROWSER_HISTORY_VISIT_COLUMNS,
     ANDROID_NOTIFICATION_EVENT_COLUMNS,
     ANDROID_MESSAGE_COLUMNS,
+    ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
@@ -1184,6 +1185,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ANDROID_MESSAGE_COLUMNS,
         ("account", "device", "message_key"),
     ),
+    # One row per file part of those messages, with its stored pointer.
+    "android_message_attachments": TableSpec(
+        ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
+        ("account", "device", "part_key"),
+    ),
     # Android notifications: one row per listener event, keyed by its uuid.
     "android_notification_events": TableSpec(
         ANDROID_NOTIFICATION_EVENT_COLUMNS,
@@ -1904,6 +1910,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "android_messages_message_at_idx",
         "android_messages",
         "CREATE INDEX IF NOT EXISTS android_messages_message_at_idx ON @android_messages (message_at DESC)",
+    ),
+    IndexSpec(
+        "android_message_attachments_message_idx",
+        "android_message_attachments",
+        "CREATE INDEX IF NOT EXISTS android_message_attachments_message_idx ON @android_message_attachments (account, device, message_key)",
+    ),
+    IndexSpec(
+        "android_message_attachments_hash_idx",
+        "android_message_attachments",
+        "CREATE INDEX IF NOT EXISTS android_message_attachments_hash_idx ON @android_message_attachments (content_sha256)",
     ),
     # Android notifications. synced_at leads for the freshness probe and the
     # adapters' incremental pass, posted_at and event_at serve their backfills, and the
@@ -2811,6 +2827,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "browser_history_visits": {"raw_json"},
     "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
     "android_messages": {"raw_json", "participants", "parts"},
+    "android_message_attachments": {"raw_json"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -2994,6 +3011,8 @@ TIMESTAMP_COLUMNS = {
     "event_at",
     # android_messages
     "sent_at",
+    "receipt_delivered_at",
+    "receipt_read_at",
     "notification_when_at",
     # hacker_news
     "fetched_at",
@@ -3113,6 +3132,11 @@ TIMESTAMP_COLUMNS = {
 INTEGER_COLUMNS = {
     # android_messages
     "bugle_id",
+    "is_reaction",
+    "is_starred",
+    "bugle_part_id",
+    "stored_size_bytes",
+    "duration_ms",
     "participant_count",
     "protocol",
     "bugle_status",
@@ -3557,7 +3581,7 @@ _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
 
 _ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
 
-_ANDROID_MESSAGES_TABLES = ("android_messages",)
+_ANDROID_MESSAGES_TABLES = ("android_messages", "android_message_attachments")
 
 _SCREEN_TIMELAPSE_TABLES = (
     "screen_timelapse_screenshots",
@@ -11034,9 +11058,32 @@ class PostgresWarehouse:
         )
 
     def ensure_android_messages_tables(self) -> None:
-        """Provision base_android_messages.messages and the messages mart over it."""
+        """Provision base_android_messages.messages and .attachments, and the
+        messages and files marts over them."""
         self._ensure_table_group(list(_ANDROID_MESSAGES_TABLES))
+        # Reactions, edits, replies and receipts joined the messages table
+        # after it was live (2026-10-24); the table is small.
+        self._reconcile_table_columns("android_messages")
         self._ensure_messages_mart_view_if_possible()
+        self._ensure_files_mart_views()
+
+    def insert_android_message_attachments(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert attachments by (account, device, part_key)."""
+        if not rows:
+            return
+        self._insert_rows(
+            "android_message_attachments",
+            [
+                {
+                    column: row.get(
+                        column, _default_python_value(column, table="android_message_attachments")
+                    )
+                    for column in ANDROID_MESSAGE_ATTACHMENT_COLUMNS
+                }
+                for row in rows
+            ],
+            ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
+        )
 
     def insert_android_messages(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert messages by (account, device, message_key)."""
@@ -17882,11 +17929,11 @@ class PostgresWarehouse:
                 a.protocol_name AS source_message_kind,
                 NULL::text AS media_type,
                 upper(a.protocol_name) AS service,
-                NULL::text AS reply_to_message_id,
+                NULLIF(a.reply_to_message_key, '') AS reply_to_message_id,
                 NULLIF(a.message_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS message_at,
-                NULL::timestamptz AS edited_at,
-                NULL::timestamptz AS read_at,
-                NULL::timestamptz AS delivered_at,
+                NULLIF(a.edited_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS edited_at,
+                NULLIF(a.receipt_read_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS read_at,
+                NULLIF(a.receipt_delivered_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS delivered_at,
                 0::bigint AS is_deleted
             FROM @android_messages a"""
         # chat_kind is one vocabulary across sources: WhatsApp calls a DM
@@ -17995,8 +18042,8 @@ class PostgresWarehouse:
     def _ensure_files_mart_views(self) -> None:
         """marts_files.attachments: one entry point for every stored attachment.
 
-        Five sources expose attachments -- Gmail, WhatsApp, iMessage, Apple
-        Notes and Slack -- each in its own raw table with its own column names
+        Six sources expose attachments -- Gmail, WhatsApp, iMessage, Android
+        texts, Apple Notes and Slack -- each in its own raw table with its own column names
         (`size` vs `size_bytes`, `storage_status = 'stored'` vs `is_missing =
         0`, `mime_type` vs `content_type`). Until this view every attachment
         enrichment pass carried a per-source descriptor naming the raw table,
@@ -18014,6 +18061,7 @@ class PostgresWarehouse:
                 "gmail_attachments",
                 "whatsapp_media_items",
                 "apple_message_attachments",
+                "android_message_attachments",
                 "apple_note_attachments",
                 "apple_note_revisions",
                 "slack_files",
@@ -18086,6 +18134,23 @@ class PostgresWarehouse:
                 NULLIF(a.ingested_at, {epoch}),
                 ''::text
             FROM @apple_message_attachments a
+            UNION ALL
+            SELECT
+                'android_messages'::text,
+                a.account,
+                a.message_key,
+                a.part_key,
+                a.filename,
+                a.content_type,
+                GREATEST(a.stored_size_bytes, a.size_bytes, 0)::bigint,
+                a.content_sha256,
+                (CASE WHEN a.is_missing = 0 AND a.content_sha256 <> '' THEN 1 ELSE 0 END)::bigint,
+                0::bigint,
+                NULLIF(a.message_at, {epoch}),
+                a.storage_backend, a.storage_key, a.storage_file_id, a.storage_url,
+                NULLIF(a.ingested_at, {epoch}),
+                ''::text
+            FROM @android_message_attachments a
             UNION ALL
             SELECT
                 'apple_notes'::text,
@@ -19412,6 +19477,15 @@ def _is_jsonb_column(table: str | None, column: str) -> bool:
 # the incoming row's value is empty (see _upsert_assignment). In-batch dedupe
 # applies the same merge so collapsing rows cannot drop these values.
 PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    # A message re-sent while its file is still pending must not erase a
+    # pointer an earlier batch recorded.
+    "android_message_attachments": (
+        "content_sha256",
+        "storage_backend",
+        "storage_key",
+        "storage_file_id",
+        "storage_url",
+    ),
     "apple_message_attachments": (
         "content_sha256",
         "storage_backend",

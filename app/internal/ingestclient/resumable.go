@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	photoResumableEndpoint          = "/ingest/photos/file/resumable"
-	voiceMemoResumableEndpoint      = "/ingest/voice-memos/audio/resumable"
-	googleRecorderResumableEndpoint = "/ingest/google-recorder/audio/resumable"
-	resumableStatusCode             = 308
-	resumableRetryAttempts          = 5
-	resumableSessionRestart         = 3
+	photoResumableEndpoint            = "/ingest/photos/file/resumable"
+	voiceMemoResumableEndpoint        = "/ingest/voice-memos/audio/resumable"
+	googleRecorderResumableEndpoint   = "/ingest/google-recorder/audio/resumable"
+	androidMessagesAttachmentEndpoint = "/ingest/android-messages/attachment/resumable"
+	resumableStatusCode               = 308
+	resumableRetryAttempts            = 5
+	resumableSessionRestart           = 3
 )
 
 var errResumableSessionExpired = errors.New("resumable session expired")
@@ -46,6 +47,13 @@ func (c *Client) UploadVoiceMemoAudio(path, recordedAt, extension, contentType, 
 // resumable Drive session, for the same reason as UploadVoiceMemoAudio.
 func (c *Client) UploadGoogleRecorderAudio(path, recordedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
 	return c.uploadResumableFile(googleRecorderResumableEndpoint, "google recorder recording", "recorded_at", recordedAt, path, extension, contentType, contentSHA256)
+}
+
+// UploadAndroidMessagesAttachment uploads one file a text carried (a photo,
+// video, voice message, contact card) through a resumable Drive session:
+// RCS files run to 100 MB, past what the raw-body route can carry.
+func (c *Client) UploadAndroidMessagesAttachment(path, messageAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(androidMessagesAttachmentEndpoint, "android message attachment", "message_at", messageAt, path, extension, contentType, contentSHA256)
 }
 
 // uploadResumableFile uploads a file through a resumable Drive session. Only

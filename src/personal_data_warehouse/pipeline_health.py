@@ -1669,6 +1669,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "android_notification_events": _data("android_notifications", "synced_at", "event_at"),
     # Android messages
     "android_messages": _data("android_messages", "synced_at", "message_at"),
+    "android_message_attachments": _support("android_messages", "ingested_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

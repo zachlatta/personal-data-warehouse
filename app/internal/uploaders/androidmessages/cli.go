@@ -21,10 +21,13 @@ USAGE
 Runs ON the phone, as root (Google Messages' database is private to it). It
 reads Messages' own database (bugle_db: every SMS, MMS and RCS message)
 read-only and sends each message received at or after --since, with its
-text, attachment details (type, name, size; not the file), sender and
-conversation, as gzipped batches to the app's /ingest/android-messages/batch
-endpoint. Each run sends new messages and re-sends any from the last three
-days whose status, read state or parts changed. A run that finds Messages'
+text, sender, conversation, reactions, edits, replies, link previews and
+read receipts, as gzipped batches to the app's /ingest/android-messages/batch
+endpoint, and each attachment's file (photo, video, voice message, contact
+card) once, through a resumable upload, with its pointer in the message.
+Each run sends new messages and re-sends any from the last three days whose
+status, read state, reactions or files changed; at most 300 MB of files go
+per run and the rest on the next. A run that finds Messages'
 database closed (no -wal/-shm beside it) sends nothing and exits 0.
 
 --since is required: messages before it are never read. On the Pixel it is
@@ -118,6 +121,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 
 	var client Uploader
+	var files AttachmentUploader
 	guard := func() string { return "" }
 	if *dryRun {
 		client = &dryRunUploader{out: stdout}
@@ -128,6 +132,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
+		files = ingest
 		// Not UploadGuard: this runs on the phone (see common.PreflightGuard).
 		guard = common.PreflightGuard(env, "ANDROID_MESSAGES", cfg.BaseURL)
 	}
@@ -138,12 +143,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Account:           accountName,
 		Device:            deviceName,
 		Client:            client,
+		Files:             files,
 		Logger:            logger,
 		DryRun:            *dryRun,
 		BeforeUploadCheck: guard,
 	}).Sync()
-	fmt.Fprintf(stdout, "Android messages upload complete: read=%d unchanged=%d messages=%d batches=%d deferred=%t dry_run=%t\n",
-		summary.Read, summary.Unchanged, summary.Uploaded, summary.Batches, summary.Deferred, *dryRun)
+	fmt.Fprintf(stdout, "Android messages upload complete: read=%d unchanged=%d messages=%d batches=%d attachments=%d attachment_bytes=%d deferred=%t dry_run=%t\n",
+		summary.Read, summary.Unchanged, summary.Uploaded, summary.Batches, summary.AttachmentsUploaded, summary.AttachmentBytes, summary.Deferred, *dryRun)
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest android-messages: %v\n", err)
 		return common.ExitFailure

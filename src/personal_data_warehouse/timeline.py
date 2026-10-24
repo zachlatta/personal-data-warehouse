@@ -4057,6 +4057,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "android_notification_events": _events(),
     # Android messages: one events table, one adapter (system rows stay in base).
     "android_messages": _events(),
+    "android_message_attachments": _detail(
+        "android_messages", "files shown with the parent message"
+    ),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(

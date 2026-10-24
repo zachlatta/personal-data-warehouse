@@ -46,33 +46,41 @@ type Uploader interface {
 
 // Summary is one run's counts.
 type Summary struct {
-	Read      int
-	Unchanged int
-	Uploaded  int
-	Batches   int
-	Deferred  bool
+	Read                int
+	Unchanged           int
+	Uploaded            int
+	Batches             int
+	AttachmentsUploaded int
+	AttachmentBytes     int64
+	Deferred            bool
 }
 
 // Runner reads the database and sends what changed.
 type Runner struct {
-	DatabasePath      string
-	StatePath         string
-	Since             time.Time
-	Account           string
-	Device            string
-	Client            Uploader
-	Logger            common.Logger
-	Now               func() time.Time
-	BatchSize         int
-	RecentWindow      time.Duration
-	DryRun            bool
-	BeforeUploadCheck func() string
+	DatabasePath string
+	StatePath    string
+	Since        time.Time
+	Account      string
+	Device       string
+	Client       Uploader
+	Files        AttachmentUploader
+	Logger       common.Logger
+	Now          func() time.Time
+	BatchSize    int
+	RecentWindow time.Duration
+	// AttachmentBytesPerRun caps the file bytes one run sends (0: the
+	// default); the rest are sent by the next runs.
+	AttachmentBytesPerRun int64
+	DryRun                bool
+	BeforeUploadCheck     func() string
 }
 
 type state struct {
 	SinceMS int64             `json:"since_ms"`
 	MaxID   int64             `json:"max_id"`
 	Sent    map[string]string `json:"sent"`
+	// Files is each file part sent, by part key, with its stored pointer.
+	Files map[string]storedFile `json:"files,omitempty"`
 }
 
 // Sync sends every message since r.Since whose content is new or changed.
@@ -113,7 +121,7 @@ func (r *Runner) Sync() (Summary, error) {
 	if st.SinceMS != sinceMS {
 		// A new start time is a fresh ledger: everything since it is sent
 		// once more and the warehouse upserts it.
-		st = state{SinceMS: sinceMS, Sent: map[string]string{}}
+		st = state{SinceMS: sinceMS, Sent: map[string]string{}, Files: map[string]storedFile{}}
 	}
 	recentMS := max(sinceMS, r.Now().Add(-r.RecentWindow).UnixMilli())
 
@@ -121,12 +129,19 @@ func (r *Runner) Sync() (Summary, error) {
 	if err != nil {
 		return summary, err
 	}
-	messages, err := readMessages(db, sinceMS, st.MaxID, recentMS)
+	messages, locations, err := readMessages(db, sinceMS, st.MaxID, recentMS)
 	db.Close()
 	if err != nil {
 		return summary, err
 	}
 	summary.Read = len(messages)
+	// Files first: a message is sent with its files' pointers, so a file
+	// sent now changes its message, which is then sent again.
+	keptFiles := map[string]storedFile{}
+	summary.AttachmentsUploaded, summary.AttachmentBytes, err = r.attachFiles(messages, locations, &st, keptFiles)
+	if err != nil {
+		return summary, err
+	}
 
 	type pending struct {
 		message map[string]any
@@ -147,7 +162,7 @@ func (r *Runner) Sync() (Summary, error) {
 		changed = append(changed, pending{message: message, key: key, sha: sha, id: intOf(message["bugle_id"])})
 	}
 	if len(changed) == 0 {
-		return summary, r.saveState(st, seen, messages)
+		return summary, r.saveState(st, seen, messages, keptFiles)
 	}
 	if r.BeforeUploadCheck != nil {
 		if reason := r.BeforeUploadCheck(); reason != "" {
@@ -188,16 +203,17 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.DryRun {
 		return summary, nil
 	}
-	return summary, r.saveState(st, seen, messages)
+	return summary, r.saveState(st, seen, messages, keptFiles)
 }
 
-// saveState keeps hashes only for what this run read (older messages are not
-// re-read, so their hashes are no longer needed) and advances the row cursor
-// past every message read.
-func (r *Runner) saveState(st state, seen map[string]string, messages []map[string]any) error {
+// saveState keeps hashes and file pointers only for what this run read
+// (older messages are not re-read, so theirs are no longer needed) and
+// advances the row cursor past every message read.
+func (r *Runner) saveState(st state, seen map[string]string, messages []map[string]any, files map[string]storedFile) error {
 	if r.DryRun {
 		return nil
 	}
+	st.Files = files
 	kept := map[string]string{}
 	for key := range seen {
 		if sha, ok := st.Sent[key]; ok {
@@ -229,7 +245,7 @@ func Envelope(account string, exportedAt time.Time, device string, message map[s
 }
 
 func loadState(path string) (state, error) {
-	st := state{Sent: map[string]string{}}
+	st := state{Sent: map[string]string{}, Files: map[string]storedFile{}}
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
@@ -242,6 +258,9 @@ func loadState(path string) (state, error) {
 	}
 	if st.Sent == nil {
 		st.Sent = map[string]string{}
+	}
+	if st.Files == nil {
+		st.Files = map[string]storedFile{}
 	}
 	return st, nil
 }

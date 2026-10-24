@@ -55,6 +55,9 @@ func resumableFileArtifacts() []resumableFileArtifact {
 		{endpoint: "/ingest/photos/file/resumable", sourceSlug: "photos", kind: "photo_file", timeField: "captured_at", keyPrefix: "photos/inbox"},
 		{endpoint: "/ingest/voice-memos/audio/resumable", sourceSlug: "apple_voice_memos", kind: "voice_memo_audio", timeField: "recorded_at", keyPrefix: "apple-voice-memos/inbox"},
 		{endpoint: "/ingest/google-recorder/audio/resumable", sourceSlug: "google_recorder", kind: "google_recorder_audio", timeField: "recorded_at", keyPrefix: "google-recorder/inbox"},
+		// A text's files go straight to the library: the message batch that
+		// names them carries the pointer, so nothing promotes them.
+		{endpoint: "/ingest/android-messages/attachment/resumable", sourceSlug: "android_messages", kind: "android_message_attachment", timeField: "message_at", keyPrefix: "android-messages/library/attachments"},
 	}
 }
 
@@ -94,7 +97,7 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	// Every notification the Pixel posts or removes, from the phone's uploader.
 	"android_notifications": {source: "android_notifications", blobKind: "android_notification_blob", metadataKind: "android_notification_export_batch"},
 	// Every SMS, MMS and RCS message on the Pixel since the switch, from the phone's uploader.
-	"android_messages": {source: "android_messages", blobKind: "android_message_blob", metadataKind: "android_message_export_batch"},
+	"android_messages": {source: "android_messages", blobKind: "android_message_attachment", metadataKind: "android_message_export_batch"},
 }
 
 // ingestBuildResult is what an artifact's build step resolves from the request's

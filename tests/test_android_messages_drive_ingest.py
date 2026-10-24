@@ -42,12 +42,16 @@ class FakeWarehouse:
     def __init__(self) -> None:
         self.ensure_called = False
         self.messages: list[dict[str, object]] = []
+        self.attachments: list[dict[str, object]] = []
 
     def ensure_android_messages_tables(self) -> None:
         self.ensure_called = True
 
     def insert_android_messages(self, rows) -> None:
         self.messages.extend(rows)
+
+    def insert_android_message_attachments(self, rows) -> None:
+        self.attachments.extend(rows)
 
 
 class FakeObjectStore:
@@ -255,6 +259,115 @@ def test_the_messages_mart_carries_the_android_texts(warehouse) -> None:
             "service": "SMS",
         }
     ]
+
+
+STORED_PHOTO = {
+    "part_id": 7,
+    "part_key": "rcs:photo-1#0",
+    "content_type": "image/jpeg",
+    "text": "",
+    "file_name": "IMG_1.jpg",
+    "width": 4032,
+    "height": 3024,
+    "duration_ms": 0,
+    "file_size_bytes": 1865067,
+    "file_status": "stored",
+    "content_sha256": "a" * 64,
+    "stored_size_bytes": 1865067,
+    "storage_backend": "google_drive",
+    "storage_key": "android-messages/library/attachments/2026/10/2026-10-24-" + "a" * 64 + ".jpg",
+    "storage_file_id": "drive-file-1",
+    "storage_url": "",
+}
+
+
+def test_reactions_replies_edits_and_receipts_become_columns() -> None:
+    reaction = record_to_message_row(
+        envelope(
+            uploader_record(
+                "rcs:r1",
+                message_protocol=3,
+                parts=[{"part_id": 3, "content_type": "text/plain", "text": " ❤️ to “lunch tomorrow?”"}],
+                reaction={"emoji": "❤️", "reacted_message_key": "content://sms/1", "reaction_type": 12},
+            )
+        )
+    )
+    assert (reaction["is_reaction"], reaction["reaction_emoji"], reaction["reacted_message_key"]) == (
+        1,
+        "❤️",
+        "content://sms/1",
+    )
+    assert reaction["message_kind"] == "reaction"
+    sent = record_to_message_row(
+        envelope(
+            uploader_record(
+                "rcs:s1",
+                message_status=2,
+                reply={"replied_to_message_key": "", "replied_to_rcs_message_id": "orig"},
+                edit={"edited_at_ms": 1792900000000, "latest_message_key": "rcs:s2", "original_message_key": "rcs:s1"},
+                caption="a caption",
+                is_starred=1,
+                link_preview={"url": "https://example.com", "title": "Example"},
+                read_reports=[
+                    {"address": "+15550000002", "delivered_at_ms": 1792900001000, "read_at_ms": 0},
+                    {"address": "+15550000003", "delivered_at_ms": 1792900002000, "read_at_ms": 1792900003000},
+                ],
+            )
+        )
+    )
+    assert sent["reply_to_message_key"] == "rcs:orig"
+    assert sent["edited_at"] == datetime.fromtimestamp(1792900000, tz=UTC)
+    assert sent["edited_to_message_key"] == "rcs:s2" and sent["edit_of_message_key"] == ""
+    assert (sent["caption"], sent["is_starred"], sent["link_url"]) == ("a caption", 1, "https://example.com")
+    assert sent["receipt_delivered_at"] == datetime.fromtimestamp(1792900002, tz=UTC)
+    assert sent["receipt_read_at"] == datetime.fromtimestamp(1792900003, tz=UTC)
+    plain = record_to_message_row(envelope())
+    assert plain["is_reaction"] == 0 and plain["receipt_read_at"] == datetime.fromtimestamp(0, tz=UTC)
+
+
+def test_file_parts_become_attachment_rows(warehouse) -> None:
+    missing = {"part_id": 8, "part_key": "rcs:photo-1#1", "content_type": "image/gif", "file_status": "missing"}
+    record = uploader_record(
+        "rcs:photo-1", message_protocol=3, parts=[STORED_PHOTO, missing], rcs_message_id="photo-1"
+    )
+    AndroidMessagesDriveIngestRunner(
+        warehouse=warehouse,
+        batch_source=lambda: [{"records": [envelope(record)]}],
+        logger=FakeLogger(),
+    ).sync()
+    rows = warehouse._query_dicts(
+        "SELECT part_key, message_key, content_type, filename, file_status, is_missing, content_sha256, "
+        "storage_file_id, size_bytes FROM @android_message_attachments ORDER BY part_key"
+    )
+    assert [(r["part_key"], r["file_status"], r["is_missing"]) for r in rows] == [
+        ("rcs:photo-1#0", "stored", 0),
+        ("rcs:photo-1#1", "missing", 1),
+    ]
+    assert rows[0]["storage_file_id"] == "drive-file-1" and rows[0]["size_bytes"] == 1865067
+    mart = warehouse._query_dicts(
+        "SELECT source, parent_id, attachment_id, filename, mime_type, is_stored, storage_file_id "
+        "FROM @marts_files_attachments WHERE source = 'android_messages' ORDER BY attachment_id"
+    )
+    assert mart[0] == {
+        "source": "android_messages",
+        "parent_id": "rcs:photo-1",
+        "attachment_id": "rcs:photo-1#0",
+        "filename": "IMG_1.jpg",
+        "mime_type": "image/jpeg",
+        "is_stored": 1,
+        "storage_file_id": "drive-file-1",
+    }
+    assert mart[1]["is_stored"] == 0
+
+
+def test_ensure_adds_columns_a_live_messages_table_predates(warehouse) -> None:
+    warehouse.ensure_android_messages_tables()
+    warehouse._command(
+        f"ALTER TABLE {warehouse.sql_relation('android_messages')} "
+        "DROP COLUMN reaction_emoji, DROP COLUMN receipt_read_at"
+    )
+    warehouse.ensure_android_messages_tables()
+    assert {"reaction_emoji", "receipt_read_at"} <= warehouse._present_columns("android_messages")
 
 
 class FakeSettings:

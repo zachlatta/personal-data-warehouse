@@ -5,8 +5,9 @@ Pixel) reads Google Messages' database and posts gzipped JSONL batches of
 every SMS, MMS and RCS message since the switch from the iPhone to the app's
 /ingest/android-messages/batch endpoint, which writes them into the Drive
 inbox. Each batch is written and promoted to the library on its own. Rows
-upsert by message key, so a message re-sent with a new status replaces its
-row.
+upsert by message key, so a message re-sent with a new status, a reaction,
+an edit or a newly uploaded file replaces its row. Each file part becomes a
+row of base_android_messages.attachments carrying the stored file's pointer.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ INBOX_PREFIX = f"{OBJECT_PREFIX}/inbox/"
 LIBRARY_PREFIX = f"{OBJECT_PREFIX}/library/"
 BATCH_KIND = "android_message_export_batch"
 SOURCE = "android_messages"
-BLOB_KIND = "android_message_blob"
+# Each attachment's file, uploaded once by the phone to the library; the
+# message record's part carries its pointer.
+BLOB_KIND = "android_message_attachment"
 RECORD_TYPE = "message"
 
 # Google Messages' message_protocol values.
@@ -48,6 +51,7 @@ class AndroidMessagesDriveIngestSummary:
     batches_seen: int
     messages_written: int
     files_promoted: int
+    attachments_written: int = 0
 
 
 class AndroidMessagesDriveIngestRunner:
@@ -71,12 +75,14 @@ class AndroidMessagesDriveIngestRunner:
         batches = 0
         written = 0
         promoted = 0
+        attachments_written = 0
         source = iter(self._batch_source())
         if self._max_batches:
             source = islice(source, self._max_batches)
         for batch in source:
             batches += 1
             by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+            attachments: dict[tuple[str, str, str], dict[str, Any]] = {}
             for envelope in batch_records(batch):
                 if str(envelope.get("record_type", "")) != RECORD_TYPE:
                     continue
@@ -84,18 +90,32 @@ class AndroidMessagesDriveIngestRunner:
                 if not row["message_key"]:
                     continue
                 by_key[(row["account"], row["device"], row["message_key"])] = row
+                for attachment in message_attachment_rows(row):
+                    attachments[
+                        (attachment["account"], attachment["device"], attachment["part_key"])
+                    ] = attachment
             rows = list(by_key.values())
             self._warehouse.insert_android_messages(rows)
+            self._warehouse.insert_android_message_attachments(list(attachments.values()))
             written += len(rows)
+            attachments_written += len(attachments)
             if self._object_store is not None:
                 batch_file = nested_mapping(batch, "batch_file")
                 target_key = library_storage_key(str(batch_file.get("storage_key", "")))
                 if batch_file.get("storage_file_id") and target_key:
                     self._object_store.move_object(batch_file, new_object_key=target_key)
                     promoted += 1
-        self._logger.info("Ingested %s Android message batches and %s message rows", batches, written)
+        self._logger.info(
+            "Ingested %s Android message batches, %s message rows and %s attachment rows",
+            batches,
+            written,
+            attachments_written,
+        )
         return AndroidMessagesDriveIngestSummary(
-            batches_seen=batches, messages_written=written, files_promoted=promoted
+            batches_seen=batches,
+            messages_written=written,
+            files_promoted=promoted,
+            attachments_written=attachments_written,
         )
 
 
@@ -145,8 +165,19 @@ def record_to_message_row(envelope: Mapping[str, Any]) -> dict[str, Any]:
     ]
     attachments = [p for p in parts if not str(p.get("content_type") or "").startswith("text/")]
     is_from_me = int(0 <= status < _INCOMING_STATUS)
+    reaction = nested_mapping(record, "reaction")
+    reply = nested_mapping(record, "reply")
+    edit = nested_mapping(record, "edit")
+    edit_of = nested_mapping(record, "edit_of")
+    link_preview = nested_mapping(record, "link_preview")
+    receipts = [r for r in record.get("read_reports") or [] if isinstance(r, Mapping)]
+    reply_to = str(reply.get("replied_to_message_key") or "")
+    if not reply_to and reply.get("replied_to_rcs_message_id"):
+        reply_to = f"rcs:{reply.get('replied_to_rcs_message_id')}"
     if status >= _EVENT_STATUS:
         kind = "system"
+    elif reaction:
+        kind = "reaction"
     elif attachments:
         kind = "attachment"
     elif texts:
@@ -184,11 +215,69 @@ def record_to_message_row(envelope: Mapping[str, Any]) -> dict[str, Any]:
         "is_hidden": int(bool(int_value(record.get("is_hidden")))),
         "telephony_uri": str(record.get("telephony_uri", "") or ""),
         "rcs_message_id": str(record.get("rcs_message_id", "") or ""),
+        "is_reaction": int(bool(reaction)),
+        "reaction_emoji": str(reaction.get("emoji") or ""),
+        "reacted_message_key": str(reaction.get("reacted_message_key") or ""),
+        "reply_to_message_key": reply_to,
+        "edited_at": epoch_ms(edit.get("edited_at_ms") or edit.get("received_at_ms")),
+        "edited_to_message_key": str(edit.get("latest_message_key") or "")
+        if str(edit.get("latest_message_key") or "") != str(record.get("message_key") or "")
+        else "",
+        "edit_of_message_key": str(edit_of.get("original_message_key") or ""),
+        "caption": str(record.get("caption") or ""),
+        "is_starred": int(bool(int_value(record.get("is_starred")))),
+        "link_url": str(link_preview.get("url") or ""),
+        "receipt_delivered_at": epoch_ms(
+            max((int_value(r.get("delivered_at_ms")) for r in receipts), default=0)
+        ),
+        "receipt_read_at": epoch_ms(max((int_value(r.get("read_at_ms")) for r in receipts), default=0)),
         "raw_json": dict(record),
         "exported_at": exported_at,
         "synced_at": exported_at,
         "sync_version": int(exported_at.timestamp() * 1_000_000),
     }
+
+
+def message_attachment_rows(message: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One row per file part of a message row (parts the uploader gave a
+    part_key: everything but its text and rich-card JSON)."""
+    rows = []
+    for part in message.get("parts") or []:
+        if not isinstance(part, Mapping) or not part.get("part_key"):
+            continue
+        status = str(part.get("file_status") or "")
+        sha = str(part.get("content_sha256") or "")
+        rows.append(
+            {
+                "account": message["account"],
+                "device": message["device"],
+                "part_key": str(part["part_key"]),
+                "message_key": message["message_key"],
+                "chat_key": message["chat_key"],
+                "is_from_me": message["is_from_me"],
+                "message_at": message["message_at"],
+                "bugle_part_id": int_value(part.get("part_id")),
+                "content_type": str(part.get("content_type") or ""),
+                "filename": str(part.get("file_name") or ""),
+                "size_bytes": int_value(part.get("file_size_bytes")),
+                "stored_size_bytes": int_value(part.get("stored_size_bytes")),
+                "width": int_value(part.get("width")),
+                "height": int_value(part.get("height")),
+                "duration_ms": int_value(part.get("duration_ms")),
+                "file_status": status,
+                "is_missing": int(not (status == "stored" and sha)),
+                "content_sha256": sha,
+                "storage_backend": str(part.get("storage_backend") or ""),
+                "storage_key": str(part.get("storage_key") or ""),
+                "storage_file_id": str(part.get("storage_file_id") or ""),
+                "storage_url": str(part.get("storage_url") or ""),
+                "raw_json": dict(part),
+                "exported_at": message["exported_at"],
+                "ingested_at": message["synced_at"],
+                "sync_version": message["sync_version"],
+            }
+        )
+    return rows
 
 
 def epoch_ms(value: object) -> datetime:

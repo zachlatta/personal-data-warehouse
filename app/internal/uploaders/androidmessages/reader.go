@@ -33,6 +33,16 @@ SELECT
   COALESCE(CAST(m.rcs_message_id AS TEXT), '') AS rcs_message_id,
   COALESCE(m.is_hidden, 0) AS is_hidden,
   COALESCE(m.sms_error_code, 0) AS sms_error_code,
+  COALESCE(m.original_rcs_message_id, '') AS original_rcs_message_id,
+  COALESCE(m.original_message_id, 0) AS original_bugle_id,
+  COALESCE(m.parent_message_id, 0) AS parent_bugle_id,
+  COALESCE(m.sender_send_destination, '') AS sender_send_destination,
+  COALESCE(m.message_report_status, 0) AS message_report_status,
+  COALESCE(m.outgoing_delivery_report_status, 0) AS outgoing_delivery_report_status,
+  COALESCE(m.outgoing_read_report_status, 0) AS outgoing_read_report_status,
+  COALESCE(m.encryption_protocol, 0) AS encryption_protocol,
+  COALESCE(m.message_original_protocol, -1) AS message_original_protocol,
+  COALESCE(m.fallback_reason, 0) AS fallback_reason,
   COALESCE(c.name, '') AS conversation_name,
   COALESCE(c.participant_count, 0) AS participant_count,
   COALESCE(c.conv_type, 0) AS conversation_type,
@@ -59,7 +69,19 @@ SELECT
   COALESCE(p.width, 0) AS width,
   COALESCE(p.height, 0) AS height,
   COALESCE(p.duration, 0) AS duration_ms,
-  COALESCE(p.file_size_bytes, 0) AS file_size_bytes
+  COALESCE(p.file_size_bytes, 0) AS file_size_bytes,
+  COALESCE(p.raw_text, '') AS raw_text,
+  COALESCE(p.uri, '') AS uri,
+  COALESCE(p.local_cache_path, '') AS local_cache_path,
+  COALESCE(p.timestamp, 0) AS timestamp_ms,
+  COALESCE(p.latitude, 0) AS latitude,
+  COALESCE(p.longitude, 0) AS longitude,
+  COALESCE(p.sticker_set_id, -1) AS sticker_set_id,
+  COALESCE(p.sticker_id, -1) AS sticker_id,
+  COALESCE(p.expressive_sticker_name, '') AS expressive_sticker_name,
+  COALESCE(p.content_description, '') AS content_description,
+  COALESCE(p.attachment_id, '') AS attachment_id,
+  COALESCE(p.preview_content_type, '') AS preview_content_type
 FROM parts p
 JOIN messages m ON m._id = p.message_id
 WHERE m.received_timestamp >= ?1
@@ -84,32 +106,47 @@ ORDER BY cp.conversation_id, p.normalized_destination`
 // either newer than afterID or received at or after recentMS (the window
 // re-read each run so a status or read change is sent again), oldest id
 // first, each with its parts and its conversation's other participants.
-func readMessages(db *sql.DB, sinceMS, afterID, recentMS int64) ([]map[string]any, error) {
+func readMessages(db *sql.DB, sinceMS, afterID, recentMS int64) ([]map[string]any, map[int64]fileLocation, error) {
 	rows, err := common.Query(db, messagesQuery, sinceMS, afterID, recentMS)
 	if err != nil {
-		return nil, fmt.Errorf("read messages: %w", err)
+		return nil, nil, fmt.Errorf("read messages: %w", err)
 	}
 	partRows, err := common.Query(db, partsQuery, sinceMS, afterID, recentMS)
 	if err != nil {
-		return nil, fmt.Errorf("read parts: %w", err)
+		return nil, nil, fmt.Errorf("read parts: %w", err)
 	}
 	participantRows, err := common.Query(db, participantsQuery, sinceMS, afterID, recentMS)
 	if err != nil {
-		return nil, fmt.Errorf("read participants: %w", err)
+		return nil, nil, fmt.Errorf("read participants: %w", err)
+	}
+	extras, err := readExtras(db, sinceMS, afterID, recentMS)
+	if err != nil {
+		return nil, nil, err
 	}
 	parts := map[int64][]map[string]any{}
+	locations := map[int64]fileLocation{}
 	for _, row := range partRows {
 		id := intOf(row.Values["message_id"])
-		parts[id] = append(parts[id], map[string]any{
-			"part_id":         intOf(row.Values["part_id"]),
-			"content_type":    stringOf(row.Values["content_type"]),
-			"text":            stringOf(row.Values["text"]),
-			"file_name":       stringOf(row.Values["file_name"]),
-			"width":           intOf(row.Values["width"]),
-			"height":          intOf(row.Values["height"]),
-			"duration_ms":     intOf(row.Values["duration_ms"]),
-			"file_size_bytes": intOf(row.Values["file_size_bytes"]),
-		})
+		part := map[string]any{}
+		for _, column := range row.Columns {
+			part[column] = row.Values[column]
+		}
+		delete(part, "message_id")
+		// Where Messages keeps the file is the uploader's business (it
+		// reads the bytes from there); the warehouse gets the bytes.
+		for _, column := range []string{"uri", "local_cache_path"} {
+			delete(part, column)
+		}
+		part["part_id"] = intOf(row.Values["part_id"])
+		part["width"] = intOf(row.Values["width"])
+		part["height"] = intOf(row.Values["height"])
+		part["duration_ms"] = intOf(row.Values["duration_ms"])
+		part["file_size_bytes"] = intOf(row.Values["file_size_bytes"])
+		parts[id] = append(parts[id], part)
+		locations[intOf(row.Values["part_id"])] = fileLocation{
+			uri:       stringOf(row.Values["uri"]),
+			cachePath: stringOf(row.Values["local_cache_path"]),
+		}
 	}
 	participants := map[int64][]map[string]any{}
 	for _, row := range participantRows {
@@ -131,9 +168,14 @@ func readMessages(db *sql.DB, sinceMS, afterID, recentMS int64) ([]map[string]an
 		message["participants"] = nonNil(participants[conversation])
 		message["chat_key"] = chatKey(stringOf(row.Values["rcs_group_id"]), participants[conversation])
 		message["message_key"] = messageKey(message)
+		for name, values := range extras {
+			if value, ok := values[id]; ok {
+				message[name] = value
+			}
+		}
 		out = append(out, message)
 	}
-	return out, nil
+	return out, locations, nil
 }
 
 // messageKey is the message's identity in the warehouse. Google Messages'
