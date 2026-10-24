@@ -1664,6 +1664,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert notifications["n1"]["actor"] == "Alex Example"
     assert notifications["n1"]["priority"] == "direct"
     assert "lunch at noon?" in notifications["n3"]["search_text"]
+    assert "[]" not in notifications["n6"]["search_text"]
     assert notifications["n5"]["priority"] == "background"
     assert notifications["n6"]["priority"] == "noise"
     assert notifications["n7"]["kind"] == "opened"

@@ -2276,8 +2276,9 @@ _ANDROID_NOTIFICATION_TEXT = (
     "t.sub_text",
     "t.summary_text",
     "t.conversation_title",
-    "left(jsonb_path_query_array(t.messages, '$[*].text')::text, 4000)",
-    "left(t.text_lines::text, 2000)",
+    # NULLIF: an empty list is no text, not the two characters "[]".
+    "NULLIF(left(jsonb_path_query_array(t.messages, '$[*].text')::text, 4000), '[]')",
+    "NULLIF(left(t.text_lines::text, 2000), '[]')",
 )
 
 _ANDROID_NOTIFICATION = _simple_adapter(
