@@ -28,13 +28,14 @@ type Service struct {
 	store   Store
 	baseURL string
 	client  *http.Client
+	pool    sessionPool
 }
 
 func New(store Store, baseURL string, client *http.Client) *Service {
 	if client == nil {
 		client = safeClient()
 	}
-	return &Service{store: store, baseURL: strings.TrimRight(baseURL, "/"), client: client}
+	return &Service{store: store, baseURL: strings.TrimRight(baseURL, "/"), client: client, pool: sessionPool{sessions: map[poolSlot]*pooledSession{}}}
 }
 func allowed(ctx context.Context, c *record) bool {
 	return c.Enabled && !c.Deleted && (c.AllClients || slices.Contains(c.Clients, pdwauth.ClientNameFromContext(ctx)))
@@ -226,6 +227,7 @@ func (t *proxyTool) InputSchema() (*jsonschema.Schema, error) {
 	err = json.Unmarshal(raw, &schema)
 	return &schema, err
 }
+
 // upstreamCallBudget bounds one live call to a connected server. It stays
 // under Cloudflare's 100s origin timeout so the caller gets this error, which
 // names the budget, rather than Cloudflare's bare one.
@@ -255,13 +257,26 @@ func (t *proxyTool) Invoke(ctx context.Context, input json.RawMessage) (any, boo
 	if err != nil {
 		return nil, true, err
 	}
-	session, err := openSession(ctx, c, client)
+	params := &mcp.CallToolParams{Name: t.definition.Name, Arguments: input}
+	session, reused, release, err := t.service.pool.get(ctx, c, client)
 	if err != nil {
 		t.service.status(ctx, c, "connection_failed")
 		return nil, true, err
 	}
-	defer session.Close()
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: t.definition.Name, Arguments: input})
+	result, err := session.CallTool(ctx, params)
+	release(err != nil)
+	if err != nil && reused && errors.Is(err, mcp.ErrSessionMissing) && ctx.Err() == nil {
+		// The upstream no longer knows the pooled session (it restarted or
+		// expired it) and rejected the call without running it, so one retry
+		// on a new session cannot repeat a write.
+		session, _, release, err = t.service.pool.get(ctx, c, client)
+		if err != nil {
+			t.service.status(ctx, c, "connection_failed")
+			return nil, true, err
+		}
+		result, err = session.CallTool(ctx, params)
+		release(err != nil)
+	}
 	if err != nil {
 		t.service.status(ctx, c, "call_failed")
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
