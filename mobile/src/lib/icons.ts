@@ -25,6 +25,7 @@ export const MATERIAL_ICON = {
   heart: 'favorite',
   'heart.fill': 'favorite',
   link: 'link',
+  magnifyingglass: 'search',
   newspaper: 'newspaper',
   paperplane: 'send',
   'play.fill': 'play_arrow',

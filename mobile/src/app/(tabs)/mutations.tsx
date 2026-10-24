@@ -1,10 +1,11 @@
 import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { Pressable, RefreshControl, SectionList, StyleSheet, View } from 'react-native';
+import { Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { StatusPill } from '@/components/status-pill';
+import { InboxRow } from '@/components/inbox-row';
+import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -92,23 +93,18 @@ export default function MutationsScreen() {
           ) : null
         }
         renderItem={({ item }) => (
-          <Pressable
+          <InboxRow
+            dot={item.status === 'pending_review' ? theme.unread : undefined}
+            sender={item.requested_by || 'unknown'}
+            time={formatWhen(item.created_at)}
+            subject={item.title}
+            preview={item.reason}
+            labels={[
+              { text: item.status.replace(/_/g, ' '), color: STATUS_COLORS[item.status] },
+              { text: `${item.mutation_count} mutation${item.mutation_count === 1 ? '' : 's'}` },
+            ]}
             onPress={() => router.push({ pathname: '/mutations/[id]', params: { id: item.id } })}
-            style={({ pressed }) => [styles.row, { borderBottomColor: theme.backgroundElement }, pressed && { backgroundColor: theme.backgroundElement }]}>
-            <View style={styles.rowHeader}>
-              <StatusPill status={item.status} />
-              <ThemedText type="small" themeColor="textSecondary">
-                {formatWhen(item.created_at)}
-              </ThemedText>
-            </View>
-            <ThemedText type="smallBold">{item.title}</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary" numberOfLines={2}>
-              {item.reason}
-            </ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">
-              {item.mutation_count} mutation{item.mutation_count === 1 ? '' : 's'} · by {item.requested_by || 'unknown'}
-            </ThemedText>
-          </Pressable>
+          />
         )}
       />
     </ThemedView>
@@ -117,10 +113,8 @@ export default function MutationsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  sectionHeader: { paddingHorizontal: Spacing.three, paddingTop: Spacing.three, paddingBottom: Spacing.two },
-  row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
-  rowHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  empty: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.three },
+  sectionHeader: { paddingLeft: 26, paddingRight: Spacing.three, paddingTop: Spacing.three, paddingBottom: 6 },
+  empty: { paddingLeft: 26, paddingRight: Spacing.three, paddingVertical: Spacing.three },
   errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
   errorText: { color: '#D0342C' },
 });

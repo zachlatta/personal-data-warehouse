@@ -1,8 +1,9 @@
 import { useRouter } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Keyboard, Pressable, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { ActivityIndicator, FlatList, Keyboard, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
-import { PRIORITY_COLORS, PriorityBadge } from '@/components/priority-badge';
+import { InboxRow, SplitChips } from '@/components/inbox-row';
+import { PRIORITY_COLORS } from '@/components/priority-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
@@ -74,7 +75,7 @@ export default function SearchScreen() {
     <ThemedView style={styles.container}>
       <View style={styles.searchRow}>
         <TextInput
-          style={[styles.input, { backgroundColor: theme.backgroundElement, color: theme.text }]}
+          style={[styles.input, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder, color: theme.text }]}
           placeholder="Words the answer would contain…"
           placeholderTextColor={theme.textSecondary}
           value={query}
@@ -85,27 +86,12 @@ export default function SearchScreen() {
           autoCorrect={false}
           clearButtonMode="while-editing"
         />
-        <Pressable onPress={() => run()} disabled={busy || !query.trim()} style={[styles.go, (busy || !query.trim()) && styles.disabled]}>
-          <ThemedText style={styles.goText}>Search</ThemedText>
+        <Pressable onPress={() => run()} disabled={busy || !query.trim()} style={[styles.go, { backgroundColor: theme.text }, (busy || !query.trim()) && styles.disabled]}>
+          <ThemedText style={[styles.goText, { color: theme.background }]}>Search</ThemedText>
         </Pressable>
       </View>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
-        {MODES.map((m) => (
-          <Pressable key={m} onPress={() => pickMode(m)} style={[styles.chip, { borderColor: '#208AEF', backgroundColor: mode === m ? '#208AEF' : 'transparent' }]}>
-            <ThemedText style={[styles.chipText, { color: mode === m ? '#fff' : '#208AEF' }]}>{m}</ThemedText>
-          </Pressable>
-        ))}
-        <View style={styles.chipGap} />
-        {PRIORITIES.map((tier) => {
-          const on = tiers.includes(tier);
-          const color = PRIORITY_COLORS[tier];
-          return (
-            <Pressable key={tier} onPress={() => toggleTier(tier)} style={[styles.chip, { borderColor: color, backgroundColor: on ? color : 'transparent' }]}>
-              <ThemedText style={[styles.chipText, { color: on ? '#fff' : color }]}>{tier}</ThemedText>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+      <SplitChips items={MODES} selected={[mode]} onToggle={pickMode} />
+      <SplitChips items={PRIORITIES} selected={tiers} onToggle={toggleTier} dotColor={(tier) => PRIORITY_COLORS[tier]} />
       {error ? <ThemedText style={styles.error}>{error}</ThemedText> : null}
       {result?.hint ? (
         <ThemedText type="small" themeColor="textSecondary" style={styles.hint}>
@@ -123,27 +109,16 @@ export default function SearchScreen() {
         keyExtractor={(hit, index) => `${hit.ref}|${index}`}
         keyboardShouldPersistTaps="handled"
         renderItem={({ item }) => (
-          <Pressable onPress={() => open(item)} style={({ pressed }) => [styles.row, { borderBottomColor: theme.backgroundElement }, pressed && { backgroundColor: theme.backgroundElement }]}>
-            <View style={styles.rowHeader}>
-              <ThemedText type="small" themeColor="textSecondary" style={styles.source}>
-                {humanSource(item.source)}
-                {item.who ? ` · ${truncate(item.who, 30)}` : ''}
-                {item.context ? ` · ${truncate(item.context, 30)}` : ''}
-              </ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">
-                {formatWhen(item.occurred_at)}
-              </ThemedText>
-            </View>
-            <View style={styles.titleRow}>
-              {item.priority ? <PriorityBadge priority={item.priority} /> : null}
-              <ThemedText type="smallBold" style={styles.title} numberOfLines={2}>
-                {item.title || item.context || truncate(item.text, 80)}
-              </ThemedText>
-            </View>
-            <ThemedText type="small" themeColor="textSecondary" numberOfLines={3}>
-              {truncate(item.text, 260)}
-            </ThemedText>
-          </Pressable>
+          <InboxRow
+            dot={item.priority ? PRIORITY_COLORS[item.priority] : undefined}
+            sender={item.who ? truncate(item.who, 60) : humanSource(item.source)}
+            time={formatWhen(item.occurred_at)}
+            subject={item.title || item.context || truncate(item.text, 80)}
+            preview={truncate(item.text, 260)}
+            previewLines={3}
+            labels={[{ text: humanSource(item.source) }]}
+            onPress={() => open(item)}
+          />
         )}
         ListEmptyComponent={
           result && !busy && !error ? (
@@ -161,21 +136,12 @@ export default function SearchScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   searchRow: { flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingTop: Spacing.two },
-  input: { flex: 1, borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 10, fontSize: 16 },
-  go: { backgroundColor: '#208AEF', borderRadius: 10, paddingHorizontal: 14, justifyContent: 'center' },
-  goText: { color: '#fff', fontWeight: '600' },
+  input: { flex: 1, borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 18, paddingVertical: 10, fontSize: 16 },
+  go: { borderRadius: 22, paddingHorizontal: 16, justifyContent: 'center' },
+  goText: { fontWeight: '600' },
   disabled: { opacity: 0.5 },
-  chips: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.two, alignItems: 'center' },
-  chipGap: { width: Spacing.two },
-  chip: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 5 },
-  chipText: { fontSize: 13, fontWeight: '600' },
   hint: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.one },
   spinner: { paddingVertical: Spacing.two },
-  row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
-  rowHeader: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
-  source: { flexShrink: 1 },
-  titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.two },
-  title: { flex: 1 },
   empty: { textAlign: 'center', padding: Spacing.five },
   footer: { textAlign: 'center', padding: Spacing.three },
   error: { color: '#D0342C', paddingHorizontal: Spacing.three },

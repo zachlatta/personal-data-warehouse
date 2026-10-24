@@ -5,7 +5,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { Palette, Spacing } from '@/constants/theme';
 import { useScrollLock } from '@/hooks/use-scroll-lock';
 import { useTheme } from '@/hooks/use-theme';
 import { GmailOverview, GmailThreadRow, type GmailScope } from '@/components/gmail-thread-review';
@@ -679,10 +679,10 @@ export default function MutationRequestScreen() {
               styles.actions,
               // Clear of the home indicator; the buttons are the two most
               // consequential controls on the screen.
-              { backgroundColor: theme.background, borderTopColor: theme.backgroundSelected, paddingBottom: Spacing.three + insets.bottom },
+              { backgroundColor: theme.background, paddingBottom: Spacing.two + insets.bottom },
             ]}>
             <View style={styles.actionButtons}>
-              <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, { backgroundColor: theme.backgroundElement }, busy && styles.disabled]}>
+              <Pressable accessibilityRole="button" onPress={deny} disabled={busy} style={[styles.button, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder, borderWidth: StyleSheet.hairlineWidth }, busy && styles.disabled]}>
                 <ThemedText style={[styles.buttonText, styles.denyText]}>{decision.denyLabel}</ThemedText>
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy || decision.running === 0} style={[styles.button, styles.approve, (busy || decision.running === 0) && styles.disabled]}>
@@ -742,11 +742,12 @@ const styles = StyleSheet.create({
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: Spacing.two },
   cardHeaderCopy: { flex: 1, minWidth: 0, gap: 2 },
   field: { gap: 2 },
-  actions: { gap: Spacing.two, paddingHorizontal: Spacing.three, paddingTop: Spacing.two, paddingBottom: Spacing.three, borderTopWidth: StyleSheet.hairlineWidth },
-  actionButtons: { flexDirection: 'row', gap: Spacing.two },
-  button: { flex: 1, minHeight: 50, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
-  approve: { backgroundColor: '#16A34A' },
-  denyText: { color: '#DC2626' },
+  // Superhuman's floating action bar: two pills, no rule above them.
+  actions: { gap: Spacing.two, paddingHorizontal: 14, paddingTop: Spacing.two, paddingBottom: Spacing.three },
+  actionButtons: { flexDirection: 'row', gap: 10 },
+  button: { flex: 1, minHeight: 50, borderRadius: 25, justifyContent: 'center', alignItems: 'center' },
+  approve: { backgroundColor: Palette.done },
+  denyText: { color: Palette.destructive },
   disabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   input: { borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 12, fontSize: 16 },

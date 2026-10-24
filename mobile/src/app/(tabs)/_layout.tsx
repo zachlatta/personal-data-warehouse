@@ -1,16 +1,38 @@
-import { Tabs } from 'expo-router';
+import { Tabs, useRouter } from 'expo-router';
+import { Pressable, StyleSheet } from 'react-native';
 
 import { Icon } from '@/components/icon';
+import { PillTabBar } from '@/components/pill-tab-bar';
 import { feedTabOptions } from '@/features/feed';
+import { useTheme } from '@/hooks/use-theme';
+
+// A round toolbar button in the header, Superhuman's top-right search and
+// compose buttons.
+function HeaderButton({ icon, label, onPress }: { icon: 'magnifyingglass'; label: string; onPress: () => void }) {
+  const theme = useTheme();
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={label} hitSlop={6} onPress={onPress} style={[styles.headerButton, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
+      <Icon name={icon} tintColor={theme.text} size={20} />
+    </Pressable>
+  );
+}
 
 export default function TabsLayout() {
+  const router = useRouter();
   return (
-    <Tabs screenOptions={{ tabBarActiveTintColor: '#208AEF' }}>
+    <Tabs
+      tabBar={(props) => <PillTabBar {...props} />}
+      screenOptions={{
+        headerShadowVisible: false,
+        headerTitleAlign: 'left',
+        headerTitleStyle: { fontSize: 22, fontWeight: '600' },
+      }}>
       <Tabs.Screen
         name="index"
         options={{
           title: 'Timeline',
           tabBarIcon: ({ color, size }) => <Icon name="clock" tintColor={color} size={size} />,
+          headerRight: () => <HeaderButton icon="magnifyingglass" label="Search" onPress={() => router.navigate('/search')} />,
         }}
       />
       <Tabs.Screen name="feed" options={feedTabOptions} />
@@ -34,3 +56,7 @@ export default function TabsLayout() {
     </Tabs>
   );
 }
+
+const styles = StyleSheet.create({
+  headerButton: { width: 40, height: 40, borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, alignItems: 'center', justifyContent: 'center', marginRight: 14 },
+});

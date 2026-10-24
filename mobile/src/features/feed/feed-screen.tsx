@@ -756,5 +756,5 @@ const styles = StyleSheet.create({
   pillFace: { borderRadius: 13, borderWidth: 2, borderColor: ACCENT },
   pillFaceOverlap: { marginLeft: -12 },
   pillText: { color: '#fff', fontSize: 14, fontWeight: '700', lineHeight: 18 },
-  undoAction: { fontSize: 15, fontWeight: '700', color: '#208AEF' },
+  undoAction: { fontSize: 15, fontWeight: '700', color: '#36A0DA' },
 });

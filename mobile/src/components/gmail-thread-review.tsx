@@ -328,7 +328,7 @@ const styles = StyleSheet.create({
   toggleBoxOn: { backgroundColor: '#2563EB' },
   toggleBoxOff: { borderWidth: 1.5, borderColor: '#D97706' },
   toggleTick: { color: '#FFFFFF', fontSize: 12, lineHeight: 14, fontWeight: '800' },
-  toggleOnText: { color: '#3c87f7' },
+  toggleOnText: { color: '#36A0DA' },
   toggleOffText: { color: '#D97706' },
   pressed: { opacity: 0.6 },
   chip: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 },
@@ -343,6 +343,6 @@ const styles = StyleSheet.create({
   messageDetails: { padding: 12, borderRadius: 8, gap: 6 },
   rowActions: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: Spacing.three, paddingTop: Spacing.one },
   rowAction: { minHeight: 44, justifyContent: 'center' },
-  link: { color: '#3c87f7' },
+  link: { color: '#36A0DA' },
   danger: { color: DANGER },
 });

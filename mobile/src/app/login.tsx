@@ -89,7 +89,7 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   content: { padding: Spacing.four, gap: Spacing.three },
   input: { borderRadius: 10, paddingHorizontal: Spacing.three, paddingVertical: 12, fontSize: 16 },
-  button: { backgroundColor: '#208AEF', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: Spacing.two },
+  button: { backgroundColor: '#36A0DA', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: Spacing.two },
   buttonDisabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
   error: { color: '#D0342C' },

@@ -6,6 +6,7 @@ import { useEffect, useRef } from 'react';
 import { Alert, AppState, useColorScheme } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
+import { Colors } from '@/constants/theme';
 import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
 import { decisions } from '@/lib/undo-decision';
 import { applyUpdateNow } from '@/lib/updates';
@@ -13,6 +14,15 @@ import { SessionProvider, useSession } from '@/lib/session';
 import { TrackedBrowserHost } from '@/features/feed/tracked-browser';
 
 SplashScreen.preventAutoHideAsync();
+
+// Navigation chrome (headers, cards, the tab scene) in the app's own palette,
+// so a header is the page's colour with no bar or shadow, as in Superhuman.
+const navTheme = (dark: boolean) => {
+  const base = dark ? DarkTheme : DefaultTheme;
+  const c = dark ? Colors.dark : Colors.light;
+  return { ...base, colors: { ...base.colors, primary: c.accent, background: c.background, card: c.background, text: c.text, border: c.separator } };
+};
+const NAV_THEMES = { dark: navTheme(true), light: navTheme(false) };
 
 function Root() {
   const { ready, config } = useSession();
@@ -88,7 +98,7 @@ function Root() {
 
   if (!ready) return null;
   return (
-    <Stack>
+    <Stack screenOptions={{ headerShadowVisible: false, headerTitleStyle: { fontSize: 17, fontWeight: '600' } }}>
       <Stack.Protected guard={config !== null}>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="timeline/[adapter]/[eventId]" options={{ title: 'Event', headerBackTitle: 'Timeline' }} />
@@ -106,7 +116,7 @@ export default function RootLayout() {
   const colorScheme = useColorScheme();
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+      <ThemeProvider value={colorScheme === 'dark' ? NAV_THEMES.dark : NAV_THEMES.light}>
         <SessionProvider>
           <Root />
           <TrackedBrowserHost />

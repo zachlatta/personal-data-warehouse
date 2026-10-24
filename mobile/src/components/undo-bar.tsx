@@ -84,9 +84,10 @@ export function UndoBar({ bottom = Spacing.three, onOpen }: { bottom?: number; o
 
 const styles = StyleSheet.create({
   wrap: { position: 'absolute', left: Spacing.three, right: Spacing.three, alignItems: 'center', zIndex: 10 },
-  pill: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: '#1F2937', borderRadius: 18, paddingHorizontal: 14, paddingVertical: 9, maxWidth: '100%', shadowColor: '#000', shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } },
-  failed: { backgroundColor: '#B91C1C' },
-  text: { color: '#FFFFFF' },
+  // Superhuman's toast: a raised charcoal pill, the action in its link blue.
+  pill: { flexDirection: 'row', alignItems: 'center', gap: 16, backgroundColor: '#3A3836', borderRadius: 24, paddingHorizontal: 18, paddingVertical: 12, maxWidth: '100%', shadowColor: '#000', shadowOpacity: 0.3, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 6 },
+  failed: { backgroundColor: '#A63D4A' },
+  text: { color: 'rgba(255,255,255,0.92)' },
   note: { flexShrink: 1 },
-  undo: { color: '#FDE68A', fontVariant: ['tabular-nums'] },
+  undo: { color: '#72C0EA', fontVariant: ['tabular-nums'] },
 });

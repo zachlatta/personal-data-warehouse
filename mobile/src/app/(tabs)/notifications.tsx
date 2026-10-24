@@ -230,7 +230,7 @@ const styles = StyleSheet.create({
   pill: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 1, alignSelf: 'flex-start' },
   pillText: { fontSize: 11, fontWeight: '600', lineHeight: 14 },
   empty: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.three },
-  more: { margin: Spacing.three, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: '#208AEF' },
+  more: { margin: Spacing.three, borderRadius: 10, paddingVertical: 10, alignItems: 'center', borderWidth: 1, borderColor: '#36A0DA' },
   disabled: { opacity: 0.6 },
   errorBox: { padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },
   errorText: { color: '#D0342C' },

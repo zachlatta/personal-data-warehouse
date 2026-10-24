@@ -1,13 +1,13 @@
 import { useRouter } from 'expo-router';
-import { useEffect, useMemo, useReducer } from 'react';
-import { ActivityIndicator, FlatList, Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
+import { useEffect, useReducer } from 'react';
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet } from 'react-native';
 
 import { OpenInSourceButton } from '@/components/open-in-source-button';
-import { PRIORITY_COLORS, PriorityBadge } from '@/components/priority-badge';
+import { InboxRow, SplitChips } from '@/components/inbox-row';
+import { PRIORITY_COLORS } from '@/components/priority-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
-import { useTheme } from '@/hooks/use-theme';
 import { listTimeline, PRIORITIES, type Priority, type TimelineItem } from '@/lib/api';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
@@ -52,7 +52,6 @@ function reducer(state: State, action: Action): State {
 
 export default function TimelineScreen() {
   const config = useConfig();
-  const theme = useTheme();
   const router = useRouter();
   const [state, dispatch] = useReducer(reducer, { tiers: DEFAULT_TIERS, items: [], hasMore: true, generation: 1, fetching: 'reset', error: null });
   const { tiers, items, cursor, generation, fetching, error } = state;
@@ -84,30 +83,9 @@ export default function TimelineScreen() {
     dispatch({ type: 'reset', tiers: next.length === 0 ? DEFAULT_TIERS : PRIORITIES.filter((p) => next.includes(p)) });
   };
 
-  const chips = useMemo(
-    () => (
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipsBar} contentContainerStyle={styles.chips}>
-        {PRIORITIES.map((tier) => {
-          const on = tiers.includes(tier);
-          const color = PRIORITY_COLORS[tier];
-          return (
-            <Pressable
-              key={tier}
-              onPress={() => toggleTier(tier)}
-              style={[styles.chip, { borderColor: color, backgroundColor: on ? color : 'transparent' }]}>
-              <ThemedText style={[styles.chipText, { color: on ? '#fff' : color }]}>{tier}</ThemedText>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
-    ),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tiers],
-  );
-
   return (
     <ThemedView style={styles.container}>
-      {chips}
+      <SplitChips items={PRIORITIES} selected={tiers} onToggle={toggleTier} dotColor={(tier) => PRIORITY_COLORS[tier]} />
       {error ? (
         <Pressable onPress={() => dispatch({ type: 'reset' })} style={styles.errorBox}>
           <ThemedText style={styles.errorText}>{error} — tap to retry</ThemedText>
@@ -116,40 +94,26 @@ export default function TimelineScreen() {
       <FlatList
         data={items}
         keyExtractor={(item) => `${item.adapter}|${item.event_id}`}
-        renderItem={({ item }) => (
-          <Pressable
-            onPress={() =>
-              router.push({
-                pathname: '/timeline/[adapter]/[eventId]',
-                params: { adapter: item.adapter, eventId: item.event_id },
-              })
-            }
-            style={({ pressed }) => [styles.row, { borderBottomColor: theme.backgroundElement }, pressed && { backgroundColor: theme.backgroundElement }]}>
-            <View style={styles.rowHeader}>
-              <ThemedText type="small" themeColor="textSecondary" style={styles.source}>
-                {humanSource(item.source)}
-                {item.actor ? ` · ${truncate(item.actor, 40)}` : ''}
-              </ThemedText>
-              <View style={styles.rowHeaderRight}>
-                <ThemedText type="small" themeColor="textSecondary">
-                  {formatWhen(item.event_ts)}
-                </ThemedText>
-                <OpenInSourceButton link={item.open} compact />
-              </View>
-            </View>
-            <View style={styles.titleRow}>
-              <PriorityBadge priority={item.priority} />
-              <ThemedText type="smallBold" style={styles.title} numberOfLines={2}>
-                {item.title || item.context || truncate(item.snippet, 80) || '(untitled)'}
-              </ThemedText>
-            </View>
-            {item.snippet && (item.title || item.context) ? (
-              <ThemedText type="small" themeColor="textSecondary" numberOfLines={2}>
-                {truncate(item.snippet, 200)}
-              </ThemedText>
-            ) : null}
-          </Pressable>
-        )}
+        renderItem={({ item }) => {
+          const headline = item.title || item.context || truncate(item.snippet, 80) || '(untitled)';
+          return (
+            <InboxRow
+              dot={PRIORITY_COLORS[item.priority]}
+              sender={item.actor ? truncate(item.actor, 60) : humanSource(item.source)}
+              time={formatWhen(item.event_ts)}
+              subject={headline}
+              preview={item.snippet && (item.title || item.context) ? truncate(item.snippet, 200) : undefined}
+              labels={[{ text: humanSource(item.source) }]}
+              accessory={<OpenInSourceButton link={item.open} compact />}
+              onPress={() =>
+                router.push({
+                  pathname: '/timeline/[adapter]/[eventId]',
+                  params: { adapter: item.adapter, eventId: item.event_id },
+                })
+              }
+            />
+          );
+        }}
         onEndReachedThreshold={0.6}
         onEndReached={() => dispatch({ type: 'more' })}
         refreshControl={<RefreshControl refreshing={fetching === 'reset' && items.length > 0} onRefresh={() => dispatch({ type: 'reset' })} />}
@@ -170,19 +134,6 @@ export default function TimelineScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  // flexGrow: 0 keeps the chip bar at its content height: a pull-to-refresh
-  // empties the list, and without it the ScrollView fills the freed space and
-  // stretches every pill to the full screen height.
-  chipsBar: { flexGrow: 0, flexShrink: 0 },
-  chips: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.two, alignItems: 'center' },
-  chip: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 5 },
-  chipText: { fontSize: 13, fontWeight: '600' },
-  row: { paddingHorizontal: Spacing.three, paddingVertical: 10, gap: 4, borderBottomWidth: StyleSheet.hairlineWidth },
-  rowHeader: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
-  rowHeaderRight: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
-  source: { flexShrink: 1 },
-  titleRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.two },
-  title: { flex: 1 },
   footer: { paddingVertical: Spacing.three },
   empty: { textAlign: 'center', padding: Spacing.five },
   errorBox: { margin: Spacing.three, padding: Spacing.three, borderRadius: 10, backgroundColor: '#D0342C22' },

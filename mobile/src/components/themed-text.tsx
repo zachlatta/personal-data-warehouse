@@ -31,20 +31,22 @@ export function ThemedText({ style, type = 'default', themeColor, ...rest }: The
 }
 
 const styles = StyleSheet.create({
+  // Superhuman's scale: line height 1.3x the size, regular body text, and
+  // weight (not size) to set a sender or subject apart.
   small: {
     fontSize: 14,
-    lineHeight: 20,
-    fontWeight: 500,
+    lineHeight: 19,
+    fontWeight: 400,
   },
   smallBold: {
     fontSize: 14,
-    lineHeight: 20,
-    fontWeight: 700,
+    lineHeight: 19,
+    fontWeight: 600,
   },
   default: {
     fontSize: 16,
-    lineHeight: 24,
-    fontWeight: 500,
+    lineHeight: 22,
+    fontWeight: 400,
   },
   title: {
     fontSize: 48,
@@ -63,7 +65,7 @@ const styles = StyleSheet.create({
   linkPrimary: {
     lineHeight: 30,
     fontSize: 14,
-    color: '#3c87f7',
+    color: '#36A0DA',
   },
   code: {
     fontFamily: Fonts.mono,

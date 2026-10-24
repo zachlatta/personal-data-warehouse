@@ -437,5 +437,5 @@ const styles = StyleSheet.create({
   bold: { fontWeight: '700' },
   italic: { fontStyle: 'italic' },
   code: { fontFamily: 'Menlo', fontSize: 15 },
-  link: { color: '#208AEF' },
+  link: { color: '#36A0DA' },
 });

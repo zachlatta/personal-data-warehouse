@@ -5,7 +5,7 @@ import { Alert, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { Palette, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { sendTestPush } from '@/lib/api';
 import { notificationSettingsName, secureStoreName } from '@/lib/platform-copy';
@@ -75,10 +75,10 @@ export default function SettingsScreen() {
             {describePush(push)}
           </ThemedText>
           <View style={styles.rowButtons}>
-            <Pressable onPress={() => void refreshPush()} style={styles.secondary}>
+            <Pressable onPress={() => void refreshPush()} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
               <ThemedText type="smallBold">Re-register</ThemedText>
             </Pressable>
-            <Pressable onPress={test} disabled={testing} style={[styles.secondary, testing && styles.disabled]}>
+            <Pressable onPress={test} disabled={testing} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }, testing && styles.disabled]}>
               <ThemedText type="smallBold">Send test push</ThemedText>
             </Pressable>
           </View>
@@ -94,7 +94,7 @@ export default function SettingsScreen() {
           </ThemedText>
           <ThemedText type="small">The on/off switch and the ledger of everything sent live in Alerts.</ThemedText>
           <View style={styles.rowButtons}>
-            <Pressable onPress={() => router.navigate('/notifications')} style={styles.secondary}>
+            <Pressable onPress={() => router.navigate('/notifications')} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
               <ThemedText type="smallBold">Open Alerts</ThemedText>
             </Pressable>
           </View>
@@ -110,7 +110,7 @@ export default function SettingsScreen() {
             {describeInstalledUpdate()}
           </ThemedText>
           <View style={styles.rowButtons}>
-            <Pressable onPress={() => void applyUpdateNow(setUpdate)} disabled={update?.state === 'checking' || update?.state === 'downloading'} style={styles.secondary}>
+            <Pressable onPress={() => void applyUpdateNow(setUpdate)} disabled={update?.state === 'checking' || update?.state === 'downloading'} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
               <ThemedText type="smallBold">Check for update</ThemedText>
             </Pressable>
           </View>
@@ -120,7 +120,7 @@ export default function SettingsScreen() {
             </ThemedText>
           ) : null}
         </View>
-        <Pressable onPress={confirmSignOut} style={styles.danger}>
+        <Pressable onPress={confirmSignOut} style={[styles.danger, { backgroundColor: theme.backgroundElement }]}>
           <ThemedText style={styles.dangerText}>Disconnect</ThemedText>
         </Pressable>
       </ScrollView>
@@ -131,10 +131,10 @@ export default function SettingsScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   content: { padding: Spacing.three, gap: Spacing.three },
-  card: { borderRadius: 12, padding: Spacing.three, gap: Spacing.two },
+  card: { borderRadius: 16, padding: Spacing.three, gap: Spacing.two },
   rowButtons: { flexDirection: 'row', gap: Spacing.two, marginTop: Spacing.one },
-  secondary: { borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: '#208AEF' },
+  secondary: { borderRadius: 999, paddingHorizontal: 16, paddingVertical: 8 },
   disabled: { opacity: 0.6 },
-  danger: { borderRadius: 12, paddingVertical: 14, alignItems: 'center', borderWidth: 1, borderColor: '#DC2626' },
-  dangerText: { color: '#DC2626', fontWeight: '600' },
+  danger: { borderRadius: 999, paddingVertical: 14, alignItems: 'center' },
+  dangerText: { color: Palette.destructive, fontWeight: '600' },
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { articleDocument, articleUrl, imageKey, parseArticleMessage, readingMinutes } from './article.ts';
 
-const colors = { text: '#000', secondary: '#666', background: '#fff', element: '#eee', rule: '#ddd', link: '#208AEF' };
+const colors = { text: '#000', secondary: '#666', background: '#fff', element: '#eee', rule: '#ddd', link: '#36A0DA' };
 
 test('an article card reads its page inline; X posts and videos do not', () => {
   assert.equal(articleUrl({ url: 'https://example.com/story' }, false), 'https://example.com/story');

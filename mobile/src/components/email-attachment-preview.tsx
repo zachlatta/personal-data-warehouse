@@ -128,7 +128,7 @@ const styles = StyleSheet.create({
   button: { minHeight: 44, justifyContent: 'center' },
   attachment: { minHeight: 48, justifyContent: 'center', gap: 4 },
   list: { gap: 6 },
-  link: { color: '#3c87f7' },
+  link: { color: '#36A0DA' },
   error: { color: '#D0342C', padding: 16 },
   text: { padding: 16 },
 });

@@ -377,7 +377,7 @@ const styles = StyleSheet.create({
   threadBody: { fontSize: 15, lineHeight: 22 },
   editedRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.three },
   linkButton: { minHeight: 44, justifyContent: 'center' },
-  link: { color: '#3c87f7' },
+  link: { color: '#36A0DA' },
   danger: { color: DANGER },
   error: { color: '#D0342C' },
 });

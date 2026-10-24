@@ -90,11 +90,11 @@ function ConversationCard({
               disabled={!!row.is_anchor}
               style={({ pressed }) => [
                 styles.convoRow,
-                row.is_anchor && { backgroundColor: theme.backgroundSelected, borderLeftColor: '#208AEF' },
+                row.is_anchor && { backgroundColor: theme.backgroundSelected, borderLeftColor: '#36A0DA' },
                 pressed && !row.is_anchor && { backgroundColor: theme.backgroundSelected },
               ]}>
               <View style={styles.convoRowHeader}>
-                <ThemedText type="smallBold" style={row.is_anchor ? { color: '#208AEF' } : undefined} numberOfLines={1}>
+                <ThemedText type="smallBold" style={[styles.convoActor, row.is_anchor && { color: '#36A0DA' }]} numberOfLines={1}>
                   {row.actor || '—'}
                   {row.title && row.title !== row.snippet ? `  ·  ${row.title}` : ''}
                 </ThemedText>
@@ -188,14 +188,23 @@ export default function TimelineItemScreen() {
     <ThemedView style={styles.container}>
       <Stack.Screen options={{ title: humanSource(item.source) }} />
       <ScrollView contentContainerStyle={styles.content}>
+        {/* Superhuman's message header: the subject large, then the sender
+            in semibold with the time at the right, then the body as plain text. */}
+        <ThemedText style={styles.subject}>{item.title || item.context || '(untitled)'}</ThemedText>
+        <View style={styles.senderRow}>
+          <ThemedText style={styles.sender} numberOfLines={1}>
+            {item.actor || humanSource(item.source)}
+          </ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">
+            {formatWhen(item.event_ts)}
+          </ThemedText>
+        </View>
         <View style={styles.headerRow}>
           <PriorityBadge priority={item.priority} />
           <ThemedText type="small" themeColor="textSecondary">
-            {item.kind.replace(/_/g, ' ')} · {formatWhen(item.event_ts)}
+            {item.kind.replace(/_/g, ' ')}
           </ThemedText>
         </View>
-        <ThemedText type="subtitle">{item.title || item.context || '(untitled)'}</ThemedText>
-        {item.actor ? <ThemedText themeColor="textSecondary">{item.actor}</ThemedText> : null}
         {item.context && item.title ? (
           <ThemedText type="small" themeColor="textSecondary">
             {item.context}
@@ -203,11 +212,7 @@ export default function TimelineItemScreen() {
         ) : null}
         <OpenInSourceButton link={item.open} />
         {media?.media_kind === 'image' && media.media_url ? <Image source={{ uri: media.media_url }} style={styles.image} contentFit="contain" /> : null}
-        {item.snippet ? (
-          <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
-            <ThemedText selectable>{cleanSnippet(item.snippet)}</ThemedText>
-          </View>
-        ) : null}
+        {item.snippet ? <ThemedText selectable style={styles.body}>{cleanSnippet(item.snippet)}</ThemedText> : null}
         {error ? (
           <ThemedText type="small" style={{ color: '#D0342C' }}>
             {error}
@@ -268,8 +273,12 @@ export default function TimelineItemScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
-  content: { padding: Spacing.three, gap: Spacing.three },
-  headerRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
+  content: { paddingHorizontal: 18, paddingTop: Spacing.two, paddingBottom: Spacing.five, gap: Spacing.three },
+  headerRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, marginTop: -6 },
+  subject: { fontSize: 22, lineHeight: 28, fontWeight: '600' },
+  senderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
+  sender: { flexShrink: 1, fontSize: 15, lineHeight: 20, fontWeight: '600' },
+  body: { fontSize: 16, lineHeight: 23 },
   image: { width: '100%', height: 280, borderRadius: 12 },
   card: { borderRadius: 12, padding: Spacing.three, gap: Spacing.two },
   cardTitle: { marginBottom: Spacing.one },
@@ -278,7 +287,8 @@ const styles = StyleSheet.create({
   convoDay: { marginTop: Spacing.two, textTransform: 'uppercase', letterSpacing: 1, fontSize: 12 },
   convoRow: { borderRadius: 8, paddingVertical: 6, paddingHorizontal: 8, gap: 2, borderLeftWidth: 3, borderLeftColor: 'transparent' },
   convoRowHeader: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
+  convoActor: { flexShrink: 1 },
   widen: { alignSelf: 'center', paddingVertical: 6, paddingHorizontal: 12 },
-  widenText: { color: '#208AEF', fontWeight: '600' },
+  widenText: { color: '#36A0DA', fontWeight: '600' },
   pressed: { opacity: 0.5 },
 });
