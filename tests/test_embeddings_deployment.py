@@ -17,8 +17,8 @@ def test_embeddings_compose_pins_the_production_image_and_model() -> None:
     service = _service()
 
     assert service["image"] == (
-        "ghcr.io/huggingface/text-embeddings-inference:86-1.8"
-        "@sha256:65f792e790f976713a5d2ab2586d93d074203d1f0ec2045e87e60113fbd0e256"
+        "ghcr.io/huggingface/text-embeddings-inference:86-1.9.4"
+        "@sha256:bee0bdb887096229add91b6fdfcf95258c12eb9180e90dc86f3b4b25b86fc613"
     )
     assert service["command"] == [
         "--model-id",
