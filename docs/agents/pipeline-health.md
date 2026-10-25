@@ -343,3 +343,49 @@ btree rotation (`HEAPCHECK_MAX_PER_RUN`, a separate 45-minute budget, `failed` r
 `failing`). Repair recipe, used that day: decode the misplaced tuple from
 `get_raw_page` with `tuple_data_split`, cross-check it against its own `payload_json`,
 `heap_force_kill` the damaged item and re-insert the decoded row in one transaction.
+
+## A torn index tuple after the mew RAM swap (2026-10-25)
+
+**A green checksum row does not clear an amcheck error; rebuild the index.** The 03:47Z
+collector run on 2026-10-25 failed `bt_index_check` on `timeline_events_priority_time_idx`
+over `timeline.events` (`btree (priority, occurred_at DESC, seq DESC)`, the index behind every
+`priority IN (...) ORDER BY occurred_at` read; the column was still `event_ts` that morning)
+with `index tuple size does not equal lp_len ... tid=(427572,118) tuple size=0 lp_len=32 page
+lsn=61B/63457570 ... This could be a torn page problem`, while the
+`data_checksums` row read clean. That is the 2026-10-05 class above: the page was damaged in
+memory and then written with a valid checksum. The row read `attention`, not `failing`, until
+the SQLSTATE classification above landed the same evening.
+
+**Date a damaged page from its LSN.** `pgbackrest info` gives each backup's start/stop LSN, and
+`61B/63…` falls between the 2026-10-23 03:01Z (`61B/47…`) and 12:38Z (`61E/4F…`) backups. So
+the page was last written during the mew RAM work and hard reboots of 2026-10-23/24.
+
+The repair, 22:44Z the same day. The error reproduced first, in both modes, failing within
+seconds at the same tid. Then the headroom checks: 523 GB of disk free, `pg_wal` at 8 GB of a
+32 GB `max_wal_size`, archiver current, no replication slots, no transaction older than five
+minutes. Then `REINDEX INDEX CONCURRENTLY` with `maintenance_work_mem = '2GB'`. It took
+**1 m 59 s** for 63.4M rows and wrote about 1.2 GB of WAL, the index went from 3,375 MB to
+2,479 MB, and no `_ccnew` copy was left behind. Never use plain `REINDEX` here: its lock
+blocks timeline writes. The re-verification afterwards was clean in every check:
+
+- `bt_index_check(..., heapallindexed => true)` on all six btree indexes of `timeline.events`,
+  with `checkunique` on the pkey (10 m 45 s, the longest).
+- amcheck 1.5's `gin_index_check` on the trigram index (6 m 13 s).
+- `verify_heapam(on_error_stop => false, check_toast => true)` over the 38 GB heap in ten
+  500,000-block ranges (56 s, 0 problems).
+- `bt_index_check` on all 27 btree indexes of `base_slack.messages` and `derived_search`, with
+  `heapallindexed` on the 16 smaller than 1.5 GB.
+
+Two gaps remain. amcheck cannot check the four bm25 indexes. `chunk_vectors_pkey` in
+`derived_search` is a partitioned parent that `bt_index_check` refuses (the collector now skips it, see above),
+so its four partition pkeys were checked directly instead. A hand-launched `collation_health_job` re-checks a failed index first, and it
+graded the row `ok` at 23:39Z. **Expect a hand-launched run to die on a deploy**: two died
+that evening ("Marked canceled during Dagster boot cleanup") before the third finished.
+
+**The same run then caught a transient bad read.** At 23:36:06Z, Postgres logged
+`page verification failed, calculated checksum 20573 but expected 22123` for block 28727 of
+`base_slack.files`, and `pg_stat_database.checksum_failures` went from 0 to 1. Minutes later the
+on-disk page computed to 22123 again, its LSN (`48E/…`) was older than the oldest backup, and
+`verify_heapam` over the whole table found nothing. So the bytes read at that moment were not
+the bytes on disk, and mew's dmesg showed no MCE or EDAC event. Nothing was repaired. Treat a
+repeat on any table as a hardware signal, not as a page to fix.
