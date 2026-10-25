@@ -80,6 +80,8 @@ READ FLAGS
   --view VIEW       list: recent (default), feed (exactly what the phone shows) or
                     saved (his read-later queue, newest saved first).
   --all             list: include removed and dismissed cards.
+  --url URL         list: only cards with this url, key or link (repeatable). Check a
+                    link with --all --url before pushing it, instead of paging the list.
   --full            history: include each version's full snapshot.
   -n, --limit N     Rows.
   --type TYPES      events: session_start, session_end, impression, open, close,
@@ -97,9 +99,22 @@ EXAMPLES
   pdw feed remove --source hn --reason "stale batch"
   pdw feed save picks:https://www.youtube.com/watch?v=LKrwhjOI8Nc --reason "Zach asked"
   pdw feed list --view saved
+  pdw feed list --all --url https://news.ycombinator.com/item?id=1
   pdw feed stats --since 7d
   pdw sql "SELECT title, impressions, dwell_ms, opens, read_ms, engagement_score FROM marts_feed.item_engagement ORDER BY last_event_at DESC NULLS LAST LIMIT 20"
 `
+
+// urlList is a repeatable flag that, unlike stringList, never splits on a
+// comma: a URL can contain one.
+type urlList []string
+
+func (u *urlList) String() string { return strings.Join(*u, " ") }
+func (u *urlList) Set(v string) error {
+	if v = strings.TrimSpace(v); v != "" {
+		*u = append(*u, v)
+	}
+	return nil
+}
 
 type stringList []string
 
@@ -460,16 +475,18 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		var source, view string
 		var all bool
 		var limit int
+		var urls urlList
 		fs.StringVar(&source, "source", "", "source")
 		fs.StringVar(&view, "view", "", "recent, feed or saved")
 		fs.BoolVar(&all, "all", false, "include removed and dismissed")
+		fs.Var(&urls, "url", "only cards with this url, key or link (repeatable)")
 		fs.IntVar(&limit, "limit", 0, "rows")
 		fs.IntVar(&limit, "n", 0, "rows")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
 		return call("feed_list", map[string]any{"source": source, "view": view, "include_removed": all,
-			"include_dismissed": all, "limit": limit, "item_ids": fs.Args()})
+			"include_dismissed": all, "limit": limit, "item_ids": fs.Args(), "urls": []string(urls)})
 	case "stats":
 		var source, since string
 		fs.StringVar(&source, "source", "", "source")
@@ -581,6 +598,9 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			fmt.Fprintf(w, "%s  score=%g  seen=%d dwell=%s opens=%d read=%s engagement=%g%s\n    %s\n", str(it, "item_id"), num(it, "score"),
 				int(num(e, "impressions")), secs(num(e, "dwell_ms")), int(num(e, "opens")), secs(num(e, "read_ms")),
 				num(e, "engagement_score"), flags, str(it, "title"))
+			if u := str(it, "url"); u != "" {
+				fmt.Fprintf(w, "    %s\n", u)
+			}
 			for _, link := range asList(it["links"]) {
 				fmt.Fprintf(w, "    + %s %s\n", str(link, "title"), str(link, "url"))
 			}

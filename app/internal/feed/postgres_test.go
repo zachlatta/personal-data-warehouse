@@ -171,6 +171,14 @@ func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) 
 		t.Fatalf("links (the main url is not repeated): %v", links)
 	}
 
+	// The dedupe check before a push: is this url already a card (its url,
+	// its key, or one of its links)? Paging --all for it missed cards past
+	// the newest few hundred and re-pushed them.
+	byURL := call(t, tools, "feed_list", map[string]any{"urls": []string{"https://example.com/2-paper", "https://example.com/1", "https://example.com/none"}})
+	if got := titles(byURL); got != "First, edited,Second" && got != "Second,First, edited" {
+		t.Fatalf("urls filter: %s", got)
+	}
+
 	// Update, rank, remove.
 	call(t, tools, "feed_update", map[string]any{"item_id": "hn:https://example.com/2", "title": "Second, better", "score": 1})
 	if err := callErr(t, tools, "feed_update", map[string]any{"item_id": "hn:nope", "title": "x"}); err == nil {

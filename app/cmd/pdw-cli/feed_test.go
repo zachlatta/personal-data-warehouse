@@ -104,6 +104,7 @@ func TestFeedSubcommandsMapToTheirTools(t *testing.T) {
 		{[]string{"save", "hn:1", "--reason", "Zach asked"}, "feed_save", `"item_ids":["hn:1"],"reason":"Zach asked","unsave":false`},
 		{[]string{"unsave", "hn:1"}, "feed_save", `"unsave":true`},
 		{[]string{"list", "--view", "saved"}, "feed_list", `"view":"saved"`},
+		{[]string{"list", "--all", "--url", "https://a.example/x?b=1,2", "--url", "https://b.example"}, "feed_list", `"urls":["https://a.example/x?b=1,2","https://b.example"]`},
 		{[]string{"events", "--type", "like,open", "--item", "hn:1"}, "feed_events", `"types":["like","open"]`},
 	} {
 		srv := feedStub(t, `{}`)

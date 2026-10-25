@@ -92,10 +92,13 @@ func linksJSON(links []Link) (string, error) {
 	return string(raw), err
 }
 
-// ListOptions selects cards for an agent; the phone's feed is Feed().
+// ListOptions selects cards for an agent; the phone's feed is Feed(). URLs
+// keeps cards whose url, key or one of whose links is one of them: "is this
+// already a card?" asked directly instead of by paging.
 type ListOptions struct {
 	Source           string
 	ItemIDs          []string
+	URLs             []string
 	IncludeRemoved   bool
 	IncludeDismissed bool
 	Limit            int
@@ -120,6 +123,12 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 	if len(opts.ItemIDs) > 0 {
 		args = append(args, tagsLiteral(opts.ItemIDs))
 		where = append(where, fmt.Sprintf("i.item_id = ANY($%d::text[])", len(args)))
+	}
+	if len(opts.URLs) > 0 {
+		args = append(args, tagsLiteral(opts.URLs))
+		n := len(args)
+		where = append(where, fmt.Sprintf(`(i.url = ANY($%[1]d::text[]) OR i.item_key = ANY($%[1]d::text[])
+			OR EXISTS (SELECT 1 FROM jsonb_array_elements(i.links) l WHERE l->>'url' = ANY($%[1]d::text[])))`, n))
 	}
 	if !opts.IncludeRemoved {
 		where = append(where, "i.removed_at = 'epoch'")

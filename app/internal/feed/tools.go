@@ -104,6 +104,7 @@ type rankOutput struct {
 type listInput struct {
 	Source           string   `json:"source,omitempty"`
 	ItemIDs          []string `json:"item_ids,omitempty"`
+	URLs             []string `json:"urls,omitempty" jsonschema:"only cards whose url, key or one of whose links is one of these: the check that a link is already a card before pushing it (add include_removed and include_dismissed to also find removed or dismissed ones)"`
 	View             string   `json:"view,omitempty" jsonschema:"recent (default, newest pushed first), feed (exactly what the phone shows, ranked) or saved (his read-later queue, newest saved first)"`
 	IncludeRemoved   bool     `json:"include_removed,omitempty"`
 	IncludeDismissed bool     `json:"include_dismissed,omitempty"`
@@ -336,7 +337,7 @@ func Tools(store *Store) []tool.Tool {
 				)
 				switch in.View {
 				case "", "recent":
-					items, err = store.List(ctx, ListOptions{Source: in.Source, ItemIDs: in.ItemIDs,
+					items, err = store.List(ctx, ListOptions{Source: in.Source, ItemIDs: in.ItemIDs, URLs: in.URLs,
 						IncludeRemoved: in.IncludeRemoved, IncludeDismissed: in.IncludeDismissed, Limit: in.Limit})
 				case "feed":
 					items, err = store.Feed(ctx, in.Limit)

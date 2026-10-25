@@ -20,6 +20,10 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   (source, key) and the key defaults to the url, so re-pushing a link updates its card;
   a re-push replaces the content, keeps the score unless one is given, and writes nothing
   when nothing changed.
+- **Before pushing a link, ask whether it is already a card**:
+  {{if .CLI}}`pdw feed list --all --url URL` (repeatable){{else}}`feed_list` with `urls` plus
+  `include_removed` and `include_dismissed`{{end}} matches a card's url, key and links, removed
+  or dismissed ones too. Paging the whole list for it misses everything past the limit.
 - A card needs a title, a body or a url. `body` is markdown (the card shows the first
   lines, the reader all of it); `image_url` must be https; `site` defaults to the url's host.
 - **X posts are embedded, not linked.** Push an `x.com/<user>/status/<id>` url (no title
