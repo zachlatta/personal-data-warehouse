@@ -743,6 +743,15 @@ def test_every_remote_device_uploader_declares_a_run_heartbeat():
         assert entry.expected_run_interval is not None, pipeline_id
 
 
+def test_muse_run_interval_matches_how_often_its_vm_wakes():
+    """The Muse hook runs only while Muse's VM is awake, about every 12 hours.
+
+    Declared with the five-minute uploaders' 30-minute interval, its heartbeat
+    read stale for most of every day and coloured every agent-session mart.
+    """
+    assert pipeline("muse").expected_run_interval >= timedelta(hours=12)
+
+
 def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse):
     """Contract C2 on a surface: the tier mix per source, with the sentinel red.
 

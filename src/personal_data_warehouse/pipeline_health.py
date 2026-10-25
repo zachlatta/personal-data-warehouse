@@ -1002,9 +1002,13 @@ PIPELINES: tuple[Pipeline, ...] = (
             " which 313 self-improvement runs and 54 feed runs are Muse's own"
             " background loops, writing every hour whether or not Zach opens the"
             " app. Two quiet days is therefore the loops or the uploader stopping,"
-            " not Zach being away; the run heartbeat is the sharper signal"
+            " not Zach being away; the run heartbeat is the sharper signal. The"
+            " hook only runs while the Muse VM is awake: measured 2026-10-25 over"
+            " 30 days of ingest, the VM wakes about every 12 hours (~01:30 and"
+            " ~13:30 UTC), longest gap 18h outside the 2026-10-24 host outage, so"
+            " a 30-minute run interval read stale for most of every day"
         ),
-        run=UPLOADER_RUN_INTERVAL,
+        run=12 * HOUR,
         state=_uploader_heartbeat("muse"),
     ),
     _source(
