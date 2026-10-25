@@ -8,8 +8,9 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 Development moved to mew-dev; porygon keeps no checkout. Each LaunchAgent in `ops/launchd/`
 runs its wrapper from the **device runtime** `~/.local/share/personal-data-warehouse` on the
 Mac: `bin/` (wrappers, status helpers, `_pdw-upload-lib.sh`) and a 0600 `.env` holding only
-uploader settings (accounts, `PDW_INGEST_*`, `VOICE_MEMOS_*`, `SCREEN_TIMELAPSE_SOURCES`; no
-OAuth tokens, database URL or API keys). Wrappers find the runtime from their own path, so
+device-job settings: accounts, `PDW_INGEST_*`, `VOICE_MEMOS_*`, `SCREEN_TIMELAPSE_SOURCES`, and
+`POSTGRES_DATABASE_URL` (the resident mutation workers exit 2 without it). No OAuth tokens or
+API keys: those live in the dev `.env` on mew-dev and in production. Wrappers find the runtime from their own path, so
 `PDW_INGEST_PROJECT_DIR` is the runtime dir. After changing a wrapper or plist, push it and
 run `bin/sync-mac-device-runtime porygon` from a mew-dev checkout: it copies `bin/` and
 reloads each installed LaunchAgent whose plist changed. It never writes `.env` and never
