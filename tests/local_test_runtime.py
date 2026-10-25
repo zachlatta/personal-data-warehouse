@@ -149,11 +149,68 @@ OWNED_POSTGRES_URL_ENV = "PDW_TEST_OWNED_POSTGRES_URL"
 WORKERS_PER_CPU = 1.5
 
 
-def auto_worker_count(env: Mapping[str, str], *, cpus: int) -> int:
-    """What `-n auto` means: oversubscribe only when workers get their own databases."""
-    if env.get("POSTGRES_DATABASE_URL", "").strip():
-        return max(1, cpus)
-    return max(1, round(cpus * WORKERS_PER_CPU))
+# What one worker costs while the suite runs: its Python process (~150 MB after
+# importing every test module) plus its Postgres backend (~30 MB), with margin.
+WORKER_BYTES = 200 * 1024**2
+
+
+def auto_worker_count(
+    env: Mapping[str, str],
+    *,
+    cpus: int,
+    busy_cpus: float = 0.0,
+    available_bytes: int | None = None,
+) -> int:
+    """What `-n auto` means on this host right now.
+
+    Many agents run the suite on one machine at once. A run sizes itself to the
+    CPUs the others leave idle (more workers than that add RAM and contention,
+    not speed) and takes at most half of the memory still available.
+    Oversubscribe only when workers get their own databases.
+    """
+    idle = max(1.0, cpus - busy_cpus)
+    per_cpu = 1.0 if env.get("POSTGRES_DATABASE_URL", "").strip() else WORKERS_PER_CPU
+    workers = max(1, round(idle * per_cpu))
+    if available_bytes is not None:
+        workers = min(workers, max(1, available_bytes // (2 * WORKER_BYTES)))
+    return workers
+
+
+def busy_cpus_now(sample_seconds: float = 0.25) -> float:
+    """CPUs busy over a short sample of /proc/stat; 0 where it is unavailable.
+
+    Not the load average: that decays over a minute, so a run started right
+    after the last one finished would mistake its predecessor for a neighbour.
+    """
+    def snapshot() -> tuple[int, int] | None:
+        try:
+            with open("/proc/stat") as stat:
+                fields = [int(value) for value in stat.readline().split()[1:9]]
+        except (OSError, ValueError):
+            return None
+        return fields[3] + fields[4], sum(fields)
+
+    before = snapshot()
+    if before is None:
+        return 0.0
+    time.sleep(sample_seconds)
+    after = snapshot()
+    if after is None or after[1] <= before[1]:
+        return 0.0
+    idle_share = (after[0] - before[0]) / (after[1] - before[1])
+    return max(0.0, (1.0 - idle_share) * (os.cpu_count() or 1))
+
+
+def available_memory_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo, None where it is unavailable."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 # What a test with no recorded duration is assumed to cost: about what an
@@ -249,6 +306,11 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
             with connection.cursor() as cursor:
                 for extension in sorted(POSTGRES_EXTENSIONS):
                     cursor.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
+                # The warehouse's big views carry cost estimates that trip JIT
+                # even over empty test tables: one marts probe spent 275 ms
+                # compiling for a query that returned no rows. Tests hold a
+                # few rows, so JIT can only cost time.
+                cursor.execute(psycopg2.sql.SQL("ALTER DATABASE {} SET jit = off").format(name))
         finally:
             connection.close()
     except psycopg2.Error as error:

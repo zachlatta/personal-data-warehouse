@@ -56,10 +56,10 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 # Parallel by default: the suite is ~3,000 tests, mostly DB round-trip-bound, each
 # in its own pdw_test_* schema, so workers hide latency rather than needing less
-# of it. `-n auto` is 1.5 workers per CPU against the run's own Postgres
+# of it. `-n auto` is 1.5 workers per idle CPU against the run's own Postgres
 # (pytest_xdist_auto_num_workers in tests/conftest.py); worksteal keeps every
 # worker busy to the end. Measured 2026-10-25 on mew-dev (16 vCPUs): 247-288s
-# -> 74-77s.
+# -> 68-73s.
 # `-n 0` runs serially (e.g. for --pdb).
 addopts = "-n auto --dist worksteal"
 markers = [

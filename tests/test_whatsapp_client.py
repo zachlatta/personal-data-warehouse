@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 import gzip
+import importlib.util
 import json
 import sqlite3
+import sys
 import warnings
 
 import pytest
@@ -36,6 +38,16 @@ from personal_data_warehouse_whatsapp.events import (
 )
 from personal_data_warehouse_whatsapp.state import WhatsAppUploadState
 from personal_data_warehouse_whatsapp.session_store import PostgresWhatsAppSessionStore, sqlite_database_bytes
+
+# neonize/__init__ imports neonize.client, which loads the Go whatsmeow library:
+# 57 MB of private memory in every process that imports it, and xdist imports
+# this file in every worker. The fixtures need only the generated protobuf
+# classes (10 MB), so register the package without running its __init__; the
+# tests that exercise the client import neonize.client and neonize.events
+# themselves, and those submodules import normally under the bare package.
+if "neonize" not in sys.modules:
+    _neonize_spec = importlib.util.find_spec("neonize")
+    sys.modules["neonize"] = importlib.util.module_from_spec(_neonize_spec)
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")

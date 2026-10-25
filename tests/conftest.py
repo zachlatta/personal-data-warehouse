@@ -14,6 +14,8 @@ from tests.local_test_runtime import (
     LocalTestStartupError,
     PostgresTestRuntime,
     auto_worker_count,
+    available_memory_bytes,
+    busy_cpus_now,
     callable_requires_postgres,
     direct_postgres_url,
     schedule_key,
@@ -73,7 +75,12 @@ def pytest_configure(config: pytest.Config) -> None:
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
     load_dotenv()
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-    return auto_worker_count(os.environ, cpus=cpus)
+    return auto_worker_count(
+        os.environ,
+        cpus=cpus,
+        busy_cpus=busy_cpus_now(),
+        available_bytes=available_memory_bytes(),
+    )
 
 
 def _item_requires_postgres(item: pytest.Item) -> bool:
@@ -111,7 +118,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     # last: on 2026-10-24 workers went idle from 110s while a few finished
     # them at 137s. Every worker reads the same cache file and the sort is
     # stable, so each still collects the identical order xdist requires.
-    durations = config.cache.get(_DURATIONS_CACHE_KEY, {}) if config.cache is not None else {}
+    cache = getattr(config, "cache", None)  # absent under -p no:cacheprovider
+    durations = cache.get(_DURATIONS_CACHE_KEY, {}) if cache is not None else {}
     items.sort(
         key=lambda item: schedule_key(
             item.nodeid,
@@ -133,7 +141,7 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
-    cache = session.config.cache
+    cache = getattr(session.config, "cache", None)
     if os.environ.get("PYTEST_XDIST_WORKER") or cache is None or not _RUN_DURATIONS:
         return
     durations = dict(cache.get(_DURATIONS_CACHE_KEY, {}))

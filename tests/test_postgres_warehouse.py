@@ -46,6 +46,7 @@ from personal_data_warehouse.postgres import (
     QUERY_ROLE_SETUP_LOCK_ID,
     index_refresh_lock_key,
     query_role_setup_lock_key,
+    POSTGRES_INDEXES,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
@@ -187,6 +188,37 @@ def test_query_role_setup_lock_is_keyed_per_namespace_and_unchanged_for_producti
     assert a != b and QUERY_ROLE_SETUP_LOCK_ID not in (a, b)
     assert query_role_setup_lock_key("pdw_test_20261024_a") == a
     assert all(-(2**63) <= key < 2**63 for key in (a, b))
+
+
+def test_an_index_pass_reads_index_state_once_not_twice_per_index(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Asking the catalog "does it exist?" and "is it invalid?" per index was
+    # two round trips each: ~80k statements and ~42 s of a full test run.
+    state_reads: list[str] = []
+    passes: list[int] = []
+    query = warehouse._query
+    each_index = warehouse._ensure_each_index
+
+    def counting_query(sql, params=None):
+        if "indisvalid" in sql:
+            state_reads.append(sql)
+        return query(sql, params)
+
+    def counting_pass(table_names):
+        passes.append(1)
+        return each_index(table_names)
+
+    monkeypatch.setattr(warehouse, "_query", counting_query)
+    monkeypatch.setattr(warehouse, "_ensure_each_index", counting_pass)
+
+    warehouse.ensure_slack_tables()
+
+    slack_indexes = [index for index in POSTGRES_INDEXES if index.table.startswith("slack_")]
+    assert len(slack_indexes) > 10
+    assert passes
+    assert len(state_reads) <= len(passes)
+    assert {"slack_messages_thread_replies_live_idx"} <= set(_index_names(warehouse, "slack_messages"))
 
 
 def test_index_refresh_skips_when_another_builder_holds_the_lock(monkeypatch) -> None:

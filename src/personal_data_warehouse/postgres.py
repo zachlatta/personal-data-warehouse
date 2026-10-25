@@ -701,6 +701,22 @@ def search_chunk_vectors_lock_key(namespace: str) -> int:
 # against the other. test_advisory_lock_ids_are_unique enforces that.
 QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_469
 
+# Returned by PostgresWarehouse._pass_index_state outside an index pass.
+_NOT_PREFETCHED = object()
+
+# A table's column names, as information_schema.columns lists them for the
+# owner (ordinary relations, views, foreign and partitioned tables; no dropped
+# columns). information_schema.columns is a view over the whole catalog with
+# per-row privilege checks and ran ~2 ms per lookup in a test warehouse; the
+# ensure paths make thousands of these, so they read pg_catalog directly.
+_COLUMN_NAMES_SQL = (
+    "SELECT a.attname FROM pg_catalog.pg_attribute AS a "
+    "INNER JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid "
+    "INNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r', 'v', 'f', 'p') "
+    "AND a.attnum > 0 AND NOT a.attisdropped"
+)
+
 
 def query_role_setup_lock_key(namespace: str) -> int:
     """The advisory-lock key the privilege sweep takes, per warehouse namespace.
@@ -7564,10 +7580,13 @@ class PostgresWarehouse:
         (embedding column, HNSW index, search_hybrid) degrades until the image
         is rolled — code never assumes it.
         """
-        rows = self._query(
-            "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
-        )
-        return bool(rows)
+        # Installed extensions only change with the server image, so ask once
+        # per connection rather than on every ensure step.
+        cached = getattr(self, "_pgvector_available_cached", None)
+        if cached is None:
+            cached = bool(self._query("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"))
+            self._pgvector_available_cached = cached
+        return cached
 
     def ensure_search_index_tables(self) -> None:
         """Tables for the derived search-retrieval layer (search_index.py).
@@ -7934,8 +7953,7 @@ class PostgresWarehouse:
         present = {
             str(row[0])
             for row in self._query(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
+                _COLUMN_NAMES_SQL,
                 (self._object_schema("claude_desktop_credentials"), "claude_desktop_credentials"),
             )
         }
@@ -9813,8 +9831,7 @@ class PostgresWarehouse:
         return {
             str(row[0])
             for row in self._query(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
+                _COLUMN_NAMES_SQL,
                 (rel.schema, rel.name),
             )
         }
@@ -9847,8 +9864,7 @@ class PostgresWarehouse:
         present = {
             str(row[0])
             for row in self._query(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
+                _COLUMN_NAMES_SQL,
                 (rel.schema, rel.name),
             )
         }
@@ -10061,6 +10077,49 @@ class PostgresWarehouse:
         ):
             self._pg_textsearch_update_checked = True
             self._ensure_pg_textsearch_current()
+        # One catalog query answers _index_exists and _drop_invalid_index for
+        # every index this pass looks at; asking per index cost two round trips
+        # each, ~80k statements per full test run.
+        self._index_states_for = {
+            index.name
+            for index in POSTGRES_INDEXES
+            if index.table in table_names and index.name not in self._ensured_index_names
+        }
+        self._index_states = None
+        try:
+            self._ensure_each_index(table_names)
+        finally:
+            self._index_states_for = frozenset()
+            self._index_states = None
+        self._drop_obsolete_indexes(table_names)
+
+    def _pass_index_state(self, index_name: str) -> tuple[str, bool] | None | object:
+        """This pass's (schema, valid) for ``index_name``, None if it does not exist.
+
+        _NOT_PREFETCHED outside an _ensure_indexes pass, or for an index the
+        pass is not handling; the caller then asks the catalog itself.
+        """
+        if index_name not in getattr(self, "_index_states_for", frozenset()):
+            return _NOT_PREFETCHED
+        if self._index_states is None:
+            self._index_states = {
+                str(name): (str(schema), bool(valid))
+                for name, schema, valid in self._query(
+                    """
+                    SELECT c.relname, n.nspname, (i.indisvalid AND i.indisready)
+                    FROM pg_class AS c
+                    INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    INNER JOIN pg_index AS i ON i.indexrelid = c.oid
+                    WHERE n.nspname = ANY(%s)
+                      AND c.relname = ANY(%s)
+                      AND c.relkind = 'i'
+                    """,
+                    (self.physical_schema_names(include_hidden=True), sorted(self._index_states_for)),
+                )
+            }
+        return self._index_states.get(index_name)
+
+    def _ensure_each_index(self, table_names: set[str]) -> None:
         for index in POSTGRES_INDEXES:
             if index.table not in table_names or index.name in self._ensured_index_names:
                 continue
@@ -10122,7 +10181,6 @@ class PostgresWarehouse:
                 # Tests often create only a subset of tables. Missing-table index failures
                 # are harmless because ensure_* is called again by each runtime asset.
                 pass
-        self._drop_obsolete_indexes(table_names)
 
     def _drop_obsolete_indexes(self, table_names: set[str]) -> None:
         """Drop the retired indexes declared on any of ``table_names``.
@@ -10133,11 +10191,33 @@ class PostgresWarehouse:
         production until 2026-10-06, maintained on every write, and one of
         them corrupt enough that every autovacuum of the table failed.
         """
-        for obsolete_name, obsolete_table in POSTGRES_OBSOLETE_INDEXES:
-            if obsolete_table not in table_names:
-                continue
+        candidates = [name for name, table in POSTGRES_OBSOLETE_INDEXES if table in table_names]
+        if not candidates:
+            return
+        # One lookup for every retired name instead of one per name: almost
+        # always none of them exists, and the per-name probes were ~24k
+        # statements per full test run.
+        try:
+            present = {
+                str(name): str(schema)
+                for name, schema in self._query(
+                    """
+                    SELECT c.relname, n.nspname
+                    FROM pg_class AS c
+                    INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    WHERE n.nspname = ANY(%s)
+                      AND c.relname = ANY(%s)
+                      AND c.relkind = 'i'
+                    """,
+                    (self.physical_schema_names(include_hidden=True), candidates),
+                )
+            }
+        except Exception:
+            logger.warning("Could not look up obsolete indexes", exc_info=True)
+            return
+        for obsolete_name in candidates:
             try:
-                schema = self._index_schema(obsolete_name)
+                schema = present.get(obsolete_name)
                 if schema:
                     self._command(
                         "DROP INDEX CONCURRENTLY IF EXISTS "
@@ -10212,43 +10292,34 @@ class PostgresWarehouse:
         and its table silently loses that access path. Production carried five
         of these across the agent-session event tables.
         """
-        invalid = self._query(
-            """
-            SELECT n.nspname
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_index i ON i.indexrelid = c.oid
-            WHERE n.nspname = ANY(%s)
-              AND c.relname = %s
-              AND c.relkind = 'i'
-              AND NOT (i.indisvalid AND i.indisready)
-            LIMIT 1
-            """,
-            (self.physical_schema_names(include_hidden=True), index_name),
-        )
+        state = self._pass_index_state(index_name)
+        if state is _NOT_PREFETCHED:
+            invalid = self._query(
+                """
+                SELECT n.nspname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_index i ON i.indexrelid = c.oid
+                WHERE n.nspname = ANY(%s)
+                  AND c.relname = %s
+                  AND c.relkind = 'i'
+                  AND NOT (i.indisvalid AND i.indisready)
+                LIMIT 1
+                """,
+                (self.physical_schema_names(include_hidden=True), index_name),
+            )
+        else:
+            invalid = [(state[0],)] if state is not None and not state[1] else []
         if not invalid:
             return
         schema = _identifier(str(invalid[0][0]))
         logger.warning("dropping invalid index %s.%s so it can be rebuilt", schema, index_name)
         self._raw_command(f"DROP INDEX CONCURRENTLY IF EXISTS {schema}.{_identifier(index_name)}")
 
-    def _index_schema(self, index_name: str) -> str | None:
-        """The warehouse schema holding ``index_name``, valid or not."""
-        rows = self._query(
-            """
-            SELECT n.nspname
-            FROM pg_class AS c
-            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE n.nspname = ANY(%s)
-              AND c.relname = %s
-              AND c.relkind = 'i'
-            LIMIT 1
-            """,
-            (self.physical_schema_names(include_hidden=True), index_name),
-        )
-        return str(rows[0][0]) if rows else None
-
     def _index_exists(self, index_name: str) -> bool:
+        state = self._pass_index_state(index_name)
+        if state is not _NOT_PREFETCHED:
+            return state is not None and state[1]
         rows = self._query(
             """
             SELECT 1
@@ -10470,7 +10541,7 @@ class PostgresWarehouse:
         existing = {
             str(row[0])
             for row in self._query(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                _COLUMN_NAMES_SQL,
                 (rel.schema, rel.name),
             )
         }
@@ -15628,8 +15699,7 @@ class PostgresWarehouse:
         present = {
             str(row[0])
             for row in self._query(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s",
+                _COLUMN_NAMES_SQL,
                 (rel.schema, rel.name),
             )
         }
@@ -17626,16 +17696,20 @@ class PostgresWarehouse:
             expected[key] = (obj.kind, obj.comment)
         if not expected:
             return
+        # Look up only the relations still unverified, by name: the sweep runs
+        # after every ensure step, and scanning every relation in the
+        # namespace each time cost 46 s of a full test run (2026-10-25).
         current = {
             (schema, name): comment
             for schema, name, comment in self._query(
                 """
                 SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class')
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = ANY(%s) AND c.relkind IN ('r', 'v', 'm', 'p')
+                FROM unnest(%s::text[], %s::text[]) AS wanted(schema_name, relation_name)
+                JOIN pg_namespace n ON n.nspname = wanted.schema_name
+                JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = wanted.relation_name
+                WHERE c.relkind IN ('r', 'v', 'm', 'p')
                 """,
-                (self.physical_schema_names(include_hidden=True),),
+                ([schema for schema, _ in expected], [name for _, name in expected]),
             )
         }
         verified = set(self._relation_comments_verified)
@@ -19282,20 +19356,20 @@ class PostgresWarehouse:
         else:
             schemas = [rel.schema]
             name = rel.name
+        # The relation kinds information_schema.tables and .views report;
+        # pg_catalog answers the same question without their per-row privilege
+        # machinery, which made this ~1 ms per call in the ensure paths.
         rows = self._query(
             """
             SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = ANY(%s)
-              AND table_name = %s
-            UNION ALL
-            SELECT 1
-            FROM information_schema.views
-            WHERE table_schema = ANY(%s)
-              AND table_name = %s
+            FROM pg_catalog.pg_class AS c
+            INNER JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY(%s)
+              AND c.relname = %s
+              AND c.relkind IN ('r', 'v', 'f', 'p')
             LIMIT 1
             """,
-            (schemas, name, schemas, name),
+            (schemas, name),
         )
         return bool(rows)
 

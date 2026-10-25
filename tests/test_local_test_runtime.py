@@ -362,6 +362,8 @@ def test_a_worker_gets_its_own_extension_complete_database_in_the_owned_cluster(
             assert cursor.fetchone() == ("pdw_gw999",)
             cursor.execute("SELECT extname FROM pg_extension")
             assert POSTGRES_EXTENSIONS <= {row[0] for row in cursor.fetchall()}
+            cursor.execute("SHOW jit")
+            assert cursor.fetchone() == ("off",)
     finally:
         connection.close()
     admin = psycopg2.connect(url)
@@ -402,6 +404,18 @@ def test_auto_workers_oversubscribe_only_the_owned_per_worker_databases() -> Non
     # A configured database is shared by every worker, where extra workers
     # contend instead of filling idle CPU.
     assert auto_worker_count({"POSTGRES_DATABASE_URL": "postgresql://ci/pdw"}, cpus=4) == 4
+
+
+def test_auto_workers_size_to_the_cpus_other_runs_leave_idle() -> None:
+    # Another agent's suite already keeps 12 of 16 CPUs busy: more workers
+    # would only add RAM and contention, not speed.
+    assert auto_worker_count({}, cpus=16, busy_cpus=12.0) == 6
+    assert auto_worker_count({}, cpus=16, busy_cpus=16.0) == 2
+
+
+def test_auto_workers_leave_half_the_available_memory_alone() -> None:
+    assert auto_worker_count({}, cpus=16, available_bytes=2 * 1024**3) == 5
+    assert auto_worker_count({}, cpus=16, available_bytes=1) == 1
 
 
 def test_workers_bypass_the_userland_port_proxy_when_the_container_ip_answers() -> None:
