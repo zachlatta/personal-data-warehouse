@@ -23,10 +23,17 @@ import (
 //
 // Resolution order: PDW_TRACE_ID, then SKILLS_TRACE_ID, when a harness sets
 // one; nothing when PDW_NO_TRACE=1; otherwise the nearest ancestor process that
-// is not a shell or shell-like wrapper. Each Claude Code tool call is a fresh
-// `zsh -c` whose parent is the long-lived agent process, so hashing that
-// ancestor's pid and start time gives one id per session with no cooperation
-// from the host.
+// is not a shell, shell-like wrapper, or script interpreter. Each Claude Code
+// tool call is a fresh `zsh -c` whose parent is the long-lived agent process,
+// so hashing that ancestor's pid and start time gives one id per session with
+// no cooperation from the host.
+//
+// Interpreters are skipped too: an agent that runs `python3 script.py` from
+// its shell starts a new interpreter each time, and keying on it gave every
+// script run its own upstream session. For porygon_cua that meant a fresh
+// computer-use REPL per script (bindings gone, and tabs left held by an
+// orphaned session). When nothing but interpreters and shells sits above pdw
+// (a standalone daemon), the nearest interpreter still names the session.
 
 // processInfoFunc reports a process's parent, start time, and command name.
 type processInfoFunc func(pid int) (ppid int, started, comm string, err error)
@@ -48,21 +55,32 @@ func resolveTraceID(getenv func(string) string) string {
 // or wrapper and derives a stable id from it. It returns "" when the tree
 // cannot be read, since a missing trace only costs deduplication.
 func sessionTraceID(host string, pid int, info processInfoFunc) string {
+	fallback := ""
 	for hops := 0; hops < 12 && pid > 1; hops++ {
 		ppid, started, comm, err := info(pid)
 		if err != nil {
-			return ""
+			return fallback
 		}
 		if !isShellLike(comm) {
-			sum := sha256.Sum256([]byte(host + "|" + strconv.Itoa(pid) + "|" + started + "|" + comm))
-			return mcpproxy.SanitizeTraceID(strings.TrimSuffix(host, ".local") + "-" + shortComm(comm) + "-" + strconv.Itoa(pid) + "-" + hex.EncodeToString(sum[:4]))
+			id := traceIDFor(host, pid, started, comm)
+			if !isInterpreter(comm) {
+				return id
+			}
+			if fallback == "" {
+				fallback = id
+			}
 		}
 		if ppid <= 1 || ppid == pid {
-			return ""
+			return fallback
 		}
 		pid = ppid
 	}
-	return ""
+	return fallback
+}
+
+func traceIDFor(host string, pid int, started, comm string) string {
+	sum := sha256.Sum256([]byte(host + "|" + strconv.Itoa(pid) + "|" + started + "|" + comm))
+	return mcpproxy.SanitizeTraceID(strings.TrimSuffix(host, ".local") + "-" + shortComm(comm) + "-" + strconv.Itoa(pid) + "-" + hex.EncodeToString(sum[:4]))
 }
 
 // isShellLike reports whether a process merely hosts the one that matters:
@@ -73,6 +91,21 @@ func isShellLike(comm string) bool {
 	switch name {
 	case "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
 		"env", "sudo", "doas", "nohup", "timeout", "xargs", "script", "caffeinate", "nice", "time", "login":
+		return true
+	}
+	return false
+}
+
+// isInterpreter reports whether a process is a script runtime an agent starts
+// per command (python3 script.py, uv run, perl -e). node is not listed: some
+// agent harnesses run as node themselves.
+func isInterpreter(comm string) bool {
+	name := strings.TrimPrefix(filepath.Base(strings.TrimSpace(comm)), "-")
+	if strings.HasPrefix(name, "python") || strings.HasPrefix(name, "pypy") {
+		return true
+	}
+	switch name {
+	case "uv", "uvx", "pipx", "poetry", "perl", "ruby", "bundle", "php", "make", "just":
 		return true
 	}
 	return false

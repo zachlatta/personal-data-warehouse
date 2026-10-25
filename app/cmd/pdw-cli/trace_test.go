@@ -55,6 +55,41 @@ func TestSessionTraceIDSkipsShellsToTheAgent(t *testing.T) {
 	}
 }
 
+func TestSessionTraceIDSkipsInterpretersToTheAgent(t *testing.T) {
+	tree := map[int]struct {
+		ppid    int
+		started string
+		comm    string
+	}{
+		300: {1, "Wed Oct  1 09:00:00 2026", "claude"},
+		// Two script runs from two tool calls: zsh -> uv -> python3.
+		510: {300, "Wed Oct  1 10:00:00 2026", "zsh"},
+		511: {510, "Wed Oct  1 10:00:00 2026", "uv"},
+		512: {511, "Wed Oct  1 10:00:01 2026", "python3.12"},
+		610: {300, "Wed Oct  1 10:05:00 2026", "zsh"},
+		611: {610, "Wed Oct  1 10:05:01 2026", "/usr/bin/python3"},
+		// A daemon with no agent above it.
+		700: {1, "Wed Oct  1 08:00:00 2026", "python3"},
+	}
+	info := func(pid int) (int, string, string, error) {
+		p, ok := tree[pid]
+		if !ok {
+			return 0, "", "", errors.New("gone")
+		}
+		return p.ppid, p.started, p.comm, nil
+	}
+	a := sessionTraceID("mew-dev", 512, info)
+	if !strings.HasPrefix(a, "mew-dev-claude-300-") {
+		t.Fatalf("script trace = %q, want the agent process", a)
+	}
+	if b := sessionTraceID("mew-dev", 611, info); b != a {
+		t.Fatalf("second script trace = %q, want %q", b, a)
+	}
+	if d := sessionTraceID("mew-dev", 700, info); !strings.HasPrefix(d, "mew-dev-python3-700-") {
+		t.Fatalf("daemon trace = %q, want its interpreter", d)
+	}
+}
+
 func TestParsePSLine(t *testing.T) {
 	ppid, started, comm, err := parsePSLine("  123 Wed Sep 24 13:41:02 2026 /usr/bin/node\n")
 	if err != nil || ppid != 123 || started != "Wed Sep 24 13:41:02 2026" || comm != "/usr/bin/node" {
