@@ -156,7 +156,12 @@ break from a Mac that only ever runs the iOS simulator:
   Messaging: `google-services.json` from a Firebase project with the
   `com.zachlatta.pdw` Android app, named by `android.googleServicesFile` in
   `app.json`, and that project's FCM V1 service-account key uploaded with
-  `eas credentials -p android`. Every alert goes to the `default` channel the
+  `eas credentials -p android`. The project is `pdw-zachlatta` (Firebase
+  console, Zach's personal Google account); its `google-services.json` is
+  committed here (client identifiers, not secrets). Without it the Android
+  build has no Firebase app and `getExpoPushTokenAsync` fails with "Unable to
+  get FirebaseMessaging instance"; it is native config, so it ships only in a
+  new APK, not over the air. Every alert goes to the `default` channel the
   app creates at high importance (`ANDROID_CHANNEL_ID` here,
   `AndroidChannelID` in `app/internal/push`); without it an alert lands
   silently in Expo's default-importance fallback channel.

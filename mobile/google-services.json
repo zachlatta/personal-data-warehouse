@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "88149479768",
+    "project_id": "pdw-zachlatta",
+    "storage_bucket": "pdw-zachlatta.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:88149479768:android:1d9267b05f978c7886552d",
+        "android_client_info": {
+          "package_name": "com.zachlatta.pdw"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAglqQxpcys8WTnvNK_AAUlo0qIBy6f__c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
