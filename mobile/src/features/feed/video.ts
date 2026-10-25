@@ -154,6 +154,12 @@ export function videoAspect(src: VideoSource): number {
   return 16 / 9;
 }
 
+// Posts "fullscreen" when the player goes full screen and "inline" when it
+// comes back, so the feed leaves a full-screen video alone (video-player.tsx).
+const FULLSCREEN_JS =
+  'function pdwFs(){window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(document.fullscreenElement||document.webkitFullscreenElement?"fullscreen":"inline")}' +
+  'document.addEventListener("fullscreenchange",pdwFs);document.addEventListener("webkitfullscreenchange",pdwFs);';
+
 /**
  * Instagram's embed page refuses to load in a frame (X-Frame-Options: DENY),
  * so the WebView loads it as the page itself; this is that page's url.
@@ -170,7 +176,7 @@ export function instagramEmbedUrl(src: { code: string; path: 'p' | 'reel' | 'tv'
  */
 export function instagramPlayerScript({ muted = false }: { muted?: boolean } = {}): string {
   return (
-    '(function(){var n=0;var t=setInterval(function(){var v=document.querySelector("video");' +
+    `(function(){${FULLSCREEN_JS}var n=0;var t=setInterval(function(){var v=document.querySelector("video");` +
     'if(!v){if(++n>40){clearInterval(t);window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")}return}' +
     'clearInterval(t);document.documentElement.style.background="#000";document.body.style.background="#000";' +
     'v.style.cssText="position:fixed;inset:0;width:100%;height:100%;object-fit:cover;z-index:2147483647;background:#000";' +
@@ -258,5 +264,5 @@ export function playerHtml(src: VideoSource, { muted = false }: { muted?: boolea
       'window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});' +
       'window.pdwSetMuted=function(m){v.muted=m;if(!m&&v.paused)v.play()};</script>';
   }
-  return `${head}${player}</body></html>`;
+  return `${head}${player}<script>${FULLSCREEN_JS}</script></body></html>`;
 }

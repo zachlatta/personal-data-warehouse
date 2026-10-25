@@ -128,3 +128,16 @@ test('every player page takes the sound button', async () => {
   ]) assert.match(playerHtml(src, { muted: true }), /window\.pdwSetMuted=function/);
   assert.match(instagramPlayerScript({ muted: true }), /window\.pdwSetMuted=function/);
 });
+
+test('every player page says when it goes full screen', async () => {
+  const { instagramPlayerScript } = await import('./video.ts');
+  for (const src of [
+    { kind: 'youtube', id: 'dQw4w9WgXcQ' },
+    { kind: 'vimeo', id: '76979871' },
+    { kind: 'tiktok', id: '7300000000000000000' },
+    { kind: 'file', url: 'https://video.example.com/a.mp4' },
+  ]) {
+    assert.match(playerHtml(src), /fullscreenchange/, src.kind);
+  }
+  assert.match(instagramPlayerScript(), /fullscreenchange/);
+});

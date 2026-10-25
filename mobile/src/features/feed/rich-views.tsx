@@ -1,10 +1,11 @@
 import { Image } from 'expo-image';
 import { useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View, useWindowDimensions, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, View, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 
 import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
+import { usePortraitWindow } from '@/hooks/use-portrait-window';
 import { useTheme } from '@/hooks/use-theme';
 import type { IconName } from '@/lib/icons';
 
@@ -266,7 +267,7 @@ export function MediaCarousel({
   width?: number;
   radius?: number;
 }) {
-  const { width: screen } = useWindowDimensions();
+  const { width: screen } = usePortraitWindow();
   const width = fixed ?? screen - inset * 2;
   const [page, setPage] = useState(0);
   const [reported] = useState(() => new Set<number>([0]));

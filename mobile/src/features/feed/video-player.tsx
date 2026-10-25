@@ -22,10 +22,15 @@ import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, s
 let playing: string | null = null;
 let autoplayed = false;
 let muted = false;
+// The player that is full screen, if any. The feed's autoplay leaves it
+// alone: turning the phone sideways for it lays the feed out again, and
+// stopping the video then would end full screen and turn the phone back.
+let fullscreen: string | null = null;
 const listeners = new Set<() => void>();
 function setPlaying(key: string | null, auto = false) {
   if (playing === key) return;
   playing = key;
+  fullscreen = null;
   autoplayed = auto;
   muted = auto;
   for (const l of listeners) l();
@@ -46,6 +51,7 @@ export function playingVideo(): string | null {
  * like on the better feeds"), muted; null stops whatever plays.
  */
 export function autoplayVideo(key: string | null) {
+  if (fullscreen !== null && fullscreen === playing) return;
   setPlaying(key, key !== null);
 }
 
@@ -205,7 +211,12 @@ export function InlineVideo({
           containerStyle={styles.clear}
           // A file or Instagram says when it draws; a YouTube, Vimeo or
           // TikTok page draws its own poster as soon as it loads.
-          onMessage={(e) => e.nativeEvent.data === 'playing' && setDrawn(true)}
+          onMessage={(e) => {
+            const msg = e.nativeEvent.data;
+            if (msg === 'playing') setDrawn(true);
+            else if (msg === 'fullscreen') fullscreen = playerKey;
+            else if (msg === 'inline' && fullscreen === playerKey) fullscreen = null;
+          }}
           onLoadEnd={() => source.kind !== 'file' && source.kind !== 'instagram' && setDrawn(true)}
           onShouldStartLoadWithRequest={(req) => {
             // The player page and everything inside it load here; a tap

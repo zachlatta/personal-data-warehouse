@@ -1,11 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, StyleSheet, View, useWindowDimensions, type LayoutChangeEvent } from 'react-native';
+import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import { useSharedValue } from 'react-native-reanimated';
 import ReanimatedSwipeable, { SwipeDirection, type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
 import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
+import { usePortraitWindow } from '@/hooks/use-portrait-window';
 import { useTheme } from '@/hooks/use-theme';
 
 import type { FeedItem } from './api';
@@ -130,7 +131,7 @@ function FeedCardImpl({
   onSwipeStart,
 }: Props) {
   const theme = useTheme();
-  const { width: screen } = useWindowDimensions();
+  const { width: screen } = usePortraitWindow();
   const swipeable = useRef<SwipeableMethods>(null);
   const videoPlaying = useSharedValue(false);
   const playing = usePlayingIn(item.item_id);

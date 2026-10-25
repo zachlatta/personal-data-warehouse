@@ -56,6 +56,7 @@ import { autoplayKey } from './video';
 import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
 import { layoutsFromHeights, ViewabilityTracker, visibleFraction, type Impression } from './viewability';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
+import { isSideways, usePortraitWindow } from '@/hooks/use-portrait-window';
 
 // Reload on return to the tab after this long away.
 const STALE_MS = 10 * 60_000;
@@ -159,6 +160,11 @@ export default function FeedScreen() {
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
   const headerHeight = useRef(0);
+  // A full-screen video turned sideways (usePortraitWindow): the feed behind
+  // it keeps its portrait size and stops measuring, so the playing card stays
+  // where it was and the video keeps playing.
+  const { sideways } = usePortraitWindow();
+  const [portraitSize, setPortraitSize] = useState<{ width: number; height: number } | null>(null);
 
   useLayoutEffect(() => {
     ids.current = shown.map((i) => i.item_id);
@@ -186,7 +192,7 @@ export default function FeedScreen() {
   }, []);
 
   const measure = useCallback(() => {
-    if (!focused.current || AppState.currentState !== 'active' || viewport.current.height === 0) return;
+    if (!focused.current || isSideways() || AppState.currentState !== 'active' || viewport.current.height === 0) return;
     const layouts = layoutsFromHeights(ids.current, heights.current, headerHeight.current);
     recordImpressions(tracker.current.update(Date.now(), viewport.current, layouts, activeNow()));
     const fractions = new Map([...layouts].map(([id, l]) => [id, visibleFraction(l, viewport.current)]));
@@ -654,8 +660,15 @@ export default function FeedScreen() {
     );
   }
 
+  const frozen = sideways && portraitSize ? { flex: 0, ...portraitSize } : null;
   return (
-    <ThemedView style={styles.fill} onTouchStart={markActive}>
+    <ThemedView
+      style={[styles.fill, frozen]}
+      onTouchStart={markActive}
+      onLayout={(e) => {
+        const { width, height } = e.nativeEvent.layout;
+        if (!isSideways() && width < height && (width !== portraitSize?.width || height !== portraitSize?.height)) setPortraitSize({ width, height });
+      }}>
       <VideoWarmup />
       {searching ? (
         <View style={styles.searchRow}>
