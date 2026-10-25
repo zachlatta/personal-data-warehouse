@@ -1,5 +1,6 @@
-import { memo, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, View, useWindowDimensions, type LayoutChangeEvent } from 'react-native';
+import { useSharedValue } from 'react-native-reanimated';
 import ReanimatedSwipeable, { SwipeDirection, type SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
 import { Icon } from '@/components/icon';
@@ -26,7 +27,7 @@ import {
   type MediaAction,
 } from './rich-views';
 import { cardVideo, videoAspect } from './video';
-import { InlineVideo } from './video-player';
+import { InlineVideo, PlayerTouch, playerTouchGesture, usePlayingIn } from './video-player';
 import { confirm } from '@/lib/haptics';
 
 const PREVIEW_LINES = 4;
@@ -42,7 +43,8 @@ const GAP = 12;
 // the heart. An X post keeps X's own shape, which is the same row.
 // A tap opens the detail view; a video plays in place (video.ts).
 // Swiping left hides the card (Undo brings it back); swiping right saves it
-// for later (not on a carousel, whose swipe pages the photos).
+// for later (not on a carousel, whose swipe pages the photos, nor from a
+// playing video, where a drag seeks).
 type Props = {
   item: FeedItem;
   saved: boolean;
@@ -130,6 +132,12 @@ function FeedCardImpl({
   const theme = useTheme();
   const { width: screen } = useWindowDimensions();
   const swipeable = useRef<SwipeableMethods>(null);
+  const videoPlaying = useSharedValue(false);
+  const playing = usePlayingIn(item.item_id);
+  useEffect(() => {
+    videoPlaying.value = playing;
+  }, [playing, videoPlaying]);
+  const playerTouch = useMemo(() => playerTouchGesture(videoPlaying), [videoPlaying]);
   const [expanded, setExpanded] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const ctx = useMemo(() => cardContext(item), [item]);
@@ -334,6 +342,8 @@ function FeedCardImpl({
     <ReanimatedSwipeable
       ref={swipeable}
       enabled={!carousel}
+      // A drag on a playing video seeks it rather than swiping the card.
+      requireExternalGestureToFail={playerTouch}
       friction={1.5}
       rightThreshold={80}
       leftThreshold={60}
@@ -352,7 +362,7 @@ function FeedCardImpl({
       <View
         style={[styles.wrap, { borderBottomColor: theme.backgroundSelected, backgroundColor: theme.background }]}
         onLayout={(e: LayoutChangeEvent) => onLayout(item.item_id, e.nativeEvent.layout.height)}>
-        {content}
+        <PlayerTouch.Provider value={playerTouch}>{content}</PlayerTouch.Provider>
       </View>
     </ReanimatedSwipeable>
   );

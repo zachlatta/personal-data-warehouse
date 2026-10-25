@@ -1,8 +1,10 @@
 import { Image } from 'expo-image';
 import { useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { ActivityIndicator, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { Gesture, GestureDetector, type GestureType } from 'react-native-gesture-handler';
+import type { SharedValue } from 'react-native-reanimated';
 import { WebView } from 'react-native-webview';
 
 import { Icon } from '@/components/icon';
@@ -57,6 +59,36 @@ export function VideoWarmup() {
     </View>
   );
 }
+
+/**
+ * A touch on a playing player, for the swipeable card around it to wait on
+ * (Zach, voice memo 2026-10-24: seeking in a YouTube video "scrolls the whole
+ * card instead of just letting me seek"). It begins on the finger down and
+ * never takes the touch itself, so the player still gets it, and it ends on
+ * the finger up, which cancels the card's swipe instead of letting it go. On
+ * a video that is not playing (live false) it fails at once and the card
+ * swipes as before. The card makes it once and its videos are wrapped in it
+ * from the start: a gesture that mounts later is missing from the card's.
+ */
+export function playerTouchGesture(live: SharedValue<boolean>) {
+  return Gesture.Manual()
+    .onTouchesDown((_e, manager) => {
+      if (!live.value) manager.fail();
+    })
+    .onTouchesUp((_e, manager) => {
+      manager.end();
+    })
+    .onTouchesCancelled((_e, manager) => {
+      manager.end();
+    });
+}
+export const PlayerTouch = createContext<GestureType | null>(null);
+
+/** Whether the card's own video (key) or its quoted post's (key:quote) plays. */
+export function usePlayingIn(key: string): boolean {
+  return useSyncExternalStore(subscribe, () => playing === key || playing === `${key}:quote`);
+}
+
 function subscribe(l: () => void) {
   listeners.add(l);
   return () => listeners.delete(l);
@@ -94,6 +126,7 @@ export function InlineVideo({
   onStop: (watchedMs: number) => void;
 }) {
   const theme = useTheme();
+  const touch = useContext(PlayerTouch);
   const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
   const [drawn, setDrawn] = useState(false);
   const soundOff = useSyncExternalStore(subscribe, () => muted);
@@ -138,9 +171,17 @@ export function InlineVideo({
     [playerKey],
   );
 
+  const wrap = (body: React.ReactElement) =>
+    touch ? (
+      <GestureDetector gesture={touch}>
+        <View collapsable={false}>{body}</View>
+      </GestureDetector>
+    ) : (
+      body
+    );
   const frame = [styles.frame, { aspectRatio: aspect, borderRadius: radius, backgroundColor: theme.backgroundElement }];
   if (active) {
-    return (
+    return wrap(
       <View style={[frame, styles.black]}>
         {source.poster ? <Image source={{ uri: source.poster }} style={StyleSheet.absoluteFill} contentFit="cover" recyclingKey={playerKey} /> : null}
         {!drawn ? (
@@ -190,7 +231,7 @@ export function InlineVideo({
     );
   }
   const length = videoLength(durationSec);
-  return (
+  return wrap(
     <Pressable
       style={frame}
       onPress={() => {
