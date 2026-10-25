@@ -297,7 +297,7 @@ function FeedCardImpl({
                     accessibilityLabel={`Open ${link.label}`}
                     style={({ pressed }) => [styles.chip, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
                     <Icon name="link" tintColor={ACCENT} size={13} />
-                    <ThemedText style={styles.chipText} numberOfLines={1}>
+                    <ThemedText style={[styles.chipText, { color: theme.textSecondary }]} numberOfLines={1}>
                       {link.label}
                     </ThemedText>
                   </Pressable>
@@ -381,7 +381,7 @@ const styles = StyleSheet.create({
   media: { marginTop: 10 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingTop: Spacing.two },
   chip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, maxWidth: '100%' },
-  chipText: { fontSize: 13, fontWeight: '600', color: ACCENT, flexShrink: 1, lineHeight: 17 },
+  chipText: { fontSize: 13, fontWeight: '500', flexShrink: 1, lineHeight: 17 },
   actions: { flexDirection: 'row', alignItems: 'center', marginLeft: -Spacing.two, paddingTop: 4 },
   action: { padding: Spacing.two, flexDirection: 'row', alignItems: 'center' },
   details: { gap: 5 },

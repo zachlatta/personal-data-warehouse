@@ -24,9 +24,16 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
   };
 
   return (
-    // Floats over the page (position absolute, no backdrop), so the list
-    // scrolls under it as in Superhuman; screens pad by useTabBarSpace().
+    // Floats over the page (position absolute), so the list scrolls under it
+    // as in Superhuman; screens pad by useTabBarSpace(). A fade in the page
+    // colour sits behind the pill so rows dissolve under it instead of
+    // colliding with it (no gradient library: stacked bands).
     <View pointerEvents="box-none" style={[styles.wrap, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+      <View pointerEvents="none" style={styles.scrim}>
+        {SCRIM.map((opacity, i) => (
+          <View key={i} style={{ flex: 1, backgroundColor: theme.background, opacity }} />
+        ))}
+      </View>
       <View style={[styles.pill, styles.shadow, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
         {tabs.map((route) => {
           const { options } = descriptors[route.key];
@@ -65,7 +72,11 @@ export function PillTabBar({ state, descriptors, navigation, insets }: BottomTab
   );
 }
 
+// Band opacities from the top of the fade down; the lower half is near solid.
+const SCRIM = [0, 0.2, 0.45, 0.65, 0.8, 0.9, 0.96, 1, 1, 1];
+
 const styles = StyleSheet.create({
+  scrim: { position: 'absolute', left: 0, right: 0, top: -18, bottom: 0 },
   wrap: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingTop: 8 },
   // A soft lift so the pill reads above the rows scrolling beneath it.
   shadow: { elevation: 8, shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
