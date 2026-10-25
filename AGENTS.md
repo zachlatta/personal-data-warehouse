@@ -33,9 +33,10 @@ Development practices:
   (`tests/local_test_runtime.py`), `-n auto` is 1.5 workers per CPU, each worker in its own
   database (DDL invalidations and advisory locks are per database), connections go straight to
   the container IP (no docker-proxy), and tests run longest-first from the last run's durations
-  in `.pytest_cache`. On mew-dev (16 vCPUs) 2026-10-25: 247-288s → 79-92s. The run is then
-  disk-bound: it writes and deletes ~7.5 GB, and the deletion's TRIMs stall the next run's
-  first ~15s. A tmpfs data directory measured 63-67s but changes the pinned `docker run` test.
+  in `.pytest_cache`. On mew-dev (16 vCPUs) 2026-10-25: 247-288s → 74-77s. Each run writes
+  and deletes ~7 GB; root is mounted without online `discard` there (fstrim.timer trims weekly),
+  because with it the deletion's TRIMs stalled the next run's first ~15s. A tmpfs data
+  directory measured 63-67s but changes the pinned `docker run` test.
 * **The Go app deploys before the Python ensure path migrates a view.** A Go query that reads a
   new `marts_*` column returns 500 ("column ... does not exist") until the next ensure run
   rebuilds the view, about a minute after the push on 2026-10-20 (the Feed `saved` column).
