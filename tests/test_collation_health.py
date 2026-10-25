@@ -449,6 +449,7 @@ def test_amcheck_candidates_include_non_unique_btrees() -> None:
 
         def _query_dicts(self, sql: str, params):
             assert "am.amname = 'btree'" in sql
+            assert "ic.relkind = 'i'" in sql
             assert "i.indisunique" not in sql
             assert params == (["base_gmail"],)
             return [{"index_name": "messages_date_idx"}]
@@ -1137,3 +1138,195 @@ def test_the_collector_verifies_real_heaps_with_amcheck(warehouse):
     assert {f.amcheck_status for f in checked} == {"ok"}
     rows = _findings(warehouse)
     assert all(rows[f.object_id]["status"] == "ok" for f in checked)
+
+
+def test_amcheck_classifies_corruption_by_pgcode_and_reads_failing(warehouse) -> None:
+    """Postgres amcheck raises XX002 (index_corrupted) / XX001 (data_corrupted)
+    with messages that do not necessarily contain 'invariant' or 'corrupt'
+    (e.g. 'index tuple size does not equal lp_len ... torn page' on 2026-10-25).
+    Those must record amcheck_status='failed' and read status='failing', while
+    operational errors stay 'error' / 'attention'.
+    """
+    import psycopg2
+
+    class _ErrorRaisingWarehouse:
+        schema_namespace = "public"
+
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def _raw_command(self, sql: str) -> None:
+            pass
+
+        def _query(self, sql: str, params=()):
+            raise self.error
+
+    class _PgCodeXX002Error(psycopg2.Error):
+        pgcode = "XX002"
+
+    class _PgCodeXX001Error(psycopg2.Error):
+        pgcode = "XX001"
+
+    class _PgCodeWrongObjectError(psycopg2.Error):
+        pgcode = "42809"
+
+    lp_len_msg = (
+        'index tuple size does not equal lp_len in index "timeline_events_priority_time_idx"\n'
+        "DETAIL:  Index tid=(427572,118) tuple size=0 lp_len=32 page lsn=61B/63457570.\n"
+        "HINT:  This could be a torn page problem."
+    )
+    assert "invariant" not in lp_len_msg.lower()
+    assert "corrupt" not in lp_len_msg.lower()
+
+    corrupt_idx = CollationFinding(
+        object_id="index:timeline.timeline_events_priority_time_idx",
+        scope=SCOPE_INDEX,
+        object_name="timeline.timeline_events_priority_time_idx",
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding=FINDING_OK,
+        detail="non-unique btree; duplicate-key corroboration is not applicable",
+    )
+    CollationHealthCollector(
+        _ErrorRaisingWarehouse(_PgCodeXX002Error(lp_len_msg)), run_amcheck=True
+    )._run_amcheck(
+        {"index_schema": "timeline", "index_name": "timeline_events_priority_time_idx"},
+        corrupt_idx,
+        "public",
+    )
+    assert corrupt_idx.amcheck_status == "failed"
+    assert "lp_len" in corrupt_idx.amcheck_detail
+
+    corrupt_heap = _heap_finding("base_gmail.messages")
+    CollationHealthCollector(
+        _ErrorRaisingWarehouse(_PgCodeXX001Error("invalid page in block 42")), run_amcheck=True
+    )._run_heapcheck(
+        {"table_schema": "base_gmail", "table_name": "messages"},
+        corrupt_heap,
+        "public",
+    )
+    assert corrupt_heap.amcheck_status == "failed"
+
+    op_error_idx = CollationFinding(
+        object_id="index:derived_search.some_other_idx",
+        scope=SCOPE_INDEX,
+        object_name="derived_search.some_other_idx",
+        provider="",
+        recorded_version="",
+        actual_version="",
+        dependent_indexes=0,
+        finding=FINDING_OK,
+        detail="",
+    )
+    CollationHealthCollector(
+        _ErrorRaisingWarehouse(
+            _PgCodeWrongObjectError('expected "btree" index as targets for verification')
+        ),
+        run_amcheck=True,
+    )._run_amcheck(
+        {"index_schema": "derived_search", "index_name": "some_other_idx"},
+        op_error_idx,
+        "public",
+    )
+    assert op_error_idx.amcheck_status == "error"
+
+    now = datetime.now(tz=UTC)
+    warehouse.write_collation_health([corrupt_idx, corrupt_heap, op_error_idx], collected_at=now)
+    rows = _findings(warehouse)
+    assert rows["index:timeline.timeline_events_priority_time_idx"]["status"] == "failing"
+    assert rows["heap:base_gmail.messages"]["status"] == "failing"
+    assert rows["index:derived_search.some_other_idx"]["status"] == "attention"
+
+
+def test_partitioned_parent_indexes_are_excluded_and_stale_parent_row_is_pruned(warehouse) -> None:
+    """Partitioned parent indexes (relkind = 'I') cannot be verified by amcheck
+    and have pg_relation_size(parent_table) == 0, which bypassed the heap-size
+    ceiling and scanned every partition until statement_timeout while their
+    leaf partition indexes (relkind = 'i') were already checked individually.
+    """
+    _require_amcheck(warehouse)
+    ops_schema = relation("collation_health").with_namespace(warehouse._schema).schema
+    warehouse._command(
+        f"""
+        CREATE TABLE "{ops_schema}".part_parent (
+            part_key text NOT NULL,
+            item_id text NOT NULL,
+            PRIMARY KEY (part_key, item_id)
+        ) PARTITION BY LIST (part_key)
+        """
+    )
+    warehouse._command(
+        f"""
+        CREATE TABLE "{ops_schema}".part_leaf_a
+        PARTITION OF "{ops_schema}".part_parent FOR VALUES IN ('a')
+        """
+    )
+    warehouse._command(
+        f"""
+        CREATE TABLE "{ops_schema}".part_leaf_b
+        PARTITION OF "{ops_schema}".part_parent FOR VALUES IN ('b')
+        """
+    )
+    warehouse._command(
+        f"""
+        INSERT INTO "{ops_schema}".part_parent (part_key, item_id)
+        VALUES ('a', '1'), ('b', '2')
+        """
+    )
+
+    parent_index = f"{ops_schema}.part_parent_pkey"
+    leaf_indexes = {f"{ops_schema}.part_leaf_a_pkey", f"{ops_schema}.part_leaf_b_pkey"}
+
+    # Seed a stale parent index row like derived_search.chunk_vectors_pkey in prod.
+    warehouse.write_collation_health(
+        [
+            CollationFinding(
+                object_id=f"index:{parent_index}",
+                scope=SCOPE_INDEX,
+                object_name=parent_index,
+                provider="",
+                recorded_version="",
+                actual_version="",
+                dependent_indexes=0,
+                finding="timeout",
+                detail="canceling statement due to statement timeout",
+                amcheck_status="error",
+                amcheck_detail='expected "btree" index as targets for verification',
+            )
+        ],
+        collected_at=datetime.now(tz=UTC) - timedelta(hours=1),
+    )
+    assert f"index:{parent_index}" in _findings(warehouse)
+
+    collector = CollationHealthCollector(warehouse, run_amcheck=True)
+    probed: list[str] = []
+    amchecked: list[str] = []
+    orig_probe = collector._probe_unique_index
+    orig_amcheck = collector._run_amcheck
+
+    def spy_probe(row):
+        probed.append(f"{row['index_schema']}.{row['index_name']}")
+        return orig_probe(row)
+
+    def spy_amcheck(row, finding, function_schema, *, timeout_ms=AMCHECK_STATEMENT_TIMEOUT_MS):
+        amchecked.append(f"{row['index_schema']}.{row['index_name']}")
+        return orig_amcheck(row, finding, function_schema, timeout_ms=timeout_ms)
+
+    collector._probe_unique_index = spy_probe
+    collector._run_amcheck = spy_amcheck
+    collector.run()
+
+    assert parent_index not in probed
+    assert parent_index not in amchecked
+    assert leaf_indexes <= set(probed)
+    assert leaf_indexes <= set(amchecked)
+
+    rows = _findings(warehouse)
+    assert f"index:{parent_index}" not in rows
+    for leaf in leaf_indexes:
+        assert rows[f"index:{leaf}"]["finding"] == FINDING_OK
+        assert rows[f"index:{leaf}"]["amcheck_status"] == "ok"
+        assert rows[f"index:{leaf}"]["status"] == "ok"
+

@@ -284,6 +284,20 @@ asset everyone ignores. Four things about it are load-bearing:
   it detects duplicate *keys*, and three of the seven damaged indexes had none — they were
   merely mis-ordered. `amcheck` is the rigorous tool for that class, and the published view's
   comment says so.
+- **Corruption is classified by SQLSTATE (`XX001`/`XX002`), and partitioned parent indexes
+  (`relkind = 'I'`) are excluded.** `bt_index_check` raises on corruption with `XX002`
+  (`index_corrupted`) or `XX001` (`data_corrupted`), including messages such as
+  `index tuple size does not equal lp_len ... torn page` (2026-10-25 on
+  `timeline_events_priority_time_idx` of `timeline.events`) that contain neither `'invariant'`
+  nor `'corrupt'`. Those record `amcheck_status = 'failed'` and read `status = 'failing'` on
+  `marts_ops.collation_health` (with `'invariant'`/`'corrupt'` kept only as a backstop, and
+  as an exception backstop beside `verify_heapam`'s normal row-returned corruption reports),
+  while operational errors stay `error` (`attention`). Both `_amcheck_candidates` and
+  `_unique_index_candidates` require `ic.relkind = 'i'`: `amcheck` refuses partitioned parent
+  indexes (`chunk_vectors_pkey` on `derived_search.chunk_vectors`), `pg_relation_size` on the
+  partitioned parent table is `0` so the heap-size ceiling never skipped the parent probe
+  (timing out after 60 s scanning every partition), and each leaf partition index is already
+  covered individually.
 
 **How to check by hand, and the two traps.** `amcheck` is the reliable tool
 (`SELECT bt_index_check('schema.index'::regclass)`; it raises rather than returning a

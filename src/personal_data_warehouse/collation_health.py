@@ -539,6 +539,7 @@ class CollationHealthCollector:
             JOIN pg_namespace tn ON tn.oid = tc.relnamespace
             JOIN pg_am am ON am.oid = ic.relam
             WHERE i.indisvalid AND i.indisready AND am.amname = 'btree'
+              AND ic.relkind = 'i'
               AND n.nspname = ANY(%s)
             ORDER BY 1, 2
             """,
@@ -644,12 +645,11 @@ class CollationHealthCollector:
             finding.amcheck_status = "timeout"
             finding.amcheck_detail = _one_line(str(error))[:500]
         except psycopg2.Error as error:
-            # amcheck reports corruption as an ERROR; unlike an infrastructure
-            # error, the invariant wording is a definitive failing result.
+            # amcheck reports corruption as an ERROR with SQLSTATE XX002
+            # (index_corrupted) or XX001 (data_corrupted); operational errors
+            # stay 'error' while corruption is a definitive failing result.
             detail = _one_line(str(error))[:500]
-            finding.amcheck_status = (
-                "failed" if "invariant" in detail.lower() or "corrupt" in detail.lower() else "error"
-            )
+            finding.amcheck_status = _amcheck_error_status(error, detail)
             finding.amcheck_detail = detail
         finally:
             finding.amcheck_ms = int((time.monotonic() - started) * 1000)
@@ -795,7 +795,7 @@ class CollationHealthCollector:
             finding.amcheck_detail = _one_line(str(error))[:500]
         except psycopg2.Error as error:
             detail = _one_line(str(error))[:500]
-            finding.amcheck_status = "failed" if "corrupt" in detail.lower() else "error"
+            finding.amcheck_status = _amcheck_error_status(error, detail)
             finding.amcheck_detail = detail
         finally:
             finding.amcheck_ms = int((time.monotonic() - started) * 1000)
@@ -809,7 +809,10 @@ class CollationHealthCollector:
         column, so there is nothing to ``count(DISTINCT ...)`` without
         re-deriving the expression, and getting that subtly wrong produces a
         confident false alarm. Those are skipped explicitly rather than
-        silently.
+        silently. Partitioned parent indexes (``ic.relkind = 'I'``) are
+        excluded because ``pg_relation_size`` on a partitioned parent table is
+        0 (bypassing the heap-size ceiling to scan all partitions) and each leaf
+        partition index (``ic.relkind = 'i'``) is covered individually.
         """
         return self._warehouse._query_dicts(
             """
@@ -838,6 +841,7 @@ class CollationHealthCollector:
             WHERE i.indisunique
               AND i.indisvalid
               AND am.amname = 'btree'
+              AND ic.relkind = 'i'
               AND n.nspname = ANY(%s)
             ORDER BY 1, 2
             """,
@@ -930,6 +934,28 @@ class CollationHealthCollector:
                 "re-verify with amcheck."
             )
         return finding
+
+
+_CORRUPTION_PGCODES = frozenset({"XX001", "XX002"})
+
+
+def _amcheck_error_status(error: psycopg2.Error, detail: str) -> str:
+    """Classify an amcheck exception into ``'failed'`` (corruption) vs ``'error'``.
+
+    Postgres sets SQLSTATE ``XX001`` (``data_corrupted``) or ``XX002``
+    (``index_corrupted``) on corruption errors, including messages such as
+    ``index tuple size does not equal lp_len ... torn page`` that contain
+    neither ``'invariant'`` nor ``'corrupt'``. Keyword matching is kept as a
+    backstop for synthetic/wrapped errors without ``pgcode``.
+    """
+    if getattr(error, "pgcode", None) in _CORRUPTION_PGCODES or isinstance(
+        error, (psycopg2.errors.DataCorrupted, psycopg2.errors.IndexCorrupted)
+    ):
+        return "failed"
+    lowered = detail.lower()
+    if "invariant" in lowered or "corrupt" in lowered:
+        return "failed"
+    return "error"
 
 
 def _table_name(row: dict[str, Any]) -> str:
