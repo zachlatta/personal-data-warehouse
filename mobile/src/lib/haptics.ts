@@ -12,3 +12,10 @@ export function tick(): void {
 export function confirm(): void {
   if (Platform.OS === 'android') Vibration.vibrate(18);
 }
+
+// A like (Zach, voice memo 2026-10-25: "vibrate my phone, make it like really
+// clear I've done it"): a quick double beat, unlike any other buzz in the app,
+// so his hand knows it landed without looking.
+export function celebrate(): void {
+  if (Platform.OS === 'android') Vibration.vibrate([0, 22, 70, 40]);
+}

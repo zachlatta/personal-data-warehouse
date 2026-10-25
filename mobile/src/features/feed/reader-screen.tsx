@@ -32,6 +32,7 @@ import {
   SourceAvatar,
   type MediaAction,
 } from './rich-views';
+import { LikeHeart } from './like-heart';
 import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
 import { openTrackedBrowser } from './tracked-browser';
@@ -264,7 +265,7 @@ export default function FeedReaderScreen() {
                 hitSlop={12}
                 onPress={() => toggleLiked(item, { position, via: 'detail' })}
                 accessibilityLabel={liked ? 'Unlike' : 'Like'}>
-                <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.text} size={22} />
+                <LikeHeart itemId={item.item_id} liked={liked} size={22} tint={theme.text} likedTint={LIKE_RED} />
               </Pressable>
               <Pressable
                 hitSlop={12}

@@ -11,6 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 
 import type { FeedItem } from './api';
 import { cardContext, profileUrl, type CardContext } from './card-context';
+import { CardLikeBurst, LikeHeart } from './like-heart';
 import { cardLinks, type CardLink } from './links';
 import { previewSpans } from './markdown';
 import { compactCount, shortAge, type FeedMedia } from './rich';
@@ -87,11 +88,11 @@ export function cardMedia(item: FeedItem): FeedMedia[] {
 }
 
 // The heart: his own "I like this", the one signal he gives on purpose.
-export function LikeButton({ liked, onPress, size = 20 }: { liked: boolean; onPress: () => void; size?: number }) {
+export function LikeButton({ itemId, liked, onPress, size = 20 }: { itemId?: string; liked: boolean; onPress: () => void; size?: number }) {
   const theme = useTheme();
   return (
     <Pressable hitSlop={10} onPress={onPress} accessibilityLabel={liked ? 'Unlike' : 'Like'} accessibilityState={{ selected: liked }} style={styles.action}>
-      <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={size} />
+      <LikeHeart itemId={itemId} liked={liked} size={size} tint={theme.textSecondary} likedTint={LIKE_RED} />
     </Pressable>
   );
 }
@@ -218,7 +219,7 @@ function FeedCardImpl({
             {embed.thread?.length ? (
               <ThemedText style={[styles.thread, { color: ACCENT }]}>Show this thread ({embed.thread.length + 1} posts)</ThemedText>
             ) : null}
-            <PostMetrics embed={embed} onShare={share} onSave={save} saved={saved} onLike={like} liked={liked} />
+            <PostMetrics embed={embed} onShare={share} onSave={save} saved={saved} onLike={like} liked={liked} itemId={item.item_id} />
           </View>
         </View>
       </Pressable>
@@ -314,7 +315,7 @@ function FeedCardImpl({
               </View>
             ) : null}
             <View style={styles.actions}>
-              <LikeButton liked={liked} onPress={like} />
+              <LikeButton itemId={item.item_id} liked={liked} onPress={like} />
               <Pressable hitSlop={10} onPress={open} accessibilityLabel="Details" style={[styles.action, styles.details]}>
                 <Icon name="text.bubble" tintColor={theme.textSecondary} size={19} />
                 <ThemedText style={[styles.actionText, { color: theme.textSecondary }]}>Details</ThemedText>
@@ -364,6 +365,7 @@ function FeedCardImpl({
         style={[styles.wrap, { borderBottomColor: theme.backgroundSelected, backgroundColor: theme.background }]}
         onLayout={(e: LayoutChangeEvent) => onLayout(item.item_id, e.nativeEvent.layout.height)}>
         <PlayerTouch.Provider value={playerTouch}>{content}</PlayerTouch.Provider>
+        <CardLikeBurst itemId={item.item_id} color={LIKE_RED} />
       </View>
     </ReanimatedSwipeable>
   );

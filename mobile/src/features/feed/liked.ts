@@ -5,6 +5,8 @@
 // of minutes so a reload that beats the event upload does not undo it.
 import { useSyncExternalStore } from 'react';
 
+import { celebrate, tick } from '@/lib/haptics';
+
 import type { FeedItem } from './api';
 import { recordFeedEvent } from './engagement';
 import { applySave, mergeSaved, type PendingSave } from './saved-queue';
@@ -12,6 +14,7 @@ import { applySave, mergeSaved, type PendingSave } from './saved-queue';
 let liked: string[] = [];
 const pending = new Map<string, PendingSave>();
 const listeners = new Set<() => void>();
+const likeListeners = new Set<(itemId: string) => void>();
 
 function emit() {
   for (const listener of listeners) listener();
@@ -38,6 +41,14 @@ export function toggleLiked(item: FeedItem, fields: { position?: number; via: st
     metadata: { via: fields.via, source: item.source },
   });
   emit();
+  // Every way in (the card's heart, an X post's heart, the detail view, the
+  // menu) buzzes, and a like plays the hearts' burst (like-heart.tsx).
+  if (like) {
+    celebrate();
+    for (const listener of likeListeners) listener(item.item_id);
+  } else {
+    tick();
+  }
   return like;
 }
 
@@ -49,4 +60,11 @@ function subscribe(listener: () => void) {
 /** The liked ids; re-renders on every change. */
 export function useLikedIds(): string[] {
   return useSyncExternalStore(subscribe, () => liked);
+}
+
+/** Calls back with the card's id each time he likes one (not on an unlike or
+ * a load), so the hearts showing it can celebrate. Returns the unsubscribe. */
+export function onLiked(listener: (itemId: string) => void): () => void {
+  likeListeners.add(listener);
+  return () => likeListeners.delete(listener);
 }

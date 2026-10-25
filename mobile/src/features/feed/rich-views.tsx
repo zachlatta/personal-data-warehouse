@@ -10,6 +10,7 @@ import { useTheme } from '@/hooks/use-theme';
 import type { IconName } from '@/lib/icons';
 
 import { startTimer } from './engagement';
+import { LikeHeart } from './like-heart';
 import { PhotoViewer } from './photo-viewer';
 import { mediaVideo } from './video';
 import { InlineVideo } from './video-player';
@@ -405,6 +406,7 @@ export function PostMetrics({
   saved,
   onLike,
   liked = false,
+  itemId,
 }: {
   embed: FeedEmbed;
   onShare?: () => void;
@@ -412,6 +414,7 @@ export function PostMetrics({
   saved?: boolean;
   onLike?: () => void;
   liked?: boolean;
+  itemId?: string;
 }) {
   const theme = useTheme();
   const cells: [IconName, number | undefined][] = [
@@ -425,7 +428,7 @@ export function PostMetrics({
       {cells.map(([icon, n]) =>
         icon === 'heart' && onLike ? (
           <Pressable key={icon} hitSlop={10} onPress={onLike} style={styles.metric} accessibilityLabel={liked ? 'Unlike' : 'Like'} accessibilityState={{ selected: liked }}>
-            <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? LIKE_RED : theme.textSecondary} size={16} />
+            <LikeHeart itemId={itemId} liked={liked} size={16} tint={theme.textSecondary} likedTint={LIKE_RED} />
             <ThemedText style={[styles.metricText, { color: liked ? LIKE_RED : theme.textSecondary }]}>{compactCount(n)}</ThemedText>
           </Pressable>
         ) : (
