@@ -7,6 +7,9 @@ infrastructure and must never become part of the warehouse runtime.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, MutableMapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import functools
 import inspect
 import os
 import re
@@ -270,7 +273,7 @@ def direct_postgres_url(
     return urlunsplit(parts._replace(netloc=netloc))
 
 
-def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> None:
+def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> bool:
     """Point an xdist worker at its own database in the disposable cluster.
 
     Two costs scale with how many workers share one database, and on
@@ -285,7 +288,7 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
     """
     url = env.get("POSTGRES_DATABASE_URL", "")
     if worker is None or not url or env.get(OWNED_POSTGRES_URL_ENV) != url:
-        return
+        return False
     if not re.fullmatch(r"gw\d+", worker):
         raise LocalTestStartupError(f"unexpected xdist worker id {worker!r}")
     database = f"pdw_{worker}"
@@ -309,8 +312,10 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
                 # The warehouse's big views carry cost estimates that trip JIT
                 # even over empty test tables: one marts probe spent 275 ms
                 # compiling for a query that returned no rows. Tests hold a
-                # few rows, so JIT can only cost time.
-                cursor.execute(psycopg2.sql.SQL("ALTER DATABASE {} SET jit = off").format(name))
+                # few rows, so JIT can only cost time. Set on the role, not the
+                # database: a database cloned from a template does not inherit
+                # the template's settings.
+                cursor.execute("ALTER ROLE CURRENT_USER SET jit = off")
         finally:
             connection.close()
     except psycopg2.Error as error:
@@ -319,6 +324,204 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
             f"Retry `uv run pytest`, or explicitly run `{_UNIT_ONLY_COMMAND}`."
         ) from error
     env["POSTGRES_DATABASE_URL"] = worker_url
+    return True
+
+
+# --- one database per Postgres test ------------------------------------------
+#
+# Building a test warehouse is ~2,100 statements (1.2 s) and dropping its 64
+# schemas another ~0.3 s; a full run built ~680 of them, ~70% of its database
+# time (mew-dev, 2026-10-25). Cloning a database from a template takes 10-60 ms
+# and dropping one 5-30 ms, so in the run's own cluster each Postgres test gets
+# a fresh database cloned from a per-worker template, and a test whose helper
+# provisions the whole warehouse starts from a clone of a template that same
+# helper built once. Contracts are unchanged: a test still sees exactly the
+# state its own code would have built, and nothing it creates outlives it.
+
+_PROVISIONS_TEMPLATE = "_pdw_provisions_template"
+# WAL_LOG copies the template block by block through WAL; FILE_COPY would
+# force a cluster-wide checkpoint for every test.
+CLONE_STRATEGY = "WAL_LOG"
+
+
+@dataclass
+class ActiveDatabase:
+    """The disposable database the current test runs against."""
+
+    name: str
+    provisioner: Callable[..., object] | None
+    namespace: str
+    namespace_taken: bool = False
+    provisioned: bool = False
+
+
+_active: ActiveDatabase | None = None
+
+
+def active_database() -> ActiveDatabase | None:
+    return _active
+
+
+def set_active_database(database: ActiveDatabase | None) -> None:
+    global _active
+    _active = database
+
+
+def warehouse_database_name(warehouse: object) -> str | None:
+    info = getattr(getattr(warehouse, "_connection", None), "info", None)
+    return getattr(info, "dbname", None)
+
+
+def provisions_template(function: Callable[..., object]) -> Callable[..., object]:
+    """Mark a helper that provisions a whole test warehouse.
+
+    A test that calls it starts from a database cloned from a template the
+    helper itself built, in the namespace make_test_schema() hands that test
+    first, so the helper's first call on that warehouse has nothing left to do.
+    Every other call (another warehouse, a second call, no template) runs it.
+    """
+
+    @functools.wraps(function)
+    def provision(warehouse, *args, **kwargs):
+        active = _active
+        if (
+            active is not None
+            and active.provisioner is provision
+            and not active.provisioned
+            and getattr(warehouse, "schema_namespace", None) == active.namespace
+            and warehouse_database_name(warehouse) == active.name
+        ):
+            active.provisioned = True
+            return None
+        return function(warehouse, *args, **kwargs)
+
+    setattr(provision, _PROVISIONS_TEMPLATE, True)
+    return provision
+
+
+def template_provisioner(function: Callable[..., object]) -> Callable[..., object] | None:
+    """The @provisions_template helper a test or fixture calls, if exactly one."""
+    found: set[Callable[..., object]] = set()
+    seen: set[int] = set()
+
+    def visit(candidate: object) -> None:
+        if not inspect.isfunction(candidate) or id(candidate) in seen:
+            return
+        seen.add(id(candidate))
+        if getattr(candidate, _PROVISIONS_TEMPLATE, False):
+            found.add(candidate)
+            return
+        for name in candidate.__code__.co_names:
+            referenced = candidate.__globals__.get(name)
+            if inspect.isfunction(referenced) and (
+                getattr(referenced, _PROVISIONS_TEMPLATE, False)
+                or getattr(referenced, "__module__", "").startswith("tests.")
+                or getattr(referenced, "__module__", "") == getattr(function, "__module__", "")
+            ):
+                visit(referenced)
+        for cell in candidate.__closure__ or ():
+            try:
+                visit(cell.cell_contents)
+            except ValueError:
+                continue
+
+    visit(function)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+class DisposableDatabases:
+    """A worker's templates and per-test clones in the run's own cluster."""
+
+    def __init__(self, admin, admin_url: str, worker: str, namespace: str) -> None:
+        self._admin = admin
+        self._admin_url = admin_url
+        self._worker = worker
+        self.namespace = namespace
+        self.base_template = f"pdw_{worker}_template"
+        self._full_templates: dict[int, str] = {}
+        self._clones = 0
+
+    @classmethod
+    def create(cls, admin_url: str, *, worker: str) -> "DisposableDatabases":
+        if not re.fullmatch(r"gw\d+", worker):
+            raise LocalTestStartupError(f"unexpected xdist worker id {worker!r}")
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
+        try:
+            admin = psycopg2.connect(admin_url)
+            admin.autocommit = True
+            databases = cls(admin, admin_url, worker, f"pdw_test_{stamp}_{uuid.uuid4().hex}")
+            databases._drop_matching(f"pdw_{worker}_")
+            databases._execute("CREATE DATABASE {} TEMPLATE template0", databases.base_template)
+            connection = psycopg2.connect(databases._url(databases.base_template))
+            connection.autocommit = True
+            try:
+                with connection.cursor() as cursor:
+                    for extension in sorted(POSTGRES_EXTENSIONS):
+                        cursor.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
+            finally:
+                connection.close()
+        except psycopg2.Error as error:
+            raise LocalTestStartupError(
+                f"Local integration startup failed: could not create {worker}'s template database: {error}. "
+                f"Retry `uv run pytest`, or explicitly run `{_UNIT_ONLY_COMMAND}`."
+            ) from error
+        return databases
+
+    def template_for(self, provisioner: Callable[..., object] | None) -> str:
+        """The base template, or the one ``provisioner`` built (built on first use)."""
+        if provisioner is None:
+            return self.base_template
+        key = id(provisioner)
+        if key not in self._full_templates:
+            from personal_data_warehouse.postgres import PostgresWarehouse
+
+            name = f"pdw_{self._worker}_full{len(self._full_templates)}"
+            self._execute("CREATE DATABASE {} TEMPLATE {}", name, self.base_template)
+            warehouse = PostgresWarehouse(self._url(name), schema=self.namespace)
+            try:
+                getattr(provisioner, "__wrapped__", provisioner)(warehouse)
+            finally:
+                warehouse.close()
+            self._full_templates[key] = name
+        return self._full_templates[key]
+
+    def clone(self, template: str) -> str:
+        self._clones += 1
+        name = f"pdw_{self._worker}_c{self._clones}"
+        self._execute(f"CREATE DATABASE {{}} TEMPLATE {{}} STRATEGY {CLONE_STRATEGY}", name, template)
+        return self._url(name)
+
+    def drop(self, url: str) -> None:
+        self._execute("DROP DATABASE IF EXISTS {} WITH (FORCE)", urlsplit(url).path.lstrip("/"))
+
+    def existing(self) -> list[str]:
+        """This worker's per-test clones still present."""
+        with self._admin.cursor() as cursor:
+            cursor.execute(
+                "SELECT datname FROM pg_database WHERE starts_with(datname, %s) ORDER BY datname",
+                (f"pdw_{self._worker}_c",),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def close(self) -> None:
+        try:
+            self._drop_matching(f"pdw_{self._worker}_")
+        finally:
+            self._admin.close()
+
+    def _drop_matching(self, prefix: str) -> None:
+        with self._admin.cursor() as cursor:
+            cursor.execute("SELECT datname FROM pg_database WHERE starts_with(datname, %s)", (prefix,))
+            names = [row[0] for row in cursor.fetchall()]
+        for name in names:
+            self._execute("DROP DATABASE IF EXISTS {} WITH (FORCE)", name)
+
+    def _execute(self, statement: str, *names: str) -> None:
+        with self._admin.cursor() as cursor:
+            cursor.execute(psycopg2.sql.SQL(statement).format(*map(psycopg2.sql.Identifier, names)))
+
+    def _url(self, database: str) -> str:
+        return urlunsplit(urlsplit(self._admin_url)._replace(path=f"/{database}"))
 
 
 class PostgresTestRuntime:

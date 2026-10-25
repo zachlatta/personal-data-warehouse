@@ -59,7 +59,7 @@ build-backend = "hatchling.build"
 # of it. `-n auto` is 1.5 workers per idle CPU against the run's own Postgres
 # (pytest_xdist_auto_num_workers in tests/conftest.py); worksteal keeps every
 # worker busy to the end. Measured 2026-10-25 on mew-dev (16 vCPUs): 247-288s
-# -> 68-73s.
+# -> 47-62s.
 # `-n 0` runs serially (e.g. for --pdb).
 addopts = "-n auto --dist worksteal"
 markers = [

@@ -11,17 +11,23 @@ from dotenv import load_dotenv
 
 from tests.local_test_runtime import (
     OWNED_POSTGRES_URL_ENV,
+    ActiveDatabase,
+    DisposableDatabases,
     LocalTestStartupError,
     PostgresTestRuntime,
+    active_database,
     auto_worker_count,
     available_memory_bytes,
     busy_cpus_now,
     callable_requires_postgres,
     direct_postgres_url,
     schedule_key,
+    set_active_database,
     subscription_tests_enabled,
     subscription_tests_skip_reason,
+    template_provisioner,
     use_worker_database,
+    warehouse_database_name,
 )
 
 if TYPE_CHECKING:
@@ -57,8 +63,12 @@ def pytest_configure(config: pytest.Config) -> None:
             os.environ["POSTGRES_DATABASE_URL"], runtime.owned_container
         )
         os.environ[OWNED_POSTGRES_URL_ENV] = os.environ["POSTGRES_DATABASE_URL"]
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
     try:
-        use_worker_database(os.environ, os.environ.get("PYTEST_XDIST_WORKER"))
+        if use_worker_database(os.environ, worker):
+            databases = DisposableDatabases.create(os.environ["POSTGRES_DATABASE_URL"], worker=worker)
+            config.stash[_DISPOSABLE_DATABASES] = databases
+            config.add_cleanup(databases.close)
     except LocalTestStartupError as error:
         raise pytest.UsageError(str(error)) from error
     if unit_only and not os.environ.get("POSTGRES_DATABASE_URL"):
@@ -70,6 +80,47 @@ def pytest_configure(config: pytest.Config) -> None:
                 os.environ.pop("POSTGRES_DATABASE_URL", None)
 
         config.add_cleanup(remove_unit_only_url)
+
+
+_DISPOSABLE_DATABASES = pytest.StashKey[DisposableDatabases]()
+
+
+@pytest.fixture(autouse=True)
+def _disposable_database(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """Run each Postgres test in its own database cloned from a worker template.
+
+    Only in the run's own cluster: a configured POSTGRES_DATABASE_URL keeps the
+    shared database and per-schema cleanup. The test's warehouse fixtures read
+    the URL from the environment, so they reach the clone unchanged.
+    """
+    databases = request.config.stash.get(_DISPOSABLE_DATABASES, None)
+    if databases is None or request.node.get_closest_marker("local_integration") is None:
+        yield
+        return
+    provisioner = _item_provisioner(request.node)
+    url = databases.clone(databases.template_for(provisioner))
+    monkeypatch.setenv("POSTGRES_DATABASE_URL", url)
+    set_active_database(
+        ActiveDatabase(name=url.rsplit("/", 1)[1], provisioner=provisioner, namespace=databases.namespace)
+    )
+    try:
+        yield
+    finally:
+        set_active_database(None)
+        databases.drop(url)
+
+
+def _item_provisioner(item: pytest.Item):
+    found = set()
+    test_function = getattr(item, "function", None)
+    if callable(test_function):
+        found.add(template_provisioner(test_function))
+    fixture_info = getattr(item, "_fixtureinfo", None)
+    for fixture_defs in (fixture_info.name2fixturedefs.values() if fixture_info else ()):
+        for fixture_def in fixture_defs:
+            found.add(template_provisioner(fixture_def.func))
+    found.discard(None)
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
@@ -160,13 +211,27 @@ _TEST_SCHEMA_MAX_AGE = timedelta(hours=12)
 
 
 def make_test_schema(label: str = "") -> str:
+    active = active_database()
+    if active is not None and active.provisioner is not None and not label and not active.namespace_taken:
+        # The test's database was cloned from a template provisioned in this
+        # namespace; its first warehouse is that warehouse.
+        active.namespace_taken = True
+        return active.namespace
     stamp = datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
     suffix = f"{label}_" if label else ""
     return f"pdw_test_{stamp}_{suffix}{uuid.uuid4().hex}"
 
 
 def cleanup_test_warehouse(warehouse: PostgresWarehouse) -> None:
-    """Drop every schema owned by a test warehouse, then close it."""
+    """Drop every schema owned by a test warehouse, then close it.
+
+    In a disposable per-test database the whole database is dropped after the
+    test, so only the connection needs closing.
+    """
+    active = active_database()
+    if active is not None and warehouse_database_name(warehouse) == active.name:
+        warehouse.close()
+        return
     try:
         schema_names = [
             *warehouse.physical_schema_names(include_hidden=True),

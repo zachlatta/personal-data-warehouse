@@ -8,6 +8,7 @@ import pytest
 from personal_data_warehouse.agent_runner import AgentContainerConfig
 from tests.local_test_runtime import (
     DEFAULT_POSTGRES_IMAGE,
+    DisposableDatabases,
     auto_worker_count,
     OWNED_POSTGRES_URL_ENV,
     POSTGRES_EXTENSIONS,
@@ -16,7 +17,9 @@ from tests.local_test_runtime import (
     callable_requires_postgres,
     direct_postgres_url,
     preflight_subscription_auth,
+    provisions_template,
     schedule_key,
+    template_provisioner,
     subscription_tests_enabled,
     use_worker_database,
 )
@@ -476,3 +479,76 @@ def test_tests_are_scheduled_longest_first_from_the_last_runs_durations() -> Non
     # Measured tests longest first; a test with no history is assumed to cost
     # what a typical Postgres test or unit test does.
     assert order == ["a::slow", "a::medium", "c::new_db", "b::fast", "b::new_unit"]
+
+
+def _make_full(wh) -> None:
+    wh.calls.append("full")
+
+
+_full = provisions_template(_make_full)
+
+
+def _test_that_provisions_fully() -> None:
+    _full(object())
+
+
+def _test_that_does_not() -> None:
+    assert True
+
+
+def test_a_test_reaching_a_provisioning_helper_is_found_by_its_code() -> None:
+    assert template_provisioner(_test_that_provisions_fully) is _full
+    assert template_provisioner(_test_that_does_not) is None
+
+
+def test_disposable_databases_clone_a_template_per_test_and_drop_it() -> None:
+    import psycopg2
+
+    url = _owned_postgres_url()
+    databases = DisposableDatabases.create(url, worker="gw998")
+    try:
+        first = databases.clone(databases.template_for(None))
+        second = databases.clone(databases.template_for(None))
+        assert first != second
+        connection = psycopg2.connect(first)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT extname FROM pg_extension")
+                assert POSTGRES_EXTENSIONS <= {row[0] for row in cursor.fetchall()}
+                cursor.execute("CREATE TABLE left_behind (id int)")
+            connection.commit()
+        finally:
+            connection.close()
+        databases.drop(first)
+        databases.drop(second)
+        assert databases.existing() == []
+    finally:
+        databases.close()
+
+
+def test_a_full_template_is_built_once_by_its_own_helper() -> None:
+    built: list[str] = []
+
+    def provision(warehouse) -> None:
+        built.append(warehouse.schema_namespace)
+        warehouse._raw_command(f'CREATE SCHEMA "{warehouse.schema_namespace}_marker"')
+
+    helper = provisions_template(provision)
+    databases = DisposableDatabases.create(_owned_postgres_url(), worker="gw997")
+    try:
+        template = databases.template_for(helper)
+        assert databases.template_for(helper) == template
+        assert built == [databases.namespace]
+        clone = databases.clone(template)
+        import psycopg2
+
+        connection = psycopg2.connect(clone)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (f"{databases.namespace}_marker",))
+                assert cursor.fetchone() == (1,)
+        finally:
+            connection.close()
+        databases.drop(clone)
+    finally:
+        databases.close()

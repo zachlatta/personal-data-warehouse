@@ -15,6 +15,7 @@ import pytest
 from dotenv import load_dotenv
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
+from tests.local_test_runtime import provisions_template
 
 from personal_data_warehouse.pipeline_health import (
     COLLECTOR_STALE_SECONDS,
@@ -383,6 +384,7 @@ class _FakeWarehouse:
 # --- live schema + collector (Postgres) ---------------------------------------
 
 
+@provisions_template
 def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_tables()
     wh.ensure_calendar_tables()

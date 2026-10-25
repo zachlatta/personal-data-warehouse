@@ -10,6 +10,7 @@ import pytest
 from dotenv import load_dotenv
 
 from tests.conftest import cleanup_test_warehouse, make_test_schema
+from tests.local_test_runtime import provisions_template
 
 from personal_data_warehouse.github_api import comment_row, commit_row, event_row, issue_row
 from personal_data_warehouse.postgres import POSTGRES_INDEXES, POSTGRES_TABLES, PostgresWarehouse
@@ -62,6 +63,7 @@ def warehouse():
         cleanup_test_warehouse(wh)
 
 
+@provisions_template
 def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     """Run every ensure_* path so the schema contains every warehouse table."""
     wh.ensure_tables()

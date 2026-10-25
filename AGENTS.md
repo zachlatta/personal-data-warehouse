@@ -34,8 +34,12 @@ Development practices:
   from /proc/stat at startup, capped at half of MemAvailable), so concurrent agents' suites do
   not stack RAM. Each worker gets its own database (DDL invalidations and advisory locks are
   per database) with JIT off, connects straight to the container IP, and tests run
-  longest-first from the last run's durations in `.pytest_cache`. On mew-dev (16 vCPUs)
-  2026-10-25: 247-288s → 68-73s, ~4.4 GiB peak; two overlapping suites peak at 6.5 GiB, not
+  longest-first from the last run's durations in `.pytest_cache`. Each Postgres test then runs
+  in its own database cloned from a worker template and dropped whole; a test calling a
+  `@provisions_template` helper starts from a clone of the template that helper built, and
+  `tests/test_warehouse_templates.py` proves that clone is the helper's fresh build, object by
+  object. Do not decorate a helper whose result depends on anything but its warehouse. On mew-dev (16 vCPUs)
+  2026-10-25: 247-288s → 47-62s, ~4 GiB peak; two overlapping suites peak at 6.5 GiB, not
   9. Each run writes and deletes ~7 GB; root is mounted without online `discard` there
   (fstrim.timer trims weekly), or the deletion's TRIMs stall the next run's first ~15s.
 * **The Go app deploys before the Python ensure path migrates a view.** A Go query that reads a
