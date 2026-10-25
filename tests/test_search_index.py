@@ -1045,20 +1045,20 @@ def _vector_rows(wh: PostgresWarehouse) -> dict[str, tuple]:
         row[0]: tuple(row[1:])
         for row in wh._query(
             "SELECT v.chunk_id, v.tableoid::regclass::text, v.adapter, v.event_id,"
-            " v.event_ts, v.model"
+            " v.occurred_at, v.model"
             " FROM @search_chunk_vectors v ORDER BY v.chunk_id"
         )
     }
 
 
 def _insert_chunk(
-    wh: PostgresWarehouse, chunk_id: str, adapter: str, sha: str, event_ts: datetime
+    wh: PostgresWarehouse, chunk_id: str, adapter: str, sha: str, occurred_at: datetime
 ) -> None:
     wh._command(
         "INSERT INTO @search_chunks (chunk_id, anchor, adapter, event_id, source, context,"
-        " event_ts, chunk_index, text, text_sha256, char_count, built_at)"
+        " occurred_at, chunk_index, text, text_sha256, char_count, built_at)"
         " VALUES (%s, %s, %s, %s, 'x', '', %s, 0, 'text', %s, 4, now())",
-        (chunk_id, chunk_id, adapter, f"{chunk_id}-event", event_ts, sha),
+        (chunk_id, chunk_id, adapter, f"{chunk_id}-event", occurred_at, sha),
     )
 
 
@@ -1076,7 +1076,7 @@ def _insert_embedding(
 def test_chunk_vectors_follow_chunk_and_embedding_writes(warehouse: PostgresWarehouse) -> None:
     """Every (chunk, vector) pair has exactly one row, in its adapter's partition.
 
-    The semantic leg filters on adapter and event_ts while it scans vectors,
+    The semantic leg filters on adapter and occurred_at while it scans vectors,
     so those columns must be on the vector row and must follow the chunk.
     """
 
@@ -1091,9 +1091,9 @@ def test_chunk_vectors_follow_chunk_and_embedding_writes(warehouse: PostgresWare
     _insert_embedding(warehouse, "sha-1")
     rows = _vector_rows(warehouse)
     assert set(rows) == {"gmail_email|a#0"}
-    partition, adapter, event_id, event_ts, model = rows["gmail_email|a#0"]
+    partition, adapter, event_id, occurred_at, model = rows["gmail_email|a#0"]
     assert partition.endswith("chunk_vectors_gmail")
-    assert (adapter, event_id, event_ts, model) == (
+    assert (adapter, event_id, occurred_at, model) == (
         "gmail_email", "gmail_email|a#0-event", ts, "fake-model"
     )
 
@@ -1108,7 +1108,7 @@ def test_chunk_vectors_follow_chunk_and_embedding_writes(warehouse: PostgresWare
     # the new text is embedded.
     later = ts + timedelta(days=3)
     warehouse._command(
-        "UPDATE @search_chunks SET event_ts = %s WHERE chunk_id = 'voice_memo|c#0'", (later,)
+        "UPDATE @search_chunks SET occurred_at = %s WHERE chunk_id = 'voice_memo|c#0'", (later,)
     )
     assert _vector_rows(warehouse)["voice_memo|c#0"][3] == later
     warehouse._command(
@@ -1173,8 +1173,8 @@ def test_the_weekly_reconcile_repairs_missing_and_stale_vector_rows(
 
     missing = next(iter(expected))
     warehouse._command(
-        "INSERT INTO @search_chunk_vectors (adapter, chunk_id, model, event_id, event_ts, embedding)"
-        " SELECT 'gmail_email', 'gmail_email|gone#0', model, 'gone', event_ts, embedding"
+        "INSERT INTO @search_chunk_vectors (adapter, chunk_id, model, event_id, occurred_at, embedding)"
+        " SELECT 'gmail_email', 'gmail_email|gone#0', model, 'gone', occurred_at, embedding"
         " FROM @search_chunk_vectors LIMIT 1"
     )
     warehouse._command("DELETE FROM @search_chunk_vectors WHERE chunk_id = %s", (missing,))

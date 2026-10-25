@@ -651,7 +651,7 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     )[0]
     assert col == ("USER-DEFINED", "timeline_priority")
     warehouse._command(
-        "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, priority) "
         "VALUES ('t', 'ep', 's', 'k', now(), 'x', 'self')"
     )
     assert warehouse._query(
@@ -659,7 +659,7 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
     )[0][0] == "self"
     with pytest.raises(Exception):
         warehouse._command(
-            "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+            "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, priority) "
             "VALUES ('t', 'ebad', 's', 'k', now(), 'x', 'not-a-tier')"
         )
     # The tiers and the columns must be self-documenting in Postgres itself:
@@ -687,7 +687,7 @@ def test_ensure_timeline_tables_is_idempotent_and_indexed(warehouse):
 
     # seq must be sequence-backed so upserts can bump it.
     warehouse._command(
-        "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table) "
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table) "
         "VALUES ('t', 'e1', 's', 'k', now(), 'x'), ('t', 'e2', 's', 'k', now(), 'x')"
     )
     seqs = [row[0] for row in warehouse._query("SELECT seq FROM @timeline_events ORDER BY event_id")]
@@ -1555,7 +1555,7 @@ def test_backfill_normalizes_every_source(warehouse):
         assert by_adapter[adapter].backfill_done, adapter
 
     rows = warehouse._query_dicts(
-        "SELECT * FROM @timeline_events ORDER BY event_ts DESC"
+        "SELECT * FROM @timeline_events ORDER BY occurred_at DESC"
     )
     assert len(rows) == sum(EXPECTED_SEEDED_EVENTS.values())
     # Newest first: gmail (NOW-1h); finance observations include older days.
@@ -1591,7 +1591,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert session["title"] == "Fix the bug"
     assert session["context"] == "/repo"
     assert session["metadata"]["events"] == 2
-    assert session["end_ts"] > session["event_ts"]
+    assert session["end_ts"] > session["occurred_at"]
     assert "fix the bug" in session["search_text"]
     # Transcript content is indexed per turn, not on the session row: one
     # session-sized document diluted BM25 relevance and hid the matched turn
@@ -1652,7 +1652,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert document["snippet"] == "Monthly checking statement"
 
     cal = next(r for r in rows if r["adapter"] == "calendar_event")
-    assert cal["end_ts"] > cal["event_ts"]
+    assert cal["end_ts"] > cal["occurred_at"]
 
     photo = next(r for r in rows if r["adapter"] == "photo")
     assert photo["source"] == "photos"
@@ -2785,7 +2785,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
 
     # Cancelled/deleted calendar events are noise. A meeting Zach set up is his
     # own action whether or not it has started yet: the tier describes who
-    # organized it, and a past-window review bounds on event_ts, so a future
+    # organized it, and a past-window review bounds on occurred_at, so a future
     # event cannot leak into one. Classifying not-yet-started events 'cc' froze
     # them there forever (no refresh window), which is why prod held 0 'self'
     # and 0 'direct' calendar rows in the future.
@@ -2842,7 +2842,7 @@ def test_quality_regressions_for_recent_self_timeline_samples(warehouse):
     assert by_event_id["z|T1|D1|dm-file-shell"]["priority"] == "background"
     stale_file = by_event_id[f"z|T1|FSTUB|D1|{stale_message_ts}"]
     assert stale_file["priority"] == "background"
-    assert stale_file["event_ts"] < now - timedelta(minutes=30)
+    assert stale_file["occurred_at"] < now - timedelta(minutes=30)
 
     whatsapp = by_event_id["z@x.test|friend@lid|voice-1"]
     assert whatsapp["context"] == "Saved Contact"
@@ -3529,7 +3529,7 @@ def test_backfill_pages_newest_first(warehouse):
         engine.run(max_seconds=0.000001)
         titles = [
             row[0]
-            for row in warehouse._query("SELECT title FROM @timeline_events ORDER BY event_ts DESC")
+            for row in warehouse._query("SELECT title FROM @timeline_events ORDER BY occurred_at DESC")
         ]
         assert titles == ["mail 0", "mail 1", "mail 2"]
         state = warehouse._query_dicts("SELECT * FROM @timeline_sync_state")[0]
@@ -3845,7 +3845,7 @@ def test_a_retired_adapters_rows_are_removed_not_stranded(warehouse):
     warehouse._command(
         """
         INSERT INTO @timeline_events
-            (adapter, event_id, source, kind, priority, event_ts, ingest_ts, title,
+            (adapter, event_id, source, kind, priority, occurred_at, ingest_ts, title,
              search_text, source_table, source_pk, metadata, seq)
         VALUES ('alice_voice_recording', 'z@x.test|gone', 'alice_voice_recordings',
                 'voice_recording', 'self', %s, %s, 'stranded', 'stranded',
@@ -3897,7 +3897,7 @@ def test_finance_evidence_missing_dates_never_uses_epoch(warehouse, missing_file
     finally:
         engine.close()
     expected = _NOW if missing_file_timestamp else _NOW - timedelta(hours=16)
-    assert warehouse._query("SELECT event_ts FROM @timeline_events WHERE adapter='manual_finance_document'") == [(expected,)]
+    assert warehouse._query("SELECT occurred_at FROM @timeline_events WHERE adapter='manual_finance_document'") == [(expected,)]
 
 
 def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehouse):
@@ -4244,3 +4244,179 @@ def test_a_whoop_workout_is_self_even_when_whoop_detected_it():
     catalog = json.loads(CATALOG_PATH.read_text())
     tiers = {t["name"]: t["typical_rows"] for t in catalog["timeline_priorities"]["tiers"]}
     assert "even WHOOP-detected ones" in tiers["self"]
+
+
+# --- event_ts -> occurred_at ----------------------------------------------------
+
+_RENAMED_TIME_TABLES = ("timeline_events", "search_chunks", "search_chunk_vectors")
+
+
+def _time_column_kinds(wh: PostgresWarehouse, table: str) -> dict[str, str]:
+    """attgenerated per time column: '' stored, 'v' virtual."""
+    return dict(
+        wh._query(
+            "SELECT attname, attgenerated::text FROM pg_attribute "
+            "WHERE attrelid = %s::regclass AND attname IN ('event_ts', 'occurred_at') "
+            "AND NOT attisdropped",
+            (wh.sql_relation(table),),
+        )
+    )
+
+
+def _restore_pre_rename_shape(wh: PostgresWarehouse) -> None:
+    """Put the tables back to how production has them before the rename."""
+    for table in _RENAMED_TIME_TABLES:
+        relation = wh.sql_relation(table)
+        wh._command(f"ALTER TABLE {relation} DROP COLUMN IF EXISTS event_ts")
+        wh._command(f"ALTER TABLE {relation} RENAME COLUMN occurred_at TO event_ts")
+
+
+def _relation_files(wh: PostgresWarehouse) -> dict[str, int]:
+    """Every heap, TOAST table, partition and index behind the renamed tables."""
+    files: dict[str, int] = {}
+    for table in _RENAMED_TIME_TABLES:
+        rows = wh._query(
+            """
+            WITH heaps AS (
+                SELECT relid AS oid FROM pg_partition_tree(%s::regclass)
+            ), objs AS (
+                SELECT oid FROM heaps
+                UNION SELECT c.reltoastrelid FROM pg_class c JOIN heaps h ON h.oid = c.oid
+                      WHERE c.reltoastrelid <> 0
+                UNION SELECT i.indexrelid FROM pg_index i JOIN heaps h ON h.oid = i.indrelid
+            )
+            SELECT c.relname, pg_relation_filenode(c.oid)
+            FROM objs o JOIN pg_class c ON c.oid = o.oid
+            """,
+            (wh.sql_relation(table),),
+        )
+        files.update({str(name): node for name, node in rows})
+    return files
+
+
+def test_timeline_time_column_is_occurred_at_with_a_virtual_event_ts_alias(warehouse):
+    warehouse.ensure_search_index_tables()
+    warehouse.ensure_timeline_tables()
+    for table in _RENAMED_TIME_TABLES:
+        assert _time_column_kinds(warehouse, table) == {"occurred_at": "", "event_ts": "v"}, table
+    warehouse._command(
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, priority) "
+        "VALUES ('t', 'e1', 's', 'k', '2026-10-25 12:00:00+00', 'x', 'self')"
+    )
+    assert warehouse._query(
+        "SELECT occurred_at, event_ts FROM @timeline_events WHERE event_id = 'e1'"
+    ) == [(datetime(2026, 10, 25, 12, tzinfo=UTC),) * 2]
+    comments = dict(
+        warehouse._query(
+            "SELECT attname, col_description(attrelid, attnum) FROM pg_attribute "
+            "WHERE attrelid = %s::regclass AND attname IN ('event_ts', 'occurred_at')",
+            (warehouse.sql_relation("timeline_events"),),
+        )
+    )
+    assert "search function" in comments["occurred_at"]
+    assert "Deprecated alias of occurred_at" in comments["event_ts"]
+    # The alias is expanded to occurred_at at plan time, so a reader still
+    # filtering on event_ts keeps the time index.
+    warehouse._command("SET enable_seqscan = off")
+    try:
+        plan = "\n".join(
+            row[0]
+            for row in warehouse._query(
+                "EXPLAIN SELECT event_id FROM @timeline_events "
+                "WHERE event_ts >= now() - interval '1 day' ORDER BY event_ts DESC LIMIT 5"
+            )
+        )
+    finally:
+        warehouse._command("RESET enable_seqscan")
+    assert "timeline_events_time_idx" in plan, plan
+
+
+def test_renaming_event_ts_rewrites_no_file_and_resets_no_backfill(warehouse):
+    """Production's 83 GB timeline is renamed in place: PostgreSQL 18 keeps the
+    heap, its TOAST table and every index (BM25 included) on their files, and
+    nothing the sync engine keys on moves."""
+    warehouse.ensure_search_index_tables()
+    warehouse.ensure_timeline_tables()
+    assert warehouse.pgvector_available()
+    index_names = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = %s::regclass",
+            (warehouse.sql_relation("timeline_events"),),
+        )
+    }
+    assert any(name.endswith("timeline_events_search_text_bm25_idx") for name in index_names), index_names
+    warehouse._command(
+        "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, "
+        "priority, search_text) "
+        "SELECT 't', 'e' || g, 's', 'k', now() - g * interval '1 minute', 'x', 'self', "
+        "'body ' || g FROM generate_series(1, 50) g"
+    )
+    warehouse._command(
+        "INSERT INTO @search_chunks (chunk_id, anchor, adapter, event_id, source, context, "
+        "occurred_at, chunk_index, text, text_sha256, char_count, built_at) "
+        "VALUES ('t|e1#0', 't|e1', 't', 'e1', 's', '', now(), 0, 'body 1', 'sha', 6, now())"
+    )
+    warehouse._command(
+        "INSERT INTO @timeline_sync_state (adapter, adapter_signature, backfill_done) "
+        "VALUES ('t', 'pinned-signature', 1)"
+    )
+    _restore_pre_rename_shape(warehouse)
+    before_rows = warehouse._query(
+        "SELECT event_id, event_ts, seq, updated_at FROM @timeline_events ORDER BY event_id"
+    )
+    before_state = warehouse._query("SELECT * FROM @timeline_sync_state ORDER BY adapter")
+    before_files = _relation_files(warehouse)
+
+    warehouse.ensure_timeline_tables()
+    warehouse.ensure_search_index_tables()
+
+    assert _relation_files(warehouse) == before_files
+    for table in _RENAMED_TIME_TABLES:
+        assert _time_column_kinds(warehouse, table) == {"occurred_at": "", "event_ts": "v"}, table
+    assert warehouse._query(
+        "SELECT event_id, occurred_at, seq, updated_at FROM @timeline_events ORDER BY event_id"
+    ) == before_rows
+    assert warehouse._query("SELECT * FROM @timeline_sync_state ORDER BY adapter") == before_state
+    assert warehouse._query(
+        "SELECT count(*) FROM @timeline_events WHERE event_ts IS DISTINCT FROM occurred_at"
+    ) == [(0,)]
+
+    # Once renamed, ensure issues no further ALTER: the alias's catalog row
+    # is untouched by a second pass.
+    def alias_xmin() -> list[tuple]:
+        return warehouse._query(
+            "SELECT xmin::text FROM pg_attribute WHERE attrelid = %s::regclass AND attname = 'event_ts'",
+            (warehouse.sql_relation("timeline_events"),),
+        )
+
+    first = alias_xmin()
+    warehouse.ensure_timeline_tables()
+    warehouse.ensure_search_index_tables()
+    assert alias_xmin() == first
+
+
+def test_the_rename_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(warehouse, monkeypatch):
+    import psycopg2
+
+    from personal_data_warehouse import postgres as postgres_module
+
+    warehouse.ensure_search_index_tables()
+    warehouse.ensure_timeline_tables()
+    _restore_pre_rename_shape(warehouse)
+    monkeypatch.setattr(postgres_module, "EVENT_TS_RENAME_LOCK_TIMEOUT", "200ms")
+    session_timeout = warehouse._query("SHOW lock_timeout")
+    holder = psycopg2.connect(_postgres_url())
+    try:
+        with holder.cursor() as cursor:
+            cursor.execute(f"LOCK TABLE {warehouse.sql_relation('timeline_events')} IN ACCESS SHARE MODE")
+        with pytest.raises(postgres_module.EventTsRenameLockTimeout):
+            warehouse.ensure_timeline_tables()
+        assert warehouse._query("SHOW lock_timeout") == session_timeout
+        assert _time_column_kinds(warehouse, "timeline_events") == {"event_ts": ""}
+    finally:
+        holder.rollback()
+        holder.close()
+    warehouse.ensure_timeline_tables()
+    assert warehouse._query("SHOW lock_timeout") == session_timeout
+    assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": "", "event_ts": "v"}

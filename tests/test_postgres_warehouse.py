@@ -2311,7 +2311,7 @@ def test_search_hybrid_semantic_helper_can_override_its_candidate_pool() -> None
 def test_search_hybrid_semantic_reads_only_the_per_chunk_vector_table() -> None:
     """The scoped-search fix is the data layout: filters on the vector row.
 
-    Joining per-sha vectors to chunks for adapter/event_ts made a scoped ANN
+    Joining per-sha vectors to chunks for adapter/occurred_at made a scoped ANN
     scan walk the global graph probing a join for survivors (10-20 s cold
     for slack since a date on 2026-10-14). Neither input table may come back.
     """
@@ -2660,7 +2660,7 @@ def test_search_text_pushes_since_into_branches() -> None:
     # full-corpus cost and could return zero rows despite in-window matches
     # existing below the all-time top-k. Each branch must filter before ranking.
     sql = _search_text_function_sql()
-    assert "%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz" in sql, (
+    assert "%3$L::timestamptz IS NULL OR t.occurred_at >= %3$L::timestamptz" in sql, (
         "@search_text() branches must push the `since` bound into the branch WHERE"
     )
     assert "query, per_branch_limit, since" in sql, (
@@ -2700,7 +2700,7 @@ def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
     sql = _search_text_exact_sql()
     assert "ILIKE pattern" in sql
     assert "to_bm25query" not in sql
-    assert "ORDER BY t.event_ts DESC" in sql
+    assert "ORDER BY t.occurred_at DESC" in sql
 
 
 def test_search_text_exact_escapes_like_wildcards() -> None:
@@ -3630,7 +3630,7 @@ def test_timeline_context_returns_neighboring_events(warehouse: PostgresWarehous
     ref = ref_rows[0][0]
 
     rows = warehouse._query(
-        "SELECT snippet FROM @timeline_context(%s, 5, 5) ORDER BY event_ts, seq", (ref,)
+        "SELECT snippet FROM @timeline_context(%s, 5, 5) ORDER BY occurred_at, seq", (ref,)
     )
     snippets = [row[0] for row in rows]
     assert len(snippets) == 3, f"expected exactly the three C1 messages, got {snippets}"
@@ -3688,7 +3688,7 @@ def test_timeline_context_of_a_gmail_hit_is_its_thread(warehouse: PostgresWareho
 
     rows = warehouse._query(
         "SELECT title FROM @timeline_context('gmail_email:z@x.test|m3', 5, 5) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     titles = [row[0] for row in rows]
     assert titles == ["offsite agenda", "Re: offsite agenda", "Re: offsite agenda again"], titles
@@ -3700,7 +3700,7 @@ def test_timeline_context_of_a_gmail_hit_is_its_thread(warehouse: PostgresWareho
     # cannot be materialized and sliced.
     rows = warehouse._query(
         "SELECT title FROM @timeline_context('gmail_email:z@x.test|m3', 1, 0) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     assert [row[0] for row in rows] == ["offsite agenda", "Re: offsite agenda"]
 
@@ -3755,7 +3755,7 @@ def test_timeline_context_of_a_slack_reply_is_its_thread(warehouse: PostgresWare
 
     rows = warehouse._query(
         "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.3', 5, 5) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     snippets = [row[0] for row in rows]
     assert len(snippets) == 3, f"expected the thread parent and both replies, got {snippets}"
@@ -3766,7 +3766,7 @@ def test_timeline_context_of_a_slack_reply_is_its_thread(warehouse: PostgresWare
     # only readable answer for it.
     rows = warehouse._query(
         "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.2', 5, 5) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     snippets = [row[0] for row in rows]
     assert len(snippets) == 4, f"expected the whole channel around it, got {snippets}"
@@ -3815,7 +3815,7 @@ def test_timeline_context_keeps_two_group_dms_apart(warehouse: PostgresWarehouse
 
     rows = warehouse._query(
         "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|G1|100.1', 5, 5) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     snippets = [row[0] for row in rows]
     assert snippets == ["G1 first", "G1 second"], snippets
@@ -3853,7 +3853,7 @@ def test_timeline_context_falls_back_when_the_source_row_is_gone(
 
     rows = warehouse._query(
         "SELECT snippet FROM @timeline_context('slack_message:zrl|T1|C1|100.1', 5, 5) "
-        "ORDER BY event_ts, seq"
+        "ORDER BY occurred_at, seq"
     )
     assert [row[0] for row in rows] == ["first", "second"], rows
 
@@ -3953,7 +3953,7 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     _ensure_all_table_groups(warehouse)
     warehouse._command(
         """
-        INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table,
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
                                      search_text, priority, actor, title, snippet, context)
         VALUES ('slack_message', 'dp1', 'slack', 'message', now(), 'slack_messages',
                 'zanzibar default path probe', 'cc', 'a', 't', 's', 'c')
@@ -7092,7 +7092,7 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
         "chat-window recovery must not rescan every chat event in the timeline"
     )
     assert "ON t.source = w.source" in chat and "AND t.context = w.context" in chat
-    assert "t.event_ts < w.window_start + interval '1 hour'" in chat
+    assert "t.occurred_at < w.window_start + interval '1 hour'" in chat
     assert "t.search_text ILIKE exact_pattern ESCAPE" in chat, (
         "the member that actually contains the literal is the one returned"
     )
@@ -7104,8 +7104,8 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
         "several chunks from one event must produce one literal rank"
     )
     assert "t.adapter = ANY (sem_adapters)" in literal
-    assert "t.event_ts >= since" in literal
-    assert "c.event_ts + interval '1 hour' > since" in literal
+    assert "t.occurred_at >= since" in literal
+    assert "c.occurred_at + interval '1 hour' > since" in literal
 
 
 def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
@@ -7265,7 +7265,7 @@ def test_search_hybrid_pushes_the_source_filter_into_the_ann_scan() -> None:
     semantic = _semantic_function_sql()
     scan = semantic[semantic.index("part_scope :=") :]
     assert "v.adapter = ANY ($2)" in scan
-    assert "v.event_ts >= $3" in scan
+    assert "v.occurred_at >= $3" in scan
     assert "map.source = ANY (sources)" not in scan, (
         "a post-join source filter blocks pgvector's filtered iterative scan"
     )
@@ -7507,7 +7507,7 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
     assert pool.count("EXECUTE format($pool$") == 2, "both the attention and the broad pool run as one-shot dynamic SQL"
     assert pool.count("USING priorities, since;") == 2
     assert "($1 IS NULL OR t.priority::text = ANY ($1))" in pool
-    assert "($2 IS NULL OR t.event_ts >= $2)" in pool
+    assert "($2 IS NULL OR t.occurred_at >= $2)" in pool
     assert "(priorities IS NULL OR" not in pool and "(since IS NULL OR" not in pool
     assert "%" not in pool.replace("%1$L", ""), "format() would misread any other percent sign in the template"
 

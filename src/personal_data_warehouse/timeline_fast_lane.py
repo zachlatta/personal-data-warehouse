@@ -1,6 +1,6 @@
 """Land a source's timeline rows from the source's own ingest run.
 
-Measured 2026-09-25 from ``timeline.events.first_seen_at - event_ts``: every
+Measured 2026-09-25 from ``timeline.events.first_seen_at - occurred_at``: every
 chat source landed in p50 4-5 min / p95 9 min, and almost all of it was two
 serial five-minute clocks -- the source's own poll or upload, then the
 ``timeline_sync`` schedule. Two uniform 0-5 minute waits is ~5 min expected

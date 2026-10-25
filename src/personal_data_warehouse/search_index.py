@@ -242,8 +242,8 @@ def split_text(text: str, *, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CH
     return chunks
 
 
-def window_start(event_ts: datetime) -> datetime:
-    epoch = int(event_ts.timestamp())
+def window_start(occurred_at: datetime) -> datetime:
+    epoch = int(occurred_at.timestamp())
     return datetime.fromtimestamp(epoch - (epoch % WINDOW_SECONDS), tz=UTC)
 
 
@@ -276,7 +276,7 @@ class _ChunkRow:
     event_id: str
     source: str
     context: str
-    event_ts: datetime
+    occurred_at: datetime
     chunk_index: int
     text: str
 
@@ -323,7 +323,7 @@ class SearchChunkBuilder:
                 event_id=row["event_id"],
                 source=row["source"],
                 context=row["context"] or "",
-                event_ts=row["event_ts"],
+                occurred_at=row["occurred_at"],
                 chunk_index=index,
                 text=piece,
             )
@@ -333,12 +333,12 @@ class SearchChunkBuilder:
     def _window_chunks(self, adapter: str, context: str, start: datetime) -> list[_ChunkRow]:
         members = self._wh._query_dicts(
             """
-            SELECT event_id, source, actor, title, snippet, event_ts
+            SELECT event_id, source, actor, title, snippet, occurred_at
             FROM @timeline_events
             WHERE adapter = %s AND context = %s
-              AND event_ts >= %s AND event_ts < %s
+              AND occurred_at >= %s AND occurred_at < %s
               AND NOT COALESCE((metadata->>'deleted')::boolean, false)
-            ORDER BY event_ts ASC, seq ASC
+            ORDER BY occurred_at ASC, seq ASC
             """,
             (adapter, context, start, start + timedelta(seconds=WINDOW_SECONDS)),
         )
@@ -364,7 +364,7 @@ class SearchChunkBuilder:
                 event_id=representative["event_id"],
                 source=representative["source"],
                 context=context,
-                event_ts=start,
+                occurred_at=start,
                 chunk_index=index,
                 text=piece,
             )
@@ -388,11 +388,11 @@ class SearchChunkBuilder:
             execute_values(
                 cursor,
                 f"INSERT INTO {table} (chunk_id, anchor, adapter, event_id, source, context,"
-                " event_ts, chunk_index, text, text_sha256, char_count, built_at)"
+                " occurred_at, chunk_index, text, text_sha256, char_count, built_at)"
                 " VALUES %s ON CONFLICT (chunk_id) DO UPDATE SET"
                 " anchor = EXCLUDED.anchor, adapter = EXCLUDED.adapter,"
                 " event_id = EXCLUDED.event_id, source = EXCLUDED.source,"
-                " context = EXCLUDED.context, event_ts = EXCLUDED.event_ts,"
+                " context = EXCLUDED.context, occurred_at = EXCLUDED.occurred_at,"
                 " chunk_index = EXCLUDED.chunk_index, text = EXCLUDED.text,"
                 " text_sha256 = EXCLUDED.text_sha256, char_count = EXCLUDED.char_count,"
                 " built_at = now()",
@@ -404,7 +404,7 @@ class SearchChunkBuilder:
                         row.event_id,
                         row.source,
                         row.context,
-                        row.event_ts,
+                        row.occurred_at,
                         row.chunk_index,
                         row.text,
                         _sha256(row.text),
@@ -424,7 +424,7 @@ class SearchChunkBuilder:
         while True:
             events = self._wh._query_dicts(
                 """
-                SELECT seq, adapter, event_id, source, context, event_ts, actor,
+                SELECT seq, adapter, event_id, source, context, occurred_at, actor,
                        title, snippet, search_text,
                        COALESCE((metadata->>'deleted')::boolean, false) AS deleted
                 FROM @timeline_events
@@ -446,7 +446,7 @@ class SearchChunkBuilder:
                 if adapter in SKIP_ADAPTERS:
                     continue
                 if adapter in WINDOW_ADAPTERS:
-                    window_keys[(adapter, row["context"] or "", window_start(row["event_ts"]))] = None
+                    window_keys[(adapter, row["context"] or "", window_start(row["occurred_at"]))] = None
                     continue
                 plain_anchors.append(f"{adapter}|{row['event_id']}")
                 if not row["deleted"]:
@@ -836,7 +836,7 @@ class SearchEmbeddingRunner:
             self._wh._command("SET LOCAL enable_hashjoin = off")
             restored = self._wh._query(
                 "WITH missing AS ("
-                "  SELECT c.adapter, c.chunk_id, c.event_id, c.event_ts, c.text_sha256"
+                "  SELECT c.adapter, c.chunk_id, c.event_id, c.occurred_at, c.text_sha256"
                 "  FROM @search_chunks c"
                 "  WHERE EXISTS (SELECT 1 FROM @search_chunk_embeddings e"
                 "                WHERE e.text_sha256 = c.text_sha256 AND e.model = %s)"
@@ -846,8 +846,8 @@ class SearchEmbeddingRunner:
                 "  LIMIT %s"
                 "), written AS ("
                 "  INSERT INTO @search_chunk_vectors"
-                "    (adapter, chunk_id, model, event_id, event_ts, embedding)"
-                "  SELECT m.adapter, m.chunk_id, e.model, m.event_id, m.event_ts, e.embedding"
+                "    (adapter, chunk_id, model, event_id, occurred_at, embedding)"
+                "  SELECT m.adapter, m.chunk_id, e.model, m.event_id, m.occurred_at, e.embedding"
                 "  FROM missing m JOIN @search_chunk_embeddings e"
                 "    ON e.text_sha256 = m.text_sha256 AND e.model = %s"
                 "  WHERE e.embedding IS NOT NULL"
@@ -945,7 +945,7 @@ class SearchEmbeddingRunner:
         Recency-first means the searchable period grows backwards from today:
         the year Zach actually queries completes long before 2014's Slack
         does. Each run scans at most EMBED_BACKFILL_SCAN_ROWS rows of the
-        (event_ts, chunk_id) index so the walk is amortized across runs
+        (occurred_at, chunk_id) index so the walk is amortized across runs
         instead of restarting from the newest chunk every ten minutes.
         Returns True when the walk has reached the oldest chunk.
         """
@@ -955,15 +955,15 @@ class SearchEmbeddingRunner:
         while scanned < EMBED_BACKFILL_SCAN_ROWS:
             if state["cursor_ts"] is None:
                 slab = self._wh._query(
-                    "SELECT text_sha256, chunk_id, event_ts FROM @search_chunks"
-                    " ORDER BY event_ts DESC, chunk_id DESC LIMIT %s",
+                    "SELECT text_sha256, chunk_id, occurred_at FROM @search_chunks"
+                    " ORDER BY occurred_at DESC, chunk_id DESC LIMIT %s",
                     (EMBED_SLAB_SIZE,),
                 )
             else:
                 slab = self._wh._query(
-                    "SELECT text_sha256, chunk_id, event_ts FROM @search_chunks"
-                    " WHERE (event_ts, chunk_id) < (%s, %s)"
-                    " ORDER BY event_ts DESC, chunk_id DESC LIMIT %s",
+                    "SELECT text_sha256, chunk_id, occurred_at FROM @search_chunks"
+                    " WHERE (occurred_at, chunk_id) < (%s, %s)"
+                    " ORDER BY occurred_at DESC, chunk_id DESC LIMIT %s",
                     (state["cursor_ts"], state["cursor_id"], EMBED_SLAB_SIZE),
                 )
             if not slab:

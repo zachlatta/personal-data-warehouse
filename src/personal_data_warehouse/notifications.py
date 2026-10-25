@@ -38,6 +38,43 @@ def ensure_notification_tables(warehouse):
 NOTIFICATION_TRIGGER_WHEN = "WHEN ((new.priority = 'direct'::"
 
 
+# Reads timeline.events by column name, so the event_ts -> occurred_at rename
+# replaces it in the rename's own transaction (postgres.py) as well as here.
+CAPTURE_FUNCTION_SQL = """CREATE OR REPLACE FUNCTION @capture_timeline_notification() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+        IF (SELECT enabled = 1 FROM @notification_state WHERE id = 'timeline' FOR SHARE) THEN
+            -- A source's first backfill inserts its whole history; an event
+            -- days old is not news, so only recent ones page (the epoch means
+            -- "time unknown" and still does).
+            IF NEW.occurred_at > 'epoch'::timestamptz AND NEW.occurred_at < now() - interval '3 days' THEN
+                RETURN NEW;
+            END IF;
+            -- A recurring invite lands as one row per expanded instance; page
+            -- for the first instance seen and let the rest ride along.
+            IF COALESCE(NEW.metadata->>'recurring_event_id', '') <> '' AND EXISTS (
+                SELECT 1 FROM @notification_events
+                WHERE adapter = NEW.adapter AND source = NEW.source
+                  AND payload->>'recurring_event_id' = NEW.metadata->>'recurring_event_id') THEN
+                RETURN NEW;
+            END IF;
+            INSERT INTO @notification_events (adapter, event_id, source, priority, event_ts, landed_at, payload)
+            VALUES (NEW.adapter, NEW.event_id, NEW.source, NEW.priority::text, NEW.occurred_at, NEW.first_seen_at,
+                jsonb_build_object('adapter',NEW.adapter,'event_id',NEW.event_id,'source',NEW.source,
+                    'source_table',NEW.source_table,'source_pk',NEW.source_pk,
+                    'actor',left(NEW.actor,200),'title',left(NEW.title,300),
+                    'snippet',left(NEW.snippet,800),'context',left(NEW.context,200),
+                    'recurring_event_id',COALESCE(NEW.metadata->>'recurring_event_id',''),
+                    -- The keys the phone groups alerts under: a Slack thread, an
+                    -- iMessage chat, a Gmail thread.
+                    'metadata',jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
+                                                  'chat_id',NEW.metadata->>'chat_id',
+                                                  'thread_id',NEW.metadata->>'thread_id')))
+            ON CONFLICT (adapter, event_id) DO NOTHING;
+        END IF;
+        RETURN NEW;
+    END $$"""
+
+
 STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS @notification_state (
         id text PRIMARY KEY, enabled bigint NOT NULL DEFAULT 0,
@@ -83,46 +120,17 @@ STATEMENTS = (
         error text NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS web_push_devices_updated_idx ON @web_push_devices (updated_at)",
-    """CREATE OR REPLACE FUNCTION @capture_timeline_notification() RETURNS trigger
-    LANGUAGE plpgsql AS $$ BEGIN
-        IF (SELECT enabled = 1 FROM @notification_state WHERE id = 'timeline' FOR SHARE) THEN
-            -- A source's first backfill inserts its whole history; an event
-            -- days old is not news, so only recent ones page (the epoch means
-            -- "time unknown" and still does).
-            IF NEW.event_ts > 'epoch'::timestamptz AND NEW.event_ts < now() - interval '3 days' THEN
-                RETURN NEW;
-            END IF;
-            -- A recurring invite lands as one row per expanded instance; page
-            -- for the first instance seen and let the rest ride along.
-            IF COALESCE(NEW.metadata->>'recurring_event_id', '') <> '' AND EXISTS (
-                SELECT 1 FROM @notification_events
-                WHERE adapter = NEW.adapter AND source = NEW.source
-                  AND payload->>'recurring_event_id' = NEW.metadata->>'recurring_event_id') THEN
-                RETURN NEW;
-            END IF;
-            INSERT INTO @notification_events (adapter, event_id, source, priority, event_ts, landed_at, payload)
-            VALUES (NEW.adapter, NEW.event_id, NEW.source, NEW.priority::text, NEW.event_ts, NEW.first_seen_at,
-                jsonb_build_object('adapter',NEW.adapter,'event_id',NEW.event_id,'source',NEW.source,
-                    'source_table',NEW.source_table,'source_pk',NEW.source_pk,
-                    'actor',left(NEW.actor,200),'title',left(NEW.title,300),
-                    'snippet',left(NEW.snippet,800),'context',left(NEW.context,200),
-                    'recurring_event_id',COALESCE(NEW.metadata->>'recurring_event_id',''),
-                    -- The keys the phone groups alerts under: a Slack thread, an
-                    -- iMessage chat, a Gmail thread.
-                    'metadata',jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
-                                                  'chat_id',NEW.metadata->>'chat_id',
-                                                  'thread_id',NEW.metadata->>'thread_id')))
-            ON CONFLICT (adapter, event_id) DO NOTHING;
-        END IF;
-        RETURN NEW;
-    END $$""",
+    CAPTURE_FUNCTION_SQL,
     """CREATE OR REPLACE VIEW @marts_notifications AS
         SELECT id, adapter, event_id, source, priority,
                NULLIF(event_ts,'epoch'::timestamptz) AS event_ts,
                NULLIF(landed_at,'epoch'::timestamptz) AS landed_at,
                NULLIF(created_at,'epoch'::timestamptz) AS created_at,
                payload->>'actor' AS actor, payload->>'title' AS title,
-               payload->>'snippet' AS snippet, status
+               payload->>'snippet' AS snippet, status,
+               -- The timeline's time column name; event_ts above is dropped
+               -- once the app reads this one.
+               NULLIF(event_ts,'epoch'::timestamptz) AS occurred_at
         FROM @notification_events""",
     """CREATE OR REPLACE VIEW @marts_notification_deliveries AS
         SELECT id, notification_id, device_id, transport, status, attempt_count,

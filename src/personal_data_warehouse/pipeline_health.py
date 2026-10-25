@@ -1851,7 +1851,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "timeline_events": _data(
         "timeline",
         "updated_at",
-        "event_ts",
+        "occurred_at",
         "43M rows and no updated_at index: writes are read from timeline_sync_state instead",
     ),
     "timeline_sync_state": _state("timeline", "updated_at", "per-adapter cursors, run time, and errors"),
@@ -1861,7 +1861,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # state rather than a pipeline of its own.
     "search_schema_state": _state("timeline", None, "search DDL signature marker; carries no timestamp"),
     # Derived search-retrieval layer (search_index.py)
-    "search_chunks": _data("search_index", "built_at", "event_ts"),
+    "search_chunks": _data("search_index", "built_at", "occurred_at"),
     "search_chunk_embeddings": _support(
         "search_index",
         "embedded_at",
@@ -2026,7 +2026,7 @@ class PriorityMixSnapshot:
 
 
 #: The tier-mix aggregate walks seven days of timeline.events through the
-#: (event_ts) index -- ~200k rows in production, ~1-3s. A bloated week must not
+#: (occurred_at) index -- ~200k rows in production, ~1-3s. A bloated week must not
 #: stretch the ten-minute collection, so it gets its own bound and a failure
 #: keeps the previous snapshot rather than blanking the surface.
 PRIORITY_MIX_STATEMENT_TIMEOUT_MS = 30_000
@@ -2156,11 +2156,11 @@ class PipelineHealthCollector:
         sql = """
             SELECT source, priority::text AS priority,
                    count(*)::bigint AS events_7d,
-                   count(*) FILTER (WHERE event_ts >= now() - interval '1 day')::bigint AS events_1d,
-                   max(event_ts) AS newest_event_at
+                   count(*) FILTER (WHERE occurred_at >= now() - interval '1 day')::bigint AS events_1d,
+                   max(occurred_at) AS newest_event_at
             FROM @timeline_events
-            WHERE event_ts >= now() - interval '7 days'
-              AND event_ts <= now()
+            WHERE occurred_at >= now() - interval '7 days'
+              AND occurred_at <= now()
             GROUP BY source, priority
         """
         try:

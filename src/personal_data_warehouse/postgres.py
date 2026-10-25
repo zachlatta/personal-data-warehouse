@@ -226,6 +226,14 @@ from personal_data_warehouse.timeline import (
 
 logger = logging.getLogger(__name__)
 
+#: How long the event_ts -> occurred_at rename waits for its ACCESS EXCLUSIVE
+#: lock before failing the run (a later run retries).
+EVENT_TS_RENAME_LOCK_TIMEOUT = "5s"
+
+
+class EventTsRenameLockTimeout(RuntimeError):
+    """The event_ts -> occurred_at rename could not get its lock in time."""
+
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # A search_text() hit's `text` is a relevance PREVIEW, not the full document.
 # Timeline search documents can include multi-megabyte source/detail text
@@ -604,7 +612,7 @@ SEARCH_HYBRID_AGENT_MAX_CANDIDATES = 200
 SEARCH_EMBEDDING_DIMENSIONS = 512
 SEARCH_EMBEDDING_DEFAULT_MODEL = "text-embedding-3-small"
 # The semantic leg reads derived_search.chunk_vectors: one row per (chunk,
-# model) carrying the vector AND its filter columns (adapter, event_ts), so a
+# model) carrying the vector AND its filter columns (adapter, occurred_at), so a
 # scoped ANN scan filters on the row it is already reading. The old layout
 # kept vectors per content sha and joined chunks for the filter: a scoped
 # search walked the global HNSW graph probing a join for survivors, 10-20 s
@@ -617,7 +625,7 @@ SEARCH_VECTOR_EXACT_SLICE_ROWS = 1_000_000
 #: Worker cap for that exact scan. The function raises
 #: max_parallel_workers_per_gather to it and lowers the parallel size
 #: thresholds for its own statement: the slice is read through the small
-#: event_ts index, which on default thresholds sizes the scan at 3 workers.
+#: occurred_at index, which on default thresholds sizes the scan at 3 workers.
 SEARCH_VECTOR_EXACT_SCAN_WORKERS = 8
 SEARCH_VECTOR_PARTITIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("search_chunk_vectors_gmail", ("gmail_email",)),
@@ -789,7 +797,7 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 
 # How fast a direct message must LAND to read `ok` on
 # marts_ops.slack_conversation_health, as the p95 of
-# timeline.events.first_seen_at - event_ts over the last 24 hours of im/mpim
+# timeline.events.first_seen_at - occurred_at over the last 24 hours of im/mpim
 # messages. The numbers come from the 2026-08-28 production audit: 1:1 DMs
 # landed p50 3.5 min / p95 62 min and group DMs p50 46 min, with multi-hour
 # tails where a whole conversation arrived in one batch an hour or more after
@@ -2302,17 +2310,17 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(
         "timeline_events_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_time_idx ON @timeline_events (event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_time_idx ON @timeline_events (occurred_at DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_source_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON @timeline_events (source, event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_source_time_idx ON @timeline_events (source, occurred_at DESC, seq DESC)",
     ),
     IndexSpec(
         "timeline_events_priority_time_idx",
         "timeline_events",
-        "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON @timeline_events (priority, event_ts DESC, seq DESC)",
+        "CREATE INDEX IF NOT EXISTS timeline_events_priority_time_idx ON @timeline_events (priority, occurred_at DESC, seq DESC)",
     ),
     # timeline.context(ref, before, after) walks a hit's neighbors within the
     # same (source, context) stream — the surrounding events a search hit needs
@@ -2325,7 +2333,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "timeline_events_context_time_idx",
         "timeline_events",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_events_context_time_idx "
-        "ON @timeline_events (source, context, event_ts DESC, seq DESC)",
+        "ON @timeline_events (source, context, occurred_at DESC, seq DESC)",
     ),
     # The search-chunk builder pages timeline changes by seq (its watermark is
     # a timeline.events.seq cursor), which nothing else does — the bare-seq
@@ -2353,13 +2361,13 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "search_chunks_sha_cover_idx",
         "search_chunks",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_sha_cover_idx "
-        "ON @search_chunks (text_sha256) INCLUDE (adapter, event_id, chunk_id, event_ts)",
+        "ON @search_chunks (text_sha256) INCLUDE (adapter, event_id, chunk_id, occurred_at)",
     ),
     IndexSpec(
         "search_chunks_adapter_ts_idx",
         "search_chunks",
         "CREATE INDEX IF NOT EXISTS search_chunks_adapter_ts_idx "
-        "ON @search_chunks (adapter, event_ts DESC)",
+        "ON @search_chunks (adapter, occurred_at DESC)",
     ),
     # The embedding drain's fresh pass reads only chunks built since its
     # persisted watermark, so a run over a caught-up corpus touches a few
@@ -2370,14 +2378,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_built_at_sha_idx "
         "ON @search_chunks (built_at) INCLUDE (text_sha256, chunk_id)",
     ),
-    # Newest-first keyset cursor for the embedding drain (event_ts, chunk_id).
+    # Newest-first keyset cursor for the embedding drain (occurred_at, chunk_id).
     # Covering for the same reason: the backfill only needs the sha to decide
     # whether a row still wants a vector, so the walk is an index-only scan.
     IndexSpec(
         "search_chunks_ts_chunk_sha_idx",
         "search_chunks",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS search_chunks_ts_chunk_sha_idx "
-        "ON @search_chunks (event_ts DESC, chunk_id DESC) INCLUDE (text_sha256)",
+        "ON @search_chunks (occurred_at DESC, chunk_id DESC) INCLUDE (text_sha256)",
     ),
     # Hybrid's short-query literal leg needs identifier recall, not the full
     # multi-megabyte timeline document returned by search_text_exact(). Search
@@ -2411,7 +2419,7 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
                 f"{table}_ts_idx",
                 table,
                 f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_ts_idx "
-                f"ON @{table} ({'event_ts' if adapters else 'adapter, event_ts'})",
+                f"ON @{table} ({'occurred_at' if adapters else 'adapter, occurred_at'})",
                 requires_pgvector=True,
             ),
         )
@@ -2600,7 +2608,7 @@ def _semantic_partition_branches_sql() -> str:
                 + ", ".join(f"'{a}'" for a in adapters)
                 + "]::text[]"
             )
-            scope = "CASE WHEN since IS NULL THEN '' ELSE ' AND v.event_ts >= $3' END"
+            scope = "CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             whole = "since IS NULL"
         else:
             in_scope = (
@@ -2609,7 +2617,7 @@ def _semantic_partition_branches_sql() -> str:
             )
             scope = (
                 "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
-                " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.event_ts >= $3' END"
+                " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             )
             whole = "sem_adapters IS NULL AND since IS NULL"
         blocks.append(
@@ -2667,7 +2675,7 @@ SEARCH_CHUNK_VECTOR_TRIGGERS: tuple[tuple[str, str], ...] = (
         " OR OLD.adapter IS DISTINCT FROM NEW.adapter"
         " OR OLD.chunk_id IS DISTINCT FROM NEW.chunk_id"
         " OR OLD.event_id IS DISTINCT FROM NEW.event_id"
-        " OR OLD.event_ts IS DISTINCT FROM NEW.event_ts)"
+        " OR OLD.occurred_at IS DISTINCT FROM NEW.occurred_at)"
         " EXECUTE FUNCTION @search_chunk_vectors_from_chunk()",
     ),
     (
@@ -3177,7 +3185,6 @@ TIMESTAMP_COLUMNS = {
     "source_modified_time",
     "full_crawled_at",
     "extracted_at",
-    "event_ts",
     "end_ts",
     "ingest_ts",
     "first_seen_at",
@@ -7531,6 +7538,83 @@ class PostgresWarehouse:
         row.update(facts)
         self._insert_rows("search_health", [row], SEARCH_HEALTH_COLUMNS)
 
+    def _event_ts_column_kind(self, table: str) -> str:
+        """``stored``, ``virtual`` or ``absent``: what ``event_ts`` is on ``table`` now."""
+        rel = canonical_relation(table).with_namespace(self._schema)
+        rows = self._query(
+            """
+            SELECT a.attgenerated::text
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+              AND a.attname = 'event_ts' AND NOT a.attisdropped
+            """,
+            (rel.schema, rel.name),
+        )
+        if not rows:
+            return "absent"
+        return "virtual" if rows[0][0] == "v" else "stored"
+
+    def _rename_event_ts_to_occurred_at(
+        self, tables: Sequence[str], *, companion_sql: Sequence[str] = ()
+    ) -> None:
+        """Rename ``event_ts`` to ``occurred_at``, leaving a virtual ``event_ts`` alias.
+
+        ``occurred_at`` is the time column's one name: every search function's
+        hits and 13 other relations already used it, and ``timeline.events``
+        was the one place it failed (the top agent SQL error in October 2026).
+        On PostgreSQL 18 both statements are catalog-only -- the heap and every
+        index keep their files -- but they need ACCESS EXCLUSIVE on a table
+        search reads, so they run under a short ``SET LOCAL`` lock timeout in
+        one explicit transaction (the connection is autocommit, and a session
+        SET would leak into every later statement). A timeout fails this run
+        loudly; the next run retries. Code after this point names
+        ``occurred_at``, so carrying on without the rename would only fail
+        later and less clearly.
+
+        The virtual ``event_ts`` alias keeps a reader that has not moved yet
+        (the app, which deploys separately, and in-flight runs) working for
+        one deploy. ``companion_sql`` is replaced in the same transaction:
+        trigger functions that read the column by name.
+        """
+        kinds = {
+            table: self._event_ts_column_kind(table)
+            for table in tables
+            if self._relation_exists(table)
+        }
+        pending = {table: kind for table, kind in kinds.items() if kind != "virtual"}
+        if not pending:
+            return
+        renamed = [table for table, kind in pending.items() if kind == "stored"]
+        with self._connection.cursor() as cursor:
+            cursor.execute("BEGIN")
+            try:
+                cursor.execute(f"SET LOCAL lock_timeout = '{EVENT_TS_RENAME_LOCK_TIMEOUT}'")
+                for table, kind in pending.items():
+                    relation = self.sql_relation(table)
+                    if kind == "stored":
+                        cursor.execute(f"ALTER TABLE {relation} RENAME COLUMN event_ts TO occurred_at")
+                    cursor.execute(
+                        f"ALTER TABLE {relation} ADD COLUMN event_ts timestamptz "
+                        "GENERATED ALWAYS AS (occurred_at) VIRTUAL"
+                    )
+                if renamed:
+                    for statement in companion_sql:
+                        cursor.execute(self._expand_relations(statement))
+                cursor.execute("COMMIT")
+            except psycopg2.errors.LockNotAvailable as exc:
+                cursor.execute("ROLLBACK")
+                raise EventTsRenameLockTimeout(
+                    f"renaming event_ts to occurred_at on {', '.join(pending)} waited more than "
+                    f"{EVENT_TS_RENAME_LOCK_TIMEOUT} for its lock; the next run retries"
+                ) from exc
+            except Exception:
+                cursor.execute("ROLLBACK")
+                raise
+        if renamed:
+            logger.warning("renamed event_ts to occurred_at on %s", ", ".join(renamed))
+
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
 
@@ -7538,13 +7622,20 @@ class PostgresWarehouse:
         integer default so it survives upsert churn: the timeline upsert bumps
         it via nextval() whenever a row's content changes, giving consumers a
         durable arrival/change order that a plain event-time sort cannot
-        provide (late backfills land in the past by event_ts but in the
+        provide (late backfills land in the past by occurred_at but in the
         present by seq).
         """
         # The priority enum must exist before the table is created: on a fresh
         # install _postgres_type builds the priority column as this type.
         self._ensure_timeline_priority_type()
-        self._ensure_table_group(["timeline_events", "timeline_sync_state"])
+        self._ensure_table("timeline_events")
+        self._ensure_table("timeline_sync_state")
+        # Before the indexes: their definitions name occurred_at, so a missing
+        # index on a not-yet-renamed table could not be created.
+        from personal_data_warehouse.notifications import CAPTURE_FUNCTION_SQL
+
+        self._rename_event_ts_to_occurred_at(["timeline_events"], companion_sql=(CAPTURE_FUNCTION_SQL,))
+        self._ensure_indexes(["timeline_events", "timeline_sync_state"])
         # Migration for pre-existing sync-state tables (the table is ~24 rows,
         # so the unconditional ACCESS EXCLUSIVE lock here is harmless).
         self._command(
@@ -7614,9 +7705,15 @@ class PostgresWarehouse:
         installable, so the same code runs against pre-pgvector hosts (the
         chunk backlog builds up and embeds later).
         """
-        self._ensure_table_group(
-            ["search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"]
+        for table in ("search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"):
+            self._ensure_table(table)
+        # The vector table's trigger functions copy the chunk's time column by
+        # name, so they are replaced in the rename's own transaction.
+        self._rename_event_ts_to_occurred_at(
+            ["search_chunks", "search_chunk_vectors"],
+            companion_sql=self._search_chunk_vector_function_sql(),
         )
+        self._ensure_indexes(["search_chunks", "search_chunk_embeddings", "search_chunk_sync_state"])
         # The embedding drain's persisted cursors joined an existing table;
         # CREATE TABLE IF NOT EXISTS cannot add them to a live deployment.
         #
@@ -7655,11 +7752,79 @@ class PostgresWarehouse:
                 )
             self._ensure_indexes(["search_chunk_embeddings"])
             self._ensure_search_chunk_vectors()
+            # A vector table created just now gets the same transitional alias.
+            self._rename_event_ts_to_occurred_at(["search_chunk_vectors"])
         self._ensure_search_views_if_possible()
         if self._relation_exists("search_chunk_vectors"):
             # After the search functions: retires the index the previous
             # semantic function walked (see POSTGRES_OBSOLETE_INDEXES).
             self._ensure_indexes(["search_chunk_vectors"])
+
+    def _search_chunk_vector_function_sql(self) -> tuple[str, str]:
+        """The two trigger functions that keep search_chunk_vectors in step."""
+        lock_sql = (
+            "PERFORM pg_advisory_xact_lock("
+            f"{search_chunk_vectors_lock_key(self._schema)});"
+        )
+        from_chunk = (
+            r"""
+            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_chunk()
+            RETURNS trigger LANGUAGE plpgsql AS $fn$
+            BEGIN
+                """ + lock_sql + r"""
+                IF TG_OP IN ('UPDATE', 'DELETE') THEN
+                    DELETE FROM @search_chunk_vectors
+                    WHERE adapter = OLD.adapter AND chunk_id = OLD.chunk_id;
+                END IF;
+                IF TG_OP IN ('INSERT', 'UPDATE') THEN
+                    INSERT INTO @search_chunk_vectors
+                        (adapter, chunk_id, model, event_id, occurred_at, embedding)
+                    SELECT NEW.adapter, NEW.chunk_id, e.model, NEW.event_id,
+                           NEW.occurred_at, e.embedding
+                    FROM @search_chunk_embeddings e
+                    WHERE e.text_sha256 = NEW.text_sha256
+                      AND e.embedding IS NOT NULL
+                    ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
+                        event_id = EXCLUDED.event_id,
+                        occurred_at = EXCLUDED.occurred_at,
+                        embedding = EXCLUDED.embedding;
+                END IF;
+                RETURN NULL;
+            END
+            $fn$
+            """
+        )
+        from_embedding = (
+            r"""
+            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_embedding()
+            RETURNS trigger LANGUAGE plpgsql AS $fn$
+            BEGIN
+                """ + lock_sql + r"""
+                IF TG_OP = 'DELETE' OR NEW.embedding IS NULL THEN
+                    DELETE FROM @search_chunk_vectors v
+                    USING @search_chunks c
+                    WHERE c.text_sha256 = OLD.text_sha256
+                      AND v.adapter = c.adapter
+                      AND v.chunk_id = c.chunk_id
+                      AND v.model = OLD.model;
+                    RETURN NULL;
+                END IF;
+                INSERT INTO @search_chunk_vectors
+                    (adapter, chunk_id, model, event_id, occurred_at, embedding)
+                SELECT c.adapter, c.chunk_id, NEW.model, c.event_id, c.occurred_at,
+                       NEW.embedding
+                FROM @search_chunks c
+                WHERE c.text_sha256 = NEW.text_sha256
+                ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
+                    event_id = EXCLUDED.event_id,
+                    occurred_at = EXCLUDED.occurred_at,
+                    embedding = EXCLUDED.embedding;
+                RETURN NULL;
+            END
+            $fn$
+            """
+        )
+        return from_chunk, from_embedding
 
     def _ensure_search_chunk_vectors(self) -> None:
         """The semantic leg's partitioned per-chunk vector table and its triggers.
@@ -7678,7 +7843,7 @@ class PostgresWarehouse:
                 " chunk_id text NOT NULL,"
                 " model text NOT NULL,"
                 " event_id text NOT NULL,"
-                " event_ts timestamptz NOT NULL,"
+                " occurred_at timestamptz NOT NULL,"
                 f" embedding public.halfvec({dims}) NOT NULL,"
                 " PRIMARY KEY (adapter, chunk_id, model)"
                 ") PARTITION BY LIST (adapter)"
@@ -7707,68 +7872,8 @@ class PostgresWarehouse:
         # each statement after the lock reads with a fresh snapshot, so the
         # second writer sees the first one's committed row. One lock key
         # cannot deadlock.
-        lock_sql = (
-            "PERFORM pg_advisory_xact_lock("
-            f"{search_chunk_vectors_lock_key(self._schema)});"
-        )
-        self._command(
-            r"""
-            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_chunk()
-            RETURNS trigger LANGUAGE plpgsql AS $fn$
-            BEGIN
-                """ + lock_sql + r"""
-                IF TG_OP IN ('UPDATE', 'DELETE') THEN
-                    DELETE FROM @search_chunk_vectors
-                    WHERE adapter = OLD.adapter AND chunk_id = OLD.chunk_id;
-                END IF;
-                IF TG_OP IN ('INSERT', 'UPDATE') THEN
-                    INSERT INTO @search_chunk_vectors
-                        (adapter, chunk_id, model, event_id, event_ts, embedding)
-                    SELECT NEW.adapter, NEW.chunk_id, e.model, NEW.event_id,
-                           NEW.event_ts, e.embedding
-                    FROM @search_chunk_embeddings e
-                    WHERE e.text_sha256 = NEW.text_sha256
-                      AND e.embedding IS NOT NULL
-                    ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
-                        event_id = EXCLUDED.event_id,
-                        event_ts = EXCLUDED.event_ts,
-                        embedding = EXCLUDED.embedding;
-                END IF;
-                RETURN NULL;
-            END
-            $fn$
-            """
-        )
-        self._command(
-            r"""
-            CREATE OR REPLACE FUNCTION @search_chunk_vectors_from_embedding()
-            RETURNS trigger LANGUAGE plpgsql AS $fn$
-            BEGIN
-                """ + lock_sql + r"""
-                IF TG_OP = 'DELETE' OR NEW.embedding IS NULL THEN
-                    DELETE FROM @search_chunk_vectors v
-                    USING @search_chunks c
-                    WHERE c.text_sha256 = OLD.text_sha256
-                      AND v.adapter = c.adapter
-                      AND v.chunk_id = c.chunk_id
-                      AND v.model = OLD.model;
-                    RETURN NULL;
-                END IF;
-                INSERT INTO @search_chunk_vectors
-                    (adapter, chunk_id, model, event_id, event_ts, embedding)
-                SELECT c.adapter, c.chunk_id, NEW.model, c.event_id, c.event_ts,
-                       NEW.embedding
-                FROM @search_chunks c
-                WHERE c.text_sha256 = NEW.text_sha256
-                ON CONFLICT (adapter, chunk_id, model) DO UPDATE SET
-                    event_id = EXCLUDED.event_id,
-                    event_ts = EXCLUDED.event_ts,
-                    embedding = EXCLUDED.embedding;
-                RETURN NULL;
-            END
-            $fn$
-            """
-        )
+        for statement in self._search_chunk_vector_function_sql():
+            self._command(statement)
         existing = {
             str(row[0])
             for row in self._query(
@@ -7848,7 +7953,14 @@ class PostgresWarehouse:
             "five definitions; filter priority IN ('self','direct','cc') for a review "
             "of what involved Zach, and exclude 'noise'/'background' machinery."
         ),
-        "event_ts": "When the thing happened in the real world. The timeline's default sort.",
+        "occurred_at": (
+            "When the thing happened in the real world. The timeline's default sort, "
+            "and the same name every search function's hits use."
+        ),
+        "event_ts": (
+            "Deprecated alias of occurred_at (a virtual column, no storage) kept for "
+            "one deploy while readers move to occurred_at; it is about to be dropped."
+        ),
         "end_ts": (
             "When it finished (meeting end, workout end, session end), or the epoch "
             "sentinel 1970-01-01 when the event is instantaneous or the end is unknown."
@@ -7876,12 +7988,12 @@ class PostgresWarehouse:
         ),
         "ingest_ts": (
             "When the warehouse last learned about this row from its source. Drives "
-            "the adapter's incremental watermark; unrelated to event_ts."
+            "the adapter's incremental watermark; unrelated to occurred_at."
         ),
         "seq": (
             "Monotonic arrival/change order, bumped only when the row's content "
             "changes. Checkpoint on this to consume the timeline exactly once, "
-            "including late backfills that land in the past by event_ts."
+            "including late backfills that land in the past by occurred_at."
         ),
         "first_seen_at": "When this timeline row was first written.",
         "updated_at": "When this timeline row was last written.",
@@ -14514,8 +14626,8 @@ class PostgresWarehouse:
                 GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds, e.history_cycle_seconds
             ),
             landing AS (
-                -- Landing latency = first_seen_at - event_ts, over the messages
-                -- WRITTEN in the last 24 hours (bounded by event_ts, which
+                -- Landing latency = first_seen_at - occurred_at, over the messages
+                -- WRITTEN in the last 24 hours (bounded by occurred_at, which
                 -- timeline_events_source_time_idx serves; a backfill landing
                 -- old messages is therefore excluded rather than read as a
                 -- day-long delay). A message written in that window that has
@@ -14530,10 +14642,10 @@ class PostgresWarehouse:
                     c.conversation_type,
                     count(*)::bigint AS landing_sample_24h,
                     percentile_cont(0.5) WITHIN GROUP (
-                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.event_ts))
+                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at))
                     ) AS landing_p50,
                     percentile_cont(0.95) WITHIN GROUP (
-                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.event_ts))
+                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at))
                     ) AS landing_p95
                 FROM @timeline_events AS e
                 JOIN @slack_conversations AS c
@@ -14542,7 +14654,7 @@ class PostgresWarehouse:
                  AND c.conversation_id = e.source_pk ->> 'conversation_id'
                 WHERE e.source = 'slack'
                   AND e.adapter = 'slack_message'
-                  AND e.event_ts >= now() - interval '24 hours'
+                  AND e.occurred_at >= now() - interval '24 hours'
                 GROUP BY c.account, c.team_id, c.conversation_type
             ),
             judged AS (
@@ -15994,7 +16106,7 @@ class PostgresWarehouse:
                 f"({adapter_filter(adapters)}) "
                 "AND t.search_text != '' "
                 "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
-                "AND (%3$L::timestamptz IS NULL OR t.event_ts >= %3$L::timestamptz) "
+                "AND (%3$L::timestamptz IS NULL OR t.occurred_at >= %3$L::timestamptz) "
                 "AND (%4$L::text[] IS NULL OR t.priority::text = ANY (%4$L::text[]))"
             )
             if source == "google_drive":
@@ -16002,7 +16114,7 @@ class PostgresWarehouse:
             return (
                 source,
                 f"( SELECT '{source}'::text AS source, {subsource} AS subsource, "
-                "t.context AS context, t.actor AS who, t.event_ts AS occurred_at, "
+                "t.context AS context, t.actor AS who, t.occurred_at AS occurred_at, "
                 "COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account, "
                 "t.adapter || ':' || t.event_id AS ref, t.search_text AS text, "
                 f"({rank})::real AS score, t.title AS title, "
@@ -16039,7 +16151,7 @@ class PostgresWarehouse:
         pool_where = (
             "t.search_text != '' "
             "AND NOT COALESCE((t.metadata->>'deleted')::boolean, false) "
-            "AND (since IS NULL OR t.event_ts >= since) "
+            "AND (since IS NULL OR t.occurred_at >= since) "
             "AND (priorities IS NULL OR t.priority::text = ANY (priorities)) "
             f"AND {SEARCH_DRIVE_EXCLUSION_SQL}"
         )
@@ -16122,7 +16234,7 @@ class PostgresWarehouse:
         def one_shot_pool(pool_sql: str) -> str:
             return (
                 pool_sql.replace("to_bm25query(query,", "to_bm25query(%1$L,")
-                .replace("(since IS NULL OR t.event_ts >= since)", "($2 IS NULL OR t.event_ts >= $2)")
+                .replace("(since IS NULL OR t.occurred_at >= since)", "($2 IS NULL OR t.occurred_at >= $2)")
                 .replace(
                     "(priorities IS NULL OR t.priority::text = ANY (priorities))",
                     "($1 IS NULL OR t.priority::text = ANY ($1))",
@@ -16585,13 +16697,13 @@ class PostgresWarehouse:
                         -- multi-megabyte window for every candidate.
                         SELECT c.source,
                                """ + pool_subsource_case + r""" AS subsource,
-                               t.context, t.actor, t.event_ts,
+                               t.context, t.actor, t.occurred_at,
                                COALESCE(t.source_pk->>'account',
                                         t.metadata->>'account', ''),
                                t.adapter || ':' || t.event_id,
                                """ + preview_fn_sql + r"""(t.search_text, query),
                                CASE WHEN c.score = 0 THEN (-1e-9)::real ELSE c.score END,
-                               t.event_ts,
+                               t.occurred_at,
                                t.title, t.source_table, t.source_pk, t.priority::text
                         FROM broad_top c
                         JOIN @timeline_events t
@@ -16809,7 +16921,7 @@ class PostgresWarehouse:
             + exact_subsource_case
             + r""" AS subsource,
                                t.context AS context, t.actor AS who,
-                               t.event_ts AS occurred_at,
+                               t.occurred_at AS occurred_at,
                                COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account,
                                t.adapter || ':' || t.event_id AS ref,
                                t.search_text AS text,
@@ -16830,9 +16942,9 @@ class PostgresWarehouse:
             + SEARCH_DRIVE_EXCLUSION_SQL
             + r"""
                           AND (sources IS NULL OR map.source = ANY (sources))
-                          AND (since IS NULL OR t.event_ts >= since)
+                          AND (since IS NULL OR t.occurred_at >= since)
                           AND (priorities IS NULL OR t.priority::text = ANY (priorities))
-                        ORDER BY t.event_ts DESC
+                        ORDER BY t.occurred_at DESC
                         LIMIT per_source
                     ) hit
                     CROSS JOIN LATERAL (
@@ -16933,8 +17045,8 @@ class PostgresWarehouse:
                             SELECT t.* FROM @timeline_events t
                             WHERE t.source = anchor.source
                               AND t.context = anchor.context
-                              AND (t.event_ts, t.seq) < (anchor.event_ts, anchor.seq)
-                            ORDER BY t.event_ts DESC, t.seq DESC
+                              AND (t.occurred_at, t.seq) < (anchor.occurred_at, anchor.seq)
+                            ORDER BY t.occurred_at DESC, t.seq DESC
                             LIMIT n_before
                         )
                         UNION ALL
@@ -16942,12 +17054,12 @@ class PostgresWarehouse:
                             SELECT t.* FROM @timeline_events t
                             WHERE t.source = anchor.source
                               AND t.context = anchor.context
-                              AND (t.event_ts, t.seq) >= (anchor.event_ts, anchor.seq)
-                            ORDER BY t.event_ts ASC, t.seq ASC
+                              AND (t.occurred_at, t.seq) >= (anchor.occurred_at, anchor.seq)
+                            ORDER BY t.occurred_at ASC, t.seq ASC
                             LIMIT n_after + 1
                         )
                     ) w
-                    ORDER BY w.event_ts ASC, w.seq ASC;
+                    ORDER BY w.occurred_at ASC, w.seq ASC;
             END;
             $ctx$;
             """
@@ -17075,7 +17187,7 @@ class PostgresWarehouse:
                 + r""")
                 END;
                 -- Route per partition. chunk_vectors carries adapter and
-                -- event_ts on the vector row and is LIST-partitioned by
+                -- occurred_at on the vector row and is LIST-partitioned by
                 -- adapter, so each branch scans one partition and filters
                 -- the row it reads. A partition wholly in scope walks its
                 -- HNSW graph unfiltered. A partial slice of at most
@@ -17087,7 +17199,7 @@ class PostgresWarehouse:
                 -- and missed a quarter of the true top-400. A larger partial
                 -- slice keeps most of its partition, where the graph wins.
                 -- The planner's estimate sizes a slice in ~2 ms from
-                -- per-partition event_ts statistics (648,951 estimated vs
+                -- per-partition occurred_at statistics (648,951 estimated vs
                 -- 642,249 real for gmail since 2025-06-01); counting it
                 -- instead cost up to 1.4 s at this threshold.
                 """ + _semantic_partition_branches_sql() + r"""
@@ -17297,7 +17409,7 @@ class PostgresWarehouse:
                                        x.ref
                                        ORDER BY x.match_chunk ASC NULLS LAST,
                                                 x.match_pos ASC NULLS LAST,
-                                                x.event_ts DESC
+                                                x.occurred_at DESC
                                    )
                               INTO exact_refs
                               FROM (
@@ -17305,7 +17417,7 @@ class PostgresWarehouse:
                                 -- id. Join back to timeline both to validate that
                                 -- ref and to apply exact's deleted/Drive filters.
                                 SELECT t.adapter || ':' || t.event_id AS ref,
-                                       max(t.event_ts) AS event_ts,
+                                       max(t.occurred_at) AS occurred_at,
                                        CASE
                                            WHEN exact_needle ~ '[0-9]' THEN NULL
                                            ELSE min(c.chunk_index)
@@ -17343,7 +17455,7 @@ class PostgresWarehouse:
                                       sem_adapters IS NULL
                                       OR t.adapter = ANY (sem_adapters)
                                   )
-                                  AND (since IS NULL OR t.event_ts >= since)
+                                  AND (since IS NULL OR t.occurred_at >= since)
                                   AND (
                                       priorities IS NULL
                                       OR t.priority::text = ANY (priorities)
@@ -17351,7 +17463,7 @@ class PostgresWarehouse:
                                 GROUP BY t.adapter, t.event_id
                                 ORDER BY match_chunk ASC NULLS LAST,
                                          match_pos ASC NULLS LAST,
-                                         event_ts DESC
+                                         occurred_at DESC
                                 LIMIT per_source
                               ) x;
 
@@ -17367,14 +17479,14 @@ class PostgresWarehouse:
                             -- 1.6-11s ("Mt Foolery" 7.3s, an amount 10.7s, a
                             -- phone number 8.9s) and was the slowest leg of
                             -- every short hybrid search that touched a chat.
-                            SELECT array_agg(m.ref ORDER BY m.event_ts DESC)
+                            SELECT array_agg(m.ref ORDER BY m.occurred_at DESC)
                               INTO chat_exact_refs
                               FROM (
                                 SELECT t.adapter || ':' || t.event_id AS ref,
-                                       t.event_ts
+                                       t.occurred_at
                                 FROM (
                                     SELECT c.source, c.context, c.adapter,
-                                           c.event_ts AS window_start
+                                           c.occurred_at AS window_start
                                     FROM @search_chunks c
                                     WHERE c.anchor LIKE c.adapter || '|w|%'
                                       AND (c.text ILIKE exact_pattern ESCAPE '\'
@@ -17386,17 +17498,17 @@ class PostgresWarehouse:
                                       )
                                       AND (
                                           since IS NULL
-                                          OR c.event_ts + interval '1 hour' > since
+                                          OR c.occurred_at + interval '1 hour' > since
                                       )
-                                    GROUP BY c.source, c.context, c.adapter, c.event_ts
-                                    ORDER BY c.event_ts DESC
+                                    GROUP BY c.source, c.context, c.adapter, c.occurred_at
+                                    ORDER BY c.occurred_at DESC
                                     LIMIT per_source * 2
                                 ) w
                                 JOIN @timeline_events t
                                   ON t.source = w.source
                                  AND t.context = w.context
-                                 AND t.event_ts >= w.window_start
-                                 AND t.event_ts < w.window_start + interval '1 hour'
+                                 AND t.occurred_at >= w.window_start
+                                 AND t.occurred_at < w.window_start + interval '1 hour'
                                  AND t.adapter = w.adapter
                                 WHERE (t.search_text ILIKE exact_pattern ESCAPE '\'
                                        OR t.search_text ILIKE exact_pattern_b ESCAPE '\'
@@ -17405,12 +17517,12 @@ class PostgresWarehouse:
                                   AND NOT COALESCE(
                                       (t.metadata->>'deleted')::boolean, false
                                   )
-                                  AND (since IS NULL OR t.event_ts >= since)
+                                  AND (since IS NULL OR t.occurred_at >= since)
                                   AND (
                                       priorities IS NULL
                                       OR t.priority::text = ANY (priorities)
                                   )
-                                ORDER BY t.event_ts DESC
+                                ORDER BY t.occurred_at DESC
                                 LIMIT per_source
                               ) m;
                             exact_refs := (
@@ -17537,12 +17649,12 @@ class PostgresWarehouse:
                        """ + exact_subsource_case + r""" AS subsource,
                        t.context,
                        COALESCE(t.actor, '') AS who,
-                       t.event_ts AS occurred_at,
+                       t.occurred_at AS occurred_at,
                        COALESCE(t.source_pk->>'account', t.metadata->>'account', '') AS account,
                        m.ref,
                        COALESCE(c.text, """ + preview_fn_sql + r"""(t.search_text, query)) AS text,
                        (-m.rrf)::real AS score,
-                       t.event_ts,
+                       t.occurred_at,
                        COALESCE(t.title, '') AS title,
                        COALESCE(t.source_table, '') AS source_table,
                        t.source_pk,
@@ -17561,7 +17673,7 @@ class PostgresWarehouse:
                 + r""") AS tmap(adapter, source) ON tmap.adapter = t.adapter
                 WHERE t.event_id IS NOT NULL
                   AND (priorities IS NULL OR t.priority::text = ANY (priorities))
-                ORDER BY m.rrf DESC, t.event_ts DESC
+                ORDER BY m.rrf DESC, t.occurred_at DESC
                 LIMIT per_source;
             END;
             $fuse$;

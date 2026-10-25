@@ -776,7 +776,7 @@ def test_priority_mix_counts_each_sources_tiers_and_flags_unclassified(warehouse
         ("future", "calendar", "noise", -24),
     ):
         warehouse._command(
-            "INSERT INTO @timeline_events (adapter, event_id, source, kind, event_ts, source_table, priority) "
+            "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, priority) "
             "VALUES ('t', %s, %s, 'k', now() - make_interval(hours => %s), 'x', %s::timeline.timeline_priority)"
             .replace("timeline.timeline_priority", warehouse.physical_schema_name("timeline") + ".timeline_priority"),
             (event_id, source, hours_ago, priority),

@@ -510,7 +510,7 @@ def resolve_truth_metadata(refs: Sequence[str]) -> dict[str, tuple[str, str, dat
     sql = (
         f"WITH want(adapter, event_id) AS (VALUES {values}) "
         "SELECT e.adapter||':'||e.event_id AS ref, e.source, coalesce(e.context,'') AS context, "
-        "e.event_ts FROM timeline.events e "
+        "e.occurred_at FROM timeline.events e "
         "JOIN want w ON w.adapter = e.adapter AND w.event_id = e.event_id"
     )
     rows = _pdw_json(
@@ -520,7 +520,7 @@ def resolve_truth_metadata(refs: Sequence[str]) -> dict[str, tuple[str, str, dat
     )
     out: dict[str, tuple[str, str, datetime]] = {}
     for row in rows if isinstance(rows, list) else []:
-        stamp = parse_timestamp(row.get("event_ts"))
+        stamp = parse_timestamp(row.get("occurred_at"))
         if stamp is not None:
             out[str(row["ref"])] = (str(row["source"]), str(row["context"] or ""), stamp)
     return out

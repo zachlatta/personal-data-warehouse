@@ -7,7 +7,7 @@ cross-source features (the timeline UI, embeddings, "what came in since the
 intelligence pass last ran") can consume a single stream instead of
 re-implementing per-source queries:
 
-- ``event_ts`` orders the timeline by when things actually happened.
+- ``occurred_at`` orders the timeline by when things actually happened.
 - ``seq`` (a monotonically increasing sequence, bumped whenever a row's
   content changes) orders by *arrival/change*, so a consumer can checkpoint
   "I have processed everything up to seq N" and never miss late backfills.
@@ -111,6 +111,10 @@ BACKFILL_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # The exact output shape every adapter query must produce, in order. The
 # engine prepends the adapter name and appends the source table on insert.
+# The output is positional: an adapter's ``event_ts`` lands in
+# ``timeline.events.occurred_at``. The name stays ``event_ts`` here and in
+# every adapter's SQL on purpose, because that SQL text is hashed into
+# ``adapter_signature`` and renaming it would reset every adapter's backfill.
 TIMELINE_NORMALIZED_COLUMNS = (
     "event_id",
     "source",
@@ -3754,7 +3758,7 @@ def _context_stream_sql(stream: TimelineContextStream) -> str:
                     SELECT ev.* FROM cand c
                     JOIN @timeline_events ev
                       ON ev.adapter = '{stream.neighbor_adapter}' AND ev.event_id = c.event_id
-                    ORDER BY ev.event_ts ASC, ev.seq ASC"""
+                    ORDER BY ev.occurred_at ASC, ev.seq ASC"""
 
 
 def timeline_context_branch_sql() -> str:
@@ -4264,7 +4268,7 @@ _TIMELINE_UPSERT_COLUMNS = (
     "source",
     "kind",
     "priority",
-    "event_ts",
+    "occurred_at",
     "end_ts",
     "actor",
     "title",
@@ -4285,7 +4289,7 @@ _TIMELINE_CONTENT_COLUMNS = (
     "source",
     "kind",
     "priority",
-    "event_ts",
+    "occurred_at",
     "end_ts",
     "actor",
     "title",

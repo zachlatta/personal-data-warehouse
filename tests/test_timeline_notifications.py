@@ -111,7 +111,7 @@ def test_go_worker_against_the_same_provisioned_schema(warehouse):
     assert result.returncode == 0, result.stdout + result.stderr
 
 @pytest.mark.parametrize("view,columns", [
-    ("marts_notifications", ("event_ts", "landed_at", "created_at")),
+    ("marts_notifications", ("event_ts", "landed_at", "created_at", "occurred_at")),
     ("marts_notification_deliveries", ("created_at", "updated_at", "accepted_at", "receipt_at", "opened_at")),
 ])
 def test_notification_marts_translate_every_absent_timestamp(warehouse, view, columns):
@@ -133,7 +133,7 @@ def test_a_backfilled_direct_event_from_long_ago_never_pages(warehouse):
     wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
     priority = "'direct'::" + wh.sql_relation("timeline_priority")
     for event_id, ts in (("old", "now() - interval '30 days'"), ("fresh", "now() - interval '2 hours'")):
-        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, event_ts) "
+        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, occurred_at) "
                     f"VALUES ('test', %s, {priority}, 'test', 'Hello', {ts})", (event_id,))
     insert(wh, "untimed", "direct")
     assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [

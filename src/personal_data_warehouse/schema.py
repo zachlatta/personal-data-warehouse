@@ -2443,13 +2443,15 @@ GOOGLE_DRIVE_FILE_TEXT_COLUMNS = (
 # warehouse (see personal_data_warehouse/timeline.py). `seq` is assigned from
 # the timeline_events_seq sequence and bumped on every content change, giving
 # consumers a durable "what's new since I last looked" arrival order.
+# `event_ts` is not listed: it is the virtual alias of `occurred_at` that
+# PostgresWarehouse._rename_event_ts_to_occurred_at leaves for one deploy.
 TIMELINE_EVENT_COLUMNS = (
     "adapter",
     "event_id",
     "source",
     "kind",
     "priority",
-    "event_ts",
+    "occurred_at",
     "end_ts",
     "actor",
     "title",
@@ -2476,7 +2478,7 @@ SEARCH_CHUNK_COLUMNS = (
     "event_id",
     "source",
     "context",
-    "event_ts",
+    "occurred_at",
     "chunk_index",
     "text",
     "text_sha256",
@@ -2499,7 +2501,7 @@ SEARCH_CHUNK_EMBEDDING_COLUMNS = (
 # cursor over timeline.events.seq. The embedding drain's row ("embeddings")
 # carries its two persisted keysets: the (built_at, chunk_id) watermark behind
 # which every chunk has been offered to the embedder, and the newest-first
-# (event_ts, chunk_id) keyset of the one-time historical backfill. Without persistence
+# (occurred_at, chunk_id) keyset of the one-time historical backfill. Without persistence
 # the drain restarted at the newest chunk on every run and re-scanned the
 # whole 7 GB chunk heap each time, which evicted the search indexes from the
 # page cache ten minutes after every search warmed them.
