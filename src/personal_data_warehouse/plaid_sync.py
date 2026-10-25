@@ -45,14 +45,22 @@ PLAID_ACTION_REQUIRED_ERROR_CODES = frozenset(
         "MFA_NOT_SUPPORTED",
         "NO_ACCOUNTS",
         "NO_AUTH_ACCOUNTS",
-        "NO_INVESTMENT_ACCOUNTS",
-        "NO_LIABILITY_ACCOUNTS",
         "PENDING_DISCONNECT",
         "PENDING_EXPIRATION",
         "USER_INPUT_TIMEOUT",
         "USER_PERMISSION_REVOKED",
     }
 )
+
+# A product the Item simply holds no accounts for: a Venmo checking Item asked
+# for liabilities, a credit card asked for investments. Plaid can list the
+# product on the Item and still answer this on every call, and no Link run
+# changes it, so it is recorded exactly like a product missing from the Item's
+# metadata (``unsupported``) rather than as a login needing repair.
+PLAID_PRODUCT_ABSENT_ERROR_CODES = {
+    "investments": "NO_INVESTMENT_ACCOUNTS",
+    "liabilities": "NO_LIABILITY_ACCOUNTS",
+}
 
 
 @dataclass(frozen=True)
@@ -337,7 +345,9 @@ class PlaidSyncRunner:
                 )
             except Exception as exc:
                 error = self._safe_error(exc, item)
-                if self._record_failure(state, item.account, item_id, "investments", error, synced_at, institution):
+                if plaid_error_code(error) == PLAID_PRODUCT_ABSENT_ERROR_CODES["investments"]:
+                    self._record_state(item.account, item_id, "investments", "", "unsupported", "", synced_at)
+                elif self._record_failure(state, item.account, item_id, "investments", error, synced_at, institution):
                     failures.append(f"{institution} investments: {error}")
                 else:
                     summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))
@@ -357,7 +367,9 @@ class PlaidSyncRunner:
                 )
             except Exception as exc:
                 error = self._safe_error(exc, item)
-                if self._record_failure(state, item.account, item_id, "liabilities", error, synced_at, institution):
+                if plaid_error_code(error) == PLAID_PRODUCT_ABSENT_ERROR_CODES["liabilities"]:
+                    self._record_state(item.account, item_id, "liabilities", "", "unsupported", "", synced_at)
+                elif self._record_failure(state, item.account, item_id, "liabilities", error, synced_at, institution):
                     failures.append(f"{institution} liabilities: {error}")
                 else:
                     summary = _merge_summary(summary, PlaidSyncSummary(action_required=1))

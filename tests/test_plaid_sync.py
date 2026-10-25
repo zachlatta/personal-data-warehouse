@@ -424,6 +424,39 @@ def test_plaid_sync_marks_permanently_broken_product_action_required_without_fai
     assert summary.action_required == 2
 
 
+def test_plaid_sync_records_a_product_the_item_has_no_accounts_for_as_unsupported() -> None:
+    # A Venmo Item has one depository account and no credit line, and Plaid can
+    # still list liabilities among its products. /liabilities/get then answers
+    # NO_LIABILITY_ACCOUNTS on every run. No re-link changes that, so it is the
+    # same fact as the product missing from the Item's metadata, not a broken
+    # login: reading it as action_required kept the plaid pipeline in attention.
+    class DepositoryOnlyClient(FakePlaidClient):
+        def investments_holdings_get(self, access_token: str):
+            raise PlaidAPIError("NO_INVESTMENT_ACCOUNTS: There are no valid investment account(s)")
+
+        def liabilities_get(self, access_token: str):
+            raise PlaidAPIError("NO_LIABILITY_ACCOUNTS: There are no valid liability account(s)")
+
+    warehouse = FakePlaidWarehouse()
+
+    summary = PlaidSyncRunner(
+        config=_plaid_config(),
+        warehouse=warehouse,
+        plaid_client=DepositoryOnlyClient(),
+        logger=FakeLogger(),
+        now=lambda: datetime(2026, 10, 25, 12, tzinfo=UTC),
+    ).sync_all()
+
+    states = {row["product"]: row["status"] for row in warehouse.sync_state_rows or []}
+    assert states == {
+        "accounts": "ok",
+        "transactions": "ok",
+        "investments": "unsupported",
+        "liabilities": "unsupported",
+    }
+    assert summary.action_required == 0
+
+
 def test_plaid_sync_marks_whole_item_action_required_when_item_get_needs_relink() -> None:
     class LoggedOutClient(FakePlaidClient):
         def item_get(self, access_token: str):
