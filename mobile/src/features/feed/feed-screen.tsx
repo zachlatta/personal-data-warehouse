@@ -1,6 +1,5 @@
-import { useFocusEffect, useNavigation, useRouter } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -41,6 +40,7 @@ import {
   startTimer,
 } from './engagement';
 import { FeedCard } from './feed-card';
+import { useFeedHost } from './feed-host';
 import type { CardLink } from './links';
 import { sourceBubbles } from './rich';
 import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
@@ -94,10 +94,13 @@ function viewName(only: string | null, searching = false): string {
 type Undo = { text: string; undo: () => void; timer: ReturnType<typeof setTimeout> };
 
 export default function FeedScreen() {
-  const tabSpace = useTabBarSpace();
+  const host = useFeedHost();
+  const tabBarSpace = useTabBarSpace();
+  // The left page has no tab bar under it.
+  const tabSpace = host.embedded ? 24 : tabBarSpace;
   const config = useConfig();
   const theme = useTheme();
-  const router = useRouter();
+  const openItem = host.useOpenItem();
   // A cold start paints the last page from disk at once; the network
   // load then replaces it (loadedAt stays 0, so the first focus fetches).
   const [cached] = useState(() => {
@@ -272,7 +275,7 @@ export default function FeedScreen() {
     return () => clearTimeout(t);
   }, [shown, measure]);
 
-  useFocusEffect(
+  host.useFocusEffect(
     useCallback(() => {
       focused.current = true;
       if (AppState.currentState === 'active') startFeedSession(ids.current.length, 'focus');
@@ -288,7 +291,7 @@ export default function FeedScreen() {
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
-      if (!focused.current) return;
+      if (!focused.current || !host.inFront()) return;
       if (state === 'active') {
         startFeedSession(ids.current.length, 'foreground');
         if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
@@ -300,7 +303,7 @@ export default function FeedScreen() {
       }
     });
     return () => sub.remove();
-  }, [load, measure, pause]);
+  }, [load, measure, pause, host]);
 
   // Search as he types, a beat after the last keystroke; an empty box lists
   // his whole history, newest seen first.
@@ -348,27 +351,20 @@ export default function FeedScreen() {
     setSearchError(null);
   }, [pause, query, results]);
 
-  const navigation = useNavigation<{
-    addListener(type: 'tabPress', cb: () => void): () => void;
-    isFocused(): boolean;
-    setOptions(options: { headerRight?: () => ReactNode }): void;
-  }>();
-
   // The magnifying glass in the header, like the Timeline's.
-  useLayoutEffect(() => {
-    navigation.setOptions({
-      headerRight: () => (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={searching ? 'Close search' : 'Search past cards'}
-          hitSlop={6}
-          onPress={searching ? closeSearch : openSearch}
-          style={[styles.headerButton, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
-          <Icon name={searching ? 'xmark' : 'magnifyingglass'} tintColor={theme.text} size={20} />
-        </Pressable>
-      ),
-    });
-  }, [navigation, searching, openSearch, closeSearch, theme]);
+  const header = host.useHeaderRight(
+    () => (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={searching ? 'Close search' : 'Search past cards'}
+        hitSlop={6}
+        onPress={searching ? closeSearch : openSearch}
+        style={[styles.headerButton, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }]}>
+        <Icon name={searching ? 'xmark' : 'magnifyingglass'} tintColor={theme.text} size={20} />
+      </Pressable>
+    ),
+    [searching, openSearch, closeSearch, theme],
+  );
 
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -382,15 +378,13 @@ export default function FeedScreen() {
 
   // Tapping Feed in the tab bar while already on it, so a double tap from
   // anywhere, scrolls back to the top, as X and Instagram do.
-  useEffect(
-    () =>
-      navigation.addListener('tabPress', () => {
-        if (!navigation.isFocused() || viewport.current.top <= 0) return;
-        recordUi('tab_to_top', { metadata: { from_y: Math.round(viewport.current.top), view: view.current } });
-        setArrivals([]);
-        list.current?.scrollToOffset({ offset: 0, animated: true });
-      }),
-    [navigation],
+  host.useTabPress(
+    useCallback((isFocused: () => boolean) => {
+      if (!isFocused() || viewport.current.top <= 0) return;
+      recordUi('tab_to_top', { metadata: { from_y: Math.round(viewport.current.top), view: view.current } });
+      setArrivals([]);
+      list.current?.scrollToOffset({ offset: 0, animated: true });
+    }, []),
   );
 
   // The card at the top of the screen at a scroll offset, so a scroll event
@@ -485,9 +479,9 @@ export default function FeedScreen() {
   const onOpen = useCallback(
     (item: FeedItem) => {
       markOpenTap(item.item_id);
-      router.push({ pathname: '/feed/[id]', params: { id: item.item_id, position: String(position(item)) } });
+      openItem(item.item_id, position(item));
     },
-    [router],
+    [openItem],
   );
 
   // A link inside a post or the card's text (index -1, via says which) or
@@ -664,6 +658,7 @@ export default function FeedScreen() {
         if (!isSideways() && width < height && (width !== portraitSize?.width || height !== portraitSize?.height)) setPortraitSize({ width, height });
       }}>
       <VideoWarmup />
+      {header}
       {searching ? (
         <View style={styles.searchRow}>
           <TextInput

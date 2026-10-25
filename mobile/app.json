@@ -66,6 +66,7 @@
     },
     "plugins": [
       "expo-router",
+      "./plugins/with-left-screen",
       [
         "expo-splash-screen",
         {

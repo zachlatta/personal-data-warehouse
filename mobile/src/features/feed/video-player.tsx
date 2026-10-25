@@ -1,5 +1,4 @@
 import { Image } from 'expo-image';
-import { useFocusEffect } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { ActivityIndicator, Platform, Pressable, StyleSheet, View } from 'react-native';
@@ -12,6 +11,7 @@ import { ThemedText } from '@/components/themed-text';
 import { useTheme } from '@/hooks/use-theme';
 
 import { startTimer } from './engagement';
+import { useFeedHost } from './feed-host';
 import { videoLength } from './rich';
 import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, setMutedScript, type VideoSource } from './video';
 
@@ -162,7 +162,7 @@ export function InlineVideo({
   const igScript = useMemo(() => (active && igPage ? instagramPlayerScript({ muted: autoplayed }) : undefined), [active, igPage]);
 
   // Off screen (a detail view opened, another tab) stops it.
-  useFocusEffect(
+  useFeedHost().useFocusEffect(
     useCallback(
       () => () => {
         if (playing === playerKey) setPlaying(null);

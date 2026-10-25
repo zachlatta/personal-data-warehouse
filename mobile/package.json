@@ -1,6 +1,6 @@
 {
   "name": "pdw-mobile",
-  "main": "expo-router/entry",
+  "main": "index.js",
   "version": "1.0.0",
   "dependencies": {
     "@bacons/apple-targets": "^5.0.0",

@@ -176,6 +176,18 @@ break from a Mac that only ever runs the iOS simulator:
   digest added there. Check a phone with
   `adb shell pm get-app-links com.zachlatta.pdw` (`verified`).
 
+- **The Feed is also the home screen's left page** on Zach's Pixel (swipe right
+  on the first home page; it replaced Google Discover). `plugins/with-left-screen.js`
+  adds `LeftScreenActivity`, which handles the Pixel Launcher's
+  `com.android.launcher3.WINDOW_OVERLAY`; the launcher embeds it in its own task
+  and runs the swipe in and out. It draws the `leftscreen` component
+  (`src/features/feed/left-screen.tsx`, registered in `index.js`): the same
+  `FeedScreen`, given its navigation by `feed-host.tsx` instead of expo-router.
+  It must stay the only activity there, so it starts everything it opens in a
+  new task (a card opens `pdw://feed/<id>` in the app). The launcher only asks
+  this app because of a static overlay on the phone (sysadmin repo,
+  `pichu/2026-10-25-pdw-left-screen.md`).
+
 The preview profile builds an installable APK (`eas build -p android
 --profile preview`); CI queues one whenever the Android fingerprint moves,
 exactly as for iOS.
