@@ -30,6 +30,8 @@ export const MATERIAL_ICON = {
   paperplane: 'send',
   'play.fill': 'play_arrow',
   safari: 'open_in_browser',
+  'speaker.slash.fill': 'volume_off',
+  'speaker.wave.2.fill': 'volume_up',
   sparkles: 'auto_awesome',
   'square.and.arrow.up': 'share',
   'text.bubble': 'comment',

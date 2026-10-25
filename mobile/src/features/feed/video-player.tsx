@@ -11,7 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 
 import { startTimer } from './engagement';
 import { videoLength } from './rich';
-import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, type VideoSource } from './video';
+import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, setMutedScript, type VideoSource } from './video';
 
 // One video plays at a time: starting another stops the last, as in X and
 // Instagram. The playing player's key, shared by the feed and detail view.
@@ -89,6 +89,9 @@ export function InlineVideo({
   const theme = useTheme();
   const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
   const [drawn, setDrawn] = useState(false);
+  // The sound button's state: an autoplay starts muted, a tap with sound.
+  const [muted, setMuted] = useState(false);
+  const webRef = useRef<WebView>(null);
   const stopRef = useRef(onStop);
   const playRef = useRef(onPlay);
   useEffect(() => {
@@ -99,6 +102,7 @@ export function InlineVideo({
   // A tap reports its play itself; an autoplay is reported here.
   useEffect(() => {
     if (!active) return undefined;
+    setMuted(autoplayed);
     if (autoplayed) playRef.current(true);
     const stop = startTimer(true);
     return () => {
@@ -107,7 +111,7 @@ export function InlineVideo({
     };
   }, [active]);
   // Muted is fixed when the player starts: an autoplay stays muted until he
-  // turns the sound on in the player.
+  // turns the sound on with the sound button (or in the player).
   const html = useMemo(() => (active && source.kind !== 'instagram' ? playerHtml(source, { muted: autoplayed }) : ''), [active, source]);
   // Instagram's embed cannot sit in a frame, so it is the page itself.
   const igPage = source.kind === 'instagram' ? instagramEmbedUrl(source) : '';
@@ -140,6 +144,7 @@ export function InlineVideo({
           </View>
         ) : null}
         <WebView
+          ref={webRef}
           source={igPage ? { uri: igPage } : { html, baseUrl: EMBED_BASE_URL }}
           injectedJavaScript={igScript}
           userAgent={source.kind === 'tiktok' && Platform.OS === 'android' ? TIKTOK_ANDROID_UA : undefined}
@@ -165,6 +170,17 @@ export function InlineVideo({
             return false;
           }}
         />
+        <Pressable
+          style={styles.sound}
+          hitSlop={10}
+          onPress={() => {
+            webRef.current?.injectJavaScript(setMutedScript(!muted));
+            setMuted(!muted);
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={muted ? 'Turn sound on' : 'Turn sound off'}>
+          <Icon name={muted ? 'speaker.slash.fill' : 'speaker.wave.2.fill'} tintColor="#fff" size={16} />
+        </Pressable>
       </View>
     );
   }
@@ -204,6 +220,7 @@ const styles = StyleSheet.create({
   warmup: { position: 'absolute', width: 1, height: 1, opacity: 0 },
   center: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' },
   play: { width: 56, height: 56, borderRadius: 28, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', paddingLeft: 3 },
+  sound: { position: 'absolute', top: 8, right: 8, width: 32, height: 32, borderRadius: 16, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center' },
   badge: { position: 'absolute', left: 8, bottom: 8, backgroundColor: 'rgba(0,0,0,0.7)', borderRadius: 4, paddingHorizontal: 6, paddingVertical: 1 },
   badgeText: { color: '#fff', fontSize: 12, fontWeight: '700', lineHeight: 16 },
 });

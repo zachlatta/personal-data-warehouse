@@ -177,7 +177,33 @@ export function instagramPlayerScript({ muted = false }: { muted?: boolean } = {
     'v.setAttribute("playsinline","");v.controls=true;v.loop=true;' +
     `v.muted=${muted ? 'true' : 'false'};` +
     'v.addEventListener("playing",function(){window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});' +
+    'window.pdwSetMuted=function(m){v.muted=m;if(!m&&v.paused)v.play()};' +
     'var p=v.play();p&&p.catch(function(){v.muted=true;v.play()})},250)})();true;'
+  );
+}
+
+/**
+ * Script the app injects into a playing player to turn its sound on or off
+ * (Zach, voice memo 2026-10-24: autoplay stays muted, "but I want to have
+ * like a toggle where I can turn on audio for it"). Every player page
+ * defines window.pdwSetMuted.
+ */
+export function setMutedScript(muted: boolean): string {
+  return `window.pdwSetMuted&&window.pdwSetMuted(${muted ? 'true' : 'false'});true;`;
+}
+
+// window.pdwSetMuted for a page whose player is a site's iframe: each site
+// takes commands as messages to its frame.
+function iframeSoundScript(kind: 'youtube' | 'vimeo' | 'tiktok'): string {
+  const send =
+    kind === 'youtube'
+      ? 'f({event:"command",func:m?"mute":"unMute",args:[]});if(!m){f({event:"command",func:"setVolume",args:[100]});f({event:"command",func:"playVideo",args:[]})}'
+      : kind === 'vimeo'
+        ? 'f({method:"setMuted",value:m});if(!m)f({method:"setVolume",value:1})'
+        : 'f({type:m?"mute":"unMute","x-tiktok-player":true})';
+  return (
+    '<script>window.pdwSetMuted=function(m){var w=document.querySelector("iframe").contentWindow;' +
+    `function f(o){w.postMessage(${kind === 'tiktok' ? 'o' : 'JSON.stringify(o)'},"*")}${send}};</script>`
   );
 }
 
@@ -204,27 +230,33 @@ export function playerHtml(src: VideoSource, { muted = false }: { muted?: boolea
     '</head><body>';
   let player: string;
   if (src.kind === 'youtube') {
-    const q = `autoplay=1&playsinline=1&rel=0&modestbranding=1${muted ? '&mute=1' : ''}${src.start ? `&start=${src.start}` : ''}`;
+    // enablejsapi lets the app's sound button command the player.
+    const origin = encodeURIComponent(EMBED_BASE_URL.replace(/\/$/, ''));
+    const q = `autoplay=1&playsinline=1&rel=0&modestbranding=1&enablejsapi=1&origin=${origin}${muted ? '&mute=1' : ''}${src.start ? `&start=${src.start}` : ''}`;
     player =
       `<iframe src="https://www.youtube.com/embed/${src.id}?${q}" referrerpolicy="strict-origin-when-cross-origin" ` +
-      'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>';
+      'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>' +
+      iframeSoundScript('youtube');
   } else if (src.kind === 'tiktok') {
     player =
       `<iframe src="https://www.tiktok.com/player/v1/${src.id}?autoplay=1&muted=${muted ? 1 : 0}&loop=1&rel=0&description=0&music_info=0" ` +
-      'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>';
+      'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>' +
+      iframeSoundScript('tiktok');
   } else if (src.kind === 'instagram') {
     // Never loaded: the WebView opens instagramEmbedUrl instead.
     player = '';
   } else if (src.kind === 'vimeo') {
     player =
       `<iframe src="https://player.vimeo.com/video/${src.id}?autoplay=1&playsinline=1${muted ? '&muted=1' : ''}" ` +
-      'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>';
+      'allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>' +
+      iframeSoundScript('vimeo');
   } else {
     const poster = src.poster ? ` poster="${escapeAttr(src.poster)}"` : '';
     player =
       `<video src="${escapeAttr(src.url)}"${poster} controls autoplay playsinline preload="auto"${muted ? ' muted' : ''}></video>` +
       '<script>var v=document.querySelector("video");v.addEventListener("playing",function(){v.style.background="#000";' +
-      'window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});</script>';
+      'window.ReactNativeWebView&&window.ReactNativeWebView.postMessage("playing")},{once:true});' +
+      'window.pdwSetMuted=function(m){v.muted=m;if(!m&&v.paused)v.play()};</script>';
   }
   return `${head}${player}</body></html>`;
 }

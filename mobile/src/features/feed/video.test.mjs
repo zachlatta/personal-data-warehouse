@@ -114,3 +114,17 @@ test('TikTok videos and Instagram reels play in their own embeds; Instagram phot
   assert.equal(videoAspect(tt), 4 / 5);
   assert.equal(videoAspect(videoSource('https://youtu.be/dQw4w9WgXcQ')), 16 / 9);
 });
+
+test('every player page takes the sound button', async () => {
+  const { playerHtml, setMutedScript, instagramPlayerScript } = await import('./video.ts');
+  assert.equal(setMutedScript(false), 'window.pdwSetMuted&&window.pdwSetMuted(false);true;');
+  const yt = playerHtml({ kind: 'youtube', id: 'dQw4w9WgXcQ', poster: '', url: '' }, { muted: true });
+  assert.match(yt, /enablejsapi=1&origin=https%3A%2F%2Fpdw\.zachlatta\.com/);
+  for (const src of [
+    { kind: 'youtube', id: 'dQw4w9WgXcQ', poster: '', url: '' },
+    { kind: 'vimeo', id: '76979871', url: '' },
+    { kind: 'tiktok', id: '6718335390845095173', url: '' },
+    { kind: 'file', url: 'https://e.com/a.mp4' },
+  ]) assert.match(playerHtml(src, { muted: true }), /window\.pdwSetMuted=function/);
+  assert.match(instagramPlayerScript({ muted: true }), /window\.pdwSetMuted=function/);
+});
