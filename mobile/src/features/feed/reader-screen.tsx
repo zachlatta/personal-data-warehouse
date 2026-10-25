@@ -14,7 +14,7 @@ import { formatWhen } from '@/lib/format';
 import { articleUrl } from './article';
 import { ArticleView, type ArticleOutcome } from './article-view';
 import { cardMedia } from './feed-card';
-import { feedItems, markActive, recordFeedEvent, recordUi, startTimer } from './engagement';
+import { feedItems, markActive, recordFeedEvent, recordUi, startTimer, takeOpenPaintMs } from './engagement';
 import { ScrollGestureTracker, scrollMetadata, type ScrollGesture } from './scroll-gestures';
 import { cardLinks } from './links';
 import { parseMarkdown, type Span } from './markdown';
@@ -146,6 +146,15 @@ export default function FeedReaderScreen() {
       };
     }, [item, position]),
   );
+
+  // The frame after the first layout is the first paint of this view.
+  const onFirstLayout = () => {
+    if (!item) return;
+    requestAnimationFrame(() => {
+      const ms = takeOpenPaintMs(item.item_id);
+      if (ms !== null) recordUi('open_paint', { item_id: item.item_id, position, dwell_ms: Math.round(ms) });
+    });
+  };
 
   const onScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     markActive();
@@ -279,6 +288,7 @@ export default function FeedReaderScreen() {
       />
       <ScrollView
         contentContainerStyle={styles.content}
+        onLayout={onFirstLayout}
         onScroll={onScroll}
         {...scrollHandlers}
         scrollEventThrottle={100}

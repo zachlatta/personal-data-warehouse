@@ -299,27 +299,30 @@ function FeedCardImpl({
               </View>
             ) : null}
             {extraLinks.length ? (
+              // One quiet line, not a stack: the first extra link, then a
+              // count that opens the detail view, which lists every link.
               <View style={styles.chips}>
-                {extraLinks.map((link) => (
+                <Pressable
+                  onPress={() => onBrowse(item, extraLinks[0])}
+                  accessibilityLabel={`Open ${extraLinks[0].label}`}
+                  style={({ pressed }) => [styles.chip, styles.flexShrink, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
+                  <Icon name="link" tintColor={ACCENT} size={13} />
+                  <ThemedText style={[styles.chipText, { color: theme.textSecondary }]} numberOfLines={1}>
+                    {extraLinks[0].label}
+                  </ThemedText>
+                </Pressable>
+                {extraLinks.length > 1 ? (
                   <Pressable
-                    key={link.index}
-                    onPress={() => onBrowse(item, link)}
-                    accessibilityLabel={`Open ${link.label}`}
+                    onPress={open}
+                    accessibilityLabel={`${extraLinks.length - 1} more links`}
                     style={({ pressed }) => [styles.chip, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
-                    <Icon name="link" tintColor={ACCENT} size={13} />
-                    <ThemedText style={[styles.chipText, { color: theme.textSecondary }]} numberOfLines={1}>
-                      {link.label}
-                    </ThemedText>
+                    <ThemedText style={[styles.chipText, { color: theme.textSecondary }]}>+{extraLinks.length - 1}</ThemedText>
                   </Pressable>
-                ))}
+                ) : null}
               </View>
             ) : null}
             <View style={styles.actions}>
               <LikeButton itemId={item.item_id} liked={liked} onPress={like} />
-              <Pressable hitSlop={10} onPress={open} accessibilityLabel="Details" style={[styles.action, styles.details]}>
-                <Icon name="text.bubble" tintColor={theme.textSecondary} size={19} />
-                <ThemedText style={[styles.actionText, { color: theme.textSecondary }]}>Details</ThemedText>
-              </Pressable>
               {item.url ? (
                 <Pressable hitSlop={10} onPress={() => onBrowse(item)} accessibilityLabel="Open page" style={styles.action}>
                   <Icon name="safari" tintColor={theme.textSecondary} size={19} />
@@ -392,13 +395,11 @@ const styles = StyleSheet.create({
   bold: { fontWeight: '700', marginTop: 0 },
   more: { paddingTop: 2, fontSize: 15, fontWeight: '600' },
   media: { marginTop: 10 },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingTop: Spacing.two },
-  chip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, maxWidth: '100%' },
+  chips: { flexDirection: 'row', gap: 6, paddingTop: Spacing.two },
+  chip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14 },
   chipText: { fontSize: 13, fontWeight: '500', flexShrink: 1, lineHeight: 17 },
   actions: { flexDirection: 'row', alignItems: 'center', marginLeft: -Spacing.two, paddingTop: 4 },
   action: { padding: Spacing.two, flexDirection: 'row', alignItems: 'center' },
-  details: { gap: 5 },
-  actionText: { fontSize: 13, fontWeight: '600', lineHeight: 17 },
   replying: { fontSize: 14, lineHeight: 19 },
   postText: { fontSize: 15, lineHeight: 20, marginTop: 2 },
   showMore: { fontSize: 15, color: ACCENT, marginTop: 2 },

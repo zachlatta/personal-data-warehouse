@@ -119,6 +119,21 @@ export function recordFeedEvent(type: FeedEventType, fields: Fields = {}) {
   if (q.size >= FLUSH_AT_SIZE) void q.flush();
 }
 
+// Tap to first paint for a card's detail view (Superhuman's 100 ms rule):
+// the feed notes when a card was tapped and the detail view reads it once,
+// when it first lays out, and records it as a ui "open_paint" event.
+let openTap: { itemId: string; at: number } | null = null;
+
+export function markOpenTap(itemId: string) {
+  openTap = { itemId, at: performance.now() };
+}
+
+export function takeOpenPaintMs(itemId: string): number | null {
+  const tap = openTap;
+  openTap = null;
+  return tap && tap.itemId === itemId ? performance.now() - tap.at : null;
+}
+
 /**
  * Any tap or gesture that is not already its own event type: the source
  * rail, the card menu, pull to refresh, Undo, the photo viewer's zoom.

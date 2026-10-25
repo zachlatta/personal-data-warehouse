@@ -36,6 +36,7 @@ import {
   feedItems,
   flushFeedEvents,
   markActive,
+  markOpenTap,
   recordFeedEvent,
   recordUi,
   startFeedSession,
@@ -484,7 +485,10 @@ export default function FeedScreen() {
   // A tap opens the card's detail view (the whole post, every photo, the
   // summary and all its links); the compass goes straight to the page.
   const onOpen = useCallback(
-    (item: FeedItem) => router.push({ pathname: '/feed/[id]', params: { id: item.item_id, position: String(position(item)) } }),
+    (item: FeedItem) => {
+      markOpenTap(item.item_id);
+      router.push({ pathname: '/feed/[id]', params: { id: item.item_id, position: String(position(item)) } });
+    },
     [router],
   );
 
