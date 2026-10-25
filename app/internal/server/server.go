@@ -136,7 +136,7 @@ var searchDescription = "FIRST tool for any text, topic, person, phrase, or iden
 	"Every hit carries priority, ref, source_table and source_pk: the context tool reads the conversation around a hit by its ref; source_table/source_pk reach the raw row."
 
 const contextDescription = "The conversation around one search hit, by the hit's ref: a Gmail hit returns its thread, a Slack hit its thread (or its channel when it is not in one), an iMessage/WhatsApp hit the rest of that chat, an agent-session turn its neighbouring turns, and anything else the neighbouring events of its stream. " +
-	"before/after are events either side (0-50, default 5). Each row carries adapter, event_id (adapter:event_id is that event's own ref, for a further hop), priority, event_ts, actor, title and snippet, oldest first. full=true returns each event's whole text instead of the snippet (up to 12,000 characters, with text_chars and a drill_sql that reads the source row) -- use it rather than writing SQL to read an email body or an agent turn."
+	"before/after are events either side (0-50, default 5). Each row carries adapter, event_id (adapter:event_id is that event's own ref, for a further hop), priority, occurred_at, actor, title and snippet, oldest first. full=true returns each event's whole text instead of the snippet (up to 12,000 characters, with text_chars and a drill_sql that reads the source row) -- use it rather than writing SQL to read an email body or an agent turn."
 
 const timelinePrioritySQLReminder = " For timeline.events attention or correspondence reads, add `priority IN ('self','direct','cc')`; use `priority = 'self'` for Zach's own acts, and omit the priority filter only for broad recall or when the relevant tier is unknown."
 

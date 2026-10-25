@@ -212,7 +212,7 @@ func TestDescribeTableAnswersTimelineSearchFunctions(t *testing.T) {
 		"max_results integer DEFAULT 50",
 		"sources text[] DEFAULT NULL",
 		"since timestamptz DEFAULT NULL",
-		"event_ts",
+		"occurred_at",
 		"source_table",
 	} {
 		if !strings.Contains(msg, want) {

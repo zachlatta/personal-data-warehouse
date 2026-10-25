@@ -24,7 +24,7 @@ func TestUndefinedColumnErrorListsEveryJoinedRelationsColumns(t *testing.T) {
 			describeColumnsSQL("timeline", "events"): {
 				Columns: []string{"name", "type"},
 				Rows: []map[string]any{
-					{"name": "event_ts", "type": "timestamp with time zone"},
+					{"name": "occurred_at", "type": "timestamp with time zone"},
 					{"name": "snippet", "type": "text"},
 				},
 			},
@@ -43,7 +43,7 @@ func TestUndefinedColumnErrorListsEveryJoinedRelationsColumns(t *testing.T) {
 	resp := svc.ExecuteFull(context.Background(), "Which timeline events came from Gmail?", sql, "csv")
 
 	for _, want := range []string{
-		"columns on timeline.events: event_ts, snippet",
+		"columns on timeline.events: occurred_at, snippet",
 		"columns on base_gmail.messages: message_id, from_address",
 	} {
 		if !strings.Contains(resp.Error, want) {
@@ -66,17 +66,17 @@ func TestUndefinedColumnErrorSkipsColumnListForManyRelations(t *testing.T) {
 	}
 }
 
-// timeline.events and the search functions describe the same events with
-// different column names, and agents mix them constantly: search hits carry
-// occurred_at/text, the table carries event_ts/snippet. The generic advice
-// ("column names differ per source") does not say that.
+// timeline.events and the search functions describe the same events, and
+// share the time column's name (occurred_at), but the preview is `text` on a
+// hit and `snippet` on the table. The generic advice ("column names differ
+// per source") does not say that.
 func TestTimelineEventsColumnHintDistinguishesTheSearchFunctionShape(t *testing.T) {
-	for _, column := range []string{"occurred_at", "text", "score"} {
+	for _, column := range []string{"text", "score"} {
 		hint := schemaErrorHint(
 			`ERROR: column "`+column+`" does not exist (SQLSTATE 42703)`,
 			"SELECT "+column+" FROM timeline.events ORDER BY 1 DESC LIMIT 5",
 		)
-		for _, want := range []string{"event_ts", "snippet", "timeline.search_text"} {
+		for _, want := range []string{"occurred_at", "snippet", "timeline.search_text"} {
 			if !strings.Contains(hint, want) {
 				t.Fatalf("hint for %q = %q, want it to name %q", column, hint, want)
 			}
@@ -406,5 +406,26 @@ func TestInventedQueueAndMailRelationsNameTheRealOnes(t *testing.T) {
 		if err := svc.DescribeTable(context.Background(), rel).Results[0].Error; !strings.Contains(err, want) {
 			t.Fatalf("describe_table(%q) = %q, want it to name %s", rel, err, want)
 		}
+	}
+}
+
+// event_ts was timeline.events' time column until 2026-10-25, so old
+// transcripts, notes and habit keep typing it. The hint names the rename on
+// every relation, not just the table.
+func TestTheRenamedEventTsColumnPointsAtOccurredAt(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT event_ts FROM timeline.events ORDER BY event_ts DESC LIMIT 5",
+		"SELECT event_ts FROM derived_search.chunks LIMIT 5",
+	} {
+		hint := schemaErrorHint(`ERROR: column "event_ts" does not exist (SQLSTATE 42703)`, sql)
+		if !strings.Contains(hint, "renamed occurred_at") {
+			t.Fatalf("hint for %q = %q, want it to name the rename", sql, hint)
+		}
+	}
+	// A search call gets the whole result contract instead, which names it too.
+	hint := schemaErrorHint(`ERROR: column "event_ts" does not exist (SQLSTATE 42703)`,
+		"SELECT event_ts, title FROM timeline.search_text('invoice', 10)")
+	if !strings.Contains(hint, "use occurred_at for time") {
+		t.Fatalf("search hint = %q, want it to name occurred_at", hint)
 	}
 }

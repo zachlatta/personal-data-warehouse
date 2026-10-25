@@ -62,7 +62,7 @@ function response(label) {
   return {
     total_rows: 1, mode: "keyword", priority_scope: "selected", selected_priorities: ["direct"],
     returned_priority_counts: { direct: 1 }, hint: label + " hint",
-    rows: [{ title: label, source: "gmail", priority: "direct", event_ts: "2026-09-01T12:00:00Z" }],
+    rows: [{ title: label, source: "gmail", priority: "direct", occurred_at: "2026-09-01T12:00:00Z" }],
   };
 }
 

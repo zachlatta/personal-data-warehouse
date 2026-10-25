@@ -8,6 +8,12 @@ TABLES = ("notification_state", "notification_events", "notification_deliveries"
 
 
 def ensure_notification_tables(warehouse):
+    # CREATE OR REPLACE VIEW cannot drop a column: the view exposed event_ts
+    # (beside occurred_at for one deploy) until 2026-10-25.
+    if warehouse._relation_exists("marts_notifications") and "event_ts" in warehouse._present_columns(
+        "marts_notifications"
+    ):
+        warehouse._command("DROP VIEW @marts_notifications")
     for statement in STATEMENTS:
         warehouse._command(statement)
     for logical in (*TABLES, "capture_timeline_notification", "marts_notifications", "marts_notification_deliveries", "marts_notification_health"):
@@ -38,8 +44,8 @@ def ensure_notification_tables(warehouse):
 NOTIFICATION_TRIGGER_WHEN = "WHEN ((new.priority = 'direct'::"
 
 
-# Reads timeline.events by column name, so the event_ts -> occurred_at rename
-# replaces it in the rename's own transaction (postgres.py) as well as here.
+# Reads timeline.events by column name, so the event_ts -> occurred_at
+# migration replaces it in its own transaction (postgres.py) as well as here.
 CAPTURE_FUNCTION_SQL = """CREATE OR REPLACE FUNCTION @capture_timeline_notification() RETURNS trigger
     LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled = 1 FROM @notification_state WHERE id = 'timeline' FOR SHARE) THEN
@@ -123,14 +129,13 @@ STATEMENTS = (
     CAPTURE_FUNCTION_SQL,
     """CREATE OR REPLACE VIEW @marts_notifications AS
         SELECT id, adapter, event_id, source, priority,
-               NULLIF(event_ts,'epoch'::timestamptz) AS event_ts,
+               -- The timeline's time column name; the outbox's own column
+               -- is still event_ts.
+               NULLIF(event_ts,'epoch'::timestamptz) AS occurred_at,
                NULLIF(landed_at,'epoch'::timestamptz) AS landed_at,
                NULLIF(created_at,'epoch'::timestamptz) AS created_at,
                payload->>'actor' AS actor, payload->>'title' AS title,
-               payload->>'snippet' AS snippet, status,
-               -- The timeline's time column name; event_ts above is dropped
-               -- once the app reads this one.
-               NULLIF(event_ts,'epoch'::timestamptz) AS occurred_at
+               payload->>'snippet' AS snippet, status
         FROM @notification_events""",
     """CREATE OR REPLACE VIEW @marts_notification_deliveries AS
         SELECT id, notification_id, device_id, transport, status, attempt_count,

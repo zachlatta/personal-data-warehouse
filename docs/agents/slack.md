@@ -170,7 +170,7 @@ reproduces the whole round trip.
 
 **Landing latency is now a column, judged for DMs.** `marts_ops.slack_conversation_health`
 carries `landing_p50_seconds` / `landing_p95_seconds` (over messages written in the last
-24 hours, `timeline.events.first_seen_at - event_ts`) and `landing_status`, folded into
+24 hours, `timeline.events.first_seen_at - occurred_at`) and `landing_status`, folded into
 `status` as the worst-of — but only for `im` and `mpim`, against
 `SLACK_DM_LANDING_P95_SECONDS` (15 min ok, 60 min late, else stale). Measured 2026-08-28
 while every other Slack health number read `ok`: 1:1 DMs p50 3.5 min / p95 62 min, group

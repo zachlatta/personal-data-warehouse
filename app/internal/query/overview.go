@@ -28,7 +28,7 @@ import (
 // curated, never inferred: the names diverge per source and picking the wrong
 // timestamptz silently answers a different question than the caller asked.
 var overviewTimeColumns = map[string]string{
-	"timeline.events":                 "event_ts",
+	"timeline.events":                 "occurred_at",
 	"base_apple_photos.files":         "captured_at",
 	"derived_photos.assets":           "capture_ts",
 	"base_plaid.transactions":         "posted_at",
@@ -268,11 +268,10 @@ var overviewPreamble = `--
 --                                                   never post-filter search_text() with ILIKE.
 --   both take (query, max_results, sources => ARRAY['slack','gmail'], since => '2026-03-01',
 --   priorities => ARRAY['self','direct']) and return (source, subsource, context, who,
---   occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk,
---   priority). ` + "`priorities`" + ` scopes to the attention tiers on timeline.events — ` + warehouse.TimelinePriorityParentheticalDefinitions() + ` — and is pushed into every scan, so a narrow tier still gets a full
+--   occurred_at, account, ref, text, score, title, source_table, source_pk, priority). ` + "`priorities`" + ` scopes to the attention tiers on timeline.events — ` + warehouse.TimelinePriorityParentheticalDefinitions() + ` — and is pushed into every scan, so a narrow tier still gets a full
 --   top-k. Omit it (or pass an empty array) for every tier; an unknown token raises listing
 --   the valid set. The ` + "`text`" + ` preview is windowed around the
---   first matched term. event_ts = occurred_at (same value, both names accepted downstream).
+--   first matched term. occurred_at is the time column here and on timeline.events alike.
 --   A hit carries its own drill-down: source_table + source_pk point at the source relation
 --   (source_table is the catalog id, e.g. gmail_messages, not a SQL name; this listing shows
 --   which schema each one lives in). Read the conversation around a hit with

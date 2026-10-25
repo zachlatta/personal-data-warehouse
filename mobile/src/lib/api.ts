@@ -55,7 +55,7 @@ export type TimelineItem = {
   source: string;
   kind: string;
   priority: Priority;
-  event_ts: string;
+  occurred_at: string;
   end_ts: string | null;
   actor: string;
   title: string;
@@ -357,7 +357,6 @@ export type SearchHit = {
   ref: string;
   text: string;
   score?: number;
-  event_ts?: string;
   title?: string;
   source_table?: string;
   source_pk?: Record<string, unknown> | string;

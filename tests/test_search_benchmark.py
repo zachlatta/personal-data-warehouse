@@ -31,7 +31,7 @@ from personal_data_warehouse.search_benchmark import (
 
 def _row(ref: str, *, source: str = "gmail", context: str = "", ts: str = "2026-05-01T00:00:00Z",
          title: str = "", text: str = "") -> ResultRow:
-    return ResultRow(ref=ref, source=source, context=context, event_ts=ts, title=title, text=text)
+    return ResultRow(ref=ref, source=source, context=context, occurred_at=ts, title=title, text=text)
 
 
 class TestPredicateMatching:
@@ -144,7 +144,7 @@ class TestParseSearchPayload:
             "selected_priorities": ["self", "direct", "cc"],
             "returned_priority_counts": {"self": 1},
             "fallback_reason": "",
-            "rows": [{"ref": "a:1", "source": "gmail", "event_ts": "2026-01-01T00:00:00Z",
+            "rows": [{"ref": "a:1", "source": "gmail", "occurred_at": "2026-01-01T00:00:00Z",
                       "title": "t", "text": "b", "context": "c", "priority": "self"}],
         }
         result = parse_search_payload(json.dumps(payload))

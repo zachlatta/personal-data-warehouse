@@ -55,7 +55,7 @@ export function mount(container, ctx) {
   function hitRow(hit, index, isCurrent) {
     const row = h("div", "row p-" + (hit.priority || "unclassified"));
     row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
-    const when = hit.event_ts || hit.occurred_at;
+    const when = hit.occurred_at;
     row.appendChild(h("div", "t", dayOf(when).slice(5) + " " + fmtTime(when)));
     const tick = h("div", "tick"); tick.style.background = hue(hit.source); row.appendChild(tick);
     const who = h("div", "who");

@@ -7,9 +7,9 @@ result, a 60-second statement budget. Every statement carries a plain-English
 {{if .CLI -}}
 ```sh
 pdw sql --output json -q 'newest attention events today' \
-  "SELECT event_ts, priority, source, actor, title FROM timeline.events
-   WHERE priority IN ('self','direct','cc') AND event_ts >= now() - interval '1 day'
-   ORDER BY event_ts DESC LIMIT 50"
+  "SELECT occurred_at, priority, source, actor, title FROM timeline.events
+   WHERE priority IN ('self','direct','cc') AND occurred_at >= now() - interval '1 day'
+   ORDER BY occurred_at DESC LIMIT 50"
 pdw sql -q 'why' --file query.sql      # multi-line SQL from a file
 pdw sql -q 'why' < query.sql           # or stdin; both avoid shell quoting
 ```
@@ -20,7 +20,7 @@ stay clean on stdout.
 {{- else -}}
 ```json
 {"queries": [{"question": "newest attention events today",
-              "sql": "SELECT event_ts, priority, source, actor, title FROM timeline.events WHERE priority IN ('self','direct','cc') AND event_ts >= now() - interval '1 day' ORDER BY event_ts DESC LIMIT 50"}],
+              "sql": "SELECT occurred_at, priority, source, actor, title FROM timeline.events WHERE priority IN ('self','direct','cc') AND occurred_at >= now() - interval '1 day' ORDER BY occurred_at DESC LIMIT 50"}],
  "format": "json"}
 ```
 
@@ -82,7 +82,7 @@ A slow query is answered by making it cheaper: the search functions instead of a
 scan, a `LIMIT`, an indexed time bound, a `sources` scope. A pattern match (`ILIKE`,
 `~`, `regexp_*`, `position()`) over a `base_*` table with no `timeline.` reference is the
 shape behind every timeout in a fortnight of sessions, and the tool warns before running
-it. `timeline.events` is ~50M rows: bound it by `event_ts` and `priority`, and never
+it. `timeline.events` is ~50M rows: bound it by `occurred_at` and `priority`, and never
 `count(*)` it — the row estimate in the schema overview is the sizing number.
 
 ## Row-count and freshness questions

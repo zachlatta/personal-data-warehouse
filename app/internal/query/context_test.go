@@ -10,7 +10,7 @@ func TestContextReadsTimelineContextWithBoundParameters(t *testing.T) {
 	runner := &fakeSearchRunner{
 		argsResults: map[string]RawResult{
 			contextSQL: {
-				Columns: []string{"adapter", "event_id", "priority", "event_ts", "actor", "title", "snippet"},
+				Columns: []string{"adapter", "event_id", "priority", "occurred_at", "actor", "title", "snippet"},
 				Rows: []map[string]any{
 					{"adapter": "slack_message", "event_id": "zrl|T|C|1.0", "priority": "direct", "actor": "sam", "snippet": "hi"},
 				},
@@ -61,7 +61,7 @@ func TestContextFullReturnsEachEventsWholeTextUpToACapAndItsDrill(t *testing.T) 
 	runner := &fakeSearchRunner{
 		argsResults: map[string]RawResult{
 			contextFullSQL: {
-				Columns: []string{"adapter", "event_id", "priority", "event_ts", "actor", "title", "text", "text_chars", "source_table", "source_pk"},
+				Columns: []string{"adapter", "event_id", "priority", "occurred_at", "actor", "title", "text", "text_chars", "source_table", "source_pk"},
 				Rows: []map[string]any{{
 					"adapter": "agent_session_turn", "event_id": "codex|s1|54", "priority": "background", "actor": "assistant",
 					"text": "the whole turn", "text_chars": int64(14), "source_table": "ai_conversation_events",

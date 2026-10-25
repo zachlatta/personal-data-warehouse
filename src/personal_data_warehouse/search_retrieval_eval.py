@@ -108,7 +108,7 @@ def _row_key(item: dict[str, Any]) -> str:
     if isinstance(ref, str) and ref:
         return canonical_ref(ref)
     source = item.get("source")
-    occurred_at = item.get("occurred_at") or item.get("event_ts")
+    occurred_at = item.get("occurred_at")
     if isinstance(source, str) and source and isinstance(occurred_at, str) and occurred_at:
         return f"event:{source}|{occurred_at}"
     return ""

@@ -76,13 +76,13 @@ function ConversationCard({
         </ThemedText>
       </Pressable>
       {page.items.map((row, index) => {
-        const showDay = index === 0 || dayOf(page.items[index - 1].event_ts) !== dayOf(row.event_ts);
+        const showDay = index === 0 || dayOf(page.items[index - 1].occurred_at) !== dayOf(row.occurred_at);
         const text = cleanSnippet(row.snippet || (row.title ? '' : `(${row.kind.replace(/_/g, ' ')})`));
         return (
           <View key={`${row.adapter}|${row.event_id}`}>
             {showDay ? (
               <ThemedText type="small" themeColor="textSecondary" style={styles.convoDay}>
-                {dayLabel(row.event_ts)}
+                {dayLabel(row.occurred_at)}
               </ThemedText>
             ) : null}
             <Pressable
@@ -99,7 +99,7 @@ function ConversationCard({
                   {row.title && row.title !== row.snippet ? `  ·  ${row.title}` : ''}
                 </ThemedText>
                 <ThemedText type="small" themeColor="textSecondary">
-                  {formatWhen(row.event_ts)}
+                  {formatWhen(row.occurred_at)}
                 </ThemedText>
               </View>
               {text ? <ThemedText selectable>{text}</ThemedText> : null}
@@ -200,7 +200,7 @@ export default function TimelineItemScreen() {
             {item.actor || humanSource(item.source)}
           </ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
-            {formatWhen(item.event_ts)}
+            {formatWhen(item.occurred_at)}
           </ThemedText>
         </View>
         <View style={styles.headerRow}>

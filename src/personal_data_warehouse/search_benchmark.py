@@ -81,14 +81,14 @@ class ResultRow:
     ref: str
     source: str = ""
     context: str = ""
-    event_ts: str = ""
+    occurred_at: str = ""
     title: str = ""
     text: str = ""
     priority: str = ""
 
     @property
     def timestamp(self) -> datetime | None:
-        return parse_timestamp(self.event_ts)
+        return parse_timestamp(self.occurred_at)
 
     @property
     def haystack(self) -> str:
@@ -242,7 +242,7 @@ def parse_search_payload(raw: str) -> SearchResult:
                 ref=str(item.get("ref") or ""),
                 source=str(item.get("source") or ""),
                 context=str(item.get("context") or ""),
-                event_ts=str(item.get("event_ts") or item.get("occurred_at") or ""),
+                occurred_at=str(item.get("occurred_at") or ""),
                 title=str(item.get("title") or ""),
                 text=str(item.get("text") or ""),
                 priority=str(item.get("priority") or ""),
@@ -494,7 +494,7 @@ def run_search(
 
 
 def resolve_truth_metadata(refs: Sequence[str]) -> dict[str, tuple[str, str, datetime]]:
-    """Look up (source, context, event_ts) for each labeled ref.
+    """Look up (source, context, occurred_at) for each labeled ref.
 
     Also proves the labels still point at live rows: an unresolved ref is a
     stale label, not a retrieval failure, and must not be scored as one.

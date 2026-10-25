@@ -124,7 +124,7 @@ func overviewRunner() *recordingRunner {
 				{"schema": "gmail", "name": "messages", "column_count": int64(31), "time_columns": "internal_date,ingested_at"},
 				{"schema": "marts_inbox", "name": "gmail_threads", "column_count": int64(12), "time_columns": ""},
 				{"schema": "slack", "name": "messages", "column_count": int64(26), "time_columns": "message_datetime,ingested_at"},
-				{"schema": "timeline", "name": "events", "column_count": int64(19), "time_columns": "event_ts,end_ts,ingest_ts"},
+				{"schema": "timeline", "name": "events", "column_count": int64(19), "time_columns": "occurred_at,end_ts,ingest_ts"},
 				// Two plausible event times and no curated entry: the overview must
 				// say so rather than pick one.
 				{"schema": "whoop", "name": "workouts", "column_count": int64(25), "time_columns": "start_at,end_at,synced_at"},
@@ -143,7 +143,7 @@ func overviewRunner() *recordingRunner {
 			Columns: []string{"name", "type"},
 			Rows: []map[string]any{
 				{"name": "adapter", "type": "text"},
-				{"name": "event_ts", "type": "timestamp with time zone"},
+				{"name": "occurred_at", "type": "timestamp with time zone"},
 				{"name": "source_pk", "type": "jsonb"},
 			},
 		},
@@ -192,7 +192,7 @@ func TestSchemaOverviewListsRelationsWithKeysAndTimeColumns(t *testing.T) {
 		"view",
 		// timeline.events keeps its columns inline; nothing else does.
 		"timeline.events — full column catalog",
-		"adapter (text),event_ts (timestamp with time zone),source_pk (jsonb)",
+		"adapter (text),occurred_at (timestamp with time zone),source_pk (jsonb)",
 	} {
 		if !strings.Contains(result.CSV, want) {
 			t.Fatalf("schema overview missing %q in:\n%s", want, result.CSV)
@@ -479,7 +479,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			message: `ERROR: column "snippet" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT snippet FROM timeline.search_text('invoice', 20)",
 			want: []string{
-				"source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority",
+				"source, subsource, context, who, occurred_at, account, ref, text, score, title, source_table, source_pk, priority",
 				"matched preview",
 				"timeline.context",
 			},
@@ -552,7 +552,7 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "hybrid search wrong column returns the shared result contract",
 			message: `ERROR: column "snippet" does not exist (SQLSTATE 42703)`,
 			sql:     "SELECT snippet FROM timeline.search_hybrid('invoice', '[0.1]', 'model')",
-			want:    []string{"timeline.search_hybrid() returns exactly", "event_ts", "source_pk"},
+			want:    []string{"timeline.search_hybrid() returns exactly", "occurred_at", "source_pk"},
 		},
 		{
 			// Pipeline-debugging sessions get pointed at ops.* sync state by the
@@ -889,12 +889,12 @@ func TestGmailBodyHintPointsAtTheCleanColumn(t *testing.T) {
 
 func TestTimelineEventsHintAsksForAnExplicitPriorityDecision(t *testing.T) {
 	cases := map[string]bool{
-		"SELECT event_ts, title FROM timeline.events ORDER BY event_ts DESC LIMIT 20": true,
-		"SELECT count(*) FROM \"timeline\".\"events\"":                                true,
-		"SELECT * FROM timeline.events WHERE priority IN ('self', 'direct', 'cc')":    false,
-		"SELECT * FROM timeline.events e WHERE e.priority = ANY(ARRAY['noise'])":      false,
-		"SELECT * FROM timeline.search_text('budget', priorities => ARRAY['self'])":   false,
-		"SELECT * FROM marts_messages.messages":                                       false,
+		"SELECT occurred_at, title FROM timeline.events ORDER BY occurred_at DESC LIMIT 20": true,
+		"SELECT count(*) FROM \"timeline\".\"events\"":                                      true,
+		"SELECT * FROM timeline.events WHERE priority IN ('self', 'direct', 'cc')":          false,
+		"SELECT * FROM timeline.events e WHERE e.priority = ANY(ARRAY['noise'])":            false,
+		"SELECT * FROM timeline.search_text('budget', priorities => ARRAY['self'])":         false,
+		"SELECT * FROM marts_messages.messages":                                             false,
 	}
 	for sql, want := range cases {
 		got := timelinePriorityHint(sql) != ""
@@ -911,9 +911,9 @@ func TestTimelineEventsHintAsksForAnExplicitPriorityDecision(t *testing.T) {
 }
 
 func TestExecuteFullReturnsTimelinePriorityHintBeforeRunning(t *testing.T) {
-	const sql = "SELECT event_ts FROM timeline.events ORDER BY event_ts DESC LIMIT 5"
+	const sql = "SELECT occurred_at FROM timeline.events ORDER BY occurred_at DESC LIMIT 5"
 	runner := fakeRunner{results: map[string]RawResult{
-		sql: {Columns: []string{"event_ts"}, Rows: []map[string]any{}},
+		sql: {Columns: []string{"occurred_at"}, Rows: []map[string]any{}},
 	}}
 	svc := NewService(runner, Options{MaxRows: 5, MaxFieldChars: 200})
 

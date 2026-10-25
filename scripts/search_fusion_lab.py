@@ -234,7 +234,7 @@ REF_META = Path(".search-eval/fusion_ref_meta.json")
 def load_ref_meta(refs: set[str]) -> dict[str, ResultRow]:
     cached: dict[str, list[str]] = json.loads(REF_META.read_text()) if REF_META.exists() else {}
     out: dict[str, ResultRow] = {
-        r: ResultRow(ref=r, source=v[0], context=v[1], event_ts=v[2])
+        r: ResultRow(ref=r, source=v[0], context=v[1], occurred_at=v[2])
         for r, v in cached.items() if r in refs
     }
     refs = sorted(r for r in refs if r not in cached)
@@ -247,12 +247,12 @@ def load_ref_meta(refs: set[str]) -> dict[str, ResultRow]:
             "fusion lab: resolve candidate refs for soft matching",
             f"WITH want(adapter, event_id) AS (VALUES {values}) "
             "SELECT e.adapter||':'||e.event_id AS ref, e.source, coalesce(e.context,'') AS context, "
-            "e.event_ts FROM timeline.events e JOIN want w ON w.adapter=e.adapter AND w.event_id=e.event_id",
+            "e.occurred_at FROM timeline.events e JOIN want w ON w.adapter=e.adapter AND w.event_id=e.event_id",
         )
         for r in rows:
             out[r["ref"]] = ResultRow(ref=r["ref"], source=r["source"], context=r["context"],
-                                      event_ts=str(r["event_ts"]))
-            cached[r["ref"]] = [r["source"], r["context"], str(r["event_ts"])]
+                                      occurred_at=str(r["occurred_at"]))
+            cached[r["ref"]] = [r["source"], r["context"], str(r["occurred_at"])]
     REF_META.write_text(json.dumps(cached))
     return out
 

@@ -193,7 +193,7 @@ func describeFunction(relation string) string {
 		return ""
 	}
 	header := "# timeline." + name + "\n\n"
-	searchReturns := "returns SETOF (" + searchHitColumns + ") — use occurred_at (or its mirror event_ts) for time, text for the matched preview; source_table + source_pk drill to the source row"
+	searchReturns := "returns SETOF (" + searchHitColumns + ") — use occurred_at for time, text for the matched preview; source_table + source_pk drill to the source row"
 	switch name {
 	case "search_text":
 		return header + "timeline.search_text is a function, not a relation: timeline.search_text(query text, max_results integer DEFAULT 50, sources text[] DEFAULT NULL, since timestamptz DEFAULT NULL, priorities text[] DEFAULT NULL) " + searchReturns + ". Ranked BM25 keyword search; call timeline.search_text_sources() for the valid source tokens."

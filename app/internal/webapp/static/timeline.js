@@ -142,13 +142,13 @@ export function mount(container, ctx) {
   function appendItems(items) {
     const rowsNode = el("rows");
     items.forEach((item, index) => {
-      const day = dayOf(item.event_ts);
+      const day = dayOf(item.occurred_at);
       if (day !== state.lastDay) {
         state.lastDay = day;
         const head = h("div", "day");
         head.appendChild(h("span", "d", day));
         let weekday = "";
-        try { weekday = WEEKDAYS[new Date(item.event_ts).getDay()]; } catch (e) { /* unknown day */ }
+        try { weekday = WEEKDAYS[new Date(item.occurred_at).getDay()]; } catch (e) { /* unknown day */ }
         head.appendChild(h("span", "w", weekday));
         head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
@@ -265,7 +265,7 @@ export function mount(container, ctx) {
 export function rowNode(item, index, onClick) {
   const row = h("div", "row p-" + (item.priority || "unclassified"));
   row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
-  row.appendChild(h("div", "t", fmtTime(item.event_ts)));
+  row.appendChild(h("div", "t", fmtTime(item.occurred_at)));
   const tick = h("div", "tick");
   tick.style.background = hue(item.source);
   row.appendChild(tick);

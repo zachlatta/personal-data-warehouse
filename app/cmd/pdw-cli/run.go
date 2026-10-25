@@ -197,7 +197,7 @@ EXAMPLES
   pdw sql 'SELECT 1'
   pdw sql -q 'How many rows?' 'SELECT count(*) FROM base_gmail.messages'
   pdw sql --output json -q 'What time is it?' 'SELECT now()'
-  pdw sql -q 'Read a Gmail thread' "SELECT event_ts, actor, snippet FROM timeline.context('<ref>', 5, 5)"
+  pdw sql -q 'Read a Gmail thread' "SELECT occurred_at, actor, snippet FROM timeline.context('<ref>', 5, 5)"
   pdw sql --no-timeout -q 'Run a long query' 'SELECT ...'
   pdw sql -q 'Find calendar transcripts mentioning Vercel' --file query.sql
   pdw sql -q 'Recent Slack messages in a channel' < query.sql

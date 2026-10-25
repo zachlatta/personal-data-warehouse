@@ -46,7 +46,7 @@ than paging deeper.
   on common words makes the ranked scan walk past every older match, and it times out
   (0.46s unscoped against past 60s with three days, 2026-10-10). Pair a recent `since`
   with `sources` or `priorities`, or use distinctive words; for "what happened this
-  week" read `timeline.events` by `event_ts` instead of searching.
+  week" read `timeline.events` by `occurred_at` instead of searching.
 - `max_results` — default 20. Raise it for recall work only; a scoped search pays per
   returned row.
 
@@ -76,7 +76,7 @@ SELECT * FROM timeline.search_text('offer letter', 20, since => '2026-01-01');
 
 The named parameters are exactly `max_results`, `sources`, `since` and `priorities`; any
 other name raises. Hits carry `occurred_at` and a `text` preview windowed around the
-first matched term (`timeline.events` itself uses `event_ts` and `snippet`).
+first matched term (`timeline.events` uses the same `occurred_at`, and `snippet` for the preview).
 `timeline.search_hybrid` exists in the schema but is **not callable from plain SQL** — it
 takes a precomputed query embedding only the app can produce (calling it with text fails
 with 42883). Hybrid retrieval from SQL does not exist; use {{if .CLI}}`pdw search`{{else}}the `search` tool{{end}}.

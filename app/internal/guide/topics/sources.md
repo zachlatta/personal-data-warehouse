@@ -222,7 +222,7 @@ or tool call). Search scope `agent_session` with priorities `self,background`. T
 
 ## Timeline
 
-`timeline.events` columns worth knowing: `event_ts`, `priority`, `source`, `adapter`,
+`timeline.events` columns worth knowing: `occurred_at`, `priority`, `source`, `adapter`,
 `kind`, `actor`, `title`, `snippet`, `context` (a display label — not the conversation
 identity for Gmail or Slack group DMs), `source_table` + `source_pk` (the one-hop drill
 down), `metadata` (per-source extras), `seq` (monotonic change order, for consuming the

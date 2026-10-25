@@ -43,8 +43,8 @@ func TestContextUnknownFlagNamesContext(t *testing.T) {
 func TestContextFullPrintsEachEventsWholeText(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"ref":"agent_session_turn:codex|s|5","before":0,"after":1,"total_rows":2,"rows":[`+
-			`{"adapter":"agent_session_turn","event_id":"codex|s|5","priority":"self","event_ts":"2026-10-01T10:00:00Z","actor":"user","title":"","text":"line one\nline two of the whole prompt","text_chars":29},`+
-			`{"adapter":"agent_session_turn","event_id":"codex|s|6","priority":"background","event_ts":"2026-10-01T10:01:00Z","actor":"assistant","title":"","text":"a long answer","text_chars":20000,"drill_sql":"SELECT * FROM marts_ai_conversations.events WHERE event_uuid = 'u6' AND session_id = 's' AND source = 'codex'"}]}}`)
+			`{"adapter":"agent_session_turn","event_id":"codex|s|5","priority":"self","occurred_at":"2026-10-01T10:00:00Z","actor":"user","title":"","text":"line one\nline two of the whole prompt","text_chars":29},`+
+			`{"adapter":"agent_session_turn","event_id":"codex|s|6","priority":"background","occurred_at":"2026-10-01T10:01:00Z","actor":"assistant","title":"","text":"a long answer","text_chars":20000,"drill_sql":"SELECT * FROM marts_ai_conversations.events WHERE event_uuid = 'u6' AND session_id = 's' AND source = 'codex'"}]}}`)
 	})
 	out, stderr, code := runCLI(t, srv.URL, "", "context", "agent_session_turn:codex|s|5", "--full", "-b", "0", "-a", "1")
 	if code != 0 {

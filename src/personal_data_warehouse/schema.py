@@ -2443,8 +2443,8 @@ GOOGLE_DRIVE_FILE_TEXT_COLUMNS = (
 # warehouse (see personal_data_warehouse/timeline.py). `seq` is assigned from
 # the timeline_events_seq sequence and bumped on every content change, giving
 # consumers a durable "what's new since I last looked" arrival order.
-# `event_ts` is not listed: it is the virtual alias of `occurred_at` that
-# PostgresWarehouse._rename_event_ts_to_occurred_at leaves for one deploy.
+# The time column was `event_ts` until 2026-10-25;
+# PostgresWarehouse._migrate_event_ts_to_occurred_at moves a live table over.
 TIMELINE_EVENT_COLUMNS = (
     "adapter",
     "event_id",

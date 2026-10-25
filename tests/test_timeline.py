@@ -4263,12 +4263,22 @@ def _time_column_kinds(wh: PostgresWarehouse, table: str) -> dict[str, str]:
     )
 
 
-def _restore_pre_rename_shape(wh: PostgresWarehouse) -> None:
-    """Put the tables back to how production has them before the rename."""
+def _restore_old_shape(wh: PostgresWarehouse, shape: str) -> None:
+    """Put the tables back to a shape production has had.
+
+    ``stored``: before the rename, the time column was event_ts.
+    ``alias``: after the rename's first deploy, occurred_at plus a virtual
+    event_ts alias.
+    """
     for table in _RENAMED_TIME_TABLES:
         relation = wh.sql_relation(table)
-        wh._command(f"ALTER TABLE {relation} DROP COLUMN IF EXISTS event_ts")
-        wh._command(f"ALTER TABLE {relation} RENAME COLUMN occurred_at TO event_ts")
+        if shape == "stored":
+            wh._command(f"ALTER TABLE {relation} RENAME COLUMN occurred_at TO event_ts")
+        else:
+            wh._command(
+                f"ALTER TABLE {relation} ADD COLUMN event_ts timestamptz "
+                "GENERATED ALWAYS AS (occurred_at) VIRTUAL"
+            )
 
 
 def _relation_files(wh: PostgresWarehouse) -> dict[str, int]:
@@ -4294,36 +4304,31 @@ def _relation_files(wh: PostgresWarehouse) -> dict[str, int]:
     return files
 
 
-def test_timeline_time_column_is_occurred_at_with_a_virtual_event_ts_alias(warehouse):
+def test_timeline_time_column_is_occurred_at_and_only_occurred_at(warehouse):
     warehouse.ensure_search_index_tables()
     warehouse.ensure_timeline_tables()
     for table in _RENAMED_TIME_TABLES:
-        assert _time_column_kinds(warehouse, table) == {"occurred_at": "", "event_ts": "v"}, table
+        assert _time_column_kinds(warehouse, table) == {"occurred_at": ""}, table
     warehouse._command(
         "INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table, priority) "
         "VALUES ('t', 'e1', 's', 'k', '2026-10-25 12:00:00+00', 'x', 'self')"
     )
-    assert warehouse._query(
-        "SELECT occurred_at, event_ts FROM @timeline_events WHERE event_id = 'e1'"
-    ) == [(datetime(2026, 10, 25, 12, tzinfo=UTC),) * 2]
-    comments = dict(
-        warehouse._query(
-            "SELECT attname, col_description(attrelid, attnum) FROM pg_attribute "
-            "WHERE attrelid = %s::regclass AND attname IN ('event_ts', 'occurred_at')",
-            (warehouse.sql_relation("timeline_events"),),
-        )
-    )
-    assert "search function" in comments["occurred_at"]
-    assert "Deprecated alias of occurred_at" in comments["event_ts"]
-    # The alias is expanded to occurred_at at plan time, so a reader still
-    # filtering on event_ts keeps the time index.
+    assert warehouse._query("SELECT occurred_at FROM @timeline_events WHERE event_id = 'e1'") == [
+        (datetime(2026, 10, 25, 12, tzinfo=UTC),)
+    ]
+    comment = warehouse._query(
+        "SELECT col_description(attrelid, attnum) FROM pg_attribute "
+        "WHERE attrelid = %s::regclass AND attname = 'occurred_at'",
+        (warehouse.sql_relation("timeline_events"),),
+    )[0][0]
+    assert "search function" in comment and "event_ts" in comment
     warehouse._command("SET enable_seqscan = off")
     try:
         plan = "\n".join(
             row[0]
             for row in warehouse._query(
                 "EXPLAIN SELECT event_id FROM @timeline_events "
-                "WHERE event_ts >= now() - interval '1 day' ORDER BY event_ts DESC LIMIT 5"
+                "WHERE occurred_at >= now() - interval '1 day' ORDER BY occurred_at DESC LIMIT 5"
             )
         )
     finally:
@@ -4331,10 +4336,11 @@ def test_timeline_time_column_is_occurred_at_with_a_virtual_event_ts_alias(wareh
     assert "timeline_events_time_idx" in plan, plan
 
 
-def test_renaming_event_ts_rewrites_no_file_and_resets_no_backfill(warehouse):
-    """Production's 83 GB timeline is renamed in place: PostgreSQL 18 keeps the
-    heap, its TOAST table and every index (BM25 included) on their files, and
-    nothing the sync engine keys on moves."""
+@pytest.mark.parametrize("shape", ["stored", "alias"])
+def test_moving_to_occurred_at_rewrites_no_file_and_resets_no_backfill(warehouse, shape):
+    """Production's 83 GB timeline moves in place, from either shape it has
+    had: PostgreSQL 18 keeps the heap, its TOAST table and every index (BM25
+    included) on their files, and nothing the sync engine keys on moves."""
     warehouse.ensure_search_index_tables()
     warehouse.ensure_timeline_tables()
     assert warehouse.pgvector_available()
@@ -4361,10 +4367,10 @@ def test_renaming_event_ts_rewrites_no_file_and_resets_no_backfill(warehouse):
         "INSERT INTO @timeline_sync_state (adapter, adapter_signature, backfill_done) "
         "VALUES ('t', 'pinned-signature', 1)"
     )
-    _restore_pre_rename_shape(warehouse)
     before_rows = warehouse._query(
-        "SELECT event_id, event_ts, seq, updated_at FROM @timeline_events ORDER BY event_id"
+        "SELECT event_id, occurred_at, seq, updated_at FROM @timeline_events ORDER BY event_id"
     )
+    _restore_old_shape(warehouse, shape)
     before_state = warehouse._query("SELECT * FROM @timeline_sync_state ORDER BY adapter")
     before_files = _relation_files(warehouse)
 
@@ -4373,37 +4379,34 @@ def test_renaming_event_ts_rewrites_no_file_and_resets_no_backfill(warehouse):
 
     assert _relation_files(warehouse) == before_files
     for table in _RENAMED_TIME_TABLES:
-        assert _time_column_kinds(warehouse, table) == {"occurred_at": "", "event_ts": "v"}, table
+        assert _time_column_kinds(warehouse, table) == {"occurred_at": ""}, table
     assert warehouse._query(
         "SELECT event_id, occurred_at, seq, updated_at FROM @timeline_events ORDER BY event_id"
     ) == before_rows
     assert warehouse._query("SELECT * FROM @timeline_sync_state ORDER BY adapter") == before_state
-    assert warehouse._query(
-        "SELECT count(*) FROM @timeline_events WHERE event_ts IS DISTINCT FROM occurred_at"
-    ) == [(0,)]
 
-    # Once renamed, ensure issues no further ALTER: the alias's catalog row
-    # is untouched by a second pass.
-    def alias_xmin() -> list[tuple]:
+    # Once moved, ensure issues no further ALTER: the column's catalog row is
+    # untouched by a second pass.
+    def column_xmin() -> list[tuple]:
         return warehouse._query(
-            "SELECT xmin::text FROM pg_attribute WHERE attrelid = %s::regclass AND attname = 'event_ts'",
+            "SELECT xmin::text FROM pg_attribute WHERE attrelid = %s::regclass AND attname = 'occurred_at'",
             (warehouse.sql_relation("timeline_events"),),
         )
 
-    first = alias_xmin()
+    first = column_xmin()
     warehouse.ensure_timeline_tables()
     warehouse.ensure_search_index_tables()
-    assert alias_xmin() == first
+    assert column_xmin() == first
 
 
-def test_the_rename_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(warehouse, monkeypatch):
+def test_the_move_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(warehouse, monkeypatch):
     import psycopg2
 
     from personal_data_warehouse import postgres as postgres_module
 
     warehouse.ensure_search_index_tables()
     warehouse.ensure_timeline_tables()
-    _restore_pre_rename_shape(warehouse)
+    _restore_old_shape(warehouse, "alias")
     monkeypatch.setattr(postgres_module, "EVENT_TS_RENAME_LOCK_TIMEOUT", "200ms")
     session_timeout = warehouse._query("SHOW lock_timeout")
     holder = psycopg2.connect(_postgres_url())
@@ -4413,10 +4416,10 @@ def test_the_rename_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(war
         with pytest.raises(postgres_module.EventTsRenameLockTimeout):
             warehouse.ensure_timeline_tables()
         assert warehouse._query("SHOW lock_timeout") == session_timeout
-        assert _time_column_kinds(warehouse, "timeline_events") == {"event_ts": ""}
+        assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": "", "event_ts": "v"}
     finally:
         holder.rollback()
         holder.close()
     warehouse.ensure_timeline_tables()
     assert warehouse._query("SHOW lock_timeout") == session_timeout
-    assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": "", "event_ts": "v"}
+    assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": ""}

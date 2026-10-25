@@ -75,7 +75,7 @@ func TestSearchRejectsUnknownFlagsAnywhereAndAcceptsLimit(t *testing.T) {
 
 func TestContextCommandNamesColumnsAndPrintsOneLinePerEvent(t *testing.T) {
 	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{"ref":"slack_message:zrl|T|C|1.0","before":2,"after":3,"total_rows":2,"rows":[{"adapter":"slack_message","event_id":"zrl|T|C|1.0","priority":"direct","event_ts":"2026-08-13T15:38:16.040079Z","actor":"sam","title":"","snippet":"fallout postcards? magazines and t-shirt?"},{"adapter":"slack_message","event_id":"zrl|T|C|2.0","priority":"direct","event_ts":"2026-08-13T15:41:08Z","actor":"lee","title":"","snippet":"are these the mini magazines perhaps?"}]}}`)
+		_, _ = io.WriteString(w, `{"data":{"ref":"slack_message:zrl|T|C|1.0","before":2,"after":3,"total_rows":2,"rows":[{"adapter":"slack_message","event_id":"zrl|T|C|1.0","priority":"direct","occurred_at":"2026-08-13T15:38:16.040079Z","actor":"sam","title":"","snippet":"fallout postcards? magazines and t-shirt?"},{"adapter":"slack_message","event_id":"zrl|T|C|2.0","priority":"direct","occurred_at":"2026-08-13T15:41:08Z","actor":"lee","title":"","snippet":"are these the mini magazines perhaps?"}]}}`)
 	})
 	out, errOut, code := runCLI(t, srv.URL, "", "context", "slack_message:zrl|T|C|1.0", "--before", "2", "-a", "3")
 	if code != 0 || errOut != "" {

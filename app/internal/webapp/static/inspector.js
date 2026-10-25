@@ -100,9 +100,9 @@ function appendChildSection(body, item, name, rows, initialMeta) {
    otherwise the adjacent events of the same (source, context) stream. */
 function contextRowNode(row, lastDay, open) {
   const node = h("div", "crow p-" + (row.priority || "unclassified") + (row.is_anchor ? " anchor" : ""));
-  const day = dayOf(row.event_ts);
+  const day = dayOf(row.occurred_at);
   if (day !== lastDay.value) { lastDay.value = day; node.appendChild(h("div", "cd", day)); }
-  node.appendChild(h("div", "ct", fmtTime(row.event_ts)));
+  node.appendChild(h("div", "ct", fmtTime(row.occurred_at)));
   const main = h("div");
   main.appendChild(h("div", "ca", (row.actor || "—") + (row.title && row.title !== row.snippet ? "  ·  " + row.title : "")));
   const text = row.snippet || (row.title ? "" : "(" + row.kind + ")");
@@ -184,7 +184,7 @@ export function openItem(item, options = {}) {
 
   const head = section("event");
   head.appendChild(kvTable([
-    ["when", fmtFull(item.event_ts)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
+    ["when", fmtFull(item.occurred_at)], ["until", isReal(item.end_ts) ? fmtFull(item.end_ts) : ""],
     ["actor", item.actor], ["context", item.context],
     ["priority", item.priority],
     ["adapter", item.adapter], ["event id", item.event_id],

@@ -216,7 +216,7 @@ type ArgsRunner interface {
 // searchResultColumns is the shared hit shape all three timeline search
 // functions return; the explicit list keeps the tool's output stable even if
 // the SQL functions grow trailing columns.
-const searchResultColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority"
+const searchResultColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, title, source_table, source_pk, priority"
 
 // The int/text[]/timestamptz casts are load-bearing: pgx binds a Go int as
 // bigint and there is no implicit bigint→integer cast during function

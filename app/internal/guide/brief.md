@@ -72,12 +72,12 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 
 ## SQL traps
 
-- PDW is PostgreSQL 18, not ClickHouse. `timeline.events` has `event_ts`, `actor`, `snippet`,
-  `search_text` and `adapter` + `event_id`; `occurred_at`, `ref`, `who` and `text` exist only on
-  `timeline.search_text()` rows and `marts_ai_conversations.events` (`occurred_at`, `text`).
+- PDW is PostgreSQL 18, not ClickHouse. `timeline.events` has `occurred_at`, `actor`, `snippet`,
+  `search_text` and `adapter` + `event_id`; `ref`, `who` and `text` exist only on
+  `timeline.search_text()` rows. There is no `event_ts` (renamed `occurred_at` on 2026-10-25).
 - Booleans are `bigint` 0/1 (`is_deleted = 0`, never `= true`). Absence is the epoch
   `1970-01-01`, not NULL, on `base_*`; `marts_*` translate it. Name the time column per source
-  (`base_gmail.messages.internal_date`, `base_slack.messages.message_datetime`, `timeline.events.event_ts`).
+  (`base_gmail.messages.internal_date`, `base_slack.messages.message_datetime`, `timeline.events.occurred_at`).
 - Read mail bodies from `body_markdown_clean`, not `body_text` (tracking URLs). JSON is `text` on
   older sources — cast before `->>`. 60s statement budget; a timeout means narrow, not retry.
 - `ops.*` is unreadable by the query role; `marts_ops.*` is the health surface (topic `ops`).

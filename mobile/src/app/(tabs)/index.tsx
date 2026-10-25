@@ -115,7 +115,7 @@ export default function TimelineScreen() {
             <InboxRow
               dot={PRIORITY_COLORS[item.priority]}
               sender={item.actor ? truncate(item.actor, 60) : humanSource(item.source)}
-              time={formatWhen(item.event_ts)}
+              time={formatWhen(item.occurred_at)}
               subject={headline}
               preview={item.snippet && (item.title || item.context) ? truncate(item.snippet, 200) : undefined}
               labels={[{ text: humanSource(item.source) }]}

@@ -175,8 +175,8 @@ WHERE n.created_at >= now() - interval '1 day'
 GROUP BY n.source;
 ~~~
 
-For message sources, compare landed_at - event_ts separately. Calendar
-event_ts is the scheduled meeting time, not creation time, so that subtraction
+For message sources, compare landed_at - occurred_at separately. Calendar
+occurred_at is the scheduled meeting time, not creation time, so that subtraction
 does **not** measure calendar sync latency.
 
 A pre-rollout stratified sample of 44 direct/cc rows across six sources on

@@ -447,7 +447,7 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
     # window chunk containing the marmoset line is the nearest neighbor.
     [query_vector] = client.embed(["marmoset enclosure"])
     hits = warehouse._query_dicts(
-        "SELECT source, ref, text, score, event_ts, source_table FROM @search_hybrid(%s, %s, 'fake-model', 10)",
+        "SELECT source, ref, text, score, occurred_at, source_table FROM @search_hybrid(%s, %s, 'fake-model', 10)",
         ("marmoset enclosure", vector_literal(query_vector)),
     )
     assert hits, "expected hybrid hits"
@@ -456,7 +456,7 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
     assert "marmoset" in top["text"]
     assert top["source"] == "slack"
     assert top["ref"].startswith("slack_message:")
-    assert top["event_ts"] is not None
+    assert top["occurred_at"] is not None
 
     # sources filter + aliases work on the semantic branch too.
     scoped = warehouse._query_dicts(

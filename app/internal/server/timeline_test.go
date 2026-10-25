@@ -70,8 +70,8 @@ func (f *fakeTimelineRunner) QueryArgs(_ context.Context, sql string, args []any
 func timelineEventRow(eventID string, seq int64, ts string) map[string]any {
 	return map[string]any{
 		"adapter": "gmail_email", "event_id": eventID, "source": "gmail", "kind": "email",
-		"priority": "direct",
-		"event_ts": ts, "end_ts": "1970-01-01T00:00:00Z", "actor": "alice@example.test",
+		"priority":    "direct",
+		"occurred_at": ts, "end_ts": "1970-01-01T00:00:00Z", "actor": "alice@example.test",
 		"title": "Hello", "snippet": "hi there", "context": "z@x.test",
 		"source_table": "gmail_messages",
 		"source_pk":    `{"account": "z@x.test", "message_id": "m1"}`,

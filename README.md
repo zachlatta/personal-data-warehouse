@@ -118,11 +118,11 @@ pdw search --priority self,direct 'budget approval'
 ```sql
 SELECT * FROM timeline.search_text('budget approval', 20, priorities => ARRAY['self','direct']);
 
-SELECT event_ts, priority, source, actor, title, snippet
+SELECT occurred_at, priority, source, actor, title, snippet
 FROM timeline.events
 WHERE priority IN ('self', 'direct', 'cc')
-  AND event_ts >= now() - interval '1 day'
-ORDER BY event_ts DESC LIMIT 100;
+  AND occurred_at >= now() - interval '1 day'
+ORDER BY occurred_at DESC LIMIT 100;
 ```
 
 The `search` tool takes it as `"priorities": ["self","direct"]`, and every hit carries its own

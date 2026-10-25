@@ -386,11 +386,11 @@ not "Zach would want to read it". Only the sweeps, interest, autopay and payroll
 moved are `noise`.
 
 ```sql
-SELECT event_ts, priority, source, actor, title, snippet
+SELECT occurred_at, priority, source, actor, title, snippet
 FROM timeline.events
 WHERE priority IN ('self', 'direct', 'cc')
-  AND event_ts >= now() - interval '1 day'
-ORDER BY event_ts DESC LIMIT 100;
+  AND occurred_at >= now() - interval '1 day'
+ORDER BY occurred_at DESC LIMIT 100;
 ```
 
 **The tier is a filter, not just a label, and it is the same filter everywhere.** Reading

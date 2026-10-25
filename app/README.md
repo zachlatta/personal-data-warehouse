@@ -308,10 +308,9 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
 
 - Ranked keyword search (the default): `SELECT * FROM timeline.search_text('offer letter', 50)`
   searches the unified timeline BM25 document and returns
-  `(source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title,
+  `(source, subsource, context, who, occurred_at, account, ref, text, score, title,
   source_table, source_pk, priority)` ranked across **every** timeline source (`score` lower / more
-  negative = better; `event_ts` duplicates `occurred_at` so `timeline.events` column lists
-  work unchanged). The `text` preview is windowed around the first matched term. A hit
+  negative = better; `occurred_at` is the same column name as on `timeline.events`). The `text` preview is windowed around the first matched term. A hit
   carries its own drill-down: `source_table`/`source_pk` point straight at the source
   relation; `ref` (`<adapter>:<event_id>`) still joins to `timeline.events` when the
   normalized row is wanted.

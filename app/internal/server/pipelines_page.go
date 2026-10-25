@@ -914,7 +914,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         // types only; a channel's landing time is the sweep rotation by design.
         ["landing", landing,
           s.expected_landing_p95_seconds
-            ? "p50 / p95 of first_seen_at - event_ts over " + rows(s.landing_sample_24h) +
+            ? "p50 / p95 of first_seen_at - occurred_at over " + rows(s.landing_sample_24h) +
               " messages written in the last 24h, less DMs quiet over 14 days that woke inside their 2h/12h poll;" +
               " ok at p95 <= " + ago(Number(s.expected_landing_p95_seconds))
             : "not judged: a channel's landing time is the sweep's rate budget, not a fault",

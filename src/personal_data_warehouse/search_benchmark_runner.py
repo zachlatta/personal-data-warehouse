@@ -216,7 +216,7 @@ class AppSearchClient:
                 rows.append(ResultRow(
                     ref=str(item.get("ref") or ""), source=str(item.get("source") or ""),
                     context=str(item.get("context") or ""),
-                    event_ts=str(item.get("event_ts") or item.get("occurred_at") or ""),
+                    occurred_at=str(item.get("occurred_at") or ""),
                     title=str(item.get("title") or ""), text=str(item.get("text") or ""),
                     priority=str(item.get("priority") or ""),
                 ))

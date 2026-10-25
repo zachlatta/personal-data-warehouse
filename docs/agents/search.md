@@ -8,7 +8,7 @@ contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md
 Text search runs through three timeline functions plus one app tool:
 
 - `timeline.search_text(query, max_results, sources, since, priorities)` — ranked BM25. Hits carry
-  `event_ts` (mirror of `occurred_at`), `title`, `source_table`, `source_pk` for one-hop
+  `occurred_at` (the same name as `timeline.events`'), `title`, `source_table`, `source_pk` for one-hop
   drill-down; the `text` preview is windowed around the first matched term; `sources`
   accepts familiar aliases (`apple_messages`, `voice_memos`, `drive`, ...); a partially
   failed fan-out WARNs and a fully failed one raises — an empty result is never a broken
@@ -372,7 +372,7 @@ the `search_chunk_embeddings` asset through any OpenAI-compatible `/v1/embedding
 deployments). Unconfigured or pre-pgvector hosts skip loudly, never red.
 
 **The semantic leg reads `derived_search.chunk_vectors`, not the cache.** One row per
-(chunk, model) carrying the vector *and* its filter columns (`adapter`, `event_ts`,
+(chunk, model) carrying the vector *and* its filter columns (`adapter`, `occurred_at`,
 `event_id`), LIST-partitioned by adapter: `chunk_vectors_gmail`, `_slack`, `_slack_file`
 (92% of chunks between them) and `_other` (the default partition). Row triggers on
 `chunks` and `chunk_embeddings` keep it exact, serialized by one transaction-scoped
@@ -547,7 +547,7 @@ not the CPU -- and three jobs were the reason:
 Together that was on the order of 150 GB of reads an hour against a 12 GB page cache.
 The fixes are structural, not tuning: the drain now keeps **two persisted keysets** in
 `ops.search_chunk_sync_state` (row `embeddings`) -- `(built_at, chunk_id)` for freshly
-built chunks and `(event_ts, chunk_id)` for the resumable one-time historical walk -- and
+built chunks and `(occurred_at, chunk_id)` for the resumable one-time historical walk -- and
 both walks are index-only over `search_chunks_built_at_sha_idx` /
 `search_chunks_ts_chunk_sha_idx`, bounded to 500k / 250k index rows per run. The thread
 backfill remembers a drained walk (`ops.slack_sync_state` row
@@ -730,7 +730,7 @@ straight after the build and before any prewarm, took 1.9 s.
 
 ## Landing latency: how long a source takes to reach the timeline
 
-**Measure it from `timeline.events.first_seen_at - event_ts`, never from a `base_*`
+**Measure it from `timeline.events.first_seen_at - occurred_at`, never from a `base_*`
 table's `ingested_at`/`synced_at`.** Those columns are re-stamped by every rescan and
 upsert: `base_apple_messages.messages.ingested_at` read 5-20 *hours* behind on 2026-09-25
 for messages the timeline had held within five minutes, because the nightly full rescan
@@ -738,11 +738,11 @@ rewrote the column. `first_seen_at` is the first time the row existed in PDW.
 
 ```sql
 SELECT source, count(*) AS n,
-  round(percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - event_ts))/60) AS p50_min,
-  round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - event_ts))/60) AS p95_min
+  round(percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - occurred_at))/60) AS p50_min,
+  round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM first_seen_at - occurred_at))/60) AS p95_min
 FROM timeline.events
-WHERE first_seen_at >= now() - interval '24 hours' AND event_ts >= now() - interval '3 days'
-  AND first_seen_at >= event_ts
+WHERE first_seen_at >= now() - interval '24 hours' AND occurred_at >= now() - interval '3 days'
+  AND first_seen_at >= occurred_at
 GROUP BY 1 ORDER BY p50_min;
 ```
 
@@ -750,7 +750,7 @@ Measured 2026-09-25 before the fast lane below: WhatsApp p50 4 min / p95 6, Slac
 4 / 9, iMessage 5 / 9, Gmail 3 / 6, agent sessions 6-7 / 9, Apple Notes 8 / 11, Drive
 17 / 30 (its 30-minute cron), Contacts 47 (hourly), Slack public channels ~3 h / ~6 h
 (the non-member sweep rotation, by design), voice memos ~4 h (transcription), WHOOP ~8 h
-(the cycle's own clock), Hacker News ~7 days (a comment's `event_ts` is when it was
+(the cycle's own clock), Hacker News ~7 days (a comment's `occurred_at` is when it was
 posted; the frontier walk finds it later). **The chat sources were fast at the source and
 slow on the schedule**: every one was two serial five-minute clocks -- the source's own
 poll or upload, then the `timeline_sync` tick -- and two uniform 0-5 minute waits is ~5 min

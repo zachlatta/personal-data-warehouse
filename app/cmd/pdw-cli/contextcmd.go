@@ -55,13 +55,13 @@ type contextToolResponse struct {
 }
 
 type contextRow struct {
-	Adapter  string `json:"adapter"`
-	EventID  string `json:"event_id"`
-	Priority string `json:"priority"`
-	EventTS  string `json:"event_ts"`
-	Actor    string `json:"actor"`
-	Title    string `json:"title"`
-	Snippet  string `json:"snippet"`
+	Adapter    string `json:"adapter"`
+	EventID    string `json:"event_id"`
+	Priority   string `json:"priority"`
+	OccurredAt string `json:"occurred_at"`
+	Actor      string `json:"actor"`
+	Title      string `json:"title"`
+	Snippet    string `json:"snippet"`
 	// --full rows carry the whole text, its untruncated length and the
 	// statement that reads the source row.
 	Text      string `json:"text"`
@@ -159,7 +159,7 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 		return 0
 	}
 	for _, row := range rows {
-		line := strings.Join(nonemptySearchParts(shortSearchTime(row.EventTS), row.Priority, row.Actor), " · ")
+		line := strings.Join(nonemptySearchParts(shortSearchTime(row.OccurredAt), row.Priority, row.Actor), " · ")
 		title := strings.TrimSpace(row.Title)
 		body := strings.TrimSpace(row.Snippet)
 		if title != "" && strings.HasPrefix(body, title) {
@@ -188,7 +188,7 @@ func runContext(client *cliclient.Client, args []string, stdout, stderr io.Write
 // reads the rest of that event's source row.
 func printContextFull(w io.Writer, rows []contextRow, refs bool) {
 	for _, row := range rows {
-		header := strings.Join(nonemptySearchParts(shortSearchTime(row.EventTS), row.Priority, row.Actor), " · ")
+		header := strings.Join(nonemptySearchParts(shortSearchTime(row.OccurredAt), row.Priority, row.Actor), " · ")
 		if title := strings.TrimSpace(row.Title); title != "" {
 			header += " — " + compactSearchLine(title, searchBriefTitleRunes)
 		}

@@ -232,13 +232,13 @@ from personal_data_warehouse.timeline import (
 
 logger = logging.getLogger(__name__)
 
-#: How long the event_ts -> occurred_at rename waits for its ACCESS EXCLUSIVE
+#: How long the event_ts -> occurred_at migration waits for its ACCESS EXCLUSIVE
 #: lock before failing the run (a later run retries).
 EVENT_TS_RENAME_LOCK_TIMEOUT = "5s"
 
 
 class EventTsRenameLockTimeout(RuntimeError):
-    """The event_ts -> occurred_at rename could not get its lock in time."""
+    """The event_ts -> occurred_at migration could not get its lock in time."""
 
 POSTGRES_TEXT_NUL_REPLACEMENT = "\\u0000"
 # A search_text() hit's `text` is a relevance PREVIEW, not the full document.
@@ -7587,37 +7587,34 @@ class PostgresWarehouse:
             return "absent"
         return "virtual" if rows[0][0] == "v" else "stored"
 
-    def _rename_event_ts_to_occurred_at(
+    def _migrate_event_ts_to_occurred_at(
         self, tables: Sequence[str], *, companion_sql: Sequence[str] = ()
     ) -> None:
-        """Rename ``event_ts`` to ``occurred_at``, leaving a virtual ``event_ts`` alias.
+        """Make ``occurred_at`` the time column's only name on ``tables``.
 
-        ``occurred_at`` is the time column's one name: every search function's
-        hits and 13 other relations already used it, and ``timeline.events``
-        was the one place it failed (the top agent SQL error in October 2026).
-        On PostgreSQL 18 both statements are catalog-only -- the heap and every
-        index keep their files -- but they need ACCESS EXCLUSIVE on a table
-        search reads, so they run under a short ``SET LOCAL`` lock timeout in
-        one explicit transaction (the connection is autocommit, and a session
-        SET would leak into every later statement). A timeout fails this run
-        loudly; the next run retries. Code after this point names
-        ``occurred_at``, so carrying on without the rename would only fail
-        later and less clearly.
-
-        The virtual ``event_ts`` alias keeps a reader that has not moved yet
-        (the app, which deploys separately, and in-flight runs) working for
-        one deploy. ``companion_sql`` is replaced in the same transaction:
-        trigger functions that read the column by name.
+        ``occurred_at`` is what every search function's hits and 13 other
+        relations already called it, and ``timeline.events`` was the one place
+        it failed (the top agent SQL error in October 2026). A stored
+        ``event_ts`` is renamed; the virtual ``event_ts`` alias the first
+        deploy of the rename left for readers that had not moved is dropped.
+        On PostgreSQL 18 both are catalog-only -- the heap and every index keep
+        their files -- but they need ACCESS EXCLUSIVE on a table search reads,
+        so they run under a short ``SET LOCAL`` lock timeout in one explicit
+        transaction (the connection is autocommit, and a session SET would leak
+        into every later statement). A timeout fails this run loudly; the next
+        run retries. Code after this point names ``occurred_at``, so carrying
+        on without it would only fail later and less clearly.
+        ``companion_sql`` -- trigger functions that read the column by name --
+        is replaced in the same transaction as a rename.
         """
         kinds = {
             table: self._event_ts_column_kind(table)
             for table in tables
             if self._relation_exists(table)
         }
-        pending = {table: kind for table, kind in kinds.items() if kind != "virtual"}
+        pending = {table: kind for table, kind in kinds.items() if kind != "absent"}
         if not pending:
             return
-        renamed = [table for table, kind in pending.items() if kind == "stored"]
         with self._connection.cursor() as cursor:
             cursor.execute("BEGIN")
             try:
@@ -7626,25 +7623,25 @@ class PostgresWarehouse:
                     relation = self.sql_relation(table)
                     if kind == "stored":
                         cursor.execute(f"ALTER TABLE {relation} RENAME COLUMN event_ts TO occurred_at")
-                    cursor.execute(
-                        f"ALTER TABLE {relation} ADD COLUMN event_ts timestamptz "
-                        "GENERATED ALWAYS AS (occurred_at) VIRTUAL"
-                    )
-                if renamed:
+                    else:
+                        cursor.execute(f"ALTER TABLE {relation} DROP COLUMN event_ts")
+                if "stored" in pending.values():
                     for statement in companion_sql:
                         cursor.execute(self._expand_relations(statement))
                 cursor.execute("COMMIT")
             except psycopg2.errors.LockNotAvailable as exc:
                 cursor.execute("ROLLBACK")
                 raise EventTsRenameLockTimeout(
-                    f"renaming event_ts to occurred_at on {', '.join(pending)} waited more than "
+                    f"moving event_ts to occurred_at on {', '.join(pending)} waited more than "
                     f"{EVENT_TS_RENAME_LOCK_TIMEOUT} for its lock; the next run retries"
                 ) from exc
             except Exception:
                 cursor.execute("ROLLBACK")
                 raise
-        if renamed:
-            logger.warning("renamed event_ts to occurred_at on %s", ", ".join(renamed))
+        logger.warning(
+            "event_ts -> occurred_at: %s",
+            ", ".join(f"{table} ({'renamed' if kind == 'stored' else 'alias dropped'})" for table, kind in pending.items()),
+        )
 
     def ensure_timeline_tables(self) -> None:
         """Tables for the unified timeline (personal_data_warehouse/timeline.py).
@@ -7665,7 +7662,7 @@ class PostgresWarehouse:
         # index on a not-yet-renamed table could not be created.
         from personal_data_warehouse.notifications import CAPTURE_FUNCTION_SQL
 
-        self._rename_event_ts_to_occurred_at(["timeline_events"], companion_sql=(CAPTURE_FUNCTION_SQL,))
+        self._migrate_event_ts_to_occurred_at(["timeline_events"], companion_sql=(CAPTURE_FUNCTION_SQL,))
         self._ensure_indexes(["timeline_events", "timeline_sync_state"])
         # Migration for pre-existing sync-state tables (the table is ~24 rows,
         # so the unconditional ACCESS EXCLUSIVE lock here is harmless).
@@ -7740,7 +7737,7 @@ class PostgresWarehouse:
             self._ensure_table(table)
         # The vector table's trigger functions copy the chunk's time column by
         # name, so they are replaced in the rename's own transaction.
-        self._rename_event_ts_to_occurred_at(
+        self._migrate_event_ts_to_occurred_at(
             ["search_chunks", "search_chunk_vectors"],
             companion_sql=self._search_chunk_vector_function_sql(),
         )
@@ -7783,8 +7780,6 @@ class PostgresWarehouse:
                 )
             self._ensure_indexes(["search_chunk_embeddings"])
             self._ensure_search_chunk_vectors()
-            # A vector table created just now gets the same transitional alias.
-            self._rename_event_ts_to_occurred_at(["search_chunk_vectors"])
         self._ensure_search_views_if_possible()
         if self._relation_exists("search_chunk_vectors"):
             # After the search functions: retires the index the previous
@@ -7986,11 +7981,8 @@ class PostgresWarehouse:
         ),
         "occurred_at": (
             "When the thing happened in the real world. The timeline's default sort, "
-            "and the same name every search function's hits use."
-        ),
-        "event_ts": (
-            "Deprecated alias of occurred_at (a virtual column, no storage) kept for "
-            "one deploy while readers move to occurred_at; it is about to be dropped."
+            "and the same name every search function's hits use (it was event_ts "
+            "until 2026-10-25)."
         ),
         "end_ts": (
             "When it finished (meeting end, workout end, session end), or the epoch "
@@ -16522,9 +16514,10 @@ class PostgresWarehouse:
         hit_type_sql = self.sql_relation("search_text_hit")
         hit_type_literal = hit_type_sql.replace("'", "''")
         preview_fn_sql = self.sql_relation("search_text_preview")
-        # The hit type carries drill-down columns (event_ts mirrors occurred_at
-        # because agents copy timeline.events column lists into search calls;
-        # title/source_table/source_pk make a hit one hop from its source row).
+        # The hit type carries drill-down columns (title/source_table/source_pk
+        # make a hit one hop from its source row). Its time column is
+        # occurred_at, the same name timeline.events uses; the event_ts mirror
+        # it carried until 2026-10 is gone with the column it mirrored.
         # Reshaping a composite type in place is impossible, so a shape change
         # drops it WITH CASCADE (the only dependents are the search functions,
         # recreated immediately below) and recreates.
@@ -16535,7 +16528,7 @@ class PostgresWarehouse:
         hit_type_columns_sql = (
             "source text, subsource text, context text, who text, "
             "occurred_at timestamptz, account text, ref text, "
-            "text text, score real, event_ts timestamptz, title text, "
+            "text text, score real, title text, "
             "source_table text, source_pk jsonb, priority text"
         )
         hit_type_attr_count = len(hit_type_columns_sql.split(","))
@@ -16842,7 +16835,6 @@ class PostgresWarehouse:
                                t.adapter || ':' || t.event_id,
                                """ + preview_fn_sql + r"""(t.search_text, query),
                                CASE WHEN c.score = 0 THEN (-1e-9)::real ELSE c.score END,
-                               t.occurred_at,
                                t.title, t.source_table, t.source_pk, t.priority::text
                         FROM broad_top c
                         JOIN @timeline_events t
@@ -16871,7 +16863,7 @@ class PostgresWarehouse:
                             'SELECT array_agg(ROW(x.source, x.subsource, x.context, '
                             'x.who, x.occurred_at, x.account, x.ref, """
             + preview_fn_sql
-            + r"""(x.text, %1$L), x.score, x.occurred_at, x.title, '
+            + r"""(x.text, %1$L), x.score, x.title, '
                             'x.source_table, x.source_pk, x.priority)::"""
             + hit_type_sql
             + r""") FROM (' || branch || ') x',
@@ -16908,7 +16900,7 @@ class PostgresWarehouse:
                     WITH ranked AS (
                         SELECT h.source, h.subsource, h.context, h.who, h.occurred_at,
                                h.account, h.ref, h.text, h.score,
-                               h.event_ts, h.title, h.source_table, h.source_pk,
+                               h.title, h.source_table, h.source_pk,
                                h.priority,
                                row_number() OVER (
                                    PARTITION BY h.source ORDER BY h.score ASC NULLS LAST
@@ -16920,7 +16912,7 @@ class PostgresWarehouse:
                     )
                     SELECT r.source, r.subsource, r.context, r.who, r.occurred_at,
                            r.account, r.ref, r.text, r.score,
-                           r.event_ts, r.title, r.source_table, r.source_pk,
+                           r.title, r.source_table, r.source_pk,
                            r.priority
                     FROM ranked r
                     ORDER BY (r.src_rank > """
@@ -17052,7 +17044,7 @@ class PostgresWarehouse:
             + r""")
                            END AS text,
                            hit.score,
-                           hit.occurred_at AS event_ts, hit.title,
+                           hit.title,
                            hit.source_table, hit.source_pk, hit.priority
                     FROM (
                         SELECT map.source AS source,
@@ -17793,7 +17785,6 @@ class PostgresWarehouse:
                        m.ref,
                        COALESCE(c.text, """ + preview_fn_sql + r"""(t.search_text, query)) AS text,
                        (-m.rrf)::real AS score,
-                       t.occurred_at,
                        COALESCE(t.title, '') AS title,
                        COALESCE(t.source_table, '') AS source_table,
                        t.source_pk,

@@ -15,14 +15,14 @@ const ContextDefaultWindow = 5
 // contextSQL names the columns a reader uses. `SELECT *` from
 // timeline.context() returned metadata and the full search_text of every row:
 // 3.8 KB against 0.5 KB, measured over twelve sessions on 2026-09-22.
-const contextSQL = "SELECT adapter, event_id, priority::text AS priority, event_ts, actor, title, snippet " +
+const contextSQL = "SELECT adapter, event_id, priority::text AS priority, occurred_at, actor, title, snippet " +
 	"FROM timeline.context($1, $2::integer, $3::integer)"
 
 // contextFullSQL is the --full read: each event's whole indexed text (the
 // same document search matches against), capped per event, plus the source
 // row's coordinates so the response can name a drill statement for anything
 // longer than the cap.
-const contextFullSQL = "SELECT adapter, event_id, priority::text AS priority, event_ts, actor, title, " +
+const contextFullSQL = "SELECT adapter, event_id, priority::text AS priority, occurred_at, actor, title, " +
 	"left(search_text, $4::integer) AS text, length(search_text) AS text_chars, source_table, source_pk " +
 	"FROM timeline.context($1, $2::integer, $3::integer)"
 

@@ -111,7 +111,7 @@ def test_go_worker_against_the_same_provisioned_schema(warehouse):
     assert result.returncode == 0, result.stdout + result.stderr
 
 @pytest.mark.parametrize("view,columns", [
-    ("marts_notifications", ("event_ts", "landed_at", "created_at", "occurred_at")),
+    ("marts_notifications", ("occurred_at", "landed_at", "created_at")),
     ("marts_notification_deliveries", ("created_at", "updated_at", "accepted_at", "receipt_at", "opened_at")),
 ])
 def test_notification_marts_translate_every_absent_timestamp(warehouse, view, columns):

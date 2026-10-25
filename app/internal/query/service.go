@@ -953,10 +953,6 @@ var timeGuessColumns = map[string]bool{
 	"occurred_date": true, "message_time": true, "msg_time": true, "epoch": true,
 	"unix_time": true, "unix_ts": true, "updated": true, "updated_at": true,
 	"synced": true, "synced_at": true,
-	// timeline.events' own time column, carried to other relations by habit
-	// (three sessions in the week to 2026-10-10, on the agent-session events,
-	// where Postgres' guess was the wrong column event_type).
-	"event_ts": true,
 }
 
 func init() {
@@ -971,6 +967,9 @@ func init() {
 // columnRemaps point a specific wrong column name at the right one. These are
 // structural renames (not time columns) that recur across sessions.
 var columnRemaps = map[string]string{
+	// timeline.events' and derived_search's time column until 2026-10-25,
+	// still typed from habit, old transcripts and old notes.
+	"event_ts":   "event_ts was renamed occurred_at on 2026-10-25: timeline.events, derived_search.*, every search hit and marts_ai_conversations.events all use occurred_at",
 	"channel_id": "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
 	"channel":    "Slack tables use conversation_id, and the channels table is named base_slack.conversations (not slack_channels)",
 	"chat_jid":   "use chat_id — base_apple_messages.messages/base_whatsapp.messages and their chat tables key on chat_id, not chat_jid",
@@ -1257,9 +1256,11 @@ var clickHouseFunctions = map[string]string{
 // searchHitColumns is the exact output shape of timeline.search_text,
 // timeline.search_text_exact, and timeline.search_hybrid — mirror of the
 // composite type built in postgres.py (hit_type_columns_sql). It drifted once
-// already: the 2026-08-19 overhaul added event_ts/title/source_table/source_pk
-// and the hint here kept describing the nine-column shape for a day.
-const searchHitColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, event_ts, title, source_table, source_pk, priority"
+// already: the 2026-08-19 overhaul added title/source_table/source_pk and the
+// hint here kept describing the nine-column shape for a day. Its time column
+// is occurred_at, the same name as timeline.events' (the event_ts mirror went
+// with the 2026-10-25 rename).
+const searchHitColumns = "source, subsource, context, who, occurred_at, account, ref, text, score, title, source_table, source_pk, priority"
 
 // searchFunctionSignatures are printed when a caller misses a search
 // function's signature — a wrong named parameter (limit_rows =>) or wrong
@@ -1384,7 +1385,7 @@ func undefinedColumnHint(message, sql string) string {
 // timeline.events. They are the single most confused pair in the warehouse:
 // the table and the functions describe the same events under different names.
 var searchHitOnlyColumns = map[string]bool{
-	"occurred_at": true, "text": true, "score": true, "subsource": true,
+	"text": true, "score": true, "subsource": true,
 	"account": true, "ref": true, "who": true,
 }
 
@@ -1401,7 +1402,7 @@ func timelineEventsColumnHint(col, sql string) string {
 		return ""
 	}
 	hint := fmt.Sprintf(
-		"(hint: %q is a column of the search FUNCTIONS' result, not of timeline.events. The table uses event_ts (time), actor (who), title, snippet (preview) and search_text (the indexed body), plus priority/source/source_table/source_pk. "+
+		"(hint: %q is a column of the search FUNCTIONS' result, not of timeline.events. The table uses occurred_at (time, the same name as the hits'), actor (who), title, snippet (preview) and search_text (the indexed body), plus priority/source/source_table/source_pk. "+
 			"timeline.search_text('needle', 50) returns (%s) instead — pick the one whose names you want.)",
 		col, searchHitColumns)
 	if col == "ref" {
@@ -1432,7 +1433,7 @@ func searchResultColumnHint(sql string) string {
 	}
 	function := "timeline." + strings.ToLower(match[1])
 	return fmt.Sprintf(
-		"(hint: %s() returns exactly (%s) — use occurred_at (or its mirror event_ts) for time, text for the matched preview, and title for the headline; source_table + source_pk drill straight to the source row, and timeline.context(ref) fetches the surrounding events.)",
+		"(hint: %s() returns exactly (%s) — use occurred_at for time, text for the matched preview, and title for the headline; source_table + source_pk drill straight to the source row, and timeline.context(ref) fetches the surrounding events.)",
 		function,
 		searchHitColumns,
 	)

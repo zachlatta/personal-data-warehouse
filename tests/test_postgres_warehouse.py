@@ -3406,10 +3406,11 @@ def test_search_text_broad_and_scoped_agree_on_a_source_ordering(
 
 
 def test_search_text_hits_carry_drilldown_columns(warehouse: PostgresWarehouse) -> None:
-    # A hit must terminate in one hop: event_ts mirrors occurred_at (agents
-    # copy timeline.events column lists into search calls — the #1 recurring
-    # 42703), and title/source_table/source_pk point straight at the source
-    # row without the intermediate timeline.events lookup.
+    # A hit must terminate in one hop: its time column is occurred_at, the
+    # same name as timeline.events' (one name, so an agent copying a column
+    # list between the two never hits a 42703), and title/source_table/
+    # source_pk point straight at the source row without the intermediate
+    # timeline.events lookup.
     if not _pg_textsearch_usable(warehouse):
         pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
 
@@ -3433,22 +3434,30 @@ def test_search_text_hits_carry_drilldown_columns(warehouse: PostgresWarehouse) 
     _sync_timeline(warehouse)
 
     rows = warehouse._query(
-        "SELECT occurred_at, event_ts, title, source_table, source_pk"
+        "SELECT occurred_at, title, source_table, source_pk"
         " FROM @search_text('zanzibar', 10) WHERE score < 0"
     )
     assert rows, "expected a ranked hit"
-    occurred_at, event_ts, title, source_table, source_pk = rows[0]
-    assert event_ts == occurred_at
+    occurred_at, title, source_table, source_pk = rows[0]
+    assert occurred_at == message_datetime
     assert source_table == "slack_messages"
     assert source_pk and "conversation_id" in source_pk
     assert title is not None
 
     exact_rows = warehouse._query(
-        "SELECT occurred_at, event_ts, source_table, source_pk"
+        "SELECT occurred_at, source_table, source_pk"
         " FROM @search_text_exact('zanzibar rollout', 10)"
     )
-    assert exact_rows and exact_rows[0][1] == exact_rows[0][0]
-    assert exact_rows[0][2] == "slack_messages"
+    assert exact_rows and exact_rows[0][0] == message_datetime
+    assert exact_rows[0][1] == "slack_messages"
+    hit_columns = {
+        row[0]
+        for row in warehouse._query(
+            "SELECT attname FROM pg_attribute WHERE attrelid = %s::regclass AND attnum > 0",
+            (warehouse.sql_relation("search_text_hit"),),
+        )
+    }
+    assert "occurred_at" in hit_columns and "event_ts" not in hit_columns
 
 
 def test_search_text_windows_ranked_preview_around_match(warehouse: PostgresWarehouse) -> None:
@@ -7351,9 +7360,11 @@ def test_search_hit_carries_its_priority_tier() -> None:
     assert "source_pk jsonb, priority text" in sql, (
         "the search hit composite type must carry priority"
     )
-    assert "hit_attr_count IS DISTINCT FROM 14" in sql, (
-        "the composite-type rebuild guard must count the new attribute; a stale "
-        "count leaves the old 13-column type in place and every branch cast fails"
+    # 13 since the event_ts mirror left the hit (2026-10-25); production's
+    # type had 14, so the changed count is what rebuilds it.
+    assert "hit_attr_count IS DISTINCT FROM 13" in sql, (
+        "the composite-type rebuild guard must count every attribute; a stale "
+        "count leaves the old type in place and every branch cast fails"
     )
 
 

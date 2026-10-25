@@ -130,7 +130,7 @@ per-adapter cursors:
 SELECT adapter, backfill_done, last_error, updated_at FROM ops.timeline_sync_state ORDER BY adapter;
 ```
 
-Do not use `max(timeline.events.event_ts)` as a freshness check. `event_ts` is
+Do not use `max(timeline.events.occurred_at)` as a freshness check. `occurred_at` is
 the event's real-world time, so future calendar events legitimately put the
 global maximum years ahead of the current ingestion time.
 

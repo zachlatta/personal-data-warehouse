@@ -102,14 +102,14 @@ func newTimelineService(timeline, source timelineQuerier, media *timelineMediaSi
 // --- list -------------------------------------------------------------------
 
 var timelineListSQL = `
-SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
+SELECT adapter, event_id, source, kind, priority, occurred_at, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq
 FROM ` + warehouse.SQLRelation("timeline_events") + `
 WHERE ($1 = '' OR source = ANY(string_to_array($1, ',')))
   AND ($2 = '' OR kind = ANY(string_to_array($2, ',')))
   AND ($3 = '' OR priority::text = ANY(string_to_array($3, ',')))
-  AND (event_ts, seq) < ($4::timestamptz, $5::bigint)
-ORDER BY event_ts DESC, seq DESC
+  AND (occurred_at, seq) < ($4::timestamptz, $5::bigint)
+ORDER BY occurred_at DESC, seq DESC
 LIMIT $6`
 
 func parseTimelineCursor(raw string) (string, int64, error) {
@@ -190,7 +190,7 @@ func (s *timelineService) handleList(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{"items": items, "has_more": len(items) == limit}
 	if len(items) == limit {
 		last := result.Rows[len(result.Rows)-1]
-		response["next_cursor"] = fmt.Sprintf("%v|%v", last["event_ts"], last["seq"])
+		response["next_cursor"] = fmt.Sprintf("%v|%v", last["occurred_at"], last["seq"])
 	}
 	writeJSON(w, response)
 }
@@ -229,7 +229,7 @@ func timelineItemJSON(row map[string]any) map[string]any {
 // --- sources / sync status ----------------------------------------------------
 
 var timelineSourcesSQL = `
-SELECT source, kind, count(*)::bigint AS count, min(event_ts) AS oldest, max(event_ts) AS newest
+SELECT source, kind, count(*)::bigint AS count, min(occurred_at) AS oldest, max(occurred_at) AS newest
 FROM ` + warehouse.SQLRelation("timeline_events") + `
 GROUP BY source, kind
 ORDER BY source, kind`
@@ -756,7 +756,7 @@ var timelineChildQueries = map[string][]timelineChildQuery{
 }
 
 var timelineItemSQL = `
-SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
+SELECT adapter, event_id, source, kind, priority, occurred_at, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq,
        ingest_ts, first_seen_at, updated_at
 FROM ` + warehouse.SQLRelation("timeline_events") + `
@@ -921,10 +921,10 @@ const (
 )
 
 var timelineContextSQL = `
-SELECT adapter, event_id, source, kind, priority, event_ts, end_ts, actor, title, snippet, context,
+SELECT adapter, event_id, source, kind, priority, occurred_at, end_ts, actor, title, snippet, context,
        source_table, source_pk::text AS source_pk, metadata::text AS metadata, seq
 FROM ` + warehouse.SQLRelation("timeline_context") + `($1, $2, $3)
-ORDER BY event_ts, seq`
+ORDER BY occurred_at, seq`
 
 type timelineContextPage struct {
 	Items  []map[string]any `json:"items"`
