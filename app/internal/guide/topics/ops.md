@@ -40,7 +40,9 @@ FROM marts_ops.mart_view_health WHERE status <> 'ok' ORDER BY status;
   re-consent). It stays until a real success clears it, so an unchanged row is an active
   incident.
 - Some sources are legitimately quiet for weeks (voice memos, contacts); their run
-  heartbeat is the detector, and a `late` data age alone is not an outage.
+  heartbeat is the detector, and a `late` data age alone is not an outage. Usage-driven
+  sources (pi, muse_code, argon, Alice) read `data_status = 'quiet'` past their usual gap
+  and stay `ok`: quiet there is Zach not using the tool.
 - The `ops.*` sync-state tables behind these views are mostly not readable by the query
   role (42501); the views are the interface.
 

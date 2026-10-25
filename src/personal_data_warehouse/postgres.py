@@ -3504,6 +3504,7 @@ INTEGER_COLUMNS = {
     # pipeline freshness snapshot
     "expected_data_interval_seconds",
     "expected_run_interval_seconds",
+    "freshness_informational",
     "row_estimate",
     "byte_size",
     "table_count",
@@ -6217,6 +6218,7 @@ class PostgresWarehouse:
                     expected_data_interval_seconds,
                     expected_run_interval_seconds,
                     expected_event_interval_seconds,
+                    freshness_informational,
                     NULLIF(last_write_at, {epoch}) AS last_write_at,
                     NULLIF(newest_event_at, {epoch}) AS newest_event_at,
                     NULLIF(last_run_at, {epoch}) AS last_run_at,
@@ -6229,12 +6231,12 @@ class PostgresWarehouse:
                     NULLIF(collected_at, {epoch}) AS collected_at
                 FROM @pipeline_health
             ),
-            classified AS (
+            judged AS (
                 SELECT
                     measured.*,
                     {freshness_status(
                         "last_write_at", "expected_data_interval_seconds", unmonitored="no_data"
-                    )} AS data_status,
+                    )} AS raw_data_status,
                     {freshness_status(
                         "last_run_at", "expected_run_interval_seconds", unmonitored="unmonitored"
                     )} AS run_status,
@@ -6263,8 +6265,24 @@ class PostgresWarehouse:
                             secs => expected_event_interval_seconds
                                     * {LATE_MULTIPLIER}) THEN 'late'
                         ELSE 'ok'
-                    END AS event_status
+                    END AS raw_event_status
                 FROM measured
+            ),
+            classified AS (
+                -- A usage-driven source (pi, muse_code, argon, Alice) goes quiet
+                -- because Zach is not using it, so past its interval its data
+                -- and event age read 'quiet', observed but never escalating;
+                -- its run heartbeat alone colours status. data=None would
+                -- have read 'manual' instead, which claims no cadence at all.
+                SELECT
+                    judged.*,
+                    CASE WHEN freshness_informational = 1
+                          AND raw_data_status IN ('late', 'stale') THEN 'quiet'
+                         ELSE raw_data_status END AS data_status,
+                    CASE WHEN freshness_informational = 1
+                          AND raw_event_status IN ('late', 'stale') THEN 'quiet'
+                         ELSE raw_event_status END AS event_status
+                FROM judged
             )
             SELECT
                 pipeline,

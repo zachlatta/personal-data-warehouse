@@ -208,11 +208,11 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   // both the tiles and the sort inside every group.
   var SEVERITY = [
     "failing", "stale", "attention", "late", "unknown",
-    "backfilling", "no_data", "unmeasured", "unmonitored", "manual", "paused", "ok"
+    "backfilling", "no_data", "unmeasured", "unmonitored", "quiet", "manual", "paused", "ok"
   ];
   var COLORS = {
     ok: "var(--ok)", late: "var(--late)", stale: "var(--stale)", failing: "var(--failing)",
-    attention: "var(--attention)", manual: "var(--manual)", no_data: "var(--nodata)",
+    attention: "var(--attention)", manual: "var(--manual)", quiet: "var(--manual)", no_data: "var(--nodata)",
     paused: "var(--manual)", unknown: "var(--unknown)", backfilling: "var(--manual)",
     unmeasured: "var(--nodata)", unmonitored: "var(--nodata)"
   };
@@ -229,6 +229,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     failing: "its own sync state records an error",
     attention: "needs a manual step (a re-link, a re-login)",
     manual: "no cadence expected (manual uploads)",
+    quiet: "past its usual gap between uses, which for a usage-driven source is Zach not using it; its run heartbeat is the detector",
     paused: "intentionally paused — enable the experiment on the notifications page",
     no_data: "nothing has ever arrived",
     unknown: "the freshness snapshot itself is stale — check the pipeline_health asset",

@@ -1514,20 +1514,21 @@ def test_mart_inputs_are_resolved_from_pg_depend_not_a_hardcoded_map(warehouse):
 
 
 def test_a_stale_input_makes_the_mart_that_reads_it_stale(warehouse):
-    """Input-freshness roll-up: this is what surfaces `pi` through the mart.
+    """Input-freshness roll-up: a stopped source surfaces through the mart.
 
     ``pi`` went 38 days without a write against a 3-day SLA, and every consumer
     of ``marts_ai_conversations.events`` was reading a source that had stopped
-    -- with nothing anywhere saying so.
+    -- with nothing anywhere saying so. pi itself is usage-driven now (its
+    silence never escalates), so codex, which has a real data SLA, stands in.
     """
     _provision_every_table(warehouse)
     now = datetime.now(tz=UTC)
-    stale_by = pipeline("pi").expected_data_interval
+    stale_by = pipeline("codex").expected_data_interval
     assert stale_by is not None
     warehouse._command(
         """
-        INSERT INTO @pi_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
-        VALUES ('z@x.test', 'pi', 's1', 'e1', %s, %s)
+        INSERT INTO @codex_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'codex', 's1', 'e1', %s, %s)
         """,
         (now - stale_by * (STALE_MULTIPLIER + 1), now - stale_by * (STALE_MULTIPLIER + 1)),
     )
@@ -1537,7 +1538,7 @@ def test_a_stale_input_makes_the_mart_that_reads_it_stale(warehouse):
         "SELECT status, input_status, stalest_pipeline, stalest_pipeline_expected_seconds"
         " FROM @marts_mart_view_health WHERE view_id = 'ai_conversation_events'"
     )[0]
-    assert row["stalest_pipeline"] == "pi"
+    assert row["stalest_pipeline"] == "codex"
     assert row["input_status"] == "stale"
     assert row["status"] == "stale"
     assert row["stalest_pipeline_expected_seconds"] == int(stale_by.total_seconds())
@@ -1742,24 +1743,30 @@ def test_mart_probe_failures_keep_their_own_severity_and_detail(warehouse):
 def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
     """Not simply the oldest input.
 
-    ``marts_ai_conversations.events`` reads six sources whose expectations
-    differ by an order of magnitude (``codex`` at 7 days, ``pi`` at 45, because
-    pi is used in bursts and leans on its run heartbeat instead). Ranking by raw
-    age would permanently nominate whichever source is legitimately the quietest
-    -- pi -- and never notice the one actually misbehaving.
+    ``marts_ai_conversations.events`` reads several sources whose expectations
+    differ (``claude_code`` at 2 days, ``codex`` at 7). Ranking by raw age would
+    permanently nominate whichever source is legitimately the quietest and
+    never notice the one actually misbehaving.
     """
     _provision_every_table(warehouse)
     now = datetime.now(tz=UTC)
+    claude_interval = pipeline("claude_code").expected_data_interval
     codex_interval = pipeline("codex").expected_data_interval
-    pi_interval = pipeline("pi").expected_data_interval
-    assert codex_interval is not None and pi_interval is not None
-    assert pi_interval > codex_interval, "the fixture needs two different SLAs"
-    # pi is OLDER in absolute terms but still inside its own loose SLA; codex is
-    # younger yet past its tighter one. Raw-age ranking picks pi; the
-    # SLA-relative ranking that matters picks codex.
-    pi_age = pi_interval * LATE_MULTIPLIER - timedelta(hours=1)
-    codex_age = codex_interval * LATE_MULTIPLIER + timedelta(hours=1)
-    assert pi_age > codex_age
+    assert claude_interval is not None and codex_interval is not None
+    assert codex_interval > claude_interval, "the fixture needs two different SLAs"
+    # codex is OLDER in absolute terms but still inside its own looser SLA;
+    # claude_code is younger yet past its tighter one. Raw-age ranking picks
+    # codex; the SLA-relative ranking that matters picks claude_code.
+    codex_age = codex_interval * LATE_MULTIPLIER - timedelta(hours=1)
+    claude_age = claude_interval * LATE_MULTIPLIER + timedelta(hours=1)
+    assert codex_age > claude_age
+    warehouse._command(
+        """
+        INSERT INTO @claude_code_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'claude_code', 's1', 'e1', %s, %s)
+        """,
+        (now - claude_age, now - claude_age),
+    )
     warehouse._command(
         """
         INSERT INTO @codex_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
@@ -1767,19 +1774,12 @@ def test_each_mart_input_is_judged_against_its_own_pipelines_sla(warehouse):
         """,
         (now - codex_age, now - codex_age),
     )
-    warehouse._command(
-        """
-        INSERT INTO @pi_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
-        VALUES ('z@x.test', 'pi', 's1', 'e1', %s, %s)
-        """,
-        (now - pi_age, now - pi_age),
-    )
     PipelineHealthCollector(warehouse).run_all()
     row = warehouse._query_dicts(
         "SELECT stalest_pipeline, input_status FROM @marts_mart_view_health"
         " WHERE view_id = 'ai_conversation_events'"
     )[0]
-    assert row["stalest_pipeline"] == "codex", (
+    assert row["stalest_pipeline"] == "claude_code", (
         "the input past its own SLA must win, not the one with the older timestamp"
     )
     assert row["input_status"] == "late"
@@ -2814,3 +2814,107 @@ def test_a_failing_search_health_component_fails_the_search_index_pipeline(wareh
     )[0]
     assert row["status"] == "failing", row
     assert "invalid page" in row["last_error"]
+
+
+# --- usage-driven sources: quiet is Zach not using it, the heartbeat judges ----
+#
+# On 2026-10-25 marts_ops.pipeline_health read pi `late` (last write 2026-07-16,
+# heartbeat minutes old), and marts_ai_conversations.sessions / .events -- the
+# start-here views for past AI sessions -- read `late` with cause_pipelines
+# {pi}. pi's 45d interval put late at 90 days of Zach not using a CLI, which is
+# not a pipeline fact; muse_code and argon copied it.
+
+USAGE_DRIVEN_PIPELINES = {"pi", "muse_code", "argon", "alice_voice_recordings"}
+
+
+def test_exactly_the_usage_driven_sources_skip_freshness_escalation():
+    from personal_data_warehouse.pipeline_health import PIPELINES
+
+    informational = {entry.id for entry in PIPELINES if not entry.freshness_escalates}
+    assert informational == USAGE_DRIVEN_PIPELINES
+    for pipeline_id in informational:
+        entry = pipeline(pipeline_id)
+        # With data age muted, the heartbeat is the only detector left.
+        assert entry.state is not None and entry.expected_run_interval is not None, pipeline_id
+        # The interval still describes the usual gap between uses, so the age
+        # stays observable as 'quiet' rather than collapsing into 'manual'.
+        assert entry.expected_data_interval is not None, pipeline_id
+
+
+def _seed_pi(warehouse, *, written_ago: timedelta, heartbeat_ago: timedelta) -> None:
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @pi_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'pi', 's1', 'e1', %s, %s)
+        """,
+        (now - written_ago, now - written_ago),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @uploader_heartbeats
+            (pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at, sync_version)
+        VALUES ('pi', 'porygon', %s, 'ok', '', 0, 5, %s, 2)
+        """,
+        (now - heartbeat_ago, now - heartbeat_ago),
+    )
+
+
+def _pi_row(warehouse) -> dict:
+    return warehouse._query_dicts(
+        "SELECT status, data_status, event_status, run_status FROM @marts_pipeline_health"
+        " WHERE pipeline = 'pi'"
+    )[0]
+
+
+def test_a_usage_driven_source_quiet_for_100_days_with_a_fresh_heartbeat_reads_ok(warehouse):
+    _provision_every_table(warehouse)
+    _seed_pi(warehouse, written_ago=timedelta(days=100), heartbeat_ago=timedelta(minutes=5))
+    PipelineHealthCollector(warehouse).run_all()
+
+    assert _pi_row(warehouse) == {
+        "status": "ok",
+        "data_status": "quiet",
+        "event_status": "quiet",
+        "run_status": "ok",
+    }
+
+
+def test_a_usage_driven_source_with_a_stale_heartbeat_reads_stale(warehouse):
+    _provision_every_table(warehouse)
+    _seed_pi(warehouse, written_ago=timedelta(days=100), heartbeat_ago=timedelta(hours=5))
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _pi_row(warehouse)
+    assert row["run_status"] == "stale"
+    assert row["status"] == "stale"
+
+
+def test_a_mart_reading_a_quiet_usage_driven_source_is_not_coloured_by_it(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    _seed_pi(warehouse, written_ago=timedelta(days=100), heartbeat_ago=timedelta(minutes=5))
+    # A healthy escalating input beside it, so the mart has something current.
+    warehouse._command(
+        """
+        INSERT INTO @codex_events (account, source, session_id, event_uuid, ingested_at, occurred_at)
+        VALUES ('z@x.test', 'codex', 's1', 'e1', %s, %s)
+        """,
+        (now - timedelta(hours=1), now - timedelta(hours=1)),
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    rows = {
+        row["view_id"]: row
+        for row in warehouse._query_dicts(
+            "SELECT view_id, status, input_status, stalest_pipeline, cause_pipelines,"
+            " input_pipelines FROM @marts_mart_view_health"
+            " WHERE view_id IN ('ai_conversation_events', 'clean_agent_sessions')"
+        )
+    }
+    assert set(rows) == {"ai_conversation_events", "clean_agent_sessions"}
+    for view_id, row in rows.items():
+        assert "pi" in row["input_pipelines"], view_id
+        assert row["input_status"] not in ("late", "stale"), (view_id, row)
+        assert "pi" not in row["cause_pipelines"], (view_id, row)
+        assert row["stalest_pipeline"] != "pi", (view_id, row)

@@ -2593,6 +2593,11 @@ PIPELINE_HEALTH_COLUMNS = (
     # its event time trails its writes while working perfectly. Zero means no
     # data table declares an event column at all — unmonitored, not late.
     "expected_event_interval_seconds",
+    # 1 when data and event freshness are informational only: a usage-driven
+    # source (pi, an occasional coding CLI) reads data_status 'quiet' past its
+    # interval and its run heartbeat alone colours status. Stored inverted
+    # (0 = escalates) so the integer default 0 is the alarming one.
+    "freshness_informational",
     # Newest payload write, newest real-world event, and newest run heartbeat.
     "last_write_at",
     "newest_event_at",

@@ -421,6 +421,13 @@ class Pipeline:
     data_basis: str = ""
     state: StateSource | None = None
     note: str = ""
+    #: False for a usage-driven source whose data goes quiet because Zach is
+    #: not using it (an occasional coding CLI, the Alice recorder). Past its
+    #: interval its data and event age read ``quiet`` -- observed, shown, never
+    #: colouring ``status`` or a mart that reads it -- and its run heartbeat is
+    #: the only detector, so it must declare one. ``data=None`` is not the same
+    #: thing: that reads ``manual``, a claim that no cadence exists at all.
+    freshness_escalates: bool = True
 
     @property
     def event_interval(self) -> timedelta | None:
@@ -509,6 +516,7 @@ def _source(
     basis: str = "",
     state: StateSource | None = None,
     note: str = "",
+    freshness_escalates: bool = True,
 ) -> Pipeline:
     return Pipeline(
         id=id,
@@ -522,6 +530,7 @@ def _source(
         data_basis=basis,
         state=state,
         note=note,
+        freshness_escalates=freshness_escalates,
     )
 
 
@@ -854,17 +863,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="daily 04:17",
         transport="Dagster alice_voice_recordings → Alice API",
         data=240 * DAY,
-        # Deliberately NOT overridden: event lateness escalates the pipeline
-        # exactly like write lateness, so a loose data interval beside a tight
-        # event one leaves the pipeline just as red. Both sides are the same
-        # fact here -- the poller writes when there is a recording to write.
+        # Deliberately NOT overridden: the poller writes when there is a
+        # recording to write, so write and event age are the same fact here,
+        # and neither escalates (freshness_escalates=False below).
         basis=(
             "measured 2026-08-27 over gaps between USES: 34 days of use across"
             " 17 months (2024-12-07 to 2026-04-27), 33 gaps, p90 17d and a"
-            " longest of 223d. 240d clears that longest real gap, which makes"
-            " data freshness nearly mute here — and that is the point. It is"
-            " not an expectation about recordings; the RUN HEARTBEAT is this"
-            " pipeline's detector, and it is the tight number. The previous 7d"
+            " longest of 223d. 240d is the usual-gap reference, and past it the"
+            " data reads 'quiet' without escalating: it is not an expectation"
+            " about recordings, and the RUN HEARTBEAT is this pipeline's only"
+            " detector. The previous 7d"
             " ingest / 30d event pair was set from the poll cadence because"
             " Alice had no heartbeat at all, and it duly reported 'stale' for"
             " weeks — holding four marts_voice_memos / marts_calendar views"
@@ -877,9 +885,10 @@ PIPELINES: tuple[Pipeline, ...] = (
             status_column="status",
             error_column="error",
         ),
+        freshness_escalates=False,
         note=(
-            "quiet means Zach is not recording; the daily poll's own heartbeat"
-            " is what says the poller is alive"
+            "quiet means Zach is not recording, so data age never colours"
+            " status; the daily poll's own heartbeat says the poller is alive"
         ),
     ),
     _source(
@@ -933,16 +942,18 @@ PIPELINES: tuple[Pipeline, ...] = (
             " measuring gaps between consecutive events, and an agent session"
             " emits those seconds apart — that number described how talkative a"
             " session is, never how often Zach opens the tool, so it alarmed on"
-            " him simply not using pi. 45d clears the longest real gap; late at"
-            " 90d and stale at 270d are deliberately far out because DATA"
-            " freshness is not this source's detector — the uploader heartbeat"
-            " is, and it is checked every 30 minutes"
+            " him simply not using pi. 45d clears the longest real gap, and past"
+            " it the data reads 'quiet' without escalating: a fixed late point"
+            " still alarmed on disuse, turning the agent-session marts late on"
+            " 2026-10-14, 90 days after the last use. The uploader heartbeat,"
+            " checked every 30 minutes, is this source's only detector"
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("pi"),
+        freshness_escalates=False,
         note=(
-            "quiet means Zach is not using pi; the run heartbeat, not data"
-            " freshness, is what says the uploader is alive"
+            "quiet means Zach is not using pi, so data age is shown but never"
+            " colours status; the run heartbeat says the uploader is alive"
         ),
     ),
     _source(
@@ -955,15 +966,18 @@ PIPELINES: tuple[Pipeline, ...] = (
             "no history yet: the source was added 2026-10-13, the day Zach"
             " started using the Muse coding CLI. Borrowed from pi, the other"
             " occasionally-used coding CLI on the same uploader, whose longest"
-            " real gap between uses was 40d; DATA freshness is not this"
-            " source's detector -- the uploader heartbeat is"
+            " real gap between uses was 40d. Past it the data reads 'quiet'"
+            " without escalating, because a gap between uses is Zach not using"
+            " the tool; the uploader heartbeat is this source's only detector"
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("muse_code"),
+        freshness_escalates=False,
         note=(
             "Muse Code is the Muse models' local coding CLI, not Muse (Meta's"
             " hosted agent, pipeline muse); quiet means Zach is not using it,"
-            " and the run heartbeat says the uploader is alive"
+            " so data age never colours status, and the run heartbeat says the"
+            " uploader is alive"
         ),
     ),
     _source(
@@ -977,15 +991,17 @@ PIPELINES: tuple[Pipeline, ...] = (
             " started using Google's Antigravity CLI (agy, running Gemini 4"
             " Argon). Borrowed from pi, the other occasionally-used coding CLI"
             " on the same uploader, whose longest real gap between uses was"
-            " 40d; DATA freshness is not this source's detector -- the uploader"
-            " heartbeat is"
+            " 40d. Past it the data reads 'quiet' without escalating, because a"
+            " gap between uses is Zach not using the tool; the uploader"
+            " heartbeat is this source's only detector"
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("argon"),
+        freshness_escalates=False,
         note=(
             "Argon is Google's Antigravity CLI (agy) running Gemini 4 Argon;"
-            " quiet means Zach is not using it, and the run heartbeat says the"
-            " uploader is alive"
+            " quiet means Zach is not using it, so data age never colours"
+            " status, and the run heartbeat says the uploader is alive"
         ),
     ),
     _source(
@@ -1971,6 +1987,8 @@ class PipelineSnapshot:
     expected_data_interval_seconds: int
     expected_run_interval_seconds: int
     expected_event_interval_seconds: int
+    #: 1 when the pipeline declares ``freshness_escalates=False``.
+    freshness_informational: int
     last_write_at: datetime | None
     newest_event_at: datetime | None
     last_run_at: datetime | None
@@ -2533,6 +2551,10 @@ class PipelineHealthCollector:
             entry = by_pipeline.get(pipeline_id)
             expected = entry.expected_data_interval_seconds if entry else 0
             written = entry.last_write_at if entry else None
+            if entry is not None and entry.freshness_informational:
+                # Its silence is Zach not using it, never the verdict, so it
+                # must not be nominated as the stalest input either.
+                continue
             if written is None or expected <= 0:
                 unmeasured += 1
                 continue
@@ -2601,6 +2623,7 @@ class PipelineHealthCollector:
             expected_data_interval_seconds=_seconds(entry.expected_data_interval),
             expected_run_interval_seconds=_seconds(entry.expected_run_interval),
             expected_event_interval_seconds=expected_event,
+            freshness_informational=0 if entry.freshness_escalates else 1,
             last_write_at=_newest(*(table.last_write_at for table in data_tables)),
             newest_event_at=_newest(*(table.newest_event_at for table in data_tables)),
             last_run_at=_newest(

@@ -48,6 +48,18 @@ opposite half of the mistake:
   error, `last_success_at`) and its data interval is 240 days, which is honestly close to
   mute — the heartbeat is the detector.
 
+Even a far-out late point still alarms on disuse once the disuse is long enough: on
+2026-10-25 pi read `late` (last use 2026-07-16, 90 days past at 2x45d) with its heartbeat
+minutes old, and `marts_ai_conversations.sessions` / `.events` read `late` with
+`cause_pipelines = {pi}`. So a **usage-driven** source declares `freshness_escalates=False`:
+past its interval its `data_status` / `event_status` read `quiet` — observed, never
+colouring `status`, a mart, or `stalest_pipeline` — and the run heartbeat alone escalates.
+That is pi, `muse_code`, `argon` and `alice_voice_recordings`, pinned by
+`test_exactly_the_usage_driven_sources_skip_freshness_escalation`, which also requires each
+to declare a heartbeat. `data=None` is not the same thing: it reads `manual`, a claim that
+no cadence exists at all. Sources with a real data SLA (contacts, browser history, voice
+memos) keep escalating.
+
 The rule both cases point at: **a loose data SLA is only honest when something else is
 tight.** Loosening one without a heartbeat is how `manual_finance` (`data=None`) made its own
 pipeline stopping in March 2026 "by construction not a detectable event".

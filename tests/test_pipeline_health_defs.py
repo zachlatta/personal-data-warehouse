@@ -69,6 +69,7 @@ def _pipeline(name: str, **kwargs) -> PipelineSnapshot:
         data_basis="",
         expected_data_interval_seconds=3600,
         expected_run_interval_seconds=0,
+        freshness_informational=0,
         expected_event_interval_seconds=3600,
         last_write_at=None,
         newest_event_at=None,
