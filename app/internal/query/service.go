@@ -1075,7 +1075,7 @@ func schemaErrorHint(message, sql string) string {
 	if hint := undefinedColumnHint(message, sql); hint != "" {
 		return hint
 	}
-	if hint := bigintBooleanHint(message); hint != "" {
+	if hint := integerBooleanHint(message); hint != "" {
 		return hint
 	}
 	if hint := textJSONHint(message); hint != "" {
@@ -1138,19 +1138,27 @@ func deniedRelationIsOps(message string) bool {
 	return false
 }
 
-// bigintBooleanHint fires when a caller writes an honest boolean predicate
+var (
+	integerAsBooleanArgumentRe   = regexp.MustCompile(`must be type boolean, not type (?:bigint|integer|smallint)\b`)
+	integerBooleanComparisonRe   = regexp.MustCompile(`operator does not exist: (?:(?:bigint|integer|smallint) (?:=|<>) boolean|boolean (?:=|<>) (?:bigint|integer|smallint))\b`)
+	integerBooleanUnmatchedTypes = regexp.MustCompile(`(?:COALESCE|CASE) types (?:(?:bigint|integer|smallint) and boolean|boolean and (?:bigint|integer|smallint)) cannot be matched`)
+)
+
+// integerBooleanHint fires when a caller writes an honest boolean predicate
 // against one of the warehouse's boolean-named columns. Every one of them is
-// bigint 0/1 (the source stores are SQLite-derived), so NOT flag, flag = true,
-// and FILTER (WHERE flag) all raise 42804 — or 42883 for the `= boolean`
-// comparison — with no indication that the column is the problem.
-func bigintBooleanHint(message string) string {
-	boolArgument := strings.Contains(message, "must be type boolean, not type bigint")
-	boolComparison := strings.Contains(message, "operator does not exist") &&
-		strings.Contains(message, "bigint = boolean")
-	if !boolArgument && !boolComparison {
+// integer 0/1: bigint on the SQLite-derived sources, integer where a view
+// computes CASE ... THEN 1 ELSE 0. So NOT flag, flag = true, FILTER (WHERE
+// flag) and COALESCE(flag, false) all raise 42804 — or 42883 for the
+// `= boolean` comparison — with no indication that the column is the problem.
+// Matching only bigint missed `NOT engaged` on marts_feed, 52 sessions in the
+// week to 2026-10-25.
+func integerBooleanHint(message string) string {
+	if !integerAsBooleanArgumentRe.MatchString(message) &&
+		!integerBooleanComparisonRe.MatchString(message) &&
+		!integerBooleanUnmatchedTypes.MatchString(message) {
 		return ""
 	}
-	return "(hint: warehouse boolean-named columns are bigint 0/1, not boolean — write `is_from_me = 1` / `is_deleted = 0`, not `NOT is_from_me`, `= true`, or `FILTER (WHERE is_read)`. Run describe_table for a relation's exact column types.)"
+	return "(hint: warehouse boolean-named columns are integer 0/1 (bigint or integer), not boolean — write `is_from_me = 1` / `is_deleted = 0`, not `NOT is_from_me`, `= true`, `COALESCE(flag, false)`, or `FILTER (WHERE is_read)`. Run describe_table for a relation's exact column types.)"
 }
 
 // textJSONHint fires when a JSON operator is applied to a column that is stored

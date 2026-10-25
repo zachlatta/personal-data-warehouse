@@ -220,7 +220,9 @@ STATEMENTS = (
 )
 
 # Booleans are bigint 0/1 and the epoch becomes NULL, as everywhere in
-# marts_*. dismissed is the item's CURRENT state: the latest of dismiss and
+# marts_*. A bare CASE ... THEN 1 ELSE 0 is integer, so the flags say
+# ::bigint (CREATE OR REPLACE cannot retype; _ensure_view recreates).
+# dismissed is the item's CURRENT state: the latest of dismiss and
 # undismiss. engaged: he opened it (any link), tapped More, shared it, or
 # looked at the card for ENGAGED_DWELL_MS. saved is the CURRENT state of his
 # read-later queue (the latest of save and unsave), saved_at when it last went
@@ -273,20 +275,20 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
            COALESCE(e.links_opened, 0) AS links_opened,
            COALESCE(e.read_ms, 0) AS read_ms,
            COALESCE(e.expands, 0) AS expands,
-           CASE WHEN e.dismiss_state = 'dismiss' THEN 1 ELSE 0 END AS dismissed,
+           CASE WHEN e.dismiss_state = 'dismiss' THEN 1 ELSE 0 END::bigint AS dismissed,
            CASE WHEN e.dismiss_state = 'dismiss' THEN COALESCE(e.dismiss_reason, '') ELSE '' END
                AS dismiss_reason,
            CASE WHEN COALESCE(e.opens, 0) > 0 OR COALESCE(e.expands, 0) > 0 OR COALESCE(e.shares, 0) > 0
                      OR e.save_state = 'save' OR e.like_state = 'like'
                      OR COALESCE(e.dwell_ms, 0) >= {ENGAGED_DWELL_MS}
-                THEN 1 ELSE 0 END AS engaged,
+                THEN 1 ELSE 0 END::bigint AS engaged,
            CASE WHEN e.item_id IS NULL THEN 0::float8 ELSE {ENGAGEMENT_SCORE_SQL} END AS engagement_score,
            e.first_seen_at,
            e.last_event_at,
            COALESCE(e.shares, 0) AS shares,
-           CASE WHEN e.save_state = 'save' THEN 1 ELSE 0 END AS saved,
+           CASE WHEN e.save_state = 'save' THEN 1 ELSE 0 END::bigint AS saved,
            CASE WHEN e.save_state = 'save' THEN e.saved_at END AS saved_at,
-           CASE WHEN e.like_state = 'like' THEN 1 ELSE 0 END AS liked,
+           CASE WHEN e.like_state = 'like' THEN 1 ELSE 0 END::bigint AS liked,
            CASE WHEN e.like_state = 'like' THEN e.liked_at END AS liked_at
     FROM @feed_items i
     LEFT JOIN e ON e.item_id = i.item_id"""

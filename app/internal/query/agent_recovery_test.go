@@ -248,6 +248,44 @@ func TestInventedAgentSessionRelationsPointAtTheMart(t *testing.T) {
 	}
 }
 
+// Boolean-named columns are integer 0/1: bigint on the SQLite-derived sources,
+// integer where a view computes CASE ... THEN 1 ELSE 0 (marts_feed). Matching
+// only bigint missed the second most common pdw sql error, e.g.
+// `WHERE impressions >= 3 AND NOT engaged`, 52 times in the week to 2026-10-25.
+func TestIntegerFlagUsedAsBooleanSaysWriteEqualsOne(t *testing.T) {
+	for _, message := range []string{
+		`ERROR: argument of NOT must be type boolean, not type integer (SQLSTATE 42804)`,
+		`ERROR: argument of AND must be type boolean, not type integer (SQLSTATE 42804)`,
+		`ERROR: argument of OR must be type boolean, not type smallint (SQLSTATE 42804)`,
+		`ERROR: argument of WHERE must be type boolean, not type bigint (SQLSTATE 42804)`,
+		`ERROR: argument of FILTER must be type boolean, not type integer (SQLSTATE 42804)`,
+		`ERROR: operator does not exist: integer = boolean (SQLSTATE 42883)`,
+		`ERROR: operator does not exist: boolean = integer (SQLSTATE 42883)`,
+		`ERROR: operator does not exist: smallint <> boolean (SQLSTATE 42883)`,
+		`ERROR: operator does not exist: boolean = bigint (SQLSTATE 42883)`,
+		`ERROR: COALESCE types integer and boolean cannot be matched (SQLSTATE 42804)`,
+		`ERROR: COALESCE types boolean and bigint cannot be matched (SQLSTATE 42804)`,
+		`ERROR: CASE types integer and boolean cannot be matched (SQLSTATE 42804)`,
+		`ERROR: CASE types boolean and smallint cannot be matched (SQLSTATE 42804)`,
+	} {
+		hint := schemaErrorHint(message, "SELECT item_id FROM marts_feed.item_engagement WHERE impressions >= 3 AND NOT engaged")
+		for _, want := range []string{"integer 0/1 (bigint or integer)", "is_from_me = 1"} {
+			if !strings.Contains(hint, want) {
+				t.Fatalf("hint for %q = %q, want it to name %q", message, hint, want)
+			}
+		}
+	}
+	for _, message := range []string{
+		`ERROR: operator does not exist: text = boolean (SQLSTATE 42883)`,
+		`ERROR: CASE types text and boolean cannot be matched (SQLSTATE 42804)`,
+		`ERROR: argument of NOT must be type boolean, not type text (SQLSTATE 42804)`,
+	} {
+		if hint := schemaErrorHint(message, "SELECT 1"); strings.Contains(hint, "0/1") {
+			t.Fatalf("hint for non-integer %q = %q, want no 0/1 hint", message, hint)
+		}
+	}
+}
+
 // A built-in text function or LIKE applied to jsonb, or LIKE applied to a
 // text[] column, was told to schema-qualify warehouse functions -- advice for
 // a different mistake entirely.

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from personal_data_warehouse import feed
 from personal_data_warehouse.feed import EVENT_TYPES, FUNCTIONS, TABLES, TIMELINE_EVENT_TYPES, VIEWS
 from personal_data_warehouse.postgres import PostgresWarehouse
 from tests.conftest import cleanup_test_warehouse, make_test_schema
@@ -228,6 +229,36 @@ def test_ensure_upgrades_the_views_that_still_carry_likes(warehouse):
     wh.ensure_timeline_tables()
     _item(wh)
     assert wh._query("SELECT engaged, engagement_score FROM @marts_feed_item_engagement") == [(0, 0.0)]
+
+
+FLAG_COLUMNS = ["dismissed", "engaged", "saved", "liked"]
+
+
+@pytestmark_db
+@pytest.mark.parametrize("column", FLAG_COLUMNS)
+def test_item_engagement_flags_are_bigint_0_1_like_every_warehouse_boolean(warehouse, column):
+    wh = warehouse
+    _item(wh)
+    assert wh._query(f"SELECT pg_typeof({column})::text, {column} FROM @marts_feed_item_engagement") == [
+        ("bigint", 0)
+    ]
+
+
+@pytestmark_db
+def test_ensure_retypes_integer_flags_of_an_existing_view_to_bigint(warehouse):
+    wh = warehouse
+    # Before 2026-10-25 the flags were CASE ... THEN 1 ELSE 0, an integer, which
+    # CREATE OR REPLACE cannot retype; ensure must recreate both views.
+    wh._command("DROP VIEW @marts_feed_source_engagement")
+    wh._command("DROP VIEW @marts_feed_item_engagement")
+    wh._command(feed.ITEM_ENGAGEMENT_VIEW.replace("END::bigint", "END"))
+    wh._command(feed.SOURCE_ENGAGEMENT_VIEW)
+    _item(wh)
+    assert wh._query("SELECT pg_typeof(engaged)::text FROM @marts_feed_item_engagement") == [("integer",)]
+    wh.ensure_timeline_tables()
+    assert wh._query(
+        "SELECT " + ", ".join(f"pg_typeof({c})::text" for c in FLAG_COLUMNS) + " FROM @marts_feed_item_engagement"
+    ) == [("bigint",) * len(FLAG_COLUMNS)]
 
 
 @pytestmark_db

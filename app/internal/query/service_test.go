@@ -434,19 +434,19 @@ func TestSchemaErrorHint(t *testing.T) {
 			name:    "boolean predicate on a bigint flag",
 			message: "ERROR: argument of NOT must be type boolean, not type bigint (SQLSTATE 42804)",
 			sql:     "SELECT count(*) FROM whatsapp.messages WHERE NOT is_from_me",
-			want:    []string{"bigint 0/1", "is_from_me = 1"},
+			want:    []string{"integer 0/1 (bigint or integer)", "is_from_me = 1"},
 		},
 		{
 			name:    "FILTER on a bigint flag",
 			message: "ERROR: argument of FILTER must be type boolean, not type bigint (SQLSTATE 42804)",
 			sql:     "SELECT count(*) FILTER (WHERE is_read) FROM apple_messages.messages",
-			want:    []string{"bigint 0/1"},
+			want:    []string{"integer 0/1 (bigint or integer)"},
 		},
 		{
 			name:    "bigint flag compared to a boolean literal",
 			message: "ERROR: operator does not exist: bigint = boolean (SQLSTATE 42883)",
 			sql:     "SELECT 1 FROM slack.messages WHERE is_deleted = true",
-			want:    []string{"bigint 0/1"},
+			want:    []string{"integer 0/1 (bigint or integer)"},
 		},
 		{
 			// json-in-text columns: 71 of them, against 44 that really are jsonb.
