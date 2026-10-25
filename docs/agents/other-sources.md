@@ -1,4 +1,4 @@
-# WhatsApp, Hacker News, Android messages and notifications, and shared attachment enrichment
+# WhatsApp, Hacker News, Android messages, notifications and screen time, and shared attachment enrichment
 
 Moved out of AGENTS.md on 2026-10-01 so the file every session loads holds only the
 contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md).
@@ -369,3 +369,38 @@ On the phone (`ssh pichu`): logs in `/data/misc_ce/0/pdw-android-notifications/l
 `touch /data/misc_ce/0/pdw-android-notifications/paused` stops uploads (the spools keep
 filling), the tail's log is `logs/system-log-tail.log`, and a manual run is
 `sh /data/adb/modules/pdw-android-notifications/bin/android-notifications-upload-android`.
+
+## Android screen time
+
+What Android's usage stats service records about how a device is used, from every rooted
+Android device that runs the module (keyed by `device`; the Pixel is `pichu`). Android keeps
+this for about ten days, so a device's history starts ten days before its first upload.
+
+- **What Android collects.** `UsageEvents`: every activity resumed, paused and stopped per app,
+  screen interactive/non-interactive, keyguard shown/hidden (lock/unlock), notification
+  interruptions and views, foreground services, shutdown and startup (~15k events a day on
+  the Pixel). Daily `UsageStats` per app (time in foreground, time visible, last used) and
+  daily `EventStats` for the device (screen-on time, unlocked time, unlock count). Daily
+  buckets roll about every 24 hours from the device's first boot, not at midnight. Digital
+  Wellbeing's screen time is computed from the same service (its own `app_usage` database
+  is derived and not read). The public API hides `instanceId` and task roots.
+- **The exporter.** APK `com.zachlatta.pdw.usage` (`ops/android/pdw-usage-exporter`, built
+  without Gradle, signed with the notification listener's key) has usage access (granted
+  with `appops set ... GET_USAGE_STATS allow`) and streams JSON lines through a content
+  provider guarded by `android.permission.DUMP`:
+  `content read --uri 'content://com.zachlatta.pdw.usage/events?begin=MS&end=MS'` and
+  `/daily?begin=MS&end=MS`. No UI, no network, no stored data.
+- **The uploader.** `pdw ingest android-screen-time` (`app/internal/uploaders/androidscreentime`)
+  runs as root, reads events from ten minutes before the newest one sent (first run: all that
+  Android holds) and daily totals for the last 12 days, sending only buckets whose content
+  changed, to `/ingest/android-screen-time/batch`. Events have no id: `event_key` hashes time,
+  type, package, class and position among identical events in the same millisecond.
+- **The trigger.** The `pdw-android-screen-time` Magisk service
+  (`ops/android/pdw-android-screen-time`) runs `bin/android-screen-time-upload-android` every
+  5 minutes and re-grants usage access at start. Heartbeat `android_screen_time`. Deployed by
+  sysadmin `scripts/install-android-screen-time-upload <ssh host> <device name>`.
+- **Tables.** `base_android_screen_time.events` (`usage_event_type_name`, `package_name`,
+  `class_name`, `event_at`) and `.daily_usage` (`usage_kind` `app`: `total_time_in_foreground_ms`
+  per `package_name`/`app_label`; `device`: `usage_event_type_name` `SCREEN_INTERACTIVE`
+  `total_time_ms` is screen-on time, `KEYGUARD_HIDDEN` `total_time_ms` unlocked time and
+  `event_count` unlocks). Not on the timeline.

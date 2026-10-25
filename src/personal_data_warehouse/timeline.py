@@ -4061,6 +4061,15 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "android_message_attachments": _detail(
         "android_messages", "files shown with the parent message"
     ),
+    # Android screen time: device telemetry (~15k usage events a day per
+    # device) and Android's own daily totals. Too fine-grained to be timeline
+    # events; read base_android_screen_time directly.
+    "android_screen_time_events": _entity(
+        "per-device usage telemetry (app foreground, screen, lock); not timeline events"
+    ),
+    "android_screen_time_daily_usage": _entity(
+        "Android's daily screen time totals per app and device; not timeline events"
+    ),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(

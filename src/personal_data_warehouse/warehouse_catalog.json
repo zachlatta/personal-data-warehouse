@@ -343,6 +343,14 @@
       "comment": "Android texts. Every SMS, MMS and RCS message on the Android phone since the switch from the iPhone, from Google Messages."
     },
     {
+      "name": "base_android_screen_time",
+      "layer": "base",
+      "domain": "android_screen_time",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Android screen time. App use, screen and lock events, and daily totals from every Android device."
+    },
+    {
       "name": "base_android_notifications",
       "layer": "base",
       "domain": "android_notifications",
@@ -3584,6 +3592,30 @@
       "query_access": "public",
       "secret": false,
       "comment": "Android text files. One row per file (photo, video, voice message, contact card) an Android text carried, with its stored pointer; marts_files.attachments unifies them with other sources."
+    },
+    {
+      "id": "android_screen_time_events",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_screen_time",
+      "schema": "base_android_screen_time",
+      "name": "events",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Android usage events. App foreground (ACTIVITY_RESUMED/PAUSED), screen on/off (SCREEN_INTERACTIVE), lock (KEYGUARD_SHOWN/HIDDEN)."
+    },
+    {
+      "id": "android_screen_time_daily_usage",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_screen_time",
+      "schema": "base_android_screen_time",
+      "name": "daily_usage",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "START HERE for screen time. Android's daily totals: usage_kind 'app' per app; 'device' screen-on (SCREEN_INTERACTIVE) and unlocked (KEYGUARD_HIDDEN) time."
     },
     {
       "id": "android_notification_events",

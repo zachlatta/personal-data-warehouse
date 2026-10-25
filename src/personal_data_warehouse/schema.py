@@ -3517,6 +3517,76 @@ ANDROID_MESSAGE_ATTACHMENT_COLUMNS = (
 )
 
 
+# --- Android screen time -----------------------------------------------------
+#
+# What Android's usage stats service records about how a device is used, read
+# on the device through the PDW usage exporter app by
+# `pdw ingest android-screen-time`. Every row is keyed by (account, device),
+# so any number of Android phones and tablets share the tables. Android keeps
+# events and daily totals for about ten days, so a device's history starts ten
+# days before its first upload.
+#
+# One row per usage event: an app's activity resumed (came to the foreground),
+# paused or stopped, the screen interactive or not, the keyguard shown
+# (locked) or hidden (unlocked), a notification interrupting or seen, a
+# foreground service started or stopped, shutdown and startup. Events carry no
+# id, so `event_key` hashes the time, type, package, class and position among
+# identical events in the same millisecond.
+ANDROID_SCREEN_TIME_EVENT_COLUMNS = (
+    "account",
+    "device",
+    "event_key",
+    "event_at",
+    # Android's UsageEvents.Event type number and constant name
+    # (ACTIVITY_RESUMED, SCREEN_INTERACTIVE, KEYGUARD_HIDDEN, ...).
+    "usage_event_type",
+    "usage_event_type_name",
+    "package_name",
+    "class_name",
+    "shortcut_id",
+    "standby_bucket",
+    "configuration",
+    # The exporter's whole record.
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+# One row per Android daily usage bucket: `usage_kind` 'app' is one app's
+# totals for the bucket, 'device' one device-level event type's
+# (usage_event_type_name SCREEN_INTERACTIVE: total_time_ms is screen-on time;
+# KEYGUARD_HIDDEN: total_time_ms is unlocked time, event_count the unlocks). Android's day
+# buckets run from bucket_start_at to bucket_end_at (they roll over about
+# every 24 hours, not at midnight); today's bucket is re-sent as it grows.
+ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS = (
+    "account",
+    "device",
+    "usage_key",
+    "usage_kind",
+    "bucket_start_at",
+    "bucket_end_at",
+    "package_name",
+    "app_label",
+    "total_time_in_foreground_ms",
+    "total_time_visible_ms",
+    "total_time_foreground_service_ms",
+    "last_time_used_at",
+    "last_time_visible_at",
+    "usage_event_type",
+    "usage_event_type_name",
+    "event_count",
+    "total_time_ms",
+    "last_event_at",
+    # The device's time zone when the bucket was read.
+    "time_zone",
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+
 # --- Screen timelapse ---------------------------------------------------------
 #
 # A periodic image of a device's whole screen and, when the capture loop could

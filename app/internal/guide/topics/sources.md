@@ -167,6 +167,19 @@ each text (a one-to-one message or call `direct`, a group conversation `cc`, ong
 expansion, swipe or snooze, both `self`. Texts themselves are
 `base_android_messages`. Android redacts one-time codes and other sensitive notifications for this listener.
 
+## Screen time (Android)
+
+`base_android_screen_time.daily_usage` is Android's own daily screen time, one row per device
+(`device`, the Pixel is `pichu`), bucket and app or device-level counter: `usage_kind` `app`
+has `package_name`, `app_label`, `total_time_in_foreground_ms`; `usage_kind` `device` has
+`usage_event_type_name` `SCREEN_INTERACTIVE` (`total_time_ms` = screen-on time) and
+`KEYGUARD_HIDDEN` (`total_time_ms` = unlocked time, `event_count` = unlocks). Buckets run
+`bucket_start_at` to `bucket_end_at` (about 24 h, not midnight to midnight).
+`base_android_screen_time.events` is every usage event (`usage_event_type_name`
+`ACTIVITY_RESUMED`/`ACTIVITY_PAUSED` per `package_name`, `SCREEN_INTERACTIVE`,
+`KEYGUARD_HIDDEN`, ...) at `event_at`. Android keeps about ten days, so a device's history
+starts ten days before its first upload (`pichu`: from its setup on 2026-10-23). Not on the timeline.
+
 ## Screen timelapse (what was on a screen)
 
 A periodic image of a device's whole screen, about once a minute while it is unlocked and

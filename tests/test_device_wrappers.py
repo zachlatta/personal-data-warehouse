@@ -29,6 +29,7 @@ SYSTEMD = REPO_ROOT / "ops" / "systemd"
 ANDROID_MODULE = REPO_ROOT / "ops" / "android" / "pdw-google-recorder"
 NOTIFICATIONS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-notifications"
 MESSAGES_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-messages"
+SCREEN_TIME_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-screen-time"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -44,6 +45,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "google-recorder-upload-android": ('"$PDW" ingest google-recorder', "google_recorder"),
     "android-notifications-upload-android": ('"$PDW" ingest android-notifications', "android_notifications"),
     "android-messages-upload-android": ('"$PDW" ingest android-messages', "android_messages"),
+    "android-screen-time-upload-android": ('"$PDW" ingest android-screen-time', "android_screen_time"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
@@ -224,10 +226,12 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
         BIN / "google-recorder-upload-android",
         BIN / "android-notifications-upload-android",
         BIN / "android-messages-upload-android",
+        BIN / "android-screen-time-upload-android",
         BIN / LIB,
         *sorted(ANDROID_MODULE.iterdir()),
         *sorted(NOTIFICATIONS_MODULE.iterdir()),
         *sorted(MESSAGES_MODULE.iterdir()),
+        *sorted(SCREEN_TIME_MODULE.iterdir()),
     ]
     for script in scripts:
         text = script.read_text()
@@ -292,3 +296,17 @@ def test_the_messages_service_runs_on_every_messages_write_and_holds_the_phone_a
     assert 'STATE_DIR="${PDW_ANDROID_MESSAGES_STATE_DIR:-/data/misc_ce/0/pdw-android-messages}"' in text
     assert '--state-file "$STATE_DIR/android-messages-upload.json"' in text
     assert state == "/data/misc_ce/0/pdw-android-messages"
+
+
+def test_the_screen_time_service_runs_every_five_minutes_and_keeps_usage_access() -> None:
+    service = (SCREEN_TIME_MODULE / "service.sh").read_text()
+    assert '"$MODDIR/bin/android-screen-time-upload-android"' in service
+    assert 'appops set "$PKG" GET_USAGE_STATS allow' in service
+    assert "FLOOR=300" in service
+    assert "timeout 360" in service
+    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert state == "/data/misc_ce/0/pdw-android-screen-time"
+    text = _wrapper("android-screen-time-upload-android")
+    assert 'STATE_DIR="${PDW_ANDROID_SCREEN_TIME_STATE_DIR:-/data/misc_ce/0/pdw-android-screen-time}"' in text
+    assert '--state-file "$STATE_DIR/android-screen-time-upload.json"' in text

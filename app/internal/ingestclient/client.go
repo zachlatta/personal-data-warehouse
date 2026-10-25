@@ -426,6 +426,12 @@ func (c *Client) UploadAndroidMessagesBatch(gzipBytes []byte, exportedAt string)
 	return c.post("/ingest/android-messages/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
 }
 
+// UploadAndroidScreenTimeBatch posts a gzipped JSONL batch of an Android
+// device's usage events and daily usage totals.
+func (c *Client) UploadAndroidScreenTimeBatch(gzipBytes []byte, exportedAt string) (StoredObject, error) {
+	return c.post("/ingest/android-screen-time/batch", gzipBytes, "application/gzip", map[string]string{"exported_at": exportedAt})
+}
+
 // --- screen timelapse --------------------------------------------------------
 
 // ScreenTimelapseFile names one capture file: the device whose screen it is,

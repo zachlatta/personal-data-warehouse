@@ -211,8 +211,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-10-24: the files those texts carry added the
 	// base_android_messages.attachments line ("Android text files."): 10282.
 	// 10285 is that line and no more.
-	if guidance > 10285 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10285)", guidance)
+	//
+	// 2026-10-24: Android screen time added the base_android_screen_time
+	// schema line ("Android screen time.") and its two tables ("Android usage
+	// events.", "START HERE for screen time."): 10344. 10345 is those three
+	// lines and no more.
+	if guidance > 10345 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10345)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

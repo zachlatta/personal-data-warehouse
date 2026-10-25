@@ -831,6 +831,24 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("android_messages"),
     ),
     _source(
+        "android_screen_time",
+        "Android screen time (usage events and daily totals, every Android device)",
+        cadence="uploader every 5 min on each device",
+        transport=(
+            "Android usage stats → PDW usage exporter app → Magisk service → pdw ingest"
+            " android-screen-time → /ingest/android-screen-time/batch → Drive inbox → Dagster"
+        ),
+        data=DAY,
+        basis=(
+            "A phone in use records thousands of usage events a day, so a day"
+            " without one is the uploader stopped. The run heartbeat is the tight"
+            " detector"
+        ),
+        note="run heartbeat posted by bin/android-screen-time-upload-android on each device",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_screen_time"),
+    ),
+    _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
@@ -1673,6 +1691,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # Android messages
     "android_messages": _data("android_messages", "synced_at", "message_at"),
     "android_message_attachments": _support("android_messages", "ingested_at"),
+    # Android screen time
+    "android_screen_time_events": _data("android_screen_time", "synced_at", "event_at"),
+    "android_screen_time_daily_usage": _support("android_screen_time", "synced_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

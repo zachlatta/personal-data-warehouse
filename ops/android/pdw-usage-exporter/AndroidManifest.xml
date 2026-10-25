@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The PDW usage exporter: streams Android's usage events and daily usage
+     totals (screen time) to `content read`, which the root uploader
+     (pdw ingest android-screen-time) runs. It has no UI, keeps no data and
+     has no network access; usage access is granted by the installer with
+     `appops set com.zachlatta.pdw.usage GET_USAGE_STATS allow`. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zachlatta.pdw.usage"
+    android:versionCode="1"
+    android:versionName="1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <!-- App labels for every package in the daily totals. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:label="PDW usage"
+        android:allowBackup="false"
+        android:hasCode="true">
+        <!-- DUMP is held by the shell and root only. -->
+        <provider
+            android:name=".UsageProvider"
+            android:authorities="com.zachlatta.pdw.usage"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

@@ -334,6 +334,14 @@ class AndroidMessagesConfig:
 
 
 @dataclass(frozen=True)
+class AndroidScreenTimeConfig:
+    """Where the Android devices' screen time uploaders' batches land (via the app)."""
+
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class BrowserHistoryConfig:
     """Where the Mac browser-history uploader's batches land (via the app)."""
 
@@ -667,6 +675,7 @@ class Settings:
     browser_history: BrowserHistoryConfig | None = None
     android_notifications: AndroidNotificationsConfig | None = None
     android_messages: AndroidMessagesConfig | None = None
+    android_screen_time: AndroidScreenTimeConfig | None = None
     photos: PhotosConfig | None = None
     manual_finance: ManualFinanceConfig | None = None
     whatsapp: WhatsAppConfig | None = None
@@ -745,6 +754,8 @@ class Settings:
             configured_domains.add(email_domain(self.android_notifications.google_drive_account))
         if self.android_messages is not None:
             configured_domains.add(email_domain(self.android_messages.google_drive_account))
+        if self.android_screen_time is not None:
+            configured_domains.add(email_domain(self.android_screen_time.google_drive_account))
         if self.whatsapp is not None:
             configured_domains.add(email_domain(self.whatsapp.google_drive_account))
         if self.agent_sessions is not None:
@@ -789,6 +800,7 @@ def load_settings(
     require_browser_history: bool = False,
     require_android_notifications: bool = False,
     require_android_messages: bool = False,
+    require_android_screen_time: bool = False,
     require_photos: bool = False,
     require_manual_finance: bool = False,
     require_whatsapp: bool = False,
@@ -1305,6 +1317,32 @@ def load_settings(
         android_messages = AndroidMessagesConfig(
             google_drive_account=android_messages_google_drive_account,
             google_drive_folder_id=android_messages_google_drive_folder_id,
+        )
+
+    # Android screen time: the same shared ingest folder and account as
+    # browser history; the app files every device's batches there.
+    android_screen_time_google_drive_account = (
+        os.getenv("ANDROID_SCREEN_TIME_GOOGLE_DRIVE_ACCOUNT") or browser_history_google_drive_account
+    ).strip()
+    android_screen_time_google_drive_folder_id = (
+        os.getenv("ANDROID_SCREEN_TIME_GOOGLE_DRIVE_FOLDER_ID") or browser_history_google_drive_folder_id
+    ).strip()
+    android_screen_time: AndroidScreenTimeConfig | None = None
+    if require_android_screen_time or os.getenv("ANDROID_SCREEN_TIME_GOOGLE_DRIVE_FOLDER_ID"):
+        if not android_screen_time_google_drive_account:
+            raise ValueError(
+                "ANDROID_SCREEN_TIME_GOOGLE_DRIVE_ACCOUNT, BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT "
+                "or GMAIL_ACCOUNTS must be set for Android screen time sync"
+            )
+        if not android_screen_time_google_drive_folder_id:
+            raise ValueError(
+                "ANDROID_SCREEN_TIME_GOOGLE_DRIVE_FOLDER_ID, BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID, "
+                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, "
+                "or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        android_screen_time = AndroidScreenTimeConfig(
+            google_drive_account=android_screen_time_google_drive_account,
+            google_drive_folder_id=android_screen_time_google_drive_folder_id,
         )
 
     photos_account = (
@@ -2220,6 +2258,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_messages:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if android_screen_time:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if whatsapp and whatsapp.storage_backend == "google_drive":
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if alice_voice_recordings and alice_voice_recordings.storage_backend == "google_drive":
@@ -2277,6 +2317,7 @@ def load_settings(
         browser_history=browser_history,
         android_notifications=android_notifications,
         android_messages=android_messages,
+        android_screen_time=android_screen_time,
         photos=photos,
         manual_finance=manual_finance,
         whatsapp=whatsapp,

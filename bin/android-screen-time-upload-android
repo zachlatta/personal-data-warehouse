@@ -1,0 +1,63 @@
+#!/system/bin/sh
+# One run of an Android device's screen time uploader: sends Android's usage
+# events and daily usage totals, read through the PDW usage exporter app, to
+# the warehouse.
+#
+# Run as root on a rooted Android device by the pdw-android-screen-time Magisk
+# service (ops/android/pdw-android-screen-time/service.sh) every 5 minutes.
+# The module carries this file, _pdw-upload-lib.sh and the release
+# linux/arm64 pdw binary side by side in its bin/; the sysadmin repository's
+# scripts/install-android-screen-time-upload assembles and deploys it, with
+# the exporter APK (ops/android/pdw-usage-exporter). There is no checkout on
+# the device.
+#
+# State lives in $STATE_DIR (root 0700, credential-encrypted storage, for the
+# reason bin/google-recorder-upload-android gives): pdw's own config file
+# under config/pdw/, a .env (ANDROID_SCREEN_TIME_DEVICE,
+# ANDROID_SCREEN_TIME_ACCOUNT), the run lock, the sent ledger and logs/.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATE_DIR="${PDW_ANDROID_SCREEN_TIME_STATE_DIR:-/data/misc_ce/0/pdw-android-screen-time}"
+# Magisk starts services with HOME=/ and no TMPDIR; pdw needs both writable.
+export HOME="$STATE_DIR/home"
+export TMPDIR="$STATE_DIR/tmp"
+export XDG_CONFIG_HOME="$STATE_DIR/config"
+export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"
+export PDW_INGEST_PROJECT_DIR="$STATE_DIR"
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+LOG_DIR="$STATE_DIR/logs"
+LOG_FILE="$LOG_DIR/android-screen-time-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/android-screen-time-upload.heartbeat"
+
+mkdir -p "$LOG_DIR" "$HOME" "$TMPDIR"
+# The device has no logrotate: keep the current log under 1 MiB and one old one.
+if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -gt 1048576 ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting android screen time upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
+else
+  "$PDW" ingest android-screen-time --lock-file "$STATE_DIR/android-screen-time-upload.lock" \
+    --state-file "$STATE_DIR/android-screen-time-upload.json" >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+pdw_post_heartbeat "android_screen_time" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+echo "[$finished_at_iso] finished android screen time upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

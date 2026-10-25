@@ -144,6 +144,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"browser_history":       "BROWSER_HISTORY",
 	"android_notifications": "ANDROID_NOTIFICATIONS",
 	"android_messages":      "ANDROID_MESSAGES",
+	"android_screen_time":   "ANDROID_SCREEN_TIME",
 	"photos":                "PHOTOS",
 	"manual_finance":        "MANUAL_FINANCE",
 	"screen_timelapse":      "SCREEN_TIMELAPSE",

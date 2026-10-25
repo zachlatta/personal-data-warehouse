@@ -293,6 +293,12 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "android_message_export_batch", "pdw_stage": "inbox", "pdw_source": "android_messages", "batch_sha256": sha(batchBody)},
 		},
 		{
+			name: "android-screen-time/batch", endpoint: "/ingest/android-screen-time/batch", body: batchBody,
+			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
+			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
+			wantProps: map[string]string{"pdw_kind": "android_screen_time_export_batch", "pdw_stage": "inbox", "pdw_source": "android_screen_time", "batch_sha256": sha(batchBody)},
+		},
+		{
 			name: "apple-messages/batch", endpoint: "/ingest/apple-messages/batch", body: batchBody,
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
 			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
@@ -536,6 +542,9 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		}},
 		{"android-messages/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadAndroidMessagesBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"android-screen-time/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadAndroidScreenTimeBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
 		}},
 		{"browser-history/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadBrowserHistoryBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")

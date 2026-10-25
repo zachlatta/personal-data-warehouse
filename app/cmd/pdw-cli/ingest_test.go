@@ -63,7 +63,7 @@ func isolatedEnv(t *testing.T, extra map[string]string) func(string) string {
 
 func TestIngestSourceTableIsExactlyTheNativeUploaders(t *testing.T) {
 	want := []string{
-		"agent-sessions", "android-messages", "android-notifications", "apple-contacts", "apple-messages", "apple-notes",
+		"agent-sessions", "android-messages", "android-notifications", "android-screen-time", "apple-contacts", "apple-messages", "apple-notes",
 		"apple-photos", "browser-history", "google-recorder", "manual-finance", "muse", "plaid", "screen-timelapse", "voice-memos",
 	}
 	var got []string
@@ -138,7 +138,7 @@ func TestIngestUnknownSourceErrors(t *testing.T) {
 	if !strings.Contains(errOut.String(), "bogus") {
 		t.Fatalf("stderr should name the bad source: %s", errOut.String())
 	}
-	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop", "plaid", "apple-photos", "manual-finance", "apple-contacts", "browser-history", "screen-timelapse", "google-recorder", "android-notifications", "android-messages"} {
+	for _, s := range []string{"voice-memos", "apple-notes", "apple-messages", "agent-sessions", "claude-desktop", "plaid", "apple-photos", "manual-finance", "apple-contacts", "browser-history", "screen-timelapse", "google-recorder", "android-notifications", "android-messages", "android-screen-time"} {
 		if !strings.Contains(errOut.String(), s) {
 			t.Fatalf("stderr should list valid source %q: %s", s, errOut.String())
 		}

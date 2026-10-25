@@ -2091,6 +2091,7 @@ def _ensure_all_table_groups(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_browser_history_tables()
     warehouse.ensure_android_notifications_tables()
     warehouse.ensure_android_messages_tables()
+    warehouse.ensure_android_screen_time_tables()
     warehouse.ensure_screen_timelapse_tables()
     warehouse.ensure_plaid_tables()
     warehouse.ensure_simplefin_tables()

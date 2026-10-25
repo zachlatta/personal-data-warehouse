@@ -95,6 +95,8 @@ from personal_data_warehouse.schema import (
     ANDROID_NOTIFICATION_EVENT_COLUMNS,
     ANDROID_MESSAGE_COLUMNS,
     ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
+    ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS,
+    ANDROID_SCREEN_TIME_EVENT_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
@@ -1194,6 +1196,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
         ("account", "device", "part_key"),
     ),
+    # Android screen time: one row per usage event and one per daily usage
+    # bucket, from every Android device.
+    "android_screen_time_events": TableSpec(
+        ANDROID_SCREEN_TIME_EVENT_COLUMNS,
+        ("account", "device", "event_key"),
+    ),
+    "android_screen_time_daily_usage": TableSpec(
+        ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS,
+        ("account", "device", "usage_key"),
+    ),
     # Android notifications: one row per listener event, keyed by its uuid.
     "android_notification_events": TableSpec(
         ANDROID_NOTIFICATION_EVENT_COLUMNS,
@@ -1929,6 +1941,32 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     # adapters' incremental pass, posted_at and event_at serve their backfills, and the
     # first-appearance test reads (device, notification_key, content_sha256,
     # event_at).
+    # Android screen time. synced_at leads for the freshness probe; event_at
+    # and bucket_start_at serve per-device time-range reads.
+    IndexSpec(
+        "android_screen_time_events_synced_idx",
+        "android_screen_time_events",
+        "CREATE INDEX IF NOT EXISTS android_screen_time_events_synced_idx "
+        "ON @android_screen_time_events (synced_at)",
+    ),
+    IndexSpec(
+        "android_screen_time_events_device_at_idx",
+        "android_screen_time_events",
+        "CREATE INDEX IF NOT EXISTS android_screen_time_events_device_at_idx "
+        "ON @android_screen_time_events (device, event_at DESC)",
+    ),
+    IndexSpec(
+        "android_screen_time_daily_usage_synced_idx",
+        "android_screen_time_daily_usage",
+        "CREATE INDEX IF NOT EXISTS android_screen_time_daily_usage_synced_idx "
+        "ON @android_screen_time_daily_usage (synced_at)",
+    ),
+    IndexSpec(
+        "android_screen_time_daily_usage_bucket_idx",
+        "android_screen_time_daily_usage",
+        "CREATE INDEX IF NOT EXISTS android_screen_time_daily_usage_bucket_idx "
+        "ON @android_screen_time_daily_usage (device, bucket_start_at DESC)",
+    ),
     IndexSpec(
         "android_notification_events_synced_idx",
         "android_notification_events",
@@ -2832,6 +2870,8 @@ JSONB_COLUMNS_BY_TABLE = {
     "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
     "android_messages": {"raw_json", "participants", "parts"},
     "android_message_attachments": {"raw_json"},
+    "android_screen_time_events": {"raw_json"},
+    "android_screen_time_daily_usage": {"raw_json"},
     "hacker_news_profile": {"raw_json"},
     "whoop_private_sports": {"raw_json"},
     # Tier-2 BFF payloads: faithful raw only. See docs/whoop-private-api.md --
@@ -3013,6 +3053,12 @@ TIMESTAMP_COLUMNS = {
     "visited_at",
     # android_notifications
     "event_at",
+    # android_screen_time
+    "bucket_start_at",
+    "bucket_end_at",
+    "last_time_used_at",
+    "last_time_visible_at",
+    "last_event_at",
     # android_messages
     "sent_at",
     "receipt_delivered_at",
@@ -3134,6 +3180,14 @@ TIMESTAMP_COLUMNS = {
 }
 
 INTEGER_COLUMNS = {
+    # android_screen_time
+    "usage_event_type",
+    "standby_bucket",
+    "total_time_in_foreground_ms",
+    "total_time_visible_ms",
+    "total_time_foreground_service_ms",
+    "event_count",
+    "total_time_ms",
     # android_messages
     "bugle_id",
     "is_reaction",
@@ -3584,6 +3638,8 @@ _WHOOP_PRIVATE_TABLES = (
 _BROWSER_HISTORY_TABLES = ("browser_history_visits",)
 
 _ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
+
+_ANDROID_SCREEN_TIME_TABLES = ("android_screen_time_events", "android_screen_time_daily_usage")
 
 _ANDROID_MESSAGES_TABLES = ("android_messages", "android_message_attachments")
 
@@ -11089,6 +11145,34 @@ class PostgresWarehouse:
                 for row in rows
             ],
             ANDROID_NOTIFICATION_EVENT_COLUMNS,
+        )
+
+    def ensure_android_screen_time_tables(self) -> None:
+        """Provision base_android_screen_time.events and .daily_usage."""
+        self._ensure_table_group(list(_ANDROID_SCREEN_TIME_TABLES))
+
+    def insert_android_screen_time_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert usage events by (account, device, event_key)."""
+        self._insert_android_screen_time("android_screen_time_events", ANDROID_SCREEN_TIME_EVENT_COLUMNS, rows)
+
+    def insert_android_screen_time_daily_usage(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Upsert daily usage buckets by (account, device, usage_key)."""
+        self._insert_android_screen_time(
+            "android_screen_time_daily_usage", ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS, rows
+        )
+
+    def _insert_android_screen_time(
+        self, table: str, columns: Sequence[str], rows: Sequence[Mapping[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        self._insert_rows(
+            table,
+            [
+                {column: row.get(column, _default_python_value(column, table=table)) for column in columns}
+                for row in rows
+            ],
+            columns,
         )
 
     def ensure_android_messages_tables(self) -> None:

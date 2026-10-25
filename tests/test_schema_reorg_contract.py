@@ -87,6 +87,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
+    wh.ensure_android_screen_time_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_agent_sessions_tables()
     wh.ensure_plaid_tables()
@@ -183,7 +184,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 base: base_android_notifications.events, the Pixel's notifications.
         # +1 base: base_android_messages.messages, the Pixel's texts.
         # +1 base: base_android_messages.attachments, the files they carry.
-        "base": 91,
+        # +2 base: base_android_screen_time.events and .daily_usage, every
+        # Android device's screen time.
+        "base": 93,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

@@ -294,6 +294,29 @@ func TestIngestAndroidMessagesBatchStoresExpectedObject(t *testing.T) {
 	}
 }
 
+func TestIngestAndroidScreenTimeBatchStoresExpectedObject(t *testing.T) {
+	svc, stores := ingestTestService()
+	body := []byte("gzipped-screen-time-batch")
+	exportedAt := "2026-10-24T22:40:00+00:00"
+	target := signedIngestTarget("/ingest/android-screen-time/batch", body, url.Values{"exported_at": {exportedAt}})
+
+	rec := postIngest(t, svc, target, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	put := stores["android_screen_time"].lastFile
+	if put == nil {
+		t.Fatal("expected PutFile to be called")
+	}
+	wantKey := "android-screen-time/inbox/batches/2026/10/20261024T224000Z-" + sha256Hex(body) + ".jsonl.gz"
+	if put.ObjectKey != wantKey {
+		t.Fatalf("object key = %q, want %q", put.ObjectKey, wantKey)
+	}
+	if put.Kind != "android_screen_time_export_batch" {
+		t.Fatalf("kind = %q", put.Kind)
+	}
+}
+
 func TestIngestRejectsBadSignature(t *testing.T) {
 	svc, _ := ingestTestService()
 	body := []byte("x")
