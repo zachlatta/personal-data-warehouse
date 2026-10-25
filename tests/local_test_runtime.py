@@ -11,6 +11,7 @@ import inspect
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -136,15 +137,26 @@ def callable_requires_postgres(
     return visit(function, is_root=True)
 
 
-# Set by the controller to the URL of the Postgres it launched, so a worker can
-# tell its own disposable cluster from a configured database it must not touch.
+# Set by the controller to the space-separated URLs of the Postgres clusters it
+# launched, so a worker can tell its own disposable clusters from a configured
+# database it must not touch.
 OWNED_POSTGRES_URL_ENV = "PDW_TEST_OWNED_POSTGRES_URL"
 
 
-# Workers per CPU when each worker gets its own database. A worker spends much
-# of its time waiting on its Postgres backend, so one per CPU left 20-30% of
-# mew-dev idle; 1.5 beat both 1 and 2 on 2026-10-25.
-WORKERS_PER_CPU = 1.5
+# Workers per CPU when the run owns its Postgres. Each worker is a ping-pong
+# with its backend, and on mew-dev (2026-10-25) such pairs only fill the CPUs
+# once ~2.5 tasks per CPU are runnable: 16 pairs of pure-CPU ping-pong left
+# 16% idle, 32 pairs 4%. One per CPU left the suite 20-30% idle.
+WORKERS_PER_CPU = 2
+# Workers per disposable Postgres. Past ~16 busy backends one instance's lock
+# manager, WAL insertion and invalidation queue made extra workers cost more
+# than they gave; split across clusters, 32 workers left 6% idle, not 16%.
+WORKERS_PER_CLUSTER = 8
+
+
+def cluster_count(workers: int) -> int:
+    """How many disposable Postgres clusters a run with this many workers starts."""
+    return max(1, -(-workers // WORKERS_PER_CLUSTER))
 
 
 def auto_worker_count(env: Mapping[str, str], *, cpus: int) -> int:
@@ -152,6 +164,63 @@ def auto_worker_count(env: Mapping[str, str], *, cpus: int) -> int:
     if env.get("POSTGRES_DATABASE_URL", "").strip():
         return max(1, cpus)
     return max(1, round(cpus * WORKERS_PER_CPU))
+
+
+# What a test with no recorded duration is assumed to cost: about what an
+# average Postgres-backed test and an average unit test took on 2026-10-25.
+_UNMEASURED_POSTGRES_TEST_SECONDS = 1.0
+_UNMEASURED_UNIT_TEST_SECONDS = 0.005
+
+
+def schedule_key(nodeid: str, *, requires_postgres: bool, durations: Mapping[str, float]) -> float:
+    """Sort key that hands xdist the longest tests first (longest-processing-time).
+
+    Started late, one 20 s test kept a single worker busy while the other 23
+    sat idle for the last ~10 s of a 74 s run. Durations come from the previous
+    run, so a test with no history gets a typical cost for its kind.
+    """
+    default = _UNMEASURED_POSTGRES_TEST_SECONDS if requires_postgres else _UNMEASURED_UNIT_TEST_SECONDS
+    return -float(durations.get(nodeid, default))
+
+
+def direct_postgres_url(
+    url: str,
+    container: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    probe: Callable[..., object] = socket.create_connection,
+) -> str:
+    """The URL of the container's own address, when the host can reach it.
+
+    The published 127.0.0.1 port goes through docker-proxy, a userspace copy
+    that adds two process wakeups to every query: removing it took ~6% off a
+    full run on mew-dev (2026-10-25). Docker Desktop cannot route to bridge
+    IPs, so anything but a working direct connection keeps the given URL.
+    """
+    try:
+        inspected = runner(
+            ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return url
+    address = str(getattr(inspected, "stdout", "") or "").strip()
+    if int(getattr(inspected, "returncode", 1)) != 0 or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", address):
+        return url
+    try:
+        connection = probe((address, 5432), timeout=1)
+    except OSError:
+        return url
+    close = getattr(connection, "close", None)
+    if callable(close):
+        close()
+    parts = urlsplit(url)
+    credentials = parts.netloc.rpartition("@")[0]
+    netloc = f"{credentials}@{address}:5432" if credentials else f"{address}:5432"
+    return urlunsplit(parts._replace(netloc=netloc))
 
 
 def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> None:
@@ -164,14 +233,17 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
     other's CPU: more workers made the suite slower. And advisory locks are
     per database, so the warehouse's serialised ensure_* steps queued every
     worker behind the others. A database per worker removes both, and 24
-    workers became faster than 16 instead of slower. A configured
-    POSTGRES_DATABASE_URL is never split; neither is a serial run.
+    workers became faster than 16 instead of slower. Workers are spread over
+    the owned clusters by worker number. A configured POSTGRES_DATABASE_URL
+    is never split; neither is a serial run.
     """
     url = env.get("POSTGRES_DATABASE_URL", "")
-    if worker is None or not url or env.get(OWNED_POSTGRES_URL_ENV) != url:
+    owned = env.get(OWNED_POSTGRES_URL_ENV, "").split()
+    if worker is None or not url or url not in owned:
         return
     if not re.fullmatch(r"gw\d+", worker):
         raise LocalTestStartupError(f"unexpected xdist worker id {worker!r}")
+    url = owned[int(worker[2:]) % len(owned)]
     database = f"pdw_{worker}"
     worker_url = urlunsplit(urlsplit(url)._replace(path=f"/{database}"))
     try:
@@ -268,6 +340,13 @@ class PostgresTestRuntime:
                 "PDW_PGBACKREST_ENABLED=false",
                 "--publish",
                 "127.0.0.1::5432",
+                # Keep the data directory in RAM. It peaks near 2.5 GB and is
+                # deleted at the end: on disk, backends stalled in
+                # DataFileWrite under writeback throttling, and deleting the
+                # volume queued GBs of TRIMs onto the next run's first ~15s
+                # (mew-dev, 2026-10-25).
+                "--tmpfs",
+                "/var/lib/postgresql:rw,size=8g",
                 image,
                 "postgres",
                 "-c",

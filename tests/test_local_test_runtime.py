@@ -9,12 +9,15 @@ from personal_data_warehouse.agent_runner import AgentContainerConfig
 from tests.local_test_runtime import (
     DEFAULT_POSTGRES_IMAGE,
     auto_worker_count,
+    cluster_count,
     OWNED_POSTGRES_URL_ENV,
     POSTGRES_EXTENSIONS,
     LocalTestStartupError,
     PostgresTestRuntime,
     callable_requires_postgres,
+    direct_postgres_url,
     preflight_subscription_auth,
+    schedule_key,
     subscription_tests_enabled,
     use_worker_database,
 )
@@ -110,6 +113,8 @@ def test_default_start_launches_extension_complete_postgres_on_a_dynamic_port() 
         "PDW_PGBACKREST_ENABLED=false",
         "--publish",
         "127.0.0.1::5432",
+        "--tmpfs",
+        "/var/lib/postgresql:rw,size=8g",
         DEFAULT_POSTGRES_IMAGE,
         "postgres",
         "-c",
@@ -395,8 +400,92 @@ def test_an_unexpected_worker_id_is_refused() -> None:
 
 
 def test_auto_workers_oversubscribe_only_the_owned_per_worker_databases() -> None:
-    assert auto_worker_count({}, cpus=16) == 24
+    assert auto_worker_count({}, cpus=16) == 32
     assert auto_worker_count({}, cpus=1) == 2
     # A configured database is shared by every worker, where extra workers
     # contend instead of filling idle CPU.
     assert auto_worker_count({"POSTGRES_DATABASE_URL": "postgresql://ci/pdw"}, cpus=4) == 4
+
+
+def test_workers_bypass_the_userland_port_proxy_when_the_container_ip_answers() -> None:
+    runner = FakeDocker()
+    seen: list[tuple[str, int]] = []
+
+    def inspect(command, **kwargs):
+        if command[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, stdout="172.17.0.9\n", stderr="")
+        return runner(command, **kwargs)
+
+    def reachable(address, timeout):
+        seen.append(address)
+        return True
+
+    url = direct_postgres_url(
+        "postgresql://postgres:postgres@127.0.0.1:49152/pdw",
+        "pdw-tests-owned-123",
+        runner=inspect,
+        probe=reachable,
+    )
+
+    assert url == "postgresql://postgres:postgres@172.17.0.9:5432/pdw"
+    assert seen == [("172.17.0.9", 5432)]
+
+
+def test_the_published_port_stays_when_the_container_ip_is_unreachable() -> None:
+    # Docker Desktop on macOS runs containers in a VM whose bridge IPs the host
+    # cannot route to; the published port is the only way in there.
+    def inspect(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout="172.17.0.9\n", stderr="")
+
+    def unreachable(address, timeout):
+        raise OSError("no route to host")
+
+    url = "postgresql://postgres:postgres@127.0.0.1:49152/pdw"
+    assert direct_postgres_url(url, "c", runner=inspect, probe=unreachable) == url
+
+
+def test_the_published_port_stays_when_docker_reports_no_ip() -> None:
+    def inspect(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="no such container")
+
+    url = "postgresql://postgres:postgres@127.0.0.1:49152/pdw"
+    assert direct_postgres_url(url, "c", runner=inspect, probe=lambda *_: True) == url
+
+
+def test_tests_are_scheduled_longest_first_from_the_last_runs_durations() -> None:
+    durations = {"a::slow": 20.0, "a::medium": 3.0, "b::fast": 0.01}
+
+    order = sorted(
+        ["b::fast", "b::new_unit", "a::medium", "c::new_db", "a::slow"],
+        key=lambda nodeid: schedule_key(
+            nodeid, requires_postgres=nodeid.endswith("_db"), durations=durations
+        ),
+    )
+
+    # Measured tests longest first; a test with no history is assumed to cost
+    # what a typical Postgres test or unit test does.
+    assert order == ["a::slow", "a::medium", "c::new_db", "b::fast", "b::new_unit"]
+
+
+def test_owned_clusters_hold_a_bounded_number_of_workers_each() -> None:
+    assert [cluster_count(workers) for workers in (1, 8, 9, 32)] == [1, 1, 2, 4]
+
+
+def test_workers_are_spread_across_the_owned_clusters_by_worker_number() -> None:
+    import psycopg2
+
+    url = _owned_postgres_url()
+    other = "postgresql://postgres:postgres@unused.invalid:5432/pdw"
+    env = {"POSTGRES_DATABASE_URL": url, OWNED_POSTGRES_URL_ENV: f"{other} {url}"}
+
+    # gw997 % 2 == 1 -> the second cluster, which is the reachable one here.
+    use_worker_database(env, "gw997")
+
+    assert env["POSTGRES_DATABASE_URL"] == url.rsplit("/", 1)[0] + "/pdw_gw997"
+    admin = psycopg2.connect(url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute("DROP DATABASE pdw_gw997")
+    finally:
+        admin.close()

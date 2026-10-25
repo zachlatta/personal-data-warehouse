@@ -29,13 +29,13 @@ Development practices:
   The suite runs under `pytest-xdist` by default (`-n auto --dist worksteal` in
   `pyproject.toml`; `-n 0` for a serial run or `--pdb`): each test warehouse is its own
   `pdw_test_*` namespace, and a lock that guards one namespace's objects is keyed per namespace
-  (`index_refresh_lock_key`, `query_role_setup_lock_key`). Against the disposable cluster each
-  worker also gets its own database (`use_worker_database`) and `-n auto` is 1.5 workers per
-  CPU: DDL invalidations and advisory locks are per database, so workers sharing one taxed each
-  other and more workers ran slower. Postgres-backed tests are scheduled first so unit tests
-  fill the tail. Full suite on mew-dev (16 vCPUs) 2026-10-25: 247-288s → 80-86s, CPU-bound;
-  the ~19% steady idle left is scheduler slack at ~88k context switches/s, unchanged by more
-  workers, more clusters, guest haltpoll or `migration_cost_ns`.
+  (`index_refresh_lock_key`, `query_role_setup_lock_key`). When the run owns its Postgres
+  (`tests/local_test_runtime.py`), `-n auto` is 2 workers per CPU, one disposable cluster per 8
+  workers, each worker in its own database (DDL invalidations and advisory locks are per
+  database), the data directory on tmpfs, connections straight to the container IP (no
+  docker-proxy), and tests run longest-first from the last run's durations in `.pytest_cache`.
+  On mew-dev (16 vCPUs) 2026-10-25: 247-288s → 63-67s, steady state ~5% CPU idle with ~38
+  tasks runnable, the floor a synthetic ping-pong of the same shape reaches on that VM.
 * **The Go app deploys before the Python ensure path migrates a view.** A Go query that reads a
   new `marts_*` column returns 500 ("column ... does not exist") until the next ensure run
   rebuilds the view, about a minute after the push on 2026-10-20 (the Feed `saved` column).

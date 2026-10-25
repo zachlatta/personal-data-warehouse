@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import uuid
@@ -14,7 +15,10 @@ from tests.local_test_runtime import (
     LocalTestStartupError,
     PostgresTestRuntime,
     auto_worker_count,
+    cluster_count,
     callable_requires_postgres,
+    direct_postgres_url,
+    schedule_key,
     subscription_tests_enabled,
     subscription_tests_skip_reason,
     use_worker_database,
@@ -41,15 +45,33 @@ def pytest_configure(config: pytest.Config) -> None:
     unit_only = bool(config.getoption("--unit-only"))
     try:
         enabled = subscription_tests_enabled(os.environ)
-        runtime = PostgresTestRuntime(unit_only=unit_only)
-        runtime.start()
+        runtimes = [PostgresTestRuntime(unit_only=unit_only)]
+        workers = int(getattr(config.option, "numprocesses", 0) or 0)
+        if (
+            "PYTEST_XDIST_WORKER" not in os.environ
+            and workers > 1
+            and not unit_only
+            and not os.environ.get("POSTGRES_DATABASE_URL", "").strip()
+        ):
+            # Each extra cluster gets its own env so only the first injects
+            # POSTGRES_DATABASE_URL; they start in parallel.
+            runtimes += [PostgresTestRuntime(env=dict(os.environ)) for _ in range(cluster_count(workers) - 1)]
+        for runtime in runtimes:
+            config.add_cleanup(runtime.close)
+        with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
+            urls = list(pool.map(lambda runtime: runtime.start(), runtimes))
     except LocalTestStartupError as error:
         raise pytest.UsageError(str(error)) from error
 
     config.stash[_SUBSCRIPTION_TESTS_ENABLED] = enabled
-    config.add_cleanup(runtime.close)
-    if runtime.owned_container is not None:
-        os.environ[OWNED_POSTGRES_URL_ENV] = os.environ["POSTGRES_DATABASE_URL"]
+    if runtimes[0].owned_container is not None:
+        owned = [
+            direct_postgres_url(url, runtime.owned_container)
+            for url, runtime in zip(urls, runtimes)
+            if url and runtime.owned_container is not None
+        ]
+        os.environ["POSTGRES_DATABASE_URL"] = owned[0]
+        os.environ[OWNED_POSTGRES_URL_ENV] = " ".join(owned)
     try:
         use_worker_database(os.environ, os.environ.get("PYTEST_XDIST_WORKER"))
     except LocalTestStartupError as error:
@@ -100,13 +122,40 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         elif not subscription_enabled and item.get_closest_marker("subscription_agent") is not None:
             item.add_marker(subscription_skip)
 
-    # Hand xdist the Postgres-backed tests first. They are ~90% of the suite's
-    # test-seconds, and collection order put the heaviest files (pipeline
-    # health, search index, timeline) last, so on 2026-10-24 workers went idle
-    # from 110s while a few finished those files at 137s. Queued after them,
-    # the ~1,500 millisecond unit tests fill the tail instead. Stable sort, so
-    # every worker still collects the identical order xdist requires.
-    items.sort(key=lambda item: item.get_closest_marker("local_integration") is None)
+    # Hand xdist the longest tests first, by the last run's durations, so the
+    # run does not end with one worker finishing a 20 s test alone. Collection
+    # order put the heaviest files (pipeline health, search index, timeline)
+    # last: on 2026-10-24 workers went idle from 110s while a few finished
+    # them at 137s. Every worker reads the same cache file and the sort is
+    # stable, so each still collects the identical order xdist requires.
+    durations = config.cache.get(_DURATIONS_CACHE_KEY, {}) if config.cache is not None else {}
+    items.sort(
+        key=lambda item: schedule_key(
+            item.nodeid,
+            requires_postgres=item.get_closest_marker("local_integration") is not None,
+            durations=durations,
+        )
+    )
+
+
+_DURATIONS_CACHE_KEY = "pdw/test-durations"
+# This run's per-test seconds (setup + call + teardown), filled on the xdist
+# controller or in a serial run; workers skip it so one process writes the cache.
+_RUN_DURATIONS: dict[str, float] = {}
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        _RUN_DURATIONS[report.nodeid] = _RUN_DURATIONS.get(report.nodeid, 0.0) + float(report.duration)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    cache = session.config.cache
+    if os.environ.get("PYTEST_XDIST_WORKER") or cache is None or not _RUN_DURATIONS:
+        return
+    durations = dict(cache.get(_DURATIONS_CACHE_KEY, {}))
+    durations.update({nodeid: round(seconds, 4) for nodeid, seconds in _RUN_DURATIONS.items()})
+    cache.set(_DURATIONS_CACHE_KEY, durations)
 
 
 # The warehouse tests run against a real (shared) Postgres, one throwaway
