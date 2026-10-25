@@ -26,6 +26,13 @@ const (
 	callbackPath = "/connections/oauth/callback"
 	startPath    = "/connections/oauth/start"
 	appReturn    = "pdw://connections"
+	// loopbackRedirectURL is where a loopback connection's provider sends the
+	// browser. Nothing listens there: the page fails to load and its address,
+	// carrying the code, is pasted back. PKCE keeps a code taken from it
+	// useless to anyone without the verifier PDW holds. Robinhood's shared
+	// MCP client rejects PDW's own callback and accepts this shape, which is
+	// what local MCP clients such as mcporter register.
+	loopbackRedirectURL = "http://127.0.0.1:8976/callback"
 )
 
 func randomSecret() string {
@@ -166,6 +173,9 @@ func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL,
 		if err := exists(c); err != nil {
 			return err
 		}
+		if app && c.Loopback {
+			return errors.New("loopback connections authenticate on the PDW web Connections page")
+		}
 		resource, metadata, err := s.discover(ctx, c.URL)
 		if err != nil {
 			return err
@@ -176,6 +186,9 @@ func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL,
 			return errors.New("upstream issuer changed; remove and recreate this connection")
 		}
 		cfg.RedirectURL = s.baseURL + callbackPath
+		if c.Loopback {
+			cfg.RedirectURL = loopbackRedirectURL
+		}
 		cfg.Endpoint = oauth2.Endpoint{AuthURL: metadata.AuthorizationEndpoint, TokenURL: metadata.TokenEndpoint, AuthStyle: oauth2.AuthStyleInParams}
 		if len(cfg.Scopes) == 0 {
 			cfg.Scopes = resource.ScopesSupported
@@ -202,7 +215,7 @@ func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL,
 		} else if cfg.ClientSecret != "" && (len(metadata.TokenEndpointAuthMethodsSupported) == 0 || slices.Contains(metadata.TokenEndpointAuthMethodsSupported, "client_secret_basic")) {
 			cfg.Endpoint.AuthStyle = oauth2.AuthStyleInHeader
 		}
-		pending := &pendingAuth{State: id + "." + randomSecret(), Browser: browser, Verifier: oauth2.GenerateVerifier(), Expires: time.Now().Add(10 * time.Minute)}
+		pending := &pendingAuth{State: id + "." + randomSecret(), Browser: browser, Verifier: oauth2.GenerateVerifier(), Expires: time.Now().Add(10 * time.Minute), Loopback: c.Loopback}
 		c.OAuth = cfg
 		c.Resource = resource.Resource
 		c.Issuer = metadata.Issuer
@@ -237,13 +250,38 @@ func (s *Service) StartAppOAuth(ctx context.Context, handoff string) (authURL, b
 	return authURL, browser, err
 }
 func (s *Service) CompleteOAuth(ctx context.Context, state, code, browser, issuer string) (string, error) {
-	id, _, err := s.completeOAuth(ctx, state, code, browser, issuer)
+	id, _, err := s.completeOAuth(ctx, state, code, issuer, boundToBrowser(browser))
 	return id, err
+}
+
+// boundToBrowser accepts a web-callback flow started by the browser holding
+// this binding cookie; loopback flows never finish through the callback.
+func boundToBrowser(browser string) func(*pendingAuth) bool {
+	return func(p *pendingAuth) bool {
+		return !p.Loopback && browser != "" && subtle.ConstantTimeCompare([]byte(p.Browser), []byte(browser)) == 1
+	}
+}
+
+// CompletePastedOAuth finishes a loopback connection's flow from the address
+// the provider redirected the browser to. The caller is the authenticated
+// owner, so the pending flow must be a loopback one belonging to id.
+func (s *Service) CompletePastedOAuth(ctx context.Context, id, pasted string) error {
+	redirect, err := url.Parse(strings.TrimSpace(pasted))
+	if err != nil || redirect.Query().Get("state") == "" {
+		return errors.New("paste the full address the browser was sent to; it carries code and state")
+	}
+	q := redirect.Query()
+	if owner, _, _ := strings.Cut(q.Get("state"), "."); owner != id {
+		return errors.New("that address belongs to a different connection's sign-in")
+	}
+	_, _, err = s.completeOAuth(ctx, q.Get("state"), q.Get("code"), q.Get("iss"), func(p *pendingAuth) bool { return p.Loopback })
+	return err
 }
 
 // completeOAuth also reports where the flow started (appReturn for the phone
 // app, "" for the web page) so the callback can send the browser back there.
-func (s *Service) completeOAuth(ctx context.Context, state, code, browser, issuer string) (id, returnTo string, err error) {
+// bound says whether this caller may finish the pending flow.
+func (s *Service) completeOAuth(ctx context.Context, state, code, issuer string, bound func(*pendingAuth) bool) (id, returnTo string, err error) {
 	id, _, ok := strings.Cut(state, ".")
 	if !ok || !namePattern.MatchString(id) {
 		return "", "", errors.New("invalid OAuth state")
@@ -254,7 +292,7 @@ func (s *Service) completeOAuth(ctx context.Context, state, code, browser, issue
 		if p != nil && p.Return == appReturn {
 			returnTo = appReturn
 		}
-		if c.Deleted || p == nil || time.Now().After(p.Expires) || subtle.ConstantTimeCompare([]byte(p.State), []byte(state)) != 1 || browser == "" || subtle.ConstantTimeCompare([]byte(p.Browser), []byte(browser)) != 1 {
+		if c.Deleted || p == nil || time.Now().After(p.Expires) || subtle.ConstantTimeCompare([]byte(p.State), []byte(state)) != 1 || !bound(p) {
 			return errors.New("OAuth state expired or does not belong to this browser; reconnect")
 		}
 		if issuer != "" && issuer != c.Issuer {

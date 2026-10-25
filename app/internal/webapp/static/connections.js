@@ -39,6 +39,8 @@ export function mount(container, ctx) {
   const clientSecret = field(advanced, "OAuth client secret", "password");
   const scopes = field(advanced, "OAuth scopes (space-separated)");
   form.append(advanced);
+  const loopback = field(form, "Sign in through a localhost loopback redirect", "checkbox");
+  form.append(h("p", "", "For providers such as Robinhood that reject PDW's callback address. After you approve, the browser lands on a 127.0.0.1 page that does not load; paste that page's address back here."));
   const clients = field(form, "Allowed PDW client names (comma-separated)", "text", "codex, claude, web");
   const all = field(form, "Share with every authenticated PDW client, including future clients", "checkbox");
   form.append(h("p", "connection-warning", "Sharing includes write tools. Calls run with your upstream account and its permissions, without adding PDW mutation review. Leave access empty to keep tools private until you choose clients. Holders of the PDW app secret have administrator access."));
@@ -60,12 +62,28 @@ export function mount(container, ctx) {
       if (!data.connections.length) list.append(h("p", "", "No connections yet. Add a server below, then authenticate."));
       for (const c of data.connections) {
         const card = h("section", "connection-card");
-        card.append(h("h2", "", c.name), h("p", "connection-url", c.url), h("p", "", `${c.enabled ? c.status.replaceAll("_", " ") : "disabled"} · ${c.tool_count} tools · prefix ${c.name}__`));
+        card.append(h("h2", "", c.name), h("p", "connection-url", c.url), h("p", "", `${c.enabled ? c.status.replaceAll("_", " ") : "disabled"} · ${c.tool_count} tools · prefix ${c.name}__${c.loopback ? " · loopback sign-in" : ""}`));
+        const paste = h("div", "connection-paste");
         const controls = h("div", "connection-actions");
         const authenticate = button("Authenticate", "primary");
         authenticate.addEventListener("click", () => run(authenticate, async () => {
           const data = await action(c.name, "authorize");
-          if (!disposed) window.location.assign(data.authorization_url);
+          if (disposed) return;
+          if (!c.loopback) { window.location.assign(data.authorization_url); return; }
+          clear(paste);
+          const open = h("a", "", "Open the provider's sign-in in a new tab");
+          open.href = data.authorization_url; open.target = "_blank"; open.rel = "noopener noreferrer";
+          const redirect = field(paste, "After approving, paste the 127.0.0.1 address the browser was sent to", "url", "http://127.0.0.1:8976/callback?code=…");
+          const finish = button("Finish sign-in", "primary");
+          finish.addEventListener("click", () => run(finish, async () => {
+            const result = await action(c.name, "complete", { url: redirect.value.trim() });
+            if (disposed) return;
+            await load();
+            message.textContent = result.status === "connected" ? "Connected. Tools are ready. Some MCP apps need a reconnect to discover newly added tools." : "Authorization succeeded, but tool discovery failed. Retry discovery below.";
+          }));
+          paste.prepend(open);
+          paste.append(finish);
+          message.textContent = "Approve in the new tab, then paste the address it ends on. The sign-in link expires in 10 minutes.";
         }));
         const refresh = button("Refresh tools");
         refresh.addEventListener("click", () => run(refresh, async () => { await action(c.name, "refresh"); await load(); }));
@@ -76,7 +94,7 @@ export function mount(container, ctx) {
           if (!window.confirm(`Remove ${c.name} and its stored credentials? This does not revoke the authorization at the upstream provider.`)) return;
           await action(c.name, "remove", { version: c.version }); await load();
         }));
-        controls.append(authenticate, refresh, toggle, remove); card.append(controls);
+        controls.append(authenticate, refresh, toggle, remove); card.append(controls, paste);
         const access = h("details"); access.append(h("summary", "", c.all_clients ? "Access: all authenticated PDW clients" : `Access: ${(c.clients || []).join(", ") || "not shared"}`));
         const names = field(access, "Allowed client names", "text"); names.value = (c.clients || []).join(", ");
         const everyone = field(access, "Share all tools, including writes, with all authenticated clients", "checkbox"); everyone.checked = c.all_clients;
@@ -89,7 +107,7 @@ export function mount(container, ctx) {
   form.addEventListener("submit", (ev) => {
     ev.preventDefault();
     run(submit, async () => {
-      const body = { name: name.value.trim(), url: url.value.trim(), token: token.value, client_id: clientID.value.trim(), client_secret: clientSecret.value, scopes: scopes.value.trim().split(/\s+/).filter(Boolean), all_clients: all.checked, clients: clientNames(clients.value) };
+      const body = { name: name.value.trim(), url: url.value.trim(), token: token.value, client_id: clientID.value.trim(), client_secret: clientSecret.value, scopes: scopes.value.trim().split(/\s+/).filter(Boolean), all_clients: all.checked, clients: clientNames(clients.value), loopback: loopback.checked };
       await request("/api/connections", { method: "POST", body });
       form.reset(); message.textContent = "Connection added. Click Authenticate for OAuth, or Refresh tools for a bearer-token or unauthenticated server.";
       await load();

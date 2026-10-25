@@ -298,3 +298,167 @@ func TestOAuthRegistrationFailureNamesTheUpstreamReason(t *testing.T) {
 		t.Fatalf("error %v", err)
 	}
 }
+
+// loopbackUpstream is an OAuth MCP server that, like Robinhood's banking MCP,
+// only accepts a loopback redirect. It records what PDW registered and sent.
+type loopbackUpstream struct {
+	*httptest.Server
+	registered []string
+	challenge  string
+	exchanges  int
+}
+
+func newLoopbackUpstream(t *testing.T) *loopbackUpstream {
+	t.Helper()
+	u := &loopbackUpstream{}
+	u.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		endpoint := u.URL
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mcp":
+			w.WriteHeader(405)
+		case "/.well-known/oauth-protected-resource/mcp":
+			json.NewEncoder(w).Encode(map[string]any{"resource": endpoint + "/mcp", "authorization_servers": []string{endpoint + "/mcp"}, "scopes_supported": []string{"credit-card"}})
+		case "/.well-known/oauth-authorization-server/mcp":
+			json.NewEncoder(w).Encode(map[string]any{"issuer": endpoint + "/mcp", "authorization_endpoint": endpoint + "/authorize", "token_endpoint": endpoint + "/token", "registration_endpoint": endpoint + "/register", "response_types_supported": []string{"code"}, "code_challenge_methods_supported": []string{"S256"}})
+		case "/register":
+			var body struct {
+				RedirectURIs []string `json:"redirect_uris"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			u.registered = body.RedirectURIs
+			json.NewEncoder(w).Encode(map[string]any{"client_id": "shared-client", "token_endpoint_auth_method": "none", "redirect_uris": body.RedirectURIs})
+		case "/token":
+			u.exchanges++
+			r.ParseForm()
+			if r.Form.Get("redirect_uri") != loopbackRedirectURL || r.Form.Get("code") != "code" || pkceChallenge(r.Form.Get("code_verifier")) != u.challenge {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant"})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"access_token": "secret-token", "refresh_token": "secret-refresh", "token_type": "Bearer", "expires_in": 3600})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(u.Close)
+	return u
+}
+
+func loopbackService(t *testing.T, upstream *loopbackUpstream) (*memoryStore, *http.ServeMux) {
+	t.Helper()
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", upstream.Client())
+	mux := http.NewServeMux()
+	service.Register(mux, func(next http.Handler) http.Handler { return next })
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/connections", strings.NewReader(`{"name":"card","url":"`+upstream.URL+`/mcp","loopback":true}`)))
+	if rr.Code != 201 || !strings.Contains(rr.Body.String(), `"loopback":true`) {
+		t.Fatalf("create: %d %s", rr.Code, rr.Body.String())
+	}
+	return store, mux
+}
+
+func post(mux *http.ServeMux, path, body string) *httptest.ResponseRecorder {
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("POST", path, strings.NewReader(body)))
+	return rr
+}
+
+func TestLoopbackConnectionCompletesFromThePastedRedirect(t *testing.T) {
+	upstream := newLoopbackUpstream(t)
+	store, mux := loopbackService(t, upstream)
+
+	rr := post(mux, "/api/connections/card/authorize", "")
+	var begun map[string]string
+	json.Unmarshal(rr.Body.Bytes(), &begun)
+	authURL, err := url.Parse(begun["authorization_url"])
+	if rr.Code != 200 || err != nil {
+		t.Fatalf("authorize: %d %s", rr.Code, rr.Body.String())
+	}
+	q := authURL.Query()
+	if q.Get("redirect_uri") != loopbackRedirectURL || len(upstream.registered) != 1 || upstream.registered[0] != loopbackRedirectURL {
+		t.Fatalf("redirect %q registered %v", q.Get("redirect_uri"), upstream.registered)
+	}
+	upstream.challenge = q.Get("code_challenge")
+	pasted := loopbackRedirectURL + "?code=code&state=" + url.QueryEscape(q.Get("state")) + "&iss=" + url.QueryEscape(upstream.URL+"/mcp")
+
+	if rr = post(mux, "/api/connections/card/complete", `{"url":"`+loopbackRedirectURL+`?code=code&state=card.forged"}`); rr.Code != 400 || upstream.exchanges != 0 {
+		t.Fatalf("forged state: %d %s exchanges=%d", rr.Code, rr.Body.String(), upstream.exchanges)
+	}
+	if rr = post(mux, "/api/connections/card/complete", `{"url":"`+pasted+`"}`); rr.Code != 200 {
+		t.Fatalf("complete: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr = post(mux, "/api/connections/card/complete", `{"url":"`+pasted+`"}`); rr.Code != 400 || upstream.exchanges != 1 {
+		t.Fatalf("replay: %d exchanges=%d", rr.Code, upstream.exchanges)
+	}
+	records, _ := store.List(context.Background())
+	// Tool discovery fails against this stub; the stored token is what matters.
+	if records[0].Token.AccessToken != "secret-token" || records[0].Token.RefreshToken != "secret-refresh" || records[0].Pending != nil {
+		t.Fatal("pasted redirect did not authorize")
+	}
+}
+
+func TestLoopbackPastedDenialIsReportedAndConsumesTheFlow(t *testing.T) {
+	upstream := newLoopbackUpstream(t)
+	store, mux := loopbackService(t, upstream)
+	rr := post(mux, "/api/connections/card/authorize", "")
+	var begun map[string]string
+	json.Unmarshal(rr.Body.Bytes(), &begun)
+	authURL, _ := url.Parse(begun["authorization_url"])
+	state := authURL.Query().Get("state")
+	rr = post(mux, "/api/connections/card/complete", `{"url":"`+loopbackRedirectURL+`?error=access_denied&state=`+url.QueryEscape(state)+`"}`)
+	if rr.Code != 400 || !strings.Contains(rr.Body.String(), "denied") {
+		t.Fatalf("denial: %d %s", rr.Code, rr.Body.String())
+	}
+	records, _ := store.List(context.Background())
+	if records[0].Status != "authorization_denied" || records[0].Pending != nil || upstream.exchanges != 0 {
+		t.Fatalf("status %s", records[0].Status)
+	}
+}
+
+// Pasting is a loopback-only path: a web-callback connection stays bound to
+// the browser cookie that started its flow.
+func TestPastedCompletionIsRefusedForAWebCallbackConnection(t *testing.T) {
+	var endpoint string
+	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/.well-known/oauth-protected-resource":
+			json.NewEncoder(w).Encode(map[string]any{"resource": endpoint + "/mcp", "authorization_servers": []string{endpoint}})
+		case "/.well-known/oauth-authorization-server":
+			json.NewEncoder(w).Encode(map[string]any{"issuer": endpoint, "authorization_endpoint": endpoint + "/authorize", "token_endpoint": endpoint + "/token", "registration_endpoint": endpoint + "/register", "response_types_supported": []string{"code"}, "code_challenge_methods_supported": []string{"S256"}})
+		case "/register":
+			json.NewEncoder(w).Encode(map[string]any{"client_id": "pdw-client", "token_endpoint_auth_method": "none"})
+		case "/token":
+			t.Error("exchanged a pasted code for a web-callback connection")
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer remote.Close()
+	endpoint = remote.URL
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", remote.Client())
+	mux := http.NewServeMux()
+	service.Register(mux, func(next http.Handler) http.Handler { return next })
+	store.Update(context.Background(), "tasks", func(c *record) error { c.Name = "tasks"; c.URL = endpoint + "/mcp"; c.Enabled = true; return nil })
+	authURL, _, err := service.BeginOAuth(context.Background(), "tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := url.Parse(authURL)
+	rr := post(mux, "/api/connections/tasks/complete", `{"url":"https://pdw.example/connections/oauth/callback?code=code&state=`+url.QueryEscape(parsed.Query().Get("state"))+`"}`)
+	if rr.Code != 400 {
+		t.Fatalf("complete: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLoopbackConnectionRefusesThePhoneAppFlow(t *testing.T) {
+	upstream := newLoopbackUpstream(t)
+	_, mux := loopbackService(t, upstream)
+	rr := post(mux, "/api/connections/card/authorize?return=app", "")
+	if rr.Code != 400 || !strings.Contains(rr.Body.String(), "web") {
+		t.Fatalf("app authorize: %d %s", rr.Code, rr.Body.String())
+	}
+}

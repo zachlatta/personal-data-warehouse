@@ -289,6 +289,7 @@ a.filelink:hover { text-decoration: underline; }
 .connection-field input:not([type=checkbox]) { width: 100%; padding: 9px 10px; box-sizing: border-box; }
 .connection-field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: flex-start; }
 .connection-field input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
+.connection-paste:not(:empty) { margin-top: 12px; }
 .connection-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
 .connection-message:not(:empty) { border-left: 3px solid #90743a; background: #faf6e8; padding: 12px; margin-top: 18px; color: #4c402b; }
 .connection-warning { font-size: 12px; }

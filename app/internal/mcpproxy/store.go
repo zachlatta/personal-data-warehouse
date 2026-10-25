@@ -33,6 +33,9 @@ type pendingAuth struct {
 	AuthURL string
 	Handoff string
 	Return  string
+	// Loopback flows finish by pasting the redirect into the authenticated
+	// API, which stands in for the browser cookie as the flow's binding.
+	Loopback bool
 }
 type record struct {
 	Generation string
@@ -41,16 +44,19 @@ type record struct {
 	Enabled    bool
 	AllClients bool
 	Clients    []string
-	Deleted    bool
-	Version    int64
-	Token      oauth2.Token
-	OAuth      oauth2.Config
-	Resource   string
-	Issuer     string
-	Pending    *pendingAuth
-	Tools      []*mcp.Tool
-	Status     string
-	UpdatedAt  time.Time
+	// Loopback redirects OAuth to loopbackRedirectURL instead of PDW's
+	// callback, for providers that accept only local clients' redirects.
+	Loopback  bool
+	Deleted   bool
+	Version   int64
+	Token     oauth2.Token
+	OAuth     oauth2.Config
+	Resource  string
+	Issuer    string
+	Pending   *pendingAuth
+	Tools     []*mcp.Tool
+	Status    string
+	UpdatedAt time.Time
 }
 
 // Store serializes all changes to a connection, including rotating refresh

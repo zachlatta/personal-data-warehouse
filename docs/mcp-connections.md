@@ -34,6 +34,20 @@ state is bound to an HttpOnly, Secure, SameSite=Lax browser cookie, expires in t
 and is consumed on exchange. Tokens and pending state survive app restarts. Refresh and
 connection updates serialize through a Postgres row lock, including across app processes.
 PDW access tokens are never forwarded upstream; each upstream uses only its own token.
+Registration accepts any 2xx carrying a `client_id` (Robinhood answers 200, not RFC 7591's
+201), and a refusal reports the upstream's own `error` and `error_description`.
+
+**Loopback sign-in.** Some providers hand every dynamically registered client one shared
+client ID whose redirect allowlist holds only local clients' addresses; Robinhood's banking
+MCP refuses PDW's callback with "Mismatching Redirect URI" *after* consent. A connection
+added with **Sign in through a localhost loopback redirect** (`"loopback": true` on create)
+registers and redirects to `http://127.0.0.1:8976/callback` instead, the shape mcporter
+uses. Nothing listens there; the owner pastes that address into the web page, which posts
+it to `POST /api/connections/<name>/complete {"url": ...}`. The authenticated admin API
+replaces the browser cookie as the flow's binding: the pasted state must be the pending
+loopback flow of that connection, PKCE keeps a code taken from the dead page useless, and
+the state is consumed on exchange. Web-callback flows cannot be finished by pasting, and
+loopback connections refuse the phone app's flow.
 
 Outbound HTTP requires HTTPS, rejects redirects, disables ambient HTTP proxies, validates
 all DNS answers and dials a validated public address directly. This applies to MCP,

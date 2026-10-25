@@ -17,6 +17,7 @@ type summary struct {
 	Enabled       bool     `json:"enabled"`
 	AllClients    bool     `json:"all_clients"`
 	Clients       []string `json:"clients"`
+	Loopback      bool     `json:"loopback"`
 	Status        string   `json:"status"`
 	ToolCount     int      `json:"tool_count"`
 	Version       int64    `json:"version"`
@@ -24,7 +25,7 @@ type summary struct {
 }
 
 func summarize(c record) summary {
-	return summary{Name: c.Name, URL: c.URL, Enabled: c.Enabled, AllClients: c.AllClients, Clients: c.Clients, Status: c.Status, ToolCount: len(c.Tools), Version: c.Version, Authenticated: c.Token.AccessToken != ""}
+	return summary{Name: c.Name, URL: c.URL, Enabled: c.Enabled, AllClients: c.AllClients, Clients: c.Clients, Loopback: c.Loopback, Status: c.Status, ToolCount: len(c.Tools), Version: c.Version, Authenticated: c.Token.AccessToken != ""}
 }
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -81,6 +82,7 @@ func (s *Service) connections(w http.ResponseWriter, r *http.Request) {
 		Scopes       []string `json:"scopes"`
 		AllClients   bool     `json:"all_clients"`
 		Clients      []string `json:"clients"`
+		Loopback     bool     `json:"loopback"`
 	}
 	if err := decode(w, r, &input); err != nil {
 		failure(w, 400, err.Error())
@@ -105,7 +107,7 @@ func (s *Service) connections(w http.ResponseWriter, r *http.Request) {
 		if c.Version > 0 && !c.Deleted {
 			return errors.New("a connection with this name already exists")
 		}
-		*c = record{Generation: randomSecret(), Name: input.Name, URL: input.URL, Enabled: true, AllClients: input.AllClients, Clients: input.Clients, Token: oauth2.Token{AccessToken: input.Token, TokenType: "Bearer"}, OAuth: oauth2.Config{ClientID: input.ClientID, ClientSecret: input.ClientSecret, Scopes: input.Scopes}, Status: "not_connected", Version: c.Version}
+		*c = record{Generation: randomSecret(), Name: input.Name, URL: input.URL, Enabled: true, AllClients: input.AllClients, Clients: input.Clients, Loopback: input.Loopback, Token: oauth2.Token{AccessToken: input.Token, TokenType: "Bearer"}, OAuth: oauth2.Config{ClientID: input.ClientID, ClientSecret: input.ClientSecret, Scopes: input.Scopes}, Status: "not_connected", Version: c.Version}
 		out = summarize(*c)
 		out.Version++
 		return nil
@@ -148,6 +150,24 @@ func (s *Service) connection(w http.ResponseWriter, r *http.Request) {
 		}
 		http.SetCookie(w, &http.Cookie{Name: "pdw_mcp_" + id, Value: browser, Path: callbackPath, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 		writeJSON(w, 200, map[string]string{"authorization_url": authURL})
+		return
+	case "complete":
+		var input struct {
+			URL string `json:"url"`
+		}
+		if err := decode(w, r, &input); err != nil {
+			failure(w, 400, err.Error())
+			return
+		}
+		if err := s.CompletePastedOAuth(r.Context(), id, input.URL); err != nil {
+			failure(w, 400, err.Error())
+			return
+		}
+		status := "connected"
+		if err := s.Refresh(r.Context(), id); err != nil {
+			status = "discovery_failed"
+		}
+		writeJSON(w, 200, map[string]string{"status": status})
 		return
 	case "refresh":
 		if err := s.Refresh(r.Context(), id); err != nil {
@@ -216,7 +236,7 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 			browser = cookie.Value
 		}
 	}
-	id, returnTo, err := s.completeOAuth(r.Context(), state, r.URL.Query().Get("code"), browser, r.URL.Query().Get("iss"))
+	id, returnTo, err := s.completeOAuth(r.Context(), state, r.URL.Query().Get("code"), r.URL.Query().Get("iss"), boundToBrowser(browser))
 	done := func(status string) {
 		if returnTo == appReturn {
 			http.Redirect(w, r, appReturn+"?auth="+status, http.StatusSeeOther)
