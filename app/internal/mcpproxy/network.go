@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -61,6 +63,45 @@ func publicIP(raw string) bool {
 	return true
 }
 
+// Tailscale addresses, minus its own service range (100.100.100.0/24: MagicDNS and friends).
+var tailnet = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")}
+var tailnetService = netip.MustParsePrefix("100.100.100.0/24")
+
+// tailnetHosts reads PDW_MCP_TAILNET_HOSTS: comma-separated upstream hostnames that may
+// resolve to Tailscale addresses, for MCP servers that are only reachable over the tailnet.
+func tailnetHosts() map[string]bool {
+	hosts := map[string]bool{}
+	for _, h := range strings.Split(os.Getenv("PDW_MCP_TAILNET_HOSTS"), ",") {
+		if h = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), ".")); h != "" {
+			hosts[h] = true
+		}
+	}
+	return hosts
+}
+
+func allowedIP(host, raw string, tailnetOK map[string]bool) bool {
+	if publicIP(raw) {
+		return true
+	}
+	if !tailnetOK[strings.ToLower(strings.TrimSuffix(host, "."))] {
+		return false
+	}
+	ip, err := netip.ParseAddr(raw)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	if tailnetService.Contains(ip) {
+		return false
+	}
+	for _, p := range tailnet {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 type checkedTransport struct{ base http.RoundTripper }
 
 func (t checkedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -102,7 +143,9 @@ func (b *boundedBody) Read(p []byte) (int, error) {
 	b.remaining -= int64(n)
 	return n, err
 }
-func safeClient() *http.Client {
+func safeClient() *http.Client { return safeClientWith(tailnetHosts()) }
+
+func safeClientWith(tailnetOK map[string]bool) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil // Never route private addresses through an ambient proxy.
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -118,7 +161,7 @@ func safeClient() *http.Client {
 			return nil, errors.New("upstream has no addresses")
 		}
 		for _, ip := range ips {
-			if !publicIP(ip.String()) {
+			if !allowedIP(host, ip.String(), tailnetOK) {
 				return nil, errors.New("upstream resolves to a non-public address")
 			}
 		}

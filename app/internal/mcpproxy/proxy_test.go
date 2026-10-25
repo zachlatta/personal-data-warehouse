@@ -34,6 +34,27 @@ func TestURLPolicy(t *testing.T) {
 	}
 }
 
+func TestTailnetHostsOnlyReachTailnet(t *testing.T) {
+	ok := map[string]bool{"box.example.ts.net": true}
+	for _, c := range []struct {
+		host, ip string
+		want     bool
+	}{
+		{"box.example.ts.net", "100.71.166.26", true},
+		{"BOX.example.ts.net.", "fd7a:115c:a1e0::1", true},
+		{"other.example.ts.net", "100.71.166.26", false},
+		{"box.example.ts.net", "100.100.100.100", false},
+		{"box.example.ts.net", "127.0.0.1", false},
+		{"box.example.ts.net", "10.1.2.3", false},
+		{"box.example.ts.net", "169.254.169.254", false},
+		{"other.example.com", "8.8.8.8", true},
+	} {
+		if got := allowedIP(c.host, c.ip, ok); got != c.want {
+			t.Errorf("allowedIP(%s, %s) = %v", c.host, c.ip, got)
+		}
+	}
+}
+
 func TestEncryptedRecords(t *testing.T) {
 	box := newCipher("test-secret")
 	raw, err := seal(box, "skills", []byte("upstream-secret"))

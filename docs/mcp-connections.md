@@ -39,6 +39,10 @@ Outbound HTTP requires HTTPS, rejects redirects, disables ambient HTTP proxies, 
 all DNS answers and dials a validated public address directly. This applies to MCP,
 metadata, registration and token requests. Loopback, private, link-local, CGNAT and reserved
 addresses are rejected. The gateway cannot be used to reach the host's internal services.
+One exception, off by default: `PDW_MCP_TAILNET_HOSTS` (comma-separated hostnames, e.g.
+`porygon.example.ts.net`) lets exactly those names resolve to Tailscale addresses
+(100.64.0.0/10 except 100.100.100.0/24, and fd7a:115c:a1e0::/48), for MCP servers kept off
+the public internet. HTTPS is still required (Tailscale Serve certificates work).
 Bearer credentials are attached only to the exact configured MCP endpoint.
 
 ## Scope and failure behavior
