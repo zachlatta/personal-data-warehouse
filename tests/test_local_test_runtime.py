@@ -9,7 +9,6 @@ from personal_data_warehouse.agent_runner import AgentContainerConfig
 from tests.local_test_runtime import (
     DEFAULT_POSTGRES_IMAGE,
     auto_worker_count,
-    cluster_count,
     OWNED_POSTGRES_URL_ENV,
     POSTGRES_EXTENSIONS,
     LocalTestStartupError,
@@ -113,8 +112,6 @@ def test_default_start_launches_extension_complete_postgres_on_a_dynamic_port() 
         "PDW_PGBACKREST_ENABLED=false",
         "--publish",
         "127.0.0.1::5432",
-        "--tmpfs",
-        "/var/lib/postgresql:rw,size=8g",
         DEFAULT_POSTGRES_IMAGE,
         "postgres",
         "-c",
@@ -400,7 +397,7 @@ def test_an_unexpected_worker_id_is_refused() -> None:
 
 
 def test_auto_workers_oversubscribe_only_the_owned_per_worker_databases() -> None:
-    assert auto_worker_count({}, cpus=16) == 32
+    assert auto_worker_count({}, cpus=16) == 24
     assert auto_worker_count({}, cpus=1) == 2
     # A configured database is shared by every worker, where extra workers
     # contend instead of filling idle CPU.
@@ -465,27 +462,3 @@ def test_tests_are_scheduled_longest_first_from_the_last_runs_durations() -> Non
     # Measured tests longest first; a test with no history is assumed to cost
     # what a typical Postgres test or unit test does.
     assert order == ["a::slow", "a::medium", "c::new_db", "b::fast", "b::new_unit"]
-
-
-def test_owned_clusters_hold_a_bounded_number_of_workers_each() -> None:
-    assert [cluster_count(workers) for workers in (1, 8, 9, 32)] == [1, 1, 2, 4]
-
-
-def test_workers_are_spread_across_the_owned_clusters_by_worker_number() -> None:
-    import psycopg2
-
-    url = _owned_postgres_url()
-    other = "postgresql://postgres:postgres@unused.invalid:5432/pdw"
-    env = {"POSTGRES_DATABASE_URL": url, OWNED_POSTGRES_URL_ENV: f"{other} {url}"}
-
-    # gw997 % 2 == 1 -> the second cluster, which is the reachable one here.
-    use_worker_database(env, "gw997")
-
-    assert env["POSTGRES_DATABASE_URL"] == url.rsplit("/", 1)[0] + "/pdw_gw997"
-    admin = psycopg2.connect(url)
-    admin.autocommit = True
-    try:
-        with admin.cursor() as cursor:
-            cursor.execute("DROP DATABASE pdw_gw997")
-    finally:
-        admin.close()
