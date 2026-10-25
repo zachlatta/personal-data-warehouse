@@ -16,13 +16,20 @@ import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, s
 // One video plays at a time: starting another stops the last, as in X and
 // Instagram. The playing player's key, shared by the feed and detail view.
 // autoplayed: the feed started it on a scroll (muted), not a tap.
+// muted: the sound button's state, which starts as autoplayed.
 let playing: string | null = null;
 let autoplayed = false;
+let muted = false;
 const listeners = new Set<() => void>();
 function setPlaying(key: string | null, auto = false) {
   if (playing === key) return;
   playing = key;
   autoplayed = auto;
+  muted = auto;
+  for (const l of listeners) l();
+}
+function setMuted(m: boolean) {
+  muted = m;
   for (const l of listeners) l();
 }
 
@@ -89,8 +96,7 @@ export function InlineVideo({
   const theme = useTheme();
   const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
   const [drawn, setDrawn] = useState(false);
-  // The sound button's state: an autoplay starts muted, a tap with sound.
-  const [muted, setMuted] = useState(false);
+  const soundOff = useSyncExternalStore(subscribe, () => muted);
   const webRef = useRef<WebView>(null);
   const stopRef = useRef(onStop);
   const playRef = useRef(onPlay);
@@ -102,7 +108,6 @@ export function InlineVideo({
   // A tap reports its play itself; an autoplay is reported here.
   useEffect(() => {
     if (!active) return undefined;
-    setMuted(autoplayed);
     if (autoplayed) playRef.current(true);
     const stop = startTimer(true);
     return () => {
@@ -174,12 +179,12 @@ export function InlineVideo({
           style={styles.sound}
           hitSlop={10}
           onPress={() => {
-            webRef.current?.injectJavaScript(setMutedScript(!muted));
-            setMuted(!muted);
+            webRef.current?.injectJavaScript(setMutedScript(!soundOff));
+            setMuted(!soundOff);
           }}
           accessibilityRole="button"
-          accessibilityLabel={muted ? 'Turn sound on' : 'Turn sound off'}>
-          <Icon name={muted ? 'speaker.slash.fill' : 'speaker.wave.2.fill'} tintColor="#fff" size={16} />
+          accessibilityLabel={soundOff ? 'Turn sound on' : 'Turn sound off'}>
+          <Icon name={soundOff ? 'speaker.slash.fill' : 'speaker.wave.2.fill'} tintColor="#fff" size={16} />
         </Pressable>
       </View>
     );
