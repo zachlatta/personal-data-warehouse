@@ -8,11 +8,15 @@ import pytest
 from personal_data_warehouse.agent_runner import AgentContainerConfig
 from tests.local_test_runtime import (
     DEFAULT_POSTGRES_IMAGE,
+    auto_worker_count,
+    OWNED_POSTGRES_URL_ENV,
+    POSTGRES_EXTENSIONS,
     LocalTestStartupError,
     PostgresTestRuntime,
     callable_requires_postgres,
     preflight_subscription_auth,
     subscription_tests_enabled,
+    use_worker_database,
 )
 
 
@@ -330,3 +334,69 @@ def test_callable_postgres_detection_does_not_classify_a_pure_env_policy_test() 
         return url
 
     assert not callable_requires_postgres(pure_environment_policy_test, include_root=False)
+
+
+def _owned_postgres_url() -> str:
+    url = os.environ.get("POSTGRES_DATABASE_URL")
+    if not url:
+        pytest.skip("POSTGRES_DATABASE_URL is not set")
+    return url
+
+
+def test_a_worker_gets_its_own_extension_complete_database_in_the_owned_cluster() -> None:
+    import psycopg2
+
+    url = _owned_postgres_url()
+    env = {"POSTGRES_DATABASE_URL": url, OWNED_POSTGRES_URL_ENV: url}
+
+    use_worker_database(env, "gw999")
+
+    worker_url = env["POSTGRES_DATABASE_URL"]
+    assert worker_url.rsplit("/", 1) == [url.rsplit("/", 1)[0], "pdw_gw999"]
+    connection = psycopg2.connect(worker_url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_database()")
+            assert cursor.fetchone() == ("pdw_gw999",)
+            cursor.execute("SELECT extname FROM pg_extension")
+            assert POSTGRES_EXTENSIONS <= {row[0] for row in cursor.fetchall()}
+    finally:
+        connection.close()
+    admin = psycopg2.connect(url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute("DROP DATABASE pdw_gw999")
+    finally:
+        admin.close()
+
+
+def test_a_configured_database_is_never_split_per_worker() -> None:
+    env = {"POSTGRES_DATABASE_URL": "postgresql://configured.example/pdw"}
+
+    use_worker_database(env, "gw0")
+
+    assert env == {"POSTGRES_DATABASE_URL": "postgresql://configured.example/pdw"}
+
+
+def test_the_controller_and_serial_runs_keep_the_owned_database() -> None:
+    env = {"POSTGRES_DATABASE_URL": "postgresql://h/pdw", OWNED_POSTGRES_URL_ENV: "postgresql://h/pdw"}
+
+    use_worker_database(env, None)
+
+    assert env["POSTGRES_DATABASE_URL"] == "postgresql://h/pdw"
+
+
+def test_an_unexpected_worker_id_is_refused() -> None:
+    env = {"POSTGRES_DATABASE_URL": "postgresql://h/pdw", OWNED_POSTGRES_URL_ENV: "postgresql://h/pdw"}
+
+    with pytest.raises(LocalTestStartupError, match="worker id"):
+        use_worker_database(env, "gw0; DROP")
+
+
+def test_auto_workers_oversubscribe_only_the_owned_per_worker_databases() -> None:
+    assert auto_worker_count({}, cpus=16) == 24
+    assert auto_worker_count({}, cpus=1) == 2
+    # A configured database is shared by every worker, where extra workers
+    # contend instead of filling idle CPU.
+    assert auto_worker_count({"POSTGRES_DATABASE_URL": "postgresql://ci/pdw"}, cpus=4) == 4

@@ -13,7 +13,11 @@ import re
 import shutil
 import subprocess
 import time
+from urllib.parse import urlsplit, urlunsplit
 import uuid
+
+import psycopg2
+import psycopg2.sql
 
 from personal_data_warehouse.agent_runner import AgentContainerConfig, auth_docker_command
 
@@ -130,6 +134,70 @@ def callable_requires_postgres(
         return False
 
     return visit(function, is_root=True)
+
+
+# Set by the controller to the URL of the Postgres it launched, so a worker can
+# tell its own disposable cluster from a configured database it must not touch.
+OWNED_POSTGRES_URL_ENV = "PDW_TEST_OWNED_POSTGRES_URL"
+
+
+# Workers per CPU when each worker gets its own database. A worker spends much
+# of its time waiting on its Postgres backend, so one per CPU left 20-30% of
+# mew-dev idle; 1.5 beat both 1 and 2 on 2026-10-25.
+WORKERS_PER_CPU = 1.5
+
+
+def auto_worker_count(env: Mapping[str, str], *, cpus: int) -> int:
+    """What `-n auto` means: oversubscribe only when workers get their own databases."""
+    if env.get("POSTGRES_DATABASE_URL", "").strip():
+        return max(1, cpus)
+    return max(1, round(cpus * WORKERS_PER_CPU))
+
+
+def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> None:
+    """Point an xdist worker at its own database in the disposable cluster.
+
+    Two costs scale with how many workers share one database, and on
+    2026-10-25 (mew-dev, 16 vCPUs) they were the suite's limit. Every DDL
+    statement broadcasts catalog invalidations that each backend in the same
+    database must replay, so workers creating and dropping schemas taxed each
+    other's CPU: more workers made the suite slower. And advisory locks are
+    per database, so the warehouse's serialised ensure_* steps queued every
+    worker behind the others. A database per worker removes both, and 24
+    workers became faster than 16 instead of slower. A configured
+    POSTGRES_DATABASE_URL is never split; neither is a serial run.
+    """
+    url = env.get("POSTGRES_DATABASE_URL", "")
+    if worker is None or not url or env.get(OWNED_POSTGRES_URL_ENV) != url:
+        return
+    if not re.fullmatch(r"gw\d+", worker):
+        raise LocalTestStartupError(f"unexpected xdist worker id {worker!r}")
+    database = f"pdw_{worker}"
+    worker_url = urlunsplit(urlsplit(url)._replace(path=f"/{database}"))
+    try:
+        admin = psycopg2.connect(url)
+        admin.autocommit = True
+        try:
+            with admin.cursor() as cursor:
+                name = psycopg2.sql.Identifier(database)
+                cursor.execute(psycopg2.sql.SQL("DROP DATABASE IF EXISTS {}").format(name))
+                cursor.execute(psycopg2.sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(name))
+        finally:
+            admin.close()
+        connection = psycopg2.connect(worker_url)
+        connection.autocommit = True
+        try:
+            with connection.cursor() as cursor:
+                for extension in sorted(POSTGRES_EXTENSIONS):
+                    cursor.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
+        finally:
+            connection.close()
+    except psycopg2.Error as error:
+        raise LocalTestStartupError(
+            f"Local integration startup failed: could not create worker database {database}: {error}. "
+            f"Retry `uv run pytest`, or explicitly run `{_UNIT_ONLY_COMMAND}`."
+        ) from error
+    env["POSTGRES_DATABASE_URL"] = worker_url
 
 
 class PostgresTestRuntime:

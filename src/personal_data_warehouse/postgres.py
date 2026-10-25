@@ -700,6 +700,24 @@ def search_chunk_vectors_lock_key(namespace: str) -> int:
 # have to stay globally unique or moving either lock silently deadlocks it
 # against the other. test_advisory_lock_ids_are_unique enforces that.
 QUERY_ROLE_SETUP_LOCK_ID = 8_407_112_469
+
+
+def query_role_setup_lock_key(namespace: str) -> int:
+    """The advisory-lock key the privilege sweep takes, per warehouse namespace.
+
+    Production has one namespace (``public``) and keeps the historical key.
+    The sweep's GRANT/REVOKEs only touch its own namespace's schemas, so
+    namespaces cannot collide; the cluster-wide role and membership it may
+    create stay under ``QUERY_ROLE_SETUP_LOCK_ID``. Until 2026-10-24 every
+    namespace shared that one key, and parallel test workers spent 80% of
+    their database time queued behind each other's sweeps.
+    """
+    if namespace == "public":
+        return QUERY_ROLE_SETUP_LOCK_ID
+    digest = hashlib.sha256(namespace.encode("utf-8")).digest()
+    return QUERY_ROLE_SETUP_LOCK_ID ^ int.from_bytes(digest[:7], "big")
+
+
 # The advisory lock above only excludes other privilege sweeps. Ordinary DDL
 # (CREATE TABLE, CREATE OR REPLACE VIEW) from unrelated processes touches the
 # same pg_class rows, and Postgres reports the collision as "tuple concurrently
@@ -4029,7 +4047,9 @@ class PostgresWarehouse:
         with self._connection.cursor() as cursor:
             cursor.execute("BEGIN")
             try:
-                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (query_role_setup_lock_key(self._schema),)
+                )
                 if self._query_role_setup_needed():
                     self._ensure_query_role_locked()
                 cursor.execute("COMMIT")
@@ -4165,15 +4185,38 @@ class PostgresWarehouse:
                 functions.append(f"{qualified}(text, integer)")
         return schemas, relations, functions
 
-    def _ensure_query_role_locked(self) -> None:
+    def _query_role_membership_ready(self) -> bool:
+        rows = self._query(
+            "SELECT pg_has_role(current_user, oid, 'MEMBER') FROM pg_roles WHERE rolname = %s",
+            (self._query_role,),
+        )
+        return bool(rows and rows[0][0])
+
+    def _ensure_query_role_membership(self) -> None:
+        # The role and its membership are cluster-wide, unlike the rest of the
+        # sweep, which only touches this namespace's schemas. Take the shared
+        # key only when they are missing, and re-check under it. In production
+        # the caller already holds this same key, and advisory locks re-enter.
+        if self._query_role_membership_ready():
+            return
+        self._raw_command("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
+        if self._query_role_membership_ready():
+            return
         role = _identifier(self._query_role)
         role_literal = self._query_role.replace("'", "''")
+        # Roles are cluster-wide but advisory locks are per database, so a
+        # session in another database can create the role between the check
+        # and the CREATE.
         self._raw_command(
             f"""
             DO $role$
             BEGIN
                 IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role_literal}') THEN
-                    CREATE ROLE {role} NOLOGIN NOINHERIT;
+                    BEGIN
+                        CREATE ROLE {role} NOLOGIN NOINHERIT;
+                    EXCEPTION WHEN duplicate_object OR unique_violation THEN
+                        NULL;
+                    END;
                 END IF;
             END
             $role$
@@ -4181,6 +4224,10 @@ class PostgresWarehouse:
         )
         current_user = str(self._query("SELECT current_user")[0][0])
         self._raw_command(f"GRANT {role} TO {_identifier(current_user)}")
+
+    def _ensure_query_role_locked(self) -> None:
+        role = _identifier(self._query_role)
+        self._ensure_query_role_membership()
 
         revokes: list[str] = []
         for schema_name in CATALOG.denied_schemas():

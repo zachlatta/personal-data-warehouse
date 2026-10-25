@@ -26,13 +26,16 @@ Development practices:
   trip — and the image is published for arm64 as well as amd64 so an Apple-silicon Mac runs it
   natively. Measured 2026-09-20 on porygon (OrbStack, image on the external NVMe) over the same
   167 DB-heavy tests: emulated amd64 with fsync on 352s, native arm64 with fsync off 88s.
-  The suite runs under `pytest-xdist` by default (`-n auto` in `pyproject.toml`; `-n 0` for a
-  serial run or `--pdb`): each test warehouse is its own `pdw_test_*` namespace and the
-  index-refresh advisory lock is keyed per namespace (`index_refresh_lock_key`), which is what
-  makes parallel workers safe — with one cluster-wide try-lock, whichever worker lost it
-  silently skipped its own schema's index pass and a different index test failed every run.
-  Full suite on porygon 2026-09-20: 1,228s → 483s (fsync off) → 261s (native arm64) → ~125s
-  (4 workers).
+  The suite runs under `pytest-xdist` by default (`-n auto --dist worksteal` in
+  `pyproject.toml`; `-n 0` for a serial run or `--pdb`): each test warehouse is its own
+  `pdw_test_*` namespace, and a lock that guards one namespace's objects is keyed per namespace
+  (`index_refresh_lock_key`, `query_role_setup_lock_key`). Against the disposable cluster each
+  worker also gets its own database (`use_worker_database`) and `-n auto` is 1.5 workers per
+  CPU: DDL invalidations and advisory locks are per database, so workers sharing one taxed each
+  other and more workers ran slower. Postgres-backed tests are scheduled first so unit tests
+  fill the tail. Full suite on mew-dev (16 vCPUs) 2026-10-25: 247-288s → 80-86s, CPU-bound;
+  the ~19% steady idle left is scheduler slack at ~88k context switches/s, unchanged by more
+  workers, more clusters, guest haltpoll or `migration_cost_ns`.
 * **The Go app deploys before the Python ensure path migrates a view.** A Go query that reads a
   new `marts_*` column returns 500 ("column ... does not exist") until the next ensure run
   rebuilds the view, about a minute after the push on 2026-10-20 (the Feed `saved` column).

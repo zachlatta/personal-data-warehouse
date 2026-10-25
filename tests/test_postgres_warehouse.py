@@ -43,7 +43,9 @@ from personal_data_warehouse.postgres import (
     FLOAT_COLUMNS,
     INTEGER_COLUMNS,
     INDEX_SCHEMA_REFRESH_LOCK_ID,
+    QUERY_ROLE_SETUP_LOCK_ID,
     index_refresh_lock_key,
+    query_role_setup_lock_key,
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
@@ -172,6 +174,18 @@ def test_index_refresh_lock_is_keyed_per_namespace_and_unchanged_for_production(
     b = index_refresh_lock_key("pdw_test_20260920_b")
     assert a != b != INDEX_SCHEMA_REFRESH_LOCK_ID and a != INDEX_SCHEMA_REFRESH_LOCK_ID
     assert index_refresh_lock_key("pdw_test_20260920_a") == a
+    assert all(-(2**63) <= key < 2**63 for key in (a, b))
+
+
+def test_query_role_setup_lock_is_keyed_per_namespace_and_unchanged_for_production() -> None:
+    # The privilege sweep only rewrites its own namespace's schemas, so one
+    # cluster-wide lock serialized every parallel test worker's setup behind
+    # the others' sweeps: 80% of sampled backends waited on it (2026-10-24).
+    assert query_role_setup_lock_key("public") == QUERY_ROLE_SETUP_LOCK_ID
+    a = query_role_setup_lock_key("pdw_test_20261024_a")
+    b = query_role_setup_lock_key("pdw_test_20261024_b")
+    assert a != b and QUERY_ROLE_SETUP_LOCK_ID not in (a, b)
+    assert query_role_setup_lock_key("pdw_test_20261024_a") == a
     assert all(-(2**63) <= key < 2**63 for key in (a, b))
 
 

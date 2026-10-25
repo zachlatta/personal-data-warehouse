@@ -10,11 +10,14 @@ import pytest
 from dotenv import load_dotenv
 
 from tests.local_test_runtime import (
+    OWNED_POSTGRES_URL_ENV,
     LocalTestStartupError,
     PostgresTestRuntime,
+    auto_worker_count,
     callable_requires_postgres,
     subscription_tests_enabled,
     subscription_tests_skip_reason,
+    use_worker_database,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +48,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
     config.stash[_SUBSCRIPTION_TESTS_ENABLED] = enabled
     config.add_cleanup(runtime.close)
+    if runtime.owned_container is not None:
+        os.environ[OWNED_POSTGRES_URL_ENV] = os.environ["POSTGRES_DATABASE_URL"]
+    try:
+        use_worker_database(os.environ, os.environ.get("PYTEST_XDIST_WORKER"))
+    except LocalTestStartupError as error:
+        raise pytest.UsageError(str(error)) from error
     if unit_only and not os.environ.get("POSTGRES_DATABASE_URL"):
         unit_only_url = "postgresql://unit-only.invalid/pdw"
         os.environ["POSTGRES_DATABASE_URL"] = unit_only_url
@@ -54,6 +63,12 @@ def pytest_configure(config: pytest.Config) -> None:
                 os.environ.pop("POSTGRES_DATABASE_URL", None)
 
         config.add_cleanup(remove_unit_only_url)
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    load_dotenv()
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    return auto_worker_count(os.environ, cpus=cpus)
 
 
 def _item_requires_postgres(item: pytest.Item) -> bool:
@@ -84,6 +99,14 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(unit_only_skip)
         elif not subscription_enabled and item.get_closest_marker("subscription_agent") is not None:
             item.add_marker(subscription_skip)
+
+    # Hand xdist the Postgres-backed tests first. They are ~90% of the suite's
+    # test-seconds, and collection order put the heaviest files (pipeline
+    # health, search index, timeline) last, so on 2026-10-24 workers went idle
+    # from 110s while a few finished those files at 137s. Queued after them,
+    # the ~1,500 millisecond unit tests fill the tail instead. Stable sort, so
+    # every worker still collects the identical order xdist requires.
+    items.sort(key=lambda item: item.get_closest_marker("local_integration") is None)
 
 
 # The warehouse tests run against a real (shared) Postgres, one throwaway
