@@ -1,9 +1,8 @@
-// Sharing a card by email: a swipe opens a new draft in the phone's default
-// mail app (Superhuman when it is the default) with the card's title as the
-// subject and its link and summary as the body, and he picks who it goes to.
-// A mailto is the only form a mail app fills in: Superhuman's mobile app opens
-// superhuman:///compose/<mailto> and its universal link as an empty draft
-// (2026-10-20), although its web router reads the mailto's fields.
+// Sharing a card: the paper plane (feed) or the header button (detail view)
+// opens the phone's share sheet with the card's title as the subject and its
+// link and summary as the text, so it can go to Slack, Messages or a mail app
+// (Zach, 2026-10-25: "use the native share thing"). Until then a mailto opened
+// a draft in the default mail app only.
 
 export type Shareable = { title?: string; url?: string; body?: string };
 
@@ -28,8 +27,4 @@ export function shareDraft(item: Shareable, preview = ''): ShareDraft {
   const summary = preview ? summaryOf(preview) : '';
   const head = [title, url].filter(Boolean).join('\n');
   return { subject: title || url, body: [head, summary].filter(Boolean).join('\n\n') };
-}
-
-export function mailtoUrl(draft: ShareDraft): string {
-  return `mailto:?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`;
 }

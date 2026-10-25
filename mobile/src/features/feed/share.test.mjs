@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { mailtoUrl, shareDraft } from './share.ts';
+import { shareDraft } from './share.ts';
 
 test('the title is the subject and the link and summary are the body', () => {
   assert.deepEqual(shareDraft({ title: 'Show HN: A thing', url: 'https://example.com/a?b=1&c=2' }, 'It does  a\nthing.'), {
@@ -26,13 +26,4 @@ test('a long summary is cut at a sentence', () => {
 test('a long summary with no sentence break ends in an ellipsis', () => {
   const { body } = shareDraft({ title: 'T' }, 'word '.repeat(200));
   assert.ok(body.endsWith('word…'), body.slice(-20));
-});
-
-test('the mailto carries the subject and body intact', () => {
-  const draft = shareDraft({ title: 'A & B: 100%?', url: 'https://example.com/a?b=1&c=2#x' }, 'Plus+signs = fine.');
-  const url = mailtoUrl(draft);
-  assert.ok(url.startsWith('mailto:?subject='), url);
-  const params = new URLSearchParams(url.split('?')[1]);
-  assert.equal(params.get('subject'), draft.subject);
-  assert.equal(params.get('body'), draft.body);
 });

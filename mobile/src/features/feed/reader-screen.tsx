@@ -11,13 +11,15 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
 
+import type { FeedItem } from './api';
 import { articleUrl } from './article';
 import { ArticleView, type ArticleOutcome } from './article-view';
+import { cardContext } from './card-context';
 import { cardMedia } from './feed-card';
 import { feedItems, markActive, recordFeedEvent, recordUi, startTimer, takeOpenPaintMs } from './engagement';
 import { ScrollGestureTracker, scrollMetadata, type ScrollGesture } from './scroll-gestures';
 import { cardLinks } from './links';
-import { parseMarkdown, type Span } from './markdown';
+import { parseMarkdown, previewSpans, type Span } from './markdown';
 import type { FeedEmbed } from './rich';
 import {
   ACCENT,
@@ -36,6 +38,7 @@ import { LikeHeart } from './like-heart';
 import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
 import { openTrackedBrowser } from './tracked-browser';
+import { shareCard } from './share-sheet';
 import { cardVideo, videoAspect } from './video';
 import { InlineVideo } from './video-player';
 
@@ -44,6 +47,12 @@ function fullDate(iso: string | undefined): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
   return `${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} · ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+}
+
+// The card's summary as plain text, as the feed card shares it.
+function sharePreview(item: FeedItem): string {
+  const { preview } = cardContext(item);
+  return preview ? previewSpans(preview).map((s) => s.text).join('') : '';
 }
 
 // One post of the detail view; thread posts hang off a line from the avatar.
@@ -281,6 +290,12 @@ export default function FeedReaderScreen() {
                 onPress={() => toggleSaved(item, { position, via: 'detail' })}
                 accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
                 <Icon name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
+              </Pressable>
+              <Pressable
+                hitSlop={12}
+                onPress={() => void shareCard(item, embed?.text || sharePreview(item), { position, via: 'detail' })}
+                accessibilityLabel="Share">
+                <Icon name="square.and.arrow.up" tintColor={theme.text} size={22} />
               </Pressable>
             </View>
           ),

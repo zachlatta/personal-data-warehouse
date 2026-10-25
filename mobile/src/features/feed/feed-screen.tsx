@@ -3,12 +3,10 @@ import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   AppState,
   FlatList,
   LayoutAnimation,
   Keyboard,
-  Linking,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -50,7 +48,7 @@ import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { readFeedCache, writeFeedCache } from './feed-cache';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
-import { mailtoUrl, shareDraft } from './share';
+import { shareCard } from './share-sheet';
 import { autoplayStep } from './autoplay';
 import { openTrackedBrowser } from './tracked-browser';
 import { autoplayKey } from './video';
@@ -529,17 +527,9 @@ export default function FeedScreen() {
     [measure, pause],
   );
 
-  // The paper plane opens a draft of the card in the default mail app for
-  // him to address.
-  const onShare = useCallback(async (item: FeedItem, preview: string) => {
-    try {
-      await Linking.openURL(mailtoUrl(shareDraft(item, preview)));
-    } catch {
-      Alert.alert('Could not open a mail app', 'No mail app is set up on this phone.');
-      recordUi('share_failed', { item_id: item.item_id, position: position(item) });
-      return;
-    }
-    recordFeedEvent('share', { item_id: item.item_id, position: position(item), metadata: { via: 'mailto', url: item.url ?? '' } });
+  // The paper plane opens the phone's share sheet for the card.
+  const onShare = useCallback((item: FeedItem, preview: string) => {
+    void shareCard(item, preview, { position: position(item), via: 'feed' });
   }, []);
 
   const onExpand = useCallback((item: FeedItem) => {
