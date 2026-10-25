@@ -39,6 +39,10 @@ for plist in "$here"/ops/launchd/*.plist; do
   fi
   echo "reloading $label"
   ssh "$host" "cat > $installed" < "$plist"
-  ssh "$host" "launchctl bootout gui/\$(id -u)/$label 2>/dev/null; launchctl bootstrap gui/\$(id -u) $installed"
+  # bootout returns before a resident (KeepAlive) job has exited, and an early
+  # bootstrap then fails with "5: Input/output error": wait, then retry.
+  ssh "$host" "d=gui/\$(id -u); launchctl bootout \$d/$label 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do launchctl print \$d/$label >/dev/null 2>&1 || break; sleep 1; done
+    launchctl bootstrap \$d $installed || { sleep 3; launchctl bootstrap \$d $installed; }"
 done
 echo "device runtime on $host is at ~/$runtime"
