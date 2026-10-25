@@ -88,8 +88,9 @@ A tool *call* and its *result* are separate rows: the assistant row carries `too
 `lead(tool_result_json) OVER (PARTITION BY source, session_id ORDER BY seq)`, coalesced
 with the same row's value because some providers fill both. Absent values are empty
 strings, not NULL (`tool_name <> ''`). All three JSON columns are `text`; cast before `->>`.
-Codex stamps its call id in `turn_id` on both rows; pair by it there, because parallel calls
-are not adjacent. `is_sidechain = 1` marks subagent turns: include them when auditing what
+Codex and Claude Code stamp the call id in `turn_id` on both rows; pair by it there, because
+parallel calls are not adjacent (a Claude Code call before 2026-10-25 has it only in
+`raw_json`). `is_sidechain = 1` marks subagent turns: include them when auditing what
 an agent did, exclude them when reconstructing the human-visible conversation.
 
 **Codex runs nearly every tool through one custom tool**, so its `tool_name` is mostly

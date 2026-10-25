@@ -194,6 +194,11 @@ def test_claude_assistant_row_extracts_text_tool_and_tokens() -> None:
     assert row["subtype"] == "tool_use"
     assert row["tool_name"] == "Bash"
     assert json.loads(row["tool_input_json"]) == {"command": "ls"}
+    # The call carries the same id its tool_result row does, so a consumer can
+    # pair the two. Only the result row had it until 2026-10-25, which left
+    # agent_usage's id join matching nothing for Claude Code and every pdw call
+    # falling back to adjacency.
+    assert row["turn_id"] == "tu-1"
     assert row["input_tokens"] == 2066
     assert row["output_tokens"] == 261
     assert row["cache_read_tokens"] == 16307

@@ -458,6 +458,8 @@ def claude_code_event_row(
             row["subtype"] = "tool_use"
             row["tool_name"] = str(tool_block.get("name", ""))
             row["tool_input_json"] = raw_json(tool_block.get("input", {}))
+            # The id its tool_result row carries as turn_id: the pair key.
+            row["turn_id"] = str(tool_block.get("id", ""))
         elif row["text"]:
             row["subtype"] = "message"
         else:
