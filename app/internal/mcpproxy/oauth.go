@@ -18,7 +18,11 @@ import (
 	"golang.org/x/oauth2"
 )
 
-const callbackPath = "/connections/oauth/callback"
+const (
+	callbackPath = "/connections/oauth/callback"
+	startPath    = "/connections/oauth/start"
+	appReturn    = "pdw://connections"
+)
 
 func randomSecret() string {
 	raw := make([]byte, 32)
@@ -85,8 +89,24 @@ func (s *Service) discover(ctx context.Context, endpoint string) (*oauthex.Prote
 	return resource, metadata, nil
 }
 func (s *Service) BeginOAuth(ctx context.Context, id string) (authURL, browser string, err error) {
+	authURL, browser, _, err = s.beginOAuth(ctx, id, false)
+	return authURL, browser, err
+}
+
+// BeginAppOAuth starts OAuth for the phone app. It returns a one-time start
+// link for the system browser: the link sets the browser-binding cookie there
+// and forwards to the provider, and the callback returns to pdw://connections.
+func (s *Service) BeginAppOAuth(ctx context.Context, id string) (string, error) {
+	_, _, handoff, err := s.beginOAuth(ctx, id, true)
+	if err != nil {
+		return "", err
+	}
+	return s.baseURL + startPath + "?h=" + url.QueryEscape(handoff), nil
+}
+
+func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL, browser, handoff string, err error) {
 	if err = validateResourceURL(s.baseURL); err != nil {
-		return "", "", errors.New("MCP_BASE_URL must be HTTPS for browser OAuth")
+		return "", "", "", errors.New("MCP_BASE_URL must be HTTPS for browser OAuth")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -138,18 +158,51 @@ func (s *Service) BeginOAuth(ctx context.Context, id string) (authURL, browser s
 		c.Pending = pending
 		c.Status = "awaiting_authorization"
 		authURL = cfg.AuthCodeURL(pending.State, oauth2.S256ChallengeOption(pending.Verifier), oauth2.SetAuthURLParam("resource", resource.Resource))
+		if app {
+			handoff = id + "." + randomSecret()
+			pending.AuthURL, pending.Handoff, pending.Return = authURL, handoff, appReturn
+		}
+		return nil
+	})
+	return authURL, browser, handoff, err
+}
+
+// StartAppOAuth consumes a one-time start link and returns the browser
+// binding to set as a cookie and the provider URL to forward to.
+func (s *Service) StartAppOAuth(ctx context.Context, handoff string) (authURL, browser string, err error) {
+	id, _, ok := strings.Cut(handoff, ".")
+	if !ok || !namePattern.MatchString(id) {
+		return "", "", errors.New("invalid start link")
+	}
+	err = s.store.Update(ctx, id, func(c *record) error {
+		p := c.Pending
+		if c.Deleted || p == nil || time.Now().After(p.Expires) || p.Handoff == "" || subtle.ConstantTimeCompare([]byte(p.Handoff), []byte(handoff)) != 1 {
+			return errors.New("start link expired or already used; reconnect")
+		}
+		p.Handoff = "" // One use: a second browser cannot claim this flow.
+		authURL, browser = p.AuthURL, p.Browser
 		return nil
 	})
 	return authURL, browser, err
 }
 func (s *Service) CompleteOAuth(ctx context.Context, state, code, browser, issuer string) (string, error) {
+	id, _, err := s.completeOAuth(ctx, state, code, browser, issuer)
+	return id, err
+}
+
+// completeOAuth also reports where the flow started (appReturn for the phone
+// app, "" for the web page) so the callback can send the browser back there.
+func (s *Service) completeOAuth(ctx context.Context, state, code, browser, issuer string) (id, returnTo string, err error) {
 	id, _, ok := strings.Cut(state, ".")
 	if !ok || !namePattern.MatchString(id) {
-		return "", errors.New("invalid OAuth state")
+		return "", "", errors.New("invalid OAuth state")
 	}
 	var exchangeErr error
-	err := s.store.Update(ctx, id, func(c *record) error {
+	err = s.store.Update(ctx, id, func(c *record) error {
 		p := c.Pending
+		if p != nil && p.Return == appReturn {
+			returnTo = appReturn
+		}
 		if c.Deleted || p == nil || time.Now().After(p.Expires) || subtle.ConstantTimeCompare([]byte(p.State), []byte(state)) != 1 || browser == "" || subtle.ConstantTimeCompare([]byte(p.Browser), []byte(browser)) != 1 {
 			return errors.New("OAuth state expired or does not belong to this browser; reconnect")
 		}
@@ -179,10 +232,10 @@ func (s *Service) CompleteOAuth(ctx context.Context, state, code, browser, issue
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", returnTo, err
 	}
 	if exchangeErr != nil {
-		return "", exchangeErr
+		return "", returnTo, exchangeErr
 	}
-	return id, nil
+	return id, returnTo, nil
 }

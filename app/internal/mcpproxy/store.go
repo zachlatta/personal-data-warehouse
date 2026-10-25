@@ -27,6 +27,12 @@ type pendingAuth struct {
 	Browser  string
 	Verifier string
 	Expires  time.Time
+	// Phone flows only: the app cannot set the browser cookie itself, so it
+	// opens a one-time start link that sets it and forwards to AuthURL, and
+	// the callback returns to the app instead of the web page.
+	AuthURL string
+	Handoff string
+	Return  string
 }
 type record struct {
 	Generation string

@@ -178,3 +178,69 @@ func TestConnectionNamesCannotCreateNamespaceCollisions(t *testing.T) {
 		}
 	}
 }
+
+func TestAppOAuthStartLinkBindsOneBrowserAndReturnsToApp(t *testing.T) {
+	var endpoint string
+	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+endpoint+`/.well-known/oauth-protected-resource"`)
+			w.WriteHeader(401)
+		case "/.well-known/oauth-protected-resource":
+			json.NewEncoder(w).Encode(map[string]any{"resource": endpoint + "/mcp", "authorization_servers": []string{endpoint}})
+		case "/.well-known/oauth-authorization-server":
+			json.NewEncoder(w).Encode(map[string]any{"issuer": endpoint, "authorization_endpoint": endpoint + "/authorize", "token_endpoint": endpoint + "/token", "registration_endpoint": endpoint + "/register", "response_types_supported": []string{"code"}, "code_challenge_methods_supported": []string{"S256"}})
+		case "/register":
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"client_id": "pdw-client", "token_endpoint_auth_method": "none"})
+		case "/token":
+			json.NewEncoder(w).Encode(map[string]any{"access_token": "secret-token", "token_type": "Bearer", "expires_in": 3600})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer remote.Close()
+	endpoint = remote.URL
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", remote.Client())
+	mux := http.NewServeMux()
+	service.Register(mux, func(next http.Handler) http.Handler { return next })
+	store.Update(context.Background(), "tasks", func(c *record) error { c.Name = "tasks"; c.URL = endpoint + "/mcp"; c.Enabled = true; return nil })
+
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/connections/tasks/authorize?return=app", nil))
+	var begun map[string]string
+	json.Unmarshal(rr.Body.Bytes(), &begun)
+	if rr.Code != 200 || len(rr.Result().Cookies()) != 0 || !strings.HasPrefix(begun["start_url"], "https://pdw.example"+startPath+"?h=tasks.") {
+		t.Fatalf("authorize: %d %s cookies=%d", rr.Code, rr.Body.String(), len(rr.Result().Cookies()))
+	}
+	start, _ := url.Parse(begun["start_url"])
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("GET", start.RequestURI(), nil))
+	cookies := rr.Result().Cookies()
+	if rr.Code != http.StatusSeeOther || !strings.HasPrefix(rr.Header().Get("Location"), endpoint+"/authorize?") || len(cookies) != 1 || cookies[0].Value == "" {
+		t.Fatalf("start: %d %s", rr.Code, rr.Header().Get("Location"))
+	}
+	state, _ := url.Parse(rr.Header().Get("Location"))
+
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("GET", start.RequestURI(), nil))
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != appReturn+"?auth=failed" || len(rr.Result().Cookies()) != 0 {
+		t.Fatalf("start link replay: %d %s", rr.Code, rr.Header().Get("Location"))
+	}
+
+	req := httptest.NewRequest("GET", callbackPath+"?state="+url.QueryEscape(state.Query().Get("state"))+"&code=code", nil)
+	req.AddCookie(cookies[0])
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	// Discovery fails against this stub; the token is what matters here.
+	if rr.Code != http.StatusSeeOther || !strings.HasPrefix(rr.Header().Get("Location"), appReturn+"?auth=") || strings.HasSuffix(rr.Header().Get("Location"), "=failed") {
+		t.Fatalf("callback: %d %s", rr.Code, rr.Header().Get("Location"))
+	}
+	rows, _ := store.List(context.Background())
+	if rows[0].Token.AccessToken != "secret-token" || rows[0].Pending != nil {
+		t.Fatal("app flow did not authorize")
+	}
+}

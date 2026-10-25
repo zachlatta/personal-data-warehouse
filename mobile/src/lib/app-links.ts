@@ -2,7 +2,8 @@
 // https://<host>/<prefix>… link (the intent filters in app.json, verified by
 // the server's /.well-known/assetlinks.json); this maps the web path to the
 // matching screen. Keep the prefixes, app.json and the server's webapp.Routes
-// in step. /connections stays in the browser: the app has no screen for it.
+// in step. /connections stays in the browser: the app's Connections screen is
+// in Settings, and a new App Link prefix needs a native build.
 export const APP_LINK_HOSTS = ['personal-data-warehouse.zachlatta.com'];
 export const APP_LINK_PREFIXES = ['/timeline', '/mutation-review', '/search', '/notifications'];
 

@@ -103,6 +103,17 @@ export default function SettingsScreen() {
         </View>
         <View style={card}>
           <ThemedText type="smallBold" themeColor="textSecondary">
+            MCP connections
+          </ThemedText>
+          <ThemedText type="small">Add, sign in to, share and turn off the remote MCP servers PDW connects to.</ThemedText>
+          <View style={styles.rowButtons}>
+            <Pressable onPress={() => router.push('/connections')} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
+              <ThemedText type="smallBold">Manage connections</ThemedText>
+            </Pressable>
+          </View>
+        </View>
+        <View style={card}>
+          <ThemedText type="smallBold" themeColor="textSecondary">
             App
           </ThemedText>
           <ThemedText type="small">

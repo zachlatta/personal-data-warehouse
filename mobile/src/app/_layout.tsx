@@ -104,6 +104,7 @@ function Root() {
         <Stack.Screen name="timeline/[adapter]/[eventId]" options={{ title: 'Event', headerBackTitle: 'Timeline' }} />
         <Stack.Screen name="mutations/[id]" options={{ title: 'Review', headerBackTitle: 'Mutations' }} />
         <Stack.Screen name="feed/[id]" options={{ title: '', headerBackTitle: 'Feed' }} />
+        <Stack.Screen name="connections" options={{ title: 'MCP connections', headerBackTitle: 'Settings' }} />
       </Stack.Protected>
       <Stack.Protected guard={config === null}>
         <Stack.Screen name="login" options={{ title: 'Connect to PDW', headerShown: false }} />

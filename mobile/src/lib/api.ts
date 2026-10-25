@@ -461,3 +461,66 @@ export async function fetchNotificationLedger(config: AppConfig, params: { limit
 export function setNotificationsEnabled(config: AppConfig, enabled: boolean): Promise<{ enabled: boolean }> {
   return request(config, '/api/notifications/settings', { method: 'POST', body: JSON.stringify({ enabled }) });
 }
+
+// --- MCP connections ----------------------------------------------------------
+// Remote MCP servers PDW proxies (Skills, Tasks, …). The same management API
+// as the web /connections page; credentials never come back from the server.
+
+export type McpConnection = {
+  name: string;
+  url: string;
+  enabled: boolean;
+  all_clients: boolean;
+  clients: string[] | null;
+  status: string;
+  tool_count: number;
+  version: number;
+  authenticated: boolean;
+};
+
+export type NewMcpConnection = {
+  name: string;
+  url: string;
+  token: string;
+  client_id: string;
+  client_secret: string;
+  scopes: string[];
+  all_clients: boolean;
+  clients: string[];
+};
+
+export async function fetchConnections(config: AppConfig): Promise<McpConnection[]> {
+  const body = await request<{ connections: McpConnection[] | null }>(config, '/api/connections');
+  return body.connections ?? [];
+}
+
+export function createConnection(config: AppConfig, input: NewMcpConnection): Promise<McpConnection> {
+  return request(config, '/api/connections', { method: 'POST', body: JSON.stringify(input) });
+}
+
+const connectionPath = (name: string, action: string) => `/api/connections/${encodeURIComponent(name)}/${action}`;
+
+// A one-time link for the system browser: it binds that browser to the OAuth
+// flow, and the provider's callback returns to pdw://connections.
+export async function beginConnectionAuth(config: AppConfig, name: string): Promise<string> {
+  const body = await request<{ start_url?: string }>(config, `${connectionPath(name, 'authorize')}?return=app`, { method: 'POST' });
+  // An older server answers with a web-only flow the phone cannot finish.
+  if (!body.start_url) throw new Error('This PDW server cannot sign in from the phone yet. Update the server and try again.');
+  return body.start_url;
+}
+
+export function refreshConnection(config: AppConfig, name: string): Promise<{ ok: boolean }> {
+  return request(config, connectionPath(name, 'refresh'), { method: 'POST' });
+}
+
+export function changeConnection(
+  config: AppConfig,
+  connection: McpConnection,
+  action: 'enable' | 'disable' | 'remove' | 'access',
+  access?: { all_clients: boolean; clients: string[] },
+): Promise<{ ok: boolean }> {
+  return request(config, connectionPath(connection.name, action), {
+    method: 'POST',
+    body: JSON.stringify({ version: connection.version, ...access }),
+  });
+}

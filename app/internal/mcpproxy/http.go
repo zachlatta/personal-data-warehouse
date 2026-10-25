@@ -51,6 +51,7 @@ func (s *Service) Register(mux *http.ServeMux, protect func(http.Handler) http.H
 	mux.Handle("/api/connections", protect(http.HandlerFunc(s.connections)))
 	mux.Handle("/api/connections/", protect(http.HandlerFunc(s.connection)))
 	mux.HandleFunc(callbackPath, s.callback)
+	mux.HandleFunc(startPath, s.start)
 }
 func (s *Service) connections(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
@@ -129,6 +130,17 @@ func (s *Service) connection(w http.ResponseWriter, r *http.Request) {
 	id, action := parts[0], parts[1]
 	switch action {
 	case "authorize":
+		// The phone app opens a one-time start link in the system browser,
+		// which cannot receive this response's cookie.
+		if r.URL.Query().Get("return") == "app" {
+			startURL, err := s.BeginAppOAuth(r.Context(), id)
+			if err != nil {
+				failure(w, 400, err.Error())
+				return
+			}
+			writeJSON(w, 200, map[string]string{"start_url": startURL})
+			return
+		}
 		authURL, browser, err := s.BeginOAuth(r.Context(), id)
 		if err != nil {
 			failure(w, 400, err.Error())
@@ -204,9 +216,16 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 			browser = cookie.Value
 		}
 	}
-	id, err := s.CompleteOAuth(r.Context(), state, r.URL.Query().Get("code"), browser, r.URL.Query().Get("iss"))
+	id, returnTo, err := s.completeOAuth(r.Context(), state, r.URL.Query().Get("code"), browser, r.URL.Query().Get("iss"))
+	done := func(status string) {
+		if returnTo == appReturn {
+			http.Redirect(w, r, appReturn+"?auth="+status, http.StatusSeeOther)
+			return
+		}
+		http.Redirect(w, r, "/connections?auth="+status, http.StatusSeeOther)
+	}
 	if err != nil {
-		http.Redirect(w, r, "/connections?auth=failed", http.StatusSeeOther)
+		done("failed")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "pdw_mcp_" + id, Path: callbackPath, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
@@ -214,5 +233,21 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 	if err := s.Refresh(r.Context(), id); err != nil {
 		status = "discovery_failed"
 	}
-	http.Redirect(w, r, "/connections?auth="+status, http.StatusSeeOther)
+	done(status)
+}
+func (s *Service) start(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if r.Method != http.MethodGet {
+		failure(w, 405, "method not allowed")
+		return
+	}
+	authURL, browser, err := s.StartAppOAuth(r.Context(), r.URL.Query().Get("h"))
+	if err != nil {
+		http.Redirect(w, r, appReturn+"?auth=failed", http.StatusSeeOther)
+		return
+	}
+	id, _, _ := strings.Cut(r.URL.Query().Get("h"), ".")
+	http.SetCookie(w, &http.Cookie{Name: "pdw_mcp_" + id, Value: browser, Path: callbackPath, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	http.Redirect(w, r, authURL, http.StatusSeeOther)
 }
