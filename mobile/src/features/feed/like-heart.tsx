@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { StyleSheet, View } from 'react-native';
+import { Platform, StyleSheet, View } from 'react-native';
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -26,6 +26,25 @@ import { onLiked } from './liked';
 
 const DOTS = 6;
 const DOT_COLORS = ['#F91880', '#FFAD1F', '#F91880', '#794BC4', '#F91880', '#17BF63'];
+
+/** A filled heart. Android's Material font has no filled glyph (icons.ts), so
+ * there it is drawn: a square turned 45 degrees with a circle on each upper
+ * edge, sized to the outline glyph it replaces. */
+function FilledHeart({ size, color }: { size: number; color: string }) {
+  if (Platform.OS !== 'android') return <Icon name="heart.fill" tintColor={color} size={size} />;
+  const s = size * 0.48;
+  const cx = size / 2;
+  const cy = size / 2 + 0.073 * s;
+  const off = s / (2 * Math.SQRT2);
+  const lobe = { position: 'absolute' as const, width: s, height: s, borderRadius: s / 2, top: cy - off - s / 2, backgroundColor: color };
+  return (
+    <View style={{ width: size, height: size }}>
+      <View style={{ position: 'absolute', width: s, height: s, left: cx - s / 2, top: cy - s / 2, backgroundColor: color, transform: [{ rotate: '45deg' }] }} />
+      <View style={[lobe, { left: cx - off - s / 2 }]} />
+      <View style={[lobe, { left: cx + off - s / 2 }]} />
+    </View>
+  );
+}
 
 /** Calls play() each time he likes this card. */
 function useOnLiked(itemId: string | undefined, play: () => void) {
@@ -104,7 +123,7 @@ export function LikeHeart({
         <Dot key={i} i={i} size={size} burst={burst} />
       ))}
       <Animated.View style={heart}>
-        <Icon name={liked ? 'heart.fill' : 'heart'} tintColor={liked ? likedTint : tint} size={size} />
+        {liked ? <FilledHeart size={size} color={likedTint} /> : <Icon name="heart" tintColor={tint} size={size} />}
       </Animated.View>
     </View>
   );
@@ -124,8 +143,9 @@ export function CardLikeBurst({ itemId, color }: { itemId: string; color: string
   const style = useAnimatedStyle(() => ({ opacity: opacity.value, transform: [{ scale: scale.value }] }));
   return (
     <View pointerEvents="none" style={styles.overlay}>
-      <Animated.View style={[styles.bigHeart, style]}>
-        <Icon name="heart.fill" tintColor={color} size={84} />
+      {/* Composited as one layer, so the drawn heart's overlapping pieces fade as one. */}
+      <Animated.View needsOffscreenAlphaCompositing style={[styles.bigHeart, style]}>
+        <FilledHeart size={88} color={color} />
       </Animated.View>
     </View>
   );
