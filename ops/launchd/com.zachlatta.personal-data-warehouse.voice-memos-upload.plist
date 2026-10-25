@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-      <string>/Users/zrl/dev/zachlatta/personal-data-warehouse/bin/voice-memos-upload-launchd</string>
+      <string>/Users/zrl/.local/share/personal-data-warehouse/bin/voice-memos-upload-launchd</string>
     </array>
 
     <key>StartInterval</key>

@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-      <string>/Users/zrl/dev/zachlatta/personal-data-warehouse/bin/photos-upload-launchd</string>
+      <string>/Users/zrl/.local/share/personal-data-warehouse/bin/photos-upload-launchd</string>
     </array>
 
     <!-- Photos scans the whole library DB each run and moves real bytes;

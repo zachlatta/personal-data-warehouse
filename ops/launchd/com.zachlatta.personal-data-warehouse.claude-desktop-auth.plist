@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-      <string>/Users/zrl/dev/zachlatta/personal-data-warehouse/bin/claude-desktop-auth-launchd</string>
+      <string>/Users/zrl/.local/share/personal-data-warehouse/bin/claude-desktop-auth-launchd</string>
     </array>
 
     <key>StartInterval</key>

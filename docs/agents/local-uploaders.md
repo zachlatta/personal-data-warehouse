@@ -3,6 +3,19 @@
 Moved out of AGENTS.md on 2026-10-01 so the file every session loads holds only the
 contracts and the rules every change needs. Start at [AGENTS.md](../../AGENTS.md).
 
+## Where the Mac jobs run from (2026-10-24)
+
+Development moved to mew-dev; porygon keeps no checkout. Each LaunchAgent in `ops/launchd/`
+runs its wrapper from the **device runtime** `~/.local/share/personal-data-warehouse` on the
+Mac: `bin/` (wrappers, status helpers, `_pdw-upload-lib.sh`) and a 0600 `.env` holding only
+uploader settings (accounts, `PDW_INGEST_*`, `VOICE_MEMOS_*`, `SCREEN_TIMELAPSE_SOURCES`; no
+OAuth tokens, database URL or API keys). Wrappers find the runtime from their own path, so
+`PDW_INGEST_PROJECT_DIR` is the runtime dir. After changing a wrapper or plist, push it and
+run `bin/sync-mac-device-runtime porygon` from a mew-dev checkout: it copies `bin/` and
+reloads each installed LaunchAgent whose plist changed. It never writes `.env` and never
+installs a new LaunchAgent. Status helpers run there too, e.g.
+`ssh porygon '~/.local/share/personal-data-warehouse/bin/apple-messages-upload-status'`.
+
 ## pdw CLI Full Disk Access vs self-updates (macOS)
 
 macOS TCC keys a Full Disk Access grant to the binary's code-signing designated
@@ -32,7 +45,7 @@ release binaries with a stable identity **in the release workflow**:
   requirement, which means a new manual FDA toggle on every Mac that granted against it.
   The canonical copy lives in the GitHub Actions secrets; the original key/cert (plus the
   rcodesign used to mint them) are kept as a local backup in `~/.config/pdw/codesign/` on
-  porygon. If the key is ever lost, generate a new one (openssl self-signed cert with the
+  mew-dev (moved from porygon 2026-10-24). If the key is ever lost, generate a new one (openssl self-signed cert with the
   `codeSigning` EKU), update both secrets, and expect one re-toggle per Mac.
 
 This covers every grant now, because every device-side job runs through the one signed

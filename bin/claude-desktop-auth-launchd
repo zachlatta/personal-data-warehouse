@@ -1,7 +1,10 @@
 #!/bin/zsh
 set -u
 
-REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# The wrapper's own install dir. On a Mac that is the device runtime
+# ~/.local/share/personal-data-warehouse (bin/ and .env only, no checkout),
+# installed by bin/sync-mac-device-runtime from a mew-dev checkout.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # The Claude Desktop auth pusher is native to the pdw CLI (Go): it decrypts the
 # claude.ai sessionKey from the local desktop app and pushes it to the warehouse
 # app, which stores it for the serverside poller. Unlike `pdw ingest <source>`

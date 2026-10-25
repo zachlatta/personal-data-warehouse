@@ -120,7 +120,7 @@ def test_launch_agent_points_at_its_wrapper(label: str) -> None:
     with (LAUNCHD / f"{full_label}.plist").open("rb") as handle:
         plist = plistlib.load(handle)
     assert plist["Label"] == full_label
-    assert plist["ProgramArguments"] == [f"/Users/zrl/dev/zachlatta/personal-data-warehouse/bin/{wrapper}"]
+    assert plist["ProgramArguments"] == [f"/Users/zrl/.local/share/personal-data-warehouse/bin/{wrapper}"]
     assert plist["RunAtLoad"] is True
     if resident:
         assert plist["KeepAlive"] is True

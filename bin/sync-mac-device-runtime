@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Install or refresh a Mac's PDW device runtime from this checkout.
+#
+# Development happens on mew-dev (since 2026-10-24); a Mac only RUNS the
+# device-side jobs (uploaders, mutation workers, session publishers). Those
+# jobs need the wrapper scripts and an uploader .env, not a git checkout, so
+# the runtime is just:
+#
+#   ~/.local/share/personal-data-warehouse/bin/   the *-launchd wrappers, the
+#                                                 *-status helpers, the lib
+#   ~/.local/share/personal-data-warehouse/.env   uploader settings (0600; this
+#                                                 script never writes it)
+#
+# Usage: bin/sync-mac-device-runtime <ssh-host>     (e.g. porygon)
+#
+# Copies bin/ (minus the Linux and Android wrappers), then refreshes each
+# LaunchAgent already installed on that Mac whose plist differs from
+# ops/launchd/, reloading it. It never installs a new LaunchAgent: do that by
+# hand (docs/agents/local-uploaders.md) so the TCC grants are set up with it.
+set -euo pipefail
+
+host="${1:?usage: bin/sync-mac-device-runtime <ssh-host>}"
+here="$(cd "$(dirname "$0")/.." && pwd)"
+runtime=".local/share/personal-data-warehouse"
+
+ssh "$host" "mkdir -p $runtime/bin && chmod 700 $runtime"
+rsync -a --delete --exclude '*-systemd' --exclude '*-android' --exclude 'sync-mac-device-runtime' \
+  "$here/bin/" "$host:$runtime/bin/"
+
+for plist in "$here"/ops/launchd/*.plist; do
+  name="$(basename "$plist")"
+  label="${name%.plist}"
+  installed="Library/LaunchAgents/$name"
+  if ! ssh "$host" "test -f $installed"; then
+    continue
+  fi
+  if ssh "$host" "cat $installed" | cmp -s - "$plist"; then
+    continue
+  fi
+  echo "reloading $label"
+  ssh "$host" "cat > $installed" < "$plist"
+  ssh "$host" "launchctl bootout gui/\$(id -u)/$label 2>/dev/null; launchctl bootstrap gui/\$(id -u) $installed"
+done
+echo "device runtime on $host is at ~/$runtime"

@@ -2,6 +2,14 @@
 
 Development practices:
 
+* **Develop on `mew-dev`** (Ubuntu VM on mew, `ssh mew-dev`, Paseo host `mew-dev`), in
+  `~/dev/zachlatta/personal-data-warehouse` there; its `.env` is the dev env file. Since
+  2026-10-24 porygon has no checkout and no Paseo project for this repo: it only runs the
+  macOS device jobs from `~/.local/share/personal-data-warehouse` (wrappers plus an uploader
+  `.env`, no git), refreshed with `bin/sync-mac-device-runtime porygon` after a wrapper or
+  plist change ([docs/agents/local-uploaders.md](docs/agents/local-uploaders.md)). Never clone
+  this repo on porygon again. Work that needs macOS (the iOS simulator, Apple data sources)
+  goes over SSH from mew-dev.
 * We use TDD for this repo and follow good code practices
 * When asked to refactor or change existing code flows, please plan to completely replace the old legacy flow with the new requested flow - including ripping out any and all legacy code
 * When querying the database, you can use the pdw CLI
@@ -605,13 +613,13 @@ its logs is the Loki wrapper in the `sysadmin` repo:
 `~/dev/zachlatta/sysadmin/scripts/coolify-and-server-loki-logs`.
 
 That script talks to Loki over Tailscale, so it only works from a machine on
-the tailnet. Zach's dev machines `crobat` and `porygon` are both on the tailnet
+the tailnet. Zach's machines `mew-dev`, `crobat` and `porygon` are on the tailnet
 and have access. Before assuming you can use it, confirm you are actually on
-`crobat` or `porygon` by running `hostname` (or `scutil --get LocalHostName`)
+one of them by running `hostname` (or `scutil --get LocalHostName`)
 and checking the output equals one of those. If you are anywhere else, stop and
 ask Zach instead of guessing.
 
-Once you have confirmed you are on `crobat` or `porygon`, useful starting points:
+Once you have confirmed you are on one of those hosts, useful starting points:
 
 ```bash
 # Recent app/container logs for the PDW deployments (they live on mew-coolify).

@@ -1,7 +1,10 @@
 #!/bin/zsh
 set -u
 
-REPO_DIR="/Users/zrl/dev/zachlatta/personal-data-warehouse"
+# The wrapper's own install dir. On a Mac that is the device runtime
+# ~/.local/share/personal-data-warehouse (bin/ and .env only, no checkout),
+# installed by bin/sync-mac-device-runtime from a mew-dev checkout.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # The uploader is native Go inside the signed pdw binary: `pdw ingest ...` reads
 # the source on this Mac and posts it to the app's ingest endpoints itself. No uv
 # and no Python anywhere in the exec chain (launchd -> zsh -> pdw). That chain
