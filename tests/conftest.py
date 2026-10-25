@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import uuid
@@ -14,6 +15,7 @@ from tests.local_test_runtime import (
     LocalTestStartupError,
     PostgresTestRuntime,
     auto_worker_count,
+    cluster_count,
     callable_requires_postgres,
     direct_postgres_url,
     schedule_key,
@@ -43,18 +45,33 @@ def pytest_configure(config: pytest.Config) -> None:
     unit_only = bool(config.getoption("--unit-only"))
     try:
         enabled = subscription_tests_enabled(os.environ)
-        runtime = PostgresTestRuntime(unit_only=unit_only)
-        runtime.start()
+        runtimes = [PostgresTestRuntime(unit_only=unit_only)]
+        workers = int(getattr(config.option, "numprocesses", 0) or 0)
+        if (
+            "PYTEST_XDIST_WORKER" not in os.environ
+            and workers > 1
+            and not unit_only
+            and not os.environ.get("POSTGRES_DATABASE_URL", "").strip()
+        ):
+            # Each extra cluster gets its own env so only the first injects
+            # POSTGRES_DATABASE_URL; they start in parallel.
+            runtimes += [PostgresTestRuntime(env=dict(os.environ)) for _ in range(cluster_count(workers) - 1)]
+        for runtime in runtimes:
+            config.add_cleanup(runtime.close)
+        with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
+            urls = list(pool.map(lambda runtime: runtime.start(), runtimes))
     except LocalTestStartupError as error:
         raise pytest.UsageError(str(error)) from error
 
     config.stash[_SUBSCRIPTION_TESTS_ENABLED] = enabled
-    config.add_cleanup(runtime.close)
-    if runtime.owned_container is not None:
-        os.environ["POSTGRES_DATABASE_URL"] = direct_postgres_url(
-            os.environ["POSTGRES_DATABASE_URL"], runtime.owned_container
-        )
-        os.environ[OWNED_POSTGRES_URL_ENV] = os.environ["POSTGRES_DATABASE_URL"]
+    if runtimes[0].owned_container is not None:
+        owned = [
+            direct_postgres_url(url, runtime.owned_container)
+            for url, runtime in zip(urls, runtimes)
+            if url and runtime.owned_container is not None
+        ]
+        os.environ["POSTGRES_DATABASE_URL"] = owned[0]
+        os.environ[OWNED_POSTGRES_URL_ENV] = " ".join(owned)
     try:
         use_worker_database(os.environ, os.environ.get("PYTEST_XDIST_WORKER"))
     except LocalTestStartupError as error:

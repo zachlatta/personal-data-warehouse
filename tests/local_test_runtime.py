@@ -137,16 +137,26 @@ def callable_requires_postgres(
     return visit(function, is_root=True)
 
 
-# Set by the controller to the URL of the Postgres it launched, so a worker can
-# tell its own disposable cluster from a configured database it must not touch.
+# Set by the controller to the space-separated URLs of the Postgres clusters it
+# launched, so a worker can tell its own disposable clusters from a configured
+# database it must not touch.
 OWNED_POSTGRES_URL_ENV = "PDW_TEST_OWNED_POSTGRES_URL"
 
 
-# Workers per CPU when each worker gets its own database. A worker spends much
-# of its time waiting on its Postgres backend, so one per CPU left 20-30% of
-# mew-dev idle; 1.5 beat 1 and 2 on 2026-10-25. More workers than that need
-# more Postgres clusters, and each cluster's data churns through the disk.
-WORKERS_PER_CPU = 1.5
+# Workers per CPU when the run owns its Postgres. Each worker is a ping-pong
+# with its backend, and on mew-dev (2026-10-25) such pairs only fill the CPUs
+# once ~2.5 tasks per CPU are runnable: 16 pairs of pure-CPU ping-pong left
+# 16% idle, 32 pairs 4%. One per CPU left the suite 20-30% idle.
+WORKERS_PER_CPU = 2
+# Workers per disposable Postgres. Past ~16 busy backends one instance's lock
+# manager, WAL insertion and invalidation queue made extra workers cost more
+# than they gave; split across clusters, 32 workers left 6% idle, not 16%.
+WORKERS_PER_CLUSTER = 8
+
+
+def cluster_count(workers: int) -> int:
+    """How many disposable Postgres clusters a run with this many workers starts."""
+    return max(1, -(-workers // WORKERS_PER_CLUSTER))
 
 
 def auto_worker_count(env: Mapping[str, str], *, cpus: int) -> int:
@@ -223,14 +233,17 @@ def use_worker_database(env: MutableMapping[str, str], worker: str | None) -> No
     other's CPU: more workers made the suite slower. And advisory locks are
     per database, so the warehouse's serialised ensure_* steps queued every
     worker behind the others. A database per worker removes both, and 24
-    workers became faster than 16 instead of slower. A configured
-    POSTGRES_DATABASE_URL is never split; neither is a serial run.
+    workers became faster than 16 instead of slower. Workers are spread over
+    the owned clusters by worker number. A configured POSTGRES_DATABASE_URL
+    is never split; neither is a serial run.
     """
     url = env.get("POSTGRES_DATABASE_URL", "")
-    if worker is None or not url or env.get(OWNED_POSTGRES_URL_ENV) != url:
+    owned = env.get(OWNED_POSTGRES_URL_ENV, "").split()
+    if worker is None or not url or url not in owned:
         return
     if not re.fullmatch(r"gw\d+", worker):
         raise LocalTestStartupError(f"unexpected xdist worker id {worker!r}")
+    url = owned[int(worker[2:]) % len(owned)]
     database = f"pdw_{worker}"
     worker_url = urlunsplit(urlsplit(url)._replace(path=f"/{database}"))
     try:
@@ -327,6 +340,13 @@ class PostgresTestRuntime:
                 "PDW_PGBACKREST_ENABLED=false",
                 "--publish",
                 "127.0.0.1::5432",
+                # Keep the data directory in RAM. It peaks near 2.5 GB and is
+                # deleted at the end: on disk, backends stalled in
+                # DataFileWrite under writeback throttling, and deleting the
+                # volume queued GBs of TRIMs onto the next run's first ~15s
+                # (mew-dev, 2026-10-25).
+                "--tmpfs",
+                "/var/lib/postgresql:rw,size=8g",
                 image,
                 "postgres",
                 "-c",
