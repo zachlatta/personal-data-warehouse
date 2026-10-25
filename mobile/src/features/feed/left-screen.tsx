@@ -66,5 +66,6 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingLeft: Spacing.three, paddingBottom: Spacing.two },
-  title: { fontSize: 28 },
+  // No size override: a smaller fontSize on this text clipped it to "Fee" on Android.
+  title: { flexShrink: 0, paddingRight: 4 },
 });
