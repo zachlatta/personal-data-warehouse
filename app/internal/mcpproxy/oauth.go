@@ -1,12 +1,16 @@
 package mcpproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -88,6 +92,53 @@ func (s *Service) discover(ctx context.Context, endpoint string) (*oauthex.Prote
 	}
 	return resource, metadata, nil
 }
+
+// registerClient performs RFC 7591 dynamic client registration. The SDK's
+// oauthex.RegisterClient accepts only 201 Created; Robinhood's banking MCP
+// answers 200 OK, so any 2xx carrying a client_id is a registration here.
+// A refusal names the upstream's own error so the connection page says why.
+func (s *Service) registerClient(ctx context.Context, endpoint, redirectURL string) (*oauthex.ClientRegistrationResponse, error) {
+	body, err := json.Marshal(&oauthex.ClientRegistrationMetadata{ClientName: "PDW MCP gateway", RedirectURIs: []string{redirectURL}, TokenEndpointAuthMethod: "none", GrantTypes: []string{"authorization_code", "refresh_token"}, ResponseTypes: []string{"code"}})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	response, err := s.client.Do(req)
+	if err != nil {
+		return nil, errors.New("upstream OAuth client registration failed: registration endpoint could not be reached")
+	}
+	defer response.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		var refusal oauthex.ClientRegistrationError
+		if json.Unmarshal(raw, &refusal) == nil && refusal.ErrorCode != "" {
+			reason := refusal.ErrorCode
+			if refusal.ErrorDescription != "" {
+				reason += ": " + refusal.ErrorDescription
+			}
+			return nil, fmt.Errorf("upstream OAuth client registration failed (%s): %s", response.Status, truncate(reason, 300))
+		}
+		return nil, fmt.Errorf("upstream OAuth client registration failed (%s)", response.Status)
+	}
+	var registration oauthex.ClientRegistrationResponse
+	if err := json.Unmarshal(raw, &registration); err != nil || registration.ClientID == "" {
+		return nil, errors.New("upstream OAuth client registration failed: response carried no client_id")
+	}
+	return &registration, nil
+}
+
+func truncate(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "…"
+}
+
 func (s *Service) BeginOAuth(ctx context.Context, id string) (authURL, browser string, err error) {
 	authURL, browser, _, err = s.beginOAuth(ctx, id, false)
 	return authURL, browser, err
@@ -133,9 +184,9 @@ func (s *Service) beginOAuth(ctx context.Context, id string, app bool) (authURL,
 			if validateURL(metadata.RegistrationEndpoint) != nil {
 				return errors.New("upstream requires a pre-registered OAuth client ID; enter it when adding the connection")
 			}
-			registration, err := oauthex.RegisterClient(ctx, metadata.RegistrationEndpoint, &oauthex.ClientRegistrationMetadata{ClientName: "PDW MCP gateway", RedirectURIs: []string{cfg.RedirectURL}, TokenEndpointAuthMethod: "none", GrantTypes: []string{"authorization_code", "refresh_token"}, ResponseTypes: []string{"code"}}, s.client)
-			if err != nil || registration.ClientID == "" {
-				return errors.New("upstream OAuth client registration failed")
+			registration, err := s.registerClient(ctx, metadata.RegistrationEndpoint, cfg.RedirectURL)
+			if err != nil {
+				return err
 			}
 			cfg.ClientID = registration.ClientID
 			cfg.ClientSecret = registration.ClientSecret

@@ -244,3 +244,57 @@ func TestAppOAuthStartLinkBindsOneBrowserAndReturnsToApp(t *testing.T) {
 		t.Fatal("app flow did not authorize")
 	}
 }
+
+// registrationUpstream is an OAuth-protected MCP server whose dynamic client
+// registration endpoint answers with the given status and body.
+func registrationUpstream(t *testing.T, status int, body map[string]any) *httptest.Server {
+	t.Helper()
+	var endpoint string
+	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mcp":
+			w.WriteHeader(405)
+		case "/.well-known/oauth-protected-resource/mcp":
+			json.NewEncoder(w).Encode(map[string]any{"resource": endpoint + "/mcp", "authorization_servers": []string{endpoint + "/mcp"}, "scopes_supported": []string{"credit-card"}})
+		case "/.well-known/oauth-authorization-server/mcp":
+			json.NewEncoder(w).Encode(map[string]any{"issuer": endpoint + "/mcp", "authorization_endpoint": endpoint + "/authorize", "token_endpoint": endpoint + "/token", "registration_endpoint": endpoint + "/register", "response_types_supported": []string{"code"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}})
+		case "/register":
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(body)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	endpoint = remote.URL
+	t.Cleanup(remote.Close)
+	return remote
+}
+
+// Robinhood's banking MCP answers a successful registration with 200 OK, not
+// the 201 Created RFC 7591 names; a client_id in a 2xx is a registration.
+func TestOAuthAcceptsAClientRegistrationAnsweredWithOK(t *testing.T) {
+	remote := registrationUpstream(t, http.StatusOK, map[string]any{"client_id": "issued-client", "token_endpoint_auth_method": "none", "redirect_uris": []string{"https://pdw.example/connections/oauth/callback"}})
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", remote.Client())
+	store.Update(context.Background(), "card", func(c *record) error { c.Name = "card"; c.URL = remote.URL + "/mcp"; c.Enabled = true; return nil })
+	authURL, _, err := service.BeginOAuth(context.Background(), "card")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, _ := url.Parse(authURL)
+	if parsed.Query().Get("client_id") != "issued-client" {
+		t.Fatalf("auth URL %s", authURL)
+	}
+}
+
+func TestOAuthRegistrationFailureNamesTheUpstreamReason(t *testing.T) {
+	remote := registrationUpstream(t, http.StatusBadRequest, map[string]any{"error": "invalid_redirect_uri", "error_description": "redirect host not allowed"})
+	store := newMemoryStore()
+	service := New(store, "https://pdw.example", remote.Client())
+	store.Update(context.Background(), "card", func(c *record) error { c.Name = "card"; c.URL = remote.URL + "/mcp"; c.Enabled = true; return nil })
+	_, _, err := service.BeginOAuth(context.Background(), "card")
+	if err == nil || !strings.Contains(err.Error(), "invalid_redirect_uri") || !strings.Contains(err.Error(), "redirect host not allowed") {
+		t.Fatalf("error %v", err)
+	}
+}
