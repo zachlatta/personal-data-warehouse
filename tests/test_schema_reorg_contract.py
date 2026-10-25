@@ -736,6 +736,268 @@ def test_docs_only_name_relations_that_exist() -> None:
     )
 
 
+_GUIDE_TEMPLATE_ACTION = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+_GUIDE_THREE_PART_COLUMN = re.compile(
+    r"`(((?:base|derived|marts)_[a-z0-9_]+|timeline|ops)\.[a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)`"
+)
+_GUIDE_TWO_PART_TOKEN = re.compile(r"`([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)`")
+_GUIDE_REL_BULLET_START = re.compile(
+    r"^\s*-\s+`((?:base|derived|marts)_[a-z0-9_]+|timeline|ops)\.[a-z_][a-z0-9_]*`"
+)
+_GUIDE_VALUES_PAREN = re.compile(r"\bvalues\s*\([^)]*\)", re.DOTALL)
+
+# Prose, literal values, search scopes, priority tiers, SQL types, and tool/CLI
+# names that appear in `schema.relation` bullets in `app/internal/guide/`.
+# This set is asserted disjoint from every real warehouse column name so a
+# column mismatch can never be silenced by allowlisting a column name.
+_GUIDE_NON_COLUMN_PROSE_TOKENS = frozenset(
+    {
+        # Priority tiers
+        "self",
+        "direct",
+        "cc",
+        "noise",
+        "background",
+        # Search scopes, modes, and guide topic names
+        "agent_session",
+        "android_messages",
+        "drive",
+        "exact",
+        "finance",
+        "health",
+        "muse",
+        "muse_file",
+        "slack",
+        "transcripts",
+        "voice_memos",
+        "whoop_private",
+        # Tool names, response fields, and CLI/HTTP helpers
+        "curl",
+        "describe_table",
+        "download_url",
+        "get_object",
+        "requests",
+        "urllib",
+        "wget",
+        # SQL types and prose terms
+        "jsonb",
+        "measure",
+        # Device and status/kind literals in relation descriptions
+        "action_clicked",
+        "active",
+        "alert",
+        "app_cancel",
+        "behavior_impact",
+        "cancel",
+        "canceled",
+        "cardio_details",
+        "click",
+        "clicked",
+        "data_checksums",
+        "duplicate",
+        "expansion",
+        "failing",
+        "heads_up",
+        "health_monitor",
+        "health_tab",
+        "high",
+        "interruption_filter",
+        "joltik",
+        "pichu",
+        "removed",
+        "screen",
+        "shade_closed",
+        "shade_opened",
+        "sleep_deep_dive",
+        "status_bar",
+        "strain_deep_dive",
+        "strength_prs",
+        "strength_workout",
+        "stress",
+        "trend",
+        "unclassified",
+        "unmatched_sale",
+        "weekly_plan",
+    }
+)
+
+
+def _iter_guide_relation_blocks(label: str, text: str) -> list[tuple[int, str]]:
+    clean = _GUIDE_TEMPLATE_ACTION.sub(" ", text)
+    lines = clean.splitlines()
+    blocks: list[tuple[int, str]] = []
+    cur: tuple[int, list[str]] | None = None
+    cur_kind: str | None = None
+    is_sources = label.endswith("sources.md")
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if cur is not None:
+                blocks.append((cur[0], "\n".join(cur[1])))
+                cur = None
+                cur_kind = None
+            continue
+        if stripped.startswith("|"):
+            if cur is not None:
+                blocks.append((cur[0], "\n".join(cur[1])))
+                cur = None
+                cur_kind = None
+            blocks.append((lineno, line))
+            continue
+        if line.lstrip().startswith("- "):
+            if cur is not None:
+                blocks.append((cur[0], "\n".join(cur[1])))
+                cur = None
+                cur_kind = None
+            if _GUIDE_REL_BULLET_START.match(line) or is_sources:
+                cur = (lineno, [line])
+                cur_kind = "bullet"
+            continue
+        if cur_kind == "bullet" and (line.startswith("  ") or line.startswith("\t")):
+            assert cur is not None
+            cur[1].append(line)
+            continue
+        if cur is not None:
+            if cur_kind == "para":
+                cur[1].append(line)
+                continue
+            blocks.append((cur[0], "\n".join(cur[1])))
+            cur = None
+            cur_kind = None
+        if is_sources:
+            cur = (lineno, [line])
+            cur_kind = "para"
+    if cur is not None:
+        blocks.append((cur[0], "\n".join(cur[1])))
+    return blocks
+
+
+def _guide_column_mismatches(
+    columns_by_relation: dict[str, set[str]],
+    files: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    all_columns = set().union(*columns_by_relation.values()) if columns_by_relation else set()
+    leaked = sorted(_GUIDE_NON_COLUMN_PROSE_TOKENS & all_columns)
+    assert not leaked, (
+        "guide prose allowlist must never contain a real warehouse column name: "
+        + ", ".join(leaked)
+    )
+
+    if files is None:
+        guide_dir = REPO_ROOT / "app/internal/guide"
+        files = [
+            (str(path.relative_to(REPO_ROOT)), path.read_text())
+            for path in sorted(guide_dir.rglob("*.md"))
+        ]
+
+    offenders: list[str] = []
+    for label, raw_text in files:
+        clean = _GUIDE_TEMPLATE_ACTION.sub(" ", raw_text)
+        for match in _GUIDE_THREE_PART_COLUMN.finditer(clean):
+            rel, col = match.group(1), match.group(3)
+            if rel in columns_by_relation and col not in columns_by_relation[rel]:
+                lineno = clean.count("\n", 0, match.start()) + 1
+                offenders.append(f"{label}:{lineno}: {rel}.{col}")
+
+        for lineno, block in _iter_guide_relation_blocks(label, raw_text):
+            rels: list[str] = []
+            for match in _QUALIFIED_RELATION.finditer(block):
+                if match.group(3) == "*":
+                    continue
+                candidate = f"{match.group(1)}.{match.group(2)}"
+                if candidate in columns_by_relation and candidate not in rels:
+                    rels.append(candidate)
+            if not rels:
+                continue
+
+            schemas = {rel.split(".", 1)[0] for rel in rels}
+            for tok in re.findall(r"`\.?([a-z_][a-z0-9_]*)`", block):
+                for schema in schemas:
+                    candidate = f"{schema}.{tok}"
+                    if candidate in columns_by_relation and candidate not in rels:
+                        rels.append(candidate)
+
+            for match in _GUIDE_TWO_PART_TOKEN.finditer(block):
+                left, right = match.group(1), match.group(2)
+                if f"{left}.{right}" in columns_by_relation:
+                    continue
+                table_rels = [
+                    f"{schema}.{left}"
+                    for schema in schemas
+                    if f"{schema}.{left}" in columns_by_relation
+                ]
+                if table_rels and not any(
+                    right in columns_by_relation[rel] for rel in table_rels
+                ):
+                    offenders.append(f"{label}:{lineno}: {left}.{right}")
+
+            valid_columns = set().union(*(columns_by_relation[rel] for rel in rels))
+            scan = re.split(r"Timeline source\b", block)[0]
+            scan = _GUIDE_VALUES_PAREN.sub(" ", scan)
+            for col in sorted(valid_columns, key=len, reverse=True):
+                scan = re.sub(rf"`{re.escape(col)}`\s*\([^)]*\)", f"`{col}`", scan)
+                scan = re.sub(rf"\(`{re.escape(col)}`\s+(?:in\s+|is\s+)?[^)]*\)", f"(`{col}`)", scan)
+                scan = re.sub(rf"`{re.escape(col)}`\s+`[a-z0-9_]+`", f"`{col}`", scan)
+
+            for match in re.finditer(r"`([a-z_][a-z0-9_]*)`", scan):
+                tok = match.group(1)
+                if (
+                    tok in schemas
+                    or tok in ALL_CANONICAL_SCHEMAS
+                    or any(f"{schema}.{tok}" in columns_by_relation for schema in schemas)
+                    or tok in _GUIDE_NON_COLUMN_PROSE_TOKENS
+                ):
+                    continue
+                if tok not in valid_columns:
+                    offenders.append(f"{label}:{lineno}: {', '.join(rels)} -> {tok}")
+
+    return offenders
+
+
+def test_guide_column_guard_flags_bad_column_names() -> None:
+    fake_columns = {
+        "marts_voice_memos.recordings": {
+            "recording_id",
+            "title",
+            "summary",
+            "transcript",
+            "participants_json",
+            "action_items_json",
+            "transcript_model",
+        },
+        "marts_voice_memos.sessions": {
+            "session_id",
+            "recording_ids",
+            "title",
+            "summary",
+            "transcript",
+            "participants_json",
+            "action_items_json",
+        },
+        "base_android_messages.messages": {
+            "participants",
+        },
+    }
+    synthetic = [
+        (
+            "app/internal/guide/topics/sources.md",
+            (
+                "- `marts_voice_memos.recordings` — with `title`, `summary`, `transcript`,\n"
+                "  `participants`, `action_items` and {{if .CLI}}`pdw columns`{{else}}`describe_table`{{end}}.\n"
+                "- `marts_voice_memos.sessions` — merged `recordings.action_items` and\n"
+                "  `marts_voice_memos.sessions.participants`.\n"
+            ),
+        )
+    ]
+    assert _guide_column_mismatches(fake_columns, files=synthetic) == [
+        "app/internal/guide/topics/sources.md:4: marts_voice_memos.sessions.participants",
+        "app/internal/guide/topics/sources.md:1: marts_voice_memos.recordings -> participants",
+        "app/internal/guide/topics/sources.md:1: marts_voice_memos.recordings -> action_items",
+        "app/internal/guide/topics/sources.md:3: recordings.action_items",
+    ]
+
+
+
 # ---------------------------------------------------------------------------
 # timeline routing
 # ---------------------------------------------------------------------------
@@ -947,3 +1209,39 @@ def test_query_role_can_execute_the_search_interface(warehouse: PostgresWarehous
             (role, f'"{rel.schema}"."{rel.name}"{signature}'),
         )[0][0]
         assert executable, logical
+
+
+def test_guide_only_names_columns_that_exist_on_their_relations(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Every column named next to a relation in ``app/internal/guide/`` must exist.
+
+    ``guide_test.go`` verifies that every ``schema.relation`` in the guide is in
+    the catalog, but the Go catalog carries no column definitions. Checking the
+    guide's column references against ``information_schema.columns`` on a freshly
+    ensured warehouse catches stale or bare column names (such as
+    ``participants`` / ``action_items`` in place of ``participants_json`` /
+    ``action_items_json`` on ``marts_voice_memos.recordings``).
+    """
+    _provision_everything(warehouse)
+    by_physical = {
+        warehouse.physical_schema_name(schema): schema for schema in ALL_CANONICAL_SCHEMAS
+    }
+    rows = warehouse._query(
+        """
+        SELECT table_schema, table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = ANY(%s)
+        """,
+        (list(by_physical),),
+    )
+    columns_by_relation: dict[str, set[str]] = {}
+    for physical_schema, table_name, column_name in rows:
+        rel = f"{by_physical[physical_schema]}.{table_name}"
+        columns_by_relation.setdefault(rel, set()).add(column_name)
+
+    offenders = _guide_column_mismatches(columns_by_relation)
+    assert not offenders, "guide names columns that do not exist on their relations: " + "; ".join(
+        offenders
+    )
+
