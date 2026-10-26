@@ -25,6 +25,7 @@ import statistics
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
 
@@ -243,9 +244,11 @@ def _real_traffic_latency() -> tuple[str, str]:
             status = YELLOW
         elif row["p50_ms"] >= LATENCY_P50_TARGET_MS:
             status = RED
+        # pdw SQL preserves PostgreSQL numeric shares as decimal strings.
+        # Compare exactly, including values immediately below the 10% boundary.
         elif (row["p90_ms"] > LATENCY_P90_TARGET_MS
               or (row.get("idle_slow_requests", 0) >= 5
-                  and (row.get("idle_slow_share") or 0) >= 0.1)
+                  and Decimal(str(row.get("idle_slow_share") or 0)) >= Decimal("0.1"))
               or row.get("status") != "ok"):
             status = YELLOW
         else:

@@ -180,8 +180,8 @@ def _benchmark_host_row(**overrides: object) -> dict[str, object]:
 def _real_traffic_rows(**overrides: object) -> list[dict[str, object]]:
     row: dict[str, object] = {
         "status": "ok", "requests": 100, "errors": 2,
-        "p50_ms": 900, "p90_ms": 1800, "share_over_2s": 0.05,
-        "slow_requests": 5, "idle_slow_requests": 0, "idle_slow_share": 0,
+        "p50_ms": 900, "p90_ms": 1800, "share_over_2s": "0.05000000000000000000",
+        "slow_requests": 5, "idle_slow_requests": 0, "idle_slow_share": "0.00000000000000000000",
         "saturation_mix": {"io_bound": 5}, "slowest_leg_mix": {"lexical": 5},
     }
     row.update(overrides)
@@ -224,8 +224,41 @@ def test_c6_missing_real_traffic_is_yellow(monkeypatch, rows):
     assert "unavailable" in evidence
 
 
+@pytest.mark.parametrize(("idle", "share", "expected"), [
+    (5, "0.10000000000000000000", "yellow"),
+    (6, "0.40000000000000000000", "yellow"),
+    (5, "0.09999999999999999999", "green"),
+    (4, "0.40000000000000000000", "green"),
+    (5, 0.1, "yellow"),
+    (0, None, "green"),
+])
+def test_c6_idle_rule_reads_decimal_shares_through_sql_json(monkeypatch, idle, share, expected):
+    rows = _real_traffic_rows(idle_slow_requests=idle, idle_slow_share=share)
+    # Exercise pdw_sql's real JSON decoding rather than handing it Python floats.
+    monkeypatch.setattr(contract_audit.subprocess, "run", lambda *args, **kwargs:
+                        subprocess.CompletedProcess(args[0], 0, stdout=json.dumps({"rows": rows})))
+    status, evidence = contract_audit._real_traffic_latency()
+    assert status == expected
+    assert "check crashed" not in evidence
+    assert str(share) in evidence
+
+
+def test_c6_decimal_idle_share_cannot_mask_a_red_probe(monkeypatch, capsys):
+    monkeypatch.setattr(contract_audit, "CHECKS", [contract_audit.c6_performance])
+    monkeypatch.setattr(contract_audit, "_validated_search_probe", lambda *args, **kwargs: (8.0, ""))
+    rows = _real_traffic_rows(idle_slow_requests=6, idle_slow_share="0.40000000000000000000")
+    monkeypatch.setattr(contract_audit.subprocess, "run", lambda args, **kwargs:
+                        subprocess.CompletedProcess(args, 0, stdout=json.dumps(
+                            {"rows": rows if "search_request_latency" in args[-1] else []})))
+    assert contract_audit.main(["--json"]) == 1
+    verdict = json.loads(capsys.readouterr().out)[0]
+    assert verdict["status"] == "red"
+    assert "check crashed" not in verdict["evidence"]
+    assert "paired serial hybrid probes" in verdict["evidence"]
+
+
 def test_c6_real_traffic_uses_worse_window(monkeypatch):
-    rows = _real_traffic_rows()
+    rows = _real_traffic_rows(idle_slow_requests=5, idle_slow_share="0.10000000000000000000")
     rows[1]["p50_ms"] = 2500
     monkeypatch.setattr(contract_audit, "pdw_sql", lambda *args: rows)
     assert contract_audit._real_traffic_latency()[0] == contract_audit.RED

@@ -564,7 +564,7 @@ you what you want to hear), and through the two-statement shape the function rea
 | `search_text_exact` on a pooled connection, `Mt Foolery` (2026-10-26) | 22.8-25.7s | 4.8s |
 | `search_hybrid_exact` literal leg, generic plan (2026-10-26) | 0.74-2.1s | 0.24-0.49s |
 
-**Exact-mode measurements before a86271c (2026-10-26) describe the old exact function.**
+**Exact-mode measurements before bf2d0ad (2026-10-26) describe the old exact function.**
 The historical numbers above are not measurements of the current exact path.
 
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
