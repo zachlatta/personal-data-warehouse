@@ -8,8 +8,11 @@ import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { usePortraitWindow } from '@/hooks/use-portrait-window';
 import { useTheme } from '@/hooks/use-theme';
+import { useConfig } from '@/lib/session';
 
 import type { FeedItem } from './api';
+import { articleUrl } from './article';
+import { readArticle } from './article-view';
 import { cardContext, profileUrl, type CardContext } from './card-context';
 import { CardLikeBurst, LikeHeart } from './like-heart';
 import { cardLinks, type CardLink } from './links';
@@ -61,7 +64,7 @@ type Props = {
   onExpand: (item: FeedItem) => void;
   onMenu: (item: FeedItem) => void;
   onShare: (item: FeedItem, preview: string) => void;
-  onSwipeStart?: (item: FeedItem, toward: 'save' | 'dismiss') => void;
+  onSwipeStart?: (item: FeedItem) => void;
 };
 
 function HideAction() {
@@ -153,7 +156,26 @@ function FeedCardImpl({
   // The column beside the icon, where the media sits.
   const column = screen - Spacing.three * 2 - AVATAR - GAP;
 
-  const open = () => onOpen(item);
+  // The article under the card starts loading when a finger rests on the
+  // card (60 ms: a touch that turns into a scroll lets go sooner) and at
+  // the latest on the tap, so the detail view usually has it at once.
+  const config = useConfig();
+  const article = articleUrl(item, !!video);
+  const warmTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const warm = () => {
+    clearTimeout(warmTimer.current);
+    if (article) void readArticle(config, article).catch(() => {});
+  };
+  const warmSoon = () => {
+    clearTimeout(warmTimer.current);
+    warmTimer.current = setTimeout(warm, 60);
+  };
+  const unwarm = () => clearTimeout(warmTimer.current);
+  useEffect(() => unwarm, []);
+  const open = () => {
+    warm();
+    onOpen(item);
+  };
   const more = () => {
     setExpanded(true);
     onExpand(item);
@@ -239,7 +261,7 @@ function FeedCardImpl({
             <SourceAvatar name={name} url={item.url} size={AVATAR} />
           </Pressable>
           <View style={styles.main}>
-            <Pressable onPress={open} style={({ pressed }) => pressed && styles.pressed}>
+            <Pressable onPress={open} onPressIn={warmSoon} onPressOut={unwarm} style={({ pressed }) => pressed && styles.pressed}>
               <View style={styles.head}>
                 <ThemedText style={styles.title} numberOfLines={3}>
                   {item.title || name}
@@ -349,6 +371,11 @@ function FeedCardImpl({
       enabled={!carousel}
       // A drag on a playing video seeks it rather than swiping the card.
       requireExternalGestureToFail={playerTouch}
+      // A swipe starts after 20 dp sideways (the default is 10), so the
+      // feed's scroll, which starts after 8 dp up or down, wins any drag
+      // that is not clearly sideways.
+      dragOffsetFromLeftEdge={20}
+      dragOffsetFromRightEdge={20}
       friction={1.5}
       rightThreshold={80}
       leftThreshold={60}
@@ -356,7 +383,10 @@ function FeedCardImpl({
       overshootLeft={false}
       renderRightActions={() => <HideAction />}
       renderLeftActions={() => <SaveAction saved={saved} />}
-      onSwipeableOpenStartDrag={(direction) => onSwipeStart?.(item, direction === SwipeDirection.RIGHT ? 'save' : 'dismiss')}
+      // No direction: the library reports "left" for every start (its first
+      // update comes before the drag has one; seen on Android 2026-10-26).
+      // The save or hide a swipe ends in carries its real direction.
+      onSwipeableOpenStartDrag={() => onSwipeStart?.(item)}
       onSwipeableOpen={(direction) => {
         confirm();
         swipeable.current?.close();

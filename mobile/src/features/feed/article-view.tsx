@@ -5,13 +5,31 @@ import { WebView } from 'react-native-webview';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import type { AppConfig } from '@/lib/config';
 import { useConfig } from '@/lib/session';
 
 import { fetchArticle } from './api';
+import { createArticleReads } from './article-reads';
 import { articleDocument, parseArticleMessage, readingMinutes, type FeedArticle } from './article';
 import { readStoredArticle, setOffline, storeArticle } from './offline';
 import { isOfflineError } from './offline-store';
 import { ACCENT } from './rich-views';
+
+// The copy downloaded for offline (offline.ts) is read first; one read
+// online is kept.
+const reads = createArticleReads<FeedArticle, AppConfig>(async (url, config) => {
+  const local = await readStoredArticle(url);
+  if (local) return { article: local, stored: true };
+  const a = await fetchArticle(config, url);
+  setOffline(false);
+  void storeArticle(url, a);
+  return { article: a, stored: false };
+}, 6);
+
+/** Starts reading the article at url (see article-reads.ts); errors wait for the view. */
+export function readArticle(config: AppConfig, url: string) {
+  return reads.read(url, config);
+}
 
 // The one script the article page may run carries this.
 const NONCE = Math.random().toString(36).slice(2);
@@ -20,10 +38,9 @@ const NONCE = Math.random().toString(36).slice(2);
 export type ArticleOutcome = { ok: true; words: number; ms: number; offline: boolean } | { ok: false; error: string; ms: number; offline: boolean };
 
 // The article at url, read by the server and shown in a WebView as tall as
-// its content (the detail view's ScrollView does the scrolling). The copy
-// downloaded for offline (offline.ts) is read first; one read online is
-// kept. A tapped link goes to onLink; a page with no article shows nothing
-// but a note, and the detail view's open button is still there.
+// its content (the detail view's ScrollView does the scrolling). A tapped
+// link goes to onLink; a page with no article shows nothing but a note, and
+// the detail view's open button is still there.
 export function ArticleView({
   url,
   shownImages,
@@ -37,38 +54,33 @@ export function ArticleView({
 }) {
   const config = useConfig();
   const theme = useTheme();
-  const [article, setArticle] = useState<FeedArticle | null>(null);
-  const [stored, setStored] = useState(false);
+  // A read that finished before this view mounted (the card started it
+  // when touched) shows on the first frame.
+  const [ready] = useState(() => reads.peek(url));
+  const [article, setArticle] = useState<FeedArticle | null>(ready?.article ?? null);
+  const [stored, setStored] = useState(ready?.stored ?? false);
   const [error, setError] = useState<{ message: string; offline: boolean } | null>(null);
   const [height, setHeight] = useState(0);
 
   useEffect(() => {
     let live = true;
     const startedAt = Date.now();
-    void (async () => {
-      const local = await readStoredArticle(url);
-      if (local) {
-        onOutcome({ ok: true, words: local.words, ms: Date.now() - startedAt, offline: true });
+    readArticle(config, url).then(
+      (r) => {
+        onOutcome({ ok: true, words: r.article.words, ms: Date.now() - startedAt, offline: r.stored });
         if (live) {
-          setStored(true);
-          setArticle(local);
+          setStored(r.stored);
+          setArticle(r.article);
         }
-        return;
-      }
-      try {
-        const a = await fetchArticle(config, url);
-        setOffline(false);
-        void storeArticle(url, a);
-        onOutcome({ ok: true, words: a.words, ms: Date.now() - startedAt, offline: false });
-        if (live) setArticle(a);
-      } catch (e: unknown) {
+      },
+      (e: unknown) => {
         const message = e instanceof Error ? e.message : String(e);
         const off = isOfflineError(e);
         if (off) setOffline(true);
         onOutcome({ ok: false, error: message, ms: Date.now() - startedAt, offline: off });
         if (live) setError({ message, offline: off });
-      }
-    })();
+      },
+    );
     return () => {
       live = false;
     };
@@ -149,7 +161,37 @@ export function ArticleView({
   );
 }
 
+// The feed's video warmup starts Android's web engine, but the first
+// article of each run still drew about half a second after its page (later
+// ones drew with it; emulator, 2026-10-26). The feed keeps this hidden
+// article page, in the same template, made a moment after it appears, so
+// the first article opens like the rest.
+export function ArticleWarmup() {
+  const theme = useTheme();
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setOn(true), 1500);
+    return () => clearTimeout(t);
+  }, []);
+  const html = useMemo(
+    () =>
+      articleDocument(
+        { url: 'about:blank', html: '<p>.</p>', words: 1 },
+        { text: theme.text, secondary: theme.textSecondary, background: theme.background, element: theme.backgroundElement, rule: theme.backgroundSelected, link: ACCENT },
+        [],
+        NONCE,
+      ),
+    [theme],
+  );
+  return on ? (
+    <View style={styles.warm} pointerEvents="none" importantForAccessibility="no-hide-descendants">
+      <WebView source={{ html }} originWhitelist={['*']} javaScriptEnabled scrollEnabled={false} style={styles.warm} />
+    </View>
+  ) : null;
+}
+
 const styles = StyleSheet.create({
+  warm: { position: 'absolute', width: 1, height: 1, opacity: 0 },
   loading: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three },
   note: { fontSize: 14, paddingHorizontal: Spacing.three },
   divider: { borderTopWidth: StyleSheet.hairlineWidth, marginHorizontal: Spacing.three, paddingTop: Spacing.three, marginBottom: Spacing.two },

@@ -3,11 +3,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   ActivityIndicator,
   AppState,
-  FlatList,
   LayoutAnimation,
   Keyboard,
   Pressable,
-  RefreshControl,
   ScrollView,
   StyleSheet,
   TextInput,
@@ -15,6 +13,11 @@ import {
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
+// The gesture library's list, not React Native's: on Android only its list
+// takes part in gesture arbitration, so a scroll that drifts sideways stays a
+// scroll instead of a card's swipe grabbing the touch (11 swipes started and
+// 2 accidental saves/hides, both undone, on 2026-10-25).
+import { FlatList, RefreshControl } from 'react-native-gesture-handler';
 
 import { ActionSheet, showActionSheet, type ActionSheetRequest } from '@/components/action-sheet';
 import { Icon } from '@/components/icon';
@@ -25,6 +28,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { useConfig } from '@/lib/session';
 
 import { fetchFeed, FeedApiError, searchFeed, type FeedItem } from './api';
+import { ArticleWarmup } from './article-view';
 import { newArrivals } from './card-context';
 import {
   activeNow,
@@ -646,8 +650,8 @@ export default function FeedScreen() {
   );
 
   // A swipe begun, whether or not it went far enough to save or hide.
-  const onSwipeStart = useCallback((item: FeedItem, toward: 'save' | 'dismiss') => {
-    recordUi('swipe_start', { item_id: item.item_id, position: position(item), metadata: { toward } });
+  const onSwipeStart = useCallback((item: FeedItem) => {
+    recordUi('swipe_start', { item_id: item.item_id, position: position(item) });
   }, []);
 
   const renderItem = useCallback(
@@ -690,6 +694,7 @@ export default function FeedScreen() {
         if (!isSideways() && width < height && (width !== portraitSize?.width || height !== portraitSize?.height)) setPortraitSize({ width, height });
       }}>
       <VideoWarmup />
+      <ArticleWarmup />
       {header}
       {searching ? (
         <View style={styles.searchRow}>
