@@ -200,7 +200,7 @@ SELECT
 FROM {target}
 WHERE {' AND '.join(filters)}
   AND bit_count(('x' || dhash)::bit(256) # ('x' || {_sql_literal(normalized)})::bit(256)) <= {max_distance}
-ORDER BY distance ASC, created_at DESC
+ORDER BY distance ASC, created_at DESC NULLS LAST
 LIMIT {limit}
 """.strip()
 

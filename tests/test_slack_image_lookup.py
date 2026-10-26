@@ -108,6 +108,12 @@ def test_lookup_sql_ranks_by_hamming_distance_and_resolves_the_uploader():
     assert "LIMIT 5" in sql
 
 
+def test_lookup_sql_ranks_an_undated_file_last_among_equal_distances():
+    # The view reports a file with no created_at as NULL, not the 1970 epoch,
+    # and DESC alone would rank NULL first.
+    assert "ORDER BY distance ASC, created_at DESC NULLS LAST" in build_lookup_sql(PROBE_DHASH)
+
+
 def test_lookup_sql_filters_to_the_stored_hash_version():
     assert HASH_VERSION in build_lookup_sql(PROBE_DHASH)
 

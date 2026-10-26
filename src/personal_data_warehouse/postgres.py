@@ -3233,6 +3233,21 @@ TIMESTAMP_COLUMNS = {
     "refresh_expires_at",
 }
 
+# The base_apple_messages timestamps whose 1970 epoch means "never happened";
+# marts_messages.apple_messages reports them as NULL. ingested_at is always a
+# real write time and stays as stored.
+_APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
+    {
+        "message_at",
+        "date_read",
+        "date_delivered",
+        "date_played",
+        "date_edited",
+        "date_retracted",
+        "date_recovered",
+    }
+)
+
 INTEGER_COLUMNS = {
     # android_screen_time
     "usage_event_type",
@@ -4396,7 +4411,7 @@ class PostgresWarehouse:
                 last_payment_amount,
                 last_statement_balance,
                 minimum_payment_amount,
-                next_payment_due_at,
+                NULLIF(next_payment_due_at, '1970-01-01 00:00:00+00'::timestamptz) AS next_payment_due_at,
                 origination_principal_amount,
                 outstanding_interest_amount,
                 is_overdue,
@@ -14904,7 +14919,7 @@ class PostgresWarehouse:
                 f.mimetype,
                 f.filetype,
                 f.size,
-                f.created_at,
+                NULLIF(f.created_at, '1970-01-01 00:00:00+00'::timestamptz) AS created_at,
                 f.is_deleted,
                 f.url_private,
                 f.user_id AS uploader_user_id,
@@ -18265,6 +18280,20 @@ class PostgresWarehouse:
         # identical to the LATERAL — verified over a 21-day window, 1,480 rows,
         # zero differences — and takes the same 30-day window to 0.4 s and a
         # full 172k-row scan to 0.7 s.
+        #
+        # The base columns are listed rather than `m.*` so the optional
+        # timestamps can say NULL instead of the 1970 epoch the NOT NULL base
+        # columns store for "never" (AGENTS.md, "Absence is the epoch, not
+        # NULL"). The list follows APPLE_MESSAGE_COLUMNS, which is the order
+        # `m.*` expanded to, so CREATE OR REPLACE replaces the view in place.
+        # A plain `ORDER BY message_at DESC` here therefore puts the ~250 rows
+        # with no send time first, as marts_messages.messages already does.
+        base_columns = ",\n                ".join(
+            f"NULLIF(m.{column}, '1970-01-01 00:00:00+00'::timestamptz) AS {column}"
+            if column in _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS
+            else f"m.{column}"
+            for column in APPLE_MESSAGE_COLUMNS
+        )
         self._ensure_view(
             "clean_apple_messages",
             """
@@ -18294,7 +18323,7 @@ class PostgresWarehouse:
                     cp.card_id
             )
             SELECT
-                m.*,
+                __BASE_COLUMNS__,
                 COALESCE(r.address, '') AS sender_address,
                 CASE
                     WHEN m.is_from_me = 1 THEN 'me'
@@ -18305,7 +18334,7 @@ class PostgresWarehouse:
             FROM @apple_messages m
             LEFT JOIN resolved_handles r
               ON r.account = m.account AND r.handle_id = m.handle_id
-            """,
+            """.replace("__BASE_COLUMNS__", base_columns),
             dependents=("marts_messages_messages",),
         )
         self._ensure_messages_mart_view_if_possible()
@@ -18356,8 +18385,8 @@ class PostgresWarehouse:
                 m.message_kind,
                 m.media_type,
                 m.quoted_message_id,
-                m.message_at,
-                m.edited_at,
+                NULLIF(m.message_at, '1970-01-01 00:00:00+00'::timestamptz) AS message_at,
+                NULLIF(m.edited_at, '1970-01-01 00:00:00+00'::timestamptz) AS edited_at,
                 m.is_deleted
             FROM @whatsapp_messages m
             LEFT JOIN @whatsapp_chats c ON c.account = m.account AND c.chat_id = m.chat_id

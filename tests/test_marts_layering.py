@@ -45,6 +45,10 @@ from personal_data_warehouse.schema import (
     CALENDAR_EVENT_COLUMNS,
     CONTACT_CARD_COLUMNS,
     GOOGLE_RECORDER_RECORDING_COLUMNS,
+    MEDIA_FINGERPRINT_COLUMNS,
+    PLAID_LIABILITY_COLUMNS,
+    SLACK_FILE_COLUMNS,
+    SLACK_FILE_FINGERPRINT_COLUMNS,
     VOICE_MEMO_ENRICHMENT_COLUMNS,
     VOICE_MEMO_FILE_COLUMNS,
     VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
@@ -1597,6 +1601,229 @@ def test_unified_messages_mart_reports_every_sentinel_timestamp_as_null(
 
     # And a real timestamp still comes through untouched.
     assert rows[("apple_messages", "m1")]["message_at"] == TS
+
+
+APPLE_MESSAGE_SENTINEL_COLUMNS = (
+    "message_at",
+    "date_read",
+    "date_delivered",
+    "date_played",
+    "date_edited",
+    "date_retracted",
+    "date_recovered",
+)
+
+
+def _view_oid(wh: PostgresWarehouse, logical: str) -> int:
+    rel = relation(logical).with_namespace(wh.schema_namespace)
+    return wh._query("SELECT %s::regclass::oid", (f"{rel.schema}.{rel.name}",))[0][0]
+
+
+def test_apple_messages_view_reports_every_sentinel_timestamp_as_null(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """marts_messages.apple_messages undoes the epoch sentinel, per column.
+
+    Production on 2026-10-25 still showed 1970-01-01 here for every unset
+    timestamp (date_played on 176,289 rows) while marts_messages.messages,
+    built on top of it, already said NULL.
+    """
+    _seed_messages(warehouse)
+    warehouse.insert_apple_messages(
+        [
+            _row(
+                APPLE_MESSAGE_COLUMNS,
+                account="zach",
+                message_id="m-sentinel",
+                message_rowid=3,
+                handle_id="h1",
+                service="iMessage",
+                body_text="never read, never delivered, no send time",
+                ingested_at=TS,
+                sync_version=1,
+            ),
+            _row(
+                APPLE_MESSAGE_COLUMNS,
+                account="zach",
+                message_id="m-real",
+                message_rowid=4,
+                handle_id="h1",
+                service="iMessage",
+                body_text="every timestamp real",
+                ingested_at=TS,
+                sync_version=1,
+                **{column: TS for column in APPLE_MESSAGE_SENTINEL_COLUMNS},
+            ),
+        ]
+    )
+
+    rows = {
+        row["message_id"]: row
+        for row in _dicts(warehouse, "clean_apple_messages")
+        if row["message_id"] in {"m-sentinel", "m-real"}
+    }
+    for column in APPLE_MESSAGE_SENTINEL_COLUMNS:
+        assert rows["m-sentinel"][column] is None, column
+        assert rows["m-real"][column] == TS, column
+    # ingested_at is a write time, always real, and is not translated.
+    assert rows["m-sentinel"]["ingested_at"] == TS
+
+
+def test_apple_messages_view_keeps_the_base_column_order_so_it_replaces_in_place(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The explicit select list must match what `m.*` produced.
+
+    CREATE OR REPLACE VIEW refuses to reorder, rename or retype a column, so a
+    list that drifted from the base table would force a DROP of the view and
+    of marts_messages.messages on top of it. Same oid across a second ensure
+    proves the replacement happened in place.
+    """
+    _seed_messages(warehouse)
+    assert _columns(warehouse, "clean_apple_messages") == [
+        *APPLE_MESSAGE_COLUMNS,
+        "sender_address",
+        "sender_name",
+        "contact_source",
+        "contact_card_id",
+    ]
+    before = _view_oid(warehouse, "clean_apple_messages")
+    mart_before = _view_oid(warehouse, "marts_messages_messages")
+    warehouse._ensure_clean_apple_messages_view()
+    assert _view_oid(warehouse, "clean_apple_messages") == before
+    assert _view_oid(warehouse, "marts_messages_messages") == mart_before
+
+
+def test_whatsapp_messages_view_reports_sentinel_timestamps_as_null(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _seed_messages(warehouse)
+    warehouse.insert_whatsapp_messages(
+        [
+            _row(
+                WHATSAPP_MESSAGE_COLUMNS,
+                account="zach",
+                chat_id="123@g.us",
+                message_id="w-sentinel",
+                sender_jid="15550002222@s.whatsapp.net",
+                body_text="never edited, no send time",
+                message_kind="text",
+                ingested_at=TS,
+                sync_version=1,
+            ),
+            _row(
+                WHATSAPP_MESSAGE_COLUMNS,
+                account="zach",
+                chat_id="123@g.us",
+                message_id="w-edited",
+                sender_jid="15550002222@s.whatsapp.net",
+                body_text="edited",
+                message_kind="text",
+                message_at=TS,
+                edited_at=TS,
+                ingested_at=TS,
+                sync_version=1,
+            ),
+        ]
+    )
+
+    rows = {row["message_id"]: row for row in _dicts(warehouse, "clean_whatsapp_messages")}
+    assert rows["w-sentinel"]["message_at"] is None
+    assert rows["w-sentinel"]["edited_at"] is None
+    assert rows["w-edited"]["message_at"] == TS
+    assert rows["w-edited"]["edited_at"] == TS
+
+
+def test_liabilities_mart_reports_a_sentinel_next_payment_due_as_null(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_plaid_tables()
+    warehouse.insert_plaid_liabilities(
+        [
+            _row(
+                PLAID_LIABILITY_COLUMNS,
+                account="zach",
+                item_id="item",
+                account_id="no-due-date",
+                liability_type="credit",
+                synced_at=TS,
+                sync_version=1,
+            ),
+            _row(
+                PLAID_LIABILITY_COLUMNS,
+                account="zach",
+                item_id="item",
+                account_id="due",
+                liability_type="mortgage",
+                next_payment_due_at=TS,
+                synced_at=TS,
+                sync_version=1,
+            ),
+        ]
+    )
+
+    rows = {row["account_id"]: row for row in _dicts(warehouse, "marts_finance_liabilities")}
+    assert rows["no-due-date"]["next_payment_due_at"] is None
+    assert rows["due"]["next_payment_due_at"] == TS
+
+
+def test_slack_image_fingerprints_view_reports_a_sentinel_created_at_as_null(
+    warehouse: PostgresWarehouse,
+) -> None:
+    warehouse.ensure_slack_file_fingerprint_tables()
+    sha = "c" * 64
+    files = [
+        _row(
+            SLACK_FILE_COLUMNS,
+            account="zach",
+            team_id="T1",
+            file_id=file_id,
+            conversation_id="D1",
+            message_ts="1786473484.611059",
+            name=f"{file_id}.png",
+            mimetype="image/png",
+            raw_json="{}",
+            synced_at=TS,
+            sync_version=1,
+            **extra,
+        )
+        for file_id, extra in (("F-no-date", {}), ("F-dated", {"created_at": TS}))
+    ]
+    warehouse.insert_slack_files(files)
+    warehouse.insert_media_fingerprints(
+        [
+            _row(
+                MEDIA_FINGERPRINT_COLUMNS,
+                content_sha256=sha,
+                hash_version="dhash16-v1",
+                dhash="0" * 64,
+                created_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse.upsert_slack_file_fingerprints(
+        [
+            _row(
+                SLACK_FILE_FINGERPRINT_COLUMNS,
+                account="zach",
+                team_id="T1",
+                file_id=file_id,
+                content_sha256=sha,
+                hash_version="dhash16-v1",
+                status="ok",
+                attempts=1,
+                created_at=TS,
+                updated_at=TS,
+                sync_version=1,
+            )
+            for file_id in ("F-no-date", "F-dated")
+        ]
+    )
+
+    rows = {row["file_id"]: row for row in _dicts(warehouse, "slack_image_fingerprints")}
+    assert rows["F-no-date"]["created_at"] is None
+    assert rows["F-dated"]["created_at"] == TS
 
 
 def test_voice_memo_mart_reports_every_sentinel_timestamp_as_null(
