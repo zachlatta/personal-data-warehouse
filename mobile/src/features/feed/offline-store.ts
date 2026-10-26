@@ -178,9 +178,16 @@ export function localizeArticle(html: string, dataUris: Record<string, string>):
   return pictures.replace(IMG, (tag) => (tag.startsWith(`<img src="data:`) ? tag : (swap(tag) ?? tag)));
 }
 
-/** A fetch that never reached the server (no connection, DNS, timeout), as against an HTTP error. */
+/**
+ * A request that never reached the server (no connection, DNS, a refused
+ * or dropped socket, a timeout), as against an HTTP error (FeedApiError
+ * carries a status) or a body that is not JSON. React Native throws
+ * TypeError('Network request failed'); 0.86 on Android also throws a plain
+ * Error('fetch failed: java.io.IOException: ...').
+ */
 export function isOfflineError(e: unknown): boolean {
-  return e instanceof TypeError || (e instanceof Error && /network request failed|network|offline|timed? ?out/i.test(e.message) && !('status' in e));
+  if (!(e instanceof Error) || 'status' in e || e instanceof SyntaxError) return false;
+  return e instanceof TypeError || e.name === 'AbortError' || /network|fetch failed|ioexception|unknownhost|connect|socket|offline|timed? ?out/i.test(e.message);
 }
 
 /**

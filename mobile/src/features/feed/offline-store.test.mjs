@@ -114,6 +114,9 @@ test('a downloaded picture reads from its data: URI; one not downloaded is untou
 
 test('only a failure to reach the server reads as offline', () => {
   assert.equal(isOfflineError(new TypeError('Network request failed')), true);
+  assert.equal(isOfflineError(new Error('fetch failed: java.io.IOException: unexpected end of stream on http://localhost:8790/...')), true);
+  assert.equal(isOfflineError(new Error('fetch failed: java.net.UnknownHostException: Unable to resolve host')), true);
+  assert.equal(isOfflineError(new SyntaxError('Unexpected token < in JSON')), false);
   const http = Object.assign(new Error('page has no article'), { status: 422 });
   assert.equal(isOfflineError(http), false);
   assert.equal(isOfflineError(new Error('boom')), false);

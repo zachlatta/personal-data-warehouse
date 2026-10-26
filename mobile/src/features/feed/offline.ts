@@ -92,9 +92,14 @@ function remove(name: string) {
   } catch {}
 }
 
+// A picture host (or a batch of them) that never answers must not hold up the rest.
+const MEDIA_BATCH_MS = 20_000;
+
 async function downloadImage(url: string, budget: ImageBudget): Promise<StoredImage | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MEDIA_BATCH_MS);
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) return null;
     const type = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
     if (!type.startsWith('image/')) return null;
@@ -106,6 +111,8 @@ async function downloadImage(url: string, budget: ImageBudget): Promise<StoredIm
     return { file, bytes: bytes.byteLength, type };
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -178,7 +185,12 @@ async function prefetchMedia(urls: string[]): Promise<void> {
   // prefetch resolves false at the first failure, so a few at a time.
   for (let i = 0; i < urls.length; i += 8) {
     if (AppState.currentState !== 'active') return;
-    await Image.prefetch(urls.slice(i, i + 8), 'disk').catch(() => false);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Image.prefetch(urls.slice(i, i + 8), 'disk').catch(() => false),
+      new Promise((resolve) => (timer = setTimeout(resolve, MEDIA_BATCH_MS))),
+    ]);
+    clearTimeout(timer);
   }
 }
 
@@ -201,7 +213,6 @@ export async function prefetchOffline(config: AppConfig, items: FeedItem[], save
   let failed = 0;
   let stopped = false;
   try {
-    await prefetchMedia(media);
     const queue = [...todo];
     const worker = async () => {
       while (queue.length && !stopped) {
@@ -222,7 +233,8 @@ export async function prefetchOffline(config: AppConfig, items: FeedItem[], save
         }
       }
     };
-    await Promise.all([worker(), worker(), worker()]);
+    // The card pictures and the articles download side by side.
+    await Promise.all([prefetchMedia(media), worker(), worker(), worker()]);
     const idx = loadIndex();
     const keep = new Set(urls.filter((u): u is string => !!u));
     const savedUrls = new Set(saved.map((c) => articleUrl(c, !c.embed && !!cardVideo(c))).filter((u): u is string => !!u));
