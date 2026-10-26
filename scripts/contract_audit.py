@@ -25,7 +25,7 @@ import statistics
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Sequence
 
@@ -247,6 +247,16 @@ def c5_layering() -> Verdict:
                    f"attachment raw-read exemptions={len(exempt_entries)}, 'pending marts_*' debts={pending}")
 
 
+def _decimal_or_none(value: object) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
 def _real_traffic_latency() -> tuple[str, str]:
     """Grade the two rolling windows using pressure sampled during each search."""
     rows = pdw_sql(
@@ -268,15 +278,17 @@ def _real_traffic_latency() -> tuple[str, str]:
         measured = (row.get("status") not in ("no_data", "unknown")
                     and row.get("requests", 0) >= 20
                     and row.get("p50_ms") is not None and row.get("p90_ms") is not None)
+        idle_slow_share = _decimal_or_none(row.get("idle_slow_share"))
         if not measured:
             status = YELLOW
         elif row["p50_ms"] >= LATENCY_P50_TARGET_MS:
             status = RED
         # pdw SQL preserves PostgreSQL numeric shares as decimal strings.
-        # Compare exactly, including values immediately below the 10% boundary.
+        # Compare exactly, including values immediately below the 10% boundary;
+        # missing or unparseable shares when idle_slow_requests >= 5 grade yellow.
         elif (row["p90_ms"] > LATENCY_P90_TARGET_MS
               or (row.get("idle_slow_requests", 0) >= 5
-                  and Decimal(str(row.get("idle_slow_share") or 0)) >= Decimal("0.1"))
+                  and (idle_slow_share is None or idle_slow_share >= Decimal("0.1")))
               or row.get("status") != "ok"):
             status = YELLOW
         else:

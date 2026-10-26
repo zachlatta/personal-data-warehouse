@@ -179,9 +179,9 @@ def _benchmark_host_row(**overrides: object) -> dict[str, object]:
 
 def _real_traffic_rows(**overrides: object) -> list[dict[str, object]]:
     row: dict[str, object] = {
-        "status": "ok", "requests": 100, "errors": 2,
+        "status": "ok", "requests": 1000, "errors": 2,
         "p50_ms": 900, "p90_ms": 1800, "share_over_2s": "0.05000000000000000000",
-        "slow_requests": 5, "idle_slow_requests": 0, "idle_slow_share": "0.00000000000000000000",
+        "slow_requests": 50, "idle_slow_requests": 0, "idle_slow_share": "0.00000000000000000000",
         "saturation_mix": {"io_bound": 5}, "slowest_leg_mix": {"lexical": 5},
     }
     row.update(overrides)
@@ -230,6 +230,8 @@ def test_c6_missing_real_traffic_is_yellow(monkeypatch, rows):
     (5, "0.09999999999999999999", "green"),
     (4, "0.40000000000000000000", "green"),
     (5, 0.1, "yellow"),
+    (5, None, "yellow"),
+    (5, "invalid", "yellow"),
     (0, None, "green"),
 ])
 def test_c6_idle_rule_reads_decimal_shares_through_sql_json(monkeypatch, idle, share, expected):
