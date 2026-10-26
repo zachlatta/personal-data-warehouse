@@ -610,6 +610,10 @@ def s2_voice() -> Verdict:
     # too short) and an empty upload (size_bytes = 0, which the candidate
     # query excludes) are not a backlog; counting them read S2 red forever
     # on eighteen recordings nothing could ever transcribe.
+    # Overdue is two days after the recording AND two days after PDW got it:
+    # on 2026-10-25 a phone migration ingested 77 Google Recorder memos from
+    # 2017-2022, and recorded_at alone counted all of them overdue four hours
+    # in, while the hourly enrichment job was draining them.
     rows = pdw_sql("voice coverage", """
         WITH r AS (
             -- Untranscribable: an empty upload, a provider rejection (no spoken
@@ -623,10 +627,12 @@ def s2_voice() -> Verdict:
             FROM marts_voice_memos.recordings r WHERE r.is_deleted = 0)
         SELECT source, count(*) AS recordings,
                count(*) FILTER (WHERE transcript IS NULL AND NOT untranscribable
-                                  AND recorded_at < now() - interval '2 days') AS untranscribed,
+                                  AND recorded_at < now() - interval '2 days'
+                                  AND ingested_at < now() - interval '2 days') AS untranscribed,
                count(*) FILTER (WHERE transcript IS NULL AND untranscribable) AS untranscribable,
                count(*) FILTER (WHERE summary IS NULL AND transcript IS NOT NULL
-                                  AND recorded_at < now() - interval '2 days') AS unenriched,
+                                  AND recorded_at < now() - interval '2 days'
+                                  AND ingested_at < now() - interval '2 days') AS unenriched,
                count(*) FILTER (WHERE calendar_event_id IS NOT NULL) AS matched
         FROM r GROUP BY source ORDER BY source""")
     if rows is None:

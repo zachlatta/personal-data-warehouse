@@ -34,6 +34,13 @@ SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: pasted session (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
 #: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
 SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=15), timedelta(hours=2), timedelta(hours=12))
+#: The activity windows those intervals are chosen by: a conversation whose
+#: newest known message is inside the warm window is due every fifteen minutes,
+#: inside the cool window every two hours, and older every twelve.
+#: marts_ops.slack_conversation_health reads the same three numbers to tell a
+#: quiet DM waking up on schedule from a DM landing late.
+SLACK_FRESHNESS_WARM_WINDOW = timedelta(days=14)
+SLACK_FRESHNESS_COOL_WINDOW = timedelta(days=365)
 
 # The end of a conversations.list walk cannot be recorded by storing an empty
 # cursor: ops.slack_sync_state.cursor_ts is upsert-preserved against empty values
@@ -323,7 +330,7 @@ class SlackSyncRunner:
         freshness_limit_by_type: Mapping[str, int] | None = None,
         freshness_warm_window: timedelta | None = None,
         freshness_due_intervals: tuple[timedelta, timedelta, timedelta] | None = None,
-        freshness_cool_window: timedelta = timedelta(days=365),
+        freshness_cool_window: timedelta = SLACK_FRESHNESS_COOL_WINDOW,
         freshness_pass_budget: timedelta | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:

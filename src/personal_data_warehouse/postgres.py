@@ -218,6 +218,11 @@ from personal_data_warehouse.relations import (
 # imported rather than restated here; this module only publishes them as
 # Postgres COMMENTs. timeline.py imports nothing from postgres.py, so there is
 # no cycle.
+from personal_data_warehouse.slack_sync import (
+    SLACK_FRESHNESS_COOL_WINDOW,
+    SLACK_FRESHNESS_DUE_INTERVALS,
+    SLACK_FRESHNESS_WARM_WINDOW,
+)
 from personal_data_warehouse.timeline import (
     TIMELINE_ADAPTERS,
     TIMELINE_PRIORITY_DEFINITIONS,
@@ -814,6 +819,14 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 SLACK_FINGERPRINT_THUMB_SIZES = (1024, 960, 800, 720, 480, 360, 160)
 SLACK_DM_LANDING_P95_SECONDS = 900
 SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
+# A DM quiet past the warm window is polled every two hours (every twelve once
+# quiet a year: SLACK_FRESHNESS_DUE_INTERVALS), so the message that wakes it --
+# and any written before it lands -- arrives up to that late by design. Live on
+# 2026-10-25, three such messages in two DMs quiet 16.5 and 19 days read the im
+# row's p95 at 5,049s and S1 red. They are left out of the 15-minute sample when
+# they landed inside their own tier's interval plus this margin; one later than
+# that is still judged, so a cool tier that stops polling is not hidden here.
+SLACK_DM_WAKEUP_MARGIN_SECONDS = 900
 
 # marts_ops.search_health reports `late` once the oldest timeline row the chunk
 # builder has not reached has waited this long. The builder runs every five
@@ -14650,7 +14663,7 @@ class PostgresWarehouse:
                 WHERE c.conversation_type <> ''
                 GROUP BY c.account, c.team_id, c.conversation_type, e.cycle_seconds, e.history_cycle_seconds
             ),
-            landing AS (
+            landing_sample AS (
                 -- Landing latency = first_seen_at - occurred_at, over the messages
                 -- WRITTEN in the last 24 hours (bounded by occurred_at, which
                 -- timeline_events_source_time_idx serves; a backfill landing
@@ -14665,13 +14678,10 @@ class PostgresWarehouse:
                     c.account,
                     c.team_id,
                     c.conversation_type,
-                    count(*)::bigint AS landing_sample_24h,
-                    percentile_cont(0.5) WITHIN GROUP (
-                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at))
-                    ) AS landing_p50,
-                    percentile_cont(0.95) WITHIN GROUP (
-                        ORDER BY GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at))
-                    ) AS landing_p95
+                    c.conversation_id,
+                    e.occurred_at,
+                    e.first_seen_at,
+                    GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at)) AS latency_seconds
                 FROM @timeline_events AS e
                 JOIN @slack_conversations AS c
                   ON c.account = e.source_pk ->> 'account'
@@ -14680,7 +14690,80 @@ class PostgresWarehouse:
                 WHERE e.source = 'slack'
                   AND e.adapter = 'slack_message'
                   AND e.occurred_at >= now() - interval '24 hours'
-                GROUP BY c.account, c.team_id, c.conversation_type
+            ),
+            dm_landing_sample AS (
+                SELECT * FROM landing_sample WHERE conversation_type IN ('im', 'mpim')
+            ),
+            dm_landing_anchor AS (
+                -- The anchor is what the freshness scheduler knew when the
+                -- message was written: the conversation's newest earlier
+                -- message that had ALREADY LANDED. Not merely the previous
+                -- message: on 2026-10-25 three DM messages written at 16:10,
+                -- after a 15:00 wake-up that landed at 16:28, came in the same
+                -- poll, and their previous message was an hour old. Inside the
+                -- window that is the sample's own first_seen_at; before it,
+                -- the newest stored message (slack_messages_conversation_time_idx),
+                -- taken as landed. The epoch is absence, not a message.
+                SELECT
+                    d.*,
+                    COALESCE(
+                        (SELECT max(p.occurred_at)
+                         FROM dm_landing_sample AS p
+                         WHERE p.account = d.account
+                           AND p.team_id = d.team_id
+                           AND p.conversation_id = d.conversation_id
+                           AND p.occurred_at < d.occurred_at
+                           AND p.first_seen_at <= d.occurred_at),
+                        (SELECT max(m.message_datetime)
+                         FROM @slack_messages AS m
+                         WHERE m.account = d.account
+                           AND m.team_id = d.team_id
+                           AND m.conversation_id = d.conversation_id
+                           AND m.message_datetime < now() - interval '24 hours'
+                           AND m.message_datetime > TIMESTAMPTZ '1970-01-01 00:00:00+00')
+                    ) AS anchor_at
+                FROM dm_landing_sample AS d
+            ),
+            landing_classified AS (
+                -- A scheduled wake-up: the anchor is older than the warm
+                -- window, so the conversation was due every two hours (twelve
+                -- past the cool window), and the message landed inside that
+                -- interval plus a margin. A brand-new conversation has no
+                -- anchor; discovery polls it at once, so it stays judged.
+                SELECT
+                    a.account,
+                    a.team_id,
+                    a.conversation_type,
+                    a.latency_seconds,
+                    COALESCE(
+                        a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_FRESHNESS_WARM_WINDOW.total_seconds():.0f})
+                        AND a.latency_seconds <= CASE
+                            WHEN a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_FRESHNESS_COOL_WINDOW.total_seconds():.0f})
+                                THEN {SLACK_FRESHNESS_DUE_INTERVALS[2].total_seconds():.0f}
+                            ELSE {SLACK_FRESHNESS_DUE_INTERVALS[1].total_seconds():.0f}
+                        END + {SLACK_DM_WAKEUP_MARGIN_SECONDS},
+                        false
+                    ) AS scheduled_wakeup
+                FROM dm_landing_anchor AS a
+                UNION ALL
+                SELECT account, team_id, conversation_type, latency_seconds, false
+                FROM landing_sample
+                WHERE conversation_type NOT IN ('im', 'mpim')
+            ),
+            landing AS (
+                SELECT
+                    account,
+                    team_id,
+                    conversation_type,
+                    count(*) FILTER (WHERE NOT scheduled_wakeup)::bigint AS landing_sample_24h,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_seconds)
+                        FILTER (WHERE NOT scheduled_wakeup) AS landing_p50,
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_seconds)
+                        FILTER (WHERE NOT scheduled_wakeup) AS landing_p95,
+                    count(*) FILTER (WHERE scheduled_wakeup)::bigint AS landing_wakeups_excluded_24h,
+                    max(latency_seconds) FILTER (WHERE scheduled_wakeup) AS landing_wakeup_max
+                FROM landing_classified
+                GROUP BY account, team_id, conversation_type
             ),
             judged AS (
                 SELECT
@@ -14691,6 +14774,8 @@ class PostgresWarehouse:
                     COALESCE(l.landing_sample_24h, 0)::bigint AS landing_sample_24h,
                     round(l.landing_p50)::bigint AS landing_p50_seconds,
                     round(l.landing_p95)::bigint AS landing_p95_seconds,
+                    COALESCE(l.landing_wakeups_excluded_24h, 0)::bigint AS landing_wakeups_excluded_24h,
+                    round(l.landing_wakeup_max)::bigint AS landing_wakeup_max_seconds,
                     CASE
                         WHEN p.live_count = 0 THEN 'unknown'
                         WHEN e.landing_p95_seconds IS NULL THEN 'ok'
@@ -14787,7 +14872,13 @@ class PostgresWarehouse:
                 p.read_state_refreshed_count,
                 round(p.read_state_refreshed_count::numeric / NULLIF(p.read_state_unread_count, 0), 4)
                     AS read_state_refreshed_fraction,
-                p.read_state_status
+                p.read_state_status,
+                -- Appended, never inserted: CREATE OR REPLACE VIEW only
+                -- tolerates new columns at the end. Context, not a verdict:
+                -- the quiet-DM wake-ups left out of landing_sample_24h above
+                -- because they landed inside their own poll interval.
+                p.landing_wakeups_excluded_24h,
+                p.landing_wakeup_max_seconds
             FROM judged AS p
             LEFT JOIN @slack_sync_state AS st
                    ON st.account = p.account

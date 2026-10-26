@@ -23,8 +23,10 @@ load-bearing and unenforced:
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -284,6 +286,61 @@ def test_contract_audit_uses_the_benchmark_collectors_latency_target() -> None:
     from scripts import contract_audit
 
     assert contract_audit.SEARCH_P50_TARGET_SECONDS == LATENCY_P50_TARGET_MS / 1000
+
+
+def test_s2_backlog_is_overdue_only_two_days_after_pdw_ingested_the_recording(monkeypatch) -> None:
+    """An old recording that arrived today is not two days overdue.
+
+    On 2026-10-25 a phone migration ingested 77 Google Recorder memos from
+    2017-2022, and a backlog bounded by recorded_at alone graded S2 red four
+    hours later while the hourly enrichment job was draining them.
+    """
+    from scripts import contract_audit
+
+    seen: dict[str, str] = {}
+
+    def fake_pdw_sql(intent: str, sql: str, **_kwargs):
+        seen[intent] = sql
+        return None
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", fake_pdw_sql)
+    contract_audit.s2_voice()
+
+    sql = " ".join(seen["voice coverage"].split())
+    for column in ("untranscribed", "unenriched"):
+        expression = sql.split(f") AS {column},", 1)[0].rsplit("count(*) FILTER", 1)[1]
+        assert "recorded_at < now() - interval '2 days'" in expression, column
+        assert "ingested_at < now() - interval '2 days'" in expression, column
+
+
+def test_slack_dm_wakeup_exclusion_reads_the_schedulers_own_windows() -> None:
+    """The health view tells a scheduled wake-up from a late DM by the scheduler's numbers.
+
+    A quiet DM is excused from the 15-minute landing SLA only because the
+    freshness pass polls it every 2h/12h. If the view kept its own copy of
+    those windows, retuning the scheduler would leave it excusing the wrong
+    messages. The behaviour itself is proven in tests/test_pipeline_health.py.
+    """
+    from personal_data_warehouse import slack_sync
+    from personal_data_warehouse.defs import slack_sync as slack_sync_defs
+
+    assert slack_sync.SLACK_FRESHNESS_WARM_WINDOW == timedelta(days=14)
+    assert slack_sync.SLACK_FRESHNESS_COOL_WINDOW == timedelta(days=365)
+    defs_source = Path(slack_sync_defs.__file__).read_text()
+    assert "SLACK_FRESHNESS_WARM_WINDOW.days" in defs_source, "the Dagster pass must default to the shared warm window"
+    runner_default = inspect.signature(slack_sync.SlackSyncRunner).parameters["freshness_cool_window"].default
+    assert runner_default == slack_sync.SLACK_FRESHNESS_COOL_WINDOW
+
+    postgres_source = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
+    view = postgres_source.split("def _ensure_slack_conversation_health_view", 1)[1].split("\n    def ", 1)[0]
+    for name in (
+        "SLACK_FRESHNESS_WARM_WINDOW",
+        "SLACK_FRESHNESS_COOL_WINDOW",
+        "SLACK_FRESHNESS_DUE_INTERVALS[1]",
+        "SLACK_FRESHNESS_DUE_INTERVALS[2]",
+        "SLACK_DM_WAKEUP_MARGIN_SECONDS",
+    ):
+        assert "{" + name in view, f"the wake-up rule must interpolate {name}, not a literal"
 
 
 def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:

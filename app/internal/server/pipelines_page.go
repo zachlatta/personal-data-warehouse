@@ -915,7 +915,8 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
         ["landing", landing,
           s.expected_landing_p95_seconds
             ? "p50 / p95 of first_seen_at - event_ts over " + rows(s.landing_sample_24h) +
-              " messages written in the last 24h; ok at p95 <= " + ago(Number(s.expected_landing_p95_seconds))
+              " messages written in the last 24h, less DMs quiet over 14 days that woke inside their 2h/12h poll;" +
+              " ok at p95 <= " + ago(Number(s.expected_landing_p95_seconds))
             : "not judged: a channel's landing time is the sweep's rate budget, not a fault",
           !s.expected_landing_p95_seconds],
         ["newest message", s.newest_message_at ? ago(ageOf(s.newest_message_at)) + " ago" : "none",

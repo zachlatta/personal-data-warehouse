@@ -2918,3 +2918,107 @@ def test_a_mart_reading_a_quiet_usage_driven_source_is_not_coloured_by_it(wareho
         assert row["input_status"] not in ("late", "stale"), (view_id, row)
         assert "pi" not in row["cause_pipelines"], (view_id, row)
         assert row["stalest_pipeline"] != "pi", (view_id, row)
+
+
+# --- marts_ops.slack_conversation_health: quiet DMs waking on schedule --------
+
+
+def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval(warehouse):
+    """A DM quiet past the warm window is polled every two hours by design.
+
+    Live on 2026-10-25 the im row read p95 5,049s and S1 red because three
+    messages woke two DMs quiet 16.5 and 19 days; they landed inside the 2h
+    interval SLACK_FRESHNESS_DUE_INTERVALS gives them. Such a wake-up -- and
+    any message written before it lands -- leaves the 15-minute sample. A
+    wake-up later than its own tier allows, and a brand-new conversation, are
+    still judged, so a cool tier that stopped polling stays visible.
+    """
+    from tests.test_postgres_warehouse import (
+        _ensure_all_table_groups,
+        _health_conversation_row,
+        _poll_every_health_conversation,
+        _slack_message_row,
+        _sync_timeline,
+    )
+
+    from personal_data_warehouse.postgres import SLACK_DM_LANDING_LATE_P95_SECONDS
+
+    warehouse.ensure_slack_tables()
+    now = datetime.now(tz=UTC)
+    fresh = now - timedelta(minutes=30)
+    conversations = {
+        "D_WARM": "im",  # quiet 3 days: warm, judged
+        "D_WOKE": "im",  # quiet 16 days, two-message wake landing inside 2h
+        "D_COLD": "im",  # quiet 400 days, wake landing inside 12h
+        "D_ANSWERED": "im",  # a wake, then a reply written after it landed
+        "G_OVERDUE": "mpim",  # quiet 16 days, landed 5h later: past its tier
+        "G_NEW": "mpim",  # no earlier message: discovery polls it at once
+    }
+    warehouse.insert_slack_conversations(
+        [_health_conversation_row(cid, kind, synced_at=fresh) for cid, kind in conversations.items()]
+    )
+    _poll_every_health_conversation(warehouse)
+    written = {
+        "D_WARM": [timedelta(days=3), timedelta(minutes=3)],
+        "D_WOKE": [timedelta(days=16), timedelta(minutes=90), timedelta(minutes=80)],
+        "D_COLD": [timedelta(days=400), timedelta(hours=6)],
+        "D_ANSWERED": [timedelta(days=16), timedelta(hours=4), timedelta(minutes=20)],
+        "G_OVERDUE": [timedelta(days=16), timedelta(hours=5)],
+        "G_NEW": [timedelta(hours=2)],
+    }
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id=cid,
+                message_ts=f"{(now - age).timestamp():.6f}",
+                message_datetime=now - age,
+                user_id=f"U{index}",
+                text=f"{cid} message {index}",
+            )
+            for cid, ages in written.items()
+            for index, age in enumerate(ages)
+        ]
+    )
+    _ensure_all_table_groups(warehouse)
+    _sync_timeline(warehouse)
+    # The sync stamps first_seen_at now. D_ANSWERED's wake landed two hours
+    # ago (inside its 2h tier), so the reply written 20 minutes ago was
+    # written into a conversation the scheduler already knew was active.
+    warehouse._command(
+        """
+        UPDATE @timeline_events SET first_seen_at = %s
+        WHERE source = 'slack' AND adapter = 'slack_message'
+          AND source_pk ->> 'conversation_id' = 'D_ANSWERED'
+          AND occurred_at = %s
+        """,
+        (now - timedelta(hours=2), now - timedelta(hours=4)),
+    )
+
+    rows = {
+        row["conversation_type"]: row
+        for row in warehouse._query_dicts(
+            """
+            SELECT conversation_type, landing_sample_24h, landing_p50_seconds, landing_p95_seconds,
+                   landing_wakeups_excluded_24h, landing_wakeup_max_seconds, landing_status, status
+            FROM @marts_ops_slack_conversation_health
+            WHERE account = 'zrl'
+            """
+        )
+    }
+
+    im = rows["im"]
+    # Judged: D_WARM's 3 minutes and D_ANSWERED's 20-minute reply. Left out:
+    # D_WOKE's two, D_COLD's one and D_ANSWERED's wake.
+    assert im["landing_sample_24h"] == 2, im
+    assert im["landing_wakeups_excluded_24h"] == 4, im
+    assert abs(im["landing_wakeup_max_seconds"] - 6 * 3600) <= 120, im
+    assert 15 * 60 < im["landing_p95_seconds"] <= 20 * 60 + 120, im
+    assert im["landing_status"] == "late", "the reply came after the wake landed and is judged"
+
+    mpim = rows["mpim"]
+    assert mpim["landing_sample_24h"] == 2, mpim
+    assert mpim["landing_wakeups_excluded_24h"] == 0 and mpim["landing_wakeup_max_seconds"] is None, mpim
+    assert mpim["landing_p95_seconds"] > SLACK_DM_LANDING_LATE_P95_SECONDS
+    assert mpim["landing_status"] == "stale" and mpim["status"] == "stale", (
+        "a wake-up later than its own poll interval is a fault, not a schedule"
+    )

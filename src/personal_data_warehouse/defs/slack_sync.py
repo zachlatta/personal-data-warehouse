@@ -21,6 +21,7 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import (
     SLACK_FRESHNESS_DUE_INTERVALS,
+    SLACK_FRESHNESS_WARM_WINDOW,
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
     SLACK_COVERAGE_STAGE_STATE_TYPE,
@@ -202,7 +203,9 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             # Conversations active inside this window are due every 15 minutes
             # (SLACK_FRESHNESS_DUE_INTERVALS); within a year every two hours;
             # older every twelve.
-            freshness_warm_window=timedelta(days=_int_env("SLACK_ASSET_FRESHNESS_WARM_DAYS", 14)),
+            freshness_warm_window=timedelta(
+                days=_int_env("SLACK_ASSET_FRESHNESS_WARM_DAYS", SLACK_FRESHNESS_WARM_WINDOW.days)
+            ),
             freshness_due_intervals=_freshness_due_intervals(),
             sync_users=False,
             sync_members=False,
