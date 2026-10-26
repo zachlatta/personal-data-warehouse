@@ -1680,8 +1680,8 @@ The warehouse also creates read views for current inbox and transcript state:
   `thread_messages_json` carrying full thread context oldest-to-newest
 - `marts_inbox.slack_items`: Slack DMs, mentions, participating threads, and channel unread items for
   the authenticated Slack user when read state is known
-- `marts_calendar.events_with_voice_memos`: calendar events joined to matched Voice Memo transcript enrichments
-- `marts_calendar.unmatched_voice_memos`: completed Voice Memo transcript enrichments without a calendar match
+- `marts_calendar.events_with_voice_memos`: calendar events joined to matched recording enrichments from every voice source, one row per recording (`recording_source` says which)
+- `marts_calendar.unmatched_voice_memos`: completed recording enrichments from every voice source without a calendar match
 
 And every one of those sources also lands on `timeline.events`, the cross-source event stream
 that is the recommended starting point — see [The contracts](AGENTS.md#the-contracts).

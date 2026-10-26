@@ -19478,6 +19478,7 @@ class PostgresWarehouse:
             ),
             enriched_recordings AS (
                 SELECT
+                    source,
                     account,
                     recording_id,
                     recorded_at,
@@ -19497,7 +19498,9 @@ class PostgresWarehouse:
                 -- enrichment_provider, not enriched_at: the timestamp is
                 -- NULL-when-sentinel, and "has a completed enrichment" must not
                 -- ride on whether that enrichment carried a real clock reading.
-                WHERE source = 'apple_voice_memos' AND enrichment_provider IS NOT NULL
+                -- Every voice source, not one: a meeting recorded on two
+                -- devices is one row per recording, keyed with its source.
+                WHERE enrichment_provider IS NOT NULL
             )
             SELECT
                 c.calendar_account AS calendar_account,
@@ -19523,7 +19526,8 @@ class PostgresWarehouse:
                 e.summary,
                 e.action_items_json,
                 e.evidence_json,
-                e.enriched_at AS created_at
+                e.enriched_at AS created_at,
+                e.source AS recording_source
             FROM latest_calendar_events AS c
             INNER JOIN enriched_recordings AS e
               ON c.event_id = e.calendar_event_id
@@ -19542,6 +19546,7 @@ class PostgresWarehouse:
             ),
             enriched_recordings AS (
                 SELECT
+                    source,
                     account,
                     recording_id,
                     recorded_at,
@@ -19561,7 +19566,9 @@ class PostgresWarehouse:
                 -- enrichment_provider, not enriched_at: the timestamp is
                 -- NULL-when-sentinel, and "has a completed enrichment" must not
                 -- ride on whether that enrichment carried a real clock reading.
-                WHERE source = 'apple_voice_memos' AND enrichment_provider IS NOT NULL
+                -- Every voice source, not one: a meeting recorded on two
+                -- devices is one row per recording, keyed with its source.
+                WHERE enrichment_provider IS NOT NULL
             )
             SELECT
                 e.account,
@@ -19583,7 +19590,8 @@ class PostgresWarehouse:
                 e.summary,
                 e.action_items_json,
                 e.evidence_json,
-                e.enriched_at AS created_at
+                e.enriched_at AS created_at,
+                e.source
             FROM enriched_recordings AS e
             LEFT JOIN latest_calendar_events AS c
               ON e.calendar_event_id = c.event_id

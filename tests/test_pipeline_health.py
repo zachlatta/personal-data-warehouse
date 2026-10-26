@@ -737,6 +737,7 @@ def test_every_remote_device_uploader_declares_a_run_heartbeat():
         "apple_notes", "apple_messages", "apple_contacts", "apple_voice_memos",
         "apple_photos", "claude_code", "codex", "openclaw", "pi", "muse_code",
         "browser_history", "argon", "screen_timelapse", "google_recorder",
+        "android_messages", "android_notifications", "android_screen_time", "muse",
     ):
         entry = pipeline(pipeline_id)
         assert entry.state is not None, pipeline_id

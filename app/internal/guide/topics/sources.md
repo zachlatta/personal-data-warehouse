@@ -43,7 +43,7 @@ and state the window and freshness.
   — normalised phones and emails for identity joins. Raw cards: `base_apple_contacts.cards`,
   `base_google_contacts.cards`.
 - `marts_calendar.events_with_voice_memos` / `marts_calendar.unmatched_voice_memos` —
-  meetings joined to the recording made during them.
+  meetings joined to the recordings made during them, from every voice source, one row each.
 
 ## Files, notes, photos
 

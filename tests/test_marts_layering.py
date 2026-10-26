@@ -988,6 +988,89 @@ def test_calendar_transcript_views_read_the_voice_memo_mart(
 
     unmatched = _dicts(warehouse, "clean_transcripts_no_calendar_match")
     assert [row["recording_id"] for row in unmatched] == []
+    assert matched[0]["recording_source"] == "apple_voice_memos"
+
+
+def test_calendar_voice_memo_views_cover_every_voice_source(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Both calendar views read every enriched recording in the voice mart.
+
+    They once kept only `source = 'apple_voice_memos'`, so Pixel, Alice and
+    Apple Notes recordings never reached a meeting. One meeting recorded on two
+    devices is one row per recording, keyed by (event_id, recording_source,
+    recording_account, recording_id): picking one would drop a transcript.
+    """
+    _seed_voice_memos(warehouse)
+    warehouse.insert_apple_voice_memos_enrichments(
+        [
+            _row(
+                VOICE_MEMO_ENRICHMENT_COLUMNS,
+                source=source,
+                account="zach",
+                recording_id=recording_id,
+                content_sha256=sha,
+                provider="agent",
+                model="m",
+                prompt_version="v2",
+                status="completed",
+                calendar_event_id=event_id,
+                calendar_confidence=confidence,
+                title=f"{source} title",
+                transcript=f"{source} transcript",
+                summary=f"{source} summary",
+                participants_json="[]",
+                action_items_json="[]",
+                created_at=TS,
+                sync_version=1,
+            )
+            for source, recording_id, sha, event_id, confidence in (
+                ("google_recorder", "pixel-1", "sha-pixel-1", "cal-1", 0.8),
+                ("alice_voice_recordings", "alice-1", "sha-3", "", 0.0),
+            )
+        ]
+    )
+    warehouse.ensure_calendar_tables()
+    warehouse.insert_calendar_events(
+        [
+            _row(
+                CALENDAR_EVENT_COLUMNS,
+                account="zach",
+                calendar_id="primary",
+                event_id="cal-1",
+                status="confirmed",
+                summary="Planning",
+                start_at=TS,
+                end_at=TS,
+                organizer_email="zach@example.invalid",
+                html_link="https://example.invalid/e",
+                synced_at=TS,
+                sync_version=1,
+            )
+        ]
+    )
+    warehouse._ensure_clean_calendar_transcript_views_if_possible()
+
+    matched = _dicts(warehouse, "clean_calendar_with_transcripts", "recording_source, recording_id")
+    assert [
+        (row["event_id"], row["recording_source"], row["recording_id"], row["transcript"])
+        for row in matched
+    ] == [
+        ("cal-1", "apple_voice_memos", "rec-1", "new transcript"),
+        ("cal-1", "google_recorder", "pixel-1", "google_recorder transcript"),
+    ]
+
+    unmatched = _dicts(warehouse, "clean_transcripts_no_calendar_match", "source, recording_id")
+    assert [(row["source"], row["recording_id"], row["calendar_match_issue"]) for row in unmatched] == [
+        ("alice_voice_recordings", "alice-1", "no_calendar_event_id"),
+    ]
+
+    # Neither definition may narrow the mart back to one source.
+    for view in ("clean_calendar_with_transcripts", "clean_transcripts_no_calendar_match"):
+        (definition,) = warehouse._query(
+            f"SELECT pg_get_viewdef('{warehouse.sql_relation(view)}'::regclass)"
+        )[0]
+        assert "'apple_voice_memos'" not in definition, view
 
 
 # ---------------------------------------------------------------------------
