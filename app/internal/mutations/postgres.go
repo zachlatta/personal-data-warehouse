@@ -162,6 +162,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if normalized, err = s.enrichGmailSettings(ctx, normalized); err != nil {
 		return Request{}, err
 	}
+	if normalized, err = s.enrichScreenTimelapsePurges(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
@@ -1962,6 +1965,19 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Preview: map[string]any{
 					"text_message": androidMessagesPreview(payload),
 				},
+			})
+		case ScreenTimelapsePurgeMomentOperation:
+			target, err := screenTimelapsePurgeTargetFromInput(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  ScreenTimelapseProvider,
+				Operation: ScreenTimelapsePurgeMomentOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, screenTimelapsePurgeTitle(target)),
+				Reason:    reason,
+				Payload:   screenTimelapsePurgePayload(target, strings.TrimSpace(mutation.Reason)),
 			})
 		case AppleMessagesMarkReadOperation:
 			if err := validateAppleMessagesMarkRead(mutation); err != nil {

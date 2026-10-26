@@ -34,6 +34,8 @@ const (
 	SlackProvider                       = "slack"
 	SlackMarkConversationReadOperation  = "slack.mark_conversation_read"
 	SlackSendMessageOperation           = "slack.send_message"
+	ScreenTimelapseProvider             = "screen_timelapse"
+	ScreenTimelapsePurgeMomentOperation = "screen_timelapse.purge_moment"
 
 	defaultRequestedBy = "mcp"
 	// reviewerActorID is the actor recorded when a reviewer surface passes

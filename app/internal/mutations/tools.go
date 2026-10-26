@@ -623,6 +623,28 @@ func MutationHelp() MutationHelpDocument {
 					"Prefer conversation_id when you found the conversation on the timeline; use user_id only for a person you have no DM with yet.",
 			},
 			{
+				Type:    ScreenTimelapsePurgeMomentOperation,
+				Summary: "Delete one captured moment of a device's screen from the warehouse and from Drive: for a frame that showed something that must not be kept (a card number, a password).",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + ScreenTimelapsePurgeMomentOperation},
+					{Name: "device", JSONType: "string", Required: true, Description: "the device as base_screen_timelapse.screenshots.device holds it; it is also the mutation's account, so account may be omitted"},
+					{Name: "captured_at", JSONType: "string", Required: true, Description: "the moment's exact base_screen_timelapse.screenshots.captured_at, as an RFC 3339 timestamp (2026-10-25T14:03:00Z); copy it from the row, a moment that matches nothing is refused"},
+					{Name: "display_index", JSONType: "integer", Required: false, Description: "purge only this display of the moment (1 is the main display); omit it to purge every display"},
+					{Name: "reason", JSONType: "string", Required: true, Description: "why the moment is deleted, naming the KIND of thing it showed (\"full card number on screen\"), never the thing itself: the request is itself a timeline event"},
+				},
+				Example: map[string]any{
+					"type":        ScreenTimelapsePurgeMomentOperation,
+					"device":      "laptop",
+					"captured_at": "2026-10-25T14:03:00Z",
+					"reason":      "full card number visible in a checkout form",
+				},
+				ExtraNotes: "Find the moment by time and device in base_screen_timelapse.screenshots or marts_screen_timelapse.active_screens, or from a screen_capture timeline hit. " +
+					"The review lists the screenshots, the accessibility tree and the readings that go, with storage ids and no text, and how many other frames have the same bytes (those show the same thing: propose them too). " +
+					"After approval the cloud worker deletes, in one transaction, the matching base_screen_timelapse.screenshots rows, the moment's base_screen_timelapse.accessibility_trees row (one per moment, so it goes even when one display is named), their derived_screen_timelapse.descriptions readings and, when display 1 goes, the moment's screen_capture timeline event; " +
+					"then it deletes each stored file from Drive and checks that Drive reports it gone, retrying until it does. The result lists the storage ids. " +
+					"The files on the device itself and the pgBackRest backups on slowking are not touched. If the device's uploader later sends a changed (redacted) copy of the file, that copy is ingested as new.",
+			},
+			{
 				Type:        CalendarDeleteEventOperation,
 				Summary:     "Delete a Google Calendar event. Use an instance event_id to cancel a single occurrence of a recurring series.",
 				RequiresEnv: "CALENDAR_ACCOUNTS",
