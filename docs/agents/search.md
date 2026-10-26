@@ -540,36 +540,69 @@ it walked `timeline_events_time_idx` newest-first and filtered every row. Agents
 for order numbers, amounts and addresses, the needles the guide sends to exact search.
 
 **Since 2026-10-26 exact search chooses its scan in three stages, not by the planner's
-estimate** (`SEARCH_TEXT_EXACT_RECENT_ROWS`, `SEARCH_TEXT_EXACT_PROBE_CAP`):
+estimate** (`SEARCH_TEXT_EXACT_RECENT_ROWS`, `SEARCH_TEXT_EXACT_PROBE_CAP`), and matches a
+single regex-escaped `~*` pattern (`needle_regex`) across all three stages while keeping the
+plain unescaped needles (`%1$L`–`%3$L`) in the final query for `position()` preview
+windowing:
 
 1. Read the newest 5,000 rows in scope and filter them. A needle that fills the limit there
-   is answered: every other match is older.
-2. Otherwise probe the trigram index, unordered, for up to 2,001 matches. Seq and plain index
-   scans are off, and `cpu_operator_cost` is raised so the planner pays for the ILIKE
-   recheck and runs the probe on parallel workers (a LIMIT plan stays serial otherwise:
-   8.9s against 2.3s). If there are no more matches than the cap, the scan reads those
-   rows by `ctid` and sorts them.
-3. Only a denser needle whose newest matches are not recent walks the time index, where
-   matches still turn up early.
+   is answered: every other match is older. When `sources` is set, read the newest 5,000 rows
+   per source from `timeline_events_source_time_idx (source, occurred_at DESC, seq DESC)`
+   (resolving `scope_timeline_sources` via a 3.7ms recursive skip-scan on that index plus
+   `TIMELINE_ADAPTERS`); when `sources` is unset, bound `timeline_events_time_idx` to 5,000
+   rows (`OFFSET 0`) *before* filtering `priorities`, so a narrow scope (`sources =>
+   ['transcript']` with 1,180 rows in 64.1M, or `priorities => ['self']`) never walks 64M
+   timeline rows looking for 5,000 matching rows.
+2. Otherwise probe `timeline_events_search_text_trgm_idx`, unordered, for up to 2,001
+   matches (`WHERE t.search_text ~* %1$L`). Seq and plain index scans are off,
+   `cpu_operator_cost` is raised so the planner pays for the recheck and runs the probe on
+   parallel workers (a LIMIT plan stays serial otherwise: 8.9s against 2.3s), and the adapter
+   filter is written `($6 IS NULL OR (t.adapter || '') = ANY ($6))` so a mid-size adapter
+   (`apple_message`, 185k rows) does not divert into a serial `BitmapAnd` on
+   `timeline_events_pkey`. Combining the distinct number-format variants into one
+   regex-escaped `~*` clause (`53845|53,845`) instead of 3× `ILIKE` avoids running 2–3
+   `Bitmap Index Scan`s and detoasting every multi-megabyte false-positive row 2–3 times
+   (785 MB–1.25 GB of TOAST blocks per variant on 5-digit numbers), and on a 189-character
+   phrase lets `pg_trgm` pick the rarest trigrams (`28,142` index buffers, 313ms index scan,
+   **1.21s** total) instead of intersecting all ~160 `ILIKE` trigrams (`392,231` index
+   buffers, 10.05s index scan, >25s for 3× `ILIKE`). If there are no more matches than the
+   cap, the scan reads those rows by `ctid` (`$5`) and sorts them.
+3. When a denser needle overflows the 2,000-match cap, disable `enable_bitmapscan` (saved and
+   restored) so `pg_trgm`'s row underestimate (`59` est vs `10,579` actual on `'invoice'`
+   under `self,direct`) cannot trigger a serial 48k-row `Bitmap Heap Scan` (5.25s), and walk
+   `timeline_events_source_time_idx` per source via `LATERAL` when `sources` is set (3–126ms),
+   `timeline_events_priority_time_idx (priority, occurred_at DESC, seq DESC)` per priority via
+   `LATERAL` when `priorities` is set (28–126ms), or `timeline_events_time_idx` when unscoped.
 
-Production, warm, 2026-10-26, against the function before the change:
+Production, 2026-10-26, across the 1-stage `ILIKE` function (`474aa01`), the initial 3-stage
+`ILIKE` function (`1946882`), and the scope-bounded `~*` 3-stage function:
 
-| needle | before | after |
-| --- | --- | --- |
-| an Amazon order number (11 matches) | 60s timeout | 3.4s |
-| `1,441.52` | past 120s | 3.8s |
-| `53845` | 108s | 4.7s |
-| `zach@hackclub.com`, 50 hits | 8.0s | 0.05s |
-| `receipt`, gmail, last 30 days | 2.7s | 0.27s |
-| no match | 1.8s | 0.7s |
-| `Hack Club` / scoped to imessage | 0.05s / 0.92s | 0.03s / 0.52s |
-| `Mt Foolery` | 1.8s | 1.8s |
-| `invoice`, `self,direct` | 2.6s | 3.6s |
+| needle / scope | `474aa01` (1-stage `ILIKE`) | `1946882` (3-stage `ILIKE`) | after (3-stage `~*`) |
+| --- | --- | --- | --- |
+| an Amazon order number (19 hits) | 10.8s (60s before `474aa01`) | 2.25–4.41s | **0.60–1.15s** |
+| `53845` (unscoped, 20 hits) | 9.6s (108s before `474aa01`) | 2.81–9.57s | **0.86–1.60s** |
+| `Mt Foolery` (unscoped, 20 hits) | 1.8s | 1.8–5.86s | **1.03–1.16s** (warm) |
+| `53845`, `priorities => ['self']` | — | 4.25s | **0.88–0.93s** |
+| `53845`, `sources => ['transcript']` | — | 60s timeout | **0.10–1.08s** |
+| `invoice`, `priorities => ['self','direct']` | 2.6s | 3.51–5.08s | **0.93–1.48s** |
+| `invoice`, `priorities => ['self']` | — | 4.17s | **0.99–1.74s** |
+| `meeting`, `sources => ['transcript']` | — | 23.86s | **0.07–0.10s** |
+| `meeting`, `sources => ['imessage']` | — | 2.88s | **0.39s** (Stage 3 walk: **6ms**) |
+| `meeting`, `sources => ['calendar']` | — | 0.02s | **0.07s** (Stage 3 walk: **3ms**) |
+| `invoice`, `sources => ['gmail']` | — | 0.58s | **1.17s** (Stage 3 walk: **126ms**) |
+| 189-char phrase (unscoped) | >11s | >25s | **1.21s** |
+| `1,441.52` | past 120s | 3.8s | **~1.0s** |
+| `zach@hackclub.com`, 50 hits | 8.0s | 0.05s | **0.05s** |
+| `receipt`, gmail, last 30 days | 2.7s | 0.27s | **0.27s** |
+| no match | 1.8s | 0.7s | **0.5–0.7s** |
+| `Hack Club` / scoped to imessage | 0.05s / 0.92s | 0.03s / 0.52s | **0.03s / 0.39s** |
 
 Apart from that, `search_text_exact` is a different shape and is **not** the same defect: it already launches
-six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap
+parallel workers and its cost is the 7 GB trigram index plus the recheck's heap
 I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either — that leg
-searches the bounded `derived_search.chunks` documents, not multi-megabyte timeline ones.
+stays on inlined `ILIKE` because it is gated to short queries (`<= 3` words) over the bounded
+2–6 KB `derived_search.chunks` documents (with an unordered `LIMIT 401` count gate and 1-hour
+chat-window recovery via `timeline_events_context_time_idx`), not multi-megabyte timeline ones.
 
 **The search working set does not fit in RAM, so what evicts it decides the latency.**
 Measured 2026-08-26 on `mew-coolify` (28 vCPU, 26 GB; `shared_buffers` was then 10 GB,

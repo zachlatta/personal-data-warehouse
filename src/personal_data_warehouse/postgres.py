@@ -16402,14 +16402,23 @@ class PostgresWarehouse:
         def exact_one_shot(fragment: str) -> str:
             return fragment.replace("%", "%%")
 
-        # search_text_exact()'s eligibility and scope, shared by its three
-        # statements; $1-$3 are sources, since and priorities.
-        exact_scope_filters = (
+        # search_text_exact()'s eligibility and scope, shared across its stages;
+        # $1-$6 are sources, since, priorities, the row limit, the probe's
+        # matched ctids, and the resolved adapter list (scope_adapters).
+        # Concatenating '' to t.adapter keeps the filter in memory on the
+        # trigram/time/source/priority scan instead of diverting a mid-size
+        # adapter (like apple_message, 185k rows) into a serial BitmapAnd or
+        # full-adapter scan+sort on timeline_events_pkey (adapter, event_id).
+        exact_table_scope_filters = (
             "NOT COALESCE((t.metadata->>'deleted')::boolean, false)\n"
             "                          AND " + SEARCH_DRIVE_EXCLUSION_SQL + "\n"
-            "                          AND ($1 IS NULL OR map.source = ANY ($1))\n"
+            "                          AND ($6 IS NULL OR (t.adapter || '') = ANY ($6))\n"
             "                          AND ($2 IS NULL OR t.occurred_at >= $2)\n"
             "                          AND ($3 IS NULL OR t.priority::text = ANY ($3))"
+        )
+        exact_scope_filters = (
+            exact_table_scope_filters
+            + "\n                          AND ($1 IS NULL OR map.source = ANY ($1))"
         )
 
         # The ATTENTION pool: the identical two-partition shape, taken from the
@@ -16482,8 +16491,16 @@ class PostgresWarehouse:
         # search_text_exact() runs as ONE scan over the timeline document, so
         # its source filter is an adapter -> token map and its subsource is a
         # CASE over the same defs the ranked branches are generated from.
+        adapter_timeline_sources = {
+            adapter.name: adapter.source for adapter in TIMELINE_ADAPTERS
+        }
         adapter_source_values = ", ".join(
             f"('{adapter}', '{source}')"
+            for source, adapters, _ in SEARCH_SOURCE_DEFS
+            for adapter in adapters
+        )
+        adapter_timeline_source_values = ", ".join(
+            f"('{adapter}', '{adapter_timeline_sources.get(adapter, source)}')"
             for source, adapters, _ in SEARCH_SOURCE_DEFS
             for adapter in adapters
         )
@@ -16990,9 +17007,13 @@ class PostgresWarehouse:
                 needle_b text;
                 needle_c text;
                 grouped text;
-                pattern text;
-                pattern_b text;
-                pattern_c text;
+                esc_a text;
+                esc_b text;
+                esc_c text;
+                needle_regex text;
+                scope_adapters text[];
+                scope_timeline_sources text[];
+                recent_slice_sql text;
                 requested_source text;
                 requested_priority text;
                 -- Saved so the parallel hints below are RESTORED to whatever
@@ -17005,6 +17026,7 @@ class PostgresWarehouse:
                 saved_cpu_operator_cost text;
                 saved_enable_indexscan text;
                 saved_enable_seqscan text;
+                saved_enable_bitmapscan text;
                 -- The probe's matches, or NULL when there are more than
                 -- the probe cap and the scan walks the time index instead.
                 matched tid[];
@@ -17028,6 +17050,67 @@ class PostgresWarehouse:
                                 USING HINT = 'call search_text_sources() to list the valid source tokens';
                         END IF;
                     END LOOP;
+                    SELECT array_agg(DISTINCT map.adapter)
+                      INTO scope_adapters
+                      FROM (VALUES """
+            + adapter_source_values
+            + r""") AS map(adapter, source)
+                     WHERE map.source = ANY (sources);
+                    WITH RECURSIVE distinct_sources AS (
+                        (SELECT t.source, t.adapter
+                         FROM @timeline_events t
+                         WHERE t.source IS NOT NULL
+                         ORDER BY t.source ASC, t.occurred_at DESC
+                         LIMIT 1)
+                        UNION ALL
+                        SELECT next_row.source, next_row.adapter
+                        FROM distinct_sources s
+                        CROSS JOIN LATERAL (
+                            SELECT t.source, t.adapter
+                            FROM @timeline_events t
+                            WHERE t.source > s.source
+                            ORDER BY t.source ASC, t.occurred_at DESC
+                            LIMIT 1
+                        ) next_row
+                    )
+                    SELECT coalesce(array_agg(DISTINCT u.source), '{}'::text[])
+                      INTO scope_timeline_sources
+                      FROM (
+                          SELECT ts.timeline_source AS source
+                          FROM (VALUES """
+            + adapter_timeline_source_values
+            + r""") AS ts(adapter, timeline_source)
+                          WHERE ts.adapter = ANY (scope_adapters)
+                          UNION ALL
+                          -- Keep a shared timeline source (such as 'muse',
+                          -- written by both muse_file and agent_session*) even
+                          -- when another adapter owns its newest row: probe
+                          -- timeline_events_pkey for the '<source>|...' event_id
+                          -- prefix agent_session* uses, and fall back to the 32
+                          -- newest rows of that source for any other event_id shape.
+                          SELECT d.source
+                          FROM distinct_sources d
+                          WHERE d.adapter = ANY (scope_adapters)
+                             OR EXISTS (
+                                 SELECT 1
+                                 FROM @timeline_events t
+                                 WHERE t.adapter = ANY (scope_adapters)
+                                   AND t.event_id >= d.source || '|'
+                                   AND t.event_id <= d.source || '|zzzzzzzz'
+                                   AND t.source = d.source
+                             )
+                             OR EXISTS (
+                                 SELECT 1
+                                 FROM (
+                                     SELECT t.adapter
+                                     FROM @timeline_events t
+                                     WHERE t.source = d.source
+                                     ORDER BY t.occurred_at DESC
+                                     LIMIT 32
+                                 ) recent_src
+                                 WHERE recent_src.adapter = ANY (scope_adapters)
+                             )
+                      ) u;
                 END IF;
                 """
             + priorities_guard_sql("search_text_exact")
@@ -17049,10 +17132,26 @@ class PostgresWarehouse:
                         needle_c := needle;
                     END IF;
                 END IF;
-                pattern := '%' || replace(replace(replace(needle, '\', '\\'), '%', '\%'), '_', '\_') || '%';
-                pattern_b := '%' || replace(replace(replace(needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
-                pattern_c := '%' || replace(replace(replace(needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
-                -- The trigram index answers in ~170ms; the ILIKE RECHECK then
+                -- Escape POSIX ERE metacharacters and combine distinct variants
+                -- into one case-insensitive regex (~*). A 3-branch ILIKE ran
+                -- 2-3 Bitmap Index Scans, detoasted every multi-megabyte
+                -- false-positive row 2-3 times (9.6s on '53845', 10.8s on an
+                -- order number), and walked every trigram posting list on long
+                -- phrases (11-25s vs 1.2s with ~*, where pg_trgm picks the
+                -- rarest trigrams). Plain needles stay in %1$L-%3$L of the
+                -- final query so position() windows the preview around the
+                -- literal match even when the needle contains metacharacters.
+                esc_a := regexp_replace(needle, '([\\^$.*+?()\[\]{}|])', '\\\&', 'g');
+                esc_b := regexp_replace(needle_b, '([\\^$.*+?()\[\]{}|])', '\\\&', 'g');
+                esc_c := regexp_replace(needle_c, '([\\^$.*+?()\[\]{}|])', '\\\&', 'g');
+                needle_regex := esc_a;
+                IF esc_b <> esc_a THEN
+                    needle_regex := needle_regex || '|' || esc_b;
+                END IF;
+                IF esc_c <> esc_a AND esc_c <> esc_b THEN
+                    needle_regex := needle_regex || '|' || esc_c;
+                END IF;
+                -- The trigram index answers in ~170ms; the ~* RECHECK then
                 -- detoasts every candidate document and that is where the
                 -- seconds go -- pure single-core CPU (measured on prod:
                 -- shared hit=50871, zero reads) while a 28-vCPU box sat 90%+
@@ -17077,38 +17176,64 @@ class PostgresWarehouse:
                 -- (2026-10-26, an Amazon order number; '53845' took 108s).
                 --
                 -- 1. The newest rows in scope. A needle that fills per_source
-                -- from them has its answer: every other match is older.
+                -- from them has its answer: every other match is older. Bound
+                -- the index walk BEFORE filtering priorities (or walk
+                -- timeline_events_source_time_idx when sources is set) so a
+                -- narrow scope never walks 64M timeline rows looking for 5,000
+                -- matching rows.
+                IF sources IS NOT NULL THEN
+                    recent_slice_sql := format($s$
+                        SELECT e.ctid, e.adapter, e.occurred_at, e.search_text, e.metadata, e.priority
+                        FROM unnest(%L::text[]) AS s(source)
+                        CROSS JOIN LATERAL (
+                            SELECT t.ctid, t.adapter, t.occurred_at, t.search_text, t.metadata, t.priority
+                            FROM @timeline_events t
+                            WHERE t.source = s.source
+                              AND ($2 IS NULL OR t.occurred_at >= $2)
+                            ORDER BY t.occurred_at DESC
+                            LIMIT %s
+                        ) e
+                        ORDER BY e.occurred_at DESC
+                        LIMIT %s
+                    $s$, coalesce(scope_timeline_sources, '{}'::text[]), """
+            + str(SEARCH_TEXT_EXACT_RECENT_ROWS)
+            + r""", """
+            + str(SEARCH_TEXT_EXACT_RECENT_ROWS)
+            + r""");
+                ELSE
+                    recent_slice_sql := format($s$
+                        SELECT t.ctid, t.adapter, t.occurred_at, t.search_text, t.metadata, t.priority
+                        FROM @timeline_events t
+                        WHERE ($2 IS NULL OR t.occurred_at >= $2)
+                        ORDER BY t.occurred_at DESC
+                        LIMIT %s
+                    $s$, """
+            + str(SEARCH_TEXT_EXACT_RECENT_ROWS)
+            + r""");
+                END IF;
                 EXECUTE format($lit$
                     SELECT array_agg(w.ctid) FROM (
                         SELECT r.ctid FROM (
                             SELECT t.ctid, t.occurred_at, t.search_text
-                            FROM @timeline_events t
-                            JOIN (VALUES """
-            + exact_one_shot(adapter_source_values)
-            + r""") AS map(adapter, source) ON map.adapter = t.adapter
+                            FROM (%2$s) t
                             WHERE t.search_text != ''
                               AND """
-            + exact_one_shot(exact_scope_filters)
+            + exact_one_shot(exact_table_scope_filters)
             + r"""
-                            ORDER BY t.occurred_at DESC
-                            LIMIT """
-            + str(SEARCH_TEXT_EXACT_RECENT_ROWS)
-            + r"""
+                            OFFSET 0
                         ) r
-                        WHERE (r.search_text ILIKE %1$L
-                               OR r.search_text ILIKE %2$L
-                               OR r.search_text ILIKE %3$L)
+                        WHERE r.search_text ~* %1$L
                         ORDER BY r.occurred_at DESC
                         LIMIT $4
                     ) w
-                $lit$, pattern, pattern_b, pattern_c)
+                $lit$, needle_regex, recent_slice_sql)
                 INTO matched
-                USING sources, since, priorities, per_source;
+                USING sources, since, priorities, per_source, matched, scope_adapters;
                 IF coalesce(cardinality(matched), 0) < per_source THEN
                     -- 2. The probe: every match up to the probe cap, unordered,
                     -- from the trigram index. Seq and plain index scans are
                     -- off, so it is the trigram bitmap. The operator cost
-                    -- makes the planner pay for the ILIKE recheck, which is
+                    -- makes the planner pay for the ~* recheck, which is
                     -- the real cost (multi-megabyte documents): otherwise it
                     -- keeps a LIMIT plan serial (8.9s against 2.3s on 4
                     -- workers).
@@ -17124,23 +17249,18 @@ class PostgresWarehouse:
                         SELECT array_agg(m.ctid) FROM (
                             SELECT t.ctid
                             FROM @timeline_events t
-                            JOIN (VALUES """
-            + exact_one_shot(adapter_source_values)
-            + r""") AS map(adapter, source) ON map.adapter = t.adapter
-                            WHERE (t.search_text ILIKE %1$L
-                                   OR t.search_text ILIKE %2$L
-                                   OR t.search_text ILIKE %3$L)
+                            WHERE t.search_text ~* %1$L
                               AND t.search_text != ''
                               AND """
-            + exact_one_shot(exact_scope_filters)
+            + exact_one_shot(exact_table_scope_filters)
             + r"""
                             LIMIT $4
                         ) m
-                    $lit$, pattern, pattern_b, pattern_c)
+                    $lit$, needle_regex)
                     INTO matched
                     USING sources, since, priorities, """
             + str(SEARCH_TEXT_EXACT_PROBE_CAP + 1)
-            + r""";
+            + r""", matched, scope_adapters;
                     PERFORM set_config('parallel_tuple_cost', saved_parallel_tuple_cost, true);
                     PERFORM set_config('cpu_operator_cost', saved_cpu_operator_cost, true);
                     PERFORM set_config('enable_indexscan', saved_enable_indexscan, true);
@@ -17155,20 +17275,73 @@ class PostgresWarehouse:
             + str(SEARCH_TEXT_EXACT_PROBE_CAP)
             + r""" THEN
                     -- 3. A needle denser than the probe cap whose newest
-                    -- matches are not recent: walk the time index, where
-                    -- matches still turn up early.
-                    matched := NULL;
-                    match_clause := format(
-                        '(t.search_text ILIKE %L OR t.search_text ILIKE %L OR t.search_text ILIKE %L)',
-                        pattern, pattern_b, pattern_c);
+                    -- matches are not in the recent slice: turn off bitmap
+                    -- scans so the planner does not re-scan the overflowing
+                    -- trigram bitmap serially, and walk the source, priority,
+                    -- or global time index newest-first.
+                    saved_enable_bitmapscan := current_setting('enable_bitmapscan');
+                    PERFORM set_config('enable_bitmapscan', 'off', true);
+                    IF sources IS NOT NULL THEN
+                        EXECUTE format($lit$
+                            SELECT array_agg(w.ctid) FROM (
+                                SELECT e.ctid, e.occurred_at
+                                FROM unnest(%2$L::text[]) AS s(source)
+                                CROSS JOIN LATERAL (
+                                    SELECT t.ctid, t.occurred_at
+                                    FROM @timeline_events t
+                                    WHERE t.source = s.source
+                                      AND t.search_text ~* %1$L
+                                      AND t.search_text != ''
+                                      AND """
+            + exact_one_shot(exact_table_scope_filters)
+            + r"""
+                                    ORDER BY t.occurred_at DESC
+                                    LIMIT $4
+                                ) e
+                                ORDER BY e.occurred_at DESC
+                                LIMIT $4
+                            ) w
+                        $lit$, needle_regex, coalesce(scope_timeline_sources, '{}'::text[]))
+                        INTO matched
+                        USING sources, since, priorities, per_source, matched, scope_adapters;
+                        match_clause := 't.ctid = ANY ($5)';
+                    ELSIF priorities IS NOT NULL THEN
+                        EXECUTE format($lit$
+                            SELECT array_agg(w.ctid) FROM (
+                                SELECT e.ctid, e.occurred_at
+                                FROM unnest($3::@timeline_priority[]) AS p(priority)
+                                CROSS JOIN LATERAL (
+                                    SELECT t.ctid, t.occurred_at
+                                    FROM @timeline_events t
+                                    WHERE t.priority = p.priority
+                                      AND t.search_text ~* %1$L
+                                      AND t.search_text != ''
+                                      AND """
+            + exact_one_shot(exact_table_scope_filters)
+            + r"""
+                                    ORDER BY t.occurred_at DESC
+                                    LIMIT $4
+                                ) e
+                                ORDER BY e.occurred_at DESC
+                                LIMIT $4
+                            ) w
+                        $lit$, needle_regex)
+                        INTO matched
+                        USING sources, since, priorities, per_source, matched, scope_adapters;
+                        match_clause := 't.ctid = ANY ($5)';
+                    ELSE
+                        matched := NULL;
+                        match_clause := format('t.search_text ~* %L', needle_regex);
+                    END IF;
                 ELSE
                     -- Every match the scan needs is in hand: read those rows.
                     match_clause := 't.ctid = ANY ($5)';
                 END IF;
                 -- EXECUTE format(...), not a static statement: see
-                -- exact_one_shot. The needles, patterns and match clause are
-                -- literals; $1-$5 are sources, since, priorities, per_source
-                -- and the probe's matches.
+                -- exact_one_shot. The plain needles (%1$L-%3$L, for preview
+                -- windowing) and match_clause (%4$s) are literals; $1-$6 are
+                -- sources, since, priorities, per_source, matched and
+                -- scope_adapters.
                 RETURN QUERY EXECUTE format($lit$
                     SELECT hit.source, hit.subsource, hit.context, hit.who,
                            hit.occurred_at, hit.account, hit.ref,
@@ -17233,7 +17406,10 @@ class PostgresWarehouse:
                     ) ld
                     ORDER BY hit.occurred_at DESC
                 $lit$, needle, needle_b, needle_c, match_clause)
-                USING sources, since, priorities, per_source, matched;
+                USING sources, since, priorities, per_source, matched, scope_adapters;
+                IF saved_enable_bitmapscan IS NOT NULL THEN
+                    PERFORM set_config('enable_bitmapscan', saved_enable_bitmapscan, true);
+                END IF;
                 PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
                 PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
             END;

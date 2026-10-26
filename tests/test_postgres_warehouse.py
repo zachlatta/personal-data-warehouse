@@ -2701,7 +2701,7 @@ def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
     # through BM25 here would re-introduce the overfetch-and-post-filter
     # pattern this function exists to remove.
     sql = _search_text_exact_sql()
-    assert "t.search_text ILIKE %1$L" in sql
+    assert "t.search_text ~* %1$L" in sql
     assert "to_bm25query" not in sql
     assert "ORDER BY t.occurred_at DESC" in sql
 
@@ -2709,8 +2709,8 @@ def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
 def test_search_text_exact_escapes_like_wildcards() -> None:
     sql = _search_text_exact_sql()
     assert (
-        "replace(replace(replace(needle, '\\', '\\\\'), '%', '\\%'), '_', '\\_')" in sql
-    ), "search_text_exact() must escape LIKE wildcards so needles are literal"
+        r"regexp_replace(needle, '([\\^$.*+?()\[\]{}|])', '\\\&', 'g')" in sql
+    ), "search_text_exact() must escape regex metacharacters so needles are literal"
 
 
 def test_search_text_exact_rejects_short_needles_and_unknown_sources() -> None:
@@ -7538,56 +7538,86 @@ def test_search_text_exact_scan_is_one_shot_dynamic_sql_with_the_patterns_inline
     every row, so a no-match needle hit the 60s timeout and 'Mt Foolery' took
     25.7s. plpgsql switches a static statement to that plan after its fifth
     call on a pooled connection. With the patterns as literals the planner
-    sees their trigrams and takes the trigram index. Both statements -- the
-    probe and the scan -- are one-shot.
+    sees their trigrams and takes the trigram index. Every stage is one-shot.
     """
     sql = _search_text_exact_sql()
     sql = sql[: sql.index("$fn$;")]
     assert sql.count("RETURN QUERY") == 1
-    assert sql.count("EXECUTE format($lit$") == 3
+    assert sql.count("EXECUTE format($lit$") == 5
 
     recent_at = sql.index("EXECUTE format($lit$")
     recent = sql[recent_at : sql.index("INTO matched", recent_at)]
     probe_at = sql.index("EXECUTE format($lit$", recent_at + 1)
     probe = sql[probe_at : sql.index("INTO matched", probe_at)]
-    scan = sql[sql.index("RETURN QUERY") : sql.index("USING sources, since, priorities, per_source, matched;")]
-    assert "$lit$, pattern, pattern_b, pattern_c)" in recent
-    assert "$lit$, pattern, pattern_b, pattern_c)" in probe
+    source_walk_at = sql.index("EXECUTE format($lit$", probe_at + 1)
+    source_walk = sql[source_walk_at : sql.index("INTO matched", source_walk_at)]
+    priority_walk_at = sql.index("EXECUTE format($lit$", source_walk_at + 1)
+    priority_walk = sql[priority_walk_at : sql.index("INTO matched", priority_walk_at)]
+    scan = sql[
+        sql.index("RETURN QUERY") : sql.index(
+            "USING sources, since, priorities, per_source, matched, scope_adapters;",
+            sql.index("RETURN QUERY"),
+        )
+    ]
+    assert "$lit$, needle_regex, recent_slice_sql)" in recent
+    assert "$lit$, needle_regex)" in probe
+    assert "$lit$, needle_regex, coalesce(scope_timeline_sources, '{}'::text[]))" in source_walk
+    assert "$lit$, needle_regex)" in priority_walk
     assert scan.startswith("RETURN QUERY EXECUTE format($lit$")
     assert "$lit$, needle, needle_b, needle_c, match_clause)" in scan
-    recent_template = recent[: recent.index("$lit$, pattern")]
-    probe_template = probe[: probe.index("$lit$, pattern")]
+    recent_template = recent[: recent.index("$lit$, needle_regex")]
+    probe_template = probe[: probe.index("$lit$, needle_regex")]
+    source_walk_template = source_walk[: source_walk.index("$lit$, needle_regex")]
+    priority_walk_template = priority_walk[: priority_walk.index("$lit$, needle_regex")]
     template = scan[: scan.index("$lit$, needle")]
 
-    assert f"LIMIT {SEARCH_TEXT_EXACT_RECENT_ROWS}" in recent_template
-    for code in ("%1$L", "%2$L", "%3$L"):
-        assert f"r.search_text ILIKE {code}" in recent_template
-        assert f"t.search_text ILIKE {code}" in probe_template
+    assert sql.count(f"{SEARCH_TEXT_EXACT_RECENT_ROWS}") == 3
+    assert "FROM (%2$s) t" in recent_template
+    assert "OFFSET 0" in recent_template
+    assert "r.search_text ~* %1$L" in recent_template
+    assert "t.search_text ~* %1$L" in probe_template
+    assert "t.source = s.source" in source_walk_template
+    assert "t.search_text ~* %1$L" in source_walk_template
+    assert "t.priority = p.priority" in priority_walk_template
+    assert "t.search_text ~* %1$L" in priority_walk_template
     assert "ORDER BY" not in probe_template, (
         "ordered by time, the probe is the newest-first walk it exists to avoid"
     )
-    assert f"USING sources, since, priorities, {SEARCH_TEXT_EXACT_PROBE_CAP + 1};" in sql
+    assert (
+        f"USING sources, since, priorities, {SEARCH_TEXT_EXACT_PROBE_CAP + 1}, matched, scope_adapters;"
+        in sql
+    )
+    assert sql.count("USING sources, since, priorities, per_source, matched, scope_adapters;") == 4
     assert "WHERE %4$s" in template
-    for template_text in (recent_template, probe_template, template):
-        assert re.search(r"ILIKE pattern", template_text) is None, (
-            "the patterns must be inlined as literals (%N$L), never read from the "
+    # The final query keeps %1$L-%3$L as the plain unescaped needles so
+    # position() windows the preview around the match even on metacharacter needles.
+    for code in ("%1$L", "%2$L", "%3$L"):
+        assert f"position(lower({code}) IN ld.lowdoc)" in template
+    for template_text in (
+        recent_template,
+        probe_template,
+        source_walk_template,
+        priority_walk_template,
+        template,
+    ):
+        assert re.search(r"~* needle_regex", template_text) is None, (
+            "the regex must be inlined as a literal (%1$L), never read from the "
             "plpgsql variable, which makes the scan a cached parameterized plan"
         )
         assert "lower(needle" not in template_text
-        assert "($1 IS NULL OR map.source = ANY ($1))" in template_text
+        assert "($6 IS NULL OR (t.adapter || '') = ANY ($6))" in template_text
         assert "($2 IS NULL OR t.occurred_at >= $2)" in template_text
         assert "($3 IS NULL OR t.priority::text = ANY ($3))" in template_text
         assert "LIMIT $4" in template_text
         assert "%" not in _without_format_codes(template_text), (
             "format() would misread any other percent sign in the template"
         )
+    assert "($1 IS NULL OR map.source = ANY ($1))" in template
     assert "ORDER BY t.occurred_at DESC" in template
-    # The dense-needle clause inlines the patterns too.
-    assert (
-        "'(t.search_text ILIKE %L OR t.search_text ILIKE %L OR t.search_text ILIKE %L)',\n"
-        "                        pattern, pattern_b, pattern_c)"
-    ) in sql
-    assert "match_clause := 't.ctid = ANY ($5)';" in sql
+    # The dense-needle clause inlines the regex too and turns bitmap scans off.
+    assert "PERFORM set_config('enable_bitmapscan', 'off', true);" in sql
+    assert "match_clause := format('t.search_text ~* %L', needle_regex);" in sql
+    assert sql.count("match_clause := 't.ctid = ANY ($5)';") == 3
 
 
 def test_search_hybrid_exact_literal_leg_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
@@ -7655,6 +7685,13 @@ def test_search_text_exact_stays_on_a_literal_plan_past_the_fifth_call(
     _ensure_all_table_groups(warehouse)
     warehouse._set_search_path()
     message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    long_phrase = (
+        "The quick brown fox jumps over the lazy dog while the warehouse "
+        "timeline indexes every real-world event across sixty-four million "
+        "rows with full trigram search coverage and hybrid retrieval"
+    )
+    assert len(long_phrase) >= 180
+    padding = "head-padding " * 800  # > SEARCH_TEXT_PREVIEW_CHARS (8000)
     warehouse.insert_slack_conversations(
         [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
     )
@@ -7664,14 +7701,19 @@ def test_search_text_exact_stays_on_a_literal_plan_past_the_fifth_call(
                 conversation_id="C1",
                 message_ts="100.1",
                 message_datetime=message_datetime,
-                text="the path is zq\\w_7%k for now",
+                text=(
+                    padding
+                    + "the path is zq\\w_7%k and a\\b and $1,441.52 and a+b (test) [1] and "
+                    + long_phrase
+                    + " for now"
+                ),
             ),
-            # Would match if '_' or '%' in the needle were wildcards.
+            # Would match if '_', '%', '.', '+', '()', '[]', '$' or '\' were wildcards/unescaped.
             _slack_message_row(
                 conversation_id="C1",
                 message_ts="100.2",
                 message_datetime=message_datetime,
-                text="the path is zq\\wY7Zk for now",
+                text=padding + "the path is zqYwZ7Xk and axb and 1X441Y52 and aaab test 1 for now",
             ),
         ]
     )
@@ -7686,15 +7728,23 @@ def test_search_text_exact_stays_on_a_literal_plan_past_the_fifth_call(
             assert warehouse._query("SELECT * FROM @search_text_exact(%s, 10)", (needle,)) == []
             assert time.monotonic() - started < 5
             plans = "".join(notices)
-            assert f"'%{needle}%'" in plans, plans
-            assert "~~* $" not in plans, plans
-        rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", ("zq\\w_7%k",))
-        assert len(rows) == 1 and "zq\\w_7%k" in rows[0][0], rows
+            assert f"'{needle}'" in plans, plans
+            assert "~* $" not in plans, plans
+        # Metacharacter needles and long phrases must match literally AND window
+        # the preview around the match past SEARCH_TEXT_PREVIEW_CHARS (not fall
+        # back to the head of the document because position() saw the escaped regex).
+        for literal_needle in ("zq\\w_7%k", "a\\b", "$1,441.52", "a+b (test) [1]", "[1]", long_phrase):
+            rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", (literal_needle,))
+            assert len(rows) == 1 and literal_needle in rows[0][0], (literal_needle, rows)
+        # Variant matching when the needle contains regex metacharacters: '$1441.52'
+        # matches '$1,441.52' via needle_b/needle_c and still windows around '$1,441.52'.
+        rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", ("$1,441.52",))
+        assert len(rows) == 1 and "$1,441.52" in rows[0][0], rows
         rows = warehouse._query(
             "SELECT text FROM @search_text_exact(%s, 10, since => %s, priorities => ARRAY['self','direct','cc','noise','background'])",
             ("zq\\w_7%k", datetime(2026, 5, 1, tzinfo=UTC)),
         )
-        assert len(rows) == 1, rows
+        assert len(rows) == 1 and "zq\\w_7%k" in rows[0][0], rows
     finally:
         _release_nested_plans(warehouse)
 
@@ -7724,6 +7774,38 @@ def _seed_exact_probe_messages(warehouse: PostgresWarehouse) -> None:
         ]
     )
     _sync_timeline(warehouse)
+    # Two adapters (`muse_file` and `agent_session_turn`) share timeline.events.source = 'muse'.
+    # Even when `muse_file` owns the newest 'muse' row, `sources => ARRAY['agent_session']`
+    # must still walk 'muse' in Stages 1 and 3 and return the newer Muse turns ahead of
+    # older turns from other harnesses, while `$6` (`scope_adapters`) drops the `muse_file` row.
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        VALUES
+            ('agent_session_turn', 'claude_code|s0|1', 'claude_code', 'agent_turn',
+             '2026-05-10 12:00:00+00', 'ai_conversation_events',
+             'muse-shared-7741 claude turn 1', 'self', 'user', 't', 's', 'claude_code|s0'),
+            ('agent_session_turn', 'claude_code|s0|2', 'claude_code', 'agent_turn',
+             '2026-05-10 12:01:00+00', 'ai_conversation_events',
+             'muse-shared-7741 claude turn 2', 'self', 'user', 't', 's', 'claude_code|s0'),
+            ('agent_session_turn', 'claude_code|s0|3', 'claude_code', 'agent_turn',
+             '2026-05-10 12:02:00+00', 'ai_conversation_events',
+             'muse-shared-7741 claude turn 3', 'self', 'user', 't', 's', 'claude_code|s0'),
+            ('agent_session_turn', 'muse|s1|1', 'muse', 'agent_turn',
+             '2026-05-11 12:00:00+00', 'ai_conversation_events',
+             'muse-shared-7741 muse turn 1', 'self', 'user', 't', 's', 'muse|s1'),
+            ('agent_session_turn', 'muse|s1|2', 'muse', 'agent_turn',
+             '2026-05-12 12:00:00+00', 'ai_conversation_events',
+             'muse-shared-7741 muse turn 2', 'self', 'user', 't', 's', 'muse|s1'),
+            ('agent_session_turn', 'muse|s1|3', 'muse', 'agent_turn',
+             '2026-05-13 12:00:00+00', 'ai_conversation_events',
+             'muse-shared-7741 muse turn 3', 'self', 'user', 't', 's', 'muse|s1'),
+            ('muse_file', 'mf-newest', 'muse', 'muse_file',
+             '2026-05-14 12:00:00+00', 'muse_files',
+             'muse-shared-7741 muse file newest', 'self', 'muse', 't', 's', 'mf-newest')
+        """
+    )
 
 
 @pytest.mark.parametrize(
@@ -7742,7 +7824,7 @@ def test_search_text_exact_returns_the_newest_matches_from_every_stage(
     Four rows match (one through the digits-only variant). The newest rows
     answer a limit they fill; one recent row never does, so the probe's ctids
     are read back; with a cap of 2 the probe overflows and the scan walks the
-    time index.
+    time, source, or priority index.
     """
     import personal_data_warehouse.postgres as postgres_module
 
@@ -7752,14 +7834,22 @@ def test_search_text_exact_returns_the_newest_matches_from_every_stage(
     warehouse._command("DELETE FROM @search_schema_state")
     warehouse._ensure_search_views_if_possible()
 
-    rows = warehouse._query(
-        "SELECT occurred_at, text FROM @search_text_exact(%s, 3)", ("112-4417092-3305861",)
-    )
-    assert [text.splitlines()[-1] for _, text in rows] == [
+    expected_top_3 = [
         "order 112-4417092-3305861 arrives friday",
         "the order 112-4417092-3305861 was a gift",
         "order 11244170923305861 refunded",
     ]
+    for extra_sql, extra_params in (
+        ("", ()),
+        (", sources => ARRAY['slack']", ()),
+        (", priorities => ARRAY['cc']", ()),
+        (", sources => ARRAY['slack'], priorities => ARRAY['cc']", ()),
+    ):
+        rows = warehouse._query(
+            f"SELECT occurred_at, text FROM @search_text_exact(%s, 3{extra_sql})",
+            ("112-4417092-3305861", *extra_params),
+        )
+        assert [text.splitlines()[-1] for _, text in rows] == expected_top_3, extra_sql
     rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", ("112-4417092-3305861",))
     assert len(rows) == 4 and rows[-1][0].endswith("order 112-4417092-3305861 shipped")
     assert warehouse._query(
@@ -7770,27 +7860,61 @@ def test_search_text_exact_returns_the_newest_matches_from_every_stage(
         "SELECT count(*) FROM @search_text_exact(%s, 10, sources => ARRAY['gmail'])",
         ("112-4417092-3305861",),
     ) == [(0,)]
+    assert warehouse._query(
+        "SELECT ref FROM @search_text_exact(%s, 3, sources => ARRAY['agent_session'])",
+        ("muse-shared-7741",),
+    ) == [
+        ("agent_session_turn:muse|s1|3",),
+        ("agent_session_turn:muse|s1|2",),
+        ("agent_session_turn:muse|s1|1",),
+    ]
+    assert warehouse._query(
+        "SELECT ref FROM @search_text_exact(%s, 3, sources => ARRAY['muse_file'])",
+        ("muse-shared-7741",),
+    ) == [("muse_file:mf-newest",)]
     assert warehouse._query("SELECT count(*) FROM @search_text_exact(%s, 10)", ("qzvxk-no-match",)) == [(0,)]
 
 
-def test_search_text_exact_restores_the_probe_planner_settings(warehouse: PostgresWarehouse) -> None:
-    """The probe's planner hints must not outlive it, on any return path."""
+def test_search_text_exact_restores_the_probe_planner_settings(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe and Stage 3 planner hints must not outlive the call, on any return path."""
+    import personal_data_warehouse.postgres as postgres_module
+
     _seed_exact_probe_messages(warehouse)
-    settings = ("enable_indexscan", "enable_seqscan", "cpu_operator_cost", "parallel_tuple_cost", "parallel_setup_cost")
+    settings = (
+        "enable_indexscan",
+        "enable_seqscan",
+        "enable_bitmapscan",
+        "cpu_operator_cost",
+        "parallel_tuple_cost",
+        "parallel_setup_cost",
+        "min_parallel_table_scan_size",
+    )
 
     def current() -> list[tuple[str, ...]]:
         return warehouse._query(
             "SELECT " + ", ".join(f"current_setting('{name}')" for name in settings)
         )
 
-    before = current()
-    warehouse._command("BEGIN")
-    try:
-        for needle in ("112-4417092-3305861", "qzvxk-no-match"):
-            warehouse._query("SELECT count(*) FROM @search_text_exact(%s, 10)", (needle,))
-            assert current() == before, needle
-    finally:
-        warehouse._command("ROLLBACK")
+    for recent_rows, probe_cap in ((SEARCH_TEXT_EXACT_RECENT_ROWS, SEARCH_TEXT_EXACT_PROBE_CAP), (1, 2)):
+        monkeypatch.setattr(postgres_module, "SEARCH_TEXT_EXACT_RECENT_ROWS", recent_rows)
+        monkeypatch.setattr(postgres_module, "SEARCH_TEXT_EXACT_PROBE_CAP", probe_cap)
+        warehouse._command("DELETE FROM @search_schema_state")
+        warehouse._ensure_search_views_if_possible()
+        before = current()
+        warehouse._command("BEGIN")
+        try:
+            for sql_call, needle in (
+                ("SELECT count(*) FROM @search_text_exact(%s, 10)", "112-4417092-3305861"),
+                ("SELECT count(*) FROM @search_text_exact(%s, 10, sources => ARRAY['slack'])", "112-4417092-3305861"),
+                ("SELECT count(*) FROM @search_text_exact(%s, 10, priorities => ARRAY['cc'])", "112-4417092-3305861"),
+                ("SELECT count(*) FROM @search_text_exact(%s, 10)", "qzvxk-no-match"),
+            ):
+                warehouse._query(sql_call, (needle,))
+                assert current() == before, (recent_rows, probe_cap, sql_call, needle)
+        finally:
+            warehouse._command("ROLLBACK")
 
 
 def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
