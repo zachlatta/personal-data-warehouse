@@ -504,6 +504,47 @@ def test_hybrid_literal_leg_returns_the_chat_member_that_holds_the_literal(
     assert scoped == []
 
 
+def test_hybrid_literal_leg_stays_on_a_literal_plan_past_the_fifth_call(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Repeated calls on one connection keep the leg's patterns as literals.
+
+    Under a generic plan the chunk-count probe was a Seq Scan over the whole
+    chunk heap on production (2026-10-26). The plans are read through
+    auto_explain with force_generic_plan set, because the test corpus is too
+    small for that plan to be slow.
+    """
+    from tests.test_postgres_warehouse import _capture_nested_plans, _release_nested_plans
+
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    _provision(warehouse)
+    warehouse._set_search_path()
+    _seed_slack(warehouse, ["morning standup", "the zq9token budget is approved", "lunch plans"])
+    _sync_timeline(warehouse)
+    SearchChunkBuilder(warehouse).run()
+    SearchEmbeddingRunner(warehouse, _FakeEmbeddingClient()).run()
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+
+    notices = _capture_nested_plans(warehouse)
+    try:
+        for attempt in range(8):
+            needle = f"qzvxk{attempt}"
+            notices.clear()
+            started = time.monotonic()
+            assert warehouse._query("SELECT ref FROM @search_hybrid_exact(%s, 10)", (needle,)) == []
+            assert time.monotonic() - started < 5
+            plans = "".join(notices)
+            assert "WARNING" not in plans, plans
+            assert f"'%{needle}%'" in plans, plans
+            assert "~~* $" not in plans and "like_escape($" not in plans, plans
+        refs = [r[0] for r in warehouse._query("SELECT ref FROM @search_hybrid_exact('zq9token', 10)")]
+        assert len(refs) == 1 and refs[0].endswith("|100.1"), refs
+    finally:
+        _release_nested_plans(warehouse)
+
+
 def _embed_state(wh: PostgresWarehouse) -> tuple:
     rows = wh._query(
         "SELECT embed_fresh_built_at, embed_fresh_chunk_id, embed_cursor_ts,"

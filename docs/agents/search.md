@@ -512,6 +512,9 @@ you what you want to hear), and through the two-statement shape the function rea
 | `priorities => ARRAY['self']`, cold | 13.6-37.3s | 1.5-7.6s (p50 2.4s) |
 | scoped `sources => ARRAY['google_drive']` | 5.1-8.6s | unchanged — see the search section |
 | `search_text_exact`, novel needle | 1.3-3.7s | unchanged |
+| `search_text_exact` on a pooled connection, no-match needle (2026-10-26) | 51.6s to 60s timeout | 0.5-2.2s |
+| `search_text_exact` on a pooled connection, `Mt Foolery` (2026-10-26) | 22.8-25.7s | 4.8s |
+| `search_hybrid_exact` literal leg, generic plan (2026-10-26) | 0.74-2.1s | 0.24-0.49s |
 
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
 (`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`
@@ -520,7 +523,21 @@ statement timeout in 14 days of agent sessions (324 such calls), and the timeout
 arrived ten seconds too late. The statement still executes; `pdw sql` prints the hint on
 stderr so scripted `--output` consumers keep clean rows on stdout.
 
-`search_text_exact` is a different shape and is **not** the same defect: it already launches
+**Exact search ran into the cached-plan trap anyway, through a different cause (2026-10-26).**
+Its ILIKE patterns were plpgsql variables, and plpgsql switches a static statement to a
+cached generic plan after its fifth call on a connection when that plan does not look more
+expensive. On the app's pooled connections it did not: the generic plan walked
+`timeline_events_time_idx` backwards and filtered every row, so `pdw search --mode exact`
+timed out at 60s on order numbers and took 51.6s on a word with no match. The hybrid leg's
+chunk-count probe became a Seq Scan over the whole chunk heap. A fresh psql session never
+showed it; `SET plan_cache_mode = force_generic_plan` reproduces it. Both now run
+`EXECUTE format(...)` with the needles and patterns inlined as `%L` literals, and the
+filters (`sources`, `since`, `priorities`, the limit) passed with `USING` (see
+`exact_one_shot` in `postgres.py`). The rows in the table above were timed on production with
+generic plans forced. Short numeric needles such as `53845` still take 9-11s: their custom
+plan walks the time index too, because the planner expects matches early.
+
+Apart from that, `search_text_exact` is a different shape and is **not** the same defect: it already launches
 six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap
 I/O. It is not comparable to hybrid's `search_hybrid_exact` leg (0.32s) either — that leg
 searches the bounded `derived_search.chunks` documents, not multi-megabyte timeline ones.

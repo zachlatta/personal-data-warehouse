@@ -16372,6 +16372,24 @@ class PostgresWarehouse:
                 )
             )
 
+        # The literal-substring statements -- search_text_exact()'s scan and
+        # search_hybrid_exact()'s literal leg -- are one-shot dynamic SQL too,
+        # with the needles and ILIKE patterns inlined, for a different reason:
+        # here it IS generic-vs-custom. Measured 2026-10-26 on production with
+        # plan_cache_mode = force_generic_plan: the generic plan for the
+        # timeline scan walks timeline_events_time_idx backwards and filters
+        # every row (a no-match needle hit the 60s timeout, 'Mt Foolery' took
+        # 25.7s), and the chunk-count probe became a Seq Scan over the whole
+        # chunk heap. With the pattern as a literal, the planner can see its
+        # trigrams and both use their trigram index. plpgsql switches a static
+        # statement to that cached generic plan after its fifth call on a
+        # connection whenever the generic plan does not look more expensive,
+        # so pooled connections hit it while a fresh psql session did not.
+        # This escapes a fragment spliced into a format() template, so
+        # format() reads only the %N$L codes written beside it.
+        def exact_one_shot(fragment: str) -> str:
+            return fragment.replace("%", "%%")
+
         # The ATTENTION pool: the identical two-partition shape, taken from the
         # partial indexes that contain only `self` and `direct`. Used only when
         # the requested tiers are a SUBSET of those -- a call for `noise` or an
@@ -17020,7 +17038,10 @@ class PostgresWarehouse:
                 saved_min_parallel_scan := current_setting('min_parallel_table_scan_size');
                 PERFORM set_config('parallel_setup_cost', '0', true);
                 PERFORM set_config('min_parallel_table_scan_size', '0', true);
-                RETURN QUERY
+                -- EXECUTE format(...), not a static statement: see
+                -- exact_one_shot. The needles and patterns are literals;
+                -- $1-$4 are sources, since, priorities and per_source.
+                RETURN QUERY EXECUTE format($lit$
                     SELECT hit.source, hit.subsource, hit.context, hit.who,
                            hit.occurred_at, hit.account, hit.ref,
                            -- Window the preview around the first match: a
@@ -17033,9 +17054,9 @@ class PostgresWarehouse:
                                ELSE substring(
                                    hit.text
                                    FROM greatest(COALESCE(
-                                       NULLIF(position(lower(needle) IN ld.lowdoc), 0),
-                                       NULLIF(position(lower(needle_b) IN ld.lowdoc), 0),
-                                       NULLIF(position(lower(needle_c) IN ld.lowdoc), 0),
+                                       NULLIF(position(lower(%1$L) IN ld.lowdoc), 0),
+                                       NULLIF(position(lower(%2$L) IN ld.lowdoc), 0),
+                                       NULLIF(position(lower(%3$L) IN ld.lowdoc), 0),
                                        1) - """
             + str(SEARCH_TEXT_PREVIEW_CHARS // 2)
             + r""", 1)
@@ -17049,7 +17070,7 @@ class PostgresWarehouse:
                     FROM (
                         SELECT map.source AS source,
                                """
-            + exact_subsource_case
+            + exact_one_shot(exact_subsource_case)
             + r""" AS subsource,
                                t.context AS context, t.actor AS who,
                                t.occurred_at AS occurred_at,
@@ -17062,21 +17083,21 @@ class PostgresWarehouse:
                                t.priority::text AS priority
                         FROM @timeline_events t
                         JOIN (VALUES """
-            + adapter_source_values
+            + exact_one_shot(adapter_source_values)
             + r""") AS map(adapter, source) ON map.adapter = t.adapter
-                        WHERE (t.search_text ILIKE pattern
-                               OR t.search_text ILIKE pattern_b
-                               OR t.search_text ILIKE pattern_c)
+                        WHERE (t.search_text ILIKE %4$L
+                               OR t.search_text ILIKE %5$L
+                               OR t.search_text ILIKE %6$L)
                           AND t.search_text != ''
                           AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)
                           AND """
-            + SEARCH_DRIVE_EXCLUSION_SQL
+            + exact_one_shot(SEARCH_DRIVE_EXCLUSION_SQL)
             + r"""
-                          AND (sources IS NULL OR map.source = ANY (sources))
-                          AND (since IS NULL OR t.occurred_at >= since)
-                          AND (priorities IS NULL OR t.priority::text = ANY (priorities))
+                          AND ($1 IS NULL OR map.source = ANY ($1))
+                          AND ($2 IS NULL OR t.occurred_at >= $2)
+                          AND ($3 IS NULL OR t.priority::text = ANY ($3))
                         ORDER BY t.occurred_at DESC
-                        LIMIT per_source
+                        LIMIT $4
                     ) hit
                     CROSS JOIN LATERAL (
                         SELECT CASE
@@ -17088,7 +17109,9 @@ class PostgresWarehouse:
             + r"""))
                         END AS lowdoc
                     ) ld
-                    ORDER BY hit.occurred_at DESC;
+                    ORDER BY hit.occurred_at DESC
+                $lit$, needle, needle_b, needle_c, pattern, pattern_b, pattern_c)
+                USING sources, since, priorities, per_source;
                 PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
                 PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
             END;
@@ -17520,29 +17543,37 @@ class PostgresWarehouse:
                                 exact_needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                             exact_pattern_c := '%' || replace(replace(replace(
                                 exact_needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
-                            SELECT count(*) INTO exact_match_count
+                            -- EXECUTE format(...), not static statements: see
+                            -- exact_one_shot. %1$L is the needle, %2$L-%4$L its
+                            -- patterns; $1-$4 are sem_adapters, since,
+                            -- priorities and per_source.
+                            EXECUTE format($lit$
+                            SELECT count(*)
                               FROM (
                                 SELECT 1
                                 FROM @search_chunks c
-                                WHERE (c.text ILIKE exact_pattern ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                WHERE (c.text ILIKE %2$L ESCAPE '\'
+                                       OR c.text ILIKE %3$L ESCAPE '\'
+                                       OR c.text ILIKE %4$L ESCAPE '\')
                                   AND (
-                                      sem_adapters IS NULL
-                                      OR c.adapter = ANY (sem_adapters)
+                                      $1 IS NULL
+                                      OR c.adapter = ANY ($1)
                                   )
                                 LIMIT """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES + 1) + r"""
-                              ) n;
+                              ) n
+                            $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
+                              INTO exact_match_count
+                              USING sem_adapters, since, priorities, per_source;
                             IF exact_match_count > """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES) + r""" THEN
                                 exact_refs := NULL;
                             ELSE
+                            EXECUTE format($lit$
                             SELECT array_agg(
                                        x.ref
                                        ORDER BY x.match_chunk ASC NULLS LAST,
                                                 x.match_pos ASC NULLS LAST,
                                                 x.occurred_at DESC
                                    )
-                              INTO exact_refs
                               FROM (
                                 -- Plain document chunks retain the source event
                                 -- id. Join back to timeline both to validate that
@@ -17550,20 +17581,20 @@ class PostgresWarehouse:
                                 SELECT t.adapter || ':' || t.event_id AS ref,
                                        max(t.occurred_at) AS occurred_at,
                                        CASE
-                                           WHEN exact_needle ~ '[0-9]' THEN NULL
+                                           WHEN %1$L ~ '[0-9]' THEN NULL
                                            ELSE min(c.chunk_index)
                                        END AS match_chunk,
                                        CASE
                                            -- Symbolic identifiers prefer their
                                            -- earliest chunk and position. Opaque
                                            -- numeric ids preserve recency.
-                                           WHEN exact_needle ~ '[0-9]' THEN NULL
+                                           WHEN %1$L ~ '[0-9]' THEN NULL
                                            ELSE (array_agg(
-                                               strpos(lower(c.text), lower(exact_needle))
+                                               strpos(lower(c.text), lower(%1$L))
                                                ORDER BY c.chunk_index,
                                                         strpos(
                                                             lower(c.text),
-                                                            lower(exact_needle)
+                                                            lower(%1$L)
                                                         )
                                            ))[1]
                                        END AS match_pos
@@ -17571,32 +17602,35 @@ class PostgresWarehouse:
                                 JOIN @timeline_events t
                                   ON t.adapter = c.adapter
                                  AND t.event_id = c.event_id
-                                WHERE c.anchor NOT LIKE c.adapter || '|w|%'
-                                  AND (c.text ILIKE exact_pattern ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_b ESCAPE '\'
-                                       OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                WHERE c.anchor NOT LIKE c.adapter || '|w|%%'
+                                  AND (c.text ILIKE %2$L ESCAPE '\'
+                                       OR c.text ILIKE %3$L ESCAPE '\'
+                                       OR c.text ILIKE %4$L ESCAPE '\')
                                   AND t.search_text != ''
                                   AND NOT COALESCE(
                                       (t.metadata->>'deleted')::boolean, false
                                   )
                                   AND """
-            + SEARCH_DRIVE_EXCLUSION_SQL
+            + exact_one_shot(SEARCH_DRIVE_EXCLUSION_SQL)
             + r"""
                                   AND (
-                                      sem_adapters IS NULL
-                                      OR t.adapter = ANY (sem_adapters)
+                                      $1 IS NULL
+                                      OR t.adapter = ANY ($1)
                                   )
-                                  AND (since IS NULL OR t.occurred_at >= since)
+                                  AND ($2 IS NULL OR t.occurred_at >= $2)
                                   AND (
-                                      priorities IS NULL
-                                      OR t.priority::text = ANY (priorities)
+                                      $3 IS NULL
+                                      OR t.priority::text = ANY ($3)
                                   )
                                 GROUP BY t.adapter, t.event_id
                                 ORDER BY match_chunk ASC NULLS LAST,
                                          match_pos ASC NULLS LAST,
                                          occurred_at DESC
-                                LIMIT per_source
-                              ) x;
+                                LIMIT $4
+                              ) x
+                            $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
+                              INTO exact_refs
+                              USING sem_adapters, since, priorities, per_source;
 
                             -- A conversation-window chunk represents the last
                             -- event in its (context, hour), not necessarily the
@@ -17610,8 +17644,8 @@ class PostgresWarehouse:
                             -- 1.6-11s ("Mt Foolery" 7.3s, an amount 10.7s, a
                             -- phone number 8.9s) and was the slowest leg of
                             -- every short hybrid search that touched a chat.
+                            EXECUTE format($lit$
                             SELECT array_agg(m.ref ORDER BY m.occurred_at DESC)
-                              INTO chat_exact_refs
                               FROM (
                                 SELECT t.adapter || ':' || t.event_id AS ref,
                                        t.occurred_at
@@ -17619,21 +17653,21 @@ class PostgresWarehouse:
                                     SELECT c.source, c.context, c.adapter,
                                            c.occurred_at AS window_start
                                     FROM @search_chunks c
-                                    WHERE c.anchor LIKE c.adapter || '|w|%'
-                                      AND (c.text ILIKE exact_pattern ESCAPE '\'
-                                           OR c.text ILIKE exact_pattern_b ESCAPE '\'
-                                           OR c.text ILIKE exact_pattern_c ESCAPE '\')
+                                    WHERE c.anchor LIKE c.adapter || '|w|%%'
+                                      AND (c.text ILIKE %2$L ESCAPE '\'
+                                           OR c.text ILIKE %3$L ESCAPE '\'
+                                           OR c.text ILIKE %4$L ESCAPE '\')
                                       AND (
-                                          sem_adapters IS NULL
-                                          OR c.adapter = ANY (sem_adapters)
+                                          $1 IS NULL
+                                          OR c.adapter = ANY ($1)
                                       )
                                       AND (
-                                          since IS NULL
-                                          OR c.occurred_at + interval '1 hour' > since
+                                          $2 IS NULL
+                                          OR c.occurred_at + interval '1 hour' > $2
                                       )
                                     GROUP BY c.source, c.context, c.adapter, c.occurred_at
                                     ORDER BY c.occurred_at DESC
-                                    LIMIT per_source * 2
+                                    LIMIT $4 * 2
                                 ) w
                                 JOIN @timeline_events t
                                   ON t.source = w.source
@@ -17641,21 +17675,24 @@ class PostgresWarehouse:
                                  AND t.occurred_at >= w.window_start
                                  AND t.occurred_at < w.window_start + interval '1 hour'
                                  AND t.adapter = w.adapter
-                                WHERE (t.search_text ILIKE exact_pattern ESCAPE '\'
-                                       OR t.search_text ILIKE exact_pattern_b ESCAPE '\'
-                                       OR t.search_text ILIKE exact_pattern_c ESCAPE '\')
+                                WHERE (t.search_text ILIKE %2$L ESCAPE '\'
+                                       OR t.search_text ILIKE %3$L ESCAPE '\'
+                                       OR t.search_text ILIKE %4$L ESCAPE '\')
                                   AND t.search_text != ''
                                   AND NOT COALESCE(
                                       (t.metadata->>'deleted')::boolean, false
                                   )
-                                  AND (since IS NULL OR t.occurred_at >= since)
+                                  AND ($2 IS NULL OR t.occurred_at >= $2)
                                   AND (
-                                      priorities IS NULL
-                                      OR t.priority::text = ANY (priorities)
+                                      $3 IS NULL
+                                      OR t.priority::text = ANY ($3)
                                   )
                                 ORDER BY t.occurred_at DESC
-                                LIMIT per_source
-                              ) m;
+                                LIMIT $4
+                              ) m
+                            $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
+                              INTO chat_exact_refs
+                              USING sem_adapters, since, priorities, per_source;
                             exact_refs := (
                                 coalesce(exact_refs, ARRAY[]::text[])
                                 || coalesce(chat_exact_refs, ARRAY[]::text[])

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import UTC, datetime, timedelta
 
 import psycopg2
@@ -2698,7 +2699,7 @@ def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
     # through BM25 here would re-introduce the overfetch-and-post-filter
     # pattern this function exists to remove.
     sql = _search_text_exact_sql()
-    assert "ILIKE pattern" in sql
+    assert "t.search_text ILIKE %4$L" in sql
     assert "to_bm25query" not in sql
     assert "ORDER BY t.occurred_at DESC" in sql
 
@@ -2722,7 +2723,7 @@ def test_search_text_exact_windows_preview_around_the_match() -> None:
     # agents back to raw-table scans. The preview must be windowed around the
     # first match position instead.
     sql = _search_text_exact_sql()
-    assert "position(lower(needle)" in sql
+    assert "position(lower(%1$L) IN ld.lowdoc)" in sql
 
 
 def test_search_text_exact_source_tokens_match_ranked_search() -> None:
@@ -7085,36 +7086,36 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     assert "i.indisvalid" in literal and "i.indisready" in literal
     assert "FROM @search_chunks" in literal
     assert "JOIN @timeline_events t" in literal
-    assert "c.anchor NOT LIKE c.adapter || '|w|%'" in literal
+    assert "c.anchor NOT LIKE c.adapter || '|w|%%'" in literal
     assert "t.metadata->>'deleted'" in literal
     assert "t.adapter = 'drive_file'" in literal
     assert "t.metadata->>'excluded'" in literal
-    assert "t.priority::text = ANY (priorities)" in literal, (
+    assert "t.priority::text = ANY ($3)" in literal, (
         "bounded exact candidates must be priority-scoped before top-k"
     )
     # A matching chat window is resolved to the member that holds the literal
     # by re-reading only that window's events. A full-corpus search_text_exact
     # over every chat event took 1.6-11s on production (2026-09-30).
-    chat = literal[literal.index("INTO chat_exact_refs"):]
+    chat = literal[literal.index("SELECT array_agg(m.ref"):]
     chat = chat[: chat.index("ELSE")]
     assert "@search_text_exact(" not in chat, (
         "chat-window recovery must not rescan every chat event in the timeline"
     )
     assert "ON t.source = w.source" in chat and "AND t.context = w.context" in chat
     assert "t.occurred_at < w.window_start + interval '1 hour'" in chat
-    assert "t.search_text ILIKE exact_pattern ESCAPE" in chat, (
+    assert "t.search_text ILIKE %2$L ESCAPE" in chat, (
         "the member that actually contains the literal is the one returned"
     )
-    assert "t.priority::text = ANY (priorities)" in chat, (
+    assert "t.priority::text = ANY ($3)" in chat, (
         "chat exact-ref recovery must preserve the hybrid priority scope"
     )
-    assert "c.adapter = ANY (sem_adapters)" in chat
+    assert "c.adapter = ANY ($1)" in chat
     assert "GROUP BY" in literal, (
         "several chunks from one event must produce one literal rank"
     )
-    assert "t.adapter = ANY (sem_adapters)" in literal
-    assert "t.occurred_at >= since" in literal
-    assert "c.occurred_at + interval '1 hour' > since" in literal
+    assert "t.adapter = ANY ($1)" in literal
+    assert "t.occurred_at >= $2" in literal
+    assert "c.occurred_at + interval '1 hour' > $2" in literal
 
 
 def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
@@ -7126,9 +7127,9 @@ def test_search_hybrid_ranks_symbolic_chunk_matches_by_prominence() -> None:
     sql = _search_text_function_sql()
     exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact("):]
     literal = exact[exact.index("exact_refs"):exact.index("RETURN QUERY")]
-    assert "WHEN exact_needle ~ '[0-9]' THEN NULL" in literal
+    assert "WHEN %1$L ~ '[0-9]' THEN NULL" in literal
     assert "c.chunk_index" in literal
-    assert "strpos(lower(c.text), lower(exact_needle))" in literal
+    assert "strpos(lower(c.text), lower(%1$L))" in literal
     assert "match_chunk ASC NULLS LAST" in literal
 
 
@@ -7521,6 +7522,152 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
     assert "($2 IS NULL OR t.occurred_at >= $2)" in pool
     assert "(priorities IS NULL OR" not in pool and "(since IS NULL OR" not in pool
     assert "%" not in pool.replace("%1$L", ""), "format() would misread any other percent sign in the template"
+
+
+def _without_format_codes(template: str) -> str:
+    return re.sub(r"%[1-9]\$L", "", template).replace("%%", "")
+
+
+def test_search_text_exact_scan_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
+    """The literal scan must not be a cached plan with the patterns as parameters.
+
+    Measured 2026-10-26 on production with plan_cache_mode = force_generic_plan:
+    the generic plan walked timeline_events_time_idx backwards and filtered
+    every row, so a no-match needle hit the 60s timeout and 'Mt Foolery' took
+    25.7s. plpgsql switches a static statement to that plan after its fifth
+    call on a pooled connection. With the patterns as literals the planner
+    sees their trigrams and takes the trigram index.
+    """
+    sql = _search_text_exact_sql()
+    sql = sql[: sql.index("$fn$;")]
+    scan = sql[sql.index("RETURN QUERY") : sql.index("USING sources, since, priorities, per_source;")]
+    assert scan.startswith("RETURN QUERY EXECUTE format($lit$")
+    assert sql.count("RETURN QUERY") == 1
+    assert "$lit$, needle, needle_b, needle_c, pattern, pattern_b, pattern_c)" in scan
+    template = scan[: scan.index("$lit$, needle")]
+    for code in ("%4$L", "%5$L", "%6$L"):
+        assert f"t.search_text ILIKE {code}" in template
+    assert re.search(r"ILIKE pattern", template) is None, (
+        "the patterns must be inlined as literals (%N$L), never read from the "
+        "plpgsql variable, which makes the scan a cached parameterized plan"
+    )
+    assert "lower(needle" not in template
+    assert "($1 IS NULL OR map.source = ANY ($1))" in template
+    assert "($2 IS NULL OR t.occurred_at >= $2)" in template
+    assert "($3 IS NULL OR t.priority::text = ANY ($3))" in template
+    assert "LIMIT $4" in template
+    assert "%" not in _without_format_codes(template), (
+        "format() would misread any other percent sign in the template"
+    )
+
+
+def test_search_hybrid_exact_literal_leg_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
+    """The hybrid literal leg's three statements inline the needle and patterns.
+
+    Measured 2026-10-26 on production with plan_cache_mode = force_generic_plan:
+    the chunk-count probe became a Seq Scan over the whole chunk heap (7.4 GB)
+    instead of the search_chunks_text_trgm_idx bitmap scan its custom plan
+    uses, and the chat-window scan's estimate went from 867 rows per needle to
+    46,859.
+    """
+    sql = _search_text_function_sql()
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(") :]
+    exact = exact[: exact.index("$exact$;")]
+    literal = exact[exact.index("exact_pattern_c := ") : exact.index("ELSE\n                            SELECT array_agg(x.ref)")]
+    statements = literal.split("EXECUTE format($lit$")[1:]
+    assert len(statements) == 3, "the count probe, the document refs and the chat refs"
+    for statement, target in zip(statements, ("exact_match_count", "exact_refs", "chat_exact_refs"), strict=True):
+        template, call = statement.split("$lit$, ", 1)
+        assert call.startswith(
+            "exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)\n"
+            f"                              INTO {target}\n"
+            "                              USING sem_adapters, since, priorities, per_source;"
+        )
+        assert "c.text ILIKE %2$L ESCAPE" in template
+        assert "c.text ILIKE %3$L ESCAPE" in template
+        assert "c.text ILIKE %4$L ESCAPE" in template
+        assert "exact_needle" not in template and "sem_adapters" not in template
+        assert "(since" not in template and "priorities IS NULL" not in template
+        assert "%" not in _without_format_codes(template), (
+            "format() would misread any other percent sign in the template"
+        )
+
+
+def _capture_nested_plans(warehouse: PostgresWarehouse) -> list[str]:
+    """Force generic plans and echo every nested statement's plan as a NOTICE."""
+    warehouse._command("SET plan_cache_mode = force_generic_plan")
+    warehouse._command("LOAD 'auto_explain'")
+    warehouse._command("SET auto_explain.log_min_duration = 0")
+    warehouse._command("SET auto_explain.log_nested_statements = on")
+    warehouse._command("SET auto_explain.log_level = 'notice'")
+    warehouse._command("SET client_min_messages = notice")
+    notices: list[str] = []
+    warehouse._connection.notices = notices
+    return notices
+
+
+def _release_nested_plans(warehouse: PostgresWarehouse) -> None:
+    warehouse._command("RESET plan_cache_mode")
+    warehouse._command("RESET auto_explain.log_min_duration")
+    warehouse._command("RESET client_min_messages")
+
+
+def test_search_text_exact_stays_on_a_literal_plan_past_the_fifth_call(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Repeated calls on one connection keep the patterns as literals.
+
+    A static statement switches to a cached generic plan after its fifth call;
+    that plan walked the whole timeline on production (2026-10-26). The test
+    corpus is too small for that to be slow, so the plans themselves are read
+    through auto_explain, with force_generic_plan set so a parameterized
+    statement would show its $N.
+    """
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+    message_datetime = datetime(2026, 5, 19, 12, tzinfo=UTC)
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.1",
+                message_datetime=message_datetime,
+                text="the path is zq\\w_7%k for now",
+            ),
+            # Would match if '_' or '%' in the needle were wildcards.
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts="100.2",
+                message_datetime=message_datetime,
+                text="the path is zq\\wY7Zk for now",
+            ),
+        ]
+    )
+    _sync_timeline(warehouse)
+
+    notices = _capture_nested_plans(warehouse)
+    try:
+        for attempt in range(8):
+            needle = f"qzvxk-no-match-{attempt}"
+            notices.clear()
+            started = time.monotonic()
+            assert warehouse._query("SELECT * FROM @search_text_exact(%s, 10)", (needle,)) == []
+            assert time.monotonic() - started < 5
+            plans = "".join(notices)
+            assert f"'%{needle}%'" in plans, plans
+            assert "~~* $" not in plans, plans
+        rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", ("zq\\w_7%k",))
+        assert len(rows) == 1 and "zq\\w_7%k" in rows[0][0], rows
+        rows = warehouse._query(
+            "SELECT text FROM @search_text_exact(%s, 10, since => %s, priorities => ARRAY['self','direct','cc','noise','background'])",
+            ("zq\\w_7%k", datetime(2026, 5, 1, tzinfo=UTC)),
+        )
+        assert len(rows) == 1, rows
+    finally:
+        _release_nested_plans(warehouse)
 
 
 def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
