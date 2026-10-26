@@ -264,6 +264,16 @@ that wakes after more than a year of quiet: it can take up to twelve hours to la
 an event feed fixes that: an Events API subscription on the workspace app, which is
 Zach's to set up.
 
+**DM landing latency judges only what the schedule promises (2026-10-25/26).** A DM active
+inside the four-hour hot window (`SLACK_IM_FRESHNESS_WINDOW`) is polled every pass, so its
+messages are held to the 15-minute p95. A message that wakes a quieter DM -- and any written
+before that wake lands -- is a scheduled wake-up when it lands inside its tier's interval
+plus `SLACK_DM_WAKEUP_MARGIN_SECONDS`: 15m + 15m when warm (4h-14d), 2h + 15m when cool,
+12h + 15m when cold. Those leave `landing_p95_seconds` and are counted in
+`landing_wakeups_excluded_24h` / `landing_wakeup_max_seconds`; one later than its tier
+allows is still judged. Without the warm tier, three DMs quiet 7-39 hours read the im row
+`late` at p95 1,669s on 2026-10-26.
+
 **"Public channels go last" means public channels Zach is not in (2026-10-17).** The pass
 caps public candidates at the 100 most recently active (`SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT`)
 out of ~14,500, and Zach's own channel ranked 223rd that day, so no pass ever polled it: the

@@ -22,6 +22,7 @@ from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.slack_sync import (
     SLACK_FRESHNESS_DUE_INTERVALS,
     SLACK_FRESHNESS_WARM_WINDOW,
+    SLACK_IM_FRESHNESS_WINDOW,
     SLACK_CONVERSATION_LIST_COMPLETE,
     SLACK_CONVERSATION_LIST_STATE_TYPE,
     SLACK_COVERAGE_STAGE_STATE_TYPE,
@@ -168,9 +169,11 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
     # measured 2026-09-16 at ~4 minutes per type, so the 5-minute cron ran
     # 8-23 minutes, skipped every other tick, and DM landing p95 sat at ~30
     # minutes while every other Slack health number read ok.
+    # DMs and group DMs share the hot window the health view reads.
+    SLACK_IM_HOT_WINDOW_MINUTES = int(SLACK_IM_FRESHNESS_WINDOW.total_seconds() // 60)
     window_by_type = {
-        "im": timedelta(minutes=_int_env("SLACK_ASSET_DM_WINDOW_MINUTES", 240)),
-        "mpim": timedelta(minutes=_int_env("SLACK_ASSET_MPIM_WINDOW_MINUTES", 240)),
+        "im": timedelta(minutes=_int_env("SLACK_ASSET_DM_WINDOW_MINUTES", SLACK_IM_HOT_WINDOW_MINUTES)),
+        "mpim": timedelta(minutes=_int_env("SLACK_ASSET_MPIM_WINDOW_MINUTES", SLACK_IM_HOT_WINDOW_MINUTES)),
         "private_channel": timedelta(minutes=_int_env("SLACK_ASSET_PRIVATE_WINDOW_MINUTES", 180)),
         "public_channel": timedelta(minutes=_int_env("SLACK_ASSET_PUBLIC_WINDOW_MINUTES", 120)),
     }

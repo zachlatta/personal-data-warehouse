@@ -317,30 +317,82 @@ def test_slack_dm_wakeup_exclusion_reads_the_schedulers_own_windows() -> None:
     """The health view tells a scheduled wake-up from a late DM by the scheduler's numbers.
 
     A quiet DM is excused from the 15-minute landing SLA only because the
-    freshness pass polls it every 2h/12h. If the view kept its own copy of
+    freshness pass polls it every 15m/2h/12h once it is quiet past the
+    four-hour hot window. If the view kept its own copy of
     those windows, retuning the scheduler would leave it excusing the wrong
     messages. The behaviour itself is proven in tests/test_pipeline_health.py.
     """
     from personal_data_warehouse import slack_sync
     from personal_data_warehouse.defs import slack_sync as slack_sync_defs
 
+    assert slack_sync.SLACK_IM_FRESHNESS_WINDOW == timedelta(hours=4)
     assert slack_sync.SLACK_FRESHNESS_WARM_WINDOW == timedelta(days=14)
     assert slack_sync.SLACK_FRESHNESS_COOL_WINDOW == timedelta(days=365)
     defs_source = Path(slack_sync_defs.__file__).read_text()
     assert "SLACK_FRESHNESS_WARM_WINDOW.days" in defs_source, "the Dagster pass must default to the shared warm window"
+    for env in ("SLACK_ASSET_DM_WINDOW_MINUTES", "SLACK_ASSET_MPIM_WINDOW_MINUTES"):
+        assert f'_int_env("{env}", SLACK_IM_HOT_WINDOW_MINUTES)' in defs_source, (
+            f"{env} must default to the shared hot window"
+        )
+    assert "SLACK_IM_HOT_WINDOW_MINUTES = int(SLACK_IM_FRESHNESS_WINDOW.total_seconds() // 60)" in defs_source
     runner_default = inspect.signature(slack_sync.SlackSyncRunner).parameters["freshness_cool_window"].default
     assert runner_default == slack_sync.SLACK_FRESHNESS_COOL_WINDOW
 
     postgres_source = (REPO_ROOT / "src/personal_data_warehouse/postgres.py").read_text()
     view = postgres_source.split("def _ensure_slack_conversation_health_view", 1)[1].split("\n    def ", 1)[0]
     for name in (
+        "SLACK_IM_FRESHNESS_WINDOW",
         "SLACK_FRESHNESS_WARM_WINDOW",
         "SLACK_FRESHNESS_COOL_WINDOW",
+        "SLACK_FRESHNESS_DUE_INTERVALS[0]",
         "SLACK_FRESHNESS_DUE_INTERVALS[1]",
         "SLACK_FRESHNESS_DUE_INTERVALS[2]",
         "SLACK_DM_WAKEUP_MARGIN_SECONDS",
     ):
         assert "{" + name in view, f"the wake-up rule must interpolate {name}, not a literal"
+
+
+def _s1_rows(*statuses: str, dm_age_seconds: float = 600) -> list[dict]:
+    types = ("im", "mpim", "private_channel", "public_channel")
+    return [
+        {"conversation_type": kind, "status": status, "refreshed_fraction": 1,
+         "message_age_seconds": dm_age_seconds if kind == "im" else 60}
+        for kind, status in zip(types, statuses)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (("ok", "ok", "ok", "ok"), "green"),
+        (("late", "ok", "ok", "ok"), "yellow"),
+        (("ok", "unknown", "ok", "ok"), "yellow"),
+        (("ok", "ok", "attention", "ok"), "yellow"),
+        (("late", "ok", "ok", "stale"), "red"),
+    ],
+)
+def test_s1_grades_stale_red_and_late_or_unknown_yellow(
+    monkeypatch: pytest.MonkeyPatch, statuses: tuple[str, ...], expected: str
+) -> None:
+    """S1 grades severity the way S2 and S3 do.
+
+    Live on 2026-10-26 the im row read `late` (p95 1,669s against 900s) and S1
+    graded RED, the same colour as a DM type an hour behind. `stale` is the
+    view's fault level; `late`, `attention` and `unknown` are worth a look.
+    """
+    from scripts import contract_audit
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql: _s1_rows(*statuses))
+    verdict = contract_audit.s1_slack()
+    assert verdict.status == expected, verdict.evidence
+
+
+def test_s1_is_yellow_when_the_newest_dm_is_over_a_day_old(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import contract_audit
+
+    rows = _s1_rows("ok", "ok", "ok", "ok", dm_age_seconds=25 * 3600)
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql: rows)
+    assert contract_audit.s1_slack().status == contract_audit.YELLOW
 
 
 def test_c5_requires_enrichment_to_read_the_intermediate_layer() -> None:

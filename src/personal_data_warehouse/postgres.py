@@ -222,6 +222,7 @@ from personal_data_warehouse.slack_sync import (
     SLACK_FRESHNESS_COOL_WINDOW,
     SLACK_FRESHNESS_DUE_INTERVALS,
     SLACK_FRESHNESS_WARM_WINDOW,
+    SLACK_IM_FRESHNESS_WINDOW,
 )
 from personal_data_warehouse.timeline import (
     TIMELINE_ADAPTERS,
@@ -819,11 +820,13 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 SLACK_FINGERPRINT_THUMB_SIZES = (1024, 960, 800, 720, 480, 360, 160)
 SLACK_DM_LANDING_P95_SECONDS = 900
 SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
-# A DM quiet past the warm window is polled every two hours (every twelve once
-# quiet a year: SLACK_FRESHNESS_DUE_INTERVALS), so the message that wakes it --
-# and any written before it lands -- arrives up to that late by design. Live on
+# A DM quiet past the four-hour hot window is polled every fifteen minutes,
+# every two hours once quiet two weeks, every twelve once quiet a year
+# (SLACK_FRESHNESS_DUE_INTERVALS), so the message that wakes it -- and any
+# written before it lands -- arrives up to that late by design. Live on
 # 2026-10-25, three such messages in two DMs quiet 16.5 and 19 days read the im
-# row's p95 at 5,049s and S1 red. They are left out of the 15-minute sample when
+# row's p95 at 5,049s and S1 red; the next night three warm DMs quiet 7-39
+# hours read it at 1,669s. They are left out of the 15-minute sample when
 # they landed inside their own tier's interval plus this margin; one later than
 # that is still judged, so a cool tier that stops polling is not hidden here.
 SLACK_DM_WAKEUP_MARGIN_SECONDS = 900
@@ -14740,22 +14743,27 @@ class PostgresWarehouse:
                 FROM dm_landing_sample AS d
             ),
             landing_classified AS (
-                -- A scheduled wake-up: the anchor is older than the warm
-                -- window, so the conversation was due every two hours (twelve
-                -- past the cool window), and the message landed inside that
-                -- interval plus a margin. A brand-new conversation has no
-                -- anchor; discovery polls it at once, so it stays judged.
+                -- A scheduled wake-up: the anchor is older than the hot
+                -- window, so the conversation was not polled every pass but
+                -- due every fifteen minutes (two hours past the warm window,
+                -- twelve past the cool one), and the message landed inside
+                -- that interval plus a margin. A message into a hot DM is
+                -- always judged (the CASE is NULL). A brand-new conversation
+                -- has no anchor; discovery polls it at once, so it stays
+                -- judged too.
                 SELECT
                     a.account,
                     a.team_id,
                     a.conversation_type,
                     a.latency_seconds,
                     COALESCE(
-                        a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_FRESHNESS_WARM_WINDOW.total_seconds():.0f})
-                        AND a.latency_seconds <= CASE
+                        a.latency_seconds <= CASE
                             WHEN a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_FRESHNESS_COOL_WINDOW.total_seconds():.0f})
                                 THEN {SLACK_FRESHNESS_DUE_INTERVALS[2].total_seconds():.0f}
-                            ELSE {SLACK_FRESHNESS_DUE_INTERVALS[1].total_seconds():.0f}
+                            WHEN a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_FRESHNESS_WARM_WINDOW.total_seconds():.0f})
+                                THEN {SLACK_FRESHNESS_DUE_INTERVALS[1].total_seconds():.0f}
+                            WHEN a.anchor_at < a.occurred_at - make_interval(secs => {SLACK_IM_FRESHNESS_WINDOW.total_seconds():.0f})
+                                THEN {SLACK_FRESHNESS_DUE_INTERVALS[0].total_seconds():.0f}
                         END + {SLACK_DM_WAKEUP_MARGIN_SECONDS},
                         false
                     ) AS scheduled_wakeup

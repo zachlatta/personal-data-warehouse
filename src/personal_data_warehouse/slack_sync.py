@@ -34,11 +34,14 @@ SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: pasted session (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
 #: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
 SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=15), timedelta(hours=2), timedelta(hours=12))
-#: The activity windows those intervals are chosen by: a conversation whose
-#: newest known message is inside the warm window is due every fifteen minutes,
-#: inside the cool window every two hours, and older every twelve.
-#: marts_ops.slack_conversation_health reads the same three numbers to tell a
+#: The activity windows those intervals are chosen by: a DM or group DM whose
+#: newest known message is inside the hot window is polled every pass (the
+#: Dagster default for SLACK_ASSET_DM_WINDOW_MINUTES and
+#: SLACK_ASSET_MPIM_WINDOW_MINUTES), inside the warm window it is due every
+#: fifteen minutes, inside the cool window every two hours, and older every
+#: twelve. marts_ops.slack_conversation_health reads the same numbers to tell a
 #: quiet DM waking up on schedule from a DM landing late.
+SLACK_IM_FRESHNESS_WINDOW = timedelta(hours=4)
 SLACK_FRESHNESS_WARM_WINDOW = timedelta(days=14)
 SLACK_FRESHNESS_COOL_WINDOW = timedelta(days=365)
 

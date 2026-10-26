@@ -597,11 +597,19 @@ def s1_slack() -> Verdict:
     rows = pdw_sql("slack recency", "SELECT conversation_type, status, refreshed_fraction, message_age_seconds FROM marts_ops.slack_conversation_health")
     if not rows:
         return _unavailable("S1", title, "marts_ops.slack_conversation_health")
-    bad = [r["conversation_type"] for r in rows if r["status"] != "ok"]
+    # Graded like S2/S3: `stale` is the view's fault level; `late` (a DM p95
+    # over 900s but under an hour) and `unknown` are worth a look, not red.
+    stale = [r["conversation_type"] for r in rows if r["status"] == "stale"]
+    warn = [f"{r['conversation_type']}={r['status']}" for r in rows if r["status"] not in ("ok", "stale")]
     dm = next((r for r in rows if r["conversation_type"] == "im"), None)
     dm_age_h = (float(dm["message_age_seconds"]) / 3600) if dm and dm["message_age_seconds"] is not None else None
-    status = RED if bad else (YELLOW if dm_age_h is not None and dm_age_h > 24 else GREEN)
-    return Verdict("S1", title, status, f"not ok types: {bad or 'none'}; newest DM {dm_age_h and f'{dm_age_h:.1f}h'} ago")
+    if stale:
+        status = RED
+    elif warn or (dm_age_h is not None and dm_age_h > 24):
+        status = YELLOW
+    else:
+        status = GREEN
+    return Verdict("S1", title, status, f"stale types: {stale or 'none'}; other not ok: {warn or 'none'}; newest DM {dm_age_h and f'{dm_age_h:.1f}h'} ago")
 
 
 def s2_voice() -> Verdict:
