@@ -464,8 +464,7 @@ between the two tables. Anything else in the folder (`.tmp`, a not-yet-gzipped `
 ignored, and a file younger than two minutes waits for the next run.
 
 **One request per file, and no inbox.** Each file goes to `/ingest/screen-timelapse/file`
-exactly as written (no re-encoding, no scrubbing: the pixels carry the same text the tree
-does). The app stores the bytes under `screen-timelapse/library/<device>/<UTC day>/` and writes
+exactly as written, except for the card guard below. The app stores the bytes under `screen-timelapse/library/<device>/<UTC day>/` and writes
 the file's row before it answers, so nothing has to promote it; it also provisions the two
 tables itself (identical to the Python `TableSpec`, pinned by
 `tests/test_screen_timelapse_store.py`). Dedup is the row: a resend of a moment whose row has
@@ -474,8 +473,37 @@ Drive per-upload dedup search skipped. A store that succeeds with a failed row w
 error and the file is sent again (worst case an orphaned Drive object, never a row without
 bytes).
 
+**A moment goes as a whole, after its tree is checked.** The uploader groups files by moment
+(device plus the stamp's instant: the tree is display 0, screenshots 1..n) and judges a moment
+only once its tree has settled. The Mac gzips its tree in place *after* renaming the image into
+place, so a screenshot can settle first; it is held (`held=` in the run line) until the tree
+settles, or for ten minutes past the settle age when the moment has no tree, and is then sent
+unchecked. Before anything of the moment is sent, the tree is scanned for payment card numbers
+(13-19 digits, unbroken or grouped 4-4-4-4 / 4-6-5 / 4-4-4-4-3 / 4-3-3-3, passing Luhn with a
+Visa, Mastercard, Amex or Discover prefix valid for the length; a run right after `/` is a URL
+id, not a card). On a hit:
+
+- the tree is sent with each number replaced by `[redacted card number]`;
+- a screenshot is boxed only when the hit can be placed on it with certainty: it is matched to
+  a screen **by pixel size** (the Mac's tree `displays` in points at 1x/2x/3x, the Android
+  dump's top-level bounds at 1x), never by `display-N` order, and every image of the moment
+  must fit exactly one screen. It is sent with solid red over the number and the card's other
+  fields near it (expiry, CVC, cardholder, billing address), redrawn in its own format (PNG in
+  Go, HEIC and AVIF through macOS `sips`);
+- every other screenshot of the moment is **withheld**: never sent, recorded in the ledger as
+  `withheld: card number in accessibility tree` at its size and mtime (`withheld=` in the run
+  line). The tree only sees the frontmost app, and on 2026-10-21 the full card was on the
+  display the tree did not cover. If two displays share a size, a hit has no frame (the
+  iPhone's trees) or the tree cannot be read, every screenshot of the moment is withheld.
+
+The log names each redacted or withheld path and the reason, never the digits. A withheld file
+that is later edited (blacked out by hand) is sent as it then is, without a new scan: the edit is
+the review. A redaction failure (`sips` missing, a frame that will not decode) fails the run
+before any of the moment is sent. The guard covers new uploads only; copies already in the
+warehouse are removed with the `screen_timelapse.purge_moment` mutation.
+
 **Ledger and backlog.** The state file remembers each acknowledged file's path, size and mtime;
-a changed file is sent again and replaces its row. A run sends at most 300 files, newest first,
+a changed file is sent again and replaces its row. A run sends at most 300 files, newest first, cut between moments,
 so a first run's backlog (months of frames) drains behind the live minute over successive runs.
 A run stops at its first failed upload and exits 1, so `/pipelines` reads `failing`. The usual
 network guard applies (`SCREEN_TIMELAPSE_UPLOAD_*`, falling back to the voice-memos settings):

@@ -191,6 +191,9 @@ iPhone before it). `base_screen_timelapse.screenshots` is one row per image: `de
 the same moment, when the loop could read one; join on `(device, captured_at)`, and expect
 moments with only one of the two. Both are raw: the pixels and the tree are the stored
 object, so read one with `get_object`; a tree's text is also inline in `content_text`.
+A moment whose tree shows a card number is redacted at the source: the tree says
+`[redacted card number]`, a screen the number can be placed on is boxed out in red, and the
+moment's other screens are withheld, so expect such moments with fewer screenshots.
 `marts_screen_timelapse.active_screens` is what was on screen: one row per frame an agent
 judged in use (black, locked and not-yet-read frames are absent) with `app`, `window_title`,
 `summary`, `screen_text`, `evidence` (accessibility tree, screenshot or both) and the frame's

@@ -19,11 +19,21 @@ USAGE
 
 Sends every capture file the screen timelapse loops wrote -- each periodic
 screenshot (one per display) and each accessibility tree -- to the app's
-/ingest/screen-timelapse/file endpoint, exactly as written, newest first. The
-app stores the bytes and writes the file's row before it answers; a file is
-then remembered and not sent again unless it changes. Files younger than two
-minutes are left for the next run, since a capture loop may still be writing
-them. A run stops at the first failed upload and exits non-zero.
+/ingest/screen-timelapse/file endpoint, newest first, one moment (a device's
+screenshots and tree of one instant) at a time. The app stores the bytes and
+writes the file's row before it answers; a file is then remembered and not
+sent again unless it changes. Files younger than two minutes are left for the
+next run, since a capture loop may still be writing them, and a moment's
+screenshots wait for its tree to settle (at most ten minutes more when it has
+none). A run stops at the first failed upload and exits non-zero.
+
+Before a moment is sent its tree is scanned for payment card numbers (13-19
+digits, Luhn, a Visa, Mastercard, Amex or Discover prefix). On a hit the tree
+goes up with the number replaced, a screenshot the number's screen can be
+matched to exactly goes up with a red box over it and the card's other fields
+(HEIC and AVIF are redrawn with sips), and the moment's other screenshots are
+withheld: recorded, never sent, until the file is edited. Files are sent
+exactly as written otherwise.
 
 FLAGS
   --sources SPEC      Comma-separated device=folder pairs: whose screen each
@@ -116,8 +126,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Limit:             *limit,
 		BeforeUploadCheck: guard,
 	}).Sync()
-	fmt.Fprintf(stdout, "Screen timelapse upload complete: sources=%d uploaded=%d already_stored=%d unsettled=%d remaining=%d deferred=%t dry_run=%t\n",
-		len(sources), summary.Uploaded, summary.Skipped, summary.Unsettled, summary.Remaining, summary.Deferred, *dryRun)
+	fmt.Fprintf(stdout, "Screen timelapse upload complete: sources=%d uploaded=%d already_stored=%d redacted=%d withheld=%d unsettled=%d held=%d remaining=%d deferred=%t dry_run=%t\n",
+		len(sources), summary.Uploaded, summary.Skipped, summary.Redacted, summary.Withheld, summary.Unsettled, summary.Held, summary.Remaining, summary.Deferred, *dryRun)
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest screen-timelapse: %v\n", err)
 		return common.ExitFailure

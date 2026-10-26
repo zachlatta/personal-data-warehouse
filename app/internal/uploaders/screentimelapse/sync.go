@@ -1,12 +1,14 @@
 // Package screentimelapse is `pdw ingest screen-timelapse`: it ships the
 // screen timelapse -- the periodic whole-screen images and accessibility trees
-// the capture loops write -- to the app one file at a time, exactly as written.
+// the capture loops write -- to the app one file at a time.
 //
 // A capture file is immutable once its loop has renamed it into place, and
 // its name carries everything the warehouse records about it (see
 // internal/timelapsefiles), so the uploader's whole job is: find each settled
 // capture file, send it once, and remember that it was acknowledged. The app
-// stores the bytes and writes the row in the same request.
+// stores the bytes and writes the row in the same request. The one exception
+// to "exactly as written" is the card guard (redact.go): a moment whose tree
+// holds a card number is sent redacted or withheld.
 package screentimelapse
 
 import (
@@ -14,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,19 +107,36 @@ func OpenState(path string) (*State, error) {
 // Close releases the database.
 func (s *State) Close() error { return s.db.Close() }
 
-func (s *State) acknowledged() (map[string][2]int64, error) {
-	rows, err := common.Query(s.db.DB, "SELECT path, size_bytes, mtime_ns FROM acknowledged")
+// ackRecord is what the ledger holds for one path. contentSHA256 is the sha
+// of the bytes the app acknowledged, or withheldMarker for a file that was
+// deliberately never sent.
+type ackRecord struct {
+	size, mtimeNS int64
+	contentSHA256 string
+}
+
+func (a ackRecord) matches(c candidate) bool {
+	return a.size == c.size && a.mtimeNS == c.modified.UnixNano()
+}
+
+// withheldMarker stands in for the sha of a screenshot the card guard
+// withheld: recorded at the file's size and mtime, so it is not considered
+// again until it changes.
+const withheldMarker = "withheld: " + cardReason
+
+func (s *State) acknowledged() (map[string]ackRecord, error) {
+	rows, err := common.Query(s.db.DB, "SELECT path, size_bytes, mtime_ns, content_sha256 FROM acknowledged")
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string][2]int64, len(rows))
+	out := make(map[string]ackRecord, len(rows))
 	for _, row := range rows {
-		out[row.String("path")] = [2]int64{row.Int("size_bytes"), row.Int("mtime_ns")}
+		out[row.String("path")] = ackRecord{row.Int("size_bytes"), row.Int("mtime_ns"), row.String("content_sha256")}
 	}
 	return out, nil
 }
 
-func (s *State) acknowledge(c candidate, sha string, now time.Time) error {
+func (s *State) acknowledge(c *candidate, sha string, now time.Time) error {
 	_, err := s.db.DB.Exec(`INSERT INTO acknowledged (path, size_bytes, mtime_ns, content_sha256, acknowledged_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns,
@@ -135,11 +155,21 @@ type Summary struct {
 	Uploaded  int
 	Skipped   int // the app already held the file
 	Unsettled int // recognised, but still too young to send
+	Held      int // settled, waiting for its moment's tree to settle
+	Redacted  int // sent with its card number replaced or boxed out
+	Withheld  int // a screenshot of a card moment the box could not cover
 	Remaining int // waiting for a later run (the limit)
 	Deferred  bool
 }
 
-// Runner sends every unacknowledged settled capture file, newest first.
+// DefaultNoTreeWait is how long past the settle age a moment's screenshots
+// wait for a tree that has not appeared. The Mac gzips its tree in place after
+// the image is renamed into place, so a screenshot can settle before its
+// tree exists under the name the uploader reads.
+const DefaultNoTreeWait = 10 * time.Minute
+
+// Runner sends every unacknowledged settled capture file, newest first, one
+// moment (a device's screenshots and tree of one instant) at a time.
 type Runner struct {
 	Sources           []Source
 	Client            Uploader
@@ -148,16 +178,63 @@ type Runner struct {
 	Now               func() time.Time
 	Location          *time.Location // the capture host's zone
 	SettleAge         time.Duration
+	NoTreeWait        time.Duration
 	Limit             int
+	Codec             ImageCodec // default SystemCodec
 	BeforeUploadCheck func() string
 }
 
 type candidate struct {
-	source   Source
-	path     string
-	file     timelapsefiles.File
-	size     int64
-	modified time.Time
+	source     Source
+	path       string
+	file       timelapsefiles.File
+	size       int64
+	modified   time.Time
+	capturedAt time.Time
+	settled    bool
+	// editedWithheld: the guard withheld this file, and it has changed
+	// since. The edit (a manual redaction) is the human review, so it is
+	// sent as it now is, without a scan.
+	editedWithheld bool
+}
+
+// moment is every recognised file of one device's instant on disk: trees
+// have DisplayIndex 0, screenshots 1..n.
+type moment struct {
+	tree        *candidate
+	screenshots []*candidate
+	pending     []*candidate // settled and not acknowledged as they are
+}
+
+func (m *moment) newest() time.Time {
+	var newest time.Time
+	for _, c := range m.pending {
+		if c.modified.After(newest) {
+			newest = c.modified
+		}
+	}
+	return newest
+}
+
+// ready is whether the moment can be judged: its tree has settled, or it has
+// none and its screenshots are past the wait for one.
+func (m *moment) ready(now time.Time, settle, noTreeWait time.Duration) bool {
+	if m.tree != nil {
+		return m.tree.settled
+	}
+	for _, c := range m.screenshots {
+		if now.Sub(c.modified) < settle+noTreeWait {
+			return false
+		}
+	}
+	return true
+}
+
+// outgoing is one file to send and the bytes to send for it.
+type outgoing struct {
+	c        *candidate
+	content  []byte
+	redacted bool
 }
 
 // Sync runs one pass. It stops at the first failed upload -- the app or its
@@ -179,6 +256,10 @@ func (r *Runner) Sync() (Summary, error) {
 	if settle <= 0 {
 		settle = DefaultSettleAge
 	}
+	noTreeWait := r.NoTreeWait
+	if noTreeWait <= 0 {
+		noTreeWait = DefaultNoTreeWait
+	}
 	limit := r.Limit
 	if limit <= 0 {
 		limit = DefaultLimit
@@ -188,7 +269,7 @@ func (r *Runner) Sync() (Summary, error) {
 		return Summary{}, err
 	}
 	var summary Summary
-	var pending []candidate
+	moments := map[string]*moment{}
 	for _, source := range r.Sources {
 		entries, err := os.ReadDir(source.Dir)
 		if err != nil {
@@ -203,61 +284,223 @@ func (r *Runner) Sync() (Summary, error) {
 			if err != nil {
 				continue // renamed away between the listing and the stat
 			}
-			c := candidate{source: source, path: filepath.Join(source.Dir, entry.Name()), file: file, size: info.Size(), modified: info.ModTime()}
-			if now.Sub(c.modified) < settle {
+			c := &candidate{source: source, path: filepath.Join(source.Dir, entry.Name()), file: file, size: info.Size(), modified: info.ModTime()}
+			c.capturedAt = file.CapturedAt(loc, c.modified)
+			c.settled = now.Sub(c.modified) >= settle
+			key := source.Device + "\x00" + c.capturedAt.Format(time.RFC3339Nano)
+			m := moments[key]
+			if m == nil {
+				m = &moment{}
+				moments[key] = m
+			}
+			if file.Kind == timelapsefiles.AccessibilityTree {
+				m.tree = c
+			} else {
+				m.screenshots = append(m.screenshots, c)
+			}
+			if !c.settled {
 				summary.Unsettled++
 				continue
 			}
-			if ack, ok := acknowledged[c.path]; ok && ack == [2]int64{c.size, c.modified.UnixNano()} {
+			ack, ok := acknowledged[c.path]
+			if ok && ack.matches(*c) {
 				continue
 			}
-			pending = append(pending, c)
+			c.editedWithheld = ok && ack.contentSHA256 == withheldMarker
+			m.pending = append(m.pending, c)
 		}
 	}
-	sort.Slice(pending, func(i, j int) bool {
-		if !pending[i].modified.Equal(pending[j].modified) {
-			return pending[i].modified.After(pending[j].modified)
+	var ready []*moment
+	for _, m := range moments {
+		if len(m.pending) == 0 {
+			continue
 		}
-		return pending[i].path > pending[j].path
+		if !m.ready(now, settle, noTreeWait) {
+			summary.Held += len(m.pending)
+			continue
+		}
+		sortNewestFirst(m.pending)
+		ready = append(ready, m)
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		a, b := ready[i].newest(), ready[j].newest()
+		if !a.Equal(b) {
+			return a.After(b)
+		}
+		return ready[i].pending[0].path > ready[j].pending[0].path
 	})
-	if len(pending) > limit {
-		summary.Remaining = len(pending) - limit
-		pending = pending[:limit]
+	// The limit cuts between moments, never through one.
+	taken, files := 0, 0
+	for taken < len(ready) && (taken == 0 || files+len(ready[taken].pending) <= limit) {
+		files += len(ready[taken].pending)
+		taken++
 	}
-	if len(pending) > 0 && r.BeforeUploadCheck != nil {
+	for _, m := range ready[taken:] {
+		summary.Remaining += len(m.pending)
+	}
+	ready = ready[:taken]
+	if len(ready) > 0 && r.BeforeUploadCheck != nil {
 		if reason := r.BeforeUploadCheck(); reason != "" {
 			r.Logger.Warningf("Skipping screen timelapse upload: %s", reason)
 			summary.Deferred = true
-			summary.Remaining += len(pending)
+			summary.Remaining += files
 			return summary, nil
 		}
 	}
-	for index, c := range pending {
-		content, err := os.ReadFile(c.path)
+	left := files
+	for _, m := range ready {
+		sends, withheld, err := r.judgeMoment(m)
 		if err != nil {
-			summary.Remaining += len(pending) - index
-			return summary, fmt.Errorf("read %s: %w", c.path, err)
-		}
-		stored, err := r.Client.UploadScreenTimelapseFile(content, ingestclient.ScreenTimelapseFile{
-			Device:         c.source.Device,
-			SourceFilename: filepath.Base(c.path),
-			CapturedAt:     c.file.CapturedAt(loc, c.modified).Format(time.RFC3339),
-			ContentType:    c.file.MimeType,
-		})
-		if err != nil {
-			summary.Remaining += len(pending) - index
-			return summary, fmt.Errorf("upload %s: %w", c.path, err)
-		}
-		if err := r.State.acknowledge(c, sha256Hex(content), now); err != nil {
+			summary.Remaining += left
 			return summary, err
 		}
-		if stored.Skipped {
-			summary.Skipped++
-		} else {
-			summary.Uploaded++
+		for _, c := range withheld {
+			if err := r.State.acknowledge(c, withheldMarker, now); err != nil {
+				return summary, err
+			}
+			summary.Withheld++
+			left--
+		}
+		for _, out := range sends {
+			stored, err := r.Client.UploadScreenTimelapseFile(out.content, ingestclient.ScreenTimelapseFile{
+				Device:         out.c.source.Device,
+				SourceFilename: filepath.Base(out.c.path),
+				CapturedAt:     out.c.capturedAt.Format(time.RFC3339),
+				ContentType:    out.c.file.MimeType,
+			})
+			if err != nil {
+				summary.Remaining += left
+				return summary, fmt.Errorf("upload %s: %w", out.c.path, err)
+			}
+			if err := r.State.acknowledge(out.c, sha256Hex(out.content), now); err != nil {
+				return summary, err
+			}
+			left--
+			if out.redacted {
+				summary.Redacted++
+			}
+			if stored.Skipped {
+				summary.Skipped++
+			} else {
+				summary.Uploaded++
+			}
 		}
 	}
 	return summary, nil
+}
+
+// judgeMoment scans the moment's tree before anything of it is sent, and
+// returns the bytes to send for each pending file and the screenshots to
+// withhold. Any failure (a file unreadable, a codec error) fails the run
+// before a byte of the moment leaves, so the whole moment is judged again.
+func (r *Runner) judgeMoment(m *moment) ([]outgoing, []*candidate, error) {
+	var sends []outgoing
+	var judged []*candidate
+	for _, c := range m.pending {
+		if c.editedWithheld {
+			content, err := os.ReadFile(c.path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read %s: %w", c.path, err)
+			}
+			r.Logger.Infof("Sending edited withheld file %s", c.path)
+			sends = append(sends, outgoing{c: c, content: content})
+			continue
+		}
+		judged = append(judged, c)
+	}
+	asWritten := func() ([]outgoing, []*candidate, error) {
+		for _, c := range judged {
+			content, err := os.ReadFile(c.path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read %s: %w", c.path, err)
+			}
+			sends = append(sends, outgoing{c: c, content: content})
+		}
+		return sends, nil, nil
+	}
+	if len(judged) == 0 || m.tree == nil {
+		return asWritten()
+	}
+	treeContent, err := os.ReadFile(m.tree.path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s: %w", m.tree.path, err)
+	}
+	scan, err := scanTree(treeContent)
+	if err != nil {
+		return nil, nil, fmt.Errorf("redact %s: %w", m.tree.path, err)
+	}
+	if scan.unreadable {
+		// A tree that cannot be read cannot be checked: nothing of the
+		// moment goes up until the file is fixed.
+		for _, c := range judged {
+			r.Logger.Warningf("Withholding %s: its accessibility tree %s is unreadable", c.path, filepath.Base(m.tree.path))
+		}
+		return sends, judged, nil
+	}
+	if scan.hits == 0 {
+		return asWritten()
+	}
+	codec := r.Codec
+	if codec == nil {
+		codec = SystemCodec{}
+	}
+	images := make([]image.Image, len(m.screenshots))
+	sizes := make([]image.Point, len(m.screenshots))
+	for i, c := range m.screenshots {
+		content, err := os.ReadFile(c.path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read %s: %w", c.path, err)
+		}
+		img, err := codec.Decode(content, c.file.MimeType)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decode %s: %w", c.path, err)
+		}
+		images[i], sizes[i] = img, img.Bounds().Size()
+	}
+	boxes, placeErr := imageBoxes(scan, sizes)
+	var withheld []*candidate
+	for _, c := range judged {
+		if c == m.tree {
+			r.Logger.Infof("Redacting %s: %s", c.path, cardReason)
+			sends = append(sends, outgoing{c: c, content: scan.redacted, redacted: true})
+			continue
+		}
+		index := indexOf(m.screenshots, c)
+		switch {
+		case placeErr != nil:
+			r.Logger.Warningf("Withholding %s: %s (no sure box: %v)", c.path, cardReason, placeErr)
+			withheld = append(withheld, c)
+		case len(boxes[index]) == 0:
+			r.Logger.Warningf("Withholding %s: %s (the box does not reach this screen)", c.path, cardReason)
+			withheld = append(withheld, c)
+		default:
+			content, err := codec.Encode(fillBoxes(images[index], boxes[index]), c.file.MimeType)
+			if err != nil {
+				return nil, nil, fmt.Errorf("encode %s: %w", c.path, err)
+			}
+			r.Logger.Infof("Redacting %s: %s", c.path, cardReason)
+			sends = append(sends, outgoing{c: c, content: content, redacted: true})
+		}
+	}
+	return sends, withheld, nil
+}
+
+func indexOf(list []*candidate, c *candidate) int {
+	for i, item := range list {
+		if item == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func sortNewestFirst(list []*candidate) {
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].modified.Equal(list[j].modified) {
+			return list[i].modified.After(list[j].modified)
+		}
+		return list[i].path > list[j].path
+	})
 }
 
 func sha256Hex(content []byte) string {
