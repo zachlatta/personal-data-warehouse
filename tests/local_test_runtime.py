@@ -22,8 +22,15 @@ import uuid
 
 import psycopg2
 import psycopg2.sql
+import pytest
 
-from personal_data_warehouse.agent_runner import AgentContainerConfig, auth_docker_command
+from personal_data_warehouse.agent_runner import (
+    AgentContainerConfig,
+    AgentRunRequest,
+    AgentRunResult,
+    ContainerAgentRunner,
+    auth_docker_command,
+)
 from personal_data_warehouse.relations import physical_schema_names
 
 DEFAULT_POSTGRES_IMAGE = "ghcr.io/zachlatta/personal-data-warehouse-postgres-pgbackrest:latest"
@@ -34,6 +41,35 @@ _POSTGRES_URL_MARKER = "POSTGRES_DATABASE_URL"
 
 class LocalTestStartupError(RuntimeError):
     """A local integration prerequisite could not be made ready."""
+
+
+class SubscriptionAuthUnavailableError(LocalTestStartupError):
+    """A subscription provider login is missing or expired on this host."""
+
+
+_SUBSCRIPTION_AUTH_FAILURE_MARKERS = (
+    "failed to refresh token",
+    "your access token could not be refreshed",
+    "please log out and sign in again",
+    "please try signing in again",
+    "could not parse your authentication token",
+    "workspace routing discovery unauthorized (401)",
+    "oauth token has expired",
+    "refresh_token_expired",
+    "not logged in",
+    "missing codex agent credential",
+    "missing claude agent credential",
+)
+_SUBSCRIPTION_AUTH_EXPIRED_REASONS: dict[tuple[str, str], str] = {}
+
+
+def subscription_auth_login_message(provider: str) -> str:
+    normalized = provider.strip().lower()
+    display = "Codex" if normalized == "codex" else "Claude"
+    return (
+        f"{display} not logged in: run personal-data-warehouse-agent-auth login {normalized} "
+        f"(`uv run personal-data-warehouse-agent-auth login {normalized}`)"
+    )
 
 
 def refuse_live_warehouse(url: str, *, connect: Callable[..., object] = psycopg2.connect) -> None:
@@ -104,6 +140,7 @@ def preflight_subscription_auth(
     """Verify a provider login without exposing the status command's output."""
     provider = config.normalized_provider
     login_command = f"uv run personal-data-warehouse-agent-auth login {provider}"
+    login_message = subscription_auth_login_message(provider)
     try:
         volume = runner(
             ["docker", "volume", "inspect", config.auth_volume],
@@ -117,8 +154,8 @@ def preflight_subscription_auth(
             f"Could not inspect the subscription auth volume. Run `{login_command}` once, then retry."
         ) from error
     if int(getattr(volume, "returncode", 1)) != 0:
-        raise LocalTestStartupError(
-            f"Subscription auth volume {config.auth_volume!r} is missing. Run `{login_command}` once, then retry."
+        raise SubscriptionAuthUnavailableError(
+            f"Subscription auth volume {config.auth_volume!r} is missing. {login_message}"
         )
 
     try:
@@ -134,9 +171,44 @@ def preflight_subscription_auth(
             f"Could not verify {provider} subscription auth. Run `{login_command}` once, then retry."
         ) from error
     if int(getattr(status, "returncode", 1)) != 0:
-        raise LocalTestStartupError(
-            f"{provider} subscription auth is missing or invalid. Run `{login_command}` once, then retry."
-        )
+        raise SubscriptionAuthUnavailableError(login_message)
+
+
+def subscription_auth_failure_reason(
+    config: AgentContainerConfig,
+    result: AgentRunResult,
+) -> str | None:
+    """Return a skip reason when a live agent run failed because its login expired."""
+    if result.status == "completed":
+        return None
+    diagnostics = [result.error]
+    for event in result.events:
+        if event.stream == "stderr" or event.event_type in {"error", "turn.failed", "fatal"}:
+            diagnostics.append(event.text)
+    haystack = "\n".join(diagnostics).lower()
+    if any(marker in haystack for marker in _SUBSCRIPTION_AUTH_FAILURE_MARKERS):
+        return f"{subscription_auth_login_message(config.normalized_provider)} (login expired)"
+    return None
+
+
+def run_subscription_smoke(
+    config: AgentContainerConfig,
+    request: AgentRunRequest,
+    *,
+    runner_factory: Callable[[AgentContainerConfig], object] = ContainerAgentRunner,
+    expired_cache: MutableMapping[tuple[str, str], str] = _SUBSCRIPTION_AUTH_EXPIRED_REASONS,
+) -> AgentRunResult:
+    """Run a subscription smoke test, skipping if the provider login has expired."""
+    cache_key = (config.auth_volume, config.normalized_provider)
+    cached_reason = expired_cache.get(cache_key)
+    if cached_reason is not None:
+        pytest.skip(cached_reason)
+    result = runner_factory(config).run(request)
+    reason = subscription_auth_failure_reason(config, result)
+    if reason is not None:
+        expired_cache[cache_key] = reason
+        pytest.skip(reason)
+    return result
 
 
 def callable_requires_postgres(

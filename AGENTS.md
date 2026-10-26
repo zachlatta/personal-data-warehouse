@@ -18,8 +18,10 @@ Development practices:
   when `POSTGRES_DATABASE_URL` is absent, reuses an explicitly configured test URL (refusing
   one whose database already holds the warehouse: `timeline.events` or another managed table
   with rows), builds/reuses
-  the managed agent image, and locally runs the subscription smokes. First-time auth is
-  `uv run personal-data-warehouse-agent-auth login codex` (or `claude` for that provider). Use
+  the managed agent image, and runs the subscription smokes when logged in (skipping them when
+  the provider login is missing or expired; log in with
+  `uv run personal-data-warehouse-agent-auth login codex` — or `claude` — and run
+  `uv run pytest tests/test_agent_runner_live.py -k subscription` to run them on purpose). Use
   `uv run pytest --unit-only` only as an explicit faster iteration, not final verification;
   missing environment variables never opt tests out. No production database URL is necessary or
   recommended for tests.

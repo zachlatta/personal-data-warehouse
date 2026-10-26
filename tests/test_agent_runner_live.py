@@ -12,12 +12,16 @@ from personal_data_warehouse.agent_runner import (
     DEFAULT_AGENT_REASONING_EFFORT,
     AgentContainerConfig,
     AgentRunRequest,
-    ContainerAgentRunner,
     ensure_agent_image,
     write_builtin_cli_tools,
 )
 from personal_data_warehouse.agent_tool_proxy import WarehouseAppConfig, run_agent_tool_proxy
-from tests.local_test_runtime import LocalTestStartupError, preflight_subscription_auth
+from tests.local_test_runtime import (
+    LocalTestStartupError,
+    SubscriptionAuthUnavailableError,
+    preflight_subscription_auth,
+    run_subscription_smoke,
+)
 from tests.warehouse_app_stub import StubWarehouseApp
 
 
@@ -69,6 +73,8 @@ def subscription_agent_config(tmp_path_factory):
     config = live_agent_config(tmp_path_factory.mktemp("subscription-agent"))
     try:
         preflight_subscription_auth(config)
+    except SubscriptionAuthUnavailableError as error:
+        pytest.skip(str(error))
     except LocalTestStartupError as error:
         pytest.fail(str(error), pytrace=False)
     return config
@@ -244,7 +250,8 @@ def test_live_agent_pdw_cli_cannot_reach_blocked_tools(tmp_path) -> None:
 def test_live_agent_subscription_smoke_returns_schema_json(subscription_agent_config) -> None:
     config = subscription_agent_config
 
-    result = ContainerAgentRunner(config).run(
+    result = run_subscription_smoke(
+        config,
         AgentRunRequest(
             prompt='Return JSON exactly like {"ok":true,"message":"subscription smoke test"}.',
             schema={
@@ -257,7 +264,7 @@ def test_live_agent_subscription_smoke_returns_schema_json(subscription_agent_co
                 "required": ["ok", "message"],
             },
             task_type="live_subscription_smoke_test",
-        )
+        ),
     )
 
     assert result.status == "completed", result.error
@@ -269,7 +276,8 @@ def test_live_agent_subscription_smoke_returns_schema_json(subscription_agent_co
 def test_live_agent_can_use_builtin_cli_tool_before_final_json(subscription_agent_config) -> None:
     config = subscription_agent_config
 
-    result = ContainerAgentRunner(config).run(
+    result = run_subscription_smoke(
+        config,
         AgentRunRequest(
             prompt=(
                 "Use bash to write a file named candidate.json containing exactly "
@@ -287,7 +295,7 @@ def test_live_agent_can_use_builtin_cli_tool_before_final_json(subscription_agen
                 "required": ["ok", "message"],
             },
             task_type="live_cli_tool_smoke_test",
-        )
+        ),
     )
 
     assert result.status == "completed", result.error

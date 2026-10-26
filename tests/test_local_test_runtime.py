@@ -8,10 +8,16 @@ import uuid
 
 import pytest
 
-from personal_data_warehouse.agent_runner import AgentContainerConfig
+from personal_data_warehouse.agent_runner import (
+    AgentContainerConfig,
+    AgentRunEvent,
+    AgentRunRequest,
+    AgentRunResult,
+)
 from tests.local_test_runtime import (
     DEFAULT_POSTGRES_IMAGE,
     DisposableDatabases,
+    SubscriptionAuthUnavailableError,
     auto_worker_count,
     OWNED_POSTGRES_URL_ENV,
     POSTGRES_EXTENSIONS,
@@ -22,7 +28,9 @@ from tests.local_test_runtime import (
     preflight_subscription_auth,
     provisions_template,
     refuse_live_warehouse,
+    run_subscription_smoke,
     schedule_key,
+    subscription_auth_failure_reason,
     template_provisioner,
     subscription_tests_enabled,
     use_worker_database,
@@ -464,10 +472,11 @@ def test_subscription_auth_preflight_missing_or_invalid_volume_gives_exact_login
 
     config = AgentContainerConfig(image="pdw-agent:test", provider="claude", auth_volume="missing")
 
-    with pytest.raises(LocalTestStartupError) as exc_info:
+    with pytest.raises(SubscriptionAuthUnavailableError) as exc_info:
         preflight_subscription_auth(config, runner=missing_volume)
 
     message = str(exc_info.value)
+    assert "Claude not logged in: run personal-data-warehouse-agent-auth login claude" in message
     assert "uv run personal-data-warehouse-agent-auth login claude" in message
     assert "credential contents" not in message
 
@@ -483,12 +492,152 @@ def test_subscription_auth_preflight_invalid_status_gives_exact_login_command() 
 
     config = AgentContainerConfig(image="pdw-agent:test", provider="codex", auth_volume="pdw-agent-auth")
 
-    with pytest.raises(LocalTestStartupError) as exc_info:
+    with pytest.raises(SubscriptionAuthUnavailableError) as exc_info:
         preflight_subscription_auth(config, runner=invalid_status)
 
     message = str(exc_info.value)
+    assert "Codex not logged in: run personal-data-warehouse-agent-auth login codex" in message
     assert "uv run personal-data-warehouse-agent-auth login codex" in message
     assert "credential contents" not in message
+
+
+def test_subscription_auth_preflight_docker_subprocess_failure_does_not_masquerade_as_missing_login() -> None:
+    def broken_docker(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, timeout=30)
+
+    config = AgentContainerConfig(image="pdw-agent:test", provider="codex", auth_volume="pdw-agent-auth")
+
+    with pytest.raises(LocalTestStartupError) as exc_info:
+        preflight_subscription_auth(config, runner=broken_docker)
+
+    assert not isinstance(exc_info.value, SubscriptionAuthUnavailableError)
+
+
+def _agent_result(
+    *,
+    status: str = "error",
+    error: str = "agent container exited with code 1",
+    events: list[AgentRunEvent] | None = None,
+) -> AgentRunResult:
+    now = datetime.now(tz=UTC)
+    return AgentRunResult(
+        run_id="run-1",
+        provider="codex",
+        model="gpt-6.1-sol",
+        task_type="live_subscription_smoke_test",
+        subject_id="",
+        prompt_version="",
+        input_sha256="sha",
+        status=status,
+        final_output_json={"ok": True} if status == "completed" else {},
+        error=error,
+        exit_code=0 if status == "completed" else 1,
+        started_at=now,
+        completed_at=now,
+        events=events or [],
+    )
+
+
+def test_subscription_auth_failure_reason_detects_expired_codex_login_and_ignores_model_or_tool_text() -> None:
+    now = datetime.now(tz=UTC)
+    config = AgentContainerConfig(image="pdw-agent:test", provider="codex", auth_volume="pdw-agent-auth")
+
+    expired = _agent_result(
+        error="agent container exited with code 1: workspace routing discovery unauthorized (401)",
+        events=[
+            AgentRunEvent(
+                event_index=0,
+                stream="stderr",
+                event_type="text",
+                event_json={"text": "ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again."},
+                text="ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.",
+                created_at=now,
+            )
+        ],
+    )
+    reason = subscription_auth_failure_reason(config, expired)
+    assert reason is not None
+    assert "Codex not logged in: run personal-data-warehouse-agent-auth login codex" in reason
+    assert "uv run personal-data-warehouse-agent-auth login codex" in reason
+
+    # A tool output or assistant message mentioning "not logged in" or "401" must not turn a real failure into a skip.
+    non_auth = _agent_result(
+        error="agent did not produce parseable final JSON",
+        events=[
+            AgentRunEvent(
+                event_index=0,
+                stream="stdout",
+                event_type="item.completed",
+                event_json={
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "aggregated_output": "Not logged in; workspace routing discovery unauthorized (401)",
+                    },
+                },
+                text='{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"Not logged in; workspace routing discovery unauthorized (401)"}}',
+                created_at=now,
+            ),
+            AgentRunEvent(
+                event_index=1,
+                stream="stdout",
+                event_type="item.completed",
+                event_json={
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "Failed to refresh token: Your access token could not be refreshed.",
+                    },
+                },
+                text='{"type":"item.completed","item":{"type":"agent_message","text":"Failed to refresh token: Your access token could not be refreshed."}}',
+                created_at=now,
+            ),
+        ],
+    )
+    assert subscription_auth_failure_reason(config, non_auth) is None
+    assert subscription_auth_failure_reason(config, _agent_result(status="completed", error="")) is None
+
+
+def test_run_subscription_smoke_skips_and_caches_expired_login_without_rerunning_container() -> None:
+    config = AgentContainerConfig(image="pdw-agent:test", provider="codex", auth_volume="pdw-agent-auth")
+    request = AgentRunRequest(prompt="smoke", schema={"type": "object"})
+    runs = 0
+    expired_cache: dict[tuple[str, str], str] = {}
+
+    class FakeRunner:
+        def __init__(self, _config: AgentContainerConfig) -> None:
+            pass
+
+        def run(self, _request: AgentRunRequest) -> AgentRunResult:
+            nonlocal runs
+            runs += 1
+            return _agent_result(
+                error="agent container exited with code 1: workspace routing discovery unauthorized (401)"
+            )
+
+    with pytest.raises(pytest.skip.Exception) as first_skip:
+        run_subscription_smoke(config, request, runner_factory=FakeRunner, expired_cache=expired_cache)
+    assert "Codex not logged in: run personal-data-warehouse-agent-auth login codex" in str(first_skip.value)
+    assert runs == 1
+
+    with pytest.raises(pytest.skip.Exception) as second_skip:
+        run_subscription_smoke(config, request, runner_factory=FakeRunner, expired_cache=expired_cache)
+    assert "Codex not logged in: run personal-data-warehouse-agent-auth login codex" in str(second_skip.value)
+    assert runs == 1
+
+
+def test_run_subscription_smoke_returns_result_for_valid_or_non_auth_runs() -> None:
+    config = AgentContainerConfig(image="pdw-agent:test", provider="codex", auth_volume="pdw-agent-auth")
+    request = AgentRunRequest(prompt="smoke", schema={"type": "object"})
+    expected = _agent_result(status="completed", error="")
+
+    result = run_subscription_smoke(
+        config,
+        request,
+        runner_factory=lambda _config: type("R", (), {"run": lambda self, _req: expected})(),
+        expired_cache={},
+    )
+    assert result is expected
 
 
 def test_callable_postgres_detection_follows_same_module_helpers() -> None:

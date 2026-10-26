@@ -159,11 +159,13 @@ uv run dg dev
 Postgres image on a random loopback port, runs the database-backed tests, and
 removes the container afterward. An explicitly configured test URL is reused.
 The same command builds or reuses the managed agent image and runs the real
-subscription smokes by default on a local machine. First-time setup is one
-command (use `claude` instead when `AGENT_PROVIDER=claude`):
+subscription smokes when logged in, skipping them when the provider login is
+missing or expired. Log in and run them on purpose with (use `claude` instead
+when `AGENT_PROVIDER=claude`):
 
 ```bash
 uv run personal-data-warehouse-agent-auth login codex
+uv run pytest tests/test_agent_runner_live.py -k subscription
 ```
 
 For a deliberately faster iteration that excludes Postgres and Docker/agent
@@ -1617,8 +1619,10 @@ CLI changes the tag and the next run rebuilds, rather than silently keeping a st
 
 The canonical `uv run pytest` suite includes the Docker agent integrations. It builds or reuses
 the managed image, verifies both agent CLIs and Docker isolation, exercises the real `pdw` proxy
-path and allowlist, and locally runs two real subscription-backed agent canaries after checking the
-durable auth volume. If that preflight fails, run the one-time login command shown above. Generic CI
+path and allowlist, and locally runs two real subscription-backed agent canaries when the durable
+auth volume has a valid login (skipping them with the login command when the login is missing or
+expired; run `uv run personal-data-warehouse-agent-auth login codex` and
+`uv run pytest tests/test_agent_runner_live.py -k subscription` to run them on purpose). Generic CI
 runs the four hermetic Docker integrations but leaves the subscription canaries off unless
 `RUN_LIVE_AGENT_TESTS=1` is explicit. A local `RUN_LIVE_AGENT_TESTS=0` is an intentional, reported
 opt-out; `uv run pytest --unit-only` is the explicit opt-out from every local integration.
