@@ -2666,6 +2666,18 @@
       "comment": "Does a restorable backup exist, and is WAL still shipping. Written by the pgBackRest loop inside the Postgres container, because the Dagster collector runs elsewhere and cannot ask pgbackrest anything - which is why backups appeared in no health surface until 2026-08-26, when production had no valid backup for a day while every pipeline read green. Archiving healthy with no base backup is a real and separately reported state: you cannot restore from WAL alone. Timestamps are NULL when absent, translating the warehouse's 1970-01-01 epoch sentinel. wal_ready_count is the archive backlog in unarchived segments: pg_stat_archiver cannot express it, and a queue that reached 5,910 segments over two days was invisible because WAL was shipping, just slower than it was produced."
     },
     {
+      "id": "marts_search_request_latency",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "search_request_latency",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Real search latency. Rolling 24h/7d traffic excluding benchmark and contract-audit clients, including failures; p50/p90 target 2000 ms. Slowest-leg and saturation mixes count requests over 2 s using each request's host pressure. idle_slow_share divides idle slow requests by all slow requests; attention at 10% with at least five. Fewer than 20 requests reads no_data; missing pressure is unmeasured."
+    },
+    {
       "id": "marts_search_benchmark",
       "kind": "view",
       "layer": "marts",
@@ -2675,7 +2687,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "The latest weekly search benchmark as a health row, per retrieval mode. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. history_runs, previous_collected_at, latency_p50_change_ms and mrr_change compare it with the prior retained run. The default remains all tiers and status is judged on its p50 (2-second goal) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
+      "comment": "Weekly search latency and quality. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. history_runs, previous_collected_at, latency_p50_change_ms and mrr_change compare it with the prior retained run. The default remains all tiers and status is judged on its p50 and p90 (2-second goals) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
     },
     {
       "id": "marts_search_benchmark_history",

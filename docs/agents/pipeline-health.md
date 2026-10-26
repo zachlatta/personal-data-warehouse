@@ -138,6 +138,7 @@ config read again, or posts a heartbeat without sourcing the lib, and
 | 3b — priority tiers | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the five tiers; an `unclassified` row is `failing` |
 | 3c — agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier (C3), measured daily from their own sessions |
 | 3d — search benchmark | `marts_ops.search_benchmark` + `search_benchmark_history` | weekly p50/p90 search latency and labeled MRR through the search tool, with retained trend (C8) |
+| 3d — real search latency | `marts_ops.search_request_latency` | rolling 24-hour and 7-day real-traffic p50/p90, errors, slow legs and per-search saturation (C6) |
 | 3e — search internals | `marts_ops.search_health` | chunk/vector convergence, orphan completeness, BM25 integrity, and shared-buffer residency |
 | 4 — integrity | `marts_ops.collation_health` | did the sort order move under us, and did anything break |
 

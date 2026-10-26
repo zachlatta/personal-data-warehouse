@@ -35,6 +35,7 @@ from personal_data_warehouse.search_benchmark import (
 )
 from personal_data_warehouse.search_benchmark_runner import (
     LATENCY_P50_TARGET_MS,
+    LATENCY_P90_TARGET_MS,
     MRR_FLOOR,
     SHORT_PROBE_QUERIES,
 )
@@ -217,8 +218,57 @@ def c5_layering() -> Verdict:
                    f"attachment raw-read exemptions={len(exempt_entries)}, 'pending marts_*' debts={pending}")
 
 
-def c6_performance() -> Verdict:
-    title = "responds fast (search p50 < 2s)"
+def _real_traffic_latency() -> tuple[str, str]:
+    """Grade the two rolling windows using pressure sampled during each search."""
+    rows = pdw_sql(
+        "real search latency and host pressure",
+        'SELECT "window", status, requests, errors, p50_ms, p90_ms, share_over_2s, '
+        "slow_requests, idle_slow_requests, idle_slow_share, saturation_mix, slowest_leg_mix "
+        "FROM marts_ops.search_request_latency "
+        "WHERE \"window\" IN ('rolling_24h', 'rolling_7d') ORDER BY \"window\" LIMIT 2",
+    )
+    by_window = {row.get("window"): row for row in rows or []}
+    statuses: list[str] = []
+    evidence: list[str] = []
+    for window in ("rolling_24h", "rolling_7d"):
+        row = by_window.get(window)
+        if row is None:
+            statuses.append(YELLOW)
+            evidence.append(f"{window}: unavailable")
+            continue
+        measured = (row.get("status") not in ("no_data", "unknown")
+                    and row.get("requests", 0) >= 20
+                    and row.get("p50_ms") is not None and row.get("p90_ms") is not None)
+        if not measured:
+            status = YELLOW
+        elif row["p50_ms"] >= LATENCY_P50_TARGET_MS:
+            status = RED
+        elif (row["p90_ms"] > LATENCY_P90_TARGET_MS
+              or (row.get("idle_slow_requests", 0) >= 5
+                  and (row.get("idle_slow_share") or 0) >= 0.1)
+              or row.get("status") != "ok"):
+            status = YELLOW
+        else:
+            status = GREEN
+        statuses.append(status)
+        evidence.append(
+            f"{window}: {row.get('status')}, requests={row.get('requests')}, "
+            f"errors={row.get('errors')}, p50={row.get('p50_ms')}ms, "
+            f"p90={row.get('p90_ms')}ms (target {LATENCY_P90_TARGET_MS}ms), "
+            f"share over 2s={row.get('share_over_2s')}, "
+            f"idle slow={row.get('idle_slow_requests')}/{row.get('slow_requests')} "
+            f"(share {row.get('idle_slow_share')}); per-search host pressure among slow searches: "
+            f"{row.get('saturation_mix')}; slowest legs: {row.get('slowest_leg_mix')}"
+        )
+    return worst(statuses), "; ".join(evidence)
+
+
+def c6_performance(*, skip_probes: bool = False) -> Verdict:
+    title = "responds fast (search p50 and p90 within 2s)"
+    real_status, real_evidence = _real_traffic_latency()
+    if skip_probes:
+        return Verdict("C6", title, worst([YELLOW, real_status]),
+                       f"latency probe skipped; real traffic: {real_evidence}")
     scopes: dict[str, tuple[str, ...]] = {
         "all tiers": (),
         "attention (self,direct,cc)": SEARCH_ATTENTION_PRIORITIES,
@@ -250,7 +300,7 @@ def c6_performance() -> Verdict:
         # An invalid response is a search failure, not a very fast latency
         # sample. Keep it in the grade even when other probes succeeded.
         scope_statuses.append(RED if errors[name] else _latency_status(p50s[name]))
-    status = worst(scope_statuses)
+    status = worst([*scope_statuses, real_status])
 
     # This row sampled host pressure while ITS older persisted probes ran. It
     # is useful context, but cannot establish what the host was doing during
@@ -300,7 +350,8 @@ def c6_performance() -> Verdict:
         "C6",
         title,
         status,
-        f"paired serial hybrid probes; {'; '.join(scope_evidence)}; {pressure}; {host}",
+        f"paired serial hybrid probes; {'; '.join(scope_evidence)}; {pressure}; {host}; "
+        f"real traffic: {real_evidence}",
     )
 
 
@@ -762,11 +813,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     verdicts: list[Verdict] = []
     for check in CHECKS:
-        if args.skip_latency and check is c6_performance:
-            verdicts.append(Verdict("C6", "responds fast (search p50 < 2s)", YELLOW, "latency probe skipped"))
-            continue
         try:
-            verdicts.append(check())
+            verdicts.append(c6_performance(skip_probes=True)
+                            if args.skip_latency and check is c6_performance else check())
         except Exception as error:  # noqa: BLE001 - one broken check must not hide the rest
             verdicts.append(Verdict(check.__name__[:3].upper().rstrip("_"), check.__name__, YELLOW, f"check crashed: {error}"))
     if args.json:

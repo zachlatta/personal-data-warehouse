@@ -243,7 +243,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_feed.sessions, one row per sitting in the feed.
             # +1 marts: marts_screen_timelapse.active_screens, the frames where
             # a device was in use and what was on them.
-            "marts": 70,
+            # +1 marts: rolling real-traffic search latency and saturation (C6).
+            "marts": 71,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -778,7 +779,6 @@ _GUIDE_NON_COLUMN_PROSE_TOKENS = frozenset(
         "describe_table",
         "download_url",
         "get_object",
-        "requests",
         "urllib",
         "wget",
         # SQL types and prose terms

@@ -18,6 +18,7 @@ from psycopg2.extras import Json, execute_values
 
 from personal_data_warehouse.search_benchmark_runner import (
     LATENCY_P50_TARGET_MS,
+    LATENCY_P90_TARGET_MS,
     MRR_FLOOR,
     SATURATION_CPU_SOME_AVG10,
     SATURATION_IO_FULL_AVG10,
@@ -7040,8 +7041,71 @@ class PostgresWarehouse:
             """,
         )
 
+        # C6: read-time windows over recorded real traffic. The timestamp index
+        # bounds the shared scan to seven days. Errors remain latency samples;
+        # synthetic probes never get to improve (or worsen) the traffic grade.
+        self._ensure_view(
+            "marts_search_request_latency",
+            f"""
+            CREATE OR REPLACE VIEW @marts_search_request_latency AS
+            WITH windows("window", span) AS (
+                VALUES ('rolling_24h', interval '24 hours'),
+                       ('rolling_7d', interval '7 days')
+            ), traffic AS MATERIALIZED (
+                SELECT occurred_at, duration_ms, status, slowest_leg,
+                       CASE
+                           WHEN io_pressure_full_avg10 < 0 OR cpu_pressure_some_avg10 < 0
+                             OR load_1m < 0 OR cpu_count < 0 THEN 'unmeasured'
+                           WHEN io_pressure_full_avg10 >= {SATURATION_IO_FULL_AVG10} THEN 'io_bound'
+                           WHEN cpu_pressure_some_avg10 >= {SATURATION_CPU_SOME_AVG10}
+                             OR load_1m >= cpu_count THEN 'cpu_bound'
+                           ELSE 'idle'
+                       END AS saturation
+                FROM @search_request_timings
+                WHERE occurred_at >= now() - interval '7 days'
+                  AND occurred_at <= now()
+                  AND client NOT IN ('search-benchmark', 'contract-audit')
+            ), windowed AS MATERIALIZED (
+                SELECT w."window", t.* FROM windows w
+                JOIN traffic t ON t.occurred_at >= now() - w.span
+            ), measured AS (
+                SELECT w."window", count(t.duration_ms) AS requests,
+                       count(*) FILTER (WHERE t.status = 'error') AS errors,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY t.duration_ms) AS p50_ms,
+                       percentile_cont(0.9) WITHIN GROUP (ORDER BY t.duration_ms) AS p90_ms,
+                       count(*) FILTER (WHERE t.duration_ms > 2000) AS slow_requests,
+                       count(*) FILTER (WHERE t.duration_ms > 2000 AND t.saturation = 'idle') AS idle_slow_requests
+                FROM windows w LEFT JOIN windowed t USING ("window")
+                GROUP BY w."window"
+            ), saturation_counts AS (
+                SELECT "window", saturation, count(*) AS n
+                FROM windowed WHERE duration_ms > 2000 GROUP BY "window", saturation
+            ), leg_counts AS (
+                SELECT "window", COALESCE(NULLIF(slowest_leg, ''), 'unmeasured') AS leg, count(*) AS n
+                FROM windowed WHERE duration_ms > 2000 GROUP BY "window", 2
+            ), rated AS (
+                SELECT m.*,
+                       slow_requests::numeric / NULLIF(requests, 0) AS share_over_2s,
+                       idle_slow_requests::numeric / NULLIF(slow_requests, 0) AS idle_slow_share,
+                       COALESCE((SELECT jsonb_object_agg(saturation, n) FROM saturation_counts s
+                                 WHERE s."window" = m."window"), '{{}}'::jsonb) AS saturation_mix,
+                       COALESCE((SELECT jsonb_object_agg(leg, n) FROM leg_counts l
+                                 WHERE l."window" = m."window"), '{{}}'::jsonb) AS slowest_leg_mix
+                FROM measured m
+            )
+            SELECT *, CASE
+                       WHEN requests < 20 THEN 'no_data'
+                       WHEN p50_ms > {LATENCY_P50_TARGET_MS}
+                         OR p90_ms > {LATENCY_P90_TARGET_MS}
+                         OR (idle_slow_requests >= 5 AND idle_slow_share >= 0.10) THEN 'attention'
+                       ELSE 'ok'
+                   END AS status
+            FROM rated
+            """,
+        )
+
         # C8 measured: the weekly benchmark's latency and labeled quality as a
-        # health row, judged against the goal (p50 under two seconds) and the
+        # health row, judged against the goals (p50 and p90 within two seconds) and the
         # MRR floor. A row older than ten days reads unknown -- the asset is
         # weekly and a benchmark that stopped running must not keep its last
         # green.
@@ -7053,7 +7117,8 @@ class PostgresWarehouse:
                    CASE
                        WHEN collected_at = {epoch} OR now() - collected_at > interval '10 days' THEN 'unknown'
                        WHEN probe_queries = 0 THEN 'no_data'
-                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS} THEN 'attention'
+                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS}
+                         OR latency_p90_ms > {LATENCY_P90_TARGET_MS} THEN 'attention'
                        WHEN labeled_cases > 0 AND mrr_milli < {int(MRR_FLOOR * 1000)} THEN 'attention'
                        ELSE 'ok'
                    END AS status,
@@ -7081,7 +7146,7 @@ class PostgresWarehouse:
                    io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count,
                    -- C6: was the host being used while the probes ran? io_bound
                    -- and cpu_bound say the machine was busy; `idle` is the case
-                   -- C6 says to fix FIRST -- slow (p50 over the target) on a
+                   -- C6 says to fix FIRST -- slow (p50 or p90 over target) on a
                    -- machine that was doing nothing, so the query was never
                    -- allowed to use the host. -1 in any sample is unmeasured.
                    CASE
@@ -7090,7 +7155,8 @@ class PostgresWarehouse:
                        WHEN io_pressure_full_avg10 >= {SATURATION_IO_FULL_AVG10} THEN 'io_bound'
                        WHEN cpu_pressure_some_avg10 >= {SATURATION_CPU_SOME_AVG10}
                             OR load_1m >= cpu_count THEN 'cpu_bound'
-                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS} THEN 'idle'
+                       WHEN latency_p50_ms > {LATENCY_P50_TARGET_MS}
+                         OR latency_p90_ms > {LATENCY_P90_TARGET_MS} THEN 'idle'
                        ELSE 'ok'
                    END AS saturation,
                    (SELECT count(*) FROM @search_benchmark_history h

@@ -123,6 +123,7 @@ func TestPipelinesAPIReadsTheMartsViews(t *testing.T) {
 		warehouse.SQLRelation("marts_agent_usage"),
 		warehouse.SQLRelation("marts_notification_health"),
 		warehouse.SQLRelation("marts_search_benchmark"),
+		warehouse.SQLRelation("marts_search_request_latency"),
 	} {
 		if !strings.Contains(joined, relation) {
 			t.Fatalf("expected a query against %s, got:\n%s", relation, joined)
@@ -549,6 +550,7 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 		{"marts_timeline_adapter_health", "adapters"},
 		{"marts_collation_health", "collation"},
 		{"marts_search_health", "search"},
+		{"marts_search_request_latency", "search_latency"},
 		{"marts_ops_slack_conversation_health", "slack"},
 		{"marts_ops_plaid_item_health", "plaid"},
 		{"marts_pgbackrest_health", "backups"},
@@ -610,5 +612,59 @@ func TestContextIsOneToolOnEverySurface(t *testing.T) {
 	}
 	if strings.Contains(searchDescription, "through query") {
 		t.Fatalf("the search description must point at the context tool, not hand-written SQL")
+	}
+}
+
+func TestPipelinesAPIReportsRealSearchLatency(t *testing.T) {
+	runner := newPipelinesTestRunner()
+	runner.argResults[warehouse.SQLRelation("marts_search_request_latency")] = query.RawResult{
+		Rows: []map[string]any{
+			{"window": "rolling_24h", "status": "attention", "requests": int64(100), "errors": int64(2),
+				"p50_ms": 1500, "p90_ms": 8800, "share_over_2s": 0.48, "slow_requests": int64(48),
+				"idle_slow_requests": int64(8), "idle_slow_share": 8.0 / 48,
+				"saturation_mix": map[string]any{"idle": 8, "io_bound": 40}, "slowest_leg_mix": map[string]any{"lexical": 48}},
+			{"window": "rolling_7d", "status": "no_data", "requests": int64(19), "p50_ms": nil, "p90_ms": nil},
+		},
+	}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/pipelines", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var payload struct {
+		Latency []map[string]any `json:"search_latency"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Latency) != 2 || payload.Latency[0]["p90_ms"] != float64(8800) || payload.Latency[1]["status"] != "no_data" {
+		t.Fatalf("expected both real-traffic windows with their grades, got %s", body)
+	}
+	if payload.Latency[0]["saturation_mix"].(map[string]any)["idle"] != float64(8) {
+		t.Fatalf("per-search host evidence was lost: %s", body)
+	}
+}
+
+func TestPipelinesAPIKeepsOtherRowsWhenSearchLatencyViewIsMissing(t *testing.T) {
+	runner := newPipelinesTestRunner()
+	runner.argErrs = map[string]error{
+		warehouse.SQLRelation("marts_search_request_latency"): errors.New(`ERROR: relation "marts_ops.search_request_latency" does not exist (SQLSTATE 42P01)`),
+	}
+	srv := newTimelineTestServer(t, runner)
+	resp, body := timelineGET(t, srv, "/api/pipelines", true)
+	var payload struct {
+		Pipelines []map[string]any `json:"pipelines"`
+		Latency   []map[string]any `json:"search_latency"`
+	}
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &payload) != nil || len(payload.Pipelines) != 2 || payload.Latency == nil || len(payload.Latency) != 0 {
+		t.Fatalf("expected the existing dashboard and an empty warming latency section, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestPipelinesPageExplainsRealTrafficLatency(t *testing.T) {
+	for _, text := range []string{"Real searches · ", "fewer than 20 requests", "p50 and p90 targets: 2s", "of searches over 2s", "state.search_latency", "Slowest leg", "host pressure"} {
+		if !strings.Contains(pipelinesPageHTML, text) {
+			t.Errorf("real-traffic latency page is missing %q", text)
+		}
 	}
 }

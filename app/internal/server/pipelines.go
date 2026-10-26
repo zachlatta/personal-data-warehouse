@@ -171,6 +171,13 @@ SELECT mode, status, probe_queries, latency_p50_ms, latency_p90_ms, latency_max_
 FROM ` + warehouse.SQLRelation("marts_search_benchmark") + `
 ORDER BY mode`
 
+// Contract C6: rolling real searches, excluding benchmark and audit probes.
+var pipelineSearchLatencySQL = `
+SELECT "window", status, requests, errors, p50_ms, p90_ms, share_over_2s,
+       slow_requests, idle_slow_requests, idle_slow_share, saturation_mix, slowest_leg_mix
+FROM ` + warehouse.SQLRelation("marts_search_request_latency") + `
+ORDER BY "window"`
+
 var pipelineSearchHealthSQL = `
 SELECT component, status, model, configured, pgvector_available,
        timeline_max_seq, chunk_cursor_seq, seq_lag, caught_up,
@@ -204,20 +211,21 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		if isMissingRelation(err) {
 			s.logger.InfoContext(r.Context(), "pipeline health views not provisioned yet", "error", err)
 			writeJSON(w, map[string]any{
-				"pipelines":  []map[string]any{},
-				"tables":     []map[string]any{},
-				"marts":      []map[string]any{},
-				"adapters":   []map[string]any{},
-				"collation":  []map[string]any{},
-				"search":     []map[string]any{},
-				"benchmark":  []map[string]any{},
-				"priority":   []map[string]any{},
-				"agents":     []map[string]any{},
-				"slack":      []map[string]any{},
-				"plaid":      []map[string]any{},
-				"backups":    []map[string]any{},
-				"server_now": s.now().UTC().Format(time.RFC3339Nano),
-				"pending":    true,
+				"pipelines":      []map[string]any{},
+				"tables":         []map[string]any{},
+				"marts":          []map[string]any{},
+				"adapters":       []map[string]any{},
+				"collation":      []map[string]any{},
+				"search":         []map[string]any{},
+				"benchmark":      []map[string]any{},
+				"search_latency": []map[string]any{},
+				"priority":       []map[string]any{},
+				"agents":         []map[string]any{},
+				"slack":          []map[string]any{},
+				"plaid":          []map[string]any{},
+				"backups":        []map[string]any{},
+				"server_now":     s.now().UTC().Format(time.RFC3339Nano),
+				"pending":        true,
 			})
 			return
 		}
@@ -242,6 +250,7 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	collation := s.optionalRows(r, "collation health", pipelineCollationHealthSQL, pipelinesCollationMaxRows)
 	search := s.optionalRows(r, "search health", pipelineSearchHealthSQL, pipelinesSearchMaxRows)
 	benchmark := s.optionalRows(r, "search benchmark", pipelineSearchBenchmarkSQL, pipelinesSearchMaxRows)
+	searchLatency := s.optionalRows(r, "real search latency", pipelineSearchLatencySQL, 2)
 	priorityMix := s.optionalRows(r, "timeline priority mix", pipelinePriorityMixSQL, pipelinesPriorityMaxRows)
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
@@ -249,20 +258,21 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	notifications := s.optionalRows(r, "notification health", pipelineNotificationHealthSQL, 1)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
 	writeJSON(w, map[string]any{
-		"pipelines":     nonNilRows(pipelines.Rows),
-		"tables":        nonNilRows(tables.Rows),
-		"marts":         marts,
-		"adapters":      adapters,
-		"collation":     collation,
-		"search":        search,
-		"benchmark":     benchmark,
-		"priority":      priorityMix,
-		"agents":        agents,
-		"slack":         slack,
-		"plaid":         plaid,
-		"backups":       backups,
-		"notifications": notifications,
-		"server_now":    s.now().UTC().Format(time.RFC3339Nano),
+		"pipelines":      nonNilRows(pipelines.Rows),
+		"tables":         nonNilRows(tables.Rows),
+		"marts":          marts,
+		"adapters":       adapters,
+		"collation":      collation,
+		"search":         search,
+		"benchmark":      benchmark,
+		"search_latency": searchLatency,
+		"priority":       priorityMix,
+		"agents":         agents,
+		"slack":          slack,
+		"plaid":          plaid,
+		"backups":        backups,
+		"notifications":  notifications,
+		"server_now":     s.now().UTC().Format(time.RFC3339Nano),
 	})
 }
 

@@ -3160,3 +3160,10 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     assert mpim["landing_status"] == "stale" and mpim["status"] == "stale", (
         "a wake-up later than its own poll interval is a fault, not a schedule"
     )
+
+
+def test_benchmark_slow_p90_grades_attention_and_idle(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    row = _seed_search_benchmark_run(warehouse, latency_p50_ms=900, latency_p90_ms=2001)
+    assert row['status'] == 'attention'
+    assert row['saturation'] == 'idle'

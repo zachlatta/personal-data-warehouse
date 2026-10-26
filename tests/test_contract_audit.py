@@ -177,6 +177,78 @@ def _benchmark_host_row(**overrides: object) -> dict[str, object]:
     return row
 
 
+def _real_traffic_rows(**overrides: object) -> list[dict[str, object]]:
+    row: dict[str, object] = {
+        "status": "ok", "requests": 100, "errors": 2,
+        "p50_ms": 900, "p90_ms": 1800, "share_over_2s": 0.05,
+        "slow_requests": 5, "idle_slow_requests": 0, "idle_slow_share": 0,
+        "saturation_mix": {"io_bound": 5}, "slowest_leg_mix": {"lexical": 5},
+    }
+    row.update(overrides)
+    return [dict(row, window=window) for window in ("rolling_24h", "rolling_7d")]
+
+
+def _c6_sql(intent: str, sql: str) -> list[dict[str, object]]:
+    if "search_request_latency" in sql:
+        return _real_traffic_rows()
+    return [_benchmark_host_row()]
+
+
+@pytest.mark.parametrize(("overrides", "expected"), [
+    ({}, "green"),
+    ({"p50_ms": 2000}, "red"),
+    ({"p50_ms": 2001}, "red"),
+    ({"p90_ms": 2000}, "green"),
+    ({"p90_ms": 2001}, "yellow"),
+    ({"idle_slow_requests": 5, "idle_slow_share": 0.1}, "yellow"),
+    ({"idle_slow_requests": 4, "idle_slow_share": 0.8}, "green"),
+    ({"idle_slow_requests": 5, "idle_slow_share": 0.099}, "green"),
+    ({"status": "no_data", "requests": 19}, "yellow"),
+    ({"status": "unknown"}, "yellow"),
+    ({"p50_ms": None}, "yellow"),
+])
+def test_c6_real_traffic_thresholds(monkeypatch, overrides, expected):
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda *args: _real_traffic_rows(**overrides))
+    status, evidence = contract_audit._real_traffic_latency()
+    assert status == expected
+    assert "rolling_24h" in evidence and "rolling_7d" in evidence
+    assert "per-search host pressure" in evidence
+    assert "lexical" in evidence
+
+
+@pytest.mark.parametrize("rows", [None, [], _real_traffic_rows()[:1]])
+def test_c6_missing_real_traffic_is_yellow(monkeypatch, rows):
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda *args: rows)
+    status, evidence = contract_audit._real_traffic_latency()
+    assert status == contract_audit.YELLOW
+    assert "unavailable" in evidence
+
+
+def test_c6_real_traffic_uses_worse_window(monkeypatch):
+    rows = _real_traffic_rows()
+    rows[1]["p50_ms"] = 2500
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda *args: rows)
+    assert contract_audit._real_traffic_latency()[0] == contract_audit.RED
+
+
+def test_c6_slow_real_traffic_overrides_fast_probes(monkeypatch):
+    monkeypatch.setattr(contract_audit, "_validated_search_probe", lambda *args, **kwargs: (0.1, ""))
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql:
+                        _real_traffic_rows(p50_ms=2200) if "search_request_latency" in sql else [])
+    assert contract_audit.c6_performance().status == contract_audit.RED
+
+
+def test_skip_latency_still_grades_real_traffic(monkeypatch, capsys):
+    monkeypatch.setattr(contract_audit, "CHECKS", [contract_audit.c6_performance])
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda *args: _real_traffic_rows(p50_ms=2200))
+    monkeypatch.setattr(contract_audit, "_validated_search_probe", lambda *args, **kwargs:
+                        pytest.fail("skip-latency must not run probes"))
+    assert contract_audit.main(["--skip-latency", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["status"] == contract_audit.RED
+    assert "rolling_24h" in payload[0]["evidence"]
+
+
 def test_c6_measures_paired_scopes_serially_and_grades_the_slower_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -210,7 +282,7 @@ def test_c6_measures_paired_scopes_serially_and_grades_the_slower_scope(
     monkeypatch.setattr(contract_audit, "run_search", fake_run_search)
     monkeypatch.setattr(contract_audit, "SEARCH_PROBE_QUERIES", ("one", "two", "three"))
     monkeypatch.setattr(
-        contract_audit, "pdw_sql", lambda intent, sql: [_benchmark_host_row()]
+        contract_audit, "pdw_sql", _c6_sql
     )
 
     verdict = contract_audit.c6_performance()
@@ -295,7 +367,7 @@ def test_c6_fast_probes_need_no_current_saturation_claim(
     monkeypatch.setattr(
         contract_audit,
         "pdw_sql",
-        lambda intent, sql: [_benchmark_host_row(saturation="idle")],
+        _c6_sql,
     )
 
     verdict = contract_audit.c6_performance()

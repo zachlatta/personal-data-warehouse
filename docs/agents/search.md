@@ -450,8 +450,8 @@ image.
 ## Performance contract
 
 PDW is supposed to answer fast, and **before anyone optimizes further, confirm we are
-actually using the host.** This is C6, it is enforced by nothing, and it has already cost
-three incidents.
+actually using the host.** C6 is graded by the real-traffic latency view, the weekly
+benchmark, and the contract audit. Both p50 and p90 have a 2-second target.
 
 **The budget hierarchy, innermost first.** Each layer's budget must sit *below* the next one
 out, so the innermost timer fires first and the failure carries a useful message:
@@ -512,6 +512,32 @@ labelled (`search-benchmark` for the benchmark, `contract-audit` for `scripts/co
 so a real-traffic grade can leave them out. The `search completed` / `slow search` log lines
 are unchanged.
 
+**Real traffic and probes both count.** `marts_ops.search_request_latency` always returns
+one row per `rolling_24h` and `rolling_7d` window, excluding clients `search-benchmark`
+and `contract-audit`. Requests and latency percentiles include errors and timeouts.
+`requests`, `errors`, `p50_ms`, `p90_ms` and `share_over_2s` describe all real traffic.
+`slowest_leg_mix` and `saturation_mix` are JSON objects of counts **among requests over
+2 seconds**; divide by `slow_requests` for shares. A missing leg is `unmeasured`.
+Saturation uses each search's own pressure: `unmeasured` if any required gauge is -1,
+then `io_bound` at I/O full avg10 >=10%, then `cpu_bound` at CPU some avg10 >=50% or
+load >= CPU count, and `idle` otherwise. The I/O condition takes precedence over CPU.
+
+Fewer than 20 requests reads `no_data`; otherwise `status` is `attention` when p50 >2000 ms,
+p90 >`LATENCY_P90_TARGET_MS` (2000 ms, chosen 2026-10-26), or at least five slow searches
+used an idle host and those searches are >=10% of all slow searches (`idle_slow_share`).
+With no requests the percentiles and shares are NULL; with no slow requests the mixes are
+empty and `idle_slow_share` is NULL. The writer's health remains the separate
+`search_requests` pipeline heartbeat, so a quiet window is distinguishable from a broken
+recorder. Both windows appear beside the benchmark on `/pipelines`.
+
+The weekly `marts_ops.search_benchmark` now grades p90 as well as p50 and MRR; a p90 over
+target on a quiet host also reads `saturation = 'idle'`. `scripts/contract_audit.py` C6 takes
+the worse of its probe verdict and both real-traffic windows: real p50 >=2000 ms is RED,
+p90 over target or the idle-slow condition is YELLOW, and unavailable/unknown/insufficient
+traffic is YELLOW. Its real-traffic evidence reports the per-search pressure mixes;
+historical benchmark pressure cannot establish saturation during a different request.
+Even `--skip-latency` reads the traffic grade, while marking the skipped probes YELLOW.
+
 **A documented performance number that silently regressed is itself a bug, so re-measure
 before you quote one — and prefer the living number.** Since 2026-08-27 the weekly
 `search_benchmark` asset writes p50/p90 hybrid latency and labeled MRR into
@@ -537,6 +563,9 @@ you what you want to hear), and through the two-statement shape the function rea
 | `search_text_exact` on a pooled connection, no-match needle (2026-10-26) | 51.6s to 60s timeout | 0.5-2.2s |
 | `search_text_exact` on a pooled connection, `Mt Foolery` (2026-10-26) | 22.8-25.7s | 4.8s |
 | `search_hybrid_exact` literal leg, generic plan (2026-10-26) | 0.74-2.1s | 0.24-0.49s |
+
+**Exact-mode measurements before a86271c (2026-10-26) describe the old exact function.**
+The historical numbers above are not measurements of the current exact path.
 
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
 (`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`

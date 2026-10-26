@@ -68,6 +68,8 @@ DEFAULT_DEPTH = 50
 LATENCY_DEPTH = 20
 #: The goal set for the tool: p50 under two seconds, end to end.
 LATENCY_P50_TARGET_MS = 2000
+#: Chosen p90 goal for real traffic and the weekly probes (2026-10-26).
+LATENCY_P90_TARGET_MS = 2000
 #: Below this the labeled set says retrieval regressed (the 2026-08 hybrid
 #: landed at 0.403; the pre-hybrid keyword path scored 0.292).
 MRR_FLOOR = 0.30

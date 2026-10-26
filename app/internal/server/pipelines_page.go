@@ -179,6 +179,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   <div id="notifications"></div>
   <div id="search"></div>
   <div id="benchmark"></div>
+  <div id="search_latency"></div>
   <div id="priority"></div>
   <div id="agents"></div>
   <div id="slack"></div>
@@ -267,7 +268,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
-    backups: [], notifications: [], priority: [], agents: [], benchmark: [],
+    backups: [], notifications: [], priority: [], agents: [], benchmark: [], search_latency: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
 
@@ -385,6 +386,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       .concat(state.marts)
       .concat(state.adapters)
       .concat(state.search)
+      .concat(state.search_latency)
       .concat(state.slack)
       .concat(state.plaid)
       .concat(state.collation);
@@ -845,6 +847,33 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       b.note || (b.errors ? rows(b.errors) + " searches failed during the run" : ""));
   }
 
+  function searchLatencyNode(b) {
+    var seconds = function (v) { return v === null || v === undefined ? "—" : (Number(v) / 1000).toFixed(2) + "s"; };
+    var mix = function (value) {
+      // jsonb may arrive as its SQL text representation from the query runner.
+      if (typeof value === "string") {
+        try { value = JSON.parse(value); } catch (_) { return "unmeasured"; }
+      }
+      return Object.keys(value || {}).sort().map(function (key) {
+        return key.replace(/_/g, " ") + " " + rows(value[key]);
+      }).join(" · ") || "none";
+    };
+    var windowName = b.window === "rolling_24h" ? "last 24 hours" : "last 7 days";
+    var detail = rows(b.requests) + " requests · " + rows(b.errors) + " errors · p50 " + seconds(b.p50_ms) + " · p90 " + seconds(b.p90_ms) +
+      ". p50 and p90 targets: 2s. " +
+      (b.status === "no_data" ? "Insufficient data: fewer than 20 requests. " : "") +
+      "Slowest leg: " + mix(b.slowest_leg_mix) + ". Per-search host pressure: " + mix(b.saturation_mix) +
+      ". Both mixes count only searches over 2s. Idle host: " + rows(b.idle_slow_requests) + " (" + pct(b.idle_slow_share) +
+      " of searches over 2s); attention at 10% with at least 5 idle slow searches. Benchmark and audit probes excluded.";
+    return healthRow(b, "Real searches · " + windowName,
+      rows(b.requests) + " requests · " + rows(b.errors) + " errors",
+      [
+        ["p90", seconds(b.p90_ms), "target 2s", false],
+        ["p50", seconds(b.p50_ms), "target 2s", true],
+        ["over 2s", pct(b.share_over_2s), rows(b.slow_requests) + " slow searches", true]
+      ], detail);
+  }
+
   function notificationNode(n) {
     return healthRow(n, "Timeline notifications", Number(n.enabled) === 1 ? "experiment on" : "experiment paused",
       [["worker", n.last_run_at ? ago(ageOf(n.last_run_at)) + " ago" : "never", "new direct/CC arrivals only; no history replay", false]],
@@ -963,6 +992,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     renderSection("adapters", LEVELS[2][1], state.adapters, adapterNode);
     renderSection("search", LEVELS[3][1], state.search, searchNode);
     renderSection("benchmark", LEVELS[4][1], state.benchmark, benchmarkNode);
+    renderSection("search_latency", "real search latency — rolling traffic and host pressure", state.search_latency, searchLatencyNode);
     renderSection("priority", LEVELS[5][1], state.priority, priorityMixNode,
       function (a, b) {
         if (a.source !== b.source) return a.source < b.source ? -1 : 1;
@@ -1052,7 +1082,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     node.appendChild(h("br"));
     node.appendChild(document.createTextNode(
       "Everything here is queryable at parity: marts_ops.pipeline_health, marts_ops.table_freshness," +
-      " marts_ops.notification_health, marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage, marts_ops.search_benchmark," +
+      " marts_ops.notification_health, marts_ops.mart_view_health, marts_ops.timeline_adapter_health, marts_ops.search_health, marts_ops.timeline_priority_mix, marts_ops.agent_usage, marts_ops.search_benchmark, marts_ops.search_request_latency," +
       " marts_ops.collation_health."));
   }
 
@@ -1083,6 +1113,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       state.notifications = body.notifications || [];
       state.search = body.search || [];
       state.benchmark = body.benchmark || [];
+      state.search_latency = body.search_latency || [];
       state.priority = body.priority || [];
       state.agents = body.agents || [];
       state.slack = body.slack || [];
