@@ -358,7 +358,7 @@ def test_c11_reads_only_source_pipelines_that_are_down(monkeypatch) -> None:
     assert verdict.status == contract_audit.GREEN
     sql = " ".join(seen["source pipeline health"].split())
     assert "FROM marts_ops.pipeline_health" in sql
-    assert "kind = 'source'" in sql
+    assert "kind IN ('source', 'derived', 'enrichment')" in sql
     assert "status NOT IN ('ok', 'manual', 'unknown')" in sql
 
 
@@ -752,6 +752,88 @@ def test_whoop_private_is_registered_in_both_registries() -> None:
         )
 
 
+# Base schemas whose tables are all classified ``entity`` or ``state`` because
+# their real-world events are normalized into an intermediate ``derived_*`` or
+# ``marts_*`` relation before reaching ``timeline.events``.
+BASE_SCHEMA_TIMELINE_INTERMEDIATES: dict[str, tuple[str, ...]] = {
+    "base_plaid": ("finance_transactions", "finance_observations"),
+    "base_simplefin": ("finance_transactions", "finance_observations"),
+}
+
+# Base schemas that genuinely do not emit rows onto ``timeline.events``. Adding
+# an entry here is a deliberate claim that the source has no event stream for
+# search or timeline context.
+TIMELINE_EXEMPT_BASE_SCHEMAS: dict[str, str] = {
+    "base_android_screen_time": (
+        "high-frequency per-app foreground/lock usage telemetry; queried via "
+        "base_android_screen_time rather than timeline.events"
+    ),
+}
+
+
+def test_every_base_source_schema_reaches_the_timeline_or_is_exempt() -> None:
+    """C1 at the source-schema level: a new ``base_*`` source cannot classify
+    every table as ``entity``/``state`` and silently omit a timeline adapter."""
+    from personal_data_warehouse.relations import (
+        AI_EVENT_SOURCE_RELATIONS,
+        VOICE_EVENT_SOURCE_RELATIONS,
+    )
+    from personal_data_warehouse.warehouse_catalog import CATALOG
+
+    adapter_tables: set[str] = set()
+    for adapter in TIMELINE_ADAPTERS:
+        if adapter.source_table == "ai_conversation_events":
+            adapter_tables.update(AI_EVENT_SOURCE_RELATIONS.values())
+        elif adapter.source_table == "marts_voice_memos_recordings":
+            adapter_tables.update(VOICE_EVENT_SOURCE_RELATIONS.values())
+        else:
+            adapter_tables.add(adapter.source_table)
+
+    base_schemas: dict[str, list[str]] = {}
+    for obj in CATALOG.objects:
+        if obj.kind == "table" and obj.layer == "base":
+            base_schemas.setdefault(obj.schema, []).append(obj.id)
+
+    direct_schemas: set[str] = set()
+    for schema, table_ids in base_schemas.items():
+        for table_id in table_ids:
+            cov = TIMELINE_TABLE_COVERAGE[table_id]
+            if cov.role == "events":
+                assert table_id in adapter_tables, (schema, table_id)
+                direct_schemas.add(schema)
+            elif cov.role == "detail":
+                cursor = cov
+                while cursor.role == "detail":
+                    assert cursor.parent in TIMELINE_TABLE_COVERAGE, (schema, table_id, cursor.parent)
+                    cursor = TIMELINE_TABLE_COVERAGE[cursor.parent]
+                assert cursor.role == "events", (schema, table_id)
+                direct_schemas.add(schema)
+
+    for schema, targets in BASE_SCHEMA_TIMELINE_INTERMEDIATES.items():
+        assert schema in base_schemas, f"unknown schema in BASE_SCHEMA_TIMELINE_INTERMEDIATES: {schema}"
+        assert schema not in direct_schemas, (
+            f"{schema} now has a direct events/detail table; drop it from BASE_SCHEMA_TIMELINE_INTERMEDIATES"
+        )
+        assert targets, schema
+        for target in targets:
+            assert TIMELINE_TABLE_COVERAGE[target].role == "events", (schema, target)
+            assert target in adapter_tables, (schema, target)
+
+    for schema in TIMELINE_EXEMPT_BASE_SCHEMAS:
+        assert schema in base_schemas, f"unknown schema in TIMELINE_EXEMPT_BASE_SCHEMAS: {schema}"
+        assert schema not in direct_schemas, (
+            f"{schema} now has a direct events/detail table; drop it from TIMELINE_EXEMPT_BASE_SCHEMAS"
+        )
+        assert schema not in BASE_SCHEMA_TIMELINE_INTERMEDIATES, schema
+
+    covered = direct_schemas | set(BASE_SCHEMA_TIMELINE_INTERMEDIATES) | set(TIMELINE_EXEMPT_BASE_SCHEMAS)
+    missing = sorted(set(base_schemas) - covered)
+    assert not missing, (
+        "base_* schemas with no events/detail table on timeline.events and no recorded intermediate or exemption: "
+        + ", ".join(missing)
+    )
+
+
 # ---------------------------------------------------------------------------
 # C5, the INPUT half: an intelligent transformation reads the intermediate
 # layer, never a raw source table.
@@ -983,6 +1065,103 @@ def test_attachment_enrichment_sources_declare_their_input_layer() -> None:
         "an attachment enrichment source scans a raw table with no recorded reason: "
         f"{offenders}"
     )
+
+
+CONTENT_ADDRESSED_AUDIO_TRANSCRIPTION_MODULES: tuple[str, ...] = (
+    "apple_voice_memos_transcription.py",
+    "audio_attachment_enrichment.py",
+)
+
+CONTENT_ADDRESSED_ATTACHMENT_MODULES: tuple[str, ...] = (
+    "attachment_text_extraction.py",
+    "audio_attachment_enrichment.py",
+    "file_attachment_enrichment.py",
+)
+
+ENRICHMENT_DEDUP_EXEMPT_OR_UPSTREAM_MODULES: dict[str, str] = {
+    "apple_voice_memos_enrichment.py": (
+        "runs over marts_voice_memos.recordings after ContentAddressedTranscriber has already "
+        "deduplicated identical audio bytes by content_sha256"
+    ),
+    "voice_memo_continuity.py": (
+        "joins adjacent already-transcribed recordings on marts_voice_memos.recordings into a session"
+    ),
+    "photo_identity.py": (
+        "canonicalizes photo assets across sources by content_sha256 and perceptual dhash64"
+    ),
+    "photo_context.py": (
+        "supplies calendar context hints to the content-addressed photo enrichment pass"
+    ),
+    "slack_file_fingerprints.py": (
+        "computes content_sha256 and dhash64 fingerprints so Slack files join content-addressed enrichment"
+    ),
+    "finance_ledger.py": (
+        "deterministic SQL/Python builder normalizing provider rows into derived_finance"
+    ),
+    "securities_ledger.py": (
+        "deterministic SQL/Python position and lot builder over derived_finance"
+    ),
+    "receipt_enrichment.py": (
+        "runs over reconciled derived_finance.transactions ledger rows"
+    ),
+    "manual_finance_extraction.py": (
+        "runs over base_manual_finance.documents, which deduplicates uploaded files by sha256 on ingest"
+    ),
+    "screen_timelapse_enrichment.py": (
+        "runs over 5-minute (window_start, window_end) activity slices rather than file copies"
+    ),
+}
+
+
+def test_enrichment_passes_enforce_content_addressed_deduplication() -> None:
+    """Paid or quota-bound enrichment is keyed by the bytes (content_sha256), not the source."""
+    from personal_data_warehouse import (
+        attachment_text_extraction,
+        audio_attachment_enrichment,
+        file_attachment_enrichment,
+    )
+
+    runner_modules = {m for m in ENRICHMENT_RUNNER_MODULES if not m.startswith("defs/")}
+    covered = (
+        set(CONTENT_ADDRESSED_AUDIO_TRANSCRIPTION_MODULES)
+        | set(CONTENT_ADDRESSED_ATTACHMENT_MODULES)
+        | set(ENRICHMENT_DEDUP_EXEMPT_OR_UPSTREAM_MODULES)
+    )
+    assert runner_modules == covered, (
+        f"unclassified enrichment modules: {sorted(runner_modules ^ covered)}"
+    )
+
+    for module_name in CONTENT_ADDRESSED_AUDIO_TRANSCRIPTION_MODULES:
+        text = (SRC_ROOT / module_name).read_text(encoding="utf-8")
+        assert "ContentAddressedTranscriber" in text, (
+            f"{module_name} must route paid audio transcription through ContentAddressedTranscriber"
+        )
+
+    allowed_transcribe_callers = {
+        "audio_transcripts.py",
+        *CONTENT_ADDRESSED_AUDIO_TRANSCRIPTION_MODULES,
+    }
+    for path in sorted(SRC_ROOT.glob("*.py")):
+        if path.name in allowed_transcribe_callers:
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert "AssemblyAIClient(" not in text and "assemblyai_client_from_settings(" not in text, (
+            f"{path.name} instantiates AssemblyAI directly; route through ContentAddressedTranscriber"
+        )
+
+    for module in (file_attachment_enrichment, audio_attachment_enrichment, attachment_text_extraction):
+        seen_descriptors = 0
+        for name in dir(module):
+            candidate = getattr(module, name)
+            if isinstance(candidate, type) or not hasattr(candidate, "table"):
+                continue
+            if not isinstance(getattr(candidate, "table", None), str):
+                continue
+            seen_descriptors += 1
+            assert getattr(candidate, "sha_column", None) == "content_sha256", (
+                f"{module.__name__}.{name} must key deduplication by content_sha256"
+            )
+        assert seen_descriptors > 0, module.__name__
 
 
 def test_sql_sentence_detector_uses_the_same_function_words_as_the_app() -> None:

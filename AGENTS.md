@@ -73,9 +73,10 @@ that, not from this prose.
   event from every source, with `source_table` + `source_pk` drilling back to the
   authoritative row. *Held up by* `TIMELINE_TABLE_COVERAGE`: every table declares itself
   `events`, `detail`, `entity` or `state`, `tests/test_timeline.py` checks that against the
-  **live** schema, and a `detail`/`entity` table must say in its `note` how a reader reaches it instead.
+  **live** schema, a `detail`/`entity` table must say in its `note` how a reader reaches it,
+  and `test_every_base_source_schema_reaches_the_timeline_or_is_exempt` requires every
+  `base_*` schema to reach `timeline.events` or declare an exemption.
   `marts_ops.timeline_adapter_health` judges ingest lag against the source's own interval.
-  *Gap:* registering an adapter for a new events table is still a silent step.
 - **C2 — five priority tiers, and everything is properly categorized.** `self` (Zach did
   it), `direct` (a real person reached him), `cc` (real people, he is peripheral), `noise`
   (bulk or automated, including his own health telemetry), `background` (machinery — the
@@ -101,9 +102,10 @@ that, not from this prose.
   intermediate layer, not one source's raw table**, so a second source is covered the day
   it lands: `base_alice_voice_recordings` sat at 53 recordings and 0 transcripts while every
   registry passed, because transcription scanned the Apple table by name. *Held up by*
-  `tests/test_schema_reorg_contract.py` and
-  `test_no_enrichment_runner_reads_a_raw_source_table_unaccounted_for`: every enrichment
-  runner's raw read is listed with a reason, and a stale exemption fails.
+  `tests/test_schema_reorg_contract.py`,
+  `test_no_enrichment_runner_reads_a_raw_source_table_unaccounted_for` (every raw read
+  is listed with a reason, and a stale exemption fails), and
+  `test_enrichment_passes_enforce_content_addressed_deduplication`.
 - **C6 — PDW responds fast, and a response over two seconds uses the whole host before
   anyone optimizes further.** CPU, RAM, GPU and disk: an unparallelized plan on an idle
   28-vCPU host is not a query that needs a cleverer algorithm. *Held up by* the per-request
@@ -474,9 +476,8 @@ someone notices a gap in an answer).
    that promotes inbox objects into the raw table, and its schedule/sensor wiring.
    **SILENT.** A remote-device uploader also posts its run heartbeat via
    `pdw_post_heartbeat` in its `bin/*-upload-*` wrapper and declares
-   `state=_uploader_heartbeat("<pipeline>")` in `PIPELINES` — **ENFORCED** for the
-   listed uploaders (`test_every_remote_device_uploader_declares_a_run_heartbeat`),
-   silent for a brand-new one.
+   `state=_uploader_heartbeat("<pipeline>")` in `PIPELINES` — **ENFORCED**
+   (`test_every_remote_device_uploader_declares_a_run_heartbeat`).
 
 **Making it a warehouse object**
 
@@ -505,10 +506,10 @@ someone notices a gap in an answer).
    (`test_every_registered_table_has_a_pipeline` and
    `test_pipeline_and_timeline_registries_cover_the_same_tables` — the two registries must
    cover *exactly* the same tables).
-10. **Register a timeline adapter** in `TIMELINE_ADAPTERS`. **SILENT** — and this is the
-    biggest hole in C1. A table classified `detail`/`entity`/`state` legitimately has no
-    adapter, so nothing can tell "correctly not on the timeline" from "forgotten". If your
-    source has events, it needs an adapter, and only you will know.
+10. **Register a timeline adapter** in `TIMELINE_ADAPTERS`. **ENFORCED** at the events-table
+    and source-schema levels (`test_adapter_source_tables_are_classified_as_events`,
+    `test_every_base_source_schema_reaches_the_timeline_or_is_exempt`); **SILENT** only for an
+    extra events table misclassified inside an already-covered source.
 11. **The adapter's pagination contract** — `backfill_sql` pages newest-first by
     `(event_ts, event_id)`, `incremental_sql` oldest-first by `(ingest_ts, event_id)`, both
     returning exactly `TIMELINE_NORMALIZED_COLUMNS`, plus `max_ingest_sql`. **ENFORCED**
@@ -522,11 +523,9 @@ someone notices a gap in an answer).
     `EXPECTED_SEEDED_EVENTS` in `tests/test_timeline.py`). **ENFORCED** —
     `test_timeline.py` asserts the seed dictionary covers exactly the registered adapters,
     so an unseeded adapter fails the suite instead of never having its SQL run.
-14. **Add the `SEARCH_SOURCE_DEFS` token** in `postgres.py`. **ENFORCED** since 2026-08-23
-    (`tests/test_repo_contracts.py::test_every_timeline_adapter_has_a_search_source_token`).
-    It was silent before, and silent here means two things at once: the source cannot be
-    scoped with `sources => ARRAY[...]`, and it falls outside the low-volume BM25 partition,
-    so a broad search reaches its rows only by walking past millions of gmail/slack documents.
+14. **Add the `SEARCH_SOURCE_DEFS` token** in `postgres.py`. **ENFORCED**
+    (`tests/test_repo_contracts.py::test_every_timeline_adapter_has_a_search_source_token`):
+    keeps `sources => ARRAY[...]` complete and puts low-volume sources in the partial BM25 index.
 15. **Document it** — a section in `AGENTS.md` and/or `README.md` with the SQL starting
     points, **and the agent guide** (`app/internal/guide/topics/sources.md`, plus the
     domain topic if one exists), because the guide is what an agent actually reads.
@@ -536,11 +535,10 @@ someone notices a gap in an answer).
     `TestEveryRelationTheGuideNamesExistsInTheCatalog` for the guide) and may not be a
     pre-reorg name (`test_no_module_names_a_pre_reorg_physical_relation`).
 
-**Paid or quota-bound enrichment is keyed by the bytes, not the source.** A new source
-often carries copies of data PDW already has (a phone migration, a forward, a re-upload).
-Any pass that pays per call decides "already done" by `content_sha256` (or a perceptual
-hash where a near-copy is the same thing), never by source, id, filename or prompt
-version: AssemblyAI goes through `audio_transcripts.ContentAddressedTranscriber`. See
+**Paid or quota-bound enrichment is keyed by the bytes, not the source.** Any pass that pays
+per call decides "already done" by `content_sha256` (or a perceptual hash), never by source,
+id or filename: AssemblyAI goes through `audio_transcripts.ContentAddressedTranscriber` —
+**ENFORCED** (`test_enrichment_passes_enforce_content_addressed_deduplication`). See
 [voice.md](docs/agents/voice.md).
 
 Photo sources have five *additional* registry edits on top of this list — see

@@ -731,19 +731,54 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
     assert rows["uploader_heartbeats"]["status"] == "ok"
 
 
+INGEST_HEARTBEAT_EXEMPT_PIPELINES: dict[str, str] = {
+    "manual_finance": (
+        "manual on-demand CLI command (pdw ingest manual-finance <files>) with no scheduled daemon"
+    ),
+    "uploader_heartbeats": "the internal heartbeat collector meta-pipeline itself",
+}
+
+
 def test_every_remote_device_uploader_declares_a_run_heartbeat():
-    """Every pipeline fed by a Mac/VM uploader reads ops.uploader_heartbeats."""
-    for pipeline_id in (
-        "apple_notes", "apple_messages", "apple_contacts", "apple_voice_memos",
-        "apple_photos", "claude_code", "codex", "openclaw", "pi", "muse_code",
-        "browser_history", "argon", "screen_timelapse", "google_recorder",
-        "android_messages", "android_notifications", "android_screen_time", "muse",
-    ):
-        entry = pipeline(pipeline_id)
-        assert entry.state is not None, pipeline_id
-        assert entry.state.table == "uploader_heartbeats", pipeline_id
-        assert entry.state.scope_value == pipeline_id, pipeline_id
-        assert entry.expected_run_interval is not None, pipeline_id
+    """Every pipeline fed by a Mac/VM/phone uploader reads ops.uploader_heartbeats."""
+    import re
+    from pathlib import Path
+
+    pipeline_ids = {entry.id for entry in PIPELINES}
+    assert set(INGEST_HEARTBEAT_EXEMPT_PIPELINES) <= pipeline_ids
+
+    ingest_pipelines = [
+        entry
+        for entry in PIPELINES
+        if ("/ingest/" in entry.transport or entry.id == "uploader_heartbeats")
+        and entry.id not in INGEST_HEARTBEAT_EXEMPT_PIPELINES
+    ]
+    assert len(ingest_pipelines) >= 18
+    for entry in ingest_pipelines:
+        assert entry.expected_run_interval is not None, entry.id
+        assert entry.state is not None, entry.id
+        assert entry.state.table == "uploader_heartbeats", entry.id
+        assert entry.state.scope_value == entry.id, entry.id
+
+    bin_dir = Path(__file__).resolve().parent.parent / "bin"
+    wrappers = sorted(
+        p
+        for p in bin_dir.iterdir()
+        if p.name.endswith(("-upload-launchd", "-upload-systemd", "-upload-android"))
+    )
+    assert wrappers, "no remote uploader wrapper scripts found under bin/"
+    for wrapper in wrappers:
+        text = wrapper.read_text(encoding="utf-8")
+        matches = re.findall(r'pdw_post_heartbeat\s+"([^"]+)"', text)
+        assert matches, f"{wrapper.name} does not call pdw_post_heartbeat"
+        for match in matches:
+            cleaned = re.sub(r"\$\{[^:}]+:-([^}]+)\}", r"\1", match)
+            for pid in cleaned.split(","):
+                entry = pipeline(pid)
+                assert entry.state is not None and entry.state.table == "uploader_heartbeats", (
+                    wrapper.name,
+                    pid,
+                )
 
 
 def test_muse_run_interval_matches_how_often_its_vm_wakes():

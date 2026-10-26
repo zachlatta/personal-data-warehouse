@@ -667,10 +667,19 @@ def test_c12_is_red_when_agents_md_outgrows_one_sitting(monkeypatch: pytest.Monk
 # flagged `error(s) detected`): neither check read anything but row presence.
 
 
-def _integrity_sql(*, checksum: str, integrity: str = "ok", backup_status: str = "ok"):
+def _integrity_sql(
+    *,
+    checksum: str,
+    integrity: str = "ok",
+    backup_status: str = "ok",
+    structural_rows: list[dict] | None = None,
+):
     def fake(intent: str, sql: str, **_: object):
         if "collation_health" in sql:
-            return [{"status": checksum, "detail": "9125 page checksum failure(s)"}]
+            rows = [{"object_id": "data_checksums", "scope": "database", "status": checksum, "detail": "9125 page checksum failure(s)"}]
+            if structural_rows:
+                rows.extend(structural_rows)
+            return rows
         if "pgbackrest_health" in sql:
             return [
                 {
@@ -695,6 +704,69 @@ def test_c10_is_red_while_the_database_fails_page_checksums(monkeypatch: pytest.
     verdict = contract_audit.c10_backups()
     assert verdict.status == contract_audit.RED
     assert "checksum" in verdict.evidence
+
+
+def test_c10_and_c4_detect_index_or_heap_corruption_with_clean_page_checksums(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page damaged in RAM before write carries a valid checksum (2026-10-05 / 2026-10-25)."""
+    corrupt_index = [
+        {
+            "object_id": "index:timeline_events_priority_time_idx",
+            "scope": "index",
+            "status": "failing",
+            "detail": "bt_index_check failed: index tuple size does not equal lp_len",
+        }
+    ]
+    monkeypatch.setattr(
+        contract_audit, "pdw_sql", _integrity_sql(checksum="ok", structural_rows=corrupt_index)
+    )
+    c10 = contract_audit.c10_backups()
+    assert c10.status == contract_audit.RED
+    assert "index:timeline_events_priority_time_idx=failing" in c10.evidence
+
+    c4 = contract_audit.c4_raw_data_queryable()
+    assert c4.status == contract_audit.YELLOW
+    assert "index:timeline_events_priority_time_idx=failing" in c4.evidence
+
+    attention_heap = [
+        {
+            "object_id": "heap:timeline.events",
+            "scope": "heap",
+            "status": "attention",
+            "detail": "verify_heapam timed out",
+        }
+    ]
+    monkeypatch.setattr(
+        contract_audit, "pdw_sql", _integrity_sql(checksum="ok", structural_rows=attention_heap)
+    )
+    assert contract_audit.c10_backups().status == contract_audit.YELLOW
+    assert contract_audit.c4_raw_data_queryable().status == contract_audit.YELLOW
+
+
+def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, str] = {}
+    rows = {
+        "slack health": [{"conversation_type": "im", "status": "ok"}],
+        "plaid health": [{"institution_name": "Bank", "status": "ok"}],
+        "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
+        "source pipeline health": [
+            {"pipeline": "finance_ledger", "status": "failing"},
+            {"pipeline": "receipt_enrichment", "status": "stale"},
+        ],
+    }
+
+    def fake_pdw_sql(intent: str, sql: str, **_kwargs):
+        seen[intent] = sql
+        return rows[intent]
+
+    monkeypatch.setattr(contract_audit, "pdw_sql", fake_pdw_sql)
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.YELLOW
+    assert "kind IN ('source', 'derived', 'enrichment')" in " ".join(seen["source pipeline health"].split())
+    assert "pipelines down 2" in verdict.evidence
+    assert "pipeline:finance_ledger=failing" in verdict.evidence
+    assert "pipeline:receipt_enrichment=stale" in verdict.evidence
 
 
 def test_c10_is_not_green_when_the_newest_backup_copied_corrupt_pages(monkeypatch: pytest.MonkeyPatch) -> None:

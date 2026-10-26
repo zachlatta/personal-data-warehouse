@@ -180,12 +180,40 @@ def c3_agents_start_at_timeline() -> Verdict:
 
 
 def _checksum_verdict() -> dict | None:
-    """The database's page-integrity row (marts_ops.collation_health)."""
+    """The database's page and structural integrity rows (marts_ops.collation_health)."""
     rows = pdw_sql(
         "database page integrity",
-        "SELECT status, detail FROM marts_ops.collation_health WHERE object_id = 'data_checksums'",
+        "SELECT object_id, scope, status, detail FROM marts_ops.collation_health "
+        "WHERE object_id = 'data_checksums' "
+        "OR (scope IN ('index', 'heap') AND status IN ('failing', 'attention', 'unknown')) "
+        "ORDER BY CASE WHEN object_id = 'data_checksums' THEN 0 ELSE 1 END, object_id",
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    checksum_row = next(
+        (r for r in rows if r.get("object_id") in (None, "data_checksums") and r.get("scope") not in ("index", "heap")),
+        None,
+    )
+    structural_rows = [r for r in rows if r.get("scope") in ("index", "heap") and r.get("status") != "ok"]
+    if checksum_row is None and not structural_rows:
+        return None
+    statuses = [str(r.get("status") or "unknown") for r in ([checksum_row] if checksum_row else []) + structural_rows]
+    if "failing" in statuses:
+        status = "failing"
+    elif any(s != "ok" for s in statuses):
+        status = next(s for s in statuses if s != "ok")
+    else:
+        status = "ok"
+    details: list[str] = []
+    if checksum_row and checksum_row.get("status") != "ok" and checksum_row.get("detail"):
+        details.append(str(checksum_row["detail"]))
+    for r in structural_rows[:3]:
+        label = str(r.get("object_id") or r.get("scope"))
+        detail = str(r.get("detail") or "")
+        details.append(f"{label}={r.get('status')}" + (f" ({detail})" if detail else ""))
+    if len(structural_rows) > 3:
+        details.append(f"+{len(structural_rows) - 3} more index/heap row(s)")
+    return {"status": status, "detail": "; ".join(details)}
 
 
 def c4_raw_data_queryable() -> Verdict:
@@ -638,15 +666,15 @@ def c11_source_slas() -> Verdict:
     title = "a source's own SLA is stated and detected"
     slack = pdw_sql("slack health", "SELECT conversation_type, status FROM marts_ops.slack_conversation_health")
     plaid = pdw_sql("plaid health", "SELECT institution_name, status FROM marts_ops.plaid_item_health")
-    # Every other source has no detector of its own yet, so its pipeline status
-    # is its SLA: browser_history failed for nine days in October 2026 with C7
-    # (which defers current state here) and C11 both green. Manual pipelines
-    # never go stale, unknown is C7's grade, and internal pipelines (pgbackrest,
-    # collation_health) are C10's. A failing derived or enrichment pipeline is
-    # still graded by neither C7 nor C11.
+    # Every other source, derived or enrichment pipeline has no dedicated
+    # detector of its own yet, so its pipeline status is its SLA:
+    # browser_history failed for nine days in October 2026 with C7 (which defers
+    # current state here) and C11 both green. Manual pipelines never go stale,
+    # unknown is C7's grade, and internal pipelines (pgbackrest,
+    # collation_health) are C10's.
     pipelines = pdw_sql("source pipeline health", """
         SELECT pipeline, status FROM marts_ops.pipeline_health
-        WHERE kind = 'source' AND status NOT IN ('ok', 'manual', 'unknown')
+        WHERE kind IN ('source', 'derived', 'enrichment') AND status NOT IN ('ok', 'manual', 'unknown')
         ORDER BY pipeline""")
     if slack is None or plaid is None or pipelines is None:
         return _unavailable("C11", title, "slack_conversation_health / plaid_item_health / pipeline_health")
@@ -656,7 +684,7 @@ def c11_source_slas() -> Verdict:
     bad += [f"plaid:{r['institution_name']}={r['status']}" for r in plaid if r["status"] not in ("ok",)]
     bad += bad_simplefin
     bad += [f"pipeline:{r['pipeline']}={r['status']}" for r in pipelines]
-    return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}, simplefin accounts {len(simplefin)} ({sum(int(r['shared_with_plaid'] or 0) for r in simplefin)} shared with plaid), source pipelines down {len(pipelines)}; not ok: {bad or 'none'}")
+    return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}, simplefin accounts {len(simplefin)} ({sum(int(r['shared_with_plaid'] or 0) for r in simplefin)} shared with plaid), pipelines down {len(pipelines)}; not ok: {bad or 'none'}")
 
 
 def s1_slack() -> Verdict:
