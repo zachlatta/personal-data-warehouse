@@ -51,6 +51,8 @@ from personal_data_warehouse.postgres import (
     POSTGRES_TABLES,
     SEARCH_SCHEMA_REFRESH_LOCK_ID,
     SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,
+    SEARCH_TEXT_EXACT_PROBE_CAP,
+    SEARCH_TEXT_EXACT_RECENT_ROWS,
     SEARCH_TEXT_LOW_VOLUME_ADAPTERS,
     SEARCH_TEXT_PREVIEW_CHARS,
     SEARCH_TEXT_SOURCE_FLOOR,
@@ -2699,7 +2701,7 @@ def test_search_text_exact_uses_trigram_ilike_not_bm25() -> None:
     # through BM25 here would re-introduce the overfetch-and-post-filter
     # pattern this function exists to remove.
     sql = _search_text_exact_sql()
-    assert "t.search_text ILIKE %4$L" in sql
+    assert "t.search_text ILIKE %1$L" in sql
     assert "to_bm25query" not in sql
     assert "ORDER BY t.occurred_at DESC" in sql
 
@@ -7405,7 +7407,7 @@ def test_search_text_exact_scopes_parallel_hints_to_the_recheck() -> None:
     assert "saved_min_parallel_scan := current_setting('min_parallel_table_scan_size')" in sql
     set_at = sql.index("PERFORM set_config('parallel_setup_cost', '0', true)")
     query_at = sql.index("RETURN QUERY")
-    restore_at = sql.index("PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true)")
+    restore_at = sql.rindex("PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true)")
     assert set_at < query_at < restore_at, (
         "the parallel hint must be set immediately before the recheck and restored "
         "immediately after it, never left over the rest of the function"
@@ -7525,40 +7527,67 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
 
 
 def _without_format_codes(template: str) -> str:
-    return re.sub(r"%[1-9]\$L", "", template).replace("%%", "")
+    return re.sub(r"%[1-9]\$[Ls]", "", template).replace("%%", "")
 
 
 def test_search_text_exact_scan_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
-    """The literal scan must not be a cached plan with the patterns as parameters.
+    """The literal statements must not be cached plans with the patterns as parameters.
 
     Measured 2026-10-26 on production with plan_cache_mode = force_generic_plan:
     the generic plan walked timeline_events_time_idx backwards and filtered
     every row, so a no-match needle hit the 60s timeout and 'Mt Foolery' took
     25.7s. plpgsql switches a static statement to that plan after its fifth
     call on a pooled connection. With the patterns as literals the planner
-    sees their trigrams and takes the trigram index.
+    sees their trigrams and takes the trigram index. Both statements -- the
+    probe and the scan -- are one-shot.
     """
     sql = _search_text_exact_sql()
     sql = sql[: sql.index("$fn$;")]
-    scan = sql[sql.index("RETURN QUERY") : sql.index("USING sources, since, priorities, per_source;")]
-    assert scan.startswith("RETURN QUERY EXECUTE format($lit$")
     assert sql.count("RETURN QUERY") == 1
-    assert "$lit$, needle, needle_b, needle_c, pattern, pattern_b, pattern_c)" in scan
+    assert sql.count("EXECUTE format($lit$") == 3
+
+    recent_at = sql.index("EXECUTE format($lit$")
+    recent = sql[recent_at : sql.index("INTO matched", recent_at)]
+    probe_at = sql.index("EXECUTE format($lit$", recent_at + 1)
+    probe = sql[probe_at : sql.index("INTO matched", probe_at)]
+    scan = sql[sql.index("RETURN QUERY") : sql.index("USING sources, since, priorities, per_source, matched;")]
+    assert "$lit$, pattern, pattern_b, pattern_c)" in recent
+    assert "$lit$, pattern, pattern_b, pattern_c)" in probe
+    assert scan.startswith("RETURN QUERY EXECUTE format($lit$")
+    assert "$lit$, needle, needle_b, needle_c, match_clause)" in scan
+    recent_template = recent[: recent.index("$lit$, pattern")]
+    probe_template = probe[: probe.index("$lit$, pattern")]
     template = scan[: scan.index("$lit$, needle")]
-    for code in ("%4$L", "%5$L", "%6$L"):
-        assert f"t.search_text ILIKE {code}" in template
-    assert re.search(r"ILIKE pattern", template) is None, (
-        "the patterns must be inlined as literals (%N$L), never read from the "
-        "plpgsql variable, which makes the scan a cached parameterized plan"
+
+    assert f"LIMIT {SEARCH_TEXT_EXACT_RECENT_ROWS}" in recent_template
+    for code in ("%1$L", "%2$L", "%3$L"):
+        assert f"r.search_text ILIKE {code}" in recent_template
+        assert f"t.search_text ILIKE {code}" in probe_template
+    assert "ORDER BY" not in probe_template, (
+        "ordered by time, the probe is the newest-first walk it exists to avoid"
     )
-    assert "lower(needle" not in template
-    assert "($1 IS NULL OR map.source = ANY ($1))" in template
-    assert "($2 IS NULL OR t.occurred_at >= $2)" in template
-    assert "($3 IS NULL OR t.priority::text = ANY ($3))" in template
-    assert "LIMIT $4" in template
-    assert "%" not in _without_format_codes(template), (
-        "format() would misread any other percent sign in the template"
-    )
+    assert f"USING sources, since, priorities, {SEARCH_TEXT_EXACT_PROBE_CAP + 1};" in sql
+    assert "WHERE %4$s" in template
+    for template_text in (recent_template, probe_template, template):
+        assert re.search(r"ILIKE pattern", template_text) is None, (
+            "the patterns must be inlined as literals (%N$L), never read from the "
+            "plpgsql variable, which makes the scan a cached parameterized plan"
+        )
+        assert "lower(needle" not in template_text
+        assert "($1 IS NULL OR map.source = ANY ($1))" in template_text
+        assert "($2 IS NULL OR t.occurred_at >= $2)" in template_text
+        assert "($3 IS NULL OR t.priority::text = ANY ($3))" in template_text
+        assert "LIMIT $4" in template_text
+        assert "%" not in _without_format_codes(template_text), (
+            "format() would misread any other percent sign in the template"
+        )
+    assert "ORDER BY t.occurred_at DESC" in template
+    # The dense-needle clause inlines the patterns too.
+    assert (
+        "'(t.search_text ILIKE %L OR t.search_text ILIKE %L OR t.search_text ILIKE %L)',\n"
+        "                        pattern, pattern_b, pattern_c)"
+    ) in sql
+    assert "match_clause := 't.ctid = ANY ($5)';" in sql
 
 
 def test_search_hybrid_exact_literal_leg_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
@@ -7668,6 +7697,100 @@ def test_search_text_exact_stays_on_a_literal_plan_past_the_fifth_call(
         assert len(rows) == 1, rows
     finally:
         _release_nested_plans(warehouse)
+
+
+def _seed_exact_probe_messages(warehouse: PostgresWarehouse) -> None:
+    _ensure_all_table_groups(warehouse)
+    warehouse._set_search_path()
+    warehouse.insert_slack_conversations(
+        [_slack_conversation_row(conversation_id="C1", conversation_type="private_channel", sync_version=1)]
+    )
+    texts = {
+        "100.1": "order 112-4417092-3305861 shipped",
+        "100.2": "order 11244170923305861 refunded",
+        "100.3": "lunch plans",
+        "100.4": "the order 112-4417092-3305861 was a gift",
+        "100.5": "order 112-4417092-3305861 arrives friday",
+    }
+    warehouse.insert_slack_messages(
+        [
+            _slack_message_row(
+                conversation_id="C1",
+                message_ts=ts,
+                message_datetime=datetime(2026, 5, 10 + index, 12, tzinfo=UTC),
+                text=text,
+            )
+            for index, (ts, text) in enumerate(texts.items())
+        ]
+    )
+    _sync_timeline(warehouse)
+
+
+@pytest.mark.parametrize(
+    ("recent_rows", "probe_cap"),
+    [
+        pytest.param(SEARCH_TEXT_EXACT_RECENT_ROWS, SEARCH_TEXT_EXACT_PROBE_CAP, id="recent-rows"),
+        pytest.param(1, SEARCH_TEXT_EXACT_PROBE_CAP, id="probe"),
+        pytest.param(1, 2, id="time-walk"),
+    ],
+)
+def test_search_text_exact_returns_the_newest_matches_from_every_stage(
+    warehouse: PostgresWarehouse, monkeypatch: pytest.MonkeyPatch, recent_rows: int, probe_cap: int
+) -> None:
+    """All three stages return the same newest-first matches.
+
+    Four rows match (one through the digits-only variant). The newest rows
+    answer a limit they fill; one recent row never does, so the probe's ctids
+    are read back; with a cap of 2 the probe overflows and the scan walks the
+    time index.
+    """
+    import personal_data_warehouse.postgres as postgres_module
+
+    monkeypatch.setattr(postgres_module, "SEARCH_TEXT_EXACT_RECENT_ROWS", recent_rows)
+    monkeypatch.setattr(postgres_module, "SEARCH_TEXT_EXACT_PROBE_CAP", probe_cap)
+    _seed_exact_probe_messages(warehouse)
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+
+    rows = warehouse._query(
+        "SELECT occurred_at, text FROM @search_text_exact(%s, 3)", ("112-4417092-3305861",)
+    )
+    assert [text.splitlines()[-1] for _, text in rows] == [
+        "order 112-4417092-3305861 arrives friday",
+        "the order 112-4417092-3305861 was a gift",
+        "order 11244170923305861 refunded",
+    ]
+    rows = warehouse._query("SELECT text FROM @search_text_exact(%s, 10)", ("112-4417092-3305861",))
+    assert len(rows) == 4 and rows[-1][0].endswith("order 112-4417092-3305861 shipped")
+    assert warehouse._query(
+        "SELECT count(*) FROM @search_text_exact(%s, 10, since => %s)",
+        ("112-4417092-3305861", datetime(2026, 5, 12, tzinfo=UTC)),
+    ) == [(2,)]
+    assert warehouse._query(
+        "SELECT count(*) FROM @search_text_exact(%s, 10, sources => ARRAY['gmail'])",
+        ("112-4417092-3305861",),
+    ) == [(0,)]
+    assert warehouse._query("SELECT count(*) FROM @search_text_exact(%s, 10)", ("qzvxk-no-match",)) == [(0,)]
+
+
+def test_search_text_exact_restores_the_probe_planner_settings(warehouse: PostgresWarehouse) -> None:
+    """The probe's planner hints must not outlive it, on any return path."""
+    _seed_exact_probe_messages(warehouse)
+    settings = ("enable_indexscan", "enable_seqscan", "cpu_operator_cost", "parallel_tuple_cost", "parallel_setup_cost")
+
+    def current() -> list[tuple[str, ...]]:
+        return warehouse._query(
+            "SELECT " + ", ".join(f"current_setting('{name}')" for name in settings)
+        )
+
+    before = current()
+    warehouse._command("BEGIN")
+    try:
+        for needle in ("112-4417092-3305861", "qzvxk-no-match"):
+            warehouse._query("SELECT count(*) FROM @search_text_exact(%s, 10)", (needle,))
+            assert current() == before, needle
+    finally:
+        warehouse._command("ROLLBACK")
 
 
 def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:

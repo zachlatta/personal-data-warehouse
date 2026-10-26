@@ -534,8 +534,37 @@ showed it; `SET plan_cache_mode = force_generic_plan` reproduces it. Both now ru
 `EXECUTE format(...)` with the needles and patterns inlined as `%L` literals, and the
 filters (`sources`, `since`, `priorities`, the limit) passed with `USING` (see
 `exact_one_shot` in `postgres.py`). The rows in the table above were timed on production with
-generic plans forced. Short numeric needles such as `53845` still take 9-11s: their custom
-plan walks the time index too, because the planner expects matches early.
+generic plans forced. The custom plan still walked the time index for needles of digits and
+punctuation: the planner estimated 8,798 matches for an Amazon order number that has 11, so
+it walked `timeline_events_time_idx` newest-first and filtered every row. Agents hit this
+for order numbers, amounts and addresses, the needles the guide sends to exact search.
+
+**Since 2026-10-26 exact search chooses its scan in three stages, not by the planner's
+estimate** (`SEARCH_TEXT_EXACT_RECENT_ROWS`, `SEARCH_TEXT_EXACT_PROBE_CAP`):
+
+1. Read the newest 5,000 rows in scope and filter them. A needle that fills the limit there
+   is answered: every other match is older.
+2. Otherwise probe the trigram index, unordered, for up to 2,001 matches. Seq and plain index
+   scans are off, and `cpu_operator_cost` is raised so the planner pays for the ILIKE
+   recheck and runs the probe on parallel workers (a LIMIT plan stays serial otherwise:
+   8.9s against 2.3s). If there are no more matches than the cap, the scan reads those
+   rows by `ctid` and sorts them.
+3. Only a denser needle whose newest matches are not recent walks the time index, where
+   matches still turn up early.
+
+Production, warm, 2026-10-26, against the function before the change:
+
+| needle | before | after |
+| --- | --- | --- |
+| an Amazon order number (11 matches) | 60s timeout | 3.4s |
+| `1,441.52` | past 120s | 3.8s |
+| `53845` | 108s | 4.7s |
+| `zach@hackclub.com`, 50 hits | 8.0s | 0.05s |
+| `receipt`, gmail, last 30 days | 2.7s | 0.27s |
+| no match | 1.8s | 0.7s |
+| `Hack Club` / scoped to imessage | 0.05s / 0.92s | 0.03s / 0.52s |
+| `Mt Foolery` | 1.8s | 1.8s |
+| `invoice`, `self,direct` | 2.6s | 3.6s |
 
 Apart from that, `search_text_exact` is a different shape and is **not** the same defect: it already launches
 six parallel workers and its cost is the 7 GB trigram index plus the ILIKE recheck's heap

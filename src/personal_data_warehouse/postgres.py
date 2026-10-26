@@ -354,6 +354,18 @@ SEARCH_TEXT_HIGH_VOLUME_SOURCES: tuple[str, ...] = (
 # dominant slow-query family; no legitimate agent flow reads deeper than this,
 # and callers needing exhaustive results should scope by sources/since instead.
 SEARCH_TEXT_MAX_RESULTS_CAP = 200
+# search_text_exact() first collects up to this many matches through the
+# trigram index, unordered. A needle with no more matches than this is then
+# read back by ctid and sorted; only a denser one takes the newest-first walk
+# of timeline_events_time_idx, where matches turn up early. Measured
+# 2026-10-26 on production: an order number (10 matches among 883 trigram
+# candidates) timed out at 60s on the walk and took 2.3s probed; 'Hack Club'
+# reached this cap in 0.9s.
+SEARCH_TEXT_EXACT_PROBE_CAP = 2000
+# Before that probe it reads this many of the newest rows in scope: a needle
+# whose newest matches are all among them (a common name, a word) has its
+# answer there. 50ms for 'Hack Club'; 94ms wasted on a needle with no match.
+SEARCH_TEXT_EXACT_RECENT_ROWS = 5000
 # The declarative source map both search functions are generated from: one
 # entry per coarse source token as (token, timeline adapters, subsource
 # expression). Keeping this the single source of truth guarantees ranked and
@@ -16390,6 +16402,16 @@ class PostgresWarehouse:
         def exact_one_shot(fragment: str) -> str:
             return fragment.replace("%", "%%")
 
+        # search_text_exact()'s eligibility and scope, shared by its three
+        # statements; $1-$3 are sources, since and priorities.
+        exact_scope_filters = (
+            "NOT COALESCE((t.metadata->>'deleted')::boolean, false)\n"
+            "                          AND " + SEARCH_DRIVE_EXCLUSION_SQL + "\n"
+            "                          AND ($1 IS NULL OR map.source = ANY ($1))\n"
+            "                          AND ($2 IS NULL OR t.occurred_at >= $2)\n"
+            "                          AND ($3 IS NULL OR t.priority::text = ANY ($3))"
+        )
+
         # The ATTENTION pool: the identical two-partition shape, taken from the
         # partial indexes that contain only `self` and `direct`. Used only when
         # the requested tiers are a SUBSET of those -- a call for `noise` or an
@@ -16979,6 +17001,14 @@ class PostgresWarehouse:
                 -- exists for, exactly like search_text's enable_sort scoping.
                 saved_parallel_setup_cost text;
                 saved_min_parallel_scan text;
+                saved_parallel_tuple_cost text;
+                saved_cpu_operator_cost text;
+                saved_enable_indexscan text;
+                saved_enable_seqscan text;
+                -- The probe's matches, or NULL when there are more than
+                -- the probe cap and the scan walks the time index instead.
+                matched tid[];
+                match_clause text;
             BEGIN
                 IF length(needle) < 3 THEN
                     RAISE EXCEPTION 'search_text_exact: query must be at least 3 characters'
@@ -17038,9 +17068,107 @@ class PostgresWarehouse:
                 saved_min_parallel_scan := current_setting('min_parallel_table_scan_size');
                 PERFORM set_config('parallel_setup_cost', '0', true);
                 PERFORM set_config('min_parallel_table_scan_size', '0', true);
+                -- Three stages pick how the scan finds its rows. Ordered by
+                -- time, the planner walks timeline_events_time_idx
+                -- newest-first and filters each row, because it expects
+                -- thousands of matches for any needle of digits and
+                -- punctuation. An order number has about ten, so that walk
+                -- read the whole timeline and hit the 60s statement timeout
+                -- (2026-10-26, an Amazon order number; '53845' took 108s).
+                --
+                -- 1. The newest rows in scope. A needle that fills per_source
+                -- from them has its answer: every other match is older.
+                EXECUTE format($lit$
+                    SELECT array_agg(w.ctid) FROM (
+                        SELECT r.ctid FROM (
+                            SELECT t.ctid, t.occurred_at, t.search_text
+                            FROM @timeline_events t
+                            JOIN (VALUES """
+            + exact_one_shot(adapter_source_values)
+            + r""") AS map(adapter, source) ON map.adapter = t.adapter
+                            WHERE t.search_text != ''
+                              AND """
+            + exact_one_shot(exact_scope_filters)
+            + r"""
+                            ORDER BY t.occurred_at DESC
+                            LIMIT """
+            + str(SEARCH_TEXT_EXACT_RECENT_ROWS)
+            + r"""
+                        ) r
+                        WHERE (r.search_text ILIKE %1$L
+                               OR r.search_text ILIKE %2$L
+                               OR r.search_text ILIKE %3$L)
+                        ORDER BY r.occurred_at DESC
+                        LIMIT $4
+                    ) w
+                $lit$, pattern, pattern_b, pattern_c)
+                INTO matched
+                USING sources, since, priorities, per_source;
+                IF coalesce(cardinality(matched), 0) < per_source THEN
+                    -- 2. The probe: every match up to the probe cap, unordered,
+                    -- from the trigram index. Seq and plain index scans are
+                    -- off, so it is the trigram bitmap. The operator cost
+                    -- makes the planner pay for the ILIKE recheck, which is
+                    -- the real cost (multi-megabyte documents): otherwise it
+                    -- keeps a LIMIT plan serial (8.9s against 2.3s on 4
+                    -- workers).
+                    saved_parallel_tuple_cost := current_setting('parallel_tuple_cost');
+                    saved_cpu_operator_cost := current_setting('cpu_operator_cost');
+                    saved_enable_indexscan := current_setting('enable_indexscan');
+                    saved_enable_seqscan := current_setting('enable_seqscan');
+                    PERFORM set_config('parallel_tuple_cost', '0', true);
+                    PERFORM set_config('cpu_operator_cost', '1', true);
+                    PERFORM set_config('enable_indexscan', 'off', true);
+                    PERFORM set_config('enable_seqscan', 'off', true);
+                    EXECUTE format($lit$
+                        SELECT array_agg(m.ctid) FROM (
+                            SELECT t.ctid
+                            FROM @timeline_events t
+                            JOIN (VALUES """
+            + exact_one_shot(adapter_source_values)
+            + r""") AS map(adapter, source) ON map.adapter = t.adapter
+                            WHERE (t.search_text ILIKE %1$L
+                                   OR t.search_text ILIKE %2$L
+                                   OR t.search_text ILIKE %3$L)
+                              AND t.search_text != ''
+                              AND """
+            + exact_one_shot(exact_scope_filters)
+            + r"""
+                            LIMIT $4
+                        ) m
+                    $lit$, pattern, pattern_b, pattern_c)
+                    INTO matched
+                    USING sources, since, priorities, """
+            + str(SEARCH_TEXT_EXACT_PROBE_CAP + 1)
+            + r""";
+                    PERFORM set_config('parallel_tuple_cost', saved_parallel_tuple_cost, true);
+                    PERFORM set_config('cpu_operator_cost', saved_cpu_operator_cost, true);
+                    PERFORM set_config('enable_indexscan', saved_enable_indexscan, true);
+                    PERFORM set_config('enable_seqscan', saved_enable_seqscan, true);
+                END IF;
+                IF matched IS NULL THEN
+                    PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
+                    PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
+                    RETURN;
+                END IF;
+                IF cardinality(matched) > """
+            + str(SEARCH_TEXT_EXACT_PROBE_CAP)
+            + r""" THEN
+                    -- 3. A needle denser than the probe cap whose newest
+                    -- matches are not recent: walk the time index, where
+                    -- matches still turn up early.
+                    matched := NULL;
+                    match_clause := format(
+                        '(t.search_text ILIKE %L OR t.search_text ILIKE %L OR t.search_text ILIKE %L)',
+                        pattern, pattern_b, pattern_c);
+                ELSE
+                    -- Every match the scan needs is in hand: read those rows.
+                    match_clause := 't.ctid = ANY ($5)';
+                END IF;
                 -- EXECUTE format(...), not a static statement: see
-                -- exact_one_shot. The needles and patterns are literals;
-                -- $1-$4 are sources, since, priorities and per_source.
+                -- exact_one_shot. The needles, patterns and match clause are
+                -- literals; $1-$5 are sources, since, priorities, per_source
+                -- and the probe's matches.
                 RETURN QUERY EXECUTE format($lit$
                     SELECT hit.source, hit.subsource, hit.context, hit.who,
                            hit.occurred_at, hit.account, hit.ref,
@@ -17085,17 +17213,11 @@ class PostgresWarehouse:
                         JOIN (VALUES """
             + exact_one_shot(adapter_source_values)
             + r""") AS map(adapter, source) ON map.adapter = t.adapter
-                        WHERE (t.search_text ILIKE %4$L
-                               OR t.search_text ILIKE %5$L
-                               OR t.search_text ILIKE %6$L)
+                        WHERE %4$s
                           AND t.search_text != ''
-                          AND NOT COALESCE((t.metadata->>'deleted')::boolean, false)
                           AND """
-            + exact_one_shot(SEARCH_DRIVE_EXCLUSION_SQL)
+            + exact_one_shot(exact_scope_filters)
             + r"""
-                          AND ($1 IS NULL OR map.source = ANY ($1))
-                          AND ($2 IS NULL OR t.occurred_at >= $2)
-                          AND ($3 IS NULL OR t.priority::text = ANY ($3))
                         ORDER BY t.occurred_at DESC
                         LIMIT $4
                     ) hit
@@ -17110,8 +17232,8 @@ class PostgresWarehouse:
                         END AS lowdoc
                     ) ld
                     ORDER BY hit.occurred_at DESC
-                $lit$, needle, needle_b, needle_c, pattern, pattern_b, pattern_c)
-                USING sources, since, priorities, per_source;
+                $lit$, needle, needle_b, needle_c, match_clause)
+                USING sources, since, priorities, per_source, matched;
                 PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
                 PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
             END;
