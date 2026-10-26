@@ -42,11 +42,13 @@ import {
 import { FeedCard } from './feed-card';
 import { useFeedHost } from './feed-host';
 import type { CardLink } from './links';
-import { sourceBubbles } from './rich';
+import { shortAge, sourceBubbles } from './rich';
 import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
 import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { readFeedCache, writeFeedCache } from './feed-cache';
+import { prefetchOffline, setOffline, useOffline } from './offline';
+import { isOfflineError, OFFLINE_PAGE_MAX_AGE_MS } from './offline-store';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { shareCard } from './share-sheet';
 import { autoplayStep } from './autoplay';
@@ -93,6 +95,19 @@ function viewName(only: string | null, searching = false): string {
 
 type Undo = { text: string; undo: () => void; timer: ReturnType<typeof setTimeout> };
 
+// Put a page read from disk where the cards and the detail view look.
+function adoptCachedPage(page: { items: FeedItem[]; saved?: FeedItem[] }) {
+  for (const item of [...page.items, ...(page.saved ?? [])]) feedItems.set(item.item_id, item);
+  loadSaved(page.saved ?? []);
+  loadLiked([...page.items, ...(page.saved ?? [])]);
+}
+
+// 12m ago, 3h ago, Oct 5.
+function offlineAge(at: number): string {
+  const age = shortAge(new Date(at).toISOString());
+  return /^\d+[smhd]$/.test(age) ? `${age} ago` : age;
+}
+
 export default function FeedScreen() {
   const host = useFeedHost();
   const tabBarSpace = useTabBarSpace();
@@ -103,15 +118,15 @@ export default function FeedScreen() {
   const openItem = host.useOpenItem();
   // A cold start paints the last page from disk at once; the network
   // load then replaces it (loadedAt stays 0, so the first focus fetches).
-  const [cached] = useState(() => {
-    const page = readFeedCache();
-    if (page) {
-      for (const item of [...page.items, ...(page.saved ?? [])]) feedItems.set(item.item_id, item);
-      loadSaved(page.saved ?? []);
-      loadLiked([...page.items, ...(page.saved ?? [])]);
-    }
-    return page;
+  const [hit] = useState(() => {
+    const disk = readFeedCache();
+    if (disk) adoptCachedPage(disk.page);
+    return disk;
   });
+  const cached = hit?.page ?? null;
+  // When the cards on screen were fetched, for the offline banner.
+  const [pageAt, setPageAt] = useState(hit?.at ?? 0);
+  const offline = useOffline();
   const [items, setItems] = useState<FeedItem[]>(() => cached?.items ?? []);
   const [loaded, setLoaded] = useState(!!cached);
   const savedPage = useRef<FeedItem[]>(cached?.saved ?? []);
@@ -242,6 +257,10 @@ export default function FeedScreen() {
       if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
       loadedIds.current = page.items.map((i) => i.item_id);
       setItems(page.items);
+      setPageAt(Date.now());
+      setOffline(false);
+      // Download what is next and saved, for reading offline.
+      void prefetchOffline(config, page.items, page.saved ?? []);
       setError(null);
       setDisabled(false);
       loadedAt.current = Date.now();
@@ -252,7 +271,20 @@ export default function FeedScreen() {
         metadata: { trigger, ok: false, status: e instanceof FeedApiError ? e.status : 0, error: e instanceof Error ? e.message.slice(0, 300) : String(e) },
       });
       if (e instanceof FeedApiError && e.status === 404) setDisabled(true);
-      else setError(e instanceof Error ? e.message : String(e));
+      else if (isOfflineError(e)) {
+        setOffline(true);
+        // Nothing on screen (the page on disk was past the cold start's 3
+        // days): offline, an older page beats an empty feed.
+        const disk = loadedIds.current.length ? null : readFeedCache(Date.now(), OFFLINE_PAGE_MAX_AGE_MS);
+        if (disk) {
+          adoptCachedPage(disk.page);
+          savedPage.current = disk.page.saved ?? [];
+          pageItems.current = [...disk.page.items, ...(disk.page.saved ?? [])];
+          loadedIds.current = disk.page.items.map((i) => i.item_id);
+          setItems(disk.page.items);
+          setPageAt(disk.at);
+        }
+      } else setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRefreshing(false);
       setLoaded(true);
@@ -772,7 +804,14 @@ export default function FeedScreen() {
                 <ThemedText style={styles.bannerText}>Could not search: {searchError}</ThemedText>
               </View>
             ) : null}
-            {error && !searching ? (
+            {offline && !searching ? (
+              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+                <ThemedText style={styles.bannerText}>
+                  {pageAt ? `You're offline · cards from ${offlineAge(pageAt)}` : "You're offline"}. Downloaded articles and photos still open.
+                </ThemedText>
+              </View>
+            ) : null}
+            {error && !offline && !searching ? (
               <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
                 <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
               </View>

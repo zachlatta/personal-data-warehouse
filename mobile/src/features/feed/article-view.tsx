@@ -9,19 +9,21 @@ import { useConfig } from '@/lib/session';
 
 import { fetchArticle } from './api';
 import { articleDocument, parseArticleMessage, readingMinutes, type FeedArticle } from './article';
+import { readStoredArticle, setOffline, storeArticle } from './offline';
+import { isOfflineError } from './offline-store';
 import { ACCENT } from './rich-views';
 
-// Read articles stay for the app's life, so reopening a card is instant.
-const articles = new Map<string, FeedArticle>();
 // The one script the article page may run carries this.
 const NONCE = Math.random().toString(36).slice(2);
 
-export type ArticleOutcome = { ok: true; words: number; ms: number } | { ok: false; error: string; ms: number };
+// offline: read from the copy on the phone (or, failed, because there is no connection).
+export type ArticleOutcome = { ok: true; words: number; ms: number; offline: boolean } | { ok: false; error: string; ms: number; offline: boolean };
 
 // The article at url, read by the server and shown in a WebView as tall as
-// its content (the detail view's ScrollView does the scrolling). A tapped
-// link goes to onLink; a page with no article shows nothing but a note,
-// and the detail view's open button is still there.
+// its content (the detail view's ScrollView does the scrolling). The copy
+// downloaded for offline (offline.ts) is read first; one read online is
+// kept. A tapped link goes to onLink; a page with no article shows nothing
+// but a note, and the detail view's open button is still there.
 export function ArticleView({
   url,
   shownImages,
@@ -35,25 +37,38 @@ export function ArticleView({
 }) {
   const config = useConfig();
   const theme = useTheme();
-  const [article, setArticle] = useState<FeedArticle | null>(articles.get(url) ?? null);
-  const [error, setError] = useState<string | null>(null);
+  const [article, setArticle] = useState<FeedArticle | null>(null);
+  const [stored, setStored] = useState(false);
+  const [error, setError] = useState<{ message: string; offline: boolean } | null>(null);
   const [height, setHeight] = useState(0);
 
   useEffect(() => {
-    if (articles.has(url)) return;
     let live = true;
     const startedAt = Date.now();
-    fetchArticle(config, url)
-      .then((a) => {
-        articles.set(url, a);
-        onOutcome({ ok: true, words: a.words, ms: Date.now() - startedAt });
+    void (async () => {
+      const local = await readStoredArticle(url);
+      if (local) {
+        onOutcome({ ok: true, words: local.words, ms: Date.now() - startedAt, offline: true });
+        if (live) {
+          setStored(true);
+          setArticle(local);
+        }
+        return;
+      }
+      try {
+        const a = await fetchArticle(config, url);
+        setOffline(false);
+        void storeArticle(url, a);
+        onOutcome({ ok: true, words: a.words, ms: Date.now() - startedAt, offline: false });
         if (live) setArticle(a);
-      })
-      .catch((e: unknown) => {
+      } catch (e: unknown) {
         const message = e instanceof Error ? e.message : String(e);
-        onOutcome({ ok: false, error: message, ms: Date.now() - startedAt });
-        if (live) setError(message);
-      });
+        const off = isOfflineError(e);
+        if (off) setOffline(true);
+        onOutcome({ ok: false, error: message, ms: Date.now() - startedAt, offline: off });
+        if (live) setError({ message, offline: off });
+      }
+    })();
     return () => {
       live = false;
     };
@@ -85,7 +100,9 @@ export function ArticleView({
   if (error) {
     return (
       <ThemedText style={[styles.note, { color: theme.textSecondary }]}>
-        The full article could not be loaded here. Open the page below to read it.
+        {error.offline
+          ? "You're offline and this article wasn't downloaded yet. It downloads the next time the feed loads online."
+          : 'The full article could not be loaded here. Open the page below to read it.'}
       </ThemedText>
     );
   }
@@ -101,7 +118,7 @@ export function ArticleView({
     <View>
       <View style={[styles.divider, { borderTopColor: theme.backgroundSelected }]}>
         <ThemedText style={[styles.meta, { color: theme.textSecondary }]}>
-          {[article.byline, `${readingMinutes(article.words)} min read`].filter(Boolean).join(' · ')}
+          {[article.byline, `${readingMinutes(article.words)} min read`, stored ? 'Saved offline' : ''].filter(Boolean).join(' · ')}
         </ThemedText>
       </View>
       <WebView

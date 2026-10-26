@@ -260,7 +260,7 @@ export default function FeedReaderScreen() {
       item_id: item.item_id,
       position,
       dwell_ms: o.ms,
-      metadata: o.ok ? { ok: true, words: o.words } : { ok: false, error: o.error.slice(0, 300) },
+      metadata: o.ok ? { ok: true, words: o.words, offline: o.offline } : { ok: false, error: o.error.slice(0, 300), offline: o.offline },
     });
 
   const embed = item.embed?.type === 'x_post' ? item.embed : undefined;

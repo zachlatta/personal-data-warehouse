@@ -80,6 +80,8 @@ they expire or are removed until he unsaves them. Read the queue with {{if .CLI}
 (`saved`, `saved_at` on each card's engagement). Save for him only when he asks ("save that
 for me"): {{if .CLI}}`pdw feed save ID... --reason "..."` (`pdw feed unsave` takes it out){{else}}`feed_save` `{"item_ids": [...], "reason": "..."}` (`"unsave": true` takes it out){{end}}.
 Push the card first if it is not in the feed.
+The phone downloads every saved card and the next 40 in the feed (pictures and article
+text, not videos) so they read offline; saving a card is how to make sure it is there.
 
 ## Reading engagement
 

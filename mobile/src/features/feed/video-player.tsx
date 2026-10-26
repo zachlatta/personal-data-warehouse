@@ -12,6 +12,7 @@ import { useTheme } from '@/hooks/use-theme';
 
 import { startTimer } from './engagement';
 import { useFeedHost } from './feed-host';
+import { useOffline } from './offline';
 import { videoLength } from './rich';
 import { EMBED_BASE_URL, instagramEmbedUrl, instagramPlayerScript, playerHtml, setMutedScript, type VideoSource } from './video';
 
@@ -133,7 +134,9 @@ export function InlineVideo({
 }) {
   const theme = useTheme();
   const touch = useContext(PlayerTouch);
-  const active = useSyncExternalStore(subscribe, () => playing) === playerKey;
+  // Videos are not downloaded: offline the poster stays, with a note.
+  const offline = useOffline();
+  const active = useSyncExternalStore(subscribe, () => playing) === playerKey && !offline;
   const [drawn, setDrawn] = useState(false);
   const soundOff = useSyncExternalStore(subscribe, () => muted);
   const webRef = useRef<WebView>(null);
@@ -246,11 +249,12 @@ export function InlineVideo({
     <Pressable
       style={frame}
       onPress={() => {
+        if (offline) return;
         setPlaying(playerKey);
         onPlay(false);
       }}
       accessibilityRole="button"
-      accessibilityLabel="Play video">
+      accessibilityLabel={offline ? 'Video needs a connection to play' : 'Play video'}>
       {source.poster ? (
         <Image source={{ uri: source.poster }} style={StyleSheet.absoluteFill} contentFit="cover" transition={150} recyclingKey={playerKey} />
       ) : (
@@ -261,9 +265,9 @@ export function InlineVideo({
           <Icon name="play.fill" tintColor="#fff" size={24} />
         </View>
       </View>
-      {length || LABEL[source.kind] ? (
+      {offline || length || LABEL[source.kind] ? (
         <View style={styles.badge} pointerEvents="none">
-          <ThemedText style={styles.badgeText}>{[LABEL[source.kind], length].filter(Boolean).join(' · ')}</ThemedText>
+          <ThemedText style={styles.badgeText}>{offline ? 'Needs a connection to play' : [LABEL[source.kind], length].filter(Boolean).join(' · ')}</ThemedText>
         </View>
       ) : null}
     </Pressable>

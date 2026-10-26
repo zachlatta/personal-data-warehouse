@@ -76,6 +76,30 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   content, in the app's colors and type, under a nonce-only CSP; it hides the article's copy
   of the photo the card already shows, and adds the page's lead image when the card has
   none. Every link tap goes to the in-app browser like any other link.
+- **Ready to read offline** (added 2026-10-26 from Zach's email: "Have pdw feed download
+  it's items and articles so stuff is ready to read offline"). After every feed load that
+  reaches the server, the phone (`offline.ts`, the plan and bookkeeping in
+  `offline-store.ts`) downloads every saved card and the first 40 cards of the page in
+  served order, seen or not. Every one gets its pictures (photos, video posters, an X post's
+  avatar, media and quoted post, the source icon) into expo-image's disk cache. Every one
+  with an article gets the article, read through the same `GET /api/feed/article`, into
+  `Documents/pdw-offline/` with up to 15 of its pictures (3 MB each, 8 MB per article; past
+  that a picture stays a network image and is hidden offline), three articles at a time.
+  No server change and no batch endpoint: the server's 6-hour read cache serves it, and the
+  phone asks for a url once (a page with no article is not asked again for a day). An
+  article opened online is kept too. The detail view reads the stored copy first, its
+  pictures inlined as `data:` URIs, and says "Saved offline"; one not downloaded says so
+  when there is no connection. Offline, the feed shows a banner with the age of its cards,
+  and when the page on disk is past the cold start's 3 days it still shows one up to 14
+  days old. The store keeps 250 MB at most and 14 days for cards no longer in the feed or
+  Saved; over the cap the least recently opened go first, saved cards last. **Videos are not
+  downloaded** (an embedded player cannot be stored and an mp4 is large): offline a video
+  shows its poster and "Needs a connection to play". Pages opened in the feed's browser are
+  not downloaded either. Each run logs a `ui` `offline_prefetch` event (`cards`,
+  `media_urls`, `planned`, `articles`, `failed`, `stopped_offline`, `stored`,
+  `store_bytes`; `dwell_ms` = how long it took), and the `ui` `article` event says
+  `offline: true` when the article came from the phone. Offline means a request that never
+  reached the server; the app has no network-type check, so it downloads on cellular too.
 - **Card context** (added 2026-10-21 after reviewing the recordings): `GET /api/feed`
   sends the phone only `hn_points` and `hn_comments`. No card has a line above it saying
   why it is here: the `taste` line (and an X post's title in that spot) came out on
@@ -255,6 +279,7 @@ Delete these files and directories:
 - `app/cmd/pdw-cli/feed.go`, `app/cmd/pdw-cli/feed_test.go`
 - `app/internal/guide/topics/feed.md`
 - `mobile/src/features/feed/` (including `scroll-gestures.ts`), `mobile/src/app/(tabs)/feed.tsx`, `mobile/src/app/feed/`
+  (on the phone, `Documents/pdw-offline/` goes with the app's data)
 - `src/personal_data_warehouse/feed.py`, `tests/test_feed.py`, this file
 
 Then remove one registration in each of these places:

@@ -14,6 +14,7 @@ import { LikeHeart } from './like-heart';
 import { PhotoViewer } from './photo-viewer';
 import { mediaVideo } from './video';
 import { InlineVideo } from './video-player';
+import { faviconUrl } from './offline-store';
 import {
   avatarColor,
   compactCount,
@@ -93,7 +94,7 @@ export function SourceAvatar({ name, url, size = 36, ring = false }: { name: str
       <ThemedText style={[styles.avatarLetter, { fontSize: inner * 0.45, lineHeight: inner * 0.6 }]}>{letter}</ThemedText>
       {host && !failed ? (
         <Image
-          source={{ uri: `https://icons.duckduckgo.com/ip3/${host}.ico` }}
+          source={{ uri: faviconUrl(url) }}
           style={[StyleSheet.absoluteFill, { borderRadius: inner / 2, backgroundColor: '#fff' }]}
           contentFit="contain"
           onError={() => setFailed(true)}
