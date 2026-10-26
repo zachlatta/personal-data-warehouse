@@ -25,6 +25,9 @@ type Options struct {
 	// SearchEmbedder powers the search tool's hybrid mode. Nil means
 	// embeddings are unconfigured and hybrid searches fall back to keyword.
 	SearchEmbedder Embedder
+	// TimingRecorder stores every search's timings (ops.search_request_timings,
+	// contract C6). Nil records nothing.
+	TimingRecorder TimingRecorder
 }
 
 type Runner interface {
@@ -67,6 +70,7 @@ type Service struct {
 	// /proc for that snapshot; tests replace both.
 	slowSearchThreshold time.Duration
 	readHostFile        func(string) ([]byte, error)
+	timingRecorder      TimingRecorder
 	// now resolves a relative search since (7d); tests pin it.
 	now func() time.Time
 }
@@ -192,6 +196,7 @@ func NewService(runner Runner, opts Options) *Service {
 	return &Service{
 		runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder,
 		slowSearchThreshold: slowSearchThreshold, readHostFile: os.ReadFile, now: time.Now,
+		timingRecorder: opts.TimingRecorder,
 	}
 }
 

@@ -2585,6 +2585,28 @@
       "secret": false
     },
     {
+      "id": "search_request_timings",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "search_request_timings",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "search_request_timing_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "search_request_timing_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "pgbackrest_health",
       "kind": "table",
       "layer": "ops",

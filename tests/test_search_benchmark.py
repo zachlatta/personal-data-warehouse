@@ -444,6 +444,8 @@ def test_run_search_uses_first_class_cli_with_structured_flags(monkeypatch) -> N
     ]
     assert seen["kwargs"]["timeout"] == 420.0
     assert result.rows[0].ref == "slack_message:abc"
+    # Probe searches are labelled so the real-search grade can leave them out.
+    assert seen["kwargs"]["env"]["PDW_CLIENT_NAME"] == "search-benchmark"
 
 
 def test_run_search_rejects_a_response_that_did_not_apply_the_requested_scope(

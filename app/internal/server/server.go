@@ -299,6 +299,18 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	} else {
 		logger.Info("search embeddings not configured; search tool falls back to keyword mode")
 	}
+	// Every search's timings into ops.search_request_timings (contract C6), off
+	// the request path: the writer queues, samples host pressure, inserts, and
+	// beats every ten minutes so a dead writer reads on /pipelines.
+	if cfg.PostgresDatabaseURL != "" {
+		if store, err := newSearchTimingStore(cfg.PostgresDatabaseURL); err != nil {
+			logger.Error("search timing store failed to initialize; search timings disabled", "error", err.Error())
+		} else {
+			timingWriter := newSearchTimingWriter(store, logger)
+			timingWriter.start(searchTimingHeartbeat)
+			queryOpts.TimingRecorder = timingWriter
+		}
+	}
 	var extra []tool.Tool
 	store, storeEnabled, err := objectStoreFromConfig(cfg)
 	if err != nil {
@@ -496,7 +508,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		Logger:       slog.Default().With("component", "mcp_streamable"),
 	})
 	protected := authSvc.RequireBearer(strings.TrimRight(baseURL, "/") + "/.well-known/oauth-protected-resource")(mcpHandler)
-	mux.Handle("/mcp", mcpproxy.TraceMiddleware(protected))
+	mux.Handle("/mcp", withSearchSurface("mcp", mcpproxy.TraceMiddleware(protected)))
 
 	apiHandler := api.NewDynamicHandler(func(ctx context.Context) (*tool.Registry, error) {
 		current, err := snapshot(ctx)
@@ -506,7 +518,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		return current.Filter(toolShowsOnCLI), nil
 	}, slog.Default())
 	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
-	apiTraced := mcpproxy.TraceMiddleware(apiProtected)
+	apiTraced := withSearchSurface("api", mcpproxy.TraceMiddleware(apiProtected))
 	mux.Handle("/api/tools", apiTraced)
 	mux.Handle("/api/tools/", apiTraced)
 

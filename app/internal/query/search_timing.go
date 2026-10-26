@@ -2,10 +2,13 @@ package query
 
 import (
 	"context"
+	"log/slog"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 // slowSearchThreshold is C6's line. A search slower than this is a question
@@ -53,10 +56,28 @@ func (t hybridTimings) logAttrs() []any {
 // pressure reads as an idle host, which is the verdict that matters most.
 func (s *Service) hostPressure() []any {
 	attrs := []any{"cpu_count", runtime.NumCPU()}
-	read := s.readHostFile
-	if read == nil {
+	if s.readHostFile == nil {
 		return attrs
 	}
+	gauges, load, loadOK := readHostGauges(s.readHostFile)
+	for _, gauge := range gauges {
+		attrs = append(attrs, gauge.name, gauge.value)
+	}
+	if loadOK {
+		attrs = append(attrs, "load_1m", load)
+	}
+	return attrs
+}
+
+type hostGauge struct {
+	name  string
+	value float64
+}
+
+// readHostGauges parses /proc/pressure/{cpu,io} avg10 lines (cpu_some_avg10,
+// io_full_avg10, ...) and the 1-minute load. Unreadable values are absent.
+func readHostGauges(read func(string) ([]byte, error)) ([]hostGauge, float64, bool) {
+	var gauges []hostGauge
 	for _, source := range []struct{ path, prefix string }{
 		{"/proc/pressure/cpu", "cpu"},
 		{"/proc/pressure/io", "io"},
@@ -75,18 +96,127 @@ func (s *Service) hostPressure() []any {
 				continue
 			}
 			if parsed, err := strconv.ParseFloat(value, 64); err == nil {
-				attrs = append(attrs, source.prefix+"_"+fields[0]+"_avg10", parsed)
+				gauges = append(gauges, hostGauge{source.prefix + "_" + fields[0] + "_avg10", parsed})
 			}
 		}
 	}
 	if raw, err := read("/proc/loadavg"); err == nil {
 		if fields := strings.Fields(string(raw)); len(fields) > 0 {
 			if parsed, err := strconv.ParseFloat(fields[0], 64); err == nil {
-				attrs = append(attrs, "load_1m", parsed)
+				return gauges, parsed, true
 			}
 		}
 	}
-	return attrs
+	return gauges, 0, false
+}
+
+// HostPressure is the host's saturation at one moment, as stored beside a
+// search's timings. -1 is unmeasured: 0 would read as an idle host.
+type HostPressure struct {
+	IOFullAvg10  float64
+	CPUSomeAvg10 float64
+	Load1m       float64
+	CPUCount     int
+}
+
+// SampleHostPressure reads the same PSI and load gauges the slow-search log
+// carries. read is os.ReadFile in production.
+func SampleHostPressure(read func(string) ([]byte, error)) HostPressure {
+	p := HostPressure{IOFullAvg10: -1, CPUSomeAvg10: -1, Load1m: -1, CPUCount: runtime.NumCPU()}
+	if read == nil {
+		return p
+	}
+	gauges, load, loadOK := readHostGauges(read)
+	for _, gauge := range gauges {
+		switch gauge.name {
+		case "io_full_avg10":
+			p.IOFullAvg10 = gauge.value
+		case "cpu_some_avg10":
+			p.CPUSomeAvg10 = gauge.value
+		}
+	}
+	if loadOK {
+		p.Load1m = load
+	}
+	return p
+}
+
+// SearchTiming is one answered search as ops.search_request_timings stores
+// it: how long, which leg, from which surface and client, and whether a scope
+// was given. Never the query text or the scope's values -- a query can be
+// private, and the timing is the evidence C6 needs.
+type SearchTiming struct {
+	OccurredAt    time.Time
+	RequestID     string
+	Surface       string
+	Client        string
+	Mode          string
+	Status        string
+	HasPriorities bool
+	HasSources    bool
+	Rows          int
+	Duration      time.Duration
+	// Hybrid is false for keyword and exact searches; their leg fields are
+	// then meaningless and stored as -1.
+	Hybrid     bool
+	Embed      time.Duration
+	Lexical    time.Duration
+	Exact      time.Duration
+	Semantic   time.Duration
+	Fuse       time.Duration
+	SlowestLeg string
+}
+
+// TimingRecorder receives every search the service ran, after the response
+// is built. Record must return at once and never fail the search: the
+// production recorder queues the timing for a background writer and drops it
+// when the queue is full.
+type TimingRecorder interface {
+	Record(SearchTiming)
+}
+
+type searchSurfaceKey struct{}
+
+// WithSearchSurface marks the entry point a request came through ("mcp" or
+// "api"), so a stored timing can tell agents on MCP from the CLI and web app.
+func WithSearchSurface(ctx context.Context, surface string) context.Context {
+	return context.WithValue(ctx, searchSurfaceKey{}, surface)
+}
+
+func searchSurfaceFrom(ctx context.Context) string {
+	surface, _ := ctx.Value(searchSurfaceKey{}).(string)
+	return surface
+}
+
+// recordSearch hands the finished search to the recorder. A recorder that
+// panics is logged and swallowed: a timing is never worth a search.
+func (s *Service) recordSearch(ctx context.Context, req SearchRequest, resp SearchResponse, status string, duration time.Duration, timings *hybridTimings) {
+	if s.timingRecorder == nil {
+		return
+	}
+	timing := SearchTiming{
+		OccurredAt:    time.Now().UTC(),
+		Surface:       searchSurfaceFrom(ctx),
+		Client:        pdwauth.ClientNameFromContext(ctx),
+		Mode:          resp.Mode,
+		Status:        status,
+		HasPriorities: len(req.Priorities) > 0,
+		HasSources:    len(req.Sources) > 0,
+		Rows:          resp.TotalRows,
+		Duration:      duration,
+	}
+	if timings != nil {
+		timing.Hybrid = true
+		timing.Embed, timing.Lexical, timing.Exact = timings.Embed, timings.Lexical, timings.Exact
+		timing.Semantic, timing.Fuse = timings.Semantic, timings.Fuse
+		timing.SlowestLeg = timings.slowestLeg()
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.WarnContext(ctx, "search timing recorder panicked", slog.Any("panic", recovered))
+		}
+	}()
+	s.timingRecorder.Record(timing)
 }
 
 func (s *Service) logSearchCompleted(ctx context.Context, resp SearchResponse, duration time.Duration, timings *hybridTimings) {

@@ -453,6 +453,9 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 			resp.Error = s.unknownSourceMessage(ctx, token)
 		}
 		s.logger.ErrorContext(ctx, "search failed", "query", resp.Query, "mode", resp.Mode, "sql", statement, "error", err, "duration", time.Since(started))
+		// A failed search is the slowest kind (a statement timeout is 60s):
+		// leaving it out would make the percentiles look better than searching felt.
+		s.recordSearch(ctx, req, resp, "error", time.Since(started), timings)
 		return resp
 	}
 	resp.ColumnNames = addDrillSQL(append([]string(nil), raw.Columns...), raw.Rows)
@@ -477,9 +480,12 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 	if err != nil {
 		resp.Error = err.Error()
 		s.logger.ErrorContext(ctx, "search encoding failed", "query", resp.Query, "mode", resp.Mode, "error", err, "duration", time.Since(started))
+		s.recordSearch(ctx, req, resp, "error", time.Since(started), timings)
 		return resp
 	}
-	s.logSearchCompleted(ctx, resp, time.Since(started), timings)
+	duration := time.Since(started)
+	s.logSearchCompleted(ctx, resp, duration, timings)
+	s.recordSearch(ctx, req, resp, "ok", duration, timings)
 	return resp
 }
 

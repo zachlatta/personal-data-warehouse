@@ -192,9 +192,12 @@ def test_c6_measures_paired_scopes_serially_and_grades_the_slower_scope(
         *,
         priorities: tuple[str, ...],
         timeout: float,
+        client_name: str,
     ) -> SearchResult:
         assert mode == "hybrid"
         assert depth == 20
+        # Labelled so the real-search grade leaves the audit's probes out.
+        assert client_name == "contract-audit"
         calls.append((query, priorities, timeout))
         elapsed = next(attention_times if priorities else all_times)
         return SearchResult(
@@ -243,6 +246,7 @@ def test_c6_invalid_probes_remain_in_the_grade_and_are_not_latency_samples(
         *,
         priorities: tuple[str, ...],
         timeout: float,
+        client_name: str,
     ) -> SearchResult:
         if priorities == attention:
             return SearchResult(
@@ -278,6 +282,7 @@ def test_c6_fast_probes_need_no_current_saturation_claim(
         *,
         priorities: tuple[str, ...],
         timeout: float,
+        client_name: str,
     ) -> SearchResult:
         return SearchResult(
             mode="hybrid",

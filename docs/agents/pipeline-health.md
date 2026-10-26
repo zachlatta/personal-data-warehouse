@@ -54,7 +54,8 @@ minutes old, and `marts_ai_conversations.sessions` / `.events` read `late` with
 `cause_pipelines = {pi}`. So a **usage-driven** source declares `freshness_escalates=False`:
 past its interval its `data_status` / `event_status` read `quiet` — observed, never
 colouring `status`, a mart, or `stalest_pipeline` — and the run heartbeat alone escalates.
-That is pi, `muse_code`, `argon` and `alice_voice_recordings`, pinned by
+That is pi, `muse_code`, `argon`, `alice_voice_recordings` and `search_requests` (searches
+stop when nobody searches; the app's timing writer beats every ten minutes), pinned by
 `test_exactly_the_usage_driven_sources_skip_freshness_escalation`, which also requires each
 to declare a heartbeat. `data=None` is not the same thing: it reads `manual`, a claim that
 no cadence exists at all. Sources with a real data SLA (contacts, browser history, voice

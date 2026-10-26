@@ -2825,7 +2825,7 @@ def test_a_failing_search_health_component_fails_the_search_index_pipeline(wareh
 # {pi}. pi's 45d interval put late at 90 days of Zach not using a CLI, which is
 # not a pipeline fact; muse_code and argon copied it.
 
-USAGE_DRIVEN_PIPELINES = {"pi", "muse_code", "argon", "alice_voice_recordings"}
+USAGE_DRIVEN_PIPELINES = {"pi", "muse_code", "argon", "alice_voice_recordings", "search_requests"}
 
 
 def test_exactly_the_usage_driven_sources_skip_freshness_escalation():
@@ -2889,6 +2889,123 @@ def test_a_usage_driven_source_with_a_stale_heartbeat_reads_stale(warehouse):
     row = _pi_row(warehouse)
     assert row["run_status"] == "stale"
     assert row["status"] == "stale"
+
+
+# --- search request timings (C6): the app appends, the writer's heartbeat judges --
+
+
+def _seed_search_timing_heartbeat(
+    warehouse, *, status: str, ticked_ago: timedelta, error: str = "", dropped: int = 0
+) -> None:
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @search_request_timing_state
+            (writer, ticked_at, last_write_at, status, error,
+             written_since_tick, dropped_since_tick, updated_at)
+        VALUES ('search_requests', %s, %s, %s, %s, 3, %s, %s)
+        ON CONFLICT (writer) DO UPDATE SET
+            ticked_at = EXCLUDED.ticked_at, status = EXCLUDED.status,
+            error = EXCLUDED.error, dropped_since_tick = EXCLUDED.dropped_since_tick,
+            updated_at = EXCLUDED.updated_at
+        """,
+        (now - ticked_ago, now - ticked_ago, status, error, dropped, now - ticked_ago),
+    )
+
+
+def _search_requests_row(warehouse) -> dict:
+    return warehouse._query_dicts(
+        "SELECT status, data_status, run_status, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'search_requests'"
+    )[0]
+
+
+@pytest.mark.parametrize(
+    ("status", "ticked_ago", "error", "dropped", "expected_status", "expected_run_status"),
+    [
+        # Nobody searched all night, the writer is alive: quiet, not red.
+        ("ok", timedelta(minutes=5), "", 0, "ok", "ok"),
+        # The writer cannot insert (DDL or permission): red, with the reason.
+        ("error", timedelta(minutes=5), "permission denied for schema ops", 0, "failing", "ok"),
+        # The queue overflowed and timings were lost: amber, not red.
+        ("dropped", timedelta(minutes=5), "dropped 12 search timings", 12, "attention", "ok"),
+        # The writer stopped ticking (app down, goroutine dead).
+        ("ok", timedelta(hours=5), "", 0, "stale", "stale"),
+    ],
+)
+def test_search_requests_pipeline_is_judged_by_the_writer_heartbeat_not_by_traffic(
+    warehouse, status, ticked_ago, error, dropped, expected_status, expected_run_status
+):
+    _provision_every_table(warehouse)
+    _seed_search_timing_heartbeat(
+        warehouse, status=status, ticked_ago=ticked_ago, error=error, dropped=dropped
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _search_requests_row(warehouse)
+    assert row["status"] == expected_status
+    assert row["run_status"] == expected_run_status
+    # No search rows at all: data age is a statement about usage, never a colour.
+    assert row["data_status"] in ("no_data", "quiet")
+    if error:
+        assert row["last_error"] == error
+
+
+def test_a_replaced_containers_error_tick_does_not_pin_search_requests_red(warehouse):
+    """The heartbeat is ONE row: the next container's ok tick replaces the error.
+
+    StateSource counts every error row in its table and never ages one out, so
+    a row per container would leave a deploy's last error behind forever.
+    """
+    _provision_every_table(warehouse)
+    _seed_search_timing_heartbeat(
+        warehouse, status="error", ticked_ago=timedelta(minutes=12), error="connection reset"
+    )
+    _seed_search_timing_heartbeat(warehouse, status="ok", ticked_ago=timedelta(minutes=1))
+    PipelineHealthCollector(warehouse).run_all()
+
+    assert warehouse._query("SELECT count(*) FROM @search_request_timing_state")[0][0] == 1
+    assert _search_requests_row(warehouse)["status"] == "ok"
+
+
+def test_search_request_timings_are_pruned_after_thirty_days(warehouse):
+    warehouse.ensure_pipeline_health_tables()
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        """
+        INSERT INTO @search_request_timings (occurred_at, request_id, surface, client, mode, status, duration_ms)
+        VALUES (%s, 'kept-29d', 'api', 'pdw', 'hybrid', 'ok', 2100),
+               (%s, 'gone-31d', 'mcp', 'claude', 'hybrid', 'ok', 900),
+               (%s, 'kept-now', 'api', 'web', 'exact', 'error', 60000)
+        """,
+        (now - timedelta(days=29), now - timedelta(days=31), now),
+    )
+
+    assert warehouse.prune_search_request_timings() == 1
+    kept = {
+        row[0]
+        for row in warehouse._query("SELECT request_id FROM @search_request_timings")
+    }
+    assert kept == {"kept-29d", "kept-now"}
+
+
+def test_a_search_timing_row_defaults_unmeasured_legs_and_pressure_to_minus_one(warehouse):
+    """0 ms reads as an instant leg and 0 pressure as an idle host; absent is -1."""
+    warehouse.ensure_pipeline_health_tables()
+    warehouse._command(
+        "INSERT INTO @search_request_timings (occurred_at, request_id, mode, duration_ms)"
+        " VALUES (now(), 'keyword-1', 'keyword', 300)"
+    )
+    row = warehouse._query_dicts(
+        "SELECT embed_ms, lexical_ms, exact_ms, semantic_ms, fuse_ms, slowest_leg,"
+        " io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count,"
+        " has_priorities, result_rows FROM @search_request_timings"
+    )[0]
+    assert row == {
+        "embed_ms": -1, "lexical_ms": -1, "exact_ms": -1, "semantic_ms": -1, "fuse_ms": -1,
+        "slowest_leg": "", "io_pressure_full_avg10": -1, "cpu_pressure_some_avg10": -1,
+        "load_1m": -1, "cpu_count": -1, "has_priorities": 0, "result_rows": 0,
+    }
 
 
 def test_a_mart_reading_a_quiet_usage_driven_source_is_not_coloured_by_it(warehouse):

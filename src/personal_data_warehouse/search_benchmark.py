@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Sequence
 import argparse
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -432,9 +433,20 @@ def trim_to_json(stdout: str) -> str:
     return stdout[min(candidates) :] if candidates else stdout
 
 
-def _pdw_json(args: list[str], *, timeout: float) -> Any:
+#: The client labels probe searches carry (``pdw --client``), so the real-search
+#: grade over ops.search_request_timings can leave them out: nine fixed probes
+#: a week are not what searching felt like.
+SEARCH_BENCHMARK_CLIENT = "search-benchmark"
+CONTRACT_AUDIT_CLIENT = "contract-audit"
+SEARCH_PROBE_CLIENTS = (SEARCH_BENCHMARK_CLIENT, CONTRACT_AUDIT_CLIENT)
+
+
+def _pdw_json(args: list[str], *, timeout: float, client_name: str = "") -> Any:
+    env = None
+    if client_name:
+        env = {**os.environ, "PDW_CLIENT_NAME": client_name}
     completed = subprocess.run(
-        ["pdw", *args], capture_output=True, text=True, timeout=timeout
+        ["pdw", *args], capture_output=True, text=True, timeout=timeout, env=env
     )
     if completed.returncode != 0:
         # CalledProcessError stringifies to "returned non-zero exit status 1"
@@ -451,6 +463,7 @@ def run_search(
     query: str, mode: str, depth: int, *, sources: Sequence[str] = (), since: str = "",
     priorities: Sequence[str] = (),
     timeout: float = 420.0,
+    client_name: str = SEARCH_BENCHMARK_CLIENT,
 ) -> SearchResult:
     args = [
         "search",
@@ -472,7 +485,7 @@ def run_search(
     args.extend(("--", query))
     started = time.time()
     try:
-        payload = _pdw_json(args, timeout=timeout)
+        payload = _pdw_json(args, timeout=timeout, client_name=client_name)
         result = parse_search_payload(json.dumps(payload))
         if not result.error:
             scope_error = priority_scope_error(result, priorities)

@@ -490,6 +490,28 @@ workers; it is waiting on pages, exactly as the working-set section below descri
 `saturation` before deciding what kind of problem a slow search is: `cpu_bound` and `idle`
 call for a better plan or more parallelism, `io_bound` calls for keeping the index resident.
 
+**Every real search is recorded, not only the probes.** Since 2026-10-26 the app writes one
+row per search it answers to `ops.search_request_timings`: `occurred_at`, `surface` (`mcp`
+or `api`, the latter being the pdw CLI, web and phone app), `client` (the authenticated client
+label such as `pdw`, `web` or `search-benchmark`, never a token), the resolved `mode`, `status`
+(`error` for a search that failed, so a timeout counts as the slow search it was),
+`has_priorities` / `has_sources`, `result_rows`, `duration_ms`, the hybrid leg timings
+(`embed_ms`, `lexical_ms`, `exact_ms`, `semantic_ms`, `fuse_ms`, `slowest_leg`; -1 for a
+keyword or exact search) and the host's `io_pressure_full_avg10`, `cpu_pressure_some_avg10`,
+`load_1m` and `cpu_count` sampled for **every** search, so a fast one is the baseline a slow one
+is compared against (-1 when unreadable: 0 would read as an idle host). It never stores the
+query text, the priority or source values, or the error text: a query can be private, and the
+timing is what C6 needs. The write is off the request path (`app/internal/server/search_timings.go`):
+the search queues the timing without blocking, a full queue drops it, and one goroutine inserts
+with a 5 s timeout, so a broken writer can never slow or fail a search. The writer's single
+heartbeat row, `ops.search_request_timing_state`, is refreshed every ten minutes whatever the
+traffic and is the `search_requests` pipeline's run heartbeat on `/pipelines`: `failing` when
+an insert or its DDL failed, `attention` when timings were dropped, late when it stopped. Rows
+older than 30 days are pruned by the ten-minute `pipeline_health` asset. Probe searches are
+labelled (`search-benchmark` for the benchmark, `contract-audit` for `scripts/contract_audit.py`)
+so a real-traffic grade can leave them out. The `search completed` / `slow search` log lines
+are unchanged.
+
 **A documented performance number that silently regressed is itself a bug, so re-measure
 before you quote one — and prefer the living number.** Since 2026-08-27 the weekly
 `search_benchmark` asset writes p50/p90 hybrid latency and labeled MRR into

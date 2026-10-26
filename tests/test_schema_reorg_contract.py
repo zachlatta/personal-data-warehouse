@@ -268,7 +268,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # only signal, on a source Zach records on ~34 days in 17 months. It
         # read 'stale' for weeks, with four marts views behind it, while the
         # poll ran and succeeded daily.
-            "ops": 40,
+        # +2 ops: ops.search_request_timings (one row per real search, C6) and
+        # ops.search_request_timing_state (its writer's heartbeat).
+            "ops": 42,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

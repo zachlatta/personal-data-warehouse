@@ -113,6 +113,8 @@ from personal_data_warehouse.schema import (
     COLLATION_HEALTH_COLUMNS,
     PGBACKREST_HEALTH_COLUMNS,
     UPLOADER_HEARTBEAT_COLUMNS,
+    SEARCH_REQUEST_TIMING_COLUMNS,
+    SEARCH_REQUEST_TIMING_STATE_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
     AGENT_USAGE_COLUMNS,
     SEARCH_BENCHMARK_LABEL_COLUMNS,
@@ -1375,6 +1377,16 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
+    # C6's per-request evidence, appended by the app after every search and
+    # pruned after SEARCH_REQUEST_TIMING_RETENTION_DAYS; the state row is the
+    # writer's heartbeat. The app creates both itself too (same DDL), because
+    # it deploys before this ensure path runs.
+    "search_request_timings": TableSpec(
+        SEARCH_REQUEST_TIMING_COLUMNS, ("occurred_at", "request_id"), "occurred_at"
+    ),
+    "search_request_timing_state": TableSpec(
+        SEARCH_REQUEST_TIMING_STATE_COLUMNS, ("writer",), "updated_at"
+    ),
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
     "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
     "search_benchmark_runs": TableSpec(SEARCH_BENCHMARK_RUN_COLUMNS, ("mode",), "collected_at"),
@@ -1389,6 +1401,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
 #: content is rewritten by each collection, so an added column is metadata-only
 #: and there is no heap to lock -- which is what makes reconciling safe here and
 #: not everywhere.
+#: How long ops.search_request_timings keeps a search. Card B's rolling views
+#: need seven days; thirty leaves room for a daily trend.
+SEARCH_REQUEST_TIMING_RETENTION_DAYS = 30
+
 PIPELINE_HEALTH_SNAPSHOT_TABLES = (
     "pipeline_health",
     "pipeline_table_freshness",
@@ -3234,6 +3250,8 @@ TIMESTAMP_COLUMNS = {
     "observed_at",
     # pipeline freshness snapshot
     "last_write_at",
+    # ops.search_request_timing_state: the writer's last heartbeat tick.
+    "ticked_at",
     "newest_event_at",
     "last_error_at",
     "collected_at",
@@ -3294,6 +3312,18 @@ INTEGER_COLUMNS = {
     # ops.gmail_settings_sync_state: what the last snapshot held.
     "label_count",
     "filter_count",
+    # ops.search_request_timings: per-search leg timings and scope flags;
+    # ops.search_request_timing_state: the writer's per-tick counts.
+    "has_priorities",
+    "has_sources",
+    "result_rows",
+    "embed_ms",
+    "lexical_ms",
+    "exact_ms",
+    "semantic_ms",
+    "fuse_ms",
+    "written_since_tick",
+    "dropped_since_tick",
     # ops.uploader_heartbeats: failed uploader runs in a row.
     "consecutive_failures",
     # Muse workspace files: 1 when the content is inline text.
@@ -6207,7 +6237,12 @@ class PostgresWarehouse:
         # official image's contrib modules, but is per-database like pg_trgm.
         self._command("CREATE EXTENSION IF NOT EXISTS pg_buffercache WITH SCHEMA public")
         self._ensure_table_group(
-            [*PIPELINE_HEALTH_SNAPSHOT_TABLES, "search_benchmark_history"]
+            [
+                *PIPELINE_HEALTH_SNAPSHOT_TABLES,
+                "search_benchmark_history",
+                "search_request_timings",
+                "search_request_timing_state",
+            ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing table,
         # so a warehouse provisioned before any of these columns existed would
@@ -7450,6 +7485,22 @@ class PostgresWarehouse:
             "live_bytes": live,
             "live_fraction": (live / on_disk) if on_disk else 1.0,
         }
+
+    def prune_search_request_timings(
+        self, *, keep_days: int = SEARCH_REQUEST_TIMING_RETENTION_DAYS
+    ) -> int:
+        """Delete per-search timings older than ``keep_days``; return how many.
+
+        The app only appends, so this is the table's whole retention. The
+        primary key leads with occurred_at, so the delete is an index range.
+        """
+        rows = self._query(
+            "WITH gone AS (DELETE FROM @search_request_timings"
+            " WHERE occurred_at < now() - make_interval(days => %s) RETURNING 1)"
+            " SELECT count(*) FROM gone",
+            (int(keep_days),),
+        )
+        return int(rows[0][0]) if rows else 0
 
     def write_search_benchmark_runs(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
         """Publish the current row and retain the append-only measurement."""
@@ -20314,6 +20365,18 @@ UNMEASURED_SENTINEL_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
         "cpu_count",
     ),
     "search_benchmark_history": (
+        "io_pressure_full_avg10",
+        "cpu_pressure_some_avg10",
+        "load_1m",
+        "cpu_count",
+    ),
+    # A keyword or exact search has no legs; 0 ms would read as an instant leg.
+    "search_request_timings": (
+        "embed_ms",
+        "lexical_ms",
+        "exact_ms",
+        "semantic_ms",
+        "fuse_ms",
         "io_pressure_full_avg10",
         "cpu_pressure_some_avg10",
         "load_1m",

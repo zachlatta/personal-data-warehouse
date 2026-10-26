@@ -1542,6 +1542,34 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="p50/p90 latency over fixed probes and MRR over private.search_benchmark_labels",
     ),
     Pipeline(
+        id="search_requests",
+        label="Search request timings (contract C6)",
+        kind="internal",
+        cadence="every search, plus a ten-minute writer heartbeat",
+        transport=(
+            "app search tool → background writer (app/internal/server/search_timings.go)"
+            " → ops.search_request_timings"
+        ),
+        expected_data_interval=DAY,
+        expected_run_interval=30 * MINUTE,
+        state=StateSource(
+            table="search_request_timing_state",
+            updated_column="ticked_at",
+            status_column="status",
+            error_column="error",
+            attention_statuses=("dropped",),
+        ),
+        # Searches stop when nobody searches: a quiet night is not an outage.
+        # The writer's own heartbeat (one row, refreshed every ten minutes
+        # whatever the traffic) is the detector: 'error' when an insert or its
+        # DDL fails, 'dropped' when the queue overflowed, late when it stopped.
+        freshness_escalates=False,
+        note=(
+            "one row per search (timings and host pressure, never the query text),"
+            " pruned after 30 days by the pipeline_health asset"
+        ),
+    ),
+    Pipeline(
         id="uploader_heartbeats",
         label="Uploader run heartbeats",
         kind="internal",
@@ -1914,6 +1942,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
     ),
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
+    "search_request_timings": _data("search_requests", "occurred_at", "occurred_at"),
+    "search_request_timing_state": _state("search_requests", "ticked_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
     "search_benchmark_runs": _data("search_benchmark", "collected_at"),

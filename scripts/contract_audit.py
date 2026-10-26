@@ -30,6 +30,7 @@ from typing import Sequence
 
 from personal_data_warehouse.search_benchmark import (
     ATTENTION_PRIORITIES,
+    CONTRACT_AUDIT_CLIENT,
     run_search,
 )
 from personal_data_warehouse.search_benchmark_runner import (
@@ -120,6 +121,7 @@ def _validated_search_probe(
         20,
         priorities=tuple(priorities),
         timeout=90.0,
+        client_name=CONTRACT_AUDIT_CLIENT,
     )
     if result.error:
         issue = "scope_error" if "scope mismatch" in result.error else "search_error"

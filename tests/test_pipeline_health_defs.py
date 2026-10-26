@@ -22,10 +22,15 @@ from personal_data_warehouse.pipeline_health import (
 class _FakeWarehouse:
     def __init__(self) -> None:
         self.ensured = False
+        self.pruned = False
         self.closed = False
 
     def ensure_pipeline_health_tables(self) -> None:
         self.ensured = True
+
+    def prune_search_request_timings(self) -> int:
+        self.pruned = True
+        return 7
 
     def close(self) -> None:
         self.closed = True
@@ -198,6 +203,9 @@ def test_asset_collects_and_reports_probe_outcomes(monkeypatch):
     assert warehouse.ensured
     assert warehouse.closed
     assert _FakeCollector.instances[0].ran
+    # The app only appends search timings; this ten-minute run is their retention.
+    assert warehouse.pruned
+    assert result.metadata["search_timings_pruned"].value == 7
     # The database's page-checksum row refreshes every ten minutes (C10), not
     # only with the daily collation run.
     assert _FakeIntegrityCollector.refreshed == [warehouse]

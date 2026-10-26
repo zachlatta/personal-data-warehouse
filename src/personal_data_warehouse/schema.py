@@ -2841,6 +2841,55 @@ UPLOADER_HEARTBEAT_COLUMNS = (
     "sync_version",
 )
 
+# One row per search the app answered (app/internal/server/search_timings.go),
+# written in the background after the response: how long it took, which
+# retrieval leg was slowest, and how busy the host was at that moment. C6's
+# per-request evidence. Never the query text, the priority or source values, or
+# the error text -- only whether a scope was given. `client` is the
+# authenticated client label (pdw, web, search-benchmark), never a token.
+# Leg timings are -1 for a search that was not hybrid; pressure gauges are -1
+# when unreadable, because 0 reads as an idle host. Pruned after 30 days.
+SEARCH_REQUEST_TIMING_COLUMNS = (
+    "occurred_at",
+    "request_id",
+    "surface",
+    "client",
+    "mode",
+    "status",
+    "has_priorities",
+    "has_sources",
+    "result_rows",
+    "duration_ms",
+    "embed_ms",
+    "lexical_ms",
+    "exact_ms",
+    "semantic_ms",
+    "fuse_ms",
+    "slowest_leg",
+    "io_pressure_full_avg10",
+    "cpu_pressure_some_avg10",
+    "load_1m",
+    "cpu_count",
+)
+
+# The search-timing writer's own heartbeat: ONE upserted row, refreshed every
+# ten minutes whether or not anyone searched, so a writer that cannot write
+# (status 'error') or has stopped (ticked_at goes stale) is visible on
+# /pipelines instead of reading like a quiet night. 'dropped' means the queue
+# overflowed and some timings were lost. One row, not one per container: a
+# container replaced by a deploy would otherwise leave its last verdict behind
+# forever.
+SEARCH_REQUEST_TIMING_STATE_COLUMNS = (
+    "writer",
+    "ticked_at",
+    "last_write_at",
+    "status",
+    "error",
+    "written_since_tick",
+    "dropped_since_tick",
+    "updated_at",
+)
+
 PGBACKREST_HEALTH_COLUMNS = (
     "stanza",
     # pgBackRest's own words, from `info --output=json`: "ok", "error", or the

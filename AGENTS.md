@@ -107,7 +107,7 @@ that, not from this prose.
 - **C6 — PDW responds fast, and a response over two seconds uses the whole host before
   anyone optimizes further.** CPU, RAM, GPU and disk: an unparallelized plan on an idle
   28-vCPU host is not a query that needs a cleverer algorithm. *Held up by* the per-request
-  leg timings every hybrid search logs, the `slow search` warning (CPU/IO pressure, load,
+  timings every search logs and stores in `ops.search_request_timings`, the `slow search` warning (CPU/IO pressure, load,
   CPU count) on any search over 2 s, the weekly `marts_ops.search_benchmark` latency and
   saturation verdict over term bags **and** the one-word queries the guide teaches, and
   `cache_residency` in `marts_ops.search_health`. See

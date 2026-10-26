@@ -4215,6 +4215,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "collation_health": _state("collation drift baselines and unique-index divergence findings"),
     "pgbackrest_health": _state("backup posture: does a restorable backup exist, is WAL shipping"),
     "uploader_heartbeats": _state("run heartbeats posted by the remote-device uploaders"),
+    "search_request_timings": _state(
+        "per-search latency, leg timings and host pressure (C6 evidence; no query text)"
+    ),
+    "search_request_timing_state": _state("the search-timing writer's ten-minute heartbeat"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
     "search_benchmark_runs": _state("weekly search benchmark: latency and labeled quality per mode"),

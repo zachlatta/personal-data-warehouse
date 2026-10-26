@@ -45,14 +45,16 @@ def pipeline_health(context) -> MaterializeResult:
     """Measure every pipeline's freshness into the ops snapshot tables.
 
     Read-only against every source table (bounded ``max()`` probes plus catalog
-    statistics); the only writes are the two snapshot tables the ``/pipelines``
-    dashboard and ``marts_ops.pipeline_health`` read.
+    statistics); the writes are the snapshot tables the ``/pipelines``
+    dashboard and ``marts_ops.pipeline_health`` read, plus the retention prune
+    of ``ops.search_request_timings``, which the app only appends to.
     """
     settings = load_settings(require_gmail=False)
     warehouse = warehouse_from_settings(settings)
     pipelines: list = []
     tables: list = []
     marts: list = []
+    pruned_search_timings = 0
     try:
         with exclusive_sync_lock(
             name="pipeline_health",
@@ -69,6 +71,7 @@ def pipeline_health(context) -> MaterializeResult:
                 # minutes rather than at the daily collation run.
                 CollationHealthCollector(warehouse).refresh_database_integrity()
                 pipelines, tables, marts = PipelineHealthCollector(warehouse).run_all()
+                pruned_search_timings = warehouse.prune_search_request_timings()
     finally:
         warehouse.close()
 
@@ -92,6 +95,7 @@ def pipeline_health(context) -> MaterializeResult:
             "pipelines": MetadataValue.int(len(pipelines)),
             "tables": MetadataValue.int(len(tables)),
             "marts": MetadataValue.int(len(marts)),
+            "search_timings_pruned": MetadataValue.int(pruned_search_timings),
             # A mart that cannot answer "is there a row?" is a broken read
             # interface, not a quiet one — worth surfacing on the run itself.
             "marts_failing_probe": MetadataValue.json(
