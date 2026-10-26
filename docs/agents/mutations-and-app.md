@@ -574,3 +574,54 @@ other Gmail mutation.
   asks for every scope production uses: a consent replaces the whole grant, and on 2026-07-15
   a re-consent without the write flags silently dropped them. Put the printed
   `GOOGLE_<SLUG>_TOKEN_JSON_B64` and `GMAIL_<SLUG>_TOKEN_JSON_B64` on the Dagster deployment.
+
+## Deleting a screen capture (screen_timelapse.purge_moment)
+
+The one mutation type that deletes warehouse data rather than writing to an upstream
+service. It exists because on 2026-10-25 a screen timelapse frame caught something that
+must not be kept, and the only way to remove it was superuser SQL on the warehouse and a
+one-off Drive script, with the agent deciding by itself whether the timeline event and
+the readings had to go too. Scope is one captured
+moment of one device; a general warehouse-row purge would be its own design.
+
+- **Proposal** (`app/internal/mutations/screen_timelapse_purge.go`): `device`,
+  `captured_at` (matched exactly), optional `display_index` (omitted = every display) and
+  a required `reason`; the device is the account. `CreateRequest` reads the moment through
+  the `@screen_timelapse_*` markers and refuses it when nothing matches (no screenshot and
+  no tree, or a display the moment lacks). The preview carries storage ids, sizes and
+  counts, the timeline event that goes and a `timeline_path` to it, and how many other
+  frames have the same bytes; never tree text or readings, because every proposal is
+  itself a `mutation_requests` timeline event.
+- **Execution** (`src/personal_data_warehouse/screen_timelapse_purge.py`, the cloud
+  worker): phase one is ONE transaction that deletes the screenshots (first, so their row
+  locks are what a racing writer waits on), the moment's accessibility tree (one per
+  moment, so it goes even when one display is named: it can hold what that display
+  showed), the matching `derived_screen_timelapse.descriptions`, and, when display 1 goes,
+  the `screen_capture` event (and any search chunks) from `timeline.events`, computed
+  with the adapter's own `event_id_expression`. The same transaction writes the removed
+  storage ids into the mutation's `result_json` (phase `rows_deleted`). Phase two runs
+  after the commit: `delete_object` on each file, then `get_metadata` must raise
+  `ObjectNotFoundError`. Any failure is `failed_retryable` with the pending objects kept
+  in `result_json`; the next claim skips straight to them, and a Drive delete of a file
+  already gone is a no-op, so a row never points at a deleted file and a retry never
+  redoes the rows. That is also why the operation is in `RECLAIMABLE_IDEMPOTENT_OPERATIONS`.
+  A file another row still names is left alone (`still_referenced`). The record holds ids
+  and counts, never content, and `not_touched` says the device's own files and the
+  pgBackRest backups on slowking are untouched.
+- **Nothing writes it back.** The `screen_capture` adapter has no `prune_sql`, so the
+  explicit event delete is the only way the event goes; the sync never re-creates it
+  without a row. Phase one runs under the timeline sync's own advisory lock
+  (`timeline_sync`, waited on for 30s, otherwise `failed_retryable`), so no sync run
+  holding a pre-purge snapshot can upsert the event again; it lives on the lock database
+  both workers already share for `upstream_mutation_worker`. The enrichment pass pages
+  its candidates before reading them, so `insert_screen_timelapse_descriptions` writes a
+  reading only while its screenshot row still exists with the bytes it read (`EXISTS …
+  FOR KEY SHARE`, which waits on a purge in flight and then sees the row gone).
+- **The uploader may bring a frame back, and that is intended.** It skips a file while its
+  path, size and mtime match what the app acknowledged; a file whose size or mtime changed
+  is sent again and ingested as a new row. That is how a redacted copy comes back in. A
+  bare `touch` re-sends the original bytes too, so redact or delete the file on the device.
+- Tests: `tests/test_screen_timelapse_purge.py` (the worker end to end, the retry, the
+  race with enrichment on two connections, and the Go proposal half run against an
+  isolated database through `TestScreenTimelapsePurgeProposalReviewApproval`), and
+  `app/internal/mutations/screen_timelapse_purge_test.go` for validation.

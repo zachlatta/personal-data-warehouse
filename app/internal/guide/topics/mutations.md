@@ -4,7 +4,8 @@ Nothing in PDW writes to an upstream service directly. A mutation is **proposed*
 in a review queue, and runs only after a human approves it in the web or phone review UI.
 Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
-something PDW has no mutation type for, and say why.
+something PDW has no mutation type for, and say why. Deleting a screen capture from the warehouse is a mutation too
+(`screen_timelapse.purge_moment`); never delete warehouse rows or stored objects by hand.
 
 ## The two calls
 
@@ -20,7 +21,7 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
-`apple_messages.mark_read`. The help call is
+`apple_messages.mark_read`, `screen_timelapse.purge_moment`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -112,6 +113,15 @@ authoritative when this list and it disagree.
   code like `72975`). No group chats. The Mac opens the conversation in Messages, so it
   runs only while porygon's screen is unlocked (it waits as `failed_retryable` until then),
   marks the whole conversation read, and sends read receipts where the sender has them on.
+- **Delete a leaked screen capture:** `screen_timelapse.purge_moment` with `device`,
+  `captured_at` (the exact `base_screen_timelapse.screenshots.captured_at`), optional
+  `display_index` (omit for every display) and `reason`. Name the KIND of thing the frame
+  showed in `reason` ("full card number on screen"), never the thing itself: the request
+  is a timeline event. A moment that matches no row is refused. After approval the worker
+  deletes the screenshots, the moment's accessibility tree, their readings, the
+  `screen_capture` timeline event (when display 1 goes) and each stored file in Drive.
+  The review counts other frames with the same bytes: propose those too. Files on the
+  device and the backups on slowking are not touched.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

@@ -17,6 +17,7 @@ from personal_data_warehouse.defs.upstream_mutations import (
     _upstream_mutation_reclaim_after,
     process_upstream_mutation_batch,
     resync_gmail_settings,
+    screen_timelapse_purge_executor,
 )
 from personal_data_warehouse.gmail_mutations import GmailMutationExecutor
 from personal_data_warehouse.mutation_notifications import (
@@ -42,6 +43,7 @@ class CloudMutationProcessor:
         self.contact_executor = GoogleContactMutationExecutor(settings=self.settings)
         self.calendar_executor = CalendarMutationExecutor(settings=self.settings)
         self.slack_executor = SlackMutationExecutor(warehouse=self.warehouse)
+        self.screen_timelapse_executor = screen_timelapse_purge_executor(settings=self.settings, warehouse=self.warehouse)
         self.claimed_by = f"resident:{socket.gethostname()}:upstream_mutation_worker"
 
     @property
@@ -65,6 +67,7 @@ class CloudMutationProcessor:
                 contact_executor=self.contact_executor,
                 calendar_executor=self.calendar_executor,
                 slack_executor=self.slack_executor,
+                screen_timelapse_executor=self.screen_timelapse_executor,
                 limit=_upstream_mutation_batch_size(),
                 claimed_by=self.claimed_by,
                 reclaim_after=_upstream_mutation_reclaim_after(),

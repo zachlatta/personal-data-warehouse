@@ -45,6 +45,11 @@ from personal_data_warehouse.slack_mutations import (
     SlackMutationExecutor,
 )
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.screen_timelapse_purge import (
+    SCREEN_TIMELAPSE_PROVIDER,
+    SCREEN_TIMELAPSE_PURGE_MOMENT_OPERATION,
+    ScreenTimelapsePurgeExecutor,
+)
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -74,6 +79,10 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", GMAIL_UNARCHIVE_OPERATION),
     ("gmail", GMAIL_MODIFY_THREAD_LABELS_OPERATION),
     (SLACK_PROVIDER, SLACK_MARK_CONVERSATION_READ_OPERATION),
+    # A purge's rows go in one transaction that also records the storage ids
+    # it removed, and a Drive delete of a file already gone is a no-op, so a
+    # replay finishes the same purge instead of doing a second one.
+    (SCREEN_TIMELAPSE_PROVIDER, SCREEN_TIMELAPSE_PURGE_MOMENT_OPERATION),
 )
 NON_RECLAIMABLE_SEND_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", "gmail.send_email"),
@@ -160,6 +169,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 contact_executor=GoogleContactMutationExecutor(settings=settings),
                 calendar_executor=CalendarMutationExecutor(settings=settings),
                 slack_executor=SlackMutationExecutor(warehouse=warehouse),
+                screen_timelapse_executor=screen_timelapse_purge_executor(settings=settings, warehouse=warehouse),
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
@@ -172,6 +182,20 @@ def process_upstream_mutations(context) -> dict[str, object]:
 
     context.log.info("Processed upstream mutations: %s", summary)
     return asdict(summary)
+
+
+def screen_timelapse_purge_executor(*, settings, warehouse) -> ScreenTimelapsePurgeExecutor:
+    """The purge executor over the Drive store the app files the frames in.
+
+    The store is built on first use, so a worker tick with no purge never
+    touches Drive credentials.
+    """
+    from personal_data_warehouse.defs.screen_timelapse_enrichment import screen_timelapse_object_store
+
+    return ScreenTimelapsePurgeExecutor(
+        warehouse=warehouse,
+        object_store_factory=lambda: screen_timelapse_object_store(settings),
+    )
 
 
 def resync_gmail_settings(*, settings, warehouse, accounts: set[str], logger) -> None:
@@ -332,6 +356,7 @@ def process_upstream_mutation_batch(
     contact_executor: GoogleContactMutationExecutor,
     calendar_executor: CalendarMutationExecutor,
     slack_executor: SlackMutationExecutor,
+    screen_timelapse_executor: ScreenTimelapsePurgeExecutor,
     limit: int,
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
@@ -409,6 +434,8 @@ def process_upstream_mutation_batch(
             result = gmail_executor.execute(mutation)
         elif provider == SLACK_PROVIDER:
             result = slack_executor.execute(mutation)
+        elif provider == SCREEN_TIMELAPSE_PROVIDER:
+            result = screen_timelapse_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker
             # version. Leave them claimable for a worker that understands them.

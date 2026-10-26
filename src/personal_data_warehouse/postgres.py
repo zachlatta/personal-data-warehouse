@@ -11331,22 +11331,47 @@ class PostgresWarehouse:
         )
 
     def insert_screen_timelapse_descriptions(self, rows: Sequence[Mapping[str, Any]]) -> None:
-        """Upsert agent readings by (device, captured_at, display_index, prompt_version)."""
+        """Upsert agent readings by (device, captured_at, display_index, prompt_version).
+
+        A reading is written only while its screenshot row still exists with
+        the bytes it read. An enrichment run pages its candidates before it
+        reads them, so a frame purged in between (screen_timelapse_purge.py)
+        would otherwise get its reading -- screen text included -- written
+        back. FOR KEY SHARE makes the write wait on a purge in flight and then
+        see the row gone.
+        """
         if not rows:
             return
-        self._insert_rows(
-            "screen_timelapse_descriptions",
-            [
-                {
-                    column: row.get(
-                        column, _default_python_value(column, table="screen_timelapse_descriptions")
-                    )
-                    for column in SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS
-                }
-                for row in rows
-            ],
-            SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
-        )
+        table = "screen_timelapse_descriptions"
+        columns = SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS
+        values = [
+            tuple(
+                _normalize_insert_value(
+                    row.get(column, _default_python_value(column, table=table)), table=table, column=column
+                )
+                for column in columns
+            )
+            for row in rows
+        ]
+        spec = POSTGRES_TABLES[table]
+        values = _dedupe_conflict_rows(values, columns, spec, table=table)
+        column_sql = ", ".join(_identifier(column) for column in columns)
+        template = "(" + ", ".join(f"%s::{_postgres_type(column, table=table)}" for column in columns) + ")"
+        sql = f"""
+            INSERT INTO {self.sql_relation(table)} AS target ({column_sql})
+            SELECT v.* FROM (VALUES %s) AS v ({column_sql})
+            WHERE EXISTS (
+                SELECT 1 FROM @screen_timelapse_screenshots s
+                WHERE s.device = v.device
+                  AND s.captured_at = v.captured_at
+                  AND s.display_index = v.display_index
+                  AND s.content_sha256 = v.content_sha256
+                FOR KEY SHARE
+            )
+            {_upsert_clause(table, spec, columns, target_alias="target")}
+        """
+        with self._connection.cursor() as cursor:
+            execute_values(cursor, self._expand_relations(sql), values, template=template, page_size=1000)
 
     def ensure_browser_history_tables(self) -> None:
         """Provision base_browser_history.visits."""
