@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import os
 import subprocess
+from urllib.parse import urlsplit, urlunsplit
+import uuid
 
 import pytest
 
@@ -18,6 +21,7 @@ from tests.local_test_runtime import (
     direct_postgres_url,
     preflight_subscription_auth,
     provisions_template,
+    refuse_live_warehouse,
     schedule_key,
     template_provisioner,
     subscription_tests_enabled,
@@ -70,6 +74,7 @@ class FakeDocker:
 
 
 def runtime(env: dict[str, str], docker: FakeDocker, **kwargs) -> PostgresTestRuntime:
+    kwargs.setdefault("probe_configured_url", lambda _url: None)
     return PostgresTestRuntime(
         env=env,
         runner=docker,
@@ -90,6 +95,178 @@ def test_existing_database_url_is_preserved_without_docker() -> None:
 
     assert docker.calls == []
     assert env["POSTGRES_DATABASE_URL"] == "postgresql://configured.example/pdw"
+
+
+class FakeProbeCursor:
+    def __init__(self, connection: "FakeProbeConnection") -> None:
+        self._connection = connection
+        self._result: tuple | None = None
+
+    def __enter__(self) -> "FakeProbeCursor":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+    def execute(self, statement: str, params=None) -> None:
+        self._connection.statements.append(statement)
+        if "to_regclass" in statement:
+            self._result = (self._connection.timeline_exists,)
+        elif "FROM timeline.events" in statement:
+            self._result = (self._connection.timeline_has_rows,)
+        elif "reltuples" in statement:
+            self._connection.schemas_probed = list(params[0])
+            self._result = (self._connection.populated_table,)
+        else:
+            raise AssertionError(f"unexpected probe statement: {statement}")
+
+    def fetchone(self) -> tuple | None:
+        return self._result
+
+
+class FakeProbeConnection:
+    def __init__(self, *, timeline_exists=False, timeline_has_rows=False, populated_table=None) -> None:
+        self.timeline_exists = timeline_exists
+        self.timeline_has_rows = timeline_has_rows
+        self.populated_table = populated_table
+        self.statements: list[str] = []
+        self.schemas_probed: list[str] = []
+        self.closed = False
+
+    def cursor(self) -> FakeProbeCursor:
+        return FakeProbeCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _probe(connection: FakeProbeConnection, url: str = "postgresql://admin:hunter2@db.example:6543/postgres"):
+    opened: list[tuple[str, dict]] = []
+
+    def connect(dsn, **kwargs):
+        opened.append((dsn, kwargs))
+        return connection
+
+    refuse_live_warehouse(url, connect=connect)
+    return opened
+
+
+def test_a_configured_url_holding_timeline_rows_is_refused_without_its_password() -> None:
+    connection = FakeProbeConnection(timeline_exists=True, timeline_has_rows=True)
+
+    with pytest.raises(LocalTestStartupError) as error:
+        _probe(connection)
+
+    message = str(error.value)
+    assert "db.example:6543/postgres" in message
+    assert "timeline.events" in message
+    assert "unset POSTGRES_DATABASE_URL" in message
+    assert "hunter2" not in message
+    assert connection.closed
+
+
+def test_a_configured_url_with_rows_in_any_managed_schema_is_refused() -> None:
+    connection = FakeProbeConnection(populated_table="base_gmail.messages")
+
+    with pytest.raises(LocalTestStartupError, match="base_gmail.messages"):
+        _probe(connection)
+
+    assert "base_gmail" in connection.schemas_probed
+    assert "timeline" in connection.schemas_probed
+    assert not any(schema.startswith("pdw_test_") for schema in connection.schemas_probed)
+
+
+def test_an_empty_configured_database_is_accepted_over_a_read_only_connection() -> None:
+    connection = FakeProbeConnection(timeline_exists=True, timeline_has_rows=False)
+
+    opened = _probe(connection)
+
+    assert opened == [
+        (
+            "postgresql://admin:hunter2@db.example:6543/postgres",
+            {"connect_timeout": 10, "options": "-c default_transaction_read_only=on"},
+        )
+    ]
+    assert len(connection.statements) == 3
+    assert connection.closed
+
+
+def test_a_configured_url_is_probed_before_it_is_used() -> None:
+    probed: list[str] = []
+    env = {"POSTGRES_DATABASE_URL": "postgresql://configured.example/pdw"}
+
+    def refuse(url: str) -> None:
+        probed.append(url)
+        raise LocalTestStartupError("live warehouse")
+
+    with pytest.raises(LocalTestStartupError, match="live warehouse"):
+        runtime(env, FakeDocker(), probe_configured_url=refuse).start()
+
+    assert probed == ["postgresql://configured.example/pdw"]
+
+
+def test_the_runs_own_postgres_is_never_probed() -> None:
+    probed: list[str] = []
+    url = "postgresql://postgres:postgres@172.17.0.5:5432/pdw"
+    env = {"POSTGRES_DATABASE_URL": url, OWNED_POSTGRES_URL_ENV: url}
+
+    assert runtime(env, FakeDocker(), probe_configured_url=probed.append).start() == url
+    assert probed == []
+
+    docker = FakeDocker()
+    runtime({}, docker, probe_configured_url=probed.append).start()
+    assert probed == []
+
+
+def test_unit_only_never_probes_a_configured_url() -> None:
+    probed: list[str] = []
+    env = {"POSTGRES_DATABASE_URL": "postgresql://configured.example/pdw"}
+
+    assert runtime(env, FakeDocker(), probe_configured_url=probed.append, unit_only=True).start() is None
+    assert probed == []
+
+
+def test_the_live_warehouse_guard_refuses_a_database_with_timeline_rows() -> None:
+    import psycopg2
+
+    url = _owned_postgres_url()
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
+    name = f"pdw_test_{stamp}_guard_{uuid.uuid4().hex}"
+    admin = psycopg2.connect(url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            # A killed run leaves its database behind and the schema reaper
+            # only drops schemas: clear this test's own leftovers older than
+            # any live run (the stamp is the run's UTC start).
+            cursor.execute("SELECT datname FROM pg_database WHERE datname ~ '^pdw_test_[0-9]{14}_guard_'")
+            cutoff = (datetime.now(tz=UTC) - timedelta(hours=12)).strftime("%Y%m%d%H%M%S")
+            for (stale,) in cursor.fetchall():
+                if stale[len("pdw_test_") : len("pdw_test_") + 14] < cutoff:
+                    cursor.execute(f'DROP DATABASE IF EXISTS "{stale}" WITH (FORCE)')
+            cursor.execute(f'CREATE DATABASE "{name}"')
+        throwaway = urlunsplit(urlsplit(url)._replace(path=f"/{name}"))
+        connection = psycopg2.connect(throwaway)
+        connection.autocommit = True
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("CREATE SCHEMA timeline")
+                cursor.execute("CREATE TABLE timeline.events (event_id text)")
+                cursor.execute("INSERT INTO timeline.events VALUES ('seeded')")
+            with pytest.raises(LocalTestStartupError, match="timeline.events"):
+                refuse_live_warehouse(throwaway)
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM timeline.events")
+                cursor.execute("VACUUM ANALYZE timeline.events")
+            refuse_live_warehouse(throwaway)
+        finally:
+            connection.close()
+    finally:
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        finally:
+            admin.close()
 
 
 def test_default_start_launches_extension_complete_postgres_on_a_dynamic_port() -> None:

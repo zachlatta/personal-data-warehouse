@@ -24,6 +24,7 @@ import psycopg2
 import psycopg2.sql
 
 from personal_data_warehouse.agent_runner import AgentContainerConfig, auth_docker_command
+from personal_data_warehouse.relations import physical_schema_names
 
 DEFAULT_POSTGRES_IMAGE = "ghcr.io/zachlatta/personal-data-warehouse-postgres-pgbackrest:latest"
 POSTGRES_EXTENSIONS = frozenset({"vector", "pg_trgm", "pg_textsearch"})
@@ -33,6 +34,48 @@ _POSTGRES_URL_MARKER = "POSTGRES_DATABASE_URL"
 
 class LocalTestStartupError(RuntimeError):
     """A local integration prerequisite could not be made ready."""
+
+
+def refuse_live_warehouse(url: str, *, connect: Callable[..., object] = psycopg2.connect) -> None:
+    """Refuse a configured test URL whose database already holds the warehouse.
+
+    Tests only ever build ``pdw_test_*``-prefixed warehouses, so the managed
+    schemas under their real names holding rows means the URL is a live
+    warehouse. On 2026-10-24 a checkout whose ``.env`` was symlinked to one
+    holding the production URL built six test warehouses (384 schemas) in
+    production. The probe connection is read-only: it can only look.
+    """
+    connection = connect(url, connect_timeout=10, options="-c default_transaction_read_only=on")
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('timeline.events') IS NOT NULL")
+            populated = None
+            if cursor.fetchone()[0]:
+                cursor.execute("SELECT EXISTS (SELECT 1 FROM timeline.events)")
+                if cursor.fetchone()[0]:
+                    populated = "timeline.events"
+            if populated is None:
+                cursor.execute(
+                    """
+                    SELECT n.nspname || '.' || c.relname
+                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = ANY(%s) AND c.relkind IN ('r', 'p') AND c.reltuples > 0
+                    ORDER BY 1 LIMIT 1
+                    """,
+                    (physical_schema_names(include_hidden=True),),
+                )
+                row = cursor.fetchone()
+                populated = row[0] if row else None
+    finally:
+        connection.close()
+    if populated is not None:
+        parts = urlsplit(url)
+        where = f"{parts.hostname}:{parts.port or 5432}{parts.path}"
+        raise LocalTestStartupError(
+            f"POSTGRES_DATABASE_URL points at a live warehouse ({where}: {populated} has rows). "
+            "Tests never need a production URL: unset POSTGRES_DATABASE_URL (check .env) and "
+            "`uv run pytest` provisions its own Postgres."
+        )
 
 
 def subscription_tests_enabled(env: Mapping[str, str]) -> bool:
@@ -538,8 +581,10 @@ class PostgresTestRuntime:
         monotonic: Callable[[], float] = time.monotonic,
         readiness_timeout_seconds: float = 120,
         unit_only: bool = False,
+        probe_configured_url: Callable[[str], None] = refuse_live_warehouse,
     ) -> None:
         self._env = env
+        self._probe_configured_url = probe_configured_url
         self._runner = runner
         self._which = which
         self._name_factory = name_factory
@@ -559,6 +604,8 @@ class PostgresTestRuntime:
             return None
         configured_url = self._env.get("POSTGRES_DATABASE_URL", "").strip()
         if configured_url:
+            if configured_url != self._env.get(OWNED_POSTGRES_URL_ENV, "").strip():
+                self._probe_configured_url(configured_url)
             return configured_url
         if self._which("docker") is None:
             self._raise_startup_error("Docker CLI is not installed")
