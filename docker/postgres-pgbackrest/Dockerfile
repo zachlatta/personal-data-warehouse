@@ -4,7 +4,12 @@ FROM ${POSTGRES_IMAGE}
 LABEL org.opencontainers.image.title="personal-data-warehouse-postgres-pgbackrest"
 LABEL org.opencontainers.image.description="Postgres with pgBackRest for S3-backed physical backups and WAL archiving"
 
+# Upgrade the base image's packages too: the official postgres image is rebuilt
+# only now and then, so without this a Debian security fix (OpenSSL
+# CVE-2026-84782, deb12u2, on 2026-10-27) waits for upstream (sysadmin
+# mew-coolify/2026-10-27-general-maintenance.md).
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         pgbackrest \
