@@ -7111,7 +7111,9 @@ def test_search_hybrid_literal_leg_searches_machine_tokens_in_bounded_chunks() -
     assert "t.priority::text = ANY ($3)" in chat, (
         "chat exact-ref recovery must preserve the hybrid priority scope"
     )
-    assert "c.adapter = ANY ($1)" in chat
+    assert "c.ctid = ANY ($5)" in chat, (
+        "chat windows come from the chunks the one trigram probe matched"
+    )
     assert "GROUP BY" in literal, (
         "several chunks from one event must produce one literal rank"
     )
@@ -7621,7 +7623,7 @@ def test_search_text_exact_scan_is_one_shot_dynamic_sql_with_the_patterns_inline
 
 
 def test_search_hybrid_exact_literal_leg_is_one_shot_dynamic_sql_with_the_patterns_inlined() -> None:
-    """The hybrid literal leg's three statements inline the needle and patterns.
+    """The hybrid literal leg's chunk probe inlines the needle and patterns.
 
     Measured 2026-10-26 on production with plan_cache_mode = force_generic_plan:
     the chunk-count probe became a Seq Scan over the whole chunk heap (7.4 GB)
@@ -7634,22 +7636,70 @@ def test_search_hybrid_exact_literal_leg_is_one_shot_dynamic_sql_with_the_patter
     exact = exact[: exact.index("$exact$;")]
     literal = exact[exact.index("exact_pattern_c := ") : exact.index("ELSE\n                            SELECT array_agg(x.ref)")]
     statements = literal.split("EXECUTE format($lit$")[1:]
-    assert len(statements) == 3, "the count probe, the document refs and the chat refs"
-    for statement, target in zip(statements, ("exact_match_count", "exact_refs", "chat_exact_refs"), strict=True):
+    assert len(statements) == 3, "the chunk probe, the document refs and the chat refs"
+    for index, (statement, target) in enumerate(
+        zip(statements, ("matched_chunks", "exact_refs", "chat_exact_refs"), strict=True)
+    ):
         template, call = statement.split("$lit$, ", 1)
+        using = "per_source;" if index == 0 else "per_source, matched_chunks;"
         assert call.startswith(
             "exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)\n"
             f"                              INTO {target}\n"
-            "                              USING sem_adapters, since, priorities, per_source;"
+            f"                              USING sem_adapters, since, priorities, {using}"
         )
-        assert "c.text ILIKE %2$L ESCAPE" in template
-        assert "c.text ILIKE %3$L ESCAPE" in template
-        assert "c.text ILIKE %4$L ESCAPE" in template
         assert "exact_needle" not in template and "sem_adapters" not in template
         assert "(since" not in template and "priorities IS NULL" not in template
         assert "%" not in _without_format_codes(template), (
             "format() would misread any other percent sign in the template"
         )
+    probe = statements[0].split("$lit$, ", 1)[0]
+    assert "c.text ILIKE %2$L ESCAPE" in probe
+    assert "c.text ILIKE %3$L ESCAPE" in probe
+    assert "c.text ILIKE %4$L ESCAPE" in probe
+
+
+def test_search_hybrid_exact_rechecks_the_chunk_text_once() -> None:
+    """One trigram recheck over the chunk heap, not three.
+
+    Measured 2026-10-27 on production: "zach@hackclub.com Zach Latta" has
+    437,728 trigram candidate chunks and 49 matches. The count gate, the
+    document refs and the chat-window refs each rechecked all of them, 7.5-8.5s
+    a pass on one core and 22-29s per search, warm. The probe collects the
+    matching ctids once and the two ranking statements read only those rows.
+    """
+    sql = _search_text_function_sql()
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(") :]
+    exact = exact[: exact.index("$exact$;")]
+    literal = exact[exact.index("exact_pattern_c := ") : exact.index("ELSE\n                            SELECT array_agg(x.ref)")]
+    assert literal.count("c.text ILIKE") == 3, "only the probe matches chunk text"
+    statements = literal.split("EXECUTE format($lit$")[1:]
+    for ranking in statements[1:]:
+        assert "c.ctid = ANY ($5)" in ranking.split("$lit$, ", 1)[0]
+
+
+def test_search_hybrid_exact_probe_runs_on_parallel_workers_and_restores_the_planner() -> None:
+    """The probe is costed for its recheck, for that one statement only.
+
+    The trigram estimate (871 rows against 437,728 candidates) keeps the bitmap
+    heap scan serial: 8.5s on one core against 2.9s on 4 workers, measured
+    2026-10-27. The hints are the ones search_text_exact scopes the same way,
+    and they are put back before the ranking statements are planned.
+    """
+    sql = _search_text_function_sql()
+    exact = sql[sql.index("CREATE OR REPLACE FUNCTION @search_hybrid_exact(") :]
+    exact = exact[: exact.index("$exact$;")]
+    probe_at = exact.index("INTO matched_chunks")
+    refs_at = exact.index("INTO exact_refs")
+    for setting, value in (
+        ("parallel_setup_cost", "0"),
+        ("parallel_tuple_cost", "0"),
+        ("min_parallel_table_scan_size", "0"),
+        ("cpu_operator_cost", "1"),
+    ):
+        hint = f"PERFORM set_config('{setting}', '{value}', true);"
+        assert exact.index(hint) < probe_at
+        restore = exact.index(f"PERFORM set_config('{setting}', saved_")
+        assert probe_at < restore < refs_at
 
 
 def _capture_nested_plans(warehouse: PostgresWarehouse) -> list[str]:

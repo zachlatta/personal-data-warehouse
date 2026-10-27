@@ -17,6 +17,12 @@ import (
 // request, so the request records it.
 const slowSearchThreshold = 2 * time.Second
 
+// exactLegGrace is how long the hybrid literal leg may run on after the
+// lexical and semantic legs have both answered before it is cut. C6's budget
+// is two seconds a search; on 2026-10-27 the median of the slower of those two
+// legs was about 1.3s, so 750ms keeps a cut search inside it.
+const exactLegGrace = 750 * time.Millisecond
+
 // hybridTimings is where a hybrid search spent its wall clock. The three
 // retrieval legs run concurrently, so wall time is roughly embed + the
 // slowest leg + fuse; naming the slowest leg says which one to fix.
@@ -26,6 +32,10 @@ type hybridTimings struct {
 	Exact    time.Duration
 	Semantic time.Duration
 	Fuse     time.Duration
+	// DegradedLegs names the legs the fused answer went without: "exact"
+	// when the literal leg was cut after exactLegGrace, or any leg that hit
+	// the statement timeout.
+	DegradedLegs []string
 }
 
 func (t hybridTimings) slowestLeg() string {
@@ -47,6 +57,7 @@ func (t hybridTimings) logAttrs() []any {
 		"semantic_ms", t.Semantic.Milliseconds(),
 		"fuse_ms", t.Fuse.Milliseconds(),
 		"slowest_leg", t.slowestLeg(),
+		"degraded_legs", strings.Join(t.DegradedLegs, ","),
 	}
 }
 
@@ -165,6 +176,9 @@ type SearchTiming struct {
 	Semantic   time.Duration
 	Fuse       time.Duration
 	SlowestLeg string
+	// DegradedLegs is the comma-separated legs the answer went without
+	// ("exact" when the literal leg was cut); empty when all three answered.
+	DegradedLegs string
 }
 
 // TimingRecorder receives every search the service ran, after the response
@@ -210,6 +224,7 @@ func (s *Service) recordSearch(ctx context.Context, req SearchRequest, resp Sear
 		timing.Embed, timing.Lexical, timing.Exact = timings.Embed, timings.Lexical, timings.Exact
 		timing.Semantic, timing.Fuse = timings.Semantic, timings.Fuse
 		timing.SlowestLeg = timings.slowestLeg()
+		timing.DegradedLegs = strings.Join(timings.DegradedLegs, ",")
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {

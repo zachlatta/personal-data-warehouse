@@ -231,6 +231,7 @@ func TestSearchTimingStoreIntegration(t *testing.T) {
 		HasPriorities: true, Rows: 10, Duration: 3400 * time.Millisecond, Hybrid: true,
 		Embed: 40 * time.Millisecond, Lexical: 800 * time.Millisecond, Exact: 300 * time.Millisecond,
 		Semantic: 3100 * time.Millisecond, Fuse: 20 * time.Millisecond, SlowestLeg: "semantic",
+		DegradedLegs: "exact",
 	}
 	keyword := query.SearchTiming{OccurredAt: occurred, RequestID: "r2", Surface: "api", Client: "pdw", Mode: "keyword", Status: "error", Duration: time.Minute}
 	if err := store.insert(ctx, hybrid, query.HostPressure{IOFullAvg10: 18.5, CPUSomeAvg10: 0.4, Load1m: 3.1, CPUCount: 28}); err != nil {
@@ -249,6 +250,26 @@ func TestSearchTimingStoreIntegration(t *testing.T) {
 	}
 	if err := store.db.QueryRowContext(ctx, `SELECT semantic_ms FROM `+store.timings+` WHERE request_id = 'r2'`).Scan(&keywordSemantic); err != nil || keywordSemantic != -1 {
 		t.Fatalf("keyword row semantic_ms = %d (%v), want -1", keywordSemantic, err)
+	}
+	var degradedLegs string
+	if err := store.db.QueryRowContext(ctx, `SELECT degraded_legs FROM `+store.timings+` WHERE request_id = 'r1'`).Scan(&degradedLegs); err != nil || degradedLegs != "exact" {
+		t.Fatalf("hybrid row degraded_legs = %q (%v), want exact", degradedLegs, err)
+	}
+
+	// A table provisioned before degraded_legs existed gets the column from
+	// the app, which deploys before the Python ensure path runs.
+	legacy := open(goSchema)
+	defer legacy.Close()
+	legacy.timings = warehouse.QuoteIdent(goSchema) + `."search_request_timings_legacy"`
+	if _, err := legacy.db.ExecContext(ctx, `CREATE TABLE `+legacy.timings+` (LIKE `+goStore.timings+` INCLUDING ALL)`); err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.db.ExecContext(ctx, `DROP TABLE IF EXISTS `+legacy.timings)
+	if _, err := legacy.db.ExecContext(ctx, `ALTER TABLE `+legacy.timings+` DROP COLUMN degraded_legs`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.insert(ctx, hybrid, query.HostPressure{IOFullAvg10: -1, CPUSomeAvg10: -1, Load1m: -1, CPUCount: 28}); err != nil {
+		t.Fatalf("insert into a pre-degraded_legs table: %v", err)
 	}
 
 	// Two containers during a deploy beat into the ONE row; the newest wins.

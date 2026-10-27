@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -563,10 +565,45 @@ func (s *Service) runHybridSearch(
 		lexicalErr, exactErr, semanticErr error
 		timings                           hybridTimings
 	)
+	// The literal leg runs on its own context so it can be cut: once the
+	// lexical and semantic legs have answered, it gets exactLegGrace more and
+	// is then cancelled (pgx sends the server a cancel request), and the
+	// search is fused from the two legs that answered. Measured 2026-10-27, a
+	// needle whose trigrams are everywhere kept that leg busy 15-37s while the
+	// other two had answered in 1-3s; it was the slowest leg of 21 of the 49
+	// real searches over 10s that day. A rare identifier, the case the leg
+	// exists for, answers in milliseconds and is never cut.
+	exactCtx, cancelExact := context.WithCancel(ctx)
+	defer cancelExact()
+	othersDone := make(chan struct{})
+	exactDone := make(chan struct{})
+	var exactCut atomic.Bool
+	go func() {
+		select {
+		case <-othersDone:
+		case <-exactDone:
+			return
+		}
+		grace := time.NewTimer(s.exactLegGrace)
+		defer grace.Stop()
+		select {
+		case <-grace.C:
+			exactCut.Store(true)
+			cancelExact()
+		case <-exactDone:
+		}
+	}()
 	// A plain group, not WithContext: one leg exhausting the statement budget
 	// must not cancel the legs that are about to answer. See degradedHybridLegs.
 	var group errgroup.Group
+	var others sync.WaitGroup
+	others.Add(2)
+	go func() {
+		others.Wait()
+		close(othersDone)
+	}()
 	group.Go(func() error {
+		defer others.Done()
 		started := time.Now()
 		defer func() { timings.Lexical = time.Since(started) }()
 		lexical, lexicalErr = runner.QueryArgs(
@@ -576,15 +613,17 @@ func (s *Service) runHybridSearch(
 		return nil
 	})
 	group.Go(func() error {
+		defer close(exactDone)
 		started := time.Now()
 		defer func() { timings.Exact = time.Since(started) }()
 		exact, exactErr = runner.QueryArgs(
-			ctx, searchHybridExactSQL,
+			exactCtx, searchHybridExactSQL,
 			[]any{query, maxResults, sources, since, priorities}, maxResults,
 		)
 		return nil
 	})
 	group.Go(func() error {
+		defer others.Done()
 		started := time.Now()
 		defer func() { timings.Semantic = time.Since(started) }()
 		// The SQL function owns the measured candidate bound. maxRows=0
@@ -596,6 +635,13 @@ func (s *Service) runHybridSearch(
 		return nil
 	})
 	_ = group.Wait()
+	cutNote := ""
+	if exactErr != nil && exactCut.Load() && ctx.Err() == nil {
+		// Cut on purpose, not failed: fuse without it, and say so.
+		exact, exactErr = RawResult{}, nil
+		timings.DegradedLegs = append(timings.DegradedLegs, "exact")
+		cutNote = searchExactLegCutNote
+	}
 	degraded, err := degradedHybridLegs([]hybridLegResult{
 		{name: "lexical", err: lexicalErr},
 		{name: "literal", err: exactErr},
@@ -603,6 +649,17 @@ func (s *Service) runHybridSearch(
 	})
 	if err != nil {
 		return RawResult{}, timings, "", err
+	}
+	for _, leg := range []struct {
+		name string
+		err  error
+	}{{"lexical", lexicalErr}, {"exact", exactErr}, {"semantic", semanticErr}} {
+		if leg.err != nil {
+			timings.DegradedLegs = append(timings.DegradedLegs, leg.name)
+		}
+	}
+	if cutNote != "" {
+		degraded = strings.TrimSpace(degraded + " " + cutNote)
 	}
 
 	// A source can legitimately have no embedded chunks. A nil Go slice
@@ -640,6 +697,12 @@ type hybridLegResult struct {
 // other legs had already answered. Any other failure -- an invalid tier, a
 // broken function, a dead connection -- is still the search's error, as is
 // every leg timing out, because then there is nothing left to answer with.
+// searchExactLegCutNote tells the caller the literal leg was left out because
+// it outran the other legs by exactLegGrace, so an identifier that BM25 and
+// the embedding cannot see still has a way to be found.
+const searchExactLegCutNote = "the hybrid literal (exact substring) leg ran long after the other legs answered and was left out; " +
+	"for an identifier, address or exact phrase, search again in exact mode"
+
 func degradedHybridLegs(legs []hybridLegResult) (string, error) {
 	dropped := make([]string, 0, len(legs))
 	var firstTimeout error

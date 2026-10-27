@@ -280,6 +280,16 @@ hints), a word the same text also uses in lowercase, or a different first letter
 makes the same sound (Kristen/Cristen). The source transcript was never affected; repair is
 re-enrichment.
 
+**The identity hints read the timeline search, not the raw Slack heap.**
+`load_event_identity_hints` gives the agent messages that name the event and a person.
+Until 2026-10-27 the Slack part ILIKE-scanned `base_slack.messages` across the 104-day
+window (90 days before the memo, 14 after): 4-10 GB and 20-48 s a call, 144 GB in 19 hours,
+which evicted the search indexes and was the largest single cause of slow agent searches
+that day ([search.md](search.md#performance-contract)). It now asks
+`timeline.search_text` for 50 BM25 candidates scoped to `slack` since the window start, and
+keeps those that name an event term and a person or team term inside the window, newest
+first. A hint's text is the timeline search document, so it starts with the channel.
+
 **Validation issues never reach the agent.** `validate_enrichment_result` runs after the
 agent returns, and its issues are stored on the row (`raw_result_json.__validation_issues`)
 rather than sent back for a retry, so a check there is a measurement, not a guard. The

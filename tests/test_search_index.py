@@ -469,6 +469,46 @@ def test_search_hybrid_fuses_semantic_and_keyword_ranks(warehouse: PostgresWareh
         warehouse._query("SELECT * FROM @search_hybrid('x', '')")
 
 
+def test_voice_memo_slack_identity_hints_read_timeline_search_on_a_real_warehouse(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The voice-memo Slack hint lookup runs against the real search_text().
+
+    It replaced a 104-day ILIKE scan of base_slack.messages (144 GB of reads in
+    19 hours on production, 2026-10-27), so the call shape -- positional
+    arguments, the 'slack' token, the window start as since -- is proven here
+    against the function itself rather than a fake.
+    """
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_slack_event_identity_snippets
+
+    _provision(warehouse)
+    warehouse._set_search_path()
+    _seed_slack(
+        warehouse,
+        ["Quill is helping staff the zebrafest dinner", "zebrafest is next month", "lunch plans with Quill"],
+    )
+    _sync_timeline(warehouse)
+
+    snippets = load_slack_event_identity_snippets(
+        warehouse,
+        {"recorded_at": datetime(2026, 5, 20, tzinfo=UTC)},
+        ["zebrafest"],
+        ["Quill"],
+    )
+    # The search document carries the channel ahead of the message text.
+    assert len(snippets) == 1, snippets
+    assert snippets[0]["snippet"].endswith("Quill is helping staff the zebrafest dinner")
+    assert snippets[0]["source"] == "slack_messages"
+
+    too_late = load_slack_event_identity_snippets(
+        warehouse,
+        {"recorded_at": datetime(2026, 12, 1, tzinfo=UTC)},
+        ["zebrafest"],
+        ["Quill"],
+    )
+    assert too_late == [], "messages before the 90-day window are not hints"
+
+
 def test_hybrid_literal_leg_returns_the_chat_member_that_holds_the_literal(
     warehouse: PostgresWarehouse,
 ) -> None:
@@ -491,8 +531,12 @@ def test_hybrid_literal_leg_returns_the_chat_member_that_holds_the_literal(
     )
     assert window and window[0][0].endswith("|100.2"), "the window is keyed by its last member"
 
+    before = warehouse._query("SELECT current_setting('parallel_setup_cost'), current_setting('cpu_operator_cost')")
     refs = [r[0] for r in warehouse._query("SELECT ref FROM @search_hybrid_exact('zq9token', 10)")]
     assert len(refs) == 1 and refs[0].endswith("|100.1"), refs
+    after = warehouse._query("SELECT current_setting('parallel_setup_cost'), current_setting('cpu_operator_cost')")
+    assert after == before, "the probe's planner hints must not outlive it"
+    assert warehouse._query("SELECT ref FROM @search_hybrid_exact('zq9absent', 10)") == []
 
     priority = warehouse._query(
         "SELECT priority::text FROM @timeline_events WHERE event_id LIKE '%%|100.1'"

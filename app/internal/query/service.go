@@ -69,8 +69,11 @@ type Service struct {
 	// leg timings beside the host's CPU and I/O pressure. readHostFile reads
 	// /proc for that snapshot; tests replace both.
 	slowSearchThreshold time.Duration
-	readHostFile        func(string) ([]byte, error)
-	timingRecorder      TimingRecorder
+	// exactLegGrace bounds the hybrid literal leg once the other legs have
+	// answered; see runHybridSearch. Tests shorten it.
+	exactLegGrace  time.Duration
+	readHostFile   func(string) ([]byte, error)
+	timingRecorder TimingRecorder
 	// now resolves a relative search since (7d); tests pin it.
 	now func() time.Time
 }
@@ -195,7 +198,7 @@ func NewService(runner Runner, opts Options) *Service {
 	}
 	return &Service{
 		runner: runner, opts: opts, logger: logger.With("component", "query"), embedder: opts.SearchEmbedder,
-		slowSearchThreshold: slowSearchThreshold, readHostFile: os.ReadFile, now: time.Now,
+		slowSearchThreshold: slowSearchThreshold, exactLegGrace: exactLegGrace, readHostFile: os.ReadFile, now: time.Now,
 		timingRecorder: opts.TimingRecorder,
 	}
 }

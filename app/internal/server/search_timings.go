@@ -271,8 +271,13 @@ func searchTimingDDL(schema, timings, state string) []string {
 	cpu_pressure_some_avg10 double precision NOT NULL DEFAULT -1,
 	load_1m double precision NOT NULL DEFAULT -1,
 	cpu_count bigint NOT NULL DEFAULT -1,
+	degraded_legs text NOT NULL DEFAULT '',
 	PRIMARY KEY (occurred_at, request_id)
 )`,
+		// Added 2026-10-27. CREATE TABLE IF NOT EXISTS leaves an existing
+		// table alone, and the app writes before the Python ensure path adds
+		// the column, so the app adds it too.
+		`ALTER TABLE ` + timings + ` ADD COLUMN IF NOT EXISTS degraded_legs text NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS ` + state + ` (
 	writer text NOT NULL DEFAULT '',
 	ticked_at timestamptz NOT NULL DEFAULT ` + epoch + `,
@@ -327,9 +332,10 @@ func (s *searchTimingStore) insert(ctx context.Context, t query.SearchTiming, p 
 			(occurred_at, request_id, surface, client, mode, status,
 			 has_priorities, has_sources, result_rows, duration_ms,
 			 embed_ms, lexical_ms, exact_ms, semantic_ms, fuse_ms, slowest_leg,
-			 io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count)
+			 io_pressure_full_avg10, cpu_pressure_some_avg10, load_1m, cpu_count,
+			 degraded_legs)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-		        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		ON CONFLICT (occurred_at, request_id) DO NOTHING`,
 		t.OccurredAt.UTC(), t.RequestID, t.Surface, t.Client, t.Mode, t.Status,
 		searchTimingFlag(t.HasPriorities), searchTimingFlag(t.HasSources), int64(t.Rows), t.Duration.Milliseconds(),
@@ -337,6 +343,7 @@ func (s *searchTimingStore) insert(ctx context.Context, t query.SearchTiming, p 
 		searchTimingMillis(t.Hybrid, t.Exact), searchTimingMillis(t.Hybrid, t.Semantic),
 		searchTimingMillis(t.Hybrid, t.Fuse), t.SlowestLeg,
 		p.IOFullAvg10, p.CPUSomeAvg10, p.Load1m, int64(p.CPUCount),
+		t.DegradedLegs,
 	)
 	return err
 }

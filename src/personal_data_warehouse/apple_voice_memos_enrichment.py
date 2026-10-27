@@ -46,6 +46,9 @@ PROMPT_EVENT_IDENTITY_TERMS_LIMIT = 8
 PROMPT_EVENT_IDENTITY_FIRST_NAMES_LIMIT = 12
 PROMPT_EVENT_IDENTITY_HINTS_LIMIT = 18
 PROMPT_EVENT_IDENTITY_SOURCE_LIMIT = 6
+# Slack hints come from timeline search: this many BM25 candidates, of which
+# the ones naming the event and a person (newest first) become the hints.
+SLACK_EVENT_IDENTITY_SEARCH_CANDIDATES = 50
 PROMPT_EVENT_IDENTITY_CONTEXT_CHARS = 1600
 PROMPT_EVENT_IDENTITY_SNIPPET_CHARS = 600
 
@@ -1076,41 +1079,64 @@ def load_slack_event_identity_snippets(
     event_terms: Sequence[str],
     first_name_terms: Sequence[str],
 ) -> list[dict[str, Any]]:
+    """Slack messages naming the event and a person, through timeline search.
+
+    Until 2026-10-27 this ILIKE-scanned base_slack.messages across the whole
+    104-day window: 32 calls read 144 GB in 19 hours, 20-48s each, a fifth of
+    every block the database read. Each pass pushed the search indexes out of
+    the page cache, and real agent searches took p90 10.0s while it ran
+    against 5.8s while it did not. The BM25 index finds the same messages, and
+    it is the working set agent searches need resident anyway. Search returns
+    candidates for any of the terms; the event-and-person rule and the
+    window's end are applied here.
+    """
+    window = event_identity_time_window(recording)
+    query = " ".join(dict.fromkeys(term for term in [*event_terms, *first_name_terms] if term))
+    if not query:
+        return []
+    since_sql = f"{_sql_string(window[0].isoformat())}::timestamptz" if window else "NULL::timestamptz"
     try:
         rows = warehouse._query(
             f"""
-            SELECT
-                m.message_datetime,
-                COALESCE(NULLIF(u.real_name, ''), NULLIF(u.display_name, ''), NULLIF(u.name, ''), m.username, '') AS speaker,
-                m.text
-            FROM @slack_messages AS m
-            LEFT JOIN @slack_users AS u
-              ON u.account = m.account
-             AND u.team_id = m.team_id
-             AND u.user_id = m.user_id
-            WHERE m.is_deleted = 0
-              AND {event_identity_time_window_sql(recording, "m.message_datetime")}
-              AND {event_identity_match_sql("COALESCE(m.text, '')", event_terms)}
-              AND {event_identity_person_or_team_match_sql("COALESCE(m.text, '')", first_name_terms)}
-            ORDER BY m.message_datetime DESC
-            LIMIT {PROMPT_EVENT_IDENTITY_SOURCE_LIMIT}
+            SELECT h.occurred_at, h.who, h.text
+            FROM @search_text(
+                {_sql_string(query)},
+                {SLACK_EVENT_IDENTITY_SEARCH_CANDIDATES},
+                ARRAY['slack']::text[],
+                {since_sql}
+            ) AS h
             """
         )
     except Exception:
         return []
-    snippets: list[dict[str, Any]] = []
+    person_or_team = [*first_name_terms, *EVENT_IDENTITY_TEAM_CONTEXT_TERMS]
+    matches = []
     for occurred_at, speaker, text in rows:
+        body = str(text or "")
+        if window and isinstance(occurred_at, datetime) and not window[0] <= occurred_at <= window[1]:
+            continue
+        if not _contains_any(body, event_terms) or not _contains_any(body, person_or_team):
+            continue
+        matches.append((occurred_at, speaker, body))
+    matches.sort(key=lambda row: row[0] if isinstance(row[0], datetime) else datetime.min.replace(tzinfo=UTC), reverse=True)
+    snippets: list[dict[str, Any]] = []
+    for occurred_at, speaker, text in matches[:PROMPT_EVENT_IDENTITY_SOURCE_LIMIT]:
         snippets.append(
             event_identity_snippet(
                 source="slack_messages",
                 occurred_at=occurred_at,
-                title=str(speaker),
-                text=str(text),
+                title=str(speaker or ""),
+                text=text,
                 event_terms=event_terms,
                 first_name_terms=first_name_terms,
             )
         )
     return snippets
+
+
+def _contains_any(text: str, terms: Sequence[str]) -> bool:
+    lowered = text.casefold()
+    return any(term and term.casefold() in lowered for term in terms)
 
 
 def load_chat_event_identity_snippets(
@@ -1168,14 +1194,23 @@ def event_identity_person_or_team_match_sql(field_sql: str, first_name_terms: Se
     return "(" + " OR ".join(clauses) + ")" if clauses else "FALSE"
 
 
-def event_identity_time_window_sql(recording: Mapping[str, Any], field_sql: str) -> str:
+def event_identity_time_window(recording: Mapping[str, Any]) -> tuple[datetime, datetime] | None:
     recorded_at = recording.get("recorded_at")
     if not isinstance(recorded_at, datetime):
-        return "TRUE"
+        return None
     if recorded_at.tzinfo is None:
         recorded_at = recorded_at.replace(tzinfo=UTC)
-    start = recorded_at.astimezone(UTC) - timedelta(days=90)
-    end = recorded_at.astimezone(UTC) + timedelta(days=14)
+    return (
+        recorded_at.astimezone(UTC) - timedelta(days=90),
+        recorded_at.astimezone(UTC) + timedelta(days=14),
+    )
+
+
+def event_identity_time_window_sql(recording: Mapping[str, Any], field_sql: str) -> str:
+    window = event_identity_time_window(recording)
+    if window is None:
+        return "TRUE"
+    start, end = window
     return (
         f"{field_sql} >= {_sql_string(start.isoformat())}::timestamptz "
         f"AND {field_sql} <= {_sql_string(end.isoformat())}::timestamptz"

@@ -511,6 +511,9 @@ older than 30 days are pruned by the ten-minute `pipeline_health` asset. Probe s
 labelled (`search-benchmark` for the benchmark, `contract-audit` for `scripts/contract_audit.py`)
 so a real-traffic grade can leave them out. The `search completed` / `slow search` log lines
 are unchanged.
+Since 2026-10-27 each row also carries `degraded_legs`: the legs the fused answer went
+without (`exact` when the literal leg was cut, or any leg that hit the statement timeout),
+empty when all three answered; the log lines carry the same field.
 
 **Real traffic and probes both count.** `marts_ops.search_request_latency` always returns
 one row per `rolling_24h` and `rolling_7d` window, excluding clients `search-benchmark`
@@ -566,6 +569,41 @@ you what you want to hear), and through the two-statement shape the function rea
 
 **Exact-mode measurements before bf2d0ad (2026-10-26) describe the old exact function.**
 The historical numbers above are not measurements of the current exact path.
+
+**The real-traffic tail, 2026-10-27: two causes, neither one the host being short of CPU.**
+The first day of `ops.search_request_timings` (532 real searches) read p50 2,148 ms and p90
+8,888 ms; with a priority filter p90 was 15,693 ms, while the serial probes read 1.7 s. Of
+the 49 real searches over 10 s, the literal leg was the slowest leg in 21 and the lexical
+leg in most of the rest.
+
+- *The literal leg rechecked one trigram bitmap three times.* `search_hybrid_exact` ran a
+  count gate, the document refs and the conversation-window refs as three statements, each
+  ILIKE-rechecking the same chunks. "zach@hackclub.com Zach Latta" has 437,728 trigram
+  candidate chunks and 49 matches; each pass took 7.5-8.5 s on one core, all of it in shared
+  buffers, 22-29 s a search, warm and on an idle host. The probe now collects the matching
+  chunks' ctids once (same 5,000-match cap) and the two ranking statements read only those
+  rows by ctid. It runs under the scoped planner hints `search_text_exact` uses, because the
+  trigram estimate (871 rows) kept it serial: 2.9 s on 4 workers against 8.5 s serial.
+- *The app cuts the literal leg once the others have answered.* `runHybridSearch` gives it
+  `exactLegGrace` (750 ms) after the lexical and semantic legs both return, then cancels its
+  statement and fuses the two answering legs; the response's `fallback_reason` says the
+  literal leg was left out and to search again in exact mode, and the timing row records
+  `degraded_legs = 'exact'`. A rare identifier, the case the leg exists for, answers in
+  milliseconds and is never cut. **The cut lives in the app only:** an agent calling
+  `timeline.search_hybrid()` or `timeline.search_hybrid_exact()` in SQL gets the single
+  recheck but no time limit, so a common needle there can still take several seconds.
+- *Voice-memo enrichment evicted the search indexes.* Its Slack identity-hint lookup
+  ILIKE-scanned `base_slack.messages` across a 104-day window: 32 calls read 144 GB in 19 hours,
+  20-48 s each, 20.5% of every block the database read (searches themselves were 28.8%).
+  The job ran during 365 of the 547 real searches; p90 was 9,970 ms with it running and 5,776 ms
+  without, and every cluster of 30-60 s lexical-leg timeouts sat inside one of its runs.
+  The lookup now goes through `timeline.search_text(..., ARRAY['slack'], since)` and applies
+  the event-and-person rule to the candidates (`docs/agents/voice.md`).
+
+What stays: the search set (20.9 GB of chunk text, BM25, HNSW and vectors) was 5.7%
+resident in shared buffers and barely more in the page cache 9 hours after a full warm, and
+the semantic leg's time was all read wait. The median is a residency question; read
+`cache_residency` beside the latency before deciding what a slow median needs.
 
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
 (`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`

@@ -896,7 +896,6 @@ ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
         "calendar_events": "identity hints: which meeting was this recorded in",
         "gmail_messages": "identity hints: has this attendee corresponded with Zach",
         "google_drive_files": "identity hints: documents naming an attendee",
-        "slack_messages": "identity hints: how an attendee is addressed in chat",
         "slack_users": "identity hints: an attendee's Slack display names",
     },
     "manual_finance_extraction.py": {

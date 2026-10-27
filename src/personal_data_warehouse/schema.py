@@ -2870,6 +2870,9 @@ SEARCH_REQUEST_TIMING_COLUMNS = (
     "cpu_pressure_some_avg10",
     "load_1m",
     "cpu_count",
+    # The legs the fused answer went without: "exact" when the literal leg was
+    # cut after the others answered, or a leg that hit the statement timeout.
+    "degraded_legs",
 )
 
 # The search-timing writer's own heartbeat: ONE upserted row, refreshed every

@@ -992,7 +992,7 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
                         "Nova is coordinating Launch Week.",
                     )
                 ]
-            if "FROM @slack_messages" in sql:
+            if "FROM @search_text(" in sql and "ARRAY['slack']" in sql:
                 return [
                     (
                         datetime(2026, 4, 22, tzinfo=UTC),
@@ -1035,9 +1035,65 @@ def test_load_event_identity_hints_queries_event_specific_context() -> None:
     }
     assert any("google_drive_file_texts" in query for query in queries)
     assert any("gmail_messages" in query for query in queries)
-    assert any("slack_messages" in query for query in queries)
+    assert not any("@slack_messages" in query for query in queries), (
+        "Slack hints come from timeline search, not a scan of the raw Slack heap"
+    )
     assert all("Launch Week" in query for query in queries)
     assert all("Nova" in query for query in queries)
+
+
+def test_slack_event_identity_hints_come_from_bm25_search_and_keep_the_event_and_person_rule() -> None:
+    """The Slack hint lookup searches the timeline instead of scanning base_slack.
+
+    The raw ILIKE scan over a 104-day window read 144 GB in 19 hours on
+    production (2026-10-27) and evicted the search indexes agents read. Search
+    returns candidates for any term, so the old SQL predicate -- an event term
+    AND a person or team term, inside the window -- is applied to them here.
+    """
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_slack_event_identity_snippets
+
+    queries: list[str] = []
+
+    class Warehouse:
+        def _query(self, sql):
+            queries.append(sql)
+            return [
+                (datetime(2026, 4, 20, tzinfo=UTC), "Coordinator", "Quill is helping staff Launch Week."),
+                (datetime(2026, 4, 25, tzinfo=UTC), "Coordinator", "Nova booked the room for Launch Week."),
+                (datetime(2026, 4, 26, tzinfo=UTC), "Someone", "Launch Week is next month."),
+                (datetime(2026, 4, 24, tzinfo=UTC), "Someone", "Nova and Quill had lunch."),
+                (datetime(2025, 12, 1, tzinfo=UTC), "Old", "Nova on Launch Week, last year."),
+                (datetime(2026, 6, 1, tzinfo=UTC), "Late", "Nova on Launch Week, too late."),
+            ]
+
+    snippets = load_slack_event_identity_snippets(
+        Warehouse(),
+        {"recorded_at": datetime(2026, 4, 27, tzinfo=UTC)},
+        ["Launch Week"],
+        ["Nova", "Quill"],
+    )
+
+    [sql] = queries
+    assert "FROM @search_text(" in sql
+    assert "ARRAY['slack']::text[]" in sql
+    assert "'Launch Week Nova Quill'" in sql
+    assert "'2026-01-27T00:00:00+00:00'::timestamptz" in sql, "the window's start is pushed into search"
+    assert "@slack_messages" not in sql and "ILIKE" not in sql
+    assert [snippet["snippet"] for snippet in snippets] == [
+        "Nova booked the room for Launch Week.",
+        "Quill is helping staff Launch Week.",
+    ], "event AND person, inside the window, newest first"
+    assert {snippet["source"] for snippet in snippets} == {"slack_messages"}
+
+
+def test_slack_event_identity_hints_survive_a_failed_search() -> None:
+    from personal_data_warehouse.apple_voice_memos_enrichment import load_slack_event_identity_snippets
+
+    class Warehouse:
+        def _query(self, sql):
+            raise RuntimeError("canceling statement due to statement timeout")
+
+    assert load_slack_event_identity_snippets(Warehouse(), {}, ["Launch Week"], ["Nova"]) == []
 
 
 def test_load_contact_alias_hints_reads_human_edited_contact_nicknames() -> None:

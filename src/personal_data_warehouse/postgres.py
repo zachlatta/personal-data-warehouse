@@ -17857,7 +17857,11 @@ class PostgresWarehouse:
                 + r""");
                 exact_refs text[];
                 chat_exact_refs text[];
-                exact_match_count integer;
+                matched_chunks tid[];
+                saved_parallel_setup_cost text;
+                saved_parallel_tuple_cost text;
+                saved_min_parallel_scan text;
+                saved_cpu_operator_cost text;
                 exact_needle text := btrim(coalesce(query, ''));
                 exact_needle_b text;
                 exact_needle_c text;
@@ -17958,14 +17962,40 @@ class PostgresWarehouse:
                                 exact_needle_b, '\', '\\'), '%', '\%'), '_', '\_') || '%';
                             exact_pattern_c := '%' || replace(replace(replace(
                                 exact_needle_c, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+                            -- One trigram recheck, not three. Until 2026-10-27
+                            -- a count gate, the plain-document refs and the
+                            -- conversation-window refs each re-ran the same
+                            -- ILIKE over the chunk heap. A needle whose
+                            -- trigrams are everywhere ("zach@hackclub.com Zach
+                            -- Latta": 437,728 candidate chunks, 49 matches)
+                            -- spent 7.5-8.5s per pass on one core, 22-29s in
+                            -- all, and was the slowest leg of 21 of the 49 real
+                            -- searches over 10s that day. Collect the matching
+                            -- chunks' ctids once, capped like the old gate, and
+                            -- read only those rows afterwards.
+                            --
+                            -- The planner costs the bitmap heap scan by the
+                            -- trigram estimate (871 rows for that needle) and
+                            -- keeps it serial; the recheck is the real cost.
+                            -- The same scoped hints search_text_exact uses put
+                            -- it on parallel workers: 2.9s on 4 workers against
+                            -- 8.5s serial, measured on production that day.
+                            saved_parallel_setup_cost := current_setting('parallel_setup_cost');
+                            saved_parallel_tuple_cost := current_setting('parallel_tuple_cost');
+                            saved_min_parallel_scan := current_setting('min_parallel_table_scan_size');
+                            saved_cpu_operator_cost := current_setting('cpu_operator_cost');
+                            PERFORM set_config('parallel_setup_cost', '0', true);
+                            PERFORM set_config('parallel_tuple_cost', '0', true);
+                            PERFORM set_config('min_parallel_table_scan_size', '0', true);
+                            PERFORM set_config('cpu_operator_cost', '1', true);
                             -- EXECUTE format(...), not static statements: see
                             -- exact_one_shot. %1$L is the needle, %2$L-%4$L its
-                            -- patterns; $1-$4 are sem_adapters, since,
-                            -- priorities and per_source.
+                            -- patterns; $1-$5 are sem_adapters, since,
+                            -- priorities, per_source and the matched ctids.
                             EXECUTE format($lit$
-                            SELECT count(*)
+                            SELECT array_agg(m.ctid)
                               FROM (
-                                SELECT 1
+                                SELECT c.ctid
                                 FROM @search_chunks c
                                 WHERE (c.text ILIKE %2$L ESCAPE '\'
                                        OR c.text ILIKE %3$L ESCAPE '\'
@@ -17975,11 +18005,16 @@ class PostgresWarehouse:
                                       OR c.adapter = ANY ($1)
                                   )
                                 LIMIT """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES + 1) + r"""
-                              ) n
+                              ) m
                             $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
-                              INTO exact_match_count
+                              INTO matched_chunks
                               USING sem_adapters, since, priorities, per_source;
-                            IF exact_match_count > """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES) + r""" THEN
+                            PERFORM set_config('parallel_setup_cost', saved_parallel_setup_cost, true);
+                            PERFORM set_config('parallel_tuple_cost', saved_parallel_tuple_cost, true);
+                            PERFORM set_config('min_parallel_table_scan_size', saved_min_parallel_scan, true);
+                            PERFORM set_config('cpu_operator_cost', saved_cpu_operator_cost, true);
+                            IF matched_chunks IS NULL
+                               OR cardinality(matched_chunks) > """ + str(SEARCH_HYBRID_EXACT_MAX_CHUNK_MATCHES) + r""" THEN
                                 exact_refs := NULL;
                             ELSE
                             EXECUTE format($lit$
@@ -18017,10 +18052,8 @@ class PostgresWarehouse:
                                 JOIN @timeline_events t
                                   ON t.adapter = c.adapter
                                  AND t.event_id = c.event_id
-                                WHERE c.anchor NOT LIKE c.adapter || '|w|%%'
-                                  AND (c.text ILIKE %2$L ESCAPE '\'
-                                       OR c.text ILIKE %3$L ESCAPE '\'
-                                       OR c.text ILIKE %4$L ESCAPE '\')
+                                WHERE c.ctid = ANY ($5)
+                                  AND c.anchor NOT LIKE c.adapter || '|w|%%'
                                   AND t.search_text != ''
                                   AND NOT COALESCE(
                                       (t.metadata->>'deleted')::boolean, false
@@ -18045,7 +18078,7 @@ class PostgresWarehouse:
                               ) x
                             $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
                               INTO exact_refs
-                              USING sem_adapters, since, priorities, per_source;
+                              USING sem_adapters, since, priorities, per_source, matched_chunks;
 
                             -- A conversation-window chunk represents the last
                             -- event in its (context, hour), not necessarily the
@@ -18068,10 +18101,8 @@ class PostgresWarehouse:
                                     SELECT c.source, c.context, c.adapter,
                                            c.occurred_at AS window_start
                                     FROM @search_chunks c
-                                    WHERE c.anchor LIKE c.adapter || '|w|%%'
-                                      AND (c.text ILIKE %2$L ESCAPE '\'
-                                           OR c.text ILIKE %3$L ESCAPE '\'
-                                           OR c.text ILIKE %4$L ESCAPE '\')
+                                    WHERE c.ctid = ANY ($5)
+                                      AND c.anchor LIKE c.adapter || '|w|%%'
                                       AND (
                                           $1 IS NULL
                                           OR c.adapter = ANY ($1)
@@ -18107,7 +18138,7 @@ class PostgresWarehouse:
                               ) m
                             $lit$, exact_needle, exact_pattern, exact_pattern_b, exact_pattern_c)
                               INTO chat_exact_refs
-                              USING sem_adapters, since, priorities, per_source;
+                              USING sem_adapters, since, priorities, per_source, matched_chunks;
                             exact_refs := (
                                 coalesce(exact_refs, ARRAY[]::text[])
                                 || coalesce(chat_exact_refs, ARRAY[]::text[])

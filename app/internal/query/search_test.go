@@ -26,9 +26,10 @@ type fakeSearchRunner struct {
 	maxActive   int
 	statements  []string
 	args        [][]any
+	cancelled   []string
 }
 
-func (r *fakeSearchRunner) QueryArgs(_ context.Context, statement string, args []any, maxRows int) (RawResult, error) {
+func (r *fakeSearchRunner) QueryArgs(ctx context.Context, statement string, args []any, maxRows int) (RawResult, error) {
 	r.mu.Lock()
 	r.statements = append(r.statements, statement)
 	r.args = append(r.args, args)
@@ -38,7 +39,17 @@ func (r *fakeSearchRunner) QueryArgs(_ context.Context, statement string, args [
 	}
 	r.mu.Unlock()
 	if delay := r.delays[statement]; delay > 0 {
-		time.Sleep(delay)
+		// A cancelled context ends the statement the way pgx's cancel
+		// request ends it on the server.
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			r.mu.Lock()
+			r.active--
+			r.cancelled = append(r.cancelled, statement)
+			r.mu.Unlock()
+			return RawResult{}, ctx.Err()
+		}
 	}
 	r.mu.Lock()
 	r.active--
@@ -997,6 +1008,128 @@ func TestSearchHybridFusesTheSurvivingLegsWhenOneTimesOut(t *testing.T) {
 	}
 	if refs, ok := fuse[0][4].([]string); !ok || len(refs) != 1 {
 		t.Fatalf("the literal leg's refs are still fused: %#v", fuse[0][4])
+	}
+}
+
+// The literal leg is cut once the other two legs have answered and it has had
+// exactLegGrace more. On 2026-10-27 a needle whose trigrams are everywhere kept
+// it busy 15-37s while lexical and semantic had answered in 1-3s; the search
+// waited for it. A cut is not a failure: the two answering legs are fused, the
+// response says what was left out, and the timing names the leg.
+func TestSearchHybridCutsTheLiteralLegOnceTheOtherLegsHaveAnswered(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridLexicalSQL:  searchRefRows("gmail_email:a|m1"),
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows("gmail_email:a|m2"),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		delays: map[string]time.Duration{
+			searchHybridLexicalSQL:  10 * time.Millisecond,
+			searchHybridSemanticSQL: 20 * time.Millisecond,
+			searchHybridExactSQL:    time.Minute,
+		},
+	}
+	recorder := &capturingRecorder{}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}, TimingRecorder: recorder})
+	svc.exactLegGrace = 50 * time.Millisecond
+
+	started := time.Now()
+	resp := svc.Search(context.Background(), SearchRequest{Query: "zach@hackclub.com Zach Latta"})
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("search waited %s for the literal leg", elapsed)
+	}
+	if resp.Error != "" {
+		t.Fatalf("a cut literal leg must not fail the search: %s", resp.Error)
+	}
+	if resp.Mode != SearchModeHybrid || !strings.Contains(resp.FallbackReason, "literal (exact substring) leg") || !strings.Contains(resp.FallbackReason, "exact mode") {
+		t.Fatalf("mode = %q fallback = %q", resp.Mode, resp.FallbackReason)
+	}
+	if strings.Contains(resp.FallbackReason, "statement timeout") {
+		t.Fatalf("a cut is not a statement timeout: %q", resp.FallbackReason)
+	}
+	if !slices.Contains(runner.cancelled, searchHybridExactSQL) {
+		t.Fatalf("the literal statement was not cancelled: %#v", runner.cancelled)
+	}
+	fuse := runner.callsFor(searchHybridFuseSQL)
+	if len(fuse) != 1 {
+		t.Fatalf("fuse calls = %#v", fuse)
+	}
+	if refs, ok := fuse[0][2].([]string); !ok || len(refs) != 1 {
+		t.Fatalf("the lexical refs are fused: %#v", fuse[0][2])
+	}
+	if refs, ok := fuse[0][4].([]string); !ok || len(refs) != 0 {
+		t.Fatalf("a cut literal leg contributes no refs: %#v", fuse[0][4])
+	}
+	if len(recorder.timings) != 1 || recorder.timings[0].DegradedLegs != "exact" || recorder.timings[0].Status != "ok" {
+		t.Fatalf("timings = %#v", recorder.timings)
+	}
+}
+
+// A literal leg that answers within the grace is kept, however long the other
+// legs took: rare identifiers, the case the leg exists for, take milliseconds.
+func TestSearchHybridKeepsALiteralLegThatAnswersWithinTheGrace(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridLexicalSQL:  searchRefRows("gmail_email:a|m1"),
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows("gmail_email:a|m2"),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		delays: map[string]time.Duration{
+			searchHybridLexicalSQL:  10 * time.Millisecond,
+			searchHybridSemanticSQL: 10 * time.Millisecond,
+			searchHybridExactSQL:    60 * time.Millisecond,
+		},
+	}
+	recorder := &capturingRecorder{}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}, TimingRecorder: recorder})
+	svc.exactLegGrace = 2 * time.Second
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "INV-4831"})
+	if resp.Error != "" || resp.FallbackReason != "" {
+		t.Fatalf("error = %q fallback = %q", resp.Error, resp.FallbackReason)
+	}
+	fuse := runner.callsFor(searchHybridFuseSQL)
+	if refs, ok := fuse[0][4].([]string); !ok || len(refs) != 1 {
+		t.Fatalf("the literal refs are fused: %#v", fuse[0][4])
+	}
+	if len(runner.cancelled) != 0 {
+		t.Fatalf("nothing should be cancelled: %#v", runner.cancelled)
+	}
+	if recorder.timings[0].DegradedLegs != "" {
+		t.Fatalf("degraded legs = %q", recorder.timings[0].DegradedLegs)
+	}
+}
+
+// The grace starts when the OTHER legs answer, not when the search starts: a
+// literal leg is never cut while lexical or semantic is still working.
+func TestSearchHybridNeverCutsTheLiteralLegWhileAnotherLegIsStillRunning(t *testing.T) {
+	runner := &fakeSearchRunner{
+		fakeRunner: fakeRunner{results: hybridProbeResult(true)},
+		argsResults: map[string]RawResult{
+			searchHybridLexicalSQL:  searchRefRows("gmail_email:a|m1"),
+			searchHybridSemanticSQL: semanticHits(),
+			searchHybridExactSQL:    searchRefRows("gmail_email:a|m2"),
+			searchHybridFuseSQL:     searchHit(),
+		},
+		delays: map[string]time.Duration{
+			searchHybridLexicalSQL:  10 * time.Millisecond,
+			searchHybridSemanticSQL: 300 * time.Millisecond,
+			searchHybridExactSQL:    200 * time.Millisecond,
+		},
+	}
+	svc := NewService(runner, Options{SearchEmbedder: &fakeEmbedder{model: "m", vector: []float64{1}}})
+	svc.exactLegGrace = 20 * time.Millisecond
+
+	resp := svc.Search(context.Background(), SearchRequest{Query: "INV-4831"})
+	if resp.Error != "" || resp.FallbackReason != "" {
+		t.Fatalf("error = %q fallback = %q", resp.Error, resp.FallbackReason)
+	}
+	if fuse := runner.callsFor(searchHybridFuseSQL); len(fuse[0][4].([]string)) != 1 {
+		t.Fatalf("the literal refs are fused: %#v", fuse[0][4])
 	}
 }
 
