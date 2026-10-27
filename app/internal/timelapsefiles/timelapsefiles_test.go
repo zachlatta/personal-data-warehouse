@@ -20,9 +20,11 @@ func TestParseRecognisesEveryCaptureFileShape(t *testing.T) {
 		{"periodic-screenshot-2026-10-22_14-00-54.ax.json.gz", AccessibilityTree, 0, "2026-10-22_14-00-54", "application/gzip"},
 		{"phone-screenshot-2026-10-18_22-39-13.png", Screenshot, 1, "2026-10-18_22-39-13", "image/png"},
 		{"phone-ax-2026-10-18_22-39-13.json", AccessibilityTree, 0, "2026-10-18_22-39-13", "application/json"},
-		// The Pixel writes AVIF frames and gzipped uiautomator XML, stamped
-		// with the phone's own UTC offset.
+		// The Pixel writes WebP (on-phone pdw compression) or AVIF frames and
+		// gzipped uiautomator XML, stamped with the phone's own UTC offset.
 		{"phone-screenshot-2026-10-23_21-09-00-0400.avif", Screenshot, 1, "2026-10-23_21-09-00", "image/avif"},
+		{"phone-screenshot-2026-10-27_08-09-01-0700.webp", Screenshot, 1, "2026-10-27_08-09-01", "image/webp"},
+		{"phone-screenshot-2026-10-27_08-09-01-0700.jpg", Screenshot, 1, "2026-10-27_08-09-01", "image/jpeg"},
 		{"phone-ax-2026-10-23_21-09-00-0400.xml.gz", AccessibilityTree, 0, "2026-10-23_21-09-00", "application/gzip"},
 		{"phone-screenshot-2026-10-23_18-09-00+0530.avif", Screenshot, 1, "2026-10-23_18-09-00", "image/avif"},
 	}

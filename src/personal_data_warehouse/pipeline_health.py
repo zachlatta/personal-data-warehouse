@@ -88,6 +88,11 @@ __all__ = [
     "PIPELINES",
     "PROBE_MAX_UNINDEXED_BYTES",
     "PROBE_STATEMENT_TIMEOUT_MS",
+    "SCREEN_TIMELAPSE_ACTIVE_DEVICE_LOOKBACK",
+    "SCREEN_TIMELAPSE_ACTIVE_USAGE_EVENT_TYPES",
+    "SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER",
+    "SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER",
+    "SCREEN_TIMELAPSE_RETIRED_DEVICES",
     "STALE_MULTIPLIER",
     "WAL_READY_ATTENTION",
     "WAL_READY_FAILING",
@@ -544,6 +549,25 @@ MINUTE = timedelta(minutes=1)
 #: an evening reads late, a LaunchAgent that stopped firing reads stale.
 UPLOADER_RUN_INTERVAL = 30 * MINUTE
 
+#: Per-device freshness thresholds for screen_timelapse:
+#: 1. An Android device with interactive usage events in base_android_screen_time.events
+#:    within the last 6 hours must have a screen timelapse frame within 6 hours,
+#:    or screen_timelapse reads attention (e.g. frames waiting on the phone or
+#:    a stopped device uploader).
+#: 2. Any non-retired device that sent frames in the last 7 days (such as crobat
+#:    Mac) must have a frame within the last 4 days (matching the pipeline's
+#:    2-day data interval, late at 4 days, which leaves room for a weekend away).
+SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER = 6 * HOUR
+SCREEN_TIMELAPSE_ACTIVE_DEVICE_LOOKBACK = 7 * DAY
+SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER = 4 * DAY
+SCREEN_TIMELAPSE_RETIRED_DEVICES: tuple[str, ...] = ("joltik",)
+SCREEN_TIMELAPSE_ACTIVE_USAGE_EVENT_TYPES: tuple[str, ...] = (
+    "ACTIVITY_RESUMED",
+    "USER_INTERACTION",
+    "KEYGUARD_HIDDEN",
+    "SCREEN_INTERACTIVE",
+)
+
 # Every ``data_basis`` below that says "measured" was taken from the production
 # corpus on 2026-08-23 with this shape, over a 730-day window: the distinct
 # minutes in which the pipeline's payload table was written, and the
@@ -674,17 +698,24 @@ PIPELINES: tuple[Pipeline, ...] = (
         "Screen timelapse",
         cadence="capture every minute while in use; uploader every 5 min",
         transport=(
-            "capture loop → Mac LaunchAgent → /ingest/screen-timelapse/file"
-            " → Drive + the row, in one request"
+            "capture loop → pdw ingest screen-timelapse (Mac LaunchAgent or Android Magisk service)"
+            " → /ingest/screen-timelapse/file → Drive + the row, in one request"
         ),
         data=2 * DAY,
         basis=(
             "the loop captures only while the screen is unlocked and in use, so a"
-            " Mac in daily use writes frames every day; 2 days (late at 4) leaves"
-            " room for a weekend away. The run heartbeat in ops.uploader_heartbeats"
-            " catches the uploader failing on a day the screen was in use"
+            " Mac in daily use writes frames every day (2 days, late at 4, leaves"
+            " room for a weekend away), and any device with recent interactive"
+            " usage events in base_android_screen_time.events must deliver frames"
+            " within 6 hours (or reads attention when frames are waiting for"
+            " connectivity or a device uploader is down). The run heartbeat in"
+            " ops.uploader_heartbeats catches the uploader failing"
         ),
-        note="run heartbeat posted by bin/screen-timelapse-upload-launchd",
+        note=(
+            "run heartbeat posted by bin/screen-timelapse-upload-launchd and"
+            " bin/screen-timelapse-upload-android; per-device freshness checked"
+            " against base_android_screen_time.events (6h) and active non-retired devices (4d)"
+        ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("screen_timelapse"),
     ),
@@ -2642,7 +2673,7 @@ class PipelineHealthCollector:
         # arrived", which is a different and much louder claim.
         event_columns = [table for table in data_tables if table.event_at_column]
         expected_event = _seconds(entry.event_interval) if event_columns else 0
-        return PipelineSnapshot(
+        snapshot = PipelineSnapshot(
             pipeline=entry.id,
             label=entry.label,
             kind=entry.kind,
@@ -2681,6 +2712,108 @@ class PipelineHealthCollector:
             last_error=str(state.get("last_error", "") or ""),
             last_error_at=_real(state.get("last_error_at")),
         )
+        if entry.id == "screen_timelapse":
+            self._apply_screen_timelapse_device_freshness(snapshot)
+        return snapshot
+
+    def _apply_screen_timelapse_device_freshness(self, snapshot: PipelineSnapshot) -> None:
+        """Flag screen_timelapse attention when one active device stops delivering frames.
+
+        Aggregate max(captured_at) and max(ingested_at) stay green whenever any
+        single device (such as crobat Mac) keeps uploading. Two per-device checks
+        prevent one device from masking another:
+        1. An Android device that recorded interactive usage events in
+           base_android_screen_time.events within the last 6 hours must also have
+           a screenshot within the last 6 hours.
+        2. Any non-retired device that delivered screenshots in the last 7 days
+           (such as crobat) must have a screenshot within the last 4 days (matching
+           the pipeline's 2-day data interval, late at 4 days, which leaves room
+           for a weekend away).
+        """
+        now = datetime.now(tz=UTC)
+        usage_cutoff = now - SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER
+        active_lookback_cutoff = now - SCREEN_TIMELAPSE_ACTIVE_DEVICE_LOOKBACK
+        silent_cutoff = now - SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER
+        retired = set(SCREEN_TIMELAPSE_RETIRED_DEVICES)
+
+        try:
+            screenshot_rows = self._warehouse._query_dicts(
+                """
+                SELECT device, max(captured_at) AS last_captured_at
+                FROM @screen_timelapse_screenshots
+                WHERE device <> ''
+                GROUP BY device
+                """
+            )
+            usage_rows = self._warehouse._query_dicts(
+                """
+                SELECT device, max(event_at) AS last_usage_at
+                FROM @android_screen_time_events
+                WHERE device <> ''
+                  AND event_at >= %s
+                  AND usage_event_type_name = ANY(%s)
+                GROUP BY device
+                """,
+                (usage_cutoff, list(SCREEN_TIMELAPSE_ACTIVE_USAGE_EVENT_TYPES)),
+            )
+        except Exception:
+            logger.warning("Failed to query per-device screen_timelapse freshness", exc_info=True)
+            return
+
+        latest_screenshots: dict[str, datetime | None] = {
+            str(row["device"]): _real(row["last_captured_at"]) for row in screenshot_rows
+        }
+        recent_usage: dict[str, datetime] = {}
+        for row in usage_rows:
+            moment = _real(row["last_usage_at"])
+            if moment is not None:
+                recent_usage[str(row["device"])] = moment
+
+        issues: list[str] = []
+        flagged_devices: set[str] = set()
+
+        for device in sorted(recent_usage):
+            if device in retired:
+                continue
+            last_usage_at = recent_usage[device]
+            last_captured_at = latest_screenshots.get(device)
+            if last_captured_at is None:
+                flagged_devices.add(device)
+                issues.append(
+                    f"{device}: no screen timelapse frames despite device usage at "
+                    f"{last_usage_at.strftime('%Y-%m-%d %H:%M UTC')} "
+                    "(frames may be waiting for connectivity or the device uploader is down)"
+                )
+            elif last_captured_at < usage_cutoff and last_usage_at > last_captured_at:
+                flagged_devices.add(device)
+                lag_hours = (now - last_captured_at).total_seconds() / 3600.0
+                issues.append(
+                    f"{device}: no screen timelapse frames for {lag_hours:.1f}h despite device usage "
+                    f"(last frame {last_captured_at.strftime('%Y-%m-%d %H:%M UTC')}, "
+                    f"last usage {last_usage_at.strftime('%Y-%m-%d %H:%M UTC')}; "
+                    "frames may be waiting for connectivity or the device uploader is down)"
+                )
+
+        for device in sorted(latest_screenshots):
+            if device in flagged_devices or device in retired:
+                continue
+            last_captured_at = latest_screenshots[device]
+            if last_captured_at is None:
+                continue
+            if last_captured_at >= active_lookback_cutoff and last_captured_at < silent_cutoff:
+                lag_hours = (now - last_captured_at).total_seconds() / 3600.0
+                issues.append(
+                    f"{device}: no screen timelapse frames for {lag_hours:.1f}h "
+                    f"(last frame {last_captured_at.strftime('%Y-%m-%d %H:%M UTC')})"
+                )
+
+        if issues:
+            snapshot.state_attention_rows += len(issues)
+            snapshot.state_rows = max(snapshot.state_rows, snapshot.state_attention_rows)
+            detail = _one_line("; ".join(issues))[:500]
+            if not snapshot.last_error:
+                snapshot.last_error = detail
+                snapshot.last_error_at = now
 
     def _state_aggregate(self, entry: Pipeline) -> dict[str, Any]:
         """Read one pipeline's heartbeat and failure counts from its state table.

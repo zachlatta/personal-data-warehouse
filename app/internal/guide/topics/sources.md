@@ -184,8 +184,9 @@ starts ten days before its first upload (`pichu`: from its setup on 2026-10-23).
 
 A periodic image of a device's whole screen, about once a minute while it is unlocked and
 in use: `device` `crobat` (the Mac), `pichu` (the Android phone, from 2026-10-23;
-AVIF frames, sent when it is on Wi-Fi, so they can land hours late) and `joltik` (the
-iPhone before it). `base_screen_timelapse.screenshots` is one row per image: `device`,
+WebP frames compressed on the phone and uploaded every five minutes, or deferred on
+cellular when Wi-Fi-only gating is enabled) and `joltik` (the iPhone before it).
+`base_screen_timelapse.screenshots` is one row per image: `device`,
 `captured_at`, `display_index` (a two-display Mac writes two per moment), `mime_type`,
 `storage_file_id`. `base_screen_timelapse.accessibility_trees` is the accessibility tree of
 the same moment, when the loop could read one; join on `(device, captured_at)`, and expect
@@ -197,7 +198,7 @@ moment's other screens are withheld, so expect such moments with fewer screensho
 `marts_screen_timelapse.active_screens` is what was on screen: one row per frame an agent
 judged in use (black, locked and not-yet-read frames are absent) with `app`, `window_title`,
 `summary`, `screen_text`, `evidence` (accessibility tree, screenshot or both) and the frame's
-`storage_file_id`. Only frames from the last day are read so far. Timeline source
+`storage_file_id`. Frames captured or ingested in the last day are read. Timeline source
 `screen_timelapse`, kind `screen_capture`, one `noise` event per moment with no search text
 yet: reach it by device and time (`pdw context` on a frame shows the frames around it), not
 by search.

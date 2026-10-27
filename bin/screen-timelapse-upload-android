@@ -1,0 +1,73 @@
+#!/system/bin/sh
+# One run of an Android device's screen timelapse uploader: compresses raw PNG
+# screenshots in memory to full-resolution WebP (after card-number redaction,
+# via pdw's embedded Android Skia helper) and sends settled screenshots and
+# accessibility trees to the warehouse, unlinking each file once acknowledged.
+#
+# Run as root on a rooted Android device by the pdw-screen-timelapse Magisk
+# service (ops/android/pdw-screen-timelapse/service.sh) every 5 minutes.
+# The module carries this file, _pdw-upload-lib.sh and the release
+# linux/arm64 pdw binary side by side in its bin/; the sysadmin repository's
+# scripts/install-pixel-screen-timelapse assembles and deploys it alongside
+# the capture loop. There is no checkout on the device.
+#
+# State lives in $STATE_DIR (root 0700, credential-encrypted storage, for the
+# reason bin/google-recorder-upload-android gives): pdw's own config file
+# under config/pdw/, an optional .env (SCREEN_TIMELAPSE_SOURCES,
+# SCREEN_TIMELAPSE_WIFI_ONLY, SCREEN_TIMELAPSE_QUALITY,
+# SCREEN_TIMELAPSE_MAX_EDGE), optional switch files (`paused`, `wifi-only`),
+# the run lock, the upload state SQLite database and logs/.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATE_DIR="${PDW_SCREEN_TIMELAPSE_STATE_DIR:-/data/misc_ce/0/pdw-screen-timelapse}"
+# Magisk starts services with HOME=/ and no TMPDIR; pdw needs both writable.
+export HOME="$STATE_DIR/home"
+export TMPDIR="$STATE_DIR/tmp"
+export XDG_CONFIG_HOME="$STATE_DIR/config"
+export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"
+export PDW_INGEST_PROJECT_DIR="$STATE_DIR"
+if [ -f "$STATE_DIR/wifi-only" ]; then
+  export SCREEN_TIMELAPSE_WIFI_ONLY=1
+fi
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+SOURCES="${SCREEN_TIMELAPSE_SOURCES:-pichu=/data/adb/screen-timelapse/out}"
+LOG_DIR="$STATE_DIR/logs"
+LOG_FILE="$LOG_DIR/screen-timelapse-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/screen-timelapse-upload.heartbeat"
+
+mkdir -p "$LOG_DIR" "$HOME" "$TMPDIR"
+# The device has no logrotate: keep the current log under 1 MiB and one old one.
+if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -gt 1048576 ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting android screen timelapse upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
+else
+  "$PDW" ingest screen-timelapse \
+    --sources "$SOURCES" \
+    --compress-png \
+    --delete-after-upload \
+    --lock-file "$STATE_DIR/screen-timelapse-upload.lock" \
+    --state-file "$STATE_DIR/screen-timelapse-upload-state.sqlite" >> "$LOG_FILE" 2>&1
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+pdw_post_heartbeat "screen_timelapse" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+echo "[$finished_at_iso] finished android screen timelapse upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

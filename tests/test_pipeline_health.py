@@ -3202,3 +3202,110 @@ def test_benchmark_slow_p90_grades_attention_and_idle(warehouse):
     row = _seed_search_benchmark_run(warehouse, latency_p50_ms=900, latency_p90_ms=2001)
     assert row['status'] == 'attention'
     assert row['saturation'] == 'idle'
+
+
+def _seed_screen_timelapse_frame(warehouse, device: str, *, captured_ago: timedelta) -> None:
+    now = datetime.now(tz=UTC)
+    stamp = now - captured_ago
+    warehouse._command(
+        """
+        INSERT INTO @screen_timelapse_screenshots
+            (device, captured_at, display_index, source_filename, content_sha256, mime_type,
+             size_bytes, storage_backend, storage_key, storage_file_id, storage_url, ingested_at)
+        VALUES (%s, %s, 1, 'frame.webp', 'sha', 'image/webp', 1000, 'google_drive', 'k', 'f', '', %s)
+        """,
+        (device, stamp, stamp),
+    )
+
+
+def _seed_screen_timelapse_heartbeat(warehouse, device: str = "crobat", *, ran_ago: timedelta = timedelta(minutes=2)) -> None:
+    now = datetime.now(tz=UTC)
+    stamp = now - ran_ago
+    warehouse._command(
+        """
+        INSERT INTO @uploader_heartbeats
+            (pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at, sync_version)
+        VALUES ('screen_timelapse', %s, %s, 'ok', '', 0, 2, %s, 1)
+        """,
+        (device, stamp, stamp),
+    )
+
+
+def _seed_android_usage_event(
+    warehouse,
+    device: str,
+    *,
+    event_ago: timedelta,
+    event_type_name: str = "ACTIVITY_RESUMED",
+) -> None:
+    now = datetime.now(tz=UTC)
+    stamp = now - event_ago
+    warehouse._command(
+        """
+        INSERT INTO @android_screen_time_events
+            (account, device, event_key, event_at, usage_event_type_name, synced_at)
+        VALUES ('z@x.test', %s, %s, %s, %s, %s)
+        """,
+        (device, f"ev-{device}-{int(event_ago.total_seconds())}", stamp, event_type_name, stamp),
+    )
+
+
+def _screen_timelapse_health_row(warehouse) -> dict:
+    return warehouse._query_dicts(
+        "SELECT status, data_status, run_status, state_attention_rows, last_error"
+        " FROM @marts_pipeline_health WHERE pipeline = 'screen_timelapse'"
+    )[0]
+
+
+def test_screen_timelapse_reads_attention_when_an_active_phone_sends_no_frames_for_six_hours(warehouse):
+    _provision_every_table(warehouse)
+    # crobat is fresh, so table-level max(captured_at) and max(ingested_at) are 5 min old.
+    _seed_screen_timelapse_frame(warehouse, "crobat", captured_ago=timedelta(minutes=5))
+    _seed_screen_timelapse_heartbeat(warehouse, "crobat", ran_ago=timedelta(minutes=2))
+    # pichu sent its last frame 8 hours ago, but has an interactive usage event 20 min ago.
+    _seed_screen_timelapse_frame(warehouse, "pichu", captured_ago=timedelta(hours=8))
+    _seed_android_usage_event(warehouse, "pichu", event_ago=timedelta(minutes=20))
+
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _screen_timelapse_health_row(warehouse)
+    assert row["status"] == "attention"
+    assert row["data_status"] == "ok"
+    assert row["run_status"] == "ok"
+    assert row["state_attention_rows"] == 1
+    assert "pichu: no screen timelapse frames for 8.0h despite device usage" in (row["last_error"] or "")
+
+
+def test_screen_timelapse_reads_attention_when_an_active_mac_sends_no_frames_past_four_days(warehouse):
+    _provision_every_table(warehouse)
+    # pichu is fresh, while crobat sent frames 5 days ago (inside 7d lookback, past 4d silence).
+    _seed_screen_timelapse_frame(warehouse, "pichu", captured_ago=timedelta(minutes=5))
+    _seed_screen_timelapse_heartbeat(warehouse, "pichu", ran_ago=timedelta(minutes=2))
+    _seed_android_usage_event(warehouse, "pichu", event_ago=timedelta(minutes=5))
+    _seed_screen_timelapse_frame(warehouse, "crobat", captured_ago=timedelta(days=5))
+
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _screen_timelapse_health_row(warehouse)
+    assert row["status"] == "attention"
+    assert row["state_attention_rows"] == 1
+    assert "crobat: no screen timelapse frames for 120.0h" in (row["last_error"] or "")
+
+
+def test_screen_timelapse_stays_ok_for_three_day_old_retired_device_and_weekend_mac(warehouse):
+    _provision_every_table(warehouse)
+    # crobat had a 2.5-day weekend away (inside the 4-day late threshold).
+    _seed_screen_timelapse_frame(warehouse, "crobat", captured_ago=timedelta(hours=60))
+    _seed_screen_timelapse_heartbeat(warehouse, "crobat", ran_ago=timedelta(minutes=2))
+    # pichu has no frame for 10 hours, and its last usage event was 9 hours ago (phone untouched).
+    _seed_screen_timelapse_frame(warehouse, "pichu", captured_ago=timedelta(hours=10))
+    _seed_android_usage_event(warehouse, "pichu", event_ago=timedelta(hours=9))
+    # joltik was retired 3 days ago (inside the 7d window, but in SCREEN_TIMELAPSE_RETIRED_DEVICES).
+    _seed_screen_timelapse_frame(warehouse, "joltik", captured_ago=timedelta(days=3))
+
+    PipelineHealthCollector(warehouse).run_all()
+
+    row = _screen_timelapse_health_row(warehouse)
+    assert row["status"] == "ok"
+    assert row["state_attention_rows"] == 0
+    assert row["last_error"] is None

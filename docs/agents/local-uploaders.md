@@ -520,15 +520,26 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zachlatta.personal-d
 launchctl enable gui/$(id -u)/com.zachlatta.personal-data-warehouse.screen-timelapse-upload
 ```
 
-**The Android phone (`pichu`) captures itself.** A root Magisk module on the phone writes a
-PNG and the tree about once a minute while the screen is on and past the keyguard; porygon's
-`com.zrl.pixel-screen-timelapse-pull` (every 2 minutes) copies them over Tailscale SSH **only while
-the phone's default network is Wi-Fi**, encodes each PNG to AVIF (`avifenc -q 60 -s 6`: a
-328 KB frame became 61 KB with the text visually identical, against 132 KB for lossy WebP and
-82 KB for lossless), places it in `~/Pictures/PhoneScreenshots/pichu` with the phone's
-mtime, and deletes it on the phone. This uploader then sends that folder like any other. The
-phone runs no `pdw`: Go on Android reads `time.Local` as UTC and needs cgo for DNS. Setup,
-switches and rollback: `pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
+**The Android phone (`pichu`) captures and uploads itself.** A root Magisk module on the phone
+writes a PNG and the tree about once a minute while the screen is on and past the keyguard.
+Until 2026-10-27 `porygon`'s `com.zrl.pixel-screen-timelapse-pull` copied them over Tailscale
+SSH only while the phone's default network was Wi-Fi, which left 822 frames waiting on the
+phone for 39 hours while on cellular (2026-10-25..27) and left `screen_timelapse` green on
+`/pipelines` because `crobat` kept uploading. Now `pdw ingest screen-timelapse` runs on the
+phone every five minutes (`ops/android/pdw-screen-timelapse/service.sh` →
+`bin/screen-timelapse-upload-android`, heartbeat `screen_timelapse` on `pichu`): after the card
+guard scans the `.xml.gz` tree and boxes out any payment card numbers in red on the PNG,
+`--compress-png` re-encodes each PNG in memory to full-resolution (`2410×1080`) lossy WebP
+(`--quality 75`, `--max-edge 0` by default) through Android's native Skia encoder
+(`app/internal/uploaders/screentimelapse/webp_android.jar`, built reproducibly by
+`ops/android/pdw-screen-timelapse/build.sh` from `PdwPngCompress.java`, with a pure-Go JPEG
+fallback off-Android), cutting an average 340 KB PNG to ~37 KB (9.2× smaller, ~10–18 MB/day,
+~0.3% battery/day), uploads it with the `.webp` filename and `image/webp` MIME type directly to
+`POST /ingest/screen-timelapse`, and deletes the local PNG and tree once acknowledged
+(`--delete-after-upload`; a screenshot withheld by the card guard is never sent or deleted).
+Pass `--wifi-only` (or `SCREEN_TIMELAPSE_WIFI_ONLY=1` in the phone's `.env`) to defer uploads
+on cellular (`dumpsys connectivity` active default network). Setup, switches and rollback:
+`pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
 **The tree is also text in the warehouse.** The app writes each tree's text, decompressed, into
 `base_screen_timelapse.accessibility_trees.content_text` in the same request (NUL and invalid
@@ -538,21 +549,24 @@ asset below, 500 a run, newest first.
 
 **What was on the screen.** The Dagster asset `screen_timelapse_enrichment`
 (`src/personal_data_warehouse/screen_timelapse_enrichment.py`; hourly at :17 plus a backlog
-sensor every 2 minutes, 30 agent runs a run) has an agent read each frame captured in the last
-`SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS` (24 by default, newest first) and write one row
-per frame and prompt version to `derived_screen_timelapse.descriptions`: `screen_state`
-(`active`, `locked`, `off`), `app`, `window_title`, `summary`, `screen_text`, and `evidence`,
-which says whether the answer came from the accessibility tree, the screenshot, or both. The
-agent reads the tree first and opens the screenshot only when the tree does not say what is on
-screen: on the first samples a Mac tree named the DataGrip query and its error, while the
-Pixel's tree of an open Superhuman email held the buttons and the sender but none of the email.
-A frame without a tree whose bytes match a frame already read reuses that answer (`is_reused`),
-so an asleep iPhone's identical black frame costs one run, not one a minute. A tree that lands
-after its frame was read, or a new `SCREEN_DESCRIPTION_PROMPT_VERSION`, reads the frame again;
-the older answer stays in the table and in the mart until the new one completes. Model and
-effort: the fleet model at `low` effort unless `SCREEN_TIMELAPSE_ENRICHMENT_MODEL` /
-`SCREEN_TIMELAPSE_ENRICHMENT_REASONING_EFFORT` say otherwise; `SCREEN_TIMELAPSE_ENRICHMENT_ENABLED=0`
-pauses it. To backfill history, raise the lookback.
+sensor every 2 minutes, 30 agent runs a run) has an agent read each frame captured **or
+ingested** in the last `SCREEN_TIMELAPSE_ENRICHMENT_LOOKBACK_HOURS` (24 by default, newest
+first — `captured_at >= since OR ingested_at >= since`, so frames delayed on a phone past 24h
+are still described when they land) and write one row per frame and prompt version to
+`derived_screen_timelapse.descriptions`: `screen_state` (`active`, `locked`, `off`), `app`,
+`window_title`, `summary`, `screen_text`, and `evidence`, which says whether the answer came
+from the accessibility tree, the screenshot, or both. The agent reads the tree first and opens
+the screenshot only when the tree does not say what is on screen: on the first samples a Mac
+tree named the DataGrip query and its error, while the Pixel's tree of an open Superhuman email
+held the buttons and the sender but none of the email. A frame without a tree whose bytes match
+a frame already read reuses that answer (`is_reused`), so an asleep iPhone's identical black
+frame costs one run, not one a minute. A tree that lands after its frame was read, or a new
+`SCREEN_DESCRIPTION_PROMPT_VERSION`, reads the frame again (re-encoding an already-described
+frame's image bytes does not); the older answer stays in the table and in the mart until the
+new one completes. Model and effort: the fleet model at `low` effort unless
+`SCREEN_TIMELAPSE_ENRICHMENT_MODEL` / `SCREEN_TIMELAPSE_ENRICHMENT_REASONING_EFFORT` say
+otherwise; `SCREEN_TIMELAPSE_ENRICHMENT_ENABLED=0` pauses it. To backfill history, raise the
+lookback.
 
 SQL starting points: `marts_screen_timelapse.active_screens` (one row per frame an agent judged
 in use, with `storage_file_id` for `get_object` and `accessibility_tree_storage_file_id`),

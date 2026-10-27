@@ -47,7 +47,7 @@ var filenamePattern = regexp.MustCompile(
 		`(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})` +
 		`([+-](?:0\d|1[0-4])[0-5]\d)?` +
 		`(?:-display-([1-9][0-9]?))?` +
-		`(\.ax\.json\.gz|\.heic|\.png|\.avif|\.json|\.xml\.gz)$`,
+		`(\.ax\.json\.gz|\.heic|\.png|\.avif|\.webp|\.jpg|\.json|\.xml\.gz)$`,
 )
 
 const stampLayout = "2006-01-02_15-04-05"
@@ -85,6 +85,10 @@ func Parse(name string) (File, bool) {
 		file.Kind, file.MimeType, file.DisplayIndex = Screenshot, "image/png", 1
 	case prefix == "phone-screenshot" && ext == ".avif" && display == "":
 		file.Kind, file.MimeType, file.DisplayIndex = Screenshot, "image/avif", 1
+	case prefix == "phone-screenshot" && ext == ".webp" && display == "":
+		file.Kind, file.MimeType, file.DisplayIndex = Screenshot, "image/webp", 1
+	case prefix == "phone-screenshot" && ext == ".jpg" && display == "":
+		file.Kind, file.MimeType, file.DisplayIndex = Screenshot, "image/jpeg", 1
 	case prefix == "phone-ax" && ext == ".json" && display == "":
 		file.Kind, file.MimeType = AccessibilityTree, "application/json"
 	case prefix == "phone-ax" && ext == ".xml.gz" && display == "":

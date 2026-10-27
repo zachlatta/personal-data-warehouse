@@ -206,6 +206,20 @@ column exists but sits on a large heap with no leading index, so the collector s
 design — `google_drive.modified_time`, `file_attachment_enrichments.ai_processed_at`).
 Neither ever colours a pipeline red: a gap in the measurement is not evidence about the data.
 
+**A multi-device pipeline cannot let one device mask another.** On 2026-10-25..27 `pichu`
+stopped delivering `screen_timelapse` frames for 39 hours while on cellular, yet
+`screen_timelapse` stayed green on `/pipelines` because `crobat` kept uploading every minute
+and aggregate `max(captured_at)` / `max(ingested_at)` saw only the freshest device.
+`_apply_screen_timelapse_device_freshness` in `pipeline_health.py` now checks each non-retired
+device (`SCREEN_TIMELAPSE_RETIRED_DEVICES = ('joltik',)`): an Android device with interactive
+usage events (`SCREEN_INTERACTIVE`, `KEYGUARD_HIDDEN`, `ACTIVITY_RESUMED`) in
+`base_android_screen_time.events` within the last 6 hours
+(`SCREEN_TIMELAPSE_DEVICE_ATTENTION_AFTER`) and no frames for 6 hours, or an active non-retired
+device (frames in the last 7 days, such as `crobat`) with no frames for 4 days
+(`SCREEN_TIMELAPSE_DEVICE_SILENT_AFTER`, matching the 2-day data interval's late-at-4-days
+threshold so a weekend away stays `ok`), increments `state_attention_rows` (`status =
+'attention'`) and names the silent device and its last frame timestamp in `last_error`.
+
 Quick check without the UI:
 
 ```bash

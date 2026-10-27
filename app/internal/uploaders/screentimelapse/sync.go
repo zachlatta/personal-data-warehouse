@@ -145,6 +145,11 @@ func (s *State) acknowledge(c *candidate, sha string, now time.Time) error {
 	return err
 }
 
+func (s *State) forget(path string) error {
+	_, err := s.db.DB.Exec(`DELETE FROM acknowledged WHERE path = ?`, path)
+	return err
+}
+
 // Uploader is what the runner needs from the ingest client.
 type Uploader interface {
 	UploadScreenTimelapseFile(content []byte, f ingestclient.ScreenTimelapseFile) (ingestclient.ScreenTimelapseStored, error)
@@ -152,14 +157,16 @@ type Uploader interface {
 
 // Summary is one run's counts.
 type Summary struct {
-	Uploaded  int
-	Skipped   int // the app already held the file
-	Unsettled int // recognised, but still too young to send
-	Held      int // settled, waiting for its moment's tree to settle
-	Redacted  int // sent with its card number replaced or boxed out
-	Withheld  int // a screenshot of a card moment the box could not cover
-	Remaining int // waiting for a later run (the limit)
-	Deferred  bool
+	Uploaded   int
+	Skipped    int // the app already held the file
+	Compressed int // PNG screenshots re-encoded in memory before upload
+	Deleted    int // local files unlinked after the server acknowledged them
+	Unsettled  int // recognised, but still too young to send
+	Held       int // settled, waiting for its moment's tree to settle
+	Redacted   int // sent with its card number replaced or boxed out
+	Withheld   int // a screenshot of a card moment the box could not cover
+	Remaining  int // waiting for a later run (the limit)
+	Deferred   bool
 }
 
 // DefaultNoTreeWait is how long past the settle age a moment's screenshots
@@ -181,6 +188,11 @@ type Runner struct {
 	NoTreeWait        time.Duration
 	Limit             int
 	Codec             ImageCodec // default SystemCodec
+	CompressPNG       bool
+	CompressQuality   int
+	CompressMaxEdge   int
+	Compressor        PNGCompressor
+	DeleteAfterUpload bool
 	BeforeUploadCheck func() string
 }
 
@@ -216,9 +228,15 @@ func (m *moment) newest() time.Time {
 	return newest
 }
 
-// ready is whether the moment can be judged: its tree has settled, or it has
-// none and its screenshots are past the wait for one.
+// ready is whether the moment can be judged: all of its screenshots have
+// settled, and its tree has settled (or it has none and its screenshots are
+// past the wait for one).
 func (m *moment) ready(now time.Time, settle, noTreeWait time.Duration) bool {
+	for _, c := range m.screenshots {
+		if !c.settled {
+			return false
+		}
+	}
 	if m.tree != nil {
 		return m.tree.settled
 	}
@@ -230,11 +248,26 @@ func (m *moment) ready(now time.Time, settle, noTreeWait time.Duration) bool {
 	return true
 }
 
+func (m *moment) hasPreviouslyWithheld(acknowledged map[string]ackRecord) bool {
+	for _, c := range m.screenshots {
+		if indexOf(m.pending, c) >= 0 {
+			continue
+		}
+		if ack, ok := acknowledged[c.path]; ok && ack.contentSHA256 == withheldMarker {
+			return true
+		}
+	}
+	return false
+}
+
 // outgoing is one file to send and the bytes to send for it.
 type outgoing struct {
-	c        *candidate
-	content  []byte
-	redacted bool
+	c          *candidate
+	content    []byte
+	filename   string
+	mimeType   string
+	redacted   bool
+	compressed bool
 }
 
 // Sync runs one pass. It stops at the first failed upload -- the app or its
@@ -364,9 +397,9 @@ func (r *Runner) Sync() (Summary, error) {
 		for _, out := range sends {
 			stored, err := r.Client.UploadScreenTimelapseFile(out.content, ingestclient.ScreenTimelapseFile{
 				Device:         out.c.source.Device,
-				SourceFilename: filepath.Base(out.c.path),
+				SourceFilename: out.filename,
 				CapturedAt:     out.c.capturedAt.Format(time.RFC3339),
-				ContentType:    out.c.file.MimeType,
+				ContentType:    out.mimeType,
 			})
 			if err != nil {
 				summary.Remaining += left
@@ -379,10 +412,37 @@ func (r *Runner) Sync() (Summary, error) {
 			if out.redacted {
 				summary.Redacted++
 			}
+			if out.compressed {
+				summary.Compressed++
+			}
 			if stored.Skipped {
 				summary.Skipped++
 			} else {
 				summary.Uploaded++
+			}
+		}
+		// Only unlink a moment's files once every send in the moment has
+		// succeeded and no screenshot is withheld, unlinking screenshots
+		// before the accessibility tree so a failed screenshot upload never
+		// loses the tree needed to box out card numbers on retry.
+		if r.DeleteAfterUpload && len(withheld) == 0 && !m.hasPreviouslyWithheld(acknowledged) {
+			for _, c := range m.screenshots {
+				if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
+					return summary, fmt.Errorf("remove %s after upload: %w", c.path, err)
+				}
+				if err := r.State.forget(c.path); err != nil {
+					return summary, err
+				}
+				summary.Deleted++
+			}
+			if m.tree != nil {
+				if err := os.Remove(m.tree.path); err != nil && !os.IsNotExist(err) {
+					return summary, fmt.Errorf("remove %s after upload: %w", m.tree.path, err)
+				}
+				if err := r.State.forget(m.tree.path); err != nil {
+					return summary, err
+				}
+				summary.Deleted++
 			}
 		}
 	}
@@ -391,8 +451,9 @@ func (r *Runner) Sync() (Summary, error) {
 
 // judgeMoment scans the moment's tree before anything of it is sent, and
 // returns the bytes to send for each pending file and the screenshots to
-// withhold. Any failure (a file unreadable, a codec error) fails the run
-// before a byte of the moment leaves, so the whole moment is judged again.
+// withhold. Any failure (a file unreadable, a codec error, a compressor error)
+// fails the run before a byte of the moment leaves, so the whole moment is
+// judged again.
 func (r *Runner) judgeMoment(m *moment) ([]outgoing, []*candidate, error) {
 	var sends []outgoing
 	var judged []*candidate
@@ -416,7 +477,11 @@ func (r *Runner) judgeMoment(m *moment) ([]outgoing, []*candidate, error) {
 			}
 			sends = append(sends, outgoing{c: c, content: content})
 		}
-		return sends, nil, nil
+		finalized, err := r.finalizeOutgoing(sends)
+		if err != nil {
+			return nil, nil, err
+		}
+		return finalized, nil, nil
 	}
 	if len(judged) == 0 || m.tree == nil {
 		return asWritten()
@@ -435,7 +500,11 @@ func (r *Runner) judgeMoment(m *moment) ([]outgoing, []*candidate, error) {
 		for _, c := range judged {
 			r.Logger.Warningf("Withholding %s: its accessibility tree %s is unreadable", c.path, filepath.Base(m.tree.path))
 		}
-		return sends, judged, nil
+		finalized, err := r.finalizeOutgoing(sends)
+		if err != nil {
+			return nil, nil, err
+		}
+		return finalized, judged, nil
 	}
 	if scan.hits == 0 {
 		return asWritten()
@@ -482,7 +551,37 @@ func (r *Runner) judgeMoment(m *moment) ([]outgoing, []*candidate, error) {
 			sends = append(sends, outgoing{c: c, content: content, redacted: true})
 		}
 	}
-	return sends, withheld, nil
+	finalized, err := r.finalizeOutgoing(sends)
+	if err != nil {
+		return nil, nil, err
+	}
+	return finalized, withheld, nil
+}
+
+// finalizeOutgoing populates filename and mimeType for each outgoing file, and
+// when CompressPNG is enabled, re-encodes PNG screenshots (after any redaction
+// boxes have been drawn) into WebP (or the fallback format).
+func (r *Runner) finalizeOutgoing(sends []outgoing) ([]outgoing, error) {
+	compressor := r.Compressor
+	if compressor == nil && r.CompressPNG {
+		compressor = &DefaultPNGCompressor{Quality: r.CompressQuality, MaxEdge: r.CompressMaxEdge}
+	}
+	for i := range sends {
+		sends[i].filename = filepath.Base(sends[i].c.path)
+		sends[i].mimeType = sends[i].c.file.MimeType
+		if compressor != nil && sends[i].c.file.Kind == timelapsefiles.Screenshot && sends[i].c.file.MimeType == "image/png" {
+			compressed, err := compressor.CompressPNG(sends[i].content)
+			if err != nil {
+				return nil, fmt.Errorf("compress %s: %w", sends[i].c.path, err)
+			}
+			base := sends[i].filename
+			sends[i].filename = strings.TrimSuffix(base, filepath.Ext(base)) + compressed.Extension
+			sends[i].mimeType = compressed.MimeType
+			sends[i].content = compressed.Content
+			sends[i].compressed = true
+		}
+	}
+	return sends, nil
 }
 
 func indexOf(list []*candidate, c *candidate) int {

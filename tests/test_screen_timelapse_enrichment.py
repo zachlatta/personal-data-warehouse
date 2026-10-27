@@ -146,15 +146,42 @@ class FakeAgent:
         )
 
 
-def _screenshot(wh, device, captured_at, *, display=1, sha, file_id, mime="image/png"):
+def _screenshot(
+    wh,
+    device,
+    captured_at,
+    *,
+    display=1,
+    sha,
+    file_id,
+    mime="image/png",
+    ingested_at=None,
+):
     wh._command(
         """
         INSERT INTO @screen_timelapse_screenshots (device, captured_at, display_index,
             source_filename, content_sha256, mime_type, size_bytes, storage_backend,
             storage_key, storage_file_id, storage_url, ingested_at)
         VALUES (%s, %s, %s, %s, %s, %s, 1000, 'google_drive', %s, %s, '', %s)
+        ON CONFLICT (device, captured_at, display_index) DO UPDATE SET
+            source_filename = EXCLUDED.source_filename,
+            content_sha256 = EXCLUDED.content_sha256,
+            mime_type = EXCLUDED.mime_type,
+            storage_key = EXCLUDED.storage_key,
+            storage_file_id = EXCLUDED.storage_file_id,
+            ingested_at = EXCLUDED.ingested_at
         """,
-        (device, captured_at, display, f"{file_id}.png", sha, mime, f"key/{file_id}", file_id, captured_at),
+        (
+            device,
+            captured_at,
+            display,
+            f"{file_id}.png",
+            sha,
+            mime,
+            f"key/{file_id}",
+            file_id,
+            ingested_at or captured_at,
+        ),
     )
 
 
@@ -287,6 +314,14 @@ def test_byte_identical_frames_without_a_tree_are_judged_once(warehouse) -> None
 
 def test_only_the_recent_window_is_read_newest_first(warehouse) -> None:
     _screenshot(warehouse, "crobat", NOW - timedelta(hours=30), sha="sha-old", file_id="fid-old")
+    _screenshot(
+        warehouse,
+        "pichu",
+        NOW - timedelta(hours=36),
+        sha="sha-late",
+        file_id="fid-late",
+        ingested_at=NOW - timedelta(minutes=10),
+    )
     _screenshot(warehouse, "crobat", NOW - timedelta(hours=3), sha="sha-a", file_id="fid-a")
     _screenshot(warehouse, "crobat", NOW - timedelta(hours=1), sha="sha-b", file_id="fid-b")
 
@@ -297,7 +332,42 @@ def test_only_the_recent_window_is_read_newest_first(warehouse) -> None:
         limit=None,
     )
 
-    assert [c["storage_file_id"] for c in candidates] == ["fid-b", "fid-a"]
+    assert [c["storage_file_id"] for c in candidates] == ["fid-b", "fid-a", "fid-late"]
+
+
+def test_a_reencoded_image_for_an_already_described_frame_is_not_redescribed(warehouse) -> None:
+    at = NOW - timedelta(hours=30)
+    _screenshot(
+        warehouse,
+        "pichu",
+        at,
+        sha="sha-avif",
+        file_id="fid-avif",
+        mime="image/avif",
+        ingested_at=NOW - timedelta(minutes=20),
+    )
+    store = FakeStore({"fid-avif": MAIL, "fid-webp": _png((20, 140, 220))})
+    agent = FakeAgent()
+
+    first = _runner(warehouse, store, agent).sync(limit=10)
+    assert first.frames_described == 1
+    assert len(agent.requests) == 1
+
+    # Switchover uploads a differently encoded image for the same moment; the
+    # completed description stands and is not re-run.
+    _screenshot(
+        warehouse,
+        "pichu",
+        at,
+        sha="sha-webp",
+        file_id="fid-webp",
+        mime="image/webp",
+        ingested_at=NOW - timedelta(minutes=5),
+    )
+    second = _runner(warehouse, store, agent).sync(limit=10)
+    assert second.frames_seen == 0
+    assert second.frames_described == 0
+    assert len(agent.requests) == 1
 
 
 def test_a_tree_that_lands_after_its_frame_was_described_is_read_again(warehouse) -> None:

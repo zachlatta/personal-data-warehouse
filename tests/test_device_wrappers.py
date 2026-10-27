@@ -30,6 +30,7 @@ ANDROID_MODULE = REPO_ROOT / "ops" / "android" / "pdw-google-recorder"
 NOTIFICATIONS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-notifications"
 MESSAGES_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-messages"
 SCREEN_TIME_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-screen-time"
+SCREEN_TIMELAPSE_MODULE = REPO_ROOT / "ops" / "android" / "pdw-screen-timelapse"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -40,6 +41,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "apple-messages-upload-launchd": ('"$PDW" ingest apple-messages --mode incremental', "apple_messages"),
     "browser-history-upload-launchd": ('"$PDW" ingest browser-history --mode incremental', "browser_history"),
     "screen-timelapse-upload-launchd": ('"$PDW" ingest screen-timelapse', "screen_timelapse"),
+    "screen-timelapse-upload-android": ('"$PDW" ingest screen-timelapse', "screen_timelapse"),
     "apple-notes-upload-launchd": ('"$PDW" ingest apple-notes --mode incremental', "apple_notes"),
     "voice-memos-upload-launchd": ('"$PDW" ingest voice-memos --mode incremental', "apple_voice_memos"),
     "google-recorder-upload-android": ('"$PDW" ingest google-recorder', "google_recorder"),
@@ -227,11 +229,13 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
         BIN / "android-notifications-upload-android",
         BIN / "android-messages-upload-android",
         BIN / "android-screen-time-upload-android",
+        BIN / "screen-timelapse-upload-android",
         BIN / LIB,
         *sorted(ANDROID_MODULE.iterdir()),
         *sorted(NOTIFICATIONS_MODULE.iterdir()),
         *sorted(MESSAGES_MODULE.iterdir()),
         *sorted(SCREEN_TIME_MODULE.iterdir()),
+        SCREEN_TIMELAPSE_MODULE / "service.sh",
     ]
     for script in scripts:
         text = script.read_text()
@@ -240,6 +244,23 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
             assert script.stat().st_mode & 0o111, f"{script.name} must be executable"
         offenders = [m.group(0).strip() for m in _BASHISMS.finditer(text)]
         assert offenders == [], f"{script.name} uses shell features mksh lacks: {offenders}"
+
+
+def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compresses_pngs() -> None:
+    service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
+    assert '"$MODDIR/bin/screen-timelapse-upload-android"' in service
+    assert "FLOOR=300" in service
+    assert "timeout 360" in service
+    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert state == "/data/misc_ce/0/pdw-screen-timelapse"
+    text = _wrapper("screen-timelapse-upload-android")
+    assert 'STATE_DIR="${PDW_SCREEN_TIMELAPSE_STATE_DIR:-/data/misc_ce/0/pdw-screen-timelapse}"' in text
+    assert 'SOURCES="${SCREEN_TIMELAPSE_SOURCES:-pichu=/data/adb/screen-timelapse/out}"' in text
+    assert '--sources "$SOURCES"' in text
+    assert '--state-file "$STATE_DIR/screen-timelapse-upload-state.sqlite"' in text
+    assert "--compress-png" in text
+    assert "--delete-after-upload" in text
 
 
 def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:

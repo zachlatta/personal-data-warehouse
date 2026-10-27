@@ -1,15 +1,18 @@
 package screentimelapse
 
 import (
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"errors"
 	"image"
 	"image/color"
 	"image/draw"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -626,5 +629,381 @@ func TestFindCardNumbers(t *testing.T) {
 	}
 	if got := redactCardNumbers("pay 4111 1111 1111 1111 now", findCardNumbers("pay 4111 1111 1111 1111 now")); got != "pay [redacted card number] now" {
 		t.Fatalf("redacted = %q", got)
+	}
+}
+
+func makeSamplePNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x % 255), G: uint8(y % 255), B: 180, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestEmbeddedWebpHelperMatchesSource(t *testing.T) {
+	zr, err := zip.NewReader(bytes.NewReader(embeddedWebpJar), int64(len(embeddedWebpJar)))
+	if err != nil {
+		t.Fatalf("embeddedWebpJar is not a valid zip: %v", err)
+	}
+	if len(zr.File) != 1 || zr.File[0].Name != "classes.dex" {
+		t.Fatalf("embeddedWebpJar files = %+v, want [classes.dex]", zr.File)
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dex, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(dex, []byte("dex\n")) {
+		t.Fatalf("classes.dex missing DEX magic header")
+	}
+	for _, needle := range []string{"PdwPngCompress", "WEBP_LOSSY"} {
+		if !bytes.Contains(dex, []byte(needle)) {
+			t.Fatalf("classes.dex missing %q", needle)
+		}
+	}
+
+	buildScript := filepath.Join("..", "..", "..", "..", "ops", "android", "pdw-screen-timelapse", "build.sh")
+	if _, err := os.Stat(buildScript); err == nil {
+		if _, err := exec.LookPath("javac"); err == nil {
+			hasSDK := false
+			for _, candidate := range []string{
+				os.Getenv("ANDROID_HOME"),
+				filepath.Join(os.Getenv("HOME"), "Android", "Sdk"),
+				"/opt/homebrew/share/android-commandlinetools",
+			} {
+				if candidate != "" {
+					if _, err := os.Stat(filepath.Join(candidate, "platforms", "android-36", "android.jar")); err == nil {
+						hasSDK = true
+						break
+					}
+				}
+			}
+			if hasSDK {
+				out, err := exec.Command(buildScript, "--check").CombinedOutput()
+				if err != nil {
+					t.Fatalf("build.sh --check failed: %v (%s)", err, strings.TrimSpace(string(out)))
+				}
+			}
+		}
+	}
+}
+
+func TestDefaultPNGCompressorUsesAndroidAppProcessAndFallsBackToJPEG(t *testing.T) {
+	raw := makeSamplePNG(t, 120, 240)
+
+	// Pure-Go fallback at full resolution (MaxEdge = 0).
+	c := &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: "/nonexistent/app_process64"}
+	gotFull, err := c.CompressPNG(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFull.Extension != ".jpg" || gotFull.MimeType != "image/jpeg" {
+		t.Fatalf("got %+v", gotFull)
+	}
+	decodedFull, err := jpeg.Decode(bytes.NewReader(gotFull.Content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedFull.Bounds().Dx() != 120 || decodedFull.Bounds().Dy() != 240 {
+		t.Fatalf("bounds = %v, want 120x240", decodedFull.Bounds())
+	}
+
+	// Pure-Go fallback with MaxEdge scaling (MaxEdge = 120 -> 60x120).
+	cScaled := &DefaultPNGCompressor{Quality: 75, MaxEdge: 120, AppProcessPath: "/nonexistent/app_process64"}
+	gotScaled, err := cScaled.CompressPNG(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedScaled, err := jpeg.Decode(bytes.NewReader(gotScaled.Content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedScaled.Bounds().Dx() != 60 || decodedScaled.Bounds().Dy() != 120 {
+		t.Fatalf("scaled bounds = %v, want 60x120", decodedScaled.Bounds())
+	}
+
+	// Android app_process64 path producing WebP.
+	fakeAppProc := filepath.Join(t.TempDir(), "app_process64")
+	script := "#!/bin/sh\n" +
+		"[ \"$1\" = \"/\" ] || exit 11\n" +
+		"[ \"$2\" = \"" + androidHelperClass + "\" ] || exit 12\n" +
+		"[ \"$3\" = \"75\" ] || exit 13\n" +
+		"[ \"$4\" = \"0\" ] || exit 14\n" +
+		"[ -f \"$5\" ] || exit 15\n" +
+		"[ -n \"$CLASSPATH\" ] && [ -f \"$CLASSPATH\" ] || exit 16\n" +
+		"printf 'RIFFxxxxWEBPVP8 fake-webp-bytes' > \"$6\"\n"
+	if err := os.WriteFile(fakeAppProc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cAndroid := &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: fakeAppProc}
+	gotWebP, err := cAndroid.CompressPNG(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotWebP.Extension != ".webp" || gotWebP.MimeType != "image/webp" || !bytes.HasPrefix(gotWebP.Content, []byte("RIFF")) {
+		t.Fatalf("gotWebP = %+v", gotWebP)
+	}
+}
+
+func TestSyncCompressesPNGScreenshotsAndDeletesAcknowledgedFiles(t *testing.T) {
+	phone := t.TempDir()
+	rawPNG := makeSamplePNG(t, 80, 160)
+	shotPath := writeCapture(t, phone, "phone-screenshot-2026-10-27_08-09-01-0700.png", string(rawPNG), 20*time.Minute)
+	treePath := writeCapture(t, phone, "phone-ax-2026-10-27_08-09-01-0700.xml.gz", gzipped(t, "<hierarchy/>"), 20*time.Minute)
+	youngPath := writeCapture(t, phone, "phone-screenshot-2026-10-27_08-29-45-0700.png", string(rawPNG), 15*time.Second)
+
+	client := &fakeUploader{}
+	runner := newRunner(t, client, Source{Device: "pichu", Dir: phone})
+	runner.CompressPNG = true
+	runner.DeleteAfterUpload = true
+	runner.Compressor = &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: "/nonexistent/app_process64"}
+
+	summary, err := runner.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 2 || summary.Compressed != 1 || summary.Deleted != 2 || summary.Unsettled != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	got := strings.Join(client.names(), ",")
+	for _, want := range []string{
+		"pichu/phone-screenshot-2026-10-27_08-09-01-0700.jpg",
+		"pichu/phone-ax-2026-10-27_08-09-01-0700.xml.gz",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("uploads %s missing %s", got, want)
+		}
+	}
+	for _, u := range client.uploads {
+		if strings.HasSuffix(u.file.SourceFilename, ".jpg") {
+			if u.file.ContentType != "image/jpeg" || !strings.HasPrefix(u.content, "\xff\xd8\xff") {
+				t.Fatalf("compressed upload = %+v", u.file)
+			}
+		}
+	}
+	if _, err := os.Stat(shotPath); !os.IsNotExist(err) {
+		t.Fatalf("acknowledged screenshot %s should be deleted", shotPath)
+	}
+	if _, err := os.Stat(treePath); !os.IsNotExist(err) {
+		t.Fatalf("acknowledged tree %s should be deleted", treePath)
+	}
+	if _, err := os.Stat(youngPath); err != nil {
+		t.Fatalf("unsettled screenshot %s must remain on disk: %v", youngPath, err)
+	}
+}
+
+func TestSyncBoxesCardNumberOnAndroidBeforeCompressingToWebpAndDeletesAfterUpload(t *testing.T) {
+	phone := t.TempDir()
+	tree := `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">` +
+		`<node index="0" text="" content-desc="" bounds="[0,0][60,120]">` +
+		`<node index="0" text="4111-1111-1111-1111" resource-id="card_number" content-desc="" bounds="[5,10][55,20]"/>` +
+		`<node index="1" text="12/29" resource-id="expiry" content-desc="Expiration" bounds="[5,25][35,35]"/>` +
+		`</node></hierarchy>`
+	treePath := writeCapture(t, phone, "phone-ax-2026-10-23_21-09-00-0400.xml.gz", gzipped(t, tree), 20*time.Minute)
+	shotPath := writeCapture(t, phone, "phone-screenshot-2026-10-23_21-09-00-0400.png", solidPNG(t, 60, 120), 20*time.Minute)
+
+	// Fake app_process64 saves the input PNG ($5) it received so we can verify
+	// the red box was drawn BEFORE WebP compression ran.
+	capturedInputPNG := filepath.Join(t.TempDir(), "compressor-input.png")
+	fakeAppProc := filepath.Join(t.TempDir(), "app_process64")
+	script := "#!/bin/sh\n" +
+		"cp \"$5\" \"" + capturedInputPNG + "\"\n" +
+		"printf 'RIFFxxxxWEBPVP8 boxed-webp' > \"$6\"\n"
+	if err := os.WriteFile(fakeAppProc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &fakeUploader{}
+	runner := newRunner(t, client, Source{Device: "pichu", Dir: phone})
+	runner.CompressPNG = true
+	runner.DeleteAfterUpload = true
+	runner.Compressor = &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: fakeAppProc}
+
+	summary, err := runner.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 2 || summary.Redacted != 2 || summary.Compressed != 1 || summary.Deleted != 2 || summary.Withheld != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	// Verify the PNG handed to the WebP compressor already had the card number
+	// and expiry boxed in solid red, and unboxed pixels untouched.
+	compressorInput, err := os.ReadFile(capturedInputPNG)
+	if err != nil {
+		t.Fatalf("compressor did not receive input PNG: %v", err)
+	}
+	red := color.RGBA{R: 255, A: 255}
+	if got := pixel(t, string(compressorInput), 30, 15); got != red {
+		t.Fatalf("card number pixel passed to compressor = %v, want red box", got)
+	}
+	if got := pixel(t, string(compressorInput), 20, 30); got != red {
+		t.Fatalf("expiry pixel passed to compressor = %v, want red box", got)
+	}
+	if got := pixel(t, string(compressorInput), 30, 100); got != testBlue {
+		t.Fatalf("unboxed pixel passed to compressor = %v, want untouched blue", got)
+	}
+
+	webpUpload := uploadNamed(t, client, "phone-screenshot-2026-10-23_21-09-00-0400.webp")
+	if webpUpload.file.ContentType != "image/webp" || webpUpload.content != "RIFFxxxxWEBPVP8 boxed-webp" {
+		t.Fatalf("webpUpload = %+v", webpUpload)
+	}
+	treeUpload := gunzipped(t, uploadNamed(t, client, "phone-ax-2026-10-23_21-09-00-0400.xml.gz").content)
+	if strings.Contains(treeUpload, "4111") || !strings.Contains(treeUpload, "[redacted card number]") {
+		t.Fatalf("uploaded tree = %s", treeUpload)
+	}
+	if _, err := os.Stat(shotPath); !os.IsNotExist(err) {
+		t.Fatalf("boxed and uploaded screenshot should be deleted: %v", err)
+	}
+	if _, err := os.Stat(treePath); !os.IsNotExist(err) {
+		t.Fatalf("redacted and uploaded tree should be deleted: %v", err)
+	}
+}
+
+func TestSyncNeverDeletesOrSendsWithheldScreenshotWhenDeleteAfterUploadIsEnabled(t *testing.T) {
+	phone := t.TempDir()
+	// Card number is in the tree, but the screen bounds [0,0][100,200] do not
+	// match the screenshot's 60x120 dimensions, so the screenshot must be withheld.
+	tree := `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">` +
+		`<node index="0" text="" content-desc="" bounds="[0,0][100,200]">` +
+		`<node index="0" text="4111-1111-1111-1111" resource-id="card_number" content-desc="" bounds="[5,10][55,20]"/>` +
+		`</node></hierarchy>`
+	treePath := writeCapture(t, phone, "phone-ax-2026-10-23_21-09-00-0400.xml.gz", gzipped(t, tree), 20*time.Minute)
+	shotPath := writeCapture(t, phone, "phone-screenshot-2026-10-23_21-09-00-0400.png", solidPNG(t, 60, 120), 20*time.Minute)
+
+	client := &fakeUploader{}
+	runner := newRunner(t, client, Source{Device: "pichu", Dir: phone})
+	runner.CompressPNG = true
+	runner.DeleteAfterUpload = true
+	runner.Compressor = &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: "/nonexistent/app_process64"}
+
+	summary, err := runner.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(client.names(), ","); got != "pichu/phone-ax-2026-10-23_21-09-00-0400.xml.gz" {
+		t.Fatalf("uploads = %s; withheld screenshot must not be sent", got)
+	}
+	if summary.Uploaded != 1 || summary.Redacted != 1 || summary.Withheld != 1 || summary.Deleted != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if _, err := os.Stat(shotPath); err != nil {
+		t.Fatalf("withheld screenshot %s must not be deleted: %v", shotPath, err)
+	}
+	if _, err := os.Stat(treePath); err != nil {
+		t.Fatalf("tree %s of a withheld moment must remain on disk: %v", treePath, err)
+	}
+
+	// Second run: the withheld screenshot is remembered in the ledger and not retried or deleted.
+	summary2, err := runner.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.uploads) != 1 || summary2.Uploaded != 0 || summary2.Withheld != 0 || summary2.Deleted != 0 {
+		t.Fatalf("second run summary = %+v, uploads = %v", summary2, client.names())
+	}
+}
+
+func TestSyncRetainsTreeWhenScreenshotUploadFailsAndBoxesCardNumberOnRetry(t *testing.T) {
+	phone := t.TempDir()
+	tree := `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0">` +
+		`<node index="0" text="" content-desc="" bounds="[0,0][60,120]">` +
+		`<node index="0" text="4111-1111-1111-1111" resource-id="card_number" content-desc="" bounds="[5,10][55,20]"/>` +
+		`</node></hierarchy>`
+	// On pichu the tree is written after the screenshot, so the tree has a
+	// newer mtime and is sent first within the moment.
+	shotPath := writeCapture(t, phone, "phone-screenshot-2026-10-23_21-09-00-0400.png", solidPNG(t, 60, 120), 20*time.Minute+2*time.Second)
+	treePath := writeCapture(t, phone, "phone-ax-2026-10-23_21-09-00-0400.xml.gz", gzipped(t, tree), 20*time.Minute)
+
+	capturedInputPNG := filepath.Join(t.TempDir(), "compressor-input.png")
+	fakeAppProc := filepath.Join(t.TempDir(), "app_process64")
+	script := "#!/bin/sh\n" +
+		"cp \"$5\" \"" + capturedInputPNG + "\"\n" +
+		"printf 'RIFFxxxxWEBPVP8 boxed-webp' > \"$6\"\n"
+	if err := os.WriteFile(fakeAppProc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 1: tree uploads first and succeeds; screenshot upload fails with HTTP 502.
+	client := &fakeUploader{failOn: "phone-screenshot-2026-10-23_21-09-00-0400.webp"}
+	runner := newRunner(t, client, Source{Device: "pichu", Dir: phone})
+	runner.CompressPNG = true
+	runner.DeleteAfterUpload = true
+	runner.Compressor = &DefaultPNGCompressor{Quality: 75, MaxEdge: 0, AppProcessPath: fakeAppProc}
+
+	summary1, err := runner.Sync()
+	if err == nil {
+		t.Fatal("expected screenshot upload failure to fail the run")
+	}
+	if summary1.Uploaded != 1 || summary1.Deleted != 0 {
+		t.Fatalf("run 1 summary = %+v; tree must not be deleted before screenshot upload succeeds", summary1)
+	}
+	if _, err := os.Stat(treePath); err != nil {
+		t.Fatalf("tree %s must remain on disk when screenshot upload fails: %v", treePath, err)
+	}
+	if _, err := os.Stat(shotPath); err != nil {
+		t.Fatalf("screenshot %s must remain on disk when its upload fails: %v", shotPath, err)
+	}
+
+	// Run 2: 3 hours later (well past DefaultNoTreeWait). Because the tree was
+	// retained on disk, judgeMoment still reads it and boxes out the card number.
+	_ = os.Remove(capturedInputPNG)
+	client.failOn = ""
+	runner.Now = func() time.Time { return testNow.Add(3 * time.Hour) }
+
+	summary2, err := runner.Sync()
+	if err != nil {
+		t.Fatalf("run 2 failed: %v", err)
+	}
+	if summary2.Uploaded != 1 || summary2.Redacted != 1 || summary2.Compressed != 1 || summary2.Deleted != 2 {
+		t.Fatalf("run 2 summary = %+v", summary2)
+	}
+	compressorInput, err := os.ReadFile(capturedInputPNG)
+	if err != nil {
+		t.Fatalf("run 2 compressor did not receive input PNG: %v", err)
+	}
+	red := color.RGBA{R: 255, A: 255}
+	if got := pixel(t, string(compressorInput), 30, 15); got != red {
+		t.Fatalf("run 2 screenshot sent with card-number region UNBOXED: %v, want %v", got, red)
+	}
+	if _, err := os.Stat(shotPath); !os.IsNotExist(err) {
+		t.Fatalf("screenshot should be deleted after moment completes: %v", err)
+	}
+	if _, err := os.Stat(treePath); !os.IsNotExist(err) {
+		t.Fatalf("tree should be deleted after moment completes: %v", err)
+	}
+}
+
+func TestCheckAndroidWiFi(t *testing.T) {
+	wifiDump := `
+Active default network: 104
+  NetworkAgentInfo{network{104}  handle{449730285581}  ni{WIFI CONNECTED extra: "Home"}}
+`
+	if reason := CheckAndroidWiFi(wifiDump); reason != "" {
+		t.Fatalf("CheckAndroidWiFi(wifi) = %q, want empty", reason)
+	}
+
+	lteDump := `
+Active default network: 100
+  NetworkAgentInfo{network{100}  handle{432550416397}  ni{MOBILE[LTE] CONNECTED}}
+  NetworkAgentInfo{network{104}  handle{449730285581}  ni{WIFI DISCONNECTED}}
+`
+	if reason := CheckAndroidWiFi(lteDump); reason == "" {
+		t.Fatal("CheckAndroidWiFi(lte) should defer when default network is MOBILE[LTE]")
+	}
+
+	noneDump := "Active default network: none\n"
+	if reason := CheckAndroidWiFi(noneDump); reason == "" {
+		t.Fatal("CheckAndroidWiFi(none) should defer when no default network is active")
 	}
 }

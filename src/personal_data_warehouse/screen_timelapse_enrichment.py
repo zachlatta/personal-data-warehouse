@@ -90,15 +90,15 @@ def load_screen_description_candidates(
     limit: int | None,
     max_error_attempts: int = DEFAULT_SCREEN_DESCRIPTION_MAX_ERROR_ATTEMPTS,
 ) -> list[dict[str, Any]]:
-    """Frames captured since ``since`` with no current reading, newest first.
+    """Frames captured or ingested since ``since`` with no current reading, newest first.
 
-    A reading is current while it read the frame's bytes and the tree its
-    moment has now: a tree that lands after its screenshot was read asks
-    again. A failed reading is retried until it has failed
-    ``max_error_attempts`` times (0 retries forever).
+    A reading is current while it read the tree its moment has now: a tree that
+    lands after its screenshot was read asks again, while a re-encoded image of
+    an already-described moment does not re-run. A failed reading is retried
+    until it has failed ``max_error_attempts`` times (0 retries forever).
     """
     error_sql = "d.status = 'error'"
-    params: list[Any] = [prompt_version, since]
+    params: list[Any] = [prompt_version, since, since]
     if max_error_attempts > 0:
         error_sql += " AND d.attempts < %s"
         params.append(int(max_error_attempts))
@@ -141,16 +141,13 @@ def load_screen_description_candidates(
          AND d.captured_at = s.captured_at
          AND d.display_index = s.display_index
          AND d.prompt_version = %s
-        WHERE s.captured_at >= %s
+        WHERE (s.captured_at >= %s OR s.ingested_at >= %s)
           AND s.storage_file_id <> ''
           AND (
               d.device IS NULL
               OR (
                   d.status = 'completed'
-                  AND (
-                      d.content_sha256 <> s.content_sha256
-                      OR d.accessibility_tree_sha256 <> COALESCE(t.content_sha256, '')
-                  )
+                  AND d.accessibility_tree_sha256 <> COALESCE(t.content_sha256, '')
               )
               OR ({error_sql})
           )
