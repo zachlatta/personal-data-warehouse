@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
+import { ComposeMeta } from '@/components/compose-meta';
 import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -93,6 +94,7 @@ export function SlackSendMessageCard({
   }
   const dirty = text.trim() !== review.text.trim();
   const [focused, setFocused] = useState(false);
+  const [showIds, setShowIds] = useState(false);
   // The callback is held in a ref: the parent passes a fresh closure every
   // render, and keying the effects on it made each report re-render the
   // parent, which re-reported — an update loop on the first keystroke.
@@ -184,22 +186,15 @@ export function SlackSendMessageCard({
               maxLength={SLACK_TEXT_MAX}
               style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#E0A05C' : '#8A878444' }]}
             />
-            <View style={styles.composeMeta}>
-              <ThemedText type="small" themeColor="textSecondary">Slack formatting: *bold*, _italic_, {'<@U…>'} mentions.</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">{text.length} / {SLACK_TEXT_MAX}</ThemedText>
-            </View>
+            <ComposeMeta
+              hint={dirty ? 'Edited. Send saves it first.' : saved ? 'Saved. Send sends this text.' : 'Slack formatting: *bold*, _italic_, <@U…> mentions.'}
+              length={text.length}
+              max={SLACK_TEXT_MAX}
+              dirty={dirty}
+              busy={busy}
+              onSave={() => { void save(); }}
+            />
             {error ? <ThemedText type="small" style={styles.error}>{error}</ThemedText> : null}
-            <View style={styles.composeActions}>
-              {saved && !dirty ? <ThemedText type="small" themeColor="textSecondary">Saved — approval sends this text.</ThemedText> : <View />}
-              <Pressable
-                accessibilityRole="button"
-                accessibilityState={{ disabled: busy || !dirty }}
-                disabled={busy || !dirty}
-                onPress={() => { void save(); }}
-                style={({ pressed }) => [styles.saveButton, (busy || !dirty) && styles.saveButtonDisabled, pressed && styles.messagePressed]}>
-                <ThemedText type="smallBold" style={styles.saveButtonText}>{busy ? 'Saving…' : 'Save message changes'}</ThemedText>
-              </Pressable>
-            </View>
           </>
         ) : (
           <View style={[styles.bubble, { backgroundColor: theme.background }]}>
@@ -213,12 +208,21 @@ export function SlackSendMessageCard({
         ) : null}
       </View>
 
-      <View style={styles.target}>
-        <ThemedText type="smallBold" themeColor="textSecondary">EXACT TARGET</ThemedText>
-        {review.conversationId ? <ThemedText type="code" selectable>Conversation {review.conversationId}</ThemedText> : null}
-        {review.userId ? <ThemedText type="code" selectable>User {review.userId}</ThemedText> : null}
-        {review.threadTs ? <ThemedText type="code" selectable>Thread {review.threadTs}</ThemedText> : null}
-      </View>
+      {review.conversationId || review.userId || review.threadTs ? (
+        <View style={styles.target}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded: showIds }}
+            hitSlop={8}
+            onPress={() => setShowIds((open) => !open)}
+            style={({ pressed }) => pressed && styles.messagePressed}>
+            <ThemedText type="small" themeColor="textSecondary">{showIds ? 'Hide Slack IDs' : 'Show Slack IDs'}</ThemedText>
+          </Pressable>
+          {showIds && review.conversationId ? <ThemedText type="code" selectable>Conversation {review.conversationId}</ThemedText> : null}
+          {showIds && review.userId ? <ThemedText type="code" selectable>User {review.userId}</ThemedText> : null}
+          {showIds && review.threadTs ? <ThemedText type="code" selectable>Thread {review.threadTs}</ThemedText> : null}
+        </View>
+      ) : null}
       {mutation.reason && mutation.reason !== requestReason ? <ThemedText type="small" themeColor="textSecondary">{mutation.reason}</ThemedText> : null}
       {mutation.error ? <ThemedText style={styles.error}>{mutation.error}</ThemedText> : null}
     </View>
@@ -249,11 +253,6 @@ const styles = StyleSheet.create({
   compose: { gap: Spacing.one },
   bubble: { borderRadius: 10, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#8A878444' },
   input: { minHeight: 110, borderRadius: 10, padding: 12, borderWidth: 1, fontSize: 16, lineHeight: 22, textAlignVertical: 'top' },
-  composeMeta: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
-  composeActions: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: Spacing.two },
-  saveButton: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, backgroundColor: '#E0A05C' },
-  saveButtonDisabled: { opacity: 0.45 },
-  saveButtonText: { color: '#fff' },
   target: { gap: 2 },
   error: { color: '#E5636D' },
 });

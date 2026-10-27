@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { StyleSheet, TextInput, View } from 'react-native';
 
 import { Avatar } from '@/components/avatar';
+import { ComposeMeta } from '@/components/compose-meta';
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { Palette, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { Mutation, UpdateTextMessageMutationInput } from '@/lib/api';
 import { formatWhen } from '@/lib/format';
@@ -131,25 +132,17 @@ export function TextMessageCard({
               autoCapitalize="sentences"
               autoCorrect
               maxLength={TEXT_MAX}
-              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#D97706' : '#6B728044' }]}
+              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? Palette.warning : '#8A878444' }]}
             />
-            <View style={styles.composeMeta}>
-              <ThemedText type="small" themeColor="textSecondary">{saved && !dirty ? 'Saved. Send sends this text.' : dirty ? 'Edited. Send saves it first.' : 'Tap to edit before sending.'}</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">{text.length} / {TEXT_MAX}</ThemedText>
-            </View>
+            <ComposeMeta
+              hint={saved && !dirty ? 'Saved. Send sends this text.' : dirty ? 'Edited. Send saves it first.' : 'Tap to edit before sending.'}
+              length={text.length}
+              max={TEXT_MAX}
+              dirty={dirty}
+              busy={busy}
+              onSave={() => { void save(); }}
+            />
             {error ? <ThemedText type="small" style={styles.error}>{error}</ThemedText> : null}
-            {dirty ? (
-              <View style={styles.composeActions}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityState={{ disabled: busy }}
-                  disabled={busy}
-                  onPress={() => { void save(); }}
-                  style={({ pressed }) => [styles.saveButton, busy && styles.saveButtonDisabled, pressed && styles.pressed]}>
-                  <ThemedText type="smallBold" style={styles.saveButtonText}>{busy ? 'Saving…' : 'Save message changes'}</ThemedText>
-                </Pressable>
-              </View>
-            ) : null}
           </>
         ) : (
           <View style={[styles.bubble, styles.finalBubble, { backgroundColor: theme.background }]}>
@@ -172,22 +165,16 @@ const styles = StyleSheet.create({
   card: { marginHorizontal: Spacing.three, borderRadius: 12, padding: 10, gap: Spacing.two },
   header: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   headerCopy: { flex: 1, minWidth: 0, gap: 2 },
-  accent: { color: '#D97706', letterSpacing: 0.8 },
-  action: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: '#D97706', padding: 10, gap: Spacing.one },
-  warning: { borderWidth: 1, borderColor: '#D0342C66', borderRadius: 10, padding: 10 },
+  accent: { color: Palette.warning, letterSpacing: 0.8 },
+  action: { borderRadius: 10, borderLeftWidth: 4, borderLeftColor: Palette.warning, padding: 10, gap: Spacing.one },
+  warning: { borderWidth: 1, borderColor: '#E5636D66', borderRadius: 10, padding: 10 },
   context: { gap: Spacing.one },
   bubbleRow: { flexDirection: 'row', justifyContent: 'flex-start' },
   bubbleRowMine: { justifyContent: 'flex-end' },
-  bubble: { maxWidth: '85%', borderRadius: 12, paddingHorizontal: 10, paddingVertical: 7, borderWidth: StyleSheet.hairlineWidth, borderColor: '#6B728044', gap: 2 },
+  bubble: { maxWidth: '85%', borderRadius: 12, paddingHorizontal: 10, paddingVertical: 7, borderWidth: StyleSheet.hairlineWidth, borderColor: '#8A878444', gap: 2 },
   finalBubble: { maxWidth: '100%' },
   when: { fontSize: 11 },
   compose: { gap: Spacing.one },
   input: { minHeight: 110, borderRadius: 10, padding: 12, borderWidth: 1, fontSize: 16, lineHeight: 22, textAlignVertical: 'top' },
-  composeMeta: { flexDirection: 'row', justifyContent: 'space-between', gap: Spacing.two },
-  composeActions: { flexDirection: 'row', justifyContent: 'flex-end' },
-  saveButton: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, backgroundColor: '#D97706' },
-  saveButtonDisabled: { opacity: 0.45 },
-  saveButtonText: { color: '#fff' },
-  pressed: { opacity: 0.7 },
-  error: { color: '#D0342C' },
+  error: { color: Palette.danger },
 });
