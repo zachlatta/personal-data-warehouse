@@ -696,3 +696,71 @@ func TestRestoreMutationUndoesARemovalDuringReview(t *testing.T) {
 		t.Fatal("a decided request cannot take a mutation back")
 	}
 }
+
+func TestCreateRequestSkipsQuotedSignatureInNewestSentMessageAndFallsBack(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("gmail_messages"))); err != nil {
+		t.Skipf("cannot create gmail schema in this database: %v", err)
+	}
+	if _, err := execContext(ctx, store.db, `
+		CREATE TABLE IF NOT EXISTS @gmail_messages (
+			account text, message_id text, thread_id text, internal_date timestamptz,
+			label_ids text[], is_deleted bigint, body_html text, body_text text,
+			from_address text, rfc822_message_id text, references_header text, in_reply_to_header text,
+			PRIMARY KEY (account, message_id)
+		)
+	`); err != nil {
+		t.Skipf("cannot create gmail_messages in this database: %v", err)
+	}
+
+	account := fmt.Sprintf("sig-fallback-%d@example.test", time.Now().UnixNano())
+	ownSigHTML := `<div dir="ltr" class="gmail_signature"><div>--<br>Zach Latta<br><a href="https://hackclub.com">Hack Club</a></div></div>`
+	otherSigHTML := `<div dir="ltr" class="gmail_signature"><div>--<br>Quoted Sender</div></div>`
+
+	olderHTML := `<div dir="ltr"><div>Earlier reply</div><div><br></div>` + ownSigHTML + `</div>`
+	newestQuotedOnlyHTML := `<div dir="ltr"><div>Quick reply without my own sig</div><br><div class="gmail_quote"><blockquote class="gmail_quote"><div>Question</div>` + otherSigHTML + `</blockquote></div></div>`
+
+	if _, err := execContext(ctx, store.db, `
+		INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date, label_ids, is_deleted, body_html, body_text)
+		VALUES
+			($1, 'msg-older', 'thread-1', '2026-09-24 18:00:00+00', ARRAY['SENT'], 0, $2, 'Earlier reply'),
+			($1, 'msg-newest-quoted', 'thread-2', '2026-09-24 21:05:44+00', ARRAY['SENT'], 0, $3, 'Quick reply')
+	`, account, olderHTML, newestQuotedOnlyHTML); err != nil {
+		t.Fatalf("seed gmail_messages: %v", err)
+	}
+
+	created, err := store.CreateRequest(ctx, CreateRequestInput{
+		Title:       "Send with fallback signature",
+		Reason:      "integration test",
+		RequestedBy: "test",
+		Mutations: []MutationInput{{
+			Type:         GmailSendEmailOperation,
+			Account:      account,
+			DeliveryMode: "send",
+			Message: map[string]any{
+				"to":        []string{"recipient@example.test"},
+				"subject":   "Hello",
+				"body_text": "Checking in.",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if len(created.Mutations) != 1 {
+		t.Fatalf("mutations = %d", len(created.Mutations))
+	}
+	message := mapFromAny(created.Mutations[0].Payload["message"])
+	bodyHTML := stringFromAny(message["body_html"])
+	if !strings.Contains(bodyHTML, ownSigHTML) {
+		t.Fatalf("body_html did not include fallback signature: %q", bodyHTML)
+	}
+	if strings.Contains(bodyHTML, "Quoted Sender") {
+		t.Fatalf("body_html leaked quoted sender signature: %q", bodyHTML)
+	}
+	bodyText := stringFromAny(message["body_text"])
+	if bodyText != "Checking in.\n\n--\nZach Latta\nHack Club\n" {
+		t.Fatalf("body_text = %q", bodyText)
+	}
+}

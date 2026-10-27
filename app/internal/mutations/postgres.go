@@ -1606,9 +1606,15 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 	return mutations
 }
 
+// latestGmailSignatureCandidateLimit bounds how many recent sent messages with
+// a gmail_signature marker are checked in newest-first order. A reply sent
+// without the account's own signature can still carry a quoted sender's
+// gmail_signature inside gmail_quote; those rows are skipped, and a run of
+// quote-only replies longer than this limit returns no signature.
+const latestGmailSignatureCandidateLimit = 50
+
 func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string) (gmailSignature, error) {
-	var bodyHTML string
-	err := queryRowContext(ctx, s.db, `
+	rows, err := queryContext(ctx, s.db, `
 		SELECT COALESCE(body_html, '')
 		FROM @gmail_messages
 		WHERE account = $1
@@ -1616,15 +1622,33 @@ func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string
 		  AND 'SENT' = ANY(label_ids)
 		  AND position('gmail_signature' in lower(COALESCE(body_html, ''))) > 0
 		ORDER BY internal_date DESC
-		LIMIT 1
-	`, account).Scan(&bodyHTML)
-	if errors.Is(err, sql.ErrNoRows) {
-		return gmailSignature{}, nil
-	}
+		LIMIT $2
+	`, account, latestGmailSignatureCandidateLimit)
 	if err != nil {
 		return gmailSignature{}, err
 	}
-	return gmailSignatureFromSentHTML(bodyHTML), nil
+	defer rows.Close()
+	bodies := []string{}
+	for rows.Next() {
+		var bodyHTML string
+		if err := rows.Scan(&bodyHTML); err != nil {
+			return gmailSignature{}, err
+		}
+		bodies = append(bodies, bodyHTML)
+	}
+	if err := rows.Err(); err != nil {
+		return gmailSignature{}, err
+	}
+	return gmailSignatureFromSentMessages(bodies), nil
+}
+
+func gmailSignatureFromSentMessages(bodies []string) gmailSignature {
+	for _, bodyHTML := range bodies {
+		if signature := gmailSignatureFromSentHTML(bodyHTML); !signature.Empty() {
+			return signature
+		}
+	}
+	return gmailSignature{}
 }
 
 func gmailSignatureFromSentHTML(bodyHTML string) gmailSignature {
@@ -2559,12 +2583,19 @@ func extractGmailSignatureHTML(bodyHTML string) string {
 	if marker < 0 {
 		return ""
 	}
+	quote := strings.Index(lower, "gmail_quote")
+	if quote >= 0 && quote <= marker {
+		return ""
+	}
 	start := strings.LastIndex(lower[:marker], "<div")
 	if start < 0 {
 		return ""
 	}
 	end := matchingDivEnd(lower, start)
 	if end <= start || end > len(bodyHTML) {
+		return ""
+	}
+	if quote >= 0 && quote < end {
 		return ""
 	}
 	return strings.TrimSpace(bodyHTML[start:end])
