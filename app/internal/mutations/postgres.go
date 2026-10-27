@@ -43,9 +43,11 @@ type storedMutation struct {
 	Preview   map[string]any
 }
 
+// gmailSignature is the gmail_signature block of Zach's newest sent message.
+// Its plain text is always derived from that block: the sent message's own
+// text part runs on past the signature into any forward or quote below it.
 type gmailSignature struct {
 	HTML string
-	Text string
 }
 
 type gmailReplyHeaderRow struct {
@@ -1605,9 +1607,9 @@ func (s *PostgresStore) enrichGmailEmailSignatures(ctx context.Context, mutation
 }
 
 func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string) (gmailSignature, error) {
-	var bodyHTML, bodyText string
+	var bodyHTML string
 	err := queryRowContext(ctx, s.db, `
-		SELECT COALESCE(body_html, ''), COALESCE(body_text, '')
+		SELECT COALESCE(body_html, '')
 		FROM @gmail_messages
 		WHERE account = $1
 		  AND is_deleted = 0
@@ -1615,21 +1617,18 @@ func (s *PostgresStore) latestGmailSignature(ctx context.Context, account string
 		  AND position('gmail_signature' in lower(COALESCE(body_html, ''))) > 0
 		ORDER BY internal_date DESC
 		LIMIT 1
-	`, account).Scan(&bodyHTML, &bodyText)
+	`, account).Scan(&bodyHTML)
 	if errors.Is(err, sql.ErrNoRows) {
 		return gmailSignature{}, nil
 	}
 	if err != nil {
 		return gmailSignature{}, err
 	}
-	signature := gmailSignature{
-		HTML: extractGmailSignatureHTML(bodyHTML),
-		Text: extractGmailSignatureText(bodyText),
-	}
-	if signature.Text == "" && signature.HTML != "" {
-		signature.Text = htmlFragmentText(signature.HTML)
-	}
-	return signature, nil
+	return gmailSignatureFromSentHTML(bodyHTML), nil
+}
+
+func gmailSignatureFromSentHTML(bodyHTML string) gmailSignature {
+	return gmailSignature{HTML: extractGmailSignatureHTML(bodyHTML)}
 }
 
 func (s *PostgresStore) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -2247,7 +2246,7 @@ func updatedGmailEmailPayload(mutation Mutation, input UpdateGmailEmailMutationI
 }
 
 func (signature gmailSignature) Empty() bool {
-	return strings.TrimSpace(signature.HTML) == "" && strings.TrimSpace(signature.Text) == ""
+	return strings.TrimSpace(signature.HTML) == ""
 }
 
 func gmailEmailHasSignature(message map[string]any) bool {
@@ -2270,17 +2269,10 @@ func appendGmailSignatureToMessage(message map[string]any, signature gmailSignat
 	out := cloneMap(message)
 	bodyText := stringFromAny(out["body_text"])
 	bodyHTML := strings.TrimSpace(stringFromAny(out["body_html"]))
-	bodyTextWithoutSignature := bodyText
-	if body, _, ok := splitEmailTextAndSignature(bodyText); ok {
-		bodyTextWithoutSignature = body
-	}
 	signatureHTML := strings.TrimSpace(signature.HTML)
-	signatureText := strings.TrimSpace(signature.Text)
-	if signatureText == "" && signatureHTML != "" {
-		signatureText = htmlFragmentText(signatureHTML)
-	}
+	signatureText := htmlFragmentText(signatureHTML)
 	if bodyHTML == "" && signatureHTML != "" {
-		bodyHTML = emailPlainTextToHTML(bodyTextWithoutSignature)
+		bodyHTML = emailPlainTextToHTML(emailTextWithoutSignature(bodyText))
 	}
 	if signatureHTML != "" && !gmailEmailHasHTMLSignature(out) {
 		out["body_html"] = joinEmailHTML(bodyHTML, signatureHTML)
@@ -2606,30 +2598,16 @@ func matchingDivEnd(lowerHTML string, start int) int {
 	return -1
 }
 
-func extractGmailSignatureText(bodyText string) string {
-	_, signature, ok := splitEmailTextAndSignature(bodyText)
-	if !ok {
-		return ""
-	}
-	return signature
-}
-
-func splitEmailTextAndSignature(bodyText string) (string, string, bool) {
+// emailTextWithoutSignature drops a typed "--" signature and everything after
+// it, so the HTML built from the text carries only the gmail_signature block.
+func emailTextWithoutSignature(bodyText string) string {
 	bodyText = strings.ReplaceAll(bodyText, "\r\n", "\n")
 	for _, delimiter := range []string{"\n--\n", "\n-- \n"} {
-		index := strings.Index(bodyText, delimiter)
-		if index < 0 {
-			continue
+		if index := strings.Index(bodyText, delimiter); index >= 0 {
+			return strings.TrimRight(bodyText[:index], "\n")
 		}
-		signature := bodyText[index+1:]
-		// Cut a quoted reply ("On <date>, <name> wrote:"). Gmail wraps long
-		// attribution lines, so "wrote:" can start its own line.
-		if quoteIndex := strings.Index(signature, "\nOn "); quoteIndex >= 0 && strings.Contains(signature[quoteIndex:], "wrote:") {
-			signature = signature[:quoteIndex]
-		}
-		return strings.TrimRight(bodyText[:index], "\n"), strings.TrimSpace(signature), true
 	}
-	return bodyText, "", false
+	return bodyText
 }
 
 func htmlFragmentText(value string) string {

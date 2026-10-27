@@ -537,8 +537,7 @@ func TestAppendGmailSignatureToMessageAddsHTMLAndText(t *testing.T) {
 		"body_html": "",
 	}
 	signature := gmailSignature{
-		HTML: `<div class="gmail_signature"><div>--<br><a href="https://hackclub.com">Hack Club</a></div></div>`,
-		Text: "--\nZach Latta\nHack Club",
+		HTML: `<div class="gmail_signature"><div>--<br>Zach Latta<br><a href="https://hackclub.com">Hack Club</a></div></div>`,
 	}
 
 	out := appendGmailSignatureToMessage(message, signature)
@@ -547,7 +546,7 @@ func TestAppendGmailSignatureToMessageAddsHTMLAndText(t *testing.T) {
 		t.Fatalf("body_html = %q", bodyHTML)
 	}
 	bodyText := stringFromAny(out["body_text"])
-	if !strings.Contains(bodyText, "Hello there.\n\n--\nZach Latta") {
+	if bodyText != "Hello there.\n\n--\nZach Latta\nHack Club\n" {
 		t.Fatalf("body_text = %q", bodyText)
 	}
 }
@@ -561,7 +560,6 @@ func TestAppendGmailSignatureToMessageReplacesPlainTextSignatureForHTML(t *testi
 	}
 	signature := gmailSignature{
 		HTML: `<div class="gmail_signature"><div>--<br><a href="https://hackclub.com">Hack Club</a></div></div>`,
-		Text: "--\nZach Latta\nHack Club",
 	}
 
 	out := appendGmailSignatureToMessage(message, signature)
