@@ -1576,10 +1576,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         id="answer_benchmark",
         label="Answer benchmark (contract C16)",
         kind="internal",
-        cadence="manual (scripts/answer_benchmark.py run --write) until the weekly asset lands",
+        cadence="weekly Tuesday 06:17 UTC",
         transport="managed agent with only pdw → app /api/tools → ops.answer_benchmark_runs",
-        expected_data_interval=None,
+        expected_data_interval=8 * DAY,
         expected_run_interval=None,
+        data_basis="a weekly asset; 8d permits the weekly cadence; the answer mart separately detects no run in ten days",
         note="real past questions graded on answer, cited source, PDW calls and time; marts_ops.answer_benchmark judges staleness",
     ),
     Pipeline(

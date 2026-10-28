@@ -41,3 +41,10 @@ def test_frequent_jobs_carry_a_run_time_cap_below_the_global_one(job, cap_second
     assert MAX_RUNTIME_TAG in job.tags, f"{job.name} has no {MAX_RUNTIME_TAG} tag"
     assert int(job.tags[MAX_RUNTIME_TAG]) == cap_seconds, job.name
     assert int(job.tags[MAX_RUNTIME_TAG]) < 14400
+
+
+def test_answer_benchmark_has_an_explicit_six_hour_cap() -> None:
+    from personal_data_warehouse.defs.answer_benchmark import answer_benchmark_job
+
+    # Dagster uses the job tag in place of the global four-hour fallback.
+    assert int(answer_benchmark_job.tags[MAX_RUNTIME_TAG]) == 6 * 60 * 60

@@ -102,17 +102,27 @@ uv run python scripts/answer_benchmark.py run --write
 uv run python scripts/answer_benchmark.py pull
 ```
 
-The agent container needs a provider login in the `pdw-agent-auth` volume, which only the
-production Dagster host has (mew-dev has none as of 2026-10-28). Until the weekly asset
-lands, run a recorded baseline inside the Dagster container there:
+Dagster's `answer_benchmark` asset runs every Tuesday at **06:17 UTC** (`17 6 * * 2`),
+a day after the search benchmark, with its schedule enabled by default. The job skips a tick
+when it is already active and takes its own exclusive warehouse lock. It reads questions from
+`private.answer_benchmark_questions` and shares the recorded-run path with `run --write`.
+Pipeline health expects new data every eight days; the answer mart separately reports
+`no_data` after ten days without a run.
 
-```bash
-sudo -n docker exec <dagster container> /app/.venv/bin/python -m \
-  personal_data_warehouse.answer_benchmark run --write --report-dir /tmp/.search-eval/answer_reports
-```
+The scheduled agent defaults to `codex` / `gpt-6.1-sol`. Override these with
+`ANSWER_BENCHMARK_AGENT_PROVIDER` / `ANSWER_BENCHMARK_AGENT_MODEL`; deployment auth,
+network and container isolation settings still come from the normal agent configuration.
+A valid provider login must exist in the configured agent auth volume.
+
+The job has a **six-hour** Dagster runtime cap and each question has a ten-minute timeout.
+Fifty questions all timing out would take about 8.3 hours: Dagster cancels such a run at
+six hours. Results are saved only after all questions finish, so cancellation saves no
+partial benchmark row; the previous row ages normally and eventually reads `no_data`.
+The first recorded baseline on 2026-10-28 took about 25 minutes for 50 questions:
+48 correct, median 22 seconds and five PDW calls.
 
 The agent is the managed container agent (`agent_runner.ContainerAgentRunner`, the one
-enrichment uses), one question at a time, ten minutes each. Its model is the deployment's
+enrichment uses), one question at a time, ten minutes each. For manual CLI runs, its model is the deployment's
 `AGENT_PROVIDER` / `AGENT_MODEL` unless `--provider` / `--model` say otherwise; Zach chose
 GPT-6.1 Sol (`codex` / `gpt-6.1-sol`) on 2026-10-28, and every result row records the model
 that answered. The prompt frame is `PROMPT_VERSION` in `answer_benchmark.py`; change it

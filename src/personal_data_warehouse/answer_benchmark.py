@@ -806,6 +806,22 @@ def _questions_command(args: argparse.Namespace) -> int:
         warehouse.close()
 
 
+def run_recorded_benchmark(
+    *, warehouse: Any, agent: AnswerAgent, provider: str, model: str,
+    limit: int | None = None, only: Sequence[str] = (), logger_: Any = None,
+) -> tuple[AnswerBenchmarkRun, list[GradedAnswer]]:
+    """Shared recorded-run path; the caller owns and closes the warehouse."""
+    warehouse.ensure_pipeline_health_tables()
+    questions = [question_from_row(row) for row in warehouse.load_answer_benchmark_questions()]
+    if only:
+        wanted = set(only)
+        questions = [question for question in questions if question.question_id in wanted]
+    return AnswerBenchmarkRunner(
+        agent=agent, resolver=WarehouseRefResolver(warehouse), provider=provider,
+        model=model, warehouse=warehouse, logger_=logger_,
+    ).run(questions, limit=limit)
+
+
 def _run_command(args: argparse.Namespace) -> int:
     from personal_data_warehouse.agent_runner import ContainerAgentRunner, agent_config_from_env
 
@@ -816,18 +832,18 @@ def _run_command(args: argparse.Namespace) -> int:
     warehouse = _warehouse() if args.write else None
     try:
         if warehouse is not None:
-            warehouse.ensure_pipeline_health_tables()
-            questions = [question_from_row(row) for row in warehouse.load_answer_benchmark_questions()]
-            resolver: RefResolver = WarehouseRefResolver(warehouse)
+            summary, graded = run_recorded_benchmark(
+                warehouse=warehouse, agent=agent, provider=provider, model=model,
+                limit=args.limit, only=args.only,
+            )
         else:
             questions = load_questions(args.questions)
-            resolver = CliRefResolver()
-        if args.only:
-            wanted = set(args.only)
-            questions = [question for question in questions if question.question_id in wanted]
-        summary, graded = AnswerBenchmarkRunner(
-            agent=agent, resolver=resolver, provider=provider, model=model, warehouse=warehouse,
-        ).run(questions, limit=args.limit)
+            if args.only:
+                wanted = set(args.only)
+                questions = [question for question in questions if question.question_id in wanted]
+            summary, graded = AnswerBenchmarkRunner(
+                agent=agent, resolver=CliRefResolver(), provider=provider, model=model,
+            ).run(questions, limit=args.limit)
     finally:
         if warehouse is not None:
             warehouse.close()

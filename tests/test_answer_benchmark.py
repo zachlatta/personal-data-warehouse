@@ -23,6 +23,7 @@ from personal_data_warehouse.answer_benchmark import (
     load_questions,
     question_from_row,
     question_row,
+    run_recorded_benchmark,
     summarize,
     write_questions,
 )
@@ -352,3 +353,24 @@ def test_warehouse_resolver_reads_timeline_refs() -> None:
     resolved = WarehouseRefResolver(Stub()).resolve([GOLD, "bad-ref", GOLD])
     assert resolved[GOLD].source == "gmail" and resolved[GOLD].timestamp == T0
     assert "('gmail_email','acct|msg-1')" in calls[0] and "bad-ref" not in calls[0]
+
+
+def test_recorded_path_loads_questions_and_persists_grades(warehouse: PostgresWarehouse) -> None:
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.publish_answer_benchmark_questions([
+        question_row(q, updated_at=T0) for q in
+        (_question(), _question(question_id="q-02"), _question(question_id="q-03", active=False))
+    ])
+
+    class Agent:
+        def ask(self, question):
+            return _attempt("Confirmed Sept 3.", [])
+
+    summary, graded = run_recorded_benchmark(
+        warehouse=warehouse, agent=Agent(), provider="codex", model="gpt-6.1-sol",
+        only=["q-02", "q-03"],
+    )
+    assert summary.questions == 1 and summary.correct == 1
+    assert [item.question_id for item in graded] == ["q-02"]
+    stored = warehouse._query_dicts("SELECT question_id, correct FROM @answer_benchmark_results")
+    assert [(r["question_id"], r["correct"]) for r in stored] == [("q-02", 1)]
