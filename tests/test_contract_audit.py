@@ -855,3 +855,53 @@ def test_s2_withholds_green_when_landing_speed_cannot_be_read(monkeypatch: pytes
     verdict = contract_audit.s2_voice()
     assert verdict.status == contract_audit.YELLOW
     assert "voice_memo_landing_health" in verdict.evidence
+
+
+def _c17_sql(usage: list[dict] | None, week: list[dict] | None) -> Callable[..., list[dict] | None]:
+    def fake(intent: str, sql: str, **_: object) -> list[dict] | None:
+        return usage if "marts_ops.agent_usage" in sql else week
+    return fake
+
+
+def _c17_usage(rate: float) -> list[dict]:
+    return [{"status": "ok", "sql_error_session_rate": rate, "invented_calls": 0, "window_days": 14, "pdw_sessions": 400}]
+
+
+def _c17_shape(rank: int, shape: str, *, kind: str = "sql_error", calls: int = 1, status: str = "attention") -> dict:
+    return {"week_start": "2026-10-19", "rank": rank, "shape": shape, "kind": kind,
+            "sessions": 10 - rank, "failed_calls": calls, "status": status}
+
+
+@pytest.mark.parametrize(
+    ("rate", "week", "expected"),
+    [
+        # Under 10% SQL-error sessions, no invented commands, nothing left over.
+        (0.05, [_c17_shape(1, '42703 column "id" does not exist on base_gmail.messages')], contract_audit.GREEN),
+        (0.05, [], contract_audit.GREEN),
+        (0.12, [], contract_audit.YELLOW),
+        (0.246, [], contract_audit.RED),
+        # "Near 0" invented calls: more than five in a complete week is yellow.
+        (0.05, [_c17_shape(1, "pdw query", kind="invented", calls=6)], contract_audit.YELLOW),
+        # A top-three shape that was also top three the week before was not fixed.
+        (0.05, [_c17_shape(1, "57014 canceling statement due to statement timeout", status="failing")],
+         contract_audit.YELLOW),
+    ],
+)
+def test_c17_grades_error_sessions_invented_calls_and_unfixed_top_failures(
+    monkeypatch: pytest.MonkeyPatch, rate: float, week: list[dict], expected: str
+) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c17_sql(_c17_usage(rate), week))
+    verdict = contract_audit.c17_agents_do_not_stumble()
+    assert verdict.status == expected, verdict.evidence
+    for row in week:
+        assert row["shape"] in verdict.evidence
+
+
+def test_c17_is_not_green_without_its_measurements(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c17_sql(None, []))
+    assert contract_audit.c17_agents_do_not_stumble().status != contract_audit.GREEN
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c17_sql(_c17_usage(0.01), None))
+    assert contract_audit.c17_agents_do_not_stumble().status != contract_audit.GREEN
+    stale = [{**_c17_usage(0.01)[0], "status": "unknown"}]
+    monkeypatch.setattr(contract_audit, "pdw_sql", _c17_sql(stale, []))
+    assert contract_audit.c17_agents_do_not_stumble().status == contract_audit.YELLOW

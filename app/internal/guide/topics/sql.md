@@ -62,6 +62,10 @@ candidates: read them, re-check, and do not guess a second name from the first f
 - **JSON is `text` on older sources** (Slack, Gmail, Calendar, Apple, WhatsApp, agent
   session tables): cast before `->>`. Newer tables carry real `jsonb`
   (`base_whoop_private.documents.raw_json`). The column type from describe settles it.
+  `LIKE`/`ILIKE` on a `jsonb` column raises 42883: `col::text ILIKE '%…%'` or `col->>'key'`.
+- **Keys are `<thing>_id`; 2 of ~200 relations have a bare `id`.** Keys are named for the thing (`base_gmail.messages.message_id`,
+  `base_feed.items.item_id`, `marts_ai_conversations.sessions.session_id`); `id` was the most
+  guessed column in the fortnight to 2026-10-27.
 - **Some address columns are `text[]`.** `base_gmail.messages.from_address` is `text`,
   but `to_addresses`, `cc_addresses` and `bcc_addresses` are arrays: `ILIKE` on them
   raises 42883; use `EXISTS (SELECT 1 FROM unnest(to_addresses) a WHERE a ILIKE '%…%')`.

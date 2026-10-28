@@ -2804,6 +2804,25 @@ AGENT_USAGE_COLUMNS = (
     "collected_at",
 )
 
+# One row per (ISO week, failure shape): the failed PDW calls agents made that
+# week, grouped by what went wrong -- a SQLSTATE plus its normalized message
+# (and the relations read, for a missing column or a timeout), or a pdw
+# subcommand the CLI does not have. Contract C17: each week's top three are
+# fixed in the guide or the CLI before the next week.
+AGENT_FAILURE_SHAPE_COLUMNS = (
+    "week_start",
+    "shape",
+    "kind",
+    "sqlstate",
+    "sessions",
+    "failed_calls",
+    "sources",
+    "example",
+    "first_failed_at",
+    "last_failed_at",
+    "collected_at",
+)
+
 # One row per (source, priority tier) over the last seven days of
 # timeline.events, taken by the pipeline_health collector. Contract C2 says
 # every row is classified into one of five tiers; this is the surface that

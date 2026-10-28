@@ -159,6 +159,12 @@ that, not from this prose.
   linked below. *Held up by* `tests/test_contracts_doc.py` (every test a contract names
   exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
   `test_every_stated_contract_has_a_living_audit_check`.
+- **C17 — agents do not stumble.** SQL-error sessions under 10%, calls to commands that do
+  not exist near zero, and each week's top three failure shapes fixed in the guide or the
+  CLI before the next week. *Held up by* `marts_ops.agent_top_failures` (failed calls by
+  shape per week; a top-three shape left over from the week before reads `failing`) and
+  `test_top_failures_rank_each_week_and_flag_a_shape_left_unfixed`. See
+  [the agent guide doc](docs/agents/agent-guide.md#finding-and-fixing-stumbles).
 
 Three sources carry a contract of their own, because each is where "the pipeline is green"
 and "the data is right" have come apart:
@@ -200,6 +206,7 @@ Read the file for the area you are changing before you change it.
 | finance: Plaid, SimpleFIN, the ledger, manual documents, securities | [docs/agents/finance.md](docs/agents/finance.md) |
 | WHOOP and the health mart | [docs/agents/health-sources.md](docs/agents/health-sources.md) |
 | agent sessions, Claude Desktop, ChatGPT, Muse, the app's ingest path | [docs/agents/agent-sessions.md](docs/agents/agent-sessions.md) |
+| the agent guide's history, how agents stumble and the weekly top failures | [docs/agents/agent-guide.md](docs/agents/agent-guide.md) |
 | local Mac uploaders and their macOS permissions | [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md) |
 | reviewed writes (Notes, Contacts), the phone app (Android and iOS) and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
 | access tokens beside `PDW_SECRET_TOKEN`, `pdw token`, the `cli_authorize` bootstrap, MCP connector grants, secret rotation | [docs/agents/access-tokens.md](docs/agents/access-tokens.md) |
@@ -213,34 +220,9 @@ Read the file for the area you are changing before you change it.
 `app/internal/guide/` (`brief.md`, `readme.md` plus `topics/*.md`, Go templates whose only
 branching is the surface's own spelling of each call). **The brief is what a session reads
 by default** (~6 KB, capped at 8 KB by `guide_test.go`); `pdw readme full` / `{"topic":
-"full"}` is the long form (capped at 14 KB). Measured over twelve real sessions on
-2026-09-22, the skill plus the full guide cost 25–45 KB before the first data call
-whatever the question was — a one-line phone-number lookup paid eight times its own
-answer in preamble — which is why the default is the brief. The same audit added
-`pdw context <ref>` (the first-class spelling of `timeline.context()`, naming its columns:
-`SELECT *` there returned `metadata` and the full `search_text` of every row, 3.8 KB
-against 0.5 KB for the three columns anyone reads, and it was used a quarter as often as
-search because the ref had to be quoted inside a quoted statement), a one-line-per-hit
-search output (`--full` for the old previews, `-n 10` default, an unknown flag anywhere
-is an error rather than query text), and on MCP `connections` + `connection_call` in
-place of a flat listing of every connected upstream tool: that list was 196 tools /
-153 KB (~38k tokens) of definitions in every MCP session, 142 KB of it proxied, and the
-sessions paying it almost never called one (the flat listing is gone, not switchable;
-`pdw list` / `pdw call` are unchanged). Since 2026-10-01 `context` is a server tool on both
-surfaces and `pdw context` calls it, so a hit's conversation is read one way everywhere. The follow-up the same day: search
-previews are cleaned after windowing (tracking URLs, markdown-table scaffolding, zero-width
-padding — a newsletter hit's whole 800-char preview had been squarespace-mail.com redirect
-links); a textless Slack hit (a file, image or canvas post, ~5,000 a week) is labelled at
-**read time** in the search service rather than in the adapter's snippet, because the
-adapter edit would change its signature and re-walk 46.8M Slack rows for a label; the SQL
-tool hints at `body_markdown_clean` when a statement reads `body_text`/`body_html` from
-`base_gmail.messages`; `schema_overview` / `pdw schema` take a schema name or layer prefix
-so one domain costs one schema instead of the 36 KB whole; and `marts_ops.agent_usage`
-pairs a tool result with its call by `turn_id` (Claude Code's `tool_use_id`, now stamped on
-result rows too) before falling back to adjacency, and reads a piped CLI search with no
-`Search:` header as unknown rather than failed — adjacency alone had lost the result of
-26% of pdw search calls and nearly every proxied MCP call, and the header rule had put 29%
-of a fortnight's searches in `search_invalid_or_failed_priority`. The fleet skill is one line that says to read
+"full"}` is the long form (capped at 14 KB). The measurements behind that default, the
+commands it added and how agent stumbles are found and fixed are in
+[docs/agents/agent-guide.md](docs/agents/agent-guide.md). The fleet skill is one line that says to read
 it. Until 2026-09-09 the guide was a hand-transcribed skill outside this repository that
 drifted from the code on every reorg; now `app/internal/guide/guide_test.go` fails when
 the guide names a relation the catalog does not have, omits a priority tier or selection,

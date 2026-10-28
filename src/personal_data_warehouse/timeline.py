@@ -4221,6 +4221,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "search_request_timing_state": _state("the search-timing writer's ten-minute heartbeat"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),
+    "agent_failure_shapes": _state("failed agent calls to PDW by shape per ISO week (daily collector snapshot)"),
     "search_benchmark_runs": _state("weekly search benchmark: latency and labeled quality per mode"),
     "search_benchmark_history": _state(
         "append-only weekly search benchmark history; trends, not real-world events"

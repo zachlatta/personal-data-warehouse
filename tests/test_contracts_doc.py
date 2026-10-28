@@ -62,6 +62,11 @@ def test_every_test_named_by_a_contract_exists() -> None:
 def test_every_contract_names_what_holds_it_up() -> None:
     section = _contracts_section()
     contracts = re.findall(r"^- \*\*C(\d+) — ", section, re.M)
-    assert [int(n) for n in contracts] == list(range(1, 13))
+    numbers = [int(n) for n in contracts]
+    # C1-C12 are the founding contracts. Later ones keep the number the
+    # 2026-10-27 product vision gave them (C13-C22) and land in any order, so
+    # the list is ascending with gaps rather than contiguous.
+    assert numbers == sorted(set(numbers)), numbers
+    assert set(range(1, 13)) <= set(numbers), numbers
     for block in re.split(r"^- \*\*C\d+ — ", section, flags=re.M)[1:]:
         assert "*Held up by*" in block, block[:80]

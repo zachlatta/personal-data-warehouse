@@ -27,6 +27,7 @@ from personal_data_warehouse.agent_usage import (
     PRIORITY_FILTER_TARGET,
     SEARCH_FIRST_TARGET,
     SQL_ERROR_SESSION_CEILING,
+    AGENT_TOP_FAILURES,
 )
 from personal_data_warehouse.schema import (
     ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
@@ -118,6 +119,7 @@ from personal_data_warehouse.schema import (
     SEARCH_REQUEST_TIMING_STATE_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
     AGENT_USAGE_COLUMNS,
+    AGENT_FAILURE_SHAPE_COLUMNS,
     SEARCH_BENCHMARK_LABEL_COLUMNS,
     SEARCH_BENCHMARK_HISTORY_COLUMNS,
     SEARCH_BENCHMARK_RUN_COLUMNS,
@@ -1390,6 +1392,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "timeline_priority_mix": TableSpec(TIMELINE_PRIORITY_MIX_COLUMNS, ("source", "priority"), "collected_at"),
     "agent_usage": TableSpec(AGENT_USAGE_COLUMNS, ("source",), "collected_at"),
+    "agent_failure_shapes": TableSpec(AGENT_FAILURE_SHAPE_COLUMNS, ("week_start", "shape"), "collected_at"),
     "search_benchmark_runs": TableSpec(SEARCH_BENCHMARK_RUN_COLUMNS, ("mode",), "collected_at"),
     "search_benchmark_history": TableSpec(
         SEARCH_BENCHMARK_HISTORY_COLUMNS, ("mode", "collected_at"), "collected_at"
@@ -1416,6 +1419,7 @@ PIPELINE_HEALTH_SNAPSHOT_TABLES = (
     "uploader_heartbeats",
     "timeline_priority_mix",
     "agent_usage",
+    "agent_failure_shapes",
     "search_benchmark_runs",
     "search_benchmark_labels",
 )
@@ -3113,6 +3117,9 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # agent_failure_shapes
+    "first_failed_at",
+    "last_failed_at",
     # github
     "authored_at",
     "committed_at",
@@ -3283,6 +3290,8 @@ _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
 )
 
 INTEGER_COLUMNS = {
+    # agent_failure_shapes
+    "failed_calls",
     # android_screen_time
     "usage_event_type",
     "standby_bucket",
@@ -7041,6 +7050,39 @@ class PostgresWarehouse:
             """,
         )
 
+        # Contract C17 as a measurement: each week's failed agent calls by
+        # shape, ranked by sessions. A top-three shape is `attention` (fix it
+        # in the guide or the CLI this week); one that was also top three the
+        # week before is `failing`. Timestamps are epoch-translated.
+        self._ensure_view(
+            "marts_agent_top_failures",
+            f"""
+            CREATE OR REPLACE VIEW @marts_agent_top_failures AS
+            WITH ranked AS (
+                SELECT week_start, shape, kind, sqlstate, sessions, failed_calls, sources, example,
+                       NULLIF(first_failed_at, {epoch}) AS first_failed_at,
+                       NULLIF(last_failed_at, {epoch}) AS last_failed_at,
+                       NULLIF(collected_at, {epoch}) AS collected_at,
+                       (row_number() OVER (
+                           PARTITION BY week_start ORDER BY sessions DESC, failed_calls DESC, shape
+                       ))::bigint AS rank
+                FROM @agent_failure_shapes
+            )
+            SELECT r.week_start, r.rank, r.shape, r.kind, r.sqlstate, r.sessions, r.failed_calls,
+                   r.sources, r.example, r.first_failed_at, r.last_failed_at,
+                   (CASE WHEN p.shape IS NULL THEN 0 ELSE 1 END)::bigint AS in_previous_top3,
+                   CASE
+                       WHEN r.rank <= {AGENT_TOP_FAILURES} AND p.shape IS NOT NULL THEN 'failing'
+                       WHEN r.rank <= {AGENT_TOP_FAILURES} THEN 'attention'
+                       ELSE 'ok'
+                   END AS status,
+                   r.collected_at
+            FROM ranked r
+            LEFT JOIN ranked p
+              ON p.week_start = r.week_start - 7 AND p.shape = r.shape AND p.rank <= {AGENT_TOP_FAILURES}
+            """,
+        )
+
         # C6: read-time windows over recorded real traffic. The timestamp index
         # bounds the shared scan to seven days. Errors remain latency samples;
         # synthetic probes never get to improve (or worsen) the traffic grade.
@@ -7632,6 +7674,20 @@ class PostgresWarehouse:
         self._command(
             "DELETE FROM @agent_usage WHERE source <> ALL(%s)",
             ([snapshot.source for snapshot in rows],),
+        )
+
+    def write_agent_failure_shapes(
+        self, rows: Sequence[Any], *, since: date, collected_at: datetime
+    ) -> None:
+        """Rewrite the weeks from ``since`` with one collection's failure shapes.
+
+        Older weeks are kept: the view compares each week with the one before.
+        """
+        self._command("DELETE FROM @agent_failure_shapes WHERE week_start >= %s", (since,))
+        self._insert_rows(
+            "agent_failure_shapes",
+            [_pipeline_health_row(shape, collected_at=collected_at) for shape in rows],
+            AGENT_FAILURE_SHAPE_COLUMNS,
         )
 
     def write_timeline_priority_mix(

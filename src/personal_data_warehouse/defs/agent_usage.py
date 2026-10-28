@@ -12,7 +12,7 @@ from dagster import (
     schedule,
 )
 
-from personal_data_warehouse.agent_usage import AgentUsageCollector
+from personal_data_warehouse.agent_usage import AgentFailureShapeCollector, AgentUsageCollector
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.schedule_guards import skip_if_job_active
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
@@ -35,6 +35,7 @@ def agent_usage(context) -> MaterializeResult:
     settings = load_settings(require_gmail=False)
     warehouse = warehouse_from_settings(settings)
     snapshots: list = []
+    shapes: list = []
     try:
         with exclusive_sync_lock(
             name="agent_usage",
@@ -45,6 +46,7 @@ def agent_usage(context) -> MaterializeResult:
             else:
                 warehouse.ensure_pipeline_health_tables()
                 snapshots = AgentUsageCollector(warehouse).run()
+                shapes = AgentFailureShapeCollector(warehouse).run()
     finally:
         warehouse.close()
     overall = next((s for s in snapshots if s.source == "all"), None)
@@ -63,6 +65,7 @@ def agent_usage(context) -> MaterializeResult:
                 overall.bulk_hint_improved_retries if overall else 0
             ),
             "sql_base_only": MetadataValue.int(overall.sql_base_only if overall else 0),
+            "failure_shapes": MetadataValue.int(len(shapes)),
         }
     )
 

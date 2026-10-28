@@ -244,7 +244,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_screen_timelapse.active_screens, the frames where
             # a device was in use and what was on them.
             # +1 marts: rolling real-traffic search latency and saturation (C6).
-            "marts": 71,
+            # +1 marts: marts_ops.agent_top_failures, failed agent calls by shape (C17).
+            "marts": 72,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -271,7 +272,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # poll ran and succeeded daily.
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
-            "ops": 42,
+            "ops": 43,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

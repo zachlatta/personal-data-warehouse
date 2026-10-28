@@ -39,7 +39,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import psycopg2
@@ -70,6 +70,17 @@ AGENT_USAGE_STATEMENT_TIMEOUT_MS = 240_000
 SEARCH_FIRST_TARGET = 0.6
 PRIORITY_FILTER_TARGET = 0.4
 SQL_ERROR_SESSION_CEILING = 0.1
+#: Contract C17: each week this many top failure shapes are fixed before the next.
+AGENT_TOP_FAILURES = 3
+
+#: The SQLSTATEs that make a session a SQL-error session: a guessed column,
+#: relation, function or operator, a denied relation, a timeout, and an integer
+#: 0/1 flag used as a boolean (42804, 42 sessions in the fortnight to
+#: 2026-10-27 that the metric did not count). Matched as `SQLSTATE <code>`, the
+#: way every error PDW returns spells it: the bare digits also matched data
+#: rows and transcripts quoted back, 34 of 371 flagged sessions that fortnight.
+SQL_ERROR_SQLSTATES = ("42703", "42P01", "42883", "42501", "57014", "42804")
+SQL_ERROR_RE = "SQLSTATE (" + "|".join(SQL_ERROR_SQLSTATES) + ")"
 
 #: The pdw CLI's real subcommands, split by whether they are a question. The
 #: lists live in pdw_cli_commands, which a test pins to the Go dispatcher.
@@ -565,9 +576,9 @@ per_session AS (
          count(*) FILTER (WHERE kind = 'sql') AS sql_calls,
          count(*) FILTER (WHERE kind = 'sql' AND inp ~* 'base_[a-z0-9_]+[.]'
                             AND inp !~* 'timeline[.]' AND inp !~* 'marts_') AS sql_base_only,
-         max(CASE WHEN kind = 'sql' AND result ~ '(42703|42P01|42883|42501|57014)' THEN 1 ELSE 0 END)
+         max(CASE WHEN kind = 'sql' AND result ~ '{sql_error}' THEN 1 ELSE 0 END)
              AS sql_error_session,
-         count(*) FILTER (WHERE kind = 'sql' AND result ~ '57014') AS sql_timeouts,
+         count(*) FILTER (WHERE kind = 'sql' AND result ~ 'SQLSTATE 57014') AS sql_timeouts,
          count(*) FILTER (WHERE kind = 'invented') AS invented_calls
   FROM reads
   GROUP BY source, session_id
@@ -632,11 +643,170 @@ def _expand_agent_usage_regexes(statement: str) -> str:
         .replace("{admin}", CLI_ADMIN_RE)
         .replace("{connection}", CLI_CONNECTION_RE)
         .replace("{mcp_connection}", MCP_CONNECTION_TOOL_RE)
+        .replace("{sql_error}", SQL_ERROR_RE)
     )
+
+
+# Contract C17's evidence: every failed PDW call -- a SQL statement the
+# server answered with a SQLSTATE, or a command the CLI does not have -- since
+# a given instant, with enough of the request and the error to name its shape.
+# The error is cut from around the first SQLSTATE so a long result row set
+# never travels.
+AGENT_FAILURE_CALLS_SQL = _AGENT_USAGE_CALLS_CTE + """
+SELECT source, session_id, seq, occurred_at, kind, left(inp, 4000) AS inp,
+       CASE WHEN kind = 'sql'
+            THEN substring(result from greatest(position('SQLSTATE' in result) - 600, 1) for 640)
+            ELSE '' END AS error
+FROM pdw
+WHERE occurred_at >= %(since)s
+  AND (kind = 'invented' OR (kind = 'sql' AND result ~ 'SQLSTATE [0-9A-Z]{5}'))
+ORDER BY occurred_at, source, session_id, seq
+"""
 
 
 AGENT_USAGE_SQL = _expand_agent_usage_regexes(AGENT_USAGE_SQL)
 AGENT_USAGE_SEARCH_CALLS_SQL = _expand_agent_usage_regexes(AGENT_USAGE_SEARCH_CALLS_SQL)
+AGENT_FAILURE_CALLS_SQL = _expand_agent_usage_regexes(AGENT_FAILURE_CALLS_SQL)
+
+
+_PY_INVENTED_RE = re.compile(CLI_INVENTED_RE.replace("[[:space:]]", r"\s"))
+_SQL_ERROR_LINE_RE = re.compile(r"ERROR:\s*([^\n]*?)\s*\(SQLSTATE ([0-9A-Z]{5})\)")
+_MISSING_COLUMN_RE = re.compile(r'^column "?(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)"? does not exist$')
+_STATEMENT_RELATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])((?:base|derived|marts)_[a-z0-9_]+|timeline|ops)\.([a-z_][a-z0-9_]*)\b(?!\s*\()"
+)
+#: SQLSTATEs whose shape names the relations the statement read: a missing
+#: column is only fixable once you know which relation it was guessed on, and
+#: a timeout once you know what was scanned. Any other error names its object.
+_SHAPE_NAMES_RELATIONS = ("42703", "57014")
+_MAX_SHAPE_RELATIONS = 3
+
+
+def _unescape(text: str) -> str:
+    """Undo the JSON string escaping a transcript wraps a command or result in."""
+    for _ in range(4):
+        unescaped = text.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+        if unescaped == text:
+            break
+        text = unescaped
+    return text
+
+
+def failure_shape(kind: str, inp: str, error: str) -> tuple[str, str, str] | None:
+    """Name what went wrong in one failed call: (kind, sqlstate, shape).
+
+    Instances differ (the alias, the literal, the character offset); the shape
+    is what a guide line, a hint or a CLI message has to name to fix all of
+    them. None when the call did not actually fail.
+    """
+    if kind == "invented":
+        match = _PY_INVENTED_RE.search(inp)
+        if not match:
+            return None
+        after = re.sub(r"^.*?pdw\s+", "", inp[match.start():], count=1, flags=re.S)
+        call = re.match(r"call\s+([A-Za-z0-9_-]+)", after)
+        if call:
+            return "invented", "", f"pdw call {call.group(1)}"
+        token = re.match(r"[-A-Za-z0-9_]+", after)
+        return "invented", "", f"pdw {token.group(0) if token else after[:20].strip()}"
+    match = _SQL_ERROR_LINE_RE.search(_unescape(error))
+    if not match:
+        return None
+    message, sqlstate = match.group(1).strip(), match.group(2)
+    column = _MISSING_COLUMN_RE.match(message)
+    if column:
+        message = f'column "{column.group(1)}" does not exist'
+    message = re.sub(r"\d+", "N", message)[:160]
+    shape = f"{sqlstate} {message}"
+    if sqlstate in _SHAPE_NAMES_RELATIONS:
+        relations = sorted({f"{schema}.{name}" for schema, name in _STATEMENT_RELATION_RE.findall(_unescape(inp))})
+        if relations:
+            shape += " on " + ", ".join(relations[:_MAX_SHAPE_RELATIONS])
+    return "sql_error", sqlstate, shape
+
+
+def _failure_example(kind: str, inp: str, error: str) -> str:
+    if kind == "invented":
+        match = _PY_INVENTED_RE.search(inp)
+        return _unescape(inp[match.start():] if match else inp)[:160].strip()
+    match = _SQL_ERROR_LINE_RE.search(_unescape(error))
+    return (match.group(0) if match else "")[:240]
+
+
+@dataclass(frozen=True)
+class AgentFailureShape:
+    """One failure shape's calls in one ISO week (Monday, UTC)."""
+
+    week_start: date
+    shape: str
+    kind: str
+    sqlstate: str
+    sessions: int
+    failed_calls: int
+    sources: str
+    example: str
+    first_failed_at: datetime
+    last_failed_at: datetime
+
+
+def week_start(when: datetime) -> date:
+    day = when.astimezone(UTC).date()
+    return day - timedelta(days=day.weekday())
+
+
+def aggregate_failure_shapes(rows: list[dict[str, Any]]) -> list[AgentFailureShape]:
+    groups: dict[tuple[date, str], dict[str, Any]] = {}
+    for row in rows:
+        inp, error = str(row.get("inp") or ""), str(row.get("error") or "")
+        named = failure_shape(str(row["kind"]), inp, error)
+        if named is None:
+            continue
+        kind, sqlstate, shape = named
+        when = row["occurred_at"]
+        group = groups.setdefault(
+            (week_start(when), shape),
+            {"kind": kind, "sqlstate": sqlstate, "sessions": set(), "calls": 0, "sources": set(),
+             "example": _failure_example(str(row["kind"]), inp, error), "first": when, "last": when},
+        )
+        group["sessions"].add((row["source"], row["session_id"]))
+        group["sources"].add(str(row["source"]))
+        group["calls"] += 1
+        group["first"] = min(group["first"], when)
+        group["last"] = max(group["last"], when)
+    return [
+        AgentFailureShape(
+            week_start=week, shape=shape, kind=g["kind"], sqlstate=g["sqlstate"],
+            sessions=len(g["sessions"]), failed_calls=g["calls"], sources=",".join(sorted(g["sources"])),
+            example=g["example"], first_failed_at=g["first"], last_failed_at=g["last"],
+        )
+        for (week, shape), g in sorted(groups.items())
+    ]
+
+
+class AgentFailureShapeCollector:
+    """This week's and last week's failed PDW calls, by shape (contract C17).
+
+    Each run rewrites both weeks whole from the transcripts, so a late-ingested
+    session lands in its week; older weeks stay as history for the view's
+    week-over-week comparison.
+    """
+
+    def __init__(self, warehouse: Any) -> None:
+        self._warehouse = warehouse
+
+    def run(self, *, now: datetime | None = None) -> list[AgentFailureShape]:
+        now = now or datetime.now(tz=UTC)
+        since_day = week_start(now) - timedelta(days=7)
+        since = datetime.combine(since_day, datetime.min.time(), tzinfo=UTC)
+        days = (now - since).days + 1
+        self._warehouse._raw_command(f"SET statement_timeout = {AGENT_USAGE_STATEMENT_TIMEOUT_MS}")
+        try:
+            rows = self._warehouse._query_dicts(AGENT_FAILURE_CALLS_SQL, {"days": days, "since": since})
+        finally:
+            self._warehouse._raw_command("SET statement_timeout = DEFAULT")
+        shapes = aggregate_failure_shapes(rows)
+        self._warehouse.write_agent_failure_shapes(shapes, since=since_day, collected_at=now)
+        return shapes
 
 
 class AgentUsageCollector:

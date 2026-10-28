@@ -1977,6 +1977,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "search_request_timing_state": _state("search_requests", "ticked_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),
+    "agent_failure_shapes": _data("agent_usage", "collected_at", "last_failed_at"),
     "search_benchmark_runs": _data("search_benchmark", "collected_at"),
     "search_benchmark_history": _support(
         "search_benchmark", "collected_at", note="append-only benchmark trend"

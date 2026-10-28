@@ -216,8 +216,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// schema line ("Android screen time.") and its two tables ("Android usage
 	// events.", "START HERE for screen time."): 10344. 10345 is those three
 	// lines and no more.
-	if guidance > 10345 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10345)", guidance)
+	//
+	// 2026-10-28: contract C17's marts_ops.agent_top_failures, each week's
+	// failed agent calls by shape, added one relation line ("Failure
+	// shapes."): 10356. 10360 is that line and no more.
+	if guidance > 10360 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10360)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

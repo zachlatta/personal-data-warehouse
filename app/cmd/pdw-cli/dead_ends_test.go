@@ -146,3 +146,29 @@ func TestSQLAcceptsFormatAsOutput(t *testing.T) {
 		}
 	}
 }
+
+// `pdw query --help` was 28 calls in the fortnight to 2026-10-27 (an hourly
+// schedule reaching for the MCP tool's name): the help check ran before the
+// redirect, so it printed the ~100-line global usage, exited 0, and the next
+// call was `pdw query "<sql>"`. A tool name typed as a command is redirected
+// even when it carries --help, and so is `pdw call <first-class tool> --help`.
+func TestToolNameRedirectsWinOverHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"query", "--help"},
+		{"query", "-h"},
+		{"tools", "--help"},
+		{"call", "query", "--help"},
+		{"call", "search", "--help"},
+	} {
+		out, errOut, code := runCLI(t, "http://127.0.0.1:1", "", args...)
+		if code != 2 {
+			t.Fatalf("pdw %v: code=%d, want the redirect's exit 2; stdout=%s stderr=%s", args, code, out, errOut)
+		}
+		if strings.Contains(out, "USAGE") || strings.Contains(errOut, "USAGE") {
+			t.Fatalf("pdw %v: must redirect, not print the global usage: %s%s", args, out, errOut)
+		}
+		if !strings.Contains(errOut, "pdw ") {
+			t.Fatalf("pdw %v: the redirect must name the real command: %s", args, errOut)
+		}
+	}
+}

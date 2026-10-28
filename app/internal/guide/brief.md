@@ -38,7 +38,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | Put cards in Zach's Feed tab, read his engagement | `pdw feed push\|edit\|remove\|restore\|history\|stats` (topic `feed`) |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 
-Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context` (each is refused with the real one).
+Not commands: `pdw query` (it is `pdw sql`), `pdw tools` / `pdw connections` (`pdw list`), `pdw schema_overview`, `pdw describe_table`, `pdw call sql|query|search|context` (each is refused with the real one).
 {{- else -}}
 ## Tool map
 
@@ -75,11 +75,13 @@ Not commands: `pdw query`, `pdw schema_overview`, `pdw describe_table`, `pdw cal
 - PDW is PostgreSQL 18, not ClickHouse. `timeline.events` has `occurred_at`, `actor`, `snippet`,
   `search_text` and `adapter` + `event_id`; `ref`, `who` and `text` exist only on
   `timeline.search_text()` rows. There is no `event_ts` (renamed `occurred_at` on 2026-10-25).
-- Booleans are `bigint` 0/1 (`is_deleted = 0`, never `= true`). Absence is the epoch
+- Booleans are `bigint` 0/1 (`is_deleted = 0`, never `= true` or `NOT is_deleted`). Absence is the epoch
   `1970-01-01`, not NULL, on `base_*`; `marts_*` translate it. Name the time column per source
   (`base_gmail.messages.internal_date`, `base_slack.messages.message_datetime`, `timeline.events.occurred_at`).
 - Read mail bodies from `body_markdown_clean`, not `body_text` (tracking URLs). JSON is `text` on
-  older sources — cast before `->>`. 60s statement budget; a timeout means narrow, not retry.
+  older sources — cast before `->>`; `jsonb` needs `::text` before `LIKE`. 60s statement budget;
+  a timeout means narrow, not retry.
+- Keys are `<thing>_id` (`message_id`, `item_id`, `session_id`), almost never a bare `id`.
 - `ops.*` is unreadable by the query role; `marts_ops.*` is the health surface (topic `ops`).
 
 ## Where things live

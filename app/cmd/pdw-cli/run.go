@@ -307,6 +307,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	if cmd == "mutations" {
 		return runMutations(rest, stdin, stdout, stderr, getenv, *baseURL, *token)
 	}
+	// A tool name typed as a command, or `pdw call` of a tool with a
+	// first-class command, is redirected before any --help handling: `pdw
+	// query --help` printed the global usage and exited 0 (28 calls in the
+	// fortnight to 2026-10-27), and the next call was `pdw query "<sql>"`.
+	// It is also before the config check: the caller's mistake is the command,
+	// and reporting a missing token instead sends them to fix the wrong thing.
+	if redirect, ok := commandRedirects[cmd]; ok {
+		fmt.Fprintf(stderr, "pdw: there is no %q command; %s\n", cmd, redirect)
+		return 2
+	}
+	if cmd == "call" {
+		if name, _, err := extractToolName(rest); err == nil && callFenceRedirect(name, stderr) {
+			return 2
+		}
+	}
 	// `pdw search --help` must print the search FlagSet's own help, not the
 	// global usage: the flags this command accepts (notably --priority) are
 	// otherwise undiscoverable from the command itself.
@@ -334,14 +349,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	if cmd == "config" {
 		return runConfig(rest, stdout, stderr, getenv)
-	}
-
-	// A tool name typed as a command is answered before the config check: the
-	// caller's mistake is the command, and reporting a missing token instead
-	// sends them to fix the wrong thing.
-	if redirect, ok := commandRedirects[cmd]; ok {
-		fmt.Fprintf(stderr, "pdw: there is no %q command; %s\n", cmd, redirect)
-		return 2
 	}
 
 	resolved, err := resolveConfig(*baseURL, *clientName, *token, getenv)
@@ -999,16 +1006,11 @@ func isWarehouseSchemaName(name string) bool {
 	return false
 }
 
-func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if hasHelpArg(args) {
-		fmt.Fprint(stdout, usage)
-		return 0
-	}
-	name, rest, err := extractToolName(args)
-	if err != nil {
-		fmt.Fprintln(stderr, "pdw call:", err)
-		return 2
-	}
+// callFenceRedirect answers `pdw call <tool>` for a tool that has a
+// first-class command (C9: one way to do each thing) and reports whether it
+// did. It runs before any --help handling, in run and in runCall, so
+// `pdw call query --help` gets the redirect rather than the global usage.
+func callFenceRedirect(name string, stderr io.Writer) bool {
 	// There is exactly one supported way to run SQL: the `sql` command. The
 	// CLI/HTTP tool is named sql and the MCP tool is named query, so callers
 	// arrive here under either name. Redirect both to the single path instead
@@ -1019,22 +1021,37 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		fmt.Fprintln(stderr, "  pdw sql -q '<question>' --file query.sql   # SQL from a file")
 		fmt.Fprintln(stderr, "  pdw sql -q '<question>' < query.sql        # SQL from stdin")
 		fmt.Fprintln(stderr, "This avoids JSON/shell quoting; `call` is only for non-SQL tools.")
-		return 2
+		return true
 	}
 	// schema_overview and describe_table have first-class commands that render
 	// their CSV as readable text; reaching them through `call` returns the same
-	// answer as raw JSON, so it is a second path to a worse result. C8 says
-	// there is one way to do each thing.
+	// answer as raw JSON, so it is a second path to a worse result.
 	if redirect, ok := callToolRedirects[name]; ok {
 		fmt.Fprintf(stderr, "pdw call: %s does not go through `call`:\n", name)
 		fmt.Fprintf(stderr, "  %s\n", redirect)
-		return 2
+		return true
 	}
 	if name == "search" {
 		fmt.Fprintln(stderr, "pdw call: use the first-class search command instead of JSON:")
 		fmt.Fprintln(stderr, "  pdw search '<terms>'")
 		fmt.Fprintln(stderr, "  pdw search --source gmail,slack --since 2026-08-01 '<terms>'")
 		fmt.Fprintln(stderr, "  pdw search --mode exact --output json '<literal>'")
+		return true
+	}
+	return false
+}
+
+func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if hasHelpArg(args) {
+		fmt.Fprint(stdout, usage)
+		return 0
+	}
+	name, rest, err := extractToolName(args)
+	if err != nil {
+		fmt.Fprintln(stderr, "pdw call:", err)
+		return 2
+	}
+	if callFenceRedirect(name, stderr) {
 		return 2
 	}
 	fs := flag.NewFlagSet("call", flag.ContinueOnError)

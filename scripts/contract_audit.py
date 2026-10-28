@@ -29,6 +29,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Sequence
 
+from personal_data_warehouse.agent_usage import AGENT_TOP_FAILURES, SQL_ERROR_SESSION_CEILING
 from personal_data_warehouse.search_benchmark import (
     ATTENTION_PRIORITIES,
     CONTRACT_AUDIT_CLIENT,
@@ -177,6 +178,46 @@ def c3_agents_start_at_timeline() -> Verdict:
           f"over {r['pdw_sessions']} PDW sessions")
     status = {"ok": GREEN, "attention": YELLOW}.get(str(r["status"]), YELLOW)
     return Verdict("C3", title, status, ev)
+
+
+#: C17's floor for "calls to invented commands near 0", per complete week, and
+#: the SQL-error session share that reads red rather than yellow (twice C3's
+#: ceiling; it was 24.6% over the fortnight to 2026-10-27).
+C17_INVENTED_CALLS_PER_WEEK = 5
+C17_SQL_ERROR_RED = 2 * SQL_ERROR_SESSION_CEILING
+
+
+def c17_agents_do_not_stumble() -> Verdict:
+    title = "agents do not stumble"
+    usage = pdw_sql("agent usage", "SELECT status, sql_error_session_rate, invented_calls, window_days, pdw_sessions FROM marts_ops.agent_usage WHERE source = 'all'")
+    if not usage:
+        return _unavailable("C17", title, "marts_ops.agent_usage (has the daily asset run?)")
+    # Graded on the last COMPLETE ISO week: the current one is partial.
+    week = pdw_sql("top failures", """
+        SELECT week_start, rank, shape, kind, sessions, failed_calls, status
+        FROM marts_ops.agent_top_failures
+        WHERE week_start = (date_trunc('week', now()) - interval '7 days')::date
+        ORDER BY rank LIMIT 500""")
+    if week is None:
+        return _unavailable("C17", title, "marts_ops.agent_top_failures")
+    u = usage[0]
+    rate = float(u["sql_error_session_rate"] or 0)
+    invented = sum(int(r["failed_calls"] or 0) for r in week if r["kind"] == "invented")
+    top = [r for r in week if int(r["rank"]) <= AGENT_TOP_FAILURES]
+    repeated = [r["shape"] for r in top if r["status"] == "failing"]
+    week_label = week[0]["week_start"] if week else "last week"
+    ev = (f"SQL-error sessions {rate:.3f} over {u['pdw_sessions']} PDW sessions ({u['window_days']} days); "
+          f"week of {week_label}: {invented} invented calls; top {AGENT_TOP_FAILURES}: "
+          + ("; ".join(f"{r['shape']} ({r['sessions']} sessions)" for r in top) or "none"))
+    if repeated:
+        ev += f"; still top {AGENT_TOP_FAILURES} from the week before: {repeated}"
+    if str(u["status"]) == "unknown":
+        return Verdict("C17", title, YELLOW, "agent usage snapshot is stale; " + ev)
+    if rate >= C17_SQL_ERROR_RED:
+        return Verdict("C17", title, RED, ev)
+    if rate >= SQL_ERROR_SESSION_CEILING or invented > C17_INVENTED_CALLS_PER_WEEK or repeated:
+        return Verdict("C17", title, YELLOW, ev)
+    return Verdict("C17", title, GREEN, ev)
 
 
 def _checksum_verdict() -> dict | None:
@@ -846,7 +887,7 @@ def c12_future_developers() -> Verdict:
 
 CHECKS = [c1_timeline_coverage, c2_priority_tiers, c3_agents_start_at_timeline, c4_raw_data_queryable,
           c5_layering, c6_performance, c7_pipeline_health, c8_search_quality, c9_one_way, c10_backups,
-          c11_source_slas, c12_future_developers, s1_slack, s2_voice, s3_finance]
+          c11_source_slas, c12_future_developers, c17_agents_do_not_stumble, s1_slack, s2_voice, s3_finance]
 
 
 def main(argv: list[str] | None = None) -> int:

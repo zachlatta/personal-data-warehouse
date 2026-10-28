@@ -2563,6 +2563,17 @@
       "secret": false
     },
     {
+      "id": "agent_failure_shapes",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "agent_failure_shapes",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "timeline_priority_mix",
       "kind": "table",
       "layer": "ops",
@@ -2712,6 +2723,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "How agents use PDW, measured daily from request/result pairs over a trailing window, per agent source plus 'all'. Priority telemetry distinguishes successful effective filters, attention-only scopes, scopes including noise/background, empty or all-five no-ops, invalid or failed filters, and bulk-hint retries whose returned mix improved. Rates also cover search-first, base-only SQL, and SQL-error sessions. Reads attention when the guidance is not landing against the targets; fewer than 10 PDW sessions reads no_data."
+    },
+    {
+      "id": "marts_agent_top_failures",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "agent_top_failures",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Failure shapes. Failed agent calls to PDW per ISO week by shape (a SQLSTATE and message, or a pdw command that does not exist), ranked by sessions; a top-three shape also top three the week before reads failing (contract C17)."
     },
     {
       "id": "marts_timeline_priority_mix",

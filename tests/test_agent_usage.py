@@ -506,3 +506,133 @@ def test_reading_the_conversation_around_a_hit_is_a_read_not_an_invention() -> N
     assert not _matches(CLI_INVENTED_RE, '{"command":"pdw hn publish-session"}')
     assert _matches(CLI_ADMIN_RE, '{"command":"pdw heartbeat --pipeline x"}')
     assert pdw_cli_invocation("pdw context 'gmail_email:z|abc'") == "pdw context"
+
+
+# --- C17: agents do not stumble -------------------------------------------------
+
+
+def test_a_failure_is_named_by_its_shape_not_its_instance() -> None:
+    """The weekly top-failures view groups calls by what went wrong.
+
+    Measured over the fortnight to 2026-10-27, a guessed `id` column was one
+    shape across 30 sessions, spelled `id`, `i.id` and `m.id`. A shape names
+    the SQLSTATE, the normalized message and, for a missing column or a
+    timeout, the relations the statement read -- which is what a guide line or
+    a hint has to name to fix it.
+    """
+    from personal_data_warehouse.agent_usage import failure_shape
+
+    sql = '{"command":"pdw sql \\"select i.id, internal_date from base_gmail.messages i where internal_date > now()\\""}'
+    err = 'pdw sql: ERROR: column i.id does not exist (SQLSTATE 42703) (hint: column names differ per source)'
+    assert failure_shape("sql", sql, err) == ("sql_error", "42703", '42703 column "id" does not exist on base_gmail.messages')
+    # The same mistake with Postgres' quoted spelling is the same shape.
+    err2 = 'pdw sql: ERROR: column \\"id\\" does not exist (SQLSTATE 42703)'
+    assert failure_shape("sql", sql, err2)[2] == '42703 column "id" does not exist on base_gmail.messages'
+
+    timeout_sql = '{"command":"pdw sql \\"select count(*) from base_slack.messages m join timeline.events e on true where m.text ilike \'%x%\' and timeline.search_text(\'x\', 5) is not null\\""}'
+    timeout = "pdw sql: ERROR: canceling statement due to statement timeout (SQLSTATE 57014)"
+    assert failure_shape("sql", timeout_sql, timeout)[2] == (
+        "57014 canceling statement due to statement timeout on base_slack.messages, timeline.events"
+    )
+    # A missing relation already names itself; the statement adds nothing.
+    missing = 'pdw sql: ERROR: relation \\"mutations.requests\\" does not exist (SQLSTATE 42P01)'
+    assert failure_shape("sql", sql, missing)[2] == '42P01 relation "mutations.requests" does not exist'
+    # Numbers vary per call, the mistake does not.
+    page = "pdw sql: ERROR: operator does not exist: timestamp with time zone > integer at character 112 (SQLSTATE 42883)"
+    assert failure_shape("sql", sql, page)[2] == "42883 operator does not exist: timestamp with time zone > integer at character N"
+
+    assert failure_shape("invented", '{"command":"pdw query --help 2>&1 | head -5"}', "") == ("invented", "", "pdw query")
+    assert failure_shape("invented", "{\"command\":\"pdw call search --data '{}'\"}", "")[2] == "pdw call search"
+    assert failure_shape("invented", '{"command":"cd /x; pdw tools 2>/dev/null"}', "")[2] == "pdw tools"
+    # A SQL call whose result carries no error line is not a failure.
+    assert failure_shape("sql", sql, "") is None
+
+
+def test_a_sql_error_needs_a_sqlstate_not_the_digits(warehouse: PostgresWarehouse) -> None:
+    """`42703` in a result row is data; `(SQLSTATE 42703)` is an error.
+
+    The old predicate matched the bare digits, so an amount, an id or an agent
+    grepping transcripts about SQL errors counted as an error session: 34 of
+    the 371 flagged sessions in the fortnight to 2026-10-27 had no error line.
+    42804 (`NOT is_deleted` on an integer flag) was 42 real error sessions the
+    metric did not count at all.
+    """
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    warehouse.insert_agent_session_events(
+        [
+            _event("data", 1, tool="Bash", inp='{"command":"pdw sql \\"SELECT amount FROM marts_finance.transactions\\""}'),
+            _event("data", 2, res="amount\n42703.00\n57014"),
+            _event("flag", 1, tool="Bash", inp='{"command":"pdw sql \\"SELECT 1 FROM base_feed.items WHERE NOT is_deleted\\""}'),
+            _event("flag", 2, res="pdw sql: ERROR: argument of NOT must be type boolean, not type bigint (SQLSTATE 42804)"),
+        ]
+    )
+    snapshots = {s.source: s for s in AgentUsageCollector(warehouse, window_days=14).run()}
+    assert snapshots["all"].sql_error_sessions == 1
+    assert snapshots["all"].sql_timeouts == 0
+
+
+def test_top_failures_rank_each_week_and_flag_a_shape_left_unfixed(warehouse: PostgresWarehouse) -> None:
+    """C17: each week's top three failure shapes are fixed before the next.
+
+    The collector writes one row per (ISO week, shape) for this week and last;
+    the view ranks shapes by sessions within a week and marks a top-three shape
+    that was also top three the week before -- the one thing C17 says must not
+    happen.
+    """
+    from personal_data_warehouse.agent_usage import AgentFailureShapeCollector
+
+    warehouse.ensure_agent_sessions_tables()
+    warehouse.ensure_pipeline_health_tables()
+    now = datetime.now(tz=UTC)
+    this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    # Midday on this week's Monday is in the future on a Monday morning; any
+    # instant from the week's start up to now is "this week".
+    this_week = this_monday + (now - this_monday) / 2
+    last_week = this_monday - timedelta(days=3)
+
+    bad_id = '{"command":"pdw sql \\"select id from base_gmail.messages limit 1\\""}'
+    bad_id_err = 'pdw sql: ERROR: column \\"id\\" does not exist (SQLSTATE 42703)'
+    events = []
+    # `pdw query`: three sessions last week, two this week -- top three both weeks.
+    for n, when in [(1, last_week), (2, last_week), (3, last_week), (4, this_week), (5, this_week)]:
+        events += [
+            _event(f"q{n}", 1, tool="Bash", inp='{"command":"pdw query \\"SELECT 1\\""}', when=when),
+            _event(f"q{n}", 2, res='pdw: there is no "query" command', when=when),
+        ]
+    # A guessed `id`: one session last week only.
+    events += [
+        _event("i1", 1, tool="Bash", inp=bad_id, when=last_week),
+        _event("i1", 2, res=bad_id_err, when=last_week),
+    ]
+    # A data row with the digits is not a failure.
+    events += [
+        _event("ok", 1, tool="Bash", inp='{"command":"pdw sql \\"SELECT 42703\\""}', when=this_week),
+        _event("ok", 2, res="?column?\n42703", when=this_week),
+    ]
+    warehouse.insert_agent_session_events(events)
+
+    shapes = AgentFailureShapeCollector(warehouse).run(now=now)
+    assert {(s.week_start, s.shape, s.sessions) for s in shapes} == {
+        (last_week.date() - timedelta(days=last_week.weekday()), "pdw query", 3),
+        (last_week.date() - timedelta(days=last_week.weekday()), '42703 column "id" does not exist on base_gmail.messages', 1),
+        (this_monday.date(), "pdw query", 2),
+    }
+
+    rows = warehouse._query_dicts(
+        "SELECT week_start, rank, shape, kind, sessions, failed_calls, in_previous_top3, status"
+        " FROM @marts_agent_top_failures ORDER BY week_start, rank"
+    )
+    current = [r for r in rows if r["week_start"] == this_monday.date()]
+    previous = [r for r in rows if r["week_start"] != this_monday.date()]
+    assert [(r["rank"], r["shape"], r["status"]) for r in previous] == [
+        (1, "pdw query", "attention"),
+        (2, '42703 column "id" does not exist on base_gmail.messages', "attention"),
+    ]
+    assert [(r["shape"], r["kind"], r["in_previous_top3"], r["status"]) for r in current] == [
+        ("pdw query", "invented", 1, "failing"),
+    ]
+
+    # The window is rewritten whole, so a re-run does not double count.
+    AgentFailureShapeCollector(warehouse).run(now=now)
+    assert len(warehouse._query_dicts("SELECT 1 FROM @marts_agent_top_failures")) == 3
