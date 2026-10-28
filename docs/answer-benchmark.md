@@ -102,6 +102,15 @@ uv run python scripts/answer_benchmark.py run --write
 uv run python scripts/answer_benchmark.py pull
 ```
 
+The agent container needs a provider login in the `pdw-agent-auth` volume, which only the
+production Dagster host has (mew-dev has none as of 2026-10-28). Until the weekly asset
+lands, run a recorded baseline inside the Dagster container there:
+
+```bash
+sudo -n docker exec <dagster container> /app/.venv/bin/python -m \
+  personal_data_warehouse.answer_benchmark run --write --report-dir /tmp/.search-eval/answer_reports
+```
+
 The agent is the managed container agent (`agent_runner.ContainerAgentRunner`, the one
 enrichment uses), one question at a time, ten minutes each. Its model is the deployment's
 `AGENT_PROVIDER` / `AGENT_MODEL` unless `--provider` / `--model` say otherwise; Zach chose
