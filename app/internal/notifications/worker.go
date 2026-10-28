@@ -239,7 +239,10 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	}
 	alert := s.Render(row)
 	alert.NotificationID = id
-	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',capabilities) FROM @push_devices WHERE status='active'
+	// capabilities is read through to_jsonb so a fan-out that runs before
+	// either ensure path has added the column sends ordinary alerts instead
+	// of failing (the Go app deploys before the Python ensure runs).
+	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',COALESCE(to_jsonb(d)->>'capabilities','')) FROM @push_devices d WHERE status='active'
  UNION ALL SELECT 'web', id, subscription FROM @web_push_devices WHERE status='active'`))
 	if err != nil {
 		return false, err
