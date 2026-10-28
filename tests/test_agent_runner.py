@@ -1331,3 +1331,245 @@ def test_unmatched_claude_result_is_not_a_call() -> None:
         ]}}), stderr="", created_at=now)
     result = AgentRunResult("run", "claude", "test", "generic", "", "", "", "completed", {}, "", 0, now, now, events)
     assert agent_run_tool_call_rows(result) == []
+
+
+def test_cancelled_agent_run_stops_container_and_removes_credentials_volume(tmp_path) -> None:
+    calls: list[list[str]] = []
+
+    class SimulatedCancellation(BaseException):
+        pass
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if is_agent_container_run(command):
+            raise SimulatedCancellation("dagster step interrupted")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    runner = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    )
+    try:
+        runner.run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-cancel"))
+    except SimulatedCancellation:
+        pass
+    else:
+        raise AssertionError("expected SimulatedCancellation to propagate")
+
+    stop_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call == ["docker", "stop", "--time", "10", "pdw-agent-run-cancel"]
+    )
+    remove_index = next(
+        index
+        for index, call in enumerate(calls)
+        if call[:4] == ["docker", "volume", "rm", "-f"]
+    )
+    assert stop_index < remove_index
+    # Cancelled runs must not persist partial/untrusted credentials back to the shared auth volume.
+    assert not any(
+        "type=volume,src=pdw-agent-auth,dst=/persistent-auth" in call
+        and "type=volume,src=pdw-agent-auth,dst=/persistent-auth,readonly" not in call
+        for call in calls
+    )
+
+
+def test_remove_credentials_volume_force_removes_containers_when_volume_is_in_use(tmp_path) -> None:
+    calls: list[tuple[list[str], dict]] = []
+    volume_rm_attempts = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_rm_attempts
+        calls.append((command, kwargs))
+        if command[:2] == ["docker", "stop"]:
+            raise subprocess.TimeoutExpired(command, timeout=30)
+        if command[:4] == ["docker", "volume", "rm", "-f"]:
+            volume_rm_attempts += 1
+            if volume_rm_attempts == 1:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr="Error response from daemon: remove vol: volume is in use - [abc]",
+                )
+        if is_agent_container_run(command):
+            raise subprocess.TimeoutExpired(command, timeout=1)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path, timeout_seconds=1),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-busy"))
+
+    assert result.status == "error"
+    assert volume_rm_attempts == 2
+    assert any(
+        call == ["docker", "rm", "-f", "pdw-agent-run-busy"] and kwargs.get("timeout") == 30
+        for call, kwargs in calls
+    )
+
+
+def test_shield_cleanup_signals_defers_and_redelivers_cancellation_signal(monkeypatch) -> None:
+    import signal
+    from personal_data_warehouse.agent_runner import _shield_cleanup_signals
+
+    events: list[str] = []
+
+    class DeferredInterrupt(BaseException):
+        pass
+
+    def previous_handler(signum, frame):
+        events.append(f"delivered:{signum}")
+        raise DeferredInterrupt(f"signal {signum}")
+
+    original = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, previous_handler)
+    try:
+        try:
+            with _shield_cleanup_signals():
+                events.append("cleanup:start")
+                active_handler = signal.getsignal(signal.SIGTERM)
+                assert callable(active_handler)
+                active_handler(signal.SIGTERM, None)
+                events.append("cleanup:after-signal")
+        except DeferredInterrupt:
+            events.append("caught:after-cleanup")
+        else:
+            raise AssertionError("expected deferred signal handler to raise after cleanup")
+        assert signal.getsignal(signal.SIGTERM) is previous_handler
+
+        raised_signals: list[int] = []
+        monkeypatch.setattr(signal, "raise_signal", lambda sig: raised_signals.append(sig))
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        with _shield_cleanup_signals():
+            active_handler = signal.getsignal(signal.SIGTERM)
+            assert callable(active_handler)
+            active_handler(signal.SIGTERM, None)
+            assert raised_signals == []
+        assert raised_signals == [signal.SIGTERM]
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+    assert events == [
+        "cleanup:start",
+        "cleanup:after-signal",
+        f"delivered:{signal.SIGTERM}",
+        "caught:after-cleanup",
+    ]
+
+
+def test_sweep_stale_credentials_volumes_respects_margin_and_running_containers() -> None:
+    from personal_data_warehouse.agent_runner import sweep_stale_credentials_volumes
+
+    now = datetime(2026, 10, 28, 20, 0, 0, tzinfo=UTC)
+    vol_old_idle = "pdw-agent-credentials-agent-old-idle-11111111111111111111111111111111"
+    vol_boundary = "pdw-agent-credentials-agent-boundary-22222222222222222222222222222222"
+    vol_mounted = "pdw-agent-credentials-agent-mounted-33333333333333333333333333333333"
+    vol_named_running = "pdw-agent-credentials-agent-running-44444444444444444444444444444444"
+
+    inspect_payload = [
+        # 2401s old (> 1800s timeout + 600s margin): eligible for removal
+        {"Name": vol_old_idle, "CreatedAt": "2026-10-28T19:19:59Z"},
+        # 1801s old (timeout + 1s, inside the 600s stage/stop/persist margin): must be kept
+        {"Name": vol_boundary, "CreatedAt": "2026-10-28T19:29:59Z"},
+        # 3600s old, but mounted by a running container: must be kept
+        {"Name": vol_mounted, "CreatedAt": "2026-10-28T19:00:00Z"},
+        # 3600s old, and its pdw-agent-<run_id> container is still running: must be kept
+        {"Name": vol_named_running, "CreatedAt": "2026-10-28T19:00:00Z"},
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:3] == ["docker", "volume", "ls"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="\n".join([vol_old_idle, vol_boundary, vol_mounted, vol_named_running]) + "\n",
+                stderr="",
+            )
+        if command[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(inspect_payload),
+                stderr="",
+            )
+        if command[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    f"some-container\t{vol_mounted},pdw-agent-runs\n"
+                    "pdw-agent-agent-running\tpdw-agent-runs\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    removed = sweep_stale_credentials_volumes(
+        timeout_seconds=1800,
+        sweep_margin_seconds=600,
+        runner=fake_run,
+        now=now,
+    )
+
+    assert removed == [vol_old_idle]
+    rm_calls = [call for call in calls if call[:4] == ["docker", "volume", "rm", "-f"]]
+    assert rm_calls == [["docker", "volume", "rm", "-f", vol_old_idle]]
+
+
+def test_sweep_stale_credentials_volumes_fails_closed_when_docker_ps_errors() -> None:
+    from personal_data_warehouse.agent_runner import sweep_stale_credentials_volumes
+
+    now = datetime(2026, 10, 28, 20, 0, 0, tzinfo=UTC)
+    vol_old = "pdw-agent-credentials-agent-old-11111111111111111111111111111111"
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:3] == ["docker", "volume", "ls"]:
+            return subprocess.CompletedProcess(command, 0, stdout=f"{vol_old}\n", stderr="")
+        if command[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps([{"Name": vol_old, "CreatedAt": "2026-10-28T18:00:00Z"}]),
+                stderr="",
+            )
+        if command[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="daemon error")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    removed = sweep_stale_credentials_volumes(timeout_seconds=1800, runner=fake_run, now=now)
+
+    assert removed == []
+    assert not any(call[:4] == ["docker", "volume", "rm", "-f"] for call in calls)
+
+
+def test_container_agent_runner_continues_when_startup_sweep_fails(tmp_path, monkeypatch) -> None:
+    from personal_data_warehouse import agent_runner as ar
+
+    monkeypatch.setattr(ar, "_STARTUP_CREDENTIALS_SWEEP_DONE", False)
+    volume_copy_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal volume_copy_calls
+        if command[:3] == ["docker", "volume", "ls"]:
+            raise OSError("docker socket temporarily unavailable")
+        if is_run_volume_copy(command):
+            volume_copy_calls += 1
+            if volume_copy_calls == 2:
+                (tmp_path / "run-sweep-err" / "final.json").write_text('{"ok":true}', encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    result = ContainerAgentRunner(
+        AgentContainerConfig(image="pdw-agent:latest", runs_dir=tmp_path),
+        runner=fake_run,
+    ).run(AgentRunRequest(prompt="Return JSON", schema={"type": "object"}, run_id="run-sweep-err"))
+
+    assert result.status == "completed"
+    assert result.final_output_json == {"ok": True}
+

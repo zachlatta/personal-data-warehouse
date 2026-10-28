@@ -9,9 +9,11 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -30,9 +32,16 @@ from personal_data_warehouse.agent_tool_proxy import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_AGENT_AUTH_VOLUME = "pdw-agent-auth"
 DEFAULT_AGENT_RUNS_VOLUME = "pdw-agent-runs"
 DEFAULT_AGENT_RUNS_DIR = ".agent-runs"
+AGENT_CREDENTIALS_VOLUME_PREFIX = "pdw-agent-credentials-"
+DEFAULT_AGENT_CREDENTIALS_VOLUME_SWEEP_MARGIN_SECONDS = 600
+_STARTUP_CREDENTIALS_SWEEP_LOCK = threading.Lock()
+_STARTUP_CREDENTIALS_SWEEP_DONE = False
 DEFAULT_AGENT_CONTAINER_AUTH_DIR = "/agent-auth"
 DEFAULT_AGENT_CONTAINER_CREDENTIALS_DIR = "/agent-credentials"
 DEFAULT_AGENT_CONTAINER_RUNS_DIR = "/agent-runs"
@@ -263,6 +272,43 @@ def safe_agent_input_path(inputs_dir: Path, relative_path: str) -> Path:
     return inputs_dir / path
 
 
+@contextmanager
+def _shield_cleanup_signals():
+    """Defer SIGINT and SIGTERM until container/credential cleanup finishes, then re-deliver."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    deferred: tuple[int, Any] | None = None
+
+    def _defer_signal(signum: int, frame: Any) -> None:
+        nonlocal deferred
+        if deferred is None:
+            deferred = (signum, frame)
+
+    previous_handlers: dict[int, Any] = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _defer_signal)
+        except (OSError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, handler in previous_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (OSError, ValueError):
+                continue
+        if deferred is not None:
+            signum, frame = deferred
+            prev_handler = previous_handlers.get(signum)
+            if callable(prev_handler):
+                prev_handler(signum, frame)
+            elif prev_handler == signal.SIG_DFL:
+                signal.raise_signal(signum)
+
+
 class ContainerAgentRunner:
     def __init__(self, config: AgentContainerConfig, *, runner=subprocess.run) -> None:
         self._config = config
@@ -294,6 +340,7 @@ class ContainerAgentRunner:
                 events=[],
             )
         self._ensure_managed_image()
+        self._ensure_startup_credentials_volume_sweep()
         run_dir = self._prepare_run_dir(request)
         self._sync_run_dir_to_volume(request.run_id, run_dir)
         credentials_volume = agent_credentials_volume_name(request.run_id)
@@ -309,12 +356,14 @@ class ContainerAgentRunner:
         exit_code = 0
         auth_lock_exclusive = self._auth_lock_must_be_exclusive(provider)
         with provider_auth_lock(provider, exclusive=auth_lock_exclusive):
+            container_running = False
             try:
                 self._prepare_credentials_volume(
                     provider=provider,
                     credentials_volume=credentials_volume,
                 )
                 try:
+                    container_running = True
                     completed = self._runner(
                         command,
                         capture_output=True,
@@ -322,6 +371,7 @@ class ContainerAgentRunner:
                         timeout=self._config.timeout_seconds,
                         check=False,
                     )
+                    container_running = False
                     exit_code = int(getattr(completed, "returncode", 1))
                     completed_at = datetime.now(tz=UTC)
                     events.extend(
@@ -333,6 +383,7 @@ class ContainerAgentRunner:
                     )
                 except subprocess.TimeoutExpired as exc:
                     self._stop_agent_container(request.run_id)
+                    container_running = False
                     completed_at = datetime.now(tz=UTC)
                     exit_code = 124
                     error = f"agent container timed out after {self._config.timeout_seconds}s"
@@ -353,7 +404,10 @@ class ContainerAgentRunner:
                     with _AUTH_EXP_CACHE_LOCK:
                         _AUTH_EXP_CACHE.pop((self._config.auth_volume, provider), None)
             finally:
-                self._remove_credentials_volume(credentials_volume)
+                with _shield_cleanup_signals():
+                    if container_running:
+                        self._stop_agent_container(request.run_id)
+                    self._remove_credentials_volume(credentials_volume, run_id=request.run_id)
 
         self._sync_run_dir_from_volume(request.run_id, run_dir)
         final_output, final_error = load_agent_final_output(run_dir=run_dir, provider=provider, events=events)
@@ -482,23 +536,83 @@ class ContainerAgentRunner:
         if int(getattr(persisted, "returncode", 1)) != 0:
             raise RuntimeError(f"failed to persist refreshed {provider} credential after agent run")
 
-    def _remove_credentials_volume(self, credentials_volume: str) -> None:
-        self._runner(
-            ["docker", "volume", "rm", "-f", credentials_volume],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+    def _remove_credentials_volume(self, credentials_volume: str, *, run_id: str = "") -> None:
+        try:
+            removed = self._runner(
+                ["docker", "volume", "rm", "-f", credentials_volume],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            removed_ok = int(getattr(removed, "returncode", 1)) == 0
+        except (OSError, subprocess.SubprocessError):
+            removed_ok = False
+        if removed_ok:
+            return
+        for container_name in _credentials_volume_container_names(
+            credentials_volume=credentials_volume,
+            run_id=run_id,
+        ):
+            self._force_remove_container(container_name)
+        try:
+            self._runner(
+                ["docker", "volume", "rm", "-f", credentials_volume],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Failed to remove agent credentials volume %s", credentials_volume, exc_info=True)
 
     def _stop_agent_container(self, run_id: str) -> None:
-        self._runner(
-            ["docker", "stop", "--time", "10", agent_container_name(run_id)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
+        container_name = agent_container_name(run_id)
+        try:
+            stopped = self._runner(
+                ["docker", "stop", "--time", "10", container_name],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            stopped_ok = int(getattr(stopped, "returncode", 1)) == 0
+        except (OSError, subprocess.SubprocessError):
+            stopped_ok = False
+        if not stopped_ok:
+            self._force_remove_container(container_name)
+
+    def _force_remove_container(self, container_name: str) -> None:
+        try:
+            self._runner(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Failed to force-remove agent container %s", container_name, exc_info=True)
+
+    def sweep_stale_credentials_volumes(self, *, now: datetime | None = None) -> list[str]:
+        return sweep_stale_credentials_volumes(
+            timeout_seconds=self._config.timeout_seconds,
+            runner=self._runner,
+            now=now,
         )
+
+    def _ensure_startup_credentials_volume_sweep(self) -> None:
+        global _STARTUP_CREDENTIALS_SWEEP_DONE
+        if _STARTUP_CREDENTIALS_SWEEP_DONE:
+            return
+        with _STARTUP_CREDENTIALS_SWEEP_LOCK:
+            if _STARTUP_CREDENTIALS_SWEEP_DONE:
+                return
+            _STARTUP_CREDENTIALS_SWEEP_DONE = True
+            try:
+                self.sweep_stale_credentials_volumes()
+            except Exception:  # noqa: BLE001 - startup sweep is best-effort
+                logger.warning("Startup agent credentials volume sweep failed", exc_info=True)
 
     def run_with_pdw(
         self,
@@ -1200,7 +1314,201 @@ def agent_container_name(run_id: str) -> str:
 
 def agent_credentials_volume_name(run_id: str) -> str:
     run_name = docker_safe_name(run_id)[:60]
-    return f"pdw-agent-credentials-{run_name}-{uuid.uuid4().hex}"
+    return f"{AGENT_CREDENTIALS_VOLUME_PREFIX}{run_name}-{uuid.uuid4().hex}"
+
+
+def agent_credentials_helper_container_name(credentials_volume: str, direction: str) -> str:
+    return docker_safe_name(f"{credentials_volume}-{direction}")
+
+
+def _credentials_volume_run_name(credentials_volume: str) -> str:
+    if not credentials_volume.startswith(AGENT_CREDENTIALS_VOLUME_PREFIX):
+        return ""
+    remainder = credentials_volume[len(AGENT_CREDENTIALS_VOLUME_PREFIX) :]
+    if (
+        len(remainder) > 33
+        and remainder[-33] == "-"
+        and all(ch in "0123456789abcdefABCDEF" for ch in remainder[-32:])
+    ):
+        return remainder[:-33]
+    return remainder
+
+
+def _credentials_volume_container_names(*, credentials_volume: str, run_id: str = "") -> list[str]:
+    names: list[str] = []
+    if run_id.strip():
+        names.append(agent_container_name(run_id))
+    run_name = _credentials_volume_run_name(credentials_volume)
+    if run_name:
+        inferred = docker_safe_name(f"pdw-agent-{run_name}")
+        if inferred not in names:
+            names.append(inferred)
+    for direction in ("stage", "persist"):
+        helper_name = agent_credentials_helper_container_name(credentials_volume, direction)
+        if helper_name not in names:
+            names.append(helper_name)
+    return names
+
+
+def _parse_docker_timestamp(value: str) -> datetime | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = f"{cleaned[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _credentials_volume_is_in_use(
+    credentials_volume: str,
+    *,
+    running_containers: Collection[str],
+    running_mounts: Collection[str],
+) -> bool:
+    if credentials_volume in running_mounts:
+        return True
+    for name in _credentials_volume_container_names(credentials_volume=credentials_volume):
+        if name in running_containers:
+            return True
+    run_name = _credentials_volume_run_name(credentials_volume)
+    if len(run_name) == 60:
+        prefix = docker_safe_name(f"pdw-agent-{run_name}")
+        if any(container.startswith(prefix) for container in running_containers):
+            return True
+    return False
+
+
+def sweep_stale_credentials_volumes(
+    *,
+    timeout_seconds: int = 1800,
+    sweep_margin_seconds: int = DEFAULT_AGENT_CREDENTIALS_VOLUME_SWEEP_MARGIN_SECONDS,
+    runner=subprocess.run,
+    now: datetime | None = None,
+) -> list[str]:
+    """Remove orphaned per-run credential volumes older than timeout + margin with no running container."""
+    try:
+        listed = runner(
+            [
+                "docker",
+                "volume",
+                "ls",
+                "--filter",
+                f"name={AGENT_CREDENTIALS_VOLUME_PREFIX}",
+                "--format",
+                "{{.Name}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Failed to list agent credentials volumes for sweep", exc_info=True)
+        return []
+    if int(getattr(listed, "returncode", 1)) != 0:
+        return []
+    volume_names = [
+        line.strip()
+        for line in (listed.stdout or "").splitlines()
+        if line.strip().startswith(AGENT_CREDENTIALS_VOLUME_PREFIX)
+    ]
+    if not volume_names:
+        return []
+
+    try:
+        inspected = runner(
+            ["docker", "volume", "inspect", *volume_names],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Failed to inspect agent credentials volumes for sweep", exc_info=True)
+        return []
+    if int(getattr(inspected, "returncode", 1)) != 0:
+        return []
+    try:
+        parsed_inspect = json.loads(inspected.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed_inspect, list):
+        return []
+
+    effective_now = now.astimezone(UTC) if now is not None else datetime.now(tz=UTC)
+    cutoff_seconds = max(int(timeout_seconds), 0) + max(int(sweep_margin_seconds), 0)
+    stale_candidates: list[str] = []
+    for entry in parsed_inspect:
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("Name") or "").strip()
+        if not name.startswith(AGENT_CREDENTIALS_VOLUME_PREFIX):
+            continue
+        created_at = _parse_docker_timestamp(str(entry.get("CreatedAt") or ""))
+        if created_at is None:
+            continue
+        if (effective_now - created_at).total_seconds() > cutoff_seconds:
+            stale_candidates.append(name)
+    if not stale_candidates:
+        return []
+
+    try:
+        ps_completed = runner(
+            ["docker", "ps", "--no-trunc", "--format", "{{.Names}}\t{{.Mounts}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Failed to inspect running containers before credentials volume sweep", exc_info=True)
+        return []
+    if int(getattr(ps_completed, "returncode", 1)) != 0:
+        return []
+
+    running_containers: set[str] = set()
+    running_mounts: set[str] = set()
+    for line in (ps_completed.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        names_field, _, mounts_field = line.partition("\t")
+        for raw_name in names_field.split(","):
+            cleaned_name = raw_name.strip().lstrip("/")
+            if cleaned_name:
+                running_containers.add(cleaned_name)
+        for raw_mount in mounts_field.split(","):
+            cleaned_mount = raw_mount.strip()
+            if cleaned_mount:
+                running_mounts.add(cleaned_mount)
+
+    removed: list[str] = []
+    for volume_name in stale_candidates:
+        if _credentials_volume_is_in_use(
+            volume_name,
+            running_containers=running_containers,
+            running_mounts=running_mounts,
+        ):
+            continue
+        try:
+            rm_completed = runner(
+                ["docker", "volume", "rm", "-f", volume_name],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Failed to remove stale agent credentials volume %s", volume_name, exc_info=True)
+            continue
+        if int(getattr(rm_completed, "returncode", 1)) == 0:
+            removed.append(volume_name)
+    return removed
 
 
 def provider_credential_relative_path(provider: str) -> str:
@@ -1250,6 +1558,8 @@ def agent_credentials_copy_command(
         "docker",
         "run",
         "--rm",
+        "--name",
+        agent_credentials_helper_container_name(credentials_volume, direction),
         "--network",
         "none",
         "--read-only",

@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 
 from dagster import DagsterInstance, DagsterRunStatus, RunsFilter
 
+from personal_data_warehouse.agent_runner import (
+    agent_config_from_env,
+    sweep_stale_credentials_volumes,
+)
 from personal_data_warehouse.build_info import build_metadata
 
 BOOT_CLEAR_STATUSES = (
@@ -68,6 +72,18 @@ def _env_bool(name: str, default: bool) -> bool:
 def main() -> None:
     metadata = build_metadata()
     print(f"Personal Data Warehouse Dagster build metadata: git_sha={metadata['git_sha']}")
+
+    try:
+        removed_volumes = sweep_stale_credentials_volumes(
+            timeout_seconds=agent_config_from_env().timeout_seconds,
+        )
+        if removed_volumes:
+            print(
+                "Dagster boot cleanup removed "
+                f"{len(removed_volumes)} stale agent credentials volumes."
+            )
+    except Exception as exc:  # noqa: BLE001 - boot volume sweep is best-effort
+        print(f"Dagster boot cleanup warning: failed to sweep agent credentials volumes: {exc}")
 
     if not _env_bool("DAGSTER_BOOT_CLEAR_IN_PROGRESS_RUNS", True):
         print("Dagster boot cleanup is disabled by DAGSTER_BOOT_CLEAR_IN_PROGRESS_RUNS")
