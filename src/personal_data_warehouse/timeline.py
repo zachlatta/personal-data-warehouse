@@ -4227,6 +4227,9 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "append-only weekly search benchmark history; trends, not real-world events"
     ),
     "search_benchmark_labels": _state("the benchmark's private labels (queries and truth refs)"),
+    "answer_benchmark_runs": _state("answer benchmark (C16): one row of counts per run"),
+    "answer_benchmark_results": _state("answer benchmark: private per-question answers and grades"),
+    "answer_benchmark_questions": _state("answer benchmark: private questions and gold answers"),
     "search_health": _state("search chunk and embedding convergence heartbeats"),
     # The timeline itself
     "timeline_events": _state("the unified timeline"),

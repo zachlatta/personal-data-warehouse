@@ -905,3 +905,35 @@ def test_c17_is_not_green_without_its_measurements(monkeypatch: pytest.MonkeyPat
     stale = [{**_c17_usage(0.01)[0], "status": "unknown"}]
     monkeypatch.setattr(contract_audit, "pdw_sql", _c17_sql(stale, []))
     assert contract_audit.c17_agents_do_not_stumble().status == contract_audit.YELLOW
+
+
+def _c16_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "status": "ok", "provider": "codex", "model": "gpt-6.1-sol", "questions": 50,
+        "correct": 46, "correct_rate": "0.920", "source_correct_rate": "0.880",
+        "contaminated": 0, "errors": 0, "elapsed_p50_ms": 41000, "pdw_calls_p50": 4,
+        "proxy_drops": 12, "collected_at": "2026-10-27T06:40:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("ok", "green"), ("attention", "yellow"), ("failing", "red"), ("no_data", "yellow"), ("unexpected", "yellow")],
+)
+def test_c16_grades_the_answer_benchmark_status(
+    monkeypatch: pytest.MonkeyPatch, status: str, expected: str
+) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql, **_: [_c16_row(status=status)])
+    verdict = contract_audit.c16_answer_benchmark()
+    assert (verdict.contract, verdict.status) == ("C16", expected)
+    if status not in {"no_data"}:
+        assert "46/50 correct" in verdict.evidence and "12 rows hidden" in verdict.evidence
+
+
+def test_c16_cannot_be_green_without_the_mart(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(contract_audit, "pdw_sql", lambda intent, sql, **_: None)
+    verdict = contract_audit.c16_answer_benchmark()
+    assert verdict.status == contract_audit.YELLOW
+    assert "marts_ops.answer_benchmark" in verdict.evidence

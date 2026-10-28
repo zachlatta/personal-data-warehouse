@@ -220,8 +220,11 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-10-28: contract C17's marts_ops.agent_top_failures, each week's
 	// failed agent calls by shape, added one relation line ("Failure
 	// shapes."): 10356. 10360 is that line and no more.
-	if guidance > 10360 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10360)", guidance)
+	//
+	// 2026-10-28: the answer benchmark added the marts_ops.answer_benchmark
+	// line ("Answer benchmark (C16)."): 10386. 10386 is that line and no more.
+	if guidance > 10386 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10386)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

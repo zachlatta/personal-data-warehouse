@@ -885,9 +885,38 @@ def c12_future_developers() -> Verdict:
     return Verdict("C12", title, worst(grades), evidence)
 
 
+def c16_answer_benchmark() -> Verdict:
+    """C16: a fresh agent with only PDW answers Zach's real past questions right.
+
+    Graded from the latest run in marts_ops.answer_benchmark: green only when
+    every target holds on a fresh run, red when it is failing, and yellow for
+    below target, a contaminated answer, an errored question, or no fresh run.
+    """
+    title = "answers are right (answer benchmark)"
+    rows = pdw_sql(
+        "answer benchmark",
+        "SELECT status, provider, model, questions, correct, correct_rate, source_correct_rate, "
+        "contaminated, errors, elapsed_p50_ms, pdw_calls_p50, proxy_drops, collected_at "
+        "FROM marts_ops.answer_benchmark",
+    )
+    if not rows:
+        return _unavailable("C16", title, "marts_ops.answer_benchmark")
+    r = rows[0]
+    status = str(r.get("status") or "")
+    if status == "no_data":
+        return Verdict("C16", title, YELLOW, "no answer benchmark run in the last ten days")
+    evidence = (
+        f"{r['correct']}/{r['questions']} correct ({r['correct_rate']}), right source {r['source_correct_rate']}, "
+        f"median {int(r['elapsed_p50_ms'] or 0) / 1000:.0f}s and {r['pdw_calls_p50']} PDW calls, "
+        f"{r['contaminated']} contaminated, {r['errors']} errored, {r['proxy_drops']} rows hidden by the proxy; "
+        f"{r['provider']}/{r['model']} at {r['collected_at']}"
+    )
+    return Verdict("C16", title, {"ok": GREEN, "failing": RED}.get(status, YELLOW), evidence)
+
+
 CHECKS = [c1_timeline_coverage, c2_priority_tiers, c3_agents_start_at_timeline, c4_raw_data_queryable,
           c5_layering, c6_performance, c7_pipeline_health, c8_search_quality, c9_one_way, c10_backups,
-          c11_source_slas, c12_future_developers, c17_agents_do_not_stumble, s1_slack, s2_voice, s3_finance]
+          c11_source_slas, c12_future_developers, c16_answer_benchmark, c17_agents_do_not_stumble, s1_slack, s2_voice, s3_finance]
 
 
 def main(argv: list[str] | None = None) -> int:

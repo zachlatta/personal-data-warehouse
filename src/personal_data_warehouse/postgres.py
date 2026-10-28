@@ -23,6 +23,13 @@ from personal_data_warehouse.search_benchmark_runner import (
     SATURATION_CPU_SOME_AVG10,
     SATURATION_IO_FULL_AVG10,
 )
+from personal_data_warehouse.answer_benchmark import (
+    CORRECT_FAILING_FLOOR as ANSWER_CORRECT_FAILING_FLOOR,
+    CORRECT_TARGET as ANSWER_CORRECT_TARGET,
+    MEDIAN_SECONDS_TARGET as ANSWER_MEDIAN_SECONDS_TARGET,
+    PDW_CALLS_TARGET as ANSWER_PDW_CALLS_TARGET,
+    STALE_DAYS as ANSWER_STALE_DAYS,
+)
 from personal_data_warehouse.agent_usage import (
     PRIORITY_FILTER_TARGET,
     SEARCH_FIRST_TARGET,
@@ -30,6 +37,9 @@ from personal_data_warehouse.agent_usage import (
     AGENT_TOP_FAILURES,
 )
 from personal_data_warehouse.schema import (
+    ANSWER_BENCHMARK_QUESTION_COLUMNS,
+    ANSWER_BENCHMARK_RESULT_COLUMNS,
+    ANSWER_BENCHMARK_RUN_COLUMNS,
     ALICE_VOICE_RECORDING_ARTIFACT_COLUMNS,
     ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
     ALICE_VOICE_RECORDING_COLUMNS,
@@ -1398,6 +1408,11 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         SEARCH_BENCHMARK_HISTORY_COLUMNS, ("mode", "collected_at"), "collected_at"
     ),
     "search_benchmark_labels": TableSpec(SEARCH_BENCHMARK_LABEL_COLUMNS, ("query",)),
+    # C16: private questions and per-question answers, and an append-only ops
+    # row of one run's counts (no question text) for marts_ops.answer_benchmark.
+    "answer_benchmark_questions": TableSpec(ANSWER_BENCHMARK_QUESTION_COLUMNS, ("question_id",)),
+    "answer_benchmark_results": TableSpec(ANSWER_BENCHMARK_RESULT_COLUMNS, ("run_id", "question_id")),
+    "answer_benchmark_runs": TableSpec(ANSWER_BENCHMARK_RUN_COLUMNS, ("run_id",), "collected_at"),
 }
 
 #: The marts_ops snapshot tables: one ensure path, and the only tables whose
@@ -3120,6 +3135,8 @@ TIMESTAMP_COLUMNS = {
     # agent_failure_shapes
     "first_failed_at",
     "last_failed_at",
+    # answer benchmark: when Zach first asked the question.
+    "origin_asked_at",
     # github
     "authored_at",
     "committed_at",
@@ -3398,6 +3415,24 @@ INTEGER_COLUMNS = {
     "attention_recall_retained",
     "all_relevant_lower_tier",
     "cpu_count",
+    # answer benchmark (C16): counts, milliseconds and bigint 0/1 flags.
+    "questions",
+    "answered",
+    "correct",
+    "source_correct",
+    "contaminated",
+    "sql_errors",
+    "proxy_drops",
+    "runs_with_proxy_drops",
+    "elapsed_p50_ms",
+    "elapsed_p90_ms",
+    "pdw_calls_p50",
+    "under_call_target",
+    "pdw_calls",
+    "facts_matched",
+    "facts_total",
+    "elapsed_ms",
+    "is_active",
     "window_days",
     "sessions",
     "pdw_sessions",
@@ -6252,6 +6287,9 @@ class PostgresWarehouse:
                 "search_benchmark_history",
                 "search_request_timings",
                 "search_request_timing_state",
+                "answer_benchmark_questions",
+                "answer_benchmark_results",
+                "answer_benchmark_runs",
             ]
         )
         # _ensure_table_group only CREATEs; it does not widen an existing table,
@@ -7233,6 +7271,65 @@ class PostgresWarehouse:
             """,
         )
 
+        # C16 measured: the latest answer-benchmark run against its targets,
+        # with the run before it for a trend. Always one row, so "never run"
+        # reads no_data instead of an empty result. A run older than ten days
+        # also reads no_data: the run is weekly and a benchmark that stopped
+        # must not keep its last green. Rates are over every question asked.
+        self._ensure_view(
+            "marts_answer_benchmark",
+            f"""
+            CREATE OR REPLACE VIEW @marts_answer_benchmark AS
+            WITH ranked AS (
+                SELECT r.*, row_number() OVER (ORDER BY r.collected_at DESC) AS recency
+                FROM @answer_benchmark_runs r
+            ), latest AS (
+                SELECT * FROM ranked WHERE recency = 1
+            ), previous AS (
+                SELECT * FROM ranked WHERE recency = 2
+            )
+            SELECT
+                CASE
+                    WHEN l.run_id IS NULL OR l.questions = 0
+                      OR now() - l.collected_at > interval '{ANSWER_STALE_DAYS} days' THEN 'no_data'
+                    WHEN l.answered = 0
+                      OR l.correct::numeric / l.questions < {ANSWER_CORRECT_FAILING_FLOOR} THEN 'failing'
+                    WHEN l.correct::numeric / l.questions < {ANSWER_CORRECT_TARGET}
+                      OR l.elapsed_p50_ms >= {ANSWER_MEDIAN_SECONDS_TARGET * 1000}
+                      OR l.pdw_calls_p50 >= {ANSWER_PDW_CALLS_TARGET}
+                      OR l.contaminated > 0 OR l.errors > 0 THEN 'attention'
+                    ELSE 'ok'
+                END AS status,
+                l.run_id, l.provider, l.model, l.prompt_version,
+                l.questions, l.answered, l.correct, l.source_correct, l.contaminated, l.errors,
+                CASE WHEN l.questions > 0 THEN round(l.correct::numeric / l.questions, 3) END AS correct_rate,
+                CASE WHEN l.questions > 0 THEN round(l.source_correct::numeric / l.questions, 3) END
+                    AS source_correct_rate,
+                l.elapsed_p50_ms, l.elapsed_p90_ms, l.pdw_calls_p50,
+                CASE WHEN l.questions > 0 THEN round(l.under_call_target::numeric / l.questions, 3) END
+                    AS under_call_target_rate,
+                l.invented_calls, l.sql_errors,
+                -- Rows the tool proxy hid from the agent (agent sessions, copies
+                -- of an answer): prevented leaks, reported, never graded.
+                l.proxy_drops, l.runs_with_proxy_drops,
+                NULLIF(l.note, '') AS note,
+                {ANSWER_CORRECT_TARGET}::numeric AS correct_target,
+                {ANSWER_MEDIAN_SECONDS_TARGET * 1000}::bigint AS elapsed_p50_target_ms,
+                {ANSWER_PDW_CALLS_TARGET}::bigint AS pdw_calls_target,
+                (SELECT count(*) FROM @answer_benchmark_runs)::bigint AS history_runs,
+                NULLIF(p.collected_at, {epoch}) AS previous_collected_at,
+                CASE WHEN p.questions > 0 AND l.questions > 0
+                     THEN round(l.correct::numeric / l.questions - p.correct::numeric / p.questions, 3)
+                END AS correct_rate_change,
+                NULLIF(l.started_at, {epoch}) AS started_at,
+                NULLIF(l.collected_at, {epoch}) AS collected_at,
+                (EXTRACT(EPOCH FROM now() - NULLIF(l.collected_at, {epoch})))::bigint AS snapshot_age_seconds
+            FROM (SELECT 1) AS one
+            LEFT JOIN latest l ON true
+            LEFT JOIN previous p ON true
+            """,
+        )
+
         # Level 3 of the health contract: "is THIS kind of data current on the
         # timeline?" The pipeline row cannot answer it. `timeline` is a single
         # pipeline whose run heartbeat is a max() over every adapter, so one
@@ -7663,6 +7760,40 @@ class PostgresWarehouse:
                 ([case.query for case in cases],),
             )
         return len(rows)
+
+    def publish_answer_benchmark_questions(self, rows: Sequence[dict[str, Any]]) -> int:
+        """Mirror the private question file into private.answer_benchmark_questions.
+
+        Questions absent from the file are deleted, so the table is the file
+        that was published, not an accumulation of retired questions.
+        """
+        self._insert_rows("answer_benchmark_questions", list(rows), ANSWER_BENCHMARK_QUESTION_COLUMNS)
+        self._command(
+            "DELETE FROM @answer_benchmark_questions WHERE question_id <> ALL(%s)",
+            ([row["question_id"] for row in rows],),
+        )
+        return len(rows)
+
+    def load_answer_benchmark_questions(self) -> list[dict[str, Any]]:
+        return self._query_dicts(
+            "SELECT " + ", ".join(ANSWER_BENCHMARK_QUESTION_COLUMNS)
+            + " FROM @answer_benchmark_questions ORDER BY question_id"
+        )
+
+    def write_answer_benchmark_run(
+        self, run: Any, results: Sequence[dict[str, Any]], *, collected_at: datetime
+    ) -> None:
+        """Store one run: private per-question rows, then the ops aggregate row."""
+        self._insert_rows("answer_benchmark_results", list(results), ANSWER_BENCHMARK_RESULT_COLUMNS)
+        self._insert_rows(
+            "answer_benchmark_runs",
+            [_pipeline_health_row(run, collected_at=collected_at)],
+            ANSWER_BENCHMARK_RUN_COLUMNS,
+        )
+
+    def query_timeline_refs(self, sql: str) -> list[dict[str, Any]]:
+        """Run the answer benchmark's ref lookup (a read of timeline.events)."""
+        return self._query_dicts(sql)
 
     def write_agent_usage(self, rows: Sequence[Any], *, collected_at: datetime) -> None:
         """Replace the agent-usage snapshot with one collection's measurements."""

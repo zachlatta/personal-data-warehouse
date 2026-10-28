@@ -159,6 +159,10 @@ that, not from this prose.
   linked below. *Held up by* `tests/test_contracts_doc.py` (every test a contract names
   exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
   `test_every_stated_contract_has_a_living_audit_check`.
+- **C16 — an agent with only PDW answers Zach's real questions right.** Past questions with
+  checked gold answers, asked by a fresh agent, graded on answer, cited source, PDW calls and
+  time (90%, median < 60 s, < 6 calls). *Held up by* `marts_ops.answer_benchmark`; see
+  [docs/answer-benchmark.md](docs/answer-benchmark.md).
 - **C17 — agents do not stumble.** SQL-error sessions under 10%, calls to commands that do
   not exist near zero, and each week's top three failure shapes fixed in the guide or the
   CLI before the next week. *Held up by* `marts_ops.agent_top_failures` (failed calls by

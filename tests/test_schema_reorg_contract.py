@@ -245,7 +245,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # a device was in use and what was on them.
             # +1 marts: rolling real-traffic search latency and saturation (C6).
             # +1 marts: marts_ops.agent_top_failures, failed agent calls by shape (C17).
-            "marts": 72,
+            # +1 marts: marts_ops.answer_benchmark, the C16 answer verdict.
+            "marts": 73,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -272,13 +273,16 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # poll ran and succeeded daily.
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
-            "ops": 43,
+        # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
+            "ops": 44,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
         # +1 private: private.app_access_tokens, issued bearer tokens beside the
         # master secret and the single-use cli_authorize codes.
-        "private": 14,  # encrypted MCP connections, HN session
+        # +2 private: private.answer_benchmark_questions and _results, C16's
+        # real questions, gold answers and the agent's graded answers.
+        "private": 16,  # encrypted MCP connections, HN session
         # +2 internal: the row-trigger functions that keep
         # derived_search.chunk_vectors in step with chunks and embeddings.
         # +2 internal: the Feed tab's card-versioning trigger and the guard

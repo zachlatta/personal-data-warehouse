@@ -2768,6 +2768,87 @@ SEARCH_BENCHMARK_LABEL_COLUMNS = (
     "sync_version",
 )
 
+# Contract C16, the answer benchmark (answer_benchmark.py). The questions and
+# the agent's answers are Zach's private data and live in private.*; the ops
+# row is one run's counts and percentiles, with no question text, and is
+# append-only (keyed by run_id) so marts_ops.answer_benchmark can show a trend.
+# Published with `answer_benchmark publish`, exported with `pull`.
+ANSWER_BENCHMARK_QUESTION_COLUMNS = (
+    "question_id",
+    "question",
+    "original_question",
+    "gold_answer",
+    "key_facts_json",
+    "gold_refs_json",
+    "gold_predicate_json",
+    "gold_source",
+    "category",
+    "as_of",
+    "origin_source",
+    "origin_session",
+    "origin_asked_at",
+    "checked_evidence",
+    "leak_markers_json",
+    "exclude_refs_json",
+    "verification_note",
+    "is_active",
+    "updated_at",
+    "sync_version",
+)
+
+ANSWER_BENCHMARK_RESULT_COLUMNS = (
+    "run_id",
+    "question_id",
+    "agent_run_id",
+    "provider",
+    "model",
+    "prompt_version",
+    "status",
+    "error",
+    "answer_text",
+    "cited_refs_json",
+    "facts_matched",
+    "facts_total",
+    "correct",
+    "source_correct",
+    "contaminated",
+    "contamination_reason",
+    "pdw_calls",
+    "invented_calls",
+    "sql_errors",
+    "proxy_drops",
+    "exclusion_counts_json",
+    "elapsed_ms",
+    "tool_trace_json",
+    "started_at",
+    "completed_at",
+    "sync_version",
+)
+
+ANSWER_BENCHMARK_RUN_COLUMNS = (
+    "run_id",
+    "provider",
+    "model",
+    "prompt_version",
+    "questions",
+    "answered",
+    "correct",
+    "source_correct",
+    "contaminated",
+    "errors",
+    "invented_calls",
+    "sql_errors",
+    "proxy_drops",
+    "runs_with_proxy_drops",
+    "elapsed_p50_ms",
+    "elapsed_p90_ms",
+    "pdw_calls_p50",
+    "under_call_target",
+    "note",
+    "started_at",
+    "collected_at",
+)
+
 # One row per agent source (plus 'all') measuring how agents use PDW over a
 # trailing window, from their own transcripts: what their first PDW call was,
 # how often searches completed with an effective priority scope, which scope

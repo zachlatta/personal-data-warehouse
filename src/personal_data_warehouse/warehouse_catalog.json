@@ -2552,6 +2552,17 @@
       "secret": false
     },
     {
+      "id": "answer_benchmark_runs",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "answer_benchmark_runs",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "agent_usage",
       "kind": "table",
       "layer": "ops",
@@ -2699,6 +2710,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Weekly search latency and quality. Every fixed latency probe and labeled case is run as a paired all-tier search and catalog-defined attention search; the row exposes both latency and MRR/hit@k plus recall lost, gained and retained by the attention scope. history_runs, previous_collected_at, latency_p50_change_ms and mrr_change compare it with the prior retained run. The default remains all tiers and status is judged on its p50 and p90 (2-second goals) and MRR (0.30 floor); attention results measure the tradeoff before any default change. A run older than ten days reads unknown. Host pressure columns feed the C6 saturation verdict."
+    },
+    {
+      "id": "marts_answer_benchmark",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "answer_benchmark",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Answer benchmark (C16). Do fresh agents with only PDW answer Zach's real past questions right? Latest run: correct and right-source rates, median seconds and PDW calls, contaminated (copied) answers. A run over ten days old reads no_data."
     },
     {
       "id": "marts_search_benchmark_history",
@@ -3457,6 +3480,28 @@
       "domain": "private",
       "schema": "private",
       "name": "search_benchmark_labels",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "answer_benchmark_results",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "answer_benchmark_results",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
+    },
+    {
+      "id": "answer_benchmark_questions",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "answer_benchmark_questions",
       "discoverable": false,
       "query_access": "denied",
       "secret": true

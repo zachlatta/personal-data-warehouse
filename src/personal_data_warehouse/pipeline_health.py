@@ -1573,6 +1573,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="p50/p90 latency over fixed probes and MRR over private.search_benchmark_labels",
     ),
     Pipeline(
+        id="answer_benchmark",
+        label="Answer benchmark (contract C16)",
+        kind="internal",
+        cadence="manual (scripts/answer_benchmark.py run --write) until the weekly asset lands",
+        transport="managed agent with only pdw → app /api/tools → ops.answer_benchmark_runs",
+        expected_data_interval=None,
+        expected_run_interval=None,
+        note="real past questions graded on answer, cited source, PDW calls and time; marts_ops.answer_benchmark judges staleness",
+    ),
+    Pipeline(
         id="search_requests",
         label="Search request timings (contract C6)",
         kind="internal",
@@ -1983,6 +1993,13 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         "search_benchmark", "collected_at", note="append-only benchmark trend"
     ),
     "search_benchmark_labels": _support("search_benchmark", "updated_at", note="private labels; a mirror of the published file"),
+    "answer_benchmark_runs": _data("answer_benchmark", "collected_at"),
+    "answer_benchmark_results": _support(
+        "answer_benchmark", "completed_at", note="private per-question answers and grades"
+    ),
+    "answer_benchmark_questions": _support(
+        "answer_benchmark", "updated_at", note="private questions; a mirror of the published file"
+    ),
     "pgbackrest_health": _data(
         "pgbackrest",
         "collected_at",
