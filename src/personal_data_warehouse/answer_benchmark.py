@@ -430,23 +430,17 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.casefold()).strip()
 
 
-def _strings(value: Any) -> Iterable[str]:
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            yield from _strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _strings(item)
+def leaked_markers(question: AnswerQuestion, calls: Sequence[ToolCall]) -> list[str]:
+    """The leak markers that appear in anything a tool returned to the agent.
 
-
-def leaked_markers(question: AnswerQuestion, events: Sequence[AgentRunEvent]) -> list[str]:
-    """The leak markers that appear anywhere in what the agent saw or wrote."""
+    Only tool output counts: the agent's own reasoning and answer may phrase the
+    gold answer the way the original agent did (measured 2026-10-28: a correct
+    run wrote one of its question's markers itself), and that is not copying.
+    """
 
     if not question.leak_markers:
         return []
-    haystack = _normalize("\n".join(text for event in events for text in _strings(event.event_json)))
+    haystack = _normalize("\n".join(call.output for call in calls))
     return [marker for marker in question.leak_markers if _normalize(marker) in haystack]
 
 
@@ -505,7 +499,7 @@ def grade(question: AnswerQuestion, attempt: AgentAttempt, resolver: RefResolver
     pdw = [call for call in calls if is_pdw_call(call)]
 
     reasons: list[str] = []
-    markers = leaked_markers(question, attempt.events)
+    markers = leaked_markers(question, calls)
     if markers:
         reasons.append(f"{len(markers)} leak marker(s) in the agent's trace")
     excluded = set(question.exclude_refs)

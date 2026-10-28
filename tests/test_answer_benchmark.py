@@ -176,6 +176,19 @@ def test_text_only_sql_that_reaches_the_origin_session_is_contaminated() -> None
     assert "leak marker" in graded.contamination_reason
 
 
+def test_the_agent_phrasing_the_answer_like_the_original_is_not_copying() -> None:
+    # A marker in the agent's own message (not in any tool output) is the agent's
+    # wording; only something a tool returned can be copied.
+    question = _question()
+    said = {"type": "item.completed", "item": {"id": "m1", "type": "agent_message",
+            "text": question.leak_markers[1] + " on Sept 3."}}
+    events = _command_event(0, "c1", "pdw search 'dinner'", "1 hit") + [
+        AgentRunEvent(2, "stdout", "item.completed", said, json.dumps(said), T0)
+    ]
+    graded = grade(question, _attempt("Confirmed Sept 3.", [GOLD], events), FakeResolver())
+    assert not graded.contaminated and graded.correct
+
+
 @pytest.mark.parametrize("cited", ["agent_session_turn:sess-origin|7", "gmail_email:acct|zrl-bot-reply"])
 def test_citing_an_agent_session_or_an_excluded_copy_is_contaminated(cited: str) -> None:
     graded = grade(_question(), _attempt("Confirmed Sept 3.", [cited]), FakeResolver())
