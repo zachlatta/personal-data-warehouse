@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -103,9 +104,14 @@ class AgentResource(ConfigurableResource):
         *,
         app: WarehouseAppConfig | None = None,
         max_rows: int = DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
+        exclude_adapters: Collection[str] = (),
+        exclude_refs: Collection[str] = (),
     ) -> AgentRunResult:
         effective_request = self._effective_request(request)
-        return self.runner().run_with_pdw(effective_request, app=app, max_rows=max_rows)
+        return self.runner().run_with_pdw(
+            effective_request, app=app, max_rows=max_rows,
+            exclude_adapters=exclude_adapters, exclude_refs=exclude_refs,
+        )
 
     def _effective_request(self, request: AgentRunRequest) -> AgentRunRequest:
         self._raise_if_unconfigured()

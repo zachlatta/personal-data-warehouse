@@ -9206,3 +9206,30 @@ def test_ensure_indexes_updates_a_stale_pg_textsearch_extension(
     warehouse.ensure_timeline_tables()
 
     assert "ALTER EXTENSION pg_textsearch UPDATE" in commands
+
+
+def test_claude_identical_tool_blocks_survive_upsert(warehouse: PostgresWarehouse) -> None:
+    from personal_data_warehouse.agent_runner import AgentRunResult, agent_events_from_streams, agent_run_tool_call_rows
+
+    now = datetime.now(tz=UTC)
+    events = agent_events_from_streams(stdout="\n".join(map(json.dumps, [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "call-a", "name": "Bash", "input": {"command": "pdw search budget"}},
+            {"type": "tool_use", "id": "call-b", "name": "Bash", "input": {"command": "pdw search budget"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "call-b", "content": "second"},
+            {"type": "tool_result", "tool_use_id": "call-a", "content": "first"},
+        ]}},
+    ])), stderr="", created_at=now)
+    result = AgentRunResult("run", "claude", "test", "generic", "", "", "", "completed", {}, "", 0, now, now, events)
+    warehouse.ensure_agent_tables()
+    rows = agent_run_tool_call_rows(result)
+    warehouse.insert_agent_run_tool_calls(rows)
+    warehouse.insert_agent_run_tool_calls(rows)
+    stored = warehouse._query(
+        "SELECT event_index, tool_name, result_json FROM @agent_run_tool_calls ORDER BY event_index"
+    )
+    assert len(stored) == 2
+    assert [row[1] for row in stored] == ["pdw search", "pdw search"]
+    assert [json.loads(row[2])["output"] for row in stored] == ["first", "second"]

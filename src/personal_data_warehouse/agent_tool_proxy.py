@@ -11,12 +11,15 @@ tools and stored objects.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import csv
+import io
 import json
 import os
+import re
 import secrets
 import threading
 from typing import Any
@@ -97,6 +100,112 @@ def agent_client_name(base: str, run_id: str) -> str:
     return f"{base}-{run_id}"[:MAX_CLIENT_NAME_CHARS]
 
 
+@dataclass
+class AgentExclusionCounts:
+    """Caller-owned counters. Never serialized into a tool response or environment."""
+
+    _values: dict[str, int] = field(default_factory=lambda: {
+        "search_rows_dropped": 0, "context_rows_dropped": 0,
+        "sql_rows_dropped": 0, "context_calls_refused": 0,
+    })
+    _lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, name: str, count: int = 1) -> None:
+        with self._lock:
+            self._values[name] += count
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._values)
+
+
+class AgentSourceExclusions:
+    """Match returned identifiers, not SQL syntax.
+
+    SQL selecting only text columns without identifiers cannot be recognized by
+    cell matching; the benchmark must detect that case itself from the trace.
+    This is a benchmark guard, not a database authorization boundary.
+    """
+
+    def __init__(self, adapters: Collection[str], refs: Collection[str]) -> None:
+        self.adapters = frozenset(value for value in adapters if value)
+        self.refs = frozenset(value for value in refs if value)
+        self.identifiers = set(self.refs)
+        for ref in self.refs:
+            adapter, separator, event_id = ref.partition(":")
+            if not separator or not event_id:
+                raise ValueError("excluded refs must have the form adapter:event_id")
+            self.identifiers.add(event_id)
+            parts = event_id.split("|")
+            # Never match the account/provider component shared by unrelated rows.
+            if adapter in {"agent_session", "agent_session_turn", "gmail_email"} and len(parts) >= 2:
+                if parts[1]:
+                    self.identifiers.add(parts[1])
+        self.adapter_refs = [re.compile(r"(?<![\w])" + re.escape(adapter) + ":") for adapter in self.adapters]
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.adapters or self.refs)
+
+    def matches(self, value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(self.matches(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(self.matches(child) for child in value)
+        if not isinstance(value, str):
+            return False
+        return (value in self.adapters or any(identifier in value for identifier in self.identifiers)
+                or any(pattern.search(value) for pattern in self.adapter_refs))
+
+    def excludes_ref(self, ref: Any) -> bool:
+        return isinstance(ref, str) and (ref in self.refs or ref.partition(":")[0] in self.adapters)
+
+    def excludes_event(self, row: Any) -> bool:
+        if not isinstance(row, Mapping):
+            return False
+        adapter = row.get("adapter", "")
+        event_id = row.get("event_id", "")
+        return (self.excludes_ref(row.get("ref")) or adapter in self.adapters
+                or (bool(adapter) and self.excludes_ref(f"{adapter}:{event_id}")))
+
+    def filter_rows(self, data: Mapping[str, Any], *, match_cells: bool) -> tuple[dict[str, Any], int]:
+        rows, header = _read_result_rows(data)
+        matches = self.matches if match_cells else self.excludes_event
+        kept = [row for row in rows if not matches(row)]
+        dropped = len(rows) - len(kept)
+        if not dropped:
+            return dict(data), 0
+        filtered = {**data, "rows": _write_result_rows(data, kept, header)}
+        if "total_rows" in data:
+            filtered["total_rows"] = len(kept)
+        return filtered, dropped
+
+
+def _read_result_rows(data: Mapping[str, Any]) -> tuple[list[Any], list[str] | None]:
+    rows = data.get("rows")
+    if isinstance(rows, list):
+        return rows, None
+    if not isinstance(rows, str):
+        return [], None
+    if str(data.get("format") or "csv").lower() == "csv":
+        parsed = list(csv.reader(io.StringIO(rows)))
+        return (parsed[1:], parsed[0]) if parsed else ([], [])
+    return [json.loads(line) for line in rows.splitlines() if line.strip()], None
+
+
+def _write_result_rows(data: Mapping[str, Any], rows: list[Any], header: list[str] | None) -> Any:
+    if isinstance(data.get("rows"), list):
+        return rows
+    if header is not None:
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        if header:
+            writer.writerow(header)
+        writer.writerows(rows)
+        return output.getvalue().removesuffix("\n")
+    return "\n".join(json.dumps(row, separators=(",", ":")) for row in rows)
+
+
 @contextmanager
 def run_agent_tool_proxy(
     *,
@@ -106,7 +215,20 @@ def run_agent_tool_proxy(
     max_rows: int = DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
     bind_host: str = "0.0.0.0",
     public_host: str = "host.docker.internal",
+    exclude_adapters: Collection[str] = (),
+    exclude_refs: Collection[str] = (),
+    exclusion_counts: AgentExclusionCounts | None = None,
 ) -> Iterator[dict[str, str]]:
+    """Serve the existing tool surface with optional per-run source exclusions.
+
+    Nonempty exclusions enable context for this run only. SQL without identifying
+    cells cannot be recognized; the benchmark inspects its trace for that case.
+    Counts go to exclusion_counts, never to the agent.
+    """
+    exclusions = AgentSourceExclusions(exclude_adapters, exclude_refs)
+    counts = exclusion_counts if exclusion_counts is not None else AgentExclusionCounts()
+    if exclusions.enabled:
+        allowed_tools = allowed_tools | {"context"}
     container_token = secrets.token_urlsafe(32)
     # The run-scoped name travels all the way upstream, so a query in the app's
     # request log names the agent run that made it instead of a shared label.
@@ -151,6 +273,17 @@ def run_agent_tool_proxy(
                     status=404,
                 )
                 return
+            if name == "context" and exclusions.enabled:
+                try:
+                    arguments = json.loads(body)
+                    ref = arguments.get("ref", "") if isinstance(arguments, dict) else ""
+                except (ValueError, UnicodeDecodeError):
+                    self._write_error("invalid_request", "context requires JSON arguments", status=400)
+                    return
+                if exclusions.excludes_ref(ref):
+                    counts.add("context_calls_refused")
+                    self._write_error("source_excluded", "this context is unavailable for this run", status=403)
+                    return
             status, payload = self._forward_json("POST", API_TOOLS_PATH + "/" + name, body=body)
             if status == 200 and isinstance(payload, dict) and isinstance(payload.get("data"), dict):
                 payload = {**payload, "data": self._shape_tool_output(name, payload["data"])}
@@ -180,6 +313,9 @@ def run_agent_tool_proxy(
             self._write_json(payload, status=status)
 
         def _shape_tool_output(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
+            if exclusions.enabled and name in {"search", "context", "sql"}:
+                data, dropped = exclusions.filter_rows(data, match_cells=name == "sql")
+                counts.add(name + "_rows_dropped", dropped)
             if name == "sql":
                 return cap_sql_rows(data, max_rows=max_rows)
             if name == "get_object":
@@ -291,18 +427,15 @@ def cap_sql_rows(data: Mapping[str, Any], *, max_rows: int) -> dict[str, Any]:
     rows = capped.get("rows")
     if max_rows <= 0 or rows is None:
         return capped
-    fmt = str(capped.get("format") or "csv").lower()
     if isinstance(rows, list):
         if len(rows) <= max_rows:
             return capped
         capped["rows"] = rows[:max_rows]
     elif isinstance(rows, str):
-        lines = rows.splitlines()
-        # CSV's first line is the header, so it does not count against the cap.
-        keep = max_rows + 1 if fmt == "csv" else max_rows
-        if len(lines) <= keep:
+        parsed, header = _read_result_rows(data)
+        if len(parsed) <= max_rows:
             return capped
-        capped["rows"] = "\n".join(lines[:keep])
+        capped["rows"] = _write_result_rows(data, parsed[:max_rows], header)
     else:
         return capped
     capped["truncated"] = True

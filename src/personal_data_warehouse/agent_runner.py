@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import argparse
 import base64
@@ -24,6 +24,7 @@ from personal_data_warehouse.agent_tool_proxy import (
     DEFAULT_AGENT_TOOL_ALLOWLIST,
     DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
     WarehouseAppConfig,
+    AgentExclusionCounts,
     run_agent_tool_proxy,
     warehouse_app_config_from_env,
 )
@@ -246,6 +247,7 @@ class AgentRunResult:
     started_at: datetime
     completed_at: datetime
     events: Sequence[AgentRunEvent]
+    exclusion_counts: Mapping[str, int] = field(default_factory=dict)
 
 
 def agent_prompt_size_error(prompt: str, max_prompt_chars: int) -> str:
@@ -504,23 +506,33 @@ class ContainerAgentRunner:
         *,
         app: WarehouseAppConfig | None = None,
         max_rows: int = DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS,
+        exclude_adapters: Collection[str] = (),
+        exclude_refs: Collection[str] = (),
     ) -> AgentRunResult:
         """Run the agent with an authenticated `pdw` CLI pointed at a per-run proxy.
 
         The container gets a throwaway token for a proxy that only forwards
         read-only warehouse tools and stored-object reads; the app's real
-        credential stays in this process.
+        credential stays in this process. Exclusions default to empty; setting
+        them also enables context for this run. Counters return only in the
+        result's exclusion_counts. SQL selecting only text without identifying
+        cells cannot be recognized; the benchmark detects that from the trace.
         """
 
         app = app or warehouse_app_config_from_env()
+        counts = AgentExclusionCounts()
         with run_agent_tool_proxy(
             app=app,
             run_id=request.run_id,
             max_rows=max_rows,
+            exclude_adapters=exclude_adapters,
+            exclude_refs=exclude_refs,
+            exclusion_counts=counts,
             bind_host=self._config.tool_proxy_bind_host,
             public_host=self._config.tool_proxy_public_host,
         ) as tool_env:
-            return self.run(request.with_extra_env(tool_env))
+            result = self.run(request.with_extra_env(tool_env))
+        return replace(result, exclusion_counts=counts.snapshot())
 
     def _ensure_managed_image(self) -> None:
         if self._config.image != default_agent_docker_image():
@@ -870,40 +882,84 @@ def _truncate_with_marker(value: str, max_chars: int) -> str:
     return value[:head_chars] + marker + value[-tail_chars:]
 
 
+def _claude_blocks(payload: Mapping[str, Any], block_type: str) -> list[tuple[int, Mapping[str, Any]]]:
+    message = payload.get("message")
+    if not isinstance(message, Mapping):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [(index, block) for index, block in enumerate(content)
+            if isinstance(block, Mapping) and block.get("type") == block_type]
+
+
+def tool_call_payloads(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Normalize every tool block in one event for both CLI providers."""
+    if payload.get("type") == "assistant":
+        return [block for _, block in _claude_blocks(payload, "tool_use")]
+    return [payload] if extract_tool_name(payload) else []
+
+
 def agent_run_tool_call_rows(result: AgentRunResult) -> list[dict[str, Any]]:
+    """Pair Claude results by ID and preserve every call without a schema change.
+
+    Codex indexes keep naming their raw event. Claude call indexes start above
+    all raw events, in content-block order; _pdw_trace in arguments maps each
+    synthetic index back to the raw event and the provider's tool_use_id.
+    """
     rows = []
     sync_version = int(result.completed_at.timestamp() * 1_000_000)
+    returned = {}
+    for event in result.events:
+        if event.event_json.get("type") == "user":
+            for _, block in _claude_blocks(event.event_json, "tool_result"):
+                if block.get("tool_use_id"):
+                    returned[block["tool_use_id"]] = (event, block)
+    next_index = max((event.event_index for event in result.events), default=-1) + 1
     for event in result.events:
         payload = event.event_json
-        tool_name = extract_tool_name(payload)
-        if not tool_name:
-            continue
-        rows.append(
-            {
+        claude = payload.get("type") == "assistant"
+        calls = (_claude_blocks(payload, "tool_use") if claude
+                 else [(0, call) for call in tool_call_payloads(payload)])
+        for block_index, call in calls:
+            arguments = dict(extract_tool_arguments(call))
+            paired = returned.get(call.get("id")) if claude else None
+            completed_event, output = paired if paired else (event, call)
+            event_index = event.event_index
+            if claude:
+                event_index = next_index
+                next_index += 1
+                arguments["_pdw_trace"] = {
+                    "tool_use_id": call.get("id", ""),
+                    "source_event_index": event.event_index,
+                    "content_block_index": block_index,
+                }
+            rows.append({
                 "run_id": result.run_id,
-                "event_index": event.event_index,
-                "tool_name": tool_name,
-                "arguments_json": json.dumps(extract_tool_arguments(payload), sort_keys=True, separators=(",", ":"), default=str),
-                "result_json": json.dumps(extract_tool_result(payload), sort_keys=True, separators=(",", ":"), default=str),
-                "error": str(payload.get("error") or ""),
+                "event_index": event_index,
+                "tool_name": extract_tool_name(call),
+                "arguments_json": json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str),
+                "result_json": json.dumps(extract_tool_result(output), sort_keys=True, separators=(",", ":"), default=str),
+                "error": str(output.get("error") or ("tool_result is_error" if output.get("is_error") else "")),
                 "started_at": event.created_at,
-                "completed_at": event.created_at,
+                "completed_at": completed_event.created_at,
                 "sync_version": sync_version,
-            }
-        )
+            })
     return rows
 
 
 def extract_tool_name(payload: Mapping[str, Any]) -> str:
+    blocks = _claude_blocks(payload, "tool_use")
+    if payload.get("type") == "assistant" and blocks:
+        return extract_tool_name(blocks[0][1])
+    if payload.get("type") == "tool_use":
+        name = str(payload.get("name") or "")
+        if name == "Bash":
+            return _shell_tool_name(str(extract_tool_arguments(payload).get("command") or ""))
+        return name
     item = payload.get("item")
     if isinstance(item, Mapping) and item.get("type") == "command_execution":
-        command = str(item.get("command") or "")
-        if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
-            return "pdw-validate-json"
-        pdw_command = pdw_cli_invocation(command)
-        if pdw_command:
-            return pdw_command
-        return "bash"
+        return _shell_tool_name(str(item.get("command") or ""))
     for key in ("tool_name", "tool", "name"):
         value = payload.get(key)
         if isinstance(value, str) and value:
@@ -918,13 +974,19 @@ def extract_tool_name(payload: Mapping[str, Any]) -> str:
     return ""
 
 
+def _shell_tool_name(command: str) -> str:
+    if "pdw-validate-json" in command or "PDW_VALIDATE_JSON" in command:
+        return "pdw-validate-json"
+    return pdw_cli_invocation(command) or "bash"
+
+
 PDW_CLI_SUBCOMMANDS = frozenset(PDW_CLI_READ_SUBCOMMANDS)
 
 
 def pdw_cli_invocation(command: str) -> str:
     """Name the `pdw` invocation inside a shell command, or "" if there is none.
 
-    Agent tool use shows up as opaque `command_execution` events, so this is how
+    Shell tool use arrives as Codex command events or Claude Bash blocks; this is how
     warehouse access gets attributed in `agent_run_tool_calls`. `pdw call <tool>`
     keeps the tool name because that is the interesting part.
     """
@@ -946,13 +1008,16 @@ def pdw_cli_invocation(command: str) -> str:
             # `--data '{"storage_file_id":...}' get_object` reads as a call to
             # "storage_file_id".
             for candidate in rest[1:]:
-                if candidate in DEFAULT_AGENT_TOOL_ALLOWLIST:
+                if candidate in DEFAULT_AGENT_TOOL_ALLOWLIST | {"context"}:
                     return f"pdw call {candidate}"
         return f"pdw {subcommand}"
     return ""
 
 
 def extract_tool_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    blocks = _claude_blocks(payload, "tool_use")
+    if payload.get("type") == "assistant" and blocks:
+        return extract_tool_arguments(blocks[0][1])
     item = payload.get("item")
     if isinstance(item, Mapping) and item.get("type") == "command_execution":
         return {"command": str(item.get("command") or "")}
@@ -970,6 +1035,17 @@ def extract_tool_arguments(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def extract_tool_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    blocks = _claude_blocks(payload, "tool_result")
+    if payload.get("type") == "user" and blocks:
+        return extract_tool_result(blocks[0][1])
+    if payload.get("type") == "tool_result":
+        content = payload.get("content", "")
+        output = ""
+        if isinstance(content, str):
+            output = content
+        elif isinstance(content, list):
+            output = "\n".join(str(block.get("text") or "") for block in content if isinstance(block, Mapping))
+        return {"output": output, "is_error": bool(payload.get("is_error"))}
     item = payload.get("item")
     if isinstance(item, Mapping) and item.get("type") == "command_execution":
         return {

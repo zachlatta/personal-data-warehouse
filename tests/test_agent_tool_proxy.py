@@ -362,3 +362,112 @@ def test_warehouse_app_config_from_env_fails_loud_when_unset() -> None:
 
     assert "PDW_API_URL" in str(excinfo.value)
     assert "PDW_SECRET_TOKEN" in str(excinfo.value)
+
+
+def test_default_proxy_still_refuses_context(fake_app) -> None:
+    app = fake_app(responses={"context": {"rows": []}}, tools=[{"name": "context"}, {"name": "sql"}])
+    with proxy_for(app) as env:
+        assert call_proxy(env, "/api/tools/context", {"ref": "gmail_email:a|m"})[0] == 404
+        assert call_proxy(env, "/api/tools")[1]["data"] == [{"name": "sql"}]
+    assert app.tool_call_paths() == []
+
+
+def test_exclusions_filter_search_context_and_keep_counts_private(fake_app) -> None:
+    from personal_data_warehouse.agent_tool_proxy import AgentExclusionCounts
+    counts = AgentExclusionCounts()
+    app = fake_app(responses={
+        "search": {"rows": [
+            {"ref": "agent_session_turn:codex|session-1|2"},
+            {"ref": "gmail_email:a|blocked-message"},
+            {"ref": "gmail_email:a|safe-message"},
+        ]},
+        "context": {"rows": [
+            {"adapter": "gmail_email", "event_id": "a|blocked-message"},
+            {"adapter": "gmail_email", "event_id": "a|safe-message"},
+        ]},
+    }, tools=[{"name": "context"}, {"name": "sql"}])
+    with proxy_for(app, exclude_adapters={"agent_session_turn"},
+                   exclude_refs={"gmail_email:a|blocked-message"}, exclusion_counts=counts) as env:
+        assert "exclusion" not in json.dumps(env)
+        assert {"name": "context"} in call_proxy(env, "/api/tools")[1]["data"]
+        for ref in ["agent_session_turn:codex|session-1|2", "gmail_email:a|blocked-message"]:
+            assert call_proxy(env, "/api/tools/context", {"ref": ref})[0] == 403
+        search = call_proxy(env, "/api/tools/search", {"query": "test"})[1]["data"]
+        context = call_proxy(env, "/api/tools/context", {"ref": "gmail_email:a|safe-message"})[1]["data"]
+    assert search["rows"] == [{"ref": "gmail_email:a|safe-message"}]
+    assert context["rows"] == [{"adapter": "gmail_email", "event_id": "a|safe-message"}]
+    assert counts.snapshot() == {"search_rows_dropped": 2, "context_rows_dropped": 1,
+                                 "sql_rows_dropped": 0, "context_calls_refused": 2}
+    assert "dropped" not in json.dumps(search)
+    assert app.tool_call_paths() == ["/api/tools/search", "/api/tools/context"]
+
+
+@pytest.mark.parametrize("fmt,rows", [
+    ("json", [{"body": "contains blocked-message"}, {"nested": {"id": "session-1"}},
+              {"body": "safe"}, {"body": "also safe"}]),
+    ("csv", 'body\n"contains blocked-message\nand more"\nsession-1\n"safe\nmultiline"\nalso safe'),
+    ("ndjson", '{"body":"contains blocked-message"}\n{"id":"session-1"}\n{"body":"safe"}\n{"body":"also safe"}'),
+])
+def test_sql_exclusions_match_cells_before_capping(fake_app, fmt, rows) -> None:
+    from personal_data_warehouse.agent_tool_proxy import AgentExclusionCounts
+    counts = AgentExclusionCounts()
+    app = fake_app(responses={"sql": {"rows": rows, "format": fmt, "total_rows": 4}})
+    with proxy_for(app, max_rows=1, exclude_refs={"gmail_email:a|blocked-message", "agent_session:codex|session-1"},
+                   exclusion_counts=counts) as env:
+        data = call_proxy(env, "/api/tools/sql", {"sql": "SELECT * FROM fixture", "format": fmt})[1]["data"]
+    assert "blocked-message" not in json.dumps(data["rows"])
+    assert "session-1" not in json.dumps(data["rows"])
+    assert counts.snapshot()["sql_rows_dropped"] == 2
+    if fmt == "csv":
+        import csv
+        import io
+        assert list(csv.reader(io.StringIO(data["rows"]))) == [["body"], ["safe\nmultiline"]]
+    else:
+        assert "safe" in json.dumps(data["rows"])
+    assert data["proxy_row_limit"] == 1
+
+
+def test_sql_exclusions_do_not_match_provider_or_account_and_document_text_only_limit(fake_app) -> None:
+    app = fake_app(responses={"sql": {"rows": [
+        {"provider": "codex"}, {"account": "a"}, {"body": "text without an identifier"},
+        {"adapter": "agent_session"}, {"body": "agent_session_turn:codex|other|1"},
+    ], "format": "json"}})
+    with proxy_for(app, exclude_refs={"agent_session:codex|session-1", "gmail_email:a|message-1"},
+                   exclude_adapters={"agent_session", "agent_session_turn"}) as env:
+        data = call_proxy(env, "/api/tools/sql", {"sql": "SELECT * FROM fixture"})[1]["data"]
+    assert data["rows"] == [{"provider": "codex"}, {"account": "a"}, {"body": "text without an identifier"}]
+
+
+def test_exclusion_counts_are_exact_under_concurrent_requests(fake_app) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from personal_data_warehouse.agent_tool_proxy import AgentExclusionCounts
+
+    counts = AgentExclusionCounts()
+    app = fake_app(responses={"search": {"rows": [
+        {"ref": "gmail_email:a|m", "body": "m"},
+    ]}})
+    with proxy_for(app, exclude_refs=["gmail_email:a|m"], exclusion_counts=counts) as env:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(lambda _: call_proxy(env, "/api/tools/search", {"query": "test"}), range(12)))
+    assert all(status == 200 and payload["data"]["rows"] == [] for status, payload in responses)
+    assert counts.snapshot()["search_rows_dropped"] == 12
+
+
+def test_default_run_leaves_excludable_rows_untouched(fake_app) -> None:
+    rows = [{"ref": "agent_session:codex|session-1"}, {"ref": "gmail_email:a|message-1"}]
+    app = fake_app(responses={"search": {"rows": rows}, "sql": {"rows": rows, "format": "json"}})
+    with proxy_for(app) as env:
+        for tool in ["search", "sql"]:
+            assert call_proxy(env, "/api/tools/" + tool, {})[1]["data"]["rows"] == rows
+
+
+def test_event_exclusions_use_source_identity_not_incidental_text(fake_app) -> None:
+    rows = [
+        {"ref": "gmail_email:a|safe-message", "text": "mentions gmail_email:a|blocked-message"},
+        {"ref": "gmail_email:a|blocked-message"},
+    ]
+    app = fake_app(responses={"search": {"rows": rows}, "context": {"rows": rows}})
+    with proxy_for(app, exclude_refs=["gmail_email:a|blocked-message"]) as env:
+        for tool in ["search", "context"]:
+            data = call_proxy(env, "/api/tools/" + tool, {"ref": "gmail_email:a|safe-message"})[1]["data"]
+            assert data["rows"] == rows[:1]

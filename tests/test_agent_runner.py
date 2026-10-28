@@ -1219,3 +1219,115 @@ def test_go_build_images_pin_the_module_toolchain_patch() -> None:
     assert version is not None
     for path in ("app/Dockerfile", "docker/agent.Dockerfile"):
         assert f"FROM golang:{version.group(1)}-bookworm AS " in (root / path).read_text(), path
+
+
+def test_claude_tool_blocks_pair_by_id_and_keep_identical_calls() -> None:
+    from personal_data_warehouse.agent_runner import agent_events_from_streams, extract_tool_name, extract_tool_arguments, extract_tool_result
+    from personal_data_warehouse.apple_voice_memos_enrichment import count_warehouse_cli_calls
+
+    now = datetime.now(tz=UTC)
+    assistant = {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Research"},
+        {"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": "pdw search budget"}},
+        {"type": "tool_use", "id": "tool-b", "name": "Bash", "input": {"command": "pdw search budget"}},
+        {"type": "tool_use", "id": "tool-c", "name": "Read", "input": {"file_path": "input.json"}},
+    ]}}
+    returned = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "tool-b", "content": "second", "is_error": True},
+        {"type": "tool_result", "tool_use_id": "tool-a", "content": [{"type": "text", "text": "first"}]},
+    ]}}
+    events = agent_events_from_streams(stdout="\n".join(map(json.dumps, [assistant, returned])), stderr="", created_at=now)
+    result = AgentRunResult("run-claude", "claude", "test", "generic", "", "", "", "completed", {}, "", 0, now, now, events)
+    rows = agent_run_tool_call_rows(result)
+    assert [r["tool_name"] for r in rows] == ["pdw search", "pdw search", "Read"]
+    assert len({(r["run_id"], r["event_index"], r["tool_name"]) for r in rows}) == 3
+    assert [r["event_index"] for r in rows] == [2, 3, 4]
+    assert json.loads(rows[0]["result_json"])["output"] == "first"
+    assert json.loads(rows[1]["result_json"])["output"] == "second"
+    assert rows[1]["error"]
+    assert json.loads(rows[2]["result_json"]) == {}
+    assert json.loads(rows[0]["arguments_json"])["_pdw_trace"] == {
+        "tool_use_id": "tool-a", "source_event_index": 0, "content_block_index": 1,
+    }
+    assert count_warehouse_cli_calls(events) == 2
+    assert extract_tool_name(assistant) == "pdw search"
+    assert extract_tool_arguments(assistant) == {"command": "pdw search budget"}
+    assert extract_tool_result(returned)["output"] == "second"
+
+
+def test_provider_shell_attribution_uses_same_parser() -> None:
+    from personal_data_warehouse.agent_runner import extract_tool_name, extract_tool_arguments
+    for command, expected in [
+        ("pdw context 'gmail_email:a|m'", "pdw context"),
+        ("pdw call get_object --data '{}'", "pdw call get_object"),
+        ("PDW_VALIDATE_JSON answer.json schema.json", "pdw-validate-json"),
+        ("echo hello", "bash"),
+    ]:
+        codex = {"item": {"type": "command_execution", "command": command}}
+        claude = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "tool-a", "name": "Bash", "input": {"command": command}}
+        ]}}
+        assert extract_tool_name(codex) == extract_tool_name(claude) == expected
+        assert extract_tool_arguments(codex) == extract_tool_arguments(claude) == {"command": command}
+
+
+def test_run_with_pdw_returns_private_exclusion_counts(tmp_path, monkeypatch) -> None:
+    from tests.warehouse_app_stub import StubWarehouseApp
+    from dataclasses import replace
+
+    now = datetime.now(tz=UTC)
+    app = StubWarehouseApp(responses={"search": {"rows": [{"ref": "agent_session:codex|s1"}]}})
+    runner = ContainerAgentRunner(AgentContainerConfig(image="test", runs_dir=tmp_path,
+        tool_proxy_bind_host="127.0.0.1", tool_proxy_public_host="127.0.0.1"))
+    plain = AgentRunResult("run", "codex", "test", "generic", "", "", "", "failed", {}, "test", 1, now, now, [])
+    captured = {}
+
+    def fake_run(req):
+        captured.update(req.extra_env)
+        response = request.urlopen(request.Request(req.extra_env["PDW_API_URL"] + "/api/tools/search",
+            data=b'{"query":"test"}',
+            headers={"authorization": "Bearer " + req.extra_env["PDW_SECRET_TOKEN"]},
+            method="POST"), timeout=10)
+        with response:
+            assert json.load(response)["data"]["rows"] == []
+        return replace(plain, run_id=req.run_id)
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    try:
+        result = runner.run_with_pdw(AgentRunRequest(prompt="test", schema={}),
+            app=WarehouseAppConfig(app.base_url, "test-token"), exclude_adapters=["agent_session"])
+    finally:
+        app.close()
+    assert result.status == "failed"
+    assert result.exclusion_counts == {"search_rows_dropped": 1, "context_rows_dropped": 0,
+                                       "sql_rows_dropped": 0, "context_calls_refused": 0}
+    assert not any("exclu" in key for key in captured)
+    assert not plain.exclusion_counts
+
+
+def test_agent_resource_forwards_run_exclusions(monkeypatch) -> None:
+    from types import SimpleNamespace
+    captured = {}
+
+    def run_with_pdw(req, **kwargs):
+        captured.update(kwargs)
+        captured["provider"] = req.provider
+        return "result"
+
+    monkeypatch.setattr(AgentResource, "runner", lambda self: SimpleNamespace(run_with_pdw=run_with_pdw))
+    resource = AgentResource(docker_image="test", provider="claude")
+    assert resource.run_with_pdw(AgentRunRequest(prompt="test", schema={}),
+        exclude_refs=["gmail_email:a|m"], exclude_adapters=["agent_session"], max_rows=7) == "result"
+    assert captured == {"app": None, "provider": "claude", "max_rows": 7,
+                        "exclude_refs": ["gmail_email:a|m"], "exclude_adapters": ["agent_session"]}
+
+
+def test_unmatched_claude_result_is_not_a_call() -> None:
+    from personal_data_warehouse.agent_runner import agent_events_from_streams
+    now = datetime.now(tz=UTC)
+    events = agent_events_from_streams(stdout=json.dumps({
+        "type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "unknown", "content": "orphan"},
+        ]}}), stderr="", created_at=now)
+    result = AgentRunResult("run", "claude", "test", "generic", "", "", "", "completed", {}, "", 0, now, now, events)
+    assert agent_run_tool_call_rows(result) == []

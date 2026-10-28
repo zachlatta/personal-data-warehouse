@@ -15,6 +15,7 @@ from personal_data_warehouse.agent_runner import (
     agent_run_row,
     agent_run_tool_call_rows,
     extract_tool_name,
+    tool_call_payloads,
 )
 from personal_data_warehouse.apple_voice_memos_transcription import ASSEMBLYAI_KEYTERMS_PROMPT, voice_recording_source
 
@@ -2265,9 +2266,10 @@ def count_warehouse_cli_calls(events: Sequence[Any]) -> int:
         payload = getattr(event, "event_json", None)
         if not isinstance(payload, Mapping):
             continue
-        invocation = extract_tool_name(payload)
-        if invocation in WAREHOUSE_CLI_COMMANDS or invocation.startswith("pdw call "):
-            count += 1
+        for call in tool_call_payloads(payload):
+            invocation = extract_tool_name(call)
+            if invocation in WAREHOUSE_CLI_COMMANDS or invocation.startswith("pdw call "):
+                count += 1
     return count
 
 

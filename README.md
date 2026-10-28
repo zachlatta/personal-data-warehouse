@@ -1581,6 +1581,27 @@ Agent run metadata, streamed CLI events, and detected tool-call events are store
 tables `agent_runs`, `agent_run_events`, and `agent_run_tool_calls`. The final Voice Memos result
 still lands in `apple_voice_memos_enrichments`.
 
+Both providers use the same tool-call parser: Claude assistant `tool_use` blocks
+are paired with user-message `tool_result` blocks by `tool_use_id`. Each Claude
+call gets its own tool-row index above the run's raw event indexes, including
+identical commands in one message. Arguments carry `_pdw_trace` with the original
+event index, content-block index, and tool-use ID.
+
+`ContainerAgentRunner.run_with_pdw` and `AgentResource.run_with_pdw` accept optional
+`exclude_adapters` and `exclude_refs` collections for benchmark runs. Both default
+to empty, retaining the existing tool allowlist. Nonempty exclusions enable
+`context` for that run: excluded requests are refused before reaching the app,
+and excluded search/context rows and SQL rows with matching identifying cells
+are removed before the SQL row cap. Reference matching includes session IDs and
+Gmail message IDs, without excluding their shared provider or account.
+
+The caller receives `AgentRunResult.exclusion_counts`: `search_rows_dropped`,
+`context_rows_dropped`, `sql_rows_dropped`, and `context_calls_refused`. These
+counters never enter agent tool responses or environment variables. This is a
+benchmark guard: SQL selecting only text columns without identifying cells
+cannot be recognized by cell matching; the benchmark must detect that case
+itself from the trace.
+
 The agent integration is exposed to Dagster as an `AgentResource`. The core Docker runner remains
 plain Python for testing, while assets receive the resource and use it to start one-off containers.
 The Voice Memos enrichment asset consumes this resource by default; other assets can reuse the same
