@@ -35,15 +35,11 @@ func (t *Transport) client() *http.Client {
 func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 	a := d.Alert
 	if d.Transport == "expo" {
-		var e struct{ Token string }
+		var e struct{ Token, Platform, Capabilities string }
 		if json.Unmarshal(d.Endpoint, &e) != nil || push.ValidateToken(e.Token) != nil {
 			return Result{Status: "failed", Error: "invalid stored Expo token"}
 		}
-		m := push.Message{To: e.Token, Title: a.Title, Subtitle: a.Subtitle, Body: a.Body, Priority: "high", Sound: "default", CategoryID: push.CategoryLink, CollapseID: d.NotificationID, ThreadID: a.ThreadID, Data: map[string]any{"kind": "timeline_notification", "route": a.Route, "open": a.Open, "delivery_id": d.ID, "open_proof": a.OpenProof}}
-		if a.Icon != "" {
-			m.MutableContent = true
-			m.RichContent = &push.RichContent{Image: a.Icon}
-		}
+		m := expoMessage(e.Token, e.Platform, e.Capabilities, d)
 		raw, _ := json.Marshal(m)
 		if len(raw) > 4000 {
 			return Result{Status: "failed", Error: "notification exceeds safe APNs payload budget"}
@@ -61,6 +57,7 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 	if json.Unmarshal(d.Endpoint, &sub) != nil || !validEndpoint(sub.Endpoint) {
 		return Result{Status: "failed", Error: "invalid stored web push endpoint"}
 	}
+	a.Android = nil // the browser draws its own alert; the style is Android-native only
 	raw, err := json.Marshal(a)
 	if err != nil || len(raw) > 3800 {
 		return Result{Status: "failed", Error: "web push payload exceeds safe encrypted-payload budget"}
@@ -81,6 +78,34 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 	default:
 		return Result{Status: "failed", Error: "web push provider rejected notification"}
 	}
+}
+
+// expoMessage picks the wire shape for one device. A chat alert to an Android
+// build that draws conversations itself is data-only: an Expo message with a
+// title is delivered as an FCM notification message, which Android renders
+// itself whenever the app is in the background, so the app's code never sees
+// it. Every other alert, and every device that has not reported the
+// capability (iOS, an older Android build, a delivery queued before platform
+// was recorded), gets the ordinary alert on the high-importance channel.
+func expoMessage(token, platform, capabilities string, d Delivery) push.Message {
+	a := d.Alert
+	data := map[string]any{"kind": "timeline_notification", "route": a.Route, "open": a.Open, "delivery_id": d.ID, "open_proof": a.OpenProof}
+	if a.Android != nil && platform == "android" && push.HasCapability(capabilities, push.CapabilityAndroidMessagingStyle) {
+		style := map[string]any{}
+		raw, _ := json.Marshal(a.Android)
+		_ = json.Unmarshal(raw, &style)
+		// The title and body ride inside the style: they are also what the
+		// phone posts as a plain notification if the conversation cannot be drawn.
+		style["title"], style["body"] = a.Title, a.Body
+		data["android_style"] = style
+		return push.Message{To: token, Priority: "high", Data: data}
+	}
+	m := push.Message{To: token, Title: a.Title, Subtitle: a.Subtitle, Body: a.Body, Priority: "high", Sound: "default", CategoryID: push.CategoryLink, CollapseID: d.NotificationID, ThreadID: a.ThreadID, ChannelID: push.AndroidChannelID, Data: data}
+	if a.Icon != "" {
+		m.MutableContent = true
+		m.RichContent = &push.RichContent{Image: a.Icon}
+	}
+	return m
 }
 
 func ticketResult(ticket push.Ticket, receipt bool) Result {

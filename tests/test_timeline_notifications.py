@@ -71,6 +71,48 @@ def test_capture_carries_the_conversation_keys_the_phone_groups_by(warehouse):
     assert payload == {"thread_id": "th1", "thread_ts": "9.9", "chat_id": "c1"}
 
 
+def test_capture_carries_a_google_messages_chat_for_the_android_chat_notification(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, metadata) "
+                "VALUES ('android_message', 'pichu|m1', 'direct'::" + wh.sql_relation("timeline_priority")
+                + ", 'android_messages', '', %s::jsonb)",
+                ('{"chat_key": "rcs-group:G1", "chat_name": "Sam, Alex", "group": true, "protocol": "rcs"}',))
+    [(payload,)] = wh._query("SELECT payload->'metadata' FROM @notification_events WHERE event_id = 'pichu|m1'")
+    assert payload == {"chat_key": "rcs-group:G1", "chat_name": "Sam, Alex", "group": True}
+
+
+PUSH_DEVICES_BEFORE_CAPABILITIES = """CREATE TABLE {table} (
+    expo_push_token text PRIMARY KEY, client_name text NOT NULL DEFAULT '', device_name text NOT NULL DEFAULT '',
+    platform text NOT NULL DEFAULT '', app_version text NOT NULL DEFAULT '', status text NOT NULL DEFAULT 'active',
+    error text NOT NULL DEFAULT '', registered_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+    last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz)"""
+
+
+def test_ensure_adds_capabilities_to_a_push_device_table_created_before_it(warehouse):
+    wh = warehouse
+    table = wh.sql_relation("push_devices")
+    wh._command(f"CREATE SCHEMA IF NOT EXISTS {table.rsplit('.', 1)[0]}")
+    wh._command(PUSH_DEVICES_BEFORE_CAPABILITIES.format(table=table))
+    wh._command("INSERT INTO @push_devices (expo_push_token, platform) VALUES ('ExponentPushToken[old]', 'android')")
+    wh.ensure_upstream_mutation_tables()
+    assert wh._query("SELECT capabilities FROM @push_devices") == [("",)]
+
+
+def test_go_push_registry_upgrades_and_replaces_capabilities(warehouse):
+    wh = warehouse
+    table = wh.sql_relation("push_devices")
+    wh._command(f"CREATE SCHEMA IF NOT EXISTS {table.rsplit('.', 1)[0]}")
+    wh._command(PUSH_DEVICES_BEFORE_CAPABILITIES.format(table=table))
+    env = dict(os.environ, PDW_PUSH_TEST_URL=os.environ["POSTGRES_DATABASE_URL"], PDW_PUSH_TEST_TABLE=table)
+    result = subprocess.run(["go", "test", "./internal/push", "-run", "TestPostgresStoreCapabilities", "-count=1", "-v"],
+                            cwd=Path(__file__).resolve().parents[1] / "app", env=env, text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--- SKIP" not in result.stdout
+
+
 def test_an_old_direct_plus_cc_trigger_is_replaced_by_ensure(warehouse):
     wh = warehouse
     wh._command("DROP TRIGGER timeline_notification_insert ON @timeline_events")

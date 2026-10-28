@@ -83,6 +83,7 @@
           "color": "#208AEF"
         }
       ],
+      "./plugins/with-messaging-notifications",
       "@bacons/apple-targets",
       "expo-sharing"
     ],
@@ -94,7 +95,10 @@
       "router": {},
       "eas": {
         "projectId": "c5085048-1a90-4340-a13d-6624522b6589"
-      }
+      },
+      "pushCapabilities": [
+        "android_messaging_style"
+      ]
     },
     "owner": "zlatta",
     "runtimeVersion": {

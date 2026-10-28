@@ -9014,9 +9014,13 @@ class PostgresWarehouse:
                 registered_at timestamptz NOT NULL DEFAULT now(),
                 updated_at timestamptz NOT NULL DEFAULT now(),
                 last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
-                last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+                last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                capabilities text NOT NULL DEFAULT ''
             )
             """,
+            # What the install's native code can render (comma-separated,
+            # replaced on every registration); added to tables created before it.
+            "ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS capabilities text NOT NULL DEFAULT ''",
             "CREATE INDEX IF NOT EXISTS push_devices_status_updated_idx ON @push_devices (status, updated_at)",
         ):
             self._command(sql)

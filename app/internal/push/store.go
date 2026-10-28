@@ -28,15 +28,20 @@ const (
 
 // Device is one registered app install.
 type Device struct {
-	ExpoPushToken string    `json:"expo_push_token"`
-	ClientName    string    `json:"client_name"`
-	DeviceName    string    `json:"device_name"`
-	Platform      string    `json:"platform"`
-	AppVersion    string    `json:"app_version"`
-	Status        string    `json:"status"`
-	Error         string    `json:"error,omitempty"`
-	RegisteredAt  time.Time `json:"registered_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ExpoPushToken string `json:"expo_push_token"`
+	ClientName    string `json:"client_name"`
+	DeviceName    string `json:"device_name"`
+	Platform      string `json:"platform"`
+	AppVersion    string `json:"app_version"`
+	// Capabilities are what this install's native code can render (see
+	// CapabilityAndroidMessagingStyle). They are replaced, never merged, on
+	// every registration: a phone rolled back to an older build re-registers
+	// without them and gets the alerts that build can show.
+	Capabilities []string  `json:"capabilities"`
+	Status       string    `json:"status"`
+	Error        string    `json:"error,omitempty"`
+	RegisteredAt time.Time `json:"registered_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Store is the device registry.
@@ -64,7 +69,9 @@ func ValidateToken(token string) error {
 
 // PostgresStore is the production Store.
 type PostgresStore struct {
-	db       *sql.DB
+	db *sql.DB
+	// Expand is overridden only by integration tests with isolated schemas.
+	Expand   func(string) string
 	timeout  time.Duration
 	ensureMu sync.Mutex
 	ensured  bool
@@ -98,8 +105,11 @@ var ensureStatements = []string{
 		registered_at timestamptz NOT NULL DEFAULT now(),
 		updated_at timestamptz NOT NULL DEFAULT now(),
 		last_sent_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
-		last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz
+		last_error_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+		capabilities text NOT NULL DEFAULT ''
 	)`,
+	// CREATE TABLE IF NOT EXISTS leaves a table created before the column alone.
+	`ALTER TABLE @push_devices ADD COLUMN IF NOT EXISTS capabilities text NOT NULL DEFAULT ''`,
 	`CREATE INDEX IF NOT EXISTS push_devices_status_updated_idx ON @push_devices (status, updated_at)`,
 }
 
@@ -109,16 +119,25 @@ func (s *PostgresStore) ensure(ctx context.Context) error {
 	if s.ensured {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, createSchemaSQL); err != nil {
-		return fmt.Errorf("ensure private schema: %w", err)
+	if s.Expand == nil {
+		if _, err := s.db.ExecContext(ctx, createSchemaSQL); err != nil {
+			return fmt.Errorf("ensure private schema: %w", err)
+		}
 	}
 	for _, statement := range ensureStatements {
-		if _, err := s.db.ExecContext(ctx, warehouse.ExpandRelations(statement)); err != nil {
+		if _, err := s.db.ExecContext(ctx, s.q(statement)); err != nil {
 			return fmt.Errorf("ensure push_devices: %w", err)
 		}
 	}
 	s.ensured = true
 	return nil
+}
+
+func (s *PostgresStore) q(statement string) string {
+	if s.Expand != nil {
+		return s.Expand(statement)
+	}
+	return warehouse.ExpandRelations(statement)
 }
 
 func (s *PostgresStore) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -138,19 +157,21 @@ func (s *PostgresStore) Register(ctx context.Context, device Device, now time.Ti
 		return Device{}, err
 	}
 	now = now.UTC()
-	row := s.db.QueryRowContext(ctx, warehouse.ExpandRelations(`
-		INSERT INTO @push_devices (expo_push_token, client_name, device_name, platform, app_version, status, error, registered_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, 'active', '', $6, $6)
+	row := s.db.QueryRowContext(ctx, s.q(`
+		INSERT INTO @push_devices (expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $7, 'active', '', $6, $6)
 		ON CONFLICT (expo_push_token) DO UPDATE SET
 			client_name = EXCLUDED.client_name,
 			device_name = EXCLUDED.device_name,
 			platform = EXCLUDED.platform,
 			app_version = EXCLUDED.app_version,
+			capabilities = EXCLUDED.capabilities,
 			status = 'active',
 			error = '',
 			updated_at = EXCLUDED.updated_at
-		RETURNING expo_push_token, client_name, device_name, platform, app_version, status, error, registered_at, updated_at`),
-		strings.TrimSpace(device.ExpoPushToken), device.ClientName, device.DeviceName, device.Platform, device.AppVersion, now)
+		RETURNING expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at`),
+		strings.TrimSpace(device.ExpoPushToken), device.ClientName, device.DeviceName, device.Platform, device.AppVersion, now,
+		strings.Join(NormalizeCapabilities(device.Capabilities), ","))
 	return scanDevice(row)
 }
 
@@ -160,8 +181,8 @@ func (s *PostgresStore) ListActive(ctx context.Context) ([]Device, error) {
 	if err := s.ensure(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, warehouse.ExpandRelations(`
-		SELECT expo_push_token, client_name, device_name, platform, app_version, status, error, registered_at, updated_at
+	rows, err := s.db.QueryContext(ctx, s.q(`
+		SELECT expo_push_token, client_name, device_name, platform, app_version, capabilities, status, error, registered_at, updated_at
 		FROM @push_devices WHERE status = 'active' ORDER BY registered_at, expo_push_token`))
 	if err != nil {
 		return nil, err
@@ -181,7 +202,7 @@ func (s *PostgresStore) ListActive(ctx context.Context) ([]Device, error) {
 func (s *PostgresStore) MarkSent(ctx context.Context, token string, now time.Time) error {
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, warehouse.ExpandRelations(
+	_, err := s.db.ExecContext(ctx, s.q(
 		`UPDATE @push_devices SET last_sent_at = $2, updated_at = $2 WHERE expo_push_token = $1`), token, now.UTC())
 	return err
 }
@@ -193,7 +214,7 @@ func (s *PostgresStore) MarkFailed(ctx context.Context, token string, reason str
 	if disable {
 		status = StatusDisabled
 	}
-	_, err := s.db.ExecContext(ctx, warehouse.ExpandRelations(
+	_, err := s.db.ExecContext(ctx, s.q(
 		`UPDATE @push_devices SET error = $2, status = $3, last_error_at = $4, updated_at = $4 WHERE expo_push_token = $1`),
 		token, reason, status, now.UTC())
 	return err
@@ -203,9 +224,11 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanDevice(row scanner) (Device, error) {
 	var d Device
-	if err := row.Scan(&d.ExpoPushToken, &d.ClientName, &d.DeviceName, &d.Platform, &d.AppVersion, &d.Status, &d.Error, &d.RegisteredAt, &d.UpdatedAt); err != nil {
+	var capabilities string
+	if err := row.Scan(&d.ExpoPushToken, &d.ClientName, &d.DeviceName, &d.Platform, &d.AppVersion, &capabilities, &d.Status, &d.Error, &d.RegisteredAt, &d.UpdatedAt); err != nil {
 		return Device{}, err
 	}
+	d.Capabilities = ParseCapabilities(capabilities)
 	return d, nil
 }
 
@@ -236,6 +259,7 @@ func (m *MemoryStore) Register(_ context.Context, device Device, now time.Time) 
 		device.RegisteredAt = now
 	}
 	device.Status, device.Error, device.UpdatedAt = StatusActive, "", now
+	device.Capabilities = NormalizeCapabilities(device.Capabilities)
 	m.devices[device.ExpoPushToken] = device
 	return device, nil
 }

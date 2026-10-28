@@ -9,6 +9,7 @@ import { rememberMutationRequest, seedMutationRequestFromNotification } from './
 
 import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest } from './api';
 import type { AppConfig } from './config';
+import { pushCapabilities } from './push-capabilities';
 
 // Foreground notifications still show a banner; the default would swallow them.
 Notifications.setNotificationHandler({
@@ -36,10 +37,22 @@ function projectId(): string | undefined {
 // alert lands silently in Expo's default-importance fallback.
 export const ANDROID_CHANNEL_ID = 'default';
 
+// Chat alerts (messages, WhatsApp, Slack) are drawn as conversations by the
+// native PdwMessagingService (plugins/with-messaging-notifications.js) on
+// their own channel, so they can be tuned apart from other alerts in Android
+// settings. The service creates it too, for an alert before first launch.
+export const ANDROID_MESSAGES_CHANNEL_ID = 'messages';
+
 async function ensureAndroidChannel(): Promise<void> {
   if (Platform.OS !== 'android') return;
   await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
     name: 'Alerts',
+    importance: Notifications.AndroidImportance.HIGH,
+    showBadge: true,
+  });
+  await Notifications.setNotificationChannelAsync(ANDROID_MESSAGES_CHANNEL_ID, {
+    name: 'Messages',
+    description: 'Messages, WhatsApp and Slack, shown as conversations',
     importance: Notifications.AndroidImportance.HIGH,
     showBadge: true,
   });
@@ -73,6 +86,7 @@ export async function registerForPush(config: AppConfig): Promise<PushStatus> {
       device_name: Device.deviceName ?? `${Device.manufacturer ?? ''} ${Device.modelName ?? ''}`.trim(),
       platform: Platform.OS,
       app_version: Constants.expoConfig?.version ?? '',
+      capabilities: pushCapabilities(Constants.expoConfig?.extra, Platform.OS),
     });
     return { state: 'registered', token };
   } catch (error) {

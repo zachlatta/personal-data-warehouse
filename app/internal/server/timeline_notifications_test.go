@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTimelineNotificationSourcePresentationAndLinks(t *testing.T) {
@@ -60,6 +63,7 @@ func TestNotificationsGroupByConversationNotBySource(t *testing.T) {
 		{"gmail thread", map[string]any{"source": "gmail", "actor": "a@example.test", "source_pk": map[string]any{"account": "me", "message_id": "m2"}, "metadata": map[string]any{"thread_id": "th1"}}, "timeline:gmail:me:th1"},
 		{"gmail without thread falls back to the sender", map[string]any{"source": "gmail", "actor": "a@example.test", "source_pk": map[string]any{"account": "me", "message_id": "m3"}}, "timeline:gmail:me:from:a@example.test"},
 		{"imessage chat", map[string]any{"source": "apple_messages", "context": "Group", "source_pk": map[string]any{"account": "me", "message_id": "9"}, "metadata": map[string]any{"chat_id": "iMessage;+;chat123"}}, "timeline:apple_messages:me:iMessage;+;chat123"},
+		{"google messages chat", map[string]any{"source": "android_messages", "context": "+15555550100", "source_pk": map[string]any{"account": "me", "device": "pichu", "message_key": "content://mms/1"}, "metadata": map[string]any{"chat_key": "+15555550100"}}, "timeline:android_messages:me:+15555550100"},
 		{"whatsapp chat", map[string]any{"source": "whatsapp", "source_pk": map[string]any{"account": "me", "chat_id": "123@g.us", "message_id": "9"}}, "timeline:whatsapp:me:123@g.us"},
 		{"drive file", map[string]any{"source": "google_drive", "source_pk": map[string]any{"account": "me", "file_id": "F1"}}, "timeline:google_drive:me:F1"},
 		{"calendar by calendar", map[string]any{"source": "calendar", "context": "primary"}, "timeline:calendar:primary"},
@@ -111,5 +115,88 @@ func TestUnnamedIMessageGroupAlertNamesItsPeople(t *testing.T) {
 	}
 	if got := appleGroupContext(map[string]any{"source": "slack", "context": "#general"}, lookup); got != "#general" {
 		t.Fatalf("non-iMessage context rewritten: %q", got)
+	}
+}
+
+// Chat sources carry what Android's conversation notification needs: who
+// said it, which conversation, and for a group the group's own name.
+func TestChatAlertsCarryTheConversationForAndroid(t *testing.T) {
+	cases := []struct {
+		name, title string
+		row         map[string]any
+		group       bool
+	}{
+		{"google messages 1:1", "", map[string]any{"source": "android_messages", "actor": "Sam Example", "context": "+15555550100", "event_id": "e1",
+			"source_pk": map[string]any{"account": "me"}, "metadata": map[string]any{"chat_key": "+15555550100", "chat_name": "Sam Example", "group": false}}, false},
+		{"google messages group", "Sam, Alex", map[string]any{"source": "android_messages", "actor": "Sam Example", "context": "rcs-group:G1", "event_id": "e2",
+			"source_pk": map[string]any{"account": "me"}, "metadata": map[string]any{"chat_key": "rcs-group:G1", "chat_name": "Sam, Alex", "group": true}}, true},
+		{"google messages group with no name", "Messages group", map[string]any{"source": "android_messages", "actor": "Sam", "context": "rcs-group:G2",
+			"source_pk": map[string]any{"account": "me"}, "metadata": map[string]any{"chat_key": "rcs-group:G2", "group": true}}, true},
+		{"imessage group", "Dinner crew", map[string]any{"source": "apple_messages", "actor": "Sam", "context": "Dinner crew",
+			"source_pk": map[string]any{"account": "me"}, "metadata": map[string]any{"chat_id": "any;+;chat1"}}, true},
+		{"whatsapp group", "Book club", map[string]any{"source": "whatsapp", "actor": "Sam", "context": "Book club", "source_pk": map[string]any{"account": "me", "chat_id": "1-2@g.us"}}, true},
+		{"slack dm", "", map[string]any{"source": "slack", "actor": "Sam", "context": "Sam", "source_pk": map[string]any{"team_id": "T1", "conversation_id": "D1"}}, false},
+		{"slack channel", "#project", map[string]any{"source": "slack", "actor": "Sam", "context": "#project", "source_pk": map[string]any{"team_id": "T1", "conversation_id": "C1"}}, true},
+	}
+	for _, tc := range cases {
+		a := renderTimelineNotification(tc.row, "", timelineLinkEnv{})
+		s := a.Android
+		if s == nil {
+			t.Errorf("%s: no chat style", tc.name)
+			continue
+		}
+		if s.Group != tc.group || s.ConversationTitle != tc.title || s.ConversationID != a.ThreadID || s.SenderName != a.Title || s.Source == "" {
+			t.Errorf("%s: %+v", tc.name, s)
+		}
+	}
+	if renderTimelineNotification(map[string]any{"source": "gmail", "actor": "Sam"}, "", timelineLinkEnv{}).Android != nil {
+		t.Fatal("an email is not a chat")
+	}
+	if a := renderTimelineNotification(map[string]any{"source": "android_messages", "actor": "Sam"}, "https://pdw.example", timelineLinkEnv{}); !strings.HasSuffix(a.Icon, "/messages.png") || !strings.HasPrefix(a.Subtitle, "Messages") {
+		t.Fatalf("google messages branding: %+v", a)
+	}
+}
+
+// The avatar lookup runs while the worker holds the outbox row: a failing,
+// empty, non-https or hung lookup leaves the initial avatar and never holds
+// the alert past its timeout.
+func TestAvatarLookupNeverDelaysOrDropsAnAlert(t *testing.T) {
+	row := map[string]any{"source": "apple_messages", "actor": "Sam", "snippet": "Hi"}
+	alert := renderTimelineNotification(row, "", timelineLinkEnv{})
+	found := func(url string, err error) avatarLookup {
+		return func(context.Context, map[string]any) (string, error) { return url, err }
+	}
+	if got := withAvatar(alert, row, found("https://photos.example/sam.jpg", nil), time.Second); got.Android.AvatarURL != "https://photos.example/sam.jpg" {
+		t.Fatalf("avatar not attached: %+v", got.Android)
+	}
+	if alert.Android.AvatarURL != "" {
+		t.Fatal("withAvatar mutated the alert it was given")
+	}
+	for name, lookup := range map[string]avatarLookup{
+		"error":     found("https://photos.example/sam.jpg", errors.New("db down")),
+		"not https": found("http://photos.example/sam.jpg", nil),
+		"empty":     found("", nil),
+		"hung": func(context.Context, map[string]any) (string, error) {
+			time.Sleep(2 * time.Second)
+			return "https://photos.example/late.jpg", nil
+		},
+	} {
+		start := time.Now()
+		got := withAvatar(alert, row, lookup, 50*time.Millisecond)
+		if got.Android == nil || got.Android.AvatarURL != "" || got.Title != "Sam" || time.Since(start) > time.Second {
+			t.Errorf("%s: %+v after %s", name, got.Android, time.Since(start))
+		}
+	}
+	plain := renderTimelineNotification(map[string]any{"source": "gmail", "actor": "Sam"}, "", timelineLinkEnv{})
+	if got := withAvatar(plain, row, found("https://photos.example/sam.jpg", nil), time.Second); got.Android != nil {
+		t.Fatal("a non-chat alert gained a chat style")
+	}
+}
+
+func TestNotificationPhoneDigitsMatchContactPoints(t *testing.T) {
+	for in, want := range map[string]string{"+1 (555) 555-0100": "15555550100", "5555550100": "15555550100", "+447700900123": "447700900123", "Sam": "", "12345": ""} {
+		if got := notificationPhoneDigits(in); got != want {
+			t.Errorf("%q: %q, want %q", in, got, want)
+		}
 	}
 }

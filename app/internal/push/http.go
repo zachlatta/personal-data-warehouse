@@ -47,6 +47,9 @@ type registerRequest struct {
 	DeviceName    string `json:"device_name"`
 	Platform      string `json:"platform"`
 	AppVersion    string `json:"app_version"`
+	// Capabilities is what the build's native code can render; omitted by
+	// every build before android_messaging_style, which clears it.
+	Capabilities []string `json:"capabilities"`
 }
 
 func (h *Handler) Register(mux *http.ServeMux, requireAuth func(http.Handler) http.Handler) {
@@ -76,6 +79,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		DeviceName:    strings.TrimSpace(input.DeviceName),
 		Platform:      strings.TrimSpace(input.Platform),
 		AppVersion:    strings.TrimSpace(input.AppVersion),
+		Capabilities:  input.Capabilities,
 	}, h.now())
 	if err != nil {
 		if errors.Is(err, ErrInvalidToken) {
@@ -86,7 +90,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not register device")
 		return
 	}
-	h.logger.InfoContext(r.Context(), "push device registered", "client", device.ClientName, "device", device.DeviceName, "platform", device.Platform)
+	h.logger.InfoContext(r.Context(), "push device registered", "client", device.ClientName, "device", device.DeviceName, "platform", device.Platform, "capabilities", strings.Join(device.Capabilities, ","))
 	writeJSON(w, http.StatusOK, map[string]any{"device": device})
 }
 

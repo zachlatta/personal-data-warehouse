@@ -30,6 +30,32 @@ type Alert struct {
 	NotificationID string         `json:"notification_id"`
 	DeliveryID     string         `json:"delivery_id"`
 	OpenProof      string         `json:"open_proof"`
+	// Android is set for chat alerts (messages, WhatsApp, Slack). An Android
+	// device that reports push.CapabilityAndroidMessagingStyle is sent it as a
+	// data-only push its native code draws as a conversation; every other
+	// device gets the ordinary alert and ignores it.
+	Android *AndroidStyle `json:"android_style,omitempty"`
+}
+
+// AndroidStyle is what NotificationCompat.MessagingStyle needs and the plain
+// alert does not carry. Its JSON is the contract with PdwMessagingService
+// (mobile/plugins/with-messaging-notifications.js).
+type AndroidStyle struct {
+	// Source names the app the message came from ("Messages", "Slack"); the
+	// phone shows it in the notification header, where Expo's dropped
+	// subtitle used to carry it.
+	Source string `json:"source"`
+	// ConversationID is the alert's thread id: one notification, and one
+	// conversation shortcut, per chat.
+	ConversationID    string `json:"conversation_id"`
+	ConversationTitle string `json:"conversation_title,omitempty"`
+	Group             bool   `json:"group"`
+	SenderName        string `json:"sender_name"`
+	SenderKey         string `json:"sender_key"`
+	// AvatarURL is an https photo of the sender, or empty for an initial.
+	AvatarURL string `json:"avatar_url,omitempty"`
+	// EventID keeps a redelivered message from being added to a chat twice.
+	EventID string `json:"event_id"`
 }
 
 type Delivery struct {
@@ -213,7 +239,7 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	}
 	alert := s.Render(row)
 	alert.NotificationID = id
-	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token) FROM @push_devices WHERE status='active'
+	rows, err := tx.QueryContext(ctx, s.q(`SELECT 'expo', expo_push_token, jsonb_build_object('token',expo_push_token,'platform',platform,'capabilities',capabilities) FROM @push_devices WHERE status='active'
  UNION ALL SELECT 'web', id, subscription FROM @web_push_devices WHERE status='active'`))
 	if err != nil {
 		return false, err

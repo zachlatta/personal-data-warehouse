@@ -300,13 +300,14 @@ export type PushDevice = {
   device_name: string;
   platform: string;
   app_version: string;
+  capabilities?: string[];
   status: string;
   registered_at: string;
 };
 
 export async function registerPushDevice(
   config: AppConfig,
-  input: { expo_push_token: string; device_name: string; platform: string; app_version: string },
+  input: { expo_push_token: string; device_name: string; platform: string; app_version: string; capabilities: string[] },
 ): Promise<PushDevice> {
   const body = await request<{ device: PushDevice }>(config, '/api/push/register', {
     method: 'POST',

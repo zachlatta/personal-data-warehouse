@@ -164,7 +164,28 @@ break from a Mac that only ever runs the iOS simulator:
   new APK, not over the air. Every alert goes to the `default` channel the
   app creates at high importance (`ANDROID_CHANNEL_ID` here,
   `AndroidChannelID` in `app/internal/push`); without it an alert lands
-  silently in Expo's default-importance fallback channel.
+  silently in Firebase's "Miscellaneous" fallback channel.
+
+- **Chat alerts are drawn natively, as conversations.** A message, WhatsApp
+  or Slack alert looks like Google Messages' own: the sender as a person
+  (contact photo, or a coloured initial), one notification per chat that
+  stacks its messages, a conversation shortcut so it sits in the shade's
+  Conversations section, on the `messages` channel ("Messages"). Expo cannot
+  express that, and an Expo push with a title is an FCM *notification*
+  message that Android draws itself while the app is in the background,
+  without running app code. So `plugins/with-messaging-notifications.js`
+  replaces expo-notifications' FCM service with `PdwMessagingService`, and the
+  server sends a chat alert to it as a **data-only** push carrying
+  `android_style` (`AndroidStyle` in `app/internal/notifications/worker.go`).
+  Only to a device that registered `capabilities: ["android_messaging_style"]`
+  (`app.json` `extra.pushCapabilities`, sent by `src/lib/push.ts`): an older
+  build would receive the same push and show nothing. Registration replaces
+  the list, so a phone rolled back to an older build stops getting data-only
+  alerts the next time it launches. Every other push goes to Expo unchanged;
+  a chat alert that cannot be drawn is posted plain (same words, same tap),
+  and a tap goes through Expo's response intent, so `handleNotificationResponse`
+  is the same for both. Check a phone with `base_android_notifications.events`:
+  channel `messages`, category `msg`, `is_conversation = 1`.
 
 - **PDW web links open in the app** (Android App Links). The intent filter in
   `app.json` claims `https://personal-data-warehouse.zachlatta.com` under

@@ -71,10 +71,15 @@ CAPTURE_FUNCTION_SQL = """CREATE OR REPLACE FUNCTION @capture_timeline_notificat
                     'snippet',left(NEW.snippet,800),'context',left(NEW.context,200),
                     'recurring_event_id',COALESCE(NEW.metadata->>'recurring_event_id',''),
                     -- The keys the phone groups alerts under: a Slack thread, an
-                    -- iMessage chat, a Gmail thread.
-                    'metadata',jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
+                    -- iMessage chat, a Gmail thread, a Google Messages chat (with
+                    -- its name and whether it is a group, which the Android chat
+                    -- notification shows).
+                    'metadata',jsonb_strip_nulls(jsonb_build_object('thread_ts',NEW.metadata->>'thread_ts',
                                                   'chat_id',NEW.metadata->>'chat_id',
-                                                  'thread_id',NEW.metadata->>'thread_id')))
+                                                  'thread_id',NEW.metadata->>'thread_id',
+                                                  'chat_key',NEW.metadata->>'chat_key',
+                                                  'chat_name',NEW.metadata->>'chat_name',
+                                                  'group',NEW.metadata->'group'))))
             ON CONFLICT (adapter, event_id) DO NOTHING;
         END IF;
         RETURN NEW;

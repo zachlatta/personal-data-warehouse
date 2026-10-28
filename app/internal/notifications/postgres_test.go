@@ -76,6 +76,11 @@ func TestPostgresNotifications(t *testing.T) {
 		t.Fatal("duplicate delivery")
 	}
 	d := sender.sent[0]
+	// The sender picks the wire shape from the device, so the fan-out carries it.
+	var endpoint map[string]any
+	if json.Unmarshal(d.Endpoint, &endpoint) != nil || endpoint["platform"] == nil || endpoint["capabilities"] == nil {
+		t.Fatalf("fan-out endpoint lacks the device's platform and capabilities: %s", d.Endpoint)
+	}
 	if d.Alert.DeliveryID != d.ID || !s.validProof(d.ID, d.Alert.OpenProof) {
 		t.Fatal("missing open proof")
 	}

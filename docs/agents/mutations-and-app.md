@@ -251,6 +251,21 @@ from the payload; a build without it shows the same push as text, and changing i
 native build, not an OTA update. Settings → "Send test push" sends an image + subtitle +
 Open button, which is how a phone proves the extension is installed.
 
+**On Android a chat alert is a data-only push the app draws as a conversation.** Since
+2026-10-28, a timeline alert from `android_messages`, `apple_messages`, `whatsapp` or `slack`
+carries `Alert.Android` (`AndroidStyle`: sender, conversation id and title, group, an
+`avatar_url` from a non-placeholder contact photo or the Slack profile, the event id), and
+`Transport.Send` (`app/internal/notifications/sender.go`) picks the wire shape per device from
+the delivery endpoint, which the fan-out fills from `push_devices.platform` and
+`push_devices.capabilities`: an Android device that registered `android_messaging_style` gets
+a data-only Expo message (no title, so FCM hands it to the app instead of drawing it in the
+"Miscellaneous" fallback channel), everything else gets the ordinary alert on the `default`
+channel. `capabilities` is declared in both ensure paths (`store.go`, `postgres.py`) with an
+`ADD COLUMN IF NOT EXISTS`, and every registration replaces it. The avatar lookup runs in the
+worker's `Render` under a one-second bound (`withAvatar`); a slow or failed lookup means an
+initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
+see `mobile/README.md`.
+
 ## Writing to Apple Notes (apple_notes mutations)
 
 Apple Notes is the first **write-back** source that reviewed mutations reach. Everything
