@@ -15,8 +15,7 @@ import { slackSendMessageReview, type SlackSendContextMessage } from '@/lib/muta
 // One message of the thread or conversation the proposed message lands in.
 // The parent being replied to is highlighted, and every row opens in Slack:
 // the honest answer to "send this?" is often "let me read the thread first".
-function ContextRow({ message }: { message: SlackSendContextMessage }) {
-  const theme = useTheme();
+function ContextRow({ message, surface }: { message: SlackSendContextMessage; surface: string }) {
   const body = (
     <>
       <Avatar name={message.actorName} url={message.avatarUrl} size={32} highlight={message.isThreadParent} />
@@ -31,7 +30,7 @@ function ContextRow({ message }: { message: SlackSendContextMessage }) {
       {message.open ? <OpenInSourceButton link={message.open} compact /> : null}
     </>
   );
-  const style = [styles.message, { backgroundColor: theme.background }, message.isThreadParent && styles.messageParent];
+  const style = [styles.message, { backgroundColor: surface }, message.isThreadParent && styles.messageParent];
   const link = message.open;
   if (!link) return <View style={style}>{body}</View>;
   return (
@@ -65,6 +64,7 @@ export function SlackSendMessageCard({
   onPendingChange,
   requestReason,
   locked,
+  alone,
 }: {
   mutation: Mutation;
   pending?: boolean;
@@ -76,8 +76,13 @@ export function SlackSendMessageCard({
   requestReason?: string;
   // The screen's scroll lock: not focusable while the page moves.
   locked?: boolean;
+  // The request's only message: drawn on the page itself, not as a card on
+  // it, so the draft gets the screen's full width.
+  alone?: boolean;
 }) {
   const theme = useTheme();
+  // What sits on the card, or on the page when there is no card.
+  const surface = alone ? theme.backgroundElement : theme.background;
   const review = useMemo(() => slackSendMessageReview(mutation), [mutation]);
   const pending = requestPending && mutation.status === 'pending_review';
   const editable = pending && !!onSave;
@@ -127,7 +132,7 @@ export function SlackSendMessageCard({
     : review.conversationType === 'private_channel' ? '◈'
       : review.conversationType === 'mpim' ? '◎' : '@';
   return (
-    <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
+    <View style={[styles.card, alone ? styles.cardAlone : { backgroundColor: theme.backgroundElement }]}>
       <View style={styles.header}>
         {review.avatarUrl && (review.delivery === 'dm' || review.conversationType === 'im') ? (
           <Avatar name={review.recipientLabel || icon} url={review.avatarUrl} size={30} />
@@ -146,11 +151,17 @@ export function SlackSendMessageCard({
         {review.open ? <OpenInSourceButton link={review.open} compact /> : null}
       </View>
 
-      <View style={[styles.action, { backgroundColor: theme.backgroundSelected }]}>
-        <ThemedText type="smallBold" style={styles.accent}>WHAT WILL HAPPEN</ThemedText>
-        <ThemedText type="small">{review.effect}</ThemedText>
-        {review.verified ? <ThemedText type="small" themeColor="textSecondary">Recipient found in the warehouse.</ThemedText> : null}
-      </View>
+      {alone ? (
+        <ThemedText type="small" themeColor="textSecondary">
+          {review.effect}{review.verified ? ' Recipient found in the warehouse.' : ''}
+        </ThemedText>
+      ) : (
+        <View style={[styles.action, { backgroundColor: theme.backgroundSelected }]}>
+          <ThemedText type="smallBold" style={styles.accent}>WHAT WILL HAPPEN</ThemedText>
+          <ThemedText type="small">{review.effect}</ThemedText>
+          {review.verified ? <ThemedText type="small" themeColor="textSecondary">Recipient found in the warehouse.</ThemedText> : null}
+        </View>
+      )}
       {review.warnings.map((warning) => (
         <View key={warning} style={styles.warning}><ThemedText type="small" style={styles.error}>{warning}</ThemedText></View>
       ))}
@@ -162,7 +173,7 @@ export function SlackSendMessageCard({
             <ThemedText type="small" themeColor="textSecondary">{review.messages.length} message{review.messages.length === 1 ? '' : 's'}</ThemedText>
           </View>
           <View style={styles.transcript}>
-            {review.messages.map((message, index) => <ContextRow key={`${message.messageTs}-${index}`} message={message} />)}
+            {review.messages.map((message, index) => <ContextRow key={`${message.messageTs}-${index}`} message={message} surface={surface} />)}
           </View>
         </View>
       ) : null}
@@ -184,7 +195,7 @@ export function SlackSendMessageCard({
               autoCapitalize="sentences"
               autoCorrect
               maxLength={SLACK_TEXT_MAX}
-              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? '#E0A05C' : '#8A878444' }]}
+              style={[styles.input, { color: theme.text, backgroundColor: surface, borderColor: dirty ? '#E0A05C' : '#8A878444' }]}
             />
             <ComposeMeta
               hint={dirty ? 'Edited. Send saves it first.' : saved ? 'Saved. Send sends this text.' : 'Slack formatting: *bold*, _italic_, <@U…> mentions.'}
@@ -197,7 +208,7 @@ export function SlackSendMessageCard({
             {error ? <ThemedText type="small" style={styles.error}>{error}</ThemedText> : null}
           </>
         ) : (
-          <View style={[styles.bubble, { backgroundColor: theme.background }]}>
+          <View style={[styles.bubble, { backgroundColor: surface }]}>
             <ThemedText selectable>{review.text || '(no text)'}</ThemedText>
           </View>
         )}
@@ -230,7 +241,8 @@ export function SlackSendMessageCard({
 }
 
 const styles = StyleSheet.create({
-  card: { marginHorizontal: Spacing.three, borderRadius: 12, padding: 10, gap: Spacing.two },
+  card: { borderRadius: 12, padding: 10, gap: Spacing.two },
+  cardAlone: { padding: 0, gap: Spacing.three },
   header: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   kindIcon: { width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: '#E0A05C1A' },
   headerCopy: { flex: 1, minWidth: 0, gap: 2 },

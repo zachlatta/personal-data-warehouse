@@ -26,6 +26,7 @@ export function TextMessageCard({
   onPendingChange,
   requestReason,
   locked,
+  alone,
 }: {
   mutation: Mutation;
   pending?: boolean;
@@ -37,8 +38,13 @@ export function TextMessageCard({
   requestReason?: string;
   // The screen's scroll lock: not focusable while the page moves.
   locked?: boolean;
+  // The request's only message: drawn on the page itself, not as a card on
+  // it, so the draft gets the screen's full width.
+  alone?: boolean;
 }) {
   const theme = useTheme();
+  // What sits on the card, or on the page when there is no card.
+  const surface = alone ? theme.backgroundElement : theme.background;
   const review = useMemo(() => textMessageReview(mutation), [mutation]);
   const pending = requestPending && mutation.status === 'pending_review';
   const editable = pending && !!onSave;
@@ -82,7 +88,7 @@ export function TextMessageCard({
     }
   };
   return (
-    <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
+    <View style={[styles.card, alone ? styles.cardAlone : { backgroundColor: theme.backgroundElement }]}>
       <View style={styles.header}>
         <Avatar name={review.recipientName || review.recipient} size={30} />
         <View style={styles.headerCopy}>
@@ -93,10 +99,14 @@ export function TextMessageCard({
         </View>
       </View>
 
-      <View style={[styles.action, { backgroundColor: theme.backgroundSelected }]}>
-        <ThemedText type="smallBold" style={styles.accent}>WHAT WILL HAPPEN</ThemedText>
-        <ThemedText type="small">{review.effect}</ThemedText>
-      </View>
+      {alone ? (
+        <ThemedText type="small" themeColor="textSecondary">{review.effect}</ThemedText>
+      ) : (
+        <View style={[styles.action, { backgroundColor: theme.backgroundSelected }]}>
+          <ThemedText type="smallBold" style={styles.accent}>WHAT WILL HAPPEN</ThemedText>
+          <ThemedText type="small">{review.effect}</ThemedText>
+        </View>
+      )}
       {review.warnings.map((warning) => (
         <View key={warning} style={styles.warning}><ThemedText type="small" style={styles.error}>{warning}</ThemedText></View>
       ))}
@@ -106,7 +116,7 @@ export function TextMessageCard({
           <ThemedText type="smallBold" themeColor="textSecondary">LATEST MESSAGES</ThemedText>
           {review.recent.map((message, index) => (
             <View key={`${message.at}-${index}`} style={[styles.bubbleRow, message.isFromMe && styles.bubbleRowMine]}>
-              <View style={[styles.bubble, { backgroundColor: message.isFromMe ? theme.backgroundSelected : theme.background }]}>
+              <View style={[styles.bubble, { backgroundColor: message.isFromMe ? theme.backgroundSelected : surface }]}>
                 <ThemedText type="small">{message.text}</ThemedText>
                 <ThemedText type="small" themeColor="textSecondary" style={styles.when}>{message.actor} · {formatWhen(message.at)}</ThemedText>
               </View>
@@ -132,7 +142,7 @@ export function TextMessageCard({
               autoCapitalize="sentences"
               autoCorrect
               maxLength={TEXT_MAX}
-              style={[styles.input, { color: theme.text, backgroundColor: theme.background, borderColor: dirty ? Palette.warning : '#8A878444' }]}
+              style={[styles.input, { color: theme.text, backgroundColor: surface, borderColor: dirty ? Palette.warning : '#8A878444' }]}
             />
             <ComposeMeta
               hint={saved && !dirty ? 'Saved. Send sends this text.' : dirty ? 'Edited. Send saves it first.' : 'Tap to edit before sending.'}
@@ -145,7 +155,7 @@ export function TextMessageCard({
             {error ? <ThemedText type="small" style={styles.error}>{error}</ThemedText> : null}
           </>
         ) : (
-          <View style={[styles.bubble, styles.finalBubble, { backgroundColor: theme.background }]}>
+          <View style={[styles.bubble, styles.finalBubble, { backgroundColor: surface }]}>
             <ThemedText selectable>{review.text || '(no text)'}</ThemedText>
           </View>
         )}
@@ -162,7 +172,8 @@ export function TextMessageCard({
 }
 
 const styles = StyleSheet.create({
-  card: { marginHorizontal: Spacing.three, borderRadius: 12, padding: 10, gap: Spacing.two },
+  card: { borderRadius: 12, padding: 10, gap: Spacing.two },
+  cardAlone: { padding: 0, gap: Spacing.three },
   header: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   headerCopy: { flex: 1, minWidth: 0, gap: 2 },
   accent: { color: Palette.warning, letterSpacing: 0.8 },

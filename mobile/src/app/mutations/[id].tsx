@@ -53,6 +53,8 @@ import {
 } from '@/lib/mutation-review';
 import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
 import { nextPendingRequestId, pendingReviewCount } from '@/lib/review-queue';
+import { markReviewOpen, takeReviewPaint } from '@/lib/review-paint';
+import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
 import { confirm } from '@/lib/haptics';
@@ -92,8 +94,8 @@ function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, o
   const theme = useTheme();
   if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
-  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} />;
-  if (isTextMessageSendMutation(mutation)) return <TextMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveTextMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'text', input } : null)} requestReason={requestReason} locked={locked} />;
+  if (isSlackSendMessageMutation(mutation)) return <SlackSendMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveSlackMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'slack', input } : null)} requestReason={requestReason} locked={locked} alone={alone} />;
+  if (isTextMessageSendMutation(mutation)) return <TextMessageCard mutation={mutation} pending={pending} busy={busy} onSave={onSaveTextMessage} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'text', input } : null)} requestReason={requestReason} locked={locked} alone={alone} />;
   if (isGmailSettingsMutation(mutation)) return <GmailSettingsCard mutation={mutation} requestReason={requestReason} />;
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
@@ -178,7 +180,9 @@ function RequestOverview({
   const [reasonOpen, setReasonOpen] = useState(false);
   return (
     <View style={[styles.overview, flush && styles.overviewFlush]}>
-      <View style={[styles.hero, { backgroundColor: theme.backgroundElement }]}>
+      {/* Above one message the header is the page's own title, not a card:
+          Superhuman's one surface, a rule under it instead of a box. */}
+      <View style={flush ? [styles.heroFlush, { borderBottomColor: theme.separator }] : [styles.hero, { backgroundColor: theme.backgroundElement }]}>
         <View style={styles.heroCopy}>
           <View style={styles.heroEyebrow}>
             <ThemedText type="small" themeColor="textSecondary">{requestKindLabel(mutations).toUpperCase()}</ThemedText>
@@ -361,6 +365,27 @@ export default function MutationRequestScreen() {
     };
   }, [config, id]);
 
+  // Tap to first paint, once per review: the first frame this request is on
+  // screen with its messages (or as a header alone, when it has none). The
+  // mark says how it was opened and whether it painted from what the phone
+  // already held; a review opened any other way records nothing.
+  const painted = request?.id === id && ((request?.mutations?.length ?? 0) > 0 || request?.mutation_count === 0);
+  const [firstSeen, setFirstSeen] = useState({ id, cached: painted });
+  if (firstSeen.id !== id) setFirstSeen({ id, cached: painted });
+  const cached = firstSeen.cached;
+  useEffect(() => {
+    if (!painted || !id) return;
+    const frame = requestAnimationFrame(() => {
+      const paint = takeReviewPaint(id);
+      if (!paint) return;
+      // A review opened from an alert may come before the Feed tab has ever
+      // mounted: connect the event log here too, so the timing is sent.
+      connectFeedLogger(config);
+      recordUi('review_paint', { dwell_ms: Math.round(paint.ms), metadata: { via: paint.via, cached } });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [painted, id, cached, config]);
+
   // Read the next request in the queue while this one is being reviewed, so
   // the screen a decision lands on paints at once instead of on a spinner.
   const status = request?.status;
@@ -394,8 +419,10 @@ export default function MutationRequestScreen() {
       }
     }
     const next = nextPendingRequestId(list, target.id, decisions.decidedRequestIds());
-    if (next) router.replace({ pathname: '/mutations/[id]', params: { id: next } });
-    else if (router.canGoBack()) router.back();
+    if (next) {
+      markReviewOpen(next, 'next');
+      router.replace({ pathname: '/mutations/[id]', params: { id: next } });
+    } else if (router.canGoBack()) router.back();
     else router.replace('/mutations');
   };
 
@@ -562,7 +589,7 @@ export default function MutationRequestScreen() {
           title: remaining ? `${remaining} to review` : requestStatusTitle(request.status),
           headerRight: skipTo
             ? () => (
-                <Pressable accessibilityRole="button" accessibilityLabel="Skip to the next request" hitSlop={8} onPress={() => router.replace({ pathname: '/mutations/[id]', params: { id: skipTo } })}>
+                <Pressable accessibilityRole="button" accessibilityLabel="Skip to the next request" hitSlop={8} onPress={() => { markReviewOpen(skipTo, 'skip'); router.replace({ pathname: '/mutations/[id]', params: { id: skipTo } }); }}>
                   <ThemedText type="smallBold" style={{ color: colorScheme === 'dark' ? '#93C5FD' : '#1D4ED8' }}>Skip</ThemedText>
                 </Pressable>
               )
@@ -572,7 +599,9 @@ export default function MutationRequestScreen() {
       <UndoBar
         bottom={pending ? 50 + Spacing.two + Spacing.three * 2 + insets.bottom : Spacing.three + insets.bottom}
         onOpen={(undone) => {
-          if (undone.requestId !== id) router.replace({ pathname: '/mutations/[id]', params: { id: undone.requestId } });
+          if (undone.requestId === id) return;
+          markReviewOpen(undone.requestId, 'undo');
+          router.replace({ pathname: '/mutations/[id]', params: { id: undone.requestId } });
         }}
       />
       <View
@@ -730,6 +759,7 @@ const styles = StyleSheet.create({
   overview: { padding: Spacing.three, gap: Spacing.two },
   overviewFlush: { padding: 0 },
   hero: { flexDirection: 'row', gap: 12, borderRadius: 14, padding: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#E0A05C44' },
+  heroFlush: { flexDirection: 'row', paddingBottom: Spacing.three, borderBottomWidth: StyleSheet.hairlineWidth },
   heroCopy: { flex: 1, minWidth: 0, gap: 4 },
   heroEyebrow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 7 },
   requestTitle: { fontSize: 21, lineHeight: 26 },

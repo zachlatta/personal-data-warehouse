@@ -8,6 +8,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { Colors } from '@/constants/theme';
 import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
+import { markReviewOpen } from '@/lib/review-paint';
 import { decisions } from '@/lib/undo-decision';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
@@ -67,6 +68,8 @@ function Root() {
       const key = `${response.notification.request.identifier}:${response.actionIdentifier}`;
       if (handled.current.has(key)) return;
       handled.current.add(key);
+      const requestId = response.notification.request.content.data?.request_id;
+      if (response.actionIdentifier === Notifications.DEFAULT_ACTION_IDENTIFIER && typeof requestId === 'string') markReviewOpen(requestId, 'notification');
       try {
         const outcome = await handleNotificationResponse(config, response);
         if (cancelled) return;

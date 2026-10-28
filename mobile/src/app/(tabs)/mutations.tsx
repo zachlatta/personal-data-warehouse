@@ -9,12 +9,30 @@ import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { listMutationRequests, type MutationRequest } from '@/lib/api';
-import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
+import { getMutationRequest, listMutationRequests, type MutationRequest } from '@/lib/api';
+import type { AppConfig } from '@/lib/config';
+import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
 import { formatWhen } from '@/lib/format';
+import { markReviewOpen } from '@/lib/review-paint';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
+
+// The list's rows carry no messages, so a review opened from it used to wait
+// on a spinner for its own read. Superhuman preloads threads before you open
+// them: the first few requests waiting on review are read in full as the list
+// lands, and any other row as a finger touches it.
+const PREFETCH_PENDING = 5;
+const reading = new Set<string>();
+
+function prefetchRequest(config: AppConfig, id: string) {
+  if (reading.has(id) || peekMutationRequest(id)?.mutations) return;
+  reading.add(id);
+  getMutationRequest(config, id)
+    .then(rememberMutationRequest)
+    .catch(() => undefined)
+    .finally(() => reading.delete(id));
+}
 
 export default function MutationsScreen() {
   const tabSpace = useTabBarSpace();
@@ -30,7 +48,9 @@ export default function MutationsScreen() {
     setRefreshing(true);
     setError(null);
     try {
-      setRequests(rememberMutationRequests(await listMutationRequests(config)));
+      const list = rememberMutationRequests(await listMutationRequests(config));
+      setRequests(list);
+      for (const row of list.filter((item) => item.status === 'pending_review').slice(0, PREFETCH_PENDING)) prefetchRequest(config, row.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -105,12 +125,19 @@ export default function MutationsScreen() {
               { text: item.status.replace(/_/g, ' '), color: STATUS_COLORS[item.status] },
               { text: `${item.mutation_count} mutation${item.mutation_count === 1 ? '' : 's'}` },
             ]}
-            onPress={() => router.push({ pathname: '/mutations/[id]', params: { id: item.id } })}
+            onPressIn={() => prefetchRequest(config, item.id)}
+            onPress={() => {
+              markReviewOpen(item.id, 'list');
+              router.push({ pathname: '/mutations/[id]', params: { id: item.id } });
+            }}
           />
         )}
       />
       {/* After the list, so the toast draws above the rows it floats over. */}
-      <UndoBar bottom={tabSpace + 8} onOpen={(undone) => router.push({ pathname: '/mutations/[id]', params: { id: undone.requestId } })} />
+      <UndoBar bottom={tabSpace + 8} onOpen={(undone) => {
+        markReviewOpen(undone.requestId, 'undo');
+        router.push({ pathname: '/mutations/[id]', params: { id: undone.requestId } });
+      }} />
     </ThemedView>
   );
 }
