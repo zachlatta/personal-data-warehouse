@@ -132,3 +132,32 @@ func TestPostgresStoreRedeemsABootstrapCodeExactlyOnce(t *testing.T) {
 		t.Fatal("agent token outlived its ttl")
 	}
 }
+
+func TestPostgresStoreKeepsOAuthGrants(t *testing.T) {
+	svc, store, c := postgresService(t)
+	ctx := context.Background()
+	id, err := svc.CreateOAuthGrant(ctx, "pg-connector")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := "pglegacy" + strings.ToLower(id[:8])
+	for i := 0; i < 2; i++ {
+		if err := svc.EnsureOAuthGrant(ctx, legacy, "pg-connector"); err != nil {
+			t.Fatalf("ensure %d: %v", i, err)
+		}
+	}
+	got, _, err := store.Get(ctx, id)
+	if err != nil || got.Kind != KindOAuth || got.Scope != pdwauth.ScopeOAuthQuery || got.IdleTimeout != OAuthGrantIdleTimeout {
+		t.Fatalf("round trip = %+v, %v", got, err)
+	}
+	c.Advance(2 * time.Minute)
+	if err := svc.CheckOAuthGrant(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Revoke(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.CheckOAuthGrant(ctx, legacy); err == nil {
+		t.Fatal("revoked grant accepted")
+	}
+}

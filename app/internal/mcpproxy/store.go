@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -71,10 +72,15 @@ type PostgresStore struct {
 	schema      string
 	relation    string
 	db          *sql.DB
-	box         cipher.AEAD
+	// boxes[0] seals; every box opens, so a row sealed under a previous
+	// master secret still reads during a rotation window.
+	boxes []cipher.AEAD
 }
 
-func NewPostgresStore(databaseURL, secret string) (*PostgresStore, error) {
+// NewPostgresStore keeps connections sealed under secret. previous are
+// master secrets being rotated out: rows sealed under them still open, and
+// ResealUnderCurrentSecret moves them to secret.
+func NewPostgresStore(databaseURL, secret string, previous ...string) (*PostgresStore, error) {
 	if secret == "" {
 		return nil, errors.New("MCP credential encryption requires the PDW app secret")
 	}
@@ -82,7 +88,13 @@ func NewPostgresStore(databaseURL, secret string) (*PostgresStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PostgresStore{db: db, box: newCipher(secret), schema: warehouse.SchemaOf("mcp_connections"), relation: warehouse.SQLRelation("mcp_connections")}, nil
+	boxes := []cipher.AEAD{newCipher(secret)}
+	for _, p := range previous {
+		if p != "" && p != secret {
+			boxes = append(boxes, newCipher(p))
+		}
+	}
+	return &PostgresStore{db: db, boxes: boxes, schema: warehouse.SchemaOf("mcp_connections"), relation: warehouse.SQLRelation("mcp_connections")}, nil
 }
 func (s *PostgresStore) Close() error { return s.db.Close() }
 func newCipher(secret string) cipher.AEAD {
@@ -104,6 +116,59 @@ func unseal(box cipher.AEAD, id, encoded string) ([]byte, error) {
 		return nil, errors.New("invalid encrypted MCP connection")
 	}
 	return box.Open(nil, raw[:box.NonceSize()], raw[box.NonceSize():], []byte(id))
+}
+
+// open unseals with the current box, then the previous ones, and reports
+// whether the current box was the one that opened it.
+func (s *PostgresStore) open(id, encoded string) ([]byte, bool, error) {
+	var err error
+	for i, box := range s.boxes {
+		var raw []byte
+		if raw, err = unseal(box, id, encoded); err == nil {
+			return raw, i == 0, nil
+		}
+	}
+	return nil, false, err
+}
+
+// ResealUnderCurrentSecret rewrites every connection still sealed under a
+// previous master secret, so the previous secret can be dropped. It returns
+// how many it rewrote.
+func (s *PostgresStore) ResealUnderCurrentSecret(ctx context.Context) (int, error) {
+	if len(s.boxes) < 2 {
+		return 0, nil
+	}
+	if err := s.ensure(ctx); err != nil {
+		return 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM `+s.relation+` WHERE payload <> '' ORDER BY name`)
+	if err != nil {
+		return 0, err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		names = append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	resealed := 0
+	for _, name := range names {
+		changed := false
+		if err := s.update(ctx, name, func(*record) error { return nil }, &changed); err != nil {
+			return resealed, fmt.Errorf("reseal %s: %w", name, err)
+		}
+		if changed {
+			resealed++
+		}
+	}
+	return resealed, nil
 }
 
 func (s *PostgresStore) ensure(ctx context.Context) error {
@@ -138,7 +203,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]record, error) {
 		if payload == "" {
 			continue
 		}
-		raw, err := unseal(s.box, id, payload)
+		raw, _, err := s.open(id, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -153,6 +218,13 @@ func (s *PostgresStore) List(ctx context.Context) ([]record, error) {
 	return result, rows.Err()
 }
 func (s *PostgresStore) Update(ctx context.Context, id string, fn func(*record) error) error {
+	return s.update(ctx, id, fn, nil)
+}
+
+// update runs fn on the connection under its row lock and writes it back if
+// fn changed it or it is still sealed under a previous secret. written, when
+// set, reports whether a row was written.
+func (s *PostgresStore) update(ctx context.Context, id string, fn func(*record) error, written *bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	if err := s.ensure(ctx); err != nil {
@@ -171,8 +243,10 @@ func (s *PostgresStore) Update(ctx context.Context, id string, fn func(*record) 
 		return err
 	}
 	c := record{Name: id}
+	sealedCurrent := true
 	if payload != "" {
-		raw, err := unseal(s.box, id, payload)
+		raw, current, err := s.open(id, payload)
+		sealedCurrent = current
 		if err != nil {
 			return err
 		}
@@ -191,21 +265,31 @@ func (s *PostgresStore) Update(ctx context.Context, id string, fn func(*record) 
 	if err != nil {
 		return err
 	}
-	if bytes.Equal(before, after) && payload != "" {
+	unchanged := bytes.Equal(before, after) && payload != ""
+	if unchanged && sealedCurrent {
 		return tx.Commit()
 	}
-	c.Version++
-	c.UpdatedAt = time.Now().UTC()
+	if !unchanged {
+		// A re-encryption alone is not a change to the connection.
+		c.Version++
+		c.UpdatedAt = time.Now().UTC()
+	}
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	payload, err = seal(s.box, id, raw)
+	payload, err = seal(s.boxes[0], id, raw)
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE `+s.relation+` SET payload=$2,updated_at=$3 WHERE name=$1`, id, payload, c.UpdatedAt); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE `+s.relation+` SET payload=$2,updated_at=now() WHERE name=$1`, id, payload); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if written != nil {
+		*written = true
+	}
+	return nil
 }

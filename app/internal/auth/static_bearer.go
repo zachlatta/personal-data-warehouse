@@ -27,7 +27,7 @@ import (
 func (s *Service) RequireStaticBearer() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if len(s.secret) == 0 {
+			if len(s.keys.current().secret) == 0 {
 				s.logger.ErrorContext(r.Context(), "static bearer middleware invoked with empty secret")
 				http.Error(w, "server misconfigured: missing secret", http.StatusInternalServerError)
 				return
@@ -85,11 +85,18 @@ func (s *Service) RequireStaticBearer() func(http.Handler) http.Handler {
 
 // authenticateStatic resolves the token half of a static bearer. The master
 // secret is compared first and in constant time, so it keeps working through
-// a token-store outage; anything else goes to the issued-token store. A
-// non-zero status is the response to send, with a client-safe reason.
+// a token-store outage; a previous master secret still in the keyring (a
+// rotation window) is accepted too, and logged so stragglers can be found.
+// Anything else goes to the issued-token store. A non-zero status is the
+// response to send, with a client-safe reason.
 func (s *Service) authenticateStatic(r *http.Request, name, token string) (Principal, int, string) {
-	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
-		return Principal{Scope: ScopeRoot, ClientName: name}, 0, ""
+	for i, key := range s.keys.keys {
+		if subtle.ConstantTimeCompare([]byte(token), key.secret) == 1 {
+			if i > 0 {
+				s.logger.WarnContext(r.Context(), "previous master secret used; update this client", "client", name, "key_id", key.id, "path", r.URL.Path)
+			}
+			return Principal{Scope: ScopeRoot, ClientName: name}, 0, ""
+		}
 	}
 	tokens := s.tokenAuthenticator()
 	if tokens == nil {

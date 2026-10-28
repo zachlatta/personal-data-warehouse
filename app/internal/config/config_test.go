@@ -1,6 +1,7 @@
 package config
 
 import (
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"strings"
 	"testing"
 	"time"
@@ -285,6 +286,33 @@ func TestLoadFromEnvRejectsWeakSecretToken(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestPreviousSecretTokenJoinsTheKeyringDuringARotation(t *testing.T) {
+	const current, previous = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+	load := func(prev string) (Config, error) {
+		env := map[string]string{
+			"POSTGRES_DATABASE_URL":     "postgres://default:secret@example.com/default",
+			"PDW_SECRET_TOKEN":          current,
+			"PDW_SECRET_TOKEN_PREVIOUS": prev,
+		}
+		return LoadFromEnv(func(key string) string { return env[key] })
+	}
+	cfg, err := load(previous)
+	if err != nil || cfg.PreviousSecretToken != previous {
+		t.Fatalf("previous = %q, %v", cfg.PreviousSecretToken, err)
+	}
+	if cfg.Keyring().CurrentKeyID() == pdwauthKeyID(previous) || cfg.Keyring().CurrentKeyID() != pdwauthKeyID(current) {
+		t.Fatal("the current secret must sign")
+	}
+	if _, err := load("short"); err == nil || !strings.Contains(err.Error(), "PDW_SECRET_TOKEN_PREVIOUS") {
+		t.Fatalf("weak previous secret: %v", err)
+	}
+	if cfg, err := load(current); err != nil || cfg.PreviousSecretToken != "" {
+		t.Fatalf("previous equal to current must be ignored: %q %v", cfg.PreviousSecretToken, err)
+	}
+}
+
+func pdwauthKeyID(secret string) string { return pdwauth.NewKeyring([]byte(secret)).CurrentKeyID() }
 
 func TestLoadFromEnvParsesSlackAccounts(t *testing.T) {
 	env := map[string]string{

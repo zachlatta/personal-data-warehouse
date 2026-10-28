@@ -22,6 +22,9 @@ const (
 	// tools API only, which is everything the pdw CLI calls. It cannot reach
 	// mutation review, so an agent cannot approve its own proposal.
 	ScopeAgent Scope = "agent"
+	// ScopeOAuthQuery is an OAuth MCP connector grant (/mcp only). It is
+	// never a static bearer: the token store refuses it there.
+	ScopeOAuthQuery Scope = "query"
 )
 
 // Issuable reports whether s is one of the scopes an issued token may carry.

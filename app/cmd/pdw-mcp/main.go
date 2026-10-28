@@ -35,7 +35,10 @@ func main() {
 	}
 	defer runner.Close()
 
-	authSvc := pdwauth.NewService([]byte(cfg.SecretToken), time.Now)
+	authSvc := pdwauth.NewServiceWithKeyring(cfg.Keyring(), time.Now)
+	if cfg.PreviousSecretToken != "" {
+		logger.Warn("master secret rotation window open: the previous secret is still accepted; unset PDW_SECRET_TOKEN_PREVIOUS once clients are updated")
+	}
 	// Reviewed mutations live in the same Postgres as the warehouse; the
 	// review surfaces are the JSON API (the web SPA and the iOS app) behind
 	// the app's static bearer, so nothing else gates them.

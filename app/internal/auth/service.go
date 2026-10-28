@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,13 +24,50 @@ import (
 )
 
 type Service struct {
-	secret        []byte
+	keys          *Keyring
 	now           func() time.Time
 	consumedCodes map[string]int64
 	mu            sync.Mutex
 	logger        *slog.Logger
 	tokens        TokenAuthenticator
+	grants        OAuthGrants
+	// legacyCutoff is when tokens issued before grants existed (no gid)
+	// stop working; see LegacyOAuthTokenCutoff.
+	legacyCutoff time.Time
 }
+
+// LegacyOAuthTokenCutoff is when OAuth tokens minted before grants existed
+// stop being accepted. Until then such a refresh token still works, and its
+// first use moves the connector onto a revocable grant; an access token of
+// that age simply expires within a day. A connector unused the whole time
+// re-authorizes once.
+var LegacyOAuthTokenCutoff = time.Date(2026, 11, 28, 0, 0, 0, 0, time.UTC)
+
+// OAuthGrants is the store of revocable OAuth MCP grants: one per
+// authorization, carried by every access and refresh token minted from it as
+// gid. Every method returns ErrUnknownToken for an id it does not have, a
+// *TokenRejectedError for a grant that is revoked or idle past its limit, and
+// any other error when the store cannot answer, which callers must treat as
+// temporary rather than as a rejection.
+type OAuthGrants interface {
+	// CreateOAuthGrant records a new grant and returns its id.
+	CreateOAuthGrant(ctx context.Context, clientName string) (string, error)
+	// EnsureOAuthGrant records grant id if it does not exist yet, then
+	// checks it as CheckOAuthGrant does. It moves a pre-grant refresh token
+	// onto a grant; a retry with the same token lands on the same row.
+	EnsureOAuthGrant(ctx context.Context, id, clientName string) error
+	// CheckOAuthGrant reports whether grant id may still be used and records
+	// the use.
+	CheckOAuthGrant(ctx context.Context, id string) error
+}
+
+// GrantUnavailableError means the grant store could not answer. It is not a
+// verdict on the token: the request should fail with a temporary error so
+// the client retries instead of discarding its credentials.
+type GrantUnavailableError struct{ Err error }
+
+func (e *GrantUnavailableError) Error() string { return "grant store unavailable: " + e.Err.Error() }
+func (e *GrantUnavailableError) Unwrap() error { return e.Err }
 
 type Claims struct {
 	ClientID   string
@@ -50,13 +88,37 @@ type signedPayload struct {
 	Nonce               string   `json:"nonce,omitempty"`
 	Exp                 int64    `json:"exp,omitempty"`
 	Iat                 int64    `json:"iat,omitempty"`
+	GrantID             string   `json:"gid,omitempty"`
 }
 
+// NewService is a Service keyed by one secret: the app with no rotation in
+// progress, or a client that signs uploads with the secret it holds.
 func NewService(secret []byte, now func() time.Time) *Service {
+	return NewServiceWithKeyring(NewKeyring(secret), now)
+}
+
+// NewServiceWithKeyring is a Service that signs with the ring's current key
+// and verifies with any key in it.
+func NewServiceWithKeyring(keys *Keyring, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{secret: secret, now: now, consumedCodes: make(map[string]int64), logger: slog.Default().With("component", "auth")}
+	return &Service{keys: keys, now: now, consumedCodes: make(map[string]int64), logger: slog.Default().With("component", "auth"), legacyCutoff: LegacyOAuthTokenCutoff}
+}
+
+// SetOAuthGrants installs the grant store. Without one the service issues no
+// OAuth tokens, since a token it could not revoke is what grants exist to
+// prevent.
+func (s *Service) SetOAuthGrants(g OAuthGrants) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.grants = g
+}
+
+func (s *Service) oauthGrants() OAuthGrants {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.grants
 }
 
 func (s *Service) RegisterHandlers(mux *http.ServeMux, baseURL string) {
@@ -87,7 +149,14 @@ func (s *Service) RegisterHandlers(mux *http.ServeMux, baseURL string) {
 
 func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Handler {
 	return mcpauth.RequireBearerToken(func(ctx context.Context, token string, req *http.Request) (*mcpauth.TokenInfo, error) {
-		claims, err := s.VerifyBearer(token)
+		claims, err := s.VerifyBearer(ctx, token)
+		var unavailable *GrantUnavailableError
+		if errors.As(err, &unavailable) {
+			// Not ErrInvalidToken: the SDK answers 500 rather than 401, so
+			// the connector retries instead of dropping its login.
+			s.logger.ErrorContext(ctx, "bearer token not checked", "path", req.URL.Path, "error", err)
+			return nil, err
+		}
 		if err != nil {
 			s.logger.WarnContext(ctx, "bearer token rejected", "path", req.URL.Path, "error", err)
 			return nil, fmt.Errorf("%w: %v", mcpauth.ErrInvalidToken, err)
@@ -105,9 +174,12 @@ func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Hand
 	})
 }
 
-func (s *Service) VerifyBearer(token string) (*Claims, error) {
+// VerifyBearer checks an OAuth access token: its signature, its expiry, and
+// that its grant has not been revoked. A *GrantUnavailableError means the
+// grant could not be checked, not that the token is bad.
+func (s *Service) VerifyBearer(ctx context.Context, token string) (*Claims, error) {
 	var payload signedPayload
-	if err := s.verifySigned(token, "access", &payload); err != nil {
+	if _, err := s.verifySigned(token, "access", &payload); err != nil {
 		return nil, err
 	}
 	if payload.Exp != 0 && s.now().Unix() > payload.Exp {
@@ -115,6 +187,13 @@ func (s *Service) VerifyBearer(token string) (*Claims, error) {
 	}
 	if payload.ClientName == "" {
 		return nil, errors.New("token missing client name; re-authorize the connector")
+	}
+	if payload.GrantID == "" {
+		if !s.now().Before(s.legacyCutoff) {
+			return nil, errors.New("token predates revocable grants; re-authorize the connector")
+		}
+	} else if err := s.checkGrant(ctx, payload.GrantID); err != nil {
+		return nil, err
 	}
 	return &Claims{
 		ClientID:   payload.ClientID,
@@ -228,7 +307,9 @@ func (s *Service) authorizePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(r.Form.Get("secret_token")), s.secret) != 1 {
+	// Only the current secret authorizes a new connector, even during a
+	// rotation window.
+	if subtle.ConstantTimeCompare([]byte(r.Form.Get("secret_token")), s.keys.current().secret) != 1 {
 		s.logger.WarnContext(r.Context(), "authorization rejected", "reason", "invalid_secret", "client", tokenFingerprint(r.Form.Get("client_id")))
 		http.Error(w, "invalid secret token", http.StatusUnauthorized)
 		return
@@ -322,7 +403,7 @@ func (s *Service) token(w http.ResponseWriter, r *http.Request) {
 func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 	rawCode := r.Form.Get("code")
 	var code signedPayload
-	if err := s.verifySigned(rawCode, "code", &code); err != nil {
+	if _, err := s.verifySigned(rawCode, "code", &code); err != nil {
 		s.logger.WarnContext(r.Context(), "authorization code token exchange rejected", "reason", "invalid_code", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid authorization code")
 		return
@@ -352,13 +433,30 @@ func (s *Service) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code missing client_name; re-authorize")
 		return
 	}
-	s.logger.InfoContext(r.Context(), "authorization code exchanged", "client", code.ClientName, "client_id", tokenFingerprint(code.ClientID))
-	s.writeTokenResponse(w, code.ClientID, code.ClientName)
+	grants := s.oauthGrants()
+	if grants == nil {
+		s.releaseAuthorizationCode(rawCode)
+		s.logger.ErrorContext(r.Context(), "authorization code token exchange failed", "reason", "no_grant_store", "client", code.ClientName)
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "grant store is not configured")
+		return
+	}
+	grantID, err := grants.CreateOAuthGrant(r.Context(), code.ClientName)
+	if err != nil {
+		// The code stays redeemable so the client's retry can succeed.
+		s.releaseAuthorizationCode(rawCode)
+		s.logger.ErrorContext(r.Context(), "authorization code token exchange failed", "reason", "grant_store", "client", code.ClientName, "error", err)
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "could not record the grant; retry")
+		return
+	}
+	s.logger.InfoContext(r.Context(), "authorization code exchanged", "client", code.ClientName, "client_id", tokenFingerprint(code.ClientID), "grant_id", grantID)
+	s.writeTokenResponse(w, code.ClientID, code.ClientName, grantID)
 }
 
 func (s *Service) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
+	rawRefresh := r.Form.Get("refresh_token")
 	var refresh signedPayload
-	if err := s.verifySigned(r.Form.Get("refresh_token"), "refresh", &refresh); err != nil {
+	key, err := s.verifySigned(rawRefresh, "refresh", &refresh)
+	if err != nil {
 		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "invalid_refresh", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid refresh token")
 		return
@@ -378,20 +476,86 @@ func (s *Service) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token missing client_name; re-authorize")
 		return
 	}
-	s.logger.InfoContext(r.Context(), "refresh token exchanged", "client", refresh.ClientName, "client_id", tokenFingerprint(refresh.ClientID))
-	s.writeTokenResponse(w, refresh.ClientID, refresh.ClientName)
+	grantID := refresh.GrantID
+	if grantID == "" {
+		if !s.now().Before(s.legacyCutoff) {
+			s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "pre_grant_token", "client", refresh.ClientName)
+			oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token predates revocable grants; re-authorize")
+			return
+		}
+		// A token from before grants: its grant id comes from the token
+		// itself, so every use of it (and a revoke) meets the same row.
+		grantID = legacyGrantID(key, rawRefresh)
+		err = s.ensureGrant(r.Context(), grantID, refresh.ClientName)
+	} else {
+		err = s.checkGrant(r.Context(), grantID)
+	}
+	var unavailable *GrantUnavailableError
+	if errors.As(err, &unavailable) {
+		s.logger.ErrorContext(r.Context(), "refresh token exchange failed", "reason", "grant_store", "client", refresh.ClientName, "grant_id", grantID, "error", err)
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "could not check the grant; retry")
+		return
+	}
+	if err != nil {
+		s.logger.WarnContext(r.Context(), "refresh token exchange rejected", "reason", "grant_rejected", "client", refresh.ClientName, "grant_id", grantID, "error", err)
+		oauthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
+		return
+	}
+	s.logger.InfoContext(r.Context(), "refresh token exchanged", "client", refresh.ClientName, "client_id", tokenFingerprint(refresh.ClientID), "grant_id", grantID, "migrated", refresh.GrantID == "")
+	s.writeTokenResponse(w, refresh.ClientID, refresh.ClientName, grantID)
 }
 
-func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID, clientName string) {
+// checkGrant asks the grant store about id. Rejections come back as they
+// are; anything the store could not answer is a *GrantUnavailableError.
+func (s *Service) checkGrant(ctx context.Context, id string) error {
+	grants := s.oauthGrants()
+	if grants == nil {
+		return &GrantUnavailableError{Err: errors.New("grant store is not configured")}
+	}
+	return classifyGrantError(grants.CheckOAuthGrant(ctx, id))
+}
+
+func (s *Service) ensureGrant(ctx context.Context, id, clientName string) error {
+	grants := s.oauthGrants()
+	if grants == nil {
+		return &GrantUnavailableError{Err: errors.New("grant store is not configured")}
+	}
+	return classifyGrantError(grants.EnsureOAuthGrant(ctx, id, clientName))
+}
+
+func classifyGrantError(err error) error {
+	var rejected *TokenRejectedError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrUnknownToken):
+		return errors.New("grant not found; re-authorize the connector")
+	case errors.As(err, &rejected):
+		return rejected
+	default:
+		return &GrantUnavailableError{Err: err}
+	}
+}
+
+// legacyGrantID is the grant a pre-grant refresh token moves onto: a keyed
+// hash of the token under the key that signed it, so it is stable for that
+// token across rotations and reveals nothing about it.
+func legacyGrantID(key rootKey, token string) string {
+	mac := hmac.New(sha256.New, key.sub[purposeOAuthGrant])
+	mac.Write([]byte(token))
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(mac.Sum(nil)[:10]))
+}
+
+func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID, clientName, grantID string) {
 	accessExp := s.now().Add(24 * time.Hour).Unix()
 	refreshExp := s.now().Add(365 * 24 * time.Hour).Unix()
-	access, err := s.sign(signedPayload{Type: "access", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: accessExp, Iat: s.now().Unix()})
+	access, err := s.sign(signedPayload{Type: "access", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: accessExp, Iat: s.now().Unix(), GrantID: grantID})
 	if err != nil {
 		s.logger.Error("access token signing failed", "client", clientName, "error", err)
 		http.Error(w, "could not issue access token", http.StatusInternalServerError)
 		return
 	}
-	refresh, err := s.sign(signedPayload{Type: "refresh", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: refreshExp, Iat: s.now().Unix()})
+	refresh, err := s.sign(signedPayload{Type: "refresh", ClientID: clientID, ClientName: clientName, Scope: "query", Nonce: nonce(), Exp: refreshExp, Iat: s.now().Unix(), GrantID: grantID})
 	if err != nil {
 		s.logger.Error("refresh token signing failed", "client", clientName, "error", err)
 		http.Error(w, "could not issue refresh token", http.StatusInternalServerError)
@@ -409,7 +573,7 @@ func (s *Service) writeTokenResponse(w http.ResponseWriter, clientID, clientName
 
 func (s *Service) validateClientRedirect(clientID, redirectURI string) error {
 	var client signedPayload
-	if err := s.verifySigned(clientID, "client", &client); err != nil {
+	if _, err := s.verifySigned(clientID, "client", &client); err != nil {
 		return errors.New("invalid client_id")
 	}
 	for _, registered := range client.RedirectURIs {
@@ -456,44 +620,76 @@ func isLoopbackRedirect(u *url.URL) bool {
 	return false
 }
 
+// sign returns "<kid>.<body>.<sig>": the current key's id, the base64url
+// JSON payload, and an HMAC over both under that key's OAuth subkey.
 func (s *Service) sign(payload signedPayload) (string, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	body := base64.RawURLEncoding.EncodeToString(data)
-	mac := hmac.New(sha256.New, s.secret)
-	mac.Write([]byte(body))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return body + "." + sig, nil
+	key := s.keys.current()
+	signed := key.id + "." + base64.RawURLEncoding.EncodeToString(data)
+	mac := hmac.New(sha256.New, key.sub[purposeOAuthToken])
+	mac.Write([]byte(signed))
+	return signed + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
-func (s *Service) verifySigned(token, expectedType string, payload *signedPayload) error {
+// verifySigned checks a signed value and returns the key that signed it. It
+// accepts the current "<kid>.<body>.<sig>" form and the original
+// "<body>.<sig>" form, an HMAC under the raw master secret, which every
+// registered client_id and pre-grant token still carries.
+func (s *Service) verifySigned(token, expectedType string, payload *signedPayload) (rootKey, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) != 2 {
-		return errors.New("malformed token")
+	var key rootKey
+	var body string
+	switch len(parts) {
+	case 3:
+		k, ok := s.keys.byID(parts[0])
+		if !ok {
+			return rootKey{}, errors.New("signed by an unknown key")
+		}
+		sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			return rootKey{}, err
+		}
+		mac := hmac.New(sha256.New, k.sub[purposeOAuthToken])
+		mac.Write([]byte(parts[0] + "." + parts[1]))
+		if !hmac.Equal(sig, mac.Sum(nil)) {
+			return rootKey{}, errors.New("bad signature")
+		}
+		key, body = k, parts[1]
+	case 2:
+		sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return rootKey{}, err
+		}
+		found := false
+		for _, k := range s.keys.keys {
+			mac := hmac.New(sha256.New, k.secret)
+			mac.Write([]byte(parts[0]))
+			if hmac.Equal(sig, mac.Sum(nil)) {
+				key, found = k, true
+				break
+			}
+		}
+		if !found {
+			return rootKey{}, errors.New("bad signature")
+		}
+		body = parts[0]
+	default:
+		return rootKey{}, errors.New("malformed token")
 	}
-	mac := hmac.New(sha256.New, s.secret)
-	mac.Write([]byte(parts[0]))
-	expectedSig := mac.Sum(nil)
-	actualSig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	data, err := base64.RawURLEncoding.DecodeString(body)
 	if err != nil {
-		return err
-	}
-	if !hmac.Equal(actualSig, expectedSig) {
-		return errors.New("bad signature")
-	}
-	data, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return err
+		return rootKey{}, err
 	}
 	if err := json.Unmarshal(data, payload); err != nil {
-		return err
+		return rootKey{}, err
 	}
 	if payload.Type != expectedType {
-		return errors.New("wrong token type")
+		return rootKey{}, errors.New("wrong token type")
 	}
-	return nil
+	return key, nil
 }
 
 func verifyPKCE(verifier, challenge, method string) bool {
@@ -520,6 +716,14 @@ func (s *Service) consumeAuthorizationCode(code string, expiresAt int64) bool {
 	}
 	s.consumedCodes[fingerprint] = expiresAt
 	return true
+}
+
+// releaseAuthorizationCode undoes consumeAuthorizationCode when the exchange
+// failed for a reason that was not the client's.
+func (s *Service) releaseAuthorizationCode(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.consumedCodes, tokenFingerprint(code))
 }
 
 func tokenFingerprint(token string) string {

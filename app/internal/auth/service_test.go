@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 
 func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	svc.SetOAuthGrants(newFakeGrants())
 	mux := http.NewServeMux()
 	svc.RegisterHandlers(mux, "https://mcp.example.com")
 
@@ -90,7 +92,7 @@ func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 	if token.AccessToken == "" || token.RefreshToken == "" || token.TokenType != "Bearer" {
 		t.Fatalf("bad token response: %#v", token)
 	}
-	claims, err := svc.VerifyBearer(token.AccessToken)
+	claims, err := svc.VerifyBearer(context.Background(), token.AccessToken)
 	if err != nil {
 		t.Fatalf("VerifyBearer failed: %v", err)
 	}
@@ -118,7 +120,7 @@ func TestOAuthFlowAcceptsSecretAndIssuesBearerToken(t *testing.T) {
 	if err := json.Unmarshal(refreshRec.Body.Bytes(), &refreshed); err != nil {
 		t.Fatal(err)
 	}
-	refreshedClaims, err := svc.VerifyBearer(refreshed.AccessToken)
+	refreshedClaims, err := svc.VerifyBearer(context.Background(), refreshed.AccessToken)
 	if err != nil {
 		t.Fatalf("VerifyBearer after refresh failed: %v", err)
 	}
@@ -338,7 +340,7 @@ func TestVerifyBearerRejectsTokenWithoutClientName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	if _, err := svc.VerifyBearer(legacy); err == nil {
+	if _, err := svc.VerifyBearer(context.Background(), legacy); err == nil {
 		t.Fatal("VerifyBearer accepted a token with no client name; legacy tokens must be rejected")
 	}
 }

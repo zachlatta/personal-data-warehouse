@@ -34,7 +34,7 @@ Answers to the open questions in the original tasks:
   its next request.
 - **Migrating existing clients:** nothing breaks. The master secret is still accepted
   everywhere, because it must exist anyway: it is the HMAC key for ingest uploads and
-  OAuth. A client moves off it by running `pdw token create --name <client>` and then
+  the root of the OAuth signing keys. A client moves off it by running `pdw token create --name <client>` and then
   `pdw login` with the printed token (or pasting that token into the phone app or web
   page). Uploaders that sign ingest bodies (`pdw ingest`, `pdw heartbeat`, the
   `publish-session` commands) keep the master secret, because an upload signature is an
@@ -86,8 +86,66 @@ keeps logs far longer than 15 minutes.
 - The Python twin of the DDL is `ensure_app_access_token_tables` in `postgres.py`, so a
   fresh warehouse inventory matches the catalog.
 
-## Follow-ups not built here
+## MCP connector grants
 
-- OAuth MCP connector tokens are still stateless HMAC tokens (24 h access, 365-day
-  refresh). Revoking one connector means rotating the master secret. Moving refresh
-  tokens into `app_access_tokens` would make connectors listable and revocable too.
+Each OAuth MCP connector login (Claude, ChatGPT, any client that goes through
+`/oauth/authorize`) is a row in `private.app_access_tokens` with kind `oauth` and scope
+`query`, created when the authorization code is exchanged. Its access tokens (24 h) and
+refresh tokens (365 days) name the row as `gid`, and both are checked against it:
+
+- `pdw token list` shows each connector's grant with its client name and last use;
+  `pdw token revoke <id>` turns that connector off. Its next MCP request is a 401 and its
+  next refresh `invalid_grant`, so it has to authorize again. Other connectors and the
+  master secret are untouched.
+- A grant lapses after **90 days** with no MCP request and no refresh
+  (`accesstokens.OAuthGrantIdleTimeout`).
+- A good answer is cached in the app for a minute; a revoke clears it.
+- When the grant store cannot answer (database down), `/mcp` returns a 5xx and
+  `/oauth/token` returns 503 `temporarily_unavailable`, never 401 or `invalid_grant`:
+  a connector told its token is invalid drops its login, and one told to retry keeps it.
+- Tokens issued before grants existed carry no `gid`. Until
+  `auth.LegacyOAuthTokenCutoff` (2026-11-28) such a refresh token still works and its
+  first use moves the connector onto a grant whose id is a keyed hash of that token, so
+  a retry lands on the same row and revoking it also stops the old token. Each
+  refresh token minted before grants moves onto its own grant, so one connector can
+  show more than one row. After the
+  cutoff they are refused, and a connector unused for the whole 30 days authorizes once
+  more.
+
+The code is `app/internal/auth/service.go` (the OAuth handlers and `VerifyBearer`) and
+`app/internal/accesstokens/oauth_grants.go` (the store side).
+
+## Keys and rotating the master secret
+
+`PDW_SECRET_TOKEN` is the root. `auth.Keyring` derives a separate subkey per purpose
+from it with HKDF-SHA256 (OAuth tokens and client ids, legacy grant ids, object
+download links) and a short key id, also HKDF-derived, that names the secret without
+revealing it. OAuth values are `<key id>.<body>.<sig>` and a download link's `sig` is
+`<key id>.<mac>`, so the verifier knows which key to use. Values from before key ids
+(`<body>.<sig>`, and a `sig` without a key id) still verify against the raw secret.
+
+Three uses stay on the raw secret by design: upload signatures (every uploader holds the
+secret and signs with it, in Go and in `ingest_client.py`; the `object-upload` prefix
+keeps those MACs apart), the static bearer, and the consent page.
+`private.mcp_connections` keeps its own derived AES key.
+
+`PDW_SECRET_TOKEN_PREVIOUS` opens a rotation window. While it is set, the previous
+secret still verifies everywhere the current one does (OAuth tokens and client ids,
+download links, uploads, the static bearer, sealed connections), except the consent
+page, which takes only the current secret. New signatures always use the current key,
+and every use of the previous secret as a bearer is logged with the client name. To
+rotate:
+
+1. Generate a new secret (at least 32 characters). In the deployment env, set
+   `PDW_SECRET_TOKEN_PREVIOUS` to the old value and `PDW_SECRET_TOKEN` to the new one,
+   then deploy. At boot the app re-encrypts `private.mcp_connections` under the new
+   secret.
+2. Update every client that holds the secret: `pdw login` on each machine, the uploader
+   `.env` files (`bin/sync-mac-device-runtime`), the phone app, the web pages, and the
+   Dagster env. Watch the logs for `previous master secret used`, which names the
+   clients still on the old one.
+3. Leave the window open long enough for idle connectors to refresh: each refresh
+   re-signs their tokens with the new key. A connector that does not refresh during the
+   window authorizes again.
+4. Unset `PDW_SECRET_TOKEN_PREVIOUS` and deploy. Anything still signed only with the old
+   secret stops verifying.

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 const MinSecretTokenLength = 32
@@ -33,6 +35,11 @@ type Config struct {
 	TimelineMediaBaseURL    string
 	TimelineMediaSigningKey string
 	SecretToken             string
+	// PreviousSecretToken is the master secret being rotated out: still
+	// accepted wherever SecretToken is verified (never for signing, never at
+	// the OAuth consent page) until it is unset. See "Rotating the master
+	// secret" in docs/agents/access-tokens.md.
+	PreviousSecretToken     string
 	MaxRows                 int
 	MaxFieldChars           int
 	QueryTimeout            time.Duration
@@ -168,6 +175,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		TimelineMediaBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
 		TimelineMediaSigningKey: strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
 		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
+		PreviousSecretToken:     strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
 		MaxRows:                 100000,
 		MaxFieldChars:           4000,
 		// One end-to-end query budget. No caller can wait longer than the
@@ -202,6 +210,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if len(cfg.SecretToken) < MinSecretTokenLength {
 		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN (or legacy MCP_SECRET_TOKEN) must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.PreviousSecretToken != "" && len(cfg.PreviousSecretToken) < MinSecretTokenLength {
+		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN_PREVIOUS must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.PreviousSecretToken == cfg.SecretToken {
+		cfg.PreviousSecretToken = ""
 	}
 	if matched, _ := regexp.MatchString(`^[A-Za-z_][A-Za-z0-9_]*$`, cfg.QueryPostgresRole); !matched {
 		return Config{}, fmt.Errorf("PDW_QUERY_POSTGRES_ROLE must be a Postgres identifier")
@@ -448,4 +462,10 @@ func parseCSV(raw string) []string {
 		}
 	}
 	return values
+}
+
+// Keyring is the app's signing keyring: the current master secret and, during
+// a rotation window, the previous one.
+func (c Config) Keyring() *pdwauth.Keyring {
+	return pdwauth.NewKeyring([]byte(c.SecretToken), []byte(c.PreviousSecretToken))
 }

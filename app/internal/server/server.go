@@ -265,6 +265,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	// routes mounted above.
 	tokenSvc := newAccessTokenService(cfg, logger)
 	authSvc.SetTokenAuthenticator(tokenSvc)
+	authSvc.SetOAuthGrants(tokenSvc)
 	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
 	// The pdw installer and its release, proxied from GitHub so a sandbox
 	// whose egress GitHub refuses can still install the CLI.
@@ -464,10 +465,20 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	mcpServer := newMCPServerFromRegistry(registry, slog.Default())
 	var proxy *mcpproxy.Service
 	if cfg.PostgresDatabaseURL != "" {
-		store, err := mcpproxy.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.SecretToken)
+		store, err := mcpproxy.NewPostgresStore(cfg.PostgresDatabaseURL, cfg.SecretToken, cfg.PreviousSecretToken)
 		if err != nil {
 			logger.Error("MCP connection store could not initialize")
 		} else {
+			if cfg.PreviousSecretToken != "" {
+				go func() {
+					resealed, err := store.ResealUnderCurrentSecret(context.Background())
+					if err != nil {
+						logger.Error("MCP connections could not be re-encrypted under the current secret", "error", err)
+						return
+					}
+					logger.Info("MCP connections re-encrypted under the current secret", "connections", resealed)
+				}()
+			}
 			proxy = mcpproxy.New(store, baseURL, nil)
 			proxy.Register(mux, authSvc.RequireStaticBearer())
 		}
@@ -543,6 +554,9 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		// Inline media links are signed for (and served by) this app unless a
 		// media override points at another app that holds the object-store
 		// credential (local dev signing for the production /objects endpoint).
+		// That signer derives its download subkey and key id from the key the
+		// same way, so its links verify there while the key is in that app's
+		// keyring.
 		mediaSigner := authSvc
 		if cfg.TimelineMediaSigningKey != "" {
 			mediaSigner = pdwauth.NewService([]byte(cfg.TimelineMediaSigningKey), time.Now)
@@ -578,7 +592,12 @@ func newAccessTokenService(cfg config.Config, logger *slog.Logger) *accesstokens
 		if err == nil {
 			return accesstokens.NewService(store, time.Now, logger)
 		}
-		logger.Error("access token store failed to initialize; issued tokens are in memory only", "error", err.Error())
+		logger.Error("access token store failed to initialize; issued tokens are in memory only and OAuth connectors get a temporary error until the app restarts with a working store", "error", err.Error())
+		svc := accesstokens.NewService(accesstokens.NewMemoryStore(), time.Now, logger)
+		// Every grant would be unknown here, and "unknown" logs a connector
+		// out for good; "unavailable" makes it retry.
+		svc.DisableOAuthGrants(accesstokens.ErrGrantStoreUnavailable)
+		return svc
 	} else {
 		logger.Warn("no application database; issued access tokens are in memory only and die with the process")
 	}

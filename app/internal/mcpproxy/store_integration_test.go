@@ -73,4 +73,36 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if err != nil || len(rows[0].Clients) != 10 {
 		t.Fatal("concurrent updates were lost")
 	}
+
+	versionBefore := rows[0].Version
+
+	// A master secret rotation: the new secret current, the old one previous.
+	rotated, err := NewPostgresStore(url, "rotated-encryption-key", "test-encryption-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rotated.Close()
+	rotated.schema, rotated.relation = store.schema, store.relation
+	if rows, err := rotated.List(ctx); err != nil || len(rows) != 1 {
+		t.Fatalf("previous-secret rows unreadable during rotation: %+v %v", rows, err)
+	}
+	if n, err := rotated.ResealUnderCurrentSecret(ctx); err != nil || n != 1 {
+		t.Fatalf("reseal = %d, %v; want 1", n, err)
+	}
+	if n, err := rotated.ResealUnderCurrentSecret(ctx); err != nil || n != 0 {
+		t.Fatalf("second reseal = %d, %v; want 0", n, err)
+	}
+	after, err := NewPostgresStore(url, "rotated-encryption-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer after.Close()
+	after.schema, after.relation = store.schema, store.relation
+	rows, err = after.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Token.AccessToken != "stored-secret" || len(rows[0].Clients) != 10 {
+		t.Fatalf("after the previous secret is dropped: %+v %v", rows, err)
+	}
+	if rows[0].Version != versionBefore {
+		t.Fatalf("re-encryption bumped the connection version %d -> %d", versionBefore, rows[0].Version)
+	}
 }

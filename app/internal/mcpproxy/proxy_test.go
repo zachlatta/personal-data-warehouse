@@ -3,6 +3,7 @@ package mcpproxy
 import (
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"encoding/json"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/api"
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
@@ -52,6 +53,26 @@ func TestTailnetHostsOnlyReachTailnet(t *testing.T) {
 		if got := allowedIP(c.host, c.ip, ok); got != c.want {
 			t.Errorf("allowedIP(%s, %s) = %v", c.host, c.ip, got)
 		}
+	}
+}
+
+func TestRowsSealedUnderAPreviousSecretStillOpen(t *testing.T) {
+	old := &PostgresStore{boxes: []cipher.AEAD{newCipher("old-secret")}}
+	raw, err := seal(old.boxes[0], "skills", []byte("upstream-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := &PostgresStore{boxes: []cipher.AEAD{newCipher("new-secret"), newCipher("old-secret")}}
+	decoded, current, err := rotated.open("skills", raw)
+	if err != nil || string(decoded) != "upstream-secret" || current {
+		t.Fatalf("open under previous = %q, current=%v, %v", decoded, current, err)
+	}
+	fresh, _ := seal(rotated.boxes[0], "skills", []byte("upstream-secret"))
+	if _, current, err := rotated.open("skills", fresh); err != nil || !current {
+		t.Fatalf("open under current: current=%v, %v", current, err)
+	}
+	if _, _, err := (&PostgresStore{boxes: []cipher.AEAD{newCipher("new-secret")}}).open("skills", raw); err == nil {
+		t.Fatal("dropped secret still opens")
 	}
 }
 

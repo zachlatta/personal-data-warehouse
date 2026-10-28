@@ -68,7 +68,7 @@ func viewOf(t Token, now time.Time) TokenView {
 		RedeemedAt:      opt(t.RedeemedAt),
 		RedeemedTokenID: t.RedeemedTokenID,
 	}
-	if t.Kind == KindAccess && t.IdleTimeout > 0 {
+	if (t.Kind == KindAccess || t.Kind == KindOAuth) && t.IdleTimeout > 0 {
 		v.IdleTimeout = formatDuration(t.IdleTimeout)
 		v.IdleExpiresAt = opt(t.IdleExpiresAt())
 	}

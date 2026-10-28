@@ -124,9 +124,11 @@ type Store interface {
 
 // Service is the token authority over a Store.
 type Service struct {
-	store  Store
-	now    func() time.Time
-	logger *slog.Logger
+	store      Store
+	now        func() time.Time
+	logger     *slog.Logger
+	grantsDown error
+	grantCache grantCache
 }
 
 func NewService(store Store, now func() time.Time, logger *slog.Logger) *Service {
@@ -253,11 +255,14 @@ func rejectionReason(token Token, status string) string {
 // List returns every token and bootstrap code, newest first.
 func (s *Service) List(ctx context.Context) ([]Token, error) { return s.store.List(ctx) }
 
-// Revoke stops a token (or an unredeemed bootstrap code) authenticating.
+// Revoke stops a token, an unredeemed bootstrap code, or an OAuth connector
+// grant (and every access and refresh token minted from it) authenticating.
 func (s *Service) Revoke(ctx context.Context, id string) error {
-	if err := s.store.Revoke(ctx, strings.TrimSpace(id), s.now().UTC()); err != nil {
+	id = strings.TrimSpace(id)
+	if err := s.store.Revoke(ctx, id, s.now().UTC()); err != nil {
 		return err
 	}
+	s.forgetGrant(id)
 	s.logger.InfoContext(ctx, "access token revoked", "token_id", id)
 	return nil
 }

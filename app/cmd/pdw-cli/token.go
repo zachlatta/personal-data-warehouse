@@ -28,6 +28,8 @@ issued token cannot list, mint or revoke tokens.
         and, with --ttl, at a hard expiry. Use it with "pdw login --token" or
         paste it into the iOS app or a web page.
   pdw token revoke ID
+        Also turns off an MCP connector: each connector login is listed with
+        kind "oauth", and revoking it stops its access and refresh tokens.
 `
 
 const tokensAPIPath = "/api/auth/tokens"

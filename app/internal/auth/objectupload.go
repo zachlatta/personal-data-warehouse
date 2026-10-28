@@ -19,12 +19,19 @@ const objectUploadKind = "object-upload"
 // different endpoint) and the content sha (so the link also authenticates the
 // body: the server recomputes the sha over the received bytes and rejects a
 // mismatch).
+//
+// The key is the raw master secret, not a derived subkey: every uploader
+// holds that secret and signs with it, in Go and in Python
+// (ingest_client.py), and the "object-upload" prefix already separates these
+// MACs from every other kind.
 func (s *Service) SignObjectUpload(endpoint, contentSHA256 string, exp time.Time) string {
-	return base64.RawURLEncoding.EncodeToString(s.objectUploadMAC(endpoint, contentSHA256, exp.Unix()))
+	return base64.RawURLEncoding.EncodeToString(objectUploadMAC(s.keys.current().secret, endpoint, contentSHA256, exp.Unix()))
 }
 
 // VerifyObjectUpload checks the signature and expiry of an upload request's
-// endpoint, content sha, and exp/sig values.
+// endpoint, content sha, and exp/sig values. Any secret in the keyring
+// verifies, so an uploader keeps working through a rotation window until its
+// own secret is updated.
 func (s *Service) VerifyObjectUpload(endpoint, contentSHA256, expRaw, sig string) error {
 	if contentSHA256 == "" || sig == "" {
 		return errors.New("missing content sha or signature")
@@ -37,7 +44,14 @@ func (s *Service) VerifyObjectUpload(endpoint, contentSHA256, expRaw, sig string
 	if err != nil {
 		return errors.New("malformed signature")
 	}
-	if !hmac.Equal(provided, s.objectUploadMAC(endpoint, contentSHA256, expUnix)) {
+	matched := false
+	for _, key := range s.keys.keys {
+		if hmac.Equal(provided, objectUploadMAC(key.secret, endpoint, contentSHA256, expUnix)) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
 		return errors.New("signature mismatch")
 	}
 	if s.now().Unix() > expUnix {
@@ -46,8 +60,8 @@ func (s *Service) VerifyObjectUpload(endpoint, contentSHA256, expRaw, sig string
 	return nil
 }
 
-func (s *Service) objectUploadMAC(endpoint, contentSHA256 string, expUnix int64) []byte {
-	mac := hmac.New(sha256.New, s.secret)
+func objectUploadMAC(secret []byte, endpoint, contentSHA256 string, expUnix int64) []byte {
+	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(objectUploadKind + "\n" + endpoint + "\n" + contentSHA256 + "\n" + strconv.FormatInt(expUnix, 10)))
 	return mac.Sum(nil)
 }
