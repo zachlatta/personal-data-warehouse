@@ -1,0 +1,10 @@
+SET
+SET
+BEGIN
+kind,shapes,calls,blocks_read
+legacy identity lookup,23,32,18836671
+kind,calls,total_ms,shared_blks_read,stats_since
+indexed identity lookup,42,14586,51548,2026-10-27 16:33:38.169808+00
+dealloc,stats_reset
+0,2026-10-26 20:33:00.300713+00
+ROLLBACK

@@ -1,0 +1,9 @@
+SET
+SET
+BEGIN
+component,status,resident_bytes,total_bytes,resident_fraction,updated_at
+cache_residency,ok,2751250432,20925833216,0.131476266851653,2026-10-28 20:27:13.412593+00
+window,requests,errors,p50_ms,p90_ms,slow_requests,idle_slow_requests,share_over_2s,idle_slow_share,saturation_mix,slowest_leg_mix,status
+rolling_24h,938,5,1482.5,4475.6,297,139,0.31663113006396588486,0.46801346801346801347,"{""idle"": 139, ""io_bound"": 158}","{""exact"": 22, ""lexical"": 105, ""semantic"": 116, ""unmeasured"": 54}",attention
+rolling_7d,1582,6,1724,6073.600000000002,639,312,0.40391908975979772440,0.48826291079812206573,"{""idle"": 312, ""io_bound"": 327}","{""exact"": 110, ""lexical"": 192, ""semantic"": 281, ""unmeasured"": 56}",attention
+ROLLBACK

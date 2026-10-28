@@ -1,0 +1,8 @@
+SET
+SET
+BEGIN
+scope,n,errors,p50,p90,over_2s,exact_cut
+unfiltered,474,2,1623,7590.499999999999,189,6
+priority filtered,334,1,1489,4038.899999999999,95,15
+all real traffic,808,3,1558.5,5623.700000000002,284,21
+ROLLBACK
