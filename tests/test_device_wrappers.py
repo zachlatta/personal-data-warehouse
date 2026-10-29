@@ -16,8 +16,12 @@ where they are held false:
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
+import signal
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -249,9 +253,15 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
 def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compresses_pngs() -> None:
     service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
     assert '"$MODDIR/bin/screen-timelapse-upload-android"' in service
+    assert "unset ASH_STANDALONE" in service
+    assert 'exec /system/bin/sh "$0" "$@"' in service
     assert "FLOOR=300" in service
     assert "timeout 360" in service
+    assert 'echo "$WAKE 390000000000" > /sys/power/wake_lock' in service
     assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
+    assert service.index('timeout 360 sh "$MODDIR/bin/screen-timelapse-upload-android"') < service.index(
+        "/sys/power/wake_unlock"
+    )
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert state == "/data/misc_ce/0/pdw-screen-timelapse"
     text = _wrapper("screen-timelapse-upload-android")
@@ -261,6 +271,91 @@ def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compre
     assert '--state-file "$STATE_DIR/screen-timelapse-upload-state.sqlite"' in text
     assert "--compress-png" in text
     assert "--delete-after-upload" in text
+
+
+def test_screen_timelapse_android_wrapper_timeout_stops_process_tree_and_waits_for_pdw_exit(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    fake_pdw = tmp_path / "fake-pdw"
+    fake_pdw.write_text(
+        "#!/bin/sh\n"
+        "set -u\n"
+        'if [ "${1:-}" != "ingest" ]; then\n'
+        "  exit 0\n"
+        "fi\n"
+        'lock_file="$STATE_DIR/screen-timelapse-upload.lock"\n'
+        'events_file="$STATE_DIR/events.log"\n'
+        'echo "$$" > "$lock_file"\n'
+        'echo "$$" > "$STATE_DIR/pdw.pid"\n'
+        "sleep 60 &\n"
+        'child_term_pid=$!\n'
+        'echo "$child_term_pid" > "$STATE_DIR/child_term.pid"\n'
+        "sh -c \"trap '' TERM; exec sleep 60\" &\n"
+        'child_stubborn_pid=$!\n'
+        'echo "$child_stubborn_pid" > "$STATE_DIR/child_stubborn.pid"\n'
+        "cleanup() {\n"
+        "  trap - TERM\n"
+        "  sleep 0.2\n"
+        '  rm -f "$lock_file"\n'
+        '  echo "pdw_exited" >> "$events_file"\n'
+        "  exit 143\n"
+        "}\n"
+        "trap cleanup TERM\n"
+        ': > "$STATE_DIR/ready"\n'
+        "sleep 60 &\n"
+        "wait $!\n"
+    )
+    fake_pdw.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PDW_SCREEN_TIMELAPSE_STATE_DIR"] = str(state_dir)
+    env["STATE_DIR"] = str(state_dir)
+    env["PDW_BIN"] = str(fake_pdw)
+    env["PDW_STOP_GRACE_TICKS"] = "3"
+
+    proc = subprocess.Popen(
+        ["sh", str(BIN / "screen-timelapse-upload-android")],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready_file = state_dir / "ready"
+        deadline = time.monotonic() + 5.0
+        while not ready_file.exists():
+            assert time.monotonic() < deadline, "fake pdw did not reach ready state"
+            time.sleep(0.05)
+
+        pdw_pid = int((state_dir / "pdw.pid").read_text().strip())
+        child_term_pid = int((state_dir / "child_term.pid").read_text().strip())
+        child_stubborn_pid = int((state_dir / "child_stubborn.pid").read_text().strip())
+        lock_file = state_dir / "screen-timelapse-upload.lock"
+        assert lock_file.exists()
+
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5.0)
+        with (state_dir / "events.log").open("a") as handle:
+            handle.write("wrapper_exited\n")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+    assert proc.returncode == 143
+    assert not lock_file.exists(), "lock file must be released before wrapper exits"
+    events = (state_dir / "events.log").read_text().splitlines()
+    assert events == ["pdw_exited", "wrapper_exited"]
+
+    for pid in (pdw_pid, child_term_pid, child_stubborn_pid):
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    heartbeat = (state_dir / "logs" / "screen-timelapse-upload.heartbeat").read_text().strip()
+    assert heartbeat.endswith(" exit_code=143")
+    assert not (state_dir / "logs" / "screen-timelapse-upload.last-success").exists()
+    run_log = (state_dir / "logs" / "screen-timelapse-upload.run.log").read_text()
+    assert "finished android screen timelapse upload exit_code=143" in run_log
 
 
 def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:

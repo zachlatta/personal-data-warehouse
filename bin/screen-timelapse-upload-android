@@ -49,17 +49,69 @@ started_at_iso="$(date -Iseconds)"
 
 echo "[$started_at_iso] starting android screen timelapse upload" >> "$LOG_FILE"
 
+pdw_pid=""
+stop_pdw() {
+  trap - TERM INT HUP
+  if [ -n "$pdw_pid" ]; then
+    children="$(pgrep -P "$pdw_pid" 2>/dev/null || true)"
+    kill -TERM "$pdw_pid" $children 2>/dev/null || true
+    pkill -P "$pdw_pid" 2>/dev/null || true
+    wait "$pdw_pid" 2>/dev/null || true
+    grace_ticks="${PDW_STOP_GRACE_TICKS:-20}"
+    tick=0
+    alive=""
+    while [ "$tick" -lt "$grace_ticks" ]; do
+      alive=""
+      for child_pid in $children; do
+        if kill -0 "$child_pid" 2>/dev/null; then
+          alive="$alive $child_pid"
+        fi
+      done
+      [ -z "$alive" ] && break
+      sleep 0.1
+      tick=$((tick + 1))
+    done
+    if [ -n "$alive" ]; then
+      kill -KILL $alive 2>/dev/null || true
+      tick=0
+      while [ "$tick" -lt 10 ]; do
+        still_alive=""
+        for child_pid in $alive; do
+          if kill -0 "$child_pid" 2>/dev/null; then
+            still_alive="$still_alive $child_pid"
+          fi
+        done
+        [ -z "$still_alive" ] && break
+        sleep 0.1
+        tick=$((tick + 1))
+      done
+    fi
+  fi
+  finished_at_epoch="$(date +%s)"
+  finished_at_iso="$(date -Iseconds)"
+  duration_seconds="$((finished_at_epoch - started_at_epoch))"
+  # Record the timeout locally without posting a network heartbeat, so a hung
+  # network connection that caused the timeout cannot block teardown.
+  pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" 143
+  echo "[$finished_at_iso] finished android screen timelapse upload exit_code=143 duration_seconds=$duration_seconds" >> "$LOG_FILE"
+  exit 143
+}
+
 if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
+  trap stop_pdw TERM INT HUP
   "$PDW" ingest screen-timelapse \
     --sources "$SOURCES" \
     --compress-png \
     --delete-after-upload \
     --lock-file "$STATE_DIR/screen-timelapse-upload.lock" \
-    --state-file "$STATE_DIR/screen-timelapse-upload-state.sqlite" >> "$LOG_FILE" 2>&1
+    --state-file "$STATE_DIR/screen-timelapse-upload-state.sqlite" >> "$LOG_FILE" 2>&1 &
+  pdw_pid=$!
+  wait "$pdw_pid"
   exit_code=$?
+  trap - TERM INT HUP
 fi
 
 finished_at_epoch="$(date +%s)"

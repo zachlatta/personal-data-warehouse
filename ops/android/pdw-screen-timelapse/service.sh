@@ -17,6 +17,15 @@
 # $STATE is credential-encrypted storage, so nothing here runs before the
 # first unlock after a boot.
 
+# Magisk starts service.sh under busybox ash with ASH_STANDALONE=1, which
+# shadows /system/bin tools (sh, timeout, pgrep, pkill) with BusyBox applets.
+# Re-exec under Android's /system/bin/sh (mksh) with ASH_STANDALONE cleared so
+# timeout and the upload wrapper use the platform binaries and signal traps.
+if [ "${ASH_STANDALONE:-}" = 1 ] && [ -x /system/bin/sh ]; then
+  unset ASH_STANDALONE
+  exec /system/bin/sh "$0" "$@"
+fi
+
 MODDIR=${0%/*}
 STATE=/data/misc_ce/0/pdw-screen-timelapse
 LOG=$STATE/logs/service.log
@@ -54,7 +63,9 @@ while :; do
     mv -f "$LOG" "$LOG.1"
   fi
   if [ ! -f "$STATE/paused" ] && [ $((now - last)) -ge $FLOOR ]; then
-    echo "$WAKE 360000000000" > /sys/power/wake_lock 2>/dev/null
+    # Hold the kernel wakelock 30s past the 360s timeout so it stays active
+    # while screen-timelapse-upload-android traps TERM and waits for pdw to exit.
+    echo "$WAKE 390000000000" > /sys/power/wake_lock 2>/dev/null
     timeout 360 sh "$MODDIR/bin/screen-timelapse-upload-android" >/dev/null 2>&1
     code=$?
     echo "$WAKE" > /sys/power/wake_unlock 2>/dev/null
