@@ -7,6 +7,7 @@ import { StatusPill } from '@/components/status-pill';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { useReviewDraftState } from '@/hooks/use-review-draft-state';
 import type { Mutation, UpdateEmailMutationInput } from '@/lib/api';
 import { cleanSnippet, formatWhen } from '@/lib/format';
 import {
@@ -156,28 +157,16 @@ export function GmailEmailComposeCard({
 }) {
   const theme = useTheme();
   const review = useMemo(() => gmailEmailReview(mutation), [mutation]);
-  const [selectedId, setSelectedId] = useState(review.selectedVariantId);
-  const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>(review.deliveryMode);
-  const [edits, setEdits] = useState<Record<string, GmailEmailEdits>>(() => Object.fromEntries(review.variants.map((variant) => [variant.id, gmailEmailEditsFor(variant)])));
+  const baselineSignature = `${review.deliveryMode}|${review.selectedVariantId}|${JSON.stringify(review.variants.map(gmailEmailEditsFor))}`;
+  const draftKey = `${mutation.request_id}:${mutation.id}`;
+  const [selectedId, setSelectedId] = useReviewDraftState(`${draftKey}:variant`, baselineSignature, review.selectedVariantId, pending);
+  const [deliveryMode, setDeliveryMode] = useReviewDraftState<DeliveryMode>(`${draftKey}:mode`, baselineSignature, review.deliveryMode, pending);
+  const [edits, setEdits] = useReviewDraftState<Record<string, GmailEmailEdits>>(`${draftKey}:edits`, baselineSignature, Object.fromEntries(review.variants.map((variant) => [variant.id, gmailEmailEditsFor(variant)])), pending);
   const [quotedOpen, setQuotedOpen] = useState(false);
   const [signatureOpen, setSignatureOpen] = useState(false);
   const [copiesOpen, setCopiesOpen] = useState(false);
   const [focused, setFocused] = useState(false);
   const focus = useMemo<InputFocus>(() => ({ onFocus: () => setFocused(true), onBlur: () => setFocused(false) }), []);
-  // A new server baseline (the save on the way to sending, or any reload)
-  // replaces the local edits, so the card never reports a difference the
-  // server has already absorbed — its normalisation of the saved text would
-  // otherwise leave "Edited" up and save a second time. Reset during render,
-  // not in an effect, as the Slack card does.
-  const baselineSignature = `${review.deliveryMode}|${review.selectedVariantId}|${JSON.stringify(review.variants.map(gmailEmailEditsFor))}`;
-  const [baseline, setBaseline] = useState(baselineSignature);
-  if (baseline !== baselineSignature) {
-    setBaseline(baselineSignature);
-    setSelectedId(review.selectedVariantId);
-    setDeliveryMode(review.deliveryMode);
-    setEdits(Object.fromEntries(review.variants.map((variant) => [variant.id, gmailEmailEditsFor(variant)])));
-  }
-
   const variant: GmailEmailVariant = review.variants.find((item) => item.id === selectedId) ?? review.variants[0];
   const current = edits[variant.id] ?? gmailEmailEditsFor(variant);
   const removed = mutation.status === 'removed' || mutation.status === 'skipped' || mutation.status === 'rejected';

@@ -57,7 +57,7 @@ export function UndoBar({ bottom = Spacing.three, onOpen }: { bottom?: number; o
           }}
           style={[styles.pill, styles.failed]}>
           <ThemedText type="smallBold" style={styles.text} numberOfLines={2}>
-            Didn’t go through · {state.decision.note}: {state.error}
+            Could not confirm · {state.decision.note}: {state.error}
           </ThemedText>
         </Pressable>
       </View>

@@ -77,6 +77,9 @@ export function createDecisionHolder(clock: Clock, windowMs: number = UNDO_WINDO
 
   return {
     hold(decision: HeldDecision): void {
+      // A second tap before navigation completes is the same decision, not
+      // a new queue item. Keep its original Undo window and one server call.
+      if (decided.includes(decision.requestId)) return;
       const previous = take();
       held = { decision, deadline: now() + windowMs };
       timer = clock.setTimer(() => {

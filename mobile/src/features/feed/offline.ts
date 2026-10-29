@@ -196,6 +196,21 @@ async function prefetchMedia(urls: string[]): Promise<void> {
 
 let running = false;
 
+// An explicit save takes priority even while the ahead-of-reading batch is
+// running. The reader uses the same storeArticle path and its per-url lock.
+export async function prefetchSavedCard(config: AppConfig, item: FeedItem): Promise<void> {
+  const url = articleUrl(item, !item.embed && !!cardVideo(item));
+  const pictures = prefetchMedia(cardMediaUrls(item));
+  try {
+    if (url && !hasStoredArticle(url)) await storeArticle(url, await fetchArticle(config, url));
+  } catch (error) {
+    if (isOfflineError(error)) setOffline(true);
+    // Saving is still valid when the article is unavailable. The reader
+    // reports whether it has an offline copy, rather than claiming success.
+  }
+  await pictures;
+}
+
 /**
  * After a feed load online: download the saved queue's and the next cards'
  * pictures and articles, three at a time, until done, offline, or the app

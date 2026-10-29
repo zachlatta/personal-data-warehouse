@@ -1,14 +1,13 @@
 // The heart (Zach, voice memo 2026-10-23: "add the like button back so I can
 // mark which things I like"). The feed, its cards and the detail view share
 // this one store; a toggle records a like or unlike event, the server keeps
-// the latest per card (engagement.liked). A tap is kept pending for a couple
-// of minutes so a reload that beats the event upload does not undo it.
+// the latest per card (engagement.liked). A tap is kept pending for until the server reports it so a reload cannot undo it.
 import { useSyncExternalStore } from 'react';
 
 import { celebrate, tick } from '@/lib/haptics';
 
 import type { FeedItem } from './api';
-import { recordFeedEvent } from './engagement';
+import { pendingFeedEvents, recordFeedEvent } from './engagement';
 import { applySave, mergeSaved, type PendingSave } from './saved-queue';
 
 let liked: string[] = [];
@@ -22,10 +21,12 @@ function emit() {
 
 /** What the server says he has liked, from a feed load. */
 export function loadLiked(items: FeedItem[]) {
+  for (const event of pendingFeedEvents()) {
+    if (event.item_id && (event.type === 'like' || event.type === 'unlike')) pending.set(event.item_id, { save: event.type === 'like', at: Date.parse(event.occurred_at) });
+  }
   liked = mergeSaved(
     items.filter((i) => i.engagement.liked).map((i) => i.item_id),
     pending,
-    Date.now(),
   );
   emit();
 }

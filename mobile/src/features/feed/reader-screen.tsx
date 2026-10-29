@@ -10,6 +10,7 @@ import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { formatWhen } from '@/lib/format';
+import { useConfig } from '@/lib/session';
 
 import type { FeedItem } from './api';
 import { articleUrl } from './article';
@@ -37,6 +38,7 @@ import {
 import { LikeHeart } from './like-heart';
 import { toggleLiked, useLikedIds } from './liked';
 import { toggleSaved, useSavedIds } from './saved';
+import { prefetchSavedCard } from './offline';
 import { openTrackedBrowser } from './tracked-browser';
 import { shareCard } from './share-sheet';
 import { cardVideo, videoAspect } from './video';
@@ -123,6 +125,7 @@ function Spans({ spans, onLink }: { spans: Span[]; onLink: (url: string) => void
 // far down it was read). dwell_ms is active time: time with the app in the
 // background, or the screen untouched past a minute, does not count.
 export default function FeedReaderScreen() {
+  const config = useConfig();
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ id: string; position?: string }>();
   const theme = useTheme();
@@ -287,7 +290,9 @@ export default function FeedReaderScreen() {
               </Pressable>
               <Pressable
                 hitSlop={12}
-                onPress={() => toggleSaved(item, { position, via: 'detail' })}
+                onPress={() => {
+                  if (toggleSaved(item, { position, via: 'detail' })) void prefetchSavedCard(config, item);
+                }}
                 accessibilityLabel={saved ? 'Remove from Saved' : 'Save for later'}>
                 <Icon name={saved ? 'bookmark.fill' : 'bookmark'} tintColor={saved ? ACCENT : theme.text} size={22} />
               </Pressable>

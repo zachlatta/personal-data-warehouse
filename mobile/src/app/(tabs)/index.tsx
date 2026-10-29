@@ -135,7 +135,7 @@ export default function TimelineScreen() {
         refreshControl={<RefreshControl refreshing={fetching === 'reset' && items.length > 0} onRefresh={() => dispatch({ type: 'reset' })} />}
         ListFooterComponent={fetching === 'more' ? <ActivityIndicator style={styles.footer} /> : null}
         ListEmptyComponent={
-          fetching === 'none' ? (
+          error ? null : fetching === 'none' ? (
             <ThemedText themeColor="textSecondary" style={styles.empty}>
               Nothing here for these tiers.
             </ThemedText>

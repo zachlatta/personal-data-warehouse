@@ -108,7 +108,7 @@ export default function MutationsScreen() {
           </ThemedView>
         )}
         renderSectionFooter={({ section }) =>
-          section.data.length === 0 && !refreshing ? (
+          section.data.length === 0 && !refreshing && !error ? (
             <ThemedText type="small" themeColor="textSecondary" style={styles.empty}>
               {section.empty}
             </ThemedText>

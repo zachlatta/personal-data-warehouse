@@ -281,6 +281,10 @@ function RequestOverview({
 
 export default function MutationRequestScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  return <MutationReview key={id} id={id} />;
+}
+
+function MutationReview({ id }: { id: string | undefined }) {
   const config = useConfig();
   const theme = useTheme();
   const insets = useSafeAreaInsets();
@@ -538,7 +542,12 @@ export default function MutationRequestScreen() {
 
   if (!request) {
     return (
-      <ThemedView style={styles.center}>{error ? <ThemedText style={styles.error}>{error}</ThemedText> : <ActivityIndicator />}</ThemedView>
+      <ThemedView style={styles.center}>
+        {error ? <Pressable accessibilityRole="button" accessibilityLabel="Retry loading review" onPress={load}>
+          <ThemedText style={styles.error}>{error}</ThemedText>
+          <ThemedText>Tap to retry</ThemedText>
+        </Pressable> : <ActivityIndicator />}
+      </ThemedView>
     );
   }
   const pending = request.status === 'pending_review';

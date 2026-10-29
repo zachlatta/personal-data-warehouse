@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { applySave, mergeSaved, PENDING_MS } from './saved-queue.ts';
+import { applySave, mergeSaved } from './saved-queue.ts';
 
 test('a save goes to the front once and an unsave takes it out', () => {
   assert.deepEqual(applySave(['a', 'b'], 'b', true), ['b', 'a']);
@@ -10,14 +10,16 @@ test('a save goes to the front once and an unsave takes it out', () => {
   assert.deepEqual(applySave([], 'a', false), []);
 });
 
-test('a reload keeps a tap the server has not heard of yet', () => {
-  const now = 1_000_000;
+test('a reload keeps taps pending until the server reports their state, even after a long outage', () => {
   const pending = new Map([
-    ['new', { save: true, at: now - 1000 }],
-    ['gone', { save: false, at: now - 500 }],
-    ['old', { save: true, at: now - PENDING_MS - 1 }],
+    ['new', { save: true, at: 1000 }],
+    ['gone', { save: false, at: 2000 }],
   ]);
-  assert.deepEqual(mergeSaved(['gone', 'kept'], pending, now), ['new', 'kept']);
-  // The server already has it: its order wins.
-  assert.deepEqual(mergeSaved(['kept', 'new'], pending, now), ['kept', 'new']);
+  assert.deepEqual(mergeSaved(['gone', 'kept'], pending), ['new', 'kept']);
+  assert.equal(pending.size, 2);
+  // A later server read confirms both changes. Its queue ordering wins.
+  assert.deepEqual(mergeSaved(['kept', 'new'], pending), ['kept', 'new']);
+  assert.equal(pending.size, 0);
+  // With the local tap acknowledged, a later change on another device wins.
+  assert.deepEqual(mergeSaved(['kept'], pending), ['kept']);
 });

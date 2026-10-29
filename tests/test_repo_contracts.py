@@ -135,6 +135,28 @@ def test_python_ci_workflow_exists_and_has_no_path_filter() -> None:
     assert "paths" not in push and "paths-ignore" not in push
 
 
+def test_mobile_changes_are_checked_before_landing_and_only_main_can_publish() -> None:
+    workflow = _workflow(REPO_ROOT / ".github/workflows/mobile-update.yml")
+    triggers = workflow["on"]
+    assert "pull_request" in triggers, "mobile verification must run before landing"
+    for event in ("pull_request", "push"):
+        assert "mobile/**" in triggers[event]["paths"]
+        assert ".github/workflows/mobile-update.yml" in triggers[event]["paths"]
+
+    steps = workflow["jobs"]["update"]["steps"]
+    commands = [step.get("run") for step in steps]
+    checks = ("npm ci", "npx tsc --noEmit", "npx expo lint", "npm test")
+    publication = [i for i, step in enumerate(steps) if "EXPO_TOKEN" in step.get("env", {})]
+    assert publication, "the preview release path must remain present"
+    for check in checks:
+        assert check in commands
+        assert commands.index(check) < min(publication), "verify before publishing"
+    for index in publication:
+        assert steps[index].get("if") == "github.event_name == 'push' && github.ref == 'refs/heads/main'", (
+            "a pull request must never publish an OTA or queue a native build"
+        )
+
+
 def test_ci_runs_the_database_backed_contract_suites() -> None:
     """CI must run the whole suite, or explicitly name every contract suite.
 

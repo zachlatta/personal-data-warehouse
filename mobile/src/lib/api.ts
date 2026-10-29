@@ -1,12 +1,7 @@
 import type { AppConfig } from './config';
 
-export class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
+import { requestJson } from './request.ts';
+export { ApiError } from './request.ts';
 
 async function request<T>(config: AppConfig, path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
@@ -14,22 +9,7 @@ async function request<T>(config: AppConfig, path: string, init: RequestInit = {
   headers.set('Accept', 'application/json');
   headers.set('X-PDW-Client', config.clientName);
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${config.baseUrl}${path}`, { ...init, headers });
-  const text = await response.text();
-  let parsed: unknown = null;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = null;
-  }
-  if (!response.ok) {
-    const message =
-      (parsed && typeof parsed === 'object' && 'error' in parsed && typeof (parsed as { error: unknown }).error === 'string'
-        ? (parsed as { error: string }).error
-        : text.trim()) || `HTTP ${response.status}`;
-    throw new ApiError(response.status, message);
-  }
-  return parsed as T;
+  return requestJson<T>(`${config.baseUrl}${path}`, { ...init, headers });
 }
 
 // --- timeline ---------------------------------------------------------------
