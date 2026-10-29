@@ -53,8 +53,11 @@ if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
+  # Keep serial compression/uploads within the service's 360s timeout.
+  # The CLI default of 300 files can take much longer on the phone.
   pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "android screen timelapse" \
     "$PDW" ingest screen-timelapse \
+    --limit 40 \
     --sources "$SOURCES" \
     --compress-png \
     --delete-after-upload \

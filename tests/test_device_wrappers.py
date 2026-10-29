@@ -427,6 +427,16 @@ def test_the_stoppable_runner_returns_the_exit_code_and_clears_its_trap(tmp_path
     assert not (tmp_path / "hb").exists()
 
 
+def test_android_screen_batches_leave_time_for_the_service_deadline() -> None:
+    # Compression and upload happen serially on the phone. The CLI default
+    # (300 files) can outlive the supervisor's six-minute timeout.
+    # Forty files still drain faster than the capture loop produces them.
+    text = _wrapper("screen-timelapse-upload-android")
+    assert "--limit 40" in text
+    service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
+    assert "timeout 360" in service
+
+
 def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:
     service = (ANDROID_MODULE / "service.sh").read_text()
     wake = (ANDROID_MODULE / "google-recorder-upload-wake").read_text()

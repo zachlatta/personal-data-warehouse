@@ -526,7 +526,9 @@ Until 2026-10-27 `porygon`'s `com.zrl.pixel-screen-timelapse-pull` copied them o
 SSH only while the phone's default network was Wi-Fi, which left 822 frames waiting on the
 phone for 39 hours while on cellular (2026-10-25..27) and left `screen_timelapse` green on
 `/pipelines` because `crobat` kept uploading. Now `pdw ingest screen-timelapse` runs on the
-phone every five minutes (`ops/android/pdw-screen-timelapse/service.sh` →
+phone every five minutes, in batches of at most 40 files to leave room for
+compression and upload within the supervisor’s six-minute timeout
+(`ops/android/pdw-screen-timelapse/service.sh` →
 `bin/screen-timelapse-upload-android`, heartbeat `screen_timelapse` on `pichu`): after the card
 guard scans the `.xml.gz` tree and boxes out any payment card numbers in red on the PNG,
 `--compress-png` re-encodes each PNG in memory to full-resolution (`2410×1080`) lossy WebP
