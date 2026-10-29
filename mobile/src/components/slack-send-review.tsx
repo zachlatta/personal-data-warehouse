@@ -7,6 +7,7 @@ import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { useReviewDraftState } from '@/hooks/use-review-draft-state';
 import type { Mutation, UpdateSlackMessageMutationInput } from '@/lib/api';
 import { openDeepLink } from '@/lib/deep-link';
 import { formatWhen } from '@/lib/format';
@@ -86,17 +87,9 @@ export function SlackSendMessageCard({
   const review = useMemo(() => slackSendMessageReview(mutation), [mutation]);
   const pending = requestPending && mutation.status === 'pending_review';
   const editable = pending && !!onSave;
-  const [text, setText] = useState(review.text);
+  const [text, setText] = useReviewDraftState(`${mutation.request_id}:${mutation.id}:text`, review.text, review.text, pending);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
-  // Reset before painting a new server baseline, rather than rendering stale
-  // text and synchronously setting state from an effect (which blocks OTA lint).
-  const [baseline, setBaseline] = useState(review.text);
-  if (baseline !== review.text) {
-    setBaseline(review.text);
-    setText(review.text);
-    setSaved(false);
-  }
   const dirty = text.trim() !== review.text.trim();
   const [focused, setFocused] = useState(false);
   const [showIds, setShowIds] = useState(false);

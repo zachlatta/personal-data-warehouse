@@ -97,6 +97,10 @@ export function flushFeedEvents(force = false): Promise<void> {
   return outbox().flush(force);
 }
 
+export function pendingFeedEvents(): FeedEvent[] {
+  return outbox().pending();
+}
+
 type Fields = Omit<FeedEvent, 'event_id' | 'type' | 'session_id' | 'occurred_at'> & { at?: number };
 
 export function recordFeedEvent(type: FeedEventType, fields: Fields = {}) {

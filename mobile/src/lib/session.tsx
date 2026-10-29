@@ -1,6 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 
 import { clearConfig, loadConfig, saveConfig, type AppConfig } from './config';
+import { reviewDrafts } from './review-drafts';
+import { forgetMutationRequests } from './mutation-cache';
 import { registerForPush, type PushStatus } from './push';
 
 type SessionValue = {
@@ -49,6 +51,8 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(async () => {
+    reviewDrafts.clear();
+    forgetMutationRequests();
     await clearConfig();
     setConfig(null);
     setPush(null);

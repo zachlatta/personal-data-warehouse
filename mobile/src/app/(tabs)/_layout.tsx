@@ -43,7 +43,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="mutations"
         options={{
-          title: 'Mutations',
+          title: 'Review',
           tabBarBadge: pendingMutations > 0 ? (pendingMutations > 99 ? '99+' : pendingMutations) : undefined,
           tabBarIcon: ({ color, size }) => <Icon name="checkmark.seal" tintColor={color} size={size} />,
         }}

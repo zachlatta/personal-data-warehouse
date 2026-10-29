@@ -186,7 +186,8 @@ export function localizeArticle(html: string, dataUris: Record<string, string>):
  * Error('fetch failed: java.io.IOException: ...').
  */
 export function isOfflineError(e: unknown): boolean {
-  if (!(e instanceof Error) || 'status' in e || e instanceof SyntaxError) return false;
+  if (!(e instanceof Error) || e instanceof SyntaxError) return false;
+  if ('status' in e) return e.status === 0;
   return e instanceof TypeError || e.name === 'AbortError' || /network|fetch failed|ioexception|unknownhost|connect|socket|offline|timed? ?out/i.test(e.message);
 }
 

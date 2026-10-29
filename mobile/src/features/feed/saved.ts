@@ -5,7 +5,7 @@
 import { useSyncExternalStore } from 'react';
 
 import type { FeedItem } from './api';
-import { feedItems, recordFeedEvent } from './engagement';
+import { feedItems, pendingFeedEvents, recordFeedEvent } from './engagement';
 import { applySave, mergeSaved, type PendingSave } from './saved-queue';
 
 let order: string[] = [];
@@ -18,11 +18,14 @@ function emit() {
 
 /** The queue as the server sent it with the feed. */
 export function loadSaved(items: FeedItem[]) {
+  // Replay durable unsent taps after a process restart too.
+  for (const event of pendingFeedEvents()) {
+    if (event.item_id && (event.type === 'save' || event.type === 'unsave')) pending.set(event.item_id, { save: event.type === 'save', at: Date.parse(event.occurred_at) });
+  }
   for (const item of items) feedItems.set(item.item_id, item);
   order = mergeSaved(
     items.map((i) => i.item_id),
     pending,
-    Date.now(),
   );
   emit();
 }

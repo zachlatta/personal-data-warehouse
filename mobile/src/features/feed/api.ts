@@ -1,9 +1,12 @@
 import type { AppConfig } from '@/lib/config';
+import { requestJson } from '@/lib/request';
 
 import type { FeedArticle } from './article';
 import type { FeedEvent } from './event-queue';
 import type { FeedLink } from './links';
 import type { FeedEmbed, FeedMedia } from './rich';
+
+export { ApiError as FeedApiError } from '@/lib/request';
 
 export type FeedItem = {
   item_id: string;
@@ -32,31 +35,13 @@ export type FeedItem = {
 // saved is his read-later queue, newest saved first (absent on an older server).
 export type FeedPage = { items: FeedItem[]; saved?: FeedItem[]; generated_at: string };
 
-export class FeedApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
 async function feedRequest<T>(config: AppConfig, path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${config.clientName}:${config.token}`);
   headers.set('Accept', 'application/json');
   headers.set('X-PDW-Client', config.clientName);
   if (init.body) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${config.baseUrl}${path}`, { ...init, headers });
-  const text = await response.text();
-  if (!response.ok) {
-    let message = text.trim() || `HTTP ${response.status}`;
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed.error === 'string') message = parsed.error;
-    } catch {}
-    throw new FeedApiError(response.status, message);
-  }
-  return (text ? JSON.parse(text) : null) as T;
+  return requestJson<T>(`${config.baseUrl}${path}`, { ...init, headers });
 }
 
 export function fetchFeed(config: AppConfig, limit = 200): Promise<FeedPage> {

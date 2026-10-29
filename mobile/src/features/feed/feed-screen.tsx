@@ -30,6 +30,7 @@ import { useConfig } from '@/lib/session';
 import { fetchFeed, FeedApiError, searchFeed, type FeedItem } from './api';
 import { ArticleWarmup } from './article-view';
 import { newArrivals } from './card-context';
+import { applyPendingDismissals, loadWithoutWaitingForEvents, refreshItems } from './refresh';
 import {
   activeNow,
   connectFeedLogger,
@@ -38,6 +39,7 @@ import {
   flushFeedEvents,
   markActive,
   markOpenTap,
+  pendingFeedEvents,
   recordFeedEvent,
   recordUi,
   startFeedSession,
@@ -51,7 +53,7 @@ import { ACCENT, SourceAvatar, type MediaAction } from './rich-views';
 import { loadLiked, toggleLiked, useLikedIds } from './liked';
 import { loadSaved, toggleSaved, useSavedIds } from './saved';
 import { readFeedCache, writeFeedCache } from './feed-cache';
-import { prefetchOffline, setOffline, useOffline } from './offline';
+import { prefetchOffline, prefetchSavedCard, setOffline, useOffline } from './offline';
 import { isOfflineError, OFFLINE_PAGE_MAX_AGE_MS } from './offline-store';
 import { ScrollGestureTracker, scrollMetadata } from './scroll-gestures';
 import { shareCard } from './share-sheet';
@@ -70,8 +72,7 @@ const UNDO_MS = 5_000;
 const SAVED = '\u0000saved';
 // A drag let go with no fling has ended if no coast began by then.
 const SETTLE_MS = 80;
-// The new-cards pill shows only when he is this far down, and goes at the top.
-const PILL_FROM_Y = 400;
+// Preserve the list once the reader has left the top.
 const PILL_GONE_Y = 120;
 
 // The served order, kept under the server's 16 KB metadata cap (one
@@ -133,6 +134,8 @@ export default function FeedScreen() {
   const offline = useOffline();
   const [items, setItems] = useState<FeedItem[]>(() => cached?.items ?? []);
   const [loaded, setLoaded] = useState(!!cached);
+  const [paintStart] = useState(() => performance.now());
+  const firstPaint = useRef({ started: paintStart, cached: !!cached, sent: false });
   const savedPage = useRef<FeedItem[]>(cached?.saved ?? []);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -141,6 +144,8 @@ export default function FeedScreen() {
   const [sheet, setSheet] = useState<ActionSheetRequest | null>(null);
   // Cards a reload brought that were not in the list, for X's "new posts" pill.
   const [arrivals, setArrivals] = useState<FeedItem[]>([]);
+  const pendingItems = useRef<FeedItem[] | null>(null);
+  const loading = useRef(false);
   const list = useRef<FlatList<FeedItem>>(null);
   const loadedIds = useRef<string[]>(cached?.items.map((i) => i.item_id) ?? []);
   // The rail across the top narrows the feed to one source.
@@ -233,12 +238,14 @@ export default function FeedScreen() {
   // pull (pull to refresh). The load event logs exactly what was served, in
   // order, so a later query can tell what he was shown but never reached.
   const load = useCallback(async (trigger: 'first' | 'stale' | 'pull') => {
+    if (loading.current) return;
+    loading.current = true;
     setRefreshing(true);
     const startedAt = Date.now();
     try {
-      // Send taps first, so the queue the server answers with includes them.
-      await flushFeedEvents(true).catch(() => {});
-      const page = await fetchFeed(config);
+      const beforeUpload = pendingFeedEvents();
+      const page = await loadWithoutWaitingForEvents(() => flushFeedEvents(true), () => fetchFeed(config));
+      page.items = applyPendingDismissals(page.items, [...beforeUpload, ...pendingFeedEvents()]);
       pause();
       recordFeedEvent('load', {
         at: startedAt,
@@ -256,11 +263,14 @@ export default function FeedScreen() {
       loadSaved(page.saved ?? []);
       pageItems.current = [...page.items, ...(page.saved ?? [])];
       loadLiked(pageItems.current);
-      const fresh = (trigger === 'stale' || loadedIds.current.length > 0) && viewport.current.top > PILL_FROM_Y ? newArrivals(loadedIds.current, page.items) : [];
+      const preserve = trigger !== 'pull' && loadedIds.current.length > 0 && viewport.current.top > PILL_GONE_Y;
+      const fresh = preserve ? newArrivals(loadedIds.current, page.items) : [];
+      pendingItems.current = preserve ? page.items : null;
       setArrivals(fresh);
       if (fresh.length) recordUi('new_pill_shown', { metadata: { count: fresh.length, view: view.current } });
-      loadedIds.current = page.items.map((i) => i.item_id);
-      setItems(page.items);
+      if (!preserve) loadedIds.current = page.items.map((i) => i.item_id);
+      setItems((current) => refreshItems(current, page.items, preserve));
+      writeFeedCache(page);
       setPageAt(Date.now());
       setOffline(false);
       // Download what is next and saved, for reading offline.
@@ -290,6 +300,7 @@ export default function FeedScreen() {
         }
       } else setError(e instanceof Error ? e.message : String(e));
     } finally {
+      loading.current = false;
       setRefreshing(false);
       setLoaded(true);
     }
@@ -406,7 +417,6 @@ export default function FeedScreen() {
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       markActive();
       viewport.current = { top: e.nativeEvent.contentOffset.y, height: e.nativeEvent.layoutMeasurement.height };
-      if (viewport.current.top < PILL_GONE_Y) setArrivals((a) => (a.length ? [] : a));
       measure();
     },
     [measure],
@@ -473,6 +483,11 @@ export default function FeedScreen() {
 
   const onCardLayout = useCallback(
     (itemId: string, height: number) => {
+      if (!firstPaint.current.sent) {
+        firstPaint.current.sent = true;
+        const { started, cached } = firstPaint.current;
+        requestAnimationFrame(() => recordUi('screen_paint', { dwell_ms: Math.round(performance.now() - started), metadata: { screen: 'feed', cached } }));
+      }
       if (heights.current.get(itemId) === height) return;
       heights.current.set(itemId, height);
       measure();
@@ -586,6 +601,7 @@ export default function FeedScreen() {
         return next;
       };
       setItems((prev) => prev.filter((i) => i.item_id !== item.item_id));
+      if (pendingItems.current) pendingItems.current = pendingItems.current.filter((i) => i.item_id !== item.item_id);
       setResults((prev) => prev && prev.filter((i) => i.item_id !== item.item_id));
       showUndo('Hidden', () => {
         recordFeedEvent('undismiss', { item_id: item.item_id, position: index });
@@ -603,12 +619,13 @@ export default function FeedScreen() {
     (item: FeedItem, via: string) => {
       if (only === SAVED) LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       const saved = toggleSaved(item, { position: position(item), via });
+      if (saved) void prefetchSavedCard(config, item);
       showUndo(saved ? 'Saved for later' : 'Removed from Saved', () => {
         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
         toggleSaved(item, { position: position(item), via: 'undo' });
       });
     },
-    [only, showUndo],
+    [only, showUndo, config],
   );
 
   const runUndo = useCallback(() => {
@@ -810,25 +827,27 @@ export default function FeedScreen() {
               </View>
             ) : null}
             {offline && !searching ? (
-              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+              <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
                 <ThemedText style={styles.bannerText}>
                   {pageAt ? `You're offline · cards from ${offlineAge(pageAt)}` : "You're offline"}. Downloaded articles and photos still open.
                 </ThemedText>
-              </View>
+                <ThemedText type="smallBold">Tap to retry</ThemedText>
+              </Pressable>
             ) : null}
             {error && !offline && !searching ? (
-              <View style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
+              <Pressable accessibilityRole="button" accessibilityLabel="Retry loading feed" onPress={() => void load('pull')} style={[styles.banner, { backgroundColor: theme.backgroundElement }]}>
                 <ThemedText style={styles.bannerText}>Could not refresh: {error}</ThemedText>
-              </View>
+                <ThemedText type="smallBold">Tap to retry</ThemedText>
+              </Pressable>
             ) : null}
           </View>
         }
         ListEmptyComponent={
           searching ? (
             <View style={styles.empty}>
-              {results === null ? (
+              {searchError ? null : results === null ? (
                 <ActivityIndicator />
-              ) : searchError ? null : (
+              ) : (
                 <>
                   <ThemedText style={styles.emptyTitle}>{query.trim() ? 'No matches' : 'Nothing seen yet'}</ThemedText>
                   <ThemedText style={[styles.emptyBody, { color: theme.textSecondary }]}>
@@ -856,7 +875,7 @@ export default function FeedScreen() {
             ) : (
               // Only before the first card is ever pushed: once there are cards
               // the server resurfaces seen ones instead of an empty feed.
-              <ActivityIndicator />
+              error || offline ? <ThemedText themeColor="textSecondary">Your feed will appear when PDW is reachable.</ThemedText> : <ThemedText themeColor="textSecondary">No cards yet. Pull down to refresh.</ThemedText>
             )}
           </View>
           )
@@ -867,6 +886,12 @@ export default function FeedScreen() {
           style={({ pressed }) => [styles.pill, pressed && styles.pillPressed]}
           onPress={() => {
             recordUi('new_pill', { metadata: { count: arrivals.length, from_y: Math.round(viewport.current.top) } });
+            if (pendingItems.current) {
+              pause();
+              loadedIds.current = pendingItems.current.map((item) => item.item_id);
+              setItems(pendingItems.current);
+              pendingItems.current = null;
+            }
             setArrivals([]);
             list.current?.scrollToOffset({ offset: 0, animated: true });
           }}

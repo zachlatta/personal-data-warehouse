@@ -209,3 +209,17 @@ test('the state is the same object until something changes', () => {
   assert.equal(holder.state(), holder.state());
   assert.equal(holder.decidedRequestIds(), holder.decidedRequestIds());
 });
+
+test('a rapid second tap on the same request cannot commit it twice or shorten Undo', async () => {
+  const clock = fakeClock();
+  const calls = [];
+  const holder = createDecisionHolder(clock);
+  holder.hold(decision('a', calls));
+  await clock.advance(100);
+  holder.hold(decision('a', calls));
+  assert.deepEqual(calls, []);
+  await clock.advance(9900);
+  assert.deepEqual(calls, ['a']);
+  await clock.advance(10000);
+  assert.deepEqual(calls, ['a']);
+});

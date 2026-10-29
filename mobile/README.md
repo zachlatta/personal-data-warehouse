@@ -5,6 +5,13 @@ timeline, the mutation review queue, and push notifications when a new
 mutation request needs a decision. Android is the phone Zach carries since
 2026-10-23; iOS still builds from the same code.
 
+The app's experience promises and release checks are in [CONTRACTS.md](CONTRACTS.md).
+The Review tab preserves unsaved email, Slack, and text edits when navigating
+within the app session. Use Save without sending before closing the app to keep
+an edit on the server; unsaved message text is never written to a local file.
+Feed refreshes do not wait for analytics uploads, and background refreshes stage
+new cards without moving the current reading position.
+
 The app talks to the same Go app the `pdw` CLI does and authenticates the same
 way — a static bearer `"<client_name>:<PDW_SECRET_TOKEN>"` — so signing in is
 pasting the app URL and the secret token once. The token lives in the Android
