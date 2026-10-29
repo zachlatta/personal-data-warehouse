@@ -25,7 +25,11 @@ FLOOR=300
 
 umask 077
 
-until [ "$(getprop sys.boot_completed)" = 1 ] && [ -d /data/misc_ce/0 ] && ls /data/data >/dev/null 2>&1; do
+# /data/misc_ce/0 exists and ls /data/data succeeds before the first unlock too
+# (the names are encrypted), so wait for Android to say CE storage is open.
+# Without that, after the 2026-10-28 restart the supervisor started locked,
+# its supervisor.pid and log writes failed, and it never logged "started".
+until [ "$(getprop sys.boot_completed)" = 1 ] && [ "$(getprop sys.user.0.ce_available)" = true ] && [ -d /data/misc_ce/0 ] && ls /data/data >/dev/null 2>&1; do
   sleep 5
 done
 mkdir -p "$STATE/logs" "$STATE/home" "$STATE/tmp"

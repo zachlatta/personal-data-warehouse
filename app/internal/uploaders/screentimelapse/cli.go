@@ -151,7 +151,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			return common.ExitFailure
 		}
 		client = ingest
-		baseGuard := common.UploadGuard(env, "SCREEN_TIMELAPSE", cfg.BaseURL)
+		baseGuard := networkGuard(env, cfg.BaseURL)
 		guard = func() string {
 			if enableWiFiOnly {
 				if reason := AndroidWiFiGuard(); reason != "" {
@@ -217,4 +217,19 @@ type dryRunUploader struct {
 func (d *dryRunUploader) UploadScreenTimelapseFile(content []byte, f ingestclient.ScreenTimelapseFile) (ingestclient.ScreenTimelapseStored, error) {
 	fmt.Fprintf(d.out, "would send %s/%s (%d bytes, captured_at %s)\n", f.Device, f.SourceFilename, len(content), f.CapturedAt)
 	return ingestclient.ScreenTimelapseStored{}, nil
+}
+
+// onAndroid reports whether this run is on the phone. A var for tests.
+var onAndroid = func() bool { return isExecutable(defaultAndroidDumpsys) }
+
+// networkGuard is UploadGuard on a Mac. On Android it is PreflightGuard, like
+// every other phone uploader: the tethering policy guards a Mac on a phone's
+// hotspot, and Android routes through policy tables, so /proc/net/route has
+// no default route and UploadGuard deferred every run on pichu ("no default
+// network route", 2026-10-27 to 2026-10-29). --wifi-only still applies.
+func networkGuard(env common.Getenv, baseURL string) func() string {
+	if onAndroid() {
+		return common.PreflightGuard(env, "SCREEN_TIMELAPSE", baseURL)
+	}
+	return common.UploadGuard(env, "SCREEN_TIMELAPSE", baseURL)
 }
