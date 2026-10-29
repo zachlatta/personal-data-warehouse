@@ -26,6 +26,15 @@
 # $STATE and Messages' own data are credential-encrypted storage, so nothing
 # here runs before the first unlock after a boot.
 
+# Magisk starts service.sh under busybox ash with ASH_STANDALONE=1, which
+# shadows /system/bin tools (sh, timeout, pgrep, pkill) with BusyBox applets.
+# Re-exec under Android's /system/bin/sh (mksh) with ASH_STANDALONE cleared so
+# timeout and the upload wrapper use the platform binaries and signal traps.
+if [ "${ASH_STANDALONE:-}" = 1 ] && [ -x /system/bin/sh ]; then
+  unset ASH_STANDALONE
+  exec /system/bin/sh "$0" "$@"
+fi
+
 MODDIR=${0%/*}
 STATE=/data/misc_ce/0/pdw-android-messages
 PKG=com.google.android.apps.messaging
@@ -78,7 +87,9 @@ while :; do
   fi
   if [ ! -f "$STATE/paused" ] && { { [ -f "$STATE/due" ] && [ $((now - last)) -ge $MIN_GAP ]; } || [ $((now - last)) -ge $FLOOR ]; }; then
     rm -f "$STATE/due"
-    echo "$WAKE 660000000000" > /sys/power/wake_lock 2>/dev/null
+    # Hold the kernel wakelock 30s past the 660s timeout so it stays active
+    # while android-messages-upload-android traps TERM and waits for pdw to exit.
+    echo "$WAKE 690000000000" > /sys/power/wake_lock 2>/dev/null
     timeout 660 sh "$MODDIR/bin/android-messages-upload-android" >/dev/null 2>&1
     code=$?
     echo "$WAKE" > /sys/power/wake_unlock 2>/dev/null

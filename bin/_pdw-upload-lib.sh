@@ -207,6 +207,86 @@ pdw_post_heartbeat() {
   return 0
 }
 
+# pdw_run_stoppable HEARTBEAT_FILE LOG_FILE LABEL CMD...
+# Run CMD (an Android wrapper's `"$PDW" ingest ...`) with its output appended
+# to LOG_FILE, and return its exit code. If the wrapper is signalled first
+# (TERM, INT or HUP), stop CMD's whole tree, record the run as exit 143 and
+# exit the wrapper with 143.
+#
+# Why: each Magisk service bounds a run with toybox `timeout N`, which signals
+# only the wrapper's shell. With pdw in the foreground the shell died and pdw
+# -- plus the `content read` and Skia helpers it starts -- kept running after
+# the service released its wakelock, suspended mid-run, and held the next
+# run's lock (pichu, 2026-10-29). So CMD runs in the background and the trap
+# sends TERM to it and its direct children (one call, with a pkill -P sweep
+# for a child started in between; toybox `pkill -TERM` is broken, so the
+# sweep uses the default signal), waits for CMD, gives the children
+# PDW_STOP_GRACE_TICKS tenths of a second (default 20) and then KILLs what is
+# left. The services hold their wakelock 30 s past the timeout to cover it.
+#
+# A stopped run is recorded only locally (heartbeat file and run log): the
+# network heartbeat is skipped on purpose, because a hung connection is the
+# usual reason for the timeout and would stall the teardown past the
+# wakelock. The next finished run's post still advances the pipeline's
+# freshness, so a source that keeps timing out still reads stale.
+#
+# Android sh (mksh) and POSIX sh only: the child lists rely on word splitting,
+# which zsh does not do, so the Mac wrappers never call this.
+pdw_run_stoppable() {
+  _stop_hb="$1"
+  _stop_log="$2"
+  _stop_label="$3"
+  shift 3
+  _stop_started="$(date +%s)"
+  _stop_pid=""
+  trap _pdw_stop_run TERM INT HUP
+  "$@" >> "$_stop_log" 2>&1 &
+  _stop_pid=$!
+  wait "$_stop_pid"
+  _stop_code=$?
+  trap - TERM INT HUP
+  return "$_stop_code"
+}
+
+_pdw_stop_run() {
+  trap - TERM INT HUP
+  if [ -n "$_stop_pid" ]; then
+    _children="$(pgrep -P "$_stop_pid" 2>/dev/null || true)"
+    kill -TERM "$_stop_pid" $_children 2>/dev/null || true
+    pkill -P "$_stop_pid" 2>/dev/null || true
+    wait "$_stop_pid" 2>/dev/null || true
+    _alive="$(_pdw_alive $_children)"
+    _tick=0
+    while [ -n "$_alive" ] && [ "$_tick" -lt "${PDW_STOP_GRACE_TICKS:-20}" ]; do
+      sleep 0.1
+      _tick=$((_tick + 1))
+      _alive="$(_pdw_alive $_alive)"
+    done
+    if [ -n "$_alive" ]; then
+      kill -KILL $_alive 2>/dev/null || true
+      _tick=0
+      while [ -n "$_alive" ] && [ "$_tick" -lt 10 ]; do
+        sleep 0.1
+        _tick=$((_tick + 1))
+        _alive="$(_pdw_alive $_alive)"
+      done
+    fi
+  fi
+  _stop_iso="$(date -Iseconds)"
+  pdw_record_run "$_stop_hb" "$_stop_iso" 143
+  echo "[$_stop_iso] finished $_stop_label upload exit_code=143 duration_seconds=$(($(date +%s) - _stop_started))" >> "$_stop_log"
+  exit 143
+}
+
+# _pdw_alive PID... -> prints the PIDs that still exist.
+_pdw_alive() {
+  for _p in "$@"; do
+    if kill -0 "$_p" 2>/dev/null; then
+      printf '%s ' "$_p"
+    fi
+  done
+}
+
 # _pdw_file_mtime FILE -> epoch seconds of the file's mtime (GNU then BSD stat).
 _pdw_file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null

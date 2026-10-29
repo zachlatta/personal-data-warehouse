@@ -51,7 +51,8 @@ if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
-  "$PDW" ingest google-recorder --state-file "$STATE_DIR/google-recorder-upload-state.sqlite" >> "$LOG_FILE" 2>&1
+  pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "google recorder" \
+    "$PDW" ingest google-recorder --state-file "$STATE_DIR/google-recorder-upload-state.sqlite"
   exit_code=$?
 fi
 

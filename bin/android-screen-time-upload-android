@@ -47,8 +47,9 @@ if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
-  "$PDW" ingest android-screen-time --lock-file "$STATE_DIR/android-screen-time-upload.lock" \
-    --state-file "$STATE_DIR/android-screen-time-upload.json" >> "$LOG_FILE" 2>&1
+  pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "android screen time" \
+    "$PDW" ingest android-screen-time --lock-file "$STATE_DIR/android-screen-time-upload.lock" \
+    --state-file "$STATE_DIR/android-screen-time-upload.json"
   exit_code=$?
 fi
 

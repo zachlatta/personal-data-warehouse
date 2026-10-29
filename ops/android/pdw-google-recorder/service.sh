@@ -23,6 +23,15 @@
 # bin/google-recorder-upload-android), so it, like Recorder's own data, does
 # not exist until the first unlock after a boot. Nothing is written before.
 
+# Magisk starts service.sh under busybox ash with ASH_STANDALONE=1, which
+# shadows /system/bin tools (sh, timeout, pgrep, pkill) with BusyBox applets.
+# Re-exec under Android's /system/bin/sh (mksh) with ASH_STANDALONE cleared so
+# timeout and the upload wrapper use the platform binaries and signal traps.
+if [ "${ASH_STANDALONE:-}" = 1 ] && [ -x /system/bin/sh ]; then
+  unset ASH_STANDALONE
+  exec /system/bin/sh "$0" "$@"
+fi
+
 MODDIR=${0%/*}
 STATE=/data/misc_ce/0/pdw-google-recorder
 REC=/data/data/com.google.android.apps.recorder
@@ -69,7 +78,9 @@ while :; do
   fi
   if [ ! -f "$STATE/paused" ] && { { [ -f "$STATE/due" ] && [ $((now - last)) -ge $MIN_GAP ]; } || [ $((now - last)) -ge $FLOOR ]; }; then
     rm -f "$STATE/due"
-    echo "$WAKE 960000000000" > /sys/power/wake_lock 2>/dev/null
+    # Hold the kernel wakelock 30s past the 960s timeout so it stays active
+    # while google-recorder-upload-android traps TERM and waits for pdw to exit.
+    echo "$WAKE 990000000000" > /sys/power/wake_lock 2>/dev/null
     timeout 960 sh "$MODDIR/bin/google-recorder-upload-android" >/dev/null 2>&1
     code=$?
     echo "$WAKE" > /sys/power/wake_unlock 2>/dev/null

@@ -253,15 +253,7 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
 def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compresses_pngs() -> None:
     service = (SCREEN_TIMELAPSE_MODULE / "service.sh").read_text()
     assert '"$MODDIR/bin/screen-timelapse-upload-android"' in service
-    assert "unset ASH_STANDALONE" in service
-    assert 'exec /system/bin/sh "$0" "$@"' in service
     assert "FLOOR=300" in service
-    assert "timeout 360" in service
-    assert 'echo "$WAKE 390000000000" > /sys/power/wake_lock' in service
-    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
-    assert service.index('timeout 360 sh "$MODDIR/bin/screen-timelapse-upload-android"') < service.index(
-        "/sys/power/wake_unlock"
-    )
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert state == "/data/misc_ce/0/pdw-screen-timelapse"
     text = _wrapper("screen-timelapse-upload-android")
@@ -273,69 +265,130 @@ def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compre
     assert "--delete-after-upload" in text
 
 
-def test_screen_timelapse_android_wrapper_timeout_stops_process_tree_and_waits_for_pdw_exit(tmp_path: Path) -> None:
+# Every Magisk service bounds a run with toybox `timeout N`, which sends TERM
+# to the wrapper's shell alone. A wrapper that ran pdw in the foreground died
+# there and left pdw (and the `content read` / Skia helper children it starts)
+# running with the wakelock released, so it suspended mid-run and held the
+# next run's lock (pichu, 2026-10-29). Each wrapper therefore runs pdw through
+# the lib's pdw_run_stoppable, and each service holds its wakelock 30 s past
+# the timeout so the phone stays awake while that teardown finishes.
+# module -> (wrapper, state-dir env var, timeout seconds)
+ANDROID_UPLOADERS: dict[str, tuple[str, str, int]] = {
+    "pdw-google-recorder": ("google-recorder-upload-android", "PDW_GOOGLE_RECORDER_STATE_DIR", 960),
+    "pdw-android-notifications": ("android-notifications-upload-android", "PDW_ANDROID_NOTIFICATIONS_STATE_DIR", 660),
+    "pdw-android-messages": ("android-messages-upload-android", "PDW_ANDROID_MESSAGES_STATE_DIR", 660),
+    "pdw-android-screen-time": ("android-screen-time-upload-android", "PDW_ANDROID_SCREEN_TIME_STATE_DIR", 360),
+    "pdw-screen-timelapse": ("screen-timelapse-upload-android", "PDW_SCREEN_TIMELAPSE_STATE_DIR", 360),
+}
+STOP_WAKELOCK_MARGIN_SECONDS = 30
+
+
+def test_every_android_wrapper_is_in_the_stoppable_run_contract() -> None:
+    present = sorted(p.name for p in BIN.iterdir() if p.name.endswith("-upload-android"))
+    assert present == sorted(w for w, _, _ in ANDROID_UPLOADERS.values())
+    modules = sorted(p.name for p in (REPO_ROOT / "ops" / "android").iterdir() if (p / "service.sh").exists())
+    assert modules == sorted(ANDROID_UPLOADERS)
+
+
+@pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))
+def test_android_service_holds_its_wakelock_past_the_timeout_under_platform_sh(module: str) -> None:
+    wrapper, _, seconds = ANDROID_UPLOADERS[module]
+    service = (REPO_ROOT / "ops" / "android" / module / "service.sh").read_text()
+    # Magisk's standalone BusyBox ash would shadow toybox timeout/pgrep/pkill.
+    assert "unset ASH_STANDALONE" in service
+    assert 'exec /system/bin/sh "$0" "$@"' in service
+    run = f'timeout {seconds} sh "$MODDIR/bin/{wrapper}"'
+    assert re.findall(r"(?m)^\s*timeout \d+ .*$", service) == [f"    {run} >/dev/null 2>&1"]
+    wakelock_ns = (seconds + STOP_WAKELOCK_MARGIN_SECONDS) * 1_000_000_000
+    lock = f'echo "$WAKE {wakelock_ns}" > /sys/power/wake_lock'
+    assert re.findall(r'echo "\$WAKE \d+" > /sys/power/wake_lock', service) == [lock]
+    assert service.index(lock) < service.index(run) < service.index('echo "$WAKE" > /sys/power/wake_unlock')
+
+
+@pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))
+def test_android_wrapper_runs_pdw_through_the_shared_stoppable_runner(module: str) -> None:
+    wrapper, _, _ = ANDROID_UPLOADERS[module]
+    text = _wrapper(wrapper)
+    invocation, _ = WRAPPERS[wrapper]
+    runner = r'pdw_run_stoppable "\$HEARTBEAT_FILE" "\$LOG_FILE" "[a-z ]+" \\\n\s+' + re.escape(invocation)
+    assert re.search(runner, text), f"{wrapper} must run {invocation!r} through pdw_run_stoppable"
+    assert text.count('"$PDW" ingest') == 1, f"{wrapper} must not run pdw outside the runner"
+    # The stop routine lives once, in the lib.
+    assert "trap " not in text and "pgrep" not in text and "pkill" not in text
+
+
+def test_the_stop_routine_lives_only_in_the_lib() -> None:
+    lib = (BIN / LIB).read_text()
+    assert "pdw_run_stoppable() {" in lib
+    owners = sorted(p.name for p in BIN.iterdir() if p.is_file() and re.search(r"\bpgrep -P\b|\bpkill -P\b", p.read_text()))
+    assert owners == [LIB]
+
+
+_FAKE_PDW = """#!/bin/sh
+set -u
+if [ "${1:-}" != "ingest" ]; then
+  echo "pdw_$1" >> "$FAKE_DIR/events.log"
+  exit 0
+fi
+lock_file="$FAKE_DIR/run.lock"
+events_file="$FAKE_DIR/events.log"
+echo "$$" > "$lock_file"
+echo "$$" > "$FAKE_DIR/pdw.pid"
+sleep 60 &
+echo "$!" > "$FAKE_DIR/child_term.pid"
+sh -c "trap '' TERM; exec sleep 60" &
+echo "$!" > "$FAKE_DIR/child_stubborn.pid"
+cleanup() {
+  trap - TERM
+  sleep 0.2
+  rm -f "$lock_file"
+  echo "pdw_exited" >> "$events_file"
+  exit 143
+}
+trap cleanup TERM
+: > "$FAKE_DIR/ready"
+sleep 60 &
+wait $!
+"""
+
+
+@pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))
+def test_android_wrapper_timeout_stops_process_tree_and_waits_for_pdw_exit(tmp_path: Path, module: str) -> None:
+    wrapper, state_env, _ = ANDROID_UPLOADERS[module]
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    fake_dir = tmp_path / "fake"
+    fake_dir.mkdir()
     fake_pdw = tmp_path / "fake-pdw"
-    fake_pdw.write_text(
-        "#!/bin/sh\n"
-        "set -u\n"
-        'if [ "${1:-}" != "ingest" ]; then\n'
-        "  exit 0\n"
-        "fi\n"
-        'lock_file="$STATE_DIR/screen-timelapse-upload.lock"\n'
-        'events_file="$STATE_DIR/events.log"\n'
-        'echo "$$" > "$lock_file"\n'
-        'echo "$$" > "$STATE_DIR/pdw.pid"\n'
-        "sleep 60 &\n"
-        'child_term_pid=$!\n'
-        'echo "$child_term_pid" > "$STATE_DIR/child_term.pid"\n'
-        "sh -c \"trap '' TERM; exec sleep 60\" &\n"
-        'child_stubborn_pid=$!\n'
-        'echo "$child_stubborn_pid" > "$STATE_DIR/child_stubborn.pid"\n'
-        "cleanup() {\n"
-        "  trap - TERM\n"
-        "  sleep 0.2\n"
-        '  rm -f "$lock_file"\n'
-        '  echo "pdw_exited" >> "$events_file"\n'
-        "  exit 143\n"
-        "}\n"
-        "trap cleanup TERM\n"
-        ': > "$STATE_DIR/ready"\n'
-        "sleep 60 &\n"
-        "wait $!\n"
-    )
+    fake_pdw.write_text(_FAKE_PDW)
     fake_pdw.chmod(0o755)
 
     env = os.environ.copy()
-    env["PDW_SCREEN_TIMELAPSE_STATE_DIR"] = str(state_dir)
-    env["STATE_DIR"] = str(state_dir)
+    env[state_env] = str(state_dir)
+    env["FAKE_DIR"] = str(fake_dir)
     env["PDW_BIN"] = str(fake_pdw)
     env["PDW_STOP_GRACE_TICKS"] = "3"
 
     proc = subprocess.Popen(
-        ["sh", str(BIN / "screen-timelapse-upload-android")],
+        ["sh", str(BIN / wrapper)],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     try:
-        ready_file = state_dir / "ready"
         deadline = time.monotonic() + 5.0
-        while not ready_file.exists():
+        while not (fake_dir / "ready").exists():
             assert time.monotonic() < deadline, "fake pdw did not reach ready state"
             time.sleep(0.05)
 
-        pdw_pid = int((state_dir / "pdw.pid").read_text().strip())
-        child_term_pid = int((state_dir / "child_term.pid").read_text().strip())
-        child_stubborn_pid = int((state_dir / "child_stubborn.pid").read_text().strip())
-        lock_file = state_dir / "screen-timelapse-upload.lock"
+        pids = [int((fake_dir / f"{name}.pid").read_text()) for name in ("pdw", "child_term", "child_stubborn")]
+        lock_file = fake_dir / "run.lock"
         assert lock_file.exists()
 
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=5.0)
-        with (state_dir / "events.log").open("a") as handle:
+        with (fake_dir / "events.log").open("a") as handle:
             handle.write("wrapper_exited\n")
     finally:
         if proc.poll() is None:
@@ -344,18 +397,34 @@ def test_screen_timelapse_android_wrapper_timeout_stops_process_tree_and_waits_f
 
     assert proc.returncode == 143
     assert not lock_file.exists(), "lock file must be released before wrapper exits"
-    events = (state_dir / "events.log").read_text().splitlines()
-    assert events == ["pdw_exited", "wrapper_exited"]
-
-    for pid in (pdw_pid, child_term_pid, child_stubborn_pid):
+    assert (fake_dir / "events.log").read_text().splitlines() == ["pdw_exited", "wrapper_exited"]
+    for pid in pids:
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
 
-    heartbeat = (state_dir / "logs" / "screen-timelapse-upload.heartbeat").read_text().strip()
-    assert heartbeat.endswith(" exit_code=143")
-    assert not (state_dir / "logs" / "screen-timelapse-upload.last-success").exists()
-    run_log = (state_dir / "logs" / "screen-timelapse-upload.run.log").read_text()
-    assert "finished android screen timelapse upload exit_code=143" in run_log
+    # Recorded locally only: events.log above has no "pdw_heartbeat", so a
+    # hung network cannot stall the teardown inside the wakelock margin.
+    base = wrapper.removesuffix("-android")
+    logs = state_dir / "logs"
+    assert (logs / f"{base}.heartbeat").read_text().strip().endswith(" exit_code=143")
+    assert not (logs / f"{base}.last-success").exists()
+    run_log = (logs / f"{base}.run.log").read_text()
+    assert re.search(r"(?m)^\[[^]]+\] finished .* upload exit_code=143 duration_seconds=\d+$", run_log)
+
+
+def test_the_stoppable_runner_returns_the_exit_code_and_clears_its_trap(tmp_path: Path) -> None:
+    script = tmp_path / "run.sh"
+    log = tmp_path / "run.log"
+    script.write_text(
+        f'. "{BIN / LIB}"\n'
+        f'pdw_run_stoppable "{tmp_path}/hb" "{log}" test sh -c "echo hello; exit 7"\n'
+        'echo "code=$?"\n'
+        "trap\n"
+    )
+    out = subprocess.run(["sh", str(script)], capture_output=True, text=True, timeout=10).stdout
+    assert out.splitlines() == ["code=7"]
+    assert log.read_text() == "hello\n"
+    assert not (tmp_path / "hb").exists()
 
 
 def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_the_phone_awake() -> None:
@@ -363,9 +432,6 @@ def test_the_android_service_runs_the_wrapper_on_every_recorder_write_and_holds_
     wake = (ANDROID_MODULE / "google-recorder-upload-wake").read_text()
     assert '"$MODDIR/bin/google-recorder-upload-android"' in service
     assert 'inotifyd "$MODDIR/bin/google-recorder-upload-wake" "$REC/databases:c" "$REC/files/recordings:' in service
-    # A run is bounded both by the uploader's own deadline and by the service.
-    assert "timeout 960" in service
-    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
     # The handler's marker and wakelock are what the loop waits on.
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert f": > {state}/due" in wake
@@ -388,8 +454,6 @@ def test_the_notification_service_sends_the_spool_on_every_finished_event_and_ho
     # The listener renames each finished event into the spool: moved_to.
     assert 'inotifyd "$MODDIR/bin/android-notifications-upload-wake" "$SPOOL:y"' in service
     assert 'cmd notification allow_listener "$LISTENER"' in service
-    assert "timeout 660" in service
-    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert f": > {state}/due" in wake
     assert "/sys/power/wake_lock" in wake
@@ -403,8 +467,6 @@ def test_the_messages_service_runs_on_every_messages_write_and_holds_the_phone_a
     wake = (MESSAGES_MODULE / "android-messages-upload-wake").read_text()
     assert '"$MODDIR/bin/android-messages-upload-android"' in service
     assert 'inotifyd "$MODDIR/bin/android-messages-upload-wake" "$DBDIR/bugle_db-wal:c"' in service
-    assert "timeout 660" in service
-    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert f": > {state}/due" in wake
     assert "/sys/power/wake_lock" in wake
@@ -419,8 +481,6 @@ def test_the_screen_time_service_runs_every_five_minutes_and_keeps_usage_access(
     assert '"$MODDIR/bin/android-screen-time-upload-android"' in service
     assert 'appops set "$PKG" GET_USAGE_STATS allow' in service
     assert "FLOOR=300" in service
-    assert "timeout 360" in service
-    assert "/sys/power/wake_lock" in service and "/sys/power/wake_unlock" in service
     state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
     assert state == "/data/misc_ce/0/pdw-android-screen-time"
     text = _wrapper("android-screen-time-upload-android")

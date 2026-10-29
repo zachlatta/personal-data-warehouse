@@ -50,8 +50,9 @@ if [ -z "$PDW" ]; then
   exit_code=1
   echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
 else
-  "$PDW" ingest android-notifications --lock-file "$STATE_DIR/android-notifications-upload.lock" \
-    --system-log-spool-dir "$STATE_DIR/system-log-spool" >> "$LOG_FILE" 2>&1
+  pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "android notifications" \
+    "$PDW" ingest android-notifications --lock-file "$STATE_DIR/android-notifications-upload.lock" \
+    --system-log-spool-dir "$STATE_DIR/system-log-spool"
   exit_code=$?
 fi
 

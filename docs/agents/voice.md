@@ -383,8 +383,11 @@ recording against the same 30 s p50.
   wakelock, because a memo stopped with the screen off is otherwise followed by suspend
   within a second or two and the upload would wait for the next wake. Runs are at least
   10 s apart (Recorder writes while it records) and every 5 minutes as the floor; each
-  run holds its own wakelock and is cut at 960 s. The heartbeat (`google_recorder` in
-  `ops.uploader_heartbeats`) is posted on a failure, on a run that sent something, and
+  run holds its own wakelock and is cut at 960 s: the timeout's TERM stops pdw and the
+  helpers it started (`pdw_run_stoppable` in `bin/_pdw-upload-lib.sh`, shared by every
+  Android uploader), and the wakelock lasts 30 s longer so the phone stays awake until
+  they exit. A run cut that way is recorded locally as `exit_code=143` and not posted.
+  The heartbeat (`google_recorder` in `ops.uploader_heartbeats`) is posted on a failure, on a run that sent something, and
   otherwise at most every four minutes. It uploads on any network: a memo is ~22 MB an
   hour, and the screen timelapse's Wi-Fi-only rule exists for frames, not memos.
 - **DNS and TLS roots.** Android has no `/etc/resolv.conf`, so Go's resolver asked
