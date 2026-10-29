@@ -11,7 +11,8 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { getMutationRequest, listMutationRequests, type MutationRequest } from '@/lib/api';
 import type { AppConfig } from '@/lib/config';
-import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
+import { peekMutationRequests, rememberMutationRequests } from '@/lib/mutation-cache';
+import { prefetchMutationRequest, prefetchPendingRequests } from '@/lib/review-prefetch';
 import { formatWhen } from '@/lib/format';
 import { markReviewOpen } from '@/lib/review-paint';
 import { decisions } from '@/lib/undo-decision';
@@ -22,16 +23,8 @@ import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 // on a spinner for its own read. Superhuman preloads threads before you open
 // them: the first few requests waiting on review are read in full as the list
 // lands, and any other row as a finger touches it.
-const PREFETCH_PENDING = 5;
-const reading = new Set<string>();
-
 function prefetchRequest(config: AppConfig, id: string) {
-  if (reading.has(id) || peekMutationRequest(id)?.mutations) return;
-  reading.add(id);
-  getMutationRequest(config, id)
-    .then(rememberMutationRequest)
-    .catch(() => undefined)
-    .finally(() => reading.delete(id));
+  prefetchMutationRequest((one) => getMutationRequest(config, one), id);
 }
 
 export default function MutationsScreen() {
@@ -50,7 +43,7 @@ export default function MutationsScreen() {
     try {
       const list = rememberMutationRequests(await listMutationRequests(config));
       setRequests(list);
-      for (const row of list.filter((item) => item.status === 'pending_review').slice(0, PREFETCH_PENDING)) prefetchRequest(config, row.id);
+      prefetchPendingRequests((one) => getMutationRequest(config, one), list);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

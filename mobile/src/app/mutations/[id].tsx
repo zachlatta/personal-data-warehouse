@@ -51,9 +51,10 @@ import {
   REMOVED_DURING_REVIEW,
   type GmailThreadReview,
 } from '@/lib/mutation-review';
-import { peekMutationRequest, peekMutationRequests, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
+import { peekMutationRequest, peekReviewQueue, rememberMutationRequest, rememberMutationRequests } from '@/lib/mutation-cache';
 import { nextPendingRequestId, pendingReviewCount } from '@/lib/review-queue';
 import { markReviewOpen, takeReviewPaint } from '@/lib/review-paint';
+import { prefetchMutationRequest, readMutationRequest } from '@/lib/review-prefetch';
 import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { decisions } from '@/lib/undo-decision';
 import { useConfig } from '@/lib/session';
@@ -356,9 +357,10 @@ function MutationReview({ id }: { id: string | undefined }) {
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
-    getMutationRequest(config, id)
+    // Joins a read already on its way (the alert tap, a list row, the queue
+    // warming up) rather than starting a second one.
+    readMutationRequest((one) => getMutationRequest(config, one), id)
       .then((loaded) => {
-        rememberMutationRequest(loaded);
         if (!cancelled) setRequest(loaded);
       })
       .catch((e) => {
@@ -395,9 +397,8 @@ function MutationReview({ id }: { id: string | undefined }) {
   const status = request?.status;
   useEffect(() => {
     if (!id || status !== 'pending_review') return;
-    const next = nextPendingRequestId(peekMutationRequests(), id);
-    if (!next || peekMutationRequest(next)?.mutations) return;
-    getMutationRequest(config, next).then(rememberMutationRequest).catch(() => undefined);
+    const next = nextPendingRequestId(peekReviewQueue(), id);
+    if (next) prefetchMutationRequest((one) => getMutationRequest(config, one), next);
   }, [config, id, status]);
 
   // No confirm: a decision is held for ten seconds (undo-decision.ts) while
@@ -414,7 +415,7 @@ function MutationReview({ id }: { id: string | undefined }) {
         rememberMutationRequest(await send());
       },
     });
-    let list = peekMutationRequests();
+    let list = peekReviewQueue();
     if (!list) {
       try {
         list = rememberMutationRequests(await listMutationRequests(config));
@@ -578,7 +579,7 @@ function MutationReview({ id }: { id: string | undefined }) {
   const gmailVisible = gmailVisibleThreads(gmailReviews, scope, query);
   const gmailSections = gmailThreadDayGroups(gmailVisible);
   const decision = requestDecision(request);
-  const queueList = peekMutationRequests();
+  const queueList = peekReviewQueue();
   const remaining = pending ? pendingReviewCount(queueList, request.id, decided) : null;
   const skipTo = pending ? nextPendingRequestId(queueList, request.id, decided) : null;
   const overview = <RequestOverview request={request} error={error} filter={slackBatch ? filter : undefined} onFilter={slackBatch ? setFilter : undefined} />;

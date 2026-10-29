@@ -7,8 +7,10 @@ import { Alert, AppState, useColorScheme } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { Colors } from '@/constants/theme';
+import { getMutationRequest } from '@/lib/api';
 import { handleNotificationResponse, seedFromNotification, syncNotificationCategories, flushNotificationOpens } from '@/lib/push';
 import { markReviewOpen } from '@/lib/review-paint';
+import { prefetchMutationRequest } from '@/lib/review-prefetch';
 import { decisions } from '@/lib/undo-decision';
 import { applyUpdateNow } from '@/lib/updates';
 import { SessionProvider, useSession } from '@/lib/session';
@@ -69,7 +71,14 @@ function Root() {
       if (handled.current.has(key)) return;
       handled.current.add(key);
       const requestId = response.notification.request.content.data?.request_id;
-      if (response.actionIdentifier === Notifications.DEFAULT_ACTION_IDENTIFIER && typeof requestId === 'string') markReviewOpen(requestId, 'notification');
+      if (response.actionIdentifier === Notifications.DEFAULT_ACTION_IDENTIFIER && typeof requestId === 'string') {
+        markReviewOpen(requestId, 'notification');
+        // Start the read now, not when the review screen mounts: an alert
+        // whose drafts did not fit the push carries only a header, and the
+        // screen joins this read instead of starting its own.
+        seedFromNotification(response.notification);
+        prefetchMutationRequest((id) => getMutationRequest(config, id), requestId);
+      }
       try {
         const outcome = await handleNotificationResponse(config, response);
         if (cancelled) return;

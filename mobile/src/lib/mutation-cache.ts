@@ -14,6 +14,9 @@ let list: MutationRequest[] | null = null;
 // this set is filled by a pending-only read and kept current by every other
 // read, so an approval anywhere takes the badge down at once.
 let pending: Set<string> | null = null;
+// The rows of that read, in the server's order: the review queue when the
+// Mutations tab has not loaded its list (a review opened from an alert).
+let pendingRows: MutationRequest[] | null = null;
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -36,7 +39,8 @@ export function subscribeMutationRequests(listener: () => void): () => void {
 // The ids of every request waiting on review, from the server's pending-only
 // list; requests seen since then move in or out of it by their status.
 export function rememberPendingMutationRequests(items: MutationRequest[]): void {
-  pending = new Set(items.filter((item) => item.status === 'pending_review').map((item) => item.id));
+  pendingRows = items.filter((item) => item.status === 'pending_review');
+  pending = new Set(pendingRows.map((item) => item.id));
   notify();
 }
 
@@ -76,10 +80,21 @@ export function peekMutationRequests(): MutationRequest[] | null {
   return list;
 }
 
+// The queue a review moves through: the Mutations tab's list, or else the
+// pending-only read the tab badge keeps fresh, less any request since seen
+// decided.
+export function peekReviewQueue(): MutationRequest[] | null {
+  if (list) return list;
+  if (!pendingRows || !pending) return null;
+  const still = pending;
+  return pendingRows.filter((row) => still.has(row.id));
+}
+
 export function forgetMutationRequests(): void {
   requests = new Map();
   list = null;
   pending = null;
+  pendingRows = null;
   notify();
 }
 

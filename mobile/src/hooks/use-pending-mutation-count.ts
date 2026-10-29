@@ -2,8 +2,9 @@ import { useEffect, useSyncExternalStore } from 'react';
 import { AppState } from 'react-native';
 
 import { useDecidedRequestIds } from '@/components/undo-bar';
-import { listMutationRequests } from '@/lib/api';
+import { getMutationRequest, listMutationRequests } from '@/lib/api';
 import { peekPendingMutationRequestIds, rememberPendingMutationRequests, subscribeMutationRequests } from '@/lib/mutation-cache';
+import { prefetchPendingRequests } from '@/lib/review-prefetch';
 import { useConfig } from '@/lib/session';
 
 // While the app is open, re-read the queue this often, so a request proposed
@@ -14,6 +15,9 @@ const REFRESH_MS = 60_000;
 // badge: the server's pending-only list, re-read on launch, on every return
 // to the foreground and once a minute, and moved at once by any review, alert
 // or list read in between. A decision held for undo already counts as made.
+// Each read also reads the first few waiting requests in full, so a review
+// opened from an alert, or the next one after a decision, paints from memory
+// even if the Mutations tab was never opened.
 export function usePendingMutationCount(): number {
   const config = useConfig();
   const pending = useSyncExternalStore(subscribeMutationRequests, peekPendingMutationRequestIds);
@@ -23,7 +27,10 @@ export function usePendingMutationCount(): number {
     let timer: ReturnType<typeof setInterval> | null = null;
     const refresh = () => {
       listMutationRequests(config, ['pending_review'], 500)
-        .then(rememberPendingMutationRequests)
+        .then((items) => {
+          rememberPendingMutationRequests(items);
+          prefetchPendingRequests((id) => getMutationRequest(config, id), items);
+        })
         .catch((error) => console.warn('pending mutation count will retry', error));
     };
     const start = () => {
