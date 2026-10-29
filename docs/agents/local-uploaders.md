@@ -541,6 +541,27 @@ Pass `--wifi-only` (or `SCREEN_TIMELAPSE_WIFI_ONLY=1` in the phone's `.env`) to 
 on cellular (`dumpsys connectivity` active default network). Setup, switches and rollback:
 `pichu/2026-10-23-screen-timelapse.md` in the sysadmin repository.
 
+**A CLI login token is not an ingestion signing key.** The installer must receive
+credentials whose token is the app's `PDW_SECRET_TOKEN` (or a still-accepted
+keyring secret). A working `pdw sql` login does not establish that: API access
+tokens authorize CLI calls but cannot sign object uploads. Installing that token
+causes `HTTP 403: invalid or expired upload link` for every screen file.
+
+For recovery, compare SHA-256 fingerprints of the uploader token and the app's
+active signing secret without printing either secret. On a device with another
+working uploader, verify its token matches the active signing secret before using
+it. For pichu, the Recorder config is
+`/data/misc_ce/0/pdw-google-recorder/config/pdw/config.json`; the screen config is
+`/data/misc_ce/0/pdw-screen-timelapse/config/pdw/config.json`. During the authorized
+landing step, copy the verified config to a sibling staging file in the screen
+config directory, set mode 0600, and rename it over `config.json`. Keep all
+credentials in credential-encrypted storage; do not copy them into logs or Git.
+Then run `/data/adb/modules/pdw-screen-timelapse/bin/screen-timelapse-upload-android`
+over SSH. Verify a successful upload in the run log and a newly captured row for
+`device = 'pichu'` in `base_screen_timelapse.screenshots` (both `captured_at` and
+`ingested_at`), then confirm the next scheduled run succeeds too. A successful
+heartbeat alone does not prove any frame landed.
+
 **The tree is also text in the warehouse.** The app writes each tree's text, decompressed, into
 `base_screen_timelapse.accessibility_trees.content_text` in the same request (NUL and invalid
 UTF-8 replaced, capped at 8 MiB; an undecodable gzip leaves it empty and the bytes stay the
