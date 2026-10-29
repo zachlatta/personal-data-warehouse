@@ -5,7 +5,13 @@ name: mobile-update
 # so Zach's phone picks it up without a reinstall. Native changes (a new
 # package, an Android or iOS config change) do not ship this way: they need
 # `eas build --profile preview` and a reinstall from the build link.
+# Pull requests run the same checks without publishing or using Expo credentials.
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - ".github/workflows/mobile-update.yml"
   push:
     branches: [main]
     paths:
@@ -13,7 +19,7 @@ on:
       - ".github/workflows/mobile-update.yml"
 
 concurrency:
-  group: mobile-update
+  group: mobile-update-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -37,6 +43,7 @@ jobs:
       # CI runs them, and an OTA publish is the last place to find out.
       - run: npm test
       - name: Publish OTA update to the preview channel
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: npx eas-cli update --channel preview --auto --non-interactive
@@ -45,6 +52,7 @@ jobs:
       # config), queue a new preview build for it; its link is on expo.dev and
       # Zach reinstalls once. Android is the phone he carries; iOS still builds.
       - name: Queue a native build when the fingerprint changed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: |

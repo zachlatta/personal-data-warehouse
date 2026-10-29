@@ -24,7 +24,8 @@ the warehouse contracts in the root AGENTS.md.
 
 Run `npm run typecheck`, `npm run lint`, and `npm test` in `mobile/`, plus the
 repository's required `uv run pytest`. Server or catalog changes also require
-the Go suite. CI publishes JavaScript changes to the preview channel; a native
+the Go suite. Mobile verification runs on pull requests before landing; only
+a push to main can publish JavaScript changes to the preview channel. A native
 fingerprint change requires a new APK.
 
 Validate with an isolated Android package and a fixture API: cached entry,
