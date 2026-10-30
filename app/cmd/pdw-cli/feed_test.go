@@ -115,6 +115,30 @@ func TestFeedSubcommandsMapToTheirTools(t *testing.T) {
 	}
 }
 
+func TestFeedRankScoresPreserveItemIDs(t *testing.T) {
+	srv := feedStub(t, `{"updated":2}`)
+	_, stderr, code := runCLI(t, srv.URL, "", "feed", "rank",
+		"--score", "picks:https://www.youtube.com/watch?v=test-video=295.5",
+		"--score", "hn:1=0.5")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	if srv.lastPath != "/api/tools/feed_rank" {
+		t.Fatalf("path %s", srv.lastPath)
+	}
+	var body struct {
+		Scores map[string]float64 `json:"scores"`
+	}
+	if err := json.Unmarshal(srv.lastBody, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Scores) != 2 ||
+		body.Scores["picks:https://www.youtube.com/watch?v=test-video"] != 295.5 ||
+		body.Scores["hn:1"] != 0.5 {
+		t.Fatalf("scores: %s", srv.lastBody)
+	}
+}
+
 func TestFeedArgumentErrorsNeverReachTheServer(t *testing.T) {
 	srv := newStubServer(t, func(http.ResponseWriter, *http.Request) { t.Error("server reached") })
 	for _, args := range [][]string{
@@ -123,6 +147,9 @@ func TestFeedArgumentErrorsNeverReachTheServer(t *testing.T) {
 		{"feed", "remove"},
 		{"feed", "save"},
 		{"feed", "rank", "--score", "nonumber"},
+		{"feed", "rank", "--score", "=1"},
+		{"feed", "rank", "--score", "hn:1="},
+		{"feed", "rank", "--score", "hn:1=invalid"},
 		{"feed", "frobnicate"},
 	} {
 		if _, _, code := runCLI(t, srv.URL, "", args...); code != 2 {

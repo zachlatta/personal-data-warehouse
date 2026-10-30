@@ -439,7 +439,7 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		return call("feed_history", map[string]any{"item_id": fs.Arg(0), "source": source, "since": since, "limit": limit, "snapshots": full})
 	case "rank":
 		var scores stringList
-		fs.Var(&scores, "score", "ID=N")
+		fs.Var(&scores, "score", "ITEM_ID=NUMBER (final = separates ID and score; repeatable)")
 		if err := parse(); err != nil {
 			return fail(err)
 		}
@@ -450,9 +450,13 @@ func runFeed(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 		if len(scores) > 0 {
 			byID := map[string]float64{}
 			for _, pair := range scores {
-				id, raw, ok := strings.Cut(pair, "=")
+				separator := strings.LastIndex(pair, "=")
+				if separator <= 0 {
+					return fail(fmt.Errorf("--score %q must be ITEM_ID=NUMBER", pair))
+				}
+				id, raw := pair[:separator], pair[separator+1:]
 				n, err := strconv.ParseFloat(raw, 64)
-				if !ok || err != nil {
+				if err != nil {
 					return fail(fmt.Errorf("--score %q must be ITEM_ID=NUMBER", pair))
 				}
 				byID[id] = n
