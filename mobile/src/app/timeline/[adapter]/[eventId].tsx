@@ -8,6 +8,7 @@ import { PriorityBadge } from '@/components/priority-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getTimelineContext,
@@ -17,6 +18,7 @@ import {
   type TimelineItemDetail,
 } from '@/lib/api';
 import { cleanSnippet, dayLabel, formatWhen, humanSource, pretty } from '@/lib/format';
+import { takeEventPaint } from '@/lib/event-paint';
 import { useConfig } from '@/lib/session';
 import { loadTimelineItem, peekTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
 
@@ -132,6 +134,24 @@ export default function TimelineItemScreen() {
   const [context, setContext] = useState<TimelineContextPage | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The raw columns and child rows are for checking the data, not reading
+  // the event: folded, like the review's Slack IDs.
+  const [showFields, setShowFields] = useState(false);
+
+  // Tap to first paint (ui event_paint): the first frame with the subject on
+  // screen. cached: the row the list showed painted it, not the network.
+  const painted = Boolean(detail || seed);
+  const cached = Boolean(seed);
+  useEffect(() => {
+    if (!painted || !adapter || !eventId) return;
+    const frame = requestAnimationFrame(() => {
+      const ms = takeEventPaint(adapter, eventId);
+      if (ms === null) return;
+      connectFeedLogger(config);
+      recordUi('event_paint', { dwell_ms: Math.round(ms), metadata: { cached, source: adapter } });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [painted, adapter, eventId, cached, config]);
 
   useEffect(() => {
     if (!adapter || !eventId) return;
@@ -234,7 +254,14 @@ export default function TimelineItemScreen() {
             {detail?.source_row_error}
           </ThemedText>
         ) : null}
-        {children.map(([name, childRows]) => (
+        {children.length > 0 || rows.length > 0 ? (
+          <Pressable accessibilityRole="button" hitSlop={8} onPress={() => setShowFields((on) => !on)} style={({ pressed }) => [styles.fieldsToggle, pressed && styles.pressed]}>
+            <ThemedText type="small" themeColor="textSecondary">
+              {showFields ? 'Hide source fields' : 'Show source fields'}
+            </ThemedText>
+          </Pressable>
+        ) : null}
+        {showFields && children.map(([name, childRows]) => (
           <View key={name} style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
             <ThemedText type="smallBold" themeColor="textSecondary" style={styles.cardTitle}>
               {name.replace(/_/g, ' ')}
@@ -253,7 +280,7 @@ export default function TimelineItemScreen() {
             )}
           </View>
         ))}
-        {rows.length > 0 ? (
+        {showFields && rows.length > 0 ? (
           <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
             <ThemedText type="smallBold" themeColor="textSecondary" style={styles.cardTitle}>
               {item.source_table}
@@ -286,6 +313,7 @@ const styles = StyleSheet.create({
   body: { fontSize: 16, lineHeight: 23 },
   image: { width: '100%', height: 280, borderRadius: 12 },
   pending: { alignSelf: 'flex-start' },
+  fieldsToggle: { alignSelf: 'flex-start', paddingVertical: 4 },
   card: { borderRadius: 12, padding: Spacing.three, gap: Spacing.two },
   cardTitle: { marginBottom: Spacing.one },
   field: { gap: 2 },

@@ -1,18 +1,21 @@
 import { useRouter } from 'expo-router';
-import { useEffect, useReducer } from 'react';
-import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet } from 'react-native';
+import { useEffect, useReducer, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, FlatList, Pressable, RefreshControl, StyleSheet } from 'react-native';
 
-import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { InboxRow, SplitChips } from '@/components/inbox-row';
 import { PRIORITY_COLORS } from '@/components/priority-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { listTimeline, PRIORITIES, type Priority, type TimelineItem } from '@/lib/api';
+import { openDeepLink } from '@/lib/deep-link';
+import { markEventOpen } from '@/lib/event-paint';
 import { formatWhen, humanSource, truncate } from '@/lib/format';
 import { useConfig } from '@/lib/session';
 import { prefetchTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
+import { tick } from '@/lib/haptics';
 
 // Attention tiers by default: noise is 82% of the corpus and is exactly what a
 // glance at the timeline should not open with.
@@ -69,6 +72,34 @@ export default function TimelineScreen() {
   const [state, dispatch] = useReducer(reducer, { tiers: DEFAULT_TIERS, items: firstPages.get(tierKey(DEFAULT_TIERS)) ?? [], hasMore: true, generation: 1, fetching: 'reset', error: null });
   const { tiers, items, cursor, generation, fetching, error } = state;
 
+  // Mount to the first frame with rows, once per mount (the feed's
+  // screen_paint): cached says the rows came from this process's memory
+  // rather than the network. No timing existed for the Timeline before
+  // 2026-10-30, so how it feels had no numbers.
+  const [paintStart] = useState(() => performance.now());
+  const firstPaint = useRef({ started: paintStart, cached: items.length > 0, sent: false });
+  useEffect(() => {
+    if (firstPaint.current.sent || items.length === 0) return;
+    firstPaint.current.sent = true;
+    const { started, cached } = firstPaint.current;
+    const frame = requestAnimationFrame(() => {
+      connectFeedLogger(config);
+      recordUi('screen_paint', { dwell_ms: Math.round(performance.now() - started), metadata: { screen: 'timeline', cached } });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [items.length, config]);
+
+  // A long press opens the event in its own app (Slack, Gmail, Messages):
+  // the one action that used to sit on every row as a round arrow, which
+  // Superhuman's rows do not carry. The event screen keeps the full button.
+  const openInSource = (item: TimelineItem) => {
+    const link = item.open;
+    if (!link?.url) return;
+    tick();
+    recordUi('timeline_open_source', { metadata: { source: item.source } });
+    openDeepLink(link).catch((e) => Alert.alert(`Could not open ${link.label}`, e instanceof Error ? e.message : String(e)));
+  };
+
   // One fetch per generation. The reducer decides what a generation means
   // (reset vs. next page); this effect only carries it out.
   useEffect(() => {
@@ -119,14 +150,15 @@ export default function TimelineScreen() {
               subject={headline}
               preview={item.snippet && (item.title || item.context) ? truncate(item.snippet, 200) : undefined}
               labels={[{ text: humanSource(item.source) }]}
-              accessory={<OpenInSourceButton link={item.open} compact />}
               onPressIn={() => prefetchTimelineItem(config, item.adapter, item.event_id)}
-              onPress={() =>
+              onLongPress={item.open?.url ? () => openInSource(item) : undefined}
+              onPress={() => {
+                markEventOpen(item.adapter, item.event_id);
                 router.push({
                   pathname: '/timeline/[adapter]/[eventId]',
                   params: { adapter: item.adapter, eventId: item.event_id },
-                })
-              }
+                });
+              }}
             />
           );
         }}
