@@ -1,4 +1,4 @@
-import { FeedSessionLifecycle, onFeedDetailClosed } from './session-lifecycle';
+import { FeedSessionLifecycle, feedSessionCoordinator, onFeedDetailClosed } from './session-lifecycle';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -184,7 +184,7 @@ export default function FeedScreen() {
   const videoKeys = useRef(new Map<string, string>());
   const videoFocus = useRef<string | null>(null);
   const focused = useRef(false);
-  const [lifecycle] = useState(() => new FeedSessionLifecycle());
+  const [lifecycle] = useState(() => new FeedSessionLifecycle(feedSessionCoordinator));
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
   const headerHeight = useRef(0);
@@ -341,6 +341,7 @@ export default function FeedScreen() {
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && !host.inFront() && !lifecycle.detail) return;
       const action = lifecycle.appState(state);
       if (!action) return;
       if (action === 'start') {
@@ -354,7 +355,7 @@ export default function FeedScreen() {
       }
     });
     return () => sub.remove();
-  }, [load, measure, pause, lifecycle]);
+  }, [load, measure, pause, lifecycle, host]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;

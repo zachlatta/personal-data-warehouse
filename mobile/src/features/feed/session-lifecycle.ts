@@ -1,18 +1,28 @@
-// Session ownership outlives list focus while a reader is above it.
+// Both list hosts write to one logger session, so only one may own it.
+export class FeedSessionCoordinator {
+  owner: FeedSessionLifecycle | null = null;
+}
+export const feedSessionCoordinator = new FeedSessionCoordinator();
+
 export class FeedSessionLifecycle {
   detail = false;
-  owns = false;
-  focus() { this.detail = false; this.owns = true; }
-  openDetail() { this.detail = true; }
+  private coordinator: FeedSessionCoordinator;
+  constructor(coordinator = new FeedSessionCoordinator()) { this.coordinator = coordinator; }
+  get owns() { return this.coordinator.owner === this; }
+  focus() {
+    this.detail = false;
+    this.coordinator.owner = this;
+  }
+  openDetail() { this.coordinator.owner = this; this.detail = true; }
   blur() {
-    if (this.detail) return false;
-    this.owns = false;
+    if (!this.owns || this.detail) return false;
+    this.coordinator.owner = null;
     return true;
   }
   closeDetail(focused: boolean) {
-    if (focused || !this.detail) return false;
+    if (!this.detail) return false;
     this.detail = false;
-    return this.blur();
+    return focused ? false : this.blur();
   }
   appState(state: string): 'start' | 'end' | null {
     if (!this.owns) return null;
@@ -20,7 +30,7 @@ export class FeedSessionLifecycle {
   }
 }
 
-// Readers notify both hosts; only the host that opened one owns its session.
+// Readers notify both hosts; only the current owner may end the session.
 const closedListeners = new Set<() => void>();
 export function onFeedDetailClosed(listener: () => void) {
   closedListeners.add(listener);

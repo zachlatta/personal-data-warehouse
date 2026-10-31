@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-import { FeedSessionLifecycle } from './session-lifecycle.ts';
+import { FeedSessionLifecycle, FeedSessionCoordinator } from './session-lifecycle.ts';
 
 // Replace only native IO. Exercise the production logger, queue and session state.
 const hooks = registerHooks({
@@ -42,3 +42,25 @@ for (const host of ['tab', 'embedded']) {
     logger.endFeedSession('background');
   });
 }
+
+test('launcher detail survives the previously focused tab blurring', () => {
+  const coordinator = new FeedSessionCoordinator();
+  const tab = new FeedSessionLifecycle(coordinator);
+  const launcher = new FeedSessionLifecycle(coordinator);
+  tab.focus();
+  launcher.focus();
+  logger.startFeedSession(1, 'focus');
+  logger.recordFeedEvent('impression', {item_id:'cross-host'});
+  launcher.openDetail();
+  if (launcher.blur()) logger.endFeedSession('blur');
+  if (tab.blur()) logger.endFeedSession('blur');
+  assert.equal(tab.appState('active'), null);
+  assert.equal(launcher.appState('background'), 'end');
+  for (const type of ['open', 'web', 'close']) logger.recordFeedEvent(type, {item_id:'cross-host'});
+  const events = logger.pendingFeedEvents().filter(e => e.item_id === 'cross-host');
+  assert.equal(events.length, 4);
+  assert.ok(events[0].session_id);
+  assert.ok(events.every(e => e.session_id === events[0].session_id));
+  assert.equal(launcher.closeDetail(false), true);
+  logger.endFeedSession('blur');
+});
