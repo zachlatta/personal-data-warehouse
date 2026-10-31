@@ -40,7 +40,9 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   under the body: the paper, the repo, the discussion. A tap on a card opens its detail view
   (whole post or summary, every photo, all links); `url` is what "Open" there and the
   card's compass button go to.
-- `score` ranks (higher first; {{if .CLI}}`pdw feed rank ID...`{{else}}`feed_rank`{{end}} sets many at once). The phone
+- `score` ranks (higher first; {{if .CLI}}`pdw feed rank ID...`{{else}}`feed_rank`{{end}} sets many at once).
+  An order list puts those cards above every card you did not list, best first; use {{if .CLI}}`--score`{{else}}`scores`{{end}} to place cards at exact weights.
+  The phone
   shows cards he has not seen first: a card leaves that part at its first impression (half of
   it on screen), so every hourly batch must be new cards. The feed never shows empty: after
   the unseen cards come seen ones he passed over (no open, share, save or 5 s on screen),

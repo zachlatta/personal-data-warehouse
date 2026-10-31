@@ -332,10 +332,37 @@ func (s *Store) Remove(ctx context.Context, ids []string, source string, m Mutat
 	return n, err
 }
 
-// SetScores writes rank weights in one transaction; it fails if any id is unknown.
-func (s *Store) SetScores(ctx context.Context, scores map[string]float64, m Mutation) error {
+// SetScores raises ordered cards above other live cards, then applies exact scores.
+// The base read and writes share a transaction; unknown ids roll back the batch.
+func (s *Store) SetScores(ctx context.Context, order []string, exact map[string]float64, m Mutation) error {
 	m.Action = "rank"
 	return s.mutate(ctx, m, func(ctx context.Context, tx *sql.Tx) error {
+		scores := make(map[string]float64, len(order)+len(exact))
+		if len(order) > 0 {
+			excluded := append([]string{}, order...)
+			for id := range exact {
+				excluded = append(excluded, id)
+			}
+			args := []any{s.now()}
+			placeholders := make([]string, len(excluded))
+			for i, id := range excluded {
+				args = append(args, id)
+				placeholders[i] = fmt.Sprintf("$%d", i+2)
+			}
+			var base float64
+			err := tx.QueryRowContext(ctx, s.q(`SELECT COALESCE(MAX(score), 0) FROM @feed_items
+				WHERE removed_at = 'epoch' AND (expires_at = 'epoch' OR expires_at > $1)
+				AND item_id NOT IN (`+strings.Join(placeholders, ",")+`)`), args...).Scan(&base)
+			if err != nil {
+				return err
+			}
+			for i, id := range order {
+				scores[id] = base + float64(len(order)-i)
+			}
+		}
+		for id, score := range exact {
+			scores[id] = score
+		}
 		statement := s.q("UPDATE @feed_items SET score = $1, updated_at = $2 WHERE item_id = $3")
 		now := s.now()
 		for id, score := range scores {

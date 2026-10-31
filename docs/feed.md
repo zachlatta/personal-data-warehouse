@@ -264,6 +264,8 @@ else `$PASEO_AGENT_ID`) and `--reason`. MCP: `feed_push`, `feed_get`, `feed_upda
 `feed_remove`, `feed_restore`, `feed_history`, `feed_rank`, `feed_list`, `feed_save`, `feed_stats`,
 `feed_events`. No scheduled agent writes the feed yet; Zach asked to hold off.
 
+An order list puts those cards above every card you did not list, best first; use --score to place cards at exact weights.
+
 ## Turning it off
 
 - Server: set `PDW_FEED_ENABLED=0` on the app deployment. No routes, no tools; the phone's

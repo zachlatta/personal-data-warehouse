@@ -91,7 +91,7 @@ type removeOutput struct {
 }
 
 type rankInput struct {
-	Order  []string           `json:"order,omitempty" jsonschema:"item ids best first; they get scores len(order) down to 1"`
+	Order  []string           `json:"order,omitempty" jsonschema:"item ids best first; listed cards get scores above every live card not listed"`
 	Scores map[string]float64 `json:"scores,omitempty" jsonschema:"item id to score; higher shows first"`
 	Agent  string             `json:"agent,omitempty"`
 	Reason string             `json:"reason,omitempty"`
@@ -305,19 +305,19 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[rankInput, rankOutput]{
 			NameStr:        "feed_rank",
 			TitleStr:       "Rank Feed Cards",
-			DescriptionStr: "Set Feed tab ranking: order (ids best first) or scores (id to score, higher first). Cards Zach has not seen yet are shown first (a card leaves that part at its first impression), sources interleaved; after them come seen cards he passed over, flagged resurfaced, so the feed is never empty. Each change is a rank version. CLI: pdw feed rank.",
+			DescriptionStr: "Set Feed tab ranking. An order list puts those cards above every card you did not list, best first; use scores to place cards at exact weights. Cards Zach has not seen yet are shown first (a card leaves that part at its first impression), sources interleaved; after them come seen cards he passed over, flagged resurfaced, so the feed is never empty. Each change is a rank version. CLI: pdw feed rank.",
 			Handle: func(ctx context.Context, in rankInput) (rankOutput, error) {
 				scores := map[string]float64{}
-				for i, id := range in.Order {
-					scores[id] = float64(len(in.Order) - i)
+				for _, id := range in.Order {
+					scores[id] = 0
 				}
-				for id, score := range in.Scores {
-					scores[id] = score
+				for id := range in.Scores {
+					scores[id] = 0
 				}
 				if len(scores) == 0 {
 					return rankOutput{}, &tool.InvalidInputError{Message: "pass order or scores"}
 				}
-				if err := store.SetScores(ctx, scores, provenance(ctx, in.Agent, in.Reason)); err != nil {
+				if err := store.SetScores(ctx, in.Order, in.Scores, provenance(ctx, in.Agent, in.Reason)); err != nil {
 					return rankOutput{}, toolError(err)
 				}
 				return rankOutput{Ranked: len(scores)}, nil

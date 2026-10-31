@@ -615,3 +615,93 @@ func TestPostgresFeedSearchesEverythingHeWasShown(t *testing.T) {
 	}
 	call(t, tools, "feed_remove", map[string]any{"source": "hist", "reason": "test"})
 }
+
+func TestPostgresPartialRank(t *testing.T) {
+	store, _ := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "rank-test", "items": []map[string]any{
+		{"key": "a", "title": "A"}, {"key": "b", "title": "B"}, {"key": "x", "title": "X", "score": 300},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'rank-test'"))
+	call(t, tools, "feed_rank", map[string]any{"order": []string{"rank-test:a", "rank-test:b"}})
+	items, err := store.Feed(context.Background(), 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, item := range items {
+		if item.Source == "rank-test" {
+			got = append(got, item.Title)
+		}
+	}
+	if strings.Join(got, ",") != "A,B,X" {
+		t.Fatalf("partial rank: %v", got)
+	}
+}
+
+func TestPostgresRankWeights(t *testing.T) {
+	// This harness shares a disposable schema across Go tests. Clear earlier
+	// fixtures so the all-cards cases really cover every live card.
+	store, _ := postgresStore(t)
+	if _, err := store.DB.Exec(store.q("DELETE FROM @feed_items")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name             string
+		order            []string
+		exact            map[string]float64
+		removed, expired bool
+		wantA, wantB     float64
+		unknown          bool
+	}{
+		{name: "all cards", order: []string{"a", "b", "x"}, wantA: 3, wantB: 2},
+		{name: "removed", order: []string{"a", "b"}, removed: true, wantA: 2, wantB: 1},
+		{name: "expired", order: []string{"a", "b"}, expired: true, wantA: 2, wantB: 1},
+		{name: "exact", exact: map[string]float64{"a": -5, "b": 7.5}, wantA: -5, wantB: 7.5},
+		{name: "override", order: []string{"a", "b"}, exact: map[string]float64{"a": -5, "x": 0}, wantA: -5, wantB: 1},
+		{name: "unknown rolls back", order: []string{"a", "missing"}, wantA: 0, wantB: 0, unknown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, now := postgresStore(t)
+			tools := Tools(store)
+			call(t, tools, "feed_push", map[string]any{"source": "weights", "items": []map[string]any{
+				{"key": "a", "title": "A"}, {"key": "b", "title": "B"}, {"key": "x", "title": "X", "score": 300},
+			}})
+			defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source = 'weights'"))
+			if tc.removed {
+				call(t, tools, "feed_remove", map[string]any{"item_ids": []string{"weights:x"}})
+			}
+			if tc.expired {
+				if _, err := store.DB.Exec(store.q("UPDATE @feed_items SET expires_at = $1 WHERE item_id = 'weights:x'"), now.Add(-time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			order := []string{}
+			for _, id := range tc.order {
+				order = append(order, "weights:"+id)
+			}
+			exact := map[string]float64{}
+			for id, score := range tc.exact {
+				exact["weights:"+id] = score
+			}
+			input := map[string]any{"order": order, "scores": exact, "reason": "rank regression"}
+			if tc.unknown {
+				if err := callErr(t, tools, "feed_rank", input); err == nil {
+					t.Fatal("expected unknown id error")
+				}
+			} else {
+				call(t, tools, "feed_rank", input)
+			}
+			for id, want := range map[string]float64{"a": tc.wantA, "b": tc.wantB} {
+				var got float64
+				if err := store.DB.QueryRow(store.q("SELECT score FROM @feed_items WHERE item_id = $1"), "weights:"+id).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Fatalf("%s score = %v, want %v", id, got, want)
+				}
+			}
+		})
+	}
+}

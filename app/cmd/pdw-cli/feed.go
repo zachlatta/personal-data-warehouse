@@ -45,6 +45,8 @@ USAGE
   pdw feed stats [--source S] [--since 7d]
   pdw feed events [--item ID] [--type open,dismiss] [--since 7d] [-n 100]
 
+An order list puts those cards above every card you did not list, best first; use --score to place cards at exact weights.
+
 Every create, edit, rank, removal, restore and deletion writes an immutable version
 (who, which agent, when, why, the diff and a full snapshot) to base_feed.item_versions.
 Nothing is ever lost: removal is soft, and restore can return to any version.
