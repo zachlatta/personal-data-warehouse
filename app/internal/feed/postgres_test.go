@@ -705,3 +705,28 @@ func TestPostgresRankWeights(t *testing.T) {
 		})
 	}
 }
+
+// Both view generations expose started_at. Counting visits must remain valid
+// while the Go deployment is ahead of the warehouse view rebuild.
+func TestPostgresFeedStatsCountSittings(t *testing.T) {
+	store, now := postgresStore(t)
+	expand := store.Expand
+	for _, extra := range []string{"", ", 'first-session'::text AS sitting_id"} {
+		t.Run(fmt.Sprintf("extra=%q", extra), func(t *testing.T) {
+			store.Expand = func(q string) string {
+				q = strings.ReplaceAll(q, "@marts_feed_sessions", fmt.Sprintf(
+					"(SELECT '%s'::timestamptz AS started_at%s UNION ALL SELECT '%s'::timestamptz%s) sittings",
+					now.Format(time.RFC3339), extra, now.Add(-48*time.Hour).Format(time.RFC3339), extra))
+				return expand(q)
+			}
+			defer func() { store.Expand = expand }()
+			// The source only filters card/event statistics; visits span sources.
+			for _, source := range []string{"", "no-cards-for-this-source"} {
+				stats, err := store.Stats(context.Background(), source, now.Add(-24*time.Hour))
+				if err != nil || stats.Sessions != 1 {
+					t.Fatalf("source=%q: want one sitting starting in window, got %d: %v", source, stats.Sessions, err)
+				}
+			}
+		})
+	}
+}

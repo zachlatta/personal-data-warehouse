@@ -169,8 +169,7 @@ function deviceContext(): Record<string, unknown> {
 /**
  * The tab is on screen with the app in front: one sitting begins. trigger
  * is why: `launch` (first since the app started), `foreground` (the app
- * came back to the front) or `focus` (back to the Feed from another tab or
- * from a card's detail view).
+ * came back to the front) or `focus` (back to the Feed from another tab).
  */
 export function startFeedSession(cards: number, trigger: 'foreground' | 'focus') {
   if (session) return;
@@ -189,7 +188,7 @@ export function startFeedSession(cards: number, trigger: 'foreground' | 'focus')
   });
 }
 
-/** The Feed left the screen (reason `blur`: another tab or a card's detail view) or the app left the front (`background`). */
+/** The Feed left the screen (reason `blur`: another tab) or the app left the front (`background`). */
 export function endFeedSession(reason: 'background' | 'blur') {
   if (!session) return;
   const ended = session;

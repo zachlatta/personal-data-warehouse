@@ -318,24 +318,72 @@ SOURCE_ENGAGEMENT_VIEW = """CREATE OR REPLACE VIEW @marts_feed_source_engagement
     FROM @marts_feed_item_engagement
     GROUP BY source"""
 
-# One row per sitting: the Feed on screen with the app in front, from
-# session_start to session_end. trigger is why it began (launch, foreground,
-# focus; NULL before 2026-10-21), end_reason why it ended (background, blur).
-# Every event the phone stamped with the sitting's id is counted, so this is
-# how he uses the feed: how often and when he opens it, for how long, how
-# far he scrolls, what he taps. Events in a card's detail view carry no
-# sitting (the Feed is off screen then); they are on the card's row in
-# item_engagement. An unfinished sitting has NULL ended_at and duration.
+# One row per sitting: consecutive raw sessions on a device join across gaps
+# strictly below two minutes. Empty-id reader events from older clients are
+# assigned once within a finite sitting interval; raw events stay unchanged.
+# Duration sums active time, never the gaps. Final unfinished sessions expose
+# NULL ended_at and duration_ms. session_id remains the first constituent id.
 SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
-    SELECT session_id,
-           min(occurred_at) FILTER (WHERE event_type = 'session_start') AS started_at,
-           max(occurred_at) FILTER (WHERE event_type = 'session_end') AS ended_at,
-           max(dwell_ms) FILTER (WHERE event_type = 'session_end') AS duration_ms,
-           (array_agg(metadata->>'trigger') FILTER (WHERE event_type = 'session_start'))[1] AS trigger,
-           (array_agg(metadata->>'reason') FILTER (WHERE event_type = 'session_end'))[1] AS end_reason,
-           max(device) AS device,
-           (array_agg(metadata->>'app_version') FILTER (WHERE event_type = 'session_start'))[1] AS app_version,
-           (array_agg(metadata->>'update_id') FILTER (WHERE event_type = 'session_start'))[1] AS update_id,
+    WITH phone AS (
+        SELECT * FROM @feed_events WHERE NOT {TEST_CLIENT_SQL}
+    ), raw AS (
+        SELECT device, session_id,
+               min(occurred_at) AS first_at, max(occurred_at) AS last_at,
+               min(occurred_at) FILTER (WHERE event_type = 'session_start') AS started_at,
+               max(occurred_at) FILTER (WHERE event_type = 'session_end') AS ended_at,
+               max(dwell_ms) FILTER (WHERE event_type = 'session_end') AS duration_ms,
+               (array_agg(metadata ORDER BY occurred_at, event_id)
+                   FILTER (WHERE event_type = 'session_start'))[1] AS start_meta,
+               (array_agg(metadata ORDER BY occurred_at DESC, event_id DESC)
+                   FILTER (WHERE event_type = 'session_end'))[1] AS end_meta
+        FROM phone WHERE session_id <> '' GROUP BY device, session_id
+    ), previous AS (
+        SELECT *, lag(ended_at) OVER w AS previous_end,
+               row_number() OVER w AS ordinal
+        FROM raw WINDOW w AS (PARTITION BY device ORDER BY first_at, session_id)
+    ), numbered AS (
+        SELECT *, sum(CASE WHEN ordinal > 1 AND (
+            (started_at >= previous_end AND started_at - previous_end < interval '2 minutes')
+            OR CASE WHEN start_meta->>'gap_ms' ~ '^[0-9]+([.][0-9]+)?$'
+                    THEN (start_meta->>'gap_ms')::numeric < 120000 ELSE false END
+        ) THEN 0 ELSE 1 END) OVER (
+            PARTITION BY device ORDER BY first_at, session_id) AS sitting_number
+        FROM previous
+    ), rollups AS (
+        SELECT device, sitting_number,
+               (array_agg(session_id ORDER BY first_at, session_id))[1] AS sitting_id,
+               min(started_at) AS started_at, min(first_at) AS first_at,
+               max(last_at) AS last_at,
+               (array_agg(ended_at ORDER BY first_at DESC, session_id DESC))[1] AS ended_at,
+               CASE WHEN (array_agg(ended_at ORDER BY first_at DESC, session_id DESC))[1] IS NOT NULL
+                    THEN sum(duration_ms)::bigint END AS duration_ms,
+               (array_agg(start_meta ORDER BY first_at, session_id))[1] AS start_meta,
+               (array_agg(end_meta ORDER BY first_at DESC, session_id DESC))[1] AS end_meta
+        FROM numbered GROUP BY device, sitting_number
+    ), sittings AS (
+        SELECT *, lead(first_at) OVER (PARTITION BY device ORDER BY first_at, sitting_id) AS next_start
+        FROM rollups
+    ), attributed AS (
+        SELECT p.*, n.sitting_number
+        FROM phone p JOIN numbered n USING (device, session_id)
+        UNION ALL
+        SELECT p.*, owner.sitting_number
+        FROM phone p CROSS JOIN LATERAL (
+            SELECT s.sitting_number FROM sittings s
+            WHERE s.device = p.device AND p.occurred_at >= s.first_at
+              AND p.occurred_at <= s.last_at
+              AND (s.next_start IS NULL OR p.occurred_at < s.next_start)
+            ORDER BY s.first_at DESC, s.sitting_id LIMIT 1
+        ) owner
+        WHERE p.session_id = '' AND p.event_type IN ('open', 'close', 'web', 'save', 'like', 'share')
+    )
+    SELECT s.sitting_id AS session_id,
+           s.started_at, s.ended_at, s.duration_ms,
+           s.start_meta->>'trigger' AS trigger,
+           s.end_meta->>'reason' AS end_reason,
+           s.device,
+           s.start_meta->>'app_version' AS app_version,
+           s.start_meta->>'update_id' AS update_id,
            count(DISTINCT item_id) FILTER (WHERE event_type = 'impression') AS cards_seen,
            count(*) FILTER (WHERE event_type = 'impression') AS impressions,
            COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'impression'), 0) AS card_dwell_ms,
@@ -351,7 +399,8 @@ SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
            count(*) FILTER (WHERE event_type = 'ui') AS taps,
            count(*) FILTER (WHERE event_type = 'load') AS loads,
            count(*) AS events,
-           count(*) FILTER (WHERE event_type = 'like') AS likes
-    FROM @feed_events
-    WHERE session_id <> '' AND NOT {TEST_CLIENT_SQL}
-    GROUP BY session_id"""
+           count(*) FILTER (WHERE event_type = 'like') AS likes,
+           s.sitting_id
+    FROM sittings s JOIN attributed a USING (device, sitting_number)
+    GROUP BY s.sitting_id, s.started_at, s.ended_at, s.duration_ms,
+             s.start_meta, s.end_meta, s.device"""

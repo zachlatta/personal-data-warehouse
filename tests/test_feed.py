@@ -61,8 +61,8 @@ def _event(
     wh._command(
         "INSERT INTO @feed_events (event_id, event_type, item_id, session_id, occurred_at, dwell_ms, "
         "visible_fraction, metadata, client_name, device) "
-        "VALUES (%s, %s, %s, %s, now() - make_interval(mins => %s), %s, %s, %s::jsonb, %s, %s)",
-        (event_id, event_type, item_id, session_id, 60 - minutes, dwell_ms, fraction, metadata, client_name, device),
+        "VALUES (%s, %s, %s, %s, now() - make_interval(secs => %s), %s, %s, %s::jsonb, %s, %s)",
+        (event_id, event_type, item_id, session_id, (60 - minutes) * 60, dwell_ms, fraction, metadata, client_name, device),
     )
 
 
@@ -354,3 +354,89 @@ def test_cards_from_before_versioning_get_a_baseline_version(warehouse):
     [(version, action, actor, *_rest)] = _versions(wh)
     assert (version, action, actor) == (1, "baseline", "versioning")
     assert _rest[-1]["title"] == "Old"
+
+
+@pytestmark_db
+def test_sittings_join_detail_gaps_and_recover_only_same_device_events(warehouse):
+    wh = warehouse
+    _item(wh)
+    for sid, start, end, meta in [('a', 0, 1, '{}'), ('b', 2, 3, '{}'), ('c', 9, 10, '{"gap_ms": 1000}')]:
+        _event(wh, sid+'0', 'session_start', minutes=start, session_id=sid, device='phone', metadata=meta)
+        _event(wh, sid+'1', 'impression', minutes=start, session_id=sid, device='phone')
+        _event(wh, sid+'2', 'session_end', minutes=end, session_id=sid, device='phone', dwell_ms=1000)
+    for i, kind in enumerate(['open', 'close', 'web', 'save', 'like', 'share']):
+        _event(wh, 'detail'+str(i), kind, minutes=1.5, session_id='', device='phone')
+    _event(wh, 'other', 'open', minutes=1.5, session_id='', device='other')
+    _event(wh, 'late', 'open', minutes=11, session_id='', device='phone')
+    assert wh._query("SELECT session_id, sitting_id, duration_ms, cards_seen, opens, saves, likes, shares "
+                     "FROM @marts_feed_sessions") == [('a', 'a', 3000, 1, 1, 1, 1, 1)]
+
+
+@pytestmark_db
+@pytest.mark.parametrize('metadata', ['{}', '{"gap_ms": -1}', '{"gap_ms": "oops"}', '{"gap_ms": 120000}'])
+def test_sittings_do_not_merge_two_minute_gaps_or_bad_metadata(warehouse, metadata):
+    wh = warehouse
+    _event(wh, 'a0', 'session_start', minutes=0, session_id='a')
+    _event(wh, 'a1', 'session_end', minutes=1, session_id='a', dwell_ms=1000)
+    _event(wh, 'b0', 'session_start', minutes=3.1, session_id='b', metadata=metadata)
+    _event(wh, 'b1', 'session_end', minutes=4, session_id='b', dwell_ms=2000)
+    assert wh._query('SELECT count(*) FROM @marts_feed_sessions') == [(2,)]
+
+
+@pytestmark_db
+def test_unfinished_sitting_is_finite_and_uses_last_session_end(warehouse):
+    wh = warehouse
+    _event(wh, 'a0', 'session_start', minutes=0, session_id='a')
+    _event(wh, 'a1', 'session_end', minutes=1, session_id='a', dwell_ms=1000)
+    _event(wh, 'b0', 'session_start', minutes=2, session_id='b')
+    _event(wh, 'b1', 'open', minutes=3, session_id='b')
+    _event(wh, 'stray', 'open', minutes=20, session_id='')
+    assert wh._query('SELECT session_id, ended_at, duration_ms, opens FROM @marts_feed_sessions') == [('a', None, None, 1)]
+
+
+@pytestmark_db
+def test_sitting_two_minute_boundary_and_first_last_metadata(warehouse):
+    wh = warehouse
+    rows = [
+        ('a0', 'session_start', 'a', 0, 0, '{"trigger":"launch","app_version":"first","update_id":"u1"}'),
+        ('a1', 'session_end', 'a', 60, 1000, '{"reason":"blur"}'),
+        ('b0', 'session_start', 'b', 180, 0, '{"gap_ms":120000,"trigger":"focus"}'),
+        ('b1', 'session_end', 'b', 240, 2000, '{"reason":"background"}'),
+        ('c0', 'session_start', 'c', 240, 0, '{"gap_ms":"bad"}'),
+        ('c1', 'session_end', 'c', 300, 3000, '{"reason":"background"}'),
+        ('open', 'open', '', 240, 0, '{}'),
+    ]
+    for eid, kind, sid, seconds, dwell, meta in rows:
+        _event(wh, eid, kind, session_id=sid, metadata=meta, dwell_ms=dwell)
+        wh._command("UPDATE @feed_events SET occurred_at = '2026-01-01'::timestamptz + make_interval(secs => %s) "
+                    "WHERE event_id = %s", (seconds, eid))
+    assert wh._query("SELECT session_id, duration_ms, trigger, end_reason, opens "
+                     "FROM @marts_feed_sessions ORDER BY session_id") == [
+        ('a', 1000, 'launch', 'blur', 0), ('b', 5000, 'focus', 'background', 1),
+    ]
+    assert wh._query("SELECT app_version, update_id FROM @marts_feed_sessions WHERE session_id='a'") == [('first', 'u1')]
+
+
+@pytestmark_db
+def test_empty_id_boundary_event_belongs_to_latest_sitting_once(warehouse):
+    wh = warehouse
+    for eid, kind, sid, seconds in [('a0', 'session_start', 'a', 0),
+                                   ('a1', 'impression', 'a', 60),
+                                   ('b0', 'session_start', 'b', 60),
+                                   ('b1', 'session_end', 'b', 120),
+                                   ('open', 'open', '', 60)]:
+        _event(wh, eid, kind, session_id=sid)
+        wh._command("UPDATE @feed_events SET occurred_at = '2026-01-01'::timestamptz + make_interval(secs => %s) "
+                    "WHERE event_id = %s", (seconds, eid))
+    assert wh._query('SELECT session_id, opens FROM @marts_feed_sessions ORDER BY session_id') == [('a', 0), ('b', 1)]
+
+
+@pytestmark_db
+def test_nearby_sessions_on_different_devices_stay_separate(warehouse):
+    wh = warehouse
+    for sid, device, start in [('a', 'phone-a', 0), ('b', 'phone-b', 1)]:
+        _event(wh, sid+'0', 'session_start', minutes=start, session_id=sid, device=device)
+        _event(wh, sid+'1', 'session_end', minutes=start+1, session_id=sid, device=device)
+    assert wh._query('SELECT session_id, device FROM @marts_feed_sessions ORDER BY session_id') == [
+        ('a', 'phone-a'), ('b', 'phone-b'),
+    ]

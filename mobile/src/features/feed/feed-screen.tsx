@@ -1,3 +1,4 @@
+import { FeedSessionLifecycle } from './session-lifecycle';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -183,6 +184,7 @@ export default function FeedScreen() {
   const videoKeys = useRef(new Map<string, string>());
   const videoFocus = useRef<string | null>(null);
   const focused = useRef(false);
+  const [lifecycle] = useState(() => new FeedSessionLifecycle());
   const loadedAt = useRef(0);
   // The error banner sits above the first card when it is showing.
   const headerHeight = useRef(0);
@@ -325,21 +327,23 @@ export default function FeedScreen() {
   host.useFocusEffect(
     useCallback(() => {
       focused.current = true;
+      lifecycle.focus();
       if (AppState.currentState === 'active') startFeedSession(ids.current.length, 'focus');
       if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
       else measure();
       return () => {
         focused.current = false;
         pause();
-        endFeedSession('blur');
+        if (lifecycle.blur()) endFeedSession('blur');
       };
-    }, [load, measure, pause]),
+    }, [load, measure, pause, lifecycle]),
   );
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
-      if (!focused.current || !host.inFront()) return;
-      if (state === 'active') {
+      const action = lifecycle.appState(state);
+      if (!action) return;
+      if (action === 'start') {
         startFeedSession(ids.current.length, 'foreground');
         if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
         else measure();
@@ -350,7 +354,7 @@ export default function FeedScreen() {
       }
     });
     return () => sub.remove();
-  }, [load, measure, pause, host]);
+  }, [load, measure, pause, lifecycle]);
 
   // Search as he types, a beat after the last keystroke; an empty box lists
   // his whole history, newest seen first.
@@ -530,9 +534,10 @@ export default function FeedScreen() {
   const onOpen = useCallback(
     (item: FeedItem) => {
       markOpenTap(item.item_id);
+      lifecycle.openDetail();
       openItem(item.item_id, position(item));
     },
-    [openItem],
+    [openItem, lifecycle],
   );
 
   // A link inside a post or the card's text (index -1, via says which) or

@@ -194,7 +194,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     down; `new_pill` = he tapped it, from `from_y`). A tap on an X post's author or a Hacker
     News counts row is an `open` (`via` `post_link`) with the profile or discussion `metadata.url`.
   - `session_start` adds `metadata.trigger` (`launch` = first sitting since the app
-    started, `foreground`, `focus` = back from another tab or a card's detail view),
+    started, `foreground`, `focus` = back from another tab),
     `gap_ms` since the last sitting, `since_app_start_ms`, `app_version`, `update_id`,
     `channel`, `os`, `color_scheme`, `tz`; `session_end` adds `reason` (`background`,
     `blur`). Impressions add `metadata.view` (`all`, `saved`, `source:<s>`), `height`
@@ -206,7 +206,14 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     `duration_ms`, `trigger`, `end_reason`, `device`, `app_version`, `update_id`,
     `cards_seen`, `impressions`, `card_dwell_ms`, `deepest_position`, `scrolls`,
     `scroll_distance`, `opens`, `expands`, `shares`, `saves`, `dismisses`, `taps`, `loads`,
-    `events`, `likes`. A detail view takes the Feed off screen, so its events have no sitting.
+    `events`, `likes`. A sitting joins consecutive raw sessions on the same device when
+    the recorded gap or measured end-to-start gap is nonnegative and under two minutes.
+    `sitting_id` and `session_id` identify its first raw session; duration sums active
+    time, excluding gaps. Detail views and the in-app browser retain the mobile session;
+    backgrounding still ends it. Events recorded before this fix may have empty
+    `session_id`: eligible engagement within the sitting interval is attributed by device
+    without rewriting raw events. `pdw feed stats` counts these sittings, excluding
+    emulators, across all sources even when its card counts are source-filtered.
 - **Saved for later** (added 2026-10-21 from Zach's voice memo: "some kind of way to mark
   something as ... an important thing for me to read or consume, like add to my queue"):
   the bookmark on a card (the card's action row, an X post's metrics row, the detail

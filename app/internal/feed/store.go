@@ -482,7 +482,7 @@ type Stats struct {
 	Sources      []SourceStats    `json:"sources"`
 	EventsByType map[string]int64 `json:"events_by_type"`
 	Since        time.Time        `json:"since"`
-	Sessions     int64            `json:"sessions"`
+	Sessions     int64            `json:"sessions"` // Sittings starting in the window; all sources, emulator excluded.
 	TopItems     []Item           `json:"top_items"`
 	Ignored      []Item           `json:"ignored"`
 }
@@ -523,7 +523,7 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		return out, err
 	}
 	typeRows, err := s.DB.QueryContext(qctx, s.q(`
-		SELECT e.event_type, count(*), count(DISTINCT e.session_id) FILTER (WHERE e.event_type = 'session_start')
+		SELECT e.event_type, count(*)
 		FROM @feed_events e LEFT JOIN @feed_items i ON i.item_id = e.item_id
 		WHERE e.occurred_at >= $1 AND ($2 = '' OR i.source = $2)
 		GROUP BY e.event_type`), since, source)
@@ -532,18 +532,24 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	}
 	for typeRows.Next() {
 		var (
-			kind    string
-			n, sess int64
+			kind string
+			n    int64
 		)
-		if err := typeRows.Scan(&kind, &n, &sess); err != nil {
+		if err := typeRows.Scan(&kind, &n); err != nil {
 			typeRows.Close()
 			return out, err
 		}
 		out.EventsByType[kind] = n
-		out.Sessions += sess
 	}
 	typeRows.Close()
 	if err := typeRows.Err(); err != nil {
+		return out, err
+	}
+	// Use the sitting rollup, including historical session stitching. Only
+	// started_at is read so this works before the rebuilt view is deployed.
+	// Visits span sources; source filters apply to cards and events only.
+	if err := s.DB.QueryRowContext(qctx, s.q(`
+		SELECT count(*) FROM @marts_feed_sessions WHERE started_at >= $1`), since).Scan(&out.Sessions); err != nil {
 		return out, err
 	}
 	sourceFilter := ""

@@ -131,7 +131,7 @@ type saveOutput struct {
 
 type statsInput struct {
 	Source string `json:"source,omitempty"`
-	Since  string `json:"since,omitempty" jsonschema:"window for events_by_type and sessions: RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
+	Since  string `json:"since,omitempty" jsonschema:"window for events_by_type and sitting starts (sessions): RFC3339, YYYY-MM-DD, or a duration back from now (7d, 24h); default 7d"`
 }
 
 type eventsInput struct {
@@ -378,8 +378,9 @@ func Tools(store *Store) []tool.Tool {
 			NameStr:  "feed_stats",
 			TitleStr: "Feed Engagement Stats",
 			DescriptionStr: "How the Feed tab is landing: per source (items, seen, engaged/open/dismiss rates, average engagement_score, dwell and read time, from " +
-				"marts_feed.source_engagement), event counts by type and sessions since a window (default 7d), the most engaged cards, " +
-				"and cards seen twice or more without any engagement. Use it before writing the next batch. CLI: pdw feed stats.",
+				"marts_feed.source_engagement), event counts by type and sittings starting since a window (sessions; default 7d), the most engaged cards, " +
+				"and cards seen twice or more without any engagement. Sittings exclude emulators and always cover all sources; " +
+				"source filters apply to cards and event counts. Use it before writing the next batch. CLI: pdw feed stats.",
 			Handle: func(ctx context.Context, in statsInput) (Stats, error) {
 				since, err := sinceTime(in.Since, store.now(), 7*24*time.Hour)
 				if err != nil {
