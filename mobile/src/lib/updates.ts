@@ -40,3 +40,12 @@ export function describeInstalledUpdate(): string {
   const when = Updates.createdAt ? ` · ${Updates.createdAt.toLocaleString()}` : '';
   return `${id} · channel ${Updates.channel ?? 'none'} · runtime ${Updates.runtimeVersion ?? '?'}${when}`;
 }
+
+// The update the phone runs, in plain words: what "close and reopen the app"
+// was meant to change.
+export function describeUpdateAge(): string {
+  if (!Updates.isEnabled) return 'Development build';
+  if (!Updates.updateId || !Updates.createdAt) return 'Running the version built into the app';
+  const when = Updates.createdAt.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `Running the update from ${when}`;
+}

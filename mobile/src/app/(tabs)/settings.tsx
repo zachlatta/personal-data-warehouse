@@ -1,8 +1,9 @@
 import Constants from 'expo-constants';
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useRouter } from 'expo-router';
 import { Alert, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
+import { Icon } from '@/components/icon';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Palette, Spacing } from '@/constants/theme';
@@ -10,14 +11,14 @@ import { useTheme } from '@/hooks/use-theme';
 import { sendTestPush } from '@/lib/api';
 import { notificationSettingsName, secureStoreName } from '@/lib/platform-copy';
 import { useConfig, useSession } from '@/lib/session';
-import { applyUpdateNow, describeInstalledUpdate, type UpdateState } from '@/lib/updates';
+import { applyUpdateNow, describeInstalledUpdate, describeUpdateAge, type UpdateState } from '@/lib/updates';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 
 function describePush(push: ReturnType<typeof useSession>['push']): string {
   if (!push) return 'Registering…';
   switch (push.state) {
     case 'registered':
-      return `Registered (${push.token})`;
+      return 'On for this phone';
     case 'denied':
       return `Permission denied — enable notifications for PDW in ${notificationSettingsName(Platform.OS)}.`;
     case 'unsupported':
@@ -29,7 +30,6 @@ function describePush(push: ReturnType<typeof useSession>['push']): string {
 
 export default function SettingsScreen() {
   const tabSpace = useTabBarSpace();
-  const theme = useTheme();
   const config = useConfig();
   const router = useRouter();
   const { push, refreshPush, signOut } = useSession();
@@ -56,84 +56,54 @@ export default function SettingsScreen() {
       { text: 'Disconnect', style: 'destructive', onPress: () => void signOut() },
     ]);
 
-  const card = [styles.card, { backgroundColor: theme.backgroundElement }];
+  const pushToken = push?.state === 'registered' ? push.token : null;
+  const updateBusy = update?.state === 'checking' || update?.state === 'downloading';
   return (
     <ThemedView style={styles.container}>
       <ScrollView contentContainerStyle={[styles.content, { paddingBottom: tabSpace }]}>
-        <View style={card}>
-          <ThemedText type="smallBold" themeColor="textSecondary">
-            Server
-          </ThemedText>
-          <ThemedText selectable>{config.baseUrl}</ThemedText>
-          <ThemedText type="small" themeColor="textSecondary">
-            client {config.clientName} · token stored in {secureStoreName(Platform.OS)}
-          </ThemedText>
-        </View>
-        <View style={card}>
-          <ThemedText type="smallBold" themeColor="textSecondary">
-            Push notifications
-          </ThemedText>
-          <ThemedText type="small" selectable>
-            {describePush(push)}
-          </ThemedText>
-          <View style={styles.rowButtons}>
-            <Pressable onPress={() => void refreshPush()} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
-              <ThemedText type="smallBold">Re-register</ThemedText>
-            </Pressable>
-            <Pressable onPress={test} disabled={testing} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }, testing && styles.disabled]}>
-              <ThemedText type="smallBold">Send test push</ThemedText>
-            </Pressable>
-          </View>
-          {testResult ? (
+        <Section title="Notifications">
+          <Row title={pushToken ? 'On for this phone' : 'Push'} detail={pushToken ? undefined : describePush(push)}>
+            {pushToken ? (
+              <ThemedText type="small" themeColor="textSecondary" numberOfLines={1} ellipsizeMode="middle" selectable>
+                {pushToken}
+              </ThemedText>
+            ) : null}
+            <View style={styles.links}>
+              <Link label="Send test push" onPress={test} disabled={testing} />
+              <Link label="Re-register" onPress={() => void refreshPush()} />
+            </View>
+            {testResult ? (
+              <ThemedText type="small" themeColor="textSecondary">
+                {testResult}
+              </ThemedText>
+            ) : null}
+          </Row>
+          <Row title="Timeline alerts" detail="The on/off switch and everything sent" onPress={() => router.navigate('/notifications')} />
+        </Section>
+        <Section title="Data">
+          <Row title="MCP connections" detail="Add, sign in to, share and turn off servers" onPress={() => router.push('/connections')} />
+          <Row title="Server" detail={config.baseUrl}>
             <ThemedText type="small" themeColor="textSecondary">
-              {testResult}
+              client {config.clientName} · token stored in {secureStoreName(Platform.OS)}
             </ThemedText>
-          ) : null}
-        </View>
-        <View style={card}>
-          <ThemedText type="smallBold" themeColor="textSecondary">
-            Timeline notifications
-          </ThemedText>
-          <ThemedText type="small">The on/off switch and the ledger of everything sent live in Alerts.</ThemedText>
-          <View style={styles.rowButtons}>
-            <Pressable onPress={() => router.navigate('/notifications')} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
-              <ThemedText type="smallBold">Open Alerts</ThemedText>
-            </Pressable>
-          </View>
-        </View>
-        <View style={card}>
-          <ThemedText type="smallBold" themeColor="textSecondary">
-            MCP connections
-          </ThemedText>
-          <ThemedText type="small">Add, sign in to, share and turn off the remote MCP servers PDW connects to.</ThemedText>
-          <View style={styles.rowButtons}>
-            <Pressable onPress={() => router.push('/connections')} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
-              <ThemedText type="smallBold">Manage connections</ThemedText>
-            </Pressable>
-          </View>
-        </View>
-        <View style={card}>
-          <ThemedText type="smallBold" themeColor="textSecondary">
-            App
-          </ThemedText>
-          <ThemedText type="small">
-            PDW {Constants.expoConfig?.version ?? ''} · EAS project {(Constants.expoConfig?.extra?.eas?.projectId as string | undefined) ?? 'none'}
-          </ThemedText>
-          <ThemedText type="small" themeColor="textSecondary" selectable>
-            {describeInstalledUpdate()}
-          </ThemedText>
-          <View style={styles.rowButtons}>
-            <Pressable onPress={() => void applyUpdateNow(setUpdate)} disabled={update?.state === 'checking' || update?.state === 'downloading'} style={[styles.secondary, { backgroundColor: theme.backgroundSelected }]}>
-              <ThemedText type="smallBold">Check for update</ThemedText>
-            </Pressable>
-          </View>
-          {update ? (
-            <ThemedText type="small" themeColor="textSecondary">
-              {update.state === 'current' ? 'Up to date.' : update.state === 'error' ? `Update error: ${update.message}` : update.state === 'disabled' ? 'Updates are disabled in this build.' : `${update.state}…`}
+          </Row>
+        </Section>
+        <Section title="App">
+          <Row title={describeUpdateAge()} detail={`PDW ${Constants.expoConfig?.version ?? ''}`}>
+            <ThemedText type="small" themeColor="textSecondary" selectable>
+              {describeInstalledUpdate()}
             </ThemedText>
-          ) : null}
-        </View>
-        <Pressable onPress={confirmSignOut} style={[styles.danger, { backgroundColor: theme.backgroundElement }]}>
+            <View style={styles.links}>
+              <Link label={updateBusy ? `${update?.state === 'checking' ? 'Checking' : 'Downloading'}…` : 'Check for update'} onPress={() => void applyUpdateNow(setUpdate)} disabled={updateBusy} />
+            </View>
+            {update && !updateBusy ? (
+              <ThemedText type="small" themeColor="textSecondary">
+                {update.state === 'current' ? 'Up to date.' : update.state === 'error' ? `Update error: ${update.message}` : 'Updates are off in this build.'}
+              </ThemedText>
+            ) : null}
+          </Row>
+        </Section>
+        <Pressable onPress={confirmSignOut} hitSlop={8} style={styles.danger}>
           <ThemedText style={styles.dangerText}>Disconnect</ThemedText>
         </Pressable>
       </ScrollView>
@@ -141,13 +111,64 @@ export default function SettingsScreen() {
   );
 }
 
+// Superhuman's settings are a plain grouped list: a small heading, then rows
+// split by hairlines, no boxes.
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  const theme = useTheme();
+  return (
+    <View>
+      <ThemedText type="smallBold" themeColor="textSecondary" style={styles.sectionTitle}>
+        {title}
+      </ThemedText>
+      <View style={[styles.section, { borderColor: theme.separator }]}>{children}</View>
+    </View>
+  );
+}
+
+function Row({ title, detail, onPress, children }: { title: string; detail?: string; onPress?: () => void; children?: ReactNode }) {
+  const theme = useTheme();
+  const body = (
+    <>
+      <View style={styles.rowText}>
+        <ThemedText>{title}</ThemedText>
+        {detail ? (
+          <ThemedText type="small" themeColor="textSecondary" selectable={!onPress}>
+            {detail}
+          </ThemedText>
+        ) : null}
+        {children}
+      </View>
+      {onPress ? <Icon name="chevron.right" tintColor={theme.textSecondary} size={18} /> : null}
+    </>
+  );
+  const style = [styles.row, { borderBottomColor: theme.separator }];
+  if (!onPress) return <View style={style}>{body}</View>;
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} android_ripple={{ color: theme.separator }} style={({ pressed }) => [...style, pressed && { backgroundColor: theme.backgroundElement }]}>
+      {body}
+    </Pressable>
+  );
+}
+
+function Link({ label, onPress, disabled }: { label: string; onPress: () => void; disabled?: boolean }) {
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} disabled={disabled} hitSlop={8} style={disabled && styles.disabled}>
+      <ThemedText type="smallBold" themeColor="accent">
+        {label}
+      </ThemedText>
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  content: { padding: Spacing.three, gap: Spacing.three },
-  card: { borderRadius: 16, padding: Spacing.three, gap: Spacing.two },
-  rowButtons: { flexDirection: 'row', gap: Spacing.two, marginTop: Spacing.one },
-  secondary: { borderRadius: 999, paddingHorizontal: 16, paddingVertical: 8 },
-  disabled: { opacity: 0.6 },
-  danger: { borderRadius: 999, paddingVertical: 14, alignItems: 'center' },
+  content: { paddingTop: Spacing.two, gap: Spacing.four },
+  sectionTitle: { paddingHorizontal: Spacing.three, paddingBottom: Spacing.one },
+  section: { borderTopWidth: StyleSheet.hairlineWidth },
+  row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
+  rowText: { flex: 1, gap: 2 },
+  links: { flexDirection: 'row', gap: Spacing.four, marginTop: Spacing.two },
+  disabled: { opacity: 0.5 },
+  danger: { alignSelf: 'center', paddingVertical: Spacing.three },
   dangerText: { color: Palette.destructive, fontWeight: '600' },
 });
