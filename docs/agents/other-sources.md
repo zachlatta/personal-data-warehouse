@@ -230,7 +230,8 @@ answering his inline review comment is `direct`; a person in a thread he comment
 the previous 30 days (or in his own repository) is `cc`; bots and the rest are `noise`.
 GitHub's notification emails in Gmail stay where they are; these rows are the record.
 
-**A backfill never pages.** Pushes fire on new `direct` timeline rows, and a new source's
+**A backfill never pages.** Pushes fire on new `direct` timeline rows (except captured phone
+notifications, see Android notifications), and a new source's
 history lands as new rows, so the capture trigger skips any event older than three days
 (`notifications.py`). Without it, the first GitHub backfill would have paged for every old
 review on his PRs.
@@ -274,7 +275,9 @@ Every SMS, MMS and RCS message on the Android phone (`pichu`) since it took over
   (`message_kind` `system`, kept out of the timeline). `protocol` 0 SMS, 1 MMS, 3 RCS.
 - **Downstream.** Timeline adapter `android_message` (kind `message`; `self` when sent, `noise`
   for short codes, RCS businesses and toll-free numbers, `cc` in a conversation of 10+, else
-  `direct`); `marts_messages.messages` source `android_messages`.
+  `direct`); `marts_messages.messages` source `android_messages`. A message first uploaded as
+  `bugle:<row>` and again under its telephony key is two rows; the push capture pages for the
+  first and skips the second (same phone, message time and `chat_key`).
 - **Files** (`attachments.go`). Every non-text part's bytes are sent once through
   `/ingest/android-messages/attachment/resumable` (RCS files run to 100 MB, past the raw-body
   cap) into `android-messages/library/attachments/YYYY/MM/<date>-<sha><ext>`. An RCS file is a
@@ -356,8 +359,10 @@ lands in `base_android_notifications.events`, from 2026-10-24.
   `android_notifications_drive_ingest` promote batches into the table, upserting by
   `(account, device, event_id)`. The `android_notification` adapter puts each notification's
   first appearance with each `content_sha256` on the timeline (re-posts of the same text, group
-  summaries and empty shells stay in `base_*`), tiered by SQL: ongoing `background`, a
-  `msg`/`call` notification `direct` (`cc` for a group conversation), the rest `noise`. The
+  summaries and empty shells stay in `base_*`), tiered by SQL: ongoing or posted by PDW's own
+  app (`com.zachlatta.pdw*`) `background`, a `msg`/`call` notification `direct` (`cc` for a group
+  conversation), the rest `noise`. These rows never page, even `direct` ones: the phone already
+  showed the notification, and most mirror a source that pages itself. The
   `android_notification_opened` adapter is a tap: a system-log `clicked`, or a listener
   `removed` with reason 1 when no `clicked` row precedes it within 10 s (before the tail ran).
   `android_notification_action` is the rest of what Zach did: an action button pressed, an

@@ -23,6 +23,10 @@ def ensure_notification_tables(warehouse):
     # Only `direct` pages (since 2026-09-20): a week of direct + cc was 1,136
     # Slack cc pushes at a 2% open rate, 651 of them over an hour old when
     # sent, against 171 direct at 7%. cc is for reading, not for paging.
+    # A captured Pixel notification never pages (since 2026-10-31): Zach saw
+    # it on the phone already, and PDW's own alerts came back through the
+    # listener as `direct` and paged again. 589 of a week's 1,717 pushes were
+    # these copies, 240 of them PDW echoing itself.
     current = warehouse._query(
         "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = %s::regclass "
         "AND tgname = 'timeline_notification_insert'", (warehouse.sql_relation("timeline_events"),))
@@ -33,15 +37,16 @@ def ensure_notification_tables(warehouse):
                 PERFORM pg_advisory_xact_lock(hashtext(%s || ':notification-trigger'));
                 DROP TRIGGER IF EXISTS timeline_notification_insert ON @timeline_events;
                 CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events
-                FOR EACH ROW WHEN (NEW.priority = 'direct')
+                FOR EACH ROW WHEN (NEW.priority = 'direct' AND NEW.adapter <> 'android_notification')
                 EXECUTE FUNCTION @capture_timeline_notification();
             END $$
         """, (warehouse.sql_relation("timeline_events"),))
 
 
 # What pg_get_triggerdef prints for the WHEN clause above; the ensure path
-# compares against it so an old `IN ('direct','cc')` trigger is replaced.
-NOTIFICATION_TRIGGER_WHEN = "WHEN ((new.priority = 'direct'::"
+# compares against it so an older trigger (`IN ('direct','cc')`, or `direct`
+# including captured phone notifications) is replaced.
+NOTIFICATION_TRIGGER_WHEN = "AND (new.adapter <> 'android_notification'::text)))"
 
 
 # Reads timeline.events by column name, so the event_ts -> occurred_at
@@ -61,6 +66,17 @@ CAPTURE_FUNCTION_SQL = """CREATE OR REPLACE FUNCTION @capture_timeline_notificat
                 SELECT 1 FROM @notification_events
                 WHERE adapter = NEW.adapter AND source = NEW.source
                   AND payload->>'recurring_event_id' = NEW.metadata->>'recurring_event_id') THEN
+                RETURN NEW;
+            END IF;
+            -- The phone uploads a text as `bugle:<id>` until Google Messages
+            -- writes its telephony row, then again as `content://sms/N`: the
+            -- same message time in the same chat on the same phone pages once.
+            IF NEW.adapter = 'android_message' AND COALESCE(NEW.metadata->>'chat_key', '') <> '' AND EXISTS (
+                SELECT 1 FROM @notification_events
+                WHERE adapter = 'android_message' AND event_ts = NEW.occurred_at
+                  AND payload->'source_pk'->>'account' = NEW.source_pk->>'account'
+                  AND payload->'source_pk'->>'device' = NEW.source_pk->>'device'
+                  AND payload->'metadata'->>'chat_key' = NEW.metadata->>'chat_key') THEN
                 RETURN NEW;
             END IF;
             INSERT INTO @notification_events (adapter, event_id, source, priority, event_ts, landed_at, payload)
@@ -106,6 +122,7 @@ STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS notification_events_pending_idx ON @notification_events (created_at, id) WHERE status = 'pending'",
     "CREATE INDEX IF NOT EXISTS notification_events_created_idx ON @notification_events (created_at)",
     "CREATE INDEX IF NOT EXISTS notification_events_series_idx ON @notification_events (adapter, source, (payload->>'recurring_event_id'))",
+    "CREATE INDEX IF NOT EXISTS notification_events_message_time_idx ON @notification_events (adapter, event_ts)",
     """CREATE TABLE IF NOT EXISTS @notification_deliveries (
         id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
         notification_id text NOT NULL, device_id text NOT NULL,

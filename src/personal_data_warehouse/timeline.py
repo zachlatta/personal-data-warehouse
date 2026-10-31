@@ -2294,11 +2294,14 @@ _ANDROID_MESSAGE = _simple_adapter(
 # empty shells stay in base_*. `opened` is a notification Zach tapped
 # (Android's removal reason 1, REASON_CLICK), and is `self`.
 #
-# A notification's tier: an ongoing one (media, VPN, a foreground service) is
-# `background` machinery; a message or call from one person is `direct`, from
-# a group conversation `cc`; everything else -- app alerts, promotions,
-# reminders -- is `noise`. A message notification often mirrors a row another
-# source already has (Slack, Gmail, WhatsApp); SMS and RCS reach PDW only here.
+# A notification's tier: an ongoing one (media, VPN, a foreground service) or
+# one PDW's own app posted (its alerts are copies of timeline events, drawn as
+# conversations since 2026-10-28) is `background` machinery; a message or call
+# from one person is `direct`, from a group conversation `cc`; everything else
+# -- app alerts, promotions, reminders -- is `noise`. A message notification
+# often mirrors a row another source already has (Slack, Gmail, WhatsApp,
+# texts from android_messages), so a captured notification never pages
+# (notifications.py).
 _ANDROID_NOTIFICATION_KEY = (
     "p.account = t.account AND p.device = t.device AND p.notification_key = t.notification_key"
 )
@@ -2370,7 +2373,8 @@ _ANDROID_NOTIFICATION = _simple_adapter(
     search_text=_search_concat(*_ANDROID_NOTIFICATION_TEXT),
     where=_ANDROID_NOTIFICATION_FIRST_APPEARANCE,
     priority=(
-        f"CASE WHEN t.is_ongoing <> 0 THEN {TIMELINE_PRIORITY_BACKGROUND} "
+        f"CASE WHEN t.is_ongoing <> 0 OR t.package_name LIKE 'com.zachlatta.pdw%%' "
+        f"THEN {TIMELINE_PRIORITY_BACKGROUND} "
         "WHEN t.category IN ('msg', 'call', 'missed_call') AND t.is_group_conversation <> 0 "
         f"THEN {TIMELINE_PRIORITY_CC} "
         f"WHEN t.category IN ('msg', 'call', 'missed_call') THEN {TIMELINE_PRIORITY_DIRECT} "

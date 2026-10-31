@@ -128,6 +128,60 @@ def test_an_old_direct_plus_cc_trigger_is_replaced_by_ensure(warehouse):
     assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("new-direct",), ("old-cc",)]
 
 
+def test_a_direct_trigger_that_pages_phone_notifications_is_replaced_by_ensure(warehouse):
+    wh = warehouse
+    wh._command("DROP TRIGGER timeline_notification_insert ON @timeline_events")
+    wh._command("CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events "
+                "FOR EACH ROW WHEN (NEW.priority = 'direct') "
+                "EXECUTE FUNCTION @capture_timeline_notification()")
+    wh.ensure_timeline_tables()
+    # A current trigger is left alone: no timeline-wide lock at every sync.
+    trigger = ("SELECT oid FROM pg_trigger WHERE tgname = 'timeline_notification_insert' "
+               "AND tgrelid = '" + wh.sql_relation("timeline_events") + "'::regclass")
+    [(replaced,)] = wh._query(trigger)
+    wh.ensure_timeline_tables()
+    assert wh._query(trigger) == [(replaced,)]
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title) "
+                "VALUES ('android_notification', 'pichu|n1', 'direct'::" + wh.sql_relation("timeline_priority")
+                + ", 'android_notifications', 'PDW: Sam')")
+    insert(wh, "direct", "direct")
+    assert wh._query("SELECT event_id FROM @notification_events") == [("direct",)]
+
+
+def test_a_captured_phone_notification_never_pages(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    for adapter, event_id in (("android_notification", "pichu|n1"), ("slack_message", "T1|C1|1.0")):
+        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title) "
+                    "VALUES (%s, %s, 'direct'::" + wh.sql_relation("timeline_priority") + ", 'test', 'Hi')",
+                    (adapter, event_id))
+    assert wh._query("SELECT event_id FROM @notification_events") == [("T1|C1|1.0",)]
+
+
+def insert_text(wh, message_key, chat_key, at, account="me", device="pichu"):
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title, occurred_at, source_pk, metadata) "
+                "VALUES ('android_message', %s, 'direct'::" + wh.sql_relation("timeline_priority")
+                + ", 'android_messages', '', %s::timestamptz, %s::jsonb, %s::jsonb)",
+                (f"{account}|{device}|{message_key}", at,
+                 json.dumps({"account": account, "device": device, "message_key": message_key}),
+                 json.dumps({"device": device, "chat_key": chat_key})))
+
+
+def test_a_text_uploaded_again_under_its_telephony_key_pages_once(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    [(at, later)] = wh._query("SELECT (now() - interval '2 minutes')::text, (now() - interval '1 minute')::text")
+    insert_text(wh, "bugle:7", "+15550100", at)
+    insert_text(wh, "content://sms/7", "+15550100", at)
+    insert_text(wh, "content://sms/8", "+15550100", later)
+    insert_text(wh, "content://sms/9", "+15550111", at)
+    insert_text(wh, "content://sms/10", "+15550100", at, device="other")
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [
+        ("me|other|content://sms/10",), ("me|pichu|bugle:7",), ("me|pichu|content://sms/8",),
+        ("me|pichu|content://sms/9",)]
+
+
 def test_capture_rolls_back_with_source_insert(warehouse):
     wh = warehouse
     wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")

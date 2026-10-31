@@ -1339,6 +1339,9 @@ def _seed_github(wh) -> None:
                           content_sha256="sha-sale", removal_reason=2, removal_reason_name="cancel"),
             _notification("n9", "k-summary", 2.45, event_type="removed", is_group_summary=1,
                           content_sha256="sha-summary", removal_reason=2, removal_reason_name="cancel"),
+            # PDW's own alert, drawn as a conversation: machinery, not a person.
+            _notification("n10", "k-pdw", 2.4, package_name="com.zachlatta.pdw", app_label="PDW",
+                          title="Alex Example", content_sha256="sha-pdw"),
             # Android's events log: the tap behind n7 (which n7 then only
             # repeats), a button, an expansion Zach made and one he did not,
             # and the notification coming on screen. Only the key is logged.
@@ -1517,9 +1520,10 @@ EXPECTED_SEEDED_EVENTS = {
     # 4 (reload) stay in base_browser_history only.
     "browser_visit": 2,
     "browser_search": 1,
-    # The message, its update, the media and the promotion; the re-post of the
-    # same text and the group summary stay in base_android_notifications.
-    "android_notification": 4,
+    # The message, its update, the media, the promotion and PDW's own alert;
+    # the re-post of the same text and the group summary stay in
+    # base_android_notifications.
+    "android_notification": 5,
     # The tap, once: the system log's click, not the listener's removal
     # that repeats it.
     "android_notification_opened": 1,
@@ -1719,7 +1723,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert "synthetic query" in browser["5"]["search_text"]
     assert browser["1"]["context"] == browser["5"]["context"]
     notifications = {r["source_pk"]["event_id"]: r for r in rows if r["source"] == "android_notifications"}
-    assert set(notifications) == {"n1", "n3", "n5", "n6", "n8", "s1", "s2", "s3"}
+    assert set(notifications) == {"n1", "n3", "n5", "n6", "n8", "n10", "s1", "s2", "s3"}
     assert notifications["n1"]["kind"] == "notification"
     assert notifications["n1"]["title"] == "Chat: Alex Example"
     assert notifications["n1"]["actor"] == "Alex Example"
@@ -1728,6 +1732,7 @@ def test_backfill_normalizes_every_source(warehouse):
     assert "[]" not in notifications["n6"]["search_text"]
     assert notifications["n5"]["priority"] == "background"
     assert notifications["n6"]["priority"] == "noise"
+    assert notifications["n10"]["priority"] == "background"
     assert notifications["s1"]["kind"] == "opened"
     assert notifications["s1"]["title"] == "Opened: Chat: Alex Example"
     assert notifications["s1"]["priority"] == "self"
