@@ -1,3 +1,4 @@
+import { feedDetailClosed } from './session-lifecycle';
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { Fragment, useCallback, useRef } from 'react';
@@ -155,6 +156,7 @@ export default function FeedReaderScreen() {
           dwell_ms: Math.max(0, dwell_ms - nested.current),
           metadata: { mode: 'detail', scroll_depth: Math.round(depth.current * 100) / 100, wall_ms, nested_ms: nested.current },
         });
+        feedDetailClosed();
       };
     }, [item, position]),
   );

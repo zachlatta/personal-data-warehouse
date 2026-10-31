@@ -114,12 +114,13 @@ How he uses the feed itself (Zach asked on 2026-10-20 to log everything and quer
 `marts_feed.sessions` joins consecutive raw sessions on one device when the recorded
 or measured end-to-start gap is nonnegative and under two minutes. `sitting_id` and
 `session_id` name the first session; duration sums active time without gaps. Detail
-and browser views retain the mobile session; backgrounding ends it. Before this fix,
-detail events may have empty `session_id`; eligible events within a sitting interval
-are attributed by device without changing raw data. Stats counts these sittings,
-excluding emulators and across all sources even with a source filter. It is one row per sitting (`started_at`, `duration_ms`, `trigger`
+and browser views retain the mobile session; backgrounding ends it. Clients preceding the session fix prepared on 2026-10-31
+may record empty `session_id`; eligible events within a sitting interval
+are attributed by device, extending blur-ended intervals to the next start without
+merging longer gaps or changing raw data. Stats counts these sittings,
+excluding emulators and across all sources even with a source filter. Each row exposes `started_at`, `duration_ms`, `trigger`
 launch / foreground / focus, `end_reason`, `cards_seen`, `deepest_position`, `scrolls`,
-`scroll_distance`, `opens`, `taps`, `loads`). In `base_feed.events`, `session_start`
+`scroll_distance`, `opens`, `taps`, `loads`. In `base_feed.events`, `session_start`
 carries app version, OTA update, OS and time zone; `load` is what the server served, in
 order (`metadata.item_ids`) and how fast; `scroll` is one gesture (`from_y`, `to_y`,
 `direction`, `release_velocity`, `from_card`, `to_card`, `metadata.in` = `detail` inside

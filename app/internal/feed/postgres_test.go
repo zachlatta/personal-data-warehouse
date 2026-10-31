@@ -124,7 +124,7 @@ func postgresStore(t *testing.T) (*Store, time.Time) {
 	}
 	store.Expand = func(q string) string {
 		// Longest names first: @feed_items must not eat @feed_items_x.
-		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "feed_item_versions", "feed_items", "feed_events"} {
+		for _, name := range []string{"marts_feed_item_engagement", "marts_feed_source_engagement", "marts_feed_sessions", "feed_item_versions", "feed_items", "feed_events"} {
 			q = strings.ReplaceAll(q, "@"+name, relations[name])
 		}
 		return q

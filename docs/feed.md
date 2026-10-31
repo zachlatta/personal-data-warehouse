@@ -210,9 +210,10 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
     the recorded gap or measured end-to-start gap is nonnegative and under two minutes.
     `sitting_id` and `session_id` identify its first raw session; duration sums active
     time, excluding gaps. Detail views and the in-app browser retain the mobile session;
-    backgrounding still ends it. Events recorded before this fix may have empty
-    `session_id`: eligible engagement within the sitting interval is attributed by device
-    without rewriting raw events. `pdw feed stats` counts these sittings, excluding
+    backgrounding still ends it. Clients preceding the session fix prepared on 2026-10-31 may record empty
+    `session_id`: eligible engagement within the sitting interval is attributed by device; after a blur,
+    attribution extends to the next session start without merging longer gaps
+    or rewriting raw events. `pdw feed stats` counts these sittings, excluding
     emulators, across all sources even when its card counts are source-filtered.
 - **Saved for later** (added 2026-10-21 from Zach's voice memo: "some kind of way to mark
   something as ... an important thing for me to read or consume, like add to my queue"):

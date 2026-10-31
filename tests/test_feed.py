@@ -440,3 +440,19 @@ def test_nearby_sessions_on_different_devices_stay_separate(warehouse):
     assert wh._query('SELECT session_id, device FROM @marts_feed_sessions ORDER BY session_id') == [
         ('a', 'phone-a'), ('b', 'phone-b'),
     ]
+
+
+@pytestmark_db
+def test_blur_gap_over_two_minutes_attributes_reader_events_without_merging(warehouse):
+    wh = warehouse
+    for eid, kind, sid, minute, meta in [
+        ('a0', 'session_start', 'a', 0, '{}'),
+        ('a1', 'session_end', 'a', 1, '{"reason":"blur"}'),
+        ('open', 'open', '', 2, '{}'),
+        ('close', 'close', '', 3, '{}'),
+        ('b0', 'session_start', 'b', 3.7, '{}'),
+        ('b1', 'session_end', 'b', 4, '{"reason":"background"}'),
+        ('late', 'open', '', 5, '{}'),
+    ]:
+        _event(wh, eid, kind, session_id=sid, minutes=minute, metadata=meta)
+    assert wh._query('SELECT session_id, opens FROM @marts_feed_sessions ORDER BY session_id') == [('a', 1), ('b', 0)]

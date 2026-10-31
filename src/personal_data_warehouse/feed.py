@@ -371,7 +371,9 @@ SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
         FROM phone p CROSS JOIN LATERAL (
             SELECT s.sitting_number FROM sittings s
             WHERE s.device = p.device AND p.occurred_at >= s.first_at
-              AND p.occurred_at <= s.last_at
+              AND (p.occurred_at <= s.last_at OR
+                   (s.end_meta->>'reason' = 'blur' AND s.next_start IS NOT NULL
+                    AND p.occurred_at < s.next_start))
               AND (s.next_start IS NULL OR p.occurred_at < s.next_start)
             ORDER BY s.first_at DESC, s.sitting_id LIMIT 1
         ) owner

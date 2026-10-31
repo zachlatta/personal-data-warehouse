@@ -1,4 +1,4 @@
-import { FeedSessionLifecycle } from './session-lifecycle';
+import { FeedSessionLifecycle, onFeedDetailClosed } from './session-lifecycle';
 import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -355,6 +355,19 @@ export default function FeedScreen() {
     });
     return () => sub.remove();
   }, [load, measure, pause, lifecycle]);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = onFeedDetailClosed(() => {
+      if (!lifecycle.detail) return;
+      // Let navigation restore focus before ending a visit that went elsewhere.
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (lifecycle.closeDetail(focused.current)) endFeedSession('blur');
+      }, 1000);
+    });
+    return () => { unsubscribe(); clearTimeout(timer); };
+  }, [lifecycle]);
 
   // Search as he types, a beat after the last keystroke; an empty box lists
   // his whole history, newest seen first.
