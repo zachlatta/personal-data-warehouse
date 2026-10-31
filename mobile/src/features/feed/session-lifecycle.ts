@@ -24,7 +24,8 @@ export class FeedSessionLifecycle {
     this.detail = false;
     return focused ? false : this.blur();
   }
-  appState(state: string): 'start' | 'end' | null {
+  appState(state: string, focusedInFront = false): 'start' | 'end' | null {
+    if (state === 'active' && focusedInFront && !this.coordinator.owner) this.focus();
     if (!this.owns) return null;
     return state === 'active' ? 'start' : 'end';
   }

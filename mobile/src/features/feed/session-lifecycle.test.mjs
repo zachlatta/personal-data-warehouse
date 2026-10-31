@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { FeedSessionLifecycle } from './session-lifecycle.ts';
+import { FeedSessionLifecycle, FeedSessionCoordinator } from './session-lifecycle.ts';
 
 test('background ends a session even with detail visible; foreground starts another', () => {
   const lifecycle = new FeedSessionLifecycle();
@@ -34,3 +34,13 @@ for (const host of ['tab', 'embedded']) {
     assert.equal(lifecycle.owns, true);
   });
 }
+
+test('foreground recovery requires visibility and preserves another host ownership', () => {
+  const coordinator = new FeedSessionCoordinator();
+  const tab = new FeedSessionLifecycle(coordinator);
+  const launcher = new FeedSessionLifecycle(coordinator);
+  assert.equal(tab.appState('active', false), null);
+  launcher.focus();
+  assert.equal(tab.appState('active', true), null);
+  assert.equal(launcher.owns, true);
+});

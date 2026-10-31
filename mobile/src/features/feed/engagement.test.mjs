@@ -64,3 +64,21 @@ test('launcher detail survives the previously focused tab blurring', () => {
   assert.equal(launcher.closeDetail(false), true);
   logger.endFeedSession('blur');
 });
+
+test('focused tab resumes after launcher hides without a router focus change', () => {
+  const coordinator = new FeedSessionCoordinator();
+  const tab = new FeedSessionLifecycle(coordinator);
+  const launcher = new FeedSessionLifecycle(coordinator);
+  tab.focus();
+  logger.startFeedSession(1, 'focus');
+  if (tab.appState('background') === 'end') logger.endFeedSession('background');
+  launcher.focus();
+  logger.startFeedSession(1, 'focus');
+  if (launcher.blur()) logger.endFeedSession('blur');
+  if (tab.appState('active', true) === 'start') logger.startFeedSession(1, 'foreground');
+  logger.recordFeedEvent('impression', {item_id:'launcher-return'});
+  const event = logger.pendingFeedEvents().find(e => e.item_id === 'launcher-return');
+  assert.ok(event.session_id);
+  assert.equal(tab.owns, true);
+  logger.endFeedSession('background');
+});

@@ -342,7 +342,7 @@ export default function FeedScreen() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active' && !host.inFront() && !lifecycle.detail) return;
-      const action = lifecycle.appState(state);
+      const action = lifecycle.appState(state, focused.current && host.inFront());
       if (!action) return;
       if (action === 'start') {
         startFeedSession(ids.current.length, 'foreground');
