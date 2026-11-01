@@ -223,8 +223,11 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	//
 	// 2026-10-28: the answer benchmark added the marts_ops.answer_benchmark
 	// line ("Answer benchmark (C16)."): 10386. 10386 is that line and no more.
-	if guidance > 10386 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10386)", guidance)
+	//
+	// 2026-11-01: scans added the base_scans schema line ("Scans."): 10399.
+	// 10399 is that line and no more.
+	if guidance > 10399 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10399)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

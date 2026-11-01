@@ -889,6 +889,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("android_screen_time"),
     ),
     _source(
+        "scans",
+        "Scans (documents scanned from the network scanner's panel)",
+        cadence="on demand: whenever Start is pressed on a PDW name",
+        transport=(
+            "scanner panel (Scan to PC) → pdw ingest scanner (a service on the scanner's LAN)"
+            " → /ingest/scans → Drive → Dagster scans_drive_ingest"
+        ),
+        data=None,
+        basis=(
+            "no expectation: a scan exists only when someone scans, so a quiet"
+            " month is not an outage. The service's heartbeat, every ten minutes,"
+            " says whether its panel names are registered and its spool is"
+            " sending"
+        ),
+        note="heartbeat posted by pdw ingest scanner itself (a long-running service, not a run)",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("scans"),
+    ),
+    _source(
         "alice_voice_recordings",
         "Alice Voice Recordings",
         cadence="daily 04:17",
@@ -1784,6 +1803,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     # Android screen time
     "android_screen_time_events": _data("android_screen_time", "synced_at", "event_at"),
     "android_screen_time_daily_usage": _support("android_screen_time", "synced_at"),
+    # Scans
+    "scan_documents": _data("scans", "synced_at", "scanned_at"),
     "alice_voice_recording_artifacts": _support("alice_voice_recordings", "ingested_at"),
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos

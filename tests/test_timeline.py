@@ -89,6 +89,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
     wh.ensure_android_screen_time_tables()
+    wh.ensure_scans_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
     wh.ensure_simplefin_tables()
@@ -1022,6 +1023,27 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO @scan_documents (account, scan_id, device, scanned_at, scan_profile, color_mode,
+                                     is_duplex, duplex_status, page_count, front_page_count,
+                                     back_page_count, scanner_name, filename, mime_type,
+                                     content_sha256, storage_file_id, synced_at, sync_version)
+        VALUES ('z@x.test', 'scan1', 'scanbox', %s, 'pdw-duplex-color', 'color', 1, 'paired', 4, 2, 2,
+                'Test MFC Scanner', 'Scan 2026-06-01 10-00.pdf', 'application/pdf', 'scansha',
+                'drive-scan1', %s, %s)
+        """,
+        (_NOW - timedelta(hours=3), _NOW, sync_version),
+    )
+    wh._command(
+        """
+        INSERT INTO @file_attachment_enrichments (content_sha256, ai_provider, ai_model,
+                                                 ai_prompt_version, text, updated_at)
+        VALUES ('scansha', 'agent_codex', 'm', 'scan-agent-v1',
+                'Lease renewal letter from a property manager', %s)
+        """,
+        (_NOW,),
+    )
+    wh._command(
+        """
         INSERT INTO @muse_files (account, path, directory, filename, device, content_sha256,
                                  size_bytes, modified_at, mime_type, is_text, content_text,
                                  ingested_at, sync_version)
@@ -1479,6 +1501,8 @@ EXPECTED_SEEDED_PRIORITIES = {
     "finance_transaction": "self",
     "finance_observation": "background",
     "manual_finance_document": "self",
+    # Zach put the paper on the scanner and pressed Start.
+    "scan_document": "self",
     "muse_file": "background",
     "mutation": "background",
     "mutation_request": "background",
@@ -1538,6 +1562,7 @@ EXPECTED_SEEDED_EVENTS = {
     "finance_transaction": 1,
     "finance_observation": 1,
     "manual_finance_document": 1,
+    "scan_document": 1,
     "muse_file": 1,
     "mutation": 1,
     "mutation_request": 1,
@@ -1654,6 +1679,17 @@ def test_backfill_normalizes_every_source(warehouse):
     assert document["metadata"]["evidence_only"] is True
     assert document["title"] == "statement.pdf"
     assert document["snippet"] == "Monthly checking statement"
+
+    scanned = next(r for r in rows if r["adapter"] == "scan_document")
+    assert (scanned["source"], scanned["kind"], scanned["actor"]) == ("scans", "scan", "me")
+    assert scanned["title"] == "Duplex color scan, 4 pages"
+    assert scanned["context"] == "Test MFC Scanner"
+    # The vision pass's reading of the PDF is the snippet, and searchable.
+    assert scanned["snippet"] == "Lease renewal letter from a property manager"
+    assert "Lease renewal" in scanned["search_text"]
+    assert scanned["source_pk"] == {"account": "z@x.test", "scan_id": "scan1"}
+    assert scanned["metadata"]["storage_file_id"] == "drive-scan1"
+    assert scanned["metadata"]["is_duplex"] is True
 
     cal = next(r for r in rows if r["adapter"] == "calendar_event")
     assert cal["end_ts"] > cal["occurred_at"]

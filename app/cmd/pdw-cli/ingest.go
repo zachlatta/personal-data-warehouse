@@ -20,6 +20,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/muse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/photos"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/plaid"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/scanner"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/screentimelapse"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/voicememos"
 )
@@ -55,6 +56,7 @@ var ingestSources = map[string]localCommand{
 	"manual-finance":        manualfinance.Run,
 	"muse":                  muse.Run,
 	"plaid":                 plaid.Run,
+	"scanner":               scanner.Run,
 	"screen-timelapse":      screentimelapse.Run,
 	"voice-memos":           voicememos.Run,
 }
@@ -104,6 +106,7 @@ SOURCES
   claude-desktop   Push the Claude Desktop (claude.ai) session credential
   plaid            Link, repair, list and unlink Plaid Items (sync runs in Dagster)
   manual-finance   Upload finance documents (statements, valuations, exports)
+  scanner          Scan into the warehouse from a network scanner's panel (a service on its LAN)
   muse             Upload a Muse agent's transcripts and workspace (run on its VM)
 
 The uploader posts to the warehouse over the same URL + token pdw uses for

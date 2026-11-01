@@ -35,6 +35,7 @@ var notificationSources = map[string]struct{ label, icon string }{
 	"slack": {"Slack", "slack"}, "gmail": {"Gmail", "gmail"},
 	"apple_messages": {"Messages", "messages"}, "android_messages": {"Messages", "messages"}, "whatsapp": {"WhatsApp", "whatsapp"},
 	"google_drive": {"Google Drive", "drive"}, "calendar": {"Google Calendar", "calendar"},
+	"scans": {"Scanner", "pdw"},
 }
 
 // notificationThreadID is what the phone stacks alerts under. iOS groups by
@@ -143,6 +144,11 @@ func renderTimelineNotification(row map[string]any, baseURL string, env timeline
 	actor := notificationText(linkString(row, "actor"), 60)
 	title := notificationText(linkString(row, "title"), 90)
 	headline := actor
+	// A scan is Zach's own act: "me" would be the headline, so what was
+	// scanned is ("Duplex color scan, 6 pages").
+	if source == "scans" {
+		headline = ""
+	}
 	if headline == "" {
 		headline = title
 	}
@@ -158,6 +164,9 @@ func renderTimelineNotification(row map[string]any, baseURL string, env timeline
 	body := notificationText(linkString(row, "snippet"), 280)
 	if source == "slack" {
 		body = notificationSlackFormatting.ReplaceAllString(body, "$1")
+	}
+	if body == "" && source == "scans" {
+		body = "Open to see the PDF"
 	}
 	if body == "[unknown message]" {
 		body = "Message preview unavailable — open to view"

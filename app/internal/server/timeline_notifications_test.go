@@ -200,3 +200,15 @@ func TestNotificationPhoneDigitsMatchContactPoints(t *testing.T) {
 		}
 	}
 }
+
+func TestAScanAlertSaysWhatWasScannedAndOpensItsEvent(t *testing.T) {
+	row := map[string]any{"source": "scans", "source_table": "scan_documents", "adapter": "scan_document", "event_id": "me@example.com|scan-1",
+		"actor": "me", "title": "Duplex color scan, 6 pages", "context": "Test MFC Scanner", "snippet": ""}
+	a := renderTimelineNotification(row, "https://pdw.example", timelineLinkEnv{})
+	if a.Title != "Duplex color scan, 6 pages" || a.Subtitle != "Scanner · Test MFC Scanner" || a.Body != "Open to see the PDF" {
+		t.Fatalf("scan alert: %+v", a)
+	}
+	if a.Route != "/timeline/scan_document/me@example.com%7Cscan-1" || a.Android != nil {
+		t.Fatalf("scan destination: %+v", a)
+	}
+}

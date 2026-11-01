@@ -299,6 +299,12 @@ func e2eCases() []e2eCase {
 			wantProps: map[string]string{"pdw_kind": "android_screen_time_export_batch", "pdw_stage": "inbox", "pdw_source": "android_screen_time", "batch_sha256": sha(batchBody)},
 		},
 		{
+			name: "scans/batch", endpoint: "/ingest/scans/batch", body: batchBody,
+			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
+			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
+			wantProps: map[string]string{"pdw_kind": "scan_export_batch", "pdw_stage": "inbox", "pdw_source": "scans", "batch_sha256": sha(batchBody)},
+		},
+		{
 			name: "apple-messages/batch", endpoint: "/ingest/apple-messages/batch", body: batchBody,
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
 			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
@@ -525,6 +531,12 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 	if err := os.WriteFile(audioPath, audio, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	scanPDF := []byte("%PDF-scan-bytes")
+	scanSHA := sha256Hex(scanPDF)
+	scanPath := filepath.Join(t.TempDir(), "scan.pdf")
+	if err := os.WriteFile(scanPath, scanPDF, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	type step struct {
 		name string
@@ -545,6 +557,12 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		}},
 		{"android-screen-time/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadAndroidScreenTimeBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"scans/batch", func() (ingestclient.StoredObject, error) {
+			return client.UploadScansBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
+		}},
+		{"scans/document", func() (ingestclient.StoredObject, error) {
+			return client.UploadScanDocument(scanPath, "2026-11-01T09:30:00-04:00", ".pdf", "application/pdf", scanSHA)
 		}},
 		{"browser-history/batch", func() (ingestclient.StoredObject, error) {
 			return client.UploadBrowserHistoryBatch([]byte("gzipped-batch"), "2026-06-19T12:34:56+00:00")
@@ -610,6 +628,8 @@ func TestIngestEndToEndGoClient(t *testing.T) {
 		"photos/file":           {"2026-06-01-" + photoSHA + ".heic", "photo_file", photo},
 		"voice-memos/audio":     {"2025-07-15-" + audioSHA + ".m4a", "voice_memo_audio", audio},
 		"google-recorder/audio": {"2026-10-23-" + audioSHA + ".m4a", "google_recorder_audio", audio},
+		// Dated by the scanning computer's own day, not UTC's.
+		"scans/document": {"2026-11-01-" + scanSHA + ".pdf", "scan_document", scanPDF},
 	}
 	if len(steps) != len(ingestArtifacts())+len(resumable) {
 		t.Fatalf("e2e client drives %d endpoints but %d artifacts (+%d resumable files) are registered", len(steps), len(ingestArtifacts()), len(resumable))

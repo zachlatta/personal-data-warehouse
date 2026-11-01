@@ -409,3 +409,50 @@ this for about ten days, so a device's history starts ten days before its first 
   per `package_name`/`app_label`; `device`: `usage_event_type_name` `SCREEN_INTERACTIVE`
   `total_time_ms` is screen-on time, `KEYGUARD_HIDDEN` `total_time_ms` unlocked time and
   `event_count` unlocks). Not on the timeline.
+
+## Scans (the scanner's panel)
+
+Press Scan on the Brother MFC-L2710DW, then **to PC > File** (or Image, OCR, E-mail), pick one
+of the four PDW names and press Start: the document lands in `base_scans.documents` and on the
+timeline, and pages Zach.
+
+- **Collector:** `pdw ingest scanner` (`app/internal/uploaders/scanner`), a long-running
+  service on a computer on the scanner's LAN: `ops/linux/pdw-scanner.service` on `mew`
+  (on the home LAN; mew-dev and mew-coolify sit behind libvirt NAT and the scanner cannot reach
+  them). Settings in `~/.config/pdw-scanner/env` there (`SCANNER_HOST`, `SCANNER_ACCOUNT`,
+  `SCANNER_DEVICE`, `PDW_API_URL`, `PDW_SECRET_TOKEN`). `journalctl -u pdw-scanner` is its log.
+- **The button (`skey.go`):** Brother's "Scan to PC" protocol, what brscan-skey does. The
+  service writes `TYPE=BR;BUTTON=SCAN;USER="PDW-Color";FUNC=FILE;HOST=<mew>:54925;APPNUM=5;
+  DURATION=360;` to SNMP object `1.3.6.1.4.1.2435.2.3.9.2.11.1.1.0` (community `internal`)
+  for each name and function, every two minutes. Start sends a UDP datagram naming the USER to
+  `:54925` (twice; the service scans once per REGID+SEQ) and the panel waits on "Connecting
+  to PC" until a scan job starts. The scanner shipped with SNMP v1/v2c **read-only**: every
+  write answered `noSuchName`/`noAccess` until web admin Network > Protocol > SNMP was set to
+  "SNMP v1/v2c read-write access" **and the printer was power-cycled** (its own restart after
+  saving was not enough). The admin password is in Vaultwarden ("Brother MFC-L2710DW printer
+  admin"). This panel has no WS Scan entry, so WS-Scan push destinations are not an option.
+- **The pages (`wsd.go`):** a WS-Scan job the service creates (`CreateScanJob`, then
+  `RetrieveImage` until a Brother forgets the job after its last page,
+  `ClientErrorJobIdNotFound`). eSCL's `ScannerStatus` `AdfState` says whether paper is in the
+  feeder; otherwise the glass is scanned.
+- **Pages to PDF:** color is the scanner's JPEG (`exif`), black and white its single-strip
+  CCITT G4 TIFF, both wrapped in the PDF unchanged (`pdf.go`; Brother's G4 is LSB-first, so
+  the strip is bit-reversed). 300 dpi; the scanner returns 2480 px (8.27 in) wide.
+- **Fake duplex:** the feeder reads one side. Scan the stack on a Duplex name, flip it without
+  reordering, scan it again on the same name within 10 minutes; the backs arrive last sheet
+  first and are interleaved reversed. `duplex_status` is `paired`, `mismatched` (page counts
+  differ; what pairs is interleaved, the rest follows) or `fronts_only` (no second pass).
+- **Transport:** every scan is spooled (PDF + record) before it is sent and removed once
+  stored, so an outage delays a scan. The PDF goes to `/ingest/scans/document/resumable`
+  (straight to the library), then one record to `/ingest/scans/batch`;
+  `scans_drive_ingest` (sensor every 30 s) upserts by (account, scan_id) and lands the
+  timeline row in the same run (fast lane).
+- **Notification:** the outbox trigger pages `direct` rows and, as the one `self` exception,
+  `scan_document` rows: Zach is standing at the scanner. The alert opens the event screen,
+  which shows the PDF (`item_media`).
+- **Words:** `scan_enrichment` runs the shared vision pass (`SCANS_SOURCE`, reading
+  `marts_files.attachments`) over the PDF's first page; the adapter folds the result into
+  the snippet and search text.
+- **Health:** pipeline `scans` has no data expectation (scanning is on demand); the service
+  posts a heartbeat every 10 minutes that fails when the panel names cannot be registered or
+  its spool cannot send.

@@ -16,6 +16,14 @@ def ensure_notification_tables(warehouse):
         warehouse._command("DROP VIEW @marts_notifications")
     for statement in STATEMENTS:
         warehouse._command(statement)
+    # An outbox made before scans paged accepted only direct and cc.
+    outbox = warehouse.sql_relation("notification_events")
+    if not warehouse._query(
+        "SELECT 1 FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'c' "
+        "AND pg_get_constraintdef(oid) LIKE %s", (outbox, "%'self'%")):
+        warehouse._command("ALTER TABLE @notification_events DROP CONSTRAINT IF EXISTS notification_events_priority_check")
+        warehouse._command("ALTER TABLE @notification_events ADD CONSTRAINT notification_events_priority_check "
+                           "CHECK (priority IN ('self','direct','cc'))")
     for logical in (*TABLES, "capture_timeline_notification", "marts_notifications", "marts_notification_deliveries", "marts_notification_health"):
         warehouse._apply_catalog_grant(logical)
     # Do not take a table-wide DDL lock on the large timeline at every sync:
@@ -27,6 +35,8 @@ def ensure_notification_tables(warehouse):
     # it on the phone already, and PDW's own alerts came back through the
     # listener as `direct` and paged again. 589 of a week's 1,717 pushes were
     # these copies, 240 of them PDW echoing itself.
+    # A scan pages although it is `self` (since 2026-11-01): Zach is standing
+    # at the scanner, and the alert is his receipt that the document landed.
     current = warehouse._query(
         "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = %s::regclass "
         "AND tgname = 'timeline_notification_insert'", (warehouse.sql_relation("timeline_events"),))
@@ -37,16 +47,18 @@ def ensure_notification_tables(warehouse):
                 PERFORM pg_advisory_xact_lock(hashtext(%s || ':notification-trigger'));
                 DROP TRIGGER IF EXISTS timeline_notification_insert ON @timeline_events;
                 CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events
-                FOR EACH ROW WHEN (NEW.priority = 'direct' AND NEW.adapter <> 'android_notification')
+                FOR EACH ROW WHEN ((NEW.priority = 'direct' AND NEW.adapter <> 'android_notification')
+                                   OR NEW.adapter = 'scan_document')
                 EXECUTE FUNCTION @capture_timeline_notification();
             END $$
         """, (warehouse.sql_relation("timeline_events"),))
 
 
 # What pg_get_triggerdef prints for the WHEN clause above; the ensure path
-# compares against it so an older trigger (`IN ('direct','cc')`, or `direct`
-# including captured phone notifications) is replaced.
-NOTIFICATION_TRIGGER_WHEN = "AND (new.adapter <> 'android_notification'::text)))"
+# compares against it so an older trigger (`IN ('direct','cc')`, `direct`
+# including captured phone notifications, or one that does not page scans)
+# is replaced.
+NOTIFICATION_TRIGGER_WHEN = "OR (new.adapter = 'scan_document'::text)))"
 
 
 # Reads timeline.events by column name, so the event_ts -> occurred_at
@@ -113,7 +125,7 @@ STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS @notification_events (
         id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
         adapter text NOT NULL, event_id text NOT NULL, source text NOT NULL,
-        priority text NOT NULL CHECK (priority IN ('direct','cc')),
+        priority text NOT NULL CHECK (priority IN ('self','direct','cc')),
         event_ts timestamptz NOT NULL, landed_at timestamptz NOT NULL,
         created_at timestamptz NOT NULL DEFAULT now(),
         payload jsonb NOT NULL, status text NOT NULL DEFAULT 'pending',

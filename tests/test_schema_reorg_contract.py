@@ -186,7 +186,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 base: base_android_messages.attachments, the files they carry.
         # +2 base: base_android_screen_time.events and .daily_usage, every
         # Android device's screen time.
-        "base": 93,
+        # +1 base: base_scans.documents, documents scanned from the scanner's panel.
+        "base": 94,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

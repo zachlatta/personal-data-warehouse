@@ -64,7 +64,7 @@ func isolatedEnv(t *testing.T, extra map[string]string) func(string) string {
 func TestIngestSourceTableIsExactlyTheNativeUploaders(t *testing.T) {
 	want := []string{
 		"agent-sessions", "android-messages", "android-notifications", "android-screen-time", "apple-contacts", "apple-messages", "apple-notes",
-		"apple-photos", "browser-history", "google-recorder", "manual-finance", "muse", "plaid", "screen-timelapse", "voice-memos",
+		"apple-photos", "browser-history", "google-recorder", "manual-finance", "muse", "plaid", "scanner", "screen-timelapse", "voice-memos",
 	}
 	var got []string
 	for name, run := range ingestSources {

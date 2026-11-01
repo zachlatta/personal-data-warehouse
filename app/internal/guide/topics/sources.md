@@ -180,6 +180,17 @@ has `package_name`, `app_label`, `total_time_in_foreground_ms`; `usage_kind` `de
 `KEYGUARD_HIDDEN`, ...) at `event_at`. Android keeps about ten days, so a device's history
 starts ten days before its first upload (`pichu`: from its setup on 2026-10-23). Not on the timeline.
 
+## Scans (paper documents)
+
+`base_scans.documents` is one row per document scanned from the scanner's panel (Scan > to PC >
+File > PDW-Color, PDW-BW, PDW-DuplexColor or PDW-DuplexBW): `scanned_at`, `color_mode`
+(`color`, `black_and_white`), `page_count`, `is_duplex` and `duplex_status` (`paired`,
+`mismatched`, `fronts_only`), and the PDF's `storage_file_id`.
+
+Every scan is also a `self` timeline event titled like "Duplex color scan, 4 pages". Search
+source `scans` scopes to them. Their words come from the vision pass over each PDF's first
+page, so search finds a scan by what it says once that pass has run.
+
 ## Screen timelapse (what was on a screen)
 
 A periodic image of a device's whole screen, about once a minute while it is unlocked and

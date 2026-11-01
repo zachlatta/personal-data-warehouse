@@ -22,6 +22,7 @@ const (
 	voiceMemoResumableEndpoint        = "/ingest/voice-memos/audio/resumable"
 	googleRecorderResumableEndpoint   = "/ingest/google-recorder/audio/resumable"
 	androidMessagesAttachmentEndpoint = "/ingest/android-messages/attachment/resumable"
+	scanDocumentResumableEndpoint     = "/ingest/scans/document/resumable"
 	resumableStatusCode               = 308
 	resumableRetryAttempts            = 5
 	resumableSessionRestart           = 3
@@ -54,6 +55,12 @@ func (c *Client) UploadGoogleRecorderAudio(path, recordedAt, extension, contentT
 // RCS files run to 100 MB, past what the raw-body route can carry.
 func (c *Client) UploadAndroidMessagesAttachment(path, messageAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
 	return c.uploadResumableFile(androidMessagesAttachmentEndpoint, "android message attachment", "message_at", messageAt, path, extension, contentType, contentSHA256)
+}
+
+// UploadScanDocument uploads one scan's PDF through a resumable Drive
+// session; a long color scan at 600 dpi runs to hundreds of megabytes.
+func (c *Client) UploadScanDocument(path, scannedAt, extension, contentType, contentSHA256 string) (StoredObject, error) {
+	return c.uploadResumableFile(scanDocumentResumableEndpoint, "scan", "scanned_at", scannedAt, path, extension, contentType, contentSHA256)
 }
 
 // uploadResumableFile uploads a file through a resumable Drive session. Only

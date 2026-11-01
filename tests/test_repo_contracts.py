@@ -898,6 +898,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "defs/manual_finance_extraction.py",
     "defs/photo_enrichment.py",
     "defs/photo_identity.py",
+    "defs/scan_enrichment.py",
     "defs/receipt_enrichment.py",
     "defs/screen_timelapse_enrichment.py",
     "defs/slack_file_fingerprints.py",

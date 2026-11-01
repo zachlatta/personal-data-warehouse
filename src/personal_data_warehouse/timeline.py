@@ -2970,6 +2970,67 @@ _MANUAL_FINANCE_DOCUMENT = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+# Documents scanned from the network scanner's panel (base_scans.documents):
+# one event per scan. The scan itself carries no words, so the row is titled
+# by what was scanned ("Duplex color scan, 6 pages") and becomes searchable
+# when the shared vision pass reads the PDF: the enrichment is keyed by the
+# PDF's content sha in file_attachment_enrichments and arrives after the row,
+# so ingest_ts folds it in and refresh_hours re-walks recent scans until it
+# lands. `self`: Zach put the paper on the scanner and pressed Start.
+_SCAN_COLOR_WORD = (
+    "CASE t.color_mode WHEN 'color' THEN 'color' WHEN 'grayscale' THEN 'grayscale' "
+    "ELSE 'black & white' END"
+)
+_SCAN_DOCUMENT = _simple_adapter(
+    name="scan_document",
+    source_table="scan_documents",
+    source="scans",
+    kind="scan",
+    from_sql="""@scan_documents t
+    LEFT JOIN LATERAL (
+        SELECT
+            string_agg(e.text, E'\n' ORDER BY e.updated_at DESC) AS enrichment_search_text,
+            max(GREATEST(e.updated_at, e.ai_processed_at)) AS enrichment_ingest_ts
+        FROM @file_attachment_enrichments e
+        WHERE e.content_sha256 <> ''
+          AND e.content_sha256 = t.content_sha256
+          AND e.text <> ''
+    ) enr ON TRUE""",
+    event_id="concat_ws('|', t.account, t.scan_id)",
+    event_ts=_real_ts("t.scanned_at", "t.synced_at"),
+    ingest_ts="GREATEST(t.synced_at, COALESCE(enr.enrichment_ingest_ts, t.synced_at))",
+    actor="'me'",
+    title=(
+        "concat("
+        f"CASE WHEN t.is_duplex = 1 THEN 'Duplex ' || {_SCAN_COLOR_WORD} "
+        "ELSE CASE t.color_mode WHEN 'color' THEN 'Color' WHEN 'grayscale' THEN 'Grayscale' "
+        "ELSE 'Black & white' END END, "
+        "' scan, ', t.page_count, CASE WHEN t.page_count = 1 THEN ' page' ELSE ' pages' END, "
+        "CASE t.duplex_status WHEN 'fronts_only' THEN ' (one side only)' "
+        "WHEN 'mismatched' THEN ' (the two sides had different page counts)' ELSE '' END)"
+    ),
+    snippet=_snippet("COALESCE(enr.enrichment_search_text, '')"),
+    context="t.scanner_name",
+    source_pk="jsonb_build_object('account', t.account, 'scan_id', t.scan_id)",
+    metadata=(
+        "jsonb_build_object("
+        "'scan_profile', t.scan_profile, "
+        "'color_mode', t.color_mode, "
+        "'page_count', t.page_count, "
+        "'is_duplex', t.is_duplex <> 0, "
+        "'duplex_status', t.duplex_status, "
+        "'input_source', t.input_source, "
+        "'device', t.device, "
+        "'mime_type', t.mime_type, "
+        "'size_bytes', t.size_bytes, "
+        "'storage_file_id', t.storage_file_id)"
+    ),
+    search_text=_search_concat("t.filename", "'scan'", "enr.enrichment_search_text"),
+    priority=TIMELINE_PRIORITY_SELF,
+    refresh_hours=48,
+)
+
+
 # The Muse agent's persistent workspace (base_muse.files): its memory files,
 # goal pages, feed research, podcasts and deliverables, plus what Zach uploaded
 # into a chat. One timeline row per path at its latest content, so a search
@@ -3454,6 +3515,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _FINANCE_TRANSACTION,
     _FINANCE_OBSERVATION,
     _MANUAL_FINANCE_DOCUMENT,
+    _SCAN_DOCUMENT,
     _MUSE_FILE,
     _SCREEN_CAPTURE,
     _MUTATION,
@@ -3656,6 +3718,8 @@ TIMELINE_CONTEXT_STREAMS: dict[str, tuple[TimelineContextStream, ...]] = {
 # `is_anchor` row both UIs light would be missing.
 TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
     {
+        # A scan stands alone; its neighbours are the scans around it.
+        "scan_document",
         "slack_file",
         "agent_session",
         "agent_session_turn",
@@ -4072,6 +4136,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # Android screen time: device telemetry (~15k usage events a day per
     # device) and Android's own daily totals. Too fine-grained to be timeline
     # events; read base_android_screen_time directly.
+    "scan_documents": _events("documents scanned from the scanner's panel"),
     "android_screen_time_events": _entity(
         "per-device usage telemetry (app foreground, screen, lock); not timeline events"
     ),

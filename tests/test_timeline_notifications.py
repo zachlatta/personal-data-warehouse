@@ -234,3 +234,31 @@ def test_a_backfilled_direct_event_from_long_ago_never_pages(warehouse):
     insert(wh, "untimed", "direct")
     assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [
         ("fresh",), ("untimed",)]
+
+
+def test_a_scan_pages_although_it_is_zachs_own_act(warehouse):
+    wh = warehouse
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    for adapter, event_id in (("scan_document", "me|scan-1"), ("photo", "ph_1")):
+        wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title) "
+                    "VALUES (%s, %s, 'self'::" + wh.sql_relation("timeline_priority") + ", 'test', 'Color scan, 2 pages')",
+                    (adapter, event_id))
+    assert wh._query("SELECT event_id, priority FROM @notification_events") == [("me|scan-1", "self")]
+
+
+def test_an_outbox_made_before_scans_paged_accepts_them_after_ensure(warehouse):
+    wh = warehouse
+    wh._command("ALTER TABLE @notification_events DROP CONSTRAINT notification_events_priority_check")
+    wh._command("ALTER TABLE @notification_events ADD CONSTRAINT notification_events_priority_check "
+                "CHECK (priority IN ('direct','cc'))")
+    wh._command("DROP TRIGGER timeline_notification_insert ON @timeline_events")
+    wh._command("CREATE TRIGGER timeline_notification_insert AFTER INSERT ON @timeline_events "
+                "FOR EACH ROW WHEN (NEW.priority = 'direct' AND NEW.adapter <> 'android_notification') "
+                "EXECUTE FUNCTION @capture_timeline_notification()")
+    wh.ensure_timeline_tables()
+    wh._command("UPDATE @notification_state SET enabled = 1 WHERE id = 'timeline'")
+    wh._command("INSERT INTO @timeline_events (adapter, event_id, priority, source, title) "
+                "VALUES ('scan_document', 'me|scan-2', 'self'::" + wh.sql_relation("timeline_priority")
+                + ", 'scans', 'Black & white scan, 1 page')")
+    insert(wh, "direct", "direct")
+    assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("direct",), ("me|scan-2",)]

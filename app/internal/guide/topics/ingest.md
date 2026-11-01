@@ -14,6 +14,7 @@ uploader's exec chain).
 | `android-notifications` | every notification the Pixel posts or removes (the listener's spool) and what happens to it on screen (`tail-system-log`'s spool); run as root ON the Pixel by a Magisk service within ~30 s of each notification (every 5 minutes as the floor); not a Mac command |
 | `android-messages` | every SMS, MMS and RCS message on the Pixel since `--since` (the switch from the iPhone), read from Google Messages' database, with reactions, edits, receipts and each attachment's file; run as root ON the Pixel by a Magisk service within ~1 minute of each text; not a Mac command |
 | `android-screen-time` | an Android device's usage events and daily usage totals (screen time), read through the PDW usage exporter app; run as root ON each Android device by a Magisk service every 5 minutes; not a Mac command |
+| `scanner` | documents scanned from the network scanner's own panel: a long-running service on a computer on its LAN (mew) that puts PDW names on the panel's Scan to PC button and sends each scan as a PDF; not a Mac command |
 | `browser-history` | this Mac's Chrome, Brave and Safari history (every profile); LaunchAgent every 15 minutes; Safari needs Full Disk Access |
 | `screen-timelapse` | the periodic whole-screen captures (and accessibility trees) of this Mac and of the phone it images, one file per request; `SCREEN_TIMELAPSE_SOURCES` says which folder is which device; LaunchAgent every 5 minutes |
 | `agent-sessions` | Claude Code, Codex, pi, Muse Code, Argon and OpenClaw transcripts from this machine |

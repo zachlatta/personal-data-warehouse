@@ -3746,6 +3746,57 @@ ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS = (
 )
 
 
+# --- Scans -------------------------------------------------------------------
+#
+# Documents scanned from a network scanner's own panel. `pdw ingest scanner`
+# runs on a computer on the scanner's LAN, puts four names on the panel's Scan
+# to PC button (color, black and white, and a two-pass duplex of each), pulls
+# the pages when Start is pressed, wraps them in one PDF and sends the PDF and
+# this record. One row per scan, keyed by the uploader's scan id.
+SCAN_DOCUMENT_COLUMNS = (
+    "account",
+    "scan_id",
+    # The computer that received the scan.
+    "device",
+    # When the (first) pass started, and when the scan was filed.
+    "scanned_at",
+    "completed_at",
+    # The panel name pressed: pdw-color, pdw-bw, pdw-duplex-color, pdw-duplex-bw.
+    "scan_profile",
+    # color, grayscale or black_and_white.
+    "color_mode",
+    "resolution_dpi",
+    "page_size",
+    # ADF (the feeder) or Platen (the glass), comma-separated per pass.
+    "input_source",
+    # 1 for a duplex profile. duplex_status: '' (single-sided), paired (the
+    # second pass had as many pages as the first), mismatched (it did not;
+    # the pages that pair are interleaved and the rest follow), fronts_only
+    # (no second pass came within the window).
+    "is_duplex",
+    "duplex_status",
+    "page_count",
+    "front_page_count",
+    "back_page_count",
+    "scanner_name",
+    "filename",
+    "mime_type",
+    "size_bytes",
+    "content_sha256",
+    "storage_backend",
+    "storage_key",
+    "storage_file_id",
+    "storage_url",
+    # The scanning computer's time zone.
+    "time_zone",
+    # The uploader's whole record.
+    "raw_json",
+    "exported_at",
+    "synced_at",
+    "sync_version",
+)
+
+
 # --- Screen timelapse ---------------------------------------------------------
 #
 # A periodic image of a device's whole screen and, when the capture loop could

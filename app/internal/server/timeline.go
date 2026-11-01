@@ -293,6 +293,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "finance", kind: "transaction"},
 	{source: "finance", kind: "balance_observation"},
 	{source: "finance", kind: "document"},
+	{source: "scans", kind: "scan"},
 	{source: "muse", kind: "muse_file"},
 	{source: "chatgpt", kind: "agent_session"},
 	{source: "claude_code", kind: "agent_session"},
@@ -1093,6 +1094,7 @@ func timelineMediaKind(contentType string) string {
 var timelineItemMediaColumns = map[string][2]string{
 	"marts_voice_memos_recordings": {"storage_file_id", "content_type"},
 	"manual_finance_documents":     {"storage_file_id", "mime_type"},
+	"scan_documents":               {"storage_file_id", "mime_type"},
 	"slack_files":                  {"file_id", "mimetype"},
 	"google_drive_files":           {"storage_file_id", "mime_type"},
 	"photo_assets":                 {"thumbnail_storage_file_id", "thumbnail_content_type"},

@@ -351,6 +351,14 @@
       "comment": "Android screen time. App use, screen and lock events, and daily totals from every Android device."
     },
     {
+      "name": "base_scans",
+      "layer": "base",
+      "domain": "scans",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Scans. Documents scanned from the network scanner's panel, one PDF each."
+    },
+    {
       "name": "base_android_notifications",
       "layer": "base",
       "domain": "android_notifications",
@@ -3718,6 +3726,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "START HERE for screen time. Android's daily totals: usage_kind 'app' per app; 'device' screen-on (SCREEN_INTERACTIVE) and unlocked (KEYGUARD_HIDDEN) time."
+    },
+    {
+      "id": "scan_documents",
+      "kind": "table",
+      "layer": "base",
+      "domain": "scans",
+      "schema": "base_scans",
+      "name": "documents",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Scans. One row per document scanned from the scanner's panel: color mode, pages, duplex pairing, and the PDF's stored pointer."
     },
     {
       "id": "android_notification_events",

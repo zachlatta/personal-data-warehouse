@@ -302,6 +302,23 @@ APPLE_NOTES_SOURCE = FileEnrichmentSource(
     pdf_requires_prior_extraction=False,
 )
 
+# Documents scanned from the scanner's panel. The scan is its own event, so
+# the enrichment is the only text it ever has: it is what search finds and
+# what the timeline row shows. Like every PDF here, only the first page is
+# read.
+SCANS_SOURCE = FileEnrichmentSource(
+    name="scans",
+    label="scanned paper document",
+    task_type="scan_enrichment",
+    prompt_version="scan-agent-v1",
+    table="marts_files_attachments",
+    stored_predicate="a.source = 'scans' AND a.is_stored = 1",
+    size_column="size_bytes",
+    order_column="occurred_at",
+    # A scan is an image-only PDF: there is no text layer to extract first.
+    pdf_requires_prior_extraction=False,
+)
+
 def photo_vision_instructions() -> str:
     """Personal-photo emphasis: the goal is finding the photo again later
     ("the whiteboard in Vermont", "dinner with the red bicycle"), not document
