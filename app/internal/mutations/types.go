@@ -36,6 +36,10 @@ const (
 	SlackSendMessageOperation           = "slack.send_message"
 	ScreenTimelapseProvider             = "screen_timelapse"
 	ScreenTimelapsePurgeMomentOperation = "screen_timelapse.purge_moment"
+	PrinterProvider                     = "printer"
+	PrinterPrintDocumentOperation       = "printer.print_document"
+	// PrinterAccount is the only printer: the home Brother MFC-L2710DW.
+	PrinterAccount = "home-brother"
 
 	defaultRequestedBy = "mcp"
 	// reviewerActorID is the actor recorded when a reviewer surface passes

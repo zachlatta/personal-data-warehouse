@@ -1,5 +1,6 @@
-# The scanner service: Coolify application "personal-data-warehouse-scanner"
-# on mew-coolify (docker compose build pack, base directory /app).
+# The scanner and printer services: Coolify application
+# "personal-data-warehouse-scanner" on mew-coolify (docker compose build pack,
+# base directory /app).
 #
 # Host networking, because the scanner sends each Scan to PC press as a UDP
 # datagram to the address the service registers: mew-coolify's own LAN
@@ -21,6 +22,20 @@ services:
       SCANNER_DEVICE: ${SCANNER_DEVICE:-mew-coolify}
     volumes:
       - scanner-state:/var/lib/pdw-scanner
+
+  # printer.print_document: the resident `pdw mutations printer` worker. It
+  # claims approved prints straight from the warehouse and sends each one to
+  # the Brother over IPP, so it needs host networking for the LAN leg too.
+  printer:
+    build:
+      context: .
+      dockerfile: printer.Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      POSTGRES_DATABASE_URL: ${POSTGRES_DATABASE_URL}
+      PRINTER_URI: ${PRINTER_URI}
+      PRINTER_MUTATIONS_ENABLED: ${PRINTER_MUTATIONS_ENABLED:-1}
 
 volumes:
   scanner-state:

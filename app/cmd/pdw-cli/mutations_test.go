@@ -21,7 +21,7 @@ func withFakeMutationWorker(t *testing.T, provider string, code int) *capturedLo
 }
 
 func TestMutationsTableIsTheLocalOnlyProviders(t *testing.T) {
-	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"android-messages", "android-messages-device", "apple-contacts", "apple-messages", "apple-notes"}) {
+	if got := mutationWorkerNames(); !reflect.DeepEqual(got, []string{"android-messages", "android-messages-device", "apple-contacts", "apple-messages", "apple-notes", "printer"}) {
 		t.Fatalf("providers = %v", got)
 	}
 	if !sort.StringsAreSorted(mutationWorkerNames()) {

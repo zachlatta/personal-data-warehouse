@@ -1,0 +1,23 @@
+# One IPP Print-Job for a printer.print_document mutation. The worker runs
+# `ipptool -t -L -d job_name=... -d copies=... -f <file.pwg> <uri> print_job.test`.
+{
+	NAME "Print-Job"
+	OPERATION Print-Job
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR naturalLanguage attributes-natural-language en
+	ATTR uri printer-uri $uri
+	ATTR name requesting-user-name pdw
+	ATTR name job-name $job_name
+	ATTR mimeMediaType document-format image/pwg-raster
+	GROUP job-attributes-tag
+	ATTR integer copies $copies
+	ATTR keyword sides one-sided
+	ATTR keyword media na_letter_8.5x11in
+	FILE $filename
+	STATUS successful-ok
+	STATUS successful-ok-ignored-or-substituted-attributes
+	EXPECT job-id OF-TYPE integer
+	DISPLAY job-id
+	DISPLAY job-state
+}

@@ -467,3 +467,6 @@ timeline, and pages Zach.
 - **Health:** pipeline `scans` has no data expectation (scanning is on demand); the service
   posts a heartbeat every 10 minutes that fails when the panel names cannot be registered or
   its spool cannot send.
+- **Printing:** the same Coolify app runs a second service, `printer`, the worker for
+  `printer.print_document` (reviewed prints on this Brother over IPP). See
+  [Printing](mutations-and-app.md#printing-printerprint_document).

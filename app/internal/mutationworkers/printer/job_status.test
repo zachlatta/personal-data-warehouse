@@ -1,0 +1,16 @@
+# Read-only: one job's state. `ipptool -t -d job_id=<id> <uri> job_status.test`.
+{
+	NAME "Get-Job-Attributes"
+	OPERATION Get-Job-Attributes
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR naturalLanguage attributes-natural-language en
+	ATTR uri printer-uri $uri
+	ATTR integer job-id $job_id
+	ATTR name requesting-user-name pdw
+	ATTR keyword requested-attributes job-state,job-state-reasons,job-impressions-completed
+	STATUS successful-ok
+	DISPLAY job-state
+	DISPLAY job-state-reasons
+	DISPLAY job-impressions-completed
+}

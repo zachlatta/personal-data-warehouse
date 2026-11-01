@@ -5,7 +5,8 @@ in a review queue, and runs only after a human approves it in the web or phone r
 Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
 something PDW has no mutation type for, and say why. Deleting a screen capture from the warehouse is a mutation too
-(`screen_timelapse.purge_moment`); never delete warehouse rows or stored objects by hand.
+(`screen_timelapse.purge_moment`); never delete warehouse rows or stored objects by hand. Printing a PDF on
+the home Brother printer is one too (`printer.print_document`).
 
 ## The two calls
 
@@ -21,7 +22,7 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
-`apple_messages.mark_read`, `screen_timelapse.purge_moment`. The help call is
+`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -122,6 +123,14 @@ authoritative when this list and it disagree.
   `screen_capture` timeline event (when display 1 goes) and each stored file in Drive.
   The review counts other frames with the same bytes: propose those too. Files on the
   device and the backups on slowking are not touched.
+- **Print a PDF:** `printer.print_document` with `filename`, `content_type`
+  `application/pdf`, `data_base64` (the PDF, at most 20 MiB) and `page_count` (count it, e.g.
+  with `pdfinfo`; a different real count is refused at print time), optional `copies` (1 to
+  20). One-sided, black and white, US Letter, on the home Brother; render anything else to
+  PDF first. Say in `reason` what the document is. The review shows file, pages, copies and
+  sha256, not the pages themselves. One approval prints at most once: a job that may have
+  printed fails "check the printer" and is never resent; to reprint, propose again with a
+  different title or reason (an identical proposal returns the old request).
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

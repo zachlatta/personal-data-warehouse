@@ -967,6 +967,15 @@ def test_the_cloud_worker_never_claims_a_text_message_send() -> None:
     assert {"apple_notes", "apple_contacts"} <= set(LOCAL_ONLY_MUTATION_PROVIDERS)
 
 
+def test_the_cloud_worker_never_claims_a_print() -> None:
+    # printer.print_document prints on the home Brother from `pdw mutations printer`
+    # beside the scanner on mew-coolify, the only host on the home LAN. A cloud claim
+    # would fail it as unknown-provider and hide it from that worker.
+    from personal_data_warehouse.defs.upstream_mutations import LOCAL_ONLY_MUTATION_PROVIDERS
+
+    assert "printer" in LOCAL_ONLY_MUTATION_PROVIDERS
+
+
 def test_gmail_label_and_filter_changes_run_before_thread_batches_and_resync_the_account() -> None:
     # One request can create a label and a filter and also move existing mail
     # under that label (modify_thread_labels with add_labels). The settings

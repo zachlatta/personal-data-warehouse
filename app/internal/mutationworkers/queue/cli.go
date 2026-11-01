@@ -278,8 +278,9 @@ func (s Spec) usage(out io.Writer) {
 	fmt.Fprintf(out, `Usage: pdw mutations %s [--once]
 
 Apply approved %s mutations from ops.upstream_mutation_operations through
-the local app over AppleScript. Without flags the process stays resident:
-it LISTENs for approvals, drains the queue, and polls every
+the provider's local executor (pdw mutations --help says which). Without
+flags the process stays resident: it LISTENs for approvals, drains the
+queue, and polls every
 %s_MUTATION_POLL_SECONDS (default %.0f) seconds until SIGTERM/SIGINT.
 
 Flags:

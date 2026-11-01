@@ -590,6 +590,57 @@ other Gmail mutation.
   a re-consent without the write flags silently dropped them. Put the printed
   `GOOGLE_<SLUG>_TOKEN_JSON_B64` and `GMAIL_<SLUG>_TOKEN_JSON_B64` on the Dagster deployment.
 
+## Printing (printer.print_document)
+
+`printer.print_document` prints one PDF on the home Brother MFC-L2710DW, the
+machine the scanner service also talks to. One-sided, black and white, US Letter (pages are
+fitted to it).
+
+- **Proposal** (`app/internal/mutations/printer.go`): `filename`, `content_type`
+  (`application/pdf` only), `data_base64` (at most 20 MiB decoded, must start with `%PDF-`),
+  `page_count` (1 to 200, what the agent counted) and optional `copies` (1 to 20, default 1).
+  The account is always `home-brother` and may be omitted; unknown fields (`sides`, a URL)
+  are refused. The bytes are stored inline like an email attachment, so what is approved is
+  what prints; the payload also stores their `sha256` and size.
+- **Review.** Review reads (`GetRequest`, so the web and phone review, the push alert and
+  the proposal response) drop `data_base64` (`hydratePrintDocuments`); the generic card
+  shows the payload and `preview.print_document`: file, pages, copies, sheets, sides, paper,
+  size and sha256. There is no PDF viewer in the review yet.
+- **Execution** (`app/internal/mutationworkers/printer`): `pdw mutations printer`, a
+  resident queue worker in the `printer` service of the Coolify app
+  `personal-data-warehouse-scanner` on mew-coolify (`app/scanner-compose.yaml` +
+  `app/printer.Dockerfile`, host networking for the LAN leg, see
+  [Scans](other-sources.md#scans-the-scanners-panel)). It needs `POSTGRES_DATABASE_URL`
+  (the warehouse writer URL, in the Coolify environment) and `PRINTER_URI` (required,
+  `ipp://<printer LAN address>/ipp/print`, set in Coolify like `SCANNER_HOST`; the worker
+  refuses to start without it). `printer` is in `LOCAL_ONLY_MUTATION_PROVIDERS`.
+  For each row it checks the bytes against the stored sha256, counts pages with `pdfinfo`
+  (a different count fails terminal, nothing sent), renders 600 dpi 8-bit grey PWG raster
+  with Ghostscript (`-sDEVICE=pwgraster`; the printer takes no PDF) and sends one IPP
+  Print-Job named `pdw-<mutation id>` with `ipptool -t -L` (`print_job.test`, embedded). It
+  then reads the job with Get-Job-Attributes (`job_status.test`) every 5 s for up to 5
+  minutes: `completed` is `succeeded` (`verified: true`), `canceled`/`aborted` is
+  `failed_terminal`, still going is `succeeded` with `verified: false`. No CUPS daemon, so
+  no spool can hold or resend a job behind the worker.
+- **One approval prints at most once.** Only a failure that proves nothing reached the
+  printer is `failed_retryable`: ipptool's `Unable to connect`, or the printer answering
+  `server-error-busy`/`server-error-service-unavailable` (an error answer creates no job).
+  Any other IPP error is `failed_terminal`, nothing printed. A failure after the document
+  may have been sent (connection drop, timeout) is `failed_terminal` "may have printed,
+  check the printer" and is never sent again; the Brother keeps no job history to check
+  (Get-Jobs `which-jobs=completed` answered empty, 2026-11-01). Nothing is reclaimed from a
+  stale `executing` claim. To reprint, propose a new request with a different title or
+  reason: an identical proposal returns the old request.
+- **`PRINTER_MUTATIONS_ENABLED=0`** pauses printing: rows wait as `failed_retryable`.
+- Tests: `app/internal/mutations/printer_test.go` (validation, preview, the read-time
+  drop), `app/internal/mutationworkers/printer/executor_test.go` (every outcome, with
+  ipptool output captured from ipptool 2.4.2), `postgres_integration_test.go`
+  (`PDW_TEST_POSTGRES_URL`: proposal, approval, the claim, the result) and
+  `realtools_test.go`, which runs the real pdfinfo, Ghostscript and ipptool against a fake
+  printer named by `PDW_PRINTER_TEST_URI`. Run it in the printer image with
+  `ippeveprinter` (cups-ipp-utils; it needs avahi and IPv6, and listens on localhost only,
+  so share its network namespace); never point it at the Brother.
+
 ## Deleting a screen capture (screen_timelapse.purge_moment)
 
 The one mutation type that deletes warehouse data rather than writing to an upstream

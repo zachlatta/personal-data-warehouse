@@ -94,20 +94,24 @@ NON_RECLAIMABLE_SEND_OPERATIONS: tuple[tuple[str, str], ...] = (
 # a claim it then fails as unknown-provider both bumps attempt_count and hides the row from
 # the local worker that could have applied it. Each entry needs a local worker -- the Go
 # `pdw mutations apple-notes` / `apple-contacts` / `apple-messages` / `android-messages`
-# resident workers (app/internal/mutationworkers, run by the *-mutation-worker LaunchAgents
-# on porygon; android-messages sends through the Pixel over SSH) -- or its rows sit
-# approved forever. The provider names are mirrored from the Go executors
+# / `printer` resident workers (app/internal/mutationworkers, run by the
+# *-mutation-worker LaunchAgents on porygon; android-messages sends through the Pixel over
+# SSH; printer runs beside the scanner on mew-coolify, app/scanner-compose.yaml) -- or its
+# rows sit approved forever. The provider names are mirrored from the Go executors
 # (app/internal/mutations/apple_notes.go, apple_contacts.go, apple_messages_read.go,
-# android_messages.go); they are the `provider` column value the proposal API writes.
+# android_messages.go, printer.go); they are the `provider` column value the proposal API
+# writes.
 APPLE_NOTES_PROVIDER = "apple_notes"
 APPLE_CONTACTS_PROVIDER = "apple_contacts"
 APPLE_MESSAGES_PROVIDER = "apple_messages"
 ANDROID_MESSAGES_PROVIDER = "android_messages"
+PRINTER_PROVIDER = "printer"
 LOCAL_ONLY_MUTATION_PROVIDERS: tuple[str, ...] = (
     APPLE_NOTES_PROVIDER,
     APPLE_CONTACTS_PROVIDER,
     APPLE_MESSAGES_PROVIDER,
     ANDROID_MESSAGES_PROVIDER,
+    PRINTER_PROVIDER,
 )
 
 # Bootstrap guard for the sensor's table-ensure. The sensor evaluates every

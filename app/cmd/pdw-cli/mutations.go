@@ -10,6 +10,7 @@ import (
 	mwapplecontacts "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applecontacts"
 	mwapplemessages "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applemessages"
 	mwapplenotes "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/applenotes"
+	mwprinter "github.com/zachlatta/personal-data-warehouse/app/internal/mutationworkers/printer"
 )
 
 // mutationWorkers maps a `pdw mutations <provider>` name to the local worker
@@ -23,6 +24,8 @@ var mutationWorkers = map[string]localCommand{
 	// phone over SSH.
 	"android-messages":        mwandroidmessages.Run,
 	"android-messages-device": mwandroidmessages.RunDevice,
+	// The home Brother, from beside the scanner on mew-coolify.
+	"printer": mwprinter.Run,
 }
 
 func mutationWorkerNames() []string {
@@ -39,9 +42,10 @@ const mutationsUsage = `pdw mutations - apply approved local-only mutations thro
 USAGE
   pdw mutations <provider> [--once]
 
-Apple Notes, Apple Contacts, Apple Messages and the Pixel's texts have no
-server API, so a reviewed mutation for them is applied here, by asking the
-app itself (over AppleScript on the Mac; over SSH on the Pixel). Without
+Apple Notes, Apple Contacts, Apple Messages, the Pixel's texts and the home
+printer have no server API, so a reviewed mutation for them is applied here,
+by asking the app itself (over AppleScript on the Mac; over SSH on the
+Pixel; over IPP on the home LAN for the printer). Without
 flags the process is the resident worker: it LISTENs on the warehouse for
 approvals, drains the queue, polls as a fallback, and stops on SIGTERM/SIGINT.
 With --once it applies one batch and exits, which is what the ingest
@@ -56,6 +60,9 @@ PROVIDERS
                    on the Pixel, over its root SSH login
   android-messages-device
                    the Pixel's half of android-messages (runs on the phone)
+  printer          printer.print_document on the home Brother over IPP
+                   (pdfinfo, Ghostscript and ipptool; runs beside the
+                   scanner on mew-coolify)
 
 FLAGS
   --once           Apply one batch and exit instead of staying resident.

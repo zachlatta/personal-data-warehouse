@@ -645,6 +645,30 @@ func MutationHelp() MutationHelpDocument {
 					"The files on the device itself and the pgBackRest backups on slowking are not touched. If the device's uploader later sends a changed (redacted) copy of the file, that copy is ingested as new.",
 			},
 			{
+				Type:    PrinterPrintDocumentOperation,
+				Summary: "Print one PDF on Zach's home printer (the Brother MFC-L2710DW), one-sided, black and white, on US Letter. Executed at home beside the scanner, not in the cloud.",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + PrinterPrintDocumentOperation},
+					{Name: "account", JSONType: "string", Required: false, Description: `"` + PrinterAccount + `", the only printer; may be omitted`},
+					{Name: "filename", JSONType: "string", Required: true, Description: "the PDF's name as the reviewer should see it (no paths or control characters, max 255 UTF-8 bytes); also the print job's document name"},
+					{Name: "content_type", JSONType: "string", Required: true, Description: "literal application/pdf; nothing else prints (render a document to PDF first)"},
+					{Name: "data_base64", JSONType: "string", Required: true, Description: "the PDF's bytes as canonical standard base64 on one line (not base64url, a URL or a local path), at most 20 MiB decoded"},
+					{Name: "page_count", JSONType: "integer", Required: true, Description: "the PDF's page count (1 to 200), e.g. from pdfinfo; the reviewer sees it, and the printer refuses a PDF whose real count differs"},
+					{Name: "copies", JSONType: "integer", Required: false, Description: "copies to print, 1 to 20; defaults to 1"},
+				},
+				Example: map[string]any{
+					"type":         PrinterPrintDocumentOperation,
+					"filename":     "boarding-pass.pdf",
+					"content_type": "application/pdf",
+					"data_base64":  "JVBERi0xLjQK...",
+					"page_count":   1,
+				},
+				ExtraNotes: "Nothing prints until a human approves the request. The review shows the file name, pages, copies, sheets, size and the PDF's sha256 (the bytes themselves are left out of review reads); say in reason what the document is and why it should be on paper. " +
+					"After approval the resident printer worker (`pdw mutations printer`, beside the scanner on mew-coolify) checks the bytes against the stored sha256, counts the pages with pdfinfo, renders them at 600 dpi grey with Ghostscript and sends one IPP Print-Job named pdw-<mutation id>, then follows the job for up to 5 minutes. The result JSON carries the IPP job id and its final state (verified false when it was still printing). " +
+					"One approval prints at most once: a job that may have reached the printer is never sent again on its own. If the connection drops after sending, the mutation fails with \"may have printed, check the printer\"; to print it again, propose a new request with a different title or reason (an identical proposal returns the old request). " +
+					"A printer that is off or unreachable before anything was sent is retried with backoff. Two-sided printing is not supported yet.",
+			},
+			{
 				Type:        CalendarDeleteEventOperation,
 				Summary:     "Delete a Google Calendar event. Use an instance event_id to cancel a single occurrence of a recurring series.",
 				RequiresEnv: "CALENDAR_ACCOUNTS",

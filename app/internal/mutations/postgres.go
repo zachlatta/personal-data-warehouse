@@ -348,6 +348,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string, page Mutation
 	mutations = s.hydrateAndroidMessagesPreviews(ctx, mutations)
 	mutations = s.hydrateAppleMessagesMarkReadPreviews(ctx, mutations)
 	mutations = s.hydrateGmailSettingsPreviews(ctx, mutations)
+	mutations = hydratePrintDocuments(mutations)
 	request.Mutations = mutations
 	return request, nil
 }
@@ -2001,6 +2002,22 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Title:     optionalTitle(mutation.Title, screenTimelapsePurgeTitle(target)),
 				Reason:    reason,
 				Payload:   screenTimelapsePurgePayload(target, strings.TrimSpace(mutation.Reason)),
+			})
+		case PrinterPrintDocumentOperation:
+			doc, err := printDocumentFromInput(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  PrinterProvider,
+				Operation: PrinterPrintDocumentOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, printDocumentTitle(doc)),
+				Reason:    reason,
+				Payload:   printDocumentPayload(doc),
+				Preview: map[string]any{
+					"print_document": printDocumentPreview(doc),
+				},
 			})
 		case AppleMessagesMarkReadOperation:
 			if err := validateAppleMessagesMarkRead(mutation); err != nil {
