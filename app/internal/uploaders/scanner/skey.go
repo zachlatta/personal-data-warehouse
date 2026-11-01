@@ -15,7 +15,7 @@ import (
 // Brother's brscan-skey does): the panel then lists its USER name under
 // Scan > to PC > Image/OCR/E-mail/File. Pressing Start sends a UDP datagram
 // naming that USER to the registered HOST:port, and the scanner shows
-// "Connecting to PC" until the computer starts a scan job (wsd.go).
+// "Connecting to PC" until the computer connects to scan (native.go).
 //
 // A registration lives DURATION seconds, so it is written again well before
 // it lapses (and after the scanner restarts, which forgets it). The scanner

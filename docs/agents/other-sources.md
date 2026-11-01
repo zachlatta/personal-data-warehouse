@@ -431,13 +431,17 @@ timeline, and pages Zach.
   "SNMP v1/v2c read-write access" **and the printer was power-cycled** (its own restart after
   saving was not enough). The admin password is in Vaultwarden ("Brother MFC-L2710DW printer
   admin"). This panel has no WS Scan entry, so WS-Scan push destinations are not an option.
-- **The pages (`wsd.go`):** a WS-Scan job the service creates (`CreateScanJob`, then
-  `RetrieveImage` until a Brother forgets the job after its last page,
-  `ClientErrorJobIdNotFound`). eSCL's `ScannerStatus` `AdfState` says whether paper is in the
-  feeder; otherwise the glass is scanned.
-- **Pages to PDF:** color is the scanner's JPEG (`exif`), black and white its single-strip
-  CCITT G4 TIFF, both wrapped in the PDF unchanged (`pdf.go`; Brother's G4 is LSB-first, so
-  the strip is bit-reversed). 300 dpi; the scanner returns 2480 px (8.27 in) wide.
+- **The pages (`native.go`):** Brother's own scan protocol on TCP 54921 (what brscan4 speaks):
+  greeting `+OK 200` (`-NG 401` = busy, also for a few seconds after the previous session),
+  an `I` request, then `X` with `M=CGRAY` (color) or `M=GRAY64` (the "B&W" profiles: 8-bit
+  grayscale; the 1-bit `TEXT` mode streams an undocumented encoding) and `C=JPEG`. The
+  scanner streams `0x64` records (7-byte header starting with the page number, then a
+  length-prefixed JPEG chunk), `0x82` per page and `0x80` at the end; each page is one JPEG.
+  It takes the feeder when loaded, else the glass. **While a press is pending the scanner
+  will not run a WS-Scan or eSCL job**: it answers each page request with no image after
+  ~60 s and then cancels (2026-11-01), so the press must be answered on 54921.
+- **Pages to PDF:** each page's JPEG wrapped in the PDF unchanged (`pdf.go`), 300 dpi; the
+  scanner returns 2480 px (8.27 in) wide.
 - **Fake duplex:** the feeder reads one side. Scan the stack on a Duplex name, flip it without
   reordering, scan it again on the same name within 10 minutes; the backs arrive last sheet
   first and are interleaved reversed. `duplex_status` is `paired`, `mismatched` (page counts

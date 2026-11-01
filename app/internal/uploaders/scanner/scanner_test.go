@@ -1,15 +1,15 @@
 package scanner
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,14 +23,16 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
 )
 
-// fakeScanner is a WS-Scan service: each CreateScanJob serves the next
-// queued pass page by page, then forgets the job the way a Brother does.
+// fakeScanner is a Brother scanner's native scan port: each X request
+// streams the next queued pass in the record format an MFC-L2710DW sends
+// (JPEG data in 64 KiB records, a page-end record per page, then 0x80).
 type fakeScanner struct {
-	mu      sync.Mutex
-	passes  [][][]byte
-	tickets []string
-	jobs    map[string][][]byte
-	nextJob int
+	mu       sync.Mutex
+	passes   [][][]byte
+	requests []string
+	// busy answers this many connections "-NG 401" first.
+	busy     int
+	listener net.Listener
 }
 
 func (f *fakeScanner) queue(pages ...[]byte) {
@@ -39,68 +41,87 @@ func (f *fakeScanner) queue(pages ...[]byte) {
 	f.passes = append(f.passes, pages)
 }
 
-var actionRE = regexp.MustCompile(`<wsa:Action>([^<]+)</wsa:Action>`)
-var jobIDRE = regexp.MustCompile(`<sca:JobId>([^<]+)</sca:JobId>`)
-
-func fault(w http.ResponseWriter, subcode string) {
-	w.Header().Set("Content-Type", "application/soap+xml")
-	w.WriteHeader(http.StatusBadRequest)
-	fmt.Fprintf(w, `<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/wdp/scan"><SOAP-ENV:Body><SOAP-ENV:Fault><SOAP-ENV:Code><SOAP-ENV:Value>SOAP-ENV:Sender</SOAP-ENV:Value><SOAP-ENV:Subcode><SOAP-ENV:Value>wscn:%s</SOAP-ENV:Value></SOAP-ENV:Subcode></SOAP-ENV:Code><SOAP-ENV:Reason><SOAP-ENV:Text xml:lang="en">fault</SOAP-ENV:Text></SOAP-ENV:Reason></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>`, subcode)
+func (f *fakeScanner) start(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.listener = listener
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go f.serve(conn)
+		}
+	}()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	return port
 }
 
-func soapResponse(w http.ResponseWriter, body string) {
-	w.Header().Set("Content-Type", "application/soap+xml")
-	fmt.Fprintf(w, `<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wse="http://schemas.xmlsoap.org/ws/2004/08/eventing" xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/wdp/scan"><SOAP-ENV:Body>%s</SOAP-ENV:Body></SOAP-ENV:Envelope>`, body)
+func readRequest(r *bufio.Reader) (string, error) {
+	if b, err := r.ReadByte(); err != nil || b != 0x1b {
+		return "", fmt.Errorf("bad request start")
+	}
+	raw, err := r.ReadBytes(0x80)
+	if err != nil {
+		return "", err
+	}
+	return string(raw[:len(raw)-1]), nil
 }
 
-func (f *fakeScanner) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	raw, _ := io.ReadAll(r.Body)
-	body := string(raw)
-	m := actionRE.FindStringSubmatch(body)
-	if m == nil {
-		http.Error(w, "no action", 400)
+func (f *fakeScanner) serve(conn net.Conn) {
+	defer conn.Close()
+	f.mu.Lock()
+	if f.busy > 0 {
+		f.busy--
+		f.mu.Unlock()
+		conn.Write([]byte("-NG 401\r\n"))
 		return
 	}
-	action := m[1][strings.LastIndexByte(m[1], '/')+1:]
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	switch action {
-	case "GetScannerElements":
-		soapResponse(w, `<wscn:GetScannerElementsResponse><wscn:ScannerElements><wscn:ElementData Name="wscn:ScannerDescription" Valid="true"><wscn:ScannerDescription><wscn:ScannerName xml:lang="en-US">Test MFC Scanner</wscn:ScannerName></wscn:ScannerDescription></wscn:ElementData></wscn:ScannerElements></wscn:GetScannerElementsResponse>`)
-	case "CreateScanJob":
-		f.tickets = append(f.tickets, body)
-		if len(f.passes) == 0 {
-			fault(w, "ServerErrorNotAcceptingJobs")
+	f.mu.Unlock()
+	conn.Write([]byte("+OK 200\r\n"))
+	r := bufio.NewReader(conn)
+	for {
+		req, err := readRequest(r)
+		if err != nil {
 			return
 		}
-		f.nextJob++
-		id := fmt.Sprint(f.nextJob)
-		if f.jobs == nil {
-			f.jobs = map[string][][]byte{}
-		}
-		f.jobs[id] = f.passes[0]
-		f.passes = f.passes[1:]
-		soapResponse(w, `<wscn:CreateScanJobResponse><wscn:JobId>`+id+`</wscn:JobId><wscn:JobToken>urn:uuid:job-`+id+`</wscn:JobToken></wscn:CreateScanJobResponse>`)
-	case "RetrieveImage":
-		id := jobIDRE.FindStringSubmatch(body)[1]
-		pages := f.jobs[id]
-		if len(pages) == 0 {
-			delete(f.jobs, id)
-			fault(w, "ClientErrorJobIdNotFound")
+		f.mu.Lock()
+		f.requests = append(f.requests, req)
+		f.mu.Unlock()
+		switch req[0] {
+		case 'I':
+			info := "300,300,1,209,2479,0,0,\x00"
+			conn.Write(append([]byte{0, byte(len(info)), 0}, info...))
+		case 'X':
+			f.mu.Lock()
+			if len(f.passes) == 0 {
+				f.mu.Unlock()
+				conn.Write([]byte{0xc2, 0x00})
+				return
+			}
+			pages := f.passes[0]
+			f.passes = f.passes[1:]
+			f.mu.Unlock()
+			var out []byte
+			for n, page := range pages {
+				header := []byte{byte(n + 1), 0, 0x84, 0x20, 0x01, 0, 0}
+				for off := 0; off < len(page); off += 1000 {
+					chunk := page[off:min(off+1000, len(page))]
+					out = append(out, 0x64, 7, 0)
+					out = append(out, header...)
+					out = append(out, byte(len(chunk)), byte(len(chunk)>>8))
+					out = append(out, chunk...)
+				}
+				out = append(out, 0x82, 7, 0, byte(n+1), 0, 0x84, 0, 0, 0, 0)
+			}
+			conn.Write(append(out, 0x80))
 			return
 		}
-		f.jobs[id] = pages[1:]
-		boundary := "b9dd7049-1890-4c80-82ee-000000000000"
-		w.Header().Set("Content-Type", `Multipart/Related; boundary="`+boundary+`"; type="application/xop+xml"; start="<root@uuid>"; start-info="application/soap+xml"`)
-		var b bytes.Buffer
-		b.WriteString("\r\n--" + boundary + "\r\nContent-Type: application/xop+xml; type=\"application/soap+xml\"; charset=utf-8\r\nContent-Transfer-Encoding: binary\r\nContent-ID: <root@uuid>\r\n\r\n")
-		b.WriteString(`<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/wdp/scan"><SOAP-ENV:Body><wscn:RetrieveImageResponse><wscn:ScanData><xop:Include xmlns:xop="http://www.w3.org/2004/08/xop/include" href="cid:image@uuid"/></wscn:ScanData></wscn:RetrieveImageResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>`)
-		b.WriteString("\r\n--" + boundary + "\r\nContent-Type: application/binary\r\nContent-Transfer-Encoding: binary\r\nContent-ID: <image@uuid>\r\n\r\n")
-		b.Write(pages[0])
-		b.WriteString("\r\n--" + boundary + "--\r\n")
-		_, _ = w.Write(b.Bytes())
-	default:
-		http.Error(w, "unknown action "+action, 400)
 	}
 }
 
@@ -167,12 +188,11 @@ func (u *fakeUploader) UploadScansBatch(gz []byte, exportedAt string) (ingestcli
 
 func newTestScanner(t *testing.T, fake *fakeScanner) (*Scanner, *fakeUploader, *time.Time) {
 	t.Helper()
-	server := httptest.NewServer(fake)
-	t.Cleanup(server.Close)
+	port := fake.start(t)
 	now := time.Date(2026, 11, 1, 14, 0, 0, 0, time.UTC)
 	uploader := &fakeUploader{}
 	s := &Scanner{
-		Client:   &Client{ServiceURL: server.URL + "/WebServices/ScannerService"},
+		Client:   &NativeClient{Host: "127.0.0.1", Port: port, BusyDelay: time.Millisecond},
 		Uploader: uploader, Logger: &common.RecordingLogger{}, Account: "me@example.com", Device: "scanbox",
 		ScannerName: "Test MFC Scanner", SpoolDir: t.TempDir(), Resolution: 300, PageSize: "letter",
 		DuplexWindow: 10 * time.Minute, Now: func() time.Time { return now },
@@ -193,16 +213,12 @@ func TestColorScanIsFiledAsAPDFAndSentWithItsRecord(t *testing.T) {
 	fake := &fakeScanner{}
 	fake.queue(markedJPEG(t, "page-f1"), markedJPEG(t, "page-f2"))
 	s, uploader, _ := newTestScanner(t, fake)
-	s.ADFLoaded = func(context.Context) (bool, error) { return true, nil }
 	profile, _ := ProfileByContext("pdw-color")
 	if err := s.HandleScan(context.Background(), profile); err != nil {
 		t.Fatal(err)
 	}
-	ticket := fake.tickets[0]
-	for _, want := range []string{"<sca:Format>exif<", "<sca:ColorProcessing>RGB24<", "<sca:InputSource>ADF<", "<sca:Width>300<"} {
-		if !strings.Contains(ticket, want) {
-			t.Fatalf("ticket lacks %s:\n%s", want, ticket)
-		}
+	if got := strings.Join(fake.requests, "|"); got != "I\nR=300,300\nM=CGRAY\n|X\nR=300,300\nM=CGRAY\nC=JPEG\nJ=MID\nB=50\nN=50\nA=0,0,2480,3300\nD=SIN\nG=1\nL=128\n" {
+		t.Fatalf("requests = %q", got)
 	}
 	sent, err := s.SendOutbox()
 	if err != nil || sent != 1 {
@@ -221,7 +237,7 @@ func TestColorScanIsFiledAsAPDFAndSentWithItsRecord(t *testing.T) {
 	}
 	checks := map[string]any{
 		"profile": "pdw-color", "color_mode": "color", "page_count": 2.0, "is_duplex": false, "duplex_status": "",
-		"input_source": "ADF", "content_type": "application/pdf", "scanner_name": "Test MFC Scanner",
+		"input_source": "auto", "content_type": "application/pdf", "scanner_name": "Test MFC Scanner",
 		"storage_backend": "google_drive", "resolution_dpi": 300.0, "scanned_at": "2026-11-01T14:00:00Z",
 	}
 	for key, want := range checks {
@@ -237,12 +253,25 @@ func TestColorScanIsFiledAsAPDFAndSentWithItsRecord(t *testing.T) {
 	}
 }
 
+func TestABusyScannerIsWaitedOutAndAnEmptyOneIsAnError(t *testing.T) {
+	fake := &fakeScanner{busy: 3}
+	fake.queue(markedJPEG(t, "page-f1"))
+	s, _, _ := newTestScanner(t, fake)
+	profile, _ := ProfileByContext("pdw-color")
+	if err := s.HandleScan(context.Background(), profile); err != nil {
+		t.Fatal(err)
+	}
+	err := s.HandleScan(context.Background(), profile)
+	if !errors.Is(err, ErrNoPaper) {
+		t.Fatalf("an empty scanner = %v", err)
+	}
+}
+
 func TestAScanStaysSpooledUntilTheWarehouseHasIt(t *testing.T) {
 	fake := &fakeScanner{}
-	fake.queue(testdata(t, "page-lsb.tif"))
+	fake.queue(testdata(t, "page-gray.jpg"))
 	s, uploader, _ := newTestScanner(t, fake)
 	uploader.fail = true
-	s.ADFLoaded = func(context.Context) (bool, error) { return false, nil }
 	profile, _ := ProfileByContext("pdw-bw")
 	if err := s.HandleScan(context.Background(), profile); err != nil {
 		t.Fatal(err)
@@ -258,11 +287,11 @@ func TestAScanStaysSpooledUntilTheWarehouseHasIt(t *testing.T) {
 		t.Fatalf("SendOutbox = %d, %v", sent, err)
 	}
 	record := uploader.batches[0]["record"].(map[string]any)
-	if record["color_mode"] != "black_and_white" || record["input_source"] != "Platen" {
+	if record["color_mode"] != "grayscale" {
 		t.Fatalf("record = %v", record)
 	}
-	if !strings.Contains(fake.tickets[0], "<sca:Format>tiff-single-g4<") || !strings.Contains(fake.tickets[0], "<sca:ColorProcessing>BlackAndWhite1<") {
-		t.Fatalf("ticket = %s", fake.tickets[0])
+	if !strings.Contains(fake.requests[1], "M=GRAY64\n") {
+		t.Fatalf("requests = %q", fake.requests)
 	}
 }
 
@@ -273,7 +302,7 @@ func TestFakeDuplexInterleavesTheFlippedStacksBacks(t *testing.T) {
 	fake.queue(markedJPEG(t, "page-f1"), markedJPEG(t, "page-f2"), markedJPEG(t, "page-f3"))
 	fake.queue(markedJPEG(t, "page-b3"), markedJPEG(t, "page-b2"), markedJPEG(t, "page-b1"))
 	s, uploader, now := newTestScanner(t, fake)
-	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Format: "exif", Color: "RGB24", Duplex: true}
+	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Mode: ModeColor, Duplex: true}
 	if err := s.HandleScan(context.Background(), profile); err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +337,7 @@ func TestADuplexFirstPassIsFiledAloneWhenItsWindowCloses(t *testing.T) {
 	fake.queue(markedJPEG(t, "page-f1"), markedJPEG(t, "page-f2"))
 	fake.queue(markedJPEG(t, "page-n1"))
 	s, uploader, now := newTestScanner(t, fake)
-	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Format: "exif", Color: "RGB24", Duplex: true}
+	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Mode: ModeColor, Duplex: true}
 	if err := s.HandleScan(context.Background(), profile); err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +372,7 @@ func TestADuplexFirstPassSurvivesARestart(t *testing.T) {
 	fake.queue(markedJPEG(t, "page-f1"))
 	fake.queue(markedJPEG(t, "page-b1"), markedJPEG(t, "page-b0"))
 	s, uploader, _ := newTestScanner(t, fake)
-	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Format: "exif", Color: "RGB24", Duplex: true}
+	profile := Profile{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Mode: ModeColor, Duplex: true}
 	if err := s.HandleScan(context.Background(), profile); err != nil {
 		t.Fatal(err)
 	}
@@ -365,80 +394,23 @@ func TestADuplexFirstPassSurvivesARestart(t *testing.T) {
 	}
 }
 
-func TestAnUnknownFeederStateFallsBackToTheGlass(t *testing.T) {
-	fake := &fakeScanner{}
-	s, _, _ := newTestScanner(t, fake)
-	// The first CreateScanJob (feeder) is refused because nothing is queued;
-	// queue the glass page once it has been asked for.
-	fakeRefuseOnce := &refuseFirstJob{fakeScanner: fake, page: markedJPEG(t, "page-g1")}
-	server := httptest.NewServer(fakeRefuseOnce)
-	defer server.Close()
-	s.Client = &Client{ServiceURL: server.URL}
-	profile, _ := ProfileByContext("pdw-color")
-	if err := s.HandleScan(context.Background(), profile); err != nil {
-		t.Fatal(err)
-	}
-	if len(fake.tickets) != 2 || !strings.Contains(fake.tickets[0], "<sca:InputSource>ADF<") || !strings.Contains(fake.tickets[1], "<sca:InputSource>Platen<") {
-		t.Fatalf("tickets = %v", fake.tickets)
-	}
-}
-
-type refuseFirstJob struct {
-	*fakeScanner
-	page    []byte
-	refused bool
-}
-
-func (r *refuseFirstJob) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	raw, _ := io.ReadAll(req.Body)
-	if strings.Contains(string(raw), "CreateScanJob") && !r.refused {
-		r.refused = true
-		r.fakeScanner.mu.Lock()
-		r.fakeScanner.tickets = append(r.fakeScanner.tickets, string(raw))
-		r.fakeScanner.mu.Unlock()
-		fault(w, "ServerErrorNoPaperInFeeder")
-		return
-	}
-	if strings.Contains(string(raw), "CreateScanJob") {
-		r.fakeScanner.queue(r.page)
-	}
-	req.Body = io.NopCloser(bytes.NewReader(raw))
-	r.fakeScanner.ServeHTTP(w, req)
-}
-
-func TestBuildPDFCarriesG4PagesInEitherBitOrderUnchanged(t *testing.T) {
-	msb, err := g4Image(Page{Format: "tiff-single-g4", Data: testdata(t, "page-msb.tif"), DPI: 300})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lsb, err := g4Image(Page{Format: "tiff-single-g4", Data: testdata(t, "page-lsb.tif"), DPI: 300})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// FillOrder 2 is bit-reversed back into the order a PDF decoder reads.
-	if !bytes.Equal(msb.stream, lsb.stream) {
-		t.Fatal("an LSB-first G4 strip was not reversed into the MSB-first order")
-	}
-	if msb.width != 600 || msb.height != 300 || msb.dpiX != 300 {
-		t.Fatalf("image = %dx%d at %v dpi", msb.width, msb.height, msb.dpiX)
-	}
-	// These fixtures are MinIsBlack; Brother's pages are MinIsWhite.
-	if !strings.Contains(msb.dict, "/BlackIs1 true") || !strings.Contains(msb.dict, "/K -1 /Columns 600 /Rows 300") {
-		t.Fatalf("dict = %s", msb.dict)
-	}
+func TestBuildPDFCarriesJPEGPagesUnchanged(t *testing.T) {
+	color, gray := testdata(t, "page-color.jpg"), testdata(t, "page-gray.jpg")
 	pdf, err := BuildPDF([]Page{
-		{Format: "tiff-single-g4", Data: testdata(t, "page-lsb.tif"), DPI: 300},
-		{Format: "exif", Data: testdata(t, "page-color.jpg"), DPI: 300},
-		{Format: "exif", Data: testdata(t, "page-gray.jpg"), DPI: 300},
+		{Format: "exif", Data: color, DPI: 300},
+		{Format: "exif", Data: gray, DPI: 300},
 	}, "Scan (test)", time.Date(2026, 11, 1, 14, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(pdf)
-	for _, want := range []string{"/Count 3", "/CCITTFaxDecode", "/DeviceRGB", "/DeviceGray /BitsPerComponent 8", "/MediaBox [0 0 144.00 72.00]", "/Title (Scan \\(test\\))", "%%EOF"} {
+	for _, want := range []string{"/Count 2", "/DeviceRGB", "/DeviceGray /BitsPerComponent 8", "/MediaBox [0 0 72.00 48.00]", "/Title (Scan \\(test\\))", "%%EOF"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("PDF lacks %q", want)
 		}
+	}
+	if !bytes.Contains(pdf, color) || !bytes.Contains(pdf, gray) {
+		t.Fatal("a page was re-encoded")
 	}
 	// Every xref offset points at its object.
 	xref := regexp.MustCompile(`(\d{10}) 00000 n`).FindAllStringSubmatch(text, -1)
@@ -454,8 +426,8 @@ func TestBuildPDFRefusesWhatItCannotCarry(t *testing.T) {
 	if _, err := BuildPDF(nil, "x", time.Now()); err == nil {
 		t.Fatal("an empty scan built a PDF")
 	}
-	if _, err := BuildPDF([]Page{{Format: "tiff-single-g4", Data: testdata(t, "page-color.jpg")}}, "x", time.Now()); err == nil {
-		t.Fatal("a JPEG was accepted as a TIFF")
+	if _, err := BuildPDF([]Page{{Format: "exif", Data: []byte("not a jpeg")}}, "x", time.Now()); err == nil {
+		t.Fatal("a non-JPEG was accepted")
 	}
 	if _, err := BuildPDF([]Page{{Format: "png", Data: []byte("x")}}, "x", time.Now()); err == nil {
 		t.Fatal("an unknown format was accepted")
@@ -504,21 +476,13 @@ func TestParsesTheScannersMessages(t *testing.T) {
 	if got := RegistrationValue("PDW-Color", "FILE", "192.0.2.41:54925", 5); got != `TYPE=BR;BUTTON=SCAN;USER="PDW-Color";FUNC=FILE;HOST=192.0.2.41:54925;APPNUM=5;DURATION=360;` {
 		t.Fatalf("registration = %s", got)
 	}
-	loaded, err := ParseADFState([]byte(`<scan:ScannerStatus><pwg:State>Idle</pwg:State><scan:AdfState>ScannerAdfLoaded</scan:AdfState></scan:ScannerStatus>`))
-	if err != nil || !loaded {
-		t.Fatalf("loaded = %v, %v", loaded, err)
+	if got, err := ParseMakeAndModel([]byte(`<scan:ScannerCapabilities><pwg:MakeAndModel>Test MFC Scanner</pwg:MakeAndModel>`)); err != nil || got != "Test MFC Scanner" {
+		t.Fatalf("ParseMakeAndModel = %q, %v", got, err)
 	}
-	loaded, err = ParseADFState([]byte(`<scan:AdfState>ScannerAdfEmpty</scan:AdfState>`))
-	if err != nil || loaded {
-		t.Fatalf("empty = %v, %v", loaded, err)
+	if err := checkHost("192.0.2.216"); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := ParseADFState([]byte(`<scan:ScannerStatus/>`)); err == nil {
-		t.Fatal("a status without AdfState read as known")
-	}
-	if got, err := ServiceURL("192.0.2.216"); err != nil || got != "http://192.0.2.216/WebServices/ScannerService" {
-		t.Fatalf("ServiceURL = %q, %v", got, err)
-	}
-	if _, err := ServiceURL("http://x/y"); err == nil {
+	if err := checkHost("http://x/y"); err == nil {
 		t.Fatal("a URL was accepted as a host")
 	}
 	for _, p := range Profiles {
@@ -637,7 +601,12 @@ func TestTheDaemonScansOncePerPressAndReportsItsHealth(t *testing.T) {
 	waitFor(t, func() bool { uploader.mu.Lock(); defer uploader.mu.Unlock(); return len(uploader.batches) == 1 })
 	time.Sleep(100 * time.Millisecond)
 	fake.mu.Lock()
-	jobs := len(fake.tickets)
+	jobs := 0
+	for _, r := range fake.requests {
+		if strings.HasPrefix(r, "X") {
+			jobs++
+		}
+	}
 	fake.mu.Unlock()
 	if jobs != 1 {
 		t.Fatalf("scan jobs = %d, want one per press", jobs)

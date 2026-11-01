@@ -184,7 +184,7 @@ starts ten days before its first upload (`pichu`: from its setup on 2026-10-23).
 
 `base_scans.documents` is one row per document scanned from the scanner's panel (Scan > to PC >
 File > PDW-Color, PDW-BW, PDW-DuplexColor or PDW-DuplexBW): `scanned_at`, `color_mode`
-(`color`, `black_and_white`), `page_count`, `is_duplex` and `duplex_status` (`paired`,
+(`color`, `grayscale`), `page_count`, `is_duplex` and `duplex_status` (`paired`,
 `mismatched`, `fronts_only`), and the PDF's `storage_file_id`.
 
 Every scan is also a `self` timeline event titled like "Duplex color scan, 4 pages". Search

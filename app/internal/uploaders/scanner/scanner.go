@@ -23,6 +23,7 @@ package scanner
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,28 +45,26 @@ type Profile struct {
 	// PanelName is the name the panel lists under Scan > to PC (at most 15
 	// characters, no spaces: what brscan-skey allows).
 	PanelName string
-	Format    string
-	Color     string
+	Mode      NativeMode
 	Duplex    bool
 }
 
 // ColorMode is the warehouse's name for a profile's color processing.
 func (p Profile) ColorMode() string {
-	switch p.Color {
-	case "BlackAndWhite1":
-		return "black_and_white"
-	case "Grayscale8":
+	if p.Mode == ModeGray {
 		return "grayscale"
 	}
 	return "color"
 }
 
-// Profiles are the names the panel lists.
+// Profiles are the names the panel lists. The "B&W" ones scan 8-bit
+// grayscale JPEG: a document reads as black and white, and the scanner's
+// 1-bit mode streams an undocumented encoding.
 var Profiles = []Profile{
-	{Context: "pdw-color", PanelName: "PDW-Color", Format: "exif", Color: "RGB24"},
-	{Context: "pdw-bw", PanelName: "PDW-BW", Format: "tiff-single-g4", Color: "BlackAndWhite1"},
-	{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Format: "exif", Color: "RGB24", Duplex: true},
-	{Context: "pdw-duplex-bw", PanelName: "PDW-DuplexBW", Format: "tiff-single-g4", Color: "BlackAndWhite1", Duplex: true},
+	{Context: "pdw-color", PanelName: "PDW-Color", Mode: ModeColor},
+	{Context: "pdw-bw", PanelName: "PDW-BW", Mode: ModeGray},
+	{Context: "pdw-duplex-color", PanelName: "PDW-DuplexColor", Mode: ModeColor, Duplex: true},
+	{Context: "pdw-duplex-bw", PanelName: "PDW-DuplexBW", Mode: ModeGray, Duplex: true},
 }
 
 // ProfileByContext finds a profile by its context.
@@ -97,11 +96,11 @@ func PanelNames() []string {
 	return out
 }
 
-// PageSizes are the scan areas, in thousandths of an inch.
-var PageSizes = map[string][2]int{
-	"letter": {8500, 11000},
-	"legal":  {8500, 14000},
-	"a4":     {8268, 11693},
+// PageHeights are the scan heights, in inches, by page size.
+var PageHeights = map[string]float64{
+	"letter": 11,
+	"legal":  14,
+	"a4":     11.69,
 }
 
 // Duplex statuses stored with each scan.
@@ -111,6 +110,11 @@ const (
 	DuplexMismatched = "mismatched"
 	DuplexFrontsOnly = "fronts_only"
 )
+
+// PageScanner scans everything loaded, one JPEG per page (NativeClient).
+type PageScanner interface {
+	Scan(ctx context.Context, mode NativeMode, dpi int, heightInches float64) ([][]byte, error)
+}
 
 // Uploader is what the scanner needs from the ingest client.
 type Uploader interface {
@@ -127,7 +131,7 @@ type Pass struct {
 
 // Scanner drives one scanner for one account.
 type Scanner struct {
-	Client      *Client
+	Client      PageScanner
 	Uploader    Uploader
 	Logger      common.Logger
 	Account     string
@@ -138,9 +142,7 @@ type Scanner struct {
 	PageSize    string
 	// DuplexWindow is how long a duplex first pass waits for its second.
 	DuplexWindow time.Duration
-	// ADFLoaded says whether paper is in the feeder; nil means unknown.
-	ADFLoaded func(ctx context.Context) (bool, error)
-	Now       func() time.Time
+	Now          func() time.Time
 	// OnFiled is told about each scan once it is spooled (tests, logs).
 	OnFiled func(record map[string]any)
 
@@ -243,57 +245,26 @@ func (s *Scanner) PendingDuplex() []string {
 	return out
 }
 
-func (s *Scanner) inputSource(ctx context.Context) (source string, known bool) {
-	if s.ADFLoaded != nil {
-		loaded, err := s.ADFLoaded(ctx)
-		if err == nil {
-			if loaded {
-				return "ADF", true
-			}
-			return "Platen", true
-		}
-		s.Logger.Warningf("Could not read the feeder state: %v", err)
-	}
-	return "ADF", false
-}
-
 func (s *Scanner) scanPass(ctx context.Context, profile Profile) (Pass, error) {
-	size, ok := PageSizes[s.PageSize]
+	height, ok := PageHeights[s.PageSize]
 	if !ok {
-		size = PageSizes["letter"]
-	}
-	source, known := s.inputSource(ctx)
-	ticket := Ticket{
-		JobName: profile.PanelName, Format: profile.Format, ColorProcessing: profile.Color,
-		Resolution: s.Resolution, InputSource: source, WidthMils: size[0], HeightMils: size[1],
+		height = PageHeights["letter"]
 	}
 	started := s.now()
-	job, err := s.Client.CreateScanJob(ctx, ticket)
-	if err != nil && !known && source == "ADF" {
-		// The feeder state was unknown and the feeder refused: the paper is
-		// on the glass.
-		s.Logger.Warningf("Feeder scan refused (%v); scanning the glass", err)
-		ticket.InputSource = "Platen"
-		job, err = s.Client.CreateScanJob(ctx, ticket)
-	}
+	jpegs, err := s.Client.Scan(ctx, profile.Mode, s.Resolution, height)
 	if err != nil {
-		return Pass{}, fmt.Errorf("create scan job: %w", err)
+		return Pass{}, fmt.Errorf("scan: %w", err)
 	}
-	pass := Pass{StartedAt: started, InputSource: ticket.InputSource}
-	for page := 0; page < maxPagesPerPass; page++ {
-		data, err := s.Client.RetrieveImage(ctx, job, page)
-		if errors.Is(err, errNoMoreImages) {
-			break
-		}
-		if err != nil {
-			return Pass{}, fmt.Errorf("retrieve page %d: %w", page+1, err)
-		}
-		pass.Pages = append(pass.Pages, Page{Format: profile.Format, Data: data, DPI: s.Resolution})
+	if len(jpegs) > maxPagesPerPass {
+		return Pass{}, fmt.Errorf("the scanner sent %d pages", len(jpegs))
 	}
-	if len(pass.Pages) == 0 {
-		return Pass{}, fmt.Errorf("the scanner sent no pages")
+	// The scanner takes the feeder when it has paper, else the glass, and
+	// does not say which.
+	pass := Pass{StartedAt: started, InputSource: "auto"}
+	for _, data := range jpegs {
+		pass.Pages = append(pass.Pages, Page{Format: "exif", Data: data, DPI: s.Resolution})
 	}
-	s.Logger.Infof("Scanned %d pages (%s, %s)", len(pass.Pages), profile.Context, pass.InputSource)
+	s.Logger.Infof("Scanned %d pages (%s)", len(pass.Pages), profile.Context)
 	return pass, nil
 }
 
@@ -330,7 +301,7 @@ func (s *Scanner) file(profile Profile, passes []Pass, duplexStatus string) erro
 	if err != nil {
 		return err
 	}
-	scanID := strings.TrimPrefix(newMessageID(), "urn:uuid:")
+	scanID := newScanID()
 	dir := filepath.Join(s.outboxDir(), scanID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -506,6 +477,14 @@ func (s *Scanner) send(dir string, record map[string]any) error {
 	}
 	s.Logger.Infof("Sent scan %s (%v pages) to the warehouse as %s", record["scan_id"], record["page_count"], stored.StorageKey)
 	return os.RemoveAll(dir)
+}
+
+func newScanID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // Envelope wraps one scan record for a batch.

@@ -34,7 +34,7 @@ four names on the scanner's Scan to PC button (Scan > to PC > File, or
 Image, OCR, E-mail):
 
   PDW-Color         color, 300 dpi
-  PDW-BW            black and white (1-bit), 300 dpi
+  PDW-BW            grayscale (reads as black and white), 300 dpi
   PDW-DuplexColor   two passes: fronts, then the flipped stack's backs
   PDW-DuplexBW      the same in black and white
 
@@ -115,7 +115,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	default:
 		return common.UsageError(fs, stderr, "--resolution must be 100, 200, 300 or 600")
 	}
-	if _, ok := PageSizes[*pageSize]; !ok {
+	if _, ok := PageHeights[*pageSize]; !ok {
 		return common.UsageError(fs, stderr, "--page-size must be letter, legal or a4")
 	}
 	if *duplexWindow <= 0 {
@@ -131,8 +131,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	cfg = cfg.WithEnvFallback(env)
 	host := strings.TrimSpace(common.FirstNonEmpty(*scannerFlag, env.Env("SCANNER_HOST")))
-	serviceURL, err := ServiceURL(host)
-	if err != nil {
+	if err := checkHost(host); err != nil {
 		fmt.Fprintf(stderr, "pdw ingest scanner: %v\n", err)
 		return common.ExitFailure
 	}
@@ -150,15 +149,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	}
 	defer lock.Release()
 
-	client := &Client{ServiceURL: serviceURL, HTTP: &http.Client{Timeout: 5 * time.Minute}}
 	s := &Scanner{
-		Client: client, Logger: logger, Account: accountName, Device: deviceName,
+		Client: &NativeClient{Host: host}, Logger: logger, Account: accountName, Device: deviceName,
 		SpoolDir: *spoolDir, Resolution: *resolution, PageSize: *pageSize, DuplexWindow: *duplexWindow,
-		ADFLoaded: func(ctx context.Context) (bool, error) { return ADFLoadedESCL(ctx, host) },
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if name, err := client.ScannerName(ctx); err == nil {
+	if name, err := ScannerNameESCL(ctx, host); err == nil {
 		s.ScannerName = name
 	} else {
 		logger.Warningf("Could not read the scanner's name: %v", err)
@@ -222,15 +219,14 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	return 0
 }
 
-// ServiceURL is a Brother scanner's WS-Scan service.
-func ServiceURL(host string) (string, error) {
+func checkHost(host string) error {
 	if host == "" {
-		return "", fmt.Errorf("--scanner or SCANNER_HOST must be set")
+		return fmt.Errorf("--scanner or SCANNER_HOST must be set")
 	}
 	if strings.ContainsAny(host, "/:") {
-		return "", fmt.Errorf("--scanner %q must be a host name or address", host)
+		return fmt.Errorf("--scanner %q must be a host name or address", host)
 	}
-	return "http://" + host + "/WebServices/ScannerService", nil
+	return nil
 }
 
 // localAddressToward is this computer's address on the route to the scanner.
@@ -243,43 +239,43 @@ func localAddressToward(scannerHost string) (string, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
 
-// ADFLoadedESCL reads whether paper is in the feeder from the scanner's
-// eSCL (AirScan) status, which WS-Scan does not report.
-func ADFLoadedESCL(ctx context.Context, host string) (bool, error) {
+// ScannerNameESCL reads the scanner's make and model from its eSCL
+// (AirScan) capabilities.
+func ScannerNameESCL(ctx context.Context, host string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/eSCL/ScannerStatus", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/eSCL/ScannerCapabilities", nil)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("eSCL status: HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("eSCL capabilities: HTTP %d", resp.StatusCode)
 	}
-	return ParseADFState(body)
+	return ParseMakeAndModel(body)
 }
 
-// ParseADFState reads an eSCL ScannerStatus's AdfState.
-func ParseADFState(body []byte) (bool, error) {
+// ParseMakeAndModel reads an eSCL ScannerCapabilities' MakeAndModel.
+func ParseMakeAndModel(body []byte) (string, error) {
 	text := string(body)
-	start := strings.Index(text, "AdfState>")
+	start := strings.Index(text, "MakeAndModel>")
 	if start < 0 {
-		return false, fmt.Errorf("eSCL status has no AdfState")
+		return "", fmt.Errorf("eSCL capabilities have no MakeAndModel")
 	}
-	rest := text[start+len("AdfState>"):]
+	rest := text[start+len("MakeAndModel>"):]
 	end := strings.IndexByte(rest, '<')
 	if end < 0 {
-		return false, fmt.Errorf("eSCL status AdfState is malformed")
+		return "", fmt.Errorf("eSCL MakeAndModel is malformed")
 	}
-	return strings.TrimSpace(rest[:end]) == "ScannerAdfLoaded", nil
+	return strings.TrimSpace(rest[:end]), nil
 }
 
 // HeartbeatPoster is what the daemon needs to report its health.

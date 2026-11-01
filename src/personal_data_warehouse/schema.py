@@ -3763,7 +3763,7 @@ SCAN_DOCUMENT_COLUMNS = (
     "completed_at",
     # The panel name pressed: pdw-color, pdw-bw, pdw-duplex-color, pdw-duplex-bw.
     "scan_profile",
-    # color, grayscale or black_and_white.
+    # color or grayscale (the PDW-BW profiles scan 8-bit grayscale).
     "color_mode",
     "resolution_dpi",
     "page_size",
