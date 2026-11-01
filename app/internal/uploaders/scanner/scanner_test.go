@@ -502,6 +502,13 @@ type fakeSNMP struct {
 
 func startFakeSNMP(t *testing.T) *fakeSNMP {
 	t.Helper()
+	return startFakeSNMPAnswering(t, false)
+}
+
+// startFakeSNMPAnswering with late set, the fake first repeats an answer to
+// an earlier request, as the scanner sometimes does.
+func startFakeSNMPAnswering(t *testing.T, late bool) *fakeSNMP {
+	t.Helper()
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -539,8 +546,13 @@ func startFakeSNMP(t *testing.T) *fakeSNMP {
 				f.sets = append(f.sets, string(value))
 				f.mu.Unlock()
 			}
-			resp := berSeq(berInt(0), berOctets(community), berTLV(0xa2, append(append(append(berInt(id), berInt(status)...), berInt(0)...), berSeq()...)))
-			conn.WriteTo(resp, from)
+			answer := func(id int) []byte {
+				return berSeq(berInt(0), berOctets(community), berTLV(0xa2, append(append(append(berInt(id), berInt(status)...), berInt(0)...), berSeq()...)))
+			}
+			if late {
+				conn.WriteTo(answer(id-1), from)
+			}
+			conn.WriteTo(answer(id), from)
 		}
 	}()
 	return f
@@ -567,6 +579,22 @@ func TestRegistrationPutsEveryNameUnderEveryFunction(t *testing.T) {
 	err := Register(context.Background(), "127.0.0.1", "public", "192.0.2.41:54925", PanelNames())
 	if err == nil || !strings.Contains(err.Error(), "noAccess") {
 		t.Fatalf("a refused write = %v", err)
+	}
+}
+
+func TestRegistrationIgnoresALateAnswerToAnEarlierRequest(t *testing.T) {
+	snmp := startFakeSNMPAnswering(t, true)
+	_, port, _ := net.SplitHostPort(snmp.conn.LocalAddr().String())
+	old := snmpPort
+	snmpPort = port
+	defer func() { snmpPort = old }()
+	if err := Register(context.Background(), "127.0.0.1", "internal", "192.0.2.41:54925", PanelNames()); err != nil {
+		t.Fatal(err)
+	}
+	snmp.mu.Lock()
+	defer snmp.mu.Unlock()
+	if len(snmp.sets) != 16 {
+		t.Fatalf("registrations = %d, want 16", len(snmp.sets))
 	}
 }
 

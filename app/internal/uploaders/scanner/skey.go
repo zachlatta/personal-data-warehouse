@@ -87,14 +87,22 @@ func snmpSet(ctx context.Context, conn net.Conn, community string, requestID int
 		return err
 	}
 	buf := make([]byte, 2048)
-	n, err := conn.Read(buf)
-	if err != nil {
-		// A community the scanner does not know gets no answer at all.
-		return fmt.Errorf("no SNMP answer (wrong community, or SNMP off): %w", err)
-	}
-	status, err := parseSetResponse(buf[:n], requestID)
-	if err != nil {
-		return err
+	var status int
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			// A community the scanner does not know gets no answer at all.
+			return fmt.Errorf("no SNMP answer (wrong community, or SNMP off): %w", err)
+		}
+		status, err = parseSetResponse(buf[:n], requestID)
+		// The scanner sometimes repeats its answer to an earlier request.
+		if errors.Is(err, errOtherRequest) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		break
 	}
 	if status != 0 {
 		name := snmpErrorNames[status]
@@ -130,7 +138,7 @@ func parseSetResponse(packet []byte, requestID int) (int, error) {
 		return 0, err
 	}
 	if id != requestID {
-		return 0, fmt.Errorf("SNMP answer to another request")
+		return 0, errOtherRequest
 	}
 	return p.nextInt()
 }
@@ -224,7 +232,10 @@ type berReader struct {
 	pos  int
 }
 
-var errBER = errors.New("malformed SNMP answer")
+var (
+	errBER          = errors.New("malformed SNMP answer")
+	errOtherRequest = errors.New("SNMP answer to another request")
+)
 
 func (r *berReader) next(tag byte) ([]byte, error) {
 	if r.pos+2 > len(r.data) || r.data[r.pos] != tag {
