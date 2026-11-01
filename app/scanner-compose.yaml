@@ -1,0 +1,26 @@
+# The scanner service: Coolify application "personal-data-warehouse-scanner"
+# on mew-coolify (docker compose build pack, base directory /app).
+#
+# Host networking, because the scanner sends each Scan to PC press as a UDP
+# datagram to the address the service registers: mew-coolify's own LAN
+# address, on its second NIC (macvtap on mew's LAN port, enp7s0), which the
+# service finds from its route to the scanner. The spool volume keeps scans
+# that have not reached the warehouse yet across redeploys.
+services:
+  scanner:
+    build:
+      context: .
+      dockerfile: scanner.Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PDW_API_URL: ${PDW_API_URL}
+      PDW_SECRET_TOKEN: ${PDW_SECRET_TOKEN}
+      SCANNER_HOST: ${SCANNER_HOST}
+      SCANNER_ACCOUNT: ${SCANNER_ACCOUNT}
+      SCANNER_DEVICE: ${SCANNER_DEVICE:-mew-coolify}
+    volumes:
+      - scanner-state:/var/lib/pdw-scanner
+
+volumes:
+  scanner-state:

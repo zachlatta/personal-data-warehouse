@@ -417,12 +417,19 @@ of the four PDW names and press Start: the document lands in `base_scans.documen
 timeline, and pages Zach.
 
 - **Collector:** `pdw ingest scanner` (`app/internal/uploaders/scanner`), a long-running
-  service on a computer on the scanner's LAN: `ops/linux/pdw-scanner.service` on `mew`
-  (on the home LAN; mew-dev and mew-coolify sit behind libvirt NAT and the scanner cannot reach
-  them). Settings in `~/.config/pdw-scanner/env` there (`SCANNER_HOST`, `SCANNER_ACCOUNT`,
-  `SCANNER_DEVICE`, `PDW_API_URL`, `PDW_SECRET_TOKEN`). `journalctl -u pdw-scanner` is its log.
+  service that must be on the scanner's LAN. It runs on `mew-coolify` as the Coolify
+  application `personal-data-warehouse-scanner` (docker compose build pack,
+  `app/scanner-compose.yaml` + `app/scanner.Dockerfile`, deployed from `main` like the app).
+  mew-coolify's default NIC is behind libvirt NAT, where the scanner cannot reach it, so the
+  VM has a second NIC on the LAN: a macvtap on mew's `enp6s0` (`virsh domiflist mew-coolify`),
+  `enp7s0` in the guest, DHCP with routes and DNS ignored (`/etc/netplan/60-lan.yaml`, which
+  also routes mew's own LAN address via the NAT, since macvtap cannot reach its host). The
+  container uses host networking and registers that LAN address. Settings are the Coolify
+  environment (`SCANNER_HOST`, `SCANNER_ACCOUNT`, `SCANNER_DEVICE`, `PDW_API_URL`,
+  `PDW_SECRET_TOKEN`); scans not yet sent survive redeploys in the `scanner-state` volume.
+  Its log is the container's, in Loki like the other Coolify apps.
 - **The button (`skey.go`):** Brother's "Scan to PC" protocol, what brscan-skey does. The
-  service writes `TYPE=BR;BUTTON=SCAN;USER="PDW-Color";FUNC=FILE;HOST=<mew>:54925;APPNUM=5;
+  service writes `TYPE=BR;BUTTON=SCAN;USER="PDW-Color";FUNC=FILE;HOST=<mew-coolify LAN address>:54925;APPNUM=5;
   DURATION=360;` to SNMP object `1.3.6.1.4.1.2435.2.3.9.2.11.1.1.0` (community `internal`)
   for each name and function, every two minutes. Start sends a UDP datagram naming the USER to
   `:54925` (twice; the service scans once per REGID+SEQ) and the panel waits on "Connecting
