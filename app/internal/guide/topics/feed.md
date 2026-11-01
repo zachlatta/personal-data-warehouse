@@ -89,10 +89,12 @@ text, not videos) so they read offline; saving a card is how to make sure it is 
 
 Interest is mostly measured; the heart is the one thing he says outright (`liked`,
 `liked_at`; the latest of `like` and `unlike`). A card is `engaged` when he opened it (any
-link), opened its detail view, tapped More, swiped its photos or played its video, shared it,
+link), opened its detail view, tapped More, swiped its photos or started its video himself, shared it,
 saved it, liked it, or kept it on screen for 5 s; `engagement_score` adds opens
-(2 each, up to 3; a detail view is an open), More or a photo swipe or video play (1), a share (3), saved for later (3), liked (5), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
+(2 each, up to 3; a detail view is an open), More or a photo swipe or user-started video play (1), a share (3), saved for later (3), liked (5), time on the card (up to 6 for a minute) and reading time (up to 10 for ten
 minutes), and takes 5 off a dismissal (a swipe left or the `...` menu). Rank his interests by it.
+
+Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
 
 {{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
 engaged and dismiss rates, average engagement_score, dwell and read time; event counts; the
@@ -131,5 +133,3 @@ card's `height`.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo
 schedule (desk `work/2026-10-20-feed-curation/`); push there only through that job.
-
-Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.

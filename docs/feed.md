@@ -150,7 +150,8 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   the full-screen viewer: swipe between photos, pinch or double-tap to zoom, and the share
   button downloads that one photo (X photos at `name=orig`) to the share sheet.
   A `close` with `metadata.mode` `video` is watch time; `metadata.inline` = it played in
-  the card (a `media` `play` with `inline` starts it).
+  the card (a `media` `play` with `inline` starts it). Inline video closes carry
+  `metadata.autoplay`: true when playback started automatically, false when he started it.
   `save` / `unsave` put a card in or out of his read-later queue (`metadata.via`: `button`,
   `swipe`, `menu`, `detail`, `undo`, or `agent` when `feed_save` did it for him).
 - **What he does inside a page** (`web`, since 2026-10-24, from Zach: "It'd be better if it
@@ -234,17 +235,22 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   action row (and the detail view's header) records `like` / `unlike`; the current state is
   `liked`, `liked_at` on `marts_feed.item_engagement`, `items_liked` per source, `likes`
   per sitting, and a like is a `feed_engagement` timeline event ("Liked: ..."). `engaged` =
-  opened (any link, or the detail view), tapped More, swiped photos or played a video
-  (`media` events count with expands), shared, saved, liked, or 5 s on screen;
-  `engagement_score` = 2 per open (up to 3) + 1 for More + 3 for a share + 3 while saved +
+  opened (any link, or the detail view), tapped More, swiped photos or started a video himself
+  (only non-autoplay `media` events count with expands), shared, saved, liked, or 5 s on screen;
+  `engagement_score` = 2 per open (up to 3) + 1 for More, a photo swipe or a user-started video play + 3 for a share + 3 while saved +
   5 while liked + time on the card (up to 6 for a minute) + reading time (up to 10 for ten
-  minutes) - 5 if dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`). The phone shows unseen cards first: a
+  minutes) - 5 if dismissed (`feed.py` `ENGAGEMENT_SCORE_SQL`).
+
+  Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
+
+  The phone shows unseen cards first: a
   card leaves that part at its first impression (Zach, 2026-10-20: "after I've seen a post,
   don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved. The feed is
   never empty (Zach, 2026-10-21: "just have it always have more stuff"): when the unseen
   cards run out, the page continues with seen cards he passed over (not engaged, saved or
   dismissed), least seen and longest ago first, flagged `resurfaced` ("Seen before" on the
   card). The "all caught up" screen and the end-of-feed footer are gone.
+
 - **Analytics**: `marts_feed.sessions` (per sitting, above), `marts_feed.item_engagement` (per card, current dismissed state, engaged,
   engagement_score, link_count, links_opened; `scroll_pasts` = impressions under 1 s) and
   `marts_feed.source_engagement` (per source rates, average score). `pdw feed stats` reads them.
@@ -316,5 +322,3 @@ base_feed CASCADE; DROP FUNCTION internal.feed_item_version(),
 internal.feed_item_versions_immutable(); DELETE FROM timeline.events WHERE adapter =
 'feed_engagement';`. Dropping the schema is the one way past the append-only guard, which
 is deliberate.
-
-Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
