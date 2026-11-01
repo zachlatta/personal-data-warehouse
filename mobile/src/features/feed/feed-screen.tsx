@@ -571,7 +571,7 @@ export default function FeedScreen() {
   const onMedia = useCallback(
     async (item: FeedItem, a: MediaAction) => {
       if (a.action === 'stop') {
-        recordFeedEvent('close', { item_id: item.item_id, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true } });
+        recordFeedEvent('close', { item_id: item.item_id, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true, autoplay: a.auto ?? false } });
         return;
       }
       recordFeedEvent('media', {

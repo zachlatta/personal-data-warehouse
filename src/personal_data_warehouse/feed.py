@@ -228,19 +228,34 @@ STATEMENTS = (
 # read-later queue (the latest of save and unsave), saved_at when it last went
 # in. liked is the CURRENT state of the heart (the latest of like and
 # unlike), liked_at when it was last liked. shares, saved, saved_at, liked
-# and liked_at are last because CREATE OR REPLACE VIEW can only add columns
-# at the end. link_opens counts opens per link url.
+# and liked_at retain their order; autoplays and watch_ms are appended because
+# CREATE OR REPLACE VIEW can only add columns at the end. link_opens counts opens per link url.
 ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
-    WITH e AS (
+    WITH events AS (
+        SELECT *, bool_or(event_type = 'media'
+            AND COALESCE(metadata->>'autoplay', 'false') <> 'true')
+            OVER (PARTITION BY item_id) AS has_manual_play
+        FROM @feed_events
+        WHERE item_id <> '' AND NOT {TEST_CLIENT_SQL}
+    ), e AS (
         SELECT item_id,
             count(*) FILTER (WHERE event_type = 'impression') AS impressions,
             COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'impression'), 0) AS dwell_ms,
             COALESCE(max(visible_fraction) FILTER (WHERE event_type = 'impression'), 0) AS max_visible_fraction,
             count(*) FILTER (WHERE event_type = 'impression' AND dwell_ms < {SCROLL_PAST_MS}) AS scroll_pasts,
             count(*) FILTER (WHERE event_type = 'open') AS opens,
-            COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'close'), 0) AS read_ms,
+            COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'close' AND (
+                NOT (COALESCE(metadata->>'mode', '') = 'video'
+                     AND COALESCE(metadata->>'inline', 'false') = 'true')
+                OR CASE WHEN metadata ? 'autoplay'
+                    THEN COALESCE(metadata->>'autoplay', 'false') <> 'true'
+                    ELSE has_manual_play END)), 0) AS read_ms,
+            count(*) FILTER (WHERE event_type = 'media' AND metadata->>'autoplay' = 'true') AS autoplays,
+            COALESCE(sum(dwell_ms) FILTER (WHERE event_type = 'close'
+                AND metadata->>'mode' = 'video' AND metadata->>'inline' = 'true'), 0) AS watch_ms,
             -- Tapping More, swiping a photo carousel or playing a video.
-            count(*) FILTER (WHERE event_type IN ('expand', 'media')) AS expands,
+            count(*) FILTER (WHERE event_type = 'expand' OR (event_type = 'media'
+                AND COALESCE(metadata->>'autoplay', 'false') <> 'true')) AS expands,
             count(*) FILTER (WHERE event_type = 'share') AS shares,
             (array_agg(event_type ORDER BY occurred_at DESC, received_at DESC)
                 FILTER (WHERE event_type IN ('dismiss', 'undismiss')))[1] AS dismiss_state,
@@ -256,8 +271,7 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
                 AS links_opened,
             min(occurred_at) FILTER (WHERE event_type = 'impression') AS first_seen_at,
             max(occurred_at) AS last_event_at
-        FROM @feed_events
-        WHERE item_id <> '' AND NOT {TEST_CLIENT_SQL}
+        FROM events
         GROUP BY item_id
     )
     SELECT i.item_id, i.source, i.title, i.url, i.site, i.author, i.tags, i.score,
@@ -289,7 +303,9 @@ ITEM_ENGAGEMENT_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_item_engagement AS
            CASE WHEN e.save_state = 'save' THEN 1 ELSE 0 END::bigint AS saved,
            CASE WHEN e.save_state = 'save' THEN e.saved_at END AS saved_at,
            CASE WHEN e.like_state = 'like' THEN 1 ELSE 0 END::bigint AS liked,
-           CASE WHEN e.like_state = 'like' THEN e.liked_at END AS liked_at
+           CASE WHEN e.like_state = 'like' THEN e.liked_at END AS liked_at,
+           COALESCE(e.autoplays, 0) AS autoplays,
+           COALESCE(e.watch_ms, 0) AS watch_ms
     FROM @feed_items i
     LEFT JOIN e ON e.item_id = i.item_id"""
 
@@ -394,7 +410,8 @@ SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
            COALESCE(sum(abs((metadata->>'distance')::numeric)) FILTER (WHERE event_type = 'scroll'), 0)::bigint
                AS scroll_distance,
            count(*) FILTER (WHERE event_type = 'open') AS opens,
-           count(*) FILTER (WHERE event_type IN ('expand', 'media')) AS expands,
+           count(*) FILTER (WHERE event_type = 'expand' OR (event_type = 'media'
+                AND COALESCE(metadata->>'autoplay', 'false') <> 'true')) AS expands,
            count(*) FILTER (WHERE event_type = 'share') AS shares,
            count(*) FILTER (WHERE event_type = 'save') AS saves,
            count(*) FILTER (WHERE event_type = 'dismiss') AS dismisses,

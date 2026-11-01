@@ -217,7 +217,7 @@ export function MediaGrid({
         durationSec={media[0].duration_sec}
         radius={16}
         onPlay={(auto) => onMedia({ action: 'play', index: 0, inline: true, auto })}
-        onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+        onStop={(ms, auto) => onMedia({ action: 'stop', index: 0, inline: true, auto, dwellMs: ms })}
       />
     );
   }
@@ -301,7 +301,7 @@ export function MediaCarousel({
           durationSec={media[0].duration_sec}
           radius={radius}
           onPlay={(auto) => onMedia({ action: 'play', index: 0, inline: true, auto })}
-          onStop={(ms) => onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+          onStop={(ms, auto) => onMedia({ action: 'stop', index: 0, inline: true, auto, dwellMs: ms })}
         />
       </View>
     );

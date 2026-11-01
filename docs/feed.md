@@ -316,3 +316,5 @@ base_feed CASCADE; DROP FUNCTION internal.feed_item_version(),
 internal.feed_item_versions_immutable(); DELETE FROM timeline.events WHERE adapter =
 'feed_engagement';`. Dropping the schema is the one way past the append-only guard, which
 is deliberate.
+
+Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.

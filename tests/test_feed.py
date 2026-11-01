@@ -456,3 +456,42 @@ def test_blur_gap_over_two_minutes_attributes_reader_events_without_merging(ware
     ]:
         _event(wh, eid, kind, session_id=sid, minutes=minute, metadata=meta)
     assert wh._query('SELECT session_id, opens FROM @marts_feed_sessions ORDER BY session_id') == [('a', 1), ('b', 0)]
+
+
+@pytestmark_db
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("flag,expected", [(None, None), (True, False), (False, True)])
+def test_inline_watch_is_separate_from_reading(warehouse, manual, flag, expected):
+    wh = warehouse
+    _item(wh)
+    _event(wh, "auto", "media", metadata='{"autoplay": true}')
+    _event(wh, "seen", "impression", dwell_ms=265)
+    if manual:
+        _event(wh, "manual", "media", metadata='{"autoplay": false}')
+    metadata = {"mode": "video", "inline": True}
+    if flag is not None:
+        metadata["autoplay"] = flag
+    _event(wh, "close", "close", dwell_ms=270, metadata=json.dumps(metadata))
+    read = manual if expected is None else expected
+    assert wh._query(
+        "SELECT expands, autoplays, read_ms, watch_ms, engaged FROM @marts_feed_item_engagement"
+    ) == [(int(manual), 1, 270 if read else 0, 270, int(manual))]
+    assert wh._query("SELECT expands FROM @marts_feed_sessions") == [(int(manual),)]
+    assert wh._query("SELECT read_ms FROM @marts_feed_source_engagement") == [(270 if read else 0,)]
+
+@pytestmark_db
+def test_autoplay_columns_append_without_recreating_dependents(warehouse):
+    wh = warehouse
+    wh._command("DROP VIEW @marts_feed_source_engagement")
+    wh._command("DROP VIEW @marts_feed_item_engagement")
+    legacy = feed.ITEM_ENGAGEMENT_VIEW.replace(
+        ",\n           COALESCE(e.autoplays, 0) AS autoplays,\n           COALESCE(e.watch_ms, 0) AS watch_ms", ""
+    )
+    wh._command(legacy)
+    wh._command(feed.SOURCE_ENGAGEMENT_VIEW)
+    before = wh._query("SELECT %s::regclass::oid", (wh._expand_relations("@marts_feed_source_engagement"),))
+    wh.ensure_timeline_tables()
+    assert wh._query("SELECT %s::regclass::oid", (wh._expand_relations("@marts_feed_source_engagement"),)) == before
+    _item(wh)
+    _event(wh, "reading", "close", dwell_ms=800)
+    assert wh._query("SELECT read_ms, watch_ms, autoplays FROM @marts_feed_item_engagement") == [(800, 0, 0)]

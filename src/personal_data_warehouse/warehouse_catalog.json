@@ -4187,7 +4187,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, read time, dismissed, shares, saved (read later), engaged, engagement_score. Epoch times are NULL."
+      "comment": "Per card. Impressions, dwell, scroll-pasts, opens, read time, dismissed, shares, saved (read later), engaged, engagement_score. Autoplay is not engagement; autoplays counts automatic starts and watch_ms measures inline video viewing separately from read_ms. Epoch times are NULL."
     },
     {
       "id": "marts_feed_source_engagement",

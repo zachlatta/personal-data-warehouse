@@ -101,7 +101,7 @@ the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
-`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`, `liked`, `liked_at`),
+`expands`, `dismissed`, `dismiss_reason`, `engaged`, `engagement_score`, `shares`, `saved`, `saved_at`, `liked`, `liked_at`, `autoplays`, `watch_ms`),
 `marts_feed.source_engagement`, and the raw log `base_feed.events` (`event_type`,
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
 `metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
@@ -131,3 +131,5 @@ card's `height`.
 
 Zach's curated picks are source `picks`, refreshed daily by the "Feed picks daily" Paseo
 schedule (desk `work/2026-10-20-feed-curation/`); push there only through that job.
+
+Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.

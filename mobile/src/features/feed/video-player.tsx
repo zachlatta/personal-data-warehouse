@@ -130,7 +130,7 @@ export function InlineVideo({
   durationSec?: number;
   radius?: number;
   onPlay: (auto: boolean) => void;
-  onStop: (watchedMs: number) => void;
+  onStop: (watchedMs: number, auto: boolean) => void;
 }) {
   const theme = useTheme();
   const touch = useContext(PlayerTouch);
@@ -150,11 +150,12 @@ export function InlineVideo({
   // A tap reports its play itself; an autoplay is reported here.
   useEffect(() => {
     if (!active) return undefined;
-    if (autoplayed) playRef.current(true);
+    const auto = autoplayed;
+    if (auto) playRef.current(true);
     const stop = startTimer(true);
     return () => {
       setDrawn(false);
-      stopRef.current(stop().dwell_ms);
+      stopRef.current(stop().dwell_ms, auto);
     };
   }, [active]);
   // Muted is fixed when the player starts: an autoplay stays muted until he

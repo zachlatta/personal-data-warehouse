@@ -312,7 +312,7 @@ function FeedCardImpl({
                   aspect={videoAspect(video)}
                   durationSec={media.find((m) => m.type !== 'image')?.duration_sec}
                   onPlay={(auto) => reportMedia({ action: 'play', index: 0, inline: true, auto })}
-                  onStop={(ms) => reportMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+                  onStop={(ms, auto) => reportMedia({ action: 'stop', index: 0, inline: true, auto, dwellMs: ms })}
                 />
               </View>
             ) : media.length ? (

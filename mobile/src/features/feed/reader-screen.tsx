@@ -230,14 +230,14 @@ export default function FeedReaderScreen() {
       if (!itemId) return;
       if (a.action === 'stop') {
         nested.current += a.dwellMs ?? 0;
-        recordFeedEvent('close', { item_id: itemId, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true, in: 'detail' } });
+        recordFeedEvent('close', { item_id: itemId, dwell_ms: a.dwellMs, metadata: { mode: 'video', index: a.index, inline: true, autoplay: a.auto ?? false, in: 'detail' } });
         return;
       }
       recordFeedEvent('media', {
         item_id: itemId,
         position,
         dwell_ms: a.dwellMs,
-        metadata: { action: a.action, index: a.index, in: 'detail', ...(a.inline ? { inline: true } : {}) },
+        metadata: { action: a.action, index: a.index, in: 'detail', ...(a.auto ? { autoplay: true } : {}), ...(a.inline ? { inline: true } : {}) },
       });
       if (a.action !== 'play' || !a.url || a.inline) return;
       const stop = startTimer(true);
@@ -354,8 +354,8 @@ export default function FeedReaderScreen() {
                 aspect={videoAspect(video)}
                 radius={0}
                 durationSec={media.find((m) => m.type !== 'image')?.duration_sec}
-                onPlay={() => void onMedia({ action: 'play', index: 0, inline: true })}
-                onStop={(ms) => void onMedia({ action: 'stop', index: 0, inline: true, dwellMs: ms })}
+                onPlay={(auto) => void onMedia({ action: 'play', index: 0, inline: true, auto })}
+                onStop={(ms, auto) => void onMedia({ action: 'stop', index: 0, inline: true, auto, dwellMs: ms })}
               />
             ) : media.length ? (
               <MediaCarousel media={media} onMedia={onMedia} recyclingKey={`detail:${item.item_id}`} />
