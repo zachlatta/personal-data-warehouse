@@ -7448,9 +7448,13 @@ class PostgresWarehouse:
                 CASE
                     WHEN NULLIF(s.last_error, '') IS NOT NULL THEN 'failing'
                     WHEN s.backfill_done = 0 THEN 'backfilling'
+                    -- A stopped probe must alarm even when its last sample
+                    -- was empty or caught up. Use existing alarm statuses.
+                    WHEN now() - NULLIF(s.source_measured_at, {epoch}) > make_interval(secs => {COLLECTOR_STALE_SECONDS * 2})
+                        THEN 'failing'
                     WHEN NULLIF(s.source_measured_at, {epoch}) IS NULL
                       OR now() - s.source_measured_at > make_interval(secs => {COLLECTOR_STALE_SECONDS})
-                        THEN 'unmeasured'
+                        THEN 'late'
                     WHEN expected.expected_ingest_interval_seconds IS NULL THEN 'ok'
                     -- No source write means there is no adapter backlog. The
                     -- source pipeline's own row judges unexpected absence.

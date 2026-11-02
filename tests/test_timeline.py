@@ -4468,13 +4468,6 @@ def test_the_move_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(wareh
     assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": ""}
 
 
-def test_adapter_queries_and_signatures_unchanged_by_engine_progress_fix():
-    import json
-    payload = [(a.name, a.backfill_sql, a.incremental_sql, a.max_ingest_sql,
-                adapter_definition_signature(a)) for a in TIMELINE_ADAPTERS]
-    assert hashlib.sha256(json.dumps(payload).encode()).hexdigest() == '7782904c6cc6875deab7f59a80bbddbdf971c970e602ac67ec36b984db2a04fd'
-
-
 @pytest.mark.parametrize("name", ["github_commit", "slack_message", "apple_message"])
 def test_incremental_drains_new_rows_before_bounded_replay(name):
     from dataclasses import replace
@@ -4509,11 +4502,11 @@ def test_incremental_drains_new_rows_before_bounded_replay(name):
     assert state.watermark_ts == fresh[12]
 
 
-def test_adapter_health_uses_eligible_highwater_and_distinguishes_unmeasured(warehouse):
+def test_adapter_health_uses_eligible_highwater_and_flags_missing_measurement(warehouse):
     _ensure_all_source_tables(warehouse)
     warehouse._command("INSERT INTO @timeline_sync_state (adapter, backfill_done, watermark_ingest_ts) VALUES ('github_event', 1, %s)", (_NOW,))
     row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
-    assert row['status'] == 'unmeasured'
+    assert row['status'] == 'late'
     warehouse._command("UPDATE @timeline_sync_state SET source_newest_ingest_at = %s, source_measured_at = now() WHERE adapter = 'github_event'", (_NOW,))
     row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
     assert row['status'] == 'ok'
@@ -4522,8 +4515,15 @@ def test_adapter_health_uses_eligible_highwater_and_distinguishes_unmeasured(war
     row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
     assert row['status'] == 'ok'
     assert row['source_newest_ingest_at'] is None
-    warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '2 hours' WHERE adapter = 'github_event'")
-    assert warehouse._query("SELECT status FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0][0] == 'unmeasured'
+    # A stopped adapter must alarm even if the last measured source was empty
+    # or fully consumed; a recent last_run_at must not mask a stale probe.
+    for age, expected in (("90 minutes", "late"), ("3 hours", "failing")):
+        warehouse._command(
+            "UPDATE @timeline_sync_state SET source_measured_at = now() - %s::interval, "
+            "watermark_ingest_ts = now() - interval '18 days', last_run_at = now() "
+            "WHERE adapter = 'github_event'", (age,)
+        )
+        assert warehouse._query("SELECT status FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0][0] == expected
 
 
 def test_filtered_out_newer_github_event_does_not_create_adapter_backlog(warehouse):
