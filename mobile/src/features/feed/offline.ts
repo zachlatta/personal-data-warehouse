@@ -211,7 +211,7 @@ export async function prefetchSavedCard(config: AppConfig, item: FeedItem): Prom
     if (url && !hasStoredArticle(url)) await storeArticle(url, await fetchArticle(config, url));
   } catch (error) {
     if (isOfflineError(error)) setOffline(true);
-    if (url && error instanceof FeedApiError) storeFailure(url, error);
+    else if (url && error instanceof FeedApiError) storeFailure(url, error);
     // Saving is still valid when the article is unavailable. The reader
     // reports whether it has an offline copy, rather than claiming success.
   }

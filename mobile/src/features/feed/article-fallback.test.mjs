@@ -114,3 +114,57 @@ test('real view still renders a successful article instead of the fallback', asy
   assert.equal(tree.props.children[1].type, 'webview');
   assert.equal(tree.props.children[1].props.source.html, '<html>Read</html>');
 });
+
+// Run the saved-card path with an in-memory filesystem: a network failure
+// must leave the article eligible for the next online prefetch.
+function savedCardHarness(error) {
+  const files = new Map();
+  class Directory { exists = true; }
+  class File {
+    constructor(_dir, name) { this.name = name; }
+    get exists() { return files.has(this.name); }
+    textSync() { return files.get(this.name); }
+    write(text) { files.set(this.name, text); }
+  }
+  const modules = {
+    'expo-file-system': { Directory, File, Paths: { document: '' } },
+    'expo-image': { Image: {} },
+    react: {},
+    'react-native': { AppState: { currentState: 'active' } },
+    './api': { FeedApiError: require('../../lib/request.ts').ApiError, fetchArticle: async () => { throw error; } },
+    './article-fallback': { knownNotArticle },
+    './article': { articleUrl: (item) => item.url },
+    './engagement': { recordUi() {} },
+    './offline-store': { ...require('./offline-store.ts'), cardMediaUrls: () => [] },
+    './video': { cardVideo: () => null },
+  };
+  const source = ts.transpileModule(readFileSync(new URL('./offline.ts', import.meta.url), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const exports = {};
+  runInNewContext(source, { exports, require: (id) => modules[id] ?? require(id), setTimeout, clearTimeout });
+  return { exports, files };
+}
+
+test('saving on a timeout or offline connection records no failure and permits the next prefetch', async () => {
+  const { ApiError } = require('../../lib/request.ts');
+  const { parseIndex, planArticles } = require('./offline-store.ts');
+  const url = 'https://example.com/post';
+  for (const error of [new ApiError(0, 'Connection timed out'), new TypeError('Network request failed')]) {
+    const h = savedCardHarness(error);
+    await h.exports.prefetchSavedCard({}, { url });
+    assert.equal(h.exports.isOffline(), true);
+    const index = parseIndex(h.files.get('index.json') ?? null);
+    assert.equal(index.entries[url], undefined);
+    assert.deepEqual(planArticles([url], index, Date.now()), [url]);
+  }
+});
+
+test('saving a non-article still remembers the definitive 422 outcome', async () => {
+  const { ApiError } = require('../../lib/request.ts');
+  const url = 'https://example.com/game';
+  const h = savedCardHarness(new ApiError(422, 'no readable article'));
+  await h.exports.prefetchSavedCard({}, { url });
+  assert.equal(h.exports.isKnownNotArticle(url), true);
+  assert.equal(h.exports.isOffline(), false);
+});
