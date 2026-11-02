@@ -1,4 +1,4 @@
-import { feedDetailClosed } from './session-lifecycle';
+import { feedDetailClosed, feedDetailOpened } from './session-lifecycle';
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
 import { Fragment, useCallback, useRef } from 'react';
@@ -147,6 +147,7 @@ export default function FeedReaderScreen() {
       if (!item) return undefined;
       depth.current = 0;
       nested.current = 0;
+      feedDetailOpened();
       recordFeedEvent('open', { item_id: item.item_id, position, metadata: { mode: 'detail' } });
       const stop = startTimer();
       return () => {

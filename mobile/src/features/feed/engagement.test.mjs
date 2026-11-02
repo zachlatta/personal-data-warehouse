@@ -55,7 +55,8 @@ test('launcher detail survives the previously focused tab blurring', () => {
   if (launcher.blur()) logger.endFeedSession('blur');
   if (tab.blur()) logger.endFeedSession('blur');
   assert.equal(tab.appState('active'), null);
-  assert.equal(launcher.appState('background'), 'end');
+  assert.equal(launcher.appState('background'), null);
+  launcher.appState('active');
   for (const type of ['open', 'web', 'close']) logger.recordFeedEvent(type, {item_id:'cross-host'});
   const events = logger.pendingFeedEvents().filter(e => e.item_id === 'cross-host');
   assert.equal(events.length, 4);

@@ -340,21 +340,24 @@ export default function FeedScreen() {
   );
 
   useEffect(() => {
+    const endBackground = () => {
+      pause();
+      endFeedSession('background');
+      void flushFeedEvents(true);
+    };
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active' && !host.inFront() && !lifecycle.detail) return;
-      const action = lifecycle.appState(state, focused.current && host.inFront());
+      const action = lifecycle.appState(state, focused.current && host.inFront(), endBackground);
       if (!action) return;
       if (action === 'start') {
         startFeedSession(ids.current.length, 'foreground');
         if (Date.now() - loadedAt.current > STALE_MS) void load(loadedAt.current ? 'stale' : 'first');
         else measure();
       } else {
-        pause();
-        endFeedSession('background');
-        void flushFeedEvents(true);
+        endBackground();
       }
     });
-    return () => sub.remove();
+    return () => { sub.remove(); lifecycle.cancelBackgroundEnd(); };
   }, [load, measure, pause, lifecycle, host]);
 
   useEffect(() => {

@@ -6,6 +6,7 @@ export const feedSessionCoordinator = new FeedSessionCoordinator();
 
 export class FeedSessionLifecycle {
   detail = false;
+  private backgroundTimer: ReturnType<typeof setTimeout> | undefined;
   private coordinator: FeedSessionCoordinator;
   constructor(coordinator = new FeedSessionCoordinator()) { this.coordinator = coordinator; }
   get owns() { return this.coordinator.owner === this; }
@@ -24,9 +25,22 @@ export class FeedSessionLifecycle {
     this.detail = false;
     return focused ? false : this.blur();
   }
-  appState(state: string, focusedInFront = false): 'start' | 'end' | null {
+  cancelBackgroundEnd() {
+    clearTimeout(this.backgroundTimer);
+    this.backgroundTimer = undefined;
+  }
+  appState(state: string, focusedInFront = false, endBackground: () => void = () => {}): 'start' | 'end' | null {
+    if (state === 'active') this.cancelBackgroundEnd();
     if (state === 'active' && focusedInFront && !this.coordinator.owner) this.focus();
     if (!this.owns) return null;
+    if (state !== 'active' && this.detail) {
+      // Moving from the launcher's activity to a reader briefly backgrounds React.
+      if (!this.backgroundTimer) this.backgroundTimer = setTimeout(() => {
+        this.backgroundTimer = undefined;
+        if (this.owns) endBackground();
+      }, 1500);
+      return null;
+    }
     return state === 'active' ? 'start' : 'end';
   }
 }
@@ -39,4 +53,8 @@ export function onFeedDetailClosed(listener: () => void) {
 }
 export function feedDetailClosed() {
   for (const listener of closedListeners) listener();
+}
+
+export function feedDetailOpened() {
+  feedSessionCoordinator.owner?.cancelBackgroundEnd();
 }
