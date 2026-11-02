@@ -250,9 +250,10 @@ When mutation review is enabled, the server also exposes:
   `add_labels` / `remove_labels`; `create_and_add_labels` explicitly creates missing user labels
   by display name and applies them, while reusing same-name labels on retry. Batching multiple
   mutations into one call groups them under one review request.
-- `propose_mutation_help` — zero-argument tool that returns the catalog of supported mutation
+- `propose_mutation_help` — tool that returns the catalog of supported mutation
   types with field-by-field descriptions and worked examples. Call this first to see how to
-  shape each mutation entry.
+  shape each mutation entry; pass `{"type":"gmail.send_email"}` for one type
+  or `{"list_only":true}` for names and summaries.
 
 These tools only create rows in the `upstream_mutation_requests` and `upstream_mutations` tables.
 They return an approval URL under `/mutation-review` (the web app, which reviews through
@@ -385,6 +386,12 @@ The default scope is **all tiers**; no priorities filter is applied. `unclassifi
   gmail,slack 'offer letter'`. It prints a compact hit list by default; `--output json` returns
   the full machine-readable response. SQL-native workflows can still call
   `timeline.search_text`, `timeline.search_text_exact`, and `timeline.context` through `pdw sql`.
+
+Built-in tools called with `pdw call --output json` return a plain JSON object
+(no MCP content array); `--output text` prints it. Connected tools return the MCP
+result envelope. An upstream `isError` result exits 1; JSON output writes exactly
+one document to stdout and nothing to stderr. Text output includes diagnostics;
+argument guidance appears only for argument errors.
 
 ### `readme`
 

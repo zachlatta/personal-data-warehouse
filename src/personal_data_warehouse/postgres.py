@@ -3286,6 +3286,8 @@ TIMESTAMP_COLUMNS = {
     "ingest_ts",
     "first_seen_at",
     "backfill_cursor_event_ts",
+    "source_newest_ingest_at",
+    "source_measured_at",
     "watermark_ingest_ts",
     "last_run_at",
     "watermark_updated_at",
@@ -7374,13 +7376,9 @@ class PostgresWarehouse:
         # against a 30-minute cadence while the pipeline reported
         # `run_age = 0.00d, ok`.
         #
-        # Facts, not just a verdict: `last_run_at` is NOT "when the adapter last
-        # ran". `_save_state` only stamps it when a batch returned rows, so an
-        # adapter with nothing to do looks identical to a wedged one. Anyone
-        # alarming on `run_age_seconds` alone will page falsely. The honest
-        # signal is `watermark_ingest_ts` compared against the newest row in the
-        # adapter's own source relation, which is why both are exposed side by
-        # side and the status stays deliberately conservative.
+        # Measure backlog against the adapter's eligible source rows, not raw
+        # table freshness: filtered-out writes cannot be timeline backlog.
+        # A recent measurement of an empty source differs from no measurement.
         # Guarded: ensure_pipeline_health_tables can run before
         # ensure_timeline_tables has created the state table it reads.
         if not self._relation_exists("timeline_sync_state"):
@@ -7433,16 +7431,16 @@ class PostgresWarehouse:
                 s.incremental_rows,
                 expected.source_pipeline,
                 expected.expected_ingest_interval_seconds,
-                NULLIF(freshness.last_write_at, {epoch}) AS source_newest_ingest_at,
+                NULLIF(s.source_newest_ingest_at, {epoch}) AS source_newest_ingest_at,
                 NULLIF(s.watermark_ingest_ts, {epoch}) AS watermark_ingest_ts,
                 NULLIF(s.last_run_at, {epoch}) AS last_run_at,
                 (EXTRACT(EPOCH FROM now() - NULLIF(s.watermark_ingest_ts, {epoch})))::bigint
                     AS watermark_age_seconds,
                 CASE
-                    WHEN NULLIF(freshness.last_write_at, {epoch}) IS NULL
+                    WHEN NULLIF(s.source_newest_ingest_at, {epoch}) IS NULL
                       OR NULLIF(s.watermark_ingest_ts, {epoch}) IS NULL THEN NULL
                     ELSE GREATEST(0, EXTRACT(EPOCH FROM (
-                        freshness.last_write_at - s.watermark_ingest_ts
+                        s.source_newest_ingest_at - s.watermark_ingest_ts
                     )))::bigint
                 END AS ingest_lag_seconds,
                 (EXTRACT(EPOCH FROM now() - NULLIF(s.last_run_at, {epoch})))::bigint
@@ -7450,18 +7448,21 @@ class PostgresWarehouse:
                 CASE
                     WHEN NULLIF(s.last_error, '') IS NOT NULL THEN 'failing'
                     WHEN s.backfill_done = 0 THEN 'backfilling'
+                    WHEN NULLIF(s.source_measured_at, {epoch}) IS NULL
+                      OR now() - s.source_measured_at > make_interval(secs => {COLLECTOR_STALE_SECONDS})
+                        THEN 'unmeasured'
                     WHEN expected.expected_ingest_interval_seconds IS NULL THEN 'ok'
                     -- No source write means there is no adapter backlog. The
                     -- source pipeline's own row judges unexpected absence.
-                    WHEN NULLIF(freshness.last_write_at, {epoch}) IS NULL THEN 'ok'
+                    WHEN NULLIF(s.source_newest_ingest_at, {epoch}) IS NULL THEN 'ok'
                     WHEN NULLIF(s.watermark_ingest_ts, {epoch}) IS NULL THEN 'failing'
                     WHEN EXTRACT(EPOCH FROM (
-                           freshness.last_write_at - s.watermark_ingest_ts
+                           s.source_newest_ingest_at - s.watermark_ingest_ts
                          ))
                          > expected.expected_ingest_interval_seconds * {STALE_MULTIPLIER}
                         THEN 'failing'
                     WHEN EXTRACT(EPOCH FROM (
-                           freshness.last_write_at - s.watermark_ingest_ts
+                           s.source_newest_ingest_at - s.watermark_ingest_ts
                          ))
                          > expected.expected_ingest_interval_seconds * {LATE_MULTIPLIER}
                         THEN 'late'
@@ -7478,8 +7479,6 @@ class PostgresWarehouse:
                 adapter, source_table, source_pipeline, expected_ingest_interval_seconds
             )
               ON expected.adapter = s.adapter
-            LEFT JOIN @pipeline_table_freshness freshness
-              ON freshness.table_id = expected.source_table
             """,
         )
 
@@ -8027,6 +8026,11 @@ class PostgresWarehouse:
             "last_reconcile_at timestamptz NOT NULL "
             "DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
         )
+        for column in ("source_newest_ingest_at", "source_measured_at"):
+            self._command(
+                f"ALTER TABLE @timeline_sync_state ADD COLUMN IF NOT EXISTS {column} "
+                "timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz"
+            )
         # These ALTERs run under an ACCESS EXCLUSIVE lock on a 45+ GB table and
         # ensure_timeline_tables runs on every timeline sync (~288/day in
         # prod), so each is gated on the current catalog state instead of

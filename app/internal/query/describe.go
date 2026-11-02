@@ -99,7 +99,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	trimmed := strings.TrimSpace(relation)
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	if trimmed == "" {
-		return tableRef{}, "relation is required, e.g. describe_table('base_gmail.messages'). Run schema_overview for the relation list."
+		return tableRef{}, "relation is required, e.g. " + discoveryCall("base_gmail.messages") + ". Run " + discoveryCall("") + " for the relation list."
 	}
 
 	parts := strings.Split(trimmed, ".")
@@ -120,7 +120,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	}
 
 	if name == "" {
-		return tableRef{}, "relation is required, e.g. describe_table('base_gmail.messages'). Run schema_overview for the relation list."
+		return tableRef{}, "relation is required, e.g. " + discoveryCall("base_gmail.messages") + ". Run " + discoveryCall("") + " for the relation list."
 	}
 	if !validIdentifier(name) || (schema != "" && !validIdentifier(schema)) {
 		return tableRef{}, fmt.Sprintf("%q is not a relation name — pass a schema-qualified relation like base_gmail.messages.", relation)
@@ -165,7 +165,7 @@ func (s *Service) resolveRelation(ctx context.Context, relation string) (tableRe
 	if len(matches) > 0 {
 		return tableRef{}, fmt.Sprintf("no relation named %s — %s exists as %s.", trimmed, name, displayNames(matches))
 	}
-	return tableRef{}, fmt.Sprintf("no relation named %s. Run schema_overview for the full relation list.", trimmed)
+	return tableRef{}, fmt.Sprintf("no relation named %s. Run %s for the full relation list.", trimmed, discoveryCall(""))
 }
 
 // describeFunction answers a describe of one of the timeline search functions

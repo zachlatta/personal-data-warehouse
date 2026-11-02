@@ -480,9 +480,9 @@ func (s *Service) SchemaOverviewFiltered(ctx context.Context, filter string) Res
 		}
 		tables = kept
 		if len(tables) == 0 {
-			failure := fmt.Sprintf("no queryable schema matches %q; run schema_overview with no filter for the list", filter)
+			failure := fmt.Sprintf("no queryable schema matches %q; run "+discoveryCall("")+" with no filter for the list", filter)
 			if filter == "ops" {
-				failure = "ops is hidden from schema_overview, but the query role reads these ops relations; describe one with describe_table (`pdw columns ops.<name>`): " + strings.Join(hiddenReadableRelationNames(), ", ")
+				failure = "ops is hidden from schema_overview, but the query role reads these ops relations; describe one with " + discoveryCall("ops.<name>") + ": " + strings.Join(hiddenReadableRelationNames(), ", ")
 			}
 			schemaResult.Error = failure
 			schemaResult.CSV = errorCSV(failure)
@@ -1165,7 +1165,7 @@ func integerBooleanHint(message string) string {
 		!integerBooleanUnmatchedTypes.MatchString(message) {
 		return ""
 	}
-	return "(hint: warehouse boolean-named columns are integer 0/1 (bigint or integer), not boolean — write `is_from_me = 1` / `is_deleted = 0`, not `NOT is_from_me`, `= true`, `COALESCE(flag, false)`, or `FILTER (WHERE is_read)`. Run describe_table for a relation's exact column types.)"
+	return "(hint: warehouse boolean-named columns are integer 0/1 (bigint or integer), not boolean — write `is_from_me = 1` / `is_deleted = 0`, not `NOT is_from_me`, `= true`, `COALESCE(flag, false)`, or `FILTER (WHERE is_read)`. Run " + discoveryCall("<schema.table>") + " for a relation's exact column types.)"
 }
 
 // textJSONHint fires when a JSON operator is applied to a column that is stored
@@ -1180,7 +1180,7 @@ func textJSONHint(message string) string {
 	if !jsonOperator && !subscript {
 		return ""
 	}
-	return "(hint: that column stores JSON as text, not jsonb — cast it first, e.g. raw_json::jsonb ->> 'key'. JSON columns are text on the older sources (slack, gmail, apple_*, whatsapp, the agent-session event tables) and real jsonb on the newer ones (plaid, whoop, google_drive, manual_finance, ...); run describe_table to see which one this is.)"
+	return "(hint: that column stores JSON as text, not jsonb — cast it first, e.g. raw_json::jsonb ->> 'key'. JSON columns are text on the older sources (slack, gmail, apple_*, whatsapp, the agent-session event tables) and real jsonb on the newer ones (plaid, whoop, google_drive, manual_finance, ...); run " + discoveryCall("<schema.table>") + " to see which one this is.)"
 }
 
 // statementTimeoutHint fires when a query exhausts the server's statement
@@ -1322,7 +1322,7 @@ func undefinedFunctionHint(message string) string {
 		}
 		return fmt.Sprintf("(hint: call %s(...) — queries carry no warehouse search_path, so its functions must be schema-qualified just like its tables.)", remap)
 	}
-	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: timeline.search_text('needle', 50) for ranked search, timeline.search_text_exact('needle', 50) for literal substrings. Run schema_overview for the rest.)"
+	return "(hint: no such function — queries carry no warehouse search_path, so schema-qualify warehouse functions: timeline.search_text('needle', 50) for ranked search, timeline.search_text_exact('needle', 50) for literal substrings. Run " + discoveryCall("") + " for the rest.)"
 }
 
 // undefinedTableHint fires on a missing relation (SQLSTATE 42P01). A known
@@ -1337,9 +1337,56 @@ func undefinedTableHint(message string) string {
 		return fmt.Sprintf("(hint: there is no %s relation — agent-session turns are marts_ai_conversations.events (one row per turn or tool call: source, session_id, seq, occurred_at, role, text, tool_name), and marts_ai_conversations.sessions has one row per session. Order turns by seq; there is no turn_index.)", rel)
 	}
 	if remap, ok := tableRemaps[rel]; ok {
-		return fmt.Sprintf("(hint: there is no %s relation — use %s. Run schema_overview for the exact relation names.)", rel, remap)
+		return fmt.Sprintf("(hint: there is no %s relation — use %s. Run "+discoveryCall("")+" for the exact relation names.)", rel, remap)
 	}
-	return "(hint: no such relation — run schema_overview for the relation list, or describe_table('<name>') to have the closest matches named for you.)"
+	if schema, name, qualified := strings.Cut(rel, "."); qualified {
+		known := false
+		candidates := []string{}
+		for _, obj := range warehouse.Objects {
+			if obj.Schema != schema {
+				continue
+			}
+			known = true
+			if obj.IsRelation() && obj.QueryAccess != "denied" && (obj.Discoverable || obj.QueryAccess == "app_only") {
+				candidates = append(candidates, obj.Name)
+			}
+		}
+		if !known {
+			return fmt.Sprintf("(hint: PDW has no schema %s; connected warehouses go through `pdw call <connection>__<tool>` (`pdw list`).)", schema)
+		}
+		slices.Sort(candidates)
+		suggestions := similarColumns(name, candidates)
+		// Reuse authoritative synonyms, but only when their target is a
+		// queryable relation in this schema.
+		synonym := tableRemaps[strings.TrimPrefix(schema, "base_")+"_"+name]
+		for _, candidate := range candidates {
+			full := schema + "." + candidate
+			if full == synonym || relationEditDistance(name, candidate) <= 2 {
+				suggestions = append(suggestions, candidate)
+			}
+		}
+		slices.Sort(suggestions)
+		suggestions = slices.Compact(suggestions)
+		slices.SortStableFunc(suggestions, func(a, b string) int {
+			score := func(name string) int {
+				if schema+"."+name == synonym {
+					return -1
+				}
+				return relationEditDistance(name, strings.TrimPrefix(rel, schema+"."))
+			}
+			return score(a) - score(b)
+		})
+		if len(suggestions) > 3 {
+			suggestions = suggestions[:3]
+		}
+		if len(suggestions) > 0 {
+			for i := range suggestions {
+				suggestions[i] = schema + "." + suggestions[i]
+			}
+			return "(hint: no such relation — suggestion: " + strings.Join(suggestions, ", ") + ". Run " + discoveryCall("") + " for exact relation names.)"
+		}
+	}
+	return "(hint: no such relation — run " + discoveryCall("") + " for the relation list, or " + discoveryCall("<schema.table>") + " to have the closest matches named for you.)"
 }
 
 // inventedAgentSessionRelation recognizes the agent-session tables models
@@ -1372,13 +1419,13 @@ func undefinedColumnHint(message, sql string) string {
 		return hint
 	}
 	if remap, ok := columnRemaps[col]; ok {
-		return "(hint: " + remap + ". Run describe_table('<schema.table>') for the full column list.)"
+		return "(hint: " + remap + ". Run " + discoveryCall("<schema.table>") + " for the full column list.)"
 	}
 	if timeGuessColumns[col] {
 		if table, column := soleTimeTable(sql); table != "" {
-			return fmt.Sprintf("(hint: the primary time column on %s is %s (timestamp with time zone) — sources name it differently, so don't guess. Run describe_table('%s') for the rest.)", table, column, table)
+			return fmt.Sprintf("(hint: the primary time column on %s is %s (timestamp with time zone) — sources name it differently, so don't guess. Run %s for the rest.)", table, column, discoveryCall(table))
 		}
-		return "(hint: each source names its primary time column differently — " + timeColumnsList() + ", all timestamp with time zone. Run describe_table('<schema.table>') for the exact columns.)"
+		return "(hint: each source names its primary time column differently — " + timeColumnsList() + ", all timestamp with time zone. Run " + discoveryCall("<schema.table>") + " for the exact columns.)"
 	}
 	// Postgres computes its own Levenshtein suggestion and we now surface it
 	// verbatim. When it fired, it is strictly better than this generic advice —
@@ -1386,7 +1433,7 @@ func undefinedColumnHint(message, sql string) string {
 	if strings.Contains(message, "HINT: Perhaps you meant") {
 		return ""
 	}
-	return "(hint: column names differ per source — run describe_table('<schema.table>') for the exact columns and their (type) annotations.)"
+	return "(hint: column names differ per source — run " + discoveryCall("<schema.table>") + " for the exact columns and their (type) annotations.)"
 }
 
 // searchHitOnlyColumns exist on a search FUNCTION's result and nowhere on
@@ -1614,4 +1661,33 @@ func hiddenReadableRelationNames() []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// discoveryCall gives the MCP and CLI spelling together on either surface.
+func discoveryCall(relation string) string {
+	if relation == "" {
+		return "schema_overview (`pdw schema`)"
+	}
+	return "describe_table (`pdw columns " + relation + "`)"
+}
+
+// relationEditDistance bounds typo suggestions to two character edits.
+func relationEditDistance(a, b string) int {
+	previous := make([]int, len(b)+1)
+	for j := range previous {
+		previous[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		current := make([]int, len(b)+1)
+		current[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			current[j] = min(current[j-1]+1, previous[j]+1, previous[j-1]+cost)
+		}
+		previous = current
+	}
+	return previous[len(b)]
 }

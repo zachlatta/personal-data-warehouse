@@ -12,7 +12,7 @@ the home Brother printer is one too (`printer.print_document`).
 
 1. {{if .CLI}}`pdw call propose_mutation_help`{{else}}`propose_mutation_help` (no arguments){{end}} — the catalog of supported types with
    field-by-field descriptions and a worked example for each. Read it first; the payload
-   shapes are strict.
+   shapes are strict. {{if .CLI}}`pdw call propose_mutation_help --data '{"type":"gmail.send_email"}'`{{else}}Pass `{"type":"gmail.send_email"}`{{end}} to get one type.
 2. {{if .CLI}}`pdw call propose_mutation --data '<json>'`{{else}}`propose_mutation`{{end}} — `mutations` is an array of `{type, ...payload}`
    entries. It returns a `request_id` and an `approval_url`; it executes nothing.
 

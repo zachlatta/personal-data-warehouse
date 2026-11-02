@@ -108,3 +108,8 @@ single fix was the `timeline.events` rename to `occurred_at` (2026-10-25): `colu
 Fixed on 2026-10-28: the brief names `pdw query`, `pdw tools` and `pdw connections` as not
 commands, and gives the `NOT is_deleted`, `jsonb` `LIKE` and bare-`id` traps. The CLI
 redirects `pdw query --help` and `pdw call query --help` instead of printing the usage.
+
+The CLI redirect for `pdw mutation` uses `propose_mutation_help`'s `type` field.
+Built-in `pdw call` JSON results are plain objects without an MCP `content` array;
+`pdw describe` and the guides state that shape. Upstream `isError` JSON results
+remain one document with empty stderr and exit status 1, including through `2>&1`.

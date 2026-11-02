@@ -3238,7 +3238,6 @@ def test_coverage_reconcile_is_not_part_of_the_adapter_signature():
             reconcile_sql="SELECT 'obviously different'",
             reconcile_hours=adapter.reconcile_hours + 24,
             incremental_lag_hours=adapter.incremental_lag_hours + 1,
-            incremental_forward_first=not adapter.incremental_forward_first,
         )
         assert adapter_definition_signature(mutated) == baseline, (
             f"{adapter.name}: reconcile/incremental tuning leaked into adapter_signature, "
@@ -3340,6 +3339,9 @@ def test_coverage_reconcile_pages_by_ingest_time(warehouse, monkeypatch, event_s
 
         monkeypatch.setattr(engine, "_fetch", record_fetch)
         # Do not run incremental/backfill: either could mask the missing rows.
+        # This is a new pass after the fixture writes: discard the previous
+        # run's source observation just as run() does at its entry point.
+        engine._source_highwaters.clear()
         repaired = engine._run_coverage_reconcile(slack, state, None)
         after = warehouse._query_dicts(
             "SELECT adapter, event_id, seq FROM @timeline_events ORDER BY adapter, event_id"
@@ -4464,3 +4466,128 @@ def test_the_move_fails_the_run_on_a_held_lock_and_never_leaks_its_timeout(wareh
     warehouse.ensure_timeline_tables()
     assert warehouse._query("SHOW lock_timeout") == session_timeout
     assert _time_column_kinds(warehouse, "timeline_events") == {"occurred_at": ""}
+
+
+def test_adapter_queries_and_signatures_unchanged_by_engine_progress_fix():
+    import json
+    payload = [(a.name, a.backfill_sql, a.incremental_sql, a.max_ingest_sql,
+                adapter_definition_signature(a)) for a in TIMELINE_ADAPTERS]
+    assert hashlib.sha256(json.dumps(payload).encode()).hexdigest() == '7782904c6cc6875deab7f59a80bbddbdf971c970e602ac67ec36b984db2a04fd'
+
+
+@pytest.mark.parametrize("name", ["github_commit", "slack_message", "apple_message"])
+def test_incremental_drains_new_rows_before_bounded_replay(name):
+    from dataclasses import replace
+    from personal_data_warehouse.timeline import _AdapterState
+
+    adapter = replace(adapter_by_name(name), batch_size=2)
+    state = _AdapterState(BACKFILL_CURSOR_START, '', True, _NOW, 'old')
+    # Nine stale batches exceed the replay safety limit that used to prevent
+    # the engine from ever reaching the fresh row.
+    def row(event_id, stamp):
+        result = [None] * 14
+        result[0], result[12] = event_id, stamp
+        return tuple(result)
+    stale = [row(f'old-{i:02}', _NOW - timedelta(minutes=1)) for i in range(18)]
+    fresh = row('new', _NOW + timedelta(seconds=1))
+    engine = TimelineSyncEngine.__new__(TimelineSyncEngine)
+    engine._batch_size = 2
+    written = []
+    engine._fetch = lambda sql, params: [r for r in stale + [fresh]
+        if (r[12], r[0]) > (params['watermark_ts'], params['watermark_id'])][:params['limit']]
+    engine._upsert = lambda adapter, rows: written.extend(rows)
+    engine._save_state = lambda *args: None
+    engine._bump_counter = lambda *args: None
+    assert engine._run_incremental(adapter, state, None) == 1
+    assert written[0] == fresh
+    assert state.watermark_ts == fresh[12]
+    # A capped source can skip replay while catching up. Its next quiet pass
+    # still replays late commits without consuming its forward-work budget.
+    written.clear()
+    assert engine._run_incremental(adapter, state, None) == 0
+    assert written and written[0] == stale[0]
+    assert state.watermark_ts == fresh[12]
+
+
+def test_adapter_health_uses_eligible_highwater_and_distinguishes_unmeasured(warehouse):
+    _ensure_all_source_tables(warehouse)
+    warehouse._command("INSERT INTO @timeline_sync_state (adapter, backfill_done, watermark_ingest_ts) VALUES ('github_event', 1, %s)", (_NOW,))
+    row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
+    assert row['status'] == 'unmeasured'
+    warehouse._command("UPDATE @timeline_sync_state SET source_newest_ingest_at = %s, source_measured_at = now() WHERE adapter = 'github_event'", (_NOW,))
+    row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
+    assert row['status'] == 'ok'
+    assert row['ingest_lag_seconds'] == 0
+    warehouse._command("UPDATE @timeline_sync_state SET source_newest_ingest_at = %s WHERE adapter = 'github_event'", (_EPOCH_TS,))
+    row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
+    assert row['status'] == 'ok'
+    assert row['source_newest_ingest_at'] is None
+    warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '2 hours' WHERE adapter = 'github_event'")
+    assert warehouse._query("SELECT status FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0][0] == 'unmeasured'
+
+
+def test_filtered_out_newer_github_event_does_not_create_adapter_backlog(warehouse):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapter = adapter_by_name('github_event')
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+        warehouse._command("UPDATE @github_events SET synced_at = %s WHERE event_type = 'PushEvent'", (_NOW + timedelta(days=10),))
+        engine.run()
+        row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
+        assert row['status'] == 'ok'
+        assert row['ingest_lag_seconds'] == 0
+        assert row['source_newest_ingest_at'] == _NOW
+        # An older overlapping observation cannot overwrite the later one.
+        measured_at = engine._source_highwaters[adapter.name][1]
+        engine._source_highwaters[adapter.name] = (_NOW + timedelta(days=1), measured_at - timedelta(seconds=1))
+        engine._measure_source(adapter)
+        assert warehouse._query("SELECT source_newest_ingest_at FROM @timeline_sync_state WHERE adapter = 'github_event'")[0][0] == _NOW
+        # A failed probe is visible, rather than silently reusing the last
+        # healthy sample; the following successful run recovers it.
+        original = engine._source_highwater
+        def fail_probe(adapter):
+            raise RuntimeError('synthetic measurement failure')
+        engine._source_highwater = fail_probe
+        with pytest.raises(TimelineSyncError):
+            engine.run()
+        assert warehouse._query("SELECT status FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0][0] == 'failing'
+        engine._source_highwater = original
+        engine.run()
+        assert warehouse._query("SELECT status FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0][0] == 'ok'
+    finally:
+        engine.close()
+
+
+def test_incremental_keyset_budget_and_interruption_preserve_watermark():
+    from dataclasses import replace
+    from personal_data_warehouse.timeline import _AdapterState
+    adapter = replace(adapter_by_name('apple_message'), batch_size=1)
+    state = _AdapterState(BACKFILL_CURSOR_START, '', True, _NOW, 'a')
+    rows = []
+    for key in ('b', 'c'):
+        row = [None] * 14
+        row[0], row[12] = key, _NOW
+        rows.append(tuple(row))
+    engine = TimelineSyncEngine.__new__(TimelineSyncEngine)
+    engine._batch_size = 1
+    engine._fetch = lambda sql, p: [r for r in rows if (r[12], r[0]) > (p['watermark_ts'], p['watermark_id'])][:p['limit']]
+    engine._save_state = lambda *args: None
+    engine._bump_counter = lambda *args: None
+    def interrupt(*args):
+        raise RuntimeError('interrupted before write')
+    engine._upsert = interrupt
+    with pytest.raises(RuntimeError):
+        engine._run_incremental(adapter, state, None)
+    assert state.watermark_id == 'a'
+    engine._upsert = lambda *args: None
+    assert engine._run_incremental(adapter, state, None) == 1
+    assert state.watermark_id == 'b'
+    assert engine._run_incremental(adapter, state, None) == 1
+    assert state.watermark_id == 'c'
+    # A spent deadline still permits the first forward batch, preserving the
+    # engine's existing minimum-progress behavior, but never begins replay.
+    state.watermark_id = 'a'
+    assert engine._run_incremental(adapter, state, 0.1) == 1
+    assert state.watermark_id == 'b'

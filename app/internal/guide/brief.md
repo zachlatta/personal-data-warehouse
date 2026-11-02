@@ -34,7 +34,7 @@ after a 42703/42P01 read the server's hint — it lists the real columns — ins
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL via `--file` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
-| Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
+| Other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`, connected `<connection>__<tool>`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'`; built-ins return a plain JSON object (no MCP content array); `--output text` prints it |
 | Put cards in Zach's Feed tab, read his engagement | `pdw feed push\|edit\|remove\|restore\|history\|stats` (topic `feed`) |
 | Setup | `pdw login`, `pdw version`, `pdw update --check`; uploaders: `pdw ingest <source>` (topic `ingest`) |
 

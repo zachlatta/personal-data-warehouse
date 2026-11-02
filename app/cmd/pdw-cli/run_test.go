@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/cliclient"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/mutations"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	pdwserver "github.com/zachlatta/personal-data-warehouse/app/internal/server"
 )
@@ -1107,5 +1109,67 @@ func TestSQLCommandTreatsALeadingSQLCommentAsTheStatement(t *testing.T) {
 	}
 	if input["sql"] != stmt {
 		t.Fatalf("sql = %q", input["sql"])
+	}
+}
+
+func TestCommandRedirectJSONFieldsMatchToolSchemas(t *testing.T) {
+	authSvc := pdwauth.NewService([]byte(cliTestToken), time.Now)
+	cfg := config.Config{BaseURL: "http://example.test", SecretToken: cliTestToken, ObjectStoreBackend: "google_drive", ObjectStoreGoogleDriveFolderID: "test-folder", ObjectStoreGoogleDriveDisableAuth: true}
+	srv := httptest.NewServer(pdwserver.NewMux(cfg, authSvc, cliIntegrationRunner{}, mutations.NewService(nil, mutations.Config{})))
+	defer srv.Close()
+	out, diagnostics, code := runCLI(t, srv.URL, "", "list", "--json")
+	if code != 0 {
+		t.Fatalf("list: %s", diagnostics)
+	}
+	var tools []cliclient.ToolInfo
+	if err := json.Unmarshal([]byte(out), &tools); err != nil {
+		t.Fatal(err)
+	}
+	schemas := map[string]map[string]json.RawMessage{}
+	for _, tool := range tools {
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+			t.Fatal(err)
+		}
+		schemas[tool.Name] = schema.Properties
+	}
+	examples := regexp.MustCompile("pdw call ([a-z_]+) --data '([^']+)'")
+	checked := 0
+	for command, redirect := range commandRedirects {
+		for _, match := range examples.FindAllStringSubmatch(redirect, -1) {
+			var input map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(match[2]), &input); err != nil {
+				continue
+			}
+			checked++
+			properties, ok := schemas[match[1]]
+			if !ok {
+				t.Errorf("%s: tool %s absent", command, match[1])
+				continue
+			}
+			for field := range input {
+				if _, ok := properties[field]; !ok {
+					t.Errorf("%s teaches unknown %s field %s", command, match[1], field)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no redirect JSON examples checked")
+	}
+}
+
+func TestDescribeExplainsBuiltInOutput(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":[{"name":"propose_mutation_help","input_schema":{}},{"name":"remote__list","input_schema":{}}]}`)
+	})
+	for _, name := range []string{"propose_mutation_help", "remote__list"} {
+		out, diagnostics, code := runCLI(t, srv.URL, "", "describe", name)
+		has := strings.Contains(out, "Output: a plain JSON object (no MCP content array); --output text prints it")
+		if code != 0 || has != (name == "propose_mutation_help") {
+			t.Fatalf("%s code=%d out=%s stderr=%s", name, code, out, diagnostics)
+		}
 	}
 }

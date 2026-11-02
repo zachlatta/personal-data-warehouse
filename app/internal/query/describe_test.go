@@ -436,3 +436,16 @@ func TestDescribeTableStillRefusesADeniedOpsRelation(t *testing.T) {
 		t.Fatalf("a denied ops relation must not be described:\n%s", result.CSV)
 	}
 }
+
+func TestDescribeRecoveryHintsNameBothSurfaces(t *testing.T) {
+	svc := NewService(gmailMessagesRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+	for _, relation := range []string{"", "base_gmail.", "zzzzzzzzzzzz"} {
+		got := svc.DescribeTable(context.Background(), relation).Results[0].Error
+		if !strings.Contains(got, "schema_overview") || !strings.Contains(got, "pdw schema") {
+			t.Errorf("%q: %s", relation, got)
+		}
+		if relation != "zzzzzzzzzzzz" && !strings.Contains(got, "pdw columns base_gmail.messages") {
+			t.Errorf("missing describe CLI example: %s", got)
+		}
+	}
+}

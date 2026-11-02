@@ -867,6 +867,9 @@ func runDescribe(client *cliclient.Client, args []string, stdout, stderr io.Writ
 			} else {
 				fmt.Fprintln(stdout, pretty)
 			}
+			if !strings.Contains(t.Name, "__") {
+				fmt.Fprintln(stdout, "\nOutput: a plain JSON object (no MCP content array); --output text prints it")
+			}
 			return 0
 		}
 	}
@@ -1130,6 +1133,9 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 			destination = stdout
 		}
 		printCallJSON(destination, out)
+		if *output == "json" {
+			return 1
+		}
 		fmt.Fprintf(stderr, "pdw call: upstream tool reported isError=true.\n")
 		// An argument error is answered with the schema here and now: in two
 		// real sessions `'schema_name' is a required property` came back
@@ -1140,8 +1146,8 @@ func runCall(client *cliclient.Client, args []string, stdin io.Reader, stdout, s
 				fmt.Fprintf(stderr, "Input schema for %s:\n%s\n", name, schema)
 				return 1
 			}
+			fmt.Fprintf(stderr, "For argument errors, check the exact input schema with: pdw describe %s\n", name)
 		}
-		fmt.Fprintf(stderr, "For argument errors, check the exact input schema with: pdw describe %s\n", name)
 		return 1
 	}
 	// The HTTP tool API returns domain-level errors as 200 with data so it can
@@ -1388,7 +1394,7 @@ var commandRedirects = map[string]string{
 	"connections":     "the CLI lists every connected upstream tool with `pdw list` (`pdw describe <connection>__<tool>` for its arguments) and calls one with `pdw call <connection>__<tool> --data '<json>'`",
 	"connection_call": "call a connected upstream tool with `pdw call <connection>__<tool> --data '<json>'`",
 	// `pdw mutation`: reviewed writes are proposed through the server tools.
-	"mutation": "reviewed writes go through `pdw call propose_mutation_help --data '{\"operation\":\"<provider.op>\"}'` then `pdw call propose_mutation`; `pdw readme mutations` is the guide (`pdw mutations` runs the local Apple workers)",
+	"mutation": "reviewed writes go through `pdw call propose_mutation_help --data '{\"type\":\"<provider.op>\"}'` then `pdw call propose_mutation`; `pdw readme mutations` is the guide (`pdw mutations` runs the local Apple workers)",
 	// `pdw get <ref>` and `pdw get-object <ref>`: five sessions in the fortnight
 	// to 2026-10-10 wanted a hit's whole record and got the global usage.
 	"get":        readHitRedirect,

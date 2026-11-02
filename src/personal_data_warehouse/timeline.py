@@ -162,12 +162,6 @@ class TimelineAdapter:
     # value lets unusually broad dimension invalidations make steady progress
     # without starving later adapters and their refresh windows.
     max_incremental_batches_per_run: int = 0
-    # Drain rows beyond the stored watermark before replaying the lag window.
-    # Sources that restamp more than ``max_stale_batches`` rows inside that
-    # window can otherwise hit the replay safety cap on every pass and never
-    # reach genuinely new rows. The replay still runs after forward catch-up,
-    # so the late-commit protection below remains intact.
-    incremental_forward_first: bool = False
     # When > 0, every sync pass re-walks rows whose event_ts falls in the last
     # N hours and re-upserts them. Classification signals that look forward or
     # arrive late (Zach replying in a chat promotes the surrounding window;
@@ -280,7 +274,6 @@ def _simple_adapter(
     signature_changed_join_sql: str | None = None,
     batch_size: int = TIMELINE_DEFAULT_BATCH_SIZE,
     max_incremental_batches_per_run: int = 0,
-    incremental_forward_first: bool = False,
     refresh_hours: float = 0.0,
     prune_sql: str = "",
     max_ingest_sql: str = "",
@@ -443,7 +436,6 @@ def _simple_adapter(
         priority_expression=priority,
         batch_size=batch_size,
         max_incremental_batches_per_run=max_incremental_batches_per_run,
-        incremental_forward_first=incremental_forward_first,
         refresh_hours=refresh_hours,
         refresh_sql=refresh_sql,
         prune_sql=prune_sql,
@@ -1105,10 +1097,6 @@ _SLACK_MESSAGE = _simple_adapter(
     search_text=_search_concat(_SLACK_DISPLAY_NAME, _SLACK_CONTEXT, "t.text"),
     priority=_SLACK_MESSAGE_PRIORITY,
     batch_size=5000,
-    # The public-channel sweep can restamp >40k rows inside the 15-minute lag
-    # window. Replay-first then hits its eight-page safety cap forever before
-    # reaching the real forward backlog.
-    incremental_forward_first=True,
     # 12h covers the +/-6h engagement window with margin while keeping the
     # per-tick re-walk (~9k rows with window probes) inside the work budget.
     refresh_hours=12,
@@ -1158,7 +1146,6 @@ _SLACK_FILE = _simple_adapter(
         _SLACK_CONTEXT,
     ),
     priority=_SLACK_FILE_PRIORITY,
-    incremental_forward_first=True,
     max_ingest_sql="SELECT max(synced_at) FROM @slack_files",
     changed_join_sql=_SLACK_FILE_INCREMENTAL_CANDIDATES,
     changed_join_anchor="@slack_files t",
@@ -4549,9 +4536,7 @@ class TimelineSyncEngine:
         # First contact: start the incremental watermark at the source's
         # current ingestion high-water so incremental only tails NEW rows,
         # and let the backfill (newest-first) load everything already there.
-        with self._source_conn.cursor() as cursor:
-            cursor.execute(self._source_sql(adapter.max_ingest_sql))
-            max_ingest = cursor.fetchone()[0]
+        max_ingest = self._source_highwater(adapter)
         state = _AdapterState(
             backfill_cursor_ts=BACKFILL_CURSOR_START,
             backfill_cursor_id="",
@@ -4561,6 +4546,27 @@ class TimelineSyncEngine:
         )
         self._save_state(adapter, state)
         return state
+
+    def _source_highwater(self, adapter: TimelineAdapter) -> datetime | None:
+        cache = getattr(self, "_source_highwaters", None)
+        if cache is None:
+            cache = self._source_highwaters = {}
+        if adapter.name not in cache:
+            measured_at = datetime.now(tz=UTC)
+            with self._source_conn.cursor() as cursor:
+                cursor.execute(self._source_sql(adapter.max_ingest_sql))
+                row = cursor.fetchone()
+            cache[adapter.name] = (row[0] if row else None, measured_at)
+        return cache[adapter.name][0]
+
+    def _measure_source(self, adapter: TimelineAdapter) -> None:
+        newest = self._source_highwater(adapter)
+        measured_at = self._source_highwaters[adapter.name][1]
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(self._dest_sql(
+                "UPDATE @timeline_sync_state SET source_newest_ingest_at = %s, "
+                "source_measured_at = %s WHERE adapter = %s AND source_measured_at < %s"
+            ), (newest or BACKFILL_EPOCH, measured_at, adapter.name, measured_at))
 
     def _save_state(self, adapter: TimelineAdapter, state: _AdapterState, error: str = "") -> None:
         with self._dest_conn.cursor() as cursor:
@@ -4689,16 +4695,14 @@ class TimelineSyncEngine:
         # after the previous pass read -- but carries an earlier ingest stamp --
         # is still reachable. See TimelineAdapter.incremental_lag_hours.
         lag = timedelta(hours=adapter.incremental_lag_hours)
-        # Rows at or below this are re-reads of the lag window, not new work.
+        # Always drain new rows first: a dense replay window can exceed the
+        # stale-batch safety limit on every run and otherwise starve new work.
+        # Rows at or below the saved watermark are re-reads, not new work.
         # Counting them would make every converged run report progress it did
         # not make, and `incremental_rows` is what tells an operator whether an
         # adapter is actually moving.
-        forward_phase = bool(lag) and adapter.incremental_forward_first
-        if forward_phase or not lag:
-            cursor_ts, cursor_id = state.watermark_ts, state.watermark_id
-        else:
-            cursor_ts = max(state.watermark_ts - lag, datetime(1970, 1, 1, tzinfo=UTC))
-            cursor_id = ""
+        forward_phase = bool(lag)
+        cursor_ts, cursor_id = state.watermark_ts, state.watermark_id
         while True:
             rows = self._fetch(
                 adapter.incremental_sql,
@@ -4894,10 +4898,7 @@ class TimelineSyncEngine:
         # A source that is paused, slow, or on a skewed clock would otherwise
         # have an empty window and reconcile nothing -- reporting healthy for
         # exactly the reason it is not.
-        with self._source_conn.cursor() as cursor:
-            cursor.execute(self._source_sql(adapter.max_ingest_sql))
-            row = cursor.fetchone()
-        newest_ingest = row[0] if row else None
+        newest_ingest = self._source_highwater(adapter)
         if newest_ingest is None:
             return 0
         window_start = newest_ingest - timedelta(hours=adapter.reconcile_hours)
@@ -5137,6 +5138,7 @@ class TimelineSyncEngine:
         outcome is reported; an adapter that was skipped carries no error.
         """
         self._connect()
+        self._source_highwaters = {}
         deadline = time.monotonic() + max_seconds if max_seconds else None
         stats: list[AdapterSyncStats] = []
         for name in adapter_names:
@@ -5153,14 +5155,19 @@ class TimelineSyncEngine:
             if not self._try_adapter_incremental_lock(adapter):
                 logger.info("timeline fast lane skipped %s: the scheduled pass holds its incremental lock", adapter.name)
                 continue
+            state = None
             try:
                 state = self._load_state(adapter)
+                self._measure_source(adapter)
                 stat.backfill_done = state.backfill_done
                 stat.incremental_rows = self._run_incremental(adapter, state, deadline)
                 self._save_state(adapter, state)
             except Exception as exc:  # noqa: BLE001 - the fast lane never fails ingestion
                 logger.exception("timeline fast lane failed for %s", adapter.name)
                 stat.error = str(exc)
+                # Preserve a failed measurement as a health finding too.
+                if state is not None:
+                    self._save_state(adapter, state, error=str(exc))
             finally:
                 self._release_adapter_incremental_lock(adapter)
         return stats
@@ -5180,6 +5187,7 @@ class TimelineSyncEngine:
         ship it. Incremental sync is never throttled by it.
         """
         self._connect()
+        self._source_highwaters = {}
         deadline = time.monotonic() + max_seconds if max_seconds else None
         stats: dict[str, AdapterSyncStats] = {
             adapter.name: AdapterSyncStats(adapter=adapter.name) for adapter in self._adapters
@@ -5214,6 +5222,7 @@ class TimelineSyncEngine:
             try:
                 state = self._load_state(adapter)
                 states[adapter.name] = state
+                self._measure_source(adapter)
                 if locked:
                     stats[adapter.name].incremental_rows = self._run_incremental(adapter, state, deadline)
                 else:

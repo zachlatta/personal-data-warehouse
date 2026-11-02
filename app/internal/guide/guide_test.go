@@ -245,3 +245,12 @@ func TestConnectionsGuideTeachesSchemaFirstAndOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestCLIGuidesExplainOtherToolOutput(t *testing.T) {
+	for _, topic := range []string{"", "full"} {
+		text := mustRender(t, SurfaceCLI, topic)
+		if !strings.Contains(text, "plain JSON object") || !strings.Contains(text, "no MCP content array") {
+			t.Fatalf("%q omits output shape", topic)
+		}
+	}
+}

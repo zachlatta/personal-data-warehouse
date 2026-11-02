@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,10 +27,17 @@ func TestCallMCPErrorPreservesEnvelopeAndFails(t *testing.T) {
 				fmt.Fprint(w, `{"data":{"isError":true,"error":"also a top-level error","structuredContent":{"detail":"failure-detail"},"content":[{"type":"text","text":"Invalid arguments"},{"type":"image","data":"image-data"}]}}`)
 			})
 			out, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__list", "--output", format)
-			if code != 1 || calls != 2 {
+			wantCalls := 2
+			if format == "json" {
+				wantCalls = 1
+			}
+			if code != 1 || calls != wantCalls {
 				t.Fatalf("code=%d calls=%d stderr=%s", code, calls, diagnostics)
 			}
-			if !strings.Contains(diagnostics, "Input schema for remote__list") || !strings.Contains(diagnostics, `"required":["schema_name"]`) {
+			if format == "json" && diagnostics != "" {
+				t.Fatalf("JSON error wrote stderr: %s", diagnostics)
+			}
+			if format != "json" && (!strings.Contains(diagnostics, "Input schema for remote__list") || !strings.Contains(diagnostics, `"required":["schema_name"]`)) {
 				t.Fatalf("argument error should carry the input schema inline: %s", diagnostics)
 			}
 			preserved := out
@@ -51,8 +60,8 @@ func TestCallMCPErrorWithoutArgumentWordingDoesNotDiscover(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"data":{"isError":true,"content":[{"type":"text","text":"upstream exploded"}]}}`)
 	})
-	_, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__list")
-	if code != 1 || calls != 1 || !strings.Contains(diagnostics, "pdw describe remote__list") {
+	_, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__list", "--output", "text")
+	if code != 1 || calls != 1 || strings.Contains(diagnostics, "For argument errors") {
 		t.Fatalf("code=%d calls=%d stderr=%s", code, calls, diagnostics)
 	}
 }
@@ -210,5 +219,26 @@ func TestCallOutputTextPrintsEmbeddedTextResources(t *testing.T) {
 	}
 	if !strings.Contains(diagnostic, "omitted 1 non-text content block") {
 		t.Fatalf("a blob resource is still omitted loudly: stderr=%s", diagnostic)
+	}
+}
+
+func TestCallJSONErrorCombinedStreamsAreOneDocument(t *testing.T) {
+	srv := newStubServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":{"isError":true,"content":[{"type":"text","text":"Error: x"}]}}`)
+	})
+	out, diagnostics, code := runCLI(t, srv.URL, "", "call", "remote__js", "--output", "json")
+	if code != 1 || diagnostics != "" {
+		t.Fatalf("code=%d stderr=%s", code, diagnostics)
+	}
+	decoder := json.NewDecoder(strings.NewReader(out + diagnostics))
+	var result map[string]any
+	if err := decoder.Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result["isError"] != true {
+		t.Fatalf("lost error: %s", out)
+	}
+	if err := decoder.Decode(&result); err != io.EOF {
+		t.Fatalf("extra output: %v", err)
 	}
 }

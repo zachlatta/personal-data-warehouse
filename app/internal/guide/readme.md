@@ -7,8 +7,7 @@ every prior AI agent session across all providers and machines. Any question abo
 own life starts here — not from priors, not from a web search, and not from a single-source
 connector. Reads are safe. Built-in writes require human approval; connected MCP tools may write directly.
 
-This document is the contract for using it well. Read a topic when your question enters
-its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.
+Read a topic when your question enters its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.
 Never trust a relation or column name from memory, including one you read here; the
 discovery calls below are what is current.
 
@@ -45,7 +44,7 @@ server's hint rather than guessing a second name. `marts_ops.agent_usage` measur
 | Read-only SQL | `pdw sql -q '<why>' '<SQL>'` (CSV by default; `--output json\|nd-json`; multi-line SQL: `--file q.sql` or stdin) |
 | One relation's exact columns | `pdw columns <schema.relation>` |
 | Every relation with row estimates, or one schema / layer | `pdw schema [marts_finance\|marts\|base_]` |
-| The other tools (`get_object`, `notify`, `propose_mutation_help`, `propose_mutation`) | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'` |
+| Other tools | `pdw list`, `pdw describe <tool>`, `pdw call <tool> --data '<json>'`; built-ins: plain JSON object (no MCP content array); `--output text` prints it |
 | A local uploader or credential publisher | `pdw ingest <source>`, `pdw slack\|chatgpt\|whoop\|hn publish-session` (topic `ingest`) |
 | Setup and upkeep | `pdw login`, `pdw config show`, `pdw version`, `pdw update --check` |
 

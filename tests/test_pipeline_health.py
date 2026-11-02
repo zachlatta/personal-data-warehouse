@@ -1186,9 +1186,9 @@ def test_timeline_adapter_health_judges_ingest_lag_against_source_cadence(wareho
     ):
         warehouse._command(
             "INSERT INTO @timeline_sync_state"
-            " (adapter, backfill_done, watermark_ingest_ts, last_run_at, updated_at)"
-            " VALUES (%s, 1, %s, %s, %s)",
-            (adapter, now - age, now, now),
+            " (adapter, backfill_done, watermark_ingest_ts, last_run_at, updated_at, source_newest_ingest_at, source_measured_at)"
+            " VALUES (%s, 1, %s, %s, %s, %s, %s)",
+            (adapter, now - age, now, now, now, now),
         )
         warehouse._command(
             "UPDATE @pipeline_table_freshness SET last_write_at = %s, collected_at = %s"
@@ -1215,8 +1215,8 @@ def test_timeline_adapter_health_judges_ingest_lag_against_source_cadence(wareho
     # idle. Once its newest source row equals the consumed watermark, the
     # adapter is current even if both timestamps are several hours old.
     warehouse._command(
-        "UPDATE @pipeline_table_freshness SET last_write_at = %s"
-        " WHERE table_id = 'finance_transactions'",
+        "UPDATE @timeline_sync_state SET source_newest_ingest_at = %s"
+        " WHERE adapter = 'finance_transaction'",
         (now - timedelta(hours=7),),
     )
     finance = warehouse._query_dicts(

@@ -405,3 +405,13 @@ on-disk page computed to 22123 again, its LSN (`48E/…`) was older than the old
 `verify_heapam` over the whole table found nothing. So the bytes read at that moment were not
 the bytes on disk, and mew's dmesg showed no MCE or EDAC event. Nothing was repaired. Treat a
 repeat on any table as a hardware signal, not as a page to fix.
+
+Timeline adapter lag uses the eligible source high-water measured with that adapter's
+existing filtered probe, rather than the raw table's most recent write. The sync state
+stores `source_newest_ingest_at` and `source_measured_at`; an empty measured source
+has no backlog, while a missing or hour-old measurement reads `unmeasured`. A failed
+probe records the adapter error. Each run reuses one measurement for initialization,
+health, and reconciliation. Incremental sync drains new rows before replaying its
+bounded lag window, so a busy replay window cannot indefinitely hide new work.
+A source's forward batch cap can defer replay until its next quiet pass; the coverage
+reconcile remains the independent repair path for late commits.

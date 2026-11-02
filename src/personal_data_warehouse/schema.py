@@ -2558,6 +2558,8 @@ TIMELINE_SYNC_STATE_COLUMNS = (
     "backfill_rows",
     "incremental_rows",
     "watermark_ingest_ts",
+    "source_newest_ingest_at",
+    "source_measured_at",
     "watermark_event_id",
     "last_run_at",
     "last_error",

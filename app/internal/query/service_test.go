@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 type fakeRunner struct {
@@ -956,5 +958,82 @@ func TestRegexRepetitionHintNamesThe255Cap(t *testing.T) {
 	hint := schemaErrorHint(`ERROR: invalid regular expression: invalid repetition count(s) (SQLSTATE 2201B)`, `SELECT substring(t from '.{0,300}x') FROM a.b t`)
 	if !strings.Contains(hint, "255") || !strings.Contains(hint, "substr") {
 		t.Fatalf("hint = %q", hint)
+	}
+}
+
+func TestMissingRelationRecoveryUsesCatalogAndBothSurfaces(t *testing.T) {
+	cases := []struct{ relation, want, absent string }{
+		{"base_slack.channels", "base_slack.conversations", ""},
+		{"base_slack.messags", "base_slack.messages", ""},
+		{"base_slack.zzzzzzzzzzzz", "pdw schema", "suggestion:"},
+		{"fillout.submissions", "PDW has no schema fillout", "suggestion:"},
+		{"private.zzzzzzzzzzzz", "pdw schema", "PDW has no schema"},
+		{"slack_channels", "use base_slack.conversations", ""},
+	}
+	for _, c := range cases {
+		got := undefinedTableHint(`ERROR: relation "` + c.relation + `" does not exist (SQLSTATE 42P01)`)
+		if !strings.Contains(got, c.want) || (c.absent != "" && strings.Contains(got, c.absent)) {
+			t.Errorf("%s: %s", c.relation, got)
+		}
+		if c.relation == "fillout.submissions" {
+			for _, want := range []string{"pdw list", "pdw call <connection>__<tool>"} {
+				if !strings.Contains(got, want) {
+					t.Error(got)
+				}
+			}
+		}
+	}
+	for _, got := range []string{
+		undefinedTableHint(`ERROR: relation "missing" does not exist (SQLSTATE 42P01)`),
+		undefinedColumnHint(`ERROR: column "unknown" does not exist (SQLSTATE 42703)`, "SELECT unknown FROM base_slack.messages"),
+		integerBooleanHint("argument of NOT must be type boolean, not type bigint"),
+		textJSONHint("operator does not exist: text ->> unknown"),
+		undefinedFunctionHint("function missing() does not exist (SQLSTATE 42883)"),
+	} {
+		if !strings.Contains(got, "pdw ") {
+			t.Errorf("missing CLI spelling: %s", got)
+		}
+	}
+}
+
+func TestSchemaFilterRecoveryNamesCLICommand(t *testing.T) {
+	svc := NewService(overviewRunner(), Options{MaxRows: 5, MaxFieldChars: 100})
+	for _, filter := range []string{"nope", "ops"} {
+		got := svc.SchemaOverviewFiltered(context.Background(), filter).Results[0].Error
+		if !strings.Contains(got, "pdw ") {
+			t.Fatalf("%s: %s", filter, got)
+		}
+	}
+}
+
+func TestCatalogRelationSuggestionsAreBoundedDeterministicAndExcludeDeniedObjects(t *testing.T) {
+	message := `ERROR: relation "base_slack.message" does not exist (SQLSTATE 42P01)`
+	first := undefinedTableHint(message)
+	_, suggestions, ok := strings.Cut(first, "suggestion: ")
+	if !ok {
+		t.Fatal(first)
+	}
+	suggestions, _, _ = strings.Cut(suggestions, ". Run ")
+	if count := len(strings.Split(suggestions, ", ")); count > 3 {
+		t.Fatalf("too many suggestions: %s", first)
+	}
+	for i := 0; i < 20; i++ {
+		if got := undefinedTableHint(message); got != first {
+			t.Fatalf("unstable suggestion: %s vs %s", first, got)
+		}
+	}
+	checked := 0
+	for _, obj := range warehouse.Objects {
+		if obj.Schema != "private" || !obj.IsRelation() || obj.QueryAccess != "denied" {
+			continue
+		}
+		got := undefinedTableHint(`ERROR: relation "private.` + obj.Name + `x" does not exist (SQLSTATE 42P01)`)
+		if strings.Contains(got, "suggestion:") || strings.Contains(got, "PDW has no schema") {
+			t.Fatalf("denied object or hidden schema leaked into suggestion: %s", got)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("test needs denied private catalog relations")
 	}
 }
