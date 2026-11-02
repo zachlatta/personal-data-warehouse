@@ -460,7 +460,7 @@ timeline, and pages Zach.
   timeline row in the same run (fast lane).
 - **Notification:** the outbox trigger pages `direct` rows and, as the one `self` exception,
   `scan_document` rows: Zach is standing at the scanner. The alert opens the event screen,
-  which shows the PDF (`item_media`).
+  whose Open PDF button hands the signed `item_media` link to the phone's PDF viewer.
 - **Words:** `scan_enrichment` runs the shared vision pass (`SCANS_SOURCE`, reading
   `marts_files.attachments`) over the PDF's first page; the adapter folds the result into
   the snippet and search text.

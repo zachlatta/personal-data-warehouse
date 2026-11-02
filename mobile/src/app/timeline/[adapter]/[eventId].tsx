@@ -1,7 +1,7 @@
 import { Image } from 'expo-image';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Alert, Linking, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { OpenInSourceButton } from '@/components/open-in-source-button';
 import { PriorityBadge } from '@/components/priority-badge';
@@ -12,15 +12,19 @@ import { connectFeedLogger, recordUi } from '@/features/feed/engagement';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getTimelineContext,
+  getTimelineItem,
   TIMELINE_CONTEXT_MAX_WINDOW,
   type TimelineContextPage,
   type TimelineItem,
   type TimelineItemDetail,
+  type TimelineMedia,
 } from '@/lib/api';
+import type { AppConfig } from '@/lib/config';
 import { cleanSnippet, dayLabel, formatWhen, humanSource, pretty } from '@/lib/format';
 import { takeEventPaint } from '@/lib/event-paint';
 import { useConfig } from '@/lib/session';
 import { loadTimelineItem, peekTimelineItem, rememberTimelineItems } from '@/lib/timeline-cache';
+import { mediaLinkIsStale, openMediaLabel } from '@/lib/timeline-media';
 
 const HIDDEN_SOURCE_KEYS = new Set(['raw_json', 'raw', 'body_html', 'search_text']);
 const CONTEXT_STEP = 15;
@@ -122,6 +126,54 @@ function ConversationCard({
   );
 }
 
+// "Open PDF" for a scan, a finance document or a Drive PDF: the event's own
+// file goes to the phone's PDF viewer. The signed link lasts an hour, so a
+// screen left open past the fresh window fetches the event again first.
+function OpenMediaButton({
+  media,
+  fetchedAt,
+  config,
+  adapter,
+  eventId,
+}: {
+  media: TimelineMedia | null;
+  fetchedAt: number;
+  config: AppConfig;
+  adapter: string;
+  eventId: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const theme = useTheme();
+  const label = openMediaLabel(media);
+  if (!label || !media) return null;
+  const onPress = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      let url = media.media_url;
+      if (mediaLinkIsStale(fetchedAt, Date.now())) {
+        const fresh = await getTimelineItem(config, adapter, eventId);
+        url = fresh.item_media?.media_url || url;
+      }
+      await Linking.openURL(url);
+    } catch (e) {
+      Alert.alert(`Could not open ${media.filename || 'the PDF'}`, e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={busy}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      style={({ pressed }) => [styles.mediaButton, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder }, (pressed || busy) && styles.pressed]}>
+      <ThemedText style={[styles.mediaButtonText, { color: theme.text }]}>↗  {label}</ThemedText>
+    </Pressable>
+  );
+}
+
 export default function TimelineItemScreen() {
   const { adapter, eventId } = useLocalSearchParams<{ adapter: string; eventId: string }>();
   const config = useConfig();
@@ -131,6 +183,8 @@ export default function TimelineItemScreen() {
   // (body, conversation, source row) fills in when it arrives.
   const [seed] = useState(() => (adapter && eventId ? peekTimelineItem(adapter, eventId) : null));
   const [detail, setDetail] = useState<TimelineItemDetail | null>(null);
+  // When the detail (and so its signed media link) arrived.
+  const [detailAt, setDetailAt] = useState(0);
   const [context, setContext] = useState<TimelineContextPage | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,6 +214,7 @@ export default function TimelineItemScreen() {
       .then((d) => {
         if (d.context) rememberTimelineItems(d.context.items);
         setDetail(d);
+        setDetailAt(Date.now());
         setContext(d.context ?? null);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -235,6 +290,7 @@ export default function TimelineItemScreen() {
           </ThemedText>
         ) : null}
         <OpenInSourceButton link={item.open} />
+        {adapter && eventId ? <OpenMediaButton media={media} fetchedAt={detailAt} config={config} adapter={adapter} eventId={eventId} /> : null}
         {media?.media_kind === 'image' && media.media_url ? <Image source={{ uri: media.media_url }} style={styles.image} contentFit="contain" /> : null}
         {item.snippet ? <ThemedText selectable style={styles.body}>{cleanSnippet(item.snippet)}</ThemedText> : null}
         {error ? (
@@ -311,6 +367,8 @@ const styles = StyleSheet.create({
   senderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
   sender: { flexShrink: 1, fontSize: 15, lineHeight: 20, fontWeight: '600' },
   body: { fontSize: 16, lineHeight: 23 },
+  mediaButton: { alignSelf: 'flex-start', borderRadius: 999, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 9 },
+  mediaButtonText: { fontWeight: '600', fontSize: 15 },
   image: { width: '100%', height: 280, borderRadius: 12 },
   pending: { alignSelf: 'flex-start' },
   fieldsToggle: { alignSelf: 'flex-start', paddingVertical: 4 },
