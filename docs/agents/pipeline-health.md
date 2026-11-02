@@ -412,8 +412,11 @@ stores `source_newest_ingest_at` and `source_measured_at`; an empty measured sou
 has no backlog. A missing measurement reads `late`; a measurement older than one
 hour reads `late`, escalating to `failing` after two hours. These existing statuses
 are counted by the C1 audit and the health page attention filter. A failed
-probe records the adapter error. Each run reuses one measurement for initialization,
-health, and reconciliation. Incremental sync drains new rows before replaying its
-bounded lag window, so a busy replay window cannot indefinitely hide new work.
+probe records the adapter error. Scheduled passes refresh the persisted measurement
+only after 30 minutes; initialization and hourly reconciliation reuse the same
+probe within a pass. The fast lane never probes: it only tails initialized
+adapters, keeping source scans out of message landing. Incremental sync drains new
+rows before replaying its bounded lag window, so a busy replay window cannot
+indefinitely hide new work.
 A source's forward batch cap can defer replay until its next quiet pass; the coverage
 reconcile remains the independent repair path for late commits.

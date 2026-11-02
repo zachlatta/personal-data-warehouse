@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 TIMELINE_SNIPPET_CHARS = 500
 TIMELINE_TITLE_CHARS = 300
 TIMELINE_DEFAULT_BATCH_SIZE = 2000
+SOURCE_MEASUREMENT_INTERVAL = timedelta(minutes=30)
 
 # Priority tiers, classified per row at sync time. Stored in the
 # ``timeline_priority`` Postgres enum so the value is self-describing (the
@@ -4560,6 +4561,15 @@ class TimelineSyncEngine:
         return cache[adapter.name][0]
 
     def _measure_source(self, adapter: TimelineAdapter) -> None:
+        # Persisted cadence survives new engine instances. These probes can
+        # scan large sources, so ordinary five-minute passes reuse the sample.
+        with self._dest_conn.cursor() as cursor:
+            cursor.execute(self._dest_sql(
+                "SELECT source_measured_at FROM @timeline_sync_state WHERE adapter = %s"
+            ), (adapter.name,))
+            row = cursor.fetchone()
+        if row and datetime.now(tz=UTC) - row[0] < SOURCE_MEASUREMENT_INTERVAL:
+            return
         newest = self._source_highwater(adapter)
         measured_at = self._source_highwaters[adapter.name][1]
         with self._dest_conn.cursor() as cursor:
@@ -5133,9 +5143,10 @@ class TimelineSyncEngine:
         message does not wait for the five-minute scheduled pass on top of
         the source's own poll. It does nothing the scheduled pass would not
         do next tick anyway -- no backfill, refresh, prune, reconcile, retire
-        or correspondent refresh -- and it skips rather than waits when the
-        scheduled pass holds an adapter's incremental lock. Every adapter's
-        outcome is reported; an adapter that was skipped carries no error.
+        or correspondent refresh, and no source high-water probes -- and it skips
+        rather than waits when the scheduled pass holds an adapter's incremental
+        lock. Every adapter's outcome is reported; an adapter that was skipped
+        carries no error.
         """
         self._connect()
         self._source_highwaters = {}
@@ -5158,14 +5169,13 @@ class TimelineSyncEngine:
             state = None
             try:
                 state = self._load_state(adapter)
-                self._measure_source(adapter)
                 stat.backfill_done = state.backfill_done
                 stat.incremental_rows = self._run_incremental(adapter, state, deadline)
                 self._save_state(adapter, state)
             except Exception as exc:  # noqa: BLE001 - the fast lane never fails ingestion
                 logger.exception("timeline fast lane failed for %s", adapter.name)
                 stat.error = str(exc)
-                # Preserve a failed measurement as a health finding too.
+                # Preserve an incremental failure as a health finding too.
                 if state is not None:
                     self._save_state(adapter, state, error=str(exc))
             finally:

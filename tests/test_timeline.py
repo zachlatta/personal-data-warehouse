@@ -4534,6 +4534,7 @@ def test_filtered_out_newer_github_event_does_not_create_adapter_backlog(warehou
     try:
         engine.run()
         warehouse._command("UPDATE @github_events SET synced_at = %s WHERE event_type = 'PushEvent'", (_NOW + timedelta(days=10),))
+        warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '31 minutes' WHERE adapter = 'github_event'")
         engine.run()
         row = warehouse._query_dicts("SELECT * FROM @marts_timeline_adapter_health WHERE adapter = 'github_event'")[0]
         assert row['status'] == 'ok'
@@ -4541,7 +4542,8 @@ def test_filtered_out_newer_github_event_does_not_create_adapter_backlog(warehou
         assert row['source_newest_ingest_at'] == _NOW
         # An older overlapping observation cannot overwrite the later one.
         measured_at = engine._source_highwaters[adapter.name][1]
-        engine._source_highwaters[adapter.name] = (_NOW + timedelta(days=1), measured_at - timedelta(seconds=1))
+        warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = %s WHERE adapter = 'github_event'", (measured_at - timedelta(minutes=31),))
+        engine._source_highwaters[adapter.name] = (_NOW + timedelta(days=1), measured_at - timedelta(minutes=32))
         engine._measure_source(adapter)
         assert warehouse._query("SELECT source_newest_ingest_at FROM @timeline_sync_state WHERE adapter = 'github_event'")[0][0] == _NOW
         # A failed probe is visible, rather than silently reusing the last
@@ -4549,6 +4551,7 @@ def test_filtered_out_newer_github_event_does_not_create_adapter_backlog(warehou
         original = engine._source_highwater
         def fail_probe(adapter):
             raise RuntimeError('synthetic measurement failure')
+        warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '31 minutes' WHERE adapter = 'github_event'")
         engine._source_highwater = fail_probe
         with pytest.raises(TimelineSyncError):
             engine.run()
@@ -4591,3 +4594,52 @@ def test_incremental_keyset_budget_and_interruption_preserve_watermark():
     state.watermark_id = 'a'
     assert engine._run_incremental(adapter, state, 0.1) == 1
     assert state.watermark_id == 'b'
+
+
+@pytest.mark.parametrize("fast_lane", [True, False])
+def test_source_probe_is_skipped_on_fast_lane_and_fresh_scheduled_pass(warehouse, monkeypatch, fast_lane):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapter = adapter_by_name("github_event")
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    # A new engine proves the persisted timestamp, rather than an in-memory
+    # cache, controls the cadence. Fast landing must skip even an overdue probe.
+    if fast_lane:
+        warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '3 hours'")
+    engine = _engine(warehouse, adapters=[adapter])
+    def forbidden_probe(adapter):
+        pytest.fail("landing or a fresh scheduled pass ran max_ingest_sql")
+    monkeypatch.setattr(engine, "_source_highwater", forbidden_probe)
+    try:
+        if fast_lane:
+            stats = engine.run_incremental(adapter_names=[adapter.name])
+        else:
+            stats = engine.run()
+        assert not stats[0].error
+    finally:
+        engine.close()
+
+
+def test_scheduled_pass_refreshes_overdue_source_measurement(warehouse, monkeypatch):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    adapter = adapter_by_name("github_event")
+    engine = _engine(warehouse, adapters=[adapter])
+    try:
+        engine.run()
+        warehouse._command("UPDATE @timeline_sync_state SET source_measured_at = now() - interval '31 minutes'")
+        calls = []
+        original = engine._source_highwater
+        def record_probe(adapter):
+            calls.append(adapter.name)
+            return original(adapter)
+        monkeypatch.setattr(engine, "_source_highwater", record_probe)
+        engine.run()
+        assert calls == [adapter.name]
+        assert warehouse._query("SELECT source_measured_at > now() - interval '1 minute' FROM @timeline_sync_state")[0][0]
+    finally:
+        engine.close()
