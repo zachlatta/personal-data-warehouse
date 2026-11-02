@@ -12,6 +12,7 @@ import { AppState } from 'react-native';
 import type { AppConfig } from '@/lib/config';
 
 import { fetchArticle, FeedApiError, type FeedItem } from './api';
+import { knownNotArticle } from './article-fallback';
 import { articleUrl, type FeedArticle } from './article';
 import { recordUi } from './engagement';
 import {
@@ -145,10 +146,15 @@ export function storeArticle(url: string, article: FeedArticle): Promise<void> {
   return job;
 }
 
-function storeFailure(url: string) {
+export function storeFailure(url: string, error: FeedApiError) {
   const idx = loadIndex();
   const now = Date.now();
-  idx.entries[url] = { url, file: '', failed_at: now, images: {}, bytes: 0, saved_at: now, used_at: now };
+  idx.entries[url] = { url, file: '', failed_at: now, failure_reason: error.status === 422 ? 'not_article' : 'unknown', images: {}, bytes: 0, saved_at: now, used_at: now };
+  saveIndex();
+}
+
+export function isKnownNotArticle(url: string): boolean {
+  return knownNotArticle(loadIndex().entries[url], Date.now());
 }
 
 /**
@@ -205,6 +211,7 @@ export async function prefetchSavedCard(config: AppConfig, item: FeedItem): Prom
     if (url && !hasStoredArticle(url)) await storeArticle(url, await fetchArticle(config, url));
   } catch (error) {
     if (isOfflineError(error)) setOffline(true);
+    if (url && error instanceof FeedApiError) storeFailure(url, error);
     // Saving is still valid when the article is unavailable. The reader
     // reports whether it has an offline copy, rather than claiming success.
   }
@@ -243,7 +250,7 @@ export async function prefetchOffline(config: AppConfig, items: FeedItem[], save
             setOffline(true);
           } else {
             failed++;
-            if (e instanceof FeedApiError) storeFailure(url);
+            if (e instanceof FeedApiError) storeFailure(url, e);
           }
         }
       }

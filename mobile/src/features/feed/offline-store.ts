@@ -31,6 +31,7 @@ export type OfflineEntry = {
   // (failed_at says when).
   file: string;
   failed_at: number;
+  failure_reason?: 'not_article' | 'unknown';
   // Keyed by the picture's url as chosen by imageChoice.
   images: Record<string, StoredImage>;
   bytes: number;

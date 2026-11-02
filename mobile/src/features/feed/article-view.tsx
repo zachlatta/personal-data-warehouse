@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 
 import { ThemedText } from '@/components/themed-text';
@@ -8,10 +8,11 @@ import { useTheme } from '@/hooks/use-theme';
 import type { AppConfig } from '@/lib/config';
 import { useConfig } from '@/lib/session';
 
-import { fetchArticle } from './api';
+import { fetchArticle, FeedApiError } from './api';
+import { articleFallback, fetchReadableArticle } from './article-fallback';
 import { createArticleReads } from './article-reads';
 import { articleDocument, parseArticleMessage, readingMinutes, type FeedArticle } from './article';
-import { readStoredArticle, setOffline, storeArticle } from './offline';
+import { isKnownNotArticle, readStoredArticle, setOffline, storeArticle, storeFailure } from './offline';
 import { isOfflineError } from './offline-store';
 import { ACCENT } from './rich-views';
 
@@ -20,7 +21,9 @@ import { ACCENT } from './rich-views';
 const reads = createArticleReads<FeedArticle, AppConfig>(async (url, config) => {
   const local = await readStoredArticle(url);
   if (local) return { article: local, stored: true };
-  const a = await fetchArticle(config, url);
+  if (isKnownNotArticle(url)) throw new FeedApiError(422, 'no readable article on this page');
+  const a = await fetchReadableArticle(url, () => fetchArticle(config, url),
+    (failedUrl) => storeFailure(failedUrl, new FeedApiError(422, 'no readable article on this page')));
   setOffline(false);
   void storeArticle(url, a);
   return { article: a, stored: false };
@@ -39,17 +42,18 @@ export type ArticleOutcome = { ok: true; words: number; ms: number; offline: boo
 
 // The article at url, read by the server and shown in a WebView as tall as
 // its content (the detail view's ScrollView does the scrolling). A tapped
-// link goes to onLink; a page with no article shows nothing but a note, and
-// the detail view's open button is still there.
+// link goes to onLink; a failed online read puts the card's page first.
 export function ArticleView({
   url,
   shownImages,
   onLink,
+  onOpenPage,
   onOutcome,
 }: {
   url: string;
   shownImages: string[];
   onLink: (url: string) => void;
+  onOpenPage: () => void;
   onOutcome: (o: ArticleOutcome) => void;
 }) {
   const config = useConfig();
@@ -59,7 +63,7 @@ export function ArticleView({
   const [ready] = useState(() => reads.peek(url));
   const [article, setArticle] = useState<FeedArticle | null>(ready?.article ?? null);
   const [stored, setStored] = useState(ready?.stored ?? false);
-  const [error, setError] = useState<{ message: string; offline: boolean } | null>(null);
+  const [error, setError] = useState<unknown>(() => isKnownNotArticle(url) ? new FeedApiError(422, 'no readable article on this page') : null);
   const [height, setHeight] = useState(0);
 
   useEffect(() => {
@@ -78,7 +82,7 @@ export function ArticleView({
         const off = isOfflineError(e);
         if (off) setOffline(true);
         onOutcome({ ok: false, error: message, ms: Date.now() - startedAt, offline: off });
-        if (live) setError({ message, offline: off });
+        if (live) setError(e);
       },
     );
     return () => {
@@ -110,14 +114,18 @@ export function ArticleView({
   );
 
   if (error) {
+    const fallback = articleFallback(url, error);
+    if (fallback.kind === 'offline') {
+      return <ThemedText style={[styles.note, { color: theme.textSecondary }]}>{fallback.message}</ThemedText>;
+    }
     return (
-      <ThemedText style={[styles.note, { color: theme.textSecondary }]}>
-        {error.offline
-          ? "You're offline and this article wasn't downloaded yet. It downloads the next time the feed loads online."
-          : 'The full article could not be loaded here. Open the page below to read it.'}
-      </ThemedText>
+      <Pressable accessibilityRole="button" onPress={onOpenPage}
+        style={({ pressed }) => [styles.openPage, { backgroundColor: ACCENT }, pressed && { opacity: 0.8 }]}>
+        <ThemedText style={styles.openLabel}>{fallback.label}</ThemedText>
+      </Pressable>
     );
   }
+
   if (!article || !html) {
     return (
       <View style={styles.loading}>
@@ -191,6 +199,8 @@ export function ArticleWarmup() {
 }
 
 const styles = StyleSheet.create({
+  openPage: { marginHorizontal: Spacing.three, padding: Spacing.three, alignItems: 'center', borderRadius: 12 },
+  openLabel: { color: '#fff', fontSize: 18, fontWeight: '600' },
   warm: { position: 'absolute', width: 1, height: 1, opacity: 0 },
   loading: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingHorizontal: Spacing.three },
   note: { fontSize: 14, paddingHorizontal: Spacing.three },

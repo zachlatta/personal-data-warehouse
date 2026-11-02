@@ -76,6 +76,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   content, in the app's colors and type, under a nonce-only CSP; it hides the article's copy
   of the photo the card already shows, and adds the page's lead image when the card has
   none. Every link tap goes to the in-app browser like any other link.
+  When an inline article fails online, a full-width “Open the page” button opens the card’s primary URL in the tracked browser; a cached 422 shows it immediately for a day, while offline failures keep their offline message.
 - **Ready to read offline** (added 2026-10-26 from Zach's email: "Have pdw feed download
   it's items and articles so stuff is ready to read offline"). After every feed load that
   reaches the server, the phone (`offline.ts`, the plan and bookkeeping in

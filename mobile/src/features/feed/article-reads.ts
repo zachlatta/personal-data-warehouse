@@ -3,7 +3,7 @@
 // before the tap opens the detail view, and the view shows a finished read
 // on its first frame instead of a spinner (on 2026-10-25 the article came
 // 155 to 829 ms after the view opened). A failed read is forgotten, so the
-// next open tries again.
+// next open tries again unless the loader has a fresh stored 422 outcome.
 
 export type ArticleRead<A> = { article: A; stored: boolean };
 

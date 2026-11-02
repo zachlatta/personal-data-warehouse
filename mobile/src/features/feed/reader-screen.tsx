@@ -398,6 +398,7 @@ export default function FeedReaderScreen() {
               <ArticleView
                 url={article}
                 shownImages={media.flatMap((m) => [m.url, m.thumbnail_url ?? ''].filter(Boolean))}
+                onOpenPage={() => void browse(item.url || article, 0)}
                 onLink={onArticleLink}
                 onOutcome={onArticle}
               />
