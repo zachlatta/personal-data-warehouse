@@ -382,8 +382,12 @@ recording against the same 30 s p50.
   `files/recordings/`; each write marks a run due and takes a 60 s auto-expiring kernel
   wakelock, because a memo stopped with the screen off is otherwise followed by suspend
   within a second or two and the upload would wait for the next wake. Runs are at least
-  10 s apart (Recorder writes while it records) and every 5 minutes as the floor; each
-  run holds its own wakelock and is cut at 960 s: the timeout's TERM stops pdw and the
+  2 s apart after the preceding run finishes (Recorder writes while it records),
+  with a run every 5 minutes as the recovery floor. Each
+  successful run reporting finished-but-unsettled audio marks another run due,
+  even if no further filesystem write arrives. The five-second audio settling
+  check stays in place, and uploads remain serial. Each run holds its own wakelock
+  and is cut at 960 s: the timeout's TERM stops pdw and the
   helpers it started (`pdw_run_stoppable` in `bin/_pdw-upload-lib.sh`, shared by every
   Android uploader), and the wakelock lasts 30 s longer so the phone stays awake until
   they exit. A run cut that way is recorded locally as `exit_code=143` and not posted.

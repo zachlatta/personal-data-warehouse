@@ -496,3 +496,80 @@ def test_the_screen_time_service_runs_every_five_minutes_and_keeps_usage_access(
     text = _wrapper("android-screen-time-upload-android")
     assert 'STATE_DIR="${PDW_ANDROID_SCREEN_TIME_STATE_DIR:-/data/misc_ce/0/pdw-android-screen-time}"' in text
     assert '--state-file "$STATE_DIR/android-screen-time-upload.json"' in text
+
+
+def test_recorder_supervisor_retries_settled_audio_without_another_write(tmp_path: Path) -> None:
+    """Execute the shipped loop and wrapper; only OS/provider boundaries are fake.
+
+    A recording is active at 1000, finishes at 1002, and settles at 1007.
+    The last write at 1002 is consumed by an unsettled run. No later write
+    arrives, so the wrapper must requeue it. A write during upload must survive.
+    """
+    import shutil
+
+    state = tmp_path / "state"
+    state.mkdir()
+    module = tmp_path / "module"
+    commands = module / "bin"
+    commands.mkdir(parents=True)
+    recorder = tmp_path / "recorder"
+    (recorder / "databases").mkdir(parents=True)
+    (recorder / "files/recordings").mkdir(parents=True)
+    (state / "clock").write_text("1000")
+    (state / "due").touch()
+    service = (ANDROID_MODULE / "service.sh").read_text()
+    # Redirect device-only paths, keeping the actual scheduling loop unchanged.
+    service = service.replace("/data/misc_ce/0/pdw-google-recorder", str(state))
+    service = service.replace("/data/data/com.google.android.apps.recorder", str(recorder))
+    service = service.replace("/sys/power/wake_lock", str(state / "wake_lock"))
+    service = service.replace("/sys/power/wake_unlock", str(state / "wake_unlock"))
+    (module / "service.sh").write_text(service)
+    shutil.copy(BIN / "google-recorder-upload-android", commands)
+    (commands / LIB).write_text('''
+ pdw_export_app_credentials() { :; }
+ pdw_resolve_bin() { echo "$PDW_BIN"; }
+ pdw_run_stoppable() { shift 3; "$@" >> "$LOG_FILE" 2>&1; }
+ pdw_record_run() { :; }
+ pdw_post_heartbeat() { :; }
+''')
+    fake = commands / "fake"
+    fake.write_text('''#!/usr/bin/env python3
+import os, pathlib, signal, sys, time
+s = pathlib.Path(os.environ["PDW_GOOGLE_RECORDER_STATE_DIR"])
+n = int((s / "clock").read_text())
+cmd = pathlib.Path(sys.argv[0]).name
+if cmd == "getprop": print("1")
+elif cmd == "date": print(n)
+elif cmd == "inotifyd": time.sleep(60)
+elif cmd == "sleep":
+    n += int(sys.argv[1])
+    # Fast-forward idle time to the recovery floor; no writes occur here.
+    if n == 1024: n = 1322
+    (s / "clock").write_text(str(n))
+    if n == 1002: (s / "due").touch()
+    if n == 1016:
+        (s / "paused").touch(); (s / "due").touch()
+    if n == 1022: (s / "paused").unlink()
+    if n >= 1330: os.kill(os.getppid(), signal.SIGTERM)
+elif cmd == "pdw":
+    with (s / "runs").open("a") as f: f.write(str(n) + "\\n")
+    if n == 1008:
+        # A save during the synchronous upload must not be erased afterwards.
+        (s / "due").touch(); (s / "clock").write_text(str(n + 2))
+    print("Google Recorder upload complete: audio=0 sidecars=0 in_progress=%d unsettled=%d missing_audio=0" %
+          (int(n < 1002), 12 if n in (1004, 1012) else int(1002 <= n < 1007)))
+    if n == 1012: sys.exit(1)
+''')
+    fake.chmod(0o755)
+    for name in ("getprop", "date", "inotifyd", "sleep", "pdw"):
+        (commands / name).symlink_to(fake)
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}",
+           "PDW_GOOGLE_RECORDER_STATE_DIR": str(state), "PDW_BIN": str(commands / "pdw")}
+    process = subprocess.Popen(["sh", str(module / "service.sh")], env=env, start_new_session=True)
+    try:
+        process.wait(timeout=45)
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    runs = [int(n) for n in (state / "runs").read_text().splitlines()]
+    assert runs == [1000, 1002, 1004, 1006, 1008, 1012, 1022, 1322]

@@ -62,11 +62,18 @@ duration_seconds="$((finished_at_epoch - started_at_epoch))"
 
 pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 # The service runs this on every write Recorder makes, so a long recording can
-# mean a run every ten seconds. Post the verdict when it matters -- a failure,
+# mean a run every two seconds. Post the verdict when it matters -- a failure,
 # a run that sent something -- and otherwise at most every four minutes, which
 # is still well inside the pipeline's 30-minute run interval.
+# Only a successful finished-recording summary can request a settle retry.
+# The supervisor consumed the triggering write before starting us; keep a new
+# marker so a just-finished file is checked again even without another write.
+summary="$(tail -n 1 "$LOG_FILE")"
+if [ "$exit_code" -eq 0 ] && printf '%s\n' "$summary" | grep -q ' unsettled=[1-9][0-9]* '; then
+  : > "$STATE_DIR/due"
+fi
 last_posted="$(cat "$POSTED_FILE" 2>/dev/null || echo 0)"
-sent="$(tail -n 1 "$LOG_FILE" | grep -c ' audio=[1-9]\| sidecars=[1-9]')"
+sent="$(printf '%s\n' "$summary" | grep -c ' audio=[1-9]\| sidecars=[1-9]')"
 if [ "$exit_code" -ne 0 ] || [ "$sent" -gt 0 ] || [ "$((finished_at_epoch - last_posted))" -ge 240 ]; then
   pdw_post_heartbeat "google_recorder" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
   echo "$finished_at_epoch" > "$POSTED_FILE"

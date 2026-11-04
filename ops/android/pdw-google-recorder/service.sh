@@ -13,7 +13,7 @@
 #   started and stopped with the power button): without it the phone suspends
 #   a second or two after Recorder saves, and the upload waits for the next
 #   time something else wakes it.
-# - The loop below starts a run when one is due (at most one every ten
+# - The loop below starts a run when one is due (at most one every two
 #   seconds, since Recorder writes to its database while it records) or five
 #   minutes have passed, holding its own wakelock for the run.
 #
@@ -38,7 +38,7 @@ REC=/data/data/com.google.android.apps.recorder
 LOG=$STATE/logs/service.log
 WAKE=pdw_google_recorder_run
 FLOOR=300
-MIN_GAP=10
+MIN_GAP=2
 
 umask 077
 
