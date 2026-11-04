@@ -32,7 +32,7 @@ from personal_data_warehouse.capital_one_alerts import (
     UNRESOLVED_METHODS,
 )
 
-PROMPT_VERSION = "capital-one-alert-review-v1"
+PROMPT_VERSION = "capital-one-alert-review-v2"
 #: ops.ai_processing_agent_runs task_type; the pipeline heartbeat scopes to it.
 ALERT_REVIEW_TASK_TYPE = "capital_one_alert_review"
 
@@ -88,6 +88,13 @@ Rules:
   unless you are sure that claim is wrong. Other unresolved alerts on the
   card are listed: two alerts for the same price on the same day are usually
   two purchases, not a duplicate, and each needs its own posted row.
+- Interchangeable purchases: when N open alerts (this one included) and N
+  unclaimed posted rows are the same purchases in any pairing (same merchant,
+  same amounts allowing for the same tip, close dates), any pairing books the
+  ledger correctly. Pair them in order: alerts by (posted_at,
+  gmail_message_id), posted rows by (posted_at, transaction_id), and settle
+  this alert by its position. That is a `high` confidence decision; refusing
+  to choose leaves real purchases unreconciled.
 - Use PDW to check when it helps: read the alert email (Gmail message id
   below), receipts or order emails from the merchant, other alerts.
 - `settled_by`: the posted transaction is this purchase. Give its exact
@@ -96,8 +103,9 @@ Rules:
   doubt and no other alert competes for the row.
 - `not_posted`: the evidence shows this authorization did not post as its
   own charge (a card check, a hold whose final charge is another row or
-  another alert, a cancellation). Give transaction_id "". Use `high` only
-  when you can say what happened to it.
+  another alert, a cancellation). Give transaction_id "". Use `high` when you
+  can say what happened to it: e.g. the merchant's posted charges in the
+  window are all accounted for by other alerts and a week or more has passed.
 - `undetermined`: anything else, including "the charge has probably not
   posted yet". It is retried later.
 
@@ -161,7 +169,11 @@ def review_prompt(
             for row in posted
         ],
         "other_unresolved_alerts_on_this_card": [
-            _jsonable(row, ("posted_at", "amount", "merchant", "match_method")) for row in other_alerts
+            {
+                **_jsonable(row, ("posted_at", "amount", "merchant", "match_method")),
+                "gmail_message_id": str(row.get("source_row_key") or "").partition("|")[2],
+            }
+            for row in other_alerts
         ],
     }
     return f"{INSTRUCTIONS}\n--- alert and candidates ---\n{json.dumps(payload, indent=2)}\n"
@@ -222,7 +234,7 @@ LIMIT %(limit)s
 """
 
 OTHER_ALERTS_SQL = """
-SELECT t.posted_at, t.amount, t.merchant, l.match_method
+SELECT l.source_row_key, t.posted_at, t.amount, t.merchant, l.match_method
 FROM @finance_transaction_links AS l
 JOIN @finance_transactions AS t
     ON t.transaction_id = l.transaction_id AND t.source = %(source)s

@@ -118,7 +118,12 @@ def test_reviewed_tips_and_same_price_repeats_settle_one_to_one(warehouse):
     summary = _runner(warehouse, agent, later).sync()
     assert (summary.reviewed, summary.settled, summary.not_posted) == (3, 2, 1)
     # Each prompt shows the card's other open alerts, so repeats are seen together.
-    assert all("other_unresolved_alerts_on_this_card" in prompt for prompt in agent.prompts)
+    others = [
+        json.loads(prompt.split("--- alert and candidates ---\n", 1)[1])["other_unresolved_alerts_on_this_card"]
+        for prompt in agent.prompts
+    ]
+    # The repeat sees its twin with the message id that orders a pairing.
+    assert any({"m1", "m2"} & {row["gmail_message_id"] for row in rows} for rows in others)
     assert warehouse._query(
         "SELECT count(*) FROM @agent_runs WHERE task_type = %s", (ALERT_REVIEW_TASK_TYPE,)
     ) == [(3,)]
