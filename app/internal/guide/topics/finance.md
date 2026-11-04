@@ -113,13 +113,18 @@ email, not a claim about the exact authorization time.
 
 A unique match by owner/account, currency, merchant, exact amount and a posting date
 within seven days replaces the provisional row with the Plaid or statement row.
+Everything else (a tip, a merchant spelled differently, same-price repeats) is
+decided by an agent two days after the purchase and recorded in
+`derived_finance.alert_reviews` (`decision`, `transaction_id`, `reasoning`); the
+ledger applies a high-confidence decision one-to-one as `alert_agent_review`.
 `derived_finance.transaction_links` retains the email's `account|message_id` as
 `source_row_key` for drill-down. Replays do not add another purchase.
 
 In `marts_finance.transactions`, sum `settled_amount` for actual net flows and
 `active_pending_amount` separately for provisional spending (both signed positive-in).
 Do not sum raw `amount` across all statuses. `reconciliation_status` distinguishes
-`posted`, `pending`, `provisional`, `needs_review`, `authorization_removed`, and
+`posted`, `pending`, `provisional`, `needs_review`, `authorization_removed`,
+`review_not_posted` (an agent found it never posted as its own charge) and
 `expired_unconfirmed`.
 
 An explicit Plaid pending-row removal retires an unambiguously matched alert from

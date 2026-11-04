@@ -4223,6 +4223,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "finance_observations": _events("append-only balance and valuation history"),
     "finance_transactions": _events("one event per deduplicated real-world transaction"),
     "finance_transaction_links": _detail("finance_transactions", "source-row resolution audit"),
+    "finance_alert_reviews": _detail(
+        "finance_transactions",
+        "agent decision settling a Capital One purchase alert against a posted row",
+    ),
     "finance_security_transactions": _detail(
         "finance_transactions", "per-security trade detail behind a brokerage flow"
     ),

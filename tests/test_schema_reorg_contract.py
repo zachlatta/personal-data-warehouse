@@ -197,7 +197,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # back-to-back recordings an agent judged one event.
         # +1 derived: derived_screen_timelapse.descriptions, an agent's reading
         # of each screen frame.
-        "derived": 32,
+        # +1 derived: derived_finance.alert_reviews, an agent's decision on
+        # each Capital One alert exact matching could not settle.
+        "derived": 33,
         # +3 marts: the cross-source entry points marts_messages.messages and
         # marts_voice_memos.recordings/.transcript_segments, which gave the two
         # domains that had per-source views but no unified read interface one.

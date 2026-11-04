@@ -1,8 +1,11 @@
 """Deterministic Capital One email evidence, not a second bank balance feed.
 
 Unknown templates/account identities fail closed. Matching is a one-to-one graph:
-only an unambiguous account/currency/merchant/amount/date edge can reconcile.
-Changed authorizations (including tips) require review, never a guessed merge.
+only an unambiguous account/currency/merchant/amount/date edge reconciles in code.
+Changed authorizations (tips), merchant spellings that differ between the alert
+and the bank, and same-price repeats are never guessed here: an agent reviews
+them (``capital_one_alert_review``) and its recorded decision is applied below,
+after code checks it is possible (same card, posted, a purchase, one-to-one).
 """
 
 from __future__ import annotations
@@ -10,13 +13,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from email.utils import parseaddr
 from typing import Any
 
 SOURCE = "capital_one_alert"
+#: The alert matched a posted row because a reviewing agent said so.
+METHOD_AGENT_REVIEW = "alert_agent_review"
+#: A reviewing agent established the authorization never posted as its own
+#: charge (a temporary hold, a card check, a hold folded into another charge).
+METHOD_REVIEW_NOT_POSTED = "review_not_posted"
+REVIEW_SETTLED_BY = "settled_by"
+REVIEW_NOT_POSTED = "not_posted"
+#: Link methods that leave an alert unresolved; the review pass's worklist.
+UNRESOLVED_METHODS = ("provisional", "needs_review", "expired_unconfirmed")
 SENDER = "capitalone@notification.capitalone.com"
 SUBJECT = "A new transaction was charged to your account"
 _PURCHASE = re.compile(
@@ -89,7 +101,11 @@ def reconcile_alerts(
     sync_version: int,
     *,
     authorizations: Sequence[dict[str, Any]] = (),
+    reviews: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``reviews`` maps an alert's ``source_row_key`` to an agent decision
+    (``decision`` + ``transaction_id``); only decisive, trusted ones belong here."""
+    reviews = reviews or {}
     alerts = {}
     for email in emails:
         alert = parse_purchase_alert(email)
@@ -160,20 +176,52 @@ def reconcile_alerts(
             tid = candidate["transaction_id"]
             claims[tid] = claims.get(tid, 0) + 1
 
+    decided = {}
+    for key, candidates in exact.items():
+        match = candidates[0] if len(candidates) == 1 else None
+        if match is not None and claims[match["transaction_id"]] == 1:
+            decided[key] = match
+    owned = {match["transaction_id"] for match in decided.values()}
+
+    # Reviewed edges only for what code could not settle, and never onto a row
+    # an exact edge owns or that two reviews both claim.
+    reviewed = {}
+    for key, alert in alerts.items():
+        decision = reviews.get(key) or {}
+        if key in decided or decision.get("decision") != REVIEW_SETTLED_BY:
+            continue
+        target = authoritative_by_id.get(str(decision.get("transaction_id") or ""))
+        if (
+            target is not None
+            and target["account_id"] == alert["account_id"]
+            and target["currency"] == alert["currency"]
+            and not target["pending"]
+            and target["amount"] < 0
+            and target["transaction_id"] not in owned
+        ):
+            reviewed[key] = target
+    review_claims: dict[str, int] = {}
+    for target in reviewed.values():
+        review_claims[target["transaction_id"]] = review_claims.get(target["transaction_id"], 0) + 1
+
     rows, links = [], []
     for key, alert in sorted(alerts.items()):
-        candidates = exact[key]
-        match = candidates[0] if len(candidates) == 1 else None
-        if match is not None and claims[match["transaction_id"]] != 1:
-            match = None
+        match = decided.get(key)
+        method = ""
+        if match is not None:
+            method = "alert_pending_successor" if key in native_successors else "alert_amount_merchant_date"
+        elif key in reviewed and review_claims[reviewed[key]["transaction_id"]] == 1:
+            match = reviewed[key]
+            method = METHOD_AGENT_REVIEW
         if match is not None:
             transaction_id = match["transaction_id"]
-            method = "alert_pending_successor" if key in native_successors else "alert_amount_merchant_date"
         else:
             transaction_id = "ft_" + hashlib.sha256(f"{SOURCE}|{key}".encode()).hexdigest()[:24]
             stale = (now.date() - alert["posted_at"].date()).days > 30
             witness = unique_witnesses.get(key)
-            if witness and witness["removed"] and not near[key]:
+            if (reviews.get(key) or {}).get("decision") == REVIEW_NOT_POSTED:
+                method = METHOD_REVIEW_NOT_POSTED
+            elif witness and witness["removed"] and not near[key]:
                 method = "authorization_removed"
             elif near[key] or witnesses[key]:
                 method = "needs_review"

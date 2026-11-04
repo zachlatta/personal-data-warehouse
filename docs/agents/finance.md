@@ -163,9 +163,16 @@ enrichment layer.
 - `derived_finance.transactions` — the unified deduped flow ledger (+
   `derived_finance.transaction_links` audit): one row per real-world money movement across Plaid and
   uploaded statements, plus authenticated Capital One purchase alerts (`pending = 1`). Alerts
-  reconcile only against a unique account/currency/merchant/exact-amount match within seven
-  days; unresolved holds stay provisional, and changed amounts or ambiguous matches need
-  review. `marts_finance.transactions.reconciliation_status` distinguishes these from posted
+  reconcile in code only against a unique account/currency/merchant/exact-amount match within
+  seven days. Capital One reaches Plaid posted-only (no pending row, no
+  `pending_transaction_id`), so a tip, a merchant spelled differently (a truncated name,
+  "Capital One Travel" vs "COT*FLT") or two same-price alerts left 30 alerts
+  open on 2026-11-03. The hourly `capital_one_alert_review` asset asks an agent about every
+  alert still open two days after its purchase, with the posted rows on its card around
+  that date; its decision (`settled_by` a listed row, `not_posted`, `undetermined`) lands
+  in `derived_finance.alert_reviews`, and the next ledger run applies a high-confidence one
+  after checking it is possible and one-to-one (`alert_agent_review`,
+  `review_not_posted`). Undetermined alerts retry daily for a week. `marts_finance.transactions.reconciliation_status` distinguishes these from posted
   spending; sum `settled_amount` and `active_pending_amount` separately. Removed authorizations
   retire; 30-day unmatched alerts expire as unconfirmed, never asserted cancelled. Refunds are
   separate posted credits. Bank-native pending links permit changed final amounts. Alerts never alter balance

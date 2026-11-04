@@ -1405,6 +1405,34 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="only runs when a statement was uploaded",
     ),
     Pipeline(
+        id="capital_one_alert_review",
+        label="Capital One alert review",
+        kind="enrichment",
+        cadence="hourly :37",
+        transport="Dagster capital_one_alert_review → agent container over the ledger",
+        expected_data_interval=None,
+        expected_run_interval=None,
+        # Like receipts, a failed review writes no decision row, so the shared
+        # agent-runs table is the only record a dead pass leaves.
+        state=StateSource(
+            table="agent_runs",
+            updated_column="started_at",
+            status_column="status",
+            error_column="error",
+            scope_column="task_type",
+            # Must equal capital_one_alert_review.ALERT_REVIEW_TASK_TYPE.
+            scope_value="capital_one_alert_review",
+            error_window=timedelta(days=7),
+            history_key_columns=(
+                "task_type",
+                "subject_id",
+                "prompt_version",
+                "input_sha256",
+            ),
+        ),
+        note="only runs when an alert is unresolved two days after the purchase",
+    ),
+    Pipeline(
         id="receipt_enrichment",
         label="Receipt research",
         kind="enrichment",
@@ -1935,6 +1963,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "finance_security_transaction_links": _support("finance_ledger", "created_at"),
     "finance_tax_lots": _support("finance_ledger", "created_at", note="FIFO reduction of the trade ledger"),
     "receipt_transaction_receipts": _data("receipt_enrichment", "updated_at", "purchased_at"),
+    "finance_alert_reviews": _data("capital_one_alert_review", "updated_at", "last_attempt_at"),
     # Shared attachment/media enrichment
     "file_attachment_enrichments": _data("attachment_enrichment", "updated_at", "ai_processed_at"),
     "gmail_attachment_backfill_state": _state("attachment_enrichment", "updated_at"),

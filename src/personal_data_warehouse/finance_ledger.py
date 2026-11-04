@@ -44,7 +44,11 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from personal_data_warehouse.capital_one_alerts import reconcile_alerts
+from personal_data_warehouse.capital_one_alerts import (
+    REVIEW_NOT_POSTED,
+    REVIEW_SETTLED_BY,
+    reconcile_alerts,
+)
 from personal_data_warehouse.postgres import PostgresWarehouse
 from personal_data_warehouse.securities_ledger import (
     SecurityIdentity,
@@ -1651,6 +1655,7 @@ class FinanceLedgerRunner:
             alert_emails, self._load_account_index(),
             list(transaction_rows.values()), now, sync_version,
             authorizations=self._alert_authorizations(all_plaid_rows, plaid_account_map),
+            reviews=self._load_alert_reviews(),
         )
         transaction_rows.update({row["transaction_id"]: row for row in alert_rows})
         link_rows.extend(alert_links)
@@ -2144,6 +2149,19 @@ class FinanceLedgerRunner:
             )
             for row in rows if row["pending"] and (row["account"], row["account_id"]) in account_map
         ]
+
+    def _load_alert_reviews(self) -> dict[str, dict[str, Any]]:
+        # Only decisive, high-confidence agent decisions; reconcile_alerts
+        # still checks each is possible before applying it.
+        rows = self._warehouse._query_dicts(
+            """
+            SELECT source_row_key, decision, transaction_id
+            FROM @finance_alert_reviews
+            WHERE decision IN (%s, %s) AND decision_confidence = 'high'
+            """,
+            (REVIEW_SETTLED_BY, REVIEW_NOT_POSTED),
+        )
+        return {str(row["source_row_key"]): row for row in rows}
 
     def _load_capital_one_alerts(self) -> list[dict[str, Any]]:
         # Gmail is optional on a fresh finance-only warehouse. Do not provision

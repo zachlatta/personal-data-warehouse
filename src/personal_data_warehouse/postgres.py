@@ -77,6 +77,7 @@ from personal_data_warehouse.schema import (
     FINANCE_TAX_LOT_COLUMNS,
     FINANCE_TRANSACTION_COLUMNS,
     FINANCE_TRANSACTION_LINK_COLUMNS,
+    FINANCE_ALERT_REVIEW_COLUMNS,
     MANUAL_FINANCE_DOCUMENT_COLUMNS,
     MUSE_FILE_COLUMNS,
     MANUAL_FINANCE_EXTRACTION_COLUMNS,
@@ -1018,6 +1019,7 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         FINANCE_TRANSACTION_LINK_COLUMNS,
         ("source", "source_row_key"),
     ),
+    "finance_alert_reviews": TableSpec(FINANCE_ALERT_REVIEW_COLUMNS, ("source_row_key",)),
     "finance_security_transactions": TableSpec(
         FINANCE_SECURITY_TRANSACTION_COLUMNS,
         ("transaction_id",),
@@ -4675,6 +4677,7 @@ class PostgresWarehouse:
                 "finance_observations",
                 "finance_transactions",
                 "finance_transaction_links",
+                "finance_alert_reviews",
                 "finance_security_transactions",
                 "finance_security_transaction_links",
                 "finance_tax_lots",
@@ -13549,6 +13552,9 @@ class PostgresWarehouse:
             (keep_keys,),
         )
         return int(removed[0][0]) if removed else 0
+
+    def insert_finance_alert_reviews(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("finance_alert_reviews", rows, FINANCE_ALERT_REVIEW_COLUMNS)
 
     def insert_receipt_transaction_receipts(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows(

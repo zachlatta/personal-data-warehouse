@@ -1207,6 +1207,31 @@ FINANCE_TRANSACTION_LINK_COLUMNS = (
     "sync_version",
 )
 
+# One agent review per Capital One purchase alert that exact matching left
+# unresolved (derived_finance.alert_reviews): which posted ledger row settles
+# it, or that it never posted as its own charge. The finance ledger applies a
+# trusted decision after checking it is possible; the reasoning is the audit.
+FINANCE_ALERT_REVIEW_COLUMNS = (
+    "source_row_key",
+    "alert_transaction_id",
+    "account_id",
+    "decision",
+    "transaction_id",
+    "decision_confidence",
+    "reasoning",
+    "attempt_count",
+    "last_attempt_at",
+    "raw_result_json",
+    "ai_provider",
+    "ai_model",
+    "ai_prompt_version",
+    "ai_elapsed_ms",
+    "agent_run_id",
+    "created_at",
+    "updated_at",
+    "sync_version",
+)
+
 # Unified deduped SECURITY trade ledger (finance.security_transactions): one
 # row per real-world share movement, resolved across sources. The cash ledger
 # above records that money left the account; this records which security, how

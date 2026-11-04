@@ -215,3 +215,91 @@ def test_refund_is_not_used_as_the_purchase_match():
     assert rows == []
     assert links[0]["transaction_id"] == "posted"
     assert sum(t["amount"] for t in bank if not t["pending"]) == 0
+
+
+# An agent's recorded review settles what exact matching cannot: a tip changed
+# the amount, the bank and the alert spell the merchant differently, or two
+# same-price alerts face two same-price posted rows. Code only checks that the
+# decision is internally possible (same card, posted, a purchase, one-to-one).
+
+
+def review(transaction_id="settled", decision="settled_by", key="owner@example.test|mail-1"):
+    return {key: {"decision": decision, "transaction_id": transaction_id}}
+
+
+def test_reviewed_tip_settles_the_alert_against_the_posted_row():
+    settled = posted("settled", amount="-7.00", description="TEST COFFEE ROASTERS")
+    rows, links = reconcile_alerts([email()], [account()], [settled], NOW, 1, reviews=review())
+    assert rows == []
+    assert links[0]["transaction_id"] == "settled"
+    assert links[0]["match_method"] == "alert_agent_review"
+
+
+def test_review_cannot_settle_onto_another_card_a_pending_row_or_a_credit():
+    for bad in (
+        posted("settled", amount="-7.00", account_id="other-card"),
+        posted("settled", amount="-7.00", pending=1),
+        posted("settled", amount="7.00"),
+        posted("settled", amount="-7.00", currency="CAD"),
+    ):
+        rows, links = reconcile_alerts([email()], [account()], [bad], NOW, 1, reviews=review())
+        assert len(rows) == 1, bad
+        assert links[0]["match_method"] != "alert_agent_review"
+
+
+def test_review_naming_a_missing_transaction_is_ignored():
+    rows, links = reconcile_alerts([email()], [account()], [], NOW, 1, reviews=review("gone"))
+    assert len(rows) == 1
+    assert links[0]["match_method"] == "provisional"
+
+
+def test_reviews_resolve_two_same_price_alerts_one_to_one():
+    second = email(message_id="mail-2")
+    bank = [posted("a"), posted("b")]
+    reviews = review("a") | review("b", key="owner@example.test|mail-2")
+    rows, links = reconcile_alerts([email(), second], [account()], bank, NOW, 1, reviews=reviews)
+    assert rows == []
+    assert {link["transaction_id"] for link in links} == {"a", "b"}
+    assert {link["match_method"] for link in links} == {"alert_agent_review"}
+
+
+def test_two_reviews_cannot_claim_one_posted_row():
+    second = email(message_id="mail-2")
+    reviews = review("a") | review("a", key="owner@example.test|mail-2")
+    rows, links = reconcile_alerts(
+        [email(), second], [account()], [posted("a", amount="-7.00")], NOW, 1, reviews=reviews
+    )
+    assert len(rows) == 2
+    assert all(link["match_method"] == "needs_review" for link in links)
+
+
+def test_review_cannot_take_a_row_an_exact_match_already_owns():
+    other = email(
+        message_id="mail-2",
+        body_text=email()["body_text"].replace("$5.97", "$7.00"),
+    )
+    # mail-2 matches "a" exactly; a review pointing mail-1 at "a" must lose.
+    rows, links = reconcile_alerts(
+        [email(), other], [account()], [posted("a", amount="-7.00")], NOW, 1, reviews=review("a")
+    )
+    by_key = {link["source_row_key"]: link for link in links}
+    assert by_key["owner@example.test|mail-2"]["transaction_id"] == "a"
+    assert by_key["owner@example.test|mail-1"]["match_method"] == "needs_review"
+    assert len(rows) == 1
+
+
+def test_reviewed_not_posted_retires_the_alert_from_active_pending():
+    rows, links = reconcile_alerts(
+        [email()], [account()], [], NOW, 1, reviews=review("", decision="not_posted")
+    )
+    assert len(rows) == 1  # The email stays as evidence, never as spending.
+    assert rows[0]["pending"] == 1
+    assert links[0]["match_method"] == "review_not_posted"
+
+
+def test_exact_match_wins_over_a_review():
+    rows, links = reconcile_alerts(
+        [email()], [account()], [posted("exact")], NOW, 1, reviews=review("", decision="not_posted")
+    )
+    assert rows == []
+    assert links[0]["transaction_id"] == "exact"

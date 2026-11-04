@@ -878,6 +878,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "apple_voice_memos_transcription.py",
     "attachment_text_extraction.py",
     "audio_attachment_enrichment.py",
+    "capital_one_alert_review.py",
     "file_attachment_enrichment.py",
     "finance_ledger.py",
     "manual_finance_extraction.py",
@@ -893,6 +894,7 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
     "defs/apple_notes_attachment_enrichment.py",
     "defs/apple_voice_memos_enrichment.py",
     "defs/apple_voice_memos_transcription.py",
+    "defs/capital_one_alert_review.py",
     "defs/finance_ledger.py",
     "defs/gmail_attachment_enrichment.py",
     "defs/manual_finance_extraction.py",
@@ -1125,6 +1127,9 @@ ENRICHMENT_DEDUP_EXEMPT_OR_UPSTREAM_MODULES: dict[str, str] = {
     ),
     "receipt_enrichment.py": (
         "runs over reconciled derived_finance.transactions ledger rows"
+    ),
+    "capital_one_alert_review.py": (
+        "runs over unresolved alert links in derived_finance.transaction_links, one review per alert email"
     ),
     "manual_finance_extraction.py": (
         "runs over base_manual_finance.documents, which deduplicates uploaded files by sha256 on ingest"

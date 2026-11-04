@@ -1954,6 +1954,17 @@
       }
     },
     {
+      "id": "finance_alert_reviews",
+      "kind": "table",
+      "layer": "derived",
+      "domain": "finance",
+      "schema": "derived_finance",
+      "name": "alert_reviews",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "finance_security_transactions",
       "kind": "table",
       "layer": "derived",

@@ -3570,3 +3570,70 @@ def test_a_bridge_with_no_flows_is_behind_a_recent_plaid_posting(warehouse):
     assert warehouse._query_dicts("SELECT value, source FROM @marts_finance_net_worth") == [
         {"value": Decimal("40.0"), "source": "plaid"}
     ]
+
+
+def test_reviewed_alert_settles_a_tipped_charge_and_a_review_of_a_hold_retires_it(warehouse):
+    import json
+    from tests.test_capital_one_alerts import email
+
+    warehouse.ensure_plaid_tables()
+    warehouse.insert_plaid_items([_plaid_item_row(institution_name='Capital One')])
+    warehouse.insert_plaid_accounts([_plaid_account_row(type='credit', subtype='credit card', mask='1234')])
+    warehouse.ensure_tables()
+    tipped = email(account='z@x.test')
+    hold = email(account='z@x.test', message_id='mail-hold',
+                 body_text=tipped['body_text'].replace('$5.97', '$9.99'))
+    for alert in (tipped, hold):
+        warehouse._command(
+            """INSERT INTO @gmail_messages (account, message_id, from_address, subject, body_text, payload_json)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (alert['account'], alert['message_id'], alert['from_address'], alert['subject'],
+             alert['body_text'], json.dumps(alert['payload_json'])),
+        )
+    now = datetime(2026, 9, 16, 18, tzinfo=UTC)
+    # Capital One through Plaid posts without a pending row, so nothing links
+    # the $5.97 authorization to the $7.00 charge with its tip.
+    warehouse.insert_plaid_transactions([_plaid_transaction_row(
+        transaction_id='tipped', amount=7.00, name='TEST COFFEE ROASTERS', merchant_name='Test Coffee',
+        posted_at=now,
+    )])
+    runner = FinanceLedgerRunner(warehouse=warehouse, now=now)
+    runner.sync()
+    status = 'SELECT amount, source, reconciliation_status FROM @marts_finance_transactions ORDER BY amount'
+    assert warehouse._query(status) == [
+        (Decimal('-9.99'), 'capital_one_alert', 'needs_review'),
+        (Decimal('-7.00'), 'plaid', 'posted'),
+        (Decimal('-5.97'), 'capital_one_alert', 'needs_review'),
+    ]
+    posted_id = warehouse._query("SELECT transaction_id FROM @marts_finance_transactions WHERE source = 'plaid'")[0][0]
+
+    def review(key, decision, transaction_id, confidence='high'):
+        return dict(
+            source_row_key=key, alert_transaction_id='', account_id='', decision=decision,
+            transaction_id=transaction_id, decision_confidence=confidence, reasoning='test',
+            attempt_count=1, last_attempt_at=now, raw_result_json='{}', ai_provider='test',
+            ai_model='test', ai_prompt_version='test', ai_elapsed_ms=0, agent_run_id='run',
+            created_at=now, updated_at=now, sync_version=1,
+        )
+
+    # A low-confidence decision is recorded but never applied.
+    warehouse.insert_finance_alert_reviews([review('z@x.test|mail-1', 'settled_by', posted_id, 'medium')])
+    runner.sync()
+    assert warehouse._query(status)[2] == (Decimal('-5.97'), 'capital_one_alert', 'needs_review')
+
+    warehouse.insert_finance_alert_reviews([
+        review('z@x.test|mail-1', 'settled_by', posted_id),
+        review('z@x.test|mail-hold', 'not_posted', ''),
+    ])
+    runner.sync()
+    assert warehouse._query(status) == [
+        (Decimal('-9.99'), 'capital_one_alert', 'review_not_posted'),
+        (Decimal('-7.00'), 'plaid', 'posted'),
+    ]
+    assert warehouse._query(
+        "SELECT match_method FROM @finance_transaction_links WHERE source_row_key = 'z@x.test|mail-1'"
+    ) == [('alert_agent_review',)]
+    assert warehouse._query(
+        'SELECT sum(settled_amount), sum(active_pending_amount) FROM @marts_finance_transactions'
+    ) == [(Decimal('-7.00'), 0)]
+    assert runner.sync().transactions_upserted == 0

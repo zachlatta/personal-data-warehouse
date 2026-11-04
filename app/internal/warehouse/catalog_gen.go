@@ -222,6 +222,7 @@ var Objects = []CatalogObject{
 	{ID: "finance_observations", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "observations", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "finance_transactions", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "transactions", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "finance_transaction_links", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "transaction_links", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "finance_alert_reviews", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "alert_reviews", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "finance_security_transactions", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "security_transactions", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "finance_security_transaction_links", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "security_transaction_links", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "finance_tax_lots", Kind: "table", Layer: "derived", Domain: "finance", Schema: "derived_finance", Name: "tax_lots", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
