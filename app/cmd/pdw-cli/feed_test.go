@@ -199,6 +199,31 @@ func TestFeedHistoryPrintsEachVersionWithItsDiff(t *testing.T) {
 	}
 }
 
+func TestFeedStatsPrintsThePerSourceBlockForTheWindow(t *testing.T) {
+	srv := feedStub(t, `{"since":"2026-11-02T04:00:00Z","sessions":3,"events_by_type":{},"sources":[`+
+		`{"source":"picks","items":40,"items_seen":40,"items_opened":21,"items_engaged":25,"avg_engagement_score":3.25,`+
+		`"window_items_seen":10,"window_items_opened":4,"window_items_engaged":5,"window_avg_engagement_score":2.75},`+
+		`{"source":"x","items":3,"items_seen":3,"avg_engagement_score":7.75,`+
+		`"window_items_seen":0,"window_items_opened":0,"window_items_engaged":0,"window_avg_engagement_score":null}]}`)
+	out, stderr, code := runCLI(t, srv.URL, "", "feed", "stats", "--since", "2d")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	for _, want := range []string{
+		"per source (since 2026-11-02):",
+		"picks                seen=10 opened=4 engaged=5 avg_engagement=2.75 all_time_avg=3.25\n",
+		// Nothing seen in the window is no score, not a score of zero.
+		"x                    seen=0 opened=0 engaged=0 avg_engagement=- all_time_avg=7.75\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "all time)") {
+		t.Fatalf("still labelled all time:\n%s", out)
+	}
+}
+
 func TestFeedGetShowsARemovedCardAndADeletedOnesSnapshot(t *testing.T) {
 	srv := feedStub(t, `{"item":{"item_id":"hn:1","source":"hn","key":"1","title":"T","tags":[],"score":2,"version":4,"removed_at":"2026-10-20T12:00:00Z","removed_reason":"stale","engagement":{"impressions":3}},"versions":4}`)
 	out, _, code := runCLI(t, srv.URL, "", "feed", "show", "hn:1")

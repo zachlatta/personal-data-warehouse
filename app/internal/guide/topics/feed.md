@@ -96,9 +96,10 @@ minutes), and takes 5 off a dismissal (a swipe left or the `...` menu). Rank his
 
 Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
 
-{{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source: cards seen and engaged, open,
-engaged and dismiss rates, average engagement_score, dwell and read time; event counts; the
-most engaged cards; and cards seen twice or more with no engagement. Read it before writing
+{{if .CLI}}`pdw feed stats [--source S] [--since 7d]`{{else}}`feed_stats` `{"source": "...", "since": "7d"}`{{end}} — per source, the cards first seen in the window: seen, opened, engaged and average
+engagement_score, with the all-time average beside it ({{if .CLI}}a source with none seen shows `-`{{else}}`window_avg_engagement_score` is null when none were seen{{end}}, not 0); event counts in the window; the
+all-time most engaged cards; and cards seen twice or more with no engagement. {{if .CLI}}`--output json`{{else}}The result{{end}} also has the all-time
+counts, rates, dismissals, dwell and read time. Read it before writing
 the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the phone shows) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the phone shows) and `feed_events`{{end}} give per card and raw detail.
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,

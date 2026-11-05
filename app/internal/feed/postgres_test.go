@@ -730,3 +730,64 @@ func TestPostgresFeedStatsCountSittings(t *testing.T) {
 		})
 	}
 }
+
+// The per-source block is what a feed job reads before each batch, so the
+// window fields must follow --since while the all-time fields stay as they were.
+func TestPostgresFeedStatsPerSourceHonorsTheWindow(t *testing.T) {
+	store, now := postgresStore(t)
+	tools := Tools(store)
+	call(t, tools, "feed_push", map[string]any{"source": "window-stats", "items": []map[string]any{
+		{"key": "recent", "title": "First seen inside the window"},
+		{"key": "older", "title": "First seen before the window"},
+	}})
+	call(t, tools, "feed_push", map[string]any{"source": "window-stats-stale", "items": []map[string]any{
+		{"key": "older", "title": "This source has had nothing new"},
+	}})
+	defer store.DB.Exec(store.q("DELETE FROM @feed_items WHERE source LIKE 'window-stats%'"))
+	at := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339Nano) }
+	events := []map[string]any{
+		{"event_id": "ws1", "type": "impression", "item_id": "window-stats:recent", "occurred_at": at(-time.Hour), "dwell_ms": 400},
+		{"event_id": "ws2", "type": "impression", "item_id": "window-stats:older", "occurred_at": at(-48 * time.Hour), "dwell_ms": 400},
+		{"event_id": "ws3", "type": "open", "item_id": "window-stats:older", "occurred_at": at(-48 * time.Hour)},
+		// Touching an older card again does not bring it into the window.
+		{"event_id": "ws4", "type": "open", "item_id": "window-stats:older", "occurred_at": at(-time.Hour)},
+		{"event_id": "ws5", "type": "impression", "item_id": "window-stats-stale:older", "occurred_at": at(-48 * time.Hour), "dwell_ms": 400},
+	}
+	mux := http.NewServeMux()
+	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
+	raw, _ := json.Marshal(map[string]any{"events": events})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("POST", APIPath+"/events", bytes.NewReader(raw)))
+	if rec.Code != 200 {
+		t.Fatalf("POST events: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var recentScore float64
+	if err := store.DB.QueryRow(store.q("SELECT engagement_score FROM @marts_feed_item_engagement WHERE item_id = 'window-stats:recent'")).Scan(&recentScore); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := store.Stats(context.Background(), "window-stats", now.Add(-24*time.Hour))
+	if err != nil || len(stats.Sources) != 1 {
+		t.Fatalf("stats: %+v, %v", stats.Sources, err)
+	}
+	got := stats.Sources[0]
+	if got.WindowItemsSeen != 1 || got.WindowItemsOpened != 0 || got.WindowItemsEngaged != 0 {
+		t.Fatalf("window counts = seen %d opened %d engaged %d, want 1 0 0", got.WindowItemsSeen, got.WindowItemsOpened, got.WindowItemsEngaged)
+	}
+	if got.WindowAvgScore == nil || *got.WindowAvgScore != recentScore {
+		t.Fatalf("window average = %v, want the in-window card's %v", got.WindowAvgScore, recentScore)
+	}
+	if got.Items != 2 || got.ItemsSeen != 2 || got.ItemsOpened != 1 || got.AvgScore == nil || *got.AvgScore == recentScore {
+		t.Fatalf("all-time fields moved with the window: %+v", got)
+	}
+
+	// A source with nothing new stays listed, with no average rather than a zero.
+	stale, err := store.Stats(context.Background(), "window-stats-stale", now.Add(-24*time.Hour))
+	if err != nil || len(stale.Sources) != 1 {
+		t.Fatalf("stale stats: %+v, %v", stale.Sources, err)
+	}
+	if s := stale.Sources[0]; s.WindowItemsSeen != 0 || s.WindowAvgScore != nil || s.ItemsSeen != 1 || s.AvgScore == nil {
+		t.Fatalf("stale source: %+v", s)
+	}
+}

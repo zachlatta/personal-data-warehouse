@@ -455,7 +455,9 @@ func (s *Store) Events(ctx context.Context, q EventQuery) ([]Event, error) {
 	return events, rows.Err()
 }
 
-// SourceStats is a row of marts_feed.source_engagement.
+// SourceStats is a row of marts_feed.source_engagement plus the same source's
+// cards first seen in the requested window, from marts_feed.item_engagement.
+// The Window fields follow the window; every other field is all time.
 type SourceStats struct {
 	Source         string     `json:"source"`
 	Items          int64      `json:"items"`
@@ -475,6 +477,11 @@ type SourceStats struct {
 	AvgScore       *float64   `json:"avg_engagement_score"`
 	LastPushedAt   *time.Time `json:"last_pushed_at,omitempty"`
 	LastEventAt    *time.Time `json:"last_event_at,omitempty"`
+
+	WindowItemsSeen    int64    `json:"window_items_seen"`
+	WindowItemsOpened  int64    `json:"window_items_opened"`
+	WindowItemsEngaged int64    `json:"window_items_engaged"`
+	WindowAvgScore     *float64 `json:"window_avg_engagement_score"`
 }
 
 // Stats is the agent's read of how the feed is landing.
@@ -492,10 +499,18 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 	qctx, cancel := s.ctx(ctx)
 	defer cancel()
 	rows, err := s.DB.QueryContext(qctx, s.q(`
-		SELECT source, items, live_items, items_seen, impressions, dwell_ms, items_opened, read_ms, items_engaged,
-		       items_dismissed, open_rate::float8, engaged_rate::float8, dismiss_rate::float8,
-		       avg_engagement_score::float8, last_pushed_at, last_event_at, items_saved, items_liked
-		FROM @marts_feed_source_engagement WHERE ($1 = '' OR source = $1) ORDER BY items DESC, source`), source)
+		SELECT s.source, s.items, s.live_items, s.items_seen, s.impressions, s.dwell_ms, s.items_opened, s.read_ms, s.items_engaged,
+		       s.items_dismissed, s.open_rate::float8, s.engaged_rate::float8, s.dismiss_rate::float8,
+		       s.avg_engagement_score::float8, s.last_pushed_at, s.last_event_at, s.items_saved, s.items_liked,
+		       COALESCE(w.seen, 0), COALESCE(w.opened, 0), COALESCE(w.engaged, 0), w.avg_score::float8
+		FROM @marts_feed_source_engagement s
+		LEFT JOIN (
+			SELECT source, count(*) AS seen, count(*) FILTER (WHERE opens > 0) AS opened,
+			       count(*) FILTER (WHERE engaged = 1) AS engaged,
+			       round(avg(engagement_score)::numeric, 2) AS avg_score
+			FROM @marts_feed_item_engagement WHERE first_seen_at >= $2 GROUP BY source
+		) w ON w.source = s.source
+		WHERE ($1 = '' OR s.source = $1) ORDER BY s.items DESC, s.source`), source, since)
 	if err != nil {
 		return out, err
 	}
@@ -506,7 +521,8 @@ func (s *Store) Stats(ctx context.Context, source string, since time.Time) (Stat
 		)
 		if err := rows.Scan(&row.Source, &row.Items, &row.LiveItems, &row.ItemsSeen, &row.Impressions, &row.DwellMS,
 			&row.ItemsOpened, &row.ReadMS, &row.ItemsEngaged, &row.ItemsDismissed, &row.OpenRate, &row.EngagedRate,
-			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen, &row.ItemsSaved, &row.ItemsLiked); err != nil {
+			&row.DismissRate, &row.AvgScore, &pushed, &lastSeen, &row.ItemsSaved, &row.ItemsLiked,
+			&row.WindowItemsSeen, &row.WindowItemsOpened, &row.WindowItemsEngaged, &row.WindowAvgScore); err != nil {
 			rows.Close()
 			return out, err
 		}

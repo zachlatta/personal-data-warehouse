@@ -226,8 +226,13 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	//
 	// 2026-11-01: scans added the base_scans schema line ("Scans."): 10399.
 	// 10399 is that line and no more.
-	if guidance > 10399 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10399)", guidance)
+	//
+	// 2026-11-05: marts_android_screen_time.daily_usage, one row per real Android
+	// bucket because the base table repeats a bucket per upload, added its schema
+	// line and took "START HERE for screen time." from the base table, which now
+	// reads "Raw, with repeats.": 10493. 10493 is that and no more.
+	if guidance > 10493 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10493)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

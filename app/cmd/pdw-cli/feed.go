@@ -622,12 +622,12 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 			}
 			fmt.Fprintln(w, "events: "+strings.Join(parts, " "))
 		}
-		fmt.Fprintln(w, "per source (all time):")
+		fmt.Fprintf(w, "per source (since %s):\n", strings.SplitN(str(out, "since"), "T", 2)[0])
 		for _, s := range asList(out["sources"]) {
-			fmt.Fprintf(w, "  %-20s items=%d seen=%d engaged=%d opened=%d dismissed=%d avg_engagement=%g dwell=%s read=%s\n",
-				str(s, "source"), int(num(s, "items")), int(num(s, "items_seen")), int(num(s, "items_engaged")),
-				int(num(s, "items_opened")), int(num(s, "items_dismissed")), num(s, "avg_engagement_score"),
-				secs(num(s, "dwell_ms")), secs(num(s, "read_ms")))
+			fmt.Fprintf(w, "  %-20s seen=%d opened=%d engaged=%d avg_engagement=%s all_time_avg=%s\n",
+				str(s, "source"), int(num(s, "window_items_seen")), int(num(s, "window_items_opened")),
+				int(num(s, "window_items_engaged")), averageOrDash(s, "window_avg_engagement_score"),
+				averageOrDash(s, "avg_engagement_score"))
 		}
 		for _, section := range []struct{ key, label string }{{"top_items", "most engaged"}, {"ignored", "seen twice+, no engagement"}} {
 			items := asList(out[section.key])
@@ -739,6 +739,15 @@ func printFeedText(w io.Writer, sub string, raw json.RawMessage) {
 		pretty, _ := json.Marshal(out)
 		fmt.Fprintln(w, string(pretty))
 	}
+}
+
+// averageOrDash prints a null average as "-": a source with no cards seen has
+// no score, and printing 0 would read as a bad one.
+func averageOrDash(m map[string]any, key string) string {
+	if v, ok := m[key].(float64); ok {
+		return fmt.Sprintf("%g", v)
+	}
+	return "-"
 }
 
 func printCardFields(w io.Writer, card map[string]any) {

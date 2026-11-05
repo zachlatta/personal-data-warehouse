@@ -244,6 +244,105 @@ def test_rows_round_trip_through_the_warehouse_and_today_upserts(warehouse) -> N
     assert daily[0]["raw_json"]["app_label"] == "Reader"
 
 
+def _daily_rows(*envelopes) -> list[dict[str, object]]:
+    return [record_to_daily_row(item) for item in envelopes]
+
+
+DAILY_VIEW_COLUMNS = (
+    "usage_kind, package_name, usage_event_type_name, usage_key, bucket_start_at, total_time_in_foreground_ms"
+)
+
+
+def test_daily_usage_view_counts_a_bucket_android_restamped_once(warehouse) -> None:
+    """Android moves a bucket's start by a few seconds, so DailyKey gives its next upload a new key."""
+    warehouse.ensure_android_screen_time_tables()
+    start = 1792780014651
+    day = 24 * 60 * 60 * 1000
+    warehouse.insert_android_screen_time_daily_usage(
+        _daily_rows(
+            envelope({**app_day("first", 1000), "bucket_start_ms": start}, exported_at="2026-10-24T22:40:00+00:00"),
+            # Latest synced wins, even though its start is the earlier of the two.
+            envelope({**app_day("second", 5000), "bucket_start_ms": start - 54}, exported_at="2026-10-31T00:51:00+00:00"),
+            envelope({**app_day("third", 3000), "bucket_start_ms": start + 2127}, exported_at="2026-10-26T00:00:00+00:00"),
+            # The next real bucket, a different app and a device counter stay their own rows.
+            envelope({**app_day("next-day", 7000), "bucket_start_ms": start + day}),
+            envelope({**app_day("other-app", 9000), "package_name": "com.example.other", "bucket_start_ms": start}),
+            envelope({**device_day("device-a"), "bucket_start_ms": start}, exported_at="2026-10-24T22:40:00+00:00"),
+            envelope({**device_day("device-b"), "bucket_start_ms": start + 2127}, exported_at="2026-10-26T00:00:00+00:00"),
+            envelope({**device_day("other-event"), "event_type": 15, "event_type_name": "SCREEN_INTERACTIVE"}),
+            # The same bucket on another device is that device's own row.
+            envelope({**app_day("tablet", 11000), "bucket_start_ms": start}, device="tablet"),
+        )
+    )
+    rows = warehouse._query_dicts(f"SELECT device, {DAILY_VIEW_COLUMNS} FROM @marts_android_screen_time_daily_usage")
+    assert sorted((row["device"], row["usage_key"]) for row in rows) == [
+        ("tablet", "tablet"),
+        ("testphone", "device-b"),
+        ("testphone", "next-day"),
+        ("testphone", "other-app"),
+        ("testphone", "other-event"),
+        ("testphone", "second"),
+    ]
+    kept = next(row for row in rows if row["usage_key"] == "second")
+    assert kept["total_time_in_foreground_ms"] == 5000
+    # The raw copies stay.
+    assert warehouse._query("SELECT count(*) FROM @android_screen_time_daily_usage") == [(9,)]
+    assert "raw_json" not in warehouse._query_dicts(
+        "SELECT * FROM @marts_android_screen_time_daily_usage LIMIT 1"
+    )[0]
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        pytest.param("2026-10-31T18:29:58+00:00", "2026-10-31T18:30:00+00:00", id="straddles-a-truncated-minute"),
+        pytest.param("2026-10-31T18:29:29+00:00", "2026-10-31T18:29:31+00:00", id="straddles-a-rounded-minute"),
+    ],
+)
+def test_daily_usage_view_joins_copies_across_any_minute_boundary(warehouse, first, second) -> None:
+    warehouse.ensure_android_screen_time_tables()
+    warehouse.insert_android_screen_time_daily_usage(
+        _daily_rows(
+            *(
+                envelope({**app_day(key), "bucket_start_ms": int(datetime.fromisoformat(at).timestamp() * 1000)})
+                for key, at in (("a", first), ("b", second))
+            )
+        )
+    )
+    assert warehouse._query("SELECT count(*) FROM @marts_android_screen_time_daily_usage") == [(1,)]
+
+
+def test_daily_usage_view_breaks_a_same_batch_tie_by_the_later_start(warehouse) -> None:
+    warehouse.ensure_android_screen_time_tables()
+    start = 1792780014651
+    warehouse.insert_android_screen_time_daily_usage(
+        _daily_rows(
+            envelope({**app_day("earlier"), "bucket_start_ms": start}),
+            envelope({**app_day("later"), "bucket_start_ms": start + 2000}),
+        )
+    )
+    assert warehouse._query("SELECT usage_key FROM @marts_android_screen_time_daily_usage") == [("later",)]
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "bucket_start_at",
+        "bucket_end_at",
+        "last_time_used_at",
+        "last_time_visible_at",
+        "last_event_at",
+        "exported_at",
+        "synced_at",
+    ],
+)
+def test_daily_usage_view_reports_the_epoch_as_null(warehouse, column) -> None:
+    warehouse.ensure_android_screen_time_tables()
+    row = {**record_to_daily_row(envelope(app_day())), column: datetime.fromtimestamp(0, tz=UTC)}
+    warehouse.insert_android_screen_time_daily_usage([row])
+    assert warehouse._query(f"SELECT {column} FROM @marts_android_screen_time_daily_usage") == [(None,)]
+
+
 class FakeSettings:
     android_screen_time = type(
         "AndroidScreenTime", (), {"google_drive_folder_id": "folder", "google_drive_account": "owner@example.test"}

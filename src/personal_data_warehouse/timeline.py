@@ -4123,13 +4123,15 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     ),
     # Android screen time: device telemetry (~15k usage events a day per
     # device) and Android's own daily totals. Too fine-grained to be timeline
-    # events; read base_android_screen_time directly.
+    # events; read daily totals from marts_android_screen_time.daily_usage,
+    # because the base table holds repeat uploads of one bucket.
     "scan_documents": _events("documents scanned from the scanner's panel"),
     "android_screen_time_events": _entity(
         "per-device usage telemetry (app foreground, screen, lock); not timeline events"
     ),
     "android_screen_time_daily_usage": _entity(
-        "Android's daily screen time totals per app and device; not timeline events"
+        "Android's daily screen time totals per app and device; reached through "
+        "marts_android_screen_time.daily_usage, not timeline events"
     ),
     # Feed tab: agents' cards are entities; the phone's engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).

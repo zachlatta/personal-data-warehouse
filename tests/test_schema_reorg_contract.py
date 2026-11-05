@@ -249,7 +249,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: rolling real-traffic search latency and saturation (C6).
             # +1 marts: marts_ops.agent_top_failures, failed agent calls by shape (C17).
             # +1 marts: marts_ops.answer_benchmark, the C16 answer verdict.
-            "marts": 73,
+            # +1 marts: marts_android_screen_time.daily_usage, one row per real
+            # Android bucket, because the base table repeats a bucket per upload.
+            "marts": 74,
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.

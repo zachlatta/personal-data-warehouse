@@ -404,11 +404,21 @@ this for about ten days, so a device's history starts ten days before its first 
   (`ops/android/pdw-android-screen-time`) runs `bin/android-screen-time-upload-android` every
   5 minutes and re-grants usage access at start. Heartbeat `android_screen_time`. Deployed by
   sysadmin `scripts/install-android-screen-time-upload <ssh host> <device name>`.
-- **Tables.** `base_android_screen_time.events` (`usage_event_type_name`, `package_name`,
-  `class_name`, `event_at`) and `.daily_usage` (`usage_kind` `app`: `total_time_in_foreground_ms`
-  per `package_name`/`app_label`; `device`: `usage_event_type_name` `SCREEN_INTERACTIVE`
-  `total_time_ms` is screen-on time, `KEYGUARD_HIDDEN` `total_time_ms` unlocked time and
-  `event_count` unlocks). Not on the timeline.
+- **Read `marts_android_screen_time.daily_usage` for totals.** `usage_kind` `app`:
+  `total_time_in_foreground_ms` per `package_name`/`app_label`; `device`:
+  `usage_event_type_name` `SCREEN_INTERACTIVE` `total_time_ms` is screen-on time,
+  `KEYGUARD_HIDDEN` `total_time_ms` unlocked time and `event_count` unlocks. Buckets are
+  Android's rolling windows of about 24 h, so a total belongs to its bucket, not to a calendar
+  day; for a true calendar day, pair resume and pause in `base_android_screen_time.events`
+  (`usage_event_type_name`, `package_name`, `class_name`, `event_at`). Not on the timeline.
+- **Why the view exists.** `base_android_screen_time.daily_usage` keeps every upload. `usage_key`
+  hashes the exact bucket start, and Android moved the starts of its historical buckets by up
+  to about 2 s between exports, so one bucket was stored up to three times under new keys:
+  summing the base table gave up to three times the bucket's real total. The view keeps the
+  latest synced row per device, app or event type, and bucket, treating starts under a minute apart as one bucket (a gap, not rounding, because starts drift about
+  20 s a day and would eventually straddle any rounding boundary). Raw rows are not deleted.
+  The cause of the shift is thought to be Android re-stamping its bucket files after a clock
+  correction; only the shift itself is confirmed from the data.
 
 ## Scans (the scanner's panel)
 

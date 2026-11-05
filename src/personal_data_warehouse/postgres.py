@@ -3839,6 +3839,57 @@ _ANDROID_NOTIFICATIONS_TABLES = ("android_notification_events",)
 
 _ANDROID_SCREEN_TIME_TABLES = ("android_screen_time_events", "android_screen_time_daily_usage")
 
+# One row per real bucket. The uploader's usage_key hashes the exact bucket
+# start, and Android has moved the start of its historical buckets by up to
+# about 2 s between exports, so one bucket is stored once per start it has had.
+# Starts under a minute apart are one bucket, and real buckets are about 24 h
+# apart. A gap rule, not rounding: starts drift about 20 s a day, so any fixed
+# rounding boundary eventually splits a pair and double-counts it. Timestamps
+# are translated per the warehouse's epoch convention. raw_json stays in base.
+_ANDROID_SCREEN_TIME_DAILY_USAGE_VIEW = """CREATE OR REPLACE VIEW @marts_android_screen_time_daily_usage AS
+    WITH starts AS (
+        SELECT *,
+               COALESCE(bucket_start_at - lag(bucket_start_at) OVER series >= interval '1 minute', true)
+                   AS starts_bucket
+        FROM @android_screen_time_daily_usage
+        WINDOW series AS (
+            PARTITION BY account, device, usage_kind, package_name, usage_event_type
+            ORDER BY bucket_start_at
+        )
+    ), buckets AS (
+        SELECT *,
+               count(*) FILTER (WHERE starts_bucket) OVER (
+                   PARTITION BY account, device, usage_kind, package_name, usage_event_type
+                   ORDER BY bucket_start_at
+               ) AS bucket_number
+        FROM starts
+    )
+    SELECT DISTINCT ON (account, device, usage_kind, package_name, usage_event_type, bucket_number)
+           account,
+           device,
+           usage_key,
+           usage_kind,
+           NULLIF(bucket_start_at, 'epoch'::timestamptz) AS bucket_start_at,
+           NULLIF(bucket_end_at, 'epoch'::timestamptz) AS bucket_end_at,
+           package_name,
+           app_label,
+           total_time_in_foreground_ms,
+           total_time_visible_ms,
+           total_time_foreground_service_ms,
+           NULLIF(last_time_used_at, 'epoch'::timestamptz) AS last_time_used_at,
+           NULLIF(last_time_visible_at, 'epoch'::timestamptz) AS last_time_visible_at,
+           usage_event_type,
+           usage_event_type_name,
+           event_count,
+           total_time_ms,
+           NULLIF(last_event_at, 'epoch'::timestamptz) AS last_event_at,
+           time_zone,
+           NULLIF(exported_at, 'epoch'::timestamptz) AS exported_at,
+           NULLIF(synced_at, 'epoch'::timestamptz) AS synced_at
+    FROM buckets
+    ORDER BY account, device, usage_kind, package_name, usage_event_type, bucket_number,
+             buckets.synced_at DESC, buckets.bucket_start_at DESC"""
+
 _SCANS_TABLES = ("scan_documents",)
 
 _ANDROID_MESSAGES_TABLES = ("android_messages", "android_message_attachments")
@@ -11833,8 +11884,11 @@ class PostgresWarehouse:
         )
 
     def ensure_android_screen_time_tables(self) -> None:
-        """Provision base_android_screen_time.events and .daily_usage."""
+        """Provision base_android_screen_time.events and .daily_usage, and the
+        marts_android_screen_time.daily_usage read view over them."""
         self._ensure_table_group(list(_ANDROID_SCREEN_TIME_TABLES))
+        self._ensure_view("marts_android_screen_time_daily_usage", _ANDROID_SCREEN_TIME_DAILY_USAGE_VIEW)
+        self._apply_catalog_grant("marts_android_screen_time_daily_usage")
 
     def insert_android_screen_time_events(self, rows: Sequence[Mapping[str, Any]]) -> None:
         """Upsert usage events by (account, device, event_key)."""

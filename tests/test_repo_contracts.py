@@ -788,7 +788,8 @@ BASE_SCHEMA_TIMELINE_INTERMEDIATES: dict[str, tuple[str, ...]] = {
 TIMELINE_EXEMPT_BASE_SCHEMAS: dict[str, str] = {
     "base_android_screen_time": (
         "high-frequency per-app foreground/lock usage telemetry; queried via "
-        "base_android_screen_time rather than timeline.events"
+        "marts_android_screen_time.daily_usage and base_android_screen_time.events "
+        "rather than timeline.events"
     ),
 }
 
