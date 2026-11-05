@@ -15,7 +15,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/pdw ./cmd/pdw-cli
 
 FROM debian:bookworm-slim
 
+# upgrade: the base image can lag a fix (CVE-2026-109518 in apt).
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends ghostscript cups-ipp-utils poppler-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin pdw
