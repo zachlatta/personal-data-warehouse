@@ -16,7 +16,7 @@ const EnabledEnv = "PDW_FEED_ENABLED"
 type Options struct {
 	DatabaseURL string
 	Timeout     time.Duration
-	// Auth wraps the phone's routes; it is the app's static bearer.
+	// Auth wraps the Feed clients' routes (the phone, the web page); it is the app's static bearer.
 	Auth   func(http.Handler) http.Handler
 	Getenv func(string) string
 	Logger *slog.Logger
@@ -34,7 +34,7 @@ func Enabled(getenv func(string) string) bool {
 	return true
 }
 
-// Register mounts the phone's routes on mux and returns the agent tools for
+// Register mounts the clients' routes on mux and returns the agent tools for
 // the shared registry. It is the module's only hook into the app: when the
 // flag is off or there is no database it mounts nothing and returns nil.
 func Register(mux *http.ServeMux, opts Options) []tool.Tool {

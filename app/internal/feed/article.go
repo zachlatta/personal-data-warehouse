@@ -24,10 +24,10 @@ import (
 // A tap on an article card shows the whole article in the detail view
 // (Zach's voice memo, 2026-10-24: "embed the entire article content directly
 // inline instead of me having to tap out ... with the images and all that
-// stuff right there"). The phone asks GET /api/feed/article?url=...; the
+// stuff right there"). A client asks GET /api/feed/article?url=...; the
 // server fetches the page, keeps its readable part with Mozilla's
 // Readability algorithm (go-readability), strips anything that could run,
-// and returns the article as HTML for the phone to show in a WebView.
+// and returns the article as HTML for it to show.
 
 // Article is one page's readable content.
 type Article struct {
@@ -242,7 +242,7 @@ func extractArticle(page []byte, pageURL *url.URL) (*Article, error) {
 	return a, nil
 }
 
-// droppedElements never reach the phone: anything that runs code, takes
+// droppedElements never reach a client: anything that runs code, takes
 // input or loads another page. An iframe (an embedded video or post)
 // becomes a link to what it showed.
 var droppedElements = map[atom.Atom]bool{

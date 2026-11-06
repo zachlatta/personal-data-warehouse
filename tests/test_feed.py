@@ -158,6 +158,28 @@ def test_an_emulator_testing_the_app_is_not_zach(warehouse):
 
 
 @pytestmark_db
+def test_the_laptop_page_counts_as_zach_and_a_simulator_client_does_not(warehouse):
+    wh = warehouse
+    _item(wh)
+    _item(wh, "hn:2")
+    laptop = {"session_id": "l", "client_name": "crobat-web", "device": "crobat"}
+    _event(wh, "l0", "session_start", item_id="", metadata='{"trigger": "launch", "update_id": "web"}', **laptop)
+    _event(wh, "l1", "impression", minutes=1, dwell_ms=4000, fraction=1.0, **laptop)
+    _event(wh, "l2", "open", minutes=2, metadata='{"mode": "browser", "url": "https://a.test", "link_index": 0}', **laptop)
+    _event(wh, "l3", "session_end", item_id="", minutes=3, dwell_ms=5000, metadata='{"reason": "background"}', **laptop)
+    # A check of the page under a simulator client marks nothing seen.
+    test_client = {"session_id": "t", "client_name": "crobat-web-simulator", "device": "crobat"}
+    _event(wh, "t0", "session_start", item_id="", minutes=4, **test_client)
+    _event(wh, "t1", "impression", item_id="hn:2", minutes=5, dwell_ms=9000, fraction=1.0, **test_client)
+    assert wh._query("SELECT session_id, device, trigger, end_reason, duration_ms, impressions, opens FROM @marts_feed_sessions") == [
+        ("l", "crobat", "launch", "background", 5000, 1, 1)
+    ]
+    assert wh._query("SELECT item_id, impressions, opens FROM @marts_feed_item_engagement ORDER BY item_id") == [
+        ("hn:1", 1, 1), ("hn:2", 0, 0)
+    ]
+
+
+@pytestmark_db
 def test_saved_is_the_latest_of_save_and_unsave_and_scores_like_a_share(warehouse):
     wh = warehouse
     _item(wh)

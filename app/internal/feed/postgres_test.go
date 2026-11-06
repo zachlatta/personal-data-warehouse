@@ -190,7 +190,7 @@ func feedEndToEnd(t *testing.T, store *Store, tools []tool.Tool, now time.Time) 
 		t.Fatalf("ranked feed: %s", got)
 	}
 
-	// The phone: GET the feed and POST engagement, behind the app's auth.
+	// A client: GET the feed and POST engagement, behind the app's auth.
 	mux := http.NewServeMux()
 	(&handler{store: store, logger: discardLogger()}).register(mux, func(h http.Handler) http.Handler { return h })
 	res := httptest.NewRecorder()
@@ -471,7 +471,7 @@ func TestPostgresFeedSavedQueue(t *testing.T) {
 		t.Fatalf("an agent's save says so: %v", meta)
 	}
 
-	// The phone gets the queue with the feed, and it outlives a removal.
+	// A client gets the queue with the feed, and it outlives a removal.
 	call(t, tools, "feed_remove", map[string]any{"item_id": watch, "reason": "stale"})
 	res := httptest.NewRecorder()
 	mux.ServeHTTP(res, httptest.NewRequest("GET", APIPath, nil))
@@ -542,7 +542,7 @@ func TestPostgresFeedResurfacesSeenCardsWhenUnseenRunOut(t *testing.T) {
 		t.Fatalf("resurfaced feed: %v", got)
 	}
 	if !strings.Contains(res.Body.String(), `"resurfaced":true`) {
-		t.Fatalf("the phone is told which cards are resurfaced: %s", res.Body.String())
+		t.Fatalf("a client is told which cards are resurfaced: %s", res.Body.String())
 	}
 
 	// A full page of unseen cards resurfaces nothing.

@@ -1,9 +1,14 @@
-# Feed: cards on Zach's phone, and what he does with them
+# Feed: cards on Zach's phone and laptop, and what he does with them
 
-The PDW phone app has a **Feed** tab: full-width cards Zach scrolls like a social feed, with no
-unread count. Agents fill it; the phone records everything he does with each card. It is
+The PDW phone app has a **Feed** tab, and the web app a **`/feed`** page with the same cards in
+the same order: full-width cards Zach scrolls like a social feed, with no unread count. Agents
+fill it; both record what he does with each card. It is
 for things worth his attention that are not messages to him: links, stories, briefings,
 finds. Do not put a reply someone is waiting on here (that is {{if .CLI}}`pdw call notify`{{else}}`notify`{{end}} or a mutation).
+
+**The page counts as Zach.** Its client name is fixed, so any browser on the live `/feed`,
+including an agent's, marks his cards seen and removes them from the fresh part on his phone.
+Check it only against a local database with fake cards.
 
 ## Pushing cards
 
@@ -42,7 +47,7 @@ Stdin also takes a JSON array of cards, one card object, or JSON Lines.{{else}}`
   card's compass button go to.
 - `score` ranks (higher first; {{if .CLI}}`pdw feed rank ID...`{{else}}`feed_rank`{{end}} sets many at once).
   An order list puts those cards above every card you did not list, best first; use {{if .CLI}}`--score`{{else}}`scores`{{end}} to place cards at exact weights.
-  The phone
+  The Feed
   shows cards he has not seen first: a card leaves that part at its first impression (half of
   it on screen), so every hourly batch must be new cards. The feed never shows empty: after
   the unseen cards come seen ones he passed over (no open, share, save or 5 s on screen),
@@ -100,7 +105,7 @@ Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts auto
 engagement_score, with the all-time average beside it ({{if .CLI}}a source with none seen shows `-`{{else}}`window_avg_engagement_score` is null when none were seen{{end}}, not 0); event counts in the window; the
 all-time most engaged cards; and cards seen twice or more with no engagement. {{if .CLI}}`--output json`{{else}}The result{{end}} also has the all-time
 counts, rates, dismissals, dwell and read time. Read it before writing
-the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the phone shows) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the phone shows) and `feed_events`{{end}} give per card and raw detail.
+the next batch, and write less of what he skips. {{if .CLI}}`pdw feed list` (`--view feed` is exactly what the Feed shows him) and `pdw feed events`{{else}}`feed_list` (`view: "feed"` is exactly what the Feed shows him) and `feed_events`{{end}} give per card and raw detail.
 
 In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressions`,
 `dwell_ms`, `scroll_pasts` (impressions under 1 s), `opens`, `links_opened`, `read_ms`,
@@ -109,7 +114,7 @@ In SQL: `marts_feed.item_engagement` (one row per card: `link_count`, `impressio
 `dwell_ms`, `visible_fraction`, `position`, `session_id`, `metadata`; an open's
 `metadata.url` and `link_index` say which link; `metadata.mode` is `detail`, `browser`
 or `video`; a `media` event is a carousel swipe or video play with `metadata.index`). An impression is one stretch of a card at
-least half on screen, with how long and how much of it was visible. All times (`dwell_ms`, `read_ms`, watch time) are active time since 2026-10-24: the app in front and touched in the last minute, or a video or link open; time in another app, a locked phone or an untouched screen does not count (`metadata.wall_ms` keeps the clock time). Before that they were clock time, and a detail view's time also counted the links and videos opened from it, so a long read before 2026-10-24 may be the phone left open. The marts count only Zach: events from a build under test (the Android emulator, an iOS simulator) stay in `base_feed.events` and are left out of `item_engagement` and `sessions`, so an agent checking the app never marks a card seen for him. A `share` is the paper plane that
+least half on screen, with how long and how much of it was visible. All times (`dwell_ms`, `read_ms`, watch time) are active time since 2026-10-24: the app or tab in front and touched in the last minute, or a video or link open on the phone; time in another app or tab, a locked phone or an untouched screen does not count (`metadata.wall_ms` keeps the clock time). Before that they were clock time, and a detail view's time also counted the links and videos opened from it, so a long read before 2026-10-24 may be the phone left open. The marts count only Zach, on either device (`device` is `crobat` for the page): events from a build under test (the Android emulator, an iOS simulator) stay in `base_feed.events` and are left out of `item_engagement` and `sessions`, so an agent checking the app never marks a card seen for him. A `share` is the paper plane that
 opened a mail draft to send the card to someone. Opens, shares, saves, likes and dismissals
 are also timeline events (source `feed`, tier `self`); impressions and sessions are not.
 
@@ -117,7 +122,7 @@ How he uses the feed itself (Zach asked on 2026-10-20 to log everything and quer
 `marts_feed.sessions` joins consecutive raw sessions on one device when the recorded
 or measured end-to-start gap is nonnegative and under two minutes. `sitting_id` and
 `session_id` name the first session; duration sums active time without gaps. Detail
-and browser views retain the mobile session; backgrounding ends it. Clients preceding the session fix prepared on 2026-10-31
+and browser views retain the mobile session; backgrounding ends it, and on the page a hidden tab or leaving `/feed` ends it. Clients preceding the session fix prepared on 2026-10-31
 may record empty `session_id`; eligible events within a sitting interval
 are attributed by device, extending blur-ended intervals to the next start without
 merging longer gaps or changing raw data. Stats counts these sittings,

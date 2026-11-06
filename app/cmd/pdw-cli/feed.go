@@ -79,7 +79,7 @@ PROVENANCE FLAGS (push, update, remove, restore, rank)
   --reason TEXT     Why; kept on the version.
 
 READ FLAGS
-  --view VIEW       list: recent (default), feed (exactly what the phone shows) or
+  --view VIEW       list: recent (default), feed (exactly what the Feed shows him) or
                     saved (his read-later queue, newest saved first).
   --all             list: include removed and dismissed cards.
   --url URL         list: only cards with this url, key or link (repeatable). Check a

@@ -243,13 +243,14 @@ Notes:
 
 ## Web app: timeline, search, and mutation review
 
-The Go app serves a browser single-page app at `/timeline`, `/search` and `/mutation-review`
+The Go app serves a browser single-page app at `/timeline`, `/feed`, `/search` and `/mutation-review`
 (`app/internal/webapp`, static ES modules embedded in the binary — no build step, no CDN). It
 renders nothing server-side: every view reads the **same bearer-protected JSON API the phone app
-uses** (`/api/timeline*`, `/api/mutations/*`, `POST /api/tools/search`), so the web and the phone
+uses** (`/api/timeline*`, `/api/feed*`, `/api/mutations/*`, `POST /api/tools/search`), so the web and the phone
 cannot disagree about what a request or an event looks like. Sign in by pasting
 `PDW_SECRET_TOKEN` once; the browser keeps it in localStorage and sends it as
-`Authorization: Bearer web:<token>`, the same credential the CLI and the phone use. There is no
+`Authorization: Bearer web:<token>` (`crobat-web:<token>` from `/feed`, whose events count as Zach:
+see [docs/feed.md](docs/feed.md)), the same credential the CLI and the phone use. There is no
 separate review password any more: `PDW_MUTATION_UI_PASSWORD`, `PDW_MUTATION_UI_SESSION_SECRET`
 and `PDW_MUTATION_UI_SESSION_TTL_SECONDS` are ignored and reported as deprecated at startup.
 

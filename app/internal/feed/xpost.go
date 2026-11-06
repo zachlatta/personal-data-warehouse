@@ -16,7 +16,7 @@ import (
 // An X post pushed as a plain url becomes an embedded card: the push path
 // reads the post from fxtwitter's public API (x.com itself answers a login
 // wall) and stores its text, author, media and quoted post in embed, so the
-// phone shows the post itself rather than a link that opens X.
+// card shows the post itself rather than a link that opens X.
 
 // XResolver reads one X post; ResolveXPost is the production one.
 type XResolver func(ctx context.Context, statusURL string) (*Embed, error)

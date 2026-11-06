@@ -1,6 +1,6 @@
 # The Feed tab
 
-A card feed in the PDW phone app that agents fill through `pdw feed` (or the `feed_*` MCP
+A card feed in the PDW phone app, and on a page in the web app, that agents fill through `pdw feed` (or the `feed_*` MCP
 tools), with detailed engagement logging into the warehouse. Built 2026-10-20 from Zach's
 request for a Muse-style feed he owns, measured the way a social feed measures its readers.
 Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
@@ -11,9 +11,9 @@ Agents: the how-to is `pdw readme feed` (`app/internal/guide/topics/feed.md`).
 agent ── pdw feed push / feed_push ──▶ app (app/internal/feed) ──▶ base_feed.items
 agent ── pdw feed get / edit / remove / restore / history ──▶ the same tools
                          every change ──trigger──▶ base_feed.item_versions (append-only)
-phone ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved),
+phone, web ── GET /api/feed ◀── ranked unseen live cards (score, freshness, sources interleaved),
                            then resurfaced seen-but-skipped cards so it is never empty
-phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement / sessions
+phone, web ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_feed.item_engagement / source_engagement / sessions
                                                   └──▶ timeline.events (open / dismiss, tier self)
 ```
 
@@ -123,7 +123,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   classified from what changed. `internal.feed_item_versions_immutable` refuses UPDATE,
   DELETE and TRUNCATE on the versions table. A hard DELETE of a card leaves a `delete`
   tombstone whose snapshot is the card as it was, and `restore` recreates it from that.
-- **Events** (`base_feed.events`) are written by the phone with device-generated ids, so a
+- **Events** (`base_feed.events`) are written by the phone and the web page with device-generated ids, so a
   retried batch is counted once. **Every duration is active time** (since 2026-10-24, from Zach:
   "Don't count inactive time as spending time on it"; `mobile/src/features/feed/active-time.ts`):
   time counts while the app is in front and he touched it in the last minute, or while a
@@ -244,7 +244,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
 
   Autoplay (`metadata.autoplay = true`) is not engagement. `autoplays` counts automatic starts, and `watch_ms` records inline video viewing separately from reading. Inline video closes also count as reading only when their autoplay flag is false; historical closes without that flag count as reading when the item has a user-started media event. Unmuting an autoplay does not record a user-started play.
 
-  The phone shows unseen cards first: a
+  The feed shows unseen cards first: a
   card leaves that part at its first impression (Zach, 2026-10-20: "after I've seen a post,
   don't show it to me again"; `store.go` `Feed`), and saved cards stay in Saved. The feed is
   never empty (Zach, 2026-10-21: "just have it always have more stuff"): when the unseen
@@ -259,7 +259,7 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
   `marts_feed.item_engagement`: seen, opened, engaged, average score, `-` when none were seen),
   with the all-time average beside it. All-time items, dismissals, dwell and read time stay in the
   JSON, because a stale all-time score must not read as how a source is doing now.
-  The marts count only Zach's phones: events from a build under test (client `android-emulator`,
+  The marts count only Zach's devices (his phones and the web page): events from a build under test (client `android-emulator`,
   device `sdk_gphone*`, or a `*simulator*` client) are kept in `base_feed.events` but left out
   (`TEST_CLIENT_SQL` in `feed.py`). On 2026-10-24 an agent checking video autoplay on the emulator
   scrolled the live feed, and its impressions marked 15 cards as seen, so they left his unseen feed.
@@ -269,9 +269,45 @@ phone ── POST /api/feed/events ──▶ base_feed.events ──▶ marts_fe
 - **C7**: pipeline `feed` with no freshness expectation (it is quiet when nobody pushes or
   reads); `marts_ops.pipeline_health` still shows its last write.
 
-The phone keeps unsent events in `Documents/pdw-feed-outbox.json`, sends them every 15 s, at
+The phone (the page's outbox is under [The page on the laptop](#the-page-on-the-laptop)) keeps unsent events in `Documents/pdw-feed-outbox.json`, sends them every 15 s, at
 40 queued, and when the tab or app goes to the background, and backs off up to 5 minutes
 when offline. A batch the server refuses as malformed (400) is dropped rather than retried.
+
+## The page on the laptop
+
+`/feed` in the web app (added 2026-11-06; request: "I want to basically replace all my web
+browsing with it"). `app/internal/webapp/static/feed.js` draws one column in exactly the order
+`GET /api/feed` served, with no cached paint, so a first paint cannot flash a card. A card shows its
+title, text, one picture, links and Hacker News counts; an X post shows its author, text and first
+photo. Pictures sit in a box whose shape is known before they load (`.fpic`, 1.91:1 unless the card
+gives a size), so a late image never moves a card. Every link opens a new tab and records an
+`open` (`mode` `browser`; `via` `card`, `link`, `body_link` or `post_link`; `url`; `link_index`).
+Time in that other tab counts nothing, and there is no `close` for it. **Not on this page yet:**
+like, save, hide, keys, the article reader and inline video (a video shows its poster, which opens
+the link), and a reload picks up new cards.
+
+- **It counts as Zach.** Its client is `crobat-web` and its device `crobat`, fixed because a browser
+  cannot read its hostname: another machine's browser would be mislabelled and still count. **Any
+  browser on the live `/feed`, including an agent's, marks his cards seen and removes them from the
+  fresh part on his phone. Check it only against a local database with fake cards.** There is no
+  test switch in the product.
+- **Same rules as the phone, ported, not shared.** The web app has no build step, so
+  `feed_log.js` holds line-for-line copies of `active-time.ts`, `viewability.ts`, `event-queue.ts`
+  and the logger in `engagement.ts`, and `feed_card.js` the markdown, link and card-context rules.
+  Change a rule in both; `tests/feed.test.mjs` reuses the phone's test numbers.
+- **A hidden tab measures nothing.** A tab opened in the background does not load or start a sitting
+  until it is first visible, and a list that arrives while hidden waits, because any stretch that
+  reaches 50% is an impression and one impression takes a card out of the fresh part. Hiding the tab
+  ends the sitting (`reason` `background`); leaving `/feed` for another view ends it (`blur`). Both end
+  every open stretch first, so each hide is a new impression and sub-300 ms ones are possible on a
+  quick flick through the tab. `session_start` has `trigger` `launch`, `foreground` or `focus`,
+  and `app_version`, `update_id` and `channel` all read `web`.
+- **`scroll` here** is one scroll from first move to 150 ms at rest, without the phone's `drag_ms`,
+  `release_velocity` and `momentum`, which need a finger.
+- **Outbox:** `localStorage` (`pdw_feed_outbox`, at most 5,000 events, read on every use because two
+  tabs share it), sent every 15 s, at 40 queued, and on every sitting's end with one `fetch` keepalive
+  under the browser's 64 KB limit. What does not fit is sent on the next visit, so a card can take
+  that long to leave the phone's fresh part.
 
 ## Agent commands
 
@@ -288,7 +324,7 @@ An order list puts those cards above every card you did not list, best first; us
 ## Turning it off
 
 - Server: set `PDW_FEED_ENABLED=0` on the app deployment. No routes, no tools; the phone's
-  tab then says the feed is off.
+  tab and the web page then say the feed is off.
 - Phone: `FEED_ENABLED = false` in `mobile/src/features/feed/index.tsx` hides the tab
   (an OTA update).
 
@@ -299,6 +335,7 @@ Delete these files and directories:
 - `app/internal/feed/` (store, HTTP API, tools, rich cards and X embeds, tests)
 - `app/cmd/pdw-cli/feed.go`, `app/cmd/pdw-cli/feed_test.go`
 - `app/internal/guide/topics/feed.md`
+- `app/internal/webapp/static/feed.js`, `feed_log.js`, `feed_card.js`, `tests/feed.test.mjs`
 - `mobile/src/features/feed/` (including `scroll-gestures.ts`), `mobile/src/app/(tabs)/feed.tsx`, `mobile/src/app/feed/`
   (on the phone, `Documents/pdw-offline/` goes with the app's data)
 - `src/personal_data_warehouse/feed.py`, `tests/test_feed.py`, this file
@@ -310,6 +347,7 @@ Then remove one registration in each of these places:
 | `app/internal/server/server.go` | `extra = append(extra, feed.Register(...)...)` and the `feed` import |
 | `app/cmd/pdw-cli/run.go` | `case "feed"`, the `"feed": feedUsage` help entry, and the `feed` block in `usage` |
 | `app/internal/guide/guide.go` | the `feed` topic; `brief.md` the two Feed tab rows |
+| `app/internal/webapp/` | `/feed` in `Routes` (`webapp.go`) and its route test; the `feed` route and import in `static/app.js`; the nav link and three `modulepreload` lines in `static/index.html`; the `feed` block in `static/api.js`; the `feed` rules in `static/app.css`; the `/feed` mentions in `README.md` and `docs/agents/mutations-and-app.md` |
 | `mobile/src/app/(tabs)/_layout.tsx` | `<Tabs.Screen name="feed" ... />` and its import |
 | `mobile/src/app/_layout.tsx` | `<Stack.Screen name="feed/[id]" ... />` |
 | `mobile/package.json` | `src/features/*/*.test.mjs` in the test script (harmless if left) |

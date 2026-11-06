@@ -2475,7 +2475,7 @@ _ANDROID_NOTIFICATION_ACTION = _simple_adapter(
 
 # --- Feed tab (personal_data_warehouse/feed.py) ------------------------------
 #
-# base_feed.events is the phone's engagement log for the cards agents push.
+# base_feed.events is the phone's and web page's engagement log for the cards agents push.
 # Only the deliberate acts are timeline events -- opening a card, sharing it,
 # saving it for later, dismissing it -- and they are `self`: Zach did them. Impressions, dwell and
 # sessions are telemetry (thousands a week) and are read through
@@ -4133,7 +4133,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "Android's daily screen time totals per app and device; reached through "
         "marts_android_screen_time.daily_usage, not timeline events"
     ),
-    # Feed tab: agents' cards are entities; the phone's engagement log is the
+    # Feed tab: agents' cards are entities; the clients' engagement log is the
     # events table (open/share/save/dismiss reach the timeline, telemetry does not).
     "feed_items": _entity(
         "cards agents push to the Feed tab; reached through marts_feed.item_engagement, "

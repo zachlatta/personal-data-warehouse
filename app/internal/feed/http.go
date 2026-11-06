@@ -13,7 +13,7 @@ import (
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
-// APIPath is the phone's surface: GET the ranked feed, POST engagement.
+// APIPath is the Feed clients' surface (the phone, the web page): GET the ranked feed, POST engagement.
 // Agents use the feed_* tools (`pdw feed ...`), which share this Store.
 const APIPath = "/api/feed"
 
@@ -83,15 +83,15 @@ func (h *handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	forPhone(items, saved)
+	forCards(items, saved)
 	writeJSON(w, http.StatusOK, feedResponse{Items: items, Saved: saved, GeneratedAt: h.store.now()})
 }
 
-// forPhone keeps the payload to what a card needs.
-func forPhone(lists ...[]Item) {
+// forCards keeps the payload to what a card needs.
+func forCards(lists ...[]Item) {
 	for _, list := range lists {
 		for i := range list {
-			list[i].Metadata = phoneMetadata(list[i].Metadata)
+			list[i].Metadata = cardMetadata(list[i].Metadata)
 			list[i].PushedBy = ""
 		}
 	}
@@ -124,18 +124,18 @@ func (h *handler) search(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	forPhone(items)
+	forCards(items)
 	writeJSON(w, http.StatusOK, searchResponse{Query: query, Items: items})
 }
 
-// phoneCardKeys are the metadata keys a card shows: Hacker News counts (its
+// cardKeys are the metadata keys a card shows: Hacker News counts (its
 // counts row). Not the interest a pick was made for: Zach did not want a
 // line saying why a card is here (2026-10-24).
-var phoneCardKeys = []string{"hn_points", "hn_comments"}
+var cardKeys = []string{"hn_points", "hn_comments"}
 
-func phoneMetadata(metadata map[string]any) map[string]any {
+func cardMetadata(metadata map[string]any) map[string]any {
 	var out map[string]any
-	for _, key := range phoneCardKeys {
+	for _, key := range cardKeys {
 		if value, ok := metadata[key]; ok {
 			if out == nil {
 				out = map[string]any{}
@@ -188,7 +188,7 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request) {
 }
 
 // article is the readable text of a card's page, for the detail view. A
-// page with no article (or one that will not load) is a 422 the phone
+// page with no article (or one that will not load) is a 422 the client
 // shows as "open the page" instead.
 func (h *handler) article(w http.ResponseWriter, r *http.Request) {
 	a, err := h.articles.Read(r.Context(), r.URL.Query().Get("url"))

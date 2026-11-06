@@ -723,11 +723,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         "feed",
         "Feed tab",
         cadence="on demand",
-        transport="agents: pdw feed push / feed_* tools → app; iOS Feed tab → /api/feed/events → base_feed",
+        transport="agents: pdw feed push / feed_* tools → app; phone Feed tab and web /feed page → /api/feed/events → base_feed",
         data=None,
         basis=(
             "no expectation: items arrive when an agent writes the feed and events"
-            " only when Zach opens the tab, so a quiet week is not an outage"
+            " only when Zach opens the feed, so a quiet week is not an outage"
         ),
         note="optional module (docs/feed.md); PDW_FEED_ENABLED=0 turns the app side off",
     ),

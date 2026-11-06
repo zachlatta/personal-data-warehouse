@@ -1,5 +1,5 @@
 // Package feed is the PDW app's Feed tab: cards agents push (`pdw feed push`,
-// the feed_* tools) and the engagement the iOS app records on them.
+// the feed_* tools) and the engagement the phone app and the web page record on them.
 //
 // It is a self-contained module. Everything it needs is in this directory;
 // it hooks into the app at exactly one line (server.go calls Register), and
@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// EventTypes are the engagement events the phone records. The Python module
+// EventTypes are the engagement events the phone and the web page record. The Python module
 // holds the same list (feed.py EVENT_TYPES); tests/test_feed.py pins the two.
 var EventTypes = []string{
 	"session_start", "session_end", "impression", "open", "close", "expand",
@@ -362,7 +362,7 @@ func normalizePush(in PushItem, defaultSource string, now time.Time) (normalized
 	return out, nil
 }
 
-// Event is one engagement record from the phone. EventID is generated on
+// Event is one engagement record from a client. EventID is generated on
 // the device, so a retried batch is idempotent.
 type Event struct {
 	EventID         string         `json:"event_id"`
@@ -415,7 +415,7 @@ func ValidateEvent(e *Event, now time.Time) error {
 	return nil
 }
 
-// Rank orders live cards the way the phone shows them, after the Feeeed
+// Rank orders live cards the way the Feed shows them, after the Feeeed
 // model: no unread count, so nothing is a backlog to clear. Higher score
 // first, then newer; and no source runs three in a row while another is
 // waiting. Seen cards never reach it: Feed puts the ones it resurfaces after

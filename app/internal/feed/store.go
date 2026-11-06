@@ -92,7 +92,7 @@ func linksJSON(links []Link) (string, error) {
 	return string(raw), err
 }
 
-// ListOptions selects cards for an agent; the phone's feed is Feed(). URLs
+// ListOptions selects cards for an agent; what Zach sees is Feed(). URLs
 // keeps cards whose url, key or one of whose links is one of them: "is this
 // already a card?" asked directly instead of by paging.
 type ListOptions struct {
@@ -147,7 +147,7 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Item, error) {
 		ORDER BY i.created_at DESC, i.item_id LIMIT $%d`, len(args)), args...)
 }
 
-// Feed is what the phone shows: live, unexpired, undismissed cards he has not
+// Feed is what he is shown, on the phone and the web page: live, unexpired, undismissed cards he has not
 // seen yet, ranked, then, so the feed never runs dry, seen cards he passed
 // over. A card leaves the fresh part at its first impression (Zach,
 // 2026-10-20: "after I've seen a post, don't show it to me again"), but an
@@ -239,8 +239,8 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]Item, er
 }
 
 // SetSaved puts cards in or takes them out of the read-later queue by
-// recording save or unsave events, the same events the phone writes, so an
-// agent saving on his behalf ("save that for me") and a tap on the phone
+// recording save or unsave events, the same events the clients write, so an
+// agent saving on his behalf ("save that for me") and a tap on a card
 // are one history. Every id must name a card.
 func (s *Store) SetSaved(ctx context.Context, ids []string, save bool, m Mutation) (int, error) {
 	if len(ids) == 0 {
@@ -347,7 +347,7 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Item, e
 }
 
 // RecordEvents stores validated events; a repeated event_id is a duplicate,
-// not an error, so the phone can retry a batch blindly.
+// not an error, so a client can retry a batch blindly.
 func (s *Store) RecordEvents(ctx context.Context, events []Event, clientName, device string) (accepted, duplicates int, err error) {
 	ctx, cancel := s.ctx(ctx)
 	defer cancel()

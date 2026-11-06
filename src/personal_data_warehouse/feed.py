@@ -1,7 +1,7 @@
-"""The Feed tab: cards agents push, and what Zach does with them on the phone.
+"""The Feed tab: cards agents push, and what Zach does with them on the phone and the web page.
 
 The Go app owns every write (app/internal/feed): agents push items through
-`pdw feed push` / the feed_* tools and the iOS app posts engagement events to
+`pdw feed push` / the feed_* tools and the phone and the web page post engagement events to
 /api/feed/events. This module is the one place the tables and the marts views
 are declared, so a fresh warehouse has them before the app's first request.
 
@@ -12,7 +12,7 @@ TABLES = ("feed_items", "feed_events", "feed_item_versions")
 FUNCTIONS = ("feed_item_version", "feed_item_versions_immutable")
 VIEWS = ("marts_feed_item_engagement", "marts_feed_source_engagement", "marts_feed_sessions")
 
-#: Event types the phone records. The Go validator holds the same list
+#: Event types the Feed clients record. The Go validator holds the same list
 #: (app/internal/feed/feed.go EventTypes); tests/test_feed.py pins the two.
 EVENT_TYPES = (
     "session_start", "session_end", "impression", "open", "close", "expand",
@@ -340,7 +340,7 @@ SOURCE_ENGAGEMENT_VIEW = """CREATE OR REPLACE VIEW @marts_feed_source_engagement
 # Duration sums active time, never the gaps. Final unfinished sessions expose
 # NULL ended_at and duration_ms. session_id remains the first constituent id.
 SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
-    WITH phone AS (
+    WITH counted AS (
         SELECT * FROM @feed_events WHERE NOT {TEST_CLIENT_SQL}
     ), raw AS (
         SELECT device, session_id,
@@ -352,7 +352,7 @@ SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
                    FILTER (WHERE event_type = 'session_start'))[1] AS start_meta,
                (array_agg(metadata ORDER BY occurred_at DESC, event_id DESC)
                    FILTER (WHERE event_type = 'session_end'))[1] AS end_meta
-        FROM phone WHERE session_id <> '' GROUP BY device, session_id
+        FROM counted WHERE session_id <> '' GROUP BY device, session_id
     ), previous AS (
         SELECT *, lag(ended_at) OVER w AS previous_end,
                row_number() OVER w AS ordinal
@@ -381,10 +381,10 @@ SESSIONS_VIEW = f"""CREATE OR REPLACE VIEW @marts_feed_sessions AS
         FROM rollups
     ), attributed AS (
         SELECT p.*, n.sitting_number
-        FROM phone p JOIN numbered n USING (device, session_id)
+        FROM counted p JOIN numbered n USING (device, session_id)
         UNION ALL
         SELECT p.*, owner.sitting_number
-        FROM phone p CROSS JOIN LATERAL (
+        FROM counted p CROSS JOIN LATERAL (
             SELECT s.sitting_number FROM sittings s
             WHERE s.device = p.device AND p.occurred_at >= s.first_at
               AND (p.occurred_at <= s.last_at OR

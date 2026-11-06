@@ -176,7 +176,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # visit from the Mac uploader.
         # +1 base: base_argon.events, Google Antigravity CLI (agy) transcripts.
         # +2 base: base_feed.items/.events, the Feed tab's cards and the
-        # phone's engagement log (docs/feed.md), +1 base_feed.item_versions,
+        # clients' engagement log (docs/feed.md), +1 base_feed.item_versions,
         # every past version of a card.
         # +2 base: base_screen_timelapse.screenshots/.accessibility_trees, the
         # periodic whole-screen captures and their accessibility trees.

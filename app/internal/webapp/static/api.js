@@ -44,11 +44,13 @@ function queryString(params) {
 }
 
 export async function request(path, options = {}) {
+  const client = options.client || CLIENT_NAME;
   const headers = new Headers(options.headers || {});
-  headers.set("Authorization", "Bearer " + CLIENT_NAME + ":" + getToken());
-  headers.set("X-PDW-Client", CLIENT_NAME);
+  headers.set("Authorization", "Bearer " + client + ":" + getToken());
+  headers.set("X-PDW-Client", client);
   headers.set("Accept", "application/json");
   const init = { method: options.method || "GET", headers };
+  if (options.keepalive) init.keepalive = true;
   if (options.body !== undefined) {
     headers.set("Content-Type", "application/json");
     init.body = JSON.stringify(options.body);
@@ -130,6 +132,21 @@ export const search = {
     const body = await request("/api/tools/search", { method: "POST", body: input });
     const data = (body && body.data) || {};
     return { ...data, rows: data.rows || [] };
+  },
+};
+
+// --- feed (the same routes as the phone's Feed tab) -------------------------
+
+// The marts count these as Zach, so a card seen here leaves the fresh part on
+// his phone. A browser cannot read its hostname, so the names are fixed: any
+// browser on the live page counts as this laptop (docs/feed.md).
+export const FEED_CLIENT = "crobat-web";
+export const FEED_DEVICE = "crobat";
+
+export const feed = {
+  page(limit = 200) { return request("/api/feed", { client: FEED_CLIENT, params: { limit } }); },
+  postEvents(events, options = {}) {
+    return request("/api/feed/events", { client: FEED_CLIENT, method: "POST", body: { device: FEED_DEVICE, events }, keepalive: options.keepalive });
   },
 };
 

@@ -13,7 +13,10 @@ import * as notificationsView from "./notifications.js";
 
 import * as connectionsView from "./connections.js";
 
+import * as feedView from "./feed.js";
+
 const ROUTES = [
+  { pattern: /^\/feed\/?$/, view: feedView, nav: "feed", params: () => ({}) },
   { pattern: /^\/connections\/?$/, view: connectionsView, nav: "connections", params: () => ({}) },
   { pattern: /^\/notifications\/?$/, view: notificationsView, nav: "notifications", params: () => ({}) },
   { pattern: /^\/timeline(?:\/([^/]+)\/(.+))?\/?$/, view: timelineView, nav: "timeline", params: (m) => ({ adapter: m[1] ? decodeURIComponent(m[1]) : "", eventId: m[2] ? decodeURIComponent(m[2]) : "" }) },
@@ -83,6 +86,7 @@ el("gateform").addEventListener("submit", async (ev) => {
     // view reports the API's error where it happens.
   }
   closeGate();
+  if (current.cleanup) { try { current.cleanup(); } catch (e) { console.error(e); } }
   current = { path: "", cleanup: null, view: null };
   render();
   refreshPendingCount();

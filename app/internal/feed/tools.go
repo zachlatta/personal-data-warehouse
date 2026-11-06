@@ -105,7 +105,7 @@ type listInput struct {
 	Source           string   `json:"source,omitempty"`
 	ItemIDs          []string `json:"item_ids,omitempty"`
 	URLs             []string `json:"urls,omitempty" jsonschema:"only cards whose url, key or one of whose links is one of these: the check that a link is already a card before pushing it (add include_removed and include_dismissed to also find removed or dismissed ones)"`
-	View             string   `json:"view,omitempty" jsonschema:"recent (default, newest pushed first), feed (exactly what the phone shows, ranked) or saved (his read-later queue, newest saved first)"`
+	View             string   `json:"view,omitempty" jsonschema:"recent (default, newest pushed first), feed (exactly what the Feed shows him, ranked) or saved (his read-later queue, newest saved first)"`
 	IncludeRemoved   bool     `json:"include_removed,omitempty"`
 	IncludeDismissed bool     `json:"include_dismissed,omitempty"`
 	Limit            int      `json:"limit,omitempty" jsonschema:"default 50, at most 500"`
@@ -166,7 +166,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[pushInput, pushOutput]{
 			NameStr:  "feed_push",
 			TitleStr: "Push Cards to the Feed Tab",
-			DescriptionStr: "Add or update cards in the Feed tab of Zach's PDW iOS app (full-width cards he scrolls like a social feed). " +
+			DescriptionStr: "Add or update cards in Zach's feed, the Feed tab of the PDW phone app and the /feed page of the web app (full-width cards he scrolls like a social feed). " +
 				"Each item needs a source (the agent or feed name, here or per item) and a title, body or url; re-pushing the same " +
 				"(source, key) updates the card instead of duplicating it, and the key defaults to the url. Optional: links (more links " +
 				"on one card, [{url, title}], e.g. the paper, the repo and the discussion), body (markdown), media (photos and " +
@@ -247,7 +247,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[removeInput, removeOutput]{
 			NameStr:        "feed_remove",
 			TitleStr:       "Remove Feed Cards",
-			DescriptionStr: "Remove Feed tab cards by item_id(s), or every live card of a source. Removal is soft: the card leaves the phone, its engagement and every version are kept, and feed_restore brings it back. CLI: pdw feed remove (alias delete).",
+			DescriptionStr: "Remove Feed tab cards by item_id(s), or every live card of a source. Removal is soft: the card leaves his Feed, its engagement and every version are kept, and feed_restore brings it back. CLI: pdw feed remove (alias delete).",
 			Handle: func(ctx context.Context, in removeInput) (removeOutput, error) {
 				ids := in.ItemIDs
 				if strings.TrimSpace(in.ItemID) != "" {
@@ -326,7 +326,7 @@ func Tools(store *Store) []tool.Tool {
 		&tool.Typed[listInput, listOutput]{
 			NameStr:        "feed_list",
 			TitleStr:       "List Feed Cards",
-			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the phone shows, ranked (unseen cards, then resurfaced seen-but-skipped ones); view=saved is his read-later queue. CLI: pdw feed list.",
+			DescriptionStr: "List Feed tab cards with each card's engagement (impressions, dwell_ms, opens, read_ms, dismissed, engaged, engagement_score) and its links. view=feed returns exactly what the Feed shows him, ranked (unseen cards, then resurfaced seen-but-skipped ones); view=saved is his read-later queue. CLI: pdw feed list.",
 			Handle: func(ctx context.Context, in listInput) (listOutput, error) {
 				if in.Limit > 500 {
 					return listOutput{}, &tool.InvalidInputError{Message: "limit is at most 500"}

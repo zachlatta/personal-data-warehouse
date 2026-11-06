@@ -46,10 +46,11 @@ back it, all behind the static bearer the CLI uses:
   and the request event ledger carries `withdrawn` / `replaces` / `superseded` with actor and
   revision. The three columns (`replaces_request_id`, `withdrawn_by`, `withdrawn_at`) are declared
   in both ensure paths and pinned by tests on each side; the worker never claims a withdrawn row.
-  **The browser UI is a client of this same API**: `/mutation-review`, `/timeline` and
+  **The browser UI is a client of this same API**: `/mutation-review`, `/timeline`, `/feed` and
   `/search` are one static single-page app (`app/internal/webapp`, ES modules embedded in
   the binary, no build step, no CDN) that renders nothing server-side and authenticates
-  with `PDW_SECRET_TOKEN` exactly like the phone (`Bearer web:<token>`). The old
+  with `PDW_SECRET_TOKEN` exactly like the phone (`Bearer web:<token>`; `/feed` names its client `crobat-web`, see
+  [the Feed doc](../feed.md)). The old
   server-rendered review pages and their password cookie are gone; a still-set
   `PDW_MUTATION_UI_*` variable is reported as deprecated at startup.
 - **A forward is a `gmail.send_email`, not a type of its own.** `message.forward_message_id`

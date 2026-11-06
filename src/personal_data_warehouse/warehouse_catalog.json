@@ -380,7 +380,7 @@
       "domain": "feed",
       "discoverable": true,
       "query_access": "public",
-      "comment": "Feed tab. Cards agents push with pdw feed push, and every engagement event the PDW iOS app records on them."
+      "comment": "Feed tab. Cards agents push with pdw feed push, and every engagement event the phone app and the web page record on them."
     },
     {
       "name": "derived_documents",
@@ -3828,7 +3828,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Feed engagement log. From the phone: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss, share, save/unsave (read later)."
+      "comment": "Feed engagement log. From the phone and web page: session_start/end, impression (dwell_ms, visible_fraction), open, close (read time), expand, dismiss/undismiss, share, save/unsave (read later)."
     },
     {
       "id": "feed_item_versions",
