@@ -1,6 +1,7 @@
 """Notification capture is transactional, insert-only, and never a history replay."""
 import os
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -304,7 +305,7 @@ def _seed_phone_event(
     )
 
 
-def test_notification_health_counts_matched_and_missing_android_alerts_and_respects_watermark(warehouse):
+def test_notification_health_counts_matched_and_missing_android_alerts_after_the_settle_window(warehouse):
     wh = warehouse
     wh._command(
         "UPDATE @notification_state SET enabled = 1, status = 'ok', last_run_at = now(), error = '' WHERE id = 'timeline'"
@@ -352,7 +353,7 @@ def test_notification_health_counts_matched_and_missing_android_alerts_and_respe
         wh,
         "d-plain-ok",
         "now() - interval '80 minutes'",
-        {"title": "Gmail · Alex", "body": "Quarterly numbers"},
+        {"title": "Gmail · Finance", "body": "Quarterly numbers"},
     )
     _seed_phone_event(
         wh,
@@ -360,7 +361,7 @@ def test_notification_health_counts_matched_and_missing_android_alerts_and_respe
         "now() - interval '80 minutes' + interval '3 seconds'",
         channel_id="default",
         notification_tag="FCM-Notification:1",
-        title="Gmail · Alex",
+        title="Gmail · Finance",
         text="Quarterly numbers",
     )
     # 4. Delivery inside the 15-minute settle window is excluded, not counted as missing.
@@ -386,34 +387,143 @@ def test_notification_health_counts_matched_and_missing_android_alerts_and_respe
     ) == [("attention", "1 of 4 Android alerts accepted in 24h never appeared on the phone", 4, 3, 1)]
 
 
-def test_notification_health_does_not_let_a_later_same_text_row_past_12h_hide_a_lost_alert(warehouse):
-    wh = warehouse
+HEALTH_COLUMNS = "status, error, android_accepted_24h, android_posted_24h, android_missing_24h"
+ONE_LOST = ("attention", "1 of 1 Android alerts accepted in 24h never appeared on the phone", 1, 0, 1)
+NOTHING_EVALUATED = ("ok", "", 0, 0, 0)
+
+
+def _android_health(wh):
+    return wh._query(f"SELECT {HEALTH_COLUMNS} FROM @marts_notification_health")[0]
+
+
+def _start_notifications(wh):
     wh._command(
         "UPDATE @notification_state SET enabled = 1, status = 'ok', last_run_at = now(), error = '' WHERE id = 'timeline'"
     )
+
+
+def _seed_upload(wh, event_id, event_sql="now()", synced_sql="now()"):
+    """A row from another app: it moves the upload watermark and can never match an alert."""
     _seed_phone_event(
-        wh,
-        "watermark",
-        "now()",
-        synced_sql="now()",
-        package_name="com.Slack",
-        channel_id="other",
-        text="heartbeat",
+        wh, event_id, event_sql, synced_sql=synced_sql, package_name="com.Slack", channel_id="other", text="heartbeat"
     )
-    # A chat alert ("Yay!!") accepted 20 hours ago was dropped; an unrelated "Yay!!" arrived 13 hours later (7h ago).
-    _seed_android_delivery(
-        wh,
-        "d-lost-yay",
-        "now() - interval '20 hours'",
-        {"body": "Yay!!", "android_style": {"event_id": "slack|old-yay", "conversation_id": "c1"}},
-    )
-    _seed_phone_event(
-        wh,
-        "p-later-yay",
-        "now() - interval '7 hours'",
-        text="Yay!!",
-        raw_json={"extras": {"pdw.event_ids": "slack|new-yay"}},
-    )
-    assert wh._query(
-        "SELECT status, error, android_accepted_24h, android_posted_24h, android_missing_24h FROM @marts_notification_health"
-    ) == [("attention", "1 of 1 Android alerts accepted in 24h never appeared on the phone", 1, 0, 1)]
+
+
+CHAT_ALERT = (
+    {"body": "Same words", "android_style": {"event_id": "slack|1", "conversation_id": "c1"}},
+    {"channel_id": "messages", "notification_tag": "pdw-chat", "text": "Same words"},
+    {"channel_id": "default", "notification_tag": "FCM-Notification:1"},
+)
+PLAIN_ALERT = (
+    {"title": "Gmail · Finance", "body": "Same words"},
+    {"channel_id": "default", "notification_tag": "FCM-Notification:1", "title": "Gmail · Finance", "text": "Same words"},
+    {"channel_id": "messages", "notification_tag": "pdw-chat"},
+)
+ALERT_KINDS = pytest.mark.parametrize("payload,row,wrong_channel", [CHAT_ALERT, PLAIN_ALERT], ids=["chat", "plain"])
+ALERT_ACCEPTED = "now() - interval '20 hours'"
+RIGHT_AFTER_ACCEPTED = f"{ALERT_ACCEPTED} + interval '2 seconds'"
+
+
+@ALERT_KINDS
+@pytest.mark.parametrize("event_type", ["posted", "active"])
+def test_notification_health_counts_the_alerts_own_phone_row_as_arrival(warehouse, payload, row, wrong_channel, event_type):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, payload)
+    _seed_phone_event(wh, "p", RIGHT_AFTER_ACCEPTED, event_type=event_type, **row)
+    assert _android_health(wh) == ("ok", "", 1, 1, 0)
+
+
+@ALERT_KINDS
+@pytest.mark.parametrize(
+    "not_arrival",
+    [
+        pytest.param({"package_name": "com.Slack"}, id="another-package"),
+        pytest.param({"event_type": "removed"}, id="a-removal"),
+        pytest.param({"event_at": f"{ALERT_ACCEPTED} - interval '1 minute'"}, id="before-the-push"),
+        pytest.param({"event_at": f"{ALERT_ACCEPTED} + interval '13 hours'"}, id="a-later-message-past-12h"),
+    ],
+)
+def test_notification_health_does_not_take_a_same_text_row_for_the_alert(warehouse, payload, row, wrong_channel, not_arrival):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, payload)
+    changes = dict(not_arrival)
+    _seed_phone_event(wh, "p", changes.pop("event_at", RIGHT_AFTER_ACCEPTED), **{**row, **changes})
+    assert _android_health(wh) == ONE_LOST
+
+
+@ALERT_KINDS
+def test_notification_health_does_not_take_another_channels_row_for_the_alert(warehouse, payload, row, wrong_channel):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, payload)
+    _seed_phone_event(wh, "p", RIGHT_AFTER_ACCEPTED, **{**row, **wrong_channel})
+    assert _android_health(wh) == ONE_LOST
+
+
+def test_notification_health_matches_a_plain_alert_on_its_title_too(warehouse):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    payload, row, _ = PLAIN_ALERT
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, payload)
+    _seed_phone_event(wh, "p", RIGHT_AFTER_ACCEPTED, **{**row, "title": "Gmail · Someone else"})
+    assert _android_health(wh) == ONE_LOST
+
+
+@pytest.mark.parametrize(
+    "lagging_upload",
+    [
+        pytest.param({"event_sql": "now()", "synced_sql": "now() - interval '2 hours'"}, id="synced_at"),
+        pytest.param({"event_sql": "now() - interval '2 hours'", "synced_sql": "now()"}, id="event_at"),
+    ],
+)
+def test_an_offline_stretch_is_not_lost_alerts_until_the_phone_uploads_past_them(warehouse, lagging_upload):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_android_delivery(wh, "d", "now() - interval '1 hour'", CHAT_ALERT[0])
+    # A phone that has never uploaded proves nothing about any alert.
+    assert _android_health(wh) == NOTHING_EVALUATED
+    # The phone's newest upload is older than the alert, by either clock.
+    _seed_upload(wh, "lagging", **lagging_upload)
+    assert _android_health(wh) == NOTHING_EVALUATED
+    # Uploads have moved past it and the alert is still not there: now it counts.
+    _seed_upload(wh, "caught-up")
+    assert _android_health(wh) == ONE_LOST
+
+
+def test_an_ios_copy_of_a_chat_alert_is_not_counted_against_the_android_phone(warehouse):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, CHAT_ALERT[0], platform="ios")
+    assert _android_health(wh) == NOTHING_EVALUATED
+
+
+@pytest.mark.parametrize("status", ["accepted", "suppressed"])
+def test_a_delivery_expo_has_not_confirmed_is_not_counted_against_the_phone(warehouse, status):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_upload(wh, "upload")
+    _seed_android_delivery(wh, "d", ALERT_ACCEPTED, CHAT_ALERT[0], status=status)
+    assert _android_health(wh) == NOTHING_EVALUATED
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "mobile/src/app/(tabs)/notifications.tsx",
+        "mobile/src/lib/api.ts",
+        "app/internal/webapp/static/notifications.js",
+        "app/internal/server/pipelines_page.go",
+        "app/internal/guide/topics/ops.md",
+        "src/personal_data_warehouse/warehouse_catalog.json",
+    ],
+)
+def test_no_surface_says_cc_events_page_when_the_trigger_captures_direct_and_scans(surface):
+    text = (Path(__file__).resolve().parent.parent / surface).read_text()
+    assert not re.search(r"direct\s*(and|or|/|\+)\s*cc", text, re.IGNORECASE)

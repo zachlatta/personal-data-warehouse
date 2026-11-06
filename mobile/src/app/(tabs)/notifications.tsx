@@ -121,7 +121,7 @@ export default function NotificationsScreen() {
           <Switch value={ledger?.enabled ?? false} disabled={!ledger || saving} onValueChange={(value) => void toggle(value)} />
         </View>
         <ThemedText type="small" themeColor="textSecondary">
-          Every new direct or CC event, with its source link. Turning this off pauses delivery everywhere and cancels anything still queued.
+          Every new direct event and document scan, with its source link. Turning this off pauses delivery everywhere and cancels anything still queued.
           {ledger ? ` Worker: ${ledger.status}${ledger.error ? ` · ${ledger.error}` : ''}.` : ''}
         </ThemedText>
       </View>

@@ -4254,7 +4254,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Direct/cc. New arrivals captured while enabled; updates never replay. Join id to marts_ops.notification_deliveries.notification_id. Epoch timestamps become NULL."
+      "comment": "Alerts. Direct and scan arrivals captured while enabled; updates never replay. Join id to marts_ops.notification_deliveries.notification_id. Epoch timestamps become NULL."
     },
     {
       "id": "marts_notification_deliveries",

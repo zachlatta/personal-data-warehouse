@@ -389,7 +389,7 @@ export function splitRef(ref: string): { adapter: string; eventId: string } | nu
 
 // --- timeline notifications ------------------------------------------------
 //
-// One global switch for the direct/cc timeline notifications, separate from
+// One global switch for the direct and scan timeline notifications, separate from
 // the OS permission, plus the ledger of everything sent and what became of it.
 
 export type NotificationEvent = {

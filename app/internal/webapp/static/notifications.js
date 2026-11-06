@@ -8,7 +8,7 @@ export function mount(container) {
   let stopped = false;
   const panel = node("section", "", "notification-panel"); container.append(panel);
   const heading = node("h1", "Your attention, in one place");
-  const intro = node("p", "New direct and CC timeline events, excluding items already read or replied to when the synced source state confirms it. No history replay. Existing app notifications stay unchanged.");
+  const intro = node("p", "New direct timeline events and document scans, excluding items already read or replied to when the synced source state confirms it. No history replay. Existing app notifications stay unchanged.");
   const health = node("p"); const controls = node("div", "", "notification-controls");
   const toggle = node("button"); const register = node("button", "Enable this browser"); const disable = node("button", "Disable this browser");
   const feedback = node("p", "", "notification-feedback"); feedback.setAttribute("role", "status");
