@@ -180,6 +180,11 @@ def test_systemd_unit_runs_the_self_locating_wrapper() -> None:
     timer = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.timer").read_text()
     assert "ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd" in service
     assert "OnUnitActiveSec=300s" in timer
+    # A restarted user manager must re-arm the timer by itself: OnBootSec plus
+    # Persistent=true left it "active (elapsed)" with no next run for 13 hours.
+    directives = [line for line in timer.splitlines() if not line.startswith("#")]
+    assert any(line.startswith("OnActiveSec=") for line in directives)
+    assert not any(line.startswith(("OnBootSec=", "Persistent=")) for line in directives)
     assert not _INTERPRETER_INVOCATION.search(service)
 
 

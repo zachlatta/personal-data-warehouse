@@ -252,7 +252,10 @@ a **systemd user timer** (zrl has `Linger=yes`, so user units run without an act
 - Wrapper: `bin/agent-sessions-upload-systemd`; status helper: `bin/agent-sessions-upload-status-systemd`.
   Its heartbeat reports the `openclaw` pipeline unless the unit sets
   `AGENT_SESSIONS_HEARTBEAT_PIPELINES` (comma-separated pipeline names).
-- Run cadence: every 300s (`OnUnitActiveSec=300s`, `Persistent=true`), mirroring the macOS cadence.
+- Run cadence: every 300s (`OnActiveSec=2min`, `OnUnitActiveSec=300s`), mirroring the macOS cadence.
+  Do not add `Persistent=true` or go back to `OnBootSec`. Together they leave the timer
+  `active (elapsed)` with `Trigger: n/a` after the user manager restarts, and uploads stop
+  until something starts the service once.
 - Run log: `~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log`;
   heartbeat: `~/.local/state/personal-data-warehouse/agent-sessions-upload.heartbeat`.
 

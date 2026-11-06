@@ -3,10 +3,12 @@ Description=Run the agent-sessions uploader every 5 minutes
 
 [Timer]
 # Mirrors the macOS LaunchAgent cadence (StartInterval=300, RunAtLoad).
-OnBootSec=2min
+# OnActiveSec, not OnBootSec, and no Persistent=true: a user manager restarted
+# after an OOM has no service run for OnUnitActiveSec to count from, and
+# Persistent's stamp makes systemd drop an OnBootSec already in the past. The
+# timer then sits "active (elapsed)" with no next run, and uploads stop.
+OnActiveSec=2min
 OnUnitActiveSec=300s
-# Catch up after the VM was suspended/offline instead of waiting a full period.
-Persistent=true
 Unit=personal-data-warehouse-agent-sessions-upload.service
 
 [Install]
