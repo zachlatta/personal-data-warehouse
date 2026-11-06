@@ -138,7 +138,10 @@ phone, web ── POST /api/feed/events ──▶ base_feed.events ──▶ mar
   he was in Instagram. Types: `session_start`, `session_end` (dwell = sitting
   length; metadata: cards seen, deepest position, acts), `impression` (one stretch of a card
   at least 50% on screen: `dwell_ms` at or above 50%, `visible_fraction` = peak, `position`,
-  `metadata.visible_ms` = any part on screen), `open` (`metadata.mode` detail, browser, or reader before 2026-10-20;
+  `metadata.visible_ms` = any part on screen; on the phone, `replaced-list.ts` holds finished
+  impressions while a `first` or `stale` reload is about to replace a list within 120 px of the
+  top — starting with the cached first paint — and on commit or screen exit posts holds of 300 ms
+  or more and drops shorter flashes, settling early if the reader scrolls past 120 px), `open` (`metadata.mode` detail, browser, or reader before 2026-10-20;
   a browser open carries `metadata.url` and `link_index`, 0 = the main url),
   `close` (`dwell_ms` = active time after the open; the detail view adds `scroll_depth` and `nested_ms`), `expand`
   (tapped "More"), `dismiss` (`metadata.reason`: `not_interested`,

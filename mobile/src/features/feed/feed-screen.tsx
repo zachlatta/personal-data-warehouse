@@ -62,7 +62,8 @@ import { autoplayStep } from './autoplay';
 import { openTrackedBrowser } from './tracked-browser';
 import { autoplayKey } from './video';
 import { autoplayVideo, playingVideo, VideoWarmup } from './video-player';
-import { layoutsFromHeights, ViewabilityTracker, visibleFraction, type Impression } from './viewability';
+import { PILL_GONE_Y, ReplacedListGate, type HeldImpression } from './replaced-list';
+import { layoutsFromHeights, ViewabilityTracker, visibleFraction } from './viewability';
 import { useTabBarSpace } from '@/hooks/use-tab-bar-space';
 import { isSideways, usePortraitWindow } from '@/hooks/use-portrait-window';
 
@@ -73,8 +74,6 @@ const UNDO_MS = 5_000;
 const SAVED = '\u0000saved';
 // A drag let go with no fling has ended if no coast began by then.
 const SETTLE_MS = 80;
-// Preserve the list once the reader has left the top.
-const PILL_GONE_Y = 120;
 
 // The served order, kept under the server's 16 KB metadata cap (one
 // oversized event would get its whole batch refused).
@@ -206,7 +205,7 @@ export default function FeedScreen() {
     endLogged.current = false;
   }, [shown, only, searching]);
 
-  const recordImpressions = useCallback((ended: Impression[]) => {
+  const recordImpressions = useCallback((ended: HeldImpression[]) => {
     for (const imp of ended) {
       recordFeedEvent('impression', {
         at: imp.startedAt,
@@ -214,32 +213,41 @@ export default function FeedScreen() {
         position: imp.position,
         dwell_ms: imp.dwellMs,
         visible_fraction: imp.maxFraction,
-        metadata: { visible_ms: imp.visibleMs, ended_at: new Date(imp.endedAt).toISOString(), height: heights.current.get(imp.itemId) ?? 0, view: view.current },
+        metadata: { visible_ms: imp.visibleMs, ended_at: new Date(imp.endedAt).toISOString(), height: imp.height, view: imp.view },
       });
     }
   }, []);
 
+  const gate = useRef(new ReplacedListGate(Boolean(cached?.items.length), recordImpressions));
+  const [loadSettled, setLoadSettled] = useState(0);
+
+  useLayoutEffect(() => {
+    if (loadSettled > 0) gate.current.settle();
+  }, [loadSettled]);
+
   const measure = useCallback(() => {
     if (!focused.current || isSideways() || AppState.currentState !== 'active' || viewport.current.height === 0) return;
+    gate.current.scroll(viewport.current.top);
     const layouts = layoutsFromHeights(ids.current, heights.current, headerHeight.current);
-    recordImpressions(tracker.current.update(Date.now(), viewport.current, layouts, activeNow()));
+    gate.current.record(tracker.current.update(Date.now(), viewport.current, layouts, activeNow()), view.current, heights.current);
     const fractions = new Map([...layouts].map(([id, l]) => [id, visibleFraction(l, viewport.current)]));
     const step = autoplayStep(fractions, videoKeys.current, videoFocus.current, playingVideo());
     videoFocus.current = step.focused;
     if (step.play !== undefined) autoplayVideo(step.play);
-  }, [recordImpressions]);
+  }, []);
 
   // Leaving the screen stops the video (InlineVideo does); coming back
   // starts the one in view again.
   const pause = useCallback(() => {
-    recordImpressions(tracker.current.flush(Date.now(), activeNow()));
+    gate.current.record(tracker.current.flush(Date.now(), activeNow()), view.current, heights.current);
     videoFocus.current = null;
-  }, [recordImpressions]);
+  }, []);
 
   // trigger: first (the tab's first load), stale (back after STALE_MS) or
   // pull (pull to refresh). The load event logs exactly what was served, in
   // order, so a later query can tell what he was shown but never reached.
   const load = useCallback(async (trigger: 'first' | 'stale' | 'pull') => {
+    gate.current.beginLoad(trigger, loadedIds.current.length > 0, viewport.current.top);
     if (loading.current) return;
     loading.current = true;
     setRefreshing(true);
@@ -305,6 +313,7 @@ export default function FeedScreen() {
       loading.current = false;
       setRefreshing(false);
       setLoaded(true);
+      if (gate.current.isOpen()) setLoadSettled((n) => n + 1);
     }
   }, [config, pause]);
 
@@ -333,17 +342,19 @@ export default function FeedScreen() {
       else measure();
       return () => {
         focused.current = false;
-        pause();
-        if (lifecycle.blur()) endFeedSession('blur');
+        gate.current.leave(pause, () => {
+          if (lifecycle.blur()) endFeedSession('blur');
+        });
       };
     }, [load, measure, pause, lifecycle]),
   );
 
   useEffect(() => {
     const endBackground = () => {
-      pause();
-      endFeedSession('background');
-      void flushFeedEvents(true);
+      gate.current.leave(pause, () => {
+        endFeedSession('background');
+        void flushFeedEvents(true);
+      });
     };
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active' && !host.inFront() && !lifecycle.detail) return;
@@ -365,6 +376,8 @@ export default function FeedScreen() {
     const unsubscribe = onFeedDetailClosed(() => {
       if (!lifecycle.detail) return;
       // Let navigation restore focus before ending a visit that went elsewhere.
+      // Blur already ran gate.leave(pause, ...) when the detail view opened, and
+      // measure() is a no-op while unfocused, so nothing is held here.
       clearTimeout(timer);
       timer = setTimeout(() => {
         if (lifecycle.closeDetail(focused.current)) endFeedSession('blur');
@@ -438,6 +451,7 @@ export default function FeedScreen() {
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       markActive();
       viewport.current = { top: e.nativeEvent.contentOffset.y, height: e.nativeEvent.layoutMeasurement.height };
+      gate.current.scroll(viewport.current.top);
       measure();
     },
     [measure],
