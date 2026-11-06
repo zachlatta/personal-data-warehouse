@@ -145,6 +145,7 @@ export const FEED_DEVICE = "crobat";
 
 export const feed = {
   page(limit = 200) { return request("/api/feed", { client: FEED_CLIENT, params: { limit } }); },
+  article(url) { return request("/api/feed/article", { client: FEED_CLIENT, params: { url } }); },
   postEvents(events, options = {}) {
     return request("/api/feed/events", { client: FEED_CLIENT, method: "POST", body: { device: FEED_DEVICE, events }, keepalive: options.keepalive });
   },

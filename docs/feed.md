@@ -75,7 +75,8 @@ phone, web ── POST /api/feed/events ──▶ base_feed.events ──▶ mar
   fetch. The phone (`article.ts`, `article-view.tsx`) shows it in a WebView as tall as its
   content, in the app's colors and type, under a nonce-only CSP; it hides the article's copy
   of the photo the card already shows, and adds the page's lead image when the card has
-  none. Every link tap goes to the in-app browser like any other link.
+  none. Every link tap goes to the in-app browser like any other link. The laptop page reads the
+  same route into a sandboxed frame; see [The page on the laptop](#the-page-on-the-laptop).
   When an inline article fails online, a full-width “Open the page” button opens the card’s primary URL in the tracked browser; a cached 422 shows it immediately for a day, while offline failures keep their offline message.
 - **Ready to read offline** (added 2026-10-26 from Zach's email: "Have pdw feed download
   it's items and articles so stuff is ready to read offline"). After every feed load that
@@ -278,22 +279,63 @@ when offline. A batch the server refuses as malformed (400) is dropped rather th
 `/feed` in the web app (added 2026-11-06; request: "I want to basically replace all my web
 browsing with it"). `app/internal/webapp/static/feed.js` draws one column in exactly the order
 `GET /api/feed` served, with no cached paint, so a first paint cannot flash a card. A card shows its
-title, text, one picture, links and Hacker News counts; an X post shows its author, text and first
-photo. Pictures sit in a box whose shape is known before they load (`.fpic`, 1.91:1 unless the card
-gives a size), so a late image never moves a card. Every link opens a new tab and records an
-`open` (`mode` `browser`; `via` `card`, `link`, `body_link` or `post_link`; `url`; `link_index`).
-Time in that other tab counts nothing, and there is no `close` for it. **Not on this page yet:**
-like, save, hide, keys, the article reader and inline video (a video shows its poster, which opens
-the link), and a reload picks up new cards.
+title, text, picture, links and Hacker News counts; an X post shows its author, text, up to four
+photos or its lone video. Pictures sit in a box whose shape is known before they load (`.fpic`,
+1.91:1 unless the card gives a size), so a late image never moves a card. Every link opens a new
+tab and records an `open` (`mode` `browser`; `via` `card`, `link`, `body_link`, `post_link` or
+`article_link`; `url`; `link_index`). Time in that other tab counts nothing, and there is no `close`
+for it. Not built here: search, the source rail, the Saved view, share, autoplay, the "N new" pill,
+X threads, TikTok and Instagram players (those cards keep a poster that opens the link, as an HLS
+video does: desktop Chrome's `<video>` cannot play it) and `less_like_this`.
 
+- **Like, save, hide.** Each card has Like, Save, Hide and Read buttons, sending the phone's fields
+  (`metadata.via` `button`, `key` or `undo`; a hide is `dismiss` with `reason` `not_interested`).
+  Save and hide offer a 5 s undo (`z`), which records `ui` `undo` and then `undismiss` or a save
+  toggle. Every load drops cards with a `dismiss` in the outbox from before or after the fetch
+  (`applyPendingDismissals`), and a like or save stays pending until a server read agrees
+  (`mergeSaved`), so a stale answer cannot undo a tap. A card keeps the `position` it was served at.
+- **Keys:** `j`/`k` next and previous (`k` goes to the top of a part-read card first), `o` or Enter
+  the reader, `v` the main link, `1`-`9` the card's numbered links, `p` play or stop, `l` like, `s` save,
+  `x` hide, `z` undo, `r` reload, Esc close the reader or stop the video. They act on the current
+  card, the one under a line near the top of the column, outlined. `j`/`k` set `scrollTop` with no
+  animation. A held key does not repeat (`event.repeat` is ignored): a held `j` would mark a card seen
+  on every repeat that reached a frame. Keys are also ignored with Ctrl, Meta or Alt, in an input and
+  while the token gate is open; Enter on a focused link or button stays native, and so do PageDown,
+  Space and the arrows. After a click inside a YouTube or Vimeo player the keys go to the player
+  until he clicks the page again: a cross-origin frame cannot hand them back.
+- **The reader** is an overlay. It logs `open` with `mode` `detail` and `ui` `article` as the phone
+  does, and reads `GET /api/feed/article` into an `<iframe sandbox="allow-scripts" srcdoc>` with no
+  same-origin, a nonce-only CSP (plus `base-uri` and `form-action` `'none'`) and no referrer, so script
+  inside cannot reach the token in `localStorage`. The page accepts a message only from that frame's
+  window, carrying that open's random nonce, in one of three shapes: `height` (bounded), `link`
+  (http(s) only; a new tab and an `open` with `via` `article_link`) and `key` (Esc, because a click in
+  the frame takes the keyboard). An X post, a video or a card with no url shows its own text with no
+  fetch (`articleUrl`, the phone's rule); a failed read offers "Open the page". Impressions stop while
+  it covers the list. `close` carries `mode` `detail`, active `dwell_ms`, `scroll_depth`, `wall_ms` and
+  `nested_ms` 0. Input inside the frame never reaches the page, so scrolling the overlay is what touches
+  the clock: reading one screen for over a minute counts only that minute. Hiding the tab writes a
+  `close`; the reader stays open and the next `close` has `resumed: true`.
+- **Video** (`cardPlayer`): a click or `p` swaps the poster for the player in the same box, one at a
+  time. YouTube keeps the referrer it insists on; a file plays in a `srcdoc` frame with none, because
+  `<video>` has no `referrerpolicy` and X's host refuses a foreign one. It stops under 25% on screen
+  and when the tab hides, the reader opens, the card is hidden or the page is left. It logs `media`
+  (`action` `play`, `inline`) and `close` (`mode` `video`, `inline`, `autoplay` false, `wall_ms`) and
+  keeps the clock busy while playing. Only a file reports a pause; a paused YouTube or Vimeo video keeps
+  the clock busy until it stops, as on the phone.
+- **Back after 10 minutes** reloads (`load` `trigger` `stale`), and nothing is measured until that
+  settles, so a stale list cannot be marked seen. Within 120 px of the top the new list replaces the
+  old one; further down the list stays put and the `load` still names what was served. `r` records `ui`
+  `refresh`, ends open stretches, holds measuring, loads with `trigger` `pull`, replaces the list and
+  goes to the top. A failed reload keeps the cards and shows a short note.
 - **It counts as Zach.** Its client is `crobat-web` and its device `crobat`, fixed because a browser
   cannot read its hostname: another machine's browser would be mislabelled and still count. **Any
   browser on the live `/feed`, including an agent's, marks his cards seen and removes them from the
   fresh part on his phone. Check it only against a local database with fake cards.** There is no
   test switch in the product.
 - **Same rules as the phone, ported, not shared.** The web app has no build step, so
-  `feed_log.js` holds line-for-line copies of `active-time.ts`, `viewability.ts`, `event-queue.ts`
-  and the logger in `engagement.ts`, and `feed_card.js` the markdown, link and card-context rules.
+  `feed_log.js` holds line-for-line copies of `active-time.ts`, `viewability.ts`, `event-queue.ts`,
+  the logger in `engagement.ts`, `applyPendingDismissals` and `saved-queue.ts`, and `feed_card.js` the
+  markdown, link, card-context, video and article rules.
   Change a rule in both; `tests/feed.test.mjs` reuses the phone's test numbers.
 - **A hidden tab measures nothing.** A tab opened in the background does not load or start a sitting
   until it is first visible, and a list that arrives while hidden waits, because any stretch that

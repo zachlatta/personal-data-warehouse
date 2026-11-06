@@ -1,7 +1,7 @@
 import test, { beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { ActiveClock, EventQueue, IDLE_MS, ViewabilityTracker, visibleFraction } from "../feed_log.js";
-import { cardContext, cardLinks, parseInline, parseMarkdown, picture, safeUrl } from "../feed_card.js";
+import { ActiveClock, EventQueue, IDLE_MS, ViewabilityTracker, applyPendingDismissals, applySave, mergeSaved, stopwatch, visibleFraction } from "../feed_log.js";
+import { articleDocument, articleUrl, cardContext, cardLinks, cardPlayer, cardVideo, fileVideoDocument, parseArticleMessage, parseInline, parseMarkdown, picture, playerUrl, safeUrl, xPhotos } from "../feed_card.js";
 
 // Only the DOM the feed view uses. Geometry is set by hand: `y` is a card's
 // place in the list and the scroller's scrollTop moves it.
@@ -13,7 +13,15 @@ class Node {
   }
   set textContent(value) { this.text = String(value); this.children = []; }
   get textContent() { return this.text + this.children.map((n) => n.textContent).join(""); }
-  appendChild(node) { this.children.push(node); return node; }
+  appendChild(node) { node.parent = this; this.children.push(node); return node; }
+  insertBefore(node, ref) {
+    node.parent = this;
+    const at = ref ? this.children.indexOf(ref) : -1;
+    if (at < 0) this.children.push(node); else this.children.splice(at, 0, node);
+    return node;
+  }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((n) => n !== this); }
+  closest() { return null; }
   setAttribute(name, value) { this.attrs[name] = String(value); }
   getAttribute(name) { return this.attrs[name]; }
   focus(options) { this.focused = options; }
@@ -33,7 +41,10 @@ const scroller = () => root.children[0];
 const cards = () => root.all((n) => n.tag === "article");
 const anchors = (card) => card.all((n) => n.tag === "a");
 
-let root, frames, posts, stats, storage, observers, documentEvents, windowEvents;
+const byClass = (node, cls) => node.all((n) => n.className.split(" ").includes(cls));
+const button = (node, label) => node.all((n) => n.tag === "button").find((b) => b.textContent.startsWith(label));
+
+let root, frames, posts, stats, storage, observers, documentEvents, windowEvents, opened, gateOpen, holdPosts;
 function setVisible(state) {
   document.visibilityState = state;
   for (const fn of documentEvents.visibilitychange || []) fn({});
@@ -49,12 +60,14 @@ const CARDS = [
   { item_id: "hn:2", source: "hn", title: "Second", url: "https://a.test/2", engagement: {}, created_at: "2026-11-05T00:00:00Z" },
   { item_id: "hn:3", source: "picks", title: "Third", engagement: {}, resurfaced: true, created_at: "2026-11-05T00:00:00Z" },
 ];
-let feedResponse;
+let feedResponse, articleResponse, articleAsks;
 
 beforeEach(() => {
   mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
-  root = new Node("div"); frames = []; posts = []; stats = ""; storage = {}; observers = []; documentEvents = {}; windowEvents = {};
+  root = new Node("div"); frames = []; posts = []; stats = ""; storage = {}; observers = []; documentEvents = {}; windowEvents = {}; opened = []; gateOpen = false; holdPosts = false;
   feedResponse = () => ({ status: 200, body: { items: CARDS, saved: [], generated_at: "2026-11-05T00:00:00Z" } });
+  articleAsks = [];
+  articleResponse = () => ({ status: 200, body: { url: "https://a.test/1", title: "Read me", byline: "A Writer", html: "<p>Words</p>", words: 321 } });
   globalThis.document = {
     visibilityState: "visible",
     createElement: (tag) => new Node(tag),
@@ -62,11 +75,13 @@ beforeEach(() => {
     addEventListener: (event, fn) => { (documentEvents[event] ||= []).push(fn); },
     removeEventListener: (event, fn) => { documentEvents[event] = (documentEvents[event] || []).filter((f) => f !== fn); },
     dispatchEvent() {},
+    getElementById: (id) => (id === "gate" ? { classList: { contains: () => gateOpen } } : null),
   };
   globalThis.window = {
     addEventListener: (event, fn) => { (windowEvents[event] ||= []).push(fn); },
     removeEventListener: (event, fn) => { windowEvents[event] = (windowEvents[event] || []).filter((f) => f !== fn); },
     matchMedia: () => ({ matches: true }),
+    open: (url, target, features) => { opened.push({ url, target, features }); return null; },
   };
   globalThis.localStorage = {
     getItem: (key) => (key in storage ? storage[key] : null),
@@ -79,8 +94,14 @@ beforeEach(() => {
   globalThis.ResizeObserver = class { constructor(fn) { this.fn = fn; observers.push(this); } observe() {} disconnect() { this.gone = true; } };
   globalThis.fetch = async (path, init = {}) => {
     if (path.startsWith("/api/feed/events")) {
+      if (holdPosts) return new Promise(() => {});
       posts.push({ path, headers: init.headers, keepalive: init.keepalive, body: JSON.parse(init.body) });
       return { ok: true, status: 200, text: async () => "{}" };
+    }
+    if (path.startsWith("/api/feed/article")) {
+      articleAsks.push(path);
+      const read = await articleResponse();
+      return { ok: read.status < 400, status: read.status, text: async () => JSON.stringify(read.body) };
     }
     const answer = await feedResponse();
     return { ok: answer.status < 400, status: answer.status, text: async () => JSON.stringify(answer.body) };
@@ -146,7 +167,7 @@ test("hidden-tab time does not count, and each visible stretch is its own impres
   runFrames();
   advance(1000);
   setVisible("hidden");
-  advance(10 * 60_000);
+  advance(9 * 60_000); // under the ten minutes that reload the list
   setVisible("visible");
   runFrames();
   advance(500);
@@ -490,4 +511,841 @@ test("a Hacker News line becomes counts and a Muse card loses its curator's labe
   const muse = cardContext({ source: "muse-wonder", author: "Muse Wonder", body: "*Essay*\n**For you:** read this" });
   assert.equal(muse.preview, "read this");
   assert.equal(muse.author, "");
+});
+
+// --- like, save, hide -----------------------------------------------------------
+
+// Press a key the way the page gets it: the document's listener, then the window's touch.
+function press(key, extra = {}) {
+  let prevented = false;
+  const ev = { key, target: scroller(), preventDefault() { prevented = true; }, ...extra };
+  for (const fn of documentEvents.keydown || []) fn(ev);
+  for (const fn of windowEvents.keydown || []) fn(ev);
+  return prevented;
+}
+
+test("like and save send the phone's fields from a button or a key, and buttons show the state", async () => {
+  await start();
+  const first = cards()[0];
+  assert.equal(button(first, "Like").title, "Like (l)");
+  button(first, "Like").fire("click");
+  assert.ok(button(first, "Liked"));
+  press("l");
+  assert.ok(button(first, "Like"));
+  button(first, "Save").fire("click");
+  assert.equal(button(first, "Saved").getAttribute("aria-pressed"), "true");
+  press("s");
+  await flushed();
+  assert.deepEqual(events().filter((e) => ["like", "unlike", "save", "unsave"].includes(e.type)).map((e) => [e.type, e.item_id, e.position, e.metadata.via, e.metadata.source]), [
+    ["like", "hn:1", 0, "button", "hn"],
+    ["unlike", "hn:1", 0, "key", "hn"],
+    ["save", "hn:1", 0, "button", "hn"],
+    ["unsave", "hn:1", 0, "key", "hn"],
+  ]);
+});
+
+test("the served page says what is already liked and saved", async () => {
+  feedResponse = () => ({ status: 200, body: { items: [{ ...CARDS[0], engagement: { liked: true } }, CARDS[1]], saved: [CARDS[1]] } });
+  await start();
+  assert.ok(button(cards()[0], "Liked"));
+  assert.ok(button(cards()[1], "Saved"));
+});
+
+test("hide sends the phone's fields, undo puts the card back in its place, and positions never renumber", async () => {
+  await start();
+  press("j"); // to hn:2
+  runFrames();
+  button(cards()[1], "Hide").fire("click");
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:1", "hn:3"]);
+  assert.match(root.textContent, /Hidden/);
+  press("z");
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:1", "hn:2", "hn:3"]);
+  assert.equal(scroller().scrollTop, 400, "the restored card is where it was");
+  await flushed();
+  const [hide] = ofType("dismiss");
+  assert.deepEqual([hide.item_id, hide.position, hide.metadata.reason, hide.metadata.source, hide.metadata.site], ["hn:2", 1, "not_interested", "hn", ""]);
+  const [ui] = ofType("ui");
+  assert.deepEqual([ui.metadata.action, ui.metadata.what], ["undo", "Hidden"]);
+  const [back] = ofType("undismiss");
+  assert.deepEqual([back.item_id, back.position], ["hn:2", 1]);
+  assert.ok(events().indexOf(ui) < events().indexOf(back));
+
+  layOut();
+  runFrames();
+  press("x"); // the current card, hn:2 again
+  layOut();
+  runFrames();
+  scrollTo(5000);
+  await flushed();
+  const third = ofType("impression").filter((e) => e.item_id === "hn:3");
+  assert.ok(third.every((e) => e.position === 2), "hn:3 keeps its served position after a card above it is hidden");
+  const hidden = ofType("impression").filter((e) => e.item_id === "hn:2").at(-1);
+  assert.equal(hidden.metadata.height, 400, "a hidden card's stretch still names its height");
+});
+
+test("undo lasts five seconds, and z with nothing to undo does nothing", async () => {
+  await start();
+  press("z");
+  press("x");
+  advance(5001);
+  press("z");
+  assert.equal(cards().length, 2);
+  await flushed();
+  assert.deepEqual(ofType("undismiss"), []);
+  assert.deepEqual(ofType("ui"), []);
+});
+
+test("save offers undo, and undo is a save toggle with via undo", async () => {
+  await start();
+  press("s");
+  assert.match(root.textContent, /Saved for later/);
+  button(root, "Undo").fire("click");
+  await flushed();
+  assert.deepEqual(events().filter((e) => e.type === "save" || e.type === "unsave").map((e) => [e.type, e.metadata.via]), [["save", "key"], ["unsave", "undo"]]);
+  assert.equal(ofType("ui")[0].metadata.what, "Saved for later");
+});
+
+test("hiding the last card says so, and undo brings it back", async () => {
+  feedResponse = () => ({ status: 200, body: { items: [CARDS[0]], saved: [] } });
+  await start();
+  press("x");
+  assert.match(root.textContent, /Nothing here yet/);
+  press("z");
+  assert.equal(cards().length, 1);
+  assert.doesNotMatch(root.textContent, /Nothing here yet/);
+});
+
+test("a stale answer cannot bring back a hidden card, whether its dismiss is unsent or already sending", async () => {
+  await start();
+  holdPosts = true;
+  press("x");
+  press("r");
+  await settle();
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:2", "hn:3"]);
+});
+
+test("a tap stays until the server agrees, so a reload cannot undo it", async () => {
+  let liked = false;
+  feedResponse = () => ({ status: 200, body: { items: [{ ...CARDS[0], engagement: { liked } }], saved: liked ? [CARDS[0]] : [] } });
+  await start();
+  holdPosts = true;
+  press("l");
+  press("s");
+  press("r");
+  await settle();
+  assert.ok(button(cards()[0], "Liked"), "the server has not heard yet");
+  assert.ok(button(cards()[0], "Saved"));
+  liked = true;
+  holdPosts = false;
+  await settle();
+  press("r");
+  await settle();
+  assert.ok(button(cards()[0], "Liked"));
+  assert.ok(button(cards()[0], "Saved"));
+});
+
+test("the outbox and read-later rules are the phone's", () => {
+  const items = [{ item_id: "a" }, { item_id: "b" }];
+  assert.deepEqual(applyPendingDismissals(items, [{ type: "dismiss", item_id: "a" }]), [items[1]]);
+  assert.deepEqual(applyPendingDismissals(items, [{ type: "dismiss", item_id: "a" }, { type: "undismiss", item_id: "a" }]), items);
+  assert.deepEqual(applySave(["a", "b"], "b", true), ["b", "a"]);
+  assert.deepEqual(applySave(["a", "b"], "b", false), ["a"]);
+  const pending = new Map([["x", { save: true, at: 1 }], ["y", { save: false, at: 2 }]]);
+  assert.deepEqual(mergeSaved(["y"], pending), ["x"]);
+  assert.equal(pending.size, 2);
+  assert.deepEqual(mergeSaved(["x"], pending), ["x"]);
+  assert.deepEqual([...pending.keys()], [], "both agree now");
+});
+
+// --- keys -------------------------------------------------------------------------
+
+test("j and k jump a card at a time with no animation, and k goes to the top of a part-read card first", async () => {
+  await start();
+  assert.equal(press("j"), true);
+  assert.equal(scroller().scrollTop, 400);
+  press("j");
+  assert.equal(scroller().scrollTop, 800);
+  press("j"); // the last card stays
+  assert.equal(scroller().scrollTop, 800);
+  scroller().scrollTop = 900;
+  press("k");
+  assert.equal(scroller().scrollTop, 800);
+  press("k");
+  assert.equal(scroller().scrollTop, 400);
+});
+
+test("the current card has an outline class and nothing else moves", async () => {
+  await start();
+  runFrames();
+  assert.ok(cards()[0].className.includes("fcur"));
+  scrollTo(400);
+  assert.ok(cards()[1].className.includes("fcur"));
+  assert.ok(!cards()[0].className.includes("fcur"));
+});
+
+test("holding a key does nothing more: no card marked seen per repeat, no card hidden per repeat, no tab per repeat", async () => {
+  await start();
+  press("j");
+  const top = scroller().scrollTop;
+  for (let i = 0; i < 5; i++) assert.equal(press("j", { repeat: true }), false);
+  assert.equal(scroller().scrollTop, top);
+  press("x");
+  for (let i = 0; i < 5; i++) press("x", { repeat: true });
+  assert.equal(cards().length, 2);
+  press("v", { repeat: true });
+  press("1", { repeat: true });
+  assert.deepEqual(opened, []);
+});
+
+test("keys stay out of the way of modifiers, inputs, the token gate and a native Enter", async () => {
+  await start();
+  for (const mod of ["ctrlKey", "metaKey", "altKey"]) assert.equal(press("j", { [mod]: true }), false);
+  const field = { closest: (selector) => (selector.includes("input") ? {} : null) };
+  assert.equal(press("j", { target: field }), false);
+  gateOpen = true;
+  assert.equal(press("j"), false);
+  gateOpen = false;
+  const link = { closest: (selector) => (selector.includes("a,") || selector.startsWith("a") ? {} : null) };
+  assert.equal(press("Enter", { target: link }), false);
+  assert.equal(root.all((n) => n.className === "freader").length, 0);
+  assert.equal(press("PageDown"), false);
+  assert.equal(press(" "), false);
+  assert.equal(press("ArrowDown"), false);
+  assert.equal(scroller().scrollTop, 0);
+});
+
+test("v opens the main link, a number opens that extra link, and both record the open", async () => {
+  await start();
+  assert.match(byClass(cards()[0], "flinks")[0].textContent, /1.*Paper/);
+  press("v");
+  press("1");
+  press("2"); // no second link
+  assert.deepEqual(opened.map((o) => [o.url, o.target, o.features]), [
+    ["https://a.test/1", "_blank", "noopener,noreferrer"],
+    ["https://paper.test/", "_blank", "noopener,noreferrer"],
+  ]);
+  await flushed();
+  assert.deepEqual(ofType("open").map((e) => [e.item_id, e.metadata.mode, e.metadata.via, e.metadata.url, e.metadata.link_index]), [
+    ["hn:1", "browser", "card", "https://a.test/1", 0],
+    ["hn:1", "browser", "link", "https://paper.test/", 1],
+  ]);
+});
+
+test("cleanup removes the key listener", async () => {
+  await start();
+  view.cleanup(); view = null;
+  assert.deepEqual(documentEvents.keydown, []);
+  assert.deepEqual(windowEvents.message, []);
+});
+
+// --- the reader -------------------------------------------------------------------
+
+const readerNode = () => byClass(root, "freader")[0];
+const readerFrame = () => readerNode().all((n) => n.tag === "iframe")[0];
+const nonceOf = (frame) => /script nonce="([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc"))[1];
+function fromFrame(frame, data, source = frame.contentWindow) {
+  for (const fn of windowEvents.message) fn({ source, data });
+}
+async function openFrame() {
+  press("o");
+  await settle();
+  const frame = readerFrame();
+  frame.contentWindow = {};
+  return frame;
+}
+
+test("o opens the article in a sealed frame, and logs open and ui article the way the phone does", async () => {
+  await start();
+  const frame = await openFrame();
+  assert.equal(articleAsks.length, 1);
+  assert.match(articleAsks[0], /\/api\/feed\/article\?url=https%3A%2F%2Fa\.test%2F1/);
+  assert.equal(frame.getAttribute("sandbox"), "allow-scripts");
+  assert.equal(frame.getAttribute("referrerpolicy"), "no-referrer");
+  const html = frame.getAttribute("srcdoc");
+  const nonce = nonceOf(frame);
+  assert.match(nonce, /^[0-9a-f]{32}$/);
+  assert.ok(html.includes(`script-src 'nonce-${nonce}'`));
+  assert.ok(html.includes("default-src 'none'"));
+  assert.ok(html.includes("base-uri 'none'"));
+  assert.ok(html.includes("form-action 'none'"));
+  assert.ok(html.includes("<p>Words</p>"));
+  assert.match(readerNode().textContent, /Read me/);
+  assert.match(readerNode().textContent, /A Writer/);
+  await flushed();
+  const [open] = ofType("open");
+  assert.deepEqual([open.item_id, open.position, open.metadata.mode], ["hn:1", 0, "detail"]);
+  const [ui] = ofType("ui");
+  assert.deepEqual([ui.item_id, ui.metadata.action, ui.metadata.ok, ui.metadata.words], ["hn:1", "article", true, 321]);
+  assert.equal(typeof ui.dwell_ms, "number");
+});
+
+test("each open gets its own nonce", async () => {
+  await start();
+  const a = nonceOf(await openFrame());
+  press("Escape");
+  const b = nonceOf(await openFrame());
+  assert.notEqual(a, b);
+});
+
+test("a message from another window, with the wrong nonce or the wrong shape does nothing", async () => {
+  await start();
+  const frame = await openFrame();
+  const nonce = nonceOf(frame);
+  const height = frame.style.height;
+  fromFrame(frame, { nonce, type: "height", height: 500 }, {});
+  fromFrame(frame, { nonce: "nope", type: "height", height: 500 });
+  fromFrame(frame, { type: "height", height: 500 });
+  fromFrame(frame, "just text");
+  fromFrame(frame, null);
+  fromFrame(frame, { nonce, type: "height", height: -1 });
+  fromFrame(frame, { nonce, type: "height", height: Infinity });
+  fromFrame(frame, { nonce, type: "height", height: 1e9 });
+  fromFrame(frame, { nonce, type: "height", height: "500" });
+  fromFrame(frame, { nonce, type: "link", url: "javascript:alert(1)" });
+  fromFrame(frame, { nonce, type: "link", url: "data:text/html,x" });
+  fromFrame(frame, { nonce, type: "link", url: 5 });
+  fromFrame(frame, { nonce, type: "key", key: "j" });
+  fromFrame(frame, { nonce, type: "other" });
+  assert.equal(frame.style.height, height);
+  assert.deepEqual(opened, []);
+  assert.ok(readerNode());
+});
+
+test("the frame sizes itself, hands links back to a new tab, and can pass Esc back", async () => {
+  await start();
+  const frame = await openFrame();
+  const nonce = nonceOf(frame);
+  fromFrame(frame, { nonce, type: "height", height: 2345 });
+  assert.equal(frame.style.height, "2345px");
+  fromFrame(frame, { nonce, type: "link", url: "https://elsewhere.test/x" });
+  assert.deepEqual(opened, [{ url: "https://elsewhere.test/x", target: "_blank", features: "noopener,noreferrer" }]);
+  fromFrame(frame, { nonce, type: "key", key: "Escape" });
+  assert.equal(readerNode(), undefined);
+  await flushed();
+  const link = ofType("open").find((e) => e.metadata.mode === "browser");
+  assert.deepEqual([link.item_id, link.position, link.metadata.via, link.metadata.url, link.metadata.link_index], ["hn:1", 0, "article_link", "https://elsewhere.test/x", -1]);
+});
+
+test("with the reader open only Esc acts, and closing gives the keyboard back", async () => {
+  await start();
+  await openFrame();
+  for (const key of ["j", "l", "s", "x", "v", "p", "r", "1", "o"]) assert.equal(press(key), false, key);
+  assert.equal(scroller().scrollTop, 0);
+  assert.equal(cards().length, 3);
+  assert.deepEqual(opened, []);
+  scroller().focused = null;
+  assert.equal(press("Escape"), true);
+  assert.equal(readerNode(), undefined);
+  assert.deepEqual(scroller().focused, { preventScroll: true });
+  press("l");
+  await flushed();
+  assert.equal(ofType("like").length, 1);
+});
+
+test("nothing counts as seen while the reader covers the list, and measuring resumes on close", async () => {
+  await start();
+  runFrames();
+  advance(400);
+  await openFrame();
+  await flushed();
+  assert.deepEqual(ofType("impression").map((e) => [e.item_id, e.dwell_ms]), [["hn:1", 400], ["hn:2", 400]]);
+  const before = ofType("impression").length;
+  scroller().fire("scroll");
+  observers.forEach((o) => o.fn());
+  runFrames();
+  advance(5000);
+  await flushed();
+  assert.equal(ofType("impression").length, before);
+  press("Escape");
+  runFrames();
+  advance(300);
+  scrollTo(5000);
+  await flushed();
+  assert.deepEqual(ofType("impression").slice(before).map((e) => e.dwell_ms), [300, 300]);
+});
+
+test("close carries active time, depth and clock time, with nothing nested", async () => {
+  await start();
+  await openFrame();
+  const overlay = readerNode();
+  overlay.scrollTop = 500; overlay.clientHeight = 500; overlay.scrollHeight = 2000;
+  overlay.fire("scroll");
+  advance(4000);
+  press("Escape");
+  await flushed();
+  const [close] = ofType("close");
+  assert.deepEqual([close.item_id, close.dwell_ms, close.metadata.mode, close.metadata.scroll_depth, close.metadata.wall_ms, close.metadata.nested_ms], ["hn:1", 4000, "detail", 0.5, 4000, 0]);
+  assert.equal(close.metadata.resumed, undefined);
+});
+
+test("scrolling the reader keeps the clock going, because input inside the frame never reaches the page", async () => {
+  await start();
+  await openFrame();
+  const overlay = readerNode();
+  for (let i = 0; i < 5; i++) { advance(50_000); overlay.fire("scroll"); }
+  advance(10_000);
+  press("Escape");
+  await flushed();
+  assert.equal(ofType("close")[0].dwell_ms, 260_000);
+});
+
+test("hiding the tab with the reader open writes a close first, and coming back starts a resumed stretch", async () => {
+  await start();
+  await openFrame();
+  advance(1000);
+  setVisible("hidden");
+  await settle();
+  assert.ok(readerNode(), "the reader stays open");
+  advance(60_000);
+  setVisible("visible");
+  advance(2000);
+  press("Escape");
+  await flushed();
+  const closes = ofType("close");
+  assert.deepEqual(closes.map((e) => [e.dwell_ms, e.metadata.resumed]), [[1000, undefined], [2000, true]]);
+  assert.ok(events().indexOf(closes[0]) < events().indexOf(ofType("session_end")[0]));
+  assert.equal(ofType("open").length, 1, "no extra open");
+});
+
+test("leaving the page with the reader open closes it once and removes it", async () => {
+  await start();
+  await openFrame();
+  advance(1000);
+  view.cleanup(); view = null;
+  await settle();
+  assert.equal(readerNode(), undefined);
+  assert.equal(ofType("close").length, 1);
+});
+
+test("a page with no article says so, offers the page, and logs the failure", async () => {
+  articleResponse = () => ({ status: 422, body: { error: "no article found" } });
+  await start();
+  press("o");
+  await settle();
+  assert.equal(readerNode().all((n) => n.tag === "iframe").length, 0);
+  const link = anchors(readerNode()).find((a) => a.textContent === "Open the page");
+  assert.equal(link.href, "https://a.test/1");
+  link.fire("click", { button: 0 });
+  await flushed();
+  const [ui] = ofType("ui");
+  assert.deepEqual([ui.metadata.action, ui.metadata.ok], ["article", false]);
+  assert.match(ui.metadata.error, /no article/);
+  assert.equal(ofType("open").at(-1).metadata.via, "card");
+});
+
+test("an answer after closing the reader draws nothing", async () => {
+  let answer;
+  articleResponse = () => new Promise((resolve) => { answer = resolve; });
+  await start();
+  press("o");
+  await settle();
+  press("Escape");
+  answer({ status: 200, body: { html: "<p>x</p>", words: 90 } });
+  await settle();
+  assert.equal(readerNode(), undefined);
+});
+
+const X_CARD = { item_id: "x:1", source: "x", url: "https://x.com/a/status/1", engagement: {}, embed: { type: "x_post", author_name: "A Poster", author_handle: "poster", text: "Hello from X", media: [
+  { type: "image", url: "https://pbs.test/1.jpg" }, { type: "image", url: "https://pbs.test/2.jpg" }, { type: "image", url: "https://pbs.test/3.jpg" }, { type: "image", url: "https://pbs.test/4.jpg" }, { type: "image", url: "https://pbs.test/5.jpg" },
+] } };
+const YT_CARD = { item_id: "yt:1", source: "yt", title: "A video", url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=90", body: "Summary", engagement: {} };
+const VIMEO_CARD = { item_id: "vm:1", source: "vm", title: "Other video", url: "https://vimeo.com/123456", image_url: "https://i.test/vm.jpg", engagement: {} };
+const FILE_CARD = { item_id: "f:1", source: "x", url: "https://x.com/a/status/2", engagement: {}, embed: { type: "x_post", author_name: "B", text: "Clip", media: [{ type: "video", url: "https://video.twimg.com/a.mp4?x=\"><script>", thumbnail_url: "https://pbs.test/p.jpg", width: 1280, height: 720 }] } };
+const HLS_CARD = { item_id: "h:1", source: "m", title: "Stream", url: "https://h.test/page", media: [{ type: "video", url: "https://h.test/live.m3u8", thumbnail_url: "https://h.test/p.jpg" }], engagement: {} };
+const TIKTOK_CARD = { item_id: "t:1", source: "t", title: "Tok", url: "https://www.tiktok.com/@a/video/1234567890123456", image_url: "https://i.test/t.jpg", engagement: {} };
+
+function serve(...items) { feedResponse = () => ({ status: 200, body: { items, saved: [] } }); }
+
+test("an X post, a video card and a card with no url show their own text without fetching anything", async () => {
+  for (const [item, text] of [[X_CARD, /Hello from X/], [YT_CARD, /Summary/], [CARDS[2], /Third/], [TIKTOK_CARD, /Tok/]]) {
+    serve(item);
+    await start();
+    press("o");
+    await settle();
+    assert.equal(articleAsks.length, 0, item.item_id);
+    assert.match(readerNode().textContent, text);
+    assert.equal(readerNode().all((n) => n.tag === "iframe").length, 0);
+    await flushed();
+    assert.equal(ofType("ui").length, 0, "no false article failure");
+    view.cleanup(); view = null;
+    root = new Node("div");
+  }
+});
+
+test("the article's document is sealed and hands everything back by message", () => {
+  const html = articleDocument({ html: "<p>x</p>", language: "en\"", image_url: "https://i.test/lead.jpg" }, "abc");
+  assert.ok(html.includes(`<meta name="referrer" content="no-referrer">`));
+  assert.ok(html.includes(`<script nonce="abc">`));
+  assert.ok(html.includes("parent.postMessage"));
+  assert.ok(html.includes("https://i.test/lead.jpg"));
+  assert.ok(html.includes(`lang="en&quot;"`));
+  assert.ok(!html.includes("unsafe-eval"));
+  assert.ok(!/script-src[^;"]*unsafe-inline/.test(html));
+  assert.ok(!articleDocument({ html: `<img src="https://i.test/lead.jpg">`, image_url: "https://i.test/lead.jpg" }, "abc").includes("<figure>"), "no second copy of the lead image");
+});
+
+test("a frame's message is checked for nonce, shape and bounds", () => {
+  assert.deepEqual(parseArticleMessage({ nonce: "n", type: "height", height: 10 }, "n"), { type: "height", height: 10 });
+  assert.deepEqual(parseArticleMessage({ nonce: "n", type: "link", url: "http://a.test/" }, "n"), { type: "link", url: "http://a.test/" });
+  assert.deepEqual(parseArticleMessage({ nonce: "n", type: "key", key: "Escape" }, "n"), { type: "key", key: "Escape" });
+  assert.equal(parseArticleMessage({ nonce: "m", type: "height", height: 10 }, "n"), null);
+  assert.equal(parseArticleMessage({ nonce: "", type: "height", height: 10 }, ""), null);
+  assert.equal(parseArticleMessage({ nonce: "n", type: "link", url: "mailto:a@b.test" }, "n"), null);
+});
+
+test("the article rule is the phone's: an X post or a video is not an article", () => {
+  assert.equal(articleUrl({ url: "https://a.test/x" }, false), "https://a.test/x");
+  assert.equal(articleUrl({ url: "https://a.test/x" }, true), null);
+  assert.equal(articleUrl({ url: "https://a.test/x", embed: { type: "x_post" } }, false), null);
+  assert.equal(articleUrl({}, false), null);
+  assert.equal(articleUrl({ url: "ftp://a.test/x" }, false), null);
+});
+
+// --- video ------------------------------------------------------------------------
+
+// A video card's box, placed for the geometry: y and height of the player's box.
+function placeBoxes() { for (const card of cards()) for (const box of byClass(card, "fpic")) { box.y = card.y; box.height = 225; } }
+const play = (card) => byClass(card, "fposter")[0].fire("click");
+const playerOf = (card) => card.all((n) => n.tag === "iframe")[0];
+
+test("a click swaps the poster for the player in the same box and logs media", async () => {
+  serve(YT_CARD, VIMEO_CARD);
+  await start();
+  placeBoxes();
+  const [first, second] = cards();
+  const box = byClass(first, "fpic")[0];
+  assert.equal(box.style.aspectRatio, String(16 / 9));
+  play(first);
+  assert.equal(byClass(first, "fpic")[0], box);
+  assert.equal(box.style.aspectRatio, String(16 / 9));
+  assert.equal(byClass(first, "fposter").length, 0);
+  const frame = playerOf(first);
+  assert.match(frame.src, /^https:\/\/www\.youtube\.com\/embed\/dQw4w9WgXcQ\?autoplay=1.*start=90/);
+  assert.equal(frame.getAttribute("referrerpolicy"), "strict-origin-when-cross-origin", "YouTube refuses to play with no referrer");
+  assert.match(frame.getAttribute("allow"), /autoplay/);
+  press("j"); // moving on keeps it only while it stays on screen
+  assert.ok(second);
+  await flushed();
+  const [media] = ofType("media");
+  assert.deepEqual([media.item_id, media.position, media.metadata.action, media.metadata.inline], ["yt:1", 0, "play", true]);
+});
+
+test("one plays at a time, and the first's close says it was watched in the card", async () => {
+  serve(YT_CARD, VIMEO_CARD);
+  await start();
+  placeBoxes();
+  const [first, second] = cards();
+  play(first);
+  advance(3000);
+  play(second);
+  assert.equal(playerOf(first), undefined);
+  assert.equal(byClass(first, "fposter").length, 1, "the poster is back");
+  assert.match(playerOf(second).src, /^https:\/\/player\.vimeo\.com\/video\/123456\?autoplay=1/);
+  await flushed();
+  const [close] = ofType("close");
+  assert.deepEqual([close.item_id, close.dwell_ms, close.metadata.mode, close.metadata.inline, close.metadata.autoplay, close.metadata.wall_ms], ["yt:1", 3000, "video", true, false, 3000]);
+});
+
+test("p plays the current card's video and p again stops it, and Esc stops it too", async () => {
+  serve(YT_CARD, CARDS[1]);
+  await start();
+  placeBoxes();
+  assert.equal(press("p"), true);
+  assert.ok(playerOf(cards()[0]));
+  press("p");
+  assert.equal(playerOf(cards()[0]), undefined);
+  press("p");
+  press("Escape");
+  assert.equal(playerOf(cards()[0]), undefined);
+  await flushed();
+  assert.equal(ofType("close").length, 2);
+});
+
+test("it stops when under a quarter of its box is on screen, and not before", async () => {
+  serve(YT_CARD, CARDS[1], CARDS[2]);
+  await start();
+  placeBoxes();
+  const first = cards()[0];
+  play(first);
+  scrollTo(150); // 75 of 225 px left, a third
+  assert.ok(playerOf(first));
+  scrollTo(200); // 25 px left, a ninth
+  assert.equal(playerOf(first), undefined);
+  await flushed();
+  assert.equal(ofType("close").length, 1);
+});
+
+test("it stops when the tab hides, with the close before the session's end, and stays stopped on return", async () => {
+  serve(YT_CARD, CARDS[1]);
+  await start();
+  placeBoxes();
+  const first = cards()[0];
+  play(first);
+  advance(2000);
+  setVisible("hidden");
+  assert.equal(playerOf(first), undefined);
+  setVisible("visible");
+  assert.equal(playerOf(first), undefined);
+  await flushed();
+  const close = ofType("close")[0];
+  assert.equal(close.dwell_ms, 2000);
+  assert.ok(events().indexOf(close) < events().indexOf(ofType("session_end")[0]));
+});
+
+test("opening the reader, leaving the page or hiding the card stops it", async () => {
+  serve(YT_CARD, CARDS[1]);
+  await start();
+  placeBoxes();
+  const first = cards()[0];
+  play(first);
+  scroller().scrollTop = 500; // the reader is on hn:2
+  press("o");
+  await settle();
+  assert.equal(playerOf(first), undefined);
+  press("Escape");
+  scroller().scrollTop = 0;
+  play(first);
+  press("x");
+  assert.equal(playerOf(first), undefined);
+  press("z");
+  play(first);
+  view.cleanup(); view = null;
+  await settle();
+  assert.equal(ofType("close").filter((e) => e.metadata.mode === "video").length, 3);
+});
+
+test("a playing video keeps the clock busy past the minute with no touches, and stopping lets it idle", async () => {
+  serve(YT_CARD, CARDS[1]);
+  await start();
+  placeBoxes();
+  const first = cards()[0];
+  runFrames();
+  play(first);
+  advance(5 * 60_000);
+  press("Escape");
+  advance(5 * 60_000);
+  await flushed();
+  assert.equal(ofType("close")[0].dwell_ms, 5 * 60_000);
+  scrollTo(5000);
+  await flushed();
+  assert.equal(ofType("impression")[0].dwell_ms, 5 * 60_000 + IDLE_MS);
+});
+
+test("a lone file video plays in a no-referrer document with escaped urls and reports its pause", async () => {
+  serve(FILE_CARD);
+  await start();
+  placeBoxes();
+  const first = cards()[0];
+  assert.match(first.textContent, /B/);
+  assert.match(first.textContent, /Clip/);
+  assert.equal(byClass(first, "fpic")[0].style.aspectRatio, String(1280 / 720));
+  play(first);
+  const frame = playerOf(first);
+  const html = frame.getAttribute("srcdoc");
+  assert.equal(frame.getAttribute("referrerpolicy"), "no-referrer");
+  assert.ok(html.includes(`<meta name="referrer" content="no-referrer">`));
+  assert.ok(html.includes("default-src 'none'"));
+  assert.ok(!html.includes(`"><script>`));
+  const video = new Node("video");
+  frame.contentDocument = { querySelector: () => video, addEventListener() {} };
+  frame.fire("load");
+  advance(10_000);
+  video.fire("pause");
+  advance(5 * 60_000);
+  video.fire("play");
+  advance(5 * 60_000);
+  press("Escape");
+  await flushed();
+  assert.equal(ofType("close")[0].dwell_ms, 10_000 + IDLE_MS + 5 * 60_000);
+});
+
+test("HLS, TikTok and a page with no player stay a poster that opens the link", async () => {
+  serve(HLS_CARD, TIKTOK_CARD);
+  await start();
+  placeBoxes();
+  for (const card of cards()) {
+    assert.equal(byClass(card, "fposter").length, 0);
+    assert.equal(byClass(card, "fpic")[0].tag, "a");
+  }
+  assert.equal(press("p"), false);
+  assert.equal(cardPlayer(HLS_CARD), null);
+  assert.ok(cardVideo(HLS_CARD), "still a video, so it is not fetched as an article");
+  assert.ok(cardVideo(TIKTOK_CARD));
+});
+
+test("the player rule is the phone's", () => {
+  assert.equal(cardVideo({ url: "https://a.test/" }), null);
+  assert.equal(cardVideo({ url: "https://youtu.be/dQw4w9WgXcQ" }).kind, "youtube");
+  assert.equal(cardVideo({ url: "https://vimeo.com/123456" }).id, "123456");
+  assert.equal(cardVideo({ url: "https://a.test/", media: [{ type: "video", url: "https://v.test/a.mp4" }] }).kind, "file");
+  assert.equal(cardVideo({ url: "https://youtu.be/dQw4w9WgXcQ", media: [{ type: "video", url: "https://v.test/a.mp4" }, { type: "image", url: "https://i.test/a.jpg" }] }), null, "a carousel keeps its pages");
+  assert.equal(cardPlayer({ embed: { type: "x_post", media: [{ type: "video", url: "https://video.twimg.com/a.mp4" }, { type: "image", url: "https://i.test/a.jpg" }] } }), null);
+  assert.equal(cardPlayer({ embed: { type: "x_post", media: [{ type: "video", url: "javascript:x" }] } }), null);
+  assert.match(playerUrl({ kind: "youtube", id: "dQw4w9WgXcQ" }), /^https:\/\/www\.youtube\.com\/embed\/dQw4w9WgXcQ\?/);
+  assert.match(playerUrl({ kind: "vimeo", id: "123456" }), /^https:\/\/player\.vimeo\.com\/video\/123456\?/);
+  assert.ok(!fileVideoDocument({ url: "https://v.test/a.mp4?a=1&b=\"", poster: "https://i.test/\"x" }).includes(`b="`));
+});
+
+test("a playing clock and a stopwatch keep the phone's numbers", () => {
+  const c = new ActiveClock(0);
+  c.setBusy(true, 0);
+  assert.equal(c.read(5 * 60_000), 5 * 60_000);
+  c.setForeground(false, 5 * 60_000);
+  assert.equal(c.read(10 * 60_000), 5 * 60_000);
+  c.setForeground(true, 10 * 60_000);
+  c.setBusy(false, 11 * 60_000);
+  assert.equal(c.read(11 * 60_000 + IDLE_MS + 30_000), 6 * 60_000 + IDLE_MS);
+  const d = new ActiveClock(0);
+  const watch = stopwatch(d, 0);
+  assert.deepEqual(watch.stop(5 * 60_000), { activeMs: IDLE_MS, wallMs: 5 * 60_000 });
+});
+
+// --- X posts ----------------------------------------------------------------------
+
+test("an X post shows its author, text and up to four photos in boxes of known shape", async () => {
+  serve({ ...X_CARD, title: "A pick" });
+  await start();
+  const [card] = cards();
+  assert.match(card.textContent, /A Poster @poster/);
+  assert.match(card.textContent, /Hello from X/);
+  const grid = byClass(card, "fgrid")[0];
+  assert.ok(grid.className.includes("fgrid4"));
+  assert.ok(grid.style.aspectRatio);
+  assert.deepEqual(grid.all((n) => n.tag === "img").map((i) => i.src), ["https://pbs.test/1.jpg", "https://pbs.test/2.jpg", "https://pbs.test/3.jpg", "https://pbs.test/4.jpg"]);
+  assert.ok(grid.all((n) => n.tag === "img").every((i) => i.getAttribute("referrerpolicy") === "no-referrer"));
+  assert.equal(xPhotos({ media: [{ type: "image", url: "javascript:x" }, { type: "video", url: "https://v.test/a.mp4" }] }).length, 0);
+});
+
+test("an X post with one photo keeps the single-picture box", async () => {
+  serve({ ...X_CARD, embed: { ...X_CARD.embed, media: [{ type: "image", url: "https://pbs.test/1.jpg", width: 100, height: 100 }] } });
+  await start();
+  assert.equal(byClass(cards()[0], "fgrid").length, 0);
+  assert.equal(byClass(cards()[0], "fpic")[0].style.aspectRatio, "1");
+});
+
+// --- coming back, and r -----------------------------------------------------------
+
+const NEW_CARDS = [{ ...CARDS[1], title: "New order" }, CARDS[0]];
+function stale() { setVisible("hidden"); advance(10 * 60_000 + 1); setVisible("visible"); }
+
+test("back after ten minutes measures nothing until the reload settles", async () => {
+  await start();
+  runFrames();
+  advance(400);
+  let answer;
+  feedResponse = () => new Promise((resolve) => { answer = resolve; });
+  stale();
+  await settle();
+  await flushed();
+  const before = ofType("impression").length;
+  scrollTo(100);
+  observers.forEach((o) => o.fn());
+  runFrames();
+  advance(1000);
+  await flushed();
+  assert.equal(ofType("impression").length, before);
+  answer({ status: 200, body: { items: CARDS, saved: [] } });
+  await settle();
+  layOut();
+  runFrames();
+  advance(300);
+  scrollTo(5000);
+  await flushed();
+  assert.ok(ofType("impression").length > before);
+});
+
+test("a stale reload that fails also lets measuring resume, and keeps the cards", async () => {
+  await start();
+  feedResponse = () => ({ status: 500, body: { error: "boom" } });
+  stale();
+  await settle();
+  assert.equal(cards().length, 3);
+  layOut();
+  runFrames();
+  advance(300);
+  scrollTo(5000);
+  await flushed();
+  assert.ok(ofType("impression").length > 0);
+  assert.equal(ofType("load").at(-1).metadata.ok, false);
+  assert.match(root.textContent, /boom/);
+});
+
+test("scrolled down, the list stays put, and the load still names what was served", async () => {
+  await start();
+  const before = cards();
+  scrollTo(121);
+  serve(...NEW_CARDS);
+  stale();
+  await settle();
+  assert.deepEqual(cards(), before);
+  assert.equal(scroller().scrollTop, 121);
+  await flushed();
+  const load = ofType("load").at(-1);
+  assert.equal(load.metadata.trigger, "stale");
+  assert.deepEqual(load.metadata.item_ids, ["hn:2", "hn:1"]);
+});
+
+test("near the top, the new list replaces the old one", async () => {
+  await start();
+  scrollTo(120);
+  serve(...NEW_CARDS);
+  stale();
+  await settle();
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:2", "hn:1"]);
+  assert.match(cards()[0].textContent, /New order/);
+  await flushed();
+  assert.equal(ofType("load").at(-1).metadata.trigger, "stale");
+});
+
+test("a return under ten minutes does not reload", async () => {
+  await start();
+  await flushed();
+  setVisible("hidden");
+  advance(10 * 60_000 - 1);
+  setVisible("visible");
+  await settle();
+  await flushed();
+  assert.equal(ofType("load").length, 1);
+});
+
+test("r ends open stretches, holds measuring, loads with pull, replaces the list and goes to the top", async () => {
+  await start();
+  runFrames();
+  advance(400);
+  scrollTo(500);
+  let answer;
+  feedResponse = () => new Promise((resolve) => { answer = resolve; });
+  assert.equal(press("r"), true);
+  await settle();
+  await flushed();
+  const during = ofType("impression").length;
+  assert.ok(during > 0);
+  assert.equal(ofType("ui")[0].metadata.action, "refresh");
+  runFrames();
+  advance(1000);
+  await flushed();
+  assert.equal(ofType("impression").length, during);
+  assert.match(root.textContent, /First/, "no flash of Loading over a list");
+  assert.doesNotMatch(root.textContent, /Loading/);
+  press("r"); // already loading
+  answer({ status: 200, body: { items: NEW_CARDS, saved: [] } });
+  await settle();
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:2", "hn:1"]);
+  assert.equal(scroller().scrollTop, 0);
+  scroller().fire("scroll");
+  advance(500);
+  await flushed();
+  assert.deepEqual(ofType("load").map((e) => e.metadata.trigger), ["first", "pull"]);
+  assert.equal(ofType("scroll").filter((e) => e.metadata.to_y === 0).length, 0, "the jump to the top is not a scroll he made");
+});
+
+test("a failed r keeps the cards on screen with a short note", async () => {
+  await start();
+  feedResponse = () => ({ status: 500, body: { error: "boom" } });
+  press("r");
+  await settle();
+  assert.equal(cards().length, 3);
+  assert.match(root.textContent, /boom/);
+  await flushed();
+  assert.deepEqual(ofType("load").map((e) => e.metadata.ok), [true, false]);
 });

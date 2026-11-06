@@ -8,7 +8,9 @@ finds. Do not put a reply someone is waiting on here (that is {{if .CLI}}`pdw ca
 
 **The page counts as Zach.** Its client name is fixed, so any browser on the live `/feed`,
 including an agent's, marks his cards seen and removes them from the fresh part on his phone.
-Check it only against a local database with fake cards.
+Check it only against a local database with fake cards. It has the phone's like, save, hide with
+undo, an article reader (`mode` `detail`) and in-card video (`mode` `video`), so those events carry
+`device` `crobat` too, plus `metadata.resumed` on a `close` after a tab hide.
 
 ## Pushing cards
 

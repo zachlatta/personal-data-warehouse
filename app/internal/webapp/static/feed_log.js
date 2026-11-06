@@ -1,11 +1,13 @@
 // What the Feed page measures, the way the phone measures it. There is no build
 // step here, so this file ports the phone's pure logic instead of importing it:
 // ActiveClock from mobile/src/features/feed/active-time.ts, ViewabilityTracker
-// from viewability.ts, EventQueue from event-queue.ts, FeedLog from engagement.ts.
+// from viewability.ts, EventQueue from event-queue.ts, FeedLog from engagement.ts,
+// the taps' rules from refresh.ts and saved-queue.ts.
 // Change the rule in both places; the tests reuse the phone's numbers.
 
 // Active time: the part of wall time Zach is actually using the page. Time
-// counts while the tab is visible and he touched it in the last IDLE_MS.
+// counts while the tab is visible and he touched it in the last IDLE_MS, or
+// while a video plays.
 export const IDLE_MS = 60_000;
 
 export class ActiveClock {
@@ -14,12 +16,13 @@ export class ActiveClock {
     this.mark = now;
     this.lastTouch = now;
     this.foreground = foreground;
+    this.busy = 0;
   }
 
   advance(now) {
     if (now <= this.mark) return;
     if (this.foreground) {
-      const until = Math.min(now, this.lastTouch + IDLE_MS);
+      const until = this.busy > 0 ? now : Math.min(now, this.lastTouch + IDLE_MS);
       if (until > this.mark) this.total += until - this.mark;
     }
     this.mark = now;
@@ -42,6 +45,45 @@ export class ActiveClock {
     this.foreground = foreground;
     if (foreground) this.lastTouch = Math.max(this.lastTouch, now);
   }
+
+  /** Something plays without touches: on, then off. */
+  setBusy(on, now) {
+    this.advance(now);
+    this.busy = Math.max(0, this.busy + (on ? 1 : -1));
+    if (!on) this.lastTouch = Math.max(this.lastTouch, now);
+  }
+}
+
+/** Times one stretch (the reader, a video) in both active and wall time. */
+export function stopwatch(clock, now) {
+  const active = clock.read(now);
+  return { stop: (end) => ({ activeMs: Math.round(clock.read(end) - active), wallMs: Math.max(0, end - now) }) };
+}
+
+// A hide still in the outbox beats whatever the server just answered.
+export function applyPendingDismissals(items, events) {
+  const hidden = new Set();
+  for (const event of events) {
+    if (!event.item_id) continue;
+    if (event.type === "dismiss") hidden.add(event.item_id);
+    if (event.type === "undismiss") hidden.delete(event.item_id);
+  }
+  return items.filter((item) => !hidden.has(item.item_id));
+}
+
+export function applySave(order, id, save) {
+  const rest = order.filter((x) => x !== id);
+  return save ? [id, ...rest] : rest;
+}
+
+// A like or save stays pending until a server read agrees, so a reload cannot undo it.
+export function mergeSaved(server, pending) {
+  let order = [...server];
+  for (const [id, p] of [...pending.entries()].sort((a, b) => a[1].at - b[1].at)) {
+    if (server.includes(id) === p.save) { pending.delete(id); continue; }
+    order = applySave(order, id, p.save);
+  }
+  return order;
 }
 
 // A card is in view while at least half of it is on screen (or, for a card
@@ -246,6 +288,8 @@ export class FeedLog {
   sessionId() { return this.session ? this.session.id : ""; }
   inSession() { return !!this.session; }
   flush(force = false, keepalive = false) { return this.queue.flush(force, keepalive); }
+  pending() { return this.queue.pending(); }
+  ui(action, fields = {}) { this.record("ui", { ...fields, metadata: { action, ...fields.metadata } }); }
 
   // sessionId: an answer that arrives after the sitting ended belongs to the
   // sitting that asked.
