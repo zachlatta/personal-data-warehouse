@@ -266,6 +266,37 @@ worker's `Render` under a one-second bound (`withAvatar`); a slow or failed look
 initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
 see `mobile/README.md`.
 
+- **Android's 50-notification package cap and burst pacing (2026-11-05).** Joining the 861
+  `provider_accepted` Android chat pushes (`857` through `2026-11-06 02:05Z`) and 715 non-chat
+  pushes from `2026-10-28` to `2026-11-06` against `base_android_notifications.events` showed that
+  66 (`64` of `857`) delayed chat pushes arrived when `pichu` reconnected from offline or
+  powered-off windows (up to 10h45m lag on Oct 29 and 1h45m on Oct 30), while 69 chat alerts (71
+  when disambiguating 2 repeated-body messages on Oct 29 within 5s of `accepted_at`) and 234
+  non-chat alerts never appeared on the phone (including 2 unexplained non-chat drops on
+  `2026-11-02 20:01..20:05Z` when ~5 alerts were active and the app was not in the foreground,
+  which shade-cap eviction does not explain). Six blackout windows accounted for 64 of the 69
+  missing chat alerts (62 of 71 exact) and 215 of the 234 missing non-chat alerts because non-chat
+  `FCM-Notification:<tag>` pushes filled Android's `MAX_PACKAGE_NOTIFICATIONS = 50` per-app limit
+  (confirmed by two `event_type = 'active'` snapshots at exactly 50 and six 50-notification removal
+  events that immediately restored delivery); the remaining 5–9 chat drops occurred in sub-second
+  burst tails before `system_server` committed the previous `notify()`. `ChatNotifications` now:
+  - Evicts the oldest active non-summary notifications across all tags (`FCM-Notification:*` first,
+    then oldest `pdw-chat` conversations other than the target conversation) down to `< 30`
+    (`MAX_ACTIVE_NOTIFICATIONS = 30`) and polls up to 250ms for async cancel completion before
+    posting.
+  - Synchronizes `post()` and `postPlain()` on the push service's thread, caches contact avatars in
+    an `LruCache<String, Bitmap>(32)`, paces `notify()` at 200ms (`MIN_NOTIFY_INTERVAL_MS = 200L`),
+    and merges in-memory `RecentPost` state within 5 seconds (`RECENT_POST_TTL_MS = 5000L`) while
+    resetting after user dismissal.
+  - Stores `pdw.event_ids` via `putString` as a newline-delimited string so
+    `SpoolListenerService.java` serializes every stacked `event_id` into
+    `raw_json->'extras'->>'pdw.event_ids'` instead of `"<ArrayList>"`.
+  - `marts_ops.notification_health` (and `/pipelines`) reconciles 24h `provider_accepted` Android
+    deliveries (settled `> 15m` and older than `LEAST(max(synced_at), max(event_at)) - 2m` on
+    `base_android_notifications.events`) against `[accepted_at - 10s, accepted_at + 12h)` phone
+    events (`android_accepted_24h`, `android_posted_24h`, `android_missing_24h`), turning
+    `attention` when accepted pushes never appear on the phone.
+
 ## Writing to Apple Notes (apple_notes mutations)
 
 Apple Notes is the first **write-back** source that reviewed mutations reach. Everything

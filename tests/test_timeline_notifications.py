@@ -197,7 +197,7 @@ def test_go_worker_against_the_same_provisioned_schema(warehouse):
     wh.ensure_upstream_mutation_tables()
     source_tables = ("gmail_messages", "slack_messages", "slack_conversations", "slack_account_identities",
                      "apple_messages", "apple_message_chat_messages", "apple_message_chats",
-                     "whatsapp_messages", "whatsapp_chats")
+                     "whatsapp_messages", "whatsapp_chats", "android_notification_events")
     wh._ensure_table_group(list(source_tables))
     names = (*TABLES, "timeline_events", "push_devices", "marts_notification_health", *source_tables)
     env = dict(os.environ, PDW_NOTIFICATION_TEST_URL=os.environ["POSTGRES_DATABASE_URL"],
@@ -262,3 +262,159 @@ def test_an_outbox_made_before_scans_paged_accepts_them_after_ensure(warehouse):
                 + ", 'scans', 'Black & white scan, 1 page')")
     insert(wh, "direct", "direct")
     assert wh._query("SELECT event_id FROM @notification_events ORDER BY event_id") == [("direct",), ("me|scan-2",)]
+
+
+def _seed_android_delivery(wh, delivery_id, accepted_sql, payload, status="provider_accepted", platform="android"):
+    wh._command(
+        f"INSERT INTO @notification_deliveries (id, notification_id, device_id, transport, endpoint, payload, status, accepted_at, updated_at) "
+        f"VALUES (%s, %s, 'pichu', 'expo', %s::jsonb, %s::jsonb, %s, {accepted_sql}, {accepted_sql})",
+        (delivery_id, delivery_id, json.dumps({"platform": platform}), json.dumps(payload), status),
+    )
+
+
+def _seed_phone_event(
+    wh,
+    event_id,
+    event_sql,
+    synced_sql="now()",
+    package_name="com.zachlatta.pdw",
+    channel_id="messages",
+    notification_tag="pdw-chat",
+    event_type="posted",
+    title="",
+    text="",
+    messages=None,
+    raw_json=None,
+):
+    wh._command(
+        f"INSERT INTO @android_notification_events "
+        f"(account, device, event_id, event_type, event_at, posted_at, synced_at, package_name, channel_id, notification_tag, title, text, messages, raw_json) "
+        f"VALUES ('me', 'pichu', %s, %s, {event_sql}, {event_sql}, {synced_sql}, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)",
+        (
+            event_id,
+            event_type,
+            package_name,
+            channel_id,
+            notification_tag,
+            title,
+            text,
+            json.dumps(messages or []),
+            json.dumps(raw_json or {}),
+        ),
+    )
+
+
+def test_notification_health_counts_matched_and_missing_android_alerts_and_respects_watermark(warehouse):
+    wh = warehouse
+    wh._command(
+        "UPDATE @notification_state SET enabled = 1, status = 'ok', last_run_at = now(), error = '' WHERE id = 'timeline'"
+    )
+    # Advance the phone upload watermark to now() so deliveries older than 15m are evaluated.
+    _seed_phone_event(
+        wh,
+        "watermark",
+        "now()",
+        synced_sql="now()",
+        package_name="com.Slack",
+        channel_id="other",
+        text="heartbeat",
+    )
+    # 1. Chat matched via pdw.event_ids newline-delimited extra.
+    _seed_android_delivery(
+        wh,
+        "d-chat-ids",
+        "now() - interval '2 hours'",
+        {"body": "First body", "android_style": {"event_id": "slack|1", "conversation_id": "c1"}},
+    )
+    _seed_phone_event(
+        wh,
+        "p-chat-ids",
+        "now() - interval '2 hours' + interval '2 seconds'",
+        text="Overwritten later text",
+        raw_json={"extras": {"pdw.event_ids": "slack|0\nslack|1\nslack|2"}},
+    )
+    # 2. Chat matched via MessagingStyle messages[] array element.
+    _seed_android_delivery(
+        wh,
+        "d-chat-msgs",
+        "now() - interval '90 minutes'",
+        {"body": "Stacked reply", "android_style": {"event_id": "slack|3", "conversation_id": "c2"}},
+    )
+    _seed_phone_event(
+        wh,
+        "p-chat-msgs",
+        "now() - interval '90 minutes' + interval '1 second'",
+        text="Newest top text",
+        messages=[{"text": "Stacked reply", "time_ms": 1}],
+    )
+    # 3. Non-chat matched on channel_id = 'default' by title + text.
+    _seed_android_delivery(
+        wh,
+        "d-plain-ok",
+        "now() - interval '80 minutes'",
+        {"title": "Gmail · Alex", "body": "Quarterly numbers"},
+    )
+    _seed_phone_event(
+        wh,
+        "p-plain-ok",
+        "now() - interval '80 minutes' + interval '3 seconds'",
+        channel_id="default",
+        notification_tag="FCM-Notification:1",
+        title="Gmail · Alex",
+        text="Quarterly numbers",
+    )
+    # 4. Delivery inside the 15-minute settle window is excluded, not counted as missing.
+    _seed_android_delivery(
+        wh,
+        "d-recent-unsettled",
+        "now() - interval '5 minutes'",
+        {"body": "Still in flight", "android_style": {"event_id": "slack|recent", "conversation_id": "c3"}},
+    )
+    assert wh._query(
+        "SELECT status, error, android_accepted_24h, android_posted_24h, android_missing_24h FROM @marts_notification_health"
+    ) == [("ok", "", 3, 3, 0)]
+
+    # 5. Add a missing chat alert (dropped by Android's 50-notification cap): health turns 'attention' and names the count.
+    _seed_android_delivery(
+        wh,
+        "d-chat-lost",
+        "now() - interval '60 minutes'",
+        {"body": "Dropped under cap", "android_style": {"event_id": "slack|lost", "conversation_id": "c4"}},
+    )
+    assert wh._query(
+        "SELECT status, error, android_accepted_24h, android_posted_24h, android_missing_24h FROM @marts_notification_health"
+    ) == [("attention", "1 of 4 Android alerts accepted in 24h never appeared on the phone", 4, 3, 1)]
+
+
+def test_notification_health_does_not_let_a_later_same_text_row_past_12h_hide_a_lost_alert(warehouse):
+    wh = warehouse
+    wh._command(
+        "UPDATE @notification_state SET enabled = 1, status = 'ok', last_run_at = now(), error = '' WHERE id = 'timeline'"
+    )
+    _seed_phone_event(
+        wh,
+        "watermark",
+        "now()",
+        synced_sql="now()",
+        package_name="com.Slack",
+        channel_id="other",
+        text="heartbeat",
+    )
+    # A chat alert ("Yay!!") accepted 20 hours ago was dropped; an unrelated "Yay!!" arrived 13 hours later (7h ago).
+    _seed_android_delivery(
+        wh,
+        "d-lost-yay",
+        "now() - interval '20 hours'",
+        {"body": "Yay!!", "android_style": {"event_id": "slack|old-yay", "conversation_id": "c1"}},
+    )
+    _seed_phone_event(
+        wh,
+        "p-later-yay",
+        "now() - interval '7 hours'",
+        text="Yay!!",
+        raw_json={"extras": {"pdw.event_ids": "slack|new-yay"}},
+    )
+    assert wh._query(
+        "SELECT status, error, android_accepted_24h, android_posted_24h, android_missing_24h FROM @marts_notification_health"
+    ) == [("attention", "1 of 1 Android alerts accepted in 24h never appeared on the phone", 1, 0, 1)]
+

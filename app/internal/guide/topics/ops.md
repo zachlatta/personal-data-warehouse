@@ -11,7 +11,7 @@ app's `/pipelines` page.
 | marts | `marts_ops.mart_view_health` | is a read view built on anything current: `stalest_pipeline`, `stalest_pipeline_at` |
 | timeline adapters | `marts_ops.timeline_adapter_health` | is THIS kind of data reaching `timeline.events`, and how far behind its source it is (`ingest_lag_seconds`) |
 | priority mix | `marts_ops.timeline_priority_mix` | how each source's last seven days split across the tiers; an `unclassified` row is `failing` |
-| notifications | `marts_ops.notification_health` | is the direct-only push experiment paused, running, backlogged or failing |
+| notifications | `marts_ops.notification_health` | is the push experiment paused, running, backlogged, failing or dropping phone alerts (`android_accepted_24h`, `android_posted_24h`, `android_missing_24h`) |
 | agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier, per agent source |
 | search | `marts_ops.search_health`, `marts_ops.search_request_latency`, `marts_ops.search_benchmark`, `marts_ops.search_benchmark_history` | chunk/embedding convergence, BM25 index integrity, cache residency; real-traffic p50/p90 and slow-host mixes; weekly latency and MRR |
 | answers | `marts_ops.answer_benchmark` | does a fresh agent with only PDW answer real past questions right, cite the right source, in few calls (C16) |
@@ -53,8 +53,8 @@ so a LaunchAgent that fires and fails reads `failing` rather than merely `late`;
 
 ## Notification experiment
 
-`marts_ops.notifications` records newly landed `direct` events captured while enabled (one per recurring calendar series);
-`marts_ops.notification_deliveries` records each device's attempts and observed opens.
+`marts_ops.notifications` records newly landed `direct` and `scan_document` events captured while enabled (one per recurring calendar series);
+`marts_ops.notification_deliveries` records each device's attempts and observed opens; `marts_ops.notification_health` reconciles 24h `provider_accepted` Android pushes against `base_android_notifications.events` (`android_accepted_24h`, `android_posted_24h`, `android_missing_24h`) and turns `attention` when accepted pushes never reach the phone shade.
 Join notification `id` to delivery `notification_id`. Use `/notifications` or the phone's
 Alerts tab to start/pause; read-only SQL cannot change the switch. Existing history and
 ordinary edits never replay. Device tokens and open capabilities are private.

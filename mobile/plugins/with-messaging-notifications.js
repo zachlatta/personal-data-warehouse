@@ -44,7 +44,10 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.service.notification.StatusBarNotification
 import android.util.Log
+import android.util.LruCache
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -111,12 +114,34 @@ object ChatNotifications {
   private const val SHORTCUT_PREFIX = "chat:"
   private const val MAX_SHORTCUTS = 10
   private const val EVENT_IDS_EXTRA = "pdw.event_ids"
+  private const val MAX_ACTIVE_NOTIFICATIONS = 30
+  private const val CANCEL_POLL_INTERVAL_MS = 25L
+  private const val CANCEL_POLL_MAX_MS = 250L
+  private const val RECENT_POST_TTL_MS = 5000L
+  private const val MAX_RECENT_CONVERSATIONS = 64
+  private const val MIN_NOTIFY_INTERVAL_MS = 200L
+  private const val AVATAR_CACHE_SIZE = 32
+
+  private data class RecentPost(
+    val shown: List<String>,
+    val messages: List<NotificationCompat.MessagingStyle.Message>,
+    val postedAtMs: Long,
+  )
+
+  private val recentPosts = object : LinkedHashMap<Int, RecentPost>(MAX_RECENT_CONVERSATIONS, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, RecentPost>?): Boolean =
+      size > MAX_RECENT_CONVERSATIONS
+  }
+
+  private val avatarCache = LruCache<String, Bitmap>(AVATAR_CACHE_SIZE)
+  private var lastNotifyElapsedMs = 0L
 
   private val palette = intArrayOf(
     0xFF1A73E8.toInt(), 0xFFD93025.toInt(), 0xFF188038.toInt(), 0xFFE37400.toInt(),
     0xFF9334E6.toInt(), 0xFF007B83.toInt(), 0xFFC5221F.toInt(), 0xFF3949AB.toInt(),
   )
 
+  @Synchronized
   fun post(context: Context, data: JSONObject, tap: Notification, sentAt: Long) {
     val style = data.getJSONObject(STYLE_KEY)
     val conversationId = style.getString("conversation_id").ifBlank { throw IllegalArgumentException("conversation_id is empty") }
@@ -129,10 +154,25 @@ object ChatNotifications {
     val manager = NotificationManagerCompat.from(context)
     val id = abs(conversationId.hashCode())
 
+    val now = System.currentTimeMillis()
     val existing = activeNotification(context, id)
-    val shown = existing?.extras?.getStringArrayList(EVENT_IDS_EXTRA) ?: arrayListOf()
+    val recent = recentPosts[id]?.takeIf { now - it.postedAtMs <= RECENT_POST_TTL_MS }
+    if (existing == null && recent == null) {
+      recentPosts.remove(id)
+    }
+    val existingShown = existing?.extras?.getString(EVENT_IDS_EXTRA)
+      ?.lineSequence()
+      ?.filter { it.isNotEmpty() }
+      ?.toList()
+      .orEmpty()
+    val shown = LinkedHashSet<String>().apply {
+      addAll(existingShown)
+      if (recent != null && (existing == null || existingShown.size < recent.shown.size)) {
+        addAll(recent.shown)
+      }
+    }.toMutableList()
     if (eventId.isNotEmpty() && shown.contains(eventId)) return
-    shown.add(eventId)
+    if (eventId.isNotEmpty()) shown.add(eventId)
     while (shown.size > 25) shown.removeAt(0)
 
     ensureChannel(context)
@@ -142,18 +182,34 @@ object ChatNotifications {
       .setKey(style.optString("sender_key").ifBlank { senderName })
       .setIcon(IconCompat.createWithBitmap(avatar))
       .build()
-    val messaging = existing?.let { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(it) }
-      ?: NotificationCompat.MessagingStyle(Person.Builder().setName("You").setKey("me").build())
+    val existingStyle = existing?.let { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(it) }
+    val existingMessages = existingStyle?.messages.orEmpty()
+    val baseMessages = if (recent != null && (existing == null || existingMessages.size < recent.messages.size)) {
+      val merged = existingMessages.toMutableList()
+      for (msg in recent.messages) {
+        if (merged.none { it.timestamp == msg.timestamp && it.text?.toString() == msg.text?.toString() }) {
+          merged.add(msg)
+        }
+      }
+      merged
+    } else {
+      existingMessages
+    }
+    val messaging = NotificationCompat.MessagingStyle(Person.Builder().setName("You").setKey("me").build())
     messaging.isGroupConversation = group
     messaging.conversationTitle = if (group) conversationTitle.ifBlank { null } else null
-    messaging.addMessage(NotificationCompat.MessagingStyle.Message(body, if (sentAt > 0) sentAt else System.currentTimeMillis(), sender))
+    for (msg in baseMessages) {
+      messaging.addMessage(msg)
+    }
+    val messageTime = if (sentAt > 0) sentAt else now
+    messaging.addMessage(NotificationCompat.MessagingStyle.Message(body, messageTime, sender))
 
     val shortcutId = SHORTCUT_PREFIX + Integer.toHexString(conversationId.hashCode())
     pushShortcut(context, shortcutId, if (group) conversationTitle.ifBlank { senderName } else senderName,
       if (group) null else sender, IconCompat.createWithBitmap(if (group) initialAvatar(conversationTitle.ifBlank { senderName }) else avatar),
       data.optString("route"))
 
-    val extras = Bundle().apply { putStringArrayList(EVENT_IDS_EXTRA, shown) }
+    val extras = Bundle().apply { putString(EVENT_IDS_EXTRA, shown.joinToString("\\n")) }
     val builder = base(context, tap)
       .setStyle(messaging)
       .setContentTitle(if (group) conversationTitle.ifBlank { senderName } else senderName)
@@ -161,27 +217,74 @@ object ChatNotifications {
       .setCategory(NotificationCompat.CATEGORY_MESSAGE)
       .setShortcutId(shortcutId)
       .setLocusId(LocusIdCompat(shortcutId))
-      .setWhen(if (sentAt > 0) sentAt else System.currentTimeMillis())
+      .setWhen(messageTime)
       .setShowWhen(true)
       .addExtras(extras)
     if (source.isNotEmpty()) builder.setSubText(source)
+    evictIfNeeded(context, NOTIFICATION_TAG, id)
+    paceNotify()
     manager.notify(NOTIFICATION_TAG, id, builder.build())
+    recentPosts[id] = RecentPost(shown.toList(), messaging.messages.toList(), System.currentTimeMillis())
   }
 
   // What a chat alert becomes when it cannot be drawn as a conversation: the
   // same words and the same tap, so the message is never lost.
+  @Synchronized
   fun postPlain(context: Context, data: JSONObject, tap: Notification) {
     val style = data.optJSONObject(STYLE_KEY) ?: JSONObject()
     val title = style.optString("title").ifBlank { style.optString("sender_name") }.ifBlank { "New message" }
     val body = style.optString("body")
+    val eventId = style.optString("event_id")
+    val id = abs((eventId.ifBlank { tap.notificationRequest.identifier }).hashCode())
     ensureChannel(context)
     val builder = base(context, tap)
       .setContentTitle(title)
       .setContentText(body)
       .setStyle(NotificationCompat.BigTextStyle().bigText(body))
       .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+    if (eventId.isNotEmpty()) {
+      builder.addExtras(Bundle().apply { putString(EVENT_IDS_EXTRA, eventId) })
+    }
     style.optString("source").takeIf { it.isNotEmpty() }?.let { builder.setSubText(it) }
-    NotificationManagerCompat.from(context).notify(PLAIN_TAG, abs((style.optString("event_id").ifBlank { tap.notificationRequest.identifier }).hashCode()), builder.build())
+    evictIfNeeded(context, PLAIN_TAG, id)
+    paceNotify()
+    NotificationManagerCompat.from(context).notify(PLAIN_TAG, id, builder.build())
+  }
+
+  private fun evictIfNeeded(context: Context, targetTag: String, targetId: Int) {
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val allActive = manager.activeNotifications
+    val candidates = allActive.filter {
+      (it.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY) == 0 &&
+        !(it.tag == targetTag && it.id == targetId)
+    }
+    if (candidates.size < MAX_ACTIVE_NOTIFICATIONS) return
+    val beforeTotal = allActive.size
+    val toEvict = candidates
+      .sortedWith(compareBy<StatusBarNotification> { it.tag == NOTIFICATION_TAG }.thenBy { it.postTime })
+      .take(candidates.size - MAX_ACTIVE_NOTIFICATIONS + 1)
+    for (sbn in toEvict) {
+      manager.cancel(sbn.tag, sbn.id)
+      if (sbn.tag == NOTIFICATION_TAG) {
+        recentPosts.remove(sbn.id)
+      }
+    }
+    var waited = 0L
+    while (waited < CANCEL_POLL_MAX_MS) {
+      val currentSize = manager.activeNotifications.size
+      if (currentSize < beforeTotal && currentSize < 45) break
+      Thread.sleep(CANCEL_POLL_INTERVAL_MS)
+      waited += CANCEL_POLL_INTERVAL_MS
+    }
+  }
+
+  private fun paceNotify() {
+    val now = SystemClock.elapsedRealtime()
+    val elapsed = now - lastNotifyElapsedMs
+    if (lastNotifyElapsedMs > 0L && elapsed in 0 until MIN_NOTIFY_INTERVAL_MS) {
+      Thread.sleep(MIN_NOTIFY_INTERVAL_MS - elapsed)
+    }
+    lastNotifyElapsedMs = SystemClock.elapsedRealtime()
   }
 
   private fun base(context: Context, tap: Notification): NotificationCompat.Builder {
@@ -235,6 +338,7 @@ object ChatNotifications {
 
   private fun avatar(url: String, name: String): Bitmap {
     if (url.startsWith("https://")) {
+      avatarCache.get(url)?.let { return it }
       try {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 3000
@@ -243,7 +347,11 @@ object ChatNotifications {
         try {
           if (connection.responseCode == 200) {
             val bytes = connection.inputStream.use { it.readBytes() }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return circle(it) }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let {
+              val rounded = circle(it)
+              avatarCache.put(url, rounded)
+              return rounded
+            }
           }
         } finally {
           connection.disconnect()

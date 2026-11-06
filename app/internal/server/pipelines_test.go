@@ -554,6 +554,7 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 		{"marts_ops_slack_conversation_health", "slack"},
 		{"marts_ops_plaid_item_health", "plaid"},
 		{"marts_pgbackrest_health", "backups"},
+		{"marts_notification_health", "notifications"},
 	} {
 		if !strings.Contains(string(source), view.catalogID) {
 			t.Errorf("/api/pipelines does not query %s; it is inspectable in SQL and invisible on the web", view.catalogID)
@@ -668,3 +669,20 @@ func TestPipelinesPageExplainsRealTrafficLatency(t *testing.T) {
 		}
 	}
 }
+
+func TestPipelinesNotificationHealthCarriesAndroidDeliveryCheck(t *testing.T) {
+	for _, col := range []string{"android_accepted_24h", "android_posted_24h", "android_missing_24h"} {
+		if !strings.Contains(pipelineNotificationHealthSQL, col) {
+			t.Fatalf("pipelineNotificationHealthSQL must select %s: %s", col, pipelineNotificationHealthSQL)
+		}
+	}
+	for _, needle := range []string{"android 24h", "missing on phone", "new direct and scan arrivals"} {
+		if !strings.Contains(pipelinesPageHTML, needle) {
+			t.Fatalf("pipelines page is missing notification health copy %q", needle)
+		}
+	}
+	if strings.Contains(pipelinesPageHTML, "direct/CC") {
+		t.Fatal("pipelines page still carries stale direct/CC notification copy")
+	}
+}
+

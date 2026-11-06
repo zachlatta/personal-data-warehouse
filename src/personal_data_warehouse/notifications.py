@@ -8,6 +8,8 @@ TABLES = ("notification_state", "notification_events", "notification_deliveries"
 
 
 def ensure_notification_tables(warehouse):
+    if not warehouse._relation_exists("android_notification_events"):
+        warehouse.ensure_android_notifications_tables()
     # CREATE OR REPLACE VIEW cannot drop a column: the view exposed event_ts
     # (beside occurred_at for one deploy) until 2026-10-25.
     if warehouse._relation_exists("marts_notifications") and "event_ts" in warehouse._present_columns(
@@ -180,8 +182,72 @@ STATEMENTS = (
                NULLIF(opened_at,'epoch'::timestamptz) AS opened_at
         FROM @notification_deliveries""",
     """CREATE OR REPLACE VIEW @marts_notification_health AS
+        WITH android_watermark AS MATERIALIZED (
+            SELECT LEAST(
+                now() - interval '15 minutes',
+                COALESCE((SELECT max(synced_at) FROM @android_notification_events), 'epoch'::timestamptz) - interval '2 minutes',
+                COALESCE((SELECT max(event_at) FROM @android_notification_events), 'epoch'::timestamptz) - interval '2 minutes'
+            ) AS cutoff_at
+        ),
+        recent_phone_events AS MATERIALIZED (
+            SELECT e.event_at, e.channel_id, e.notification_tag, e.title, e.text, e.messages,
+                   string_to_array(COALESCE(e.raw_json->'extras'->>'pdw.event_ids', ''), E'\n') AS event_ids
+            FROM @android_notification_events e
+            WHERE e.event_at >= now() - interval '24 hours 10 seconds'
+              AND e.package_name = 'com.zachlatta.pdw'
+              AND e.event_type IN ('posted', 'active')
+        ),
+        android_window AS MATERIALIZED (
+            SELECT d.id,
+                   CASE
+                       WHEN d.payload ? 'android_style' THEN EXISTS (
+                           SELECT 1 FROM recent_phone_events e
+                           WHERE (e.channel_id = 'messages' OR e.notification_tag = 'pdw-chat-plain')
+                             AND e.event_at >= d.accepted_at - interval '10 seconds'
+                             AND e.event_at < d.accepted_at + interval '12 hours'
+                             AND (
+                                 (COALESCE(d.payload->'android_style'->>'event_id', '') <> ''
+                                  AND (d.payload->'android_style'->>'event_id') = ANY(e.event_ids))
+                                 OR e.text = COALESCE(d.payload->>'body', '')
+                                 OR EXISTS (
+                                     SELECT 1 FROM jsonb_array_elements(
+                                         CASE WHEN jsonb_typeof(e.messages) = 'array' THEN e.messages ELSE '[]'::jsonb END
+                                     ) AS m
+                                     WHERE m->>'text' = COALESCE(d.payload->>'body', '')
+                                 )
+                             )
+                       )
+                       ELSE EXISTS (
+                           SELECT 1 FROM recent_phone_events e
+                           WHERE e.channel_id = 'default'
+                             AND e.event_at >= d.accepted_at - interval '10 seconds'
+                             AND e.event_at < d.accepted_at + interval '12 hours'
+                             AND e.title = COALESCE(d.payload->>'title', '')
+                             AND e.text = COALESCE(d.payload->>'body', '')
+                       )
+                   END AS matched
+            FROM @notification_deliveries d
+            CROSS JOIN android_watermark w
+            WHERE d.status = 'provider_accepted'
+              AND d.endpoint->>'platform' = 'android'
+              AND d.accepted_at >= now() - interval '24 hours'
+              AND d.accepted_at < w.cutoff_at
+        ),
+        android_counts AS MATERIALIZED (
+            SELECT count(*)::bigint AS android_accepted_24h,
+                   count(*) FILTER (WHERE matched)::bigint AS android_posted_24h,
+                   count(*) FILTER (WHERE NOT matched)::bigint AS android_missing_24h
+            FROM android_window
+        )
         SELECT s.enabled, NULLIF(s.last_run_at,'epoch'::timestamptz) AS last_run_at,
-               s.error, CASE WHEN s.enabled = 0 THEN 'paused'
+               CASE
+                   WHEN s.error <> '' THEN s.error
+                   WHEN c.android_missing_24h > 0 THEN
+                       c.android_missing_24h::text || ' of ' || c.android_accepted_24h::text
+                       || ' Android alerts accepted in 24h never appeared on the phone'
+                   ELSE s.error
+               END AS error,
+               CASE WHEN s.enabled = 0 THEN 'paused'
                    WHEN s.status = 'error' THEN 'failing'
                    WHEN s.last_run_at < now() - interval '2 minutes' THEN 'stale'
                    WHEN EXISTS (SELECT 1 FROM @notification_deliveries
@@ -191,7 +257,13 @@ STATEMENTS = (
                         OR EXISTS (SELECT 1 FROM @notification_events WHERE status = 'no_devices'
                                    AND created_at > now() - interval '1 day')
                         OR EXISTS (SELECT 1 FROM @notification_deliveries WHERE status IN ('pending','retry','sending')
-                                   AND created_at < now() - interval '2 minutes') THEN 'attention'
-                   ELSE 'ok' END AS status
-        FROM @notification_state s WHERE id = 'timeline'""",
+                                   AND created_at < now() - interval '2 minutes')
+                        OR c.android_missing_24h > 0 THEN 'attention'
+                   ELSE 'ok' END AS status,
+               c.android_accepted_24h,
+               c.android_posted_24h,
+               c.android_missing_24h
+        FROM @notification_state s
+        CROSS JOIN android_counts c
+        WHERE s.id = 'timeline'""",
 )

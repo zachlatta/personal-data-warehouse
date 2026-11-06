@@ -875,8 +875,15 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   }
 
   function notificationNode(n) {
+    if (!n) return h("div");
+    var accepted = Number(n.android_accepted_24h || 0);
+    var posted = Number(n.android_posted_24h || 0);
+    var missing = Number(n.android_missing_24h || 0);
     return healthRow(n, "Timeline notifications", Number(n.enabled) === 1 ? "experiment on" : "experiment paused",
-      [["worker", n.last_run_at ? ago(ageOf(n.last_run_at)) + " ago" : "never", "new direct/CC arrivals only; no history replay", false]],
+      [
+        ["worker", n.last_run_at ? ago(ageOf(n.last_run_at)) + " ago" : "never", "new direct and scan arrivals only; no history replay", false],
+        ["android 24h", rows(posted) + " / " + rows(accepted) + " posted", rows(missing) + " missing on phone", true]
+      ],
       n.error || "Delivery/open ledger and controls: /notifications. Provider acceptance is not proof of device display.");
   }
 
@@ -986,7 +993,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   }
 
   function renderLevels() {
-    renderSection("notifications", "notifications — are new direct/CC arrivals being delivered", state.notifications, notificationNode);
+    renderSection("notifications", "notifications — are new direct and scan arrivals being delivered", state.notifications, notificationNode);
     renderSection("backups", LEVELS[0][1], state.backups, backupNode);
     renderSection("marts", LEVELS[1][1], state.marts, martNode);
     renderSection("adapters", LEVELS[2][1], state.adapters, adapterNode);

@@ -31,7 +31,7 @@ const (
 	pipelinesAgentsMaxRows    = 50
 )
 
-var pipelineNotificationHealthSQL = `SELECT enabled,last_run_at,error,status FROM ` + warehouse.SQLRelation("marts_notification_health")
+var pipelineNotificationHealthSQL = `SELECT enabled,last_run_at,error,status,android_accepted_24h,android_posted_24h,android_missing_24h FROM ` + warehouse.SQLRelation("marts_notification_health")
 
 var pipelineHealthSQL = `
 SELECT pipeline, label, kind, cadence, transport, status, data_status, run_status,

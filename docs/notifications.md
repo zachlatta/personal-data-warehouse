@@ -138,6 +138,24 @@ Start with health:
 SELECT * FROM marts_ops.notification_health;
 ~~~
 
+`marts_ops.notification_health` also reconciles the last 24 hours of `provider_accepted`
+Android pushes against `base_android_notifications.events` (`android_accepted_24h`,
+`android_posted_24h`, `android_missing_24h`). To avoid false alarms while the phone is
+offline or between upload batches, only deliveries accepted more than 15 minutes ago and
+at least 2 minutes before `LEAST(max(synced_at), max(event_at))` on
+`base_android_notifications.events` are evaluated, matching phone events in
+`[accepted_at - 10s, accepted_at + 12h)` (bounded by `event_at >= now() - interval '24 hours 10 seconds'`).
+Chat pushes (`payload ? 'android_style'`) match by `pdw.event_ids` (newline-delimited
+string extra), top-level `text`, or `messages[]` element text; non-chat pushes match on
+`channel_id = 'default'` by `title` and `text`. When `android_missing_24h > 0`, `status`
+becomes `attention` and `error` reports how many accepted Android alerts never appeared on
+the phone. (In the 2026-10-28..11-06 audit of 861 chat and 715 non-chat Android pushes,
+66 delayed chat alerts arrived on reconnect, 69 view-matched / 71 exact-timestamp chat
+alerts and 234 non-chat alerts never reached the phone—64/62 chat and 215 non-chat inside
+six windows where `com.zachlatta.pdw` hit Android's 50-notification per-package limit,
+5–9 chat alerts in sub-second bursts, and 2 unexplained non-chat drops on
+2026-11-02 20:01..20:05Z when ~5 notifications were active in the shade.)
+
 Compare device-delivery cohorts by source and tier, allowing a day for opens:
 
 ~~~sql

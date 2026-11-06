@@ -64,6 +64,26 @@ test('the native renderer and the server agree on the channel and payload key', 
   assert.ok(app.plugins.includes('./plugins/with-messaging-notifications'));
 });
 
+test('chat notifications evict above the 30-notification shade ceiling, merge 5s bursts, cache avatars, pace notify, and serialize event_ids as a string', () => {
+  const kotlin = plugin.KOTLIN('com.zachlatta.pdw');
+  assert.match(kotlin, /MAX_ACTIVE_NOTIFICATIONS = 30/);
+  assert.match(kotlin, /FLAG_GROUP_SUMMARY/);
+  assert.match(kotlin, /compareBy<StatusBarNotification> \{ it\.tag == NOTIFICATION_TAG \}\.thenBy \{ it\.postTime \}/);
+  assert.match(kotlin, /manager\.cancel\(sbn\.tag, sbn\.id\)/);
+  assert.match(kotlin, /while \(waited < CANCEL_POLL_MAX_MS\)/);
+  assert.match(kotlin, /@Synchronized\s+fun post\(/);
+  assert.match(kotlin, /@Synchronized\s+fun postPlain\(/);
+  assert.match(kotlin, /RECENT_POST_TTL_MS = 5000L/);
+  assert.match(kotlin, /recentPosts\.remove\(id\)/);
+  assert.match(kotlin, /LruCache<String, Bitmap>\(AVATAR_CACHE_SIZE\)/);
+  assert.match(kotlin, /MIN_NOTIFY_INTERVAL_MS = 200L/);
+  assert.match(kotlin, /SystemClock\.elapsedRealtime\(\)/);
+  assert.match(kotlin, /putString\(EVENT_IDS_EXTRA, shown\.joinToString\("\\n"\)\)/);
+  assert.match(kotlin, /getString\(EVENT_IDS_EXTRA\)/);
+  assert.doesNotMatch(kotlin, /putStringArrayList/);
+  assert.doesNotMatch(kotlin, /getStringArrayList/);
+});
+
 function kotlinDependencies() {
   const source = readFileSync(path.join(mobile, 'plugins/with-messaging-notifications.js'), 'utf8');
   return [...source.matchAll(/"(implementation '[^']+')"/g)].map((m) => m[1]);

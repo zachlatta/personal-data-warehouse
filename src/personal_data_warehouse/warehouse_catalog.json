@@ -4278,7 +4278,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "Health. Paused, stale worker, or attention for failures, no devices and backlog."
+      "comment": "Health. Paused, stale worker, or attention for failures, no devices, backlog and missing phone alerts."
     },
     {
       "id": "mcp_connections",
