@@ -286,8 +286,8 @@ see `mobile/README.md`.
     posting.
   - Synchronizes `post()` and `postPlain()` on the push service's thread, caches contact avatars in
     an `LruCache<String, Bitmap>(32)`, paces `notify()` at 200ms (`MIN_NOTIFY_INTERVAL_MS = 200L`),
-    and merges in-memory `RecentPost` state within 5 seconds (`RECENT_POST_TTL_MS = 5000L`) while
-    resetting after user dismissal.
+    and prefers its own last post over the shade's copy for 5 seconds (`RECENT_POST_TTL_MS = 5000L`), after
+    which a conversation missing from the shade counts as dismissed and starts fresh.
   - Stores `pdw.event_ids` via `putString` as a newline-delimited string so
     `SpoolListenerService.java` serializes every stacked `event_id` into
     `raw_json->'extras'->>'pdw.event_ids'` instead of `"<ArrayList>"`.
@@ -296,6 +296,9 @@ see `mobile/README.md`.
     `base_android_notifications.events`) against `[accepted_at - 10s, accepted_at + 12h)` phone
     events (`android_accepted_24h`, `android_posted_24h`, `android_missing_24h`), turning
     `attention` when accepted pushes never appear on the phone.
+  - **Limit:** eviction runs only when a chat push reaches `ChatNotifications`. FCM draws a non-chat
+    push itself while the app is in the background, so a run of only non-chat pushes can still reach
+    50 until the next chat push evicts; the health view reports what that drops.
 
 ## Writing to Apple Notes (apple_notes mutations)
 

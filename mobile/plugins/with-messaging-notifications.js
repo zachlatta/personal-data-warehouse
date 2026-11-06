@@ -156,21 +156,15 @@ object ChatNotifications {
 
     val now = System.currentTimeMillis()
     val existing = activeNotification(context, id)
+    // notify() reaches system_server asynchronously, so for a few seconds the
+    // shade can lag this process's last post, which is always the newest state.
     val recent = recentPosts[id]?.takeIf { now - it.postedAtMs <= RECENT_POST_TTL_MS }
-    if (existing == null && recent == null) {
-      recentPosts.remove(id)
-    }
-    val existingShown = existing?.extras?.getString(EVENT_IDS_EXTRA)
+    if (recent == null) recentPosts.remove(id)
+    val shown = (recent?.shown ?: existing?.extras?.getString(EVENT_IDS_EXTRA)
       ?.lineSequence()
       ?.filter { it.isNotEmpty() }
       ?.toList()
-      .orEmpty()
-    val shown = LinkedHashSet<String>().apply {
-      addAll(existingShown)
-      if (recent != null && (existing == null || existingShown.size < recent.shown.size)) {
-        addAll(recent.shown)
-      }
-    }.toMutableList()
+      .orEmpty()).toMutableList()
     if (eventId.isNotEmpty() && shown.contains(eventId)) return
     if (eventId.isNotEmpty()) shown.add(eventId)
     while (shown.size > 25) shown.removeAt(0)
@@ -182,19 +176,8 @@ object ChatNotifications {
       .setKey(style.optString("sender_key").ifBlank { senderName })
       .setIcon(IconCompat.createWithBitmap(avatar))
       .build()
-    val existingStyle = existing?.let { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(it) }
-    val existingMessages = existingStyle?.messages.orEmpty()
-    val baseMessages = if (recent != null && (existing == null || existingMessages.size < recent.messages.size)) {
-      val merged = existingMessages.toMutableList()
-      for (msg in recent.messages) {
-        if (merged.none { it.timestamp == msg.timestamp && it.text?.toString() == msg.text?.toString() }) {
-          merged.add(msg)
-        }
-      }
-      merged
-    } else {
-      existingMessages
-    }
+    val baseMessages = recent?.messages
+      ?: existing?.let { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(it) }?.messages.orEmpty()
     val messaging = NotificationCompat.MessagingStyle(Person.Builder().setName("You").setKey("me").build())
     messaging.isGroupConversation = group
     messaging.conversationTitle = if (group) conversationTitle.ifBlank { null } else null

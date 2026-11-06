@@ -417,4 +417,3 @@ def test_notification_health_does_not_let_a_later_same_text_row_past_12h_hide_a_
     assert wh._query(
         "SELECT status, error, android_accepted_24h, android_posted_24h, android_missing_24h FROM @marts_notification_health"
     ) == [("attention", "1 of 1 Android alerts accepted in 24h never appeared on the phone", 1, 0, 1)]
-

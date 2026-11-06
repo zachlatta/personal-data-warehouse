@@ -875,7 +875,6 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   }
 
   function notificationNode(n) {
-    if (!n) return h("div");
     var accepted = Number(n.android_accepted_24h || 0);
     var posted = Number(n.android_posted_24h || 0);
     var missing = Number(n.android_missing_24h || 0);

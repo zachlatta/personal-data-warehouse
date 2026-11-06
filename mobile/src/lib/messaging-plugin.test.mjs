@@ -75,6 +75,10 @@ test('chat notifications evict above the 30-notification shade ceiling, merge 5s
   assert.match(kotlin, /@Synchronized\s+fun postPlain\(/);
   assert.match(kotlin, /RECENT_POST_TTL_MS = 5000L/);
   assert.match(kotlin, /recentPosts\.remove\(id\)/);
+  // The last in-process post is the newest state; a same-length stale shade copy at the 25-message cap must not win.
+  assert.match(kotlin, /recent\?\.shown \?:/);
+  assert.match(kotlin, /recent\?\.messages\s+\?:/);
+  assert.doesNotMatch(kotlin, /existingMessages\.size < recent\.messages\.size/);
   assert.match(kotlin, /LruCache<String, Bitmap>\(AVATAR_CACHE_SIZE\)/);
   assert.match(kotlin, /MIN_NOTIFY_INTERVAL_MS = 200L/);
   assert.match(kotlin, /SystemClock\.elapsedRealtime\(\)/);

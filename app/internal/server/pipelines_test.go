@@ -685,4 +685,3 @@ func TestPipelinesNotificationHealthCarriesAndroidDeliveryCheck(t *testing.T) {
 		t.Fatal("pipelines page still carries stale direct/CC notification copy")
 	}
 }
-
