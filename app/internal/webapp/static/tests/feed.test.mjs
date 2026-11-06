@@ -558,6 +558,7 @@ test("hide sends the phone's fields, undo puts the card back in its place, and p
   button(cards()[1], "Hide").fire("click");
   assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:1", "hn:3"]);
   assert.match(root.textContent, /Hidden/);
+  scrollTo(0);
   press("z");
   assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:1", "hn:2", "hn:3"]);
   assert.equal(scroller().scrollTop, 400, "the restored card is where it was");
@@ -661,6 +662,26 @@ test("a tap stays until the server agrees, so a reload cannot undo it", async ()
   assert.ok(button(cards()[0], "Saved"));
 });
 
+test("a like and a save still unsent when the page reloads stay on, and pressing again takes them back", async () => {
+  await start();
+  holdPosts = true;
+  press("l");
+  press("s");
+  view.cleanup();
+  await start(); // a new page: only the outbox remembers, and the server has heard neither
+  assert.ok(button(cards()[0], "Liked"));
+  assert.ok(button(cards()[0], "Saved"));
+  press("l");
+  press("s");
+  view.cleanup();
+  holdPosts = false; // a held send stays in flight for its page, so the next page sends the outbox
+  await start();
+  await flushed();
+  assert.deepEqual(events().filter((e) => e.item_id === "hn:1" && /like|save/.test(e.type)).map((e) => e.type), ["like", "save", "unlike", "unsave"]);
+  assert.equal(button(cards()[0], "Liked"), undefined, "the unlike is the last word");
+  assert.equal(button(cards()[0], "Saved"), undefined);
+});
+
 test("the outbox and read-later rules are the phone's", () => {
   const items = [{ item_id: "a" }, { item_id: "b" }];
   assert.deepEqual(applyPendingDismissals(items, [{ type: "dismiss", item_id: "a" }]), [items[1]]);
@@ -722,7 +743,7 @@ test("keys stay out of the way of modifiers, inputs, the token gate and a native
   gateOpen = true;
   assert.equal(press("j"), false);
   gateOpen = false;
-  const link = { closest: (selector) => (selector.includes("a,") || selector.startsWith("a") ? {} : null) };
+  const link = { closest: (selector) => (selector === "a, button" ? {} : null) };
   assert.equal(press("Enter", { target: link }), false);
   assert.equal(root.all((n) => n.className === "freader").length, 0);
   assert.equal(press("PageDown"), false);
@@ -1365,14 +1386,13 @@ test("r ends open stretches, holds measuring, loads with pull, replaces the list
   await start();
   runFrames();
   advance(400);
-  scrollTo(500);
   let answer;
   feedResponse = () => new Promise((resolve) => { answer = resolve; });
   assert.equal(press("r"), true);
   await settle();
   await flushed();
   const during = ofType("impression").length;
-  assert.ok(during > 0);
+  assert.deepEqual(ofType("impression").map((e) => e.item_id), ["hn:1", "hn:2"], "the cards still on screen when r was pressed");
   assert.equal(ofType("ui")[0].metadata.action, "refresh");
   layOut();
   scrollTo(100);
