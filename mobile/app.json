@@ -97,7 +97,7 @@
         "projectId": "c5085048-1a90-4340-a13d-6624522b6589"
       },
       "pushCapabilities": [
-        "android_messaging_style"
+        "android_native_alerts"
       ]
     },
     "owner": "zlatta",

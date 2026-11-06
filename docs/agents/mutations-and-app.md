@@ -243,25 +243,34 @@ unknown category shows no buttons, an `http` image is blocked by App Transport S
 in the extension. Three senders share it: the `notify` tool (`pdw call notify --data
 '{…}'`, also on MCP), `POST /api/push/send` (same JSON, for curl), and the mutation hook,
 whose alert is now `mutation_review` with Approve / Deny / Review buttons that act without
-opening the app. Categories live in `app/internal/push/categories.go` and are published
+opening the app on iOS (Android draws no buttons; a tap opens the review, see below). Categories live in `app/internal/push/categories.go` and are published
 at `GET /api/push/categories`; the app registers them on launch, so a new button is a Go
 edit — only handling a *new action id* needs `mobile/src/lib/push.ts`. Images on iOS need
 the Notification Service Extension target (`mobile/targets/notification-service`, added
 at prebuild by `@bacons/apple-targets`), which reads Expo's `body._richContent.image`
 from the payload; a build without it shows the same push as text, and changing it is a
 native build, not an OTA update. Settings → "Send test push" sends an image + subtitle +
-Open button, which is how a phone proves the extension is installed.
+Open button, which is how a phone proves the extension is installed. On Android the native
+service below downloads the image and a test push has no button.
 
-**On Android a chat alert is a data-only push the app draws as a conversation.** Since
-2026-10-28, a timeline alert from `android_messages`, `apple_messages`, `whatsapp` or `slack`
+**On Android every alert is a data-only push the app draws itself.** Since 2026-10-28, a timeline alert from `android_messages`, `apple_messages`, `whatsapp` or `slack`
 carries `Alert.Android` (`AndroidStyle`: sender, conversation id and title, group, an
 `avatar_url` from a non-placeholder contact photo or the Slack profile, the event id), and
 `Transport.Send` (`app/internal/notifications/sender.go`) picks the wire shape per device from
 the delivery endpoint, which the fan-out fills from `push_devices.platform` and
-`push_devices.capabilities`: an Android device that registered `android_messaging_style` gets
+`push_devices.capabilities`: an Android device that registered `android_native_alerts` gets
 a data-only Expo message (no title, so FCM hands it to the app instead of drawing it in the
 "Miscellaneous" fallback channel), everything else gets the ordinary alert on the `default`
-channel. `capabilities` is declared in both ensure paths (`store.go`, `postgres.py`) with an
+channel. Since 2026-11-06 a non-chat alert goes the same way from both Expo senders
+(`expoMessage`, and `Notification.message` behind the `notify` tool, `POST /api/push/send`, the
+mutation hook and the test push): `Message.AndroidDataOnly` moves its title, subtitle, body,
+image, collapse id and silence under `data.android_alert`, and `push.DrawsAlertsNatively` is the
+one gate. `android_native_alerts` replaced `android_messaging_style`, whose builds draw chats only
+and show nothing for a data-only non-chat push; the old stored value normalizes away, so such a
+build gets ordinary alerts for everything until it registers again. Android alerts have no action
+buttons: a tap opens the route (an Approve with no running JS would wait silently for the next
+launch), and `collapse_id` now really replaces an alert there, which Expo's Android path never did.
+`capabilities` is declared in both ensure paths (`store.go`, `postgres.py`) with an
 `ADD COLUMN IF NOT EXISTS`, and every registration replaces it. The avatar lookup runs in the
 worker's `Render` under a one-second bound (`withAvatar`); a slow or failed lookup means an
 initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
@@ -280,9 +289,10 @@ see `mobile/README.md`.
   `FCM-Notification:<tag>` pushes filled Android's `MAX_PACKAGE_NOTIFICATIONS = 50` per-app limit
   (confirmed by two `event_type = 'active'` snapshots at exactly 50 and six 50-notification removal
   events that immediately restored delivery); the remaining 5–9 chat drops occurred in sub-second
-  burst tails before `system_server` committed the previous `notify()`. `ChatNotifications` now:
-  - Evicts the oldest active non-summary notifications across all tags (`FCM-Notification:*` first,
-    then oldest `pdw-chat` conversations other than the target conversation) down to `< 30`
+  burst tails before `system_server` committed the previous `notify()`. `PdwNotifications` now:
+  - Evicts the oldest active non-summary notifications across all tags (every non-chat tag first,
+    `pdw-alert` and anything else, then oldest `pdw-chat` conversations other than the target
+    conversation) down to `< 30`
     (`MAX_ACTIVE_NOTIFICATIONS = 30`) and polls up to 250ms for async cancel completion before
     posting.
   - Synchronizes `post()` and `postPlain()` on the push service's thread, caches contact avatars in
@@ -297,9 +307,15 @@ see `mobile/README.md`.
     `base_android_notifications.events`) against `[accepted_at - 10s, accepted_at + 12h)` phone
     events (`android_accepted_24h`, `android_posted_24h`, `android_missing_24h`), turning
     `attention` when accepted pushes never appear on the phone.
-  - **Limit:** eviction runs only when a chat push reaches `ChatNotifications`. FCM draws a non-chat
-    push itself while the app is in the background, so a run of only non-chat pushes can still reach
-    50 until the next chat push evicts; the health view reports what that drops.
+  - **Eviction runs for every alert** since 2026-11-06, when non-chat alerts became data-only and
+    `PdwNotifications.postAlert` started drawing them under the tag `pdw-alert` on the `default`
+    channel. A build without `android_native_alerts` still has FCM drawing its non-chat alerts, so
+    a run of them can reach 50 there; the health view reports what that drops.
+  - **Rolling a phone back needs a launch.** After reinstalling an older APK (as root on the phone,
+    `pm install -r -d <apk>`; a refused downgrade means rebuilding that commit with a higher version
+    code, never an uninstall, which loses the app's data), open the app and confirm
+    `private.push_devices.capabilities` no longer holds `android_native_alerts`. Until that launch
+    the server keeps sending data-only alerts, which the older build drops without a sign.
 
 ## Writing to Apple Notes (apple_notes mutations)
 

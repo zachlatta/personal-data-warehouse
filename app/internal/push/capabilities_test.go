@@ -11,17 +11,37 @@ import (
 )
 
 func TestCapabilitiesKeepOnlyKnownValuesOnceSorted(t *testing.T) {
-	got := NormalizeCapabilities([]string{" android_messaging_style ", "teleport", "android_messaging_style", ""})
-	if strings.Join(got, ",") != CapabilityAndroidMessagingStyle {
+	got := NormalizeCapabilities([]string{" android_native_alerts ", "teleport", "android_native_alerts", ""})
+	if strings.Join(got, ",") != CapabilityAndroidNativeAlerts {
 		t.Fatalf("got %q", got)
 	}
-	if !HasCapability("x,android_messaging_style", CapabilityAndroidMessagingStyle) || HasCapability("", CapabilityAndroidMessagingStyle) {
+	if !HasCapability("x,android_native_alerts", CapabilityAndroidNativeAlerts) || HasCapability("", CapabilityAndroidNativeAlerts) {
 		t.Fatal("stored capability list misread")
 	}
 }
 
-// A phone rolled back to a build without the native chat renderer must stop
-// being sent data-only chat alerts the moment it re-registers, so the
+// The label before this one meant "draws chats only". A build still claiming it
+// shows nothing for a data-only non-chat alert, so it must read as no capability.
+func TestTheChatOnlyLabelIsNotACapability(t *testing.T) {
+	if got := NormalizeCapabilities([]string{"android_messaging_style"}); len(got) != 0 {
+		t.Fatalf("got %q", got)
+	}
+	if DrawsAlertsNatively("android", "android_messaging_style") {
+		t.Fatal("a chat-only build was treated as drawing every alert")
+	}
+}
+
+func TestDrawsAlertsNativelyNeedsAndroidAndTheCapability(t *testing.T) {
+	if !DrawsAlertsNatively("android", "android_native_alerts") {
+		t.Fatal("capable android device refused")
+	}
+	if DrawsAlertsNatively("ios", "android_native_alerts") || DrawsAlertsNatively("android", "") || DrawsAlertsNatively("", "android_native_alerts") {
+		t.Fatal("a device that cannot draw was accepted")
+	}
+}
+
+// A phone rolled back to a build without the native alert renderer must stop
+// being sent data-only alerts the moment it re-registers, so the
 // registration replaces the capability list rather than merging into it.
 func TestRegisterReplacesCapabilities(t *testing.T) {
 	store := NewMemoryStore()
@@ -37,8 +57,8 @@ func TestRegisterReplacesCapabilities(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	post(`{"expo_push_token":"ExponentPushToken[px]","platform":"android","capabilities":["android_messaging_style"]}`)
-	if d, _ := store.Get("ExponentPushToken[px]"); strings.Join(d.Capabilities, ",") != CapabilityAndroidMessagingStyle {
+	post(`{"expo_push_token":"ExponentPushToken[px]","platform":"android","capabilities":["android_native_alerts"]}`)
+	if d, _ := store.Get("ExponentPushToken[px]"); strings.Join(d.Capabilities, ",") != CapabilityAndroidNativeAlerts {
 		t.Fatalf("capability not stored: %+v", d)
 	}
 	post(`{"expo_push_token":"ExponentPushToken[px]","platform":"android"}`)
@@ -62,11 +82,11 @@ func TestPostgresStoreCapabilities(t *testing.T) {
 	store.Expand = func(q string) string { return strings.ReplaceAll(q, "@push_devices", table) }
 	ctx := context.Background()
 	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-	d, err := store.Register(ctx, Device{ExpoPushToken: "ExponentPushToken[px]", Platform: "android", Capabilities: []string{CapabilityAndroidMessagingStyle, "unknown"}}, now)
+	d, err := store.Register(ctx, Device{ExpoPushToken: "ExponentPushToken[px]", Platform: "android", Capabilities: []string{CapabilityAndroidNativeAlerts, "unknown"}}, now)
 	if err != nil {
 		t.Fatalf("register against the old table: %v", err)
 	}
-	if strings.Join(d.Capabilities, ",") != CapabilityAndroidMessagingStyle {
+	if strings.Join(d.Capabilities, ",") != CapabilityAndroidNativeAlerts {
 		t.Fatalf("capabilities %q", d.Capabilities)
 	}
 	if _, err = store.Register(ctx, Device{ExpoPushToken: "ExponentPushToken[px]", Platform: "android"}, now.Add(time.Minute)); err != nil {

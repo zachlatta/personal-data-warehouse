@@ -80,17 +80,20 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 	}
 }
 
-// expoMessage picks the wire shape for one device. A chat alert to an Android
-// build that draws conversations itself is data-only: an Expo message with a
-// title is delivered as an FCM notification message, which Android renders
-// itself whenever the app is in the background, so the app's code never sees
-// it. Every other alert, and every device that has not reported the
-// capability (iOS, an older Android build, a delivery queued before platform
-// was recorded), gets the ordinary alert on the high-importance channel.
+// expoMessage picks the wire shape for one device. Every alert to an Android
+// build that draws alerts itself is data-only: an Expo message with a title is
+// delivered as an FCM notification message, which Android renders itself
+// whenever the app is in the background, so the app's code never sees it and
+// cannot make room under Android's 50-notification limit. A chat alert carries
+// its conversation under android_style, any other alert goes through
+// Message.AndroidDataOnly. Every device that has not reported the capability
+// (iOS, an older Android build, a delivery queued before platform was recorded)
+// gets the ordinary alert on the high-importance channel.
 func expoMessage(token, platform, capabilities string, d Delivery) push.Message {
 	a := d.Alert
 	data := map[string]any{"kind": "timeline_notification", "route": a.Route, "open": a.Open, "delivery_id": d.ID, "open_proof": a.OpenProof}
-	if a.Android != nil && platform == "android" && push.HasCapability(capabilities, push.CapabilityAndroidMessagingStyle) {
+	native := push.DrawsAlertsNatively(platform, capabilities)
+	if a.Android != nil && native {
 		style := map[string]any{}
 		raw, _ := json.Marshal(a.Android)
 		_ = json.Unmarshal(raw, &style)
@@ -104,6 +107,9 @@ func expoMessage(token, platform, capabilities string, d Delivery) push.Message 
 	if a.Icon != "" {
 		m.MutableContent = true
 		m.RichContent = &push.RichContent{Image: a.Icon}
+	}
+	if native {
+		return m.AndroidDataOnly()
 	}
 	return m
 }

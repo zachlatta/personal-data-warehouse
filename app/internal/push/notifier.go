@@ -28,7 +28,8 @@ type Notification struct {
 	// it is expanded. It must be https and publicly fetchable by the phone;
 	// a signed /objects/ download link qualifies.
 	ImageURL string `json:"image_url,omitempty"`
-	// Category selects the action buttons (see Categories).
+	// Category selects the action buttons (see Categories). iOS only: an
+	// Android build that draws its own alerts opens the route on a tap.
 	Category string `json:"category,omitempty"`
 	// ThreadID groups related alerts in Notification Center.
 	ThreadID string `json:"thread_id,omitempty"`
@@ -56,19 +57,23 @@ type Notification struct {
 // render it before it has network) budget against this with MessageSize.
 const MaxMessageBytes = 4096
 
-// MessageSize is the byte length of the Expo wire message this notification
-// becomes, measured with a placeholder token so it can be judged before any
-// device is looked up.
+// MessageSize is the byte length of the largest Expo wire message this
+// notification becomes on any device, measured with a placeholder token so it
+// can be judged before any device is looked up.
 func MessageSize(n Notification) (int, error) {
-	m, err := n.message("ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]")
+	m, err := n.message(Device{ExpoPushToken: "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]"})
 	if err != nil {
 		return 0, err
 	}
-	raw, err := json.Marshal(m)
+	ordinary, err := json.Marshal(m)
 	if err != nil {
 		return 0, err
 	}
-	return len(raw), nil
+	dataOnly, err := json.Marshal(m.AndroidDataOnly())
+	if err != nil {
+		return 0, err
+	}
+	return max(len(ordinary), len(dataOnly)), nil
 }
 
 // Interruption levels, per UNNotificationInterruptionLevel.
@@ -118,13 +123,14 @@ func (n Notification) Validate() error {
 // than arriving silently in Expo's default-importance fallback channel.
 const AndroidChannelID = "default"
 
-// message builds the Expo message for one device.
-func (n Notification) message(token string) (Message, error) {
+// message builds the Expo message for one device, in the wire shape that
+// device can show.
+func (n Notification) message(device Device) (Message, error) {
 	if err := n.Validate(); err != nil {
 		return Message{}, err
 	}
 	m := Message{
-		To:                token,
+		To:                device.ExpoPushToken,
 		Title:             n.Title,
 		Subtitle:          n.Subtitle,
 		Body:              n.Body,
@@ -151,6 +157,9 @@ func (n Notification) message(token string) (Message, error) {
 		if n.Route != "" {
 			m.Data["route"] = n.Route
 		}
+	}
+	if DrawsAlertsNatively(device.Platform, strings.Join(device.Capabilities, ",")) {
+		return m.AndroidDataOnly(), nil
 	}
 	return m, nil
 }
@@ -199,7 +208,7 @@ func (n *Notifier) Notify(ctx context.Context, notification Notification) (Repor
 	}
 	messages := make([]Message, 0, len(devices))
 	for _, device := range devices {
-		message, err := notification.message(device.ExpoPushToken)
+		message, err := notification.message(device)
 		if err != nil {
 			return report, err
 		}

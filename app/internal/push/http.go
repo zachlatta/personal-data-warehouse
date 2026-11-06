@@ -48,7 +48,7 @@ type registerRequest struct {
 	Platform      string `json:"platform"`
 	AppVersion    string `json:"app_version"`
 	// Capabilities is what the build's native code can render; omitted by
-	// every build before android_messaging_style, which clears it.
+	// every build before the first capability existed, which clears it.
 	Capabilities []string `json:"capabilities"`
 }
 
@@ -154,7 +154,7 @@ func (h *Handler) handleTest(w http.ResponseWriter, r *http.Request) {
 	report, err := h.notifier.Notify(r.Context(), Notification{
 		Title:    "PDW test notification",
 		Subtitle: "Rich push check",
-		Body:     "Push is working. If you see an image beside this and an Open button when you long-press, the rich path works too. Sent " + h.now().UTC().Format(time.RFC3339) + ".",
+		Body:     "Push is working. If you see an image with this, the rich path works too; on iPhone a long-press also shows an Open button. Sent " + h.now().UTC().Format(time.RFC3339) + ".",
 		ImageURL: testImageURL,
 		Category: CategoryLink,
 		ThreadID: "test",

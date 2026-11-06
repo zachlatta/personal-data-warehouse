@@ -9,7 +9,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 )
 
-const notifyDescription = "Send a push notification to Zach's phone (every device registered with the PDW iOS app). Use it for something that genuinely needs his attention now — a real person waiting on a reply, a deadline, a security alert — not for status. Fields map onto the iOS alert: title (required), subtitle, body, an https image_url shown as a thumbnail (or image_storage_file_id for a warehouse object, which becomes a signed link), category for action buttons (mutation_review: Approve/Deny/Review; link: Open; reply: inline text reply), route for the in-app screen a tap opens (/mutations/<id>, /timeline/<adapter>/<event_id>, /timeline, /search), thread_id to group related alerts, collapse_id to replace an earlier alert, interruption_level (passive, active, time-sensitive, critical), badge, and sound (default or none). Returns the delivery report per device."
+const notifyDescription = "Send a push notification to Zach's phone (every device registered with the PDW app). Use it for something that genuinely needs his attention now — a real person waiting on a reply, a deadline, a security alert — not for status. Fields map onto the alert: title (required), subtitle, body, an https image_url shown as a thumbnail (or image_storage_file_id for a warehouse object, which becomes a signed link), category for iOS action buttons (mutation_review: Approve/Deny/Review; link: Open; reply: inline text reply; Android has none, a tap opens the route), route for the in-app screen a tap opens (/mutations/<id>, /timeline/<adapter>/<event_id>, /timeline, /search), thread_id to group related alerts, collapse_id to replace an earlier alert, interruption_level (passive, active, time-sensitive, critical), badge, and sound (default or none). Returns the delivery report per device."
 
 type notifyInput struct {
 	Title              string         `json:"title" jsonschema:"the alert title; keep it under ~40 characters"`
@@ -18,7 +18,7 @@ type notifyInput struct {
 	ImageURL           string         `json:"image_url,omitempty" jsonschema:"absolute https URL of an image to attach; the phone downloads it, so it must be publicly fetchable"`
 	ImageStorageFileID string         `json:"image_storage_file_id,omitempty" jsonschema:"a warehouse storage_file_id (from get_object / storage_* columns) to attach instead of image_url; the app signs a download link for it"`
 	ImageAccount       string         `json:"image_account,omitempty" jsonschema:"account for a google_drive_source image_storage_file_id"`
-	Category           string         `json:"category,omitempty" jsonschema:"action buttons: mutation_review, link, or reply; omit for a plain alert"`
+	Category           string         `json:"category,omitempty" jsonschema:"iOS action buttons: mutation_review, link, or reply; omit for a plain alert; Android ignores it and a tap opens the route"`
 	Route              string         `json:"route,omitempty" jsonschema:"in-app path a tap opens, starting with /"`
 	ThreadID           string         `json:"thread_id,omitempty" jsonschema:"groups alerts in Notification Center; e.g. mutations, digest, finance"`
 	CollapseID         string         `json:"collapse_id,omitempty" jsonschema:"a newer alert with the same id replaces the older one"`

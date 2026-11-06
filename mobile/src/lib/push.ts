@@ -37,10 +37,11 @@ function projectId(): string | undefined {
 // alert lands silently in Expo's default-importance fallback.
 export const ANDROID_CHANNEL_ID = 'default';
 
-// Chat alerts (messages, WhatsApp, Slack) are drawn as conversations by the
-// native PdwMessagingService (plugins/with-messaging-notifications.js) on
-// their own channel, so they can be tuned apart from other alerts in Android
-// settings. The service creates it too, for an alert before first launch.
+// Every alert is drawn by the native PdwMessagingService
+// (plugins/with-messaging-notifications.js), which also creates both channels
+// for an alert before first launch. Chat alerts (messages, WhatsApp, Slack) are
+// conversations on their own channel, so they can be tuned apart from other
+// alerts in Android settings.
 export const ANDROID_MESSAGES_CHANNEL_ID = 'messages';
 
 async function ensureAndroidChannel(): Promise<void> {
@@ -96,8 +97,10 @@ export async function registerForPush(config: AppConfig): Promise<PushStatus> {
 
 // Register the server's notification categories so its categoryId values
 // put action buttons on alerts. Failure is logged, not fatal: the alert still
-// shows, only without buttons.
+// shows, only without buttons. Android has no buttons: the native service draws
+// its alerts and a tap opens the route, so nothing there would use a category.
 export async function syncNotificationCategories(config: AppConfig): Promise<void> {
+  if (Platform.OS === 'android') return;
   try {
     const categories = await fetchPushCategories(config);
     await Promise.all(

@@ -22,7 +22,8 @@ const expoBatchSize = 100
 // Message is one Expo push message, in Expo's own wire shape
 // (https://docs.expo.dev/push-notifications/sending-notifications/#message-request-format).
 // Build it through Notification.message rather than by hand so the
-// validation there runs.
+// validation there runs. A device that draws its own alerts takes
+// AndroidDataOnly's form of it.
 type Message struct {
 	To       string         `json:"to"`
 	Title    string         `json:"title,omitempty"`
@@ -47,6 +48,35 @@ type Message struct {
 	RichContent    *RichContent `json:"richContent,omitempty"`
 	// ChannelID is Android-only; harmless on iOS.
 	ChannelID string `json:"channelId,omitempty"`
+}
+
+// AndroidAlertKey is the data key carrying a non-chat alert to a device that
+// draws it itself (PdwNotifications.ALERT_KEY in
+// mobile/plugins/with-messaging-notifications.js).
+const AndroidAlertKey = "android_alert"
+
+// AndroidDataOnly is this message as a device that draws its own alerts takes
+// it. An Expo message with a title becomes an FCM notification message, which
+// Android draws itself while the app is in the background, so the app cannot
+// make room under Android's 50-notification limit first. Only data and urgency
+// remain at the top level; what the phone needs to draw moves under
+// AndroidAlertKey. The receiver is not changed.
+func (m Message) AndroidDataOnly() Message {
+	alert := map[string]any{"title": m.Title, "silent": m.Sound == ""}
+	for key, value := range map[string]string{"subtitle": m.Subtitle, "body": m.Body, "collapse_id": m.CollapseID} {
+		if value != "" {
+			alert[key] = value
+		}
+	}
+	if m.RichContent != nil && m.RichContent.Image != "" {
+		alert["image_url"] = m.RichContent.Image
+	}
+	data := make(map[string]any, len(m.Data)+1)
+	for key, value := range m.Data {
+		data[key] = value
+	}
+	data[AndroidAlertKey] = alert
+	return Message{To: m.To, Priority: m.Priority, Data: data}
 }
 
 // RichContent is the media Expo attaches to a message. Android renders it

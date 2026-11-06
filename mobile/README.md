@@ -117,21 +117,20 @@ id, an interruption level and a badge. The server builds them
 ```bash
 pdw call notify --data '{"title":"Wire due today","subtitle":"Invoice 4831","body":"Instructions in inbox.","image_url":"https://…/receipt.png","category":"link","route":"/timeline","interruption_level":"time-sensitive"}'
 curl -X POST "$PDW_API_URL/api/push/send" -H "Authorization: Bearer cli:$PDW_SECRET_TOKEN" -d '{"title":"…"}'
-# Settings → "Send test push" sends one with an image, subtitle and Open button.
+# Settings → "Send test push" sends one with an image, subtitle and, on iOS, an Open button.
 ```
 
-Two pieces of the app make that work, and both are worth knowing when
-something looks plain:
+Two pieces of the app make that work on iOS, and both are worth knowing when
+something looks plain (on Android the app draws every alert itself, below):
 
-- **Images on iOS need the Notification Service Extension** (Android shows
-  `richContent.image` itself), the
+- **Images on iOS need the Notification Service Extension**, the
   `targets/notification-service` Swift target that `@bacons/apple-targets`
   adds at prebuild. iOS runs it for any push with `mutableContent`; it reads
   the Expo payload's `body._richContent.image`, downloads it and attaches it.
   Without the extension (Expo Go, or a build before it existed) the same push
   is delivered as text only. Changing the Swift or the target config needs a
   new native build (`eas build`), not an OTA update.
-- **Action buttons are categories the server publishes.** On launch the app
+- **Action buttons are categories the server publishes, on iOS.** On launch the app
   fetches `GET /api/push/categories` and registers each with
   `setNotificationCategoryAsync`, so adding a button is a Go edit
   (`app/internal/push/categories.go`). Handling a NEW action id is the one
@@ -139,6 +138,7 @@ something looks plain:
   `src/lib/push.ts`): `approve`/`deny` on a `mutation_review` alert call the
   review API in the background without opening the app; `open` (and a plain
   tap) opens `data.route`; a `reply` action's text arrives as `userText`.
+  Android alerts have no buttons, and a tap opens `data.route`.
 
 ## Android
 
@@ -173,7 +173,7 @@ break from a Mac that only ever runs the iOS simulator:
   `AndroidChannelID` in `app/internal/push`); without it an alert lands
   silently in Firebase's "Miscellaneous" fallback channel.
 
-- **Chat alerts are drawn natively, as conversations.** A message, WhatsApp
+- **Every alert is drawn natively, chat alerts as conversations.** A message, WhatsApp
   or Slack alert looks like Google Messages' own: the sender as a person
   (contact photo, or a coloured initial), one notification per chat that
   stacks its messages, a conversation shortcut so it sits in the shade's
@@ -184,15 +184,24 @@ break from a Mac that only ever runs the iOS simulator:
   replaces expo-notifications' FCM service with `PdwMessagingService`, and the
   server sends a chat alert to it as a **data-only** push carrying
   `android_style` (`AndroidStyle` in `app/internal/notifications/worker.go`).
-  Only to a device that registered `capabilities: ["android_messaging_style"]`
-  (`app.json` `extra.pushCapabilities`, sent by `src/lib/push.ts`): an older
-  build would receive the same push and show nothing. Registration replaces
-  the list, so a phone rolled back to an older build stops getting data-only
-  alerts the next time it launches. Every other push goes to Expo unchanged;
-  a chat alert that cannot be drawn is posted plain (same words, same tap),
-  and a tap goes through Expo's response intent, so `handleNotificationResponse`
-  is the same for both. Check a phone with `base_android_notifications.events`:
-  channel `messages`, category `msg`, `is_conversation = 1`.
+  Every other alert is data-only too, carrying `android_alert`
+  (`Message.AndroidDataOnly` in `app/internal/push/expo.go`), and is drawn with
+  its title, text and picture on the `default` channel ("Alerts"), under the tag
+  `pdw-alert`, because Android caps an app at 50 active notifications and only
+  the app's own code can make room before each one. Its `collapse_id` picks the
+  notification, so a later push replaces it; without one the push's own
+  identifier keeps it separate. These alerts have no action buttons: a tap opens
+  `data.route`. Data-only goes only to a device that registered
+  `capabilities: ["android_native_alerts"]` (`app.json`
+  `extra.pushCapabilities`, sent by `src/lib/push.ts`): an older build would
+  receive the same push and show nothing. Registration replaces the list, so a
+  phone rolled back to an older build stops getting data-only alerts the next
+  time it launches, and shows nothing until then. Any other push goes to Expo
+  unchanged; an alert that cannot be drawn is posted plain (same words, same
+  tap), and a tap goes through Expo's response intent, so
+  `handleNotificationResponse` is the same for both. Check a phone with
+  `base_android_notifications.events`: chats on channel `messages`, category
+  `msg`, `is_conversation = 1`; other alerts on channel `default`, tag `pdw-alert`.
 
 - **PDW web links open in the app** (Android App Links). The intent filter in
   `app.json` claims `https://personal-data-warehouse.zachlatta.com` under

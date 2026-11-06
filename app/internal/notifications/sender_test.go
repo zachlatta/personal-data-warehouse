@@ -184,46 +184,62 @@ func TestHTTPAuthenticationBoundary(t *testing.T) {
 }
 
 // Expo turns a message with a title into an FCM notification message, which
-// Android draws itself in the background without running any app code. So a
-// chat alert is data-only, but only to an Android build that says it can draw
-// one: iOS, an older Android build, and a delivery queued before the platform
-// was recorded all get the ordinary alert, on the high-importance channel.
-func TestChatAlertWireShapeFollowsTheDevice(t *testing.T) {
+// Android draws itself in the background without running any app code. So every
+// alert is data-only, but only to an Android build that says it can draw one:
+// iOS, an older Android build, and a delivery queued before the platform was
+// recorded all get the ordinary alert, on the high-importance channel.
+func TestAlertWireShapeFollowsTheDevice(t *testing.T) {
 	chat := Alert{Title: "Sam", Subtitle: "Messages · Sam", Body: "On my way", Icon: "https://pdw.example/icon.png", Route: "/timeline/m/1", ThreadID: "timeline:apple_messages:me:c1", OpenProof: "proof",
 		Android: &AndroidStyle{Source: "Messages", ConversationID: "timeline:apple_messages:me:c1", SenderName: "Sam", SenderKey: "apple_messages:Sam", EventID: "1", AvatarURL: "https://photos.example/sam.jpg"}}
 	plain := chat
 	plain.Android = nil
-	capable := `{"token":"ExponentPushToken[px]","platform":"android","capabilities":"android_messaging_style"}`
+	capable := `{"token":"ExponentPushToken[px]","platform":"android","capabilities":"android_native_alerts"}`
+	const (
+		ordinary = iota
+		chatStyle
+		nativeAlert
+	)
 	cases := []struct {
 		name, endpoint string
 		alert          Alert
-		dataOnly       bool
+		shape          int
 	}{
-		{"capable android chat", capable, chat, true},
-		{"capable android, not a chat", capable, plain, false},
-		{"android build without the renderer", `{"token":"ExponentPushToken[px]","platform":"android","capabilities":""}`, chat, false},
-		{"ios", `{"token":"ExponentPushToken[ip]","platform":"ios","capabilities":"android_messaging_style"}`, chat, false},
-		{"delivery queued before platform was recorded", `{"token":"ExponentPushToken[px]"}`, chat, false},
+		{"capable android chat", capable, chat, chatStyle},
+		{"capable android, not a chat", capable, plain, nativeAlert},
+		{"android build without the renderer, chat", `{"token":"ExponentPushToken[px]","platform":"android","capabilities":""}`, chat, ordinary},
+		{"android build without the renderer, not a chat", `{"token":"ExponentPushToken[px]","platform":"android","capabilities":""}`, plain, ordinary},
+		{"chat-only build that cannot draw other alerts", `{"token":"ExponentPushToken[px]","platform":"android","capabilities":"android_messaging_style"}`, plain, ordinary},
+		{"ios", `{"token":"ExponentPushToken[ip]","platform":"ios","capabilities":"android_native_alerts"}`, chat, ordinary},
+		{"delivery queued before platform was recorded", `{"token":"ExponentPushToken[px]"}`, chat, ordinary},
 	}
 	for _, tc := range cases {
 		var e struct{ Token, Platform, Capabilities string }
 		_ = json.Unmarshal([]byte(tc.endpoint), &e)
 		m := expoMessage(e.Token, e.Platform, e.Capabilities, Delivery{ID: "d1", NotificationID: "n1", Alert: tc.alert})
-		if m.Priority != "high" || m.Data["open_proof"] != "proof" || m.Data["delivery_id"] != "d1" || m.Data["route"] != "/timeline/m/1" {
+		if m.Priority != "high" || m.Data["open_proof"] != "proof" || m.Data["delivery_id"] != "d1" || m.Data["route"] != "/timeline/m/1" || m.Data["kind"] != "timeline_notification" {
 			t.Errorf("%s: lost the tap contract: %+v", tc.name, m)
 		}
-		if tc.dataOnly {
-			style, _ := m.Data["android_style"].(map[string]any)
-			if m.Title != "" || m.Body != "" || m.Subtitle != "" || m.Sound != "" || m.RichContent != nil || m.CategoryID != "" {
-				t.Errorf("%s: not data-only: %+v", tc.name, m)
-			}
-			if style["title"] != "Sam" || style["body"] != "On my way" || style["sender_name"] != "Sam" || style["conversation_id"] != chat.ThreadID || style["avatar_url"] != "https://photos.example/sam.jpg" || style["source"] != "Messages" {
-				t.Errorf("%s: style %+v", tc.name, style)
+		_, hasStyle := m.Data["android_style"]
+		_, hasAlert := m.Data[push.AndroidAlertKey]
+		if tc.shape == ordinary {
+			if hasStyle || hasAlert || m.Title != "Sam" || m.Body != "On my way" || m.ChannelID != push.AndroidChannelID || m.RichContent == nil {
+				t.Errorf("%s: wrong ordinary alert: %+v", tc.name, m)
 			}
 			continue
 		}
-		if _, ok := m.Data["android_style"]; ok || m.Title != "Sam" || m.Body != "On my way" || m.ChannelID != push.AndroidChannelID || m.RichContent == nil {
-			t.Errorf("%s: wrong ordinary alert: %+v", tc.name, m)
+		if m.Title != "" || m.Body != "" || m.Subtitle != "" || m.Sound != "" || m.RichContent != nil || m.CategoryID != "" || m.ChannelID != "" || m.CollapseID != "" {
+			t.Errorf("%s: not data-only: %+v", tc.name, m)
+		}
+		if tc.shape == chatStyle {
+			style, _ := m.Data["android_style"].(map[string]any)
+			if hasAlert || style["title"] != "Sam" || style["body"] != "On my way" || style["sender_name"] != "Sam" || style["conversation_id"] != chat.ThreadID || style["avatar_url"] != "https://photos.example/sam.jpg" || style["source"] != "Messages" {
+				t.Errorf("%s: style %+v", tc.name, m.Data)
+			}
+			continue
+		}
+		alert, _ := m.Data[push.AndroidAlertKey].(map[string]any)
+		if hasStyle || alert["title"] != "Sam" || alert["subtitle"] != "Messages · Sam" || alert["body"] != "On my way" || alert["image_url"] != "https://pdw.example/icon.png" || alert["collapse_id"] != "n1" || alert["silent"] != false {
+			t.Errorf("%s: alert %+v", tc.name, m.Data)
 		}
 	}
 }

@@ -34,7 +34,7 @@ type Device struct {
 	Platform      string `json:"platform"`
 	AppVersion    string `json:"app_version"`
 	// Capabilities are what this install's native code can render (see
-	// CapabilityAndroidMessagingStyle). They are replaced, never merged, on
+	// CapabilityAndroidNativeAlerts). They are replaced, never merged, on
 	// every registration: a phone rolled back to an older build re-registers
 	// without them and gets the alerts that build can show.
 	Capabilities []string  `json:"capabilities"`

@@ -360,7 +360,7 @@ def test_notification_health_counts_matched_and_missing_android_alerts_after_the
         "p-plain-ok",
         "now() - interval '80 minutes' + interval '3 seconds'",
         channel_id="default",
-        notification_tag="FCM-Notification:1",
+        notification_tag="pdw-alert",
         title="Gmail · Finance",
         text="Quarterly numbers",
     )
@@ -412,11 +412,11 @@ def _seed_upload(wh, event_id, event_sql="now()", synced_sql="now()"):
 CHAT_ALERT = (
     {"body": "Same words", "android_style": {"event_id": "slack|1", "conversation_id": "c1"}},
     {"channel_id": "messages", "notification_tag": "pdw-chat", "text": "Same words"},
-    {"channel_id": "default", "notification_tag": "FCM-Notification:1"},
+    {"channel_id": "default", "notification_tag": "pdw-alert"},
 )
 PLAIN_ALERT = (
     {"title": "Gmail · Finance", "body": "Same words"},
-    {"channel_id": "default", "notification_tag": "FCM-Notification:1", "title": "Gmail · Finance", "text": "Same words"},
+    {"channel_id": "default", "notification_tag": "pdw-alert", "title": "Gmail · Finance", "text": "Same words"},
     {"channel_id": "messages", "notification_tag": "pdw-chat"},
 )
 ALERT_KINDS = pytest.mark.parametrize("payload,row,wrong_channel", [CHAT_ALERT, PLAIN_ALERT], ids=["chat", "plain"])

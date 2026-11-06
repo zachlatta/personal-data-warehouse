@@ -5,18 +5,27 @@ import (
 	"strings"
 )
 
-// CapabilityAndroidMessagingStyle is reported by an Android build whose
-// native PdwMessagingService (mobile/plugins/with-messaging-notifications.js)
-// draws a data-only push carrying `android_style` as a chat notification.
-// Only such a device may be sent a chat alert as data-only: an older build
-// receives the same push and shows nothing at all.
-const CapabilityAndroidMessagingStyle = "android_messaging_style"
+// CapabilityAndroidNativeAlerts is reported by an Android build whose native
+// PdwMessagingService (mobile/plugins/with-messaging-notifications.js) draws
+// every data-only push: `android_style` as a chat notification, `android_alert`
+// as an ordinary one. Only such a device may be sent an alert as data-only: an
+// older build receives the same push and shows nothing at all. It replaced
+// android_messaging_style, whose builds draw chats only and so must keep
+// getting ordinary alerts; that stored value now normalizes away.
+const CapabilityAndroidNativeAlerts = "android_native_alerts"
 
 // AndroidMessagesChannelID is the channel the native renderer posts chat
 // alerts on ("Messages"); the app also creates it in mobile/src/lib/push.ts.
 const AndroidMessagesChannelID = "messages"
 
-var knownCapabilities = map[string]bool{CapabilityAndroidMessagingStyle: true}
+var knownCapabilities = map[string]bool{CapabilityAndroidNativeAlerts: true}
+
+// DrawsAlertsNatively reports whether a device must be sent alerts data-only,
+// given its platform and stored capability list. It is the one gate both Expo
+// senders use.
+func DrawsAlertsNatively(platform, capabilities string) bool {
+	return platform == "android" && HasCapability(capabilities, CapabilityAndroidNativeAlerts)
+}
 
 // NormalizeCapabilities keeps the capabilities this server knows, once each,
 // sorted, so the stored column is a stable comma-separated list.

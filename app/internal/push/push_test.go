@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -303,7 +304,7 @@ func TestMessageSizeMeasuresTheWireJSON(t *testing.T) {
 }
 
 func TestNotificationDefaultsAreTheOldPlainAlert(t *testing.T) {
-	m, err := Notification{Title: "t", Body: "b"}.message("ExponentPushToken[abc]")
+	m, err := Notification{Title: "t", Body: "b"}.message(Device{ExpoPushToken: "ExponentPushToken[abc]"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,12 +318,107 @@ func TestNotificationDefaultsAreTheOldPlainAlert(t *testing.T) {
 // no channelId Expo delivers to a "Miscellaneous" channel of default
 // importance, which lands silently in the shade.
 func TestEveryNotificationGoesToTheAppsAndroidChannel(t *testing.T) {
-	m, err := Notification{Title: "t"}.message("ExponentPushToken[abc]")
+	m, err := Notification{Title: "t"}.message(Device{ExpoPushToken: "ExponentPushToken[abc]"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.ChannelID != AndroidChannelID || AndroidChannelID != "default" {
 		t.Fatalf("channel = %q, want %q", m.ChannelID, "default")
+	}
+}
+
+// FCM draws anything with a title itself, without running app code, so the app
+// can make no room under Android's 50-notification limit. Every field the phone
+// needs to draw the alert moves into data, and nothing that triggers FCM stays.
+func TestAndroidDataOnlyLeavesNothingForFCMToDraw(t *testing.T) {
+	badge := 3
+	m, err := Notification{Title: "Wire due", Subtitle: "Invoice 4831", Body: "Instructions in inbox.", ImageURL: "https://example.com/r.png", Category: CategoryLink, ThreadID: "finance", InterruptionLevel: InterruptionTimeSensitive, Badge: &badge, CollapseID: "wire-due", Route: "/timeline/gmail/abc", Data: map[string]any{"kind": "digest"}}.message(Device{ExpoPushToken: "ExponentPushToken[px]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := m
+	got := m.AndroidDataOnly()
+	if got.To != m.To || got.Priority != "high" {
+		t.Fatalf("lost addressing or urgency: %+v", got)
+	}
+	raw, _ := json.Marshal(got)
+	var wire map[string]any
+	_ = json.Unmarshal(raw, &wire)
+	delete(wire, "to")
+	delete(wire, "priority")
+	delete(wire, "data")
+	if len(wire) != 0 {
+		t.Fatalf("top-level fields would reach FCM: %v", wire)
+	}
+	if got.Data["kind"] != "digest" || got.Data["route"] != "/timeline/gmail/abc" {
+		t.Fatalf("tap data lost: %+v", got.Data)
+	}
+	alert, _ := got.Data[AndroidAlertKey].(map[string]any)
+	want := map[string]any{"title": "Wire due", "subtitle": "Invoice 4831", "body": "Instructions in inbox.", "image_url": "https://example.com/r.png", "collapse_id": "wire-due", "silent": false}
+	if !reflect.DeepEqual(alert, want) {
+		t.Fatalf("alert = %+v, want %+v", alert, want)
+	}
+	if _, leaked := original.Data[AndroidAlertKey]; leaked {
+		t.Fatal("converting must not change the message it came from")
+	}
+}
+
+func TestAndroidDataOnlyCarriesSilenceAndOmitsWhatIsAbsent(t *testing.T) {
+	m, err := Notification{Title: "t", Sound: "none"}.message(Device{ExpoPushToken: "ExponentPushToken[px]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert, _ := m.AndroidDataOnly().Data[AndroidAlertKey].(map[string]any)
+	if !reflect.DeepEqual(alert, map[string]any{"title": "t", "silent": true}) {
+		t.Fatalf("alert = %+v", alert)
+	}
+}
+
+func TestNotifyPicksTheWireShapePerDevice(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	for _, d := range []Device{
+		{ExpoPushToken: "ExponentPushToken[a]", Platform: "android", Capabilities: []string{CapabilityAndroidNativeAlerts}},
+		{ExpoPushToken: "ExponentPushToken[b]", Platform: "android"},
+		{ExpoPushToken: "ExponentPushToken[c]", Platform: "ios"},
+	} {
+		if _, err := store.Register(ctx, d, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sender := &fakeSender{tickets: []Ticket{ticket("ok", ""), ticket("ok", ""), ticket("ok", "")}}
+	if _, err := NewNotifier(store, sender, nil, nil).Notify(ctx, Notification{Title: "t", Body: "b", Category: CategoryLink, Route: "/settings"}); err != nil {
+		t.Fatal(err)
+	}
+	byToken := map[string]Message{}
+	for _, m := range sender.got[0] {
+		byToken[m.To] = m
+	}
+	native := byToken["ExponentPushToken[a]"]
+	if native.Title != "" || native.Body != "" || native.ChannelID != "" || native.CategoryID != "" || native.Data[AndroidAlertKey] == nil || native.Data["route"] != "/settings" {
+		t.Fatalf("capable android: %+v", native)
+	}
+	for _, token := range []string{"ExponentPushToken[b]", "ExponentPushToken[c]"} {
+		m := byToken[token]
+		if m.Title != "t" || m.Body != "b" || m.ChannelID != AndroidChannelID || m.CategoryID != CategoryLink || m.Data[AndroidAlertKey] != nil {
+			t.Fatalf("%s must get the ordinary alert: %+v", token, m)
+		}
+	}
+}
+
+// The budget has to hold on whichever device receives it, and the data-only
+// form repeats the alert's fields under longer keys.
+func TestMessageSizeMeasuresTheLargerWireForm(t *testing.T) {
+	n := Notification{Title: "t", Body: strings.Repeat("\"", 100), CollapseID: "c"}
+	size, err := MessageSize(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := n.message(Device{ExpoPushToken: "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]"})
+	ordinary, _ := json.Marshal(m)
+	dataOnly, _ := json.Marshal(m.AndroidDataOnly())
+	if len(dataOnly) <= len(ordinary) || size != len(dataOnly) {
+		t.Fatalf("size %d, ordinary %d, data-only %d", size, len(ordinary), len(dataOnly))
 	}
 }
 

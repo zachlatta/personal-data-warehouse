@@ -31,7 +31,7 @@ type Alert struct {
 	DeliveryID     string         `json:"delivery_id"`
 	OpenProof      string         `json:"open_proof"`
 	// Android is set for chat alerts (messages, WhatsApp, Slack). An Android
-	// device that reports push.CapabilityAndroidMessagingStyle is sent it as a
+	// device that reports push.CapabilityAndroidNativeAlerts is sent it as a
 	// data-only push its native code draws as a conversation; every other
 	// device gets the ordinary alert and ignores it.
 	Android *AndroidStyle `json:"android_style,omitempty"`
