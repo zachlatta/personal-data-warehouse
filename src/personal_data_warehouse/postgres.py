@@ -3370,6 +3370,7 @@ INTEGER_COLUMNS = {
     "is_online",
     "has_outdoor_reading",
     "indoor_humidity",
+    "schedule_enabled",
     "devices_seen",
     "readings_written",
     # scans

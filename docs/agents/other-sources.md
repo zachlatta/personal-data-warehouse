@@ -508,6 +508,8 @@ file.
   thermostat on every load. After approval the worker re-reads the device, refuses a value outside
   its limits, skips a setpoint already held, writes, then reads back for up to 30 s. A 202 only
   means queued, so a change that has not appeared yet is `succeeded` with `verified: false`.
+  With no schedule on (the T5 at home, checked 2026-11-06) a temporary hold has no period to end
+  at, so the worker sends a permanent one and the review says so.
   Offline or a 5xx is `failed_retryable`, but an approval over an hour old is `failed_terminal`, so
   a retry cannot change the heat at a time nobody chose. It never sends a command without its
   value: upstream saw a bare body switch a live thermostat off.

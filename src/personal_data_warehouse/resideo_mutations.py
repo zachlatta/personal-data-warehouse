@@ -96,6 +96,10 @@ class ResideoMutationExecutor:
         client = self._client_factory()
         configuration = client.get_configuration(device_id)
         before = thermostat_state(client.get_device(device_id), configuration)
+        if not before["schedule_enabled"]:
+            # A temporary hold ends at the next scheduled period; with no schedule
+            # on there is none, so the setpoint holds until something changes it.
+            status = _SETPOINT_STATUS["permanent"]
         for kind, value in targets.items():
             low, high = before[f"min_{kind}_setpoint"], before[f"max_{kind}_setpoint"]
             if not low <= value <= high:

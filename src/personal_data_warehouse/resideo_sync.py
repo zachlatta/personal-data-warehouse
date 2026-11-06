@@ -69,6 +69,7 @@ def thermostat_state(device: dict[str, Any], configuration: dict[str, Any]) -> d
         "max_heat_setpoint": float(limits.get("MaximumHeatSetpointAllowed") or 0),
         "min_cool_setpoint": float(limits.get("MinimumCoolSetpointAllowed") or 0),
         "max_cool_setpoint": float(limits.get("MaximumCoolSetpointAllowed") or 0),
+        "schedule_enabled": 1 if reported.get("ScheduleEnabled") else 0,
     }
 
 

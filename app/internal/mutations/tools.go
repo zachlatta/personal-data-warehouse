@@ -652,7 +652,7 @@ func MutationHelp() MutationHelpDocument {
 					{Name: "device_id", JSONType: "string", Required: true, Description: "base_resideo.thermostats.device_id"},
 					{Name: "heat_setpoint", JSONType: "number", Required: false, Description: "degrees to heat to, in the thermostat's units; at least one of heat_setpoint and cool_setpoint"},
 					{Name: "cool_setpoint", JSONType: "number", Required: false, Description: "degrees to cool to, in the thermostat's units"},
-					{Name: "hold", JSONType: "string", Required: false, Description: "temporary (default): until the thermostat's next scheduled period, like pressing its arrows. permanent: until something changes it again"},
+					{Name: "hold", JSONType: "string", Required: false, Description: "temporary (default): until the thermostat's next scheduled period, or until changed when no schedule is on. permanent: until something changes it again"},
 					{Name: "reason", JSONType: "string", Required: true, Description: "why the temperature is changing"},
 				},
 				Example: map[string]any{

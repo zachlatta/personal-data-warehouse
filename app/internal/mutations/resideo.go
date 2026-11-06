@@ -168,6 +168,7 @@ type thermostatRow struct {
 	MinCool, MaxCool         float64
 	Mode, Running, HoldState string
 	Units                    string
+	ScheduleEnabled          int64
 	LastPolledAt             time.Time
 }
 
@@ -176,12 +177,12 @@ func (s *PostgresStore) thermostatRow(ctx context.Context, deviceID string) (the
 	err := queryRowContext(ctx, s.db, `
 		SELECT name, is_online, indoor_temperature, heat_setpoint, cool_setpoint,
 		       min_heat_setpoint, max_heat_setpoint, min_cool_setpoint, max_cool_setpoint,
-		       system_mode, operation_mode, setpoint_status, temperature_units, last_polled_at
+		       system_mode, operation_mode, setpoint_status, temperature_units, schedule_enabled, last_polled_at
 		FROM @resideo_thermostats
 		WHERE account = $1 AND device_id = $2
 	`, ResideoAccount, deviceID).Scan(&row.Name, &row.IsOnline, &row.Indoor, &row.Heat, &row.Cool,
 		&row.MinHeat, &row.MaxHeat, &row.MinCool, &row.MaxCool,
-		&row.Mode, &row.Running, &row.HoldState, &row.Units, &row.LastPolledAt)
+		&row.Mode, &row.Running, &row.HoldState, &row.Units, &row.ScheduleEnabled, &row.LastPolledAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return row, false, nil
 	}
@@ -250,6 +251,9 @@ func thermostatPreview(change thermostatChange, row *thermostatRow, now time.Tim
 		preview["current"] = "unknown"
 		preview["warnings"] = append(warnings, "The thermostat's current state could not be read.")
 		return preview
+	}
+	if row.ScheduleEnabled == 0 {
+		preview["effect"] = "Holds this setpoint until something changes it again: the thermostat has no schedule on."
 	}
 	preview["current"] = map[string]any{
 		"name":               row.Name,

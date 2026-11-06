@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import base64
 import hashlib
+import html
 import json
+import re
 import secrets
 import time
 from typing import Any
@@ -37,6 +39,10 @@ OAUTH_CLIENT_ID = "SRmiA7CaYi1JgivDZdzzoZu4X5VBogGt"
 OAUTH_REDIRECT_URI = "com.resideo.firstalert://login.resideo.com/ios/com.resideo.firstalert/callback"
 OAUTH_AUDIENCE = "https://resideo-prod.auth0.com/api/v2/"
 OAUTH_SCOPE = "openid profile email offline_access"
+OAUTH_TENANT = "resideo-prod"
+OAUTH_CONNECTION = "Username-Password-Authentication"
+#: What Resideo's own sign-in page sends as its Auth0 client: base64 of its name and version.
+AUTH0_LOGIN_PAGE_CLIENT = "eyJuYW1lIjoiYXV0aDAuanMtdWxwIiwidmVyc2lvbiI6IjkuMTMuMiJ9"
 COMMAND_CHANNEL_ID = "ds-notification-service"
 USER_AGENT = "personal-data-warehouse"
 TOKEN_REFRESH_MARGIN_SECONDS = 300
@@ -98,6 +104,96 @@ def build_authorize_request() -> AuthorizeRequest:
         }
     )
     return AuthorizeRequest(f"{AUTH_BASE_URL}/authorize?{query}", code_verifier, state)
+
+
+def login_with_password(
+    email: str, password: str, *, session: Any = None, timeout: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """Sign in with the account's email and password, as Resideo's sign-in page does.
+
+    Resideo's bot detection can refuse this with `invalid_captcha`; then only the
+    browser flow (build_authorize_request) can sign in.
+    """
+
+    http = session or requests.Session()
+    request = build_authorize_request()
+    response = _login_step(http, "GET", request.url, timeout, redirects=False)
+    auth_state = parse_qs(urlparse(response.headers.get("Location", "")).query).get("state", [""])[0]
+    if not auth_state:
+        raise ResideoAuthError("Resideo's sign-in did not start: no state in its redirect")
+    _login_step(http, "GET", f"{AUTH_BASE_URL}/login?{urlencode({'state': auth_state})}", timeout)
+    csrf = http.cookies.get("_csrf", "")
+    if not csrf:
+        raise ResideoAuthError("Resideo's sign-in page set no _csrf cookie; its login flow may have changed")
+    response = _login_step(
+        http,
+        "POST",
+        f"{AUTH_BASE_URL}/usernamepassword/login",
+        timeout,
+        check=False,
+        json={
+            "client_id": OAUTH_CLIENT_ID,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "tenant": OAUTH_TENANT,
+            "response_type": "code",
+            "scope": OAUTH_SCOPE,
+            "audience": OAUTH_AUDIENCE,
+            "_csrf": csrf,
+            "state": auth_state,
+            "_intstate": "deprecated",
+            "username": email,
+            "password": password,
+            "connection": OAUTH_CONNECTION,
+        },
+        headers={"Auth0-Client": AUTH0_LOGIN_PAGE_CLIENT, "Origin": AUTH_BASE_URL},
+    )
+    wresult = re.search(r'name="wresult"\s+value="([^"]+)"', response.text)
+    if response.status_code != 200 or not wresult:
+        raise ResideoAuthError(f"Resideo refused the sign-in: {_login_error(response)}")
+    form = {"wa": "wsignin1.0", "wresult": html.unescape(wresult.group(1))}
+    wctx = re.search(r'name="wctx"\s+value="([^"]+)"', response.text)
+    if wctx:
+        form["wctx"] = html.unescape(wctx.group(1))
+    response = _login_step(
+        http,
+        "POST",
+        f"{AUTH_BASE_URL}/login/callback",
+        timeout,
+        redirects=False,
+        data=form,
+        headers={"Origin": AUTH_BASE_URL},
+    )
+    resume = response.headers.get("Location", "")
+    if not resume:
+        raise ResideoAuthError("Resideo's sign-in stopped after the password step: no redirect")
+    if not resume.startswith("http"):
+        resume = AUTH_BASE_URL + resume
+    response = _login_step(http, "GET", resume, timeout, redirects=False)
+    code = authorization_code_from_redirect(response.headers.get("Location", ""), expected_state=request.state)
+    return exchange_authorization_code(code, code_verifier=request.code_verifier, timeout=timeout)
+
+
+def _login_step(
+    http: Any, method: str, url: str, timeout: int, *, redirects: bool = True, check: bool = True, **kwargs: Any
+) -> Any:
+    headers = {"User-Agent": USER_AGENT, **kwargs.pop("headers", {})}
+    try:
+        response = http.request(method, url, headers=headers, timeout=timeout, allow_redirects=redirects, **kwargs)
+    except requests.RequestException as exc:
+        raise ResideoTransientError(f"Resideo sign-in request failed: {type(exc).__name__}") from exc
+    if check and response.status_code >= 400:
+        path = urlparse(url).path
+        raise _error_for_status(response.status_code, f"Resideo sign-in step {path} returned {response.status_code}")
+    return response
+
+
+def _login_error(response: Any) -> str:
+    """Auth0's error code only: the body can repeat what was sent."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return f"status {response.status_code}"
+    return str(payload.get("code") or payload.get("error") or f"status {response.status_code}")
 
 
 def authorization_code_from_redirect(pasted: str, *, expected_state: str) -> str:

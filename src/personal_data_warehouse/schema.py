@@ -3215,6 +3215,7 @@ RECEIPT_TRANSACTION_RECEIPT_COLUMNS = (
 # --------------------------------------------------------------------------
 # Resideo thermostat. `has_outdoor_reading` exists because 0 is a real outdoor
 # temperature here, so the warehouse's absent-is-zero default cannot say "none".
+# `indoor_humidity` = 0 means not reported: a T5 has no humidity sensor.
 _RESIDEO_STATE_COLUMNS = (
     "is_online",
     "indoor_temperature",
@@ -3241,6 +3242,7 @@ RESIDEO_THERMOSTAT_COLUMNS = (
     "max_heat_setpoint",
     "min_cool_setpoint",
     "max_cool_setpoint",
+    "schedule_enabled",
     "last_polled_at",
     "raw_json",
     "synced_at",

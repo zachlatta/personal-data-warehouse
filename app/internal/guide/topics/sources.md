@@ -85,7 +85,8 @@ and state the window and freshness.
 `base_resideo.thermostats` is each thermostat now: temperature, setpoints, mode, polled every
 five minutes (`last_polled_at`). `base_resideo.thermostat_readings` has one row per CHANGE, not
 per poll, so the value at a moment is the newest row at or before it, and an average over rows
-is wrong. `has_outdoor_reading = 0` means `outdoor_temperature` is absent, not zero degrees. On
+is wrong. `has_outdoor_reading = 0` means `outdoor_temperature` is absent, not zero degrees, and
+`indoor_humidity = 0` means not reported (a T5 has no humidity sensor). On
 the timeline these are source resideo events at `noise`. To change a setpoint, see
 `resideo.set_thermostat` in the mutations topic.
 

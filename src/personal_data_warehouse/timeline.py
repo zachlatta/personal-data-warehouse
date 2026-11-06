@@ -2526,7 +2526,8 @@ _RESIDEO_THERMOSTAT_READING = _simple_adapter(
     snippet=(
         "concat('Inside ', t.indoor_temperature::text, ', heat to ', t.heat_setpoint::text, "
         "', cool to ', t.cool_setpoint::text, ', mode ', t.system_mode, ', running ', t.operation_mode, "
-        "', hold ', t.setpoint_status, ', humidity ', t.indoor_humidity::text, '%%')"
+        "', hold ', t.setpoint_status, "
+        "CASE WHEN t.indoor_humidity > 0 THEN concat(', humidity ', t.indoor_humidity::text, '%%') END)"
     ),
     context="t.device_id",
     source_pk=(

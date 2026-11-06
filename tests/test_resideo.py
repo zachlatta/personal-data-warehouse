@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 
 import psycopg2
 from psycopg2 import sql
@@ -34,6 +35,7 @@ from personal_data_warehouse.resideo_api import (
     WarehouseTokenSource,
     authorization_code_from_redirect,
     build_authorize_request,
+    login_with_password,
 )
 from personal_data_warehouse.resideo_mutations import (
     RESIDEO_PROVIDER,
@@ -46,7 +48,7 @@ NOW = datetime(2026, 11, 6, 20, 0, tzinfo=UTC)
 DEVICE = "AABBCCDDEEFF"
 
 
-def shadow(*, indoor=70.0, heat=66.0, cool=80.0, status="NoHold", mode="Heat", online=True, outdoor=41.0):
+def shadow(*, indoor=70.0, heat=66.0, cool=80.0, status="NoHold", mode="Heat", online=True, outdoor=41.0, schedule=True):
     reported = {
         "DeviceName": "Thermostat",
         "SystemSwitch": mode,
@@ -56,6 +58,7 @@ def shadow(*, indoor=70.0, heat=66.0, cool=80.0, status="NoHold", mode="Heat", o
         "FanSwitch": {"Position": "Auto"},
         "OperationStatus": {"Mode": "Off"},
         "Online": online,
+        "ScheduleEnabled": schedule,
         "BackLightState": "Active",
     }
     if outdoor is not None:
@@ -229,6 +232,21 @@ def test_a_permanent_hold_is_sent_as_one():
     client = FakeClient([shadow(), shadow(cool=76.0, status="PermanentHold")])
     executor(client).execute(mutation(heat_setpoint=None, cool_setpoint=76.0, hold="permanent"))
     assert client.writes == [("cool", 76.0, "PermanentHold")]
+
+
+def test_with_no_schedule_on_a_temporary_hold_is_sent_as_permanent():
+    """The real T5 runs this way: there is no next period for it to end at."""
+
+    client = FakeClient([shadow(schedule=False), shadow(heat=68.0, status="PermanentHold", schedule=False)])
+    result = executor(client).execute(mutation())
+    assert client.writes == [("heat", 68.0, "PermanentHold")]
+    assert result.result_json["verified"] is True
+
+
+def test_a_thermostat_with_no_humidity_sensor_stores_zero_and_stays_on_the_state():
+    t5 = shadow()
+    t5["Reported"].pop("DisplayedIndoorHumidity")
+    assert thermostat_state(t5, CONFIGURATION)["indoor_humidity"] == 0
 
 
 def test_a_write_the_device_has_not_shown_yet_succeeds_unverified():
@@ -628,3 +646,69 @@ def test_the_sensor_sits_out_until_the_api_key_is_set_and_then_polls_on_its_inte
         assert isinstance(defs_module.resideo_sync_sensor(build_sensor_context(instance=instance)), RunRequest)
         recent = build_sensor_context(instance=instance, cursor=str(time.time()))
         assert isinstance(defs_module.resideo_sync_sensor(recent), SkipReason)
+
+
+class LoginResponse:
+    def __init__(self, status_code=200, text="", location=""):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {"Location": location} if location else {}
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class LoginSession:
+    """Answers each step of Resideo's sign-in, keeping what the page would send."""
+
+    def __init__(self, *, login_response):
+        self.cookies = {"_csrf": "csrf-token"}
+        self.login_response = login_response
+        self.login_body = None
+        self.callback_form = None
+
+    def request(self, method, url, **kwargs):
+        if "/authorize?" in url:
+            self.client_state = parse_qs(urlparse(url).query)["state"][0]
+            return LoginResponse(302, location="/login?state=auth-state")
+        if url.endswith("/login?state=auth-state"):
+            return LoginResponse(200)
+        if url.endswith("/usernamepassword/login"):
+            self.login_body = kwargs["json"]
+            return self.login_response
+        if url.endswith("/login/callback"):
+            self.callback_form = kwargs["data"]
+            return LoginResponse(302, location="/authorize/resume?state=r")
+        if "/authorize/resume" in url:
+            return LoginResponse(302, location=f"{OAUTH_REDIRECT_URI}?code=the-code&state={self.client_state}")
+        raise AssertionError(url)
+
+
+def test_a_password_sign_in_walks_the_page_flow_and_exchanges_the_code(monkeypatch) -> None:
+    exchanged = {}
+
+    def exchange(code, *, code_verifier, timeout):
+        exchanged.update(code=code, verifier=code_verifier)
+        return {"access_token": "a", "refresh_token": "r", "expires_at": 1}
+
+    monkeypatch.setattr("personal_data_warehouse.resideo_api.exchange_authorization_code", exchange)
+    session = LoginSession(
+        login_response=LoginResponse(text='<input name="wresult" value="a&amp;b"><input name="wctx" value="c">')
+    )
+    token = login_with_password("me@example.test", "hunter2", session=session)
+
+    assert token["refresh_token"] == "r"
+    assert exchanged["code"] == "the-code" and exchanged["verifier"]
+    assert session.login_body["_csrf"] == "csrf-token"
+    assert session.login_body["state"] == "auth-state"
+    assert (session.login_body["username"], session.login_body["password"]) == ("me@example.test", "hunter2")
+    assert session.callback_form == {"wa": "wsignin1.0", "wresult": "a&b", "wctx": "c"}
+
+
+def test_a_refused_password_names_auth0s_code_and_never_repeats_the_body() -> None:
+    body = json.dumps({"code": "invalid_captcha", "description": "hunter2 was here"})
+    session = LoginSession(login_response=LoginResponse(400, text=body))
+    with pytest.raises(ResideoAuthError) as refused:
+        login_with_password("me@example.test", "hunter2", session=session)
+    assert "invalid_captcha" in str(refused.value)
+    assert "hunter2" not in str(refused.value)

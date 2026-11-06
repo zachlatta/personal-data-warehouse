@@ -133,7 +133,8 @@ authoritative when this list and it disagree.
   different title or reason (an identical proposal returns the old request).
 - **Change the thermostat:** `resideo.set_thermostat` with `device_id` (from
   `base_resideo.thermostats`), `heat_setpoint` and/or `cool_setpoint`, and `reason`. `hold` is
-  `temporary` (default: until the next scheduled period) or `permanent`. It does not change the
+  `temporary` (default: until the next scheduled period, or until changed when no schedule is
+on) or `permanent`. It does not change the
   mode (heat, cool, off). The review shows the temperature and mode now and warns when the mode
   makes the change do nothing. An approval over an hour old is not applied: propose again.
 - **Status lives in the warehouse.** The request's state, result and error are in

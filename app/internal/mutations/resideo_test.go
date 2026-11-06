@@ -120,6 +120,21 @@ func TestThermostatPreviewWarnsWhatTheReviewerCannotSeeOtherwise(t *testing.T) {
 	}
 }
 
+func TestThermostatPreviewSaysAHoldLastsWhenNoScheduleIsOn(t *testing.T) {
+	heat := 68.0
+	now := time.Now()
+	row := thermostatRow{IsOnline: 1, Mode: "Heat", LastPolledAt: now}
+	effect, _ := thermostatPreview(thermostatChange{Heat: &heat, Hold: thermostatHoldTemporary}, &row, now)["effect"].(string)
+	if !strings.Contains(effect, "no schedule") {
+		t.Fatalf("effect = %q", effect)
+	}
+	row.ScheduleEnabled = 1
+	effect, _ = thermostatPreview(thermostatChange{Heat: &heat, Hold: thermostatHoldTemporary}, &row, now)["effect"].(string)
+	if !strings.Contains(effect, "next scheduled period") {
+		t.Fatalf("effect = %q", effect)
+	}
+}
+
 func TestThermostatPreviewShowsAnUnreadableStateAsUnknown(t *testing.T) {
 	heat := 68.0
 	preview := thermostatPreview(thermostatChange{Heat: &heat}, nil, time.Now())
