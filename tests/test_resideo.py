@@ -712,3 +712,12 @@ def test_a_refused_password_names_auth0s_code_and_never_repeats_the_body() -> No
         login_with_password("me@example.test", "hunter2", session=session)
     assert "invalid_captcha" in str(refused.value)
     assert "hunter2" not in str(refused.value)
+
+
+def test_a_table_created_before_a_column_was_added_gains_it(warehouse) -> None:
+    """Production's table predates schedule_enabled, which no fresh database can show."""
+
+    warehouse._command("ALTER TABLE @resideo_thermostats DROP COLUMN schedule_enabled")
+    warehouse.ensure_resideo_tables()
+    run_sync(warehouse, FakeClient([shadow()]))
+    assert warehouse._query("SELECT schedule_enabled FROM @resideo_thermostats") == [(1,)]

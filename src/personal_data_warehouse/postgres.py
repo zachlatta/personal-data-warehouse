@@ -12008,6 +12008,8 @@ class PostgresWarehouse:
         self._ensure_table_group(
             ["resideo_thermostats", "resideo_thermostat_readings", "resideo_sync_state", "resideo_oauth_tokens"]
         )
+        # CREATE TABLE IF NOT EXISTS never revisits a table that already exists.
+        self._reconcile_table_columns("resideo_thermostats")
 
     def insert_resideo_thermostats(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("resideo_thermostats", rows, RESIDEO_THERMOSTAT_COLUMNS)
