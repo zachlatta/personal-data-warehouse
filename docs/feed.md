@@ -293,7 +293,9 @@ video does: desktop Chrome's `<video>` cannot play it) and `less_like_this`.
   Save and hide offer a 5 s undo (`z`), which records `ui` `undo` and then `undismiss` or a save
   toggle. Every load drops cards with a `dismiss` in the outbox from before or after the fetch
   (`applyPendingDismissals`), and a like or save stays pending until a server read agrees
-  (`mergeSaved`), so a stale answer cannot undo a tap. A card keeps the `position` it was served at.
+  (`mergeSaved`), so a stale answer cannot undo a tap. As on the phone, the one gap is a card hidden
+  during a reload whose `dismiss` also finishes sending during it: it can return until the next
+  reload. A card keeps the `position` it was served at.
 - **Keys:** `j`/`k` next and previous (`k` goes to the top of a part-read card first), `o` or Enter
   the reader, `v` the main link, `1`-`9` the card's numbered links, `p` play or stop, `l` like, `s` save,
   `x` hide, `z` undo, `r` reload, Esc close the reader or stop the video. They act on the current

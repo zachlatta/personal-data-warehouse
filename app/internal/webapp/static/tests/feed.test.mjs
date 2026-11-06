@@ -615,11 +615,28 @@ test("hiding the last card says so, and undo brings it back", async () => {
   assert.doesNotMatch(root.textContent, /Nothing here yet/);
 });
 
-test("a stale answer cannot bring back a hidden card, whether its dismiss is unsent or already sending", async () => {
+test("a stale answer cannot bring back a card whose dismiss was sent before the answer came", async () => {
   await start();
-  holdPosts = true;
+  let answer;
+  feedResponse = () => new Promise((resolve) => { answer = resolve; });
   press("x");
   press("r");
+  await settle();
+  assert.deepEqual(events().filter((e) => e.type === "dismiss").map((e) => e.item_id), ["hn:1"], "the dismiss has left the outbox");
+  answer({ status: 200, body: { items: CARDS, saved: [] } });
+  await settle();
+  assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:2", "hn:3"]);
+});
+
+test("a stale answer cannot bring back a card hidden during the load", async () => {
+  await start();
+  let answer;
+  feedResponse = () => new Promise((resolve) => { answer = resolve; });
+  press("r");
+  await settle();
+  holdPosts = true;
+  press("x");
+  answer({ status: 200, body: { items: CARDS, saved: [] } });
   await settle();
   assert.deepEqual(cards().map((c) => c.getAttribute("data-id")), ["hn:2", "hn:3"]);
 });
@@ -984,6 +1001,41 @@ test("the article's document is sealed and hands everything back by message", ()
   assert.ok(!articleDocument({ html: `<img src="https://i.test/lead.jpg">`, image_url: "https://i.test/lead.jpg" }, "abc").includes("<figure>"), "no second copy of the lead image");
 });
 
+// Runs the frame's own script against a stub page, as the sandbox would.
+function runArticleScript() {
+  const script = articleDocument({ html: "<p>x</p>" }, "abc").match(/<script nonce="abc">([\s\S]*?)<\/script>/)[1];
+  const listeners = {};
+  const sent = [];
+  const page = {
+    addEventListener(type, fn) { listeners[type] = fn; },
+    getElementById() { return { getBoundingClientRect: () => ({ height: 10 }) }; },
+    querySelectorAll() { return []; },
+  };
+  new Function("document", "window", "parent", script)(page, { addEventListener() {} }, { postMessage: (m) => sent.push(m) });
+  const click = (href, resolved, extra = {}) => {
+    let prevented = false;
+    const anchor = href === null ? null : { getAttribute: () => href, href: resolved };
+    listeners[extra.type || "click"]({ type: "click", button: 0, target: { closest: () => anchor }, preventDefault() { prevented = true; }, ...extra });
+    return prevented;
+  };
+  return { click, links: () => sent.filter((m) => m.type === "link") };
+}
+
+test("a link within the article stays in the frame: following it would load the parent's url there and blank the reader", () => {
+  const frame = runArticleScript();
+  assert.equal(frame.click("#note-1", "https://pdw.test/feed#note-1"), true);
+  assert.equal(frame.click("#note-1", "https://pdw.test/feed#note-1", { type: "auxclick", button: 1 }), true);
+  assert.deepEqual(frame.links(), [], "nothing to open: the server strips the ids these links point at");
+});
+
+test("a link out of the article goes to the page by message, and other clicks are left alone", () => {
+  const frame = runArticleScript();
+  assert.equal(frame.click("https://a.test/x", "https://a.test/x"), true);
+  assert.deepEqual(frame.links().map((m) => [m.url, m.nonce]), [["https://a.test/x", "abc"]]);
+  assert.equal(frame.click(null), false);
+  assert.equal(frame.links().length, 1);
+});
+
 test("a frame's message is checked for nonce, shape and bounds", () => {
   assert.deepEqual(parseArticleMessage({ nonce: "n", type: "height", height: 10 }, "n"), { type: "height", height: 10 });
   assert.deepEqual(parseArticleMessage({ nonce: "n", type: "link", url: "http://a.test/" }, "n"), { type: "link", url: "http://a.test/" });
@@ -1238,16 +1290,17 @@ test("back after ten minutes measures nothing until the reload settles", async (
   await settle();
   await flushed();
   const before = ofType("impression").length;
+  layOut();
   scrollTo(100);
-  observers.forEach((o) => o.fn());
-  runFrames();
-  advance(1000);
+  advance(400);
+  scrollTo(5000);
+  advance(400);
   await flushed();
   assert.equal(ofType("impression").length, before);
   answer({ status: 200, body: { items: CARDS, saved: [] } });
   await settle();
   layOut();
-  runFrames();
+  scrollTo(0);
   advance(300);
   scrollTo(5000);
   await flushed();
@@ -1321,8 +1374,11 @@ test("r ends open stretches, holds measuring, loads with pull, replaces the list
   const during = ofType("impression").length;
   assert.ok(during > 0);
   assert.equal(ofType("ui")[0].metadata.action, "refresh");
-  runFrames();
-  advance(1000);
+  layOut();
+  scrollTo(100);
+  advance(400);
+  scrollTo(5000);
+  advance(400);
   await flushed();
   assert.equal(ofType("impression").length, during);
   assert.match(root.textContent, /First/, "no flash of Loading over a list");

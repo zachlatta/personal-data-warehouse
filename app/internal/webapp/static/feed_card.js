@@ -301,8 +301,10 @@ hr { border: 0; border-top: 1px solid #2f3844; margin: 1.5em 0; }
   var onLink = function (e) {
     var a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
     if (!a || (e.type === "auxclick" && e.button !== 1)) return;
-    if ((a.getAttribute("href") || "").charAt(0) === "#") return;
+    // A srcdoc frame resolves "#x" against the parent's url, so following it would
+    // load the app in here. The server strips the ids these point at: go nowhere.
     e.preventDefault();
+    if ((a.getAttribute("href") || "").charAt(0) === "#") return;
     post({ type: "link", url: a.href });
   };
   document.addEventListener("click", onLink, true);
