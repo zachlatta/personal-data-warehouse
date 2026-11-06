@@ -645,6 +645,26 @@ func MutationHelp() MutationHelpDocument {
 					"The files on the device itself and the pgBackRest backups on slowking are not touched. If the device's uploader later sends a changed (redacted) copy of the file, that copy is ingested as new.",
 			},
 			{
+				Type:    ResideoSetThermostatOperation,
+				Summary: "Change the heat or cool setpoint on Zach's home thermostat (Resideo). Executed by the cloud worker after a human approves.",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + ResideoSetThermostatOperation},
+					{Name: "device_id", JSONType: "string", Required: true, Description: "base_resideo.thermostats.device_id"},
+					{Name: "heat_setpoint", JSONType: "number", Required: false, Description: "degrees to heat to, in the thermostat's units; at least one of heat_setpoint and cool_setpoint"},
+					{Name: "cool_setpoint", JSONType: "number", Required: false, Description: "degrees to cool to, in the thermostat's units"},
+					{Name: "hold", JSONType: "string", Required: false, Description: "temporary (default): until the thermostat's next scheduled period, like pressing its arrows. permanent: until something changes it again"},
+					{Name: "reason", JSONType: "string", Required: true, Description: "why the temperature is changing"},
+				},
+				Example: map[string]any{
+					"type":          ResideoSetThermostatOperation,
+					"device_id":     "AABBCCDDEEFF",
+					"heat_setpoint": 68,
+					"reason":        "warming up the house before Zach gets home",
+				},
+				ExtraNotes: "A proposal naming a thermostat the warehouse does not have, or a value outside its own limits, is refused. The review shows the current temperature, mode and setpoints, read fresh, and warns when the mode means the change does nothing or when a heat setpoint is low enough to risk frozen pipes. " +
+					"The worker re-reads the thermostat, skips a setpoint already held, writes, and reads back to report verified. An approval over an hour old is not applied: propose again. Status lives in ops.upstream_mutation_operations; the change appears in base_resideo.thermostat_readings.",
+			},
+			{
 				Type:    PrinterPrintDocumentOperation,
 				Summary: "Print one PDF on Zach's home printer (the Brother MFC-L2710DW), one-sided, black and white, on US Letter. Executed at home beside the scanner, not in the cloud.",
 				Fields: []MutationHelpArg{

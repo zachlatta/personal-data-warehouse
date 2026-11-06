@@ -1120,6 +1120,23 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "resideo",
+        "Resideo thermostat",
+        cadence="every 5 min",
+        transport="Dagster resideo_sync → Resideo consumer API (unofficial, OAuth refresh)",
+        # Readings only appear on a change, and a heating system can sit at one
+        # value for hours: run freshness is what proves the poller is alive.
+        data=DAY,
+        run=30 * MINUTE,
+        state=StateSource(
+            table="resideo_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note="action_required means sign in again with `personal-data-warehouse-resideo-auth`",
+    ),
+    _source(
         "whoop",
         "WHOOP",
         cadence="every 5 min",
@@ -1856,6 +1873,10 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "chatgpt_sessions": _state("chatgpt", "updated_at", "published chatgpt.com session"),
     "chatgpt_conversation_sync": _state("chatgpt", "synced_at"),
     # WHOOP
+    "resideo_thermostat_readings": _data("resideo", "synced_at", "observed_at"),
+    "resideo_thermostats": _support("resideo", "synced_at", note="current state, refreshed every poll"),
+    "resideo_sync_state": _state("resideo", "updated_at"),
+    "resideo_oauth_tokens": _state("resideo", "updated_at", "rotating OAuth credential"),
     "whoop_cycles": _data("whoop", "synced_at", "start_at"),
     "whoop_recoveries": _data("whoop", "synced_at", "created_at"),
     "whoop_sleeps": _data("whoop", "synced_at", "start_at"),

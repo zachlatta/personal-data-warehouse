@@ -75,6 +75,10 @@ DEFAULT_CHATGPT_PAGE_SIZE = 28
 DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com"
 DEFAULT_CHATGPT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_CHATGPT_CLIENT_ENABLED = True
+DEFAULT_RESIDEO_POLL_INTERVAL_SECONDS = 300
+DEFAULT_RESIDEO_REQUEST_TIMEOUT_SECONDS = 30
+#: The one Resideo account; a label, like the printer's account.
+RESIDEO_ACCOUNT = "home"
 DEFAULT_HACKER_NEWS_API_BASE_URL = "https://hacker-news.firebaseio.com/v0"
 DEFAULT_HACKER_NEWS_SITE_BASE_URL = "https://news.ycombinator.com"
 DEFAULT_HACKER_NEWS_POLL_INTERVAL_SECONDS = 1800
@@ -500,6 +504,17 @@ class GitHubConfig:
 
 
 @dataclass(frozen=True)
+class ResideoConfig:
+    """The thermostat poller and worker. The credential is in private.resideo_oauth_tokens."""
+
+    subscription_key: str
+    account: str = RESIDEO_ACCOUNT
+    enabled: bool = True
+    poll_interval_seconds: int = DEFAULT_RESIDEO_POLL_INTERVAL_SECONDS
+    request_timeout_seconds: int = DEFAULT_RESIDEO_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class HackerNewsConfig:
     """The Hacker News source: public API items plus the account's lists.
 
@@ -695,6 +710,7 @@ class Settings:
     whoop: WhoopConfig | None = None
     whoop_private: WhoopPrivateConfig | None = None
     hacker_news: HackerNewsConfig | None = None
+    resideo: "ResideoConfig | None" = None
     github: GitHubConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
@@ -1837,6 +1853,20 @@ def load_settings(
     # The private (app) API rides on the same account label as the public one
     # and needs no client credentials at all: its credential is the published
     # browser session. It is therefore configured whenever WHOOP is.
+    resideo_subscription_key = (os.getenv("RESIDEO_API_SUBSCRIPTION_KEY") or "").strip()
+    resideo: ResideoConfig | None = None
+    if resideo_subscription_key:
+        resideo = ResideoConfig(
+            subscription_key=resideo_subscription_key,
+            enabled=os.getenv("RESIDEO_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+            poll_interval_seconds=max(
+                60, int(os.getenv("RESIDEO_POLL_INTERVAL_SECONDS", DEFAULT_RESIDEO_POLL_INTERVAL_SECONDS))
+            ),
+            request_timeout_seconds=max(
+                1, int(os.getenv("RESIDEO_REQUEST_TIMEOUT_SECONDS", DEFAULT_RESIDEO_REQUEST_TIMEOUT_SECONDS))
+            ),
+        )
+
     hacker_news_account = (os.getenv("HACKER_NEWS_ACCOUNT") or "").strip()
     hacker_news: HackerNewsConfig | None = None
     if require_hacker_news or hacker_news_account or os.getenv("HACKER_NEWS_ENABLED"):
@@ -2369,6 +2399,7 @@ def load_settings(
         whoop=whoop,
         whoop_private=whoop_private,
         hacker_news=hacker_news,
+        resideo=resideo,
         github=github,
         google_drive_source=google_drive_source,
         plaid=plaid,

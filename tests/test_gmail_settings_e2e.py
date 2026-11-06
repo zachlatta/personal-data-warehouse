@@ -117,6 +117,7 @@ def test_gmail_filter_and_label_mutations_from_proposal_to_resync():
             calendar_executor=None,  # type: ignore[arg-type]
             slack_executor=None,  # type: ignore[arg-type]
             screen_timelapse_executor=None,  # type: ignore[arg-type]
+            resideo_executor=None,  # type: ignore[arg-type]
             limit=50,
             claimed_by="e2e",
             on_gmail_settings_changed=lambda accounts: (resynced.append(accounts), sync.run()),

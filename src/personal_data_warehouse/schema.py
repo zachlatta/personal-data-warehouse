@@ -3212,6 +3212,68 @@ RECEIPT_TRANSACTION_RECEIPT_COLUMNS = (
 # `account` is the HN username (not an email): every relation here is
 # about what THAT user did, and the timeline's self/direct tiers are decided
 # by comparing an item's author to it.
+# --------------------------------------------------------------------------
+# Resideo thermostat. `has_outdoor_reading` exists because 0 is a real outdoor
+# temperature here, so the warehouse's absent-is-zero default cannot say "none".
+_RESIDEO_STATE_COLUMNS = (
+    "is_online",
+    "indoor_temperature",
+    "outdoor_temperature",
+    "has_outdoor_reading",
+    "indoor_humidity",
+    "heat_setpoint",
+    "cool_setpoint",
+    "system_mode",
+    "operation_mode",
+    "fan_mode",
+    "setpoint_status",
+    "temperature_units",
+)
+
+RESIDEO_THERMOSTAT_COLUMNS = (
+    "account",
+    "device_id",
+    "name",
+    "location_name",
+    "device_type",
+    *_RESIDEO_STATE_COLUMNS,
+    "min_heat_setpoint",
+    "max_heat_setpoint",
+    "min_cool_setpoint",
+    "max_cool_setpoint",
+    "last_polled_at",
+    "raw_json",
+    "synced_at",
+)
+
+#: One row per change, not per poll (resideo_sync.py).
+RESIDEO_THERMOSTAT_READING_COLUMNS = (
+    "account",
+    "device_id",
+    "observed_at",
+    "name",
+    *_RESIDEO_STATE_COLUMNS,
+    "state_sha256",
+    "raw_json",
+    "synced_at",
+)
+
+RESIDEO_SYNC_STATE_COLUMNS = (
+    "account",
+    "status",
+    "error",
+    "last_success_at",
+    "devices_seen",
+    "readings_written",
+    "updated_at",
+)
+
+RESIDEO_OAUTH_TOKEN_COLUMNS = (
+    "account",
+    "token_json",
+    "updated_at",
+)
+
 HACKER_NEWS_ITEM_COLUMNS = (
     "account",
     # HN's numeric id, stored as text like every other provider id here.

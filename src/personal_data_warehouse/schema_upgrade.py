@@ -555,6 +555,7 @@ def provision_everything(warehouse) -> None:
     warehouse.ensure_whoop_tables()
     warehouse.ensure_whoop_private_tables()
     warehouse.ensure_hacker_news_tables()
+    warehouse.ensure_resideo_tables()
     warehouse.ensure_github_tables()
     warehouse.ensure_browser_history_tables()
     warehouse.ensure_android_notifications_tables()

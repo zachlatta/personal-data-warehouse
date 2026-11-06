@@ -327,6 +327,14 @@
       "comment": "Faithful hacker news source data: Zach's items and lists plus the full discussion under every story he touched; not a mirror of HN."
     },
     {
+      "name": "base_resideo",
+      "layer": "base",
+      "domain": "resideo",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Thermostat."
+    },
+    {
       "name": "base_browser_history",
       "layer": "base",
       "domain": "browser_history",
@@ -3592,6 +3600,51 @@
         "schema": "private",
         "name": "whoop_oauth_tokens"
       }
+    },
+    {
+      "id": "resideo_thermostats",
+      "kind": "table",
+      "layer": "base",
+      "domain": "resideo",
+      "schema": "base_resideo",
+      "name": "thermostats",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "resideo_thermostat_readings",
+      "kind": "table",
+      "layer": "base",
+      "domain": "resideo",
+      "schema": "base_resideo",
+      "name": "thermostat_readings",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "One row per change, not per poll."
+    },
+    {
+      "id": "resideo_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "resideo_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
+      "id": "resideo_oauth_tokens",
+      "kind": "table",
+      "layer": "private",
+      "domain": "private",
+      "schema": "private",
+      "name": "resideo_oauth_tokens",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": true
     },
     {
       "id": "slack_sessions",

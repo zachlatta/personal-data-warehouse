@@ -22,7 +22,7 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
-`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`. The help call is
+`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -131,6 +131,11 @@ authoritative when this list and it disagree.
   sha256, not the pages themselves. One approval prints at most once: a job that may have
   printed fails "check the printer" and is never resent; to reprint, propose again with a
   different title or reason (an identical proposal returns the old request).
+- **Change the thermostat:** `resideo.set_thermostat` with `device_id` (from
+  `base_resideo.thermostats`), `heat_setpoint` and/or `cool_setpoint`, and `reason`. `hold` is
+  `temporary` (default: until the next scheduled period) or `permanent`. It does not change the
+  mode (heat, cool, off). The review shows the temperature and mode now and warns when the mode
+  makes the change do nothing. An approval over an hour old is not applied: propose again.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

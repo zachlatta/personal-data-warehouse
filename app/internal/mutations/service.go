@@ -422,6 +422,10 @@ func (s *Service) validateMutation(index int, mutation MutationInput) error {
 		if err := validatePrintDocument(mutation); err != nil {
 			return fmt.Errorf("mutation %d %w", index, err)
 		}
+	case ResideoSetThermostatOperation:
+		if _, err := thermostatChangeFromInput(mutation); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	default:
 		return fmt.Errorf("mutation %d has unsupported type %q; expected gmail.archive_threads, gmail.unarchive_threads, gmail.modify_thread_labels, gmail.send_email, gmail.create_filter, gmail.replace_filter, gmail.delete_filter, gmail.create_label, gmail.update_label, gmail.delete_label, google_people.contacts, contacts.batch_mutation, calendar.create_event, calendar.update_event, calendar.delete_event, apple_notes.create_note, apple_notes.update_note, apple_contacts.create_contact, apple_contacts.update_contact, apple_contacts.merge_contacts, android_messages.send_message, apple_messages.mark_read, slack.mark_conversation_read, slack.send_message, screen_timelapse.purge_moment, or printer.print_document", index, mutationType)
 	}
@@ -484,6 +488,9 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	}
 	if account == "" && strings.TrimSpace(mutationType) == PrinterPrintDocumentOperation {
 		account = PrinterAccount
+	}
+	if account == "" && strings.TrimSpace(mutationType) == ResideoSetThermostatOperation {
+		account = ResideoAccount
 	}
 	return MutationInput{
 		Type:               strings.TrimSpace(mutationType),

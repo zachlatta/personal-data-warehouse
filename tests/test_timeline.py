@@ -84,6 +84,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
+    wh.ensure_resideo_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
@@ -1073,6 +1074,16 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO @resideo_thermostat_readings (account, device_id, observed_at, name, is_online,
+                                                  indoor_temperature, heat_setpoint, cool_setpoint,
+                                                  system_mode, operation_mode, setpoint_status,
+                                                  temperature_units, state_sha256, synced_at)
+        VALUES ('home', 'AABBCCDDEEFF', %s, 'Thermostat', 1, 70, 66, 80, 'Heat', 'Off', 'NoHold', 'F', 'h1', %s)
+        """,
+        (_NOW - timedelta(hours=1), _NOW),
+    )
+    wh._command(
+        """
         INSERT INTO @whoop_cycles (account, cycle_id, start_at, end_at, score_state, strain,
                                   average_heart_rate, max_heart_rate, created_at, synced_at)
         VALUES ('z@x.test', 'cyc1', %s, %s, 'SCORED', 12.5, 62, 141, %s, %s)
@@ -1468,6 +1479,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "photo": "self",
     "contact_update": "background",
     "apple_contact_update": "background",
+    "resideo_thermostat_reading": "noise",
     "whoop_cycle": "noise",
     "whoop_recovery": "noise",
     "whoop_sleep": "noise",
@@ -1510,6 +1522,7 @@ EXPECTED_SEEDED_PRIORITIES = {
 }
 
 EXPECTED_SEEDED_EVENTS = {
+    "resideo_thermostat_reading": 1,
     "gmail_email": 1,
     "slack_message": 1,
     "slack_file": 1,

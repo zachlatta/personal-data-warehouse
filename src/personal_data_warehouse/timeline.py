@@ -2509,6 +2509,45 @@ _FEED_ENGAGEMENT = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+_RESIDEO_THERMOSTAT_READING = _simple_adapter(
+    name="resideo_thermostat_reading",
+    source_table="resideo_thermostat_readings",
+    source="resideo",
+    kind="thermostat_reading",
+    from_sql="@resideo_thermostat_readings t",
+    event_id=(
+        "concat_ws('|', t.account, t.device_id, "
+        "to_char(t.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))"
+    ),
+    event_ts="t.observed_at",
+    ingest_ts="t.synced_at",
+    actor="''",
+    title="concat(COALESCE(NULLIF(t.name, ''), 'Thermostat'), ' ', t.indoor_temperature::text, '°', t.temperature_units)",
+    snippet=(
+        "concat('Inside ', t.indoor_temperature::text, ', heat to ', t.heat_setpoint::text, "
+        "', cool to ', t.cool_setpoint::text, ', mode ', t.system_mode, ', running ', t.operation_mode, "
+        "', hold ', t.setpoint_status, ', humidity ', t.indoor_humidity::text, '%%')"
+    ),
+    context="t.device_id",
+    source_pk=(
+        "jsonb_build_object('account', t.account, 'device_id', t.device_id, "
+        "'observed_at', to_char(t.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))"
+    ),
+    metadata=(
+        "jsonb_build_object("
+        "'indoor_temperature', t.indoor_temperature, "
+        "'heat_setpoint', t.heat_setpoint, "
+        "'cool_setpoint', t.cool_setpoint, "
+        "'system_mode', t.system_mode, "
+        "'operation_mode', t.operation_mode, "
+        "'setpoint_status', t.setpoint_status, "
+        "'is_online', t.is_online)"
+    ),
+    # A reading from a device: nothing here says who moved a setpoint, and a
+    # reviewed change already has its own mutation_requests event.
+    priority="'noise'",
+)
+
 _HACKER_NEWS_ITEM = _simple_adapter(
     name="hacker_news_item",
     source_table="hacker_news_items",
@@ -3467,6 +3506,7 @@ def _agent_session_turn_adapter() -> TimelineAdapter:
 _AGENT_SESSION_TURN = _agent_session_turn_adapter()
 
 TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
+    _RESIDEO_THERMOSTAT_READING,
     _GMAIL_EMAIL,
     _SLACK_MESSAGE,
     _SLACK_FILE,
@@ -3718,6 +3758,7 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "photo",
         "contact_update",
         "apple_contact_update",
+        "resideo_thermostat_reading",
         "whoop_cycle",
         "whoop_recovery",
         "whoop_sleep",
@@ -4097,6 +4138,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # WHOOP
     "whoop_profiles": _entity("current WHOOP user profile"),
     "whoop_body_measurements": _entity("current WHOOP body measurements"),
+    "resideo_thermostat_readings": _events(),
+    "resideo_thermostats": _entity(
+        "current state of each thermostat; reach it by device_id, the context of a thermostat_reading event"
+    ),
+    "resideo_sync_state": _state("thermostat poll heartbeat"),
+    "resideo_oauth_tokens": _state("rotating Resideo OAuth credential"),
     "whoop_cycles": _events(),
     "whoop_recoveries": _events(),
     "whoop_sleeps": _events(),

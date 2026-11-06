@@ -80,6 +80,7 @@ def _provision_everything(wh: PostgresWarehouse) -> None:
     wh.ensure_alice_voice_recordings_tables()
     wh.ensure_whatsapp_tables()
     wh.ensure_photos_tables()
+    wh.ensure_resideo_tables()
     wh.ensure_whoop_tables()
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
@@ -145,6 +146,8 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     for obj in CATALOG.objects:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
+        # +2 base: the resideo source (base_resideo.thermostats/thermostat_readings),
+        # with +1 ops (resideo_sync_state) and +1 private (resideo_oauth_tokens).
         # +9 base: the whoop_private source (base_whoop_private), which adds
         # the time series the public WHOOP API has no endpoint for. It was 10
         # until 2026-08-26, when continuous heart rate moved to the same
@@ -187,7 +190,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 base: base_android_screen_time.events and .daily_usage, every
         # Android device's screen time.
         # +1 base: base_scans.documents, documents scanned from the scanner's panel.
-        "base": 94,
+        "base": 96,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter
@@ -279,7 +282,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
-            "ops": 44,
+            "ops": 45,
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
@@ -287,7 +290,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # master secret and the single-use cli_authorize codes.
         # +2 private: private.answer_benchmark_questions and _results, C16's
         # real questions, gold answers and the agent's graded answers.
-        "private": 16,  # encrypted MCP connections, HN session
+        "private": 17,  # encrypted MCP connections, HN session
         # +2 internal: the row-trigger functions that keep
         # derived_search.chunk_vectors in step with chunks and embeddings.
         # +2 internal: the Feed tab's card-versioning trigger and the guard

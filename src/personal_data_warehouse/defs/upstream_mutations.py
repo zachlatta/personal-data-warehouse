@@ -19,6 +19,12 @@ from dagster import (
     sensor,
 )
 
+from personal_data_warehouse.resideo_mutations import (
+    RESIDEO_PROVIDER,
+    RESIDEO_SET_THERMOSTAT_OPERATION,
+    ResideoMutationExecutor,
+    resideo_mutation_executor,
+)
 from personal_data_warehouse.calendar_mutations import (
     CALENDAR_PROVIDER,
     CalendarMutationResult,
@@ -83,6 +89,8 @@ RECLAIMABLE_IDEMPOTENT_OPERATIONS: tuple[tuple[str, str], ...] = (
     # it removed, and a Drive delete of a file already gone is a no-op, so a
     # replay finishes the same purge instead of doing a second one.
     (SCREEN_TIMELAPSE_PROVIDER, SCREEN_TIMELAPSE_PURGE_MOMENT_OPERATION),
+    # A setpoint already held writes nothing, so a replay is a no-op.
+    (RESIDEO_PROVIDER, RESIDEO_SET_THERMOSTAT_OPERATION),
 )
 NON_RECLAIMABLE_SEND_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("gmail", "gmail.send_email"),
@@ -174,6 +182,7 @@ def process_upstream_mutations(context) -> dict[str, object]:
                 calendar_executor=CalendarMutationExecutor(settings=settings),
                 slack_executor=SlackMutationExecutor(warehouse=warehouse),
                 screen_timelapse_executor=screen_timelapse_purge_executor(settings=settings, warehouse=warehouse),
+                resideo_executor=resideo_mutation_executor(settings=settings, warehouse=warehouse),
                 limit=batch_size,
                 claimed_by=claimed_by,
                 reclaim_after=reclaim_after,
@@ -361,6 +370,7 @@ def process_upstream_mutation_batch(
     calendar_executor: CalendarMutationExecutor,
     slack_executor: SlackMutationExecutor,
     screen_timelapse_executor: ScreenTimelapsePurgeExecutor,
+    resideo_executor: ResideoMutationExecutor,
     limit: int,
     claimed_by: str,
     reclaim_after: timedelta = timedelta(seconds=DEFAULT_UPSTREAM_MUTATION_RECLAIM_AFTER_SECONDS),
@@ -440,6 +450,8 @@ def process_upstream_mutation_batch(
             result = slack_executor.execute(mutation)
         elif provider == SCREEN_TIMELAPSE_PROVIDER:
             result = screen_timelapse_executor.execute(mutation)
+        elif provider == RESIDEO_PROVIDER:
+            result = resideo_executor.execute(mutation)
         else:
             # Unknown providers should not be burned to failed_terminal by a stale worker
             # version. Leave them claimable for a worker that understands them.

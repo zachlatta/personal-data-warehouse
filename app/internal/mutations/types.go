@@ -36,8 +36,12 @@ const (
 	SlackSendMessageOperation           = "slack.send_message"
 	ScreenTimelapseProvider             = "screen_timelapse"
 	ScreenTimelapsePurgeMomentOperation = "screen_timelapse.purge_moment"
-	PrinterProvider                     = "printer"
-	PrinterPrintDocumentOperation       = "printer.print_document"
+	ResideoProvider                     = "resideo"
+	ResideoSetThermostatOperation       = "resideo.set_thermostat"
+	// ResideoAccount labels the one Resideo sign-in (config.RESIDEO_ACCOUNT).
+	ResideoAccount                = "home"
+	PrinterProvider               = "printer"
+	PrinterPrintDocumentOperation = "printer.print_document"
 	// PrinterAccount is the only printer: the home Brother MFC-L2710DW.
 	PrinterAccount = "home-brother"
 

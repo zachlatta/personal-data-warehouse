@@ -480,3 +480,34 @@ timeline, and pages Zach.
 - **Printing:** the same Coolify app runs a second service, `printer`, the worker for
   `printer.print_document` (reviewed prints on this Brother over IPP). See
   [Printing](mutations-and-app.md#printing-printerprint_document).
+
+## Resideo thermostat
+
+The T5 thermostat at home is set up in the Resideo Connect app (package
+`com.resideo.firstalert`, formerly First Alert). Its cloud is the **unofficial consumer API** at
+`api.ha.resideo.com`, reached with the app's public Auth0 client
+(`src/personal_data_warehouse/resideo_api.py`; the wire format comes from the MIT-licensed
+sfcodes/ha-resideo). The developer portal (`developer.honeywellhome.com`) serves the older Lyric
+generation, and a report from 2026-10-24 says it was not accepting registrations. The API can
+change without notice: when it does, `/pipelines` shows `resideo` failing and the fix is that one
+file.
+
+- **Setup.** `RESIDEO_API_SUBSCRIPTION_KEY` on the Dagster deployment is the app's Azure APIM key,
+  kept out of this repository; the sensor sits out until it is set. The refresh token lives in
+  `private.resideo_oauth_tokens`, installed by `uv run personal-data-warehouse-resideo-auth` with
+  `POSTGRES_DATABASE_URL` pointing at the warehouse. `RESIDEO_ENABLED=0` pauses the poller.
+- **The token rotates, and reuse revokes the grant.** Every refresh runs under the row lock in
+  `rotate_resideo_oauth_token`, because the poller and the mutation worker share the row.
+- **Readings are changes.** `resideo_sync` polls every five minutes and refreshes
+  `base_resideo.thermostats`; `base_resideo.thermostat_readings` gets a row only when the tracked
+  state differs from its newest row, so backlight and firmware fields do not write rows. An empty
+  account fails the run rather than reading green. Run freshness, not data freshness, is what
+  proves the poller is alive on a steady day.
+- **`resideo.set_thermostat`** (`app/internal/mutations/resideo.go`,
+  `src/personal_data_warehouse/resideo_mutations.py`, the cloud worker). The review reads the
+  thermostat on every load. After approval the worker re-reads the device, refuses a value outside
+  its limits, skips a setpoint already held, writes, then reads back for up to 30 s. A 202 only
+  means queued, so a change that has not appeared yet is `succeeded` with `verified: false`.
+  Offline or a 5xx is `failed_retryable`, but an approval over an hour old is `failed_terminal`, so
+  a retry cannot change the heat at a time nobody chose. It never sends a command without its
+  value: upstream saw a bare body switch a live thermostat off.

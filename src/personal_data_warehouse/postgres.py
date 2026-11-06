@@ -115,6 +115,10 @@ from personal_data_warehouse.schema import (
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
+    RESIDEO_OAUTH_TOKEN_COLUMNS,
+    RESIDEO_SYNC_STATE_COLUMNS,
+    RESIDEO_THERMOSTAT_COLUMNS,
+    RESIDEO_THERMOSTAT_READING_COLUMNS,
     HACKER_NEWS_SESSION_COLUMNS,
     HACKER_NEWS_SYNC_STATE_COLUMNS,
     HACKER_NEWS_USER_ITEM_COLUMNS,
@@ -414,6 +418,7 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("transcript", ("voice_memo",), "t.kind"),
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
+    ("resideo", ("resideo_thermostat_reading",), "t.kind"),
     ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
     # The private (app) API contributes only events the public API has no
     # equivalent of: the journal, the weekly Healthspan update and WHOOP Coach
@@ -1331,6 +1336,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "hacker_news_user_items": TableSpec(
         HACKER_NEWS_USER_ITEM_COLUMNS, ("account", "item_id", "relation")
     ),
+    "resideo_thermostats": TableSpec(RESIDEO_THERMOSTAT_COLUMNS, ("account", "device_id"), "synced_at"),
+    "resideo_thermostat_readings": TableSpec(
+        RESIDEO_THERMOSTAT_READING_COLUMNS, ("account", "device_id", "observed_at"), "synced_at"
+    ),
+    "resideo_sync_state": TableSpec(RESIDEO_SYNC_STATE_COLUMNS, ("account",), "updated_at"),
+    "resideo_oauth_tokens": TableSpec(RESIDEO_OAUTH_TOKEN_COLUMNS, ("account",), "updated_at"),
     "hacker_news_profile": TableSpec(HACKER_NEWS_PROFILE_COLUMNS, ("account", "user_id")),
     "hacker_news_sync_state": TableSpec(
         HACKER_NEWS_SYNC_STATE_COLUMNS, ("account", "list_name"), "updated_at"
@@ -1978,6 +1989,18 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "google_drive_file_texts",
         "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON @google_drive_file_texts USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "resideo_thermostat_readings_synced_idx",
+        "resideo_thermostat_readings",
+        "CREATE INDEX IF NOT EXISTS resideo_thermostat_readings_synced_idx "
+        "ON @resideo_thermostat_readings (synced_at DESC)",
+    ),
+    IndexSpec(
+        "resideo_thermostat_readings_observed_idx",
+        "resideo_thermostat_readings",
+        "CREATE INDEX IF NOT EXISTS resideo_thermostat_readings_observed_idx "
+        "ON @resideo_thermostat_readings (observed_at DESC)",
     ),
     IndexSpec(
         "whoop_cycles_start_idx",
@@ -2978,6 +3001,8 @@ JSONB_COLUMNS_BY_TABLE = {
     },
     "whoop_profiles": {"raw_json"},
     "whoop_body_measurements": {"raw_json"},
+    "resideo_thermostats": {"raw_json"},
+    "resideo_thermostat_readings": {"raw_json"},
     "whoop_cycles": {"score_json", "raw_json"},
     "whoop_recoveries": {"score_json", "raw_json"},
     "whoop_sleeps": {"stage_summary_json", "sleep_needed_json", "score_json", "raw_json"},
@@ -3160,6 +3185,8 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    # Resideo thermostat
+    "last_polled_at",
     # agent_failure_shapes
     "first_failed_at",
     "last_failed_at",
@@ -3339,6 +3366,12 @@ _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
 )
 
 INTEGER_COLUMNS = {
+    # Resideo thermostat
+    "is_online",
+    "has_outdoor_reading",
+    "indoor_humidity",
+    "devices_seen",
+    "readings_written",
     # scans
     "resolution_dpi",
     "is_duplex",
@@ -3704,6 +3737,15 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    # Resideo thermostat, in the device's own units.
+    "indoor_temperature",
+    "outdoor_temperature",
+    "heat_setpoint",
+    "cool_setpoint",
+    "min_heat_setpoint",
+    "max_heat_setpoint",
+    "min_cool_setpoint",
+    "max_cool_setpoint",
     # voice memo continuity: seconds between one recording ending and the next starting.
     "gap_seconds",
     # WHOOP Healthspan and Advanced Labs (whoop_private_healthspan.py).
@@ -8065,6 +8107,9 @@ class PostgresWarehouse:
         # The priority enum must exist before the table is created: on a fresh
         # install _postgres_type builds the priority column as this type.
         self._ensure_timeline_priority_type()
+        # The poller only starts once its API key is set, and until a table an
+        # adapter reads exists, every timeline sync run fails on that adapter.
+        self.ensure_resideo_tables()
         self._ensure_table("timeline_events")
         self._ensure_table("timeline_sync_state")
         # Before the indexes: their definitions name occurred_at, so a missing
@@ -11957,6 +12002,103 @@ class PostgresWarehouse:
             ],
             ANDROID_MESSAGE_COLUMNS,
         )
+
+    def ensure_resideo_tables(self) -> None:
+        self._ensure_table_group(
+            ["resideo_thermostats", "resideo_thermostat_readings", "resideo_sync_state", "resideo_oauth_tokens"]
+        )
+
+    def insert_resideo_thermostats(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("resideo_thermostats", rows, RESIDEO_THERMOSTAT_COLUMNS)
+
+    def insert_resideo_thermostat_readings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("resideo_thermostat_readings", rows, RESIDEO_THERMOSTAT_READING_COLUMNS)
+
+    def latest_resideo_reading_sha256(self, *, account: str, device_id: str) -> str:
+        rows = self._query(
+            "SELECT state_sha256 FROM @resideo_thermostat_readings WHERE account = %s AND device_id = %s "
+            "ORDER BY observed_at DESC LIMIT 1",
+            (account, device_id),
+        )
+        return str(rows[0][0]) if rows else ""
+
+    def insert_resideo_sync_state(
+        self,
+        *,
+        account: str,
+        status: str,
+        error: str,
+        last_success_at: datetime | None,
+        devices_seen: int,
+        readings_written: int,
+        updated_at: datetime,
+    ) -> None:
+        """Record a poll. A failed one (no ``last_success_at``) keeps the last success."""
+
+        self._command(
+            "INSERT INTO @resideo_sync_state AS target (account, status, error, last_success_at, devices_seen, "
+            "readings_written, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (account) DO UPDATE SET status = EXCLUDED.status, error = EXCLUDED.error, "
+            "last_success_at = GREATEST(target.last_success_at, EXCLUDED.last_success_at), "
+            "devices_seen = EXCLUDED.devices_seen, readings_written = EXCLUDED.readings_written, "
+            "updated_at = EXCLUDED.updated_at",
+            (account, status, error, last_success_at or EPOCH_UTC, devices_seen, readings_written, updated_at),
+        )
+
+    def load_resideo_oauth_token(self, *, account: str) -> str:
+        rows = self._query("SELECT token_json FROM @resideo_oauth_tokens WHERE account = %s", (account,))
+        return str(rows[0][0]) if rows else ""
+
+    def replace_resideo_oauth_token(self, *, account: str, token_json: str, updated_at: datetime) -> None:
+        """Install a new sign-in, which supersedes whatever the row held."""
+
+        self._command(
+            "INSERT INTO @resideo_oauth_tokens (account, token_json, updated_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (account) DO UPDATE SET token_json = EXCLUDED.token_json, "
+            "updated_at = EXCLUDED.updated_at",
+            (account, token_json, updated_at),
+        )
+
+    def rotate_resideo_oauth_token(
+        self,
+        *,
+        account: str,
+        expected_token_json: str,
+        rotate: Callable[[str], str],
+        updated_at: datetime,
+    ) -> str:
+        """Refresh under the row lock, on a connection of its own.
+
+        Auth0 revokes the whole grant when a refresh token is used twice, so the
+        provider call runs while the row is locked: a racer that read the old
+        token waits, sees the winner's, and returns it without calling Auth0. A
+        failed refresh rolls back and leaves the stored token untouched.
+        """
+
+        relation = self.sql_relation("resideo_oauth_tokens")
+        connection = psycopg2.connect(self._database_url)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT token_json FROM {relation} WHERE account = %s FOR UPDATE", (account,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("the Resideo token row disappeared before its refresh")
+                current = str(row[0])
+                if current != expected_token_json:
+                    connection.commit()
+                    return current
+                rotated = rotate(current)
+                cursor.execute(
+                    f"UPDATE {relation} SET token_json = %s, updated_at = %s WHERE account = %s",
+                    (rotated, updated_at, account),
+                )
+            connection.commit()
+            return rotated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def ensure_hacker_news_tables(self) -> None:
         """Provision the Hacker News source: items, why-rows, profile, state, session."""

@@ -167,6 +167,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if normalized, err = s.enrichScreenTimelapsePurges(ctx, normalized); err != nil {
 		return Request{}, err
 	}
+	if normalized, err = s.enrichThermostatChanges(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
@@ -349,6 +352,7 @@ func (s *PostgresStore) GetRequest(ctx context.Context, id string, page Mutation
 	mutations = s.hydrateAppleMessagesMarkReadPreviews(ctx, mutations)
 	mutations = s.hydrateGmailSettingsPreviews(ctx, mutations)
 	mutations = hydratePrintDocuments(mutations)
+	s.hydrateThermostatPreviews(ctx, mutations)
 	request.Mutations = mutations
 	return request, nil
 }
@@ -2002,6 +2006,19 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Title:     optionalTitle(mutation.Title, screenTimelapsePurgeTitle(target)),
 				Reason:    reason,
 				Payload:   screenTimelapsePurgePayload(target, strings.TrimSpace(mutation.Reason)),
+			})
+		case ResideoSetThermostatOperation:
+			change, err := thermostatChangeFromInput(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  ResideoProvider,
+				Operation: ResideoSetThermostatOperation,
+				Account:   account,
+				Title:     optionalTitle(mutation.Title, thermostatChangeTitle(change)),
+				Reason:    reason,
+				Payload:   thermostatChangePayload(change),
 			})
 		case PrinterPrintDocumentOperation:
 			doc, err := printDocumentFromInput(mutation)

@@ -231,8 +231,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// bucket because the base table repeats a bucket per upload, added its schema
 	// line and took "START HERE for screen time." from the base table, which now
 	// reads "Raw, with repeats.": 10493. 10493 is that and no more.
-	if guidance > 10493 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10493)", guidance)
+	//
+	// 2026-11-06: the resideo source added its schema line and the one trap in
+	// base_resideo.thermostat_readings, that a row is a change and not a poll: 10530.
+	// 10530 is that and no more.
+	if guidance > 10530 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10530)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)
