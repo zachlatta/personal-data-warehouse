@@ -6301,7 +6301,11 @@ def test_postgres_slack_account_state_refresh_skips_while_another_refresh_holds_
     try:
         with other.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_lock(%s)", (SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,))
-        result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+            result = warehouse.refresh_slack_account_state_items(account="zrl", team_id="T1", synced_at=now)
+            # close() returns before the server has released the session's locks, so
+            # release explicitly: the next refresh must not race the backend's exit.
+            cursor.execute("SELECT pg_advisory_unlock(%s)", (SLACK_ACCOUNT_STATE_REFRESH_LOCK_ID,))
+            assert cursor.fetchone() == (True,)
     finally:
         other.close()
 
