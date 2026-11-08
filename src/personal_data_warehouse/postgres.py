@@ -21108,6 +21108,12 @@ OBSERVATION_ONLY_UPSERT_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
     "slack_conversations": ("synced_at",),
 }
 
+# Columns that keep the earliest value ever written: a resent Android location
+# sample keeps the server receipt time of its first successful upload.
+FIRST_OBSERVED_UPSERT_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    "android_location_samples": ("received_at",),
+}
+
 
 def _dedupe_conflict_rows(
     rows: list[tuple[Any, ...]],
@@ -21216,6 +21222,7 @@ def _upsert_clause(
     target_ref = _identifier(target_alias) if target_alias else _identifier(table)
     version_column = spec.version_column
     observation_columns = OBSERVATION_ONLY_UPSERT_COLUMNS_BY_TABLE.get(table, ())
+    first_observed_columns = FIRST_OBSERVED_UPSERT_COLUMNS_BY_TABLE.get(table, ())
     content_columns = [
         column
         for column in update_columns
@@ -21236,7 +21243,7 @@ def _upsert_clause(
     assignments_list: list[str] = []
     for column in update_columns:
         quoted_column = _identifier(column)
-        if table == "android_location_samples" and column == "received_at":
+        if column in first_observed_columns:
             assignments_list.append(f"{quoted_column} = LEAST({target_ref}.{quoted_column}, EXCLUDED.{quoted_column})")
         elif column in observation_columns:
             assignments_list.append(
