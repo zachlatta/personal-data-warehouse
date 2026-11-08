@@ -365,8 +365,21 @@ deployed by the sysadmin repo's `scripts/install-pixel-photos-upload`). The hear
   JPEG's EXIF (MediaStore has not exposed location since Android 10); MediaStore's row
   (id, owner app, favourite, orientation, duration) is the `android_record` block, and its
   `latitude`/`longitude` are what the identity layer reads as the photo's location.
+- **Motion photos.** Pixel Camera appends a motion photo's video (an MP4, HEVC) to the
+  JPEG and says where in the XMP: Motion Photo format 1's `Container:Directory` (the
+  video's `Item:Length`/`Item:Padding`, laid end to end with the items after it up to the
+  end of the file) or the older `GCamera:MicroVideoOffset`. The uploader cuts the video
+  out, checks it starts with an `ftyp` box, and sends it as an `.mp4` under the **same
+  native id with role `live_video`**, the role an Apple Live Photo's `.mov` has, so the
+  identity layer attaches it to the still's photo (`source_id`) and never fingerprints
+  it. The still is sent unchanged, video and all: its bytes are the original. An XMP that
+  points at something other than an MP4 sends the still alone and counts
+  `motion_unreadable` in the run's summary. Motion photos copied from the iPhone (`_MP.HEIC`
+  in `DCIM/`) are not split: their Live Photo videos are already in `base_apple_photos.files`.
 - **Ledger.** `/data/misc_ce/0/pdw-android-photos/android-photos-upload-state.sqlite` keeps,
-  per path, the size, mtime and sha it landed; an unchanged file is never re-read. An edit
+  per path, the size, mtime and sha it landed, and whether its motion video was checked
+  (`motion_checked`, `motion_sha256`, added in place on 2026-11-08 so files landed before
+  then send their video alone, never the still again); an unchanged file is never re-read. An edit
   saved over the file sends the new bytes under the same native id, which the identity
   layer links to the same photo (`source_id`). A deleted photo is NOT tombstoned.
 - **Triggered, and awake.** `inotifyd` watches `DCIM/Camera` and `Pictures/Screenshots`

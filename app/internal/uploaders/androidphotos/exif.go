@@ -43,60 +43,83 @@ const (
 // empty facts and no error; only an unreadable file is an error. Nothing
 // here is a judgement: it copies the fields the camera wrote.
 func ReadJPEGExif(path string) (ExifFacts, error) {
-	file, err := os.Open(path)
-	if err != nil {
+	blocks, err := readJPEGBlocks(path)
+	if err != nil || blocks.exif == nil {
 		return ExifFacts{}, err
 	}
-	defer file.Close()
-	tiff, err := jpegExifSegment(bufio.NewReader(file))
-	if err != nil || tiff == nil {
-		return ExifFacts{}, nil
-	}
-	return parseTIFF(tiff), nil
+	return parseTIFF(blocks.exif), nil
 }
 
-// jpegExifSegment returns the TIFF bytes of the first APP1 "Exif" segment,
-// or nil when the markers before the image data carry none.
-func jpegExifSegment(r *bufio.Reader) ([]byte, error) {
+// jpegBlocks are the APP1 payloads before the image data: the TIFF bytes of
+// the EXIF block and the XMP packet.
+type jpegBlocks struct {
+	exif []byte
+	xmp  []byte
+}
+
+const xmpSignature = "http://ns.adobe.com/xap/1.0/\x00"
+
+// readJPEGBlocks reads a JPEG's APP1 blocks. A file that is not a JPEG, or
+// whose markers are damaged, has none; only an unopenable file is an error.
+func readJPEGBlocks(path string) (jpegBlocks, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return jpegBlocks{}, err
+	}
+	defer file.Close()
+	blocks, _ := jpegAPP1Blocks(bufio.NewReader(file))
+	return blocks, nil
+}
+
+// jpegAPP1Blocks walks the markers up to the start of scan, keeping the
+// first EXIF and the first XMP APP1 segment.
+func jpegAPP1Blocks(r *bufio.Reader) (jpegBlocks, error) {
+	var blocks jpegBlocks
 	var soi [2]byte
 	if _, err := io.ReadFull(r, soi[:]); err != nil || soi != [2]byte{0xFF, 0xD8} {
-		return nil, errors.New("not a JPEG")
+		return blocks, errors.New("not a JPEG")
 	}
 	for {
 		b, err := r.ReadByte()
 		if err != nil {
-			return nil, err
+			return blocks, err
 		}
 		if b != 0xFF {
-			return nil, errors.New("corrupt JPEG marker")
+			return blocks, errors.New("corrupt JPEG marker")
 		}
 		marker, err := r.ReadByte()
 		for err == nil && marker == 0xFF { // fill bytes
 			marker, err = r.ReadByte()
 		}
 		if err != nil {
-			return nil, err
+			return blocks, err
 		}
 		if marker == 0xD9 || marker == 0xDA { // end of image, start of scan
-			return nil, nil
+			return blocks, nil
 		}
 		if marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7) {
 			continue // standalone markers carry no length
 		}
 		var lengthBytes [2]byte
 		if _, err := io.ReadFull(r, lengthBytes[:]); err != nil {
-			return nil, err
+			return blocks, err
 		}
 		length := int(binary.BigEndian.Uint16(lengthBytes[:])) - 2
 		if length < 0 {
-			return nil, errors.New("corrupt JPEG segment length")
+			return blocks, errors.New("corrupt JPEG segment length")
 		}
 		segment := make([]byte, length)
 		if _, err := io.ReadFull(r, segment); err != nil {
-			return nil, err
+			return blocks, err
 		}
-		if marker == 0xE1 && len(segment) > 6 && string(segment[:6]) == "Exif\x00\x00" {
-			return segment[6:], nil
+		if marker != 0xE1 {
+			continue
+		}
+		switch {
+		case blocks.exif == nil && len(segment) > 6 && string(segment[:6]) == "Exif\x00\x00":
+			blocks.exif = segment[6:]
+		case blocks.xmp == nil && strings.HasPrefix(string(segment), xmpSignature):
+			blocks.xmp = segment[len(xmpSignature):]
 		}
 	}
 }

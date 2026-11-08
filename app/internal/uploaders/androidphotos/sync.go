@@ -46,8 +46,12 @@ type Summary struct {
 	Skipped   int // already landed, unchanged
 	Unsettled int // changed in the last few seconds
 	Missing   int // listed by MediaStore but gone from storage, or empty
-	Remaining int // waiting for a later run (the limit)
-	Deferred  bool
+	Motion    int // motion-photo videos sent (role live_video)
+	// MotionUnreadable counts motion photos whose XMP points at bytes that are
+	// not an MP4: the still is sent, the video is not, and the log names it.
+	MotionUnreadable int
+	Remaining        int // waiting for a later run (the limit)
+	Deferred         bool
 }
 
 // Runner sends every gallery file the ledger has not seen land.
@@ -69,12 +73,15 @@ type Runner struct {
 }
 
 type pending struct {
-	item    MediaItem
-	path    string
-	size    int64
-	mtimeNS int64
-	sha     string
+	item      MediaItem
+	path      string
+	size      int64
+	mtimeNS   int64
+	sha       string
+	sendStill bool // false: the still landed before videos were sent; send only its video
 }
+
+func isJPEG(item MediaItem) bool { return strings.EqualFold(item.MimeType, "image/jpeg") }
 
 // Sync runs one pass, newest shot first. It stops at the first failed upload
 // (the network or the app being down fails every file alike) and returns an
@@ -145,21 +152,27 @@ func (r *Runner) Sync() (Summary, error) {
 		if err != nil {
 			return summary, err
 		}
+		motionDone := known && (entry.MotionChecked || !isJPEG(item))
 		if known && entry.SizeBytes == p.size && entry.ModifiedNS == p.mtimeNS {
-			summary.Skipped++
-			continue
-		}
-		if p.sha, err = common.FileSHA256(path); err != nil {
-			return summary, fmt.Errorf("%s: hash: %w", item.RelativePath, err)
-		}
-		if known && entry.ContentSHA256 == p.sha {
-			// Touched but unchanged: remember the new stat so it is not re-hashed.
-			summary.Skipped++
-			if err := r.State.record(item.RelativePath, p.size, p.mtimeNS, p.sha, now); err != nil {
-				return summary, err
+			if motionDone {
+				summary.Skipped++
+				continue
 			}
-			continue
+			p.sha = entry.ContentSHA256
+		} else {
+			if p.sha, err = common.FileSHA256(path); err != nil {
+				return summary, fmt.Errorf("%s: hash: %w", item.RelativePath, err)
+			}
+			if known && entry.ContentSHA256 == p.sha && motionDone {
+				// Touched but unchanged: remember the new stat so it is not re-hashed.
+				summary.Skipped++
+				if err := r.State.record(item.RelativePath, p.size, p.mtimeNS, p.sha, entry.MotionChecked, entry.MotionSHA256, now); err != nil {
+					return summary, err
+				}
+				continue
+			}
 		}
+		p.sendStill = !known || entry.ContentSHA256 != p.sha
 		queue = append(queue, p)
 		if len(queue) > r.Limit {
 			break
@@ -180,44 +193,89 @@ func (r *Runner) Sync() (Summary, error) {
 		}
 	}
 	for i, p := range queue {
-		r.Logger.Infof("[%d/%d] upload %s (%s, sha256=%s) -> app", i+1, len(queue), p.item.RelativePath,
+		what := "upload"
+		if !p.sendStill {
+			what = "motion video of"
+		}
+		r.Logger.Infof("[%d/%d] %s %s (%s, sha256=%s) -> app", i+1, len(queue), what, p.item.RelativePath,
 			common.FormatBytes(p.size), common.ShortSHA256(p.sha))
-		if err := r.upload(p); err != nil {
+		motionSHA, err := r.upload(p, &summary)
+		if err != nil {
 			return summary, fmt.Errorf("%s: %w", p.item.RelativePath, err)
 		}
-		summary.Uploaded++
-		if err := r.State.record(p.item.RelativePath, p.size, p.mtimeNS, p.sha, r.Now()); err != nil {
+		if p.sendStill {
+			summary.Uploaded++
+		}
+		if err := r.State.record(p.item.RelativePath, p.size, p.mtimeNS, p.sha, true, motionSHA, r.Now()); err != nil {
 			return summary, err
 		}
 	}
 	return summary, nil
 }
 
-func (r *Runner) upload(p pending) error {
+// upload sends the file (unless only its video is owed) and, for a motion
+// photo, the video inside it as the same photo's live_video rendition. It
+// returns the video's sha, or "" for a still without one.
+func (r *Runner) upload(p pending, summary *Summary) (string, error) {
 	var facts ExifFacts
-	if strings.EqualFold(p.item.MimeType, "image/jpeg") {
+	var blocks jpegBlocks
+	if isJPEG(p.item) {
 		var err error
-		if facts, err = ReadJPEGExif(p.path); err != nil {
-			return fmt.Errorf("read exif: %w", err)
+		if blocks, err = readJPEGBlocks(p.path); err != nil {
+			return "", fmt.Errorf("read jpeg: %w", err)
+		}
+		if blocks.exif != nil {
+			facts = parseTIFF(blocks.exif)
 		}
 	}
 	capturedAt, _ := CaptureTime(p.item.TakenAt, facts.OffsetTimeOriginal)
-	mimeType := p.item.MimeType
-	if mimeType == "" {
-		mimeType = common.GuessMimeType(p.item.Filename)
+	if p.sendStill {
+		mimeType := p.item.MimeType
+		if mimeType == "" {
+			mimeType = common.GuessMimeType(p.item.Filename)
+		}
+		if _, err := r.Client.UploadPhotoFile(p.path, capturedAt, strings.ToLower(filepath.Ext(p.item.Filename)), mimeType, p.sha); err != nil {
+			return "", fmt.Errorf("upload file: %w", err)
+		}
+		envelope, err := BuildEnvelope(r.Account, r.Device, p.item, facts, p.sha, p.size, r.Now())
+		if err != nil {
+			return "", err
+		}
+		dedup := photos.ProvenanceDedupSHA256(PhotoSource, r.Account, p.item.RelativePath, "original", p.sha)
+		if _, err := r.Client.UploadPhotoMetadata(envelope, capturedAt, p.sha, dedup); err != nil {
+			return "", fmt.Errorf("upload metadata: %w", err)
+		}
 	}
-	if _, err := r.Client.UploadPhotoFile(p.path, capturedAt, strings.ToLower(filepath.Ext(p.item.Filename)), mimeType, p.sha); err != nil {
-		return fmt.Errorf("upload file: %w", err)
+	video, ok := FindMotionVideo(blocks.xmp, p.size)
+	if !ok {
+		return "", nil
 	}
-	envelope, err := BuildEnvelope(r.Account, r.Device, p.item, facts, p.sha, p.size, r.Now())
+	tmp, err := os.CreateTemp("", "pdw-motion-*.mp4")
 	if err != nil {
-		return err
+		return "", err
 	}
-	dedup := photos.ProvenanceDedupSHA256(PhotoSource, r.Account, p.item.RelativePath, "original", p.sha)
-	if _, err := r.Client.UploadPhotoMetadata(envelope, capturedAt, p.sha, dedup); err != nil {
-		return fmt.Errorf("upload metadata: %w", err)
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+	videoSHA, err := ExtractMotionVideo(p.path, video, tmpPath)
+	if err != nil {
+		r.Logger.Warningf("%s: motion photo video not sent: %v", p.item.RelativePath, err)
+		summary.MotionUnreadable++
+		return "", nil
 	}
-	return nil
+	if _, err := r.Client.UploadPhotoFile(tmpPath, capturedAt, ".mp4", "video/mp4", videoSHA); err != nil {
+		return "", fmt.Errorf("upload motion video: %w", err)
+	}
+	envelope, err := BuildMotionEnvelope(r.Account, r.Device, p.item, facts, video, p.sha, videoSHA, r.Now())
+	if err != nil {
+		return "", err
+	}
+	dedup := photos.ProvenanceDedupSHA256(PhotoSource, r.Account, p.item.RelativePath, "live_video", videoSHA)
+	if _, err := r.Client.UploadPhotoMetadata(envelope, capturedAt, videoSHA, dedup); err != nil {
+		return "", fmt.Errorf("upload motion video metadata: %w", err)
+	}
+	summary.Motion++
+	return videoSHA, nil
 }
 
 var utcOffset = regexp.MustCompile(`^[+-](0\d|1[0-4]):[0-5]\d$`)
@@ -245,6 +303,64 @@ func CaptureTime(takenAt time.Time, exifOffset string) (string, string) {
 // camera's EXIF facts as its android_record.
 func BuildEnvelope(account, device string, item MediaItem, facts ExifFacts, sha string, size int64, uploadedAt time.Time) (map[string]any, error) {
 	capturedAt, offset := CaptureTime(item.TakenAt, facts.OffsetTimeOriginal)
+	return photos.BuildPhotoMetadata(photos.Envelope{
+		Source:          PhotoSource,
+		Account:         account,
+		NativeID:        item.RelativePath,
+		Role:            "original",
+		Filename:        item.Filename,
+		MimeType:        item.MimeType,
+		SizeBytes:       size,
+		ContentSHA256:   sha,
+		UploadedAt:      common.ISOFormat(uploadedAt),
+		Width:           item.Width,
+		Height:          item.Height,
+		CapturedAt:      capturedAt,
+		CaptureTZOffset: offset,
+		CameraMake:      facts.Make,
+		CameraModel:     facts.Model,
+		FileModifiedAt:  common.ISOFormat(item.ModifiedAt),
+		RecordKey:       RecordKey,
+		Record:          androidRecord(device, item, facts),
+	})
+}
+
+// BuildMotionEnvelope is the envelope of a motion photo's video: the same
+// native id as its still (which is what attaches it to the still's photo),
+// role live_video, and where in the still's file it was found.
+func BuildMotionEnvelope(account, device string, item MediaItem, facts ExifFacts, video MotionVideo, stillSHA, videoSHA string, uploadedAt time.Time) (map[string]any, error) {
+	capturedAt, offset := CaptureTime(item.TakenAt, facts.OffsetTimeOriginal)
+	record := androidRecord(device, item, facts)
+	record["media_type"] = "video"
+	record["motion_photo"] = map[string]any{
+		"format":                    video.Format,
+		"offset":                    video.Offset,
+		"length":                    video.Length,
+		"presentation_timestamp_us": video.PresentationTimestampUs,
+		"still_content_sha256":      stillSHA,
+	}
+	return photos.BuildPhotoMetadata(photos.Envelope{
+		Source:          PhotoSource,
+		Account:         account,
+		NativeID:        item.RelativePath,
+		Role:            "live_video",
+		Filename:        strings.TrimSuffix(item.Filename, filepath.Ext(item.Filename)) + ".mp4",
+		MimeType:        "video/mp4",
+		SizeBytes:       video.Length,
+		ContentSHA256:   videoSHA,
+		UploadedAt:      common.ISOFormat(uploadedAt),
+		CapturedAt:      capturedAt,
+		CaptureTZOffset: offset,
+		CameraMake:      facts.Make,
+		CameraModel:     facts.Model,
+		FileModifiedAt:  common.ISOFormat(item.ModifiedAt),
+		RecordKey:       RecordKey,
+		Record:          record,
+	})
+}
+
+// androidRecord is MediaStore's row and the camera's EXIF facts.
+func androidRecord(device string, item MediaItem, facts ExifFacts) map[string]any {
 	record := map[string]any{
 		"device":              device,
 		"media_store_id":      item.MediaID,
@@ -270,24 +386,5 @@ func BuildEnvelope(account, device string, item MediaItem, facts ExifFacts, sha 
 		record["latitude"] = *facts.Latitude
 		record["longitude"] = *facts.Longitude
 	}
-	return photos.BuildPhotoMetadata(photos.Envelope{
-		Source:          PhotoSource,
-		Account:         account,
-		NativeID:        item.RelativePath,
-		Role:            "original",
-		Filename:        item.Filename,
-		MimeType:        item.MimeType,
-		SizeBytes:       size,
-		ContentSHA256:   sha,
-		UploadedAt:      common.ISOFormat(uploadedAt),
-		Width:           item.Width,
-		Height:          item.Height,
-		CapturedAt:      capturedAt,
-		CaptureTZOffset: offset,
-		CameraMake:      facts.Make,
-		CameraModel:     facts.Model,
-		FileModifiedAt:  common.ISOFormat(item.ModifiedAt),
-		RecordKey:       RecordKey,
-		Record:          record,
-	})
+	return record
 }

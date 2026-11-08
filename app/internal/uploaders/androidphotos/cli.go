@@ -24,7 +24,9 @@ finished image and video under DCIM/, Pictures/ and Movies/ -- the camera,
 screenshots and images apps save -- and sends each file, unchanged, to the
 app's /ingest/photos endpoints with a photo envelope (source android_photos):
 MediaStore's capture time, size and owner app, and the camera, UTC offset and
-GPS from the JPEG's EXIF. Newest first. A file is remembered by its path and
+GPS from the JPEG's EXIF. A motion photo's video, which Pixel Camera appends to
+the JPEG, is cut out and sent as the same photo's live_video rendition (an
+.mp4). Newest first. A file is remembered by its path and
 sent again only when its bytes change. Uploads go over Wi-Fi only: on any other
 network (or when dumpsys cannot say) the run defers, before reading a file. A
 run stops at the first failed upload and exits non-zero.
@@ -156,8 +158,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		BeforeUploadCheck: guard,
 		NetworkCheck:      network,
 	}).Sync()
-	fmt.Fprintf(stdout, "Android photo upload complete: seen=%d uploaded=%d already_landed=%d unsettled=%d missing=%d remaining=%d deferred=%t dry_run=%t\n",
-		summary.Seen, summary.Uploaded, summary.Skipped, summary.Unsettled, summary.Missing, summary.Remaining, summary.Deferred, *dryRun)
+	fmt.Fprintf(stdout, "Android photo upload complete: seen=%d uploaded=%d motion=%d motion_unreadable=%d already_landed=%d unsettled=%d missing=%d remaining=%d deferred=%t dry_run=%t\n",
+		summary.Seen, summary.Uploaded, summary.Motion, summary.MotionUnreadable, summary.Skipped, summary.Unsettled, summary.Missing, summary.Remaining, summary.Deferred, *dryRun)
 	if err != nil {
 		fmt.Fprintf(stderr, "pdw ingest android-photos: %v\n", err)
 		return common.ExitFailure
@@ -177,6 +179,6 @@ func (d *dryRunUploader) UploadPhotoFile(path, capturedAt, extension, contentTyp
 
 func (d *dryRunUploader) UploadPhotoMetadata(payload map[string]any, capturedAt, fileContentSHA256, metadataDedupSHA256 string) (ingestclient.StoredObject, error) {
 	file, _ := payload["file"].(map[string]any)
-	fmt.Fprintf(d.out, "would send envelope for %v (camera %v %v, offset %q)\n", file["native_id"], file["camera_make"], file["camera_model"], file["capture_tz_offset"])
+	fmt.Fprintf(d.out, "would send %v envelope for %v (camera %v %v, offset %q)\n", file["role"], file["native_id"], file["camera_make"], file["camera_model"], file["capture_tz_offset"])
 	return ingestclient.StoredObject{}, nil
 }

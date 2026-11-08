@@ -488,7 +488,7 @@ func TestRunDryRunListsWithoutSendingOrRecording(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "would send envelope for DCIM/Camera/PXL_1.jpg (camera Google Pixel 11 Pro, offset \"-05:00\")") ||
+	if !strings.Contains(stdout.String(), "would send original envelope for DCIM/Camera/PXL_1.jpg (camera Google Pixel 11 Pro, offset \"-05:00\")") ||
 		!strings.Contains(stdout.String(), "uploaded=1") {
 		t.Fatalf("stdout = %s", stdout.String())
 	}
@@ -523,5 +523,182 @@ func TestSyncOffWiFiDefersBeforeReadingMediaStoreOrAnyFile(t *testing.T) {
 	runner.NetworkCheck = func() string { return "" }
 	if _, err := runner.Sync(); err != nil || len(client.files) != 1 {
 		t.Fatalf("on Wi-Fi: files=%d err=%v", len(client.files), err)
+	}
+}
+
+// --- motion photos -----------------------------------------------------------
+
+// motionXMP is the Container directory Pixel Camera writes: the primary JPEG,
+// a gain map, then the video, last in the file.
+func motionXMP(gainMap, video int) string {
+	return fmt.Sprintf(`<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description
+ GCamera:MotionPhoto="1" GCamera:MotionPhotoVersion="1" GCamera:MotionPhotoPresentationTimestampUs="1196528">
+<Container:Directory><rdf:Seq>
+<rdf:li rdf:parseType="Resource"><Container:Item
+  Item:Semantic="Primary"
+  Item:Mime="image/jpeg"/></rdf:li>
+<rdf:li rdf:parseType="Resource"><Container:Item
+  Item:Length="%d"
+  Item:Mime="image/jpeg"
+  Item:Semantic="GainMap"/></rdf:li>
+<rdf:li rdf:parseType="Resource"><Container:Item
+  Item:Mime="video/mp4"
+  Item:Semantic="MotionPhoto"
+  Item:Length="%d"
+  Item:Padding="0"/></rdf:li>
+</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>`, gainMap, video)
+}
+
+func fakeMP4(n int) []byte {
+	video := append([]byte{0, 0, 0, 24}, []byte("ftypisom")...)
+	return append(video, bytes.Repeat([]byte{0x42}, n-len(video))...)
+}
+
+// motionJPEG is a JPEG with EXIF and XMP before the image data, then a gain
+// map and the video appended after the end-of-image marker.
+func motionJPEG(t *testing.T, xmp string, video []byte) []byte {
+	t.Helper()
+	base := pixelJPEG(t, false)
+	// Insert the XMP APP1 after SOI.
+	payload := append([]byte(xmpSignature), []byte(xmp)...)
+	var seg bytes.Buffer
+	seg.Write([]byte{0xFF, 0xE1})
+	_ = binary.Write(&seg, binary.BigEndian, uint16(len(payload)+2))
+	seg.Write(payload)
+	out := append([]byte{}, base[:2]...)
+	out = append(out, seg.Bytes()...)
+	out = append(out, base[2:]...)
+	out = append(out, bytes.Repeat([]byte{0xEE}, 100)...) // the gain map
+	return append(out, video...)
+}
+
+func TestFindMotionVideoReadsTheContainerDirectory(t *testing.T) {
+	video := fakeMP4(5000)
+	file := motionJPEG(t, motionXMP(100, len(video)), video)
+	got, ok := FindMotionVideo([]byte(motionXMP(100, len(video))), int64(len(file)))
+	if !ok || got.Offset != int64(len(file)-len(video)) || got.Length != int64(len(video)) ||
+		got.Format != "motion_photo" || got.PresentationTimestampUs != 1196528 {
+		t.Fatalf("got %+v ok=%v", got, ok)
+	}
+	// A video that is not the last item: the items after it are skipped over.
+	xmp := `<Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg"/>
+<Container:Item Item:Semantic="MotionPhoto" Item:Mime="video/mp4" Item:Length="300" Item:Padding="8"/>
+<Container:Item Item:Semantic="Depth" Item:Mime="image/jpeg" Item:Length="50"/>`
+	got, ok = FindMotionVideo([]byte(xmp), 10000)
+	if !ok || got.Offset != 10000-50-8-300 || got.Length != 300 {
+		t.Fatalf("got %+v ok=%v", got, ok)
+	}
+}
+
+func TestFindMotionVideoReadsTheOlderMicroVideoTags(t *testing.T) {
+	got, ok := FindMotionVideo([]byte(`GCamera:MicroVideo="1" GCamera:MicroVideoVersion="1" GCamera:MicroVideoOffset="4000" GCamera:MicroVideoPresentationTimestampUs="5"`), 9000)
+	if !ok || got.Offset != 5000 || got.Length != 4000 || got.Format != "micro_video" || got.PresentationTimestampUs != 5 {
+		t.Fatalf("got %+v ok=%v", got, ok)
+	}
+}
+
+func TestFindMotionVideoIgnoresAStill(t *testing.T) {
+	for _, xmp := range []string{"", `<Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg"/>`, `GCamera:MicroVideo="0"`} {
+		if got, ok := FindMotionVideo([]byte(xmp), 1000); ok {
+			t.Fatalf("%q: got %+v", xmp, got)
+		}
+	}
+	// A length past the start of the file is not a video.
+	if got, ok := FindMotionVideo([]byte(motionXMP(0, 5000)), 1000); ok {
+		t.Fatalf("oversized: got %+v", got)
+	}
+}
+
+func TestSyncSendsAMotionPhotosVideoAsTheSamePhotosLiveVideo(t *testing.T) {
+	lib := newLibrary(t)
+	video := fakeMP4(5000)
+	lib.add("DCIM/Camera/PXL_20261106_214733378.MP.jpg", "image/jpeg", lib.now.Add(-time.Hour),
+		motionJPEG(t, motionXMP(100, len(video)), video))
+	client := &fakeUploader{}
+	summary, err := lib.runner(t, client, openState(t)).Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 1 || summary.Motion != 1 || len(client.files) != 2 || len(client.envelopes) != 2 {
+		t.Fatalf("summary=%+v files=%d envelopes=%d", summary, len(client.files), len(client.envelopes))
+	}
+	still, motion := client.envelopes[0].payload["file"].(map[string]any), client.envelopes[1].payload["file"].(map[string]any)
+	if still["role"] != "original" || motion["role"] != "live_video" || motion["native_id"] != still["native_id"] {
+		t.Fatalf("still=%+v motion=%+v", still, motion)
+	}
+	if motion["filename"] != "PXL_20261106_214733378.MP.mp4" || motion["mime_type"] != "video/mp4" ||
+		motion["size_bytes"] != int64(len(video)) || motion["captured_at"] != still["captured_at"] {
+		t.Fatalf("motion = %+v", motion)
+	}
+	if client.files[1].extension != ".mp4" || client.files[1].contentType != "video/mp4" || client.files[1].sha != common.BytesSHA256(video) {
+		t.Fatalf("video file = %+v, want the appended bytes exactly", client.files[1])
+	}
+	wantDedup := photos.ProvenanceDedupSHA256("android_photos", "zach@example.com", "DCIM/Camera/PXL_20261106_214733378.MP.jpg", "live_video", common.BytesSHA256(video))
+	if client.envelopes[1].dedup != wantDedup {
+		t.Fatalf("dedup = %s, want %s", client.envelopes[1].dedup, wantDedup)
+	}
+	block := client.envelopes[1].payload["android_record"].(map[string]any)["motion_photo"].(map[string]any)
+	if block["format"] != "motion_photo" || block["length"] != int64(len(video)) || block["still_content_sha256"] != client.files[0].sha {
+		t.Fatalf("motion_photo = %+v", block)
+	}
+	// The extracted copy does not outlive the run.
+	if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), "pdw-motion-*.mp4")); len(leftovers) != 0 {
+		t.Fatalf("temp videos left behind: %v", leftovers)
+	}
+}
+
+func TestSyncSendsOnlyTheVideoForAStillThatLandedBeforeVideosWereSent(t *testing.T) {
+	lib := newLibrary(t)
+	video := fakeMP4(4000)
+	lib.add("DCIM/Camera/PXL_old.MP.jpg", "image/jpeg", lib.now.Add(-time.Hour), motionJPEG(t, motionXMP(100, len(video)), video))
+	lib.add("DCIM/Camera/PXL_plain.jpg", "image/jpeg", lib.now.Add(-2*time.Hour), pixelJPEG(t, false))
+	// A ledger written by the first release: no motion columns at all.
+	statePath := filepath.Join(t.TempDir(), "state.sqlite")
+	old, err := common.OpenStateDB(statePath, []string{`CREATE TABLE IF NOT EXISTS landed (
+		native_id TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+		content_sha256 TEXT NOT NULL, landed_at TEXT NOT NULL DEFAULT '')`}, map[string]string{"schema_version": "1"}, []string{"landed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range lib.items {
+		path := filepath.Join(lib.root, item.RelativePath)
+		info, _ := os.Stat(path)
+		sha, _ := common.FileSHA256(path)
+		if _, err := old.DB.Exec(`INSERT INTO landed VALUES (?, ?, ?, ?, '')`, item.RelativePath, info.Size(), info.ModTime().UnixNano(), sha); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old.Close()
+	state, err := OpenState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	client := &fakeUploader{}
+	summary, err := lib.runner(t, client, state).Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 0 || summary.Motion != 1 || len(client.files) != 1 || client.files[0].contentType != "video/mp4" {
+		t.Fatalf("summary=%+v files=%+v", summary, client.files)
+	}
+	// Both are now checked: a second run sends nothing.
+	again := &fakeUploader{}
+	if summary, err := lib.runner(t, again, state).Sync(); err != nil || len(again.files) != 0 || summary.Skipped != 2 {
+		t.Fatalf("second run: %+v files=%d err=%v", summary, len(again.files), err)
+	}
+}
+
+func TestSyncSendsTheStillWhenTheMotionVideoIsUnreadable(t *testing.T) {
+	lib := newLibrary(t)
+	notVideo := bytes.Repeat([]byte{0x11}, 3000)
+	lib.add("DCIM/Camera/PXL_bad.MP.jpg", "image/jpeg", lib.now.Add(-time.Hour), motionJPEG(t, motionXMP(100, len(notVideo)), notVideo))
+	client := &fakeUploader{}
+	summary, err := lib.runner(t, client, openState(t)).Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Uploaded != 1 || summary.Motion != 0 || summary.MotionUnreadable != 1 || len(client.files) != 1 {
+		t.Fatalf("summary=%+v files=%d", summary, len(client.files))
 	}
 }
