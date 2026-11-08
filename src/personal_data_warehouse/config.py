@@ -346,6 +346,14 @@ class AndroidScreenTimeConfig:
 
 
 @dataclass(frozen=True)
+class AndroidLocationConfig:
+    """Where the Android devices' location uploaders' batches land (via the app)."""
+
+    google_drive_account: str
+    google_drive_folder_id: str
+
+
+@dataclass(frozen=True)
 class ScansConfig:
     """Where the scanner uploader's PDFs and scan records land (via the app)."""
 
@@ -698,6 +706,7 @@ class Settings:
     browser_history: BrowserHistoryConfig | None = None
     android_notifications: AndroidNotificationsConfig | None = None
     android_messages: AndroidMessagesConfig | None = None
+    android_location: AndroidLocationConfig | None = None
     android_screen_time: AndroidScreenTimeConfig | None = None
     scans: ScansConfig | None = None
     photos: PhotosConfig | None = None
@@ -779,6 +788,8 @@ class Settings:
             configured_domains.add(email_domain(self.android_notifications.google_drive_account))
         if self.android_messages is not None:
             configured_domains.add(email_domain(self.android_messages.google_drive_account))
+        if self.android_location is not None:
+            configured_domains.add(email_domain(self.android_location.google_drive_account))
         if self.android_screen_time is not None:
             configured_domains.add(email_domain(self.android_screen_time.google_drive_account))
         if self.scans is not None:
@@ -827,6 +838,7 @@ def load_settings(
     require_browser_history: bool = False,
     require_android_notifications: bool = False,
     require_android_messages: bool = False,
+    require_android_location: bool = False,
     require_android_screen_time: bool = False,
     require_scans: bool = False,
     require_photos: bool = False,
@@ -1371,6 +1383,32 @@ def load_settings(
         android_screen_time = AndroidScreenTimeConfig(
             google_drive_account=android_screen_time_google_drive_account,
             google_drive_folder_id=android_screen_time_google_drive_folder_id,
+        )
+
+    # Android location: the same shared ingest folder and account as
+    # browser history; the app files every device's batches there.
+    android_location_google_drive_account = (
+        os.getenv("ANDROID_LOCATION_GOOGLE_DRIVE_ACCOUNT") or browser_history_google_drive_account
+    ).strip()
+    android_location_google_drive_folder_id = (
+        os.getenv("ANDROID_LOCATION_GOOGLE_DRIVE_FOLDER_ID") or browser_history_google_drive_folder_id
+    ).strip()
+    android_location: AndroidLocationConfig | None = None
+    if require_android_location or os.getenv("ANDROID_LOCATION_GOOGLE_DRIVE_FOLDER_ID"):
+        if not android_location_google_drive_account:
+            raise ValueError(
+                "ANDROID_LOCATION_GOOGLE_DRIVE_ACCOUNT, BROWSER_HISTORY_GOOGLE_DRIVE_ACCOUNT "
+                "or GMAIL_ACCOUNTS must be set for Android location sync"
+            )
+        if not android_location_google_drive_folder_id:
+            raise ValueError(
+                "ANDROID_LOCATION_GOOGLE_DRIVE_FOLDER_ID, BROWSER_HISTORY_GOOGLE_DRIVE_FOLDER_ID, "
+                "APPLE_MESSAGES_GOOGLE_DRIVE_FOLDER_ID, APPLE_NOTES_GOOGLE_DRIVE_FOLDER_ID, "
+                "or VOICE_MEMOS_GOOGLE_DRIVE_FOLDER_ID must be set"
+            )
+        android_location = AndroidLocationConfig(
+            google_drive_account=android_location_google_drive_account,
+            google_drive_folder_id=android_location_google_drive_folder_id,
         )
 
     # Scans: the same shared ingest folder and account as browser history;
@@ -2326,6 +2364,8 @@ def load_settings(
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_messages:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
+    if android_location:
+        google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if android_screen_time:
         google_scopes.append(GOOGLE_DRIVE_SCOPE)
     if scans:
@@ -2387,6 +2427,7 @@ def load_settings(
         browser_history=browser_history,
         android_notifications=android_notifications,
         android_messages=android_messages,
+        android_location=android_location,
         android_screen_time=android_screen_time,
         scans=scans,
         photos=photos,

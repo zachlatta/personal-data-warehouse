@@ -122,6 +122,7 @@ var Schemas = []CatalogSchema{
 	{Name: "marts_health", Layer: "marts", Domain: "health", Discoverable: true, Comment: "Stable health read interface conforming both WHOOP sources (base_whoop, the public API; base_whoop_private, the app API). Start with marts_health.cycles for a day's strain, then marts_health.sleeps, marts_health.recoveries and marts_health.workouts. Units are conformed — HRV in milliseconds, every duration in seconds — and the 1970-01-01 epoch sentinel is NULL on every timestamp."},
 	{Name: "marts_feed", Layer: "marts", Domain: "feed", Discoverable: true, Comment: "Feed tab engagement; start with marts_feed.item_engagement."},
 	{Name: "marts_android_screen_time", Layer: "marts", Domain: "android_screen_time", Discoverable: true, Comment: "Phone minutes; start with marts_android_screen_time.daily_usage."},
+	{Name: "base_android_location", Layer: "base", Domain: "android_location", Discoverable: true, Comment: "Approximate Android location."},
 }
 
 // Objects is every managed warehouse object keyed by its stable logical id.
@@ -412,6 +413,7 @@ var Objects = []CatalogObject{
 	{ID: "marts_notification_health", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "notification_health", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "Health. Paused, stale worker, or attention for failures, no devices, backlog and missing phone alerts."},
 	{ID: "mcp_connections", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "mcp_connections", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "app_access_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "app_access_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
+	{ID: "android_location_samples", Kind: "table", Layer: "base", Domain: "android_location", Schema: "base_android_location", Name: "samples", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 }
 
 // PreviousLocations maps each object's pre-reorganization physical

@@ -89,6 +89,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
+    wh.ensure_android_location_tables()
     wh.ensure_android_screen_time_tables()
     wh.ensure_scans_tables()
     wh.ensure_screen_timelapse_tables()
@@ -750,6 +751,7 @@ _EPOCH_TS = datetime(1970, 1, 1, tzinfo=UTC)
 
 def _seed_sources(wh: PostgresWarehouse) -> None:
     """A little bit of everything, with distinct event times."""
+    wh.insert_android_location_samples([dict(account="z@x.test", device="testphone", sample_id="sample1", latitude=0.0, longitude=0.0, accuracy_m=500.0, provider="network", measured_at=_NOW-timedelta(hours=1), received_at=_NOW, exported_at=_NOW, synced_at=_NOW, sync_version=1, raw_json={})])
     wh._command(
         """
         INSERT INTO @gmail_messages (account, message_id, thread_id, internal_date, subject,
@@ -1501,6 +1503,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "browser_visit": "self",
     "browser_search": "self",
     # The oldest seeded notification is the one-to-one message.
+    "android_location": "noise",
     "android_notification": "direct",
     "android_notification_opened": "self",
     # The oldest seeded text is from a person.
@@ -1522,6 +1525,7 @@ EXPECTED_SEEDED_PRIORITIES = {
 }
 
 EXPECTED_SEEDED_EVENTS = {
+    "android_location": 1,
     "resideo_thermostat_reading": 1,
     "gmail_email": 1,
     "slack_message": 1,
@@ -1600,11 +1604,11 @@ def test_backfill_normalizes_every_source(warehouse):
         "SELECT * FROM @timeline_events ORDER BY occurred_at DESC"
     )
     assert len(rows) == sum(EXPECTED_SEEDED_EVENTS.values())
-    # Newest first: gmail (NOW-1h); finance observations include older days.
-    assert rows[0]["adapter"] == "gmail_email"
+    # Newest first: several sources share NOW-1h; finance observations include older days.
+    assert rows[0]["occurred_at"] == _NOW - timedelta(hours=1)
     assert rows[-1]["adapter"] == "finance_observation"
 
-    gmail = rows[0]
+    gmail = next(row for row in rows if row["adapter"] == "gmail_email")
     assert gmail["source"] == "gmail"
     assert gmail["kind"] == "email"
     assert gmail["actor"] == "alice@example.test"
@@ -4656,3 +4660,20 @@ def test_scheduled_pass_refreshes_overdue_source_measurement(warehouse, monkeypa
         assert warehouse._query("SELECT source_measured_at > now() - interval '1 minute' FROM @timeline_sync_state")[0][0]
     finally:
         engine.close()
+
+
+def test_location_source_filter_reads_approximate_sample(warehouse):
+    _ensure_all_source_tables(warehouse)
+    _seed_sources(warehouse)
+    engine = _engine(warehouse, adapters=[adapter_by_name("android_location")])
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    hits = warehouse._query_dicts(
+        "SELECT source, source_pk, priority FROM @search_text_exact('Approximate location', 10, sources => ARRAY['android_location'])"
+    )
+    assert len(hits) == 1
+    assert hits[0]["source"] == "android_location"
+    assert hits[0]["source_pk"]["sample_id"] == "sample1"
+    assert hits[0]["priority"] == "noise"

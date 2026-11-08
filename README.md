@@ -487,6 +487,22 @@ Messages (already in `base_apple_messages` from the Mac) never leaves the phone.
 (source `android_messages`) and `marts_messages.messages` carry them; see
 [docs/agents/other-sources.md](docs/agents/other-sources.md#android-messages).
 
+## Android Location Sync
+
+`pdw ingest android-location` sends approximate, network-provider location samples through
+PDW's existing authenticated ingest service. A small Android helper requests one bounded
+fix per scheduled run, aiming for about 15 minutes between samples; it never requests GPS.
+Android may defer acquisition while idle. Samples survive offline periods in the helper's
+credential-encrypted spool and leave the spool only after the server stores their batch.
+
+Start with the timeline (`source = 'android_location'`, priority `noise`), then drill into
+the raw source for measurement time, accuracy and receipt time. A recently received sample
+can describe an old location. Do not use it alone to automate home/away actions.
+
+Installation is an explicit reviewed operation; building does not activate tracking.
+See [the rollout and rollback runbook](docs/android-location-rollout.md). Hardware cadence
+and battery impact have not yet been measured. No extra tracker account or receiver is used.
+
 ## Android Notification Sync
 
 Every notification the Android phone (`pichu`) posts or removes, and what happens to it on

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -238,6 +240,11 @@ type e2eCase struct {
 func e2eCases() []e2eCase {
 	sha := func(b []byte) string { return sha256Hex(b) }
 	batchBody := []byte("gzipped-batch")
+	var locationBuffer bytes.Buffer
+	locationGzip := gzip.NewWriter(&locationBuffer)
+	locationGzip.Write([]byte(`{"source":"android_location","record_type":"location","record":{"sample_id":"fake"}}`))
+	locationGzip.Close()
+	locationBody := locationBuffer.Bytes()
 	att := []byte("attachment-bytes")
 	audio := []byte("audio-bytes")
 	meta := []byte(`{"schema_version":1}`)
@@ -297,6 +304,12 @@ func e2eCases() []e2eCase {
 			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
 			wantName: "20260619T123456Z-" + sha(batchBody) + ".jsonl.gz", wantMime: "application/gzip",
 			wantProps: map[string]string{"pdw_kind": "android_screen_time_export_batch", "pdw_stage": "inbox", "pdw_source": "android_screen_time", "batch_sha256": sha(batchBody)},
+		},
+		{
+			name: "android-location/batch", endpoint: "/ingest/android-location/batch", body: locationBody,
+			extra:    url.Values{"exported_at": {"2026-06-19T12:34:56+00:00"}},
+			wantName: "20260619T123456Z-" + sha(locationBody) + ".jsonl.gz", wantMime: "application/gzip",
+			wantProps: map[string]string{"pdw_kind": "android_location_export_batch", "pdw_source": "android_location", "batch_sha256": sha(locationBody)},
 		},
 		{
 			name: "scans/batch", endpoint: "/ingest/scans/batch", body: batchBody,
@@ -465,13 +478,17 @@ func TestIngestEndToEndEveryEndpoint(t *testing.T) {
 			if up.Name != tc.wantName {
 				t.Errorf("drive name = %q, want %q", up.Name, tc.wantName)
 			}
-			if string(up.Media) != string(tc.body) {
+			expectedBody := tc.body
+			if tc.endpoint == "/ingest/android-location/batch" {
+				expectedBody, _ = stampLocationReceipt(tc.body, objectsTestNow, svc.maxBytes)
+			}
+			if string(up.Media) != string(expectedBody) {
 				t.Errorf("drive media = %q, want %q", up.Media, tc.body)
 			}
 			if tc.wantMime != "" && up.MimeType != tc.wantMime {
 				t.Errorf("drive mimeType = %q, want %q", up.MimeType, tc.wantMime)
 			}
-			if up.AppProps["content_sha256"] != sha256Hex(tc.body) {
+			if up.AppProps["content_sha256"] != sha256Hex(expectedBody) {
 				t.Errorf("content_sha256 = %q, want %q", up.AppProps["content_sha256"], sha256Hex(tc.body))
 			}
 			if up.AppProps["pdw_root_folder_id"] != "root-folder" {

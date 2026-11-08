@@ -375,6 +375,24 @@ On the phone (`ssh pichu`): logs in `/data/misc_ce/0/pdw-android-notifications/l
 filling), the tail's log is `logs/system-log-tail.log`, and a manual run is
 `sh /data/adb/modules/pdw-android-notifications/bin/android-notifications-upload-android`.
 
+## Android approximate location
+
+The opt-in Android location collector reuses the on-phone PDW binary, existing ingest
+credentials and Drive transport. The helper has coarse and background location permissions;
+it requests a bounded network-provider fix, never GPS or continuous tracking. The root service
+aims for one sample every 900 seconds after first unlock. Doze and provider availability can
+delay or prevent a fix; hardware cadence and battery cost have not yet been measured.
+
+Each sample is durably queued in credential-encrypted app storage before export. The root
+uploader deletes only acknowledged files, so offline runs retry safely. Server receipt time
+is distinct from the provider's measurement time; inspect measurement age and accuracy before
+answering where the phone is. The timeline classifies this passive telemetry as `noise`.
+No address inference, thermostat automation or separate tracking server is included.
+
+See [the reviewed rollout, rollback and trial checks](../android-location-rollout.md).
+Location history follows the warehouse's retained-history policy; stopping collection preserves
+already stored history and queued samples. Deleting history is a separate reviewed operation.
+
 ## Android screen time
 
 What Android's usage stats service records about how a device is used, from every rooted

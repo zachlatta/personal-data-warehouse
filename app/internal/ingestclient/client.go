@@ -718,3 +718,8 @@ func (c *Client) PostHeartbeat(h Heartbeat) (map[string]any, error) {
 func (c *Client) SignObjectUpload(endpoint, contentSHA256 string, exp time.Time) string {
 	return c.signer.SignObjectUpload(endpoint, contentSHA256, exp)
 }
+
+// UploadAndroidLocationBatch posts queued approximate location samples.
+func (c *Client) UploadAndroidLocationBatch(body []byte, exportedAt string) (StoredObject, error) {
+	return c.post("/ingest/android-location/batch", body, "application/gzip", map[string]string{"exported_at": exportedAt})
+}

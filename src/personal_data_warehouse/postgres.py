@@ -110,6 +110,7 @@ from personal_data_warehouse.schema import (
     ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
     ANDROID_SCREEN_TIME_DAILY_USAGE_COLUMNS,
     ANDROID_SCREEN_TIME_EVENT_COLUMNS,
+    ANDROID_LOCATION_SAMPLE_COLUMNS,
     SCAN_DOCUMENT_COLUMNS,
     SCREEN_TIMELAPSE_ACCESSIBILITY_TREE_COLUMNS,
     SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS,
@@ -392,6 +393,7 @@ SEARCH_TEXT_EXACT_RECENT_ROWS = 5000
 # expression). Keeping this the single source of truth guarantees ranked and
 # exact search accept the same `sources` vocabulary.
 SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("android_location", ("android_location",), "t.kind"),
     ("agent_session", ("agent_session", "agent_session_turn"), "t.source"),
     ("calendar", ("calendar_event",), "t.kind"),
     ("contact", ("contact_update", "apple_contact_update"), "t.kind"),
@@ -1296,6 +1298,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         ANDROID_MESSAGE_ATTACHMENT_COLUMNS,
         ("account", "device", "part_key"),
     ),
+    "android_location_samples": TableSpec(
+        ANDROID_LOCATION_SAMPLE_COLUMNS, ("account", "device", "sample_id")
+    ),
     # Android screen time: one row per usage event and one per daily usage
     # bucket, from every Android device.
     "android_screen_time_events": TableSpec(
@@ -2099,6 +2104,14 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     ),
     # Android screen time. synced_at leads for the freshness probe; event_at
     # and bucket_start_at serve per-device time-range reads.
+    IndexSpec(
+        "android_location_samples_synced_idx", "android_location_samples",
+        "CREATE INDEX IF NOT EXISTS android_location_samples_synced_idx ON @android_location_samples (synced_at)",
+    ),
+    IndexSpec(
+        "android_location_samples_measured_idx", "android_location_samples",
+        "CREATE INDEX IF NOT EXISTS android_location_samples_measured_idx ON @android_location_samples (measured_at DESC)",
+    ),
     IndexSpec(
         "android_screen_time_events_synced_idx",
         "android_screen_time_events",
@@ -3028,6 +3041,7 @@ JSONB_COLUMNS_BY_TABLE = {
     "android_notification_events": {"raw_json", "text_lines", "messages", "people", "actions"},
     "android_messages": {"raw_json", "participants", "parts"},
     "android_message_attachments": {"raw_json"},
+    "android_location_samples": {"raw_json"},
     "android_screen_time_events": {"raw_json"},
     "android_screen_time_daily_usage": {"raw_json"},
     "scan_documents": {"raw_json"},
@@ -3185,6 +3199,7 @@ def _is_text_column(table: str | None, column: str) -> bool:
     return column in TEXT_COLUMNS_BY_TABLE.get(table or "", set())
 
 TIMESTAMP_COLUMNS = {
+    "measured_at", "received_at",
     # Resideo thermostat
     "last_polled_at",
     # agent_failure_shapes
@@ -3738,6 +3753,7 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    "accuracy_m",
     # Resideo thermostat, in the device's own units.
     "indoor_temperature",
     "outdoor_temperature",
@@ -11928,6 +11944,18 @@ class PostgresWarehouse:
             ],
             SCAN_DOCUMENT_COLUMNS,
         )
+
+    def ensure_android_location_tables(self) -> None:
+        self._ensure_table_group(["android_location_samples"])
+
+    def insert_android_location_samples(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if rows:
+            self._insert_rows(
+                "android_location_samples",
+                [{column: row.get(column, _default_python_value(column, table="android_location_samples"))
+                  for column in ANDROID_LOCATION_SAMPLE_COLUMNS} for row in rows],
+                ANDROID_LOCATION_SAMPLE_COLUMNS,
+            )
 
     def ensure_android_screen_time_tables(self) -> None:
         """Provision base_android_screen_time.events and .daily_usage, and the
@@ -21208,7 +21236,9 @@ def _upsert_clause(
     assignments_list: list[str] = []
     for column in update_columns:
         quoted_column = _identifier(column)
-        if column in observation_columns:
+        if table == "android_location_samples" and column == "received_at":
+            assignments_list.append(f"{quoted_column} = LEAST({target_ref}.{quoted_column}, EXCLUDED.{quoted_column})")
+        elif column in observation_columns:
             assignments_list.append(
                 f"{quoted_column} = GREATEST({target_ref}.{quoted_column}, "
                 f"EXCLUDED.{quoted_column})"

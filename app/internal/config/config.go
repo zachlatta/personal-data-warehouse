@@ -152,6 +152,7 @@ var ingestSourceEnvInfix = map[string]string{
 	"android_notifications": "ANDROID_NOTIFICATIONS",
 	"android_messages":      "ANDROID_MESSAGES",
 	"android_screen_time":   "ANDROID_SCREEN_TIME",
+	"android_location":      "ANDROID_LOCATION",
 	"photos":                "PHOTOS",
 	"manual_finance":        "MANUAL_FINANCE",
 	"screen_timelapse":      "SCREEN_TIMELAPSE",

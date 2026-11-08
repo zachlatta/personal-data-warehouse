@@ -2272,6 +2272,17 @@ _ANDROID_MESSAGE = _simple_adapter(
     ),
 )
 
+_ANDROID_LOCATION = _simple_adapter(
+    name="android_location", source="android_location", kind="location", source_table="android_location_samples",
+    from_sql="@android_location_samples t", event_id="concat_ws('|', t.account, t.device, t.sample_id)",
+    event_ts="t.measured_at", ingest_ts="t.synced_at", actor="t.device",
+    title="'Approximate location'", snippet="concat(t.latitude, ', ', t.longitude, ' (accuracy ', t.accuracy_m, ' m)')",
+    context="t.device", source_pk="jsonb_build_object('account', t.account, 'device', t.device, 'sample_id', t.sample_id)",
+    metadata="jsonb_build_object('latitude', t.latitude, 'longitude', t.longitude, 'accuracy_m', t.accuracy_m, 'received_at', t.received_at, 'provider', t.provider)",
+    search_text="concat('Approximate location ', t.device, ' ', t.latitude, ', ', t.longitude)",
+    priority=TIMELINE_PRIORITY_NOISE,
+)
+
 # --- Android notifications -------------------------------------------------
 #
 # base_android_notifications.events holds every listener event; the timeline
@@ -3537,6 +3548,7 @@ TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _BROWSER_VISIT,
     _BROWSER_SEARCH,
     _ANDROID_MESSAGE,
+    _ANDROID_LOCATION,
     _ANDROID_NOTIFICATION,
     _ANDROID_NOTIFICATION_OPENED,
     _ANDROID_NOTIFICATION_ACTION,
@@ -3747,6 +3759,7 @@ TIMELINE_CONTEXT_STREAMS: dict[str, tuple[TimelineContextStream, ...]] = {
 # `is_anchor` row both UIs light would be missing.
 TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
     {
+        "android_location",
         # A scan stands alone; its neighbours are the scans around it.
         "scan_document",
         "slack_file",
@@ -4163,6 +4176,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "browser_history_visits": _events(),
     # Android notifications: one events table, two adapters (a notification's
     # first appearance with each content, and a tap that opened one).
+    "android_location_samples": _events(),
     "android_notification_events": _events(),
     # Android messages: one events table, one adapter (system rows stay in base).
     "android_messages": _events(),

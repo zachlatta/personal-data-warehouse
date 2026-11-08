@@ -871,6 +871,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("android_messages"),
     ),
     _source(
+        "android_location", "Android approximate location",
+        cadence="target one sample every 15 min, Android may delay",
+        transport="Android helper → pdw ingest android-location → authenticated app → Drive inbox → Dagster",
+        data=timedelta(hours=1),
+        basis="Measurement age detects unavailable or stale fixes even when uploads continue; cadence is a hardware test target",
+        note="Uploader run heartbeat and measurement freshness are independent",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_location"),
+    ),
+    _source(
         "android_screen_time",
         "Android screen time (usage events and daily totals, every Android device)",
         cadence="uploader every 5 min on each device",
@@ -1846,6 +1856,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "android_messages": _data("android_messages", "synced_at", "message_at"),
     "android_message_attachments": _support("android_messages", "ingested_at"),
     # Android screen time
+    "android_location_samples": _data("android_location", "synced_at", "measured_at"),
     "android_screen_time_events": _data("android_screen_time", "synced_at", "event_at"),
     "android_screen_time_daily_usage": _support("android_screen_time", "synced_at"),
     # Scans

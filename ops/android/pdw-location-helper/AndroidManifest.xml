@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.zachlatta.pdw.location" android:versionCode="1" android:versionName="1">
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <application android:label="PDW approximate location" android:allowBackup="false" android:hasCode="true">
+        <provider android:name=".LocationProvider" android:authorities="com.zachlatta.pdw.location"
+            android:exported="true" android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

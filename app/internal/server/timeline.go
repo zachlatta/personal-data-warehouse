@@ -255,6 +255,7 @@ type timelineFilterCatalogEntry struct {
 // count aggregates warm in the background. Keep this list in step with the
 // Python timeline adapter registry in src/personal_data_warehouse/timeline.py.
 var timelineFilterCatalog = []timelineFilterCatalogEntry{
+	{source: "android_location", kind: "location"},
 	{source: "gmail", kind: "email"},
 	{source: "slack", kind: "message"},
 	{source: "slack", kind: "file_share"},

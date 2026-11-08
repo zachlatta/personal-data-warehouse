@@ -3970,3 +3970,5 @@ SCREEN_TIMELAPSE_DESCRIPTION_COLUMNS = (
     "created_at",
     "sync_version",
 )
+
+ANDROID_LOCATION_SAMPLE_COLUMNS = ("account", "device", "sample_id", "latitude", "longitude", "accuracy_m", "provider", "measured_at", "received_at", "exported_at", "raw_json", "synced_at", "sync_version")

@@ -252,3 +252,9 @@ identity for Gmail or Slack group DMs), `source_table` + `source_pk` (the one-ho
 down), `metadata` (per-source extras), `seq` (monotonic change order, for consuming the
 timeline exactly once), `first_seen_at`. `search_text` is the indexed document: search it
 through the functions, never scan it.
+
+Android approximate location: start with timeline (`source = 'android_location'`, priority `noise`),
+then drill into `base_android_location.samples`. `measured_at` is when the fix was taken;
+`received_at` is server receipt, not evidence of a current fix. `accuracy_m` is the reported
+radius in metres. A roughly 15 minute cadence is a target, not a guarantee; missing samples
+and old measurements must not be treated as proof of presence or absence.

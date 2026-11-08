@@ -621,6 +621,14 @@
       "discoverable": true,
       "query_access": "public",
       "comment": "Phone minutes; start with marts_android_screen_time.daily_usage."
+    },
+    {
+      "name": "base_android_location",
+      "layer": "base",
+      "domain": "android_location",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Approximate Android location."
     }
   ],
   "objects": [
@@ -4354,6 +4362,18 @@
       "discoverable": false,
       "query_access": "denied",
       "secret": true
+    },
+    {
+      "id": "android_location_samples",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_location",
+      "schema": "base_android_location",
+      "name": "samples",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": ""
     }
   ],
   "renamed_timeline_source_tables": {

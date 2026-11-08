@@ -39,6 +39,7 @@ LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
 WRAPPERS: dict[str, tuple[str, str | None]] = {
+    "android-location-upload-android": ('"$PDW" ingest android-location', "android_location"),
     "agent-sessions-upload-launchd": ('"$PDW" ingest agent-sessions --mode incremental', "claude_code,codex,pi,muse_code,argon"),
     "agent-sessions-upload-systemd": ('"$PDW" ingest agent-sessions --mode incremental', "${AGENT_SESSIONS_HEARTBEAT_PIPELINES:-openclaw}"),
     "apple-contacts-upload-launchd": ('"$PDW" ingest apple-contacts --mode incremental', "apple_contacts"),
@@ -279,6 +280,7 @@ def test_the_screen_timelapse_android_service_runs_every_five_minutes_and_compre
 # the timeout so the phone stays awake while that teardown finishes.
 # module -> (wrapper, state-dir env var, timeout seconds)
 ANDROID_UPLOADERS: dict[str, tuple[str, str, int]] = {
+    "pdw-android-location": ("android-location-upload-android", "PDW_ANDROID_LOCATION_STATE_DIR", 120),
     "pdw-google-recorder": ("google-recorder-upload-android", "PDW_GOOGLE_RECORDER_STATE_DIR", 960),
     "pdw-android-notifications": ("android-notifications-upload-android", "PDW_ANDROID_NOTIFICATIONS_STATE_DIR", 660),
     "pdw-android-messages": ("android-messages-upload-android", "PDW_ANDROID_MESSAGES_STATE_DIR", 660),
@@ -303,11 +305,11 @@ def test_android_service_holds_its_wakelock_past_the_timeout_under_platform_sh(m
     assert "unset ASH_STANDALONE" in service
     assert 'exec /system/bin/sh "$0" "$@"' in service
     run = f'timeout {seconds} sh "$MODDIR/bin/{wrapper}"'
-    assert re.findall(r"(?m)^\s*timeout \d+ .*$", service) == [f"    {run} >/dev/null 2>&1"]
+    assert [line.removesuffix(" &") for line in re.findall(r"(?m)^\s*timeout \d+ .*$", service)] == [f"    {run} >/dev/null 2>&1"]
     wakelock_ns = (seconds + STOP_WAKELOCK_MARGIN_SECONDS) * 1_000_000_000
     lock = f'echo "$WAKE {wakelock_ns}" > /sys/power/wake_lock'
     assert re.findall(r'echo "\$WAKE \d+" > /sys/power/wake_lock', service) == [lock]
-    assert service.index(lock) < service.index(run) < service.index('echo "$WAKE" > /sys/power/wake_unlock')
+    assert service.index(lock) < service.index(run) < service.index('echo "$WAKE" > /sys/power/wake_unlock', service.index(run))
 
 
 @pytest.mark.parametrize("module", sorted(ANDROID_UPLOADERS))

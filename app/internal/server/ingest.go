@@ -102,6 +102,7 @@ var ingestSourceDefs = map[string]ingestSourceDef{
 	// Every SMS, MMS and RCS message on the Pixel since the switch, from the phone's uploader.
 	"android_messages": {source: "android_messages", blobKind: "android_message_attachment", metadataKind: "android_message_export_batch"},
 	// Usage events and daily usage totals (screen time) from each Android device's uploader.
+	"android_location":    {source: "android_location", blobKind: "android_location_blob", metadataKind: "android_location_export_batch"},
 	"android_screen_time": {source: "android_screen_time", blobKind: "android_screen_time_blob", metadataKind: "android_screen_time_export_batch"},
 	// Documents scanned from a network scanner's panel (pdw ingest scanner).
 	"scans": {source: "scans", blobKind: "scan_document", metadataKind: "scan_export_batch"},
@@ -279,6 +280,14 @@ func (svc *ingestService) handler() http.Handler {
 			svc.logger.WarnContext(r.Context(), "ingest request rejected", "endpoint", endpoint, "error", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if artifact.sourceSlug == "android_location" {
+			body, err = stampLocationReceipt(body, svc.now(), svc.maxBytes)
+			if err != nil {
+				http.Error(w, "invalid location batch", http.StatusBadRequest)
+				return
+			}
+			actualSHA = hex.EncodeToString(sha256Sum(body))
 		}
 		store := svc.stores[artifact.sourceSlug]
 		var stored objectstore.StoredObject
@@ -605,6 +614,7 @@ func ingestArtifacts() []ingestArtifact {
 		batch("/ingest/android-notifications/batch", "android_notifications", "android-notifications/inbox", "android_notification_export_batch"),
 		batch("/ingest/android-messages/batch", "android_messages", "android-messages/inbox", "android_message_export_batch"),
 		batch("/ingest/android-screen-time/batch", "android_screen_time", "android-screen-time/inbox", "android_screen_time_export_batch"),
+		batch("/ingest/android-location/batch", "android_location", "android-location/inbox", "android_location_export_batch"),
 		batch("/ingest/scans/batch", "scans", "scans/inbox", "scan_export_batch"),
 		// --- muse: a workspace file whose bytes do not ride inline in a batch
 		{

@@ -409,6 +409,7 @@ def _provision_every_table(wh: PostgresWarehouse) -> None:
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
     wh.ensure_android_messages_tables()
+    wh.ensure_android_location_tables()
     wh.ensure_android_screen_time_tables()
     wh.ensure_screen_timelapse_tables()
     wh.ensure_plaid_tables()
@@ -3309,3 +3310,20 @@ def test_screen_timelapse_stays_ok_for_three_day_old_retired_device_and_weekend_
     assert row["status"] == "ok"
     assert row["state_attention_rows"] == 0
     assert row["last_error"] is None
+
+
+def test_location_recent_upload_does_not_hide_old_measurement(warehouse):
+    _provision_every_table(warehouse)
+    now = datetime.now(UTC)
+    warehouse.insert_android_location_samples([dict(
+        account="test@example.test", device="testphone", sample_id="stale-fix",
+        latitude=0.0, longitude=0.0, accuracy_m=500.0, provider="network",
+        measured_at=now-timedelta(days=1), received_at=now, exported_at=now,
+        synced_at=now, sync_version=int(now.timestamp()*1_000_000), raw_json={},
+    )])
+    PipelineHealthCollector(warehouse).run_all()
+    row = warehouse._query_dicts(
+        "SELECT event_status, data_status FROM @marts_pipeline_health WHERE pipeline = 'android_location'"
+    )[0]
+    assert row["data_status"] == "ok"
+    assert row["event_status"] == "stale"
