@@ -2520,6 +2520,44 @@ _FEED_ENGAGEMENT = _simple_adapter(
     priority=TIMELINE_PRIORITY_SELF,
 )
 
+_COMMA_DRIVE = _simple_adapter(
+    name="comma_drive",
+    source_table="comma_routes",
+    source="comma",
+    kind="drive",
+    from_sql="@comma_routes t",
+    event_id="concat_ws('|', t.account, t.dongle_id, t.route_name)",
+    event_ts="t.start_at",
+    end_ts="t.end_at",
+    ingest_ts="t.synced_at",
+    actor="'me'",
+    title=(
+        "concat('Drove ', round(t.distance_miles::numeric, 1)::text, ' mi in ', "
+        "round(extract(epoch FROM (t.end_at - t.start_at)) / 60)::text, ' min')"
+    ),
+    snippet=(
+        "concat_ws(', ', NULLIF(btrim(concat_ws(' ', t.car_make, t.car_platform)), ''), "
+        "NULLIF(btrim(concat_ws(' ', 'openpilot', t.git_branch, t.openpilot_version)), 'openpilot'), "
+        "CASE WHEN t.has_gps = 1 THEN concat('from ', round(t.start_lat::numeric, 4)::text, ',', "
+        "round(t.start_lng::numeric, 4)::text, ' to ', round(t.end_lat::numeric, 4)::text, ',', "
+        "round(t.end_lng::numeric, 4)::text) END)"
+    ),
+    context="t.dongle_id",
+    source_pk="jsonb_build_object('account', t.account, 'dongle_id', t.dongle_id, 'route_name', t.route_name)",
+    metadata=(
+        "jsonb_build_object("
+        "'distance_miles', t.distance_miles, "
+        "'car_platform', t.car_platform, "
+        "'has_gps', t.has_gps, "
+        "'start_lat', t.start_lat, 'start_lng', t.start_lng, "
+        "'end_lat', t.end_lat, 'end_lng', t.end_lng, "
+        "'segment_count', t.segment_count)"
+    ),
+    # A drive in his car is an act Zach took, like a workout the strap recorded;
+    # comma cannot say who was at the wheel.
+    priority=TIMELINE_PRIORITY_SELF,
+)
+
 _RESIDEO_THERMOSTAT_READING = _simple_adapter(
     name="resideo_thermostat_reading",
     source_table="resideo_thermostat_readings",
@@ -3527,6 +3565,7 @@ _AGENT_SESSION_TURN = _agent_session_turn_adapter()
 
 TIMELINE_ADAPTERS: tuple[TimelineAdapter, ...] = (
     _RESIDEO_THERMOSTAT_READING,
+    _COMMA_DRIVE,
     _GMAIL_EMAIL,
     _SLACK_MESSAGE,
     _SLACK_FILE,
@@ -3781,6 +3820,7 @@ TIMELINE_CONTEXT_GENERIC_ADAPTERS: frozenset[str] = frozenset(
         "contact_update",
         "apple_contact_update",
         "resideo_thermostat_reading",
+        "comma_drive",
         "whoop_cycle",
         "whoop_recovery",
         "whoop_sleep",
@@ -4160,6 +4200,11 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # WHOOP
     "whoop_profiles": _entity("current WHOOP user profile"),
     "whoop_body_measurements": _entity("current WHOOP body measurements"),
+    "comma_routes": _events(),
+    "comma_devices": _entity(
+        "each comma device now, with comma's lifetime totals; reach it by dongle_id, the context of a drive event"
+    ),
+    "comma_sync_state": _state("comma poll heartbeat and token expiry"),
     "resideo_thermostat_readings": _events(),
     "resideo_thermostats": _entity(
         "current state of each thermostat; reach it by device_id, the context of a thermostat_reading event"

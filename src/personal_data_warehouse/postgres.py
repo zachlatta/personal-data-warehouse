@@ -117,6 +117,10 @@ from personal_data_warehouse.schema import (
     SCREEN_TIMELAPSE_SCREENSHOT_COLUMNS,
     HACKER_NEWS_PROFILE_COLUMNS,
     RESIDEO_OAUTH_TOKEN_COLUMNS,
+    COMMA_DEVICE_COLUMNS,
+    COMMA_DEVICE_COLUMNS_WITHOUT_LOCATION,
+    COMMA_ROUTE_COLUMNS,
+    COMMA_SYNC_STATE_COLUMNS,
     RESIDEO_SYNC_STATE_COLUMNS,
     RESIDEO_THERMOSTAT_COLUMNS,
     RESIDEO_THERMOSTAT_READING_COLUMNS,
@@ -421,6 +425,7 @@ SEARCH_SOURCE_DEFS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("warehouse", ("enrichment_run",), "t.kind"),
     ("whatsapp", ("whatsapp_message",), "t.kind"),
     ("resideo", ("resideo_thermostat_reading",), "t.kind"),
+    ("comma", ("comma_drive",), "t.kind"),
     ("whoop", ("whoop_cycle", "whoop_recovery", "whoop_sleep", "whoop_workout"), "t.kind"),
     # The private (app) API contributes only events the public API has no
     # equivalent of: the journal, the weekly Healthspan update and WHOOP Coach
@@ -1347,6 +1352,9 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     ),
     "resideo_sync_state": TableSpec(RESIDEO_SYNC_STATE_COLUMNS, ("account",), "updated_at"),
     "resideo_oauth_tokens": TableSpec(RESIDEO_OAUTH_TOKEN_COLUMNS, ("account",), "updated_at"),
+    "comma_devices": TableSpec(COMMA_DEVICE_COLUMNS, ("account", "dongle_id"), "synced_at"),
+    "comma_routes": TableSpec(COMMA_ROUTE_COLUMNS, ("account", "dongle_id", "route_name"), "synced_at"),
+    "comma_sync_state": TableSpec(COMMA_SYNC_STATE_COLUMNS, ("account",), "updated_at"),
     "hacker_news_profile": TableSpec(HACKER_NEWS_PROFILE_COLUMNS, ("account", "user_id")),
     "hacker_news_sync_state": TableSpec(
         HACKER_NEWS_SYNC_STATE_COLUMNS, ("account", "list_name"), "updated_at"
@@ -1994,6 +2002,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "google_drive_file_texts",
         "CREATE INDEX IF NOT EXISTS google_drive_file_texts_text_trgm_idx ON @google_drive_file_texts USING gin (text public.gin_trgm_ops)",
         requires_pg_trgm=True,
+    ),
+    IndexSpec(
+        "comma_routes_synced_idx",
+        "comma_routes",
+        "CREATE INDEX IF NOT EXISTS comma_routes_synced_idx ON @comma_routes (synced_at DESC)",
+    ),
+    IndexSpec(
+        "comma_routes_start_idx",
+        "comma_routes",
+        "CREATE INDEX IF NOT EXISTS comma_routes_start_idx ON @comma_routes (start_at DESC)",
     ),
     IndexSpec(
         "resideo_thermostat_readings_synced_idx",
@@ -3015,6 +3033,8 @@ JSONB_COLUMNS_BY_TABLE = {
     "whoop_profiles": {"raw_json"},
     "whoop_body_measurements": {"raw_json"},
     "resideo_thermostats": {"raw_json"},
+    "comma_devices": {"raw_json"},
+    "comma_routes": {"raw_json"},
     "resideo_thermostat_readings": {"raw_json"},
     "whoop_cycles": {"score_json", "raw_json"},
     "whoop_recoveries": {"score_json", "raw_json"},
@@ -3200,6 +3220,10 @@ def _is_text_column(table: str | None, column: str) -> bool:
 
 TIMESTAMP_COLUMNS = {
     "measured_at", "received_at",
+    # comma.ai
+    "last_athena_ping_at",
+    "location_at",
+    "token_expires_at",
     # Resideo thermostat
     "last_polled_at",
     # agent_failure_shapes
@@ -3381,6 +3405,19 @@ _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
 )
 
 INTEGER_COLUMNS = {
+    # comma.ai
+    "is_owner",
+    "is_paired",
+    "prime",
+    "has_location",
+    "total_minutes",
+    "total_routes",
+    "week_minutes",
+    "week_routes",
+    "segment_count",
+    "is_preserved",
+    "routes_seen",
+    "routes_written",
     # Resideo thermostat
     "is_online",
     "has_outdoor_reading",
@@ -3753,6 +3790,16 @@ INTEGER_COLUMNS = {
 }
 
 FLOAT_COLUMNS = {
+    # comma.ai: miles, as comma reports them, and WGS84 degrees.
+    "total_distance_miles",
+    "week_distance_miles",
+    "distance_miles",
+    "location_lat",
+    "location_lng",
+    "start_lat",
+    "start_lng",
+    "end_lat",
+    "end_lng",
     "accuracy_m",
     # Resideo thermostat, in the device's own units.
     "indoor_temperature",
@@ -8127,6 +8174,7 @@ class PostgresWarehouse:
         # The poller only starts once its API key is set, and until a table an
         # adapter reads exists, every timeline sync run fails on that adapter.
         self.ensure_resideo_tables()
+        self.ensure_comma_tables()
         self._ensure_table("timeline_events")
         self._ensure_table("timeline_sync_state")
         # Before the indexes: their definitions name occurred_at, so a missing
@@ -12030,6 +12078,85 @@ class PostgresWarehouse:
                 for row in rows
             ],
             ANDROID_MESSAGE_COLUMNS,
+        )
+
+    def ensure_comma_tables(self) -> None:
+        self._ensure_table_group(["comma_devices", "comma_routes", "comma_sync_state"])
+
+    def insert_comma_devices(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert devices; a poll that could not place one keeps its last known location."""
+
+        located = [row for row in rows if row["has_location"]]
+        unlocated = [row for row in rows if not row["has_location"]]
+        self._insert_rows("comma_devices", located, COMMA_DEVICE_COLUMNS)
+        self._insert_rows("comma_devices", unlocated, COMMA_DEVICE_COLUMNS_WITHOUT_LOCATION)
+
+    def upsert_comma_routes(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert drives and return how many were inserted or changed."""
+
+        if not rows:
+            return 0
+        table = "comma_routes"
+        spec = POSTGRES_TABLES[table]
+        columns = COMMA_ROUTE_COLUMNS
+        values = _dedupe_conflict_rows(
+            [tuple(_normalize_insert_value(row[column], table=table, column=column) for column in columns) for row in rows],
+            columns,
+            spec,
+            table=table,
+        )
+        column_sql = ", ".join(_identifier(column) for column in columns)
+        sql = (
+            f"INSERT INTO {self.sql_relation(table)} AS target ({column_sql}) VALUES %s "
+            f"{_upsert_clause(table, spec, columns, target_alias='target')} RETURNING 1"
+        )
+        with self._connection.cursor() as cursor:
+            written = execute_values(
+                cursor,
+                self._expand_relations(sql),
+                values,
+                template="(" + ", ".join(["%s"] * len(columns)) + ")",
+                page_size=1000,
+                fetch=True,
+            )
+        return len(written)
+
+    def insert_comma_sync_state(
+        self,
+        *,
+        account: str,
+        status: str,
+        error: str,
+        last_success_at: datetime | None,
+        token_expires_at: datetime | None,
+        devices_seen: int,
+        routes_seen: int,
+        routes_written: int,
+        updated_at: datetime,
+    ) -> None:
+        """Record a poll. A failed one keeps the last success and the last known expiry."""
+
+        self._command(
+            "INSERT INTO @comma_sync_state AS target (account, status, error, last_success_at, token_expires_at, "
+            "devices_seen, routes_seen, routes_written, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (account) DO UPDATE SET status = EXCLUDED.status, error = EXCLUDED.error, "
+            "last_success_at = GREATEST(target.last_success_at, EXCLUDED.last_success_at), "
+            "token_expires_at = CASE WHEN EXCLUDED.token_expires_at = %s THEN target.token_expires_at "
+            "ELSE EXCLUDED.token_expires_at END, "
+            "devices_seen = EXCLUDED.devices_seen, routes_seen = EXCLUDED.routes_seen, "
+            "routes_written = EXCLUDED.routes_written, updated_at = EXCLUDED.updated_at",
+            (
+                account,
+                status,
+                error,
+                last_success_at or EPOCH_UTC,
+                token_expires_at or EPOCH_UTC,
+                devices_seen,
+                routes_seen,
+                routes_written,
+                updated_at,
+                EPOCH_UTC,
+            ),
         )
 
     def ensure_resideo_tables(self) -> None:
@@ -21084,6 +21211,9 @@ PRESERVE_NON_EMPTY_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
 # timeline adapter re-walk old rows forever and hides genuine edit latency.
 # Compare every other mutable column before allowing the upsert.
 NOOP_UPSERT_GUARD_EXCLUDED_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
+    # Every comma poll re-reads the whole retained window; only a route that
+    # grew (more segments uploaded) may be rewritten and re-walk the timeline.
+    "comma_routes": ("synced_at",),
     # GitHub rows are re-read on every overlapping search page; an unchanged
     # row must not bump its version (or re-walk its timeline row).
     "github_commits": ("synced_at", "sync_version"),

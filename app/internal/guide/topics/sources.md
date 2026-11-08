@@ -90,6 +90,14 @@ is wrong. `has_outdoor_reading = 0` means `outdoor_temperature` is absent, not z
 the timeline these are source resideo events at `noise`. To change a setpoint, see
 `resideo.set_thermostat` in the mutations topic.
 
+## Driving (comma.ai)
+
+`base_comma.routes` is one row per drive of the car's comma device: `start_at`, `end_at`,
+`distance_miles` (miles), start and end coordinates. Kept from 2026-11-05 on; earlier drives are
+gone, but `base_comma.devices` holds comma's lifetime and trailing-week totals. `has_gps = 0`
+means the coordinates are absent, not 0,0. On the timeline these are source comma, kind drive,
+at `self`.
+
 ## Health (WHOOP)
 
 Two sources for one wearable: `marts_health.cycles`, `.sleeps`, `.recoveries`, `.workouts`

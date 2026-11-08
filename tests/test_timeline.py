@@ -85,6 +85,7 @@ def _ensure_all_source_tables(wh: PostgresWarehouse) -> None:
     wh.ensure_whoop_private_tables()
     wh.ensure_hacker_news_tables()
     wh.ensure_resideo_tables()
+    wh.ensure_comma_tables()
     wh.ensure_github_tables()
     wh.ensure_browser_history_tables()
     wh.ensure_android_notifications_tables()
@@ -1076,6 +1077,16 @@ def _seed_sources(wh: PostgresWarehouse) -> None:
     )
     wh._command(
         """
+        INSERT INTO @comma_routes (account, dongle_id, route_name, start_at, end_at, distance_miles,
+                                   has_gps, start_lat, start_lng, end_lat, end_lng, car_make,
+                                   car_platform, openpilot_version, git_branch, segment_count, synced_at)
+        VALUES ('00aa11bb22cc33dd', 'feedfacecafe0001', '00000001--abcdef0123', %s, %s, 12.34,
+                1, 40.01, -75.2, 40.3, -75.1, 'examplemake', 'EXAMPLE_PLATFORM', '0.11.2', 'release3', 21, %s)
+        """,
+        (_NOW - timedelta(hours=3), _NOW - timedelta(hours=3) + timedelta(minutes=20), _NOW),
+    )
+    wh._command(
+        """
         INSERT INTO @resideo_thermostat_readings (account, device_id, observed_at, name, is_online,
                                                   indoor_temperature, heat_setpoint, cool_setpoint,
                                                   system_mode, operation_mode, setpoint_status,
@@ -1482,6 +1493,7 @@ EXPECTED_SEEDED_PRIORITIES = {
     "contact_update": "background",
     "apple_contact_update": "background",
     "resideo_thermostat_reading": "noise",
+    "comma_drive": "self",
     "whoop_cycle": "noise",
     "whoop_recovery": "noise",
     "whoop_sleep": "noise",
@@ -1527,6 +1539,7 @@ EXPECTED_SEEDED_PRIORITIES = {
 EXPECTED_SEEDED_EVENTS = {
     "android_location": 1,
     "resideo_thermostat_reading": 1,
+    "comma_drive": 1,
     "gmail_email": 1,
     "slack_message": 1,
     "slack_file": 1,

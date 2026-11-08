@@ -499,6 +499,31 @@ timeline, and pages Zach.
   `printer.print_document` (reviewed prints on this Brother over IPP). See
   [Printing](mutations-and-app.md#printing-printerprint_document).
 
+## comma.ai (the car's drives)
+
+The car carries a comma 3X running openpilot. comma's API (`api.commadotai.com`, the backend of
+comma connect) is reached with the JWT comma connect holds after a Google sign-in
+(`src/personal_data_warehouse/comma_api.py`). `comma_sync` (Dagster, every 15 minutes) writes
+`base_comma.devices` (the device, its last GPS fix, comma's lifetime and trailing-week totals) and
+`base_comma.routes` (one row per drive; the timeline's `comma_drive` events, at `self`).
+
+- **Setup.** `COMMA_API_TOKEN` on the Dagster deployment; the sensor sits out until it is set.
+  `COMMA_ENABLED=0` pauses it, `COMMA_POLL_INTERVAL_SECONDS` changes the interval.
+- **The token lasts 90 days and has no refresh.** The sync reads its `exp` claim into
+  `ops.comma_sync_state.token_expires_at`, and from 14 days before it the pipeline reads
+  `action_required` while still polling. To renew: sign in at connect.comma.ai, copy the JWT the
+  site sends as `Authorization: JWT <token>`, and set `COMMA_API_TOKEN`. A refused token
+  ends the run without retries.
+- **comma deletes a free account's drives after about three days.** Measured 2026-11-08: the API
+  listed the drives of Nov 5-8 and one preserved route, against 2,372 lifetime routes in the
+  device's stats. The warehouse is therefore the only lasting copy: a route comma has aged out is
+  never deleted here, and an outage longer than about three days loses drives for good.
+- **A drive grows while it uploads.** Every poll re-reads the whole retained window; the upsert
+  rewrites a route (and re-walks its timeline event) only when something other than `synced_at`
+  changed. `share_sig`/`share_exp` (a link that lets anyone watch the drive) are never stored.
+- **Not yet synced:** the per-segment logs (`qlog`) with the full GPS track and the camera files.
+  `/v1/route/<dongle>|<route>/files` returns signed URLs for them.
+
 ## Resideo thermostat
 
 The T5 thermostat at home is set up in the Resideo Connect app (package

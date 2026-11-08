@@ -277,6 +277,7 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "whoop_private", kind: "coach_message"},
 	{source: "hacker_news", kind: "hn_item"},
 	{source: "resideo", kind: "thermostat_reading"},
+	{source: "comma", kind: "drive"},
 	{source: "github", kind: "commit"},
 	{source: "github", kind: "issue"},
 	{source: "github", kind: "comment"},

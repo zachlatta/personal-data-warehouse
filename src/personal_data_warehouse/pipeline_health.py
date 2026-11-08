@@ -1130,6 +1130,32 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
     ),
     _source(
+        "comma",
+        "comma.ai drives",
+        cadence="every 15 min",
+        transport="Dagster comma_sync → api.commadotai.com with comma connect's JWT",
+        # A car can sit for days; the poll heartbeat is what proves the poller is
+        # alive, and it matters, because comma deletes a free account's drives
+        # after about three days.
+        data=7 * DAY,
+        run=HOUR,
+        basis=(
+            "measured 2026-11-08: comma's own stats count 40 drives in the trailing week, and the"
+            " 19 visible drives of Nov 5-8 never left a gap over a day; a week covers a trip away"
+            " from the car, and the 1h run heartbeat is the sharper signal"
+        ),
+        state=StateSource(
+            table="comma_sync_state",
+            updated_column="updated_at",
+            status_column="status",
+            error_column="error",
+        ),
+        note=(
+            "the token is a 90-day JWT with no refresh; action_required means it expires within 14 days"
+            " (still polling) or was refused: sign in at connect.comma.ai and set COMMA_API_TOKEN"
+        ),
+    ),
+    _source(
         "resideo",
         "Resideo thermostat",
         cadence="every 5 min",
@@ -1884,6 +1910,9 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "chatgpt_sessions": _state("chatgpt", "updated_at", "published chatgpt.com session"),
     "chatgpt_conversation_sync": _state("chatgpt", "synced_at"),
     # WHOOP
+    "comma_routes": _data("comma", "synced_at", "start_at"),
+    "comma_devices": _support("comma", "synced_at", note="current device and totals, refreshed every poll"),
+    "comma_sync_state": _state("comma", "updated_at"),
     "resideo_thermostat_readings": _data("resideo", "synced_at", "observed_at"),
     "resideo_thermostats": _support("resideo", "synced_at", note="current state, refreshed every poll"),
     "resideo_sync_state": _state("resideo", "updated_at"),

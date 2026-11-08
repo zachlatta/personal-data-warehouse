@@ -3276,6 +3276,83 @@ RESIDEO_OAUTH_TOKEN_COLUMNS = (
     "updated_at",
 )
 
+# --------------------------------------------------------------------------
+# comma.ai (comma_sync.py). `account` is the comma user id the token names.
+# `has_gps` / `has_location` exist because 0,0 is a real coordinate: the
+# warehouse's absent-is-zero default cannot say "no fix".
+COMMA_DEVICE_COLUMNS = (
+    "account",
+    "dongle_id",
+    "alias",
+    "device_type",
+    "serial",
+    "openpilot_version",
+    "is_owner",
+    "is_paired",
+    "prime",
+    "last_athena_ping_at",
+    "has_location",
+    "location_lat",
+    "location_lng",
+    "location_at",
+    # comma's own lifetime and trailing-week totals, which outlive the routes it keeps.
+    "total_distance_miles",
+    "total_minutes",
+    "total_routes",
+    "week_distance_miles",
+    "week_minutes",
+    "week_routes",
+    "last_polled_at",
+    "raw_json",
+    "synced_at",
+)
+
+#: Without a device's location, the upsert leaves the last known one in place.
+COMMA_DEVICE_COLUMNS_WITHOUT_LOCATION = tuple(
+    column
+    for column in COMMA_DEVICE_COLUMNS
+    if column not in ("has_location", "location_lat", "location_lng", "location_at")
+)
+
+#: One row per drive (comma's "route"), kept after comma ages it out.
+COMMA_ROUTE_COLUMNS = (
+    "account",
+    "dongle_id",
+    "route_name",
+    "start_at",
+    "end_at",
+    "distance_miles",
+    "has_gps",
+    "start_lat",
+    "start_lng",
+    "end_lat",
+    "end_lng",
+    "car_make",
+    "car_platform",
+    "vin",
+    "openpilot_version",
+    "git_remote",
+    "git_branch",
+    "git_commit",
+    "segment_count",
+    "is_preserved",
+    "is_public",
+    "raw_json",
+    "synced_at",
+)
+
+COMMA_SYNC_STATE_COLUMNS = (
+    "account",
+    "status",
+    "error",
+    "last_success_at",
+    "token_expires_at",
+    "devices_seen",
+    "routes_seen",
+    "routes_written",
+    "updated_at",
+)
+
 HACKER_NEWS_ITEM_COLUMNS = (
     "account",
     # HN's numeric id, stored as text like every other provider id here.

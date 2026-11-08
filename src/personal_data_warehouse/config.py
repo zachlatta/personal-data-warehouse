@@ -79,6 +79,9 @@ DEFAULT_RESIDEO_POLL_INTERVAL_SECONDS = 300
 DEFAULT_RESIDEO_REQUEST_TIMEOUT_SECONDS = 30
 #: The one Resideo account; a label, like the printer's account.
 RESIDEO_ACCOUNT = "home"
+#: comma keeps a free account's drives for about three days; poll well inside that.
+DEFAULT_COMMA_POLL_INTERVAL_SECONDS = 900
+DEFAULT_COMMA_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_HACKER_NEWS_API_BASE_URL = "https://hacker-news.firebaseio.com/v0"
 DEFAULT_HACKER_NEWS_SITE_BASE_URL = "https://news.ycombinator.com"
 DEFAULT_HACKER_NEWS_POLL_INTERVAL_SECONDS = 1800
@@ -523,6 +526,16 @@ class ResideoConfig:
 
 
 @dataclass(frozen=True)
+class CommaConfig:
+    """The comma.ai drive poller. ``token`` is comma connect's 90-day JWT (COMMA_API_TOKEN)."""
+
+    token: str
+    enabled: bool = True
+    poll_interval_seconds: int = DEFAULT_COMMA_POLL_INTERVAL_SECONDS
+    request_timeout_seconds: int = DEFAULT_COMMA_REQUEST_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
 class HackerNewsConfig:
     """The Hacker News source: public API items plus the account's lists.
 
@@ -720,6 +733,7 @@ class Settings:
     whoop_private: WhoopPrivateConfig | None = None
     hacker_news: HackerNewsConfig | None = None
     resideo: "ResideoConfig | None" = None
+    comma: "CommaConfig | None" = None
     github: GitHubConfig | None = None
     google_drive_source: GoogleDriveSourceConfig | None = None
     plaid: PlaidConfig | None = None
@@ -1905,6 +1919,20 @@ def load_settings(
             ),
         )
 
+    comma_token = (os.getenv("COMMA_API_TOKEN") or "").strip()
+    comma: CommaConfig | None = None
+    if comma_token:
+        comma = CommaConfig(
+            token=comma_token,
+            enabled=os.getenv("COMMA_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+            poll_interval_seconds=max(
+                60, int(os.getenv("COMMA_POLL_INTERVAL_SECONDS", DEFAULT_COMMA_POLL_INTERVAL_SECONDS))
+            ),
+            request_timeout_seconds=max(
+                1, int(os.getenv("COMMA_REQUEST_TIMEOUT_SECONDS", DEFAULT_COMMA_REQUEST_TIMEOUT_SECONDS))
+            ),
+        )
+
     hacker_news_account = (os.getenv("HACKER_NEWS_ACCOUNT") or "").strip()
     hacker_news: HackerNewsConfig | None = None
     if require_hacker_news or hacker_news_account or os.getenv("HACKER_NEWS_ENABLED"):
@@ -2441,6 +2469,7 @@ def load_settings(
         whoop_private=whoop_private,
         hacker_news=hacker_news,
         resideo=resideo,
+        comma=comma,
         github=github,
         google_drive_source=google_drive_source,
         plaid=plaid,

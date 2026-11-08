@@ -327,6 +327,14 @@
       "comment": "Faithful hacker news source data: Zach's items and lists plus the full discussion under every story he touched; not a mirror of HN."
     },
     {
+      "name": "base_comma",
+      "layer": "base",
+      "domain": "comma",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Car drives (comma.ai)."
+    },
+    {
       "name": "base_resideo",
       "layer": "base",
       "domain": "resideo",
@@ -3608,6 +3616,39 @@
         "schema": "private",
         "name": "whoop_oauth_tokens"
       }
+    },
+    {
+      "id": "comma_devices",
+      "kind": "table",
+      "layer": "base",
+      "domain": "comma",
+      "schema": "base_comma",
+      "name": "devices",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "comma_routes",
+      "kind": "table",
+      "layer": "base",
+      "domain": "comma",
+      "schema": "base_comma",
+      "name": "routes",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "comma_sync_state",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "comma_sync_state",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
     },
     {
       "id": "resideo_thermostats",
