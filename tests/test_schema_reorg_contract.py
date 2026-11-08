@@ -148,6 +148,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
     for obj in CATALOG.objects:
         by_layer[obj.layer] = by_layer.get(obj.layer, 0) + 1
     assert by_layer == {
+        # +2 base: base_comma.route_points/route_segments, each drive's GPS track.
         # +2 base: the comma source (base_comma.devices/routes), with +1 ops
         # (comma_sync_state).
         # +2 base: the resideo source (base_resideo.thermostats/thermostat_readings),
@@ -195,7 +196,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # Android device's screen time.
         # +1 base: base_scans.documents, documents scanned from the scanner's panel.
         # +1 base: base_android_photos.files, the Pixel's gallery.
-        "base": 100,
+        "base": 102,
         # +1 derived / +1 marts: derived_slack.file_fingerprints and its
         # marts_slack.image_fingerprints read view (Slack image identification).
         # +5 derived: derived_search.chunk_vectors and its four adapter

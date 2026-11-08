@@ -3660,6 +3660,28 @@
       "secret": false
     },
     {
+      "id": "comma_route_points",
+      "kind": "table",
+      "layer": "base",
+      "domain": "comma",
+      "schema": "base_comma",
+      "name": "route_points",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
+      "id": "comma_route_segments",
+      "kind": "table",
+      "layer": "base",
+      "domain": "comma",
+      "schema": "base_comma",
+      "name": "route_segments",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false
+    },
+    {
       "id": "comma_sync_state",
       "kind": "table",
       "layer": "ops",

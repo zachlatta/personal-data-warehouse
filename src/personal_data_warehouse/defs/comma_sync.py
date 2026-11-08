@@ -62,6 +62,8 @@ def comma_sync(context) -> MaterializeResult:
             "devices": MetadataValue.int(summary.devices),
             "routes_seen": MetadataValue.int(summary.routes_seen),
             "routes_written": MetadataValue.int(summary.routes_written),
+            "track_segments_written": MetadataValue.int(summary.track_segments_written),
+            "track_points_written": MetadataValue.int(summary.track_points_written),
         }
     )
 

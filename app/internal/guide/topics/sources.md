@@ -97,8 +97,10 @@ the timeline these are source resideo events at `noise`. To change a setpoint, s
 `base_comma.routes` is one row per drive of the car's comma device: `start_at`, `end_at`,
 `distance_miles` (miles), start and end coordinates. Kept from 2026-11-05 on; earlier drives are
 gone, but `base_comma.devices` holds comma's lifetime and trailing-week totals. `has_gps = 0`
-means the coordinates are absent, not 0,0. On the timeline these are source comma, kind drive,
-at `self`.
+means the coordinates are absent, not 0,0. `base_comma.route_points` is each drive's GPS track
+at 1 Hz (`recorded_at`, `latitude`, `longitude`, `speed_mps` in metres per second), joined on
+`route_name`; where was the car at a time is the nearest point. On the timeline these are
+source comma, kind drive, at `self`.
 
 ## Health (WHOOP)
 

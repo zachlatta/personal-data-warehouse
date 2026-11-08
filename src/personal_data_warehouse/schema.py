@@ -3341,6 +3341,36 @@ COMMA_ROUTE_COLUMNS = (
     "synced_at",
 )
 
+#: One row per segment (a minute of driving) whose GPS track has been read,
+#: even an empty one, so a segment without a fix is not fetched on every poll.
+COMMA_ROUTE_SEGMENT_COLUMNS = (
+    "account",
+    "dongle_id",
+    "route_name",
+    "segment_number",
+    "point_count",
+    # Miles driven within the segment, from comma's coords.json.
+    "distance_miles",
+    "synced_at",
+)
+
+#: The drive's GPS track at 1 Hz, from comma's per-segment coords.json.
+COMMA_ROUTE_POINT_COLUMNS = (
+    "account",
+    "dongle_id",
+    "route_name",
+    "segment_number",
+    # Seconds since the drive started (comma's `t`).
+    "offset_seconds",
+    "recorded_at",
+    "latitude",
+    "longitude",
+    "speed_mps",
+    # Miles so far within this segment; it restarts at 0 every segment.
+    "segment_distance_miles",
+    "synced_at",
+)
+
 COMMA_SYNC_STATE_COLUMNS = (
     "account",
     "status",

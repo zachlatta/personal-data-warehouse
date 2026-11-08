@@ -120,6 +120,8 @@ from personal_data_warehouse.schema import (
     COMMA_DEVICE_COLUMNS,
     COMMA_DEVICE_COLUMNS_WITHOUT_LOCATION,
     COMMA_ROUTE_COLUMNS,
+    COMMA_ROUTE_POINT_COLUMNS,
+    COMMA_ROUTE_SEGMENT_COLUMNS,
     COMMA_SYNC_STATE_COLUMNS,
     RESIDEO_SYNC_STATE_COLUMNS,
     RESIDEO_THERMOSTAT_COLUMNS,
@@ -1359,6 +1361,14 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "comma_devices": TableSpec(COMMA_DEVICE_COLUMNS, ("account", "dongle_id"), "synced_at"),
     "comma_routes": TableSpec(COMMA_ROUTE_COLUMNS, ("account", "dongle_id", "route_name"), "synced_at"),
     "comma_sync_state": TableSpec(COMMA_SYNC_STATE_COLUMNS, ("account",), "updated_at"),
+    "comma_route_segments": TableSpec(
+        COMMA_ROUTE_SEGMENT_COLUMNS, ("account", "dongle_id", "route_name", "segment_number"), "synced_at"
+    ),
+    "comma_route_points": TableSpec(
+        COMMA_ROUTE_POINT_COLUMNS,
+        ("account", "dongle_id", "route_name", "segment_number", "offset_seconds"),
+        "synced_at",
+    ),
     "hacker_news_profile": TableSpec(HACKER_NEWS_PROFILE_COLUMNS, ("account", "user_id")),
     "hacker_news_sync_state": TableSpec(
         HACKER_NEWS_SYNC_STATE_COLUMNS, ("account", "list_name"), "updated_at"
@@ -2021,6 +2031,21 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "comma_routes_synced_idx",
         "comma_routes",
         "CREATE INDEX IF NOT EXISTS comma_routes_synced_idx ON @comma_routes (synced_at DESC)",
+    ),
+    IndexSpec(
+        "comma_route_points_synced_idx",
+        "comma_route_points",
+        "CREATE INDEX IF NOT EXISTS comma_route_points_synced_idx ON @comma_route_points (synced_at DESC)",
+    ),
+    IndexSpec(
+        "comma_route_points_recorded_idx",
+        "comma_route_points",
+        "CREATE INDEX IF NOT EXISTS comma_route_points_recorded_idx ON @comma_route_points (recorded_at DESC)",
+    ),
+    IndexSpec(
+        "comma_route_segments_synced_idx",
+        "comma_route_segments",
+        "CREATE INDEX IF NOT EXISTS comma_route_segments_synced_idx ON @comma_route_segments (synced_at DESC)",
     ),
     IndexSpec(
         "comma_routes_start_idx",
@@ -3421,6 +3446,9 @@ _APPLE_MESSAGE_OPTIONAL_TIMESTAMPS = frozenset(
 
 INTEGER_COLUMNS = {
     # comma.ai
+    "segment_number",
+    "offset_seconds",
+    "point_count",
     "is_owner",
     "is_paired",
     "prime",
@@ -3809,6 +3837,8 @@ FLOAT_COLUMNS = {
     "total_distance_miles",
     "week_distance_miles",
     "distance_miles",
+    "speed_mps",
+    "segment_distance_miles",
     "location_lat",
     "location_lng",
     "start_lat",
@@ -12096,7 +12126,27 @@ class PostgresWarehouse:
         )
 
     def ensure_comma_tables(self) -> None:
-        self._ensure_table_group(["comma_devices", "comma_routes", "comma_sync_state"])
+        self._ensure_table_group(
+            ["comma_devices", "comma_routes", "comma_sync_state", "comma_route_segments", "comma_route_points"]
+        )
+
+    def comma_tracked_segments(self, *, account: str, dongle_id: str, route_names: list[str]) -> set[tuple[str, int]]:
+        """The (route, segment) pairs whose GPS track is already stored."""
+
+        if not route_names:
+            return set()
+        rows = self._query(
+            "SELECT route_name, segment_number FROM @comma_route_segments "
+            "WHERE account = %s AND dongle_id = %s AND route_name = ANY(%s)",
+            (account, dongle_id, list(route_names)),
+        )
+        return {(str(row[0]), int(row[1])) for row in rows}
+
+    def insert_comma_track(self, *, segments: list[dict[str, Any]], points: list[dict[str, Any]]) -> None:
+        """Store points before their segment row, which is what marks the segment done."""
+
+        self._insert_rows("comma_route_points", points, COMMA_ROUTE_POINT_COLUMNS)
+        self._insert_rows("comma_route_segments", segments, COMMA_ROUTE_SEGMENT_COLUMNS)
 
     def insert_comma_devices(self, rows: list[dict[str, Any]]) -> None:
         """Upsert devices; a poll that could not place one keeps its last known location."""

@@ -35,6 +35,8 @@ class CommaSyncSummary:
     devices: int
     routes_seen: int
     routes_written: int
+    track_segments_written: int = 0
+    track_points_written: int = 0
 
 
 def _utc_from_millis(value: Any, *, field: str, route: str) -> datetime:
@@ -84,6 +86,36 @@ def route_row(route: dict[str, Any], *, account: str, synced_at: datetime) -> di
         "raw_json": raw,
         "synced_at": synced_at,
     }
+
+
+def track_rows(
+    route: dict[str, Any], *, segment: int, points: list[dict[str, Any]], account: str, synced_at: datetime
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """One segment's ``coords.json`` as a segment row and its point rows."""
+
+    dongle_id, _, route_name = str(route["fullname"]).partition("|")
+    started_at = _utc_from_millis(route.get("start_time_utc_millis"), field="start_time_utc_millis", route=route_name)
+    identity = {"account": account, "dongle_id": dongle_id, "route_name": route_name, "segment_number": segment}
+    rows = [
+        {
+            **identity,
+            "offset_seconds": int(point["t"]),
+            "recorded_at": started_at + timedelta(seconds=int(point["t"])),
+            "latitude": float(point["lat"]),
+            "longitude": float(point["lng"]),
+            "speed_mps": _float(point.get("speed")),
+            "segment_distance_miles": _float(point.get("dist")),
+            "synced_at": synced_at,
+        }
+        for point in points
+    ]
+    segment_row = {
+        **identity,
+        "point_count": len(rows),
+        "distance_miles": rows[-1]["segment_distance_miles"] if rows else 0.0,
+        "synced_at": synced_at,
+    }
+    return segment_row, rows
 
 
 def device_row(
@@ -174,7 +206,7 @@ class CommaSyncRunner:
             # A device moved off the account must read as an outage.
             raise CommaRequestError("the comma account lists no device")
         now = self._now()
-        seen = written = 0
+        seen = written = segments_written = points_written = 0
         for device in devices:
             dongle_id = str(device["dongle_id"])
             self._warehouse.insert_comma_devices(
@@ -192,7 +224,47 @@ class CommaSyncRunner:
             rows = [route_row(route, account=self._account, synced_at=now) for route in routes]
             seen += len(rows)
             written += self._warehouse.upsert_comma_routes(rows)
-        return CommaSyncSummary(devices=len(devices), routes_seen=seen, routes_written=written)
+            tracked_segments, tracked_points = self._track(dongle_id, routes, now)
+            segments_written += tracked_segments
+            points_written += tracked_points
+        return CommaSyncSummary(
+            devices=len(devices),
+            routes_seen=seen,
+            routes_written=written,
+            track_segments_written=segments_written,
+            track_points_written=points_written,
+        )
+
+    def _track(self, dongle_id: str, routes: list[dict[str, Any]], now: datetime) -> tuple[int, int]:
+        """Store the GPS track of every segment comma has processed and we have not stored.
+
+        Oldest drive first: comma deletes a free account's drives oldest first,
+        and once a route is gone its track is unreachable.
+        """
+
+        names = [str(route["fullname"]).partition("|")[2] for route in routes]
+        done = self._warehouse.comma_tracked_segments(account=self._account, dongle_id=dongle_id, route_names=names)
+        segments_written = points_written = 0
+        for route in sorted(routes, key=lambda r: int(r.get("start_time_utc_millis") or 0)):
+            route_name = str(route["fullname"]).partition("|")[2]
+            url = str(route.get("url") or "")
+            processed = int(route.get("procqlog") if route.get("procqlog") is not None else -1)
+            if not url:
+                continue
+            for segment in route.get("segment_numbers") or []:
+                segment = int(segment)
+                if segment > processed or (route_name, segment) in done:
+                    continue
+                points = self._client.segment_coords(url, segment)
+                if points is None:
+                    continue
+                segment_row, point_rows = track_rows(
+                    route, segment=segment, points=points, account=self._account, synced_at=now
+                )
+                self._warehouse.insert_comma_track(segments=[segment_row], points=point_rows)
+                segments_written += 1
+                points_written += len(point_rows)
+        return segments_written, points_written
 
     def _record(
         self,

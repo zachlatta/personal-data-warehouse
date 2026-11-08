@@ -114,6 +114,36 @@ class CommaClient:
             end = min(int(route["start_time_utc_millis"]) for route in page) - 1
         raise CommaRequestError(f"routes for {dongle_id} did not end within {MAX_ROUTE_PAGES} pages")
 
+    def segment_coords(self, route_url: str, segment: int) -> list[dict[str, Any]] | None:
+        """One segment's 1 Hz GPS track, or None until comma has processed the segment.
+
+        comma derives ``coords.json`` from the segment's qlog and serves it from
+        the route's blob ``url`` (which the API hands out with the route), the
+        same file comma connect draws its map from. Each point is ``t`` (seconds
+        since the drive started), ``lat``, ``lng``, ``speed`` (m/s) and ``dist``
+        (miles so far within this segment). The blob store takes no JWT: it
+        rejects an Authorization scheme it does not know.
+        """
+
+        url = f"{route_url.rstrip('/')}/{int(segment)}/coords.json"
+        try:
+            response = self._session.request(
+                "GET", url, headers={"User-Agent": USER_AGENT}, timeout=self._timeout
+            )
+        except requests.RequestException as exc:
+            raise CommaRequestError(f"GET segment {segment} coords.json failed: {exc}") from exc
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 300:
+            raise CommaRequestError(f"GET segment {segment} coords.json answered HTTP {response.status_code}")
+        try:
+            points = response.json()
+        except ValueError as exc:
+            raise CommaRequestError(f"segment {segment} coords.json is not JSON") from exc
+        if not isinstance(points, list):
+            raise CommaRequestError(f"segment {segment} coords.json is not a list")
+        return points
+
     def _get(self, path: str, *, missing_ok: bool = False) -> Any:
         url = f"{self._base_url}{path}"
         try:

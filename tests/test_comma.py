@@ -112,12 +112,41 @@ class FakeClient:
         self.route_windows.append((start_ms, end_ms))
         return self.routes_by_call[0]
 
+    #: Segments comma has not processed yet answer None, as a 404 does.
+    unprocessed: set = set()
+    coords_calls: list
+
+    def segment_coords(self, route_url, segment):
+        self.__dict__.setdefault("coords_calls", []).append((route_url, segment))
+        if segment in self.unprocessed:
+            return None
+        return coords(segment)
+
+
+def coords(segment, *, points=3):
+    """comma's per-segment track: t counts seconds from the drive's start, dist resets per segment."""
+
+    return [
+        {"t": segment * 60 + i, "lat": 40.0 + segment / 100 + i / 1000, "lng": -75.0, "speed": 10.0 + i,
+         "dist": i * 0.01}
+        for i in range(points)
+    ]
+
 
 class FakeWarehouse:
     def __init__(self):
         self.devices = []
         self.routes = []
         self.state = []
+        self.segments = []
+        self.points = []
+
+    def comma_tracked_segments(self, *, account, dongle_id, route_names):
+        return {(row["route_name"], row["segment_number"]) for row in self.segments}
+
+    def insert_comma_track(self, *, segments, points):
+        self.segments.extend(segments)
+        self.points.extend(points)
 
     def insert_comma_devices(self, rows):
         self.devices.extend(rows)
@@ -386,3 +415,97 @@ def test_settings_read_the_token_and_clamp_the_interval(monkeypatch) -> None:
     assert config.poll_interval_seconds == 60
     monkeypatch.delenv("COMMA_API_TOKEN")
     assert load_settings(require_gmail=False).comma is None
+
+
+# --- the GPS track ----------------------------------------------------------
+
+
+def test_every_processed_segment_lands_its_track_with_absolute_times():
+    warehouse = FakeWarehouse()
+    route = api_route(minutes=2)  # segments 0, 1, 2
+    summary = run_sync(warehouse, FakeClient([route]))
+    assert summary.track_points_written == 9
+    assert [(row["segment_number"], row["point_count"]) for row in warehouse.segments] == [(0, 3), (1, 3), (2, 3)]
+    first = warehouse.points[0]
+    assert first["route_name"] == "00000131--5a0a6a29f3"
+    assert first["offset_seconds"] == 0
+    assert first["recorded_at"] == datetime(2026, 11, 8, 13, 53, 34, tzinfo=UTC)
+    assert (first["latitude"], first["longitude"], first["speed_mps"]) == (40.0, -75.0, 10.0)
+    later = warehouse.points[4]
+    assert later["recorded_at"] == first["recorded_at"] + timedelta(seconds=61)
+    assert warehouse.segments[0]["distance_miles"] == 0.02
+
+
+def test_a_segment_already_tracked_is_not_fetched_again():
+    warehouse = FakeWarehouse()
+    route = api_route(minutes=2)
+    run_sync(warehouse, FakeClient([route]))
+    client = FakeClient([route])
+    summary = run_sync(warehouse, client, now=NOW + timedelta(minutes=15))
+    assert getattr(client, "coords_calls", []) == []
+    assert summary.track_points_written == 0
+
+
+def test_a_segment_comma_has_not_processed_waits_for_a_later_poll():
+    warehouse = FakeWarehouse()
+    route = api_route(minutes=3)
+    route["procqlog"] = 1  # comma has processed segments 0 and 1 only
+    client = FakeClient([route])
+    run_sync(warehouse, client)
+    assert [segment for _, segment in client.coords_calls] == [0, 1]
+
+    route["procqlog"] = 3
+    late = FakeClient([route])
+    late.unprocessed = {3}  # listed as processed, but its coords.json is not there yet
+    run_sync(warehouse, late, now=NOW + timedelta(minutes=15))
+    assert [segment for _, segment in late.coords_calls] == [2, 3]
+    assert sorted(row["segment_number"] for row in warehouse.segments) == [0, 1, 2]
+
+
+def test_a_segment_without_a_gps_fix_is_recorded_so_it_is_not_fetched_forever():
+    class NoFix(FakeClient):
+        def segment_coords(self, route_url, segment):
+            super().segment_coords(route_url, segment)
+            return []
+
+    warehouse = FakeWarehouse()
+    run_sync(warehouse, NoFix([api_route(minutes=0)]))
+    assert [(row["segment_number"], row["point_count"]) for row in warehouse.segments] == [(0, 0)]
+    assert warehouse.points == []
+
+
+def test_the_oldest_drive_is_tracked_first_because_comma_deletes_it_first():
+    warehouse = FakeWarehouse()
+    newer = api_route(name="00000002--b", start_ms=START_MS + 3_600_000, minutes=0)
+    older = api_route(name="00000001--a", minutes=0)
+    newer["url"], older["url"] = "https://example.invalid/newer", "https://example.invalid/older"
+    client = FakeClient([newer, older])  # comma lists newest first
+    run_sync(warehouse, client)
+    assert [url for url, _ in client.coords_calls] == ["https://example.invalid/older", "https://example.invalid/newer"]
+
+
+def test_segment_coords_reads_the_derived_file_without_the_jwt_and_a_404_is_none():
+    session = Session([Response(200, coords(0)), Response(404, {})])
+    client = CommaClient(token=TOKEN, session=session)
+    assert client.segment_coords("https://blob.example.invalid/route", 0) == coords(0)
+    assert client.segment_coords("https://blob.example.invalid/route", 1) is None
+    method, url, kwargs = session.calls[0]
+    assert (method, url) == ("GET", "https://blob.example.invalid/route/0/coords.json")
+    # The blob store rejects an Authorization scheme it does not know.
+    assert "Authorization" not in kwargs["headers"]
+
+
+def test_the_track_round_trips_and_a_rerun_does_not_duplicate_it(warehouse) -> None:
+    route = api_route(minutes=1)
+    run_sync(warehouse, FakeClient([route]))
+    run_sync(warehouse, FakeClient([route]), now=NOW + timedelta(minutes=15))
+    points = warehouse._query(
+        "SELECT segment_number, offset_seconds, recorded_at, latitude, speed_mps, segment_distance_miles "
+        "FROM @comma_route_points ORDER BY recorded_at"
+    )
+    assert len(points) == 6
+    assert tuple(points[3]) == (1, 60, datetime(2026, 11, 8, 13, 54, 34, tzinfo=UTC), 40.01, 10.0, 0.0)
+    segments = warehouse._query(
+        "SELECT segment_number, point_count, distance_miles FROM @comma_route_segments ORDER BY segment_number"
+    )
+    assert [tuple(row) for row in segments] == [(0, 3, 0.02), (1, 3, 0.02)]

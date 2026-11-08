@@ -1934,6 +1934,8 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "comma_routes": _data("comma", "synced_at", "start_at"),
     "comma_devices": _support("comma", "synced_at", note="current device and totals, refreshed every poll"),
     "comma_sync_state": _state("comma", "updated_at"),
+    "comma_route_points": _support("comma", "synced_at", "recorded_at", note="1 Hz GPS track of each drive"),
+    "comma_route_segments": _support("comma", "synced_at", note="segments whose GPS track is stored"),
     "resideo_thermostat_readings": _data("resideo", "synced_at", "observed_at"),
     "resideo_thermostats": _support("resideo", "synced_at", note="current state, refreshed every poll"),
     "resideo_sync_state": _state("resideo", "updated_at"),

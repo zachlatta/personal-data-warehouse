@@ -4206,6 +4206,12 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
         "each comma device now, with comma's lifetime totals; reach it by dongle_id, the context of a drive event"
     ),
     "comma_sync_state": _state("comma poll heartbeat and token expiry"),
+    "comma_route_points": _detail(
+        "comma_routes", "the drive's 1 Hz GPS track; join on account, dongle_id, route_name from a drive's source_pk"
+    ),
+    "comma_route_segments": _detail(
+        "comma_routes", "which minutes of a drive have their GPS track stored, joined on route_name"
+    ),
     "resideo_thermostat_readings": _events(),
     "resideo_thermostats": _entity(
         "current state of each thermostat; reach it by device_id, the context of a thermostat_reading event"

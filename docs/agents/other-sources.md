@@ -521,8 +521,17 @@ comma connect) is reached with the JWT comma connect holds after a Google sign-i
 - **A drive grows while it uploads.** Every poll re-reads the whole retained window; the upsert
   rewrites a route (and re-walks its timeline event) only when something other than `synced_at`
   changed. `share_sig`/`share_exp` (a link that lets anyone watch the drive) are never stored.
-- **Not yet synced:** the per-segment logs (`qlog`) with the full GPS track and the camera files.
-  `/v1/route/<dongle>|<route>/files` returns signed URLs for them.
+- **The GPS track.** comma derives a `coords.json` per segment (one minute) from its qlog and
+  serves it from the route's blob `url`, the file comma connect draws its map from; the blob
+  store takes no JWT. Each poll reads every segment up to the route's `procqlog` that
+  `base_comma.route_segments` does not have yet, oldest drive first, into
+  `base_comma.route_points` (1 Hz: `offset_seconds` since the drive started, `recorded_at`,
+  `latitude`, `longitude`, `speed_mps`, `segment_distance_miles`, which restarts every segment;
+  a drive's segment miles sum to its `distance_miles`). A segment with no fix gets a row with
+  `point_count = 0`, so it is not fetched again; a 404 means not processed yet, retried next poll.
+- **Camera footage is not synced, by Zach's choice (2026-11-08).** The device uploads only qlogs;
+  footage stays on the car until it is overwritten, and pulling it means an athena upload request.
+  If that changes, ask Zach which network the car may upload on first.
 
 ## Resideo thermostat
 

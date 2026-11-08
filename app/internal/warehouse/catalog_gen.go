@@ -354,6 +354,8 @@ var Objects = []CatalogObject{
 	{ID: "whoop_oauth_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "whoop_oauth_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "comma_devices", Kind: "table", Layer: "base", Domain: "comma", Schema: "base_comma", Name: "devices", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "comma_routes", Kind: "table", Layer: "base", Domain: "comma", Schema: "base_comma", Name: "routes", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "comma_route_points", Kind: "table", Layer: "base", Domain: "comma", Schema: "base_comma", Name: "route_points", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "comma_route_segments", Kind: "table", Layer: "base", Domain: "comma", Schema: "base_comma", Name: "route_segments", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "comma_sync_state", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "comma_sync_state", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "resideo_thermostats", Kind: "table", Layer: "base", Domain: "resideo", Schema: "base_resideo", Name: "thermostats", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "resideo_thermostat_readings", Kind: "table", Layer: "base", Domain: "resideo", Schema: "base_resideo", Name: "thermostat_readings", Discoverable: true, QueryAccess: "public", Secret: false, Comment: "One row per change, not per poll."},
