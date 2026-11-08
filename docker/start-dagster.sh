@@ -23,9 +23,10 @@ daemon_pid=""
 webserver_pid=""
 mutation_worker_pid=""
 voice_worker_pid=""
+agent_sessions_worker_pid=""
 
 shutdown() {
-  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid" "$mutation_worker_pid" "$voice_worker_pid"; do
+  for pid in "$webserver_pid" "$daemon_pid" "$grpc_pid" "$mutation_worker_pid" "$voice_worker_pid" "$agent_sessions_worker_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -56,6 +57,17 @@ case "${VOICE_MEMO_LANDING_WORKER_ENABLED:-1}" in
   *)
     uv run python -m personal_data_warehouse.voice_memo_landing_worker &
     voice_worker_pid="$!"
+    ;;
+esac
+
+# An agent turn should land in seconds too: the app NOTIFYs when it stores an
+# agent-sessions batch and this worker ingests it and lands the turns on the
+# timeline without a sensor tick and a run start. The sensor stays the floor.
+case "${AGENT_SESSIONS_LANDING_WORKER_ENABLED:-1}" in
+  0|false|False|no|No) ;;
+  *)
+    uv run python -m personal_data_warehouse.agent_sessions_landing_worker &
+    agent_sessions_worker_pid="$!"
     ;;
 esac
 
@@ -114,6 +126,10 @@ while :; do
   fi
   if [ -n "$voice_worker_pid" ] && ! kill -0 "$voice_worker_pid" 2>/dev/null; then
     wait "$voice_worker_pid"
+    exit $?
+  fi
+  if [ -n "$agent_sessions_worker_pid" ] && ! kill -0 "$agent_sessions_worker_pid" 2>/dev/null; then
+    wait "$agent_sessions_worker_pid"
     exit $?
   fi
   sleep 2

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux/systemd counterpart of bin/agent-sessions-upload-launchd.
 #
-# Runs the incremental agent-sessions uploader once. Used by the
+# Runs the incremental agent-sessions uploader for one --watch window. Used by the
 # personal-data-warehouse-agent-sessions-upload.service systemd user unit on
 # Linux hosts (e.g. the openclaw VM, which syncs ~/.openclaw agent sessions).
 # Self-locating: it derives the repo root from its own path, so the same script
@@ -36,7 +36,10 @@ elif ! cd "$REPO_DIR"; then
   exit_code=1
   echo "[$(date -Iseconds)] failed to cd to $REPO_DIR" >> "$LOG_FILE"
 else
-  "$PDW" ingest agent-sessions --mode incremental >> "$LOG_FILE" 2>&1
+  # Resident window: a pass every two seconds ships each new line within
+  # seconds; after the window the heartbeat below is posted and the
+  # supervisor (systemd Restart=always / launchd KeepAlive) starts the next.
+  "$PDW" ingest agent-sessions --mode incremental --watch "${AGENT_SESSIONS_WATCH_WINDOW:-300s}" >> "$LOG_FILE" 2>&1
   exit_code=$?
 fi
 

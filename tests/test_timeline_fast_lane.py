@@ -218,3 +218,20 @@ def test_a_stale_scheduled_save_cannot_rewind_a_watermark_the_fast_lane_advanced
     finally:
         scheduled.close()
         fast.close()
+
+
+def test_the_engine_runs_with_jit_off_on_both_connections(warehouse):
+    """Measured 2026-11-08 on prod: the agent_session roll-up's incremental
+    query ran in 2 ms and then spent 5.4 s in JIT (531 functions, 3.3 s of
+    optimization) because its plan was costed at 1.6M. One fast-lane pass for
+    two rows took 15.4 s; with JIT off it took 1.7 s. Every timeline query is
+    a page of rows, never the long analytic scan JIT pays off on."""
+    engine = _engine(warehouse)
+    try:
+        engine._connect()
+        for conn in (engine._source_conn, engine._dest_conn):
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT setting, source FROM pg_settings WHERE name = 'jit'")
+                assert cursor.fetchone() == ("off", "session")
+    finally:
+        engine.close()

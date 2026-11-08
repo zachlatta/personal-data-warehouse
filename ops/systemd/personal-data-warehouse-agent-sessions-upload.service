@@ -1,16 +1,22 @@
 [Unit]
-Description=Upload local AI agent session transcripts (openclaw/Claude Code/Codex) to the Drive inbox
-# Don't fail loudly when the box is briefly offline; the next timer tick retries.
+Description=Upload local AI agent session transcripts (openclaw/Claude Code/Codex) as they are written
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+# Resident: the wrapper runs `pdw ingest agent-sessions --watch 300s` (a pass
+# every two seconds), posts the window's heartbeat, and exits; Restart=always
+# starts the next window. No timer: on 2026-11-06 a restarted user manager left
+# the old five-minute timer "active (elapsed)" and nothing ran for 13 hours.
+Type=simple
 # Self-locating wrapper: derives the repo root from its own path. Installed copy
 # lives at the checkout below; update WorkingDirectory/ExecStart if you relocate it.
 WorkingDirectory=%h/dev/zachlatta/personal-data-warehouse
 ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd
-# A run that walks ~/.openclaw/agents/main/sessions should finish in well under
-# this; the cap just stops a wedged run from blocking the next tick forever.
-TimeoutStartSec=1800
+Restart=always
+# A failed window (app unreachable, box offline) retries after this pause.
+RestartSec=5
 Nice=10
+
+[Install]
+WantedBy=default.target

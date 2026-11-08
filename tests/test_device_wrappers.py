@@ -40,8 +40,8 @@ LIB = "_pdw-upload-lib.sh"
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
 WRAPPERS: dict[str, tuple[str, str | None]] = {
     "android-location-upload-android": ('"$PDW" ingest android-location', "android_location"),
-    "agent-sessions-upload-launchd": ('"$PDW" ingest agent-sessions --mode incremental', "claude_code,codex,pi,muse_code,argon"),
-    "agent-sessions-upload-systemd": ('"$PDW" ingest agent-sessions --mode incremental', "${AGENT_SESSIONS_HEARTBEAT_PIPELINES:-openclaw}"),
+    "agent-sessions-upload-launchd": ('"$PDW" ingest agent-sessions --mode incremental --watch', "claude_code,codex,pi,muse_code,argon"),
+    "agent-sessions-upload-systemd": ('"$PDW" ingest agent-sessions --mode incremental --watch', "${AGENT_SESSIONS_HEARTBEAT_PIPELINES:-openclaw}"),
     "apple-contacts-upload-launchd": ('"$PDW" ingest apple-contacts --mode incremental', "apple_contacts"),
     "apple-messages-upload-launchd": ('"$PDW" ingest apple-messages --mode incremental', "apple_messages"),
     "browser-history-upload-launchd": ('"$PDW" ingest browser-history --mode incremental', "browser_history"),
@@ -64,7 +64,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
 
 # LaunchAgent label -> (wrapper, resident?)
 LAUNCH_AGENTS: dict[str, tuple[str, bool]] = {
-    "agent-sessions-upload": ("agent-sessions-upload-launchd", False),
+    "agent-sessions-upload": ("agent-sessions-upload-launchd", True),
     "apple-contacts-upload": ("apple-contacts-upload-launchd", False),
     "apple-messages-upload": ("apple-messages-upload-launchd", False),
     "browser-history-upload": ("browser-history-upload-launchd", False),
@@ -148,7 +148,7 @@ def test_uploaders_run_every_five_minutes_and_photos_every_thirty() -> None:
         with (LAUNCHD / f"com.zachlatta.personal-data-warehouse.{label}.plist").open("rb") as handle:
             return plistlib.load(handle)["StartInterval"]
 
-    for label in ("agent-sessions-upload", "apple-contacts-upload", "apple-messages-upload", "apple-notes-upload", "voice-memos-upload", "screen-timelapse-upload"):
+    for label in ("apple-contacts-upload", "apple-messages-upload", "apple-notes-upload", "voice-memos-upload", "screen-timelapse-upload"):
         assert interval(label) == 300, label
     assert interval("photos-upload") == 1800
     # History lands in the browser's own database continuously; fifteen
@@ -178,15 +178,34 @@ def test_nothing_schedules_the_slack_session_publisher() -> None:
 
 def test_systemd_unit_runs_the_self_locating_wrapper() -> None:
     service = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.service").read_text()
-    timer = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.timer").read_text()
     assert "ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd" in service
-    assert "OnUnitActiveSec=300s" in timer
-    # A restarted user manager must re-arm the timer by itself: OnBootSec plus
-    # Persistent=true left it "active (elapsed)" with no next run for 13 hours.
-    directives = [line for line in timer.splitlines() if not line.startswith("#")]
-    assert any(line.startswith("OnActiveSec=") for line in directives)
-    assert not any(line.startswith(("OnBootSec=", "Persistent=")) for line in directives)
     assert not _INTERPRETER_INVOCATION.search(service)
+
+
+def test_agent_sessions_uploader_is_resident_and_ships_within_seconds() -> None:
+    """An agent turn should land in under a minute, so its uploader cannot wait for a tick.
+
+    Measured 2026-11-08 over seven days, Claude Code, Codex, OpenClaw and Argon
+    turns landed p50 3-4 min, p99 6-7 min, and the device's share was the
+    five-minute timer (systemd) or StartInterval (launchd). The wrapper now
+    runs `--watch`: a pass every two seconds for five minutes, then it exits so
+    the heartbeat is posted, and the supervisor starts the next window at once.
+    There is no timer left to disarm: on 2026-11-06 a restarted user manager
+    left the old one "active (elapsed)" and mew-dev uploaded nothing for 13 h.
+    """
+    assert not (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.timer").exists()
+    service = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.service").read_text()
+    directives = [line for line in service.splitlines() if not line.startswith("#")]
+    assert "Type=simple" in directives
+    assert "Restart=always" in directives
+    assert any(line.startswith("RestartSec=") for line in directives)
+    assert "WantedBy=default.target" in directives
+    with (LAUNCHD / "com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist").open("rb") as handle:
+        plist = plistlib.load(handle)
+    assert plist["ThrottleInterval"] == 10
+    for wrapper in ("agent-sessions-upload-launchd", "agent-sessions-upload-systemd"):
+        text = (BIN / wrapper).read_text()
+        assert '--watch "${AGENT_SESSIONS_WATCH_WINDOW:-300s}"' in text, wrapper
 
 
 def test_message_and_note_uploaders_also_fire_when_the_store_changes() -> None:

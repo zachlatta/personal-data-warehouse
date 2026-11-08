@@ -56,6 +56,13 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 	if _, err := os.Stat(path); err != nil {
 		return nil
 	}
+	// A write lands in the WAL first, so both files make the signature.
+	sig, _ := signatureOf(path, path+"-wal")
+	storeKey := "openclaw-store:" + path
+	if r.unchanged(storeKey, sig) {
+		summary.FilesUnchanged++
+		return nil
+	}
 	db, err := common.OpenSQLiteReadOnly(path)
 	if err != nil {
 		return &common.PermissionError{Path: path, Err: err}
@@ -70,7 +77,9 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 	}
 	sessions := r.openClawStoreSessions(rows)
 	summary.FilesSeen += len(sessions)
-	r.Logger.Infof("Discovered %d OpenClaw session(s) in %s", len(sessions), path)
+	if !r.SkipUnchanged {
+		r.Logger.Infof("Discovered %d OpenClaw session(s) in %s", len(sessions), path)
+	}
 	for _, session := range sessions {
 		if r.Limit > 0 && *remaining <= 0 {
 			summary.LimitReached = true
@@ -118,5 +127,6 @@ func (r *Runner) readOpenClawStore(batch *pendingBatch, remaining *int, summary 
 			return nil
 		}
 	}
+	r.caughtUp(storeKey, sig)
 	return nil
 }

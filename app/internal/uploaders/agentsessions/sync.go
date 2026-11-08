@@ -30,6 +30,9 @@ type Summary struct {
 	LinesSkipped      int
 	BatchesUploaded   int
 	LimitReached      bool
+	// FilesUnchanged counts transcripts (and the OpenClaw store) a
+	// SkipUnchanged pass passed over because nothing about them moved.
+	FilesUnchanged int
 }
 
 // BatchUploader posts one gzipped batch; the ingest client satisfies it.
@@ -48,8 +51,60 @@ type Runner struct {
 	Limit             int    // 0 = unlimited
 	BatchSize         int
 	BeforeUploadCheck func() string
+	// SkipUnchanged is the resident watcher's mode (`--watch`): a transcript
+	// whose size and mtime are what they were when a previous pass of this
+	// Runner left it fully shipped is passed over without a state lookup or
+	// a read, and idle passes log nothing. A pass every two seconds over
+	// thousands of transcripts then costs one directory walk.
+	SkipUnchanged bool
 
 	checkedNetwork bool
+	// shipped is each source's signature as of the last pass that left it
+	// fully uploaded; pass holds this pass's candidates until it succeeds.
+	shipped map[string]fileSignature
+	pass    map[string]fileSignature
+}
+
+// fileSignature is what a watcher compares between passes. An append moves
+// the size; a SQLite write moves the database's or its WAL's mtime.
+type fileSignature struct {
+	size    int64
+	modTime int64
+}
+
+func signatureOf(paths ...string) (fileSignature, bool) {
+	var sig fileSignature
+	found := false
+	for i, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			if i == 0 {
+				return fileSignature{}, false
+			}
+			continue
+		}
+		found = true
+		sig.size = sig.size*31 + info.Size()
+		sig.modTime = sig.modTime*31 + info.ModTime().UnixNano()
+	}
+	return sig, found
+}
+
+// unchanged reports whether key still has the signature it was shipped at.
+func (r *Runner) unchanged(key string, sig fileSignature) bool {
+	if !r.SkipUnchanged {
+		return false
+	}
+	shipped, ok := r.shipped[key]
+	return ok && shipped == sig
+}
+
+// caughtUp records that key was read to its end this pass; it becomes
+// skippable once the pass's uploads succeed.
+func (r *Runner) caughtUp(key string, sig fileSignature) {
+	if r.SkipUnchanged {
+		r.pass[key] = sig
+	}
 }
 
 type pendingBatch struct {
@@ -98,8 +153,14 @@ func (r *Runner) Sync() (Summary, error) {
 	if r.BatchSize < 1 {
 		r.BatchSize = DefaultBatchSize
 	}
+	if r.SkipUnchanged && r.shipped == nil {
+		r.shipped = map[string]fileSignature{}
+	}
+	r.pass = map[string]fileSignature{}
 	files := Discover(r.Dirs)
-	r.Logger.Infof("Discovered %d agent session transcript file(s)", len(files))
+	if !r.SkipUnchanged {
+		r.Logger.Infof("Discovered %d agent session transcript file(s)", len(files))
+	}
 	// One buffer spanning all files so many small transcripts (OpenClaw can
 	// have thousands of ~5-line sessions) coalesce into full-size batches
 	// instead of one tiny upload per file. A file's offset is only committed
@@ -113,7 +174,7 @@ func (r *Runner) Sync() (Summary, error) {
 			summary.LimitReached = true
 			break
 		}
-		result, ok, err := r.readFile(file, batch, remaining)
+		result, ok, err := r.readFile(file, batch, remaining, &summary)
 		if err != nil {
 			return summary, err
 		}
@@ -142,6 +203,12 @@ func (r *Runner) Sync() (Summary, error) {
 		return summary, err
 	}
 	summary.BatchesUploaded = batch.batches
+	for key, sig := range r.pass {
+		r.shipped[key] = sig
+	}
+	if r.SkipUnchanged && summary.LinesSelected == 0 && summary.LinesSkipped == 0 {
+		return summary, nil
+	}
 	suffix := ""
 	if summary.LimitReached {
 		suffix = " (run limit reached; remaining lines deferred to next run)"
@@ -157,17 +224,22 @@ type fileResult struct {
 	deferred bool
 }
 
-func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int) (fileResult, bool, error) {
-	info, err := os.Stat(file.Path)
-	if err != nil {
+func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, summary *Summary) (fileResult, bool, error) {
+	sig, found := signatureOf(file.Path)
+	if !found {
 		return fileResult{}, false, nil
 	}
-	size := info.Size()
+	if r.unchanged(file.Path, sig) {
+		summary.FilesUnchanged++
+		return fileResult{}, false, nil
+	}
+	size := sig.size
 	startOffset, startLine, err := r.startPosition(file.Path, size)
 	if err != nil {
 		return fileResult{}, false, err
 	}
 	if size <= startOffset {
+		r.caughtUp(file.Path, sig)
 		return fileResult{}, true, nil
 	}
 	handle, err := os.Open(file.Path)
@@ -215,6 +287,11 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int) 
 				return result, true, err
 			}
 		}
+	}
+	if !result.deferred {
+		// Read to the end (a trailing partial line stays in the size, so
+		// finishing it moves the signature and brings the file back).
+		r.caughtUp(file.Path, sig)
 	}
 	if result.selected == 0 && offset != startOffset {
 		// Consumed only skipped/blank lines; advance so we do not reprocess

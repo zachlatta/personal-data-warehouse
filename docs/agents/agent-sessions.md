@@ -10,15 +10,16 @@ sessions are queryable in the warehouse. The append-only transcripts are tailed 
 line by line, through the same Drive-inbox pipeline as Apple Messages/WhatsApp.
 
 > The macOS LaunchAgent below runs on Zach's Macs (crobat, porygon) for Claude Code/Codex/pi/Muse Code/Argon. The
-> **openclaw VM** runs the same uploader for OpenClaw sessions via a systemd user timer — see
+> **openclaw VM** runs the same uploader for OpenClaw sessions as a resident systemd user service — see
 > [OpenClaw Agent Sessions](#openclaw-agent-sessions-openclaw-vm) below.
 
 - LaunchAgent label: `com.zachlatta.personal-data-warehouse.agent-sessions-upload`
 - Installed plist: `~/Library/LaunchAgents/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Checked-in plist template: `ops/launchd/com.zachlatta.personal-data-warehouse.agent-sessions-upload.plist`
 - Wrapper script: `bin/agent-sessions-upload-launchd`
-- Run cadence: every 300 seconds with `RunAtLoad`
-- Command: `pdw ingest agent-sessions --mode incremental` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
+- Run cadence: resident (`KeepAlive`, `RunAtLoad`, 10 s `ThrottleInterval`): each run is a
+  five-minute `--watch` window with a pass every two seconds, then the heartbeat, then the next window
+- Command: `pdw ingest agent-sessions --mode incremental --watch 300s` (native Go in the signed pdw binary; the wrapper runs nothing else — no uv, no Python)
 - Main run log: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.run.log`
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/agent-sessions-upload.heartbeat`
 - Status helper: `bin/agent-sessions-upload-status`
@@ -74,6 +75,28 @@ coalesces new lines across files into full-size gzipped JSONL batches, and posts
 app's ingest endpoint (see below), which writes them into the `agent-sessions/inbox/` Drive
 folder. The `--limit` flag bounds a run (useful for a first backfill). In Dagster, the
 `agent_sessions_drive_inbox_sensor` + `agent_sessions_drive_ingest` asset consume the batches.
+
+**A turn lands in seconds, not minutes.** Measured 2026-11-08 over seven days from
+`timeline.events.first_seen_at - occurred_at`, Claude Code, Codex, OpenClaw and Argon turns
+landed p50 3-4 min, p99 6-7 min, and almost none of it was work: the five-minute uploader
+tick, a 60 s inbox sensor and a Dagster run start (~5 s), then a fast lane that took 15.2 s
+for two rows because the `agent_session` roll-up's plan is costed at 1.6M and Postgres spent
+5.4 s per query compiling JIT code for a 2 ms query. Now:
+
+- the device runs `--watch`: one pass every two seconds, and a transcript whose size and
+  mtime did not move (the OpenClaw store: the database and its WAL) costs a `stat`, not a
+  state lookup and a read. A window ends after five minutes (`AGENT_SESSIONS_WATCH_WINDOW`)
+  so the wrapper posts the heartbeat as before; a failed pass ends it early and non-zero;
+- the app NOTIFYs `pdw_agent_sessions_landing` when it stores a batch, and the resident
+  `agent_sessions_landing_worker` in the Dagster container runs the asset's own
+  `ingest_agent_sessions_inbox` (one advisory lock, so the worker and a sensor run never
+  ingest at once) and then the timeline fast lane. `AGENT_SESSIONS_LANDING_WORKER_ENABLED=0`
+  turns it off; the sensor stays the floor and the inbox the durable queue;
+- the timeline engine runs with `jit = off` on both connections (1.7 s for that pass).
+
+**Measure landing from `timeline.events.first_seen_at`, never `base_*.ingested_at`.** A
+re-shipped row (an OpenClaw compaction re-sends the whole session) gets a new `ingested_at`,
+which made October's OpenClaw events look 3.5 days late when they had landed in minutes.
 
 ## Client uploads via the app (the write path for remote devices)
 
@@ -231,7 +254,7 @@ OpenClaw runs on the `openclaw` Ubuntu VM (libvirt/KVM guest on `rotom`; reach i
 time out, a known rotom-side issue). It writes one JSONL transcript per session under
 `~/.openclaw/agents/main/sessions/` (through 2026.8; since 2026.9 in the agent's SQLite
 store, which the same uploader reads -- see above). Because the VM is Linux (no launchd), the uploader runs as
-a **systemd user timer** (zrl has `Linger=yes`, so user units run without an active login).
+a resident **systemd user service** (zrl has `Linger=yes`, so user units run without an active login).
 
 - Checkout: `~/dev/zachlatta/personal-data-warehouse` (clone of `main` via a read-only GitHub
   deploy key; `core.sshCommand` points at `~/.ssh/pdw_deploy_key`). The checkout supplies only
@@ -247,15 +270,15 @@ a **systemd user timer** (zrl has `Linger=yes`, so user units run without an act
   VM uploads only OpenClaw sessions. `device` auto-resolves to the hostname `openclaw`. Uploads
   POST to the app, which writes the batch into the Drive inbox the Dagster ingest reads — see
   [Client uploads via the app](#client-uploads-via-the-app-the-write-path-for-remote-devices).
-- Systemd unit: `personal-data-warehouse-agent-sessions-upload.{service,timer}` (user scope).
-- Checked-in templates: `ops/systemd/personal-data-warehouse-agent-sessions-upload.{service,timer}`.
+- Systemd unit: `personal-data-warehouse-agent-sessions-upload.service` (user scope, enabled for `default.target`).
+- Checked-in template: `ops/systemd/personal-data-warehouse-agent-sessions-upload.service`.
 - Wrapper: `bin/agent-sessions-upload-systemd`; status helper: `bin/agent-sessions-upload-status-systemd`.
   Its heartbeat reports the `openclaw` pipeline unless the unit sets
   `AGENT_SESSIONS_HEARTBEAT_PIPELINES` (comma-separated pipeline names).
-- Run cadence: every 300s (`OnActiveSec=2min`, `OnUnitActiveSec=300s`), mirroring the macOS cadence.
-  Do not add `Persistent=true` or go back to `OnBootSec`. Together they leave the timer
-  `active (elapsed)` with `Trigger: n/a` after the user manager restarts, and uploads stop
-  until something starts the service once.
+- Run cadence: resident. The service is `Type=simple`, `Restart=always` (`RestartSec=5`), and
+  each run is one five-minute `--watch` window, as on the Macs. There is no timer: on
+  2026-11-06 a restarted user manager left the old five-minute timer `active (elapsed)` with
+  `Trigger: n/a`, and mew-dev uploaded nothing for 13 hours.
 - Run log: `~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log`;
   heartbeat: `~/.local/state/personal-data-warehouse/agent-sessions-upload.heartbeat`.
 
@@ -263,8 +286,8 @@ Inspect or repair it (from `ssh -J rotom openclaw`):
 
 ```bash
 ~/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-status-systemd
-systemctl --user list-timers personal-data-warehouse-agent-sessions-upload.timer --all
-systemctl --user start personal-data-warehouse-agent-sessions-upload.service   # run once now
+systemctl --user status personal-data-warehouse-agent-sessions-upload.service
+systemctl --user restart personal-data-warehouse-agent-sessions-upload.service   # start a fresh window
 journalctl --user -u personal-data-warehouse-agent-sessions-upload.service -n 80 --no-pager
 tail -80 ~/.local/state/personal-data-warehouse/agent-sessions-upload.run.log
 ```
@@ -273,9 +296,12 @@ Install / reinstall the units after editing the templates:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ops/systemd/personal-data-warehouse-agent-sessions-upload.* ~/.config/systemd/user/
+# A host still on the five-minute timer: remove it first.
+systemctl --user disable --now personal-data-warehouse-agent-sessions-upload.timer 2>/dev/null
+rm -f ~/.config/systemd/user/personal-data-warehouse-agent-sessions-upload.timer
+cp ops/systemd/personal-data-warehouse-agent-sessions-upload.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now personal-data-warehouse-agent-sessions-upload.timer
+systemctl --user enable --now personal-data-warehouse-agent-sessions-upload.service
 ```
 
 To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull` for the wrapper and
@@ -283,12 +309,12 @@ To pull new code: `cd ~/dev/zachlatta/personal-data-warehouse && git pull` for t
 uploads go through the app, end-to-end also depends on the **app** (`/ingest/agent-sessions/batch`)
 and the **prod Dagster** reader both running `main` (the app writes the object tags the Dagster
 reader expects, and the reader carries `openclaw_event_row`). Land/deploy code on both before
-relying on the timer.
+relying on the service.
 
 ### mew-dev (Linux dev VM)
 
-`mew-dev` (libvirt guest on `mew`, a Paseo host since 2026-10-24) runs the same systemd user
-timer for its Claude Code and Codex sessions. Differences from openclaw: the `.env` keeps the
+`mew-dev` (libvirt guest on `mew`, a Paseo host since 2026-10-24) runs the same resident
+systemd user service for its Claude Code and Codex sessions. Differences from openclaw: the `.env` keeps the
 Claude/Codex/pi scans on (it only sets `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.com` and
 `PDW_INGEST_TAILSCALE_HOST=mew-coolify`), and a drop-in
 (`~/.config/systemd/user/personal-data-warehouse-agent-sessions-upload.service.d/`) sets

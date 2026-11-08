@@ -139,6 +139,12 @@ type ingestArtifact struct {
 // the durable queue: the notification only removes the sensor's wait.
 const voiceMemoLandingChannel = "pdw_voice_memo_landing"
 
+// agentSessionsLandingChannel wakes the resident agent-sessions landing
+// worker (personal_data_warehouse.agent_sessions_landing_worker), which
+// ingests the batch and lands its turns on the timeline in seconds. As with
+// voice memos, the Drive inbox and the 60 s sensor stay the floor.
+const agentSessionsLandingChannel = "pdw_agent_sessions_landing"
+
 // postgresNotifier sends NOTIFYs over a lazily opened pool. sql.Open does not
 // connect, so an unreachable database costs a warning per upload, never the
 // app's startup.
@@ -582,6 +588,12 @@ func required(q url.Values, key string) (string, error) {
 // museFileExtensionRe is the only extension shape allowed into a Muse blob key.
 var museFileExtensionRe = regexp.MustCompile(`^\.[A-Za-z0-9]{1,12}$`)
 
+// withNotify sets the NOTIFY channel a stored object of artifact wakes.
+func withNotify(artifact ingestArtifact, channel string) ingestArtifact {
+	artifact.notifyChannel = channel
+	return artifact
+}
+
 // ingestArtifacts is the registry of single-object semantic endpoints.
 func ingestArtifacts() []ingestArtifact {
 	batch := func(endpoint, slug, prefix, kind string) ingestArtifact {
@@ -607,7 +619,7 @@ func ingestArtifacts() []ingestArtifact {
 		}
 	}
 	return []ingestArtifact{
-		batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"),
+		withNotify(batch("/ingest/agent-sessions/batch", "agent_sessions", "agent-sessions/inbox", "agent_sessions_export_batch"), agentSessionsLandingChannel),
 		batch("/ingest/apple-contacts/batch", "apple_contacts", "apple-contacts/inbox", "apple_contact_export_batch"),
 		batch("/ingest/apple-messages/batch", "apple_messages", "apple-messages/inbox", "apple_message_export_batch"),
 		batch("/ingest/browser-history/batch", "browser_history", "browser-history/inbox", "browser_history_export_batch"),

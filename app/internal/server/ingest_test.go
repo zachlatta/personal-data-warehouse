@@ -951,3 +951,36 @@ func TestIngestMuseFileIsContentAddressedInTheAgentSessionsStore(t *testing.T) {
 		t.Fatalf("unsafe extension key = %q", got)
 	}
 }
+
+// A stored agent-sessions batch wakes the resident landing worker, so a turn
+// reaches the warehouse and the timeline seconds after the device posts it
+// instead of at the next 60 s sensor tick plus a Dagster run start.
+func TestAgentSessionsBatchNotifiesTheLandingWorker(t *testing.T) {
+	svc, _ := ingestTestService()
+	var notified []string
+	svc.notify = func(_ context.Context, channel, payload string) error {
+		notified = append(notified, channel+"|"+payload)
+		return nil
+	}
+	body := []byte("batch-bytes")
+	target := signedIngestTarget("/ingest/agent-sessions/batch", body, url.Values{
+		"exported_at": {"2026-11-08T16:00:00+00:00"},
+	})
+	if rec := postIngest(t, svc, target, body); rec.Code != http.StatusOK {
+		t.Fatalf("batch status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if len(notified) != 1 || !strings.HasPrefix(notified[0], agentSessionsLandingChannel+"|agent-sessions/inbox/batches/") {
+		t.Fatalf("notifications = %v", notified)
+	}
+
+	other := []byte("messages-bytes")
+	otherTarget := signedIngestTarget("/ingest/apple-messages/batch", other, url.Values{
+		"exported_at": {"2026-11-08T16:00:00+00:00"},
+	})
+	if rec := postIngest(t, svc, otherTarget, other); rec.Code != http.StatusOK {
+		t.Fatalf("messages status = %d", rec.Code)
+	}
+	if len(notified) != 1 {
+		t.Fatalf("only agent-sessions batches wake the agent-sessions worker: %v", notified)
+	}
+}

@@ -11,8 +11,15 @@
       <string>/Users/zrl/.local/share/personal-data-warehouse/bin/agent-sessions-upload-launchd</string>
     </array>
 
-    <key>StartInterval</key>
-    <integer>300</integer>
+    <!-- Resident: the wrapper watches the transcripts for a five-minute
+         window (a pass every two seconds), posts the heartbeat and exits;
+         KeepAlive starts the next window. ThrottleInterval spaces relaunches
+         after a window that failed fast. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 
     <key>RunAtLoad</key>
     <true/>

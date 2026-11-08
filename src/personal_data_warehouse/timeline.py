@@ -3414,6 +3414,14 @@ def _agent_session_adapter() -> TimelineAdapter:
 
 _AGENT_SESSION = _agent_session_adapter()
 
+# Every timeline query reads or writes a page of rows, never the long
+# analytic scan JIT pays off on, and a wide adapter's plan is costed far past
+# jit_optimize_above_cost. Measured 2026-11-08 on prod: the agent_session
+# roll-up's incremental query ran in 2 ms and spent 5.4 s compiling 531 JIT
+# functions; one fast-lane pass for two rows took 15.4 s, and 1.7 s with JIT
+# off. Both of the engine's connections set it.
+_TIMELINE_JIT_OFF_SQL = "SET jit = off"
+
 
 
 # Turns the harness writes on the user channel: task notifications, stop-hook
@@ -4538,6 +4546,7 @@ class TimelineSyncEngine:
             self._source_conn.autocommit = True
             with self._source_conn.cursor() as cursor:
                 cursor.execute("SET default_transaction_read_only = on")
+                cursor.execute(_TIMELINE_JIT_OFF_SQL)
                 cursor.execute(self._search_path_sql(self._source_schema))
         if self._dest_conn is None:
             # Import here to avoid a module cycle (postgres.py is the DDL layer).
@@ -4549,6 +4558,7 @@ class TimelineSyncEngine:
             self._dest_conn = psycopg2.connect(self._dest_url)
             self._dest_conn.autocommit = True
             with self._dest_conn.cursor() as cursor:
+                cursor.execute(_TIMELINE_JIT_OFF_SQL)
                 cursor.execute(self._search_path_sql(self._dest_schema))
 
     def close(self) -> None:
