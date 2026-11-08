@@ -139,6 +139,20 @@ def test_photo_source_table_routes_by_registry_and_fails_loud() -> None:
         photo_source_table({})
 
 
+def test_the_pixels_envelopes_route_to_their_own_table_at_the_right_instant() -> None:
+    """pdw ingest android-photos sends the local wall clock with the camera's
+    EXIF offset, and the UTC wall clock with no offset when a file has none
+    (screenshots, videos); both must land at the instant MediaStore recorded."""
+    pixel = {**envelope(), "source": "android_photos"}
+    assert photo_source_table(pixel) == "android_photos_files"
+    with_offset = {**pixel, "file": {**pixel["file"], "captured_at": "2026-11-07T17:15:46.101", "capture_tz_offset": "-05:00"}}
+    without = {**pixel, "file": {**pixel["file"], "captured_at": "2026-11-07T22:15:46.101", "capture_tz_offset": ""}}
+    ingested_at = datetime(2026, 11, 8, tzinfo=UTC)
+    expected = datetime(2026, 11, 7, 22, 15, 46, 101000, tzinfo=UTC)
+    assert metadata_to_row(with_offset, ingested_at=ingested_at)["captured_at"] == expected
+    assert metadata_to_row(without, ingested_at=ingested_at)["captured_at"] == expected
+
+
 def test_metadata_to_row_maps_envelope_and_rewrites_library_keys() -> None:
     payload = attach_storage_context(
         envelope(), metadata_listing=_metadata_listing(), file_listing=_file_listing()

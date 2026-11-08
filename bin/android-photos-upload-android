@@ -1,0 +1,86 @@
+#!/system/bin/sh
+# One run of the Pixel's photo uploader: the Android counterpart of
+# bin/photos-upload-launchd.
+#
+# Run as root on the rooted Pixel by the pdw-android-photos Magisk service
+# (ops/android/pdw-android-photos/service.sh), seconds after the camera or a
+# screenshot writes a file and every 5 minutes as the floor. The module
+# carries this file, _pdw-upload-lib.sh and the release linux/arm64 pdw
+# binary side by side in its bin/; the sysadmin repository's
+# scripts/install-pixel-photos-upload assembles and deploys it. There is no
+# checkout on the phone.
+#
+# State lives in $STATE_DIR (root 0700): pdw's own config file (URL, token,
+# client name) under config/pdw/, an optional .env (ANDROID_PHOTOS_DEVICE,
+# ANDROID_PHOTOS_ACCOUNT), the upload ledger, and logs/. It is in
+# credential-encrypted storage on purpose: the token is the warehouse's
+# master secret (ingest uploads are signed with it), and the bootloader is
+# unlocked, so it must not sit in /data/adb, which is readable before the PIN
+# is entered. The photos themselves are credential-encrypted too, so nothing
+# here can run before the first unlock anyway.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+STATE_DIR="${PDW_ANDROID_PHOTOS_STATE_DIR:-/data/misc_ce/0/pdw-android-photos}"
+# Magisk starts services with HOME=/ and no TMPDIR; pdw needs both writable.
+export HOME="$STATE_DIR/home"
+export TMPDIR="$STATE_DIR/tmp"
+export XDG_CONFIG_HOME="$STATE_DIR/config"
+export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"
+# The uploader's own settings (device name, account) come from here.
+export PDW_INGEST_PROJECT_DIR="$STATE_DIR"
+. "$SCRIPT_DIR/_pdw-upload-lib.sh"
+pdw_export_app_credentials
+PDW="$(pdw_resolve_bin)"
+LOG_DIR="$STATE_DIR/logs"
+LOG_FILE="$LOG_DIR/android-photos-upload.run.log"
+HEARTBEAT_FILE="$LOG_DIR/android-photos-upload.heartbeat"
+POSTED_FILE="$LOG_DIR/android-photos-upload.heartbeat-posted"
+
+mkdir -p "$LOG_DIR" "$HOME" "$TMPDIR"
+# The phone has no logrotate: keep the current log under 1 MiB and one old one.
+if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -gt 1048576 ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
+started_at_epoch="$(date +%s)"
+started_at_iso="$(date -Iseconds)"
+
+echo "[$started_at_iso] starting android photos upload" >> "$LOG_FILE"
+
+if [ -z "$PDW" ]; then
+  exit_code=1
+  echo "[$(date -Iseconds)] no pdw binary found (the module ships one at $SCRIPT_DIR/pdw; set PDW_BIN)" >> "$LOG_FILE"
+else
+  pdw_run_stoppable "$HEARTBEAT_FILE" "$LOG_FILE" "android photos" \
+    "$PDW" ingest android-photos --state-file "$STATE_DIR/android-photos-upload-state.sqlite"
+  exit_code=$?
+fi
+
+finished_at_epoch="$(date +%s)"
+finished_at_iso="$(date -Iseconds)"
+duration_seconds="$((finished_at_epoch - started_at_epoch))"
+
+pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
+# A successful run that left a backlog (the per-run limit) or a file still
+# being written asks for the next run now rather than at the 5-minute floor:
+# the supervisor consumed the triggering write before starting us. A deferred
+# run (app unreachable) does not, or it would retry every two seconds.
+summary="$(tail -n 1 "$LOG_FILE")"
+if [ "$exit_code" -eq 0 ] && printf '%s\n' "$summary" | grep -q ' deferred=false ' &&
+  printf '%s\n' "$summary" | grep -q ' unsettled=[1-9]\| remaining=[1-9]'; then
+  : > "$STATE_DIR/due"
+fi
+# The service runs this on every camera write, so a burst can mean a run every
+# two seconds. Post the verdict when it matters -- a failure, a run that sent
+# something -- and otherwise at most every four minutes, which is still well
+# inside the pipeline's 30-minute run interval.
+last_posted="$(cat "$POSTED_FILE" 2>/dev/null || echo 0)"
+sent="$(printf '%s\n' "$summary" | grep -c ' uploaded=[1-9]')"
+if [ "$exit_code" -ne 0 ] || [ "$sent" -gt 0 ] || [ "$((finished_at_epoch - last_posted))" -ge 240 ]; then
+  pdw_post_heartbeat "android_photos" "$finished_at_iso" "$exit_code" "$duration_seconds" "$LOG_FILE"
+  echo "$finished_at_epoch" > "$POSTED_FILE"
+fi
+echo "[$finished_at_iso] finished android photos upload exit_code=$exit_code duration_seconds=$duration_seconds" >> "$LOG_FILE"
+
+exit "$exit_code"

@@ -340,9 +340,53 @@ per deduplicated logical photo), `derived_photos.asset_files` (identity links + 
 `marts_photos.files` (all renditions across sources), and timeline `source = 'photos'`. Free-text
 search: `timeline.search_text()` with `sources => ARRAY['photo']`.
 
+## Pixel photos (`android_photos`)
+
+Zach carries a Pixel from 2026-10-23, so new photos never reach Apple Photos: the iPhone
+library ends on 2026-10-24 and every later photo is on the phone. The phone is rooted, so the
+uploader runs **on the phone, as root**: `pdw ingest android-photos`, the release
+linux/arm64 build, started by the `pdw-android-photos` Magisk module
+(`ops/android/pdw-android-photos/service.sh`, wrapper `bin/android-photos-upload-android`,
+deployed by the sysadmin repo's `scripts/install-pixel-photos-upload`). The heartbeat is
+`android_photos` in `ops.uploader_heartbeats`; the rows land in `base_android_photos.files`.
+
+- **What it reads.** MediaStore (`content query --uri content://media/external/file`), not a
+  directory walk: every finished (`is_pending = 0`), untrashed image or video on the primary
+  volume under `DCIM/`, `Pictures/` and `Movies/` — the camera, screenshots, images apps save,
+  and the iPhone photos the migration copied into `DCIM/`. Those copies merge into their
+  Apple assets by perceptual hash (a different source, so the burst guard does not apply),
+  and enrichment runs once per logical photo, so they cost an upload, not a caption.
+  Files are read from `/data/media/0` (the storage under the FUSE view).
+- **What it sends.** The file unchanged, and the shared photo envelope: `source =
+  android_photos`, native id = the path under the volume (`DCIM/Camera/PXL_….jpg`), role
+  `original`. `captured_at` is MediaStore's `datetaken` (UTC ms), written as the local wall
+  clock with the JPEG's EXIF `OffsetTimeOriginal`, or as the UTC wall clock with no offset
+  when the file has none (screenshots, videos). Camera make/model and GPS come from the
+  JPEG's EXIF (MediaStore has not exposed location since Android 10); MediaStore's row
+  (id, owner app, favourite, orientation, duration) is the `android_record` block, and its
+  `latitude`/`longitude` are what the identity layer reads as the photo's location.
+- **Ledger.** `/data/misc_ce/0/pdw-android-photos/android-photos-upload-state.sqlite` keeps,
+  per path, the size, mtime and sha it landed; an unchanged file is never re-read. An edit
+  saved over the file sends the new bytes under the same native id, which the identity
+  layer links to the same photo (`source_id`). A deleted photo is NOT tombstoned.
+- **Triggered, and awake.** `inotifyd` watches `DCIM/Camera` and `Pictures/Screenshots`
+  (the camera renames a finished shot into place; hidden pending names are ignored); each
+  event marks a run due and takes a 60 s wakelock. The floor run every 5 minutes covers
+  every other gallery folder. A run sends at most 25 files, newest first; a successful run
+  that left a backlog or a file still being written asks for the next run at once, so a
+  first backfill drains in back-to-back runs. A deferred run (app unreachable) waits for
+  the floor. Each run is cut at 960 s, like the Recorder uploader.
+- **Any network.** It uploads on cellular too, like the Recorder uploader: a shot is
+  ~3–12 MB. `touch /data/misc_ce/0/pdw-android-photos/paused` stops uploads.
+
+On the phone (`ssh pichu`): logs and heartbeat in `/data/misc_ce/0/pdw-android-photos/logs/`,
+a manual run is `sh /data/adb/modules/pdw-android-photos/bin/android-photos-upload-android`,
+and `pdw ingest android-photos --dry-run --account <email>` lists what would be sent.
+
 ### Adding a photo source (google_photos Takeout import, manual imports, ...)
 
-The photos pipeline is multi-source by construction; Apple Photos is just the first source.
+The photos pipeline is multi-source by construction: Apple Photos and the Pixel
+(`android_photos`, above) both use it.
 `PHOTO_SOURCE_RELATIONS` in `src/personal_data_warehouse/relations.py` is THE extension point —
 it drives Drive-ingest routing, the identity runner's scan, and the `marts_photos.files` union.
 To add a source:

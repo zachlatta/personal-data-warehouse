@@ -1,0 +1,11 @@
+#!/system/bin/sh
+# inotifyd handler for the pdw-android-photos service: a file was written,
+# renamed into, or removed from a watched gallery folder ($1 event, $2
+# directory, $3 file). Marks an upload run due and keeps the phone awake for a
+# minute so the service's loop gets to it before the phone suspends.
+case "${3:-}" in
+  .*) exit 0 ;;
+esac
+: > /data/misc_ce/0/pdw-android-photos/due
+echo "pdw_android_photos_due 60000000000" > /sys/power/wake_lock 2>/dev/null
+exit 0

@@ -30,6 +30,7 @@ import (
 var overviewTimeColumns = map[string]string{
 	"timeline.events":                 "occurred_at",
 	"base_apple_photos.files":         "captured_at",
+	"base_android_photos.files":       "captured_at",
 	"derived_photos.assets":           "capture_ts",
 	"base_plaid.transactions":         "posted_at",
 	"base_whatsapp.media_items":       "message_at",
@@ -248,7 +249,7 @@ var overviewPreamble = `--
 --     base_whatsapp, and the agent-session event tables (base_claude_code, base_claude_desktop,
 --     base_codex, base_chatgpt, base_openclaw, base_pi, base_muse_code, base_argon). jsonb on: base_plaid, base_whoop,
 --     base_google_drive, base_google_contacts, base_apple_contacts, base_apple_photos,
---     base_manual_finance, base_alice_voice_recordings. On a text one, cast before
+--     base_android_photos, base_manual_finance, base_alice_voice_recordings. On a text one, cast before
 --     -> / ->> / subscripting, else 42883. describe_table is authoritative — check, don't assume.
 --  3. Time columns are per-source names, all timestamptz, given as ` + "`time:`" + ` on each line below.
 --     Compare them to timestamps, never epoch ints (>= '2026-01-01', not > 1700000000).

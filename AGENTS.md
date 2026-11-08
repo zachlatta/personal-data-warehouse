@@ -211,7 +211,7 @@ Read the file for the area you are changing before you change it.
 | WHOOP and the health mart | [docs/agents/health-sources.md](docs/agents/health-sources.md) |
 | agent sessions, Claude Desktop, ChatGPT, Muse, the app's ingest path | [docs/agents/agent-sessions.md](docs/agents/agent-sessions.md) |
 | the agent guide's history, how agents stumble and the weekly top failures | [docs/agents/agent-guide.md](docs/agents/agent-guide.md) |
-| local Mac uploaders and their macOS permissions | [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md) |
+| local Mac uploaders and their macOS permissions, and the Pixel's photo uploader | [docs/agents/local-uploaders.md](docs/agents/local-uploaders.md) |
 | reviewed writes (Notes, Contacts), the phone app (Android and iOS) and push | [docs/agents/mutations-and-app.md](docs/agents/mutations-and-app.md) |
 | access tokens beside `PDW_SECRET_TOKEN`, `pdw token`, the `cli_authorize` bootstrap, MCP connector grants, secret rotation | [docs/agents/access-tokens.md](docs/agents/access-tokens.md) |
 | the Feed tab: `pdw feed`, engagement logging, how to remove it | [docs/feed.md](docs/feed.md) |

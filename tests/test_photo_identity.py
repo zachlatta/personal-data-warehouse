@@ -256,9 +256,9 @@ class FakeObjectStore:
 
 def _seed_file(warehouse, *, native_id, sha, blob_id, role="original", source="apple_photos",
                mime="image/heic", filename="IMG.HEIC", captured_at=_TS, camera=("Apple", "iPhone 16 Pro"),
-               record=None, ingested_at=_TS):
+               record=None, ingested_at=_TS, table="apple_photos_files"):
     warehouse.insert_photo_source_files(
-        "apple_photos_files",
+        table,
         [
             _photo_file_row(
                 source=source,
@@ -370,6 +370,62 @@ def test_runner_burst_frames_stay_distinct_but_cross_source_rendition_merges(war
     assert asset["best_file_sha256"] == _sha(original)
     assert asset["camera_model"] == "iPhone 16 Pro"
     assert warehouse._query("SELECT count(*) FROM @photo_assets")[0][0] == 2
+
+
+def test_runner_merges_the_pixels_copy_of_an_iphone_photo_and_keeps_its_own_shots(warehouse):
+    """The Pixel's gallery (base_android_photos.files) is a second photo source:
+    the iPhone library copied onto the phone merges into the Apple assets, and
+    a Pixel shot is its own asset with the camera and GPS its EXIF carried."""
+    warehouse.ensure_photos_tables()
+    iphone = synthetic_photo(23)
+    original = image_bytes(iphone)
+    # The phone migration re-encoded the HEIC: different bytes, same picture.
+    copied = image_bytes(iphone, format="JPEG", quality=80)
+    pixel_shot = image_bytes(synthetic_photo(24), format="JPEG", quality=90)
+    _seed_file(warehouse, native_id="UUID-IPHONE", sha=_sha(original), blob_id="b-iphone")
+    _seed_file(
+        warehouse, table="android_photos_files", source="android_photos",
+        native_id="DCIM/IMG_0324.jpg", sha=_sha(copied), blob_id="b-copy",
+        mime="image/jpeg", filename="IMG_0324.jpg", camera=("", ""),
+        record={"android_record": {"relative_path": "DCIM/IMG_0324.jpg"}},
+        ingested_at=_TS + timedelta(seconds=1),
+    )
+    _seed_file(
+        warehouse, table="android_photos_files", source="android_photos",
+        native_id="DCIM/Camera/PXL_20261107_221546101.jpg", sha=_sha(pixel_shot), blob_id="b-pixel",
+        mime="image/jpeg", filename="PXL_20261107_221546101.jpg", camera=("Google", "Pixel 11 Pro"),
+        captured_at=_TS + timedelta(days=150),
+        record={"android_record": {"relative_path": "DCIM/Camera/PXL_20261107_221546101.jpg",
+                                   "latitude": 12.5, "longitude": -45.25}},
+        ingested_at=_TS + timedelta(seconds=2),
+    )
+    store = FakeObjectStore({"b-iphone": original, "b-copy": copied, "b-pixel": pixel_shot})
+    PhotoIdentityRunner(
+        warehouse=warehouse, object_store=store, logger=_Logger(),
+        now=lambda: datetime(2026, 11, 8, 12, 0, tzinfo=UTC),
+    ).sync()
+
+    rows = warehouse._query_dicts(
+        "SELECT source, source_native_id, photo_id, match_method FROM @photo_asset_files"
+    )
+    by_native = {row["source_native_id"]: row for row in rows}
+    assert by_native["DCIM/IMG_0324.jpg"]["photo_id"] == by_native["UUID-IPHONE"]["photo_id"]
+    assert by_native["DCIM/IMG_0324.jpg"]["match_method"] == "perceptual"
+    merged = warehouse._query_dicts(
+        "SELECT * FROM @photo_assets WHERE photo_id = %s", (by_native["UUID-IPHONE"]["photo_id"],)
+    )[0]
+    # Apple outranks the Pixel copy: its original stays the best file.
+    assert merged["best_file_sha256"] == _sha(original)
+    pixel = warehouse._query_dicts(
+        "SELECT * FROM @photo_assets WHERE photo_id = %s",
+        (by_native["DCIM/Camera/PXL_20261107_221546101.jpg"]["photo_id"],),
+    )[0]
+    assert pixel["camera_model"] == "Pixel 11 Pro"
+    assert (pixel["latitude"], pixel["longitude"]) == (12.5, -45.25)
+    files = warehouse._query(
+        "SELECT source, count(*) FROM @photo_files GROUP BY source ORDER BY source"
+    )
+    assert files == [("android_photos", 2), ("apple_photos", 1)]
 
 
 def test_runner_rerun_is_idempotent(warehouse):

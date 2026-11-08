@@ -11,6 +11,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidlocation"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidmessages"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidnotifications"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidphotos"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/androidscreentime"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applecontacts"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/applemessages"
@@ -53,6 +54,7 @@ var ingestSources = map[string]localCommand{
 	"android-notifications": androidnotifications.Run,
 	"android-messages":      androidmessages.Run,
 	"android-location":      androidlocation.Run,
+	"android-photos":        androidphotos.Run,
 	"android-screen-time":   androidscreentime.Run,
 	"google-recorder":       googlerecorder.Run,
 	"manual-finance":        manualfinance.Run,
@@ -97,6 +99,7 @@ SOURCES
   google-recorder  Upload Google Recorder's recordings (run as root on the Pixel)
   android-notifications  Upload the notifications the Pixel receives (run as root on it)
   android-messages Upload the texts (SMS, MMS, RCS) the Pixel sends and receives (run as root on it)
+  android-photos   Upload the Pixel's photos and videos: camera, screenshots, saved images (run as root on it)
   android-location Collect approximate network location and upload its offline queue (root on Android)
   android-screen-time  Upload an Android device's screen time: app usage, screen and lock events (run as root on it)
   screen-timelapse Upload the periodic whole-screen captures (Mac and phone)

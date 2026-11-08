@@ -22,6 +22,10 @@ Current ingestion path:
 - Google Recorder recordings from the Pixel use the same shape from the phone itself: a Magisk
   service runs `pdw ingest google-recorder` as root seconds after Recorder saves a recording,
   and Dagster promotes them into `base_google_recorder.recordings`.
+- Pixel photos use the shared photo path from the phone itself: a Magisk service runs
+  `pdw ingest android-photos` as root seconds after a shot or screenshot, posting the
+  file and a photo envelope to `/ingest/photos/*`; Dagster promotes them into
+  `base_android_photos.files`, and photo identity merges them with every other photo source.
 - Apple Notes use the same two-stage local Mac path: a LaunchAgent snapshots the local Notes
   SQLite store, posts immutable note revision payloads to the app, and Dagster ingests the
   app-written Drive objects.

@@ -1131,6 +1131,10 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
         PHOTO_SOURCE_FILE_COLUMNS,
         ("source", "account", "source_native_id", "content_sha256"),
     ),
+    "android_photos_files": TableSpec(
+        PHOTO_SOURCE_FILE_COLUMNS,
+        ("source", "account", "source_native_id", "content_sha256"),
+    ),
     "photo_assets": TableSpec(PHOTO_ASSET_COLUMNS, ("photo_id",)),
     "photo_asset_files": TableSpec(
         PHOTO_ASSET_FILE_COLUMNS,
@@ -1732,6 +1736,16 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
         "apple_photos_files_content_sha256_idx",
         "apple_photos_files",
         "CREATE INDEX IF NOT EXISTS apple_photos_files_content_sha256_idx ON @apple_photos_files (content_sha256)",
+    ),
+    IndexSpec(
+        "android_photos_files_ingested_at_idx",
+        "android_photos_files",
+        "CREATE INDEX IF NOT EXISTS android_photos_files_ingested_at_idx ON @android_photos_files (ingested_at)",
+    ),
+    IndexSpec(
+        "android_photos_files_content_sha256_idx",
+        "android_photos_files",
+        "CREATE INDEX IF NOT EXISTS android_photos_files_content_sha256_idx ON @android_photos_files (content_sha256)",
     ),
     IndexSpec(
         "photo_assets_capture_ts_idx",
@@ -3026,6 +3040,7 @@ JSONB_COLUMNS_BY_TABLE = {
         "raw_metadata_json",
     },
     "apple_photos_files": {"raw_metadata_json"},
+    "android_photos_files": {"raw_metadata_json"},
     "timeline_events": {
         "source_pk",
         "metadata",

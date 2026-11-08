@@ -4125,6 +4125,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     # one timeline event per logical photo)
     "photo_assets": _events("one event per deduplicated logical photo"),
     "apple_photos_files": _detail("photo_assets", "raw Apple Photos renditions in the photo's detail view"),
+    "android_photos_files": _detail("photo_assets", "raw Pixel gallery files in the photo's detail view"),
     "photo_asset_files": _detail("photo_assets", "identity links + dedup audit (match_method/match_score)"),
     "media_fingerprints": _state("perceptual-hash cache keyed by content sha"),
     "audio_transcripts": _state("transcription provider results keyed by audio sha; read through each pass's own rows"),

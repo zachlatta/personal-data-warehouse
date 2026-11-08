@@ -137,7 +137,10 @@ def test_photo_source_registry_shape():
     # The registry is the single extension point: every registered source table
     # must be a real warehouse table sharing the raw photo file shape and the
     # provenance primary key.
-    assert PHOTO_SOURCE_RELATIONS == {"apple_photos": "apple_photos_files"}
+    assert PHOTO_SOURCE_RELATIONS == {
+        "apple_photos": "apple_photos_files",
+        "android_photos": "android_photos_files",
+    }
     for source, table in PHOTO_SOURCE_RELATIONS.items():
         spec = POSTGRES_TABLES[table]
         assert spec.columns == PHOTO_SOURCE_FILE_COLUMNS, table
@@ -147,6 +150,8 @@ def test_photo_source_registry_shape():
 
 def test_photo_relations_are_registered():
     assert "base_apple_photos" in BASE_SCHEMAS
+    assert "base_android_photos" in BASE_SCHEMAS
+    assert (relation("android_photos_files").schema, relation("android_photos_files").name) == ("base_android_photos", "files")
     assert "derived_photos" in DERIVED_SCHEMAS
     assert (relation("apple_photos_files").schema, relation("apple_photos_files").name) == ("base_apple_photos", "files")
     assert (relation("photo_assets").schema, relation("photo_assets").name) == ("derived_photos", "assets")

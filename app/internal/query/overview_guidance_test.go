@@ -235,8 +235,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-06: the resideo source added its schema line and the one trap in
 	// base_resideo.thermostat_readings, that a row is a change and not a poll: 10530.
 	// 10530 is that and no more.
-	if guidance > 10530 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10530)", guidance)
+	//
+	// 2026-11-08: photos from the Pixel added the base_android_photos schema
+	// line ("Pixel photos.") and its raw table ("Pixel photo files."): 10555.
+	// 10555 is those two lines and no more.
+	if guidance > 10555 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10555)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

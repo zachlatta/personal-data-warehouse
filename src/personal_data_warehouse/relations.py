@@ -111,6 +111,9 @@ VOICE_EVENT_SOURCE_RELATIONS: dict[str, str] = {
 # Identity, dedup, thumbnails, enrichment, timeline, and search then follow.
 PHOTO_SOURCE_RELATIONS: dict[str, str] = {
     "apple_photos": "apple_photos_files",
+    # The Pixel's gallery (camera, screenshots, saved images), uploaded from
+    # the phone itself by `pdw ingest android-photos`.
+    "android_photos": "android_photos_files",
 }
 
 

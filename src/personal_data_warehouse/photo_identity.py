@@ -44,7 +44,7 @@ CAPTURE_TIME_TOLERANCE_SECONDS = 5.0
 # Canonical-field precedence: earlier sources win (Apple's asset record is
 # richer and better-normalized than EXIF or a Takeout sidecar). A future
 # source slots itself in here.
-PHOTO_SOURCE_PRECEDENCE: tuple[str, ...] = ("apple_photos",)
+PHOTO_SOURCE_PRECEDENCE: tuple[str, ...] = ("apple_photos", "android_photos")
 
 _ROLE_RANK = {"original": 0, "edited": 1, "live_video": 2}
 

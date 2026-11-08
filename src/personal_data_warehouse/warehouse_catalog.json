@@ -127,6 +127,14 @@
       "comment": "Faithful apple notes source data: what the provider gave us, plus provenance. Drill in here for complete source detail."
     },
     {
+      "name": "base_android_photos",
+      "layer": "base",
+      "domain": "android_photos",
+      "discoverable": true,
+      "query_access": "public",
+      "comment": "Pixel photos."
+    },
+    {
       "name": "base_apple_photos",
       "layer": "base",
       "domain": "apple_photos",
@@ -1176,6 +1184,18 @@
         "schema": "apple_photos",
         "name": "files"
       }
+    },
+    {
+      "id": "android_photos_files",
+      "kind": "table",
+      "layer": "base",
+      "domain": "android_photos",
+      "schema": "base_android_photos",
+      "name": "files",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "Pixel photo files. One row per (file path, bytes) the phone uploaded: camera shots, screenshots and saved images, with MediaStore's row and the camera's EXIF in raw_metadata_json->'android_record'. One logical photo per row is in marts_photos.photos."
     },
     {
       "id": "alice_voice_recordings",

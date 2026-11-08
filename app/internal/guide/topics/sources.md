@@ -52,7 +52,9 @@ and state the window and freshness.
 - `base_apple_notes.notes`, `.revisions`, `.attachments` (call recordings and voicemails are
   audio attachments and are transcribed through the voice pipeline).
 - `marts_photos.photos` — one row per deduplicated logical photo with its AI caption;
-  `marts_photos.files` every rendition; `base_apple_photos.files` raw. Search scope `photos`.
+  `marts_photos.files` every rendition; raw in `base_apple_photos.files` (iPhone, to
+  2026-10-23) and `base_android_photos.files` (the Pixel's camera, screenshots and saved
+  images, from the phone). Search scope `photos`.
 - `marts_files.attachments` — one conformed row per attachment from Gmail, WhatsApp,
   iMessage, Android texts, Apple Notes and Slack, with `content_sha256`, `is_stored` and the
   `storage_*` columns; enrichment text in `derived_enrichment.file_attachment_enrichments`.

@@ -832,6 +832,25 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("google_recorder"),
     ),
     _source(
+        "android_photos",
+        "Pixel photos",
+        cadence="uploader on every camera or screenshot write, every 5 min as the floor",
+        transport=(
+            "pichu Magisk service → pdw ingest android-photos (MediaStore)"
+            " → /ingest/photos/* → Drive inbox → Dagster"
+        ),
+        data=5 * DAY,
+        basis=(
+            "the Pixel replaced the iPhone on 2026-10-23, so the iPhone's photo"
+            " habit carries over: over the year before, 340 days had a photo,"
+            " gaps p95 2d and max 4d. The run heartbeat is the tight detector:"
+            " it fails when the phone cannot query MediaStore or reach the app"
+        ),
+        note="run heartbeat posted by bin/android-photos-upload-android on the phone",
+        run=UPLOADER_RUN_INTERVAL,
+        state=_uploader_heartbeat("android_photos"),
+    ),
+    _source(
         "android_notifications",
         "Android notifications (Pixel)",
         cadence="uploader within ~30 s of each notification, every 5 min as the floor",
@@ -1891,6 +1910,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "alice_voice_recordings_sync_state": _state("alice_voice_recordings", "updated_at"),
     # Photos
     "apple_photos_files": _data("apple_photos", "ingested_at", "captured_at"),
+    "android_photos_files": _data("android_photos", "ingested_at", "captured_at"),
     "photo_assets": _data("photo_identity", "updated_at", "capture_ts"),
     "photo_asset_files": _support("photo_identity", "created_at"),
     "media_fingerprints": _support("photo_identity", "created_at", note="perceptual-hash cache"),

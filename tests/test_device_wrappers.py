@@ -35,6 +35,7 @@ NOTIFICATIONS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-notification
 MESSAGES_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-messages"
 SCREEN_TIME_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-screen-time"
 SCREEN_TIMELAPSE_MODULE = REPO_ROOT / "ops" / "android" / "pdw-screen-timelapse"
+PHOTOS_MODULE = REPO_ROOT / "ops" / "android" / "pdw-android-photos"
 LIB = "_pdw-upload-lib.sh"
 
 # wrapper -> (the pdw invocation it must contain, heartbeat pipelines or None)
@@ -53,6 +54,7 @@ WRAPPERS: dict[str, tuple[str, str | None]] = {
     "android-notifications-upload-android": ('"$PDW" ingest android-notifications', "android_notifications"),
     "android-messages-upload-android": ('"$PDW" ingest android-messages', "android_messages"),
     "android-screen-time-upload-android": ('"$PDW" ingest android-screen-time', "android_screen_time"),
+    "android-photos-upload-android": ('"$PDW" ingest android-photos', "android_photos"),
     "photos-upload-launchd": ('"$PDW" ingest apple-photos --mode incremental --limit', "apple_photos"),
     "apple-notes-mutation-worker-launchd": ('exec "$PDW" mutations apple-notes', None),
     "apple-contacts-mutation-worker-launchd": ('exec "$PDW" mutations apple-contacts', None),
@@ -259,11 +261,13 @@ def test_the_android_scripts_are_plain_sh_for_android() -> None:
         BIN / "android-messages-upload-android",
         BIN / "android-screen-time-upload-android",
         BIN / "screen-timelapse-upload-android",
+        BIN / "android-photos-upload-android",
         BIN / LIB,
         *sorted(ANDROID_MODULE.iterdir()),
         *sorted(NOTIFICATIONS_MODULE.iterdir()),
         *sorted(MESSAGES_MODULE.iterdir()),
         *sorted(SCREEN_TIME_MODULE.iterdir()),
+        *sorted(PHOTOS_MODULE.iterdir()),
         SCREEN_TIMELAPSE_MODULE / "service.sh",
     ]
     for script in scripts:
@@ -305,6 +309,7 @@ ANDROID_UPLOADERS: dict[str, tuple[str, str, int]] = {
     "pdw-android-messages": ("android-messages-upload-android", "PDW_ANDROID_MESSAGES_STATE_DIR", 660),
     "pdw-android-screen-time": ("android-screen-time-upload-android", "PDW_ANDROID_SCREEN_TIME_STATE_DIR", 360),
     "pdw-screen-timelapse": ("screen-timelapse-upload-android", "PDW_SCREEN_TIMELAPSE_STATE_DIR", 360),
+    "pdw-android-photos": ("android-photos-upload-android", "PDW_ANDROID_PHOTOS_STATE_DIR", 960),
 }
 STOP_WAKELOCK_MARGIN_SECONDS = 30
 
@@ -599,3 +604,62 @@ elif cmd == "pdw":
         process.wait()
     runs = [int(n) for n in (state / "runs").read_text().splitlines()]
     assert runs == [1000, 1002, 1004, 1006, 1008, 1012, 1022, 1322]
+
+
+def test_the_photos_service_runs_on_every_camera_and_screenshot_write_and_holds_the_phone_awake() -> None:
+    service = (PHOTOS_MODULE / "service.sh").read_text()
+    wake = (PHOTOS_MODULE / "android-photos-upload-wake").read_text()
+    assert '"$MODDIR/bin/android-photos-upload-android"' in service
+    # The camera renames a finished shot into place (moved_to); a screenshot
+    # is closed after writing.
+    assert 'inotifyd "$MODDIR/bin/android-photos-upload-wake" "$MEDIA/DCIM/Camera:wy" "$MEDIA/Pictures/Screenshots:wy"' in service
+    assert "FLOOR=300" in service
+    # Root must never create a gallery folder SystemUI or the camera writes to.
+    assert "mkdir -p \"$MEDIA" not in service
+    state = re.search(r"(?m)^STATE=(\S+)$", service).group(1)
+    assert state == "/data/misc_ce/0/pdw-android-photos"
+    assert f": > {state}/due" in wake
+    assert "/sys/power/wake_lock" in wake
+    # The camera's in-progress file is hidden; only the finished name counts.
+    assert ".*) exit 0" in wake
+    text = _wrapper("android-photos-upload-android")
+    assert 'STATE_DIR="${PDW_ANDROID_PHOTOS_STATE_DIR:-/data/misc_ce/0/pdw-android-photos}"' in text
+    assert '--state-file "$STATE_DIR/android-photos-upload-state.sqlite"' in text
+    assert 'export PDW_BIN="${PDW_BIN:-$SCRIPT_DIR/pdw}"' in text
+
+
+@pytest.mark.parametrize(
+    ("summary", "exit_code", "requeued"),
+    [
+        ("seen=600 uploaded=25 already_landed=0 unsettled=0 missing=0 remaining=1 deferred=false dry_run=false", 0, True),
+        ("seen=600 uploaded=0 already_landed=599 unsettled=1 missing=0 remaining=0 deferred=false dry_run=false", 0, True),
+        ("seen=600 uploaded=3 already_landed=597 unsettled=0 missing=0 remaining=0 deferred=false dry_run=false", 0, False),
+        # The app unreachable: wait for the floor, never spin every two seconds.
+        ("seen=600 uploaded=0 already_landed=575 unsettled=0 missing=0 remaining=25 deferred=true dry_run=false", 0, False),
+        ("seen=600 uploaded=10 already_landed=0 unsettled=0 missing=0 remaining=1 deferred=false dry_run=false", 1, False),
+    ],
+)
+def test_the_photos_wrapper_asks_for_the_next_run_only_for_a_backlog_it_can_drain(
+    tmp_path: Path, summary: str, exit_code: int, requeued: bool
+) -> None:
+    import shutil
+
+    state = tmp_path / "state"
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    shutil.copy(BIN / "android-photos-upload-android", commands)
+    (commands / LIB).write_text("""
+ pdw_export_app_credentials() { :; }
+ pdw_resolve_bin() { echo "$PDW_BIN"; }
+ pdw_run_stoppable() { shift 3; "$@" >> "$LOG_FILE" 2>&1; }
+ pdw_record_run() { :; }
+ pdw_post_heartbeat() { echo "$1" >> "$PDW_ANDROID_PHOTOS_STATE_DIR/posted"; }
+""")
+    fake = commands / "pdw"
+    fake.write_text(f"#!/bin/sh\necho 'Android photo upload complete: {summary}'\nexit {exit_code}\n")
+    fake.chmod(0o755)
+    env = {**os.environ, "PDW_ANDROID_PHOTOS_STATE_DIR": str(state), "PDW_BIN": str(fake)}
+    result = subprocess.run(["sh", str(commands / "android-photos-upload-android")], env=env, check=False)
+    assert result.returncode == exit_code
+    assert (state / "due").exists() == requeued
+    assert (state / "posted").read_text().split() == ["android_photos"]
