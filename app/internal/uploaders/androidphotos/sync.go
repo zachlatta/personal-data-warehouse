@@ -62,7 +62,10 @@ type Runner struct {
 	SettleAge         time.Duration
 	Limit             int
 	BeforeUploadCheck func() string
-	List              func() ([]MediaItem, error) // MediaStore; replaced in tests
+	// NetworkCheck runs first, before MediaStore is read or a file hashed: a
+	// non-empty reason defers the whole run. The CLI makes it Wi-Fi only.
+	NetworkCheck func() string
+	List         func() ([]MediaItem, error) // MediaStore; replaced in tests
 }
 
 type pending struct {
@@ -98,6 +101,12 @@ func (r *Runner) Sync() (Summary, error) {
 	}
 	if r.MediaRoot == "" {
 		r.MediaRoot = DefaultMediaRoot
+	}
+	if r.NetworkCheck != nil {
+		if reason := r.NetworkCheck(); reason != "" {
+			r.Logger.Infof("Android photo upload deferred: %s", reason)
+			return Summary{Deferred: true}, nil
+		}
 	}
 	list := r.List
 	if list == nil {

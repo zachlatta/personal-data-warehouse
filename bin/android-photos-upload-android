@@ -65,7 +65,8 @@ pdw_record_run "$HEARTBEAT_FILE" "$finished_at_iso" "$exit_code"
 # A successful run that left a backlog (the per-run limit) or a file still
 # being written asks for the next run now rather than at the 5-minute floor:
 # the supervisor consumed the triggering write before starting us. A deferred
-# run (app unreachable) does not, or it would retry every two seconds.
+# run (off Wi-Fi, or the app unreachable) does not, or it would retry every two
+# seconds.
 summary="$(tail -n 1 "$LOG_FILE")"
 if [ "$exit_code" -eq 0 ] && printf '%s\n' "$summary" | grep -q ' deferred=false ' &&
   printf '%s\n' "$summary" | grep -q ' unsettled=[1-9]\| remaining=[1-9]'; then

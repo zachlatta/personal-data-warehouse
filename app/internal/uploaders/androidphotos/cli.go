@@ -25,8 +25,9 @@ screenshots and images apps save -- and sends each file, unchanged, to the
 app's /ingest/photos endpoints with a photo envelope (source android_photos):
 MediaStore's capture time, size and owner app, and the camera, UTC offset and
 GPS from the JPEG's EXIF. Newest first. A file is remembered by its path and
-sent again only when its bytes change. A run stops at the first failed upload
-and exits non-zero.
+sent again only when its bytes change. Uploads go over Wi-Fi only: on any other
+network (or when dumpsys cannot say) the run defers, before reading a file. A
+run stops at the first failed upload and exits non-zero.
 
 FLAGS
   --media-root DIR       Backing directory of the primary volume
@@ -114,7 +115,11 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 	statePath := *stateFile
 	var client Uploader
 	guard := func() string { return "" }
+	// Photos go over Wi-Fi only (Zach, 2026-11-08), and a phone that cannot
+	// tell which network it is on defers rather than risk cellular data.
+	network := func() string { return common.AndroidWiFiGuard(true) }
 	if *dryRun {
+		network = nil
 		scratch, err := os.MkdirTemp("", "pdw-android-photos-dry-run-")
 		if err != nil {
 			fmt.Fprintf(stderr, "pdw ingest android-photos: %v\n", err)
@@ -149,6 +154,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		Logger:            logger,
 		Limit:             *limit,
 		BeforeUploadCheck: guard,
+		NetworkCheck:      network,
 	}).Sync()
 	fmt.Fprintf(stdout, "Android photo upload complete: seen=%d uploaded=%d already_landed=%d unsettled=%d missing=%d remaining=%d deferred=%t dry_run=%t\n",
 		summary.Seen, summary.Uploaded, summary.Skipped, summary.Unsettled, summary.Missing, summary.Remaining, summary.Deferred, *dryRun)

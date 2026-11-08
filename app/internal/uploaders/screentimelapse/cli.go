@@ -154,7 +154,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		baseGuard := networkGuard(env, cfg.BaseURL)
 		guard = func() string {
 			if enableWiFiOnly {
-				if reason := AndroidWiFiGuard(); reason != "" {
+				if reason := common.AndroidWiFiGuard(false); reason != "" {
 					return reason
 				}
 			}

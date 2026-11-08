@@ -834,7 +834,7 @@ PIPELINES: tuple[Pipeline, ...] = (
     _source(
         "android_photos",
         "Pixel photos",
-        cadence="uploader on every camera or screenshot write, every 5 min as the floor",
+        cadence="uploader on every camera or screenshot write, every 5 min as the floor; Wi-Fi only",
         transport=(
             "pichu Magisk service → pdw ingest android-photos (MediaStore)"
             " → /ingest/photos/* → Drive inbox → Dagster"
@@ -843,7 +843,8 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis=(
             "the Pixel replaced the iPhone on 2026-10-23, so the iPhone's photo"
             " habit carries over: over the year before, 340 days had a photo,"
-            " gaps p95 2d and max 4d. The run heartbeat is the tight detector:"
+            " gaps p95 2d and max 4d. Uploads go over Wi-Fi only, so a stretch"
+            " away from Wi-Fi delays them. The run heartbeat is the tight detector:"
             " it fails when the phone cannot query MediaStore or reach the app"
         ),
         note="run heartbeat posted by bin/android-photos-upload-android on the phone",

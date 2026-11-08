@@ -376,8 +376,14 @@ deployed by the sysadmin repo's `scripts/install-pixel-photos-upload`). The hear
   that left a backlog or a file still being written asks for the next run at once, so a
   first backfill drains in back-to-back runs. A deferred run (app unreachable) waits for
   the floor. Each run is cut at 960 s, like the Recorder uploader.
-- **Any network.** It uploads on cellular too, like the Recorder uploader: a shot is
-  ~3–12 MB. `touch /data/misc_ce/0/pdw-android-photos/paused` stops uploads.
+- **Wi-Fi only** (Zach, 2026-11-08). Every run first reads `dumpsys connectivity`
+  (`common.AndroidWiFiGuard`, strict): unless the default network's transport is Wi-Fi it
+  defers before reading MediaStore or hashing a file, and an output it cannot read defers
+  too. Tailscale is not the default network there; the transport under it is. A deferred
+  run exits 0 and does not ask for a quick re-run, so photos taken away from Wi-Fi go at
+  the first 5-minute floor run after the phone joins one. Away from Wi-Fi for more than the
+  5-day data window, `/pipelines` reads stale; that is the detector, not a bug.
+  `touch /data/misc_ce/0/pdw-android-photos/paused` stops uploads entirely.
 
 On the phone (`ssh pichu`): logs and heartbeat in `/data/misc_ce/0/pdw-android-photos/logs/`,
 a manual run is `sh /data/adb/modules/pdw-android-photos/bin/android-photos-upload-android`,

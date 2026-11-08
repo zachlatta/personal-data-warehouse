@@ -506,3 +506,22 @@ func TestRunRequiresAnAccount(t *testing.T) {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 }
+
+func TestSyncOffWiFiDefersBeforeReadingMediaStoreOrAnyFile(t *testing.T) {
+	lib := newLibrary(t)
+	lib.add("DCIM/Camera/PXL_1.jpg", "image/jpeg", lib.now.Add(-time.Hour), []byte("x"))
+	client := &fakeUploader{}
+	runner := lib.runner(t, client, openState(t))
+	listed := false
+	runner.List = func() ([]MediaItem, error) { listed = true; return lib.items, nil }
+	runner.NetworkCheck = func() string { return "device is not on Wi-Fi (Wi-Fi only)" }
+	summary, err := runner.Sync()
+	if err != nil || !summary.Deferred || listed || len(client.files) != 0 {
+		t.Fatalf("summary=%+v listed=%v files=%d err=%v", summary, listed, len(client.files), err)
+	}
+	// Back on Wi-Fi, the same run sends it.
+	runner.NetworkCheck = func() string { return "" }
+	if _, err := runner.Sync(); err != nil || len(client.files) != 1 {
+		t.Fatalf("on Wi-Fi: files=%d err=%v", len(client.files), err)
+	}
+}
