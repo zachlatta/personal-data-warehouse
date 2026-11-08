@@ -155,13 +155,25 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 		cmd := exec.CommandContext(ctx, "content", "read", "--uri", "content://com.zachlatta.pdw.location/sample")
-		var captureStderr bytes.Buffer
+		var captureStderr, captureStdout bytes.Buffer
+		cmd.Stdout = &captureStdout
 		cmd.Stderr = &captureStderr
 		// Never print the response: it may include coordinates. Acquisition failure
 		// must not block upload of the durable offline queue.
 		acquisitionErr = cmd.Run()
 		if acquisitionErr == nil && captureStderr.Len() > 0 {
 			acquisitionErr = fmt.Errorf("helper reported acquisition failure")
+		}
+		if acquisitionErr == nil {
+			// Android's content command can swallow reliable-pipe errors and exit
+			// zero with empty stdout. Only the helper's durable-queue acknowledgement
+			// proves acquisition succeeded; never log arbitrary provider output.
+			var ack struct {
+				Queued string `json:"queued"`
+			}
+			if json.Unmarshal(captureStdout.Bytes(), &ack) != nil || ack.Queued == "" {
+				acquisitionErr = fmt.Errorf("helper did not acknowledge a queued location sample")
+			}
 		}
 		if acquisitionErr != nil {
 			fmt.Fprintln(stderr, "Location acquisition failed; draining existing queue")

@@ -90,7 +90,13 @@ func TestCLIDryRunDoesNotAcquireOrDelete(t *testing.T) {
 }
 
 func TestAcquisitionFailureReturnsNonzeroAfterDrainingEmptyQueue(t *testing.T) {
-	for _, script := range []string{"#!/bin/sh\nexit 1\n", "#!/bin/sh\necho 'Error while accessing provider' >&2\nexit 0\n"} {
+	for _, script := range []string{`#!/bin/sh
+exit 0
+`, `#!/bin/sh
+echo 'Error while accessing provider'
+`, `#!/bin/sh
+echo '{"queued":""}'
+`, "#!/bin/sh\nexit 1\n", "#!/bin/sh\necho 'Error while accessing provider' >&2\nexit 0\n"} {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, "content"), []byte(script), 0700)
 		t.Setenv("PATH", dir)
@@ -105,5 +111,24 @@ func TestAcquisitionFailureReturnsNonzeroAfterDrainingEmptyQueue(t *testing.T) {
 		if code == 0 || !strings.Contains(out.String(), "queued samples drained") {
 			t.Fatalf("failure reported success: %d %s", code, out.String())
 		}
+	}
+}
+
+func TestAcquisitionAcknowledgementSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "content"), []byte(`#!/bin/sh
+echo '{"queued":"fake-sample.json"}'
+`), 0700)
+	t.Setenv("PATH", dir)
+	env := func(k string) string {
+		if k == "PDW_INGEST_PROJECT_DIR" {
+			return dir
+		}
+		return ""
+	}
+	var out bytes.Buffer
+	code := Run([]string{"--spool-dir", dir, "--lock-file", filepath.Join(dir, "lock"), "--account", "test@example.invalid"}, strings.NewReader(""), &out, &out, env, ingestclient.Config{BaseURL: "http://127.0.0.1:1", Token: "fake"})
+	if code != 0 {
+		t.Fatalf("acknowledged acquisition failed: %d %s", code, out.String())
 	}
 }

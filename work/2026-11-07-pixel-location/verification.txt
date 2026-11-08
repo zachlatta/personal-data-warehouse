@@ -76,3 +76,18 @@ Acquisition: two JVM tests with injected fake fixes passed; also included in fin
 Service/wrapper: sh -n passed; shared wrapper/heartbeat/stoppable-run contract tests passed in final suite.
 
 Physical-device acquisition, permissions, Doze cadence, accuracy and battery use are not measured. No phone install, location acquisition, production ingest, service restart, email or archive occurred during build.
+
+Post-rollout failure-reporting correction (synthetic data only):
+The new regression test first failed: a content command returning zero with empty
+stdout was incorrectly accepted. It now returns nonzero and logs acquisition
+failure unless the helper returns its existing nonempty queued acknowledgement.
+Regression cases cover empty output, stdout error text, empty acknowledgement,
+nonzero exit and stderr errors; the valid acknowledgement succeeds.
+go -C app test ./...: exit 0.
+uv run pytest: exit 0; 3415 passed, 5 skipped in 103.00s.
+Pytest emitted temporary-directory cleanup warnings; no test failed.
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go -C app build -o /dev/null ./cmd/pdw-cli: exit 0.
+git diff --check: passed.
+No production writes or phone changes during this correction. Deployment and
+live failure-reporting verification remain for the next landing step; only the
+CLI changes, not the helper APK or permissions.
