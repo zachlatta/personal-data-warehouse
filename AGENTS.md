@@ -159,8 +159,8 @@ that, not from this prose.
 - **C12 — future developers understand these contracts and honor them.** This file is
   loaded into every session in this repository, so it holds only the contracts and the
   rules every change needs; per-source and incident detail lives in `docs/agents/` and is
-  linked below. *Held up by* `tests/test_contracts_doc.py` (every test a contract names
-  exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
+  linked below. *Held up by* `tests/test_contracts_doc.py` (every test this file names,
+  in any section, exists), `test_agents_md_fits_one_sitting` (a byte cap on this file), and
   `test_every_stated_contract_has_a_living_audit_check`.
 - **C16 — an agent with only PDW answers Zach's real questions right.** Past questions with
   checked gold answers, asked by a fresh agent, graded on answer, cited source, PDW calls and
@@ -326,8 +326,9 @@ Two rules follow, and the second is the one that bites:
   inherit an inconsistency — it *manufactures* one, and every downstream `ORDER BY`,
   `MIN()`, `COALESCE` and `IS NULL` then disagrees depending on which column was asked.
 - **Test it per column.** Seed a row carrying the sentinel, read it back through the view,
-  and assert `NULL`. `test_whoop_cycles_view_reports_an_unfinished_cycle_as_null_not_the_epoch`
-  is the shape to copy; it is cheap to repeat once per exposed timestamp.
+  and assert `NULL`. `test_health_mart_reports_a_running_cycle_as_null_not_the_epoch`
+  (`tests/test_marts_layering.py`) is the shape to copy; it is cheap to repeat once per
+  exposed timestamp.
 
 Booleans are the sibling trap: they are `bigint` 0/1 here, not `boolean` (`is_from_me = 1`,
 never `= true`). A conforming view over several sources should make the conformed column's
