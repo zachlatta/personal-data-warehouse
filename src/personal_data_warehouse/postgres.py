@@ -20196,7 +20196,15 @@ class PostgresWarehouse:
                 -- were voice: 40 attachments, 10 recordings, 0 transcripts,
                 -- the Alice defect one source later. An attachment appears
                 -- once per note REVISION with the same sha, so it is collapsed
-                -- to one recording on the newest revision. Core Data stamps
+                -- to one recording on the newest revision: latest note
+                -- modified_at, then the revision ingested last. A recording
+                -- can grow or be replaced without the note's modified_at
+                -- moving, and revision_id is a content hash, so on a tie it
+                -- picked a revision at random: until 2026-11-11 an
+                -- attachment could serve its old bytes while the longer
+                -- revision was never transcribed. The newest bytes are a new
+                -- content_sha256, so transcription and enrichment redo them
+                -- (both are keyed on the sha). Core Data stamps
                 -- (seconds since 2001-01-01) are the recording's own creation
                 -- time; the revision's date is only the fallback.
                 SELECT DISTINCT ON (a.account, a.attachment_id)
@@ -20245,7 +20253,7 @@ class PostgresWarehouse:
                       lower(a.content_type) LIKE 'audio/%'
                       OR lower(a.filename) ~ '\\.(m4a|mp3|caf|wav|aac|aiff?|opus|ogg)$'
                   )
-                ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.revision_id DESC
+                ORDER BY a.account, a.attachment_id, n.modified_at DESC, a.ingested_at DESC, a.revision_id DESC
                 ) AS note_audio
             ),
             recordings AS (

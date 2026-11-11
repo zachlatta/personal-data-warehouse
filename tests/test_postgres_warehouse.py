@@ -6713,6 +6713,56 @@ def test_voice_mart_treats_apple_notes_audio_as_a_voice_source(warehouse: Postgr
     }
 
 
+def test_voice_mart_serves_the_newest_bytes_of_a_revised_note_recording(warehouse: PostgresWarehouse) -> None:
+    """A Notes recording that grew is the new bytes, transcribed again.
+
+    An attachment's audio replaced by a longer recording while the note's
+    modified_at did not move tied every revision, and the tie fell to
+    revision_id, a content hash: the mart could keep serving the older bytes
+    and the new revision was never transcribed. Within a tie the
+    revision ingested last is the newest.
+    """
+    now = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+    # Revision ids are hashes, so their order says nothing; "f..." sorts last.
+    revisions = [("f-old-1", now), ("a-old-2", now + timedelta(hours=4)),
+                 ("9-new-1", now + timedelta(days=1)), ("0-new-2", now + timedelta(days=2))]
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         title="Meeting", modified_at=now, ingested_at=ingested)
+            for rev, ingested in revisions
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         attachment_id="att-audio", filename="Recording.m4a", content_type="audio/mp4",
+                         size_bytes=20 if rev.endswith(("new-1", "new-2")) else 10,
+                         content_sha256="sha-new" if rev.endswith(("new-1", "new-2")) else "sha-old",
+                         is_missing=0, storage_file_id=f"drive-{rev}", ingested_at=ingested)
+            for rev, ingested in revisions
+        ]
+    )
+    # The old bytes were transcribed when they were the only ones.
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse.insert_apple_voice_memos_transcription_runs(
+        [
+            _default_row(VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS, source="apple_notes", account="z",
+                         recording_id="att-audio", content_sha256="sha-old", provider="assemblyai",
+                         provider_transcript_id="t-old", status="completed", transcript_text="first half",
+                         requested_at=now, completed_at=now)
+        ]
+    )
+
+    (row,) = warehouse._query_dicts(
+        "SELECT content_sha256, size_bytes FROM @marts_voice_memos_recordings WHERE source = 'apple_notes'"
+    )
+    assert (row["content_sha256"], row["size_bytes"]) == ("sha-new", 20)
+    (candidate,) = warehouse.load_untranscribed_voice_recordings(provider="assemblyai", limit=10)
+    assert (candidate["recording_id"], candidate["content_sha256"]) == ("att-audio", "sha-new")
+
+
 def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     older = datetime(2026, 5, 19, 11, tzinfo=UTC)
