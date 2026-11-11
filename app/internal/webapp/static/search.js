@@ -52,7 +52,7 @@ export function mount(container, ctx) {
     priNode.appendChild(chip);
   });
 
-  function hitRow(hit, index, isCurrent) {
+  function hitRow(hit, isCurrent) {
     const row = h("div", "row p-" + (hit.priority || "unclassified"));
     row.style.setProperty("--src", hue(hit.source));
     const when = hit.occurred_at;
@@ -130,7 +130,7 @@ export function mount(container, ctx) {
       if (data.fallback_reason) hint.appendChild(h("div", "m", "fell back: " + data.fallback_reason));
       if (data.hint) hint.appendChild(h("div", "m", data.hint));
       if (!data.rows.length) hint.appendChild(h("div", "m", "no hits — try the words the record would contain, scope by priority, or lower the depth"));
-      data.rows.forEach((hit, index) => results.appendChild(hitRow(hit, index, isCurrent)));
+      data.rows.forEach((hit) => results.appendChild(hitRow(hit, isCurrent)));
     } catch (err) {
       if (!isCurrent()) return;
       clear(hint);

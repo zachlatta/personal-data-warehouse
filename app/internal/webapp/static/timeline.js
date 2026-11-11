@@ -141,7 +141,7 @@ export function mount(container, ctx) {
   /* ---- ledger ---- */
   function appendItems(items) {
     const rowsNode = el("rows");
-    items.forEach((item, index) => {
+    items.forEach((item) => {
       const day = dayOf(item.occurred_at);
       if (day !== state.lastDay) {
         state.lastDay = day;
@@ -150,10 +150,9 @@ export function mount(container, ctx) {
         let weekday = "";
         try { weekday = WEEKDAYS[new Date(item.occurred_at).getDay()]; } catch (e) { /* unknown day */ }
         head.appendChild(h("span", "w", weekday));
-        head.appendChild(h("span", "rule"));
         rowsNode.appendChild(head);
       }
-      rowsNode.appendChild(rowNode(item, index, (row) => {
+      rowsNode.appendChild(rowNode(item, (row) => {
         if (state.selected) state.selected.classList.remove("sel");
         state.selected = row;
         row.classList.add("sel");
@@ -262,7 +261,7 @@ export function mount(container, ctx) {
 }
 
 // rowNode renders one ledger row; shared with the search results list.
-export function rowNode(item, index, onClick) {
+export function rowNode(item, onClick) {
   const row = h("div", "row p-" + (item.priority || "unclassified"));
   row.style.setProperty("--src", hue(item.source));
   row.appendChild(h("div", "t", fmtTime(item.occurred_at)));

@@ -260,9 +260,10 @@ and `PDW_MUTATION_UI_SESSION_TTL_SECONDS` are ignored and reported as deprecated
 
 Every browser page shares one stylesheet, `app/internal/webapp/static/app.css`: the SPA, the
 server-rendered `/pipelines` dashboard and the `/oauth/authorize` consent page all link it, and
-`/pipelines` carries the same header and tabs as the SPA. The look is a calm admin console — a
-neutral palette, one blue accent, colour kept for status, white cards, sentence-case labels,
-monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every UI
+`/pipelines` carries the same header and tabs as the SPA. The SPA's mutation review adds
+`mutations.css` for its own layout, which reads only `app.css`'s tokens. The look is a calm
+admin console — a neutral palette, one blue accent, colour kept for status, white cards,
+sentence-case labels, monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every UI
 colour, radius and shadow is a token in its `:root`. The Feed reader's sandboxed frame cannot read
 those tokens, so `feed.js` resolves them and passes the values in. Two colour sets live elsewhere on
 purpose: the per-source identity dots in `format.js`, and the white frame that shows a sender's own

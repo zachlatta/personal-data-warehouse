@@ -190,7 +190,6 @@ button.ok:hover { filter: brightness(.95); }
 .day .d { color: var(--text); font-weight: 600; font-size: 13px; font-variant-numeric: tabular-nums; }
 .day .w { color: var(--text-3); font-size: 12px; font-weight: 500; text-transform: lowercase; }
 .day .w::first-letter { text-transform: uppercase; }
-.day .rule { display: none; }
 
 .row {
   --src: var(--text-3);
