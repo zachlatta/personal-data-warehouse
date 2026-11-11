@@ -380,155 +380,178 @@ func TestTimelineItemNotFound(t *testing.T) {
 	}
 }
 
-// slowCapableTimelineRunner adds the timelineSlowQuerier capability so tests
-// can observe which statements ride the long background budget.
-type slowCapableTimelineRunner struct {
-	fakeTimelineRunner
-	slowMu       sync.Mutex
-	slowSQL      []string
-	slowTimeouts []time.Duration
+// statsTimelineRunner answers the sidebar's count statements by what they
+// bind, so a test can tell an estimate from an exact count and see exactly
+// which values were counted.
+type statsTimelineRunner struct {
+	mu     sync.Mutex
+	stats  []map[string]any
+	exact  map[string]int64 // "source=x", "source=x,kind=y", "priority=x"
+	calls  []fakeArgsCall
+	oldest string
+	newest string
 }
 
-func (f *slowCapableTimelineRunner) QueryArgsWithTimeout(ctx context.Context, sql string, args []any, maxRows int, timeout time.Duration) (query.RawResult, error) {
-	f.slowMu.Lock()
-	f.slowSQL = append(f.slowSQL, sql)
-	f.slowTimeouts = append(f.slowTimeouts, timeout)
-	f.slowMu.Unlock()
-	return f.fakeTimelineRunner.QueryArgs(ctx, sql, args, maxRows)
+func (f *statsTimelineRunner) QueryArgs(_ context.Context, sql string, args []any, _ int) (query.RawResult, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, fakeArgsCall{SQL: sql, Args: args})
+	f.mu.Unlock()
+	switch sql {
+	case timelineCountStatsSQL:
+		return query.RawResult{Rows: f.stats}, nil
+	case timelineSpanSQL:
+		return query.RawResult{Rows: []map[string]any{{"oldest": f.oldest, "newest": f.newest}}}, nil
+	case timelineSourceCountSQL:
+		return f.count("source=" + fmt.Sprint(args[0])), nil
+	case timelineSourceKindCountSQL:
+		return f.count("source=" + fmt.Sprint(args[0]) + ",kind=" + fmt.Sprint(args[1])), nil
+	case timelinePriorityCountSQL:
+		return f.count("priority=" + fmt.Sprint(args[0])), nil
+	case timelineSyncStateSQL:
+		return query.RawResult{Rows: []map[string]any{{"adapter": "gmail_email"}}}, nil
+	}
+	return query.RawResult{}, fmt.Errorf("unexpected statement: %s", sql)
 }
 
-func TestTimelineSourcesAggregatesUseTheBackgroundStatementBudget(t *testing.T) {
-	// The sidebar count aggregates scan all of timeline.events and
-	// legitimately outlive the agent-facing statement timeout; they must run
-	// with their own budget or the cache would never warm. The fast sync-state
-	// read stays on the normal budget.
-	runner := &slowCapableTimelineRunner{}
+func (f *statsTimelineRunner) count(key string) query.RawResult {
+	return query.RawResult{Rows: []map[string]any{{"count": f.exact[key]}}}
+}
+
+func (f *statsTimelineRunner) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+type timelineCountsPayload struct {
+	Sources []struct {
+		Source    string `json:"source"`
+		Count     *int64 `json:"count"`
+		Estimated bool   `json:"estimated"`
+	} `json:"sources"`
+	Kinds []struct {
+		Kind      string `json:"kind"`
+		Count     *int64 `json:"count"`
+		Estimated bool   `json:"estimated"`
+	} `json:"kinds"`
+	Priorities []struct {
+		Priority  string `json:"priority"`
+		Count     *int64 `json:"count"`
+		Estimated bool   `json:"estimated"`
+	} `json:"priorities"`
+	Total  int64            `json:"total"`
+	Oldest string           `json:"oldest"`
+	Newest string           `json:"newest"`
+	Sync   []map[string]any `json:"sync"`
+}
+
+func TestTimelineSourcesCountWithoutScanningTheTimeline(t *testing.T) {
+	// The sidebar's GROUP BY source, kind read the whole 38 GB timeline heap
+	// (37 GB per call, 332 GB in 3.5 days on 2026-11-11, the largest reader
+	// in the database), flushing the search indexes out of the page cache.
+	// A common value's count is now the planner's own statistics; a rare one
+	// is counted exactly through an index, and only when its source is small.
+	runner := &statsTimelineRunner{
+		stats: []map[string]any{
+			{"dimension": "total", "name": "", "count": int64(2_000_200)},
+			{"dimension": "source", "name": "slack", "count": int64(2_000_000)},
+			{"dimension": "kind", "name": "message", "count": int64(1_900_000)},
+			{"dimension": "priority", "name": "noise", "count": int64(1_900_000)},
+		},
+		exact: map[string]int64{
+			"source=whoop":                       int64(7),
+			"source=whoop,kind=sleep":            int64(3),
+			"source=whoop,kind=recovery":         int64(2),
+			"source=apple_messages,kind=message": int64(99),
+			"priority=self":                      int64(150),
+		},
+		oldest: "2020-01-01T00:00:00Z",
+		newest: "2026-11-11T00:00:00Z",
+	}
 	svc := newTimelineService(runner, runner, nil, slog.Default())
-	if _, err := svc.buildSourcesPayload(context.Background()); err != nil {
-		t.Fatalf("buildSourcesPayload: %v", err)
-	}
-	if len(runner.slowSQL) != 2 {
-		t.Fatalf("slow-budget statements = %d (%q), want the two count aggregates", len(runner.slowSQL), runner.slowSQL)
-	}
-	for i, sql := range runner.slowSQL {
-		if !strings.Contains(sql, "GROUP BY") {
-			t.Fatalf("slow-budget statement %d is not an aggregate: %q", i, sql)
+	fetch := func() timelineCountsPayload {
+		recorder := httptest.NewRecorder()
+		svc.handleSources(recorder, httptest.NewRequest(http.MethodGet, "/api/timeline/sources", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("got %d: %s", recorder.Code, recorder.Body.String())
 		}
-		if runner.slowTimeouts[i] != timelineSourcesRefreshBudget {
-			t.Fatalf("slow-budget timeout = %s, want %s", runner.slowTimeouts[i], timelineSourcesRefreshBudget)
-		}
-	}
-}
-
-func TestTimelineSourcesAggregatesAndCaches(t *testing.T) {
-	runner := &fakeTimelineRunner{argResults: map[string]query.RawResult{
-		"GROUP BY source, kind": {Rows: []map[string]any{
-			{"source": "gmail", "kind": "email", "count": int64(10), "oldest": "2020-01-01T00:00:00Z", "newest": "2026-06-01T00:00:00Z"},
-		}},
-		"FROM " + warehouse.SQLRelation("timeline_sync_state"): {Rows: []map[string]any{
-			{"adapter": "gmail_email", "backfill_done": int64(1), "backfill_rows": int64(10)},
-		}},
-	}}
-	srv := newTimelineTestServer(t, runner)
-	type sourcesPayload struct {
-		Sources    []map[string]any `json:"sources"`
-		Sync       []map[string]any `json:"sync"`
-		Priorities []map[string]any `json:"priorities"`
-		Warming    bool             `json:"warming"`
-	}
-
-	// The aggregates never block a request: the first call returns a warming
-	// payload carrying only the fast sync rows while the aggregate builds in
-	// the background.
-	resp, body := timelineGET(t, srv, "/api/timeline/sources", true)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("got %d", resp.StatusCode)
-	}
-	var first sourcesPayload
-	if err := json.Unmarshal(body, &first); err != nil {
-		t.Fatal(err)
-	}
-	if !first.Warming || len(first.Sync) != 1 {
-		t.Fatalf("first payload should be warming with sync rows: %s", body)
-	}
-	if !timelinePayloadHasSourceKind(first.Sources, "gmail", "email") || !timelinePayloadHasSourceKind(first.Sources, "slack", "message") {
-		t.Fatalf("warming payload should include filter catalog so the sidebar is usable immediately: %s", body)
-	}
-	for _, kind := range []string{"health_cycle", "recovery", "sleep", "workout"} {
-		if !timelinePayloadHasSourceKind(first.Sources, "whoop", kind) {
-			t.Fatalf("warming payload should expose WHOOP %s filters immediately: %s", kind, body)
-		}
-	}
-	for _, pair := range [][2]string{
-		{"voice_memos", "voice_memo"},
-		{"finance", "transaction"},
-		{"finance", "balance_observation"},
-		{"finance", "document"},
-		{"chatgpt", "agent_session"},
-		{"claude_code", "agent_session"},
-		{"claude_desktop", "agent_session"},
-		{"codex", "agent_session"},
-		{"openclaw", "agent_session"},
-		{"pi", "agent_session"},
-		{"muse_code", "agent_session"},
-		{"argon", "agent_session"},
-	} {
-		if !timelinePayloadHasSourceKind(first.Sources, pair[0], pair[1]) {
-			t.Fatalf("warming payload missing %s/%s: %s", pair[0], pair[1], body)
-		}
-	}
-	if timelinePayloadHasSourceKind(first.Sources, "agent_sessions", "agent_session") {
-		t.Fatalf("warming payload must not expose synthetic agent_sessions source: %s", body)
-	}
-	if !timelinePayloadHasPriority(first.Priorities, "self") || !timelinePayloadHasPriority(first.Priorities, "background") {
-		t.Fatalf("warming payload should include priority catalog: %s", body)
-	}
-
-	var warmed sourcesPayload
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, body = timelineGET(t, srv, "/api/timeline/sources", true)
-		if err := json.Unmarshal(body, &warmed); err != nil {
+		var payload timelineCountsPayload
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 			t.Fatal(err)
 		}
-		if !warmed.Warming {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("sources cache never warmed: %s", body)
-		}
-		time.Sleep(10 * time.Millisecond)
+		return payload
 	}
-	if len(warmed.Sources) != 1 || len(warmed.Sync) != 1 {
-		t.Fatalf("warmed payload = %s", body)
+	payload := fetch()
+
+	for _, call := range runner.calls {
+		if strings.Contains(call.SQL, "GROUP BY") {
+			t.Fatalf("a whole-timeline aggregate ran: %s", call.SQL)
+		}
+	}
+	for _, call := range runner.calls {
+		if call.SQL == timelineSourceKindCountSQL && call.Args[0] == "slack" {
+			t.Fatalf("counted a kind inside a %d-row source row by row: %v", 2_000_000, call.Args)
+		}
 	}
 
-	callsAfterWarm := runner.callCount()
-	resp2, _ := timelineGET(t, srv, "/api/timeline/sources", true)
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("got %d", resp2.StatusCode)
+	source := map[string]struct {
+		count     *int64
+		estimated bool
+	}{}
+	for _, row := range payload.Sources {
+		source[row.Source] = struct {
+			count     *int64
+			estimated bool
+		}{row.Count, row.Estimated}
 	}
-	if runner.callCount() != callsAfterWarm {
-		t.Fatalf("cached read must not re-query; calls %d -> %d", callsAfterWarm, runner.callCount())
+	if got := source["slack"]; got.count == nil || *got.count != 2_000_000 || !got.estimated {
+		t.Fatalf("slack = %+v, want the 2,000,000 estimate", got)
 	}
-}
+	if got := source["whoop"]; got.count == nil || *got.count != 7 || got.estimated {
+		t.Fatalf("whoop = %+v, want an exact 7", got)
+	}
+	if _, ok := source["comma"]; !ok {
+		t.Fatalf("every catalog source must have a chip, even an empty one: %+v", payload.Sources)
+	}
 
-func timelinePayloadHasSourceKind(rows []map[string]any, source, kind string) bool {
-	for _, row := range rows {
-		if row["source"] == source && row["kind"] == kind {
-			return true
-		}
+	kind := map[string]*int64{}
+	estimatedKind := map[string]bool{}
+	for _, row := range payload.Kinds {
+		kind[row.Kind] = row.Count
+		estimatedKind[row.Kind] = row.Estimated
 	}
-	return false
-}
+	if got := kind["message"]; got == nil || *got != 1_900_000 || !estimatedKind["message"] {
+		t.Fatalf("message = %v, want the estimate", got)
+	}
+	if got := kind["sleep"]; got == nil || *got != 3 || estimatedKind["sleep"] {
+		t.Fatalf("sleep = %v, want an exact 3", got)
+	}
+	if got, ok := kind["file_share"]; !ok || got != nil {
+		t.Fatalf("file_share (only in the huge slack source) = %v, want a chip with no count", got)
+	}
 
-func timelinePayloadHasPriority(rows []map[string]any, priority string) bool {
-	for _, row := range rows {
-		if fmt.Sprint(row["priority"]) == priority {
-			return true
-		}
+	priority := map[string]*int64{}
+	for _, row := range payload.Priorities {
+		priority[row.Priority] = row.Count
 	}
-	return false
+	if got := priority["self"]; got == nil || *got != 150 {
+		t.Fatalf("self = %v, want an exact 150", got)
+	}
+	if got := priority["noise"]; got == nil || *got != 1_900_000 {
+		t.Fatalf("noise = %v, want the estimate", got)
+	}
+	if _, ok := priority["unclassified"]; ok {
+		t.Fatalf("the sidebar must not offer the unclassified sentinel: %+v", payload.Priorities)
+	}
+	if payload.Total != 2_000_200 || payload.Oldest == "" || payload.Newest == "" || len(payload.Sync) != 1 {
+		t.Fatalf("payload = %+v", payload)
+	}
+
+	calls := runner.callCount()
+	fetch()
+	if runner.callCount() != calls {
+		t.Fatalf("a read inside the cache window must not re-query; calls %d -> %d", calls, runner.callCount())
+	}
 }
 
 func TestTimelineChildQueriesCoverEveryEventTable(t *testing.T) {

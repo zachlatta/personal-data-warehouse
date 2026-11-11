@@ -35,9 +35,9 @@ export function mount(container, ctx) {
 
   const state = {
     cursor: "", exhausted: false, loading: false,
-    sources: {}, kinds: {}, priorities: {}, haveCounts: false,
+    sources: {}, kinds: {}, priorities: {},
     lastDay: "", selected: null, count: 0, jump: "", dead: false,
-    sourcesTimer: null, retryTimer: null,
+    sourcesTimer: null,
   };
 
   /* ---- filters ---- */
@@ -64,34 +64,20 @@ export function mount(container, ctx) {
   function loadSources() {
     return timeline.sources().then((body) => {
       if (state.dead) return;
-      // Counts are aggregated in the background server-side; retry until the
-      // first aggregate lands, rendering the sync panel in the meantime.
-      if (body.warming && !state.retryTimer) {
-        state.retryTimer = setTimeout(() => { state.retryTimer = null; loadSources().catch(() => {}); }, 8000);
-      }
-      if (!body.warming || !state.haveCounts) renderCounts(body);
+      renderCounts(body);
       renderSync(body);
     });
   }
 
+  // Counts of common values are Postgres's statistics estimates (estimated:
+  // true); rare values are exact. A null count is one the server would not
+  // walk the table to find.
   function renderCounts(body) {
-    const bySource = {}, byKind = {};
-    let total = 0, oldest = "", newest = "";
-    function addBucket(buckets, key, rowCount, known) {
-      if (!buckets[key]) buckets[key] = { count: 0, known: false };
-      if (known) { buckets[key].count += rowCount; buckets[key].known = true; }
-    }
-    (body.sources || []).forEach((row) => {
-      const known = typeof row.count === "number" && isFinite(row.count);
-      const rowCount = known ? row.count : 0;
-      if (known) total += rowCount;
-      addBucket(bySource, row.source, rowCount, known);
-      addBucket(byKind, row.kind, rowCount, known);
-      if (row.oldest && (!oldest || row.oldest < oldest)) oldest = row.oldest;
-      if (row.newest && (!newest || row.newest > newest)) newest = row.newest;
-    });
-    function toCatalog(counts) {
-      const list = Object.keys(counts).map((key) => ({ name: key, count: counts[key].known ? counts[key].count : null }));
+    function toCatalog(rows, key) {
+      const list = (rows || []).map((row) => ({
+        name: row[key],
+        count: (typeof row.count === "number" && isFinite(row.count)) ? row.count : null,
+      }));
       list.sort((a, b) => {
         const ak = typeof a.count === "number", bk = typeof b.count === "number";
         if (ak && bk && a.count !== b.count) return b.count - a.count;
@@ -100,19 +86,16 @@ export function mount(container, ctx) {
       });
       return list;
     }
-    renderChips(el("srclist"), toCatalog(bySource), state.sources, true);
-    renderChips(el("kindlist"), toCatalog(byKind), state.kinds, false);
+    renderChips(el("srclist"), toCatalog(body.sources, "source"), state.sources, true);
+    renderChips(el("kindlist"), toCatalog(body.kinds, "kind"), state.kinds, false);
     const priorityCatalog = (body.priorities || []).map((row) => ({ name: row.priority, label: row.priority, count: row.count }));
     renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
-    if (body.warming) {
-      ctx.setStats("warming filter counts…");
-    } else {
-      state.haveCounts = true;
-      const stats = h("span");
-      stats.appendChild(h("b", "", total.toLocaleString()));
-      stats.appendChild(document.createTextNode(" events · " + (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—")));
-      ctx.setStats(stats);
-    }
+    const total = typeof body.total === "number" ? body.total : 0;
+    const oldest = body.oldest || "", newest = body.newest || "";
+    const stats = h("span");
+    stats.appendChild(h("b", "", "≈" + total.toLocaleString()));
+    stats.appendChild(document.createTextNode(" events · " + (oldest ? oldest.slice(0, 10) : "—") + " → " + (newest ? newest.slice(0, 10) : "—")));
+    ctx.setStats(stats);
   }
 
   function renderSync(body) {
@@ -255,7 +238,6 @@ export function mount(container, ctx) {
       state.dead = true;
       observer.disconnect();
       clearInterval(state.sourcesTimer);
-      if (state.retryTimer) clearTimeout(state.retryTimer);
     },
   };
 }

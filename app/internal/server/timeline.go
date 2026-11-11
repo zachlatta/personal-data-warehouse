@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,14 +19,6 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
-// timelineSlowQuerier is the optional capability for app-internal background
-// aggregates whose legitimate runtime exceeds the agent-facing statement
-// budget (the sidebar's full-table counts take minutes cold). Fakes without it
-// fall back to the plain QueryArgs budget.
-type timelineSlowQuerier interface {
-	QueryArgsWithTimeout(ctx context.Context, statement string, args []any, maxRows int, timeout time.Duration) (query.RawResult, error)
-}
-
 // timelineQuerier is the parameterized-query capability the timeline endpoints
 // need. *query.PostgresRunner implements it; the plain fake runner used by
 // unrelated tests does not, in which case the timeline endpoints simply are
@@ -35,20 +28,10 @@ type timelineQuerier interface {
 }
 
 const (
-	timelineDefaultPageSize = 60
-	timelineMaxPageSize     = 200
-	// The sidebar count aggregates scan all of timeline.events (~85s of
-	// database time per refresh in production); counts of a 42M-row table do
-	// not need minute-level freshness, and the handler already serves the
-	// stale payload while a background refresh runs. `?refresh=` still forces
-	// an immediate rebuild.
-	timelineSourcesCacheTTL   = 24 * time.Hour
+	timelineDefaultPageSize   = 60
+	timelineMaxPageSize       = 200
 	timelineDetailFieldChars  = 50000
 	timelineChildRowFieldChar = 4000
-	// Statement budget for the background sidebar-count aggregates; they scan
-	// all of timeline.events and legitimately outlive the agent-facing query
-	// timeout.
-	timelineSourcesRefreshBudget = 10 * time.Minute
 )
 
 // timelineMediaSigner mints signed /objects/ download links for inline media
@@ -85,10 +68,9 @@ type timelineService struct {
 	// pages (the mutation review UI).
 	baseURL string
 
-	mu                sync.Mutex
-	sourcesPayload    []byte
-	sourcesFetched    time.Time
-	sourcesRefreshing bool
+	mu             sync.Mutex
+	sourcesPayload []byte
+	sourcesFetched time.Time
 
 	linksMu            sync.Mutex
 	slackDomainCache   map[string]string
@@ -226,19 +208,51 @@ func timelineItemJSON(row map[string]any) map[string]any {
 	return item
 }
 
-// --- sources / sync status ----------------------------------------------------
+// --- sidebar counts -----------------------------------------------------------
+//
+// The sidebar used to GROUP BY source, kind over the whole timeline: 37 GB of
+// heap per call, 332 GB in the 3.5 days to 2026-11-11 and the largest reader
+// in the database, and every call pushed the search indexes out of the page
+// cache. Its counts are filter-chip labels, so they now come from what
+// Postgres already knows:
+//
+//   - a value common enough to be in the column's most-common-values list is
+//     its statistics frequency times the table's row estimate (refreshed by
+//     every autoanalyze, ~1.3M changed rows on this table);
+//   - a rarer value is counted exactly through an index with the value bound,
+//     so it is planned for that value (the smallest MCV entry is ~5k rows, so
+//     everything below it is cheap). A rare kind inside a source too large to
+//     walk has no count rather than a scan;
+//   - oldest/newest are the time index's two endpoints.
 
-var timelineSourcesSQL = `
-SELECT source, kind, count(*)::bigint AS count, min(occurred_at) AS oldest, max(occurred_at) AS newest
-FROM ` + warehouse.SQLRelation("timeline_events") + `
-GROUP BY source, kind
-ORDER BY source, kind`
+// timelineCountStatsSQL returns the planner's statistics for the timeline's
+// filter columns: one row per most-common value plus the row estimate.
+var timelineCountStatsSQL = `
+SELECT s.attname::text AS dimension, m.val AS name,
+       round(m.freq * greatest(c.reltuples, 0))::bigint AS count
+FROM pg_stats s
+JOIN pg_namespace n ON n.nspname = s.schemaname
+JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = s.tablename
+CROSS JOIN LATERAL unnest(s.most_common_vals::text::text[], s.most_common_freqs) AS m(val, freq)
+WHERE c.oid = '` + warehouse.SQLRelation("timeline_events") + `'::regclass
+  AND s.attname IN ('source', 'kind', 'priority')
+UNION ALL
+SELECT 'total', '', greatest(c.reltuples, 0)::bigint
+FROM pg_class c
+WHERE c.oid = '` + warehouse.SQLRelation("timeline_events") + `'::regclass`
 
-var timelinePrioritiesSQL = `
-SELECT priority, count(*)::bigint AS count
-FROM ` + warehouse.SQLRelation("timeline_events") + `
-GROUP BY priority
-ORDER BY priority`
+var timelineSourceCountSQL = `
+SELECT count(*)::bigint AS count FROM ` + warehouse.SQLRelation("timeline_events") + ` WHERE source = $1`
+
+var timelineSourceKindCountSQL = `
+SELECT count(*)::bigint AS count FROM ` + warehouse.SQLRelation("timeline_events") + ` WHERE source = $1 AND kind = $2`
+
+var timelinePriorityCountSQL = `
+SELECT count(*)::bigint AS count FROM ` + warehouse.SQLRelation("timeline_events") + `
+WHERE priority = $1::` + warehouse.SQLRelation("timeline_priority")
+
+var timelineSpanSQL = `
+SELECT min(occurred_at) AS oldest, max(occurred_at) AS newest FROM ` + warehouse.SQLRelation("timeline_events")
 
 var timelineSyncStateSQL = `
 SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremental_rows,
@@ -246,14 +260,25 @@ SELECT adapter, backfill_done, backfill_cursor_event_ts, backfill_rows, incremen
 FROM ` + warehouse.SQLRelation("timeline_sync_state") + `
 ORDER BY adapter`
 
+// timelineExactKindSourceCeiling bounds the one count that walks heap rows:
+// a rare kind inside a source is counted only when the whole source is at
+// most this many rows (the slowest such count on 2026-11-11 was 161 ms for a
+// 110k-row source).
+const timelineExactKindSourceCeiling = 1_000_000
+
+// timelineCountsCacheTTL is how long one set of counts is served. They cost
+// tens of milliseconds now; the cache only spares a reloading page.
+const timelineCountsCacheTTL = 10 * time.Minute
+
 type timelineFilterCatalogEntry struct {
 	source string
 	kind   string
 }
 
-// A cheap static catalog keeps the sidebar usable while the expensive exact
-// count aggregates warm in the background. Keep this list in step with the
-// Python timeline adapter registry in src/personal_data_warehouse/timeline.py.
+// The sidebar's filter values. Every one gets a chip even when it has no rows,
+// and it is how a rare kind finds the sources to count it in. Keep this list in
+// step with the Python timeline adapter registry in
+// src/personal_data_warehouse/timeline.py.
 var timelineFilterCatalog = []timelineFilterCatalogEntry{
 	{source: "android_location", kind: "location"},
 	{source: "gmail", kind: "email"},
@@ -324,112 +349,215 @@ var timelineFilterCatalog = []timelineFilterCatalogEntry{
 // needs a sidebar filter chip.
 var timelinePriorityCatalog = warehouse.TimelinePriorityTierNames()
 
-// handleSources serves the sidebar's counts. The aggregates behind them scan
-// the whole timeline (minutes on a cold multi-GB table), so the handler never
-// makes a request wait for them: it serves the cached payload (refreshing in
-// the background once stale), and before the first aggregate completes it
-// serves a "warming" payload carrying just the fast sync-state rows so the
-// page renders immediately and retries for counts.
+// handleSources serves the sidebar's filter counts, the timeline's span and
+// the adapters' sync state. See timelineCountStatsSQL for why the counts are
+// statistics and index counts rather than an aggregate.
 func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	cached := s.sourcesPayload
-	stale := time.Since(s.sourcesFetched) >= timelineSourcesCacheTTL
+	fresh := cached != nil && time.Since(s.sourcesFetched) < timelineCountsCacheTTL
 	s.mu.Unlock()
-
-	if cached == nil || stale || r.URL.Query().Get("refresh") != "" {
-		s.refreshSourcesAsync()
-	}
-	if cached != nil {
+	if fresh && r.URL.Query().Get("refresh") == "" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(cached)
 		return
 	}
-	syncRows, err := s.timeline.QueryArgs(r.Context(), timelineSyncStateSQL, nil, 1000)
+	payload, err := s.buildSourcesPayload(r.Context())
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "timeline sync state query failed", "error", err)
-		httpError(w, http.StatusInternalServerError, "timeline sync state query failed")
+		s.logger.ErrorContext(r.Context(), "timeline sources query failed", "error", err)
+		httpError(w, http.StatusInternalServerError, "timeline sources query failed")
 		return
 	}
-	writeJSON(w, map[string]any{
-		"sources":    timelineFilterCatalogRows(),
-		"sync":       nonNilRows(syncRows.Rows),
-		"priorities": timelinePriorityCatalogRows(),
-		"warming":    true,
-	})
-}
-
-func timelineFilterCatalogRows() []map[string]any {
-	rows := make([]map[string]any, 0, len(timelineFilterCatalog))
-	for _, entry := range timelineFilterCatalog {
-		rows = append(rows, map[string]any{
-			"source": entry.source,
-			"kind":   entry.kind,
-			"count":  nil,
-			"oldest": nil,
-			"newest": nil,
-		})
-	}
-	return rows
-}
-
-func timelinePriorityCatalogRows() []map[string]any {
-	rows := make([]map[string]any, 0, len(timelinePriorityCatalog))
-	for _, priority := range timelinePriorityCatalog {
-		rows = append(rows, map[string]any{"priority": priority, "count": nil})
-	}
-	return rows
-}
-
-func (s *timelineService) refreshSourcesAsync() {
 	s.mu.Lock()
-	if s.sourcesRefreshing {
-		s.mu.Unlock()
-		return
-	}
-	s.sourcesRefreshing = true
+	s.sourcesPayload = payload
+	s.sourcesFetched = time.Now()
 	s.mu.Unlock()
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		defer cancel()
-		payload, err := s.buildSourcesPayload(ctx)
-		s.mu.Lock()
-		s.sourcesRefreshing = false
-		if err == nil {
-			s.sourcesPayload = payload
-			s.sourcesFetched = time.Now()
-		}
-		s.mu.Unlock()
-		if err != nil {
-			s.logger.Error("timeline sources refresh failed", "error", err)
-		}
-	}()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(payload)
 }
 
-func (s *timelineService) slowQueryArgs(ctx context.Context, statement string, maxRows int) (query.RawResult, error) {
-	if slow, ok := s.timeline.(timelineSlowQuerier); ok {
-		return slow.QueryArgsWithTimeout(ctx, statement, nil, maxRows, timelineSourcesRefreshBudget)
+// timelineCount is one filter chip's count: nil when it is not known.
+type timelineCount struct {
+	count     *int64
+	estimated bool
+}
+
+func (s *timelineService) exactCount(ctx context.Context, statement string, args ...any) (int64, error) {
+	result, err := s.timeline.QueryArgs(ctx, statement, args, 1)
+	if err != nil {
+		return 0, err
 	}
-	return s.timeline.QueryArgs(ctx, statement, nil, maxRows)
+	if len(result.Rows) == 0 {
+		return 0, nil
+	}
+	return timelineInt64(result.Rows[0]["count"]), nil
+}
+
+func timelineInt64(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int32:
+		return int64(v)
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case string:
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	}
+	return 0
 }
 
 func (s *timelineService) buildSourcesPayload(ctx context.Context) ([]byte, error) {
-	sources, err := s.slowQueryArgs(ctx, timelineSourcesSQL, 10000)
+	stats, err := s.timeline.QueryArgs(ctx, timelineCountStatsSQL, nil, 10000)
 	if err != nil {
-		return nil, fmt.Errorf("sources aggregate: %w", err)
+		return nil, fmt.Errorf("timeline statistics: %w", err)
+	}
+	common := map[string]map[string]int64{"source": {}, "kind": {}, "priority": {}}
+	var total int64
+	for _, row := range stats.Rows {
+		dimension, name := fmt.Sprint(row["dimension"]), fmt.Sprint(row["name"])
+		if dimension == "total" {
+			total = timelineInt64(row["count"])
+			continue
+		}
+		if values, ok := common[dimension]; ok {
+			values[name] = timelineInt64(row["count"])
+		}
+	}
+
+	// Every catalog value gets a chip, plus any common value the catalog
+	// does not list yet.
+	var sourceNames, kindNames []string
+	seenSource, seenKind := map[string]bool{}, map[string]bool{}
+	for _, entry := range timelineFilterCatalog {
+		if !seenSource[entry.source] {
+			seenSource[entry.source] = true
+			sourceNames = append(sourceNames, entry.source)
+		}
+		if !seenKind[entry.kind] {
+			seenKind[entry.kind] = true
+			kindNames = append(kindNames, entry.kind)
+		}
+	}
+	for _, name := range sortedKeys(common["source"]) {
+		if !seenSource[name] {
+			seenSource[name] = true
+			sourceNames = append(sourceNames, name)
+		}
+	}
+	for _, name := range sortedKeys(common["kind"]) {
+		if !seenKind[name] {
+			seenKind[name] = true
+			kindNames = append(kindNames, name)
+		}
+	}
+
+	sources := make(map[string]timelineCount, len(sourceNames))
+	for _, name := range sourceNames {
+		if n, ok := common["source"][name]; ok {
+			sources[name] = timelineCount{count: &n, estimated: true}
+			continue
+		}
+		n, err := s.exactCount(ctx, timelineSourceCountSQL, name)
+		if err != nil {
+			return nil, fmt.Errorf("count source %s: %w", name, err)
+		}
+		sources[name] = timelineCount{count: &n}
+	}
+
+	kinds := make(map[string]timelineCount, len(kindNames))
+	for _, name := range kindNames {
+		if n, ok := common["kind"][name]; ok {
+			kinds[name] = timelineCount{count: &n, estimated: true}
+			continue
+		}
+		var sum int64
+		known := true
+		for _, entry := range timelineFilterCatalog {
+			if entry.kind != name {
+				continue
+			}
+			size := sources[entry.source].count
+			if size == nil || *size > timelineExactKindSourceCeiling {
+				known = false
+				break
+			}
+			if *size == 0 {
+				continue
+			}
+			n, err := s.exactCount(ctx, timelineSourceKindCountSQL, entry.source, name)
+			if err != nil {
+				return nil, fmt.Errorf("count kind %s in %s: %w", name, entry.source, err)
+			}
+			sum += n
+		}
+		if known {
+			kinds[name] = timelineCount{count: &sum}
+		} else {
+			kinds[name] = timelineCount{}
+		}
+	}
+
+	priorities := make([]map[string]any, 0, len(timelinePriorityCatalog))
+	for _, name := range timelinePriorityCatalog {
+		if n, ok := common["priority"][name]; ok {
+			priorities = append(priorities, map[string]any{"priority": name, "count": n, "estimated": true})
+			continue
+		}
+		n, err := s.exactCount(ctx, timelinePriorityCountSQL, name)
+		if err != nil {
+			return nil, fmt.Errorf("count priority %s: %w", name, err)
+		}
+		priorities = append(priorities, map[string]any{"priority": name, "count": n, "estimated": false})
+	}
+
+	span, err := s.timeline.QueryArgs(ctx, timelineSpanSQL, nil, 1)
+	if err != nil {
+		return nil, fmt.Errorf("timeline span: %w", err)
+	}
+	var oldest, newest any
+	if len(span.Rows) > 0 {
+		oldest, newest = span.Rows[0]["oldest"], span.Rows[0]["newest"]
 	}
 	syncRows, err := s.timeline.QueryArgs(ctx, timelineSyncStateSQL, nil, 1000)
 	if err != nil {
 		return nil, fmt.Errorf("sync state: %w", err)
 	}
-	priorities, err := s.slowQueryArgs(ctx, timelinePrioritiesSQL, 100)
-	if err != nil {
-		return nil, fmt.Errorf("priorities aggregate: %w", err)
-	}
+
 	return json.Marshal(map[string]any{
-		"sources":    nonNilRows(sources.Rows),
+		"sources":    timelineCountRows("source", sourceNames, sources),
+		"kinds":      timelineCountRows("kind", kindNames, kinds),
+		"priorities": priorities,
+		"total":      total,
+		"oldest":     oldest,
+		"newest":     newest,
 		"sync":       nonNilRows(syncRows.Rows),
-		"priorities": nonNilRows(priorities.Rows),
 	})
+}
+
+func timelineCountRows(key string, names []string, counts map[string]timelineCount) []map[string]any {
+	rows := make([]map[string]any, 0, len(names))
+	for _, name := range names {
+		count := counts[name]
+		row := map[string]any{key: name, "count": nil, "estimated": count.estimated}
+		if count.count != nil {
+			row["count"] = *count.count
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func sortedKeys(values map[string]int64) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func nonNilRows(rows []map[string]any) []map[string]any {
