@@ -63,6 +63,7 @@ var ErrNotFound = errors.New("token not found")
 // Token is one row of private.app_access_tokens, without its secret. Zero
 // times mean "never" (the warehouse stores the epoch).
 type Token struct {
+	RequestCount    int64         `json:"request_count"`
 	ID              string        `json:"id"`
 	Kind            string        `json:"kind"`
 	Scope           pdwauth.Scope `json:"scope"`
@@ -114,6 +115,7 @@ type Store interface {
 	Insert(ctx context.Context, token Token, secretHash string) error
 	Get(ctx context.Context, id string) (Token, string, error)
 	Touch(ctx context.Context, id string, at time.Time) error
+	RecordFeedUse(ctx context.Context, id string, at time.Time) error
 	List(ctx context.Context) ([]Token, error)
 	Revoke(ctx context.Context, id string, at time.Time) error
 	// Redeem locks the bootstrap row codeID, calls mint with it and its
@@ -162,13 +164,16 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 		scope = pdwauth.ScopeFull
 	}
 	if !scope.Issuable() {
-		return Issued{}, fmt.Errorf("scope must be %q or %q", pdwauth.ScopeFull, pdwauth.ScopeAgent)
+		return Issued{}, fmt.Errorf("scope must be %q, %q or %q", pdwauth.ScopeFull, pdwauth.ScopeAgent, pdwauth.ScopeVoiceFeed)
 	}
 	idle := req.IdleTimeout
 	if idle == 0 {
 		idle = DefaultIdleTimeout
 	}
-	if idle < MinIdleTimeout || idle > MaxIdleTimeout {
+	if scope == pdwauth.ScopeVoiceFeed {
+		idle = 0
+	}
+	if scope != pdwauth.ScopeVoiceFeed && (idle < MinIdleTimeout || idle > MaxIdleTimeout) {
 		return Issued{}, fmt.Errorf("idle timeout must be between %s and %s", MinIdleTimeout, MaxIdleTimeout)
 	}
 	if req.TTL < 0 {
@@ -224,7 +229,7 @@ func (s *Service) AuthenticateToken(ctx context.Context, raw string) (pdwauth.Pr
 	if status := token.Status(now); status != StatusActive {
 		return pdwauth.Principal{}, &pdwauth.TokenRejectedError{Reason: rejectionReason(token, status)}
 	}
-	if now.Sub(token.LastUsedAt) >= touchEvery {
+	if token.Scope != pdwauth.ScopeVoiceFeed && now.Sub(token.LastUsedAt) >= touchEvery {
 		if err := s.store.Touch(ctx, id, now); err != nil {
 			// A missed touch costs at most a minute of idle clock; it is not
 			// worth failing an otherwise valid request over.
@@ -401,4 +406,8 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dd", d/(24*time.Hour))
 	}
 	return d.String()
+}
+
+func (s *Service) RecordFeedUse(ctx context.Context, id string) error {
+	return s.store.RecordFeedUse(ctx, id, s.now().UTC())
 }

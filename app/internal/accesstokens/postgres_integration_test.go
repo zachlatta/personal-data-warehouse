@@ -33,6 +33,17 @@ func postgresService(t *testing.T) (*Service, *PostgresStore, *clock) {
 func TestPostgresStoreRoundTripsTheTokenLifecycle(t *testing.T) {
 	svc, store, c := postgresService(t)
 	ctx := context.Background()
+	feed := mustIssue(t, svc, IssueRequest{ClientName: "feed-consumer", Scope: pdwauth.ScopeVoiceFeed})
+	for i := 0; i < 2; i++ {
+		c.Advance(time.Second)
+		if err := svc.RecordFeedUse(ctx, feed.Token.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	used, _, err := store.Get(ctx, feed.Token.ID)
+	if err != nil || used.RequestCount != 2 || !used.LastUsedAt.Equal(c.Now()) {
+		t.Fatalf("feed usage: %+v %v", used, err)
+	}
 	busy := mustIssue(t, svc, IssueRequest{ClientName: "pg-busy", Label: "integration", IdleTimeout: 2 * time.Hour, CreatedBy: "test"})
 	idle := mustIssue(t, svc, IssueRequest{ClientName: "pg-idle", IdleTimeout: 2 * time.Hour})
 	bounded := mustIssue(t, svc, IssueRequest{ClientName: "pg-bounded", TTL: 3 * time.Hour})

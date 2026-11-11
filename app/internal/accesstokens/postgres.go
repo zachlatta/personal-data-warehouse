@@ -40,11 +40,12 @@ var ensureStatements = []string{
 		redeemed_token_id text NOT NULL DEFAULT '',
 		updated_at timestamptz NOT NULL DEFAULT now()
 	)`,
+	`ALTER TABLE @app_access_tokens ADD COLUMN IF NOT EXISTS request_count bigint NOT NULL DEFAULT 0`,
 	`CREATE INDEX IF NOT EXISTS app_access_tokens_updated_idx ON @app_access_tokens (updated_at)`,
 }
 
 const tokenColumns = `id, kind, scope, client_name, label, created_by, secret_sha256, created_at, last_used_at,
-	idle_timeout_seconds, expires_at, revoked_at, grant_ttl_seconds, redeemed_at, redeemed_token_id`
+	idle_timeout_seconds, expires_at, revoked_at, grant_ttl_seconds, redeemed_at, redeemed_token_id, request_count`
 
 // PostgresStore keeps tokens in private.app_access_tokens.
 type PostgresStore struct {
@@ -108,11 +109,11 @@ type execer interface {
 func insertToken(ctx context.Context, db execer, token Token, hash string) error {
 	_, err := db.ExecContext(ctx, warehouse.ExpandRelations(`
 		INSERT INTO @app_access_tokens (`+tokenColumns+`, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $8)`),
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $8)`),
 		token.ID, token.Kind, string(token.Scope), token.ClientName, token.Label, token.CreatedBy, hash,
 		token.CreatedAt.UTC(), token.LastUsedAt.UTC(), int64(token.IdleTimeout/time.Second),
 		toDB(token.ExpiresAt), toDB(token.RevokedAt), int64(token.GrantTTL/time.Second),
-		toDB(token.RedeemedAt), token.RedeemedTokenID)
+		toDB(token.RedeemedAt), token.RedeemedTokenID, token.RequestCount)
 	return err
 }
 
@@ -124,7 +125,7 @@ func scanToken(row scanner) (Token, string, error) {
 	var idle, grant int64
 	var expires, revoked, redeemed time.Time
 	if err := row.Scan(&t.ID, &t.Kind, &scope, &t.ClientName, &t.Label, &t.CreatedBy, &hash, &t.CreatedAt, &t.LastUsedAt,
-		&idle, &expires, &revoked, &grant, &redeemed, &t.RedeemedTokenID); err != nil {
+		&idle, &expires, &revoked, &grant, &redeemed, &t.RedeemedTokenID, &t.RequestCount); err != nil {
 		return Token{}, "", err
 	}
 	t.Scope = pdwauth.Scope(scope)
@@ -254,4 +255,14 @@ func fromDB(t time.Time) time.Time {
 		return time.Time{}
 	}
 	return t.UTC()
+}
+
+func (s *PostgresStore) RecordFeedUse(ctx context.Context, id string, at time.Time) error {
+	ctx, cancel, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	_, err = s.db.ExecContext(ctx, warehouse.ExpandRelations(`UPDATE @app_access_tokens SET request_count=request_count+1,last_used_at=GREATEST(last_used_at,$2),updated_at=GREATEST(updated_at,$2) WHERE id=$1`), id, at)
+	return err
 }

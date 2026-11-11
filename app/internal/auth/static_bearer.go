@@ -70,6 +70,10 @@ func (s *Service) RequireStaticBearer() func(http.Handler) http.Handler {
 			}
 			if !principal.Allows(r.URL.Path) {
 				s.logger.WarnContext(r.Context(), "static bearer scope denied", "client", name, "token_id", principal.TokenID, "scope", principal.Scope, "path", r.URL.Path)
+				if principal.Scope == ScopeVoiceFeed {
+					http.Error(w, "this token reaches only "+VoiceFeedPath, http.StatusForbidden)
+					return
+				}
 				http.Error(w, "this token's scope ("+string(principal.Scope)+") reaches only "+agentToolsPath+", the warehouse tools API the pdw CLI uses", http.StatusForbidden)
 				return
 			}

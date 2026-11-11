@@ -270,3 +270,8 @@ then drill into `base_android_location.samples`. `measured_at` is when the fix w
 `received_at` is server receipt, not evidence of a current fix. `accuracy_m` is the reported
 radius in metres. A roughly 15 minute cadence is a target, not a guarantee; missing samples
 and old measurements must not be treated as proof of presence or absence.
+
+External consumers: the web app's `/external-feeds` page issues scoped voice-memo
+keys. `GET /api/external-feeds/voice-memos` exposes only the last 48 hours after
+transcription and recording enrichment, including unmatched calendar outcomes;
+merged-session enrichment is separate. Feed keys cannot access warehouse tools.

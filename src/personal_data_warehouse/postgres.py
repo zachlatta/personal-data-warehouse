@@ -1585,6 +1585,24 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
 
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    # The external voice feed reads the mart's newest completed attempt per
+    # recording on every poll. Match its DISTINCT ON ordering, including ties.
+    IndexSpec(
+        "voice_enrichments_completed_lookup_idx",
+        "apple_voice_memos_enrichments",
+        "CREATE INDEX IF NOT EXISTS voice_enrichments_completed_lookup_idx "
+        "ON @apple_voice_memos_enrichments "
+        "(source, account, recording_id, created_at DESC, provider DESC, model DESC, prompt_version DESC) "
+        "WHERE status = 'completed'",
+    ),
+    IndexSpec(
+        "voice_transcriptions_completed_lookup_idx",
+        "apple_voice_memos_transcription_runs",
+        "CREATE INDEX IF NOT EXISTS voice_transcriptions_completed_lookup_idx "
+        "ON @apple_voice_memos_transcription_runs "
+        "(source, account, recording_id, completed_at DESC, requested_at DESC, provider DESC) "
+        "WHERE status = 'completed'",
+    ),
     IndexSpec(
         "finance_transactions_account_time_idx",
         "finance_transactions",
@@ -9273,6 +9291,7 @@ class PostgresWarehouse:
                 updated_at timestamptz NOT NULL DEFAULT now()
             )
             """,
+            "ALTER TABLE @app_access_tokens ADD COLUMN IF NOT EXISTS request_count bigint NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS app_access_tokens_updated_idx ON @app_access_tokens (updated_at)",
         ):
             self._command(sql)

@@ -149,3 +149,40 @@ rotate:
    window authorizes again.
 4. Unset `PDW_SECRET_TOKEN_PREVIOUS` and deploy. Anything still signed only with the old
    secret stops verifying.
+
+## External feeds
+
+The web app's **External feeds** tab (`/external-feeds`) issues dedicated keys,
+shows creation, optional absolute expiry, last use and lifetime request counts,
+and revokes keys. Administration uses the same root-only `/api/auth/tokens`
+API as `pdw token`. Keys are shown once and stored only as SHA-256 hashes in
+`private.app_access_tokens`; no new credential table or upstream MCP connection
+is created. The name “External feeds” distinguishes these outgoing read interfaces
+from **Connections**, which proxies upstream MCP tools.
+
+The first scope is `feed:voice-memos`. It permits only
+`GET /api/external-feeds/voice-memos`, with
+`Authorization: Bearer <client>:<key>`. A feed key cannot query SQL, use MCP,
+read other PDW endpoints or administer keys. Other credentials cannot read the
+feed; issue a dedicated key. Feed keys have no idle expiry; an optional
+`expires_at` (RFC3339, in the future) is a hard deadline. Revocation and expiry
+are checked on every request, including conditional requests.
+
+The response is `{feed: "voice-memos", recordings: [...], next_offset: null}`.
+Each recording includes `source`, `account`, `recording_id`, `content_sha256`,
+`recorded_at`, duration, title, summary, transcript, participants/action-items/evidence
+JSON text, calendar result and transcription/enrichment timestamps. Storage URLs
+and audio credentials are excluded. Identity is the source/account/recording-id
+triple; use `enriched_at` to detect revised enrichment.
+
+Poll once per second. Retain each page's `ETag` and send `If-None-Match`; unchanged
+pages return 304. A response has at most 200 recordings, newest enrichment first;
+follow `?offset=<next_offset>` until null. Rescan pages after a first-page change
+and periodically, deduplicating by identity and enrichment timestamp (pages are
+live, not snapshot cursors). The process shares a one-second page cache and limits
+each database read to two seconds. The 48-hour window is based on recording time,
+not enrichment or upload time. Cached pages expire at the earliest recording
+cutoff or after one second. Usage counts every authorized GET, including 304 and
+failed feed reads, and stamps last use on each request. Counters are constant space per key;
+there is no unbounded per-poll log. If usage cannot be recorded, the feed returns
+503 rather than serving an untracked request.

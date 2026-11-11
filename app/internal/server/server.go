@@ -267,6 +267,21 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	authSvc.SetTokenAuthenticator(tokenSvc)
 	authSvc.SetOAuthGrants(tokenSvc)
 	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
+	voiceFeed := newVoiceFeed(runner)
+	mux.Handle(pdwauth.VoiceFeedPath, authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, _ := pdwauth.PrincipalFromContext(r.Context())
+		if p.Scope != pdwauth.ScopeVoiceFeed {
+			http.Error(w, "use a dedicated voice-memos feed key", http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodGet {
+			if err := tokenSvc.RecordFeedUse(r.Context(), p.TokenID); err != nil {
+				http.Error(w, "usage store unavailable", 503)
+				return
+			}
+		}
+		voiceFeed.ServeHTTP(w, r)
+	})))
 	// The pdw installer and its release, proxied from GitHub so a sandbox
 	// whose egress GitHub refuses can still install the CLI.
 	clirelease.Register(mux, clirelease.New(clirelease.Options{Logger: logger.With("component", "cli_release")}), baseURL)

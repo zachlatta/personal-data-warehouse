@@ -15,6 +15,9 @@ const (
 	// ScopeRoot is the master secret (PDW_SECRET_TOKEN): every surface,
 	// including token administration.
 	ScopeRoot Scope = "root"
+	// ScopeVoiceFeed is a dedicated external connection: no warehouse or admin access.
+	ScopeVoiceFeed Scope = "feed:voice-memos"
+	VoiceFeedPath        = "/api/external-feeds/voice-memos"
 	// ScopeFull is an issued token: every bearer surface except token
 	// administration, so a leaked token cannot mint its own successor.
 	ScopeFull Scope = "full"
@@ -29,7 +32,7 @@ const (
 
 // Issuable reports whether s is one of the scopes an issued token may carry.
 // Root is never issued: it is the master secret.
-func (s Scope) Issuable() bool { return s == ScopeFull || s == ScopeAgent }
+func (s Scope) Issuable() bool { return s == ScopeFull || s == ScopeAgent || s == ScopeVoiceFeed }
 
 // agentToolsPath is the whole surface an agent-scoped token reaches.
 const agentToolsPath = "/api/tools"
@@ -46,6 +49,8 @@ func (p Principal) Allows(path string) bool {
 	switch p.Scope {
 	case ScopeRoot, ScopeFull:
 		return true
+	case ScopeVoiceFeed:
+		return path == VoiceFeedPath
 	case ScopeAgent:
 		return path == agentToolsPath || strings.HasPrefix(path, agentToolsPath+"/")
 	}
