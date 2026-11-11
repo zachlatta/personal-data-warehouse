@@ -120,6 +120,11 @@ export type MutationRequestStatus =
   | 'withdrawn';
 
 export type Mutation = {
+  // A step's own schedule: when it may run, its deadline, and what is
+  // checked right before it runs (thermostat steps only).
+  not_before?: string | null;
+  not_after?: string | null;
+  precondition?: Record<string, unknown> | null;
   id: string;
   request_id: string;
   request_index: number;
@@ -179,6 +184,11 @@ export type MutationRequest = {
   policy?: Record<string, unknown> | null;
   // The detail read says whether Undo applies: a thermostat change that ran.
   can_undo?: boolean;
+  // ...and whether Cancel does: an approved request with steps still waiting.
+  can_cancel?: boolean;
+  // Approve now, run later: the earliest a step runs and its deadline.
+  not_before?: string | null;
+  not_after?: string | null;
   // true on the copy a push alert carries when the request was too big for
   // the 4 KB notification: the header is real, the mutations still need a read.
   partial?: boolean;
@@ -232,6 +242,15 @@ export async function setAutoApprove(config: AppConfig, enabled: boolean): Promi
     method: 'POST',
     body: JSON.stringify({ auto_approve: enabled }),
   });
+}
+
+// Cancel an approved request before it runs: what has not run never will.
+export async function cancelMutationRequest(config: AppConfig, id: string, reason: string): Promise<MutationRequest> {
+  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
+  return body.request;
 }
 
 // Undo puts back what a thermostat request changed: the server proposes the

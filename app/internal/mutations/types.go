@@ -177,6 +177,9 @@ type UpdateTextMessageMutationInput struct {
 }
 
 type MutationInput struct {
+	// Schedule is the entry's not_before, not_after and precondition, lifted
+	// off before the type parses the rest (schedule.go).
+	Schedule           MutationSchedule
 	Type               string
 	Account            string
 	Title              string
@@ -270,6 +273,10 @@ type Request struct {
 	PendingMutationCount int
 	// Mutations is the page GetRequest was asked for, in request order.
 	Mutations []Mutation
+	// NotBefore is the earliest any mutation may run, NotAfter the latest
+	// deadline (zero: none). The review shows "runs at".
+	NotBefore time.Time
+	NotAfter  time.Time
 	// Policy is the mutation policy's decision on the request
 	// (context.policy), nil when no policy could touch it.
 	Policy map[string]any
@@ -301,4 +308,9 @@ type Mutation struct {
 	ApprovedAt     time.Time
 	ExecutedAt     time.Time
 	ObservedAt     time.Time
+	// NotBefore and NotAfter bound when the worker may run it (zero: none);
+	// Precondition is checked right before it runs.
+	NotBefore    time.Time
+	NotAfter     time.Time
+	Precondition map[string]any
 }

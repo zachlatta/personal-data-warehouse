@@ -779,3 +779,16 @@ test("policyBadge names a dry run's would-approve and why a policy did not cover
   // The decision is shown as a badge, not again as raw context.
   assert.equal("policy" in V.splitRequestContext({ policy: { decision: "review" }, note: "x" }).leftover, false);
 });
+
+test("requestSchedule reads a scheduled request's runs-at and deadline", () => {
+  assert.deepEqual(V.requestSchedule({ not_before: "2026-12-04T12:30:00Z", not_after: "2026-12-04T14:30:00Z" }), { runsAt: "2026-12-04T12:30:00Z", deadline: "2026-12-04T14:30:00Z" });
+  assert.deepEqual(V.requestSchedule({ not_before: null }), { runsAt: "", deadline: "" });
+});
+
+test("mutationSchedule shows each step its own runs-at, deadline and precondition", () => {
+  const step = V.mutationSchedule({ not_before: null, not_after: "2026-12-04T14:30:00Z", precondition: { kind: "not_home", within_minutes: 120 } });
+  assert.equal(step.runsAt, "");
+  assert.equal(step.deadline, "2026-12-04T14:30:00Z");
+  assert.match(step.precondition, /at home .*120 minutes/);
+  assert.deepEqual(V.mutationSchedule({}), { runsAt: "", deadline: "", precondition: "" });
+});

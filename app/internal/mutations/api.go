@@ -142,6 +142,29 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.apiWriteRequestPage(w, r, requestID, page)
+	case len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost:
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		if err := decodeOptionalJSON(r, &body); err != nil {
+			apiError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		reason := strings.TrimSpace(body.Reason)
+		if reason == "" {
+			reason = "cancelled from the review"
+		}
+		if _, err := s.CancelRequest(r.Context(), requestID, CancelInput{Actor: actor, Reason: reason}); err != nil {
+			var inputErr *proposalInputError
+			var stateErr *RequestStateError
+			if errors.As(err, &inputErr) || errors.As(err, &stateErr) {
+				apiError(w, http.StatusConflict, err.Error())
+				return
+			}
+			apiStoreError(w, err)
+			return
+		}
+		s.apiWriteRequestPage(w, r, requestID, page)
 	case len(parts) == 2 && parts[1] == "undo" && r.Method == http.MethodPost:
 		// Undo proposes and approves the inverse of a thermostat change that
 		// ran; the answer is the new request, not the undone one.
@@ -244,7 +267,7 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 
 // reviewerOnlyMessage is the 403 an agent sees when it calls a review route.
 const reviewerOnlyMessage = "only Zach's web or phone session can approve, deny, supersede, undo or edit a mutation request; " +
-	"an agent proposes with propose_mutation and withdraws with withdraw_mutation"
+	"an agent proposes with propose_mutation, withdraws with withdraw_mutation and cancels its own approved request with cancel_mutation"
 
 // requestCanReview reports whether the request's static-bearer principal may
 // decide a mutation request. A request with no principal never may.
@@ -370,7 +393,11 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		"approved_at":           nullableTime(request.ApprovedAt),
 		"executed_at":           nullableTime(request.ExecutedAt),
 		"observed_at":           nullableTime(request.ObservedAt),
-		"mutation_count":        request.MutationCount,
+		// Approve now, run later: the earliest a step runs and the latest
+		// deadline (null when it runs once approved); the review's "Runs at".
+		"not_before":     nullableTime(request.NotBefore),
+		"not_after":      nullableTime(request.NotAfter),
+		"mutation_count": request.MutationCount,
 		// What approving runs now, across every page of the request.
 		"pending_mutation_count": request.PendingMutationCount,
 		"review_url":             s.requestURL(request.ID),
@@ -394,6 +421,7 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		}
 		item["mutations"] = mutations
 		item["can_undo"] = canUndo(request)
+		item["can_cancel"] = canCancel(request)
 	}
 	return item
 }
@@ -422,6 +450,9 @@ func mutationJSON(mutation Mutation) map[string]any {
 		"approved_at":   nullableTime(mutation.ApprovedAt),
 		"executed_at":   nullableTime(mutation.ExecutedAt),
 		"observed_at":   nullableTime(mutation.ObservedAt),
+		"not_before":    nullableTime(mutation.NotBefore),
+		"not_after":     nullableTime(mutation.NotAfter),
+		"precondition":  mutation.Precondition,
 	}
 	if isGmailEmailMutation(mutation) {
 		item["email"] = gmailEmailView(mutation)

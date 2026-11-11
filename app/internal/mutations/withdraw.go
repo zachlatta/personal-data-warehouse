@@ -50,6 +50,10 @@ type requestLock struct {
 }
 
 func lockRequest(ctx context.Context, tx *sql.Tx, id string) (requestLock, error) {
+	// Mutations first, then the request: the one lock order (lockRequestMutations).
+	if err := lockRequestMutations(ctx, tx, id); err != nil {
+		return requestLock{}, err
+	}
 	var lock requestLock
 	err := queryRowContext(ctx, tx, `
 		SELECT id, status, revision, superseded_by_request_id, replaces_request_id

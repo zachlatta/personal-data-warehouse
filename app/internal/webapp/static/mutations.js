@@ -1194,7 +1194,24 @@ function renderGeneric(mutation) {
   return article;
 }
 
+// renderMutation is a step's card with its own schedule (runs at, deadline,
+// precondition) when it has one.
 function renderMutation(request, mutation, actions) {
+  const card = renderMutationCard(request, mutation, actions);
+  const schedule = V.mutationSchedule(mutation);
+  if (!schedule.runsAt && !schedule.deadline && !schedule.precondition) return card;
+  const line = h("p", "mutation-schedule m");
+  const parts = [];
+  if (schedule.runsAt) parts.push("Runs at " + formatWhen(schedule.runsAt));
+  if (schedule.deadline) parts.push("deadline " + formatWhen(schedule.deadline));
+  if (schedule.precondition) parts.push(schedule.precondition);
+  line.textContent = parts.join(" · ");
+  if (schedule.runsAt) line.title = fmtFull(schedule.runsAt);
+  card.insertBefore(line, card.firstChild ? card.firstChild.nextSibling : null);
+  return card;
+}
+
+function renderMutationCard(request, mutation, actions) {
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isGmailSettingsMutation(mutation)) return renderGmailSettings(mutation);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);
@@ -1428,6 +1445,9 @@ function renderRequestHeader(request) {
     ["By", request.requested_by, ""], ["Created", formatWhen(request.created_at), request.created_at],
     ["Approved by", request.approved_by, ""], ["Approved", formatWhen(request.approved_at), request.approved_at],
     ["Executed", formatWhen(request.executed_at), request.executed_at], ["Updated", formatWhen(request.updated_at), request.updated_at],
+    // Approve now, run later: when the worker may run it, and its deadline.
+    ["Runs at", formatWhen(V.requestSchedule(request).runsAt), V.requestSchedule(request).runsAt],
+    ["Deadline", formatWhen(V.requestSchedule(request).deadline), V.requestSchedule(request).deadline],
   ];
   for (const [label, value, rawTime] of metaPairs) {
     if (!value) continue;
@@ -1490,6 +1510,21 @@ function renderDecisionDock(request, actions) {
     controls.appendChild(button("Deny", "danger", async () => {
       errorNode.textContent = "";
       try { await mutations.reject(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    dock.appendChild(controls);
+  } else if (request.can_cancel === true) {
+    const copy = h("div", "decision-copy");
+    const schedule = V.requestSchedule(request);
+    copy.appendChild(h("strong", "", schedule.runsAt ? "Scheduled" : "Approved"));
+    copy.appendChild(h("span", "", schedule.runsAt ? "Runs at " + formatWhen(schedule.runsAt) : "Waiting for the worker"));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
+    const reason = h("input"); reason.placeholder = "why (optional)"; reason.className = "reason";
+    controls.appendChild(reason);
+    controls.appendChild(button("Cancel", "danger", async () => {
+      if (!confirmDialog("Cancel? What has not run yet never will.")) return;
+      errorNode.textContent = "";
+      try { await mutations.cancel(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
     }));
     dock.appendChild(controls);
   } else if (request.can_undo === true) {

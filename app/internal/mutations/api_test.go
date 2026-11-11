@@ -158,6 +158,7 @@ var reviewRoutes = []string{
 	"/requests/req-1/reject",
 	"/requests/req-1/supersede",
 	"/requests/req-1/undo",
+	"/requests/req-1/cancel",
 	"/policies/settings",
 	"/policies/heating-winter/mode",
 	"/requests/req-1/mutations/mut-1/update-email",

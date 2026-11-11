@@ -60,6 +60,32 @@ export function requestListStatus(request) {
   return status + (request.status === "withdrawn" ? " (replaced)" : " (superseded)");
 }
 
+// preconditionText says what a step's precondition checks, in plain words.
+export function preconditionText(precondition) {
+  const p = asMap(precondition);
+  const kind = trimStr(p.kind);
+  if (!kind) return "";
+  if (kind === "not_home") {
+    const minutes = Number(p.within_minutes);
+    return "Skipped if the phone was at home (or had no location) in the " + (Number.isFinite(minutes) ? minutes : "?") + " minutes before it runs";
+  }
+  return "Precondition " + kind;
+}
+
+// mutationSchedule is one step's own "Runs at", deadline and precondition,
+// which a plan's steps each carry (a trip's away step and its return step).
+export function mutationSchedule(mutation) {
+  const m = asMap(mutation);
+  return { runsAt: trimStr(m.not_before), deadline: trimStr(m.not_after), precondition: preconditionText(m.precondition) };
+}
+
+// requestSchedule is a scheduled request's "Runs at" and deadline (the
+// API's not_before / not_after), empty strings when it runs once approved.
+export function requestSchedule(request) {
+  const r = asMap(request);
+  return { runsAt: trimStr(r.not_before), deadline: trimStr(r.not_after) };
+}
+
 // policyBadge is the mutation policy's decision as a badge: "would
 // auto-approve" for a dry run, who approved it for an enforced policy, and
 // why a policy did not cover it. Null when no policy could touch the request.

@@ -40,6 +40,15 @@ func Tools(service *Service) []tool.Tool {
 				return response, agentFacingError(err)
 			},
 		},
+		&tool.Typed[CancelMutationInput, WithdrawResponse]{
+			NameStr:        "cancel_mutation",
+			TitleStr:       "Cancel Mutation",
+			DescriptionStr: cancelMutationDescription,
+			Handle: func(ctx context.Context, in CancelMutationInput) (WithdrawResponse, error) {
+				response, err := service.CancelMutation(ctx, in)
+				return response, agentFacingError(err)
+			},
+		},
 		&tool.Typed[ProposeMutationHelpInput, MutationHelpDocument]{
 			NameStr:        "propose_mutation_help",
 			TitleStr:       "Propose Mutation Help",

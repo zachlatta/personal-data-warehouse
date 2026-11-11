@@ -876,3 +876,48 @@ opens the review, which has the Undo button.
 heat outside 50 to 72°F, or any cool setpoint, whatever the policy says
 (`POLICY_APPROVED_HEAT_RANGE`); only Zach's own approval reaches past it. It is a second
 check in another language, so one bad change to the Go policy code is not enough.
+
+### Approve now, run later; cancel; preconditions
+
+Any mutation entry may carry `not_before` and `not_after` (RFC 3339 with a zone), and a
+`resideo.set_thermostat` entry a `precondition` (only the cloud worker's thermostat path
+checks one, so other types refuse it at proposal rather than ignore it); `scheduleFromMap` lifts them off before the type parses the entry, so no
+type knows them. They are stored on `ops.upstream_mutation_operations` (`not_before`, `not_after`,
+`precondition_json`) and summarized on the request: the earliest `not_before` only when
+every step has one (a step without one runs once approved, so the request starts then),
+the latest `not_after` only when every step has one. The review shows the request's **Runs
+at** and deadline, and on each step card that step's own run time, deadline and
+precondition. The Dagster sensor counts only rows the worker can act on now (due, or past
+their deadline), so a plan approved days ahead does not start an empty run every 10 s.
+Every request-status rollup (Python `derive_request_status`, Go `DeriveRequestStatus`, used
+by cancel and the device queue) applies one ladder, held equal by
+`tests/contracts/request_status_ladder.json`: cancelled, withdrawn and rejected steps are not
+live work, and `skipped_precondition` counts as finished. Workers (the Python claim and
+the Go device queue) never claim a row before its `not_before` and fail a claimable row
+past its `not_after` as `failed_terminal` ("the approval expired"). Those two are the only
+claim paths (the resident worker and the Dagster fallback share the Python one). Only the
+Python one re-checks a policy approval, so the Go device queue never claims a row a policy
+approved (device types are never auto-approvable). The Resideo executor's
+one-hour rule now counts from the later of approval and `not_before`, unless `not_after`
+is set.
+
+**Cancel** stops an approved request whose remaining mutations have not been claimed:
+each waiting one ends `cancelled` (terminal) and never runs, and a request with nothing
+left that ran reads `cancelled`. A reviewer cancels from the web or phone review
+(`POST /api/mutations/requests/<id>/cancel`, reviewer-only); the token that proposed the
+request cancels it with the `cancel_mutation` tool. Cancel takes the rows `FOR UPDATE`,
+so it and a claim serialize; a running step is refused ("Undo it after it finishes").
+**One row-lock order** for a request, in every Go path and in the Python worker: its
+mutations first (`lockRequestMutations`, by request_index), then the request row. The
+worker's claim, send-back and status rollup already take that order; cancel, approve, deny,
+withdraw, supersede and the edit routes do too, so none deadlocks against the worker.
+
+**Preconditions** are checked by the worker right before the step runs
+(`upstream_mutation_schedule.precondition_failure`); a failed one ends the mutation as
+`skipped_precondition` (never a write) and the app pushes "Skipped: …". The one kind today
+is `{"kind": "not_home", "within_minutes": N}`: skip when phone location
+(`base_android_location.samples`) in the window puts the phone within the home radius,
+and also when there is no location in the window, because missing data must never send
+the house to away. Home is `PDW_HOME_LATITUDE` / `PDW_HOME_LONGITUDE` /
+`PDW_HOME_RADIUS_METERS` (default 1000) on the Dagster deployment, never in Git; with none
+set the step is skipped.

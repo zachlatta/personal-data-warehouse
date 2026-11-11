@@ -2377,3 +2377,34 @@ export function policyBadge(request: { policy?: unknown } | null | undefined): P
   const label = typeof policy.label === 'string' && policy.label.trim() ? policy.label.trim() : decision.replace(/_/g, ' ');
   return { decision, tone: POLICY_TONES[decision] ?? 'muted', label, reasons };
 }
+
+// What a step's precondition checks, in plain words.
+export function preconditionText(precondition: unknown): string {
+  const p = precondition && typeof precondition === 'object' ? (precondition as Record<string, unknown>) : {};
+  const kind = typeof p.kind === 'string' ? p.kind.trim() : '';
+  if (!kind) return '';
+  if (kind === 'not_home') {
+    const minutes = typeof p.within_minutes === 'number' ? p.within_minutes : NaN;
+    return `Skipped if the phone was at home (or had no location) in the ${Number.isFinite(minutes) ? minutes : '?'} minutes before it runs`;
+  }
+  return `Precondition ${kind}`;
+}
+
+// One step's own "Runs at", deadline and precondition: a plan's steps each
+// carry their own (a trip's away step and its return step).
+export function mutationSchedule(mutation: { not_before?: string | null; not_after?: string | null; precondition?: unknown } | null | undefined): { runsAt: string; deadline: string; precondition: string } {
+  return {
+    runsAt: typeof mutation?.not_before === 'string' ? mutation.not_before.trim() : '',
+    deadline: typeof mutation?.not_after === 'string' ? mutation.not_after.trim() : '',
+    precondition: preconditionText(mutation?.precondition),
+  };
+}
+
+// A scheduled request's "Runs at" and deadline (the API's not_before /
+// not_after); empty strings when it runs once approved.
+export function requestSchedule(request: { not_before?: string | null; not_after?: string | null } | null | undefined): { runsAt: string; deadline: string } {
+  return {
+    runsAt: typeof request?.not_before === 'string' ? request.not_before.trim() : '',
+    deadline: typeof request?.not_after === 'string' ? request.not_after.trim() : '',
+  };
+}

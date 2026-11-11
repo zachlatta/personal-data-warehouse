@@ -292,6 +292,26 @@ def test_an_approval_too_old_to_mean_now_is_never_applied():
     assert "propose" in result.error
 
 
+def test_a_step_approved_days_ahead_runs_at_its_time_and_not_an_hour_late():
+    """The one-hour limit counts from the later of approval and not_before,
+    unless the request set its own not_after."""
+
+    scheduled = mutation()
+    scheduled["approved_at"] = NOW - timedelta(days=3)
+    scheduled["not_before"] = NOW - timedelta(minutes=5)
+    client = FakeClient([shadow(), shadow(heat=68.0, status="TemporaryHold")])
+    assert executor(client).execute(scheduled).status == "succeeded"
+
+    late = dict(scheduled, not_before=NOW - timedelta(hours=2))
+    client = FakeClient([shadow()])
+    assert executor(client).execute(late).status == "failed_terminal"
+    assert client.writes == []
+
+    stretched = dict(late, not_after=NOW + timedelta(hours=1))
+    client = FakeClient([shadow(), shadow(heat=68.0, status="TemporaryHold")])
+    assert executor(client).execute(stretched).status == "succeeded"
+
+
 def test_a_policy_approved_setpoint_outside_the_fixed_cap_is_refused_without_a_write():
     """The executor's own cap (heat 50 to 72) holds whatever a policy says."""
 

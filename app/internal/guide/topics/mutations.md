@@ -144,6 +144,12 @@ authoritative when this list and it disagree.
 on) or `permanent`. It does not change the
   mode (heat, cool, off). The review shows the temperature and mode now and warns when the mode
   makes the change do nothing. An approval over an hour old is not applied: propose again.
+- **Approve now, run later:** any entry may carry `not_before` / `not_after` (RFC 3339 with a
+  zone). A `resideo.set_thermostat` entry may also carry `precondition`
+  `{"kind": "not_home", "within_minutes": 120}` (skipped, never run, when recent phone
+  location is at home or missing); other types refuse a precondition. Zach approves a plan once; each step
+  runs at its time. To drop an approved plan that no longer stands, {{if .CLI}}`pdw call cancel_mutation --data '{"request_id": "...", "reason": "..."}'`{{else}}`cancel_mutation` with `request_id` and `reason`{{end}}
+  (only the token that proposed it), then propose the new one.
 - **Status lives in the warehouse.** The request's state, result and error are in
   `ops.upstream_mutation_operations` (readable by the query role for exactly this), and
   every proposal is a `mutation_requests` event on the timeline (search scope `mutations`).

@@ -19,7 +19,7 @@ import { SlackSendMessageCard } from '@/components/slack-send-review';
 import { TextMessageCard } from '@/components/text-message-review';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { StatusPill } from '@/components/status-pill';
-import { approveMutationRequest, undoMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, updateTextMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput, type UpdateTextMessageMutationInput } from '@/lib/api';
+import { approveMutationRequest, cancelMutationRequest, undoMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, updateTextMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput, type UpdateTextMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
   MUTATION_PAGE_SIZE,
@@ -40,6 +40,8 @@ import {
   mutationReviewContext,
   pendingApproveLabel,
   policyBadge,
+  requestSchedule,
+  mutationSchedule,
   requestDecision,
   requestKindLabel,
   requestLifecycle,
@@ -92,7 +94,25 @@ const HEADLINE_KEYS = ['recipient', 'chat', 'text', 'service', 'to', 'cc', 'bcc'
 // version, never the screen's.
 type PendingEdit = { kind: 'email'; input: UpdateEmailMutationInput } | { kind: 'slack'; input: UpdateSlackMessageMutationInput } | { kind: 'text'; input: UpdateTextMessageMutationInput };
 
-function MutationCard({ mutation, pending, busy, onRemove, onSaveSlackMessage, onSaveTextMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onSaveTextMessage?: (input: UpdateTextMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
+// A step's card with its own schedule above it (runs at, deadline,
+// precondition), when it has one.
+function MutationCard(props: Parameters<typeof MutationCardBody>[0]) {
+  const schedule = mutationSchedule(props.mutation);
+  const parts = [
+    schedule.runsAt ? `Runs at ${formatWhen(schedule.runsAt)}` : '',
+    schedule.deadline ? `deadline ${formatWhen(schedule.deadline)}` : '',
+    schedule.precondition,
+  ].filter(Boolean);
+  if (!parts.length) return <MutationCardBody {...props} />;
+  return (
+    <View>
+      <ThemedText type="small" themeColor="textSecondary">{parts.join(' · ')}</ThemedText>
+      <MutationCardBody {...props} />
+    </View>
+  );
+}
+
+function MutationCardBody({ mutation, pending, busy, onRemove, onSaveSlackMessage, onSaveTextMessage, onPendingChange, requestReason, alone, locked }: { mutation: Mutation; pending: boolean; busy: boolean; onRemove: () => void; onSaveSlackMessage: (input: UpdateSlackMessageMutationInput) => Promise<void>; onSaveTextMessage?: (input: UpdateTextMessageMutationInput) => Promise<void>; onPendingChange?: (edit: PendingEdit | null) => void; requestReason?: string; alone?: boolean; locked?: boolean }) {
   const theme = useTheme();
   if (isGmailSendEmailMutation(mutation)) return <GmailEmailComposeCard mutation={mutation} pending={pending} busy={busy} onRemove={onRemove} onPendingChange={(input) => onPendingChange?.(input ? { kind: 'email', input } : null)} requestReason={requestReason} alone={alone} locked={locked} />;
   if (isSlackMarkReadMutation(mutation)) return <SlackMarkReadCard mutation={mutation} requestReason={requestReason} defaultExpanded={alone} />;
@@ -173,6 +193,7 @@ function RequestOverview({
   const theme = useTheme();
   const context = mutationReviewContext(request.context);
   const policy = policyBadge(request);
+  const schedule = requestSchedule(request);
   const lifecycle = requestLifecycle(request);
   const mutations = request.mutations ?? [];
   // An email's source line ("Gmail … thread 1a0e…, 12:35pm ET") says what
@@ -200,6 +221,11 @@ function RequestOverview({
           <ThemedText type="small" themeColor="textSecondary">
             {formatWhen(request.created_at)} · by {request.requested_by || 'unknown'}
           </ThemedText>
+          {schedule.runsAt || schedule.deadline ? (
+            <ThemedText type="small" themeColor="textSecondary">
+              {[schedule.runsAt ? `Runs at ${formatWhen(schedule.runsAt)}` : '', schedule.deadline ? `Deadline ${formatWhen(schedule.deadline)}` : ''].filter(Boolean).join(' · ')}
+            </ThemedText>
+          ) : null}
           {policy ? (
             <ThemedText type="small" themeColor={policy.tone === 'muted' ? 'textSecondary' : 'text'} style={styles.requestReason}>
               {policy.label}{policy.reasons.length && policy.decision !== 'would_approve' && policy.decision !== 'approved' ? ` · ${policy.reasons.join('; ')}` : ''}
@@ -464,6 +490,20 @@ function MutationReview({ id }: { id: string | undefined }) {
       }
     }
     await decide(current, requestDecision(current).doneLabel, () => approveMutationRequest(config, current.id));
+  };
+  // Cancel an approved request whose steps have not run (a scheduled plan).
+  const cancelRequest = async () => {
+    if (!request) return;
+    setBusy(true);
+    try {
+      const cancelled = rememberMutationRequest(await cancelMutationRequest(config, request.id, 'Cancelled from the phone.'));
+      setRequest(cancelled);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
   };
   // Undo a thermostat change that ran (a policy's automatic change, usually):
   // the server proposes and approves the inverse, and the screen moves to it.
@@ -768,6 +808,15 @@ function MutationReview({ id }: { id: string | undefined }) {
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy || decision.running === 0} style={[styles.button, styles.approve, (busy || decision.running === 0) && styles.disabled]}>
                 {busy ? <ActivityIndicator color="#fff" /> : <ThemedText style={styles.buttonText}>{pendingApproveLabel(decision, pendingSummary)}</ThemedText>}
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+        {!pending && request?.can_cancel ? (
+          <View style={[styles.actions, { backgroundColor: theme.background, paddingBottom: Spacing.two + insets.bottom }]}>
+            <View style={styles.actionButtons}>
+              <Pressable accessibilityRole="button" onPress={cancelRequest} disabled={busy} style={[styles.button, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder, borderWidth: StyleSheet.hairlineWidth }, busy && styles.disabled]}>
+                {busy ? <ActivityIndicator /> : <ThemedText style={[styles.buttonText, styles.denyText]}>Cancel</ThemedText>}
               </Pressable>
             </View>
           </View>

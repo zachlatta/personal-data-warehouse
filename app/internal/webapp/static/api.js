@@ -110,6 +110,8 @@ export const mutations = {
   async policies() { return request("/api/mutations/policies"); },
   async setPolicyMode(id, mode) { return request("/api/mutations/policies/" + encodeURIComponent(id) + "/mode", { method: "POST", body: { mode } }); },
   async setAutoApprove(enabled) { return request("/api/mutations/policies/settings", { method: "POST", body: { auto_approve: enabled } }); },
+  // Cancel an approved request before it runs (a scheduled plan).
+  async cancel(id, reason) { return (await request(requestPath(id, "cancel"), { method: "POST", body: { reason: reason || "" } })).request; },
   // Undo a thermostat change that ran: the answer is the new request.
   async undo(id) { return (await request(requestPath(id, "undo"), { method: "POST" })).request; },
   async reject(id, reason) { return (await request(requestPath(id, "reject"), { method: "POST", body: { reason: reason || "" } })).request; },

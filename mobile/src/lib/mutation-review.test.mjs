@@ -1341,3 +1341,18 @@ test('policyBadge shows a dry run as would auto-approve and says why a policy di
   assert.equal(review.tone, 'muted');
   assert.deepEqual(review.reasons, ['heat_setpoint 74 is above this policy\'s 72']);
 });
+
+test('requestSchedule reads a scheduled request runs-at and deadline', async () => {
+  const { requestSchedule } = await import('./mutation-review.ts');
+  assert.deepEqual(requestSchedule({ not_before: '2026-12-04T12:30:00Z', not_after: null }), { runsAt: '2026-12-04T12:30:00Z', deadline: '' });
+  assert.deepEqual(requestSchedule(null), { runsAt: '', deadline: '' });
+});
+
+test('mutationSchedule shows each step its own runs-at, deadline and precondition', async () => {
+  const { mutationSchedule } = await import('./mutation-review.ts');
+  const step = mutationSchedule({ not_before: '2026-12-04T12:30:00Z', not_after: null, precondition: { kind: 'not_home', within_minutes: 120 } });
+  assert.equal(step.runsAt, '2026-12-04T12:30:00Z');
+  assert.equal(step.deadline, '');
+  assert.match(step.precondition, /at home .*120 minutes/);
+  assert.deepEqual(mutationSchedule({}), { runsAt: '', deadline: '', precondition: '' });
+});

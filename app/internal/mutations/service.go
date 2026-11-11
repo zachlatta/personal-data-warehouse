@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
@@ -242,6 +243,12 @@ func (s *Service) validateCreateInput(input CreateRequestInput) error {
 	}
 	if len(missing) > 0 {
 		return errors.New(strings.Join(missing, "; ") + " (required top-level fields: title, reason, mutations)")
+	}
+	now := time.Now().UTC()
+	for index, mutation := range input.Mutations {
+		if err := validateSchedule(mutation.Type, mutation.Schedule, now); err != nil {
+			return fmt.Errorf("mutation %d %w", index, err)
+		}
 	}
 	if input.Replaces != nil {
 		if strings.TrimSpace(input.Replaces.RequestID) == "" {
@@ -496,6 +503,10 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 	if strings.TrimSpace(mutationType) == "" {
 		mutationType = stringFromAny(raw["operation"])
 	}
+	schedule, raw, err := scheduleFromMap(raw)
+	if err != nil {
+		return MutationInput{}, fmt.Errorf("mutation %d %w", index, err)
+	}
 	deliveryMode := stringFromAny(raw["delivery_mode"])
 	if deliveryMode == "" {
 		deliveryMode = "send"
@@ -511,6 +522,7 @@ func mutationInputFromMap(raw map[string]any, index int) (MutationInput, error) 
 		account = ResideoAccount
 	}
 	return MutationInput{
+		Schedule:           schedule,
 		Type:               strings.TrimSpace(mutationType),
 		Account:            account,
 		Title:              strings.TrimSpace(stringFromAny(raw["title"])),

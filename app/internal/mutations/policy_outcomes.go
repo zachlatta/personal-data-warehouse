@@ -19,6 +19,9 @@ const (
 	PolicyOutcomeFailed         = "failed"
 	PolicyOutcomeSentBack       = "sent_back"
 	PolicyOutcomePolicyDisabled = "policy_disabled"
+	// PolicyOutcomeSkipped: a scheduled step's precondition failed, so the
+	// worker skipped it (any request, approved by a policy or by Zach).
+	PolicyOutcomeSkipped = "skipped_precondition"
 
 	// PolicyAutoOffAfterFailures is how many failed runs in a row turn a
 	// policy off.
@@ -61,18 +64,25 @@ func (s *PostgresStore) ClaimPolicyOutcomes(ctx context.Context, limit int) ([]P
 	// a newer outcome.
 	rows, err := queryContext(ctx, tx, `
 		SELECT request.id, request.status, request.approved_by, request.title, request.reason, request.error,
-		       flags.recheck_index, flags.reported_recheck, flags.outcome_reported
+		       flags.recheck_index, flags.reported_recheck, flags.outcome_reported,
+		       flags.skipped_index, flags.reported_skip,
+		       COALESCE((SELECT m.error FROM @upstream_mutations AS m
+		                  WHERE m.request_id = request.id AND m.status = 'skipped_precondition'
+		                  ORDER BY m.updated_at DESC LIMIT 1), '') AS skipped_error
 		FROM @upstream_mutation_requests AS request
 		CROSS JOIN LATERAL (
 			SELECT COALESCE(max(e.event_index) FILTER (WHERE e.event_type = 'policy_recheck_failed'), -1) AS recheck_index,
 			       COALESCE(max((e.event_json->>'recheck_index')::bigint) FILTER (WHERE e.event_type = 'policy_recheck_reported'), -1) AS reported_recheck,
-			       COALESCE(bool_or(e.event_type = 'policy_outcome_reported'), false) AS outcome_reported
+			       COALESCE(bool_or(e.event_type = 'policy_outcome_reported'), false) AS outcome_reported,
+			       COALESCE(max(e.event_index) FILTER (WHERE e.event_type = 'precondition_skipped'), -1) AS skipped_index,
+			       COALESCE(max((e.event_json->>'skipped_index')::bigint) FILTER (WHERE e.event_type = 'precondition_reported'), -1) AS reported_skip
 			FROM @upstream_mutation_request_events AS e
 			WHERE e.request_id = request.id
 		) AS flags
 		WHERE request.updated_at >= now() - interval '2 days'
-		  AND (starts_with(request.approved_by, 'policy:') OR request.status = 'pending_review')
+		  AND (starts_with(request.approved_by, 'policy:') OR request.status = 'pending_review' OR flags.skipped_index >= 0)
 		  AND ((flags.recheck_index > flags.reported_recheck AND request.status = 'pending_review')
+		       OR flags.skipped_index > flags.reported_skip
 		       OR (NOT flags.outcome_reported AND starts_with(request.approved_by, 'policy:')
 		           AND request.status IN ('succeeded', 'observed', 'failed_terminal', 'blocked_missing_credentials')))
 		ORDER BY request.updated_at
@@ -87,11 +97,13 @@ func (s *PostgresStore) ClaimPolicyOutcomes(ctx context.Context, limit int) ([]P
 		title, reason, errText string
 		recheck, reported      int64
 		outcomeReported        bool
+		skipped, reportedSkip  int64
+		skippedError           string
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.id, &c.status, &c.approvedBy, &c.title, &c.reason, &c.errText, &c.recheck, &c.reported, &c.outcomeReported); err != nil {
+		if err := rows.Scan(&c.id, &c.status, &c.approvedBy, &c.title, &c.reason, &c.errText, &c.recheck, &c.reported, &c.outcomeReported, &c.skipped, &c.reportedSkip, &c.skippedError); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -116,6 +128,12 @@ func (s *PostgresStore) ClaimPolicyOutcomes(ctx context.Context, limit int) ([]P
 	}
 	var outcomes []PolicyOutcome
 	for _, c := range candidates {
+		if c.skipped > c.reportedSkip {
+			if err := appendRequestEvent(ctx, tx, c.id, "precondition_reported", "policy", "pdw-policy-engine", map[string]any{"skipped_index": c.skipped}); err != nil {
+				return nil, err
+			}
+			outcomes = append(outcomes, PolicyOutcome{Kind: PolicyOutcomeSkipped, Request: Request{ID: c.id}, PolicyID: policyIDFromActor(c.approvedBy), Detail: c.skippedError})
+		}
 		switch {
 		case c.recheck > c.reported && c.status == StatusPendingReview:
 			if err := appendRequestEvent(ctx, tx, c.id, "policy_recheck_reported", "policy", "pdw-policy-engine", map[string]any{"recheck_index": c.recheck}); err != nil {
@@ -264,6 +282,9 @@ func PolicyOutcomeAlert(outcome PolicyOutcome) map[string]any {
 		alert["title"] = "Back for your review: " + request.Title
 		alert["snippet"] = firstNonEmpty(request.Error, "an automatic approval no longer held when it was about to run")
 		alert["category"], alert["kind"] = "mutation_review", "mutation_request"
+	case PolicyOutcomeSkipped:
+		alert["title"] = "Skipped: " + request.Title
+		alert["snippet"] = firstNonEmpty(outcome.Detail, request.Error, "Its precondition did not hold, so it did not run.")
 	case PolicyOutcomePolicyDisabled:
 		alert["title"] = "Policy " + outcome.PolicyID + " turned off"
 		alert["snippet"] = "It " + outcome.Detail + "; changes it covered now come to you for review."

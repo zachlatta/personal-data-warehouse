@@ -9734,6 +9734,12 @@ class PostgresWarehouse:
             # The authenticated token behind a proposal (the Go app writes it;
             # requested_by is only the caller-chosen client name).
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS requested_by_token_id text NOT NULL DEFAULT ''",
+            # Approve now, run later (app/internal/mutations/schedule.go).
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS not_after timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            "ALTER TABLE @upstream_mutations ADD COLUMN IF NOT EXISTS precondition_json jsonb NOT NULL DEFAULT '{}'::jsonb",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''",
@@ -9888,12 +9894,27 @@ class PostgresWarehouse:
         sent_back: dict[str, str] = {}
         self._command("BEGIN")
         try:
+            # A step whose not_after passed before it ran is not run late.
+            expired = self._query_dicts(
+                f"""
+                UPDATE @upstream_mutations
+                   SET status = 'failed_terminal', updated_at = %s,
+                       error = 'the approval expired at ' || to_char(not_after AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC before this ran; propose it again if it is still wanted'
+                 WHERE status = ANY(%s)
+                   {provider_filter}
+                   AND not_after > '1970-01-01 00:00:00+00'::timestamptz AND not_after < %s
+                RETURNING id, request_id, error
+                """,
+                (now, list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, now),
+            )
             candidates = self._query_dicts(
                 f"""
                 SELECT id, request_id, approved_by, operation, payload_json
                 FROM @upstream_mutations
                 WHERE status = ANY(%s)
                   {provider_filter}
+                  -- Approved now, run later: not before its time.
+                  AND not_before <= %s
                 -- Mutations of one request share approved_at and created_at;
                 -- request_index keeps them in the order they were proposed
                 -- (a label is created before the filter that uses it).
@@ -9901,7 +9922,7 @@ class PostgresWarehouse:
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
                 """,
-                (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, int(limit)),
+                (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, now, int(limit)),
             )
             # The same locks every policy writer takes (kill switch, then each
             # policy id, sorted), held to commit: a switch-off, a revoke or a
@@ -9948,6 +9969,16 @@ class PostgresWarehouse:
             self._command("ROLLBACK")
             raise
         for request_id in sorted(sent_back):
+            self._refresh_upstream_mutation_request_status(request_id)
+        for row in expired:
+            self._append_upstream_mutation_event(
+                str(row["id"]),
+                event_type="failed",
+                actor_type="dagster",
+                actor_id=claimed_by,
+                event_json={"status": "failed_terminal", "error": str(row["error"])},
+            )
+        for request_id in sorted({str(row["request_id"]) for row in expired if row.get("request_id")}):
             self._refresh_upstream_mutation_request_status(request_id)
         # UPDATE ... RETURNING comes back in heap order, not the CTE's.
         rows.sort(
@@ -10233,6 +10264,37 @@ class PostgresWarehouse:
             self._refresh_upstream_mutation_request_status(request_id)
         return len(rows)
 
+    def skip_upstream_mutation_for_precondition(self, mutation_id: str, *, reason: str, actor_id: str) -> None:
+        """End a scheduled step whose precondition failed: never a write. The
+        request gets a precondition_skipped event, which the app reports."""
+        now = datetime.now(tz=UTC)
+        self._command(
+            "UPDATE @upstream_mutations SET status = 'skipped_precondition', error = %s, updated_at = %s, executed_at = %s WHERE id = %s",
+            (reason, now, now, mutation_id),
+        )
+        self._append_upstream_mutation_event(
+            mutation_id,
+            event_type="skipped_precondition",
+            actor_type="dagster",
+            actor_id=actor_id,
+            event_json={"reason": reason},
+        )
+        mutation = self.get_upstream_mutation(mutation_id)
+        request_id = str((mutation or {}).get("request_id") or "")
+        if request_id:
+            self._command(
+                """
+                INSERT INTO @upstream_mutation_request_events (
+                    request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+                )
+                SELECT %s, COALESCE(max(event_index) + 1, 0), 'precondition_skipped', 'dagster', %s, %s, %s
+                FROM @upstream_mutation_request_events
+                WHERE request_id = %s
+                """,
+                (request_id, actor_id, _jsonb_param({"mutation_id": mutation_id, "reason": reason}), now, request_id),
+            )
+            self._refresh_upstream_mutation_request_status(request_id)
+
     def fail_upstream_mutation(
         self,
         mutation_id: str,
@@ -10280,12 +10342,18 @@ class PostgresWarehouse:
             providers=providers,
             exclude_providers=exclude_providers,
         )
+        # Only rows the worker can act on now: due (not_before reached) or
+        # past their deadline (the claim fails those). A step approved days
+        # ahead is not work yet; counting it made the sensor start an empty
+        # run every 10 seconds until its time.
         rows = self._query(
             f"""
             SELECT count(*)::bigint
             FROM @upstream_mutations
             WHERE status = ANY(%s)
               {provider_filter}
+              AND (not_before <= now()
+                   OR (not_after > '1970-01-01 00:00:00+00'::timestamptz AND not_after < now()))
             """,
             (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params),
         )
@@ -10865,30 +10933,7 @@ class PostgresWarehouse:
         if not mutations:
             return
         statuses = [str(mutation["status"]) for mutation in mutations]
-        # A withdrawn row is the agent's retraction, a rejected one the
-        # reviewer's decision; neither is live work, and a request whose every
-        # row was withdrawn is withdrawn, not denied.
-        active_statuses = [status for status in statuses if status not in {"rejected", "withdrawn"}]
-        if not active_statuses:
-            status = "withdrawn" if all(status == "withdrawn" for status in statuses) else "rejected"
-        elif any(status == "pending_review" for status in active_statuses):
-            status = "pending_review"
-        elif any(status == "executing" for status in active_statuses):
-            status = "executing"
-        elif any(status == "approved" for status in active_statuses):
-            status = "approved"
-        elif any(status == "failed_retryable" for status in active_statuses):
-            status = "failed_retryable"
-        elif any(status == "blocked_missing_credentials" for status in active_statuses):
-            status = "blocked_missing_credentials"
-        elif any(status == "failed_terminal" for status in active_statuses):
-            status = "failed_terminal"
-        elif all(status == "observed" for status in active_statuses):
-            status = "observed"
-        elif all(status in {"succeeded", "observed"} for status in active_statuses):
-            status = "succeeded"
-        else:
-            status = request[0]["status"]
+        status = derive_request_status(statuses, str(request[0]["status"]))
 
         now = datetime.now(tz=UTC)
         executed_at = max((mutation["executed_at"] for mutation in mutations), default=request[0]["executed_at"])
@@ -22472,6 +22517,41 @@ def _numeric_ts(expression: str) -> str:
 
 def _json_numeric(expression: str, field: str) -> str:
     return f"COALESCE(NULLIF(({expression}::jsonb ->> '{field}'), '')::numeric, 0)"
+
+
+def derive_request_status(statuses: Sequence[str], current: str) -> str:
+    """A request's status from every one of its mutations' statuses: the one
+    ladder Python and Go (app/internal/mutations/status_ladder.go) apply, held
+    equal by tests/contracts/request_status_ladder.json.
+
+    A withdrawn row is the agent's retraction, a rejected one the reviewer's
+    decision and a cancelled one a stopped step; none is live work, and a
+    request whose every row is one of those takes that status (rejected when
+    they differ). ``current`` stands for no rows or statuses the ladder does
+    not know.
+    """
+
+    if not statuses:
+        return current
+    active = [status for status in statuses if status not in {"rejected", "withdrawn", "cancelled"}]
+    if not active:
+        if all(status == "withdrawn" for status in statuses):
+            return "withdrawn"
+        if all(status == "cancelled" for status in statuses):
+            return "cancelled"
+        return "rejected"
+    for status in ("pending_review", "executing", "approved", "failed_retryable", "blocked_missing_credentials", "failed_terminal"):
+        if status in active:
+            return status
+    if all(status == "observed" for status in active):
+        return "observed"
+    if all(status in {"succeeded", "observed"} for status in active):
+        return "succeeded"
+    if all(status == "skipped_precondition" for status in active):
+        return "skipped_precondition"
+    if all(status in {"succeeded", "observed", "skipped_precondition"} for status in active):
+        return "succeeded"
+    return current
 
 
 def _upstream_mutation_provider_filter(
