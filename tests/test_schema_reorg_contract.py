@@ -261,7 +261,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
             # +1 marts: marts_ops.answer_benchmark, the C16 answer verdict.
             # +1 marts: marts_android_screen_time.daily_usage, one row per real
             # Android bucket, because the base table repeats a bucket per upload.
-            "marts": 75,  # daily script pilot usage
+            # +1 marts: marts_ops.source_upstream_health, each source's own
+            # newest item against base_* (C11).
+            "marts": 76,  # daily script pilot usage
         # +1 timeline: timeline.context(ref, before, after), the search-hit
         # neighborhood reader. +3 timeline: the semantic, literal, and fusion
         # helpers that let the app execute hybrid retrieval legs concurrently.
@@ -289,7 +291,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
-            "ops": 49,  # outgoing feed projection and script-run telemetry
+        # +1 ops: ops.source_upstream_observations, what each source itself
+        # says is its newest item (C11).
+            "ops": 50,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

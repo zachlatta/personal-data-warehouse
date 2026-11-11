@@ -239,8 +239,12 @@ func TestOverviewGuidanceStaysWithinBudget(t *testing.T) {
 	// 2026-11-08: photos from the Pixel added the base_android_photos schema
 	// line ("Pixel photos.") and its raw table ("Pixel photo files."): 10555.
 	// 10555 is those two lines and no more.
-	if guidance > 10555 {
-		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10555)", guidance)
+	//
+	// 2026-11-11: contract C11's marts_ops.source_upstream_health, each
+	// source's own newest item against base_*, added one relation line
+	// ("Source vs PDW."): 10576. 10576 is that line and no more.
+	if guidance > 10576 {
+		t.Fatalf("catalog guidance renders %d bytes; keep it selective (cap 10576)", guidance)
 	}
 	if guidance < 3000 {
 		t.Fatalf("catalog guidance renders only %d bytes; it is not reaching the caller", guidance)

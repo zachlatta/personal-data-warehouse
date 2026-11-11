@@ -2899,7 +2899,7 @@
       "discoverable": true,
       "query_access": "public",
       "secret": false,
-      "comment": "C11 detector. Per (pipeline, scope): the provider's own newest item vs the newest that landed in base_*. status: ok, late, failing (newest upstream item missing past tolerance), unknown (source not observed lately)."
+      "comment": "Source vs PDW. C11: per (pipeline, scope), the source's own newest item against the newest in base_*; status ok, late, failing, unknown (not observed lately)."
     },
     {
       "id": "marts_ops_voice_memo_landing_health",

@@ -4401,6 +4401,10 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "collation_health": _state("collation drift baselines and unique-index divergence findings"),
     "pgbackrest_health": _state("backup posture: does a restorable backup exist, is WAL shipping"),
     "uploader_heartbeats": _state("run heartbeats posted by the remote-device uploaders"),
+    "source_upstream_observations": _state(
+        "what each source itself reports as its newest item (C11), judged in"
+        " marts_ops.source_upstream_health"
+    ),
     "search_request_timings": _state(
         "per-search latency, leg timings and host pressure (C6 evidence; no query text)"
     ),

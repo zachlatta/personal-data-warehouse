@@ -2390,6 +2390,12 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
         note="collation baselines, duplicate-key corroboration, and scheduled amcheck",
     ),
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
+    # C11 evidence, written by each source's own collector (and the app for
+    # device uploaders) and judged live by marts_ops.source_upstream_health,
+    # which the pipeline_health collector folds into sla_detector_status.
+    "source_upstream_observations": _state(
+        "pipeline_health", "updated_at", note="each source's own newest item, per scope (C11)"
+    ),
     "search_request_timings": _data("search_requests", "occurred_at", "occurred_at"),
     "script_runs": _support("agent_usage", "occurred_at", "occurred_at", note="traffic-dependent script telemetry; no calls is not a collector outage"),
     "search_request_timing_state": _state("search_requests", "ticked_at"),
@@ -3168,11 +3174,12 @@ class PipelineHealthCollector:
         if entry.detector not in self._detector_rows:
             scope = DETECTOR_SCOPE_COLUMNS.get(entry.detector)
             select = f"{scope}::text AS scope" if scope else "''::text AS scope"
+            # Already inside collect()'s probe budget: nesting it would reset
+            # statement_timeout to the default for every probe after this one.
             try:
-                with self._probe_budget(PROBE_STATEMENT_TIMEOUT_MS):
-                    rows = self._warehouse._query_dicts(
-                        f"SELECT {select}, status::text AS status FROM @{entry.detector}"
-                    )
+                rows = self._warehouse._query_dicts(
+                    f"SELECT {select}, status::text AS status FROM @{entry.detector}"
+                )
             except psycopg2.Error as error:
                 logger.warning("source detector %s unreadable: %s", entry.detector, error)
                 rows = []
