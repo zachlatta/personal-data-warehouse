@@ -16,7 +16,7 @@
 #
 # Usage: bin/sync-linux-device-runtime <ssh-host> [--enable]
 #
-# Idempotent. A changed unit is rewritten and, if the service is enabled,
+# Idempotent. A changed unit is rewritten and, if the service was running,
 # restarted; --enable also enables and starts it. Host settings (the ingest
 # secret's EnvironmentFile, AGENT_SESSIONS_HEARTBEAT_PIPELINES) belong in a
 # drop-in under ~/.config/systemd/user/<unit>.d/, which this never touches
@@ -50,6 +50,13 @@ ssh "$host" "mkdir -p $runtime/bin .config/systemd/user && chmod 700 $runtime"
 rsync -a --delete --include '_pdw-upload-lib.sh' --include '*-systemd' --exclude '*' \
   "$here/bin/" "$host:$runtime/bin/"
 
+# Restart only a service that was already running the old unit: on a first
+# install, `enable --now` below starts it with the new one.
+was_active=0
+if ssh "$host" "$user_bus systemctl --user is-active --quiet $unit"; then
+  was_active=1
+fi
+
 changed=0
 if [ "$current" != "$rendered" ]; then
   printf '%s\n' "$rendered" | ssh "$host" "cat > $installed"
@@ -57,12 +64,10 @@ if [ "$current" != "$rendered" ]; then
   echo "wrote ~/$installed"
 fi
 ssh "$host" "$user_bus systemctl --user daemon-reload"
+if [ "$changed" = 1 ] && [ "$was_active" = 1 ]; then
+  ssh "$host" "$user_bus systemctl --user restart $unit"
+fi
 if [ "$enable" = 1 ]; then
   ssh "$host" "$user_bus systemctl --user enable --now $unit"
-  if [ "$changed" = 1 ]; then
-    ssh "$host" "$user_bus systemctl --user restart $unit"
-  fi
-elif [ "$changed" = 1 ] && ssh "$host" "$user_bus systemctl --user is-enabled --quiet $unit"; then
-  ssh "$host" "$user_bus systemctl --user restart $unit"
 fi
 echo "device runtime on $host is at ~/$runtime"

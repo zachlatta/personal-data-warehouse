@@ -665,7 +665,7 @@ def test_the_photos_wrapper_asks_for_the_next_run_only_for_a_backlog_it_can_drai
     assert (state / "posted").read_text().split() == ["android_photos"]
 
 
-def _fake_linux_host(tmp_path: Path, *, enabled: bool) -> tuple[Path, Path, dict[str, str]]:
+def _fake_linux_host(tmp_path: Path, *, active: bool) -> tuple[Path, Path, dict[str, str]]:
     """Stub ssh/rsync/systemctl so bin/sync-linux-device-runtime runs against a
     directory standing in for the remote home. ssh runs its command in that
     home; rsync maps host:path into it; systemctl records its arguments."""
@@ -682,7 +682,7 @@ def _fake_linux_host(tmp_path: Path, *, enabled: bool) -> tuple[Path, Path, dict
     )
     (stubs / "systemctl").write_text(
         '#!/usr/bin/env bash\necho "$*" >> "$SYSTEMCTL_CALLS"\n'
-        'if [ "$2" = is-enabled ]; then [ "$FAKE_ENABLED" = 1 ]; exit $?; fi\nexit 0\n'
+        'if [ "$2" = is-active ]; then [ "$FAKE_ACTIVE" = 1 ]; exit $?; fi\nexit 0\n'
     )
     for stub in stubs.iterdir():
         stub.chmod(0o755)
@@ -693,14 +693,14 @@ def _fake_linux_host(tmp_path: Path, *, enabled: bool) -> tuple[Path, Path, dict
         "FAKE_HOME": str(home),
         "REAL_RSYNC": real_rsync,
         "SYSTEMCTL_CALLS": str(calls),
-        "FAKE_ENABLED": "1" if enabled else "0",
+        "FAKE_ACTIVE": "1" if active else "0",
     }
     return home, calls, env
 
 
 @pytest.mark.skipif(not Path("/usr/bin/rsync").exists() and not Path("/opt/homebrew/bin/rsync").exists(), reason="rsync")
 def test_linux_device_runtime_installs_the_uploader_without_a_checkout(tmp_path: Path) -> None:
-    home, calls, env = _fake_linux_host(tmp_path, enabled=False)
+    home, calls, env = _fake_linux_host(tmp_path, active=False)
     script = str(BIN / "sync-linux-device-runtime")
     result = subprocess.run([script, "fakehost", "--enable"], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -714,6 +714,8 @@ def test_linux_device_runtime_installs_the_uploader_without_a_checkout(tmp_path:
     assert "ExecStart=%h/.local/share/personal-data-warehouse/bin/agent-sessions-upload-systemd" in unit
     assert "dev/zachlatta" not in unit
     assert "--user enable --now personal-data-warehouse-agent-sessions-upload.service" in calls.read_text()
+    # A first install is started by enable --now alone, not restarted on top.
+    assert "restart" not in calls.read_text()
     # The wrapper finds its lib and its .env beside it, not in a checkout.
     assert (runtime_bin / "agent-sessions-upload-systemd").stat().st_mode & 0o111
 
@@ -726,7 +728,7 @@ def test_linux_device_runtime_installs_the_uploader_without_a_checkout(tmp_path:
 
 
 def test_linux_device_runtime_refuses_a_checkout_host(tmp_path: Path) -> None:
-    home, _, env = _fake_linux_host(tmp_path, enabled=True)
+    home, _, env = _fake_linux_host(tmp_path, active=True)
     unit_dir = home / ".config/systemd/user"
     unit_dir.mkdir(parents=True)
     checkout_unit = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.service").read_text()
@@ -742,3 +744,15 @@ def test_mac_device_runtime_does_not_ship_the_linux_or_android_pieces() -> None:
     text = (BIN / "sync-mac-device-runtime").read_text()
     for pattern in ("'*-systemd'", "'*-android'", "'sync-*-device-runtime'"):
         assert f"--exclude {pattern}" in text, pattern
+
+
+def test_linux_device_runtime_restarts_a_running_service_whose_unit_changed(tmp_path: Path) -> None:
+    home, calls, env = _fake_linux_host(tmp_path, active=True)
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    stale = "[Service]\nExecStart=%h/.local/share/personal-data-warehouse/bin/agent-sessions-upload-systemd\n"
+    (unit_dir / "personal-data-warehouse-agent-sessions-upload.service").write_text(stale)
+    result = subprocess.run([str(BIN / "sync-linux-device-runtime"), "fakehost"], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "--user restart personal-data-warehouse-agent-sessions-upload.service" in calls.read_text()
+    assert "enable" not in calls.read_text()

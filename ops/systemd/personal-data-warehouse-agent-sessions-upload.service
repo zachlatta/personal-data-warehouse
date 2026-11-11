@@ -9,8 +9,10 @@ Wants=network-online.target
 # starts the next window. No timer: on 2026-11-06 a restarted user manager left
 # the old five-minute timer "active (elapsed)" and nothing ran for 13 hours.
 Type=simple
-# Self-locating wrapper: derives the repo root from its own path. Installed copy
-# lives at the checkout below; update WorkingDirectory/ExecStart if you relocate it.
+# Self-locating wrapper: derives its root from its own path. As checked in, it
+# runs from a checkout (mew-dev, openclaw); bin/sync-linux-device-runtime
+# rewrites both paths to ~/.local/share/personal-data-warehouse for a host
+# with no checkout (mew).
 WorkingDirectory=%h/dev/zachlatta/personal-data-warehouse
 ExecStart=%h/dev/zachlatta/personal-data-warehouse/bin/agent-sessions-upload-systemd
 Restart=always
