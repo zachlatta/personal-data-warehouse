@@ -133,7 +133,8 @@ button.ok:hover { filter: brightness(.95); }
 
 /* ---- page scaffolding shared by the full-width views ---- */
 .page { padding: 28px max(24px, calc((100% - 1120px) / 2)) 120px; }
-.page-head { margin-bottom: 20px; }
+.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; margin-bottom: 20px; }
+.page-actions { display: flex; gap: 8px; }
 .page-head h1, .notification-panel h1, .connections h1 { font-size: 24px; font-weight: 650; letter-spacing: -.02em; line-height: 1.25; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); }
 .pill {
@@ -587,7 +588,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--text-2); }
   #nav { gap: 0; }
   #nav a { padding: 0 9px; font-size: 13.5px; min-height: 44px; }
   #lock { min-width: 44px; min-height: 36px; }
-  .row .right .ctx { display: none; }
+  .row .ctx { max-width: 96px; }
   .row .snip.wrap { -webkit-line-clamp: 3; }
   #sv, .notification-panel, .connections { padding: 20px 14px 80px; }
   #sq { min-width: 0; }
@@ -602,9 +603,14 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--text-2); }
   body.auth-page { padding: 24px 12px; }
   .auth-card { padding: 24px 20px; }
   #tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .plhead { grid-template-columns: 10px minmax(0, 1fr) auto; padding: 11px 12px; }
-  .pl .col { display: none; }
+  /* Phones keep each row's first measured column (a pipeline's last data,
+     a mart's stalest input) beside the status pill. */
+  .plhead { grid-template-columns: 10px minmax(0, 1fr) auto auto; gap: 0 10px; padding: 11px 12px; }
+  .plhead.plbar { grid-template-columns: 10px minmax(0, 1fr); }
+  .pl .col.hide { display: none; }
+  .pl .col { text-align: right; }
+  .pl .col .v { font-size: 12.5px; }
+  .page-actions button { min-height: 40px; }
   .plerr, .plnote { margin-left: 12px; padding-left: 10px; }
   .detail { padding: 12px; overflow-x: auto; }
-  #page-controls #snapshot { display: none; }
 }

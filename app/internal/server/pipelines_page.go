@@ -36,15 +36,17 @@ const pipelinesPageHTML = `<!doctype html>
       <a href="/connections">Connections</a>
       <a href="/pipelines" class="on" aria-current="page">Pipelines</a>
     </nav>
-    <div id="topctl">
-      <button id="attention">Needs attention</button>
-      <button id="reload">Reload</button>
-    </div>
   </div>
 </header>
 
 <div id="page">
-  <div class="page-head"><h1>Pipelines</h1><p class="m">What is still arriving: every source, mart, timeline adapter and integrity check, worst first.</p></div>
+  <div class="page-head">
+    <div><h1>Pipelines</h1><p class="m">What is still arriving: every source, mart, timeline adapter and integrity check, worst first.</p></div>
+    <div class="page-actions">
+      <button id="attention">Needs attention</button>
+      <button id="reload">Reload</button>
+    </div>
+  </div>
   <div id="tiles"></div>
   <div id="groups"></div>
   <div id="marts"></div>

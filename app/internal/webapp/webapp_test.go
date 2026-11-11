@@ -468,3 +468,40 @@ func TestConsentPageFitsAPhone(t *testing.T) {
 		t.Fatalf(".auth-card must never be wider than the page, got %q", card)
 	}
 }
+
+// What a phone showed before the redesign, it still shows: the pipelines
+// actions, each pipeline's first measured column (its last data), and a
+// timeline row's context. Hidden on a phone, they are simply gone.
+func TestPhoneLayoutKeepsWhatPhonesShowed(t *testing.T) {
+	data, _ := fs.ReadFile(staticFS, "static/app.css")
+	css := string(data)
+	var phone strings.Builder
+	for rest := css; ; {
+		i := strings.Index(rest, "@media (max-width: 640px)")
+		if i < 0 {
+			break
+		}
+		block := rest[i:]
+		depth, end := 0, 0
+		for j, r := range block {
+			if r == '{' {
+				depth++
+			} else if r == '}' {
+				depth--
+				if depth == 0 {
+					end = j
+					break
+				}
+			}
+		}
+		phone.WriteString(block[:end])
+		rest = block[end:]
+	}
+	for _, hidden := range []string{".page-actions", ".row .right .ctx", ".pl .col {", ".pl .col{"} {
+		for _, line := range strings.Split(phone.String(), "\n") {
+			if strings.Contains(line, hidden) && strings.Contains(line, "display: none") {
+				t.Errorf("phones hide %s: %s", hidden, strings.TrimSpace(line))
+			}
+		}
+	}
+}

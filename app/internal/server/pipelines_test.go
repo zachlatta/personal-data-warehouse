@@ -708,3 +708,19 @@ func TestPipelinesNotificationHealthCarriesAndroidDeliveryCheck(t *testing.T) {
 		t.Fatal("pipelines page still carries stale direct/CC notification copy")
 	}
 }
+
+// The SPA hides its header controls (#topctl) on a phone, as it always has.
+// The dashboard's own filter and reload must not live there: on a phone they
+// are the only way to narrow a long list to what needs attention.
+func TestPipelinesControlsStayReachableOnAPhone(t *testing.T) {
+	head := pipelinesPageHTML[strings.Index(pipelinesPageHTML, `<div class="page-head">`):]
+	head = head[:strings.Index(head, `<div id="tiles">`)]
+	for _, id := range []string{`id="attention"`, `id="reload"`} {
+		if !strings.Contains(head, id) {
+			t.Fatalf("the pipelines page head must carry %s, where a phone can reach it", id)
+		}
+	}
+	if strings.Contains(pipelinesPageHTML, `id="topctl"`) {
+		t.Fatal("the pipelines page must not put controls in #topctl, which phones hide")
+	}
+}
