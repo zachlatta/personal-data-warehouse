@@ -561,6 +561,13 @@ export function mount(container, ctx) {
     schedule();
   }
 
+  // The app's tokens as they resolve right now (light or dark), for the frame.
+  function readerPalette() {
+    const css = getComputedStyle(document.documentElement);
+    const token = (name) => css.getPropertyValue(name).trim();
+    return { bg: token("--surface"), text: token("--text"), muted: token("--text-2"), border: token("--border"), code: token("--surface-2"), link: token("--accent") };
+  }
+
   function readerFrame(article) {
     const nonce = newNonce();
     const frame = h("iframe", "frframe");
@@ -568,7 +575,7 @@ export function mount(container, ctx) {
     // No allow-same-origin: script in here has an opaque origin and no localStorage.
     frame.setAttribute("sandbox", "allow-scripts");
     frame.setAttribute("referrerpolicy", "no-referrer");
-    frame.setAttribute("srcdoc", articleDocument(article, nonce));
+    frame.setAttribute("srcdoc", articleDocument(article, nonce, readerPalette()));
     reader.frame = frame;
     reader.nonce = nonce;
     return frame;

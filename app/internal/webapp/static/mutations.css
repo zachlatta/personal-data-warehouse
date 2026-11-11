@@ -205,7 +205,7 @@ details.gmsg[open] .gmsg-preview { display: none; }
 .gmsg-body { padding: 0 12px 12px 52px; }
 .gmsg-body p { color: var(--text-2); font-size: 13.5px; white-space: pre-wrap; }
 iframe.mail-frame { display: block; width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); background: white; }
-iframe.mail-frame.quoted { margin-top: 6px; opacity: .9; }
+iframe.mail-frame.quoted { margin-top: 6px; }
 details.gquoted { margin-top: 8px; }
 
 /* send_email composer */
@@ -276,10 +276,15 @@ ul.cal-meta li.notify-off { color: var(--text-2); }
 ul.cal-attendees { list-style: none; display: grid; gap: 8px; }
 .cal-attendee { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; }
 .cal-attendee .avatar { width: 28px; height: 28px; }
-.avatar.color-a { color: #8a5a00; background: #fbecc8; } .avatar.color-b { color: #17663a; background: #d4f1df; }
-.avatar.color-c { color: #1f4f9a; background: #d8e5fb; } .avatar.color-d { color: #9b2727; background: #fadcdc; }
-.avatar.color-e { color: #5b3a9c; background: #e7defa; } .avatar.color-f { color: #6b5a00; background: #f4ecc0; }
-.avatar.color-g { color: #0d5f5f; background: #cfeeee; } .avatar.color-h { color: #8c3d0b; background: #fbe1cd; }
+/* Guest avatars: a tint of a token each, so they follow light and dark. */
+.avatar.color-a { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--surface)); }
+.avatar.color-b { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, var(--surface)); }
+.avatar.color-c { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface)); }
+.avatar.color-d { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
+.avatar.color-e { color: var(--violet); background: color-mix(in srgb, var(--violet) 14%, var(--surface)); }
+.avatar.color-f { color: var(--orange); background: color-mix(in srgb, var(--orange) 14%, var(--surface)); }
+.avatar.color-g { color: var(--info); background: color-mix(in srgb, var(--info) 14%, var(--surface)); }
+.avatar.color-h { color: var(--text-2); background: color-mix(in srgb, var(--text-2) 14%, var(--surface)); }
 .cal-tags { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
 .tag { padding: 0 7px; border-radius: 999px; background: var(--surface-3); color: var(--text-2); font-size: 11.5px; line-height: 18px; }
 .tag.organizer { color: var(--accent-text); background: var(--accent-soft); }
@@ -304,7 +309,8 @@ table.cal-patch tbody th { width: 130px; color: var(--text-2); font-size: 13px; 
 .slack-msg { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
 .slack-msg:last-child { border-bottom: 0; }
 .slack-msg.target { box-shadow: inset 2px 0 0 var(--accent); background: var(--accent-soft); }
-.slack-msg.after { opacity: .6; }
+.slack-msg.after { background: var(--surface-2); }
+.slack-msg.after .slack-msg-text { color: var(--text-3); }
 .slack-msg .avatar { width: 30px; height: 30px; }
 .slack-msg-copy { min-width: 0; flex: 1; }
 .slack-msg-head { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }

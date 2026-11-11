@@ -76,7 +76,10 @@ beforeEach(() => {
     removeEventListener: (event, fn) => { documentEvents[event] = (documentEvents[event] || []).filter((f) => f !== fn); },
     dispatchEvent() {},
     getElementById: (id) => (id === "gate" ? { classList: { contains: () => gateOpen } } : null),
+    documentElement: {},
   };
+  // The page's resolved tokens, which the reader frame is painted with.
+  globalThis.getComputedStyle = () => ({ getPropertyValue: (name) => ({ "--surface": "#ffffff", "--text": "#1c1b1a", "--accent": "#3459c4" })[name] || "" });
   globalThis.window = {
     addEventListener: (event, fn) => { (windowEvents[event] ||= []).push(fn); },
     removeEventListener: (event, fn) => { windowEvents[event] = (windowEvents[event] || []).filter((f) => f !== fn); },
@@ -807,6 +810,7 @@ test("o opens the article in a sealed frame, and logs open and ui article the wa
   assert.ok(html.includes("base-uri 'none'"));
   assert.ok(html.includes("form-action 'none'"));
   assert.ok(html.includes("<p>Words</p>"));
+  assert.ok(html.includes("background: #ffffff; color: #1c1b1a") && html.includes("color: #3459c4"), "painted with the page's tokens");
   assert.match(readerNode().textContent, /Read me/);
   assert.match(readerNode().textContent, /A Writer/);
   await flushed();
@@ -1020,6 +1024,18 @@ test("the article's document is sealed and hands everything back by message", ()
   assert.ok(!html.includes("unsafe-eval"));
   assert.ok(!/script-src[^;"]*unsafe-inline/.test(html));
   assert.ok(!articleDocument({ html: `<img src="https://i.test/lead.jpg">`, image_url: "https://i.test/lead.jpg" }, "abc").includes("<figure>"), "no second copy of the lead image");
+});
+
+// The frame cannot read the page's tokens, so the page resolves them and hands
+// them in: the reader is app.css's palette, light or dark, with none of its own.
+test("the article's document is painted with the palette it is given, and only with colours", () => {
+  const palette = { bg: "#ffffff", text: "#1c1b1a", muted: "#57534f", border: "rgb(231, 229, 226)", code: "#f8f8f7", link: "#3459c4" };
+  const html = articleDocument({ html: "<p>x</p>" }, "abc", palette);
+  for (const value of Object.values(palette)) assert.ok(html.includes(value), value);
+  assert.ok(!/#[0-9a-f]{3,8}\b/i.test(articleDocument({ html: "<p>x</p>" }, "abc")), "no palette of its own");
+  const hostile = articleDocument({ html: "<p>x</p>" }, "abc", { ...palette, text: "red; } body { display: none" });
+  assert.ok(!hostile.includes("display: none"), "a value that is not a colour is dropped");
+  assert.ok(hostile.includes("CanvasText"), "and replaced by the system colour");
 });
 
 // Runs the frame's own script against a stub page, as the sandbox would.

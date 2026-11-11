@@ -247,7 +247,7 @@ export function fileVideoDocument(source) {
   const poster = safeUrl(source.poster) ? ` poster="${escapeHtml(source.poster)}"` : "";
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http:; media-src https: http:; style-src 'unsafe-inline'">
-<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}video{display:block;width:100%;height:100%}</style>
+<style>html,body{margin:0;height:100%;background:black;overflow:hidden}video{display:block;width:100%;height:100%}</style>
 </head><body><video src="${escapeHtml(source.url)}"${poster} controls autoplay playsinline preload="auto"></video></body></html>`;
 }
 
@@ -263,13 +263,29 @@ export function parseArticleMessage(data, nonce) {
   return null;
 }
 
+// The reader frame cannot see app.css, so feed.js resolves the app's tokens
+// (light or dark) and passes them in; app.css stays the only palette. Anything
+// that is not a plain colour value is dropped for the matching system colour,
+// so nothing but a colour can reach the frame's stylesheet.
+const COLOR_VALUE = /^(#[0-9a-f]{3,8}|rgba?\([\d.,%\s/]+\)|hsla?\([\d.,%\sdeg/]+\))$/i;
+const SYSTEM_COLORS = { bg: "Canvas", text: "CanvasText", muted: "GrayText", border: "GrayText", code: "Canvas", link: "LinkText" };
+export function readerColors(palette) {
+  const out = {};
+  for (const key of Object.keys(SYSTEM_COLORS)) {
+    const value = String((palette && palette[key]) || "").trim();
+    out[key] = COLOR_VALUE.test(value) ? value : SYSTEM_COLORS[key];
+  }
+  return out;
+}
+
 // The reader's document: the phone's article.ts in this page's colors, sandboxed
 // by feed.js with no same-origin, so nothing in it can reach the token in
 // localStorage. Only this page's own script runs (a nonce'd CSP); the server
 // already stripped the article's scripts, frames and handlers. The script speaks
 // only by postMessage, each message carrying the nonce, which a page the frame
 // navigated to would not know.
-export function articleDocument(article, nonce) {
+export function articleDocument(article, nonce, palette = {}) {
+  const c = readerColors(palette);
   const lead = article.image_url && !article.html.includes(article.image_url) ? `<figure><img src="${escapeHtml(article.image_url)}" alt=""></figure>` : "";
   return `<!doctype html><html${article.language ? ` lang="${escapeHtml(article.language)}"` : ""}><head>
 <meta charset="utf-8">
@@ -277,31 +293,23 @@ export function articleDocument(article, nonce) {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data:; media-src https: http:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
 <style>
 html, body { overflow: hidden; }
-body { margin: 0; background: #ffffff; color: #1c1b1a; font: 17px/1.65 Inter, "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: break-word; }
+body { margin: 0; background: ${c.bg}; color: ${c.text}; font: 17px/1.65 Inter, "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: break-word; }
 #root { padding: 1px 16px; }
 p, ul, ol, blockquote, figure, pre, table { margin: 0 0 1em; }
 h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.3em 0 0.5em; }
 h1 { font-size: 1.45em; } h2 { font-size: 1.3em; } h3 { font-size: 1.15em; } h4, h5, h6 { font-size: 1em; }
-a { color: #3b63d4; text-decoration: none; }
+a { color: ${c.link}; text-decoration: none; }
 a:hover { text-decoration: underline; }
 img, video, picture { display: block; max-width: 100%; height: auto; border-radius: 10px; margin: 0 auto; }
 figure { margin-left: 0; margin-right: 0; }
-figcaption { color: #5a5753; font-size: 0.8em; line-height: 1.4; margin-top: 6px; }
-blockquote { border-left: 3px solid #e7e5e2; margin-left: 0; padding-left: 14px; color: #5a5753; }
+figcaption { color: ${c.muted}; font-size: 0.8em; line-height: 1.4; margin-top: 6px; }
+blockquote { border-left: 3px solid ${c.border}; margin-left: 0; padding-left: 14px; color: ${c.muted}; }
 pre, code { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
-pre { background: #f8f8f7; border: 1px solid #e7e5e2; padding: 12px; border-radius: 8px; overflow-x: auto; }
-:not(pre) > code { background: #f8f8f7; padding: 1px 4px; border-radius: 4px; }
+pre { background: ${c.code}; border: 1px solid ${c.border}; padding: 12px; border-radius: 8px; overflow-x: auto; }
+:not(pre) > code { background: ${c.code}; padding: 1px 4px; border-radius: 4px; }
 table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 0.9em; }
-td, th { border: 1px solid #e7e5e2; padding: 6px 8px; }
-hr { border: 0; border-top: 1px solid #e7e5e2; margin: 1.5em 0; }
-/* The frame cannot read the app's tokens, so its dark palette is spelled here. */
-@media (prefers-color-scheme: dark) {
-  body { background: #1d1d1c; color: #ecebe9; }
-  a { color: #6d8ff0; }
-  figcaption, blockquote { color: #b0ada8; }
-  blockquote, td, th, hr, pre { border-color: #3d3d3b; }
-  pre, :not(pre) > code { background: #222221; }
-}
+td, th { border: 1px solid ${c.border}; padding: 6px 8px; }
+hr { border: 0; border-top: 1px solid ${c.border}; margin: 1.5em 0; }
 </style></head><body><div id="root">${lead}${article.html}</div>
 <script nonce="${nonce}">
 (function () {

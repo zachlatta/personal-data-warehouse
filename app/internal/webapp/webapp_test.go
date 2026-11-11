@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -339,5 +341,130 @@ func TestShellHeaderLinksEveryPage(t *testing.T) {
 	}
 	if !strings.Contains(shell, `class="brand-mark"`) {
 		t.Fatal("the header has no brand mark")
+	}
+}
+
+// themeTokens reads the hex tokens of the light :root and of the dark override.
+func themeTokens(t *testing.T) (light, dark map[string]string) {
+	t.Helper()
+	data, err := fs.ReadFile(staticFS, "static/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(data)
+	split := strings.Index(css, "@media (prefers-color-scheme: dark)")
+	if split < 0 {
+		t.Fatal("app.css has no dark theme")
+	}
+	end := strings.Index(css[split:], "\n}\n")
+	read := func(block string) map[string]string {
+		out := map[string]string{}
+		for _, m := range regexp.MustCompile(`(--[a-z0-9-]+):\s*(#[0-9a-fA-F]{6})\b`).FindAllStringSubmatch(block, -1) {
+			out[m[1]] = m[2]
+		}
+		return out
+	}
+	light = read(css[:split])
+	dark = map[string]string{}
+	for k, v := range light {
+		dark[k] = v
+	}
+	for k, v := range read(css[split : split+end]) {
+		dark[k] = v
+	}
+	return light, dark
+}
+
+func contrast(a, b string) float64 {
+	lum := func(hex string) float64 {
+		var rgb [3]float64
+		for i := range rgb {
+			v, _ := strconv.ParseUint(hex[1+2*i:3+2*i], 16, 8)
+			c := float64(v) / 255
+			if c <= 0.03928 {
+				rgb[i] = c / 12.92
+			} else {
+				rgb[i] = math.Pow((c+0.055)/1.055, 2.4)
+			}
+		}
+		return 0.2126*rgb[0] + 0.7152*rgb[1] + 0.0722*rgb[2]
+	}
+	la, lb := lum(a), lum(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+// Every text colour the design uses meets WCAG AA (4.5:1) on every surface it
+// sits on, in both themes. Muted text and status pills are where a calm palette
+// drifts below it, so they are listed explicitly.
+func TestDesignTokensMeetWCAGAAContrast(t *testing.T) {
+	light, dark := themeTokens(t)
+	pairs := [][2]string{
+		{"--text", "--bg"}, {"--text", "--surface"}, {"--text-2", "--bg"}, {"--text-2", "--surface-3"},
+		{"--text-3", "--bg"}, {"--text-3", "--surface"}, {"--text-3", "--surface-2"}, {"--text-3", "--surface-3"},
+		{"--accent", "--surface"}, {"--accent-text", "--accent-soft"}, {"--on-accent", "--accent"}, {"--on-ok", "--ok"},
+		{"--ok", "--surface"}, {"--ok", "--ok-soft"}, {"--warn", "--surface"}, {"--warn", "--warn-soft"},
+		{"--orange", "--orange-soft"}, {"--danger", "--surface"}, {"--danger", "--danger-soft"},
+		{"--violet", "--violet-soft"}, {"--info", "--surface"}, {"--info", "--info-soft"},
+	}
+	for name, theme := range map[string]map[string]string{"light": light, "dark": dark} {
+		for _, pair := range pairs {
+			fg, bg := theme[pair[0]], theme[pair[1]]
+			if fg == "" || bg == "" {
+				t.Fatalf("%s theme is missing %s or %s", name, pair[0], pair[1])
+			}
+			if got := contrast(fg, bg); got < 4.5 {
+				t.Errorf("%s: %s (%s) on %s (%s) is %.2f:1, below WCAG AA 4.5:1", name, pair[0], fg, pair[1], bg, got)
+			}
+		}
+	}
+	app, _ := fs.ReadFile(staticFS, "static/app.css")
+	if regexp.MustCompile(`\.row[^{]*\{[^}]*opacity`).Match(app) {
+		t.Error("timeline rows fade by opacity, which takes muted text below AA; weight them by colour instead")
+	}
+}
+
+// Colour literals live in app.css. The only others are named here with their
+// reason: the per-source identity dots, and the frame that shows a sender's own
+// HTML email on white the way a mail client does.
+func TestNoColourLiteralsOutsideAppCSS(t *testing.T) {
+	allowed := map[string]bool{"format.js": true, "mutation_view.js": true}
+	sub, _ := fs.Sub(staticFS, "static")
+	literal := regexp.MustCompile(`#[0-9a-fA-F]{3,8}\b|rgba?\(\s*\d`)
+	_ = fs.WalkDir(sub, ".", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || strings.HasPrefix(name, "tests/") || name == "app.css" || allowed[name] {
+			return err
+		}
+		if !strings.HasSuffix(name, ".css") && !strings.HasSuffix(name, ".js") {
+			return nil
+		}
+		data, _ := fs.ReadFile(sub, name)
+		if found := literal.FindString(string(data)); found != "" {
+			t.Errorf("%s carries the colour %q; colours are tokens in app.css", name, found)
+		}
+		return nil
+	})
+}
+
+// The consent page is opened on phones by connector flows. Its one column must
+// be allowed to shrink: an auto grid track sized to the 440px card pushed a
+// 390px page 66px sideways.
+func TestConsentPageFitsAPhone(t *testing.T) {
+	data, _ := fs.ReadFile(staticFS, "static/app.css")
+	css := string(data)
+	rule := func(selector string) string {
+		i := strings.Index(css, selector+" {")
+		if i < 0 {
+			t.Fatalf("app.css has no %s rule", selector)
+		}
+		return css[i : i+strings.Index(css[i:], "}")]
+	}
+	if page := rule("body.auth-page"); !strings.Contains(page, "grid-template-columns: minmax(0, 1fr)") {
+		t.Fatalf("body.auth-page must use a shrinkable column, got %q", page)
+	}
+	if card := rule(".auth-card"); !strings.Contains(card, "width: min(440px, 100%)") {
+		t.Fatalf(".auth-card must never be wider than the page, got %q", card)
 	}
 }

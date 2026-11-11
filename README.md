@@ -262,9 +262,17 @@ Every browser page shares one stylesheet, `app/internal/webapp/static/app.css`: 
 server-rendered `/pipelines` dashboard and the `/oauth/authorize` consent page all link it, and
 `/pipelines` carries the same header and tabs as the SPA. The look is a calm admin console — a
 neutral palette, one blue accent, colour kept for status, white cards, sentence-case labels,
-monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every colour,
-radius and shadow is a token in its `:root`; `TestDesignTokensAreDefinedOnceInAppCSS` fails if
-another file declares a palette or reads a token `app.css` does not define.
+monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every UI
+colour, radius and shadow is a token in its `:root`. The Feed reader's sandboxed frame cannot read
+those tokens, so `feed.js` resolves them and passes the values in. Two colour sets live elsewhere on
+purpose: the per-source identity dots in `format.js`, and the white frame that shows a sender's own
+HTML email in mutation review. In `app/internal/webapp/webapp_test.go`:
+
+- `TestDesignTokensAreDefinedOnceInAppCSS` fails if another file declares a `:root` palette or reads
+  a token that `app.css` does not define.
+- `TestNoColourLiteralsOutsideAppCSS` fails on a colour literal anywhere else.
+- `TestDesignTokensMeetWCAGAAContrast` holds every text/surface pair, in both themes, to WCAG AA
+  4.5:1.
 
 Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>`, which
 opens that request directly. The review view shows each mutation the way it will be applied —
