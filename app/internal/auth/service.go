@@ -70,6 +70,7 @@ func (e *GrantUnavailableError) Error() string { return "grant store unavailable
 func (e *GrantUnavailableError) Unwrap() error { return e.Err }
 
 type Claims struct {
+	GrantID    string
 	ClientID   string
 	ClientName string
 	Scope      string
@@ -162,6 +163,8 @@ func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Hand
 			return nil, fmt.Errorf("%w: %v", mcpauth.ErrInvalidToken, err)
 		}
 		SetClientName(ctx, claims.ClientName)
+		setPrincipal(ctx, Principal{Scope: ScopeOAuthQuery, ClientName: claims.ClientName, TokenID: claims.GrantID})
+		setAuthorizationCheck(ctx, func(checkCtx context.Context) error { _, err := s.VerifyBearer(checkCtx, token); return err })
 		s.logger.DebugContext(ctx, "bearer token accepted", "path", req.URL.Path, "client", claims.ClientName)
 		return &mcpauth.TokenInfo{
 			Scopes:     strings.Fields(claims.Scope),
@@ -196,6 +199,7 @@ func (s *Service) VerifyBearer(ctx context.Context, token string) (*Claims, erro
 		return nil, err
 	}
 	return &Claims{
+		GrantID:    payload.GrantID,
 		ClientID:   payload.ClientID,
 		ClientName: payload.ClientName,
 		Scope:      payload.Scope,

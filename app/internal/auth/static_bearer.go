@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
@@ -82,6 +83,13 @@ func (s *Service) RequireStaticBearer() func(http.Handler) http.Handler {
 				r = r.WithContext(WithClientNameHolder(r.Context()))
 			}
 			setPrincipal(r.Context(), principal)
+			setAuthorizationCheck(r.Context(), func(checkCtx context.Context) error {
+				_, status, _ := s.authenticateStatic(r.WithContext(checkCtx), name, token)
+				if status != 0 {
+					return ErrUnknownToken
+				}
+				return nil
+			})
 			s.logger.InfoContext(r.Context(), "static bearer accepted", "client", name, "scope", principal.Scope, "token_id", principal.TokenID, "path", r.URL.Path)
 			next.ServeHTTP(w, r)
 		})
