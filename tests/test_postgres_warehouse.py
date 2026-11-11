@@ -4019,6 +4019,57 @@ def test_every_search_function_runs_with_jit_off(warehouse: PostgresWarehouse) -
     assert [name for name, config in rows if "jit=off" not in config] == []
 
 
+@pytest.mark.parametrize("priorities", [None, ["self", "direct", "cc"]], ids=["broad", "attention"])
+def test_search_text_runs_its_pool_partitions_on_parallel_workers(
+    warehouse: PostgresWarehouse, priorities: list[str] | None
+) -> None:
+    """Contract C6: each pool partition is an index-ordered BM25 scan that
+    fetches its heap rows one at a time, and in one backend the pool cost the
+    sum of its partitions (prod, 2026-11-11, cold, scoped: 13.1 s and then
+    1.65 s). The partitions must run as the children of one Parallel Append,
+    each on its own process, and the pool must still hold both partitions'
+    rows."""
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        VALUES ('slack_message', 'pp1', 'slack', 'message', now(), 'slack_messages',
+                'quokka parallel pool probe', 'direct', 'a', 't', 's', 'c'),
+               ('apple_note_revision', 'pp2', 'apple_notes', 'note_edit', now(),
+                'apple_note_revisions', 'quokka parallel pool note', 'self', 'a', 't', 's', 'c')
+        """
+    )
+    connection = warehouse._connection
+    warehouse._command("LOAD 'auto_explain'")
+    warehouse._command("SET auto_explain.log_min_duration = 0")
+    warehouse._command("SET auto_explain.log_analyze = on")
+    warehouse._command("SET auto_explain.log_nested_statements = on")
+    warehouse._command("SET client_min_messages = log")
+    del connection.notices[:]
+    try:
+        rows = warehouse._query(
+            "SELECT ref FROM @search_text('quokka', 10, NULL, NULL, %s::text[])",
+            (priorities,),
+        )
+        plans = "".join(connection.notices)
+    finally:
+        warehouse._command("RESET client_min_messages")
+        warehouse._command("RESET auto_explain.log_min_duration")
+
+    assert "Parallel Append" in plans, plans
+    assert plans.count("Function Scan on search_text_pool_partition") == 2, plans
+    launched = [int(n) for n in re.findall(r"Workers Launched: (\d+)", plans)]
+    assert launched and max(launched) >= 1, plans
+    assert {ref for (ref,) in rows} == {
+        "slack_message:pp1",
+        "apple_note_revision:pp2",
+    }
+
+
 def test_search_text_preview_strips_tracking_urls_and_table_scaffolding(warehouse: PostgresWarehouse) -> None:
     # Measured 2026-09-22: a newsletter hit's whole 800-char preview was
     # squarespace-mail.com redirect URLs and `| | --- |` markdown-table debris,
@@ -7015,6 +7066,26 @@ def test_search_text_broad_pool_scans_low_volume_adapters_separately() -> None:
     )
 
 
+
+def _search_text_pool_partitions_sql() -> str:
+    """The partition scans: the CASE body of search_text_pool_partition()."""
+    sql = _search_text_function_sql()
+    start = sql.index("CREATE OR REPLACE FUNCTION @search_text_pool_partition(")
+    body = sql[sql.index("partition_sql text := CASE partition_number", start) :]
+    return body[: body.index("END;")]
+
+
+def _search_text_pool_window_sql() -> str:
+    """search_text()'s statement under the enable_sort hint."""
+    sql = _search_text_function_sql()
+    fn = sql[sql.index("CREATE OR REPLACE FUNCTION @search_text(") :]
+    return fn[
+        fn.index("set_config('enable_sort', 'off', true)") : fn.index(
+            "set_config('enable_sort', 'on', true)"
+        )
+    ]
+
+
 def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
     # With the default cost model the planner reads every row of a selective
     # adapter filter and recomputes the bm25 operator per row, which is ~100x
@@ -7031,16 +7102,17 @@ def test_search_text_broad_pool_forces_the_index_ordered_plan() -> None:
     # too left the planner no sane way to feed the window function: at a 10k
     # pool one query ran for five MINUTES. The pool is therefore collected in
     # its own statement, into arrays, before the hint is restored.
-    off_at = sql.index("set_config('enable_sort', 'off', true)")
-    on_at = sql.index("set_config('enable_sort', 'on', true)")
-    scoped = sql[off_at:on_at]
-    assert "array_agg" in scoped, (
+    scoped = _search_text_pool_window_sql()
+    assert "array_agg" in scoped and "@search_text_pool(" in scoped, (
         "the pooled scan must be collected in its own statement while the "
         "enable_sort hint is in force"
     )
     assert "PARTITION BY" not in scoped, (
         "the per-source ranking must run AFTER enable_sort is restored"
     )
+    # The scans themselves run in search_text_pool_partition on parallel
+    # workers, which inherit the hint from the session that launched them.
+    scoped = _search_text_pool_partitions_sql()
     # The one window allowed under the hint is the bare `row_number() OVER ()`
     # that captures each partition's scan ordinal. It carries no PARTITION BY
     # and no ORDER BY, so it needs no sort and cannot be the plan the disabled
@@ -7136,10 +7208,7 @@ def test_search_text_broad_pool_ranks_by_scan_ordinal_not_a_per_row_rescore() ->
     This is the guard for the defect, not for the fix: it fails on the shape
     that was shipped.
     """
-    sql = _search_text_function_sql()
-    off_at = sql.index("set_config('enable_sort', 'off', true)")
-    on_at = sql.index("set_config('enable_sort', 'on', true)")
-    pooled = sql[off_at:on_at]
+    pooled = _search_text_pool_partitions_sql()
     assert "<@>" in pooled, "the pooled scan must still ORDER BY the bm25 operator"
     for match in re.finditer("<@>", pooled):
         assert pooled[: match.start()].rstrip().endswith("ORDER BY t.search_text"), (
@@ -7680,12 +7749,7 @@ def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() 
     """
     import personal_data_warehouse.postgres as postgres_module
 
-    sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_window_sql()
     assert (
         "priorities <@ ARRAY["
         + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL
@@ -7694,9 +7758,11 @@ def test_search_text_serves_an_attention_scoped_call_from_the_attention_index() 
         "the broad pool must choose the attention index only when the requested "
         "tiers are a SUBSET of the ones it contains"
     )
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_idx')" in pool
+    partitions = _search_text_pool_partitions_sql()
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_idx')" in partitions
     assert (
-        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_lowvol_idx')" in pool
+        "to_bm25query(%1$L, 'timeline_events_search_text_bm25_attention_lowvol_idx')"
+        in partitions
     )
 
 
@@ -7712,17 +7778,13 @@ def test_search_text_pool_is_one_shot_dynamic_sql_with_the_query_inlined() -> No
     query needs to be a literal; priorities and since travel through USING.
     """
     sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_partitions_sql()
     assert "to_bm25query(query," not in pool, (
         "the pool must inline the query as a literal (%1$L), never reference "
         "the plpgsql variable, which makes it a cached parameterized plan"
     )
-    assert pool.count("EXECUTE format($pool$") == 2, "both the attention and the broad pool run as one-shot dynamic SQL"
-    assert pool.count("USING priorities, since;") == 2
+    assert pool.count("to_bm25query(%1$L,") == 4, "all four partitions inline the query"
+    assert "RETURN QUERY EXECUTE format(partition_sql, query) USING priorities, since;" in sql
     assert "($1 IS NULL OR t.priority::text = ANY ($1))" in pool
     assert "($2 IS NULL OR t.occurred_at >= $2)" in pool
     assert "(priorities IS NULL OR" not in pool and "(since IS NULL OR" not in pool
@@ -8181,12 +8243,7 @@ def test_the_attention_pool_repeats_the_index_predicate_as_a_literal() -> None:
     """
     import personal_data_warehouse.postgres as postgres_module
 
-    sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
+    pool = _search_text_pool_partitions_sql()
     literal = f"t.priority IN ({postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
     assert pool.count(literal) == 2, (
         "both attention partitions must carry the index predicate as a literal; "

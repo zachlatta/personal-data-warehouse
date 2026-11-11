@@ -17561,26 +17561,31 @@ class PostgresWarehouse:
 
         def two_partition_pool(
             high_index: str, low_index: str, high_part: int, low_part: int, extra_where: str = ""
-        ) -> str:
-            return (
-                pool_partition(
-                    f"t.adapter NOT IN ({low_volume_list})",
-                    high_index,
-                    SEARCH_TEXT_BROAD_POOL,
+        ) -> list[tuple[int, str]]:
+            return [
+                (
                     high_part,
-                    extra_where,
-                )
-                + "\n                        UNION ALL\n                        "
-                + pool_partition(
-                    f"t.adapter IN ({low_volume_list})",
-                    low_index,
-                    SEARCH_TEXT_BROAD_SMALL_POOL,
+                    pool_partition(
+                        f"t.adapter NOT IN ({low_volume_list})",
+                        high_index,
+                        SEARCH_TEXT_BROAD_POOL,
+                        high_part,
+                        extra_where,
+                    ),
+                ),
+                (
                     low_part,
-                    extra_where,
-                )
-            )
+                    pool_partition(
+                        f"t.adapter IN ({low_volume_list})",
+                        low_index,
+                        SEARCH_TEXT_BROAD_SMALL_POOL,
+                        low_part,
+                        extra_where,
+                    ),
+                ),
+            ]
 
-        broad_pool_sql = two_partition_pool(
+        broad_pool_parts = two_partition_pool(
             "timeline_events_search_text_bm25_idx",
             "timeline_events_search_text_bm25_lowvol_idx",
             SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
@@ -17658,12 +17663,92 @@ class PostgresWarehouse:
         # to_bm25query() pins an index by name and checks the plan used it.
         # The runtime `priorities` filter in pool_where still does the actual
         # selection (a call for just `self` must not return `direct`).
-        attention_pool_sql = two_partition_pool(
+        attention_pool_parts = two_partition_pool(
             "timeline_events_search_text_bm25_attention_idx",
             "timeline_events_search_text_bm25_attention_lowvol_idx",
             SEARCH_TEXT_POOL_PART_ATTENTION_HIGH_VOLUME,
             SEARCH_TEXT_POOL_PART_ATTENTION_LOW_VOLUME,
             f" AND t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})",
+        )
+        # The pool's partitions run side by side, one per worker. Each is an
+        # index-ordered BM25 scan that fetches its heap rows one at a time,
+        # so in one backend the pool cost the SUM of its partitions (prod,
+        # 2026-11-11, cold, 'contract renewal' scoped to self/direct/cc:
+        # 13.1 s for the 5,000-row partition, then 1.65 s for the 800-row
+        # one). A LIMIT subquery is never planned on a worker and plpgsql's
+        # SELECT INTO never runs a parallel plan, so each partition is a
+        # PARALLEL SAFE function and the pool function returns their Parallel
+        # Append through RETURN QUERY EXECUTE. Rows are the partitions' rows.
+        pool_partition_whens = "\n                        ".join(
+            f"WHEN {part} THEN $part${one_shot_pool(sql)}$part$"
+            for part, sql in broad_pool_parts + attention_pool_parts
+        )
+
+        def pool_union(parts: list[tuple[int, str]]) -> str:
+            return " UNION ALL ".join(
+                f"SELECT * FROM @search_text_pool_partition($1, {part}, $2, $3)"
+                for part, _ in parts
+            )
+
+        search_text_pool_functions_sql = (
+            r"""
+            DROP FUNCTION IF EXISTS @search_text_pool_partition(text, integer, text[], timestamptz);
+            CREATE OR REPLACE FUNCTION @search_text_pool_partition(
+                query text,
+                partition_number integer,
+                priorities text[],
+                since timestamptz
+            )
+            RETURNS TABLE (adapter text, event_id text, source text, part integer, pool_rank bigint)
+            LANGUAGE plpgsql
+            SET jit = off
+            STABLE
+            -- Reads only and sets nothing (the caller pins enable_sort off
+            -- before the workers start; they inherit it), so a worker may run it.
+            PARALLEL SAFE
+            COST 10000000
+            ROWS """
+            + str(SEARCH_TEXT_BROAD_POOL)
+            + r"""
+            AS $partition$
+            DECLARE
+                partition_sql text := CASE partition_number
+                        """
+            + pool_partition_whens
+            + r"""
+                    END;
+            BEGIN
+                IF partition_sql IS NULL THEN
+                    RAISE EXCEPTION 'search_text_pool_partition: no partition %', partition_number;
+                END IF;
+                -- One-shot: the query reaches the planner as a literal.
+                RETURN QUERY EXECUTE format(partition_sql, query) USING priorities, since;
+            END;
+            $partition$;
+            CREATE OR REPLACE FUNCTION @search_text_pool(
+                query text,
+                attention boolean,
+                priorities text[],
+                since timestamptz
+            )
+            RETURNS TABLE (adapter text, event_id text, source text, part integer, pool_rank bigint)
+            LANGUAGE plpgsql
+            SET jit = off
+            VOLATILE
+            AS $pool$
+            BEGIN
+                IF attention THEN
+                    RETURN QUERY EXECUTE $q$"""
+            + pool_union(attention_pool_parts)
+            + r"""$q$ USING query, priorities, since;
+                ELSE
+                    RETURN QUERY EXECUTE $q$"""
+            + pool_union(broad_pool_parts)
+            + r"""$q$ USING query, priorities, since;
+                END IF;
+            END;
+            $pool$;
+            """
         )
         # Scoring a candidate needs the index its partition was scanned
         # through: the two partitions are two BM25 corpora with their own
@@ -17917,6 +18002,9 @@ class PostgresWarehouse:
                     '(\|[[:space:]]*|-{3,}[[:space:]]*)+(\||$)', ' ', 'g'),
                     '[[:space:]]{2,}', ' ', 'g')), '')
             $preview$;
+            """
+            + search_text_pool_functions_sql
+            + r"""
             CREATE OR REPLACE FUNCTION @search_text(
                 query text,
                 max_results integer DEFAULT 50,
@@ -18010,30 +18098,21 @@ class PostgresWarehouse:
                     -- read the general indexes or it returns silently empty.
                     -- `priorities` is NULL-normalized to "all tiers" above, so
                     -- an unscoped call correctly fails this test.
-                    -- EXECUTE format(...), not a static statement: a cached
-                    -- plan for this scan re-scores every returned document
-                    -- (14-28s when a few are multi-megabyte); the query text
-                    -- must reach the planner as a literal. See one_shot_pool.
-                    IF priorities IS NOT NULL
-                       AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""] THEN
-                        EXECUTE format($pool$
-                        SELECT array_agg(p.adapter), array_agg(p.event_id),
-                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          FROM (
-                            """ + one_shot_pool(attention_pool_sql) + r"""
-                          ) p$pool$, query)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
-                          USING priorities, since;
-                    ELSE
-                        EXECUTE format($pool$
-                        SELECT array_agg(p.adapter), array_agg(p.event_id),
-                               array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
-                          FROM (
-                            """ + one_shot_pool(broad_pool_sql) + r"""
-                          ) p$pool$, query)
-                          INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
-                          USING priorities, since;
-                    END IF;
+                    -- search_text_pool runs both partitions on parallel
+                    -- workers, each as one-shot dynamic SQL: a cached plan for
+                    -- this scan re-scores every returned document (14-28s when
+                    -- a few are multi-megabyte), so the query text reaches the
+                    -- planner as a literal there. See one_shot_pool.
+                    SELECT array_agg(p.adapter), array_agg(p.event_id),
+                           array_agg(p.source), array_agg(p.part), array_agg(p.pool_rank)
+                      INTO pool_adapter, pool_event_id, pool_source, pool_part, pool_rank
+                      FROM @search_text_pool(
+                          query,
+                          priorities IS NOT NULL
+                              AND priorities <@ ARRAY[""" + SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + r"""],
+                          priorities,
+                          since
+                      ) p;
                     PERFORM set_config('enable_sort', 'on', true);
                     RETURN QUERY
                         -- The per-source floor needs a RANK, not a score, and

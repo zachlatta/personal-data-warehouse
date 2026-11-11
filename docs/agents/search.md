@@ -622,8 +622,36 @@ guest saw as idle. Two plan faults, both fixed in the functions themselves:
   5.5M, past `jit_above_cost`, so it paid ~600 ms of inlining and optimization (22
   functions) for a scan that runs in ~200 ms warm: 811-868 ms with JIT against 185-215 ms
   without. Every `timeline.search*` plpgsql function now carries `SET jit = off`
-  (`test_every_search_function_runs_with_jit_off`). This was most of why scoped searches
-  were slower than unscoped ones.
+  (`test_every_search_function_runs_with_jit_off`). That is the warm case only. Cold, the
+  same leg is read wait: `search_text('contract renewal', 20, priorities =>
+  ARRAY['self','direct','cc'])` with JIT off took 14.8 s, 14.1 s of it waiting on 5,784
+  reads. The 5,000-row `bm25_attention_idx` partition fetched its heap rows one at a time
+  in 13.1 s (2.28 s to its first row), and the 800-row low-volume partition then took
+  another 1.65 s. Ten fresh scoped queries ran 2.6-5.0 s cold for both partitions.
+- *The lexical pool ran its partitions one after another.* Each partition is now
+  `internal.search_text_pool_partition(query, part, ...)`, a PARALLEL SAFE function, and
+  `internal.search_text_pool` returns their Parallel Append through `RETURN QUERY
+  EXECUTE`, so the low-volume partition no longer adds to the cold pool
+  (`test_search_text_runs_its_pool_partitions_on_parallel_workers`). plpgsql never runs a
+  parallel plan for `SELECT ... INTO`, which is why the pool is a function of its own.
+  This is the smaller half: the 5,000-row partition stays one serial chain of heap reads,
+  and running the two partitions from two sessions gave 3.4-4.2 s against 2.6-5.0 s
+  serial. Three things keep that chain serial, and each was checked:
+  - pg_textsearch 1.5.1's `bm25` access method has no bitmap scan and no returnable
+    column (`pg_index_has_property(..., 'bitmap_scan')` and `'returnable'` are false), so
+    every pooled row is a heap visit. PostgreSQL 18 prefetches heap pages for bitmap heap
+    scans and sequential scans, not for plain index scans, so `effective_io_concurrency`
+    and `io_workers` do not reach these reads.
+  - One index-ordered scan cannot be split across workers. A filter on a hash or a ctid
+    is applied after the heap visit, so each worker would fetch as many rows as the whole
+    scan. Splitting by adapter would need comparable scores, which the pool deliberately
+    does not compute.
+  - The pool's depth is a measured ranking trade (2000/300 scored MRR 0.278 against
+    0.292 at 5000/800; see `SEARCH_TEXT_BROAD_POOL`), so it is not shrunk to save reads.
+
+  So the cold lexical leg costs about one random read per pooled row. Two levers shorten
+  it without changing ranking: the disk read latency (below), and keeping the BM25
+  indexes resident (the six-hourly re-warm). A warm leg is ~200 ms.
 
 What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
 guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),

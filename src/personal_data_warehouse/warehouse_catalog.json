@@ -3070,6 +3070,28 @@
       "secret": false
     },
     {
+      "id": "search_text_pool",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_text_pool",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
+      "id": "search_text_pool_partition",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_text_pool_partition",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
       "id": "timeline_context",
       "kind": "function",
       "layer": "timeline",

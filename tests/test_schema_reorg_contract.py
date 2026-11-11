@@ -308,7 +308,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # that keeps base_feed.item_versions append-only.
         # +1 internal: internal.search_hybrid_semantic_walk, one partition's
         # graph walk as a PARALLEL SAFE function so the walks share workers.
-        "internal": 8,
+        # +2 internal: internal.search_text_pool and its PARALLEL SAFE
+        # search_text_pool_partition, the lexical pool's partitions on workers.
+        "internal": 10,
     }
 
 
@@ -453,6 +455,8 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         "utf8_byte_prefix",
         "search_text_preview",
         "search_hybrid_semantic_walk",
+        "search_text_pool",
+        "search_text_pool_partition",
     }
     assert set(CATALOG.denied_schemas()) == {"private"}
 

@@ -1386,16 +1386,21 @@ def test_the_semantic_leg_walks_its_partition_graphs_on_parallel_workers(
     walking four of them one after another in one backend made the unscoped
     semantic leg cost their sum (6.47 s cold on production, 2026-11-11, with
     27 idle cores). The walks must run as the children of one Parallel Append,
-    each on its own process, and return exactly what the serial walks did."""
+    each on its own process, and return exactly what the serial walks did.
+
+    Every partition holds more rows than pgvector's default hnsw.ef_search
+    (40), so a worker that did not inherit the leg's hnsw.* settings would cut
+    its walk short; all of them must come back."""
 
     _provision(warehouse)
     if not _pgvector_usable(warehouse):
         pytest.skip("pgvector is not installed on this Postgres host")
     ts = datetime(2026, 7, 5, tzinfo=UTC)
+    per_partition = 45
     chunks = [
-        (f"{adapter}|{name}#0", adapter, axis)
+        (f"{adapter}|{'near' if i == 0 else f'n{i}'}#0", adapter, 0.05 * i)
         for adapter in ("gmail_email", "slack_message", "slack_file", "voice_memo")
-        for name, axis in (("near", 0.0), ("mid", 0.5), ("far", 3.0))
+        for i in range(per_partition)
     ]
     for chunk_id, adapter, axis in chunks:
         _insert_chunk(warehouse, chunk_id, adapter, f"sha-{chunk_id}", ts)
@@ -1427,16 +1432,20 @@ def test_the_semantic_leg_walks_its_partition_graphs_on_parallel_workers(
     launched = [int(n) for n in re.findall(r"Workers Launched: (\d+)", plans)]
     assert launched and max(launched) >= 1, plans
 
-    serial = warehouse._query(
-        " UNION ALL ".join(
-            f"SELECT * FROM @search_hybrid_semantic_walk({part}, 'fake-model', NULL, NULL,"
-            " %s::public.halfvec, 400)"
-            for part in range(1, 5)
-        ),
-        (query,) * 4,
-    )
+    warehouse._command("SET hnsw.ef_search = 400")
+    try:
+        serial = warehouse._query(
+            " UNION ALL ".join(
+                f"SELECT * FROM @search_hybrid_semantic_walk({part}, 'fake-model', NULL, NULL,"
+                " %s::public.halfvec, 400)"
+                for part in range(1, 5)
+            ),
+            (query,) * 4,
+        )
+    finally:
+        warehouse._command("RESET hnsw.ef_search")
     assert len(serial) == len(chunks)
-    assert len(rows) == len(chunks)
+    assert len(rows) == len(chunks), "a walk on a worker stopped at the default ef_search"
     nearest_first = [f"{adapter}:{chunk_id}-event" for chunk_id, adapter, _ in chunks]
     assert {ref for ref, _ in rows} == set(nearest_first)
     assert {ref for ref, best in rows if best <= 4} == {

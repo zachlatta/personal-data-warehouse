@@ -309,6 +309,8 @@ var Objects = []CatalogObject{
 	{ID: "search_text_sources", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "search_text_sources", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "search_text_preview", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "search_text_preview", Discoverable: false, QueryAccess: "execute_only", Secret: false, Comment: ""},
 	{ID: "search_hybrid_semantic_walk", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "search_hybrid_semantic_walk", Discoverable: false, QueryAccess: "execute_only", Secret: false, Comment: ""},
+	{ID: "search_text_pool", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "search_text_pool", Discoverable: false, QueryAccess: "execute_only", Secret: false, Comment: ""},
+	{ID: "search_text_pool_partition", Kind: "function", Layer: "internal", Domain: "internal", Schema: "internal", Name: "search_text_pool_partition", Discoverable: false, QueryAccess: "execute_only", Secret: false, Comment: ""},
 	{ID: "timeline_context", Kind: "function", Layer: "timeline", Domain: "timeline", Schema: "timeline", Name: "context", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "search_chunks", Kind: "table", Layer: "derived", Domain: "search", Schema: "derived_search", Name: "chunks", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 	{ID: "search_chunk_embeddings", Kind: "table", Layer: "derived", Domain: "search", Schema: "derived_search", Name: "chunk_embeddings", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
