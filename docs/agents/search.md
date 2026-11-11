@@ -768,7 +768,7 @@ every warm evicted every other page Postgres held; and the global BM25 index was
 **13.4 GB on disk with 6.4 GB of live segments** — pg_textsearch spills and merges park
 displaced pages for deferred reclaim and never truncate the file, so a day after a plain
 REINDEX to 6.36 GB the warm was reading 7 GB of dead pages every time. Now the
-post-reconcile repair measures residency and goes through the same floor and 24-hour
+post-reconcile repair measures residency and goes through the same floor and
 interval as the cold-cache guard (`restore_search_cache_after_reconcile`), the warm has
 no `buffer` pass, and `marts_ops.search_health` carries a `bm25_index_bloat` row
 (`resident_bytes` = live segment bytes, `total_bytes` = file bytes, `attention` below
@@ -790,17 +790,21 @@ as file cache: the host's real page cache is ~10 GB, which is why a 10 GB HNSW g
 cannot stay resident there while the sync workload runs beside it.
 
 **A cold cache with no index-identity change is re-warmed by the five-minute search
-health pass, at most once a day.** `prewarm_search_indexes_if_needed` fires on a schema
+health pass, at most every six hours.** `prewarm_search_indexes_if_needed` fires on a schema
 signature, a database restart, or a REINDEX (the relfilenode fingerprint) — and none of
 those happened between 2026-09-16 and 09-19, while the 09-14..16 index-definition flap
 (`bm25_attention_lowvol_idx` rebuilt 1,705 times, ~57 TB through the page cache in nine
 days) had left residency at 10% for three days with unscoped hybrid at 3-4s. The
 `search_chunks` asset now calls `rewarm_search_indexes_if_cold` after it records
 `cache_residency`: below `SEARCH_RESIDENCY_REWARM_FLOOR` (20%) and more than
-`SEARCH_RESIDENCY_REWARM_MIN_INTERVAL` (24h) since the last warm, it forces one. The
+`SEARCH_RESIDENCY_REWARM_MIN_INTERVAL` (6h) since the last warm, it forces one. The
 interval is the point: a forced warm that did not stick means something else is evicting
 the cache, and the answer to that is `pg_stat_statements ORDER BY shared_blks_read DESC`,
-not another 20 GB read every five minutes.
+not another 20 GB read every five minutes. It was 24h until 2026-11-11, when a 07:52 warm
+had decayed to 13% by 19:12 while searches waited on reads. That day the evictor search
+found was the timeline sidebar's `GROUP BY source, kind`: 37 GB of heap per call,
+332 GB in 3.5 days, the largest reader in the database. It now reads `pg_stats` and bound
+index counts instead, and four ~20 GB warms a day read less than it did.
 
 The second coordinate on the fresh keyset is non-negotiable: one chunk-builder batch
 stamps thousands of rows with the same `built_at`. A timestamp-only cursor once stopped in

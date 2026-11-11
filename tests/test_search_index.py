@@ -900,6 +900,21 @@ def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:
     assert not should_rewarm_search_indexes(resident_fraction=-1, last_prewarmed_at=long_ago, now=now)
 
 
+def test_a_cold_cache_is_rewarmed_within_the_working_day() -> None:
+    # 2026-11-11: the warm at 07:52 had decayed to 13% residency by 19:12,
+    # and searches spent the afternoon at p50 4-9 s on read wait while the
+    # 24-hour guard waited for the next morning. The largest evictor (the
+    # timeline sidebar's 37 GB scan, ~95 GB a day) is gone; four ~20 GB warms
+    # a day cost less than it did, and restore the cache the same day.
+    now = datetime(2026, 11, 11, 19, 12, tzinfo=UTC)
+    assert should_rewarm_search_indexes(
+        resident_fraction=0.13, last_prewarmed_at=now - timedelta(hours=7), now=now
+    )
+    assert not should_rewarm_search_indexes(
+        resident_fraction=0.13, last_prewarmed_at=now - timedelta(hours=5), now=now
+    )
+
+
 def test_rewarm_forces_a_prewarm_when_cold_and_records_why() -> None:
     class Warehouse:
         def __init__(self, prewarmed_at):

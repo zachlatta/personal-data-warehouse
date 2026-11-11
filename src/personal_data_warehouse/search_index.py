@@ -105,8 +105,11 @@ SEARCH_RESIDENCY_REWARM_FLOOR = 0.20
 #: A forced warm is never repeated within this window: if one did not stick,
 #: something else is evicting the cache, and re-reading ~20 GB every five
 #: minutes would be that something. Find the evictor in pg_stat_statements
-#: (ORDER BY shared_blks_read DESC) rather than fighting it.
-SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=24)
+#: (ORDER BY shared_blks_read DESC) rather than fighting it. Six hours, not
+#: 24, since 2026-11-11: a morning warm had decayed to 13% by the evening
+#: while searches waited on reads, and the timeline sidebar's ~95 GB/day
+#: scan that did most of the evicting is gone. Four warms a day read less.
+SEARCH_RESIDENCY_REWARM_MIN_INTERVAL = timedelta(hours=6)
 
 
 def should_rewarm_search_indexes(
