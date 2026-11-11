@@ -16,7 +16,8 @@ when the token is issued.
 | credential | spelled | scope | lifetime |
 | --- | --- | --- | --- |
 | master secret | `PDW_SECRET_TOKEN` | `root`: everything, including token administration and ingest signing | until rotated in the deployment env |
-| issued token | `pdw_<id>_<secret>` | `full`: every bearer surface except token administration | dies after `idle_timeout` unused (default 30 days), optionally a hard `expires_at` |
+| issued token | `pdw_<id>_<secret>` | `full`: every bearer surface except token administration and mutation review decisions | dies after `idle_timeout` unused (default 30 days), optionally a hard `expires_at` |
+| reviewer token (the phone app) | `pdw_<id>_<secret>` | `reviewer`: what `full` reaches, plus approving, denying, editing and undoing mutation requests | as `full` |
 | CLI token from `cli_authorize` | `pdw_<id>_<secret>` | `agent`: `/api/tools` only (the CLI's entire surface) | hard expiry, default 24 h, max 7 days |
 | bootstrap code | `pdwb_<id>_<secret>` | none: redeemable once for one `agent` token | 15 minutes, single use |
 
@@ -49,6 +50,30 @@ Answers to the open questions in the original tasks:
   expiry.
 - **Single use:** the redemption marks the code row under `SELECT ... FOR UPDATE`. A
   second redemption, an expired code, or a revoked code returns 401 and issues nothing.
+
+## The upload-only key: `PDW_INGEST_SECRET`
+
+Uploads are authenticated by an HMAC over the endpoint, the body's sha256 and an expiry,
+never by a bearer. Until 2026-11 the only key was the master secret, so every uploader host
+held a credential that could also approve mutations and mint tokens. `PDW_INGEST_SECRET`
+(at least 32 characters, different from the master secret) is a second key the app accepts
+**for upload signatures only** (`auth.Service.SetIngestSecret`): as a bearer it is refused,
+so a host that holds it can upload and nothing else. Uploaders sign with it ahead of the
+master secret (`ingestclient.ResolveConfig`, `ingest_client.py`), and the master secret keeps
+verifying uploads while hosts move over. An uploader host's env file holds
+`PDW_INGEST_SECRET` and no `PDW_SECRET_TOKEN`.
+
+## Who may decide a mutation request
+
+Approve, deny, supersede, undo, cancel-by-reviewer and every edit route under
+`/api/mutations/requests/<id>/…` require a principal that `CanReview`: the master secret
+(the web app) or a `reviewer` token (the phone app). A `full` token, the kind a host CLI
+holds, gets 403 there, as do `agent` and feed tokens: an agent proposes with
+`propose_mutation` and withdraws with `withdraw_mutation`, and never decides. Reading a
+request (`GET`) stays open to `full`. Issue the phone's token with
+`pdw token create --name <phone> --scope reviewer`; never give a host a reviewer token, and never the master secret (hosts sign uploads with `PDW_INGEST_SECRET`).
+The test that holds this is `TestOnlyAReviewerPrincipalReachesAReviewRoute`
+(`app/internal/mutations/api_test.go`): add a new review route to its list.
 
 ## Why `agent` is narrower than `full`
 

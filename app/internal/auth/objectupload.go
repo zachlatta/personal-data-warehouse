@@ -20,10 +20,10 @@ const objectUploadKind = "object-upload"
 // body: the server recomputes the sha over the received bytes and rejects a
 // mismatch).
 //
-// The key is the raw master secret, not a derived subkey: every uploader
-// holds that secret and signs with it, in Go and in Python
-// (ingest_client.py), and the "object-upload" prefix already separates these
-// MACs from every other kind.
+// The key is a raw secret, not a derived subkey: uploaders sign with
+// PDW_INGEST_SECRET (or, until a host moves, the master secret), in Go and in
+// Python (ingest_client.py), and the "object-upload" prefix already separates
+// these MACs from every other kind.
 func (s *Service) SignObjectUpload(endpoint, contentSHA256 string, exp time.Time) string {
 	return base64.RawURLEncoding.EncodeToString(objectUploadMAC(s.keys.current().secret, endpoint, contentSHA256, exp.Unix()))
 }
@@ -45,8 +45,8 @@ func (s *Service) VerifyObjectUpload(endpoint, contentSHA256, expRaw, sig string
 		return errors.New("malformed signature")
 	}
 	matched := false
-	for _, key := range s.keys.keys {
-		if hmac.Equal(provided, objectUploadMAC(key.secret, endpoint, contentSHA256, expUnix)) {
+	for _, key := range s.uploadKeys() {
+		if hmac.Equal(provided, objectUploadMAC(key, endpoint, contentSHA256, expUnix)) {
 			matched = true
 			break
 		}
@@ -64,4 +64,29 @@ func objectUploadMAC(secret []byte, endpoint, contentSHA256 string, expUnix int6
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(objectUploadKind + "\n" + endpoint + "\n" + contentSHA256 + "\n" + strconv.FormatInt(expUnix, 10)))
 	return mac.Sum(nil)
+}
+
+// SetIngestSecret adds PDW_INGEST_SECRET: a key that verifies upload
+// signatures and nothing else. Uploader hosts hold it instead of the master
+// secret, so what a host holds can sign uploads but never authenticate as a
+// bearer, administer tokens, or decide a mutation. The master secret keeps
+// verifying uploads while hosts move over.
+func (s *Service) SetIngestSecret(secret []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ingestSecret = append([]byte(nil), secret...)
+}
+
+func (s *Service) uploadKeys() [][]byte {
+	s.mu.Lock()
+	ingest := s.ingestSecret
+	s.mu.Unlock()
+	keys := make([][]byte, 0, len(s.keys.keys)+1)
+	if len(ingest) > 0 {
+		keys = append(keys, ingest)
+	}
+	for _, key := range s.keys.keys {
+		keys = append(keys, key.secret)
+	}
+	return keys
 }

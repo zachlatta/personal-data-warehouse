@@ -125,7 +125,8 @@ ENVIRONMENT
                           environment wins over the file. Default: the current
                           directory.
   PDW_API_URL             Warehouse URL the uploader posts to (else "pdw login").
-  PDW_SECRET_TOKEN        App secret token used to sign uploads (else "pdw login").
+  PDW_INGEST_SECRET       Upload-only signing key; what an uploader host should hold.
+  PDW_SECRET_TOKEN        App secret token, used to sign uploads when PDW_INGEST_SECRET is unset (else "pdw login").
 
 EXAMPLES
   pdw ingest voice-memos --mode incremental

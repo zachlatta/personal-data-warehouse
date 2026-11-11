@@ -255,6 +255,19 @@ class IngestClient:
         )
 
 
+def _signing_secret() -> str:
+    """The upload signing key: PDW_INGEST_SECRET, the upload-only key a host
+    should hold (it can never authenticate to the API or approve a mutation),
+    else the master secret while a host still has it."""
+
+    return (
+        os.getenv("PDW_INGEST_SECRET")
+        or os.getenv("PDW_SECRET_TOKEN")
+        or os.getenv("MCP_SECRET_TOKEN")
+        or ""
+    ).strip()
+
+
 def ingest_upload_config_problem() -> str | None:
     """Return a human-readable reason http_app upload env is missing, else None.
 
@@ -267,8 +280,8 @@ def ingest_upload_config_problem() -> str | None:
 
     if not (os.getenv("PDW_API_URL") or os.getenv("MCP_BASE_URL") or "").strip():
         return "PDW_API_URL (or MCP_BASE_URL) must be set for http_app uploads"
-    if not (os.getenv("PDW_SECRET_TOKEN") or os.getenv("MCP_SECRET_TOKEN") or "").strip():
-        return "PDW_SECRET_TOKEN (or MCP_SECRET_TOKEN) must be set for http_app uploads"
+    if not _signing_secret():
+        return "PDW_INGEST_SECRET (or PDW_SECRET_TOKEN / MCP_SECRET_TOKEN) must be set for http_app uploads"
     return None
 
 
@@ -393,11 +406,7 @@ def ingest_client_from_env(
         or os.getenv("MCP_BASE_URL")
         or ""
     ).strip()
-    secret = (
-        os.getenv("PDW_SECRET_TOKEN")
-        or os.getenv("MCP_SECRET_TOKEN")
-        or ""
-    ).strip()
+    secret = _signing_secret()
     max_object_bytes = _positive_int_env("PDW_INGEST_MAX_OBJECT_BYTES", DEFAULT_INGEST_MAX_OBJECT_BYTES)
     upload_base_url = resolve_direct(
         base_url,

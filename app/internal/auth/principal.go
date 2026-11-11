@@ -17,11 +17,12 @@ const (
 	// including token administration.
 	ScopeRoot Scope = "root"
 	// ScopeFull is an issued token: every bearer surface except token
-	// administration, so a leaked token cannot mint its own successor.
+	// administration, so a leaked token cannot mint its own successor. It
+	// cannot decide a mutation request (see CanReview): host CLIs hold one,
+	// and an agent there must not approve its own proposal.
 	ScopeFull Scope = "full"
 	// ScopeAgent is a token minted by the cli_authorize flow: the warehouse
-	// tools API only, which is everything the pdw CLI calls. It cannot reach
-	// mutation review, so an agent cannot approve its own proposal.
+	// tools API only, which is everything the pdw CLI calls.
 	ScopeAgent Scope = "agent"
 	// ScopeReviewer is an issued token for Zach's own review surfaces (the
 	// phone app): every surface full reaches, plus the mutation review
@@ -70,10 +71,6 @@ func (p Principal) Allows(path string) bool {
 func (p Principal) CanReview() bool {
 	switch p.Scope {
 	case ScopeRoot, ScopeReviewer:
-		return true
-	case ScopeFull:
-		// Transition: full tokens keep review until the phone's token is
-		// moved to the reviewer scope; the next commit removes this.
 		return true
 	}
 	return false

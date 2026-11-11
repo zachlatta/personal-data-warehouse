@@ -31,6 +31,8 @@ type Service struct {
 	logger        *slog.Logger
 	tokens        TokenAuthenticator
 	grants        OAuthGrants
+	// ingestSecret verifies upload signatures only (SetIngestSecret).
+	ingestSecret []byte
 	// legacyCutoff is when tokens issued before grants existed (no gid)
 	// stop working; see LegacyOAuthTokenCutoff.
 	legacyCutoff time.Time

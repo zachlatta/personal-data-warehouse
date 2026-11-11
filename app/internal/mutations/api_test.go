@@ -168,7 +168,10 @@ func TestOnlyAReviewerPrincipalReachesAReviewRoute(t *testing.T) {
 	nonReviewers := map[string]func(http.Handler) http.Handler{
 		"no principal": unauthenticated,
 		"agent token":  asPrincipal(auth.Principal{Scope: auth.ScopeAgent, TokenID: "agenttoken", ClientName: "pixel"}),
-		"feed token":   asPrincipal(auth.Principal{Scope: auth.Scope("feed:voice-memos"), TokenID: "feedtoken", ClientName: "web"}),
+		// A host CLI's issued token: an agent on that host must not approve
+		// its own proposal, whatever client name it sends.
+		"full host token": asPrincipal(auth.Principal{Scope: auth.ScopeFull, TokenID: "hosttoken", ClientName: "test-phone"}),
+		"feed token":      asPrincipal(auth.Principal{Scope: auth.Scope("feed:voice-memos"), TokenID: "feedtoken", ClientName: "web"}),
 	}
 	for name, requireAuth := range nonReviewers {
 		store := newAPIFakeStore(pendingFixture())

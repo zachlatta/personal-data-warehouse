@@ -2,6 +2,8 @@
 
 Nothing in PDW writes to an upstream service directly. A mutation is **proposed**, lands
 in a review queue, and runs only after a human approves it in the web or phone review UI.
+Only Zach's web and phone sessions can approve, deny or edit a request: every agent token,
+including a host's `full` token, gets 403 on those routes. Never try to approve your own proposal.
 Prefer this path for any change to Zach's Gmail (mail, labels and filters), Calendar, Google or Apple Contacts, Slack
 (a message sent as him, or his read state), Apple Notes, or a text message (RCS/SMS from his Pixel); use a direct connector only for
 something PDW has no mutation type for, and say why. Deleting a screen capture from the warehouse is a mutation too

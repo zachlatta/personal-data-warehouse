@@ -10,7 +10,9 @@ review queue, and push notifications; see `mobile/README.md`. Three server piece
 back it, all behind the static bearer the CLI uses:
 
 - `GET|POST /api/mutations/requests…` (`app/internal/mutations/api.go`) is THE review
-  surface: list/get, approve, deny, drop one email, edit an email before approval
+  surface. Every `POST` there decides or edits a request and needs a reviewer principal:
+  the master secret (web) or a `reviewer`-scope token (phone); a host's `full` token gets
+  403 (see [access tokens](access-tokens.md#who-may-decide-a-mutation-request)). It offers list/get, approve, deny, drop one email, edit an email before approval
   (`…/mutations/<id>/update-email`), and mark a dead request superseded
   (`…/supersede`, offered when `can_supersede`). Every `gmail.send_email` mutation
   carries an `email` view-model (delivery mode, variants with the selected one marked,

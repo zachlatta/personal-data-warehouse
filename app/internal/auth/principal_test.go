@@ -187,7 +187,7 @@ func TestReviewerScopeReachesWhatFullDoesAndMayDecideMutations(t *testing.T) {
 	if (Principal{Scope: ScopeRoot}).CanReview() != true {
 		t.Fatal("the master secret (the web app) must be able to review")
 	}
-	for _, scope := range []Scope{ScopeAgent, ScopeOAuthQuery, Scope("feed:voice-memos"), Scope("")} {
+	for _, scope := range []Scope{ScopeFull, ScopeAgent, ScopeOAuthQuery, Scope("feed:voice-memos"), Scope("")} {
 		if (Principal{Scope: scope}).CanReview() {
 			t.Fatalf("scope %q must not review mutations", scope)
 		}

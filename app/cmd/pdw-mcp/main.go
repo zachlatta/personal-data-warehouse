@@ -43,6 +43,9 @@ func main() {
 	defer runner.Close()
 
 	authSvc := pdwauth.NewServiceWithKeyring(cfg.Keyring(), time.Now)
+	if cfg.IngestSecret != "" {
+		authSvc.SetIngestSecret([]byte(cfg.IngestSecret))
+	}
 	if cfg.PreviousSecretToken != "" {
 		logger.Warn("master secret rotation window open: the previous secret is still accepted; unset PDW_SECRET_TOKEN_PREVIOUS once clients are updated")
 	}

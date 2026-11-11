@@ -41,7 +41,11 @@ type Config struct {
 	// accepted wherever SecretToken is verified (never for signing, never at
 	// the OAuth consent page) until it is unset. See "Rotating the master
 	// secret" in docs/agents/access-tokens.md.
-	PreviousSecretToken     string
+	PreviousSecretToken string
+	// IngestSecret (PDW_INGEST_SECRET) verifies upload signatures and nothing
+	// else. Uploader hosts hold it instead of the master secret, so what a
+	// host holds can never authenticate to the API or decide a mutation.
+	IngestSecret            string
 	MaxRows                 int
 	MaxFieldChars           int
 	QueryTimeout            time.Duration
@@ -181,6 +185,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		TimelineMediaSigningKey:  strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
 		SecretToken:              firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
 		PreviousSecretToken:      strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
+		IngestSecret:             strings.TrimSpace(getenv("PDW_INGEST_SECRET")),
 		MaxRows:                  100000,
 		MaxFieldChars:            4000,
 		// One end-to-end query budget. No caller can wait longer than the
@@ -218,6 +223,12 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 	}
 	if cfg.PreviousSecretToken != "" && len(cfg.PreviousSecretToken) < MinSecretTokenLength {
 		return Config{}, fmt.Errorf("PDW_SECRET_TOKEN_PREVIOUS must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.IngestSecret != "" && len(cfg.IngestSecret) < MinSecretTokenLength {
+		return Config{}, fmt.Errorf("PDW_INGEST_SECRET must be at least %d characters", MinSecretTokenLength)
+	}
+	if cfg.IngestSecret != "" && (cfg.IngestSecret == cfg.SecretToken || cfg.IngestSecret == cfg.PreviousSecretToken) {
+		return Config{}, fmt.Errorf("PDW_INGEST_SECRET must differ from the master secret: it exists so uploader hosts need not hold that")
 	}
 	if cfg.PreviousSecretToken == cfg.SecretToken {
 		cfg.PreviousSecretToken = ""
