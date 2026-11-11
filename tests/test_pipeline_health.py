@@ -1120,7 +1120,7 @@ def test_collector_skips_probes_it_cannot_afford(warehouse, monkeypatch):
     assert all(row["probe_detail"] for row in rows)
 
 
-def test_read_only_query_role_can_read_the_marts_views(warehouse):
+def test_read_only_query_role_can_read_the_marts_views(warehouse, query_login):
     """Zach and the MCP agent must be able to ask "when was gmail last updated?".
 
     The snapshot lives in ops, which the query role cannot read directly; the
@@ -1128,6 +1128,7 @@ def test_read_only_query_role_can_read_the_marts_views(warehouse):
     """
     _provision_every_table(warehouse)
     PipelineHealthCollector(warehouse).run()
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:
@@ -1143,7 +1144,7 @@ def test_read_only_query_role_can_read_the_marts_views(warehouse):
         connection.close()
 
 
-def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehouse):
+def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehouse, query_login):
     """Level 3 of the health contract: is THIS kind of data current on the timeline?
 
     The single ``timeline`` row in ``marts_ops.pipeline_health`` cannot answer
@@ -1162,6 +1163,7 @@ def test_timeline_adapter_health_exposes_every_adapter_to_the_query_role(warehou
         dest_schema=warehouse._schema,
     ).run()
 
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:
@@ -1909,9 +1911,10 @@ def test_a_stale_mart_snapshot_reports_unknown(warehouse):
     assert statuses == {"unknown"}
 
 
-def test_mart_health_is_readable_by_the_query_role(warehouse):
+def test_mart_health_is_readable_by_the_query_role(warehouse, query_login):
     _provision_every_table(warehouse)
     PipelineHealthCollector(warehouse).run_all()
+    query_login(warehouse)
     connection = warehouse.read_only_connection()
     try:
         with connection.cursor() as cursor:

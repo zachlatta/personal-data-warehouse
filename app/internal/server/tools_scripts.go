@@ -20,8 +20,15 @@ func scriptTool(runner query.Runner, opts query.Options) tool.Tool {
 	// runner places stricter wire/row limits on every script read.
 	opts.MaxRows = 1000
 	svc := query.NewService(query.ScriptRunner{Runner: runner}, opts)
-	guarded, ok := runner.(interface{ QueryRole() string })
-	role := ok && guarded.QueryRole() == "pdw_query"
+	guarded, ok := runner.(interface {
+		QueryRole() string
+		CheckQuerySafety(context.Context) error
+	})
+	role := ok && guarded.QueryRole() != ""
+	var check func(context.Context) error
+	if ok {
+		check = guarded.CheckQuerySafety
+	}
 	var record scripts.Recorder
 	if writer, ok := opts.ScriptRecorder.(scripts.Recorder); ok {
 		record = writer
@@ -94,7 +101,7 @@ func scriptTool(runner query.Runner, opts query.Options) tool.Tool {
 			return v, nil
 		}
 		return nil, fmt.Errorf("method is unavailable")
-	}, role, record)
+	}, role, record, check)
 	base := &tool.Typed[scripts.Input, scripts.Response]{NameStr: "run", TitleStr: "Run read-only JavaScript", DescriptionStr: "Compose warehouse reads on the PDW server in one fresh sandbox. Async JavaScript function body supports await and return. Globals: frozen pdw.search({query,priorities?,sources?,since?,max_results?}), pdw.context({ref,before?,after?,full?}), pdw.columns({table}), pdw.schema({schema?}), pdw.sql({sql,question?}) and immutable args. Search first, use priorities, preserve refs. No imports, files, network, timers, connections or writes. 12 inner calls, 32 KiB code/args each, 128 KiB output, 30s default/60s max. Read readme topic scripts for schemas, limits and examples.", Handle: func(ctx context.Context, in scripts.Input) (scripts.Response, error) { return run.Run(ctx, in), nil }, IsError: func(r scripts.Response) bool { return r.Error != nil }}
 	return scriptToolWithoutResultLog{base}
 }

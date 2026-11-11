@@ -115,8 +115,9 @@ def test_plaid_query_role_can_read_source_tables_but_not_private_tokens(warehous
         connection.close()
 
 
-def test_python_readonly_runner_cannot_read_private_plaid_tokens(warehouse: PostgresWarehouse) -> None:
+def test_python_readonly_runner_cannot_read_private_plaid_tokens(warehouse: PostgresWarehouse, query_login) -> None:
     warehouse.ensure_plaid_tables()
+    query_login(warehouse)
     runner = PostgresReadOnlyRunner(warehouse)
     try:
         assert runner.query(

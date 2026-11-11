@@ -18,6 +18,8 @@ type Config struct {
 	Addr                string
 	BaseURL             string
 	PostgresDatabaseURL string
+	// Dedicated unprivileged login, separate from the app's writer pool.
+	QueryPostgresDatabaseURL string
 	// QueryPostgresRole is the NOLOGIN database role assumed for every
 	// user-authored read-only query. It has SELECT on queryable schemas but no
 	// USAGE/SELECT on the private schema.
@@ -169,17 +171,18 @@ func (c Config) IngestEnabled() bool {
 
 func LoadFromEnv(getenv func(string) string) (Config, error) {
 	cfg := Config{
-		Addr:                    valueOrDefault(getenv("MCP_ADDR"), ":8080"),
-		BaseURL:                 strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
-		PostgresDatabaseURL:     normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
-		QueryPostgresRole:       valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
-		TimelineDatabaseURL:     normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
-		TimelineMediaBaseURL:    strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
-		TimelineMediaSigningKey: strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
-		SecretToken:             firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
-		PreviousSecretToken:     strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
-		MaxRows:                 100000,
-		MaxFieldChars:           4000,
+		Addr:                     valueOrDefault(getenv("MCP_ADDR"), ":8080"),
+		BaseURL:                  strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
+		PostgresDatabaseURL:      normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
+		QueryPostgresRole:        valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
+		QueryPostgresDatabaseURL: strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_URL")),
+		TimelineDatabaseURL:      normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
+		TimelineMediaBaseURL:     strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
+		TimelineMediaSigningKey:  strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),
+		SecretToken:              firstNonEmpty(getenv("PDW_SECRET_TOKEN"), getenv("MCP_SECRET_TOKEN")),
+		PreviousSecretToken:      strings.TrimSpace(getenv("PDW_SECRET_TOKEN_PREVIOUS")),
+		MaxRows:                  100000,
+		MaxFieldChars:            4000,
 		// One end-to-end query budget. No caller can wait longer than the
 		// public edge allows (~100s at the CDN; the CLI default is aligned to
 		// this value), so a larger server-side ceiling only produced orphaned

@@ -45,7 +45,7 @@ func configurePool(db *sql.DB) {
 }
 
 func NewPostgresRunner(databaseURL string, timeout time.Duration) (*PostgresRunner, error) {
-	return NewPostgresRunnerWithRole(databaseURL, timeout, "")
+	return NewPostgresRunnerWithRole(databaseURL, timeout, "pdw_query")
 }
 
 func NewPostgresRunnerWithRole(databaseURL string, timeout time.Duration, queryRole string) (*PostgresRunner, error) {
@@ -115,6 +115,10 @@ func (r *PostgresRunner) QueryArgsWithTimeout(ctx context.Context, statement str
 		return RawResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := checkQuerySession(ctx, tx, r.queryRole); err != nil {
+		logger.ErrorContext(ctx, "unsafe query database login refused", "error", err)
+		return RawResult{}, err
+	}
 
 	timeoutMs := timeout.Milliseconds()
 	if timeoutMs <= 0 {
@@ -230,6 +234,47 @@ func withPostgresDiagnostics(err error) error {
 }
 
 var postgresRoleIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// CheckQuerySafety also gates scripts which do not issue SQL. QueryArgs checks
+// again on the actual transaction/connection before every warehouse read.
+func (r *PostgresRunner) CheckQuerySafety(ctx context.Context) error {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	return checkQuerySession(ctx, tx, r.queryRole)
+}
+
+func checkQuerySession(ctx context.Context, tx *sql.Tx, role string) error {
+	if role == "" {
+		return fmt.Errorf("query role is not configured; configure PDW_QUERY_POSTGRES_ROLE and PDW_QUERY_POSTGRES_URL")
+	}
+	var safe bool
+	// A restricted effective role is insufficient: SQL can RESET ROLE or call
+	// set_config. The authenticated login must have no route to another role.
+	// pg_has_role(...,'MEMBER') includes indirect/admin memberships, even when
+	// their SET option is currently disabled. Reject those conservatively too.
+	err := tx.QueryRowContext(ctx, `SELECT
+ NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+   WHERE (r.rolname=session_user OR r.rolname=$1)
+   AND (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls))
+ AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=$1)
+ AND session_user <> $1
+ AND pg_catalog.pg_has_role(session_user,$1,'MEMBER')
+ AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname NOT IN (session_user,$1)
+                 AND pg_catalog.pg_has_role(session_user,r.oid,'MEMBER'))
+ AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_shdepend WHERE refclassid='pg_catalog.pg_authid'::regclass
+   AND refobjid=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=session_user)
+   AND (deptype='o' OR (deptype='a' AND classid<>'pg_catalog.pg_database'::regclass)))`, role).Scan(&safe)
+	if err != nil {
+		return fmt.Errorf("cannot verify query login safety: %w", err)
+	}
+	if !safe {
+		return fmt.Errorf("unsafe query database login: use PDW_QUERY_POSTGRES_URL with an unprivileged login that belongs only to the configured query role")
+	}
+	return nil
+}
 
 func queryRoleSQL(role string) (string, error) {
 	if role == "" {

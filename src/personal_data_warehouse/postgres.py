@@ -4,6 +4,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 import hashlib
+import base64
+import hmac
 import inspect
 import json
 import logging
@@ -4306,14 +4308,40 @@ class PostgresWarehouse:
 
     def read_only_connection(self):
         """Open a dedicated connection for untrusted read-only SQL."""
+        query_url = os.getenv("PDW_QUERY_POSTGRES_URL", "")
+        if not query_url:
+            config = self._query_login_config()
+            if config is None:
+                raise ValueError("PDW_QUERY_POSTGRES_URL or provisioned query login credentials are required for untrusted reads")
+            query_url = psycopg2.extensions.make_dsn(self._database_url, user=config[0], password=config[1])
         connection = psycopg2.connect(
-            self._database_url,
+            query_url,
             options="-c default_transaction_read_only=on -c statement_timeout=30000",
         )
         connection.autocommit = True
-        with connection.cursor() as cursor:
-            cursor.execute(self._search_path_sql())
-            cursor.execute(f"SET ROLE {_identifier(self._query_role)}")
+        try:
+            with connection.cursor() as cursor:
+                # This local admin helper is not an agent tool. It still must
+                # authenticate as an unprivileged session before SET ROLE;
+                # transaction read-only does not contain a superuser login.
+                cursor.execute("""SELECT session_user <> %s
+                  AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname=%s)
+                  AND pg_has_role(session_user,%s,'MEMBER')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE
+                    ((r.rolname=session_user OR r.rolname=%s) AND
+                     (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls))
+                    OR (r.rolname NOT IN (session_user,%s) AND pg_has_role(session_user,r.oid,'MEMBER')))
+                  AND NOT EXISTS (SELECT 1 FROM pg_shdepend WHERE refclassid='pg_authid'::regclass
+                    AND refobjid=(SELECT oid FROM pg_roles WHERE rolname=session_user)
+                    AND (deptype='o' OR (deptype='a' AND classid<>'pg_database'::regclass)))
+                  """, (self._query_role,) * 5)
+                if not cursor.fetchone()[0]:
+                    raise ValueError("unsafe query database login; a dedicated unprivileged login is required")
+                cursor.execute(self._search_path_sql())
+                cursor.execute(f"SET ROLE {_identifier(self._query_role)}")
+        except Exception:
+            connection.close()
+            raise
         return connection
 
     def ensure_tables(self) -> None:
@@ -4496,6 +4524,8 @@ class PostgresWarehouse:
             cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (self._query_role,))
             if cursor.fetchone() is None:
                 return True
+            if self._query_login_setup_needed():
+                return True
             cursor.execute(
                 """
                 SELECT
@@ -4604,6 +4634,61 @@ class PostgresWarehouse:
         )
         return bool(rows and rows[0][0])
 
+    def _query_login_config(self) -> tuple[str, str] | None:
+        password = os.getenv("PDW_QUERY_POSTGRES_PASSWORD", "")
+        if not password:
+            return None
+        login = _validate_identifier(os.getenv("PDW_QUERY_POSTGRES_LOGIN", "pdw_query_login"))
+        if len(login.encode()) > 63 or login == self._query_role or len(password) < 32:
+            raise ValueError("query login must be distinct, at most 63 bytes, with a password of at least 32 characters")
+        return login, password
+
+    def _query_login_setup_needed(self) -> bool:
+        config = self._query_login_config()
+        if config is None:
+            return False
+        login, password = config
+        rows = self._query("SELECT rolcanlogin,rolsuper,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls,rolinherit,rolpassword FROM pg_authid WHERE rolname=%s", (login,))
+        if not rows:
+            return True
+        flags, stored = rows[0][:-1], rows[0][-1]
+        if flags != (True, False, False, False, False, False, False):
+            raise ValueError("existing query login has unsafe attributes; choose a fresh dedicated login")
+        memberships = self._query("SELECT r.rolname,m.admin_option,m.inherit_option,m.set_option FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid JOIN pg_roles u ON u.oid=m.member WHERE u.rolname=%s", (login,))
+        if any(row != (self._query_role, False, False, True) for row in memberships):
+            raise ValueError("existing query login has unexpected role memberships; choose a fresh dedicated login")
+        # Compare SCRAM stored keys without issuing ALTER ROLE on every sensor
+        # tick. Rotation writes exactly once under the existing setup lock.
+        matches = False
+        if stored and stored.startswith("SCRAM-SHA-256$"):
+            try:
+                _, iterations_salt, keys = stored.split("$")
+                iterations, salt = iterations_salt.split(":")
+                salted = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(iterations))
+                client_key = hmac.digest(salted, b"Client Key", "sha256")
+                matches = hmac.compare_digest(base64.b64encode(hashlib.sha256(client_key).digest()).decode(), keys.split(":")[0])
+            except (ValueError, TypeError):
+                matches = False
+        return not matches or not memberships
+
+    def _ensure_query_login_locked(self) -> None:
+        config = self._query_login_config()
+        if config is None or not self._query_login_setup_needed():
+            return
+        login, password = config
+        name = _identifier(login)
+        # The outer lock is namespace-local. This extra cluster-role lock also
+        # serializes login/password changes across namespaces in this database.
+        self._raw_command("SELECT pg_advisory_xact_lock(%s)", (QUERY_ROLE_SETUP_LOCK_ID,))
+        if not self._query_login_setup_needed():
+            return
+        if not self._query("SELECT 1 FROM pg_roles WHERE rolname=%s", (login,)):
+            self._raw_command(f"CREATE ROLE {name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT")
+        self._raw_command("SET LOCAL password_encryption = 'scram-sha-256'")
+        # Use a bound value; never put the password in logs or source text.
+        self._raw_command(f"ALTER ROLE {name} PASSWORD %s", (password,))
+        self._raw_command(f"GRANT {_identifier(self._query_role)} TO {name} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE")
+
     def _ensure_query_role_membership(self) -> None:
         # The role and its membership are cluster-wide, unlike the rest of the
         # sweep, which only touches this namespace's schemas. Take the shared
@@ -4706,6 +4791,7 @@ class PostgresWarehouse:
         ]
         if allowlist:
             self._raw_command("; ".join(allowlist))
+        self._ensure_query_login_locked()
 
     def _ensure_plaid_finance_mart_views(self) -> None:
         # marts_finance.accounts / marts_finance.transactions are ledger views
@@ -7410,8 +7496,8 @@ class PostgresWarehouse:
                    sum(truncated) AS truncated_runs,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS duration_p50_ms,
                    percentile_cont(0.9) WITHIN GROUP (ORDER BY duration_ms) AS duration_p90_ms,
-                   max(occurred_at) AS newest_run_at
-            FROM @script_runs GROUP BY 1, 2, 3
+                   max(occurred_at) AS newest_run_at, outcome
+            FROM @script_runs GROUP BY 1, 2, 3, outcome
             """,
         )
 

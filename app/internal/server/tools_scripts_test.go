@@ -11,7 +11,8 @@ import (
 
 type boundedScriptFake struct{}
 
-func (boundedScriptFake) QueryRole() string { return "pdw_query" }
+func (boundedScriptFake) QueryRole() string                      { return "custom_read_role" }
+func (boundedScriptFake) CheckQuerySafety(context.Context) error { return nil }
 func (r boundedScriptFake) Query(ctx context.Context, sql string, n int) (query.RawResult, error) {
 	return r.QueryArgs(ctx, sql, nil, n)
 }

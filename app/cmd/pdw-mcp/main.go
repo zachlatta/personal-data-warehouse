@@ -28,7 +28,14 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("configuration loaded", "addr", cfg.Addr, "base_url", cfg.BaseURL, "max_rows", cfg.MaxRows, "max_field_chars", cfg.MaxFieldChars, "query_timeout", cfg.QueryTimeout, "git_sha", buildinfo.GitSHA())
-	runner, err := query.NewPostgresRunnerWithRole(cfg.PostgresDatabaseURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
+	queryURL := cfg.QueryPostgresDatabaseURL
+	if queryURL == "" {
+		// Keep ingestion and other writer services available, but the runner's
+		// per-transaction safety check refuses reads from a privileged login.
+		slog.Error("PDW_QUERY_POSTGRES_URL is missing; warehouse reads require an unprivileged login")
+		queryURL = cfg.PostgresDatabaseURL
+	}
+	runner, err := query.NewPostgresRunnerWithRole(queryURL, cfg.QueryTimeout, cfg.QueryPostgresRole)
 	if err != nil {
 		logger.Error("connect to Postgres failed", "error", err)
 		os.Exit(1)

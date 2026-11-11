@@ -37,6 +37,28 @@ if TYPE_CHECKING:
 _SUBSCRIPTION_TESTS_ENABLED = pytest.StashKey[bool]()
 
 
+@pytest.fixture
+def query_login(monkeypatch):
+    """Provision isolated credentials for tests of the untrusted SQL helper."""
+    import secrets
+    import psycopg2
+
+    created = []
+    def provision(warehouse):
+        login = "pdw_reader_" + uuid.uuid4().hex[:16]
+        monkeypatch.setenv("PDW_QUERY_POSTGRES_LOGIN", login)
+        monkeypatch.setenv("PDW_QUERY_POSTGRES_PASSWORD", secrets.token_urlsafe(32))
+        monkeypatch.delenv("PDW_QUERY_POSTGRES_URL", raising=False)
+        warehouse._ensure_query_role()
+        created.append((warehouse._database_url, login))
+    yield provision
+    for url, login in created:
+        with psycopg2.connect(url) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute(f'DROP ROLE "{login}"')
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--unit-only",

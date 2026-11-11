@@ -22,19 +22,24 @@ import (
 )
 
 type Service struct {
-	invoke     Invoke
-	role       bool
-	record     Recorder
-	mu         sync.Mutex
-	clients    map[string]int
-	runs       chan struct{}
-	inner      chan struct{}
-	executable string
+	invoke      Invoke
+	role        bool
+	checkSafety func(context.Context) error
+	record      Recorder
+	mu          sync.Mutex
+	clients     map[string]int
+	runs        chan struct{}
+	inner       chan struct{}
+	executable  string
 }
 
-func New(invoke Invoke, role bool, record Recorder) *Service {
+func New(invoke Invoke, role bool, record Recorder, checks ...func(context.Context) error) *Service {
 	exe, _ := os.Executable()
-	return &Service{invoke: invoke, role: role, record: record, clients: map[string]int{}, runs: make(chan struct{}, 4), inner: make(chan struct{}, 6), executable: exe}
+	s := &Service{invoke: invoke, role: role, record: record, clients: map[string]int{}, runs: make(chan struct{}, 4), inner: make(chan struct{}, 6), executable: exe}
+	if len(checks) > 0 {
+		s.checkSafety = checks[0]
+	}
+	return s
 }
 
 // Run never supplies credentials or objects to the worker: only serialized JSON.
@@ -80,8 +85,17 @@ func (s *Service) Run(ctx context.Context, in Input) (r Response) {
 		}
 	}()
 	if !s.role {
-		r.Error = fault("query_role_required", "Scripts require the configured pdw_query role")
+		r.Error = fault("query_role_required", "Scripts require a configured query role and a verified unprivileged database login")
 		return
+	}
+	if s.checkSafety != nil {
+		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err := s.checkSafety(checkCtx)
+		cancel()
+		if err != nil {
+			r.Error = fault("unsafe_query_login", err.Error())
+			return
+		}
 	}
 	if len(in.Code) == 0 || len(in.Code) > 32768 || len(in.Args) > 32768 {
 		r.Error = fault("input_limit", "Code and args must each be at most 32 KiB")
@@ -108,11 +122,9 @@ func (s *Service) Run(ctx context.Context, in Input) (r Response) {
 	client := auth.ClientNameFromContext(ctx)
 	p, _ := auth.PrincipalFromContext(ctx)
 	client += "/" + p.TokenID
-	if p.TokenID != "" {
-		client = p.TokenID
-	} else if p.Scope == auth.ScopeRoot {
-		client = "root"
-	}
+	// Client names divide shared-root capacity too; the global four-run cap
+	// remains authoritative even when a client supplies a different name.
+	client = string(p.Scope) + "/" + client
 	s.mu.Lock()
 	if s.clients[client] >= 2 {
 		s.mu.Unlock()
@@ -354,7 +366,7 @@ func allowed(method string) bool {
 
 func knownErrorCode(code string) bool {
 	switch code {
-	case "script_error", "operation_error", "operation_limit", "input_limit", "output_limit", "encoding_error", "timeout", "busy", "worker_error", "worker_protocol", "query_role_required", "invalid_input", "telemetry_unavailable", "cpu_limit", "memory_limit":
+	case "script_error", "stack_limit", "operation_error", "operation_limit", "input_limit", "output_limit", "encoding_error", "timeout", "busy", "worker_error", "worker_protocol", "query_role_required", "invalid_input", "telemetry_unavailable", "cpu_limit", "memory_limit":
 		return true
 	}
 	return false

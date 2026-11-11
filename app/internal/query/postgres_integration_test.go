@@ -11,9 +11,9 @@ import (
 
 func postgresURLForIntegrationTest(t *testing.T) string {
 	t.Helper()
-	postgresURL := os.Getenv("POSTGRES_DATABASE_URL")
+	postgresURL := os.Getenv("PDW_QUERY_POSTGRES_URL")
 	if postgresURL == "" {
-		t.Skip("POSTGRES_DATABASE_URL is not set")
+		t.Skip("PDW_QUERY_POSTGRES_URL is not set; integration reads require a dedicated unprivileged login")
 	}
 	return postgresURL
 }
@@ -70,7 +70,7 @@ func TestPostgresRunnerAssumesRestrictedRoleAndCannotReadPrivatePlaidTokens(t *t
 	if len(result.Rows) != 1 || result.Rows[0]["role"] != role {
 		t.Fatalf("query ran as %#v, want %q", result.Rows, role)
 	}
-	if _, err := runner.Query(context.Background(), "SELECT count(*) FROM plaid.accounts", 1); err != nil {
+	if _, err := runner.Query(context.Background(), "SELECT count(*) FROM base_plaid.accounts", 1); err != nil {
 		t.Fatalf("restricted query role could not read a queryable Plaid table: %v", err)
 	}
 	if _, err := runner.Query(context.Background(), "SELECT access_token FROM private.plaid_item_tokens LIMIT 1", 1); err == nil {

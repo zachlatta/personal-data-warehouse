@@ -19,6 +19,7 @@ Required:
 
 ```bash
 POSTGRES_DATABASE_URL=...
+PDW_QUERY_POSTGRES_URL=postgresql://dedicated_query_login:...@host/database
 PDW_SECRET_TOKEN=...
 MCP_BASE_URL=https://your-public-coolify-domain
 ```
@@ -147,6 +148,17 @@ MCP_BASE_URL=https://your-public-coolify-domain
 ```
 
 Do not reuse the root `Dockerfile`; that one runs Dagster.
+
+`POSTGRES_DATABASE_URL` is the trusted app writer pool. All warehouse reads use
+the separate, unprivileged login in `PDW_QUERY_POSTGRES_URL` and assume
+`PDW_QUERY_POSTGRES_ROLE` (default `pdw_query`). The runner refuses privileged
+session users or membership in any other role, including superuser sessions.
+Provision the login through Python warehouse construction first with
+`PDW_QUERY_POSTGRES_LOGIN` (default `pdw_query_login`) and secret
+`PDW_QUERY_POSTGRES_PASSWORD` (at least 32 random ASCII characters); set the Go
+query URL and verify that login before deploying the Go change. SQL and scripts
+both fail closed; there is no temporary superuser mode. See
+[`internal/scripts/README.md`](internal/scripts/README.md) for the complete rollout.
 
 ## HTTP API
 
