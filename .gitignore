@@ -229,3 +229,7 @@ __marimo__/
 
 # The iOS app keeps its client code in mobile/src/lib; the lib/ rule above is for Python build output.
 !mobile/src/lib/
+
+# Public repo: agent work items (reports, audits, query output) belong in a private repository.
+/work/
+/scratch/
