@@ -302,3 +302,28 @@ func TestRevokingAnUnknownTokenSaysSo(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestAWorkflowAgentTokenNeedsAHardExpiryWithinASeason(t *testing.T) {
+	svc, c := newTestService(t)
+	for _, req := range []IssueRequest{
+		{ClientName: "wf-heating", Scope: pdwauth.ScopeAgent},
+		{ClientName: "wf-heating", Scope: pdwauth.ScopeAgent, TTL: 400 * 24 * time.Hour},
+		{ClientName: "wf-heating", Scope: pdwauth.ScopeAgent, ExpiresAt: c.Now().Add(200 * 24 * time.Hour)},
+	} {
+		if _, err := svc.Issue(context.Background(), req); err == nil {
+			t.Fatalf("%+v: issued an agent token without a hard expiry inside %s", req, MaxWorkflowTokenLifetime)
+		}
+	}
+	deadline := c.Now().Add(155 * 24 * time.Hour)
+	issued, err := svc.Issue(context.Background(), IssueRequest{ClientName: "wf-heating", Scope: pdwauth.ScopeAgent, ExpiresAt: deadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !issued.Token.ExpiresAt.Equal(deadline) || issued.Token.Scope != pdwauth.ScopeAgent {
+		t.Fatalf("issued = %+v", issued.Token)
+	}
+	principal, err := authenticate(svc, issued.Secret)
+	if err != nil || principal.TokenID != issued.Token.ID || principal.CanReview() {
+		t.Fatalf("principal = %+v, %v", principal, err)
+	}
+}

@@ -211,17 +211,18 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if _, err := execContext(ctx, tx, `
 		INSERT INTO @upstream_mutation_requests (
 			id, status, title, reason, context_json, result_json, idempotency_key,
-			requested_by, created_at, updated_at
+			requested_by, requested_by_token_id, created_at, updated_at
 		)
-		VALUES ($1, 'pending_review', $2, $3, $4::jsonb, '{}'::jsonb, $5, $6, $7, $8)
-	`, requestID, input.Title, input.Reason, jsonString(input.Context), idempotencyKey, input.RequestedBy, now, now); err != nil {
+		VALUES ($1, 'pending_review', $2, $3, $4::jsonb, '{}'::jsonb, $5, $6, $7, $8, $9)
+	`, requestID, input.Title, input.Reason, jsonString(input.Context), idempotencyKey, input.RequestedBy, input.RequestedByTokenID, now, now); err != nil {
 		return Request{}, err
 	}
 	if err := appendRequestEvent(ctx, tx, requestID, "created", "agent", input.RequestedBy, map[string]any{
-		"title":          input.Title,
-		"reason":         input.Reason,
-		"context":        input.Context,
-		"mutation_count": len(normalized),
+		"requested_by_token_id": input.RequestedByTokenID,
+		"title":                 input.Title,
+		"reason":                input.Reason,
+		"context":               input.Context,
+		"mutation_count":        len(normalized),
 	}); err != nil {
 		return Request{}, err
 	}
@@ -295,7 +296,7 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       NULL::jsonb AS context_json, NULL::jsonb AS result_json,
 		       request.error, request.idempotency_key,
 		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.requested_by, request.requested_by_token_id, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count,
@@ -993,7 +994,7 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 		SELECT request.id, request.status, request.title, request.reason, request.context_json,
 		       request.result_json, request.error, request.idempotency_key,
 		       request.superseded_by_request_id, request.replaces_request_id, request.revision,
-		       request.requested_by, request.approved_by, request.withdrawn_by,
+		       request.requested_by, request.requested_by_token_id, request.approved_by, request.withdrawn_by,
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count,
@@ -1688,6 +1689,7 @@ func scanRequest(row scanner) (Request, error) {
 		&request.ReplacesRequestID,
 		&request.Revision,
 		&request.RequestedBy,
+		&request.RequestedByTokenID,
 		&request.ApprovedBy,
 		&request.WithdrawnBy,
 		&request.CreatedAt,
@@ -2934,6 +2936,9 @@ var upstreamMutationSchemaStatements = []string{
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''`,
 	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz`,
+	// The authenticated token behind a proposal (2026-11-11); requested_by is
+	// only the caller-chosen client name. The Python ensure path declares it too.
+	`ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS requested_by_token_id text NOT NULL DEFAULT ''`,
 	`CREATE TABLE IF NOT EXISTS @upstream_mutation_events (
 		mutation_id text NOT NULL,
 		event_index bigint NOT NULL,

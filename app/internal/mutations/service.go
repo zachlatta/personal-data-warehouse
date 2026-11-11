@@ -115,6 +115,8 @@ func (s *Service) ProposeMutation(ctx context.Context, input ProposeMutationInpu
 		Context:     cloneMap(input.Context),
 		Mutations:   mutations,
 		RequestedBy: requestActor(ctx),
+		// The id, not the name: a policy grant binds to who authenticated.
+		RequestedByTokenID: requestTokenID(ctx),
 	}
 	if replaces := strings.TrimSpace(input.ReplacesRequestID); replaces != "" {
 		create.Replaces = &RequestReplacement{
@@ -136,6 +138,16 @@ func requestActor(ctx context.Context) string {
 		return name
 	}
 	return defaultRequestedBy
+}
+
+// requestTokenID is the authenticated token behind the call: an issued
+// token's id, or an OAuth connector grant's id. Empty for the master secret
+// and for a caller with no principal.
+func requestTokenID(ctx context.Context) string {
+	if principal, ok := auth.PrincipalFromContext(ctx); ok {
+		return principal.TokenID
+	}
+	return ""
 }
 
 func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (ProposalResponse, error) {

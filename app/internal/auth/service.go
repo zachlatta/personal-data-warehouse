@@ -164,6 +164,8 @@ func (s *Service) RequireBearer(metadataURL string) func(http.Handler) http.Hand
 			s.logger.WarnContext(ctx, "bearer token rejected", "path", req.URL.Path, "error", err)
 			return nil, fmt.Errorf("%w: %v", mcpauth.ErrInvalidToken, err)
 		}
+		// The grant id is the connector's authenticated identity, recorded on
+		// what it proposes; the client name is only what it called itself.
 		SetClientName(ctx, claims.ClientName)
 		setPrincipal(ctx, Principal{Scope: ScopeOAuthQuery, ClientName: claims.ClientName, TokenID: claims.GrantID})
 		setAuthorizationCheck(ctx, func(checkCtx context.Context) error { _, err := s.VerifyBearer(checkCtx, token); return err })

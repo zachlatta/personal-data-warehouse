@@ -123,6 +123,11 @@ type CreateRequestInput struct {
 	Context     map[string]any
 	Mutations   []MutationInput
 	RequestedBy string
+	// RequestedByTokenID is the authenticated token behind the proposal: the
+	// issued token's id, or the OAuth connector grant's id; empty for the
+	// master secret. RequestedBy is only the name the caller chose to send;
+	// a mutation policy grant binds to this id, never to that name.
+	RequestedByTokenID string
 	// Replaces names the earlier request this proposal stands in for. The
 	// store closes that request out in the same transaction — withdrawing it
 	// if it is still pending, linking it if it is dead — or refuses the whole
@@ -246,7 +251,10 @@ type Request struct {
 	ReplacesRequestID string
 	Revision          int64
 	RequestedBy       string
-	ApprovedBy        string
+	// RequestedByTokenID is the authenticated token that proposed the
+	// request (see CreateRequestInput).
+	RequestedByTokenID string
+	ApprovedBy         string
 	// WithdrawnBy is the agent identity that withdrew the request; the
 	// reason is in Error, exactly where a reviewer's denial reason lives.
 	WithdrawnBy   string

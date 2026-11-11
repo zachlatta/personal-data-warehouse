@@ -403,3 +403,23 @@ func TestPreGrantTokensAreRefusedAfterTheCutoff(t *testing.T) {
 		t.Fatalf("cutoff = %s; it is 30 days after the deploy that introduced grants", LegacyOAuthTokenCutoff)
 	}
 }
+
+// A connector's proposals record its grant id, the identity it
+// authenticated with, not just the client name it registered.
+func TestTheMCPEndpointCarriesTheConnectorsGrantAsItsPrincipal(t *testing.T) {
+	svc, _, mux := newGrantTestServiceAt(t, NewKeyring([]byte("setup-secret")), time.Now)
+	pair := connect(t, mux, registerClient(t, mux), "setup-secret")
+	var seen Principal
+	handler := svc.RequireBearer("https://mcp.example.com/.well-known/oauth-protected-resource")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, _ = PrincipalFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req = req.WithContext(WithClientNameHolder(req.Context()))
+	req.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	grant := payloadOf(t, pair.AccessToken).GrantID
+	if grant == "" || seen.TokenID != grant || seen.Scope != ScopeOAuthQuery || seen.CanReview() {
+		t.Fatalf("principal = %+v, want the grant %q", seen, grant)
+	}
+}

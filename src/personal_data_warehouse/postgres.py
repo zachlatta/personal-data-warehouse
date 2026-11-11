@@ -9722,6 +9722,9 @@ class PostgresWarehouse:
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS replaces_request_id text NOT NULL DEFAULT ''",
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_by text NOT NULL DEFAULT ''",
             "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS withdrawn_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz",
+            # The authenticated token behind a proposal (the Go app writes it;
+            # requested_by is only the caller-chosen client name).
+            "ALTER TABLE @upstream_mutation_requests ADD COLUMN IF NOT EXISTS requested_by_token_id text NOT NULL DEFAULT ''",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutation_requests_idempotency_idx ON @upstream_mutation_requests (idempotency_key) WHERE idempotency_key != ''",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_requests_status_updated_idx ON @upstream_mutation_requests (status, updated_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_mutations_idempotency_idx ON @upstream_mutations (idempotency_key) WHERE idempotency_key != ''",

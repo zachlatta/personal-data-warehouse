@@ -23,9 +23,11 @@ docs/agents/access-tokens.md. Managing them needs the master secret: an
 issued token cannot list, mint or revoke tokens.
 
   pdw token list [--output text|json]
-  pdw token create --name CLIENT [--label TEXT] [--idle 30d] [--ttl DURATION] [--scope full|agent|reviewer]
+  pdw token create --name CLIENT [--label TEXT] [--idle 30d] [--ttl DURATION | --expires DATE] [--scope full|agent|reviewer]
         Print a new token once. It dies after --idle without use (default 30d)
-        and, with --ttl, at a hard expiry. Use it with "pdw login --token" or
+        and, with --ttl or --expires (2027-04-15 or RFC 3339), at a hard
+        expiry. An agent-scope token (one workflow's identity, which a
+        mutation policy grant names) must have a hard expiry, at most 183d. Use it with "pdw login --token" or
         paste it into the iOS app or a web page.
   pdw token revoke ID
         Also turns off an MCP connector: each connector login is listed with
@@ -66,14 +68,28 @@ func runToken(client *cliclient.Client, args []string, stdout, stderr io.Writer)
 		label := fs.String("label", "", "free-text note")
 		idle := fs.String("idle", "", "idle timeout, e.g. 30d")
 		ttl := fs.String("ttl", "", "hard expiry, e.g. 90d")
+		expires := fs.String("expires", "", "hard expiry as a date (2027-04-15, midnight UTC) or RFC 3339 time")
 		scope := fs.String("scope", "", "full (default), agent, or reviewer (the phone app: may approve mutations)")
 		if err := fs.Parse(args[1:]); err != nil || fs.NArg() > 0 || strings.TrimSpace(*name) == "" {
 			fmt.Fprint(stderr, tokenUsage)
 			return 2
 		}
-		raw, err := client.Request(ctx, http.MethodPost, tokensAPIPath, map[string]string{
+		body := map[string]any{
 			"client_name": *name, "label": *label, "idle_timeout": *idle, "ttl": *ttl, "scope": *scope,
-		})
+		}
+		if value := strings.TrimSpace(*expires); value != "" {
+			if *ttl != "" {
+				fmt.Fprintln(stderr, "pdw token create: pass --ttl or --expires, not both")
+				return 2
+			}
+			at, err := parseExpiry(value)
+			if err != nil {
+				fmt.Fprintln(stderr, "pdw token create: --expires:", err)
+				return 2
+			}
+			body["expires_at"] = at.UTC().Format(time.RFC3339)
+		}
+		raw, err := client.Request(ctx, http.MethodPost, tokensAPIPath, body)
 		if err != nil {
 			return tokenError(stderr, err)
 		}
@@ -161,4 +177,17 @@ func tokenError(stderr io.Writer, err error) int {
 	}
 	fmt.Fprintln(stderr, "pdw token:", err)
 	return 1
+}
+
+// parseExpiry reads --expires: a calendar date (midnight UTC) or an RFC 3339
+// time.
+func parseExpiry(value string) (time.Time, error) {
+	if at, err := time.Parse("2006-01-02", value); err == nil {
+		return at, nil
+	}
+	at, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("want a date like 2027-04-15 or an RFC 3339 time, got %q", value)
+	}
+	return at, nil
 }

@@ -40,6 +40,13 @@ const (
 	DefaultAgentTTL = 24 * time.Hour
 	MaxAgentTTL     = 7 * 24 * time.Hour
 
+	// MaxWorkflowTokenLifetime bounds an agent-scope token issued with `pdw
+	// token create --scope agent`: one scheduled workflow's identity, which a
+	// mutation policy grant names by token id. It must carry a hard expiry
+	// (a grant names one token id, so it cannot be renewed weekly like a
+	// cli_authorize token) and that expiry is at most about one season away.
+	MaxWorkflowTokenLifetime = 183 * 24 * time.Hour
+
 	// BootstrapCodeLifetime is how long a cli_authorize command can wait to be
 	// run before its code is useless.
 	BootstrapCodeLifetime = 15 * time.Minute
@@ -184,6 +191,18 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 	now := s.now().UTC()
 	if !req.ExpiresAt.IsZero() && !req.ExpiresAt.After(now) {
 		return Issued{}, errors.New("expires_at must be in the future")
+	}
+	if scope == pdwauth.ScopeAgent {
+		deadline := req.ExpiresAt
+		if deadline.IsZero() && req.TTL > 0 {
+			deadline = now.Add(req.TTL)
+		}
+		if deadline.IsZero() {
+			return Issued{}, errors.New("an agent-scope token needs a hard expiry: pass ttl or expires_at")
+		}
+		if deadline.Sub(now) > MaxWorkflowTokenLifetime {
+			return Issued{}, fmt.Errorf("an agent-scope token may live at most %s", formatDuration(MaxWorkflowTokenLifetime))
+		}
 	}
 	token := Token{
 		Kind:        KindAccess,

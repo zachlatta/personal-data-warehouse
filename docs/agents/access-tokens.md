@@ -75,6 +75,22 @@ request (`GET`) stays open to `full`. Issue the phone's token with
 The test that holds this is `TestOnlyAReviewerPrincipalReachesAReviewRoute`
 (`app/internal/mutations/api_test.go`): add a new review route to its list.
 
+## Workflow identities and `requested_by_token_id`
+
+The `<client>` half of `Bearer <client>:<token>` is chosen by the caller, so it says
+nothing about who is calling. Every mutation request therefore stores
+`requested_by_token_id` beside `requested_by`: the issued token's id, or for an MCP
+connector its grant id (both rows of `private.app_access_tokens`); empty for the master
+secret. A mutation policy grant binds to that id, never to the name.
+
+A scheduled workflow that proposes mutations gets its own token:
+`pdw token create --name wf-<name> --scope agent --expires 2027-04-15`. An agent-scope
+token issued this way **must** carry a hard expiry, at most 183 days away
+(`MaxWorkflowTokenLifetime`), because a policy grant names that one token id for a season
+and cannot follow weekly renewals the way a `cli_authorize` token is renewed. Keep it
+readable only by the workflow (its own Unix user, mode `0600`), and design the grant so a
+stolen token is an acceptable outcome.
+
 ## Why `agent` is narrower than `full`
 
 `cli_authorize` is meant to be called by an agent, for an agent. Without a narrower
