@@ -24,7 +24,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 runtime=".local/share/personal-data-warehouse"
 
 ssh "$host" "mkdir -p $runtime/bin && chmod 700 $runtime"
-rsync -a --delete --exclude '*-systemd' --exclude '*-android' --exclude 'sync-mac-device-runtime' \
+rsync -a --delete --exclude '*-systemd' --exclude '*-android' --exclude 'sync-*-device-runtime' \
   "$here/bin/" "$host:$runtime/bin/"
 
 for plist in "$here"/ops/launchd/*.plist; do

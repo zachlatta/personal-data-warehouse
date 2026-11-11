@@ -663,3 +663,82 @@ def test_the_photos_wrapper_asks_for_the_next_run_only_for_a_backlog_it_can_drai
     assert result.returncode == exit_code
     assert (state / "due").exists() == requeued
     assert (state / "posted").read_text().split() == ["android_photos"]
+
+
+def _fake_linux_host(tmp_path: Path, *, enabled: bool) -> tuple[Path, Path, dict[str, str]]:
+    """Stub ssh/rsync/systemctl so bin/sync-linux-device-runtime runs against a
+    directory standing in for the remote home. ssh runs its command in that
+    home; rsync maps host:path into it; systemctl records its arguments."""
+    home = tmp_path / "home"
+    home.mkdir()
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    calls = tmp_path / "systemctl.calls"
+    (stubs / "ssh").write_text('#!/usr/bin/env bash\nshift\ncd "$FAKE_HOME" && HOME="$FAKE_HOME" exec bash -c "$*"\n')
+    (stubs / "rsync").write_text(
+        "#!/usr/bin/env bash\nargs=()\nfor a in \"$@\"; do\n"
+        '  case "$a" in fakehost:*) args+=("$FAKE_HOME/${a#fakehost:}") ;; *) args+=("$a") ;; esac\ndone\n'
+        'exec /usr/bin/env -u PATH "$REAL_RSYNC" "${args[@]}"\n'
+    )
+    (stubs / "systemctl").write_text(
+        '#!/usr/bin/env bash\necho "$*" >> "$SYSTEMCTL_CALLS"\n'
+        'if [ "$2" = is-enabled ]; then [ "$FAKE_ENABLED" = 1 ]; exit $?; fi\nexit 0\n'
+    )
+    for stub in stubs.iterdir():
+        stub.chmod(0o755)
+    real_rsync = subprocess.run(["bash", "-c", "command -v rsync"], capture_output=True, text=True).stdout.strip()
+    env = {
+        **os.environ,
+        "PATH": f"{stubs}:{os.environ['PATH']}",
+        "FAKE_HOME": str(home),
+        "REAL_RSYNC": real_rsync,
+        "SYSTEMCTL_CALLS": str(calls),
+        "FAKE_ENABLED": "1" if enabled else "0",
+    }
+    return home, calls, env
+
+
+@pytest.mark.skipif(not Path("/usr/bin/rsync").exists() and not Path("/opt/homebrew/bin/rsync").exists(), reason="rsync")
+def test_linux_device_runtime_installs_the_uploader_without_a_checkout(tmp_path: Path) -> None:
+    home, calls, env = _fake_linux_host(tmp_path, enabled=False)
+    script = str(BIN / "sync-linux-device-runtime")
+    result = subprocess.run([script, "fakehost", "--enable"], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+    runtime_bin = home / ".local/share/personal-data-warehouse/bin"
+    shipped = sorted(p.name for p in runtime_bin.iterdir())
+    assert shipped == sorted([LIB, *(p.name for p in BIN.iterdir() if p.name.endswith("-systemd"))])
+    unit = (home / ".config/systemd/user/personal-data-warehouse-agent-sessions-upload.service").read_text()
+    template = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.service").read_text()
+    assert unit == template.replace("%h/dev/zachlatta/personal-data-warehouse", "%h/.local/share/personal-data-warehouse")
+    assert "ExecStart=%h/.local/share/personal-data-warehouse/bin/agent-sessions-upload-systemd" in unit
+    assert "dev/zachlatta" not in unit
+    assert "--user enable --now personal-data-warehouse-agent-sessions-upload.service" in calls.read_text()
+    # The wrapper finds its lib and its .env beside it, not in a checkout.
+    assert (runtime_bin / "agent-sessions-upload-systemd").stat().st_mode & 0o111
+
+    # A second run with nothing changed rewrites and restarts nothing.
+    calls.write_text("")
+    result = subprocess.run([script, "fakehost"], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "wrote" not in result.stdout
+    assert "restart" not in calls.read_text()
+
+
+def test_linux_device_runtime_refuses_a_checkout_host(tmp_path: Path) -> None:
+    home, _, env = _fake_linux_host(tmp_path, enabled=True)
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    checkout_unit = (SYSTEMD / "personal-data-warehouse-agent-sessions-upload.service").read_text()
+    (unit_dir / "personal-data-warehouse-agent-sessions-upload.service").write_text(checkout_unit)
+    result = subprocess.run([str(BIN / "sync-linux-device-runtime"), "fakehost"], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "refusing" in result.stderr
+    assert (unit_dir / "personal-data-warehouse-agent-sessions-upload.service").read_text() == checkout_unit
+    assert not (home / ".local/share/personal-data-warehouse").exists()
+
+
+def test_mac_device_runtime_does_not_ship_the_linux_or_android_pieces() -> None:
+    text = (BIN / "sync-mac-device-runtime").read_text()
+    for pattern in ("'*-systemd'", "'*-android'", "'sync-*-device-runtime'"):
+        assert f"--exclude {pattern}" in text, pattern

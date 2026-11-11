@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Install or refresh a Linux host's PDW device runtime from this checkout.
+#
+# The Linux counterpart of bin/sync-mac-device-runtime, for a host that only
+# RUNS the agent-sessions uploader (mew, the hypervisor) and has no checkout.
+# The runtime is:
+#
+#   ~/.local/share/personal-data-warehouse/bin/   bin/_pdw-upload-lib.sh and
+#                                                 the *-systemd wrappers and
+#                                                 status helpers
+#   ~/.local/share/personal-data-warehouse/.env   uploader settings (0600; this
+#                                                 script never writes it)
+#   ~/.config/systemd/user/personal-data-warehouse-agent-sessions-upload.service
+#                                                 ops/systemd's unit, pointed at
+#                                                 the runtime instead of a checkout
+#
+# Usage: bin/sync-linux-device-runtime <ssh-host> [--enable]
+#
+# Idempotent. A changed unit is rewritten and, if the service is enabled,
+# restarted; --enable also enables and starts it. Host settings (the ingest
+# secret's EnvironmentFile, AGENT_SESSIONS_HEARTBEAT_PIPELINES) belong in a
+# drop-in under ~/.config/systemd/user/<unit>.d/, which this never touches
+# (docs/agents/agent-sessions.md). It refuses a host whose installed unit runs
+# a checkout (mew-dev, openclaw): those update with `git pull`.
+set -euo pipefail
+
+host="${1:?usage: bin/sync-linux-device-runtime <ssh-host> [--enable]}"
+enable=0
+case "${2:-}" in
+  "") ;;
+  --enable) enable=1 ;;
+  *) echo "usage: bin/sync-linux-device-runtime <ssh-host> [--enable]" >&2; exit 2 ;;
+esac
+here="$(cd "$(dirname "$0")/.." && pwd)"
+runtime=".local/share/personal-data-warehouse"
+unit="personal-data-warehouse-agent-sessions-upload.service"
+installed=".config/systemd/user/$unit"
+user_bus='export XDG_RUNTIME_DIR="/run/user/$(id -u)";'
+
+rendered="$(sed 's#%h/dev/zachlatta/personal-data-warehouse#%h/.local/share/personal-data-warehouse#g' \
+  "$here/ops/systemd/$unit")"
+
+current="$(ssh "$host" "cat $installed 2>/dev/null || true")"
+if [ -n "$current" ] && ! printf '%s\n' "$current" | grep -q "^ExecStart=%h/$runtime/bin/"; then
+  echo "refusing: $host's $unit does not run from ~/$runtime (a checkout host?)" >&2
+  exit 1
+fi
+
+ssh "$host" "mkdir -p $runtime/bin .config/systemd/user && chmod 700 $runtime"
+rsync -a --delete --include '_pdw-upload-lib.sh' --include '*-systemd' --exclude '*' \
+  "$here/bin/" "$host:$runtime/bin/"
+
+changed=0
+if [ "$current" != "$rendered" ]; then
+  printf '%s\n' "$rendered" | ssh "$host" "cat > $installed"
+  changed=1
+  echo "wrote ~/$installed"
+fi
+ssh "$host" "$user_bus systemctl --user daemon-reload"
+if [ "$enable" = 1 ]; then
+  ssh "$host" "$user_bus systemctl --user enable --now $unit"
+  if [ "$changed" = 1 ]; then
+    ssh "$host" "$user_bus systemctl --user restart $unit"
+  fi
+elif [ "$changed" = 1 ] && ssh "$host" "$user_bus systemctl --user is-enabled --quiet $unit"; then
+  ssh "$host" "$user_bus systemctl --user restart $unit"
+fi
+echo "device runtime on $host is at ~/$runtime"
