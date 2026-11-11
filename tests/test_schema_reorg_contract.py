@@ -125,10 +125,11 @@ def test_catalog_layers_and_schema_names_are_consistent() -> None:
 
 
 def test_public_schemas_sort_base_then_derived_then_marts_then_timeline() -> None:
-    """Plain alphabetical order is the intended reading order.
+    """Plain alphabetical order is the intended listing order.
 
     A bare ``\\dn`` in psql, an ORDER BY table_schema, and the schema overview
-    all agree without anyone hand-sorting them.
+    all agree without anyone hand-sorting them. It is not the reading order:
+    consumers read timeline → marts_*/derived_* → base_* (AGENTS.md C5).
     """
     ordered = list(DISCOVERABLE_SCHEMAS)
     assert ordered == sorted(ordered)

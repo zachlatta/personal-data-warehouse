@@ -270,10 +270,16 @@ func TestGuideWalksTheLayersTimelineFirst(t *testing.T) {
 			if name == "full" {
 				timeline = strings.Index(flat, "timeline first: bounded `timeline.events`")
 			}
-			marts := strings.Index(flat, "`marts_*`")
-			derived := strings.Index(flat, "`derived_*`")
-			base := strings.Index(flat, "→ `base_*`")
-			if timeline < 0 || marts < timeline || derived < marts || base < derived {
+			if timeline < 0 {
+				t.Fatalf("%s guide (%v) has no timeline-first SQL step:\n%s", name, surface, flat)
+			}
+			// Search only after the anchor, so a mention elsewhere on the page
+			// cannot satisfy (or break) the order.
+			step := flat[timeline:]
+			marts := strings.Index(step, "`marts_*`")
+			derived := strings.Index(step, "`derived_*`")
+			base := strings.Index(step, "→ `base_*`")
+			if marts < 0 || derived < marts || base < derived {
 				t.Fatalf("%s guide (%v) must walk timeline → marts_*/derived_* → base_*:\n%s", name, surface, flat)
 			}
 			if strings.Contains(strings.ToLower(flat), "order to reach for") {
