@@ -261,3 +261,29 @@ class fake_exclusive_sync_lock:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         return None
+
+
+def test_alice_transcript_import_runs_after_the_archive_and_writes_summary_metadata(monkeypatch) -> None:
+    from personal_data_warehouse.alice_voice_recordings_transcript_import import AliceTranscriptImportSummary
+
+    class FakeImporter:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def sync(self):
+            return AliceTranscriptImportSummary(
+                recordings_seen=1, recordings_imported=1, recordings_failed=0, segments_written=12
+            )
+
+    monkeypatch.setattr(alice_defs, "load_settings", lambda **_kwargs: FakeSettings())
+    monkeypatch.setattr(alice_defs, "warehouse_from_settings", lambda _settings: object())
+    monkeypatch.setattr(alice_defs, "alice_object_store", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(alice_defs, "exclusive_sync_lock", fake_exclusive_sync_lock)
+    monkeypatch.setattr(alice_defs, "AliceTranscriptDocumentImporter", FakeImporter)
+
+    result = alice_defs.alice_voice_recordings_transcript_import(build_asset_context())
+
+    assert result.metadata["recordings_imported"].value == 1
+    assert result.metadata["segments_written"].value == 12
+    job = defs().get_repository_def().get_job("alice_voice_recordings_import_job")
+    assert "alice_voice_recordings_transcript_import" in {node.name for node in job.graph.node_defs}

@@ -313,6 +313,21 @@ green and the contract audit graded them "untranscribable". The skip now require
 audio object and the sidecar; a `size_bytes = 0` row with a live source id is a fetch
 failure to investigate, never a quiet source.
 
+**An Alice recording with no audio but a mailed transcript is transcribed from the document
+(2026-11-11).** The Gmail recovery pass archives the `.transcript-formatted.docx` Alice mails
+as a `voice_recording_transcript` artifact, and for a recording whose audio Alice no longer
+serves that document is the only copy of what was said; a meeting could sit with 0 audio
+bytes and no transcript beside its stored transcript. The
+`alice_voice_recordings_transcript_import` asset (in the daily Alice job, after the Drive
+ingest) copies the document's text into `derived_voice_memos.transcription_runs` under
+provider `alice_transcript_document`, one segment per paragraph, verbatim: speaker names and
+timestamps stay in the text for the enrichment agent to read, not parsed out. Enrichment reads
+whichever transcript the mart serves (`transcript_provider`), so calendar matching and
+continuity follow. A recording with audio is never imported this way; AssemblyAI transcribes
+the audio. A zero-byte Alice row can have neither: Alice reports `media_file_ready = false`,
+`transcript_ready = false` and the media URL answers 404 on every daily poll, and no Alice
+email names it, so it is an empty upstream stub.
+
 The three derived tables — `derived_voice_memos.transcription_runs`, `.transcript_segments`
 and `.enrichments` — are keyed by **`source` first**, because a `recording_id` is unique
 only inside its own source. Without that column a second source's run upserts onto the

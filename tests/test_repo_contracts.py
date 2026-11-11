@@ -875,6 +875,7 @@ SRC_ROOT = REPO_ROOT / "src" / "personal_data_warehouse"
 # named below; excluding their filenames from discovery is how a raw Slack-file
 # scan lived outside the contract while every registry stayed green.
 ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
+    "alice_voice_recordings_transcript_import.py",
     "apple_voice_memos_enrichment.py",
     "apple_voice_memos_transcription.py",
     "attachment_text_extraction.py",
@@ -914,6 +915,13 @@ ENRICHMENT_RUNNER_MODULES: tuple[str, ...] = (
 # An entry here is a claim someone made on purpose, not a default: the whole
 # point is that adding one requires writing down why.
 ALLOWED_RAW_ENRICHMENT_READS: dict[str, dict[str, str]] = {
+    "alice_voice_recordings_transcript_import.py": {
+        # Only Alice mails a transcript document for a recording, so there is
+        # no second source to conform; the pass writes the voice domain's
+        # transcription run and everything downstream reads the voice mart.
+        "alice_voice_recordings": "single-source step: Alice recordings whose audio is gone",
+        "alice_voice_recording_artifacts": "single-source step: the transcript document Alice mailed",
+    },
     "apple_voice_memos_enrichment.py": {
         # Context lookups, not the candidate scan: the agent is given identity
         # hints so it can put a name to a voice. They are single-source
@@ -1104,6 +1112,10 @@ CONTENT_ADDRESSED_ATTACHMENT_MODULES: tuple[str, ...] = (
 )
 
 ENRICHMENT_DEDUP_EXEMPT_OR_UPSTREAM_MODULES: dict[str, str] = {
+    "alice_voice_recordings_transcript_import.py": (
+        "free and deterministic: copies a stored transcript document's text, keyed by the "
+        "document's content_sha256, and calls no paid provider"
+    ),
     "apple_voice_memos_enrichment.py": (
         "runs over marts_voice_memos.recordings after ContentAddressedTranscriber has already "
         "deduplicated identical audio bytes by content_sha256"

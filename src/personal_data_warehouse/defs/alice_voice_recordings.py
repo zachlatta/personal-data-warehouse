@@ -18,6 +18,7 @@ from personal_data_warehouse.alice_voice_recordings_drive_ingest import (
     AliceVoiceRecordingsDriveIngestRunner,
     iter_archive_payloads,
 )
+from personal_data_warehouse.alice_voice_recordings_transcript_import import AliceTranscriptDocumentImporter
 from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.gmail_sync import build_gmail_service
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
@@ -33,6 +34,7 @@ from personal_data_warehouse.warehouse import warehouse_from_settings
 
 ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
 ALICE_VOICE_RECORDINGS_DRIVE_INGEST_POSTGRES_LOCK_ID = 7_403_111_854
+ALICE_VOICE_RECORDINGS_TRANSCRIPT_IMPORT_POSTGRES_LOCK_ID = 7_403_111_863
 
 
 #: Absence is the epoch here, as everywhere in the warehouse -- a poll that has
@@ -261,12 +263,56 @@ def alice_voice_recordings_drive_ingest(context) -> MaterializeResult:
     )
 
 
+@asset(
+    deps=[alice_voice_recordings_drive_ingest],
+    group_name="alice_voice_recordings",
+    retry_policy=RetryPolicy(max_retries=3, delay=60),
+)
+def alice_voice_recordings_transcript_import(context) -> MaterializeResult:
+    """A recording whose audio Alice no longer serves keeps the transcript it mailed.
+
+    Moves a stored ``voice_recording_transcript`` document into the voice domain
+    as its transcript, so enrichment and calendar matching reach it.
+    """
+    settings = load_settings(
+        require_gmail=False,
+        require_alice_voice_recordings=True,
+    )
+    if settings.alice_voice_recordings is None:
+        raise RuntimeError("Alice voice recordings import is not configured")
+    config = settings.alice_voice_recordings
+
+    with exclusive_sync_lock(
+        name="alice_voice_recordings_transcript_import",
+        postgres_lock_id=ALICE_VOICE_RECORDINGS_TRANSCRIPT_IMPORT_POSTGRES_LOCK_ID,
+    ) as acquired:
+        if not acquired:
+            context.log.warning("Skipping Alice transcript import because another run is already active")
+            summary = None
+        else:
+            summary = AliceTranscriptDocumentImporter(
+                warehouse=warehouse_from_settings(settings),
+                object_store=alice_object_store(config, settings),
+                logger=context.log,
+            ).sync()
+
+    return MaterializeResult(
+        metadata={
+            "recordings_seen": MetadataValue.int(summary.recordings_seen if summary else 0),
+            "recordings_imported": MetadataValue.int(summary.recordings_imported if summary else 0),
+            "recordings_failed": MetadataValue.int(summary.recordings_failed if summary else 0),
+            "segments_written": MetadataValue.int(summary.segments_written if summary else 0),
+        }
+    )
+
+
 alice_voice_recordings_import_job = define_asset_job(
     "alice_voice_recordings_import_job",
     selection=[
         alice_voice_recordings_import,
         alice_voice_recordings_gmail_recovery,
         alice_voice_recordings_drive_ingest,
+        alice_voice_recordings_transcript_import,
     ],
 )
 
@@ -287,6 +333,7 @@ def defs() -> Definitions:
             alice_voice_recordings_import,
             alice_voice_recordings_gmail_recovery,
             alice_voice_recordings_drive_ingest,
+            alice_voice_recordings_transcript_import,
         ],
         jobs=[alice_voice_recordings_import_job],
         schedules=[alice_voice_recordings_import_daily],
