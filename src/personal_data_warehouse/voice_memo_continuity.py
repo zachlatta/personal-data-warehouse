@@ -54,6 +54,17 @@ MERGE_MEMBER_TRANSCRIPT_MIN_CHARS = 4_000
 
 JUDGMENT_VERDICTS = ("same_event", "separate")
 
+# The pass's health is its RUN, not its output: a judgment is written only
+# when Zach records two memos back to back, so a 7d data-age SLA would
+# often flag a healthy pass. Every run
+# posts a heartbeat (ops.uploader_heartbeats, device "dagster"); it reads
+# error when a judgment or merge failed, or when an eligible pair has waited
+# longer than this while the run had room to judge it -- which a working pass
+# (hourly :47 plus a two-minute backlog sensor) never allows.
+CONTINUITY_HEARTBEAT_PIPELINE = "voice_memo_continuity"
+CONTINUITY_HEARTBEAT_DEVICE = "dagster"
+CONTINUITY_STUCK_AFTER_SECONDS = 2 * 60 * 60
+
 
 @dataclass(frozen=True)
 class VoiceMemoContinuitySummary:
@@ -64,6 +75,7 @@ class VoiceMemoContinuitySummary:
     sessions_seen: int
     sessions_merged: int
     sessions_failed: int
+    pairs_stuck: int = 0
 
 
 def _sql_string(value: str) -> str:
@@ -157,6 +169,63 @@ def load_continuity_pair_candidates(
         """
     )
     return [dict(row) for row in rows]
+
+
+def count_unjudged_eligible_pairs(warehouse, *, older_than: datetime, max_gap_seconds: float) -> int:
+    """Back-to-back recordings with speech, enriched before ``older_than``, with no current judgment.
+
+    Deliberately NOT load_continuity_pair_candidates: this is the check on it.
+    It shares the contract's definition of a pair (consecutive recordings with
+    speech of one source and account, within the gap) and none of the loader's
+    bookkeeping, so a candidate-query regression -- the LAG() bug that hid
+    pairs -- or a pair abandoned after repeated agent failures reads as a stuck
+    backlog instead of a quiet one.
+    """
+    rows = warehouse._query_dicts(
+        f"""
+        WITH spoken AS (
+            SELECT
+                r.source,
+                r.account,
+                r.recording_id,
+                r.recorded_at,
+                r.enriched_at,
+                COALESCE(r.provider_transcript_id, '') AS provider_transcript_id,
+                LAG(r.recording_id) OVER w AS previous_recording_id,
+                LAG(r.recorded_at) OVER w AS previous_recorded_at,
+                LAG(r.duration_seconds) OVER w AS previous_duration_seconds,
+                LAG(r.enriched_at) OVER w AS previous_enriched_at,
+                LAG(COALESCE(r.provider_transcript_id, '')) OVER w AS previous_provider_transcript_id
+            FROM @marts_voice_memos_recordings r
+            WHERE r.is_deleted = 0
+              AND r.recorded_at IS NOT NULL
+              AND NULLIF(btrim(r.transcript), '') IS NOT NULL
+            WINDOW w AS (PARTITION BY r.source, r.account ORDER BY r.recorded_at, r.recording_id)
+        )
+        SELECT count(*) AS stuck
+        FROM spoken p
+        WHERE p.previous_recording_id IS NOT NULL
+          AND EXTRACT(EPOCH FROM (
+                p.recorded_at
+                - (p.previous_recorded_at + make_interval(secs => COALESCE(p.previous_duration_seconds, 0)::float8))
+              )) <= {float(max_gap_seconds)}
+          AND p.enriched_at IS NOT NULL
+          AND p.previous_enriched_at IS NOT NULL
+          AND GREATEST(p.enriched_at, p.previous_enriched_at) < TIMESTAMPTZ {_sql_string(older_than.astimezone(UTC).isoformat())}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM @voice_memo_continuity_judgments j
+              WHERE j.source = p.source
+                AND j.account = p.account
+                AND j.previous_recording_id = p.previous_recording_id
+                AND j.recording_id = p.recording_id
+                AND j.status = 'completed'
+                AND j.provider_transcript_id = p.provider_transcript_id
+                AND j.previous_provider_transcript_id = p.previous_provider_transcript_id
+          )
+        """
+    )
+    return int(rows[0]["stuck"]) if rows else 0
 
 
 def load_session_merge_candidates(
@@ -397,9 +466,11 @@ class VoiceMemoContinuityRunner:
         now: Callable[[], datetime] | None = None,
         max_gap_seconds: float = DEFAULT_CONTINUITY_MAX_GAP_SECONDS,
         max_error_attempts: int = DEFAULT_CONTINUITY_MAX_ERROR_ATTEMPTS,
+        stuck_after_seconds: float = CONTINUITY_STUCK_AFTER_SECONDS,
     ) -> None:
         self._warehouse = warehouse
         self._client = client
+        self._stuck_after_seconds = stuck_after_seconds
         self._logger = logger
         self._provider = provider
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -407,6 +478,47 @@ class VoiceMemoContinuityRunner:
         self._max_error_attempts = max_error_attempts
 
     def sync(self, *, limit: int | None) -> VoiceMemoContinuitySummary:
+        started_at = self._now()
+        summary = self._sync(limit=limit)
+        self._record_heartbeat(summary, started_at=started_at)
+        return summary
+
+    def _record_heartbeat(self, summary: VoiceMemoContinuitySummary, *, started_at: datetime) -> None:
+        problems = []
+        if summary.pairs_failed:
+            problems.append(f"{summary.pairs_failed} pair judgment(s) failed")
+        if summary.sessions_failed:
+            problems.append(f"{summary.sessions_failed} session merge(s) failed")
+        if summary.pairs_stuck:
+            problems.append(
+                f"{summary.pairs_stuck} eligible pair(s) unjudged for over "
+                f"{int(self._stuck_after_seconds // 60)} min"
+            )
+        finished_at = self._now()
+        self._warehouse.record_run_heartbeat(
+            pipeline=CONTINUITY_HEARTBEAT_PIPELINE,
+            device=CONTINUITY_HEARTBEAT_DEVICE,
+            ran_at=finished_at,
+            ok=not problems,
+            error="; ".join(problems),
+            duration_seconds=max((finished_at - started_at).total_seconds(), 0.0),
+        )
+
+    def _stuck_pairs(self, *, limit: int | None, pairs_seen: int) -> int:
+        """Eligible pairs left without a judgment although this run had room.
+
+        A run that used its whole batch is draining a backlog, not stuck; the
+        next run (two minutes later, from the backlog sensor) continues it.
+        """
+        if limit is not None and limit > 0 and pairs_seen >= limit:
+            return 0
+        return count_unjudged_eligible_pairs(
+            self._warehouse,
+            older_than=datetime.fromtimestamp(self._now().timestamp() - self._stuck_after_seconds, tz=UTC),
+            max_gap_seconds=self._max_gap_seconds,
+        )
+
+    def _sync(self, *, limit: int | None) -> VoiceMemoContinuitySummary:
         self._warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
         pairs = load_continuity_pair_candidates(
             self._warehouse,
@@ -501,6 +613,7 @@ class VoiceMemoContinuityRunner:
             sessions_seen=len(sessions),
             sessions_merged=merged,
             sessions_failed=sessions_failed,
+            pairs_stuck=self._stuck_pairs(limit=limit, pairs_seen=len(pairs)),
         )
 
     def _judgment_row(

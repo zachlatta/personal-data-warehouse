@@ -363,6 +363,16 @@ enrichment); `merge_status` is `single`, `pending` (joined, merged record not wr
 the first member's title stands in) or `merged`. Each member recording keeps its own row in
 `marts_voice_memos.recordings` and on the timeline; sessions are not a timeline source yet.
 
+**Continuity health is its run, not its output (2026-11-11).** A judgment is written only when
+Zach records two memos back to back, so data age says nothing about whether the pass works:
+the newest back-to-back pair is often over 14 days old while the pass is healthy. In
+`marts_ops.pipeline_health` `voice_memo_continuity` is usage-driven (data reads `quiet`), and every run posts a heartbeat to `ops.uploader_heartbeats` (device `dagster`),
+judged on the hourly cadence. The heartbeat reads `error` when a judgment or merge failed, or
+when an eligible pair (consecutive recordings with speech, both enriched over 2 h ago) still has
+no current judgment although the run had room for it. That check
+(`count_unjudged_eligible_pairs`) deliberately does not reuse the candidate query, so a
+candidate bug or a pair abandoned after three agent failures stays red until someone looks.
+
 ## Google Recorder on the Pixel
 
 Zach carries a Pixel from 2026-10-23, so new memos are Google Recorder recordings (a

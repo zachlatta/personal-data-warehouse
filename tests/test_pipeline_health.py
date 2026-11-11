@@ -2886,6 +2886,9 @@ USAGE_DRIVEN_PIPELINES = {
     "search_requests",
     # Since the Pixel replaced the iPhone (2026-10-23) a Mac memo is occasional.
     "apple_voice_memos",
+    # Judgments exist only when Zach records two memos back to back; the run
+    # heartbeat (failed judgments, stuck backlog) is the detector.
+    "voice_memo_continuity",
 }
 
 
@@ -3003,6 +3006,50 @@ def test_a_quiet_mac_voice_memos_library_is_ok_while_its_uploader_runs_clean(
         "SELECT status, data_status, run_status FROM @marts_pipeline_health WHERE pipeline = 'apple_voice_memos'"
     )
     assert row == expected
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_ago", "heartbeat_ok", "expected"),
+    [
+        # Weeks without a back-to-back pair, the hourly run clean: Zach, not a fault.
+        (timedelta(minutes=20), True, {"status": "ok", "data_status": "quiet", "run_status": "ok"}),
+        # A failed judgment or a stuck backlog: the run says so.
+        (timedelta(minutes=20), False, {"status": "failing", "data_status": "quiet", "run_status": "ok"}),
+        # The pass stopped running (schedule and sensor both dead).
+        (timedelta(hours=7), True, {"status": "stale", "data_status": "quiet", "run_status": "stale"}),
+    ],
+)
+def test_voice_memo_continuity_is_judged_by_its_run_not_by_how_often_zach_records(
+    warehouse, heartbeat_ago, heartbeat_ok, expected
+):
+    _provision_every_table(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse._command(
+        """
+        INSERT INTO @voice_memo_continuity_judgments
+            (source, account, previous_recording_id, recording_id, status, created_at, sync_version)
+        VALUES ('google_recorder', 'z', 'a', 'b', 'completed', %s, 1)
+        """,
+        (now - timedelta(days=30),),
+    )
+    warehouse.record_run_heartbeat(
+        pipeline="voice_memo_continuity",
+        device="dagster",
+        ran_at=now - heartbeat_ago,
+        ok=heartbeat_ok,
+        error="" if heartbeat_ok else "1 eligible pair(s) unjudged for over 120 min",
+        duration_seconds=4,
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    (row,) = warehouse._query_dicts(
+        "SELECT status, data_status, run_status, last_error FROM @marts_pipeline_health"
+        " WHERE pipeline = 'voice_memo_continuity'"
+    )
+    assert {k: row[k] for k in ("status", "data_status", "run_status")} == expected
+    if not heartbeat_ok:
+        assert "unjudged" in row["last_error"]
 
 
 # --- search request timings (C6): the app appends, the writer's heartbeat judges --

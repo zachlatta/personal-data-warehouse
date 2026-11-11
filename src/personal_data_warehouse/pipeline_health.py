@@ -1462,24 +1462,28 @@ PIPELINES: tuple[Pipeline, ...] = (
         kind="enrichment",
         cadence="hourly :47 + backlog sensor",
         transport="Dagster voice_memo_continuity → agent container",
-        # It runs on a schedule and a backlog sensor, so it has a cadence; it
-        # read 'manual' (no interval declared) while a candidate bug left
-        # pairs unjudged for weeks, and 'manual' could not say so.
+        # Usage-driven output: a judgment is written only when Zach records two
+        # memos back to back. A 7d data-age SLA (late at 14 d with no new pair)
+        # would often read late with the pass healthy, and no interval at all
+        # read 'manual' while a candidate bug left pairs unjudged for weeks.
+        # So data age only reads 'quiet', and the RUN is judged: every run
+        # posts a heartbeat that reads error when a judgment or merge failed or
+        # an eligible pair waited over 2 h with room to judge it
+        # (voice_memo_continuity.CONTINUITY_STUCK_AFTER_SECONDS).
         expected_data_interval=7 * DAY,
-        expected_run_interval=None,
+        expected_run_interval=HOUR,
         data_basis=(
-            "same 7d as voice_memo_enrichment, whose output it follows"
+            "the newest back-to-back pair is often over 14 d old with the pass"
+            " healthy, so a 7d late line would fire on a healthy pass."
+            " Usage-driven: past 7d it reads 'quiet' and the run heartbeat is the detector"
         ),
-        note="writes only when two recordings with speech sit back to back",
-        # One judgment row per recording pair, overwritten on retry: an agent
-        # failure lands as status='error' with the exception text.
-        state=StateSource(
-            table="voice_memo_continuity_judgments",
-            updated_column="created_at",
-            status_column="status",
-            error_column="error",
-            error_window=timedelta(days=7),
+        note=(
+            "writes only when two recordings with speech sit back to back; the run"
+            " heartbeat (ops.uploader_heartbeats, device dagster) reads error on a"
+            " failed judgment or merge, or an eligible pair unjudged for over 2 h"
         ),
+        state=_uploader_heartbeat("voice_memo_continuity"),
+        freshness_escalates=False,
     ),
     Pipeline(
         id="manual_finance_extraction",

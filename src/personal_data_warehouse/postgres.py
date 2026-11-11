@@ -14337,6 +14337,65 @@ class PostgresWarehouse:
             ALICE_VOICE_RECORDINGS_SYNC_STATE_COLUMNS,
         )
 
+    def record_run_heartbeat(
+        self,
+        *,
+        pipeline: str,
+        device: str,
+        ran_at: datetime,
+        ok: bool,
+        error: str,
+        duration_seconds: float,
+    ) -> None:
+        """One run of an in-warehouse pass, in ops.uploader_heartbeats.
+
+        For a pass whose output depends on how Zach uses a source (continuity
+        writes only when two recordings sit back to back), data age cannot say
+        whether it works; its run can. Same row shape and failure-streak rules
+        as the app's /ingest/heartbeat (app/internal/server/heartbeat_ingest.go),
+        so marts_ops.pipeline_health reads it like any uploader's heartbeat.
+        """
+        self._ensure_table_group(["uploader_heartbeats"])
+        exit_code = 0 if ok else 1
+        self._command(
+            """
+            INSERT INTO @uploader_heartbeats AS hb
+                (pipeline, device, ran_at, status, error, exit_code, duration_seconds,
+                 consecutive_failures, failing_since, updated_at, sync_version)
+            VALUES (%(pipeline)s, %(device)s, %(ran_at)s, %(status)s, %(error)s, %(exit_code)s,
+                    %(duration)s,
+                    CASE WHEN %(exit_code)s <> 0 THEN 1 ELSE 0 END,
+                    CASE WHEN %(exit_code)s <> 0 THEN %(ran_at)s::timestamptz
+                         ELSE TIMESTAMPTZ '1970-01-01 00:00:00+00' END,
+                    now(), %(sync_version)s)
+            ON CONFLICT (pipeline, device) DO UPDATE SET
+                ran_at = EXCLUDED.ran_at,
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                exit_code = EXCLUDED.exit_code,
+                duration_seconds = EXCLUDED.duration_seconds,
+                consecutive_failures = CASE WHEN EXCLUDED.exit_code <> 0 THEN hb.consecutive_failures + 1 ELSE 0 END,
+                failing_since = CASE
+                    WHEN EXCLUDED.exit_code = 0 THEN TIMESTAMPTZ '1970-01-01 00:00:00+00'
+                    WHEN hb.consecutive_failures = 0 THEN EXCLUDED.ran_at
+                    ELSE hb.failing_since
+                END,
+                updated_at = now(),
+                sync_version = EXCLUDED.sync_version
+            WHERE hb.sync_version <= EXCLUDED.sync_version
+            """,
+            {
+                "pipeline": pipeline,
+                "device": device,
+                "ran_at": ran_at,
+                "status": "ok" if ok else "error",
+                "error": error,
+                "exit_code": exit_code,
+                "duration": int(round(duration_seconds)),
+                "sync_version": int(ran_at.timestamp() * 1_000_000),
+            },
+        )
+
     def insert_voice_memo_files(self, rows: list[dict[str, Any]]) -> None:
         self.insert_apple_voice_memos_files(rows)
 

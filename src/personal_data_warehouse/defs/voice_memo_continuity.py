@@ -79,6 +79,7 @@ def voice_memo_continuity(context, agent: AgentResource) -> MaterializeResult:
             "sessions_seen": MetadataValue.int(summary.sessions_seen if summary else 0),
             "sessions_merged": MetadataValue.int(summary.sessions_merged if summary else 0),
             "sessions_failed": MetadataValue.int(summary.sessions_failed if summary else 0),
+            "pairs_stuck": MetadataValue.int(summary.pairs_stuck if summary else 0),
         }
     )
 
