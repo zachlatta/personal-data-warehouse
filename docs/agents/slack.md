@@ -264,8 +264,12 @@ the token's ~39 calls a minute could give. `SlackSessionApiClient` sends the ses
 `d` cookie and the browser's own User-Agent; if Slack refuses the session itself
 (`invalid_auth`, `team_is_restricted`, …) `SlackSessionFallbackClient` polls with the OAuth
 token for the rest of the pass and logs it. A pass stops after
-`SLACK_ASSET_FRESHNESS_PASS_SECONDS` (240) of polling, so the job fits its five-minute
-schedule and hot DMs are polled every tick while a backlog drains across passes.
+`SLACK_ASSET_FRESHNESS_PASS_SECONDS` (180) of polling, so the job fits its five-minute
+schedule and hot DMs are polled every tick while a backlog drains across passes. It was
+240 while the rate-limit sleep budget cut every pass at ~180s anyway; once the public
+sweep gave calls back (2026-11-11) passes polled the full 240s, runs took 4m53s-5m32s
+with the read-state pass and the timeline fast lane, and each overrun skipped the next
+tick. A run longer than five minutes is the thing to watch after any budget change.
 `SLACK_ASSET_FRESHNESS_USE_SESSION=0` polls with the OAuth token only. `marts_ops.slack_conversation_health` judges every type on
 `history_polled_fraction` within its cycle (24 hours for DMs, group DMs and private
 channels) beside DM landing latency.

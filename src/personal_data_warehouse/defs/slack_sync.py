@@ -196,10 +196,13 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             warehouse=warehouse,
             logger=logger,
             client_factory=_session_client_factory(settings=settings, warehouse=warehouse, logger=logger),
-            # Four minutes of polling a pass, so the job finishes inside its
-            # five-minute schedule and hot DMs are polled every tick while a
-            # backlog drains across passes.
-            freshness_pass_budget=timedelta(seconds=_int_env("SLACK_ASSET_FRESHNESS_PASS_SECONDS", 240)),
+            # Three minutes of polling a pass, so the whole run (~10s of
+            # preamble, the polls, the read-state pass and the timeline fast
+            # lane) finishes inside its five-minute schedule and hot DMs are
+            # polled every tick while a backlog drains across passes. At 240s
+            # runs took 4m53s-5m32s once the rate limit stopped cutting the
+            # pass short (2026-11-11), and each overrun skipped a tick.
+            freshness_pass_budget=timedelta(seconds=_int_env("SLACK_ASSET_FRESHNESS_PASS_SECONDS", 180)),
             history_window=max(window_by_type.values()),
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,

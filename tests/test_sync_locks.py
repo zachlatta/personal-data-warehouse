@@ -187,6 +187,13 @@ def test_slack_freshness_sync_runs_priority_cycle(monkeypatch) -> None:
     # The blanket poll's warm tier: conversations active in the last two weeks
     # are rotated in after the ones active inside the freshness window.
     assert freshness["freshness_warm_window"] == timedelta(days=14)
+    # Three minutes of polling, so the whole run -- ~10s of preamble, the
+    # polls, the read-state pass and the timeline fast lane -- fits its
+    # five-minute schedule. At 240s the pass used to be cut at ~180s by the
+    # rate-limit sleep budget anyway; once the sweep gave calls back
+    # (2026-11-11) passes ran the full 240s and the runs took 4m53s-5m32s,
+    # so the next tick was skipped and a hot DM waited ten minutes.
+    assert freshness["freshness_pass_budget"] == timedelta(seconds=180)
     assert all(call["sync_users"] is False for call in calls)
     assert all(call["sync_members"] is False for call in calls)
     # Freshness fetches replies inline so brand-new threads are captured complete.
