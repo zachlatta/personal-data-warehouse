@@ -3236,10 +3236,20 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
         "D_ANSWERED": "im",  # a wake, then a reply written after it landed
         "G_OVERDUE": "mpim",  # quiet 16 days, landed 5h later: past its tier
         "G_WARM_SLOW": "mpim",  # quiet 3 days, landed 40m later: past 10m + margin
-        "G_NEW": "mpim",  # no earlier message: discovery polls it at once
+        "G_NEW": "mpim",  # created with its first message: discovery polls it at once
+        # Opened in January and never written in until 6h ago: the scheduler
+        # polls a long-empty DM every twelve hours, so its first message is a
+        # cold wake-up landing inside 12h + margin.
+        "D_EMPTY_OLD": "im",
     }
+    created = {"G_NEW": now - timedelta(hours=2, minutes=1)}
     warehouse.insert_slack_conversations(
-        [_health_conversation_row(cid, kind, synced_at=fresh) for cid, kind in conversations.items()]
+        [
+            _health_conversation_row(
+                cid, kind, synced_at=fresh, **({"created_at": created[cid]} if cid in created else {})
+            )
+            for cid, kind in conversations.items()
+        ]
     )
     _poll_every_health_conversation(warehouse)
     written = {
@@ -3251,6 +3261,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
         "G_OVERDUE": [timedelta(days=16), timedelta(hours=5)],
         "G_WARM_SLOW": [timedelta(days=3), timedelta(minutes=40)],
         "G_NEW": [timedelta(hours=2)],
+        "D_EMPTY_OLD": [timedelta(hours=6)],
     }
     warehouse.insert_slack_messages(
         [
@@ -3305,10 +3316,11 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
 
     im = rows["im"]
     # Judged: D_WARM's 3-minute hot reply and D_ANSWERED's 20-minute reply.
-    # Left out: D_WOKE's two, D_COLD's one, D_ANSWERED's wake, and the warm
-    # wakes of D_WARM (1 minute) and D_WARM_WOKE (20 minutes).
+    # Left out: D_WOKE's two, D_COLD's one, D_ANSWERED's wake, the warm
+    # wakes of D_WARM (1 minute) and D_WARM_WOKE (20 minutes), and
+    # D_EMPTY_OLD's first message (6 hours, a cold wake).
     assert im["landing_sample_24h"] == 2, im
-    assert im["landing_wakeups_excluded_24h"] == 6, im
+    assert im["landing_wakeups_excluded_24h"] == 7, im
     assert abs(im["landing_wakeup_max_seconds"] - 6 * 3600) <= 120, im
     assert 15 * 60 < im["landing_p95_seconds"] <= 20 * 60 + 120, im
     assert im["landing_status"] == "late", "the reply came after the wake landed and is judged"

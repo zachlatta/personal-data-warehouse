@@ -15712,6 +15712,7 @@ class PostgresWarehouse:
                     c.team_id,
                     c.conversation_type,
                     c.conversation_id,
+                    c.created_at AS conversation_created_at,
                     e.occurred_at,
                     e.first_seen_at,
                     GREATEST(0, EXTRACT(EPOCH FROM e.first_seen_at - e.occurred_at)) AS latency_seconds
@@ -15737,6 +15738,14 @@ class PostgresWarehouse:
                 -- window that is the sample's own first_seen_at; before it,
                 -- the newest stored message (slack_messages_conversation_time_idx),
                 -- taken as landed. The epoch is absence, not a message.
+                --
+                -- With no earlier message at all, the scheduler dates the
+                -- conversation the way SlackSyncRunner does: by its creation
+                -- when that is inside the warm window (so a brand-new
+                -- conversation's first message is hot and judged), otherwise
+                -- as never active -- the epoch here, which reads as a cold
+                -- wake-up. 2,198 DMs and group DMs had never held a message on
+                -- 2026-11-11; they are polled every twelve hours.
                 SELECT
                     d.*,
                     COALESCE(
@@ -15753,7 +15762,13 @@ class PostgresWarehouse:
                            AND m.team_id = d.team_id
                            AND m.conversation_id = d.conversation_id
                            AND m.message_datetime < now() - interval '24 hours'
-                           AND m.message_datetime > TIMESTAMPTZ '1970-01-01 00:00:00+00')
+                           AND m.message_datetime > TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                        CASE
+                            WHEN d.conversation_created_at >= d.occurred_at
+                                - make_interval(secs => {SLACK_FRESHNESS_WARM_WINDOW.total_seconds():.0f})
+                            THEN d.conversation_created_at
+                            ELSE TIMESTAMPTZ '1970-01-01 00:00:00+00'
+                        END
                     ) AS anchor_at
                 FROM dm_landing_sample AS d
             ),
@@ -15764,8 +15779,8 @@ class PostgresWarehouse:
                 -- twelve past the cool one), and the message landed inside
                 -- that interval plus a margin. A message into a hot DM is
                 -- always judged (the CASE is NULL). A brand-new conversation
-                -- has no anchor; discovery polls it at once, so it stays
-                -- judged too.
+                -- is anchored at its creation; discovery polls it at once, so
+                -- it stays judged too.
                 SELECT
                     a.account,
                     a.team_id,

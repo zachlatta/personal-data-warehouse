@@ -38,6 +38,10 @@ SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
 #: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
 SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=10), timedelta(hours=2), timedelta(hours=12))
+#: A conversation due within this much of a pass's start is polled by that pass
+#: rather than the next: half the five-minute schedule, so an interval of N
+#: ticks is N passes however the passes' start times jitter.
+SLACK_FRESHNESS_DUE_TOLERANCE = timedelta(seconds=150)
 #: The activity windows those intervals are chosen by: a DM or group DM whose
 #: newest known message is inside the hot window is polled every pass (the
 #: Dagster default for SLACK_ASSET_DM_WINDOW_MINUTES and
@@ -1031,17 +1035,33 @@ class SlackSyncRunner:
                 updated = updated.replace(tzinfo=UTC)
             return updated.timestamp()
 
+        def _activity(conversation: Mapping[str, object]) -> float:
+            cursor_ts = _conversation_cursor_ts(conversation)
+            if cursor_ts is not None:
+                return cursor_ts
+            if _last_polled(conversation) == float("-inf"):
+                # Never polled: it is due at once whatever this says.
+                return conversation_activity_ts(conversation)
+            # Polled, and holding no message: conversations.list's `updated`
+            # is metadata (profile and membership edits), not a message, and
+            # dated 2,140 empty DMs and group DMs inside the year on
+            # 2026-11-11, so they were polled every two hours -- ~90 of each
+            # pass's ~250 polls. One opened inside the warm window may get its
+            # first message soon and is dated by its creation; any other is
+            # as quiet as a conversation silent for a year.
+            created = conversation.get("created")
+            created_ts = float(str(created)) if created not in (None, "") else 0.0
+            if warm_floor is not None and created_ts >= warm_floor:
+                return created_ts
+            return 0.0
+
         def _hot(conversation: Mapping[str, object], oldest_ts: float) -> bool:
             if str(conversation["id"]) in newly_discovered_ids:
                 return True
-            return conversation_activity_ts(
-                conversation, cursor_ts=_conversation_cursor_ts(conversation)
-            ) >= oldest_ts
+            return _activity(conversation) >= oldest_ts
 
         def _interval(conversation: Mapping[str, object]) -> float:
-            activity = conversation_activity_ts(
-                conversation, cursor_ts=_conversation_cursor_ts(conversation)
-            )
+            activity = _activity(conversation)
             if warm_floor is not None and activity >= warm_floor:
                 return warm_interval
             if activity >= cool_floor:
@@ -1092,7 +1112,12 @@ class SlackSyncRunner:
                 due = _last_polled(conversation)
             else:
                 due = _last_polled(conversation) + _interval(conversation)
-                if due > now_ts:
+                # Due before the next pass would get to it: passes start every
+                # five minutes give or take half a minute, so a DM due ten
+                # minutes after its poll was often checked seconds early by the
+                # pass two ticks on and polled a third tick later -- warm DMs
+                # every ~15 minutes, not 10 (2026-11-11).
+                if due > now_ts + SLACK_FRESHNESS_DUE_TOLERANCE.total_seconds():
                     continue
             scheduled.append(((lane, due, type_rank[group]), entry))
         scheduled.sort(key=lambda item: item[0])

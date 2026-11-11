@@ -3743,6 +3743,124 @@ def test_freshness_polls_due_dms_and_group_dms_before_any_channel(monkeypatch):
     ]
 
 
+def _scheduler_runner(settings, warehouse, client, now):
+    return SlackSyncRunner(
+        settings=settings, warehouse=warehouse, logger=NullLogger(),
+        client_factory=lambda account: client, now=lambda: now,
+        history_window=timedelta(hours=4), freshness_warm_window=timedelta(days=14),
+        sync_users=False, sync_members=False, use_existing_conversations=True,
+        freshness_priority=True, sync_thread_replies=False, sleep=lambda seconds: None,
+    )
+
+
+def test_freshness_dates_a_dm_that_never_held_a_message_by_its_creation_not_slacks_updated(monkeypatch):
+    """`updated` is metadata, so a DM with no messages was polled as if active.
+
+    Measured 2026-11-11: 2,198 of ~6,800 DMs and group DMs had never held a
+    message. With no cursor the scheduler dated them by conversations.list's
+    `updated` -- profile and membership edits, not messages -- which put ~2,140
+    inside the year and polled them every two hours: 1,029 of them in one hour,
+    ~90 of the ~250 polls each pass could make, while warm DMs slipped to fifteen
+    minutes. A polled conversation holding no message is dated by when it was
+    created if that is inside the warm window (opened lately, so a first message
+    is likely), and is otherwise as quiet as a conversation silent for a year:
+    due every twelve hours. One never polled is still due at once.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    t = 1_790_000_000
+    day = 86_400
+
+    def empty_state(conversation_id, polled_minutes_ago):
+        return {
+            "account": "zrl", "team_id": "T1", "object_type": "conversation",
+            "object_id": conversation_id, "cursor_ts": "", "last_sync_type": "full",
+            "status": "ok", "error": "", "updated_at": now - timedelta(minutes=polled_minutes_ago),
+        }
+
+    warehouse = FakeWarehouse(
+        states={
+            # Opened 200 days ago, never written in, `updated` yesterday; polled 3h ago.
+            ("zrl", "T1", "conversation", "D_EMPTY_OLD"): empty_state("D_EMPTY_OLD", 180),
+            # The same, polled 13h ago: due on the twelve-hour interval.
+            ("zrl", "T1", "conversation", "G_EMPTY_OLD_DUE"): empty_state("G_EMPTY_OLD_DUE", 13 * 60),
+            # Opened two days ago, still empty; polled 11 minutes ago: warm, due.
+            ("zrl", "T1", "conversation", "D_EMPTY_NEW"): empty_state("D_EMPTY_NEW", 11),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "D_EMPTY_OLD", "user": "U1", "is_im": True, "created": t - 200 * day, "updated": (t - day) * 1000},
+        {"id": "G_EMPTY_OLD_DUE", "name": "mpdm-a--b-1", "is_mpim": True, "created": t - 200 * day,
+         "updated": (t - day) * 1000},
+        {"id": "D_EMPTY_NEW", "user": "U2", "is_im": True, "created": t - 2 * day, "updated": (t - 2 * day) * 1000},
+        # Listed but never polled: due at once whatever its dates say.
+        {"id": "D_NEVER_POLLED", "user": "U3", "is_im": True, "created": t - 900 * day},
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty] * 4,
+        }
+    )
+    _scheduler_runner(settings, warehouse, client, now).sync_all()
+
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert polled == ["D_NEVER_POLLED", "G_EMPTY_OLD_DUE", "D_EMPTY_NEW"]
+
+
+def test_freshness_polls_a_conversation_due_before_the_next_pass_would_reach_it(monkeypatch):
+    """A due time between two passes is met by the earlier one, not the later.
+
+    Passes start on a five-minute schedule, give or take half a minute. A DM
+    due ten minutes after a poll was checked by the next-but-one pass a few
+    seconds before it fell due, skipped, and polled a third pass later: warm
+    DMs were polled every ~15 minutes on 2026-11-11, not every 10. A
+    conversation that falls due within half a schedule tick of now is polled
+    now, so the warm interval is two passes however their start times jitter.
+    """
+    monkeypatch.setenv("SLACK_ACCOUNTS", "zrl")
+    monkeypatch.setenv("SLACK_ZRL_TOKEN", "xoxp-test-token")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_slack=True)
+    now = datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    t = 1_790_000_000
+
+    def state(conversation_id, polled_seconds_ago):
+        return {
+            "account": "zrl", "team_id": "T1", "object_type": "conversation",
+            "object_id": conversation_id, "cursor_ts": f"{t - 3 * 86_400:.6f}", "last_sync_type": "partial",
+            "status": "ok", "error": "", "updated_at": now - timedelta(seconds=polled_seconds_ago),
+        }
+
+    warehouse = FakeWarehouse(
+        states={
+            # Polled 9m40s ago: due in 20 seconds, before the next pass.
+            ("zrl", "T1", "conversation", "D_ALMOST_DUE"): state("D_ALMOST_DUE", 580),
+            # Polled one pass ago (5m10s): due in 4m50s, the next pass gets it.
+            ("zrl", "T1", "conversation", "D_ONE_PASS_AGO"): state("D_ONE_PASS_AGO", 310),
+        }
+    )
+    warehouse.conversation_payloads = [
+        {"id": "D_ALMOST_DUE", "user": "U1", "is_im": True},
+        {"id": "D_ONE_PASS_AGO", "user": "U2", "is_im": True},
+    ]
+    empty = {"ok": True, "messages": [], "response_metadata": {}}
+    client = FakeSlackClient(
+        {
+            "auth.test": [{"ok": True, "team_id": "T1", "team": "Hack Club"}],
+            "team.info": [{"ok": True, "team": {"id": "T1", "name": "Hack Club"}}],
+            "conversations.history": [empty] * 2,
+        }
+    )
+    _scheduler_runner(settings, warehouse, client, now).sync_all()
+
+    polled = [params["channel"] for method, params in client.calls if method == "conversations.history"]
+    assert polled == ["D_ALMOST_DUE"]
+
+
 def test_freshness_schedules_member_public_channels_with_dms_not_behind_the_public_cap(monkeypatch):
     """A public channel Zach is in is his conversation, not workspace chatter.
 

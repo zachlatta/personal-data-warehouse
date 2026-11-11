@@ -314,6 +314,28 @@ Nothing cheaper can tell PDW which DMs moved: on 2026-11-11 the workspace token 
 `not_allowed_token_type` from both `client.counts` and `users.counts`, and the session is
 off polling (below).
 
+**Two things kept warm DMs at fifteen minutes after that (2026-11-11, an hour after
+deploy).** First, **a conversation that never held a message was dated by Slack's
+`updated`**. 2,198 of ~6,800 DMs and group DMs had never held a message, so they had no
+cursor, and the scheduler fell back to `conversations.list`'s `updated`. That field tracks
+profile and membership edits, not messages, and it put ~2,140 of them inside the year:
+polled every two hours, 1,029 of them in one hour, ~90 of each pass's ~250 polls. A polled
+conversation with no message is now dated by its creation when that is inside the warm
+window (opened lately, so a first message is likely) and is otherwise treated as silent
+for a year, due every twelve hours. `marts_ops.slack_conversation_health` anchors a first
+message the same way, so a long-empty DM waking inside 12h + margin is a cold wake-up and a
+brand-new conversation's first message is still judged. Second, **a due time between two
+passes was met by the later one.** Passes start every five minutes give or take half a
+minute, so a DM due ten minutes after its poll was often checked a few seconds early by the
+pass two ticks on, and polled a third tick later. A conversation due within
+`SLACK_FRESHNESS_DUE_TOLERANCE` (150s, half a tick) of a pass's start is now polled by that
+pass, so the warm interval is two passes. The budget that leaves, from that hour's numbers:
+DMs and group DMs ~195 polls a pass (~13 hot, ~100 warm, ~42 within the year, ~39 older or
+empty) against the 235-277 a 180-second pass made, so a warm DM is polled every ten minutes
+and lands within ~14 (p95 inside fifteen). The channels Zach is in share the remaining
+~40-80 a pass by how overdue they are, so his active member channels can lag DMs by tens
+of minutes.
+
 **"Public channels go last" means public channels Zach is not in (2026-10-17).** The pass
 caps public candidates at the 100 most recently active (`SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT`)
 out of ~14,500, and Zach's own channel ranked 223rd that day, so no pass ever polled it: the

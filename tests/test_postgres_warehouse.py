@@ -8451,6 +8451,7 @@ def _health_conversation_row(
     conversation_type: str,
     *,
     synced_at: datetime,
+    created_at: datetime = datetime(2026, 1, 1, tzinfo=UTC),
 ) -> dict:
     return {
         "account": "zrl",
@@ -8466,7 +8467,7 @@ def _health_conversation_row(
         "is_archived": 0,
         "is_member": 1,
         "creator": "U1",
-        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "created_at": created_at,
         "topic": "",
         "purpose": "",
         "num_members": 3,
@@ -8668,10 +8669,14 @@ def test_slack_conversation_health_judges_dm_landing_latency(
     warehouse.ensure_slack_tables()
     now = datetime.now(tz=UTC)
     fresh = now - timedelta(minutes=30)
+    # Opened three hours ago, so every message here is judged: a first message
+    # in a conversation opened long ago is a cold wake-up instead (see
+    # test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval).
+    opened = now - timedelta(hours=3)
     warehouse.insert_slack_conversations(
         [
-            _health_conversation_row("D_FAST", "im", synced_at=fresh),
-            _health_conversation_row("G_SLOW", "mpim", synced_at=fresh),
+            _health_conversation_row("D_FAST", "im", synced_at=fresh, created_at=opened),
+            _health_conversation_row("G_SLOW", "mpim", synced_at=fresh, created_at=opened),
             _health_conversation_row("P_QUIET", "private_channel", synced_at=fresh),
             _health_conversation_row("C_SWEPT", "public_channel", synced_at=fresh),
         ]
@@ -8755,7 +8760,8 @@ def test_slack_conversation_health_reads_late_dms_as_late_and_quiet_dms_as_unkno
     fresh = now - timedelta(minutes=30)
     warehouse.insert_slack_conversations(
         [
-            _health_conversation_row("D_LATE", "im", synced_at=fresh),
+            # Opened an hour ago, so its messages are judged rather than a wake-up.
+            _health_conversation_row("D_LATE", "im", synced_at=fresh, created_at=now - timedelta(hours=1)),
             _health_conversation_row("G_SILENT", "mpim", synced_at=fresh),
         ]
     )

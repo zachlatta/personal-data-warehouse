@@ -39,8 +39,8 @@ people talking about him in public are `cc`.
 
 - Everything Zach participates in — DMs, group DMs, private channels, his active member
   channels — is **polled**: a conversation active in the last four hours every five
-  minutes, within two weeks every ten minutes, within a year every two hours, older every
-  twelve hours, and a brand-new DM or group DM is found by listing within five minutes.
+  minutes, within two weeks every ten minutes, within a year every two hours, older (or
+  never written in) every twelve hours, and a brand-new DM or group DM is found by listing within five minutes.
   DMs and group DMs are polled before channels, so a member channel can lag them. A
   DM that wakes after months of quiet can therefore take hours to land. DM landing latency
   is judged in `marts_ops.slack_conversation_health` (`landing_p95_seconds`); a wake-up
