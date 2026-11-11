@@ -146,6 +146,34 @@ type MuseManifestEntry struct {
 	ModifiedAt    string `json:"modified_at"`
 }
 
+// MuseManifestCounts is what one transcript file contributes to its entry:
+// the warehouse's row count for it and its newest line's timestamp.
+type MuseManifestCounts struct {
+	EventCount    int64
+	LastTimestamp string
+}
+
+// MuseManifestCache remembers each file's counts by its stat, so a run that
+// finds a transcript unchanged does not read it again. On the VM that is
+// hundreds of megabytes every five minutes otherwise. A nil cache reads
+// every file.
+type MuseManifestCache interface {
+	Lookup(path string, size, mtimeNS int64) (MuseManifestCounts, bool)
+	Store(path string, size, mtimeNS int64, counts MuseManifestCounts) error
+	// Retain drops every cached path not in keep.
+	Retain(keep map[string]bool) error
+}
+
+// readMuseTranscript is os.ReadFile; tests count the reads through it.
+var readMuseTranscript = os.ReadFile
+
+type museManifestFile struct {
+	path    string
+	agentID string
+	size    int64
+	mtime   time.Time
+}
+
 // MuseManifest lists every transcript the Muse uploader ships from
 // agentsRoot (the VM's ~/agents), sorted by session id. EventCount is the
 // number of rows marts_ai_conversations.sessions will hold for the session
@@ -154,9 +182,12 @@ type MuseManifestEntry struct {
 // (`#<seq>` for an item, `#compaction-<id>`, `#header`, else `#line-<n>`),
 // because base_muse.events is unique on that key and a repeated key is one
 // row. A trailing partial line is left out, as the uploader leaves it.
-func MuseManifest(agentsRoot string) []MuseManifestEntry {
-	byID := map[string]*MuseManifestEntry{}
-	keys := map[string]map[string]bool{}
+//
+// A session id found in more than one file is counted over the union of its
+// files' keys and never cached: a per-file count cannot say which keys two
+// files share.
+func MuseManifest(agentsRoot string, cache MuseManifestCache) ([]MuseManifestEntry, error) {
+	files := map[string][]museManifestFile{}
 	walkJSONL(agentsRoot, func(path, name string) {
 		if filepath.Base(filepath.Dir(path)) != "sessions" {
 			return
@@ -165,42 +196,86 @@ func MuseManifest(agentsRoot string) []MuseManifestEntry {
 		if err != nil {
 			return
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return
-		}
 		id := stem(name)
-		entry, ok := byID[id]
-		if !ok {
-			entry = &MuseManifestEntry{
-				SessionID: id,
-				AgentID:   strings.TrimPrefix(filepath.Base(filepath.Dir(filepath.Dir(path))), "agent-"),
-			}
-			byID[id] = entry
-			keys[id] = map[string]bool{}
-		}
-		entry.SizeBytes += info.Size()
-		if modified := info.ModTime().UTC().Format(time.RFC3339Nano); modified > entry.ModifiedAt {
-			entry.ModifiedAt = modified
-		}
-		for lineNo, raw := range completeLines(data) {
-			line, _ := parseLine(raw)
-			if line == nil {
-				continue
-			}
-			keys[id][museEventKey(line, int64(lineNo))] = true
-			if stamp := museTimestampText(line["created_at"]); stamp != "" {
-				entry.LastTimestamp = stamp
-			}
-		}
-		entry.EventCount = int64(len(keys[id]))
+		files[id] = append(files[id], museManifestFile{
+			path:    path,
+			agentID: strings.TrimPrefix(filepath.Base(filepath.Dir(filepath.Dir(path))), "agent-"),
+			size:    info.Size(),
+			mtime:   info.ModTime(),
+		})
 	})
-	out := make([]MuseManifestEntry, 0, len(byID))
-	for _, entry := range byID {
-		out = append(out, *entry)
+	out := make([]MuseManifestEntry, 0, len(files))
+	keep := map[string]bool{}
+	for id, group := range files {
+		entry := MuseManifestEntry{SessionID: id, AgentID: group[0].agentID}
+		var newest time.Time
+		for _, file := range group {
+			entry.SizeBytes += file.size
+			if file.mtime.After(newest) {
+				newest = file.mtime
+			}
+		}
+		entry.ModifiedAt = newest.UTC().Format(time.RFC3339Nano)
+		if len(group) == 1 {
+			file := group[0]
+			keep[file.path] = true
+			counts, ok := MuseManifestCounts{}, false
+			if cache != nil {
+				counts, ok = cache.Lookup(file.path, file.size, file.mtime.UnixNano())
+			}
+			if !ok {
+				keys := map[string]bool{}
+				var err error
+				if counts.LastTimestamp, err = countMuseFile(file.path, keys); err != nil {
+					continue
+				}
+				counts.EventCount = int64(len(keys))
+				if cache != nil {
+					if err := cache.Store(file.path, file.size, file.mtime.UnixNano(), counts); err != nil {
+						return nil, err
+					}
+				}
+			}
+			entry.EventCount, entry.LastTimestamp = counts.EventCount, counts.LastTimestamp
+		} else {
+			keys := map[string]bool{}
+			for _, file := range group {
+				if stamp, err := countMuseFile(file.path, keys); err == nil && stamp != "" {
+					entry.LastTimestamp = stamp
+				}
+			}
+			entry.EventCount = int64(len(keys))
+		}
+		out = append(out, entry)
+	}
+	if cache != nil {
+		if err := cache.Retain(keep); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
-	return out
+	return out, nil
+}
+
+// countMuseFile adds the file's event keys to keys and returns its newest
+// line's timestamp.
+func countMuseFile(path string, keys map[string]bool) (string, error) {
+	data, err := readMuseTranscript(path)
+	if err != nil {
+		return "", err
+	}
+	last := ""
+	for lineNo, raw := range completeLines(data) {
+		line, _ := parseLine(raw)
+		if line == nil {
+			continue
+		}
+		keys[museEventKey(line, int64(lineNo))] = true
+		if stamp := museTimestampText(line["created_at"]); stamp != "" {
+			last = stamp
+		}
+	}
+	return last, nil
 }
 
 // museEventKey mirrors the event_uuid suffix muse_event_row builds

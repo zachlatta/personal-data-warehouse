@@ -95,6 +95,7 @@ type WorkspaceSummary struct {
 	// GeneratedDeferred those that changed but are inside their interval.
 	GeneratedSent     int
 	GeneratedDeferred int
+	GeneratedTooLarge int
 }
 
 // skippedTopLevel are home entries that are not the agent's workspace: the
@@ -309,6 +310,13 @@ func (w *Workspace) addGenerated(batch *fileBatch, generated GeneratedFile, know
 		return errors.New("generated path " + generated.Path + " is not under " + GeneratedDir + "/")
 	}
 	seen[rel] = true
+	if int64(len(generated.Content)) > w.MaxInlineBytes {
+		// Generated records ride inline; the builder splits a manifest
+		// shard long before this. Refuse rather than fail the batch.
+		summary.GeneratedTooLarge++
+		w.Logger.Warningf("Not sending %s: %s is above the %s inline cap", rel, common.FormatBytes(int64(len(generated.Content))), common.FormatBytes(w.MaxInlineBytes))
+		return nil
+	}
 	sha := common.BytesSHA256(generated.Content)
 	prior, hadPrior := known[rel]
 	if w.Mode == "incremental" && hadPrior && prior.ContentSHA256 == sha {

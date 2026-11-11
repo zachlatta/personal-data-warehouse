@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/agentsessions"
 )
 
 func transcript(id string, items int) []byte {
@@ -24,7 +26,7 @@ func TestSessionManifestShardsBySessionIDAndCarriesNoText(t *testing.T) {
 	write(t, home, "agents/agent-"+a+"/sessions/"+a+".jsonl", transcript(a, 2))
 	write(t, home, "agents/agent-"+b+"/sessions/"+b+".jsonl", transcript(b, 1))
 	write(t, home, "agents/agent-"+c+"/sessions/"+c+".jsonl", transcript(c, 3))
-	files, err := SessionManifestFiles(home + "/agents")
+	files, err := SessionManifestFiles(home+"/agents", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,5 +130,78 @@ func TestTheWalkNeverShipsARealFileUnderTheGeneratedDir(t *testing.T) {
 	}
 	if _, ok := transport.records()[".pdw/session-manifest/0.json"]; ok {
 		t.Fatalf("walked a file under .pdw: %v", transport.records())
+	}
+}
+
+func TestSessionManifestSplitsAShardThatWouldNotFitInline(t *testing.T) {
+	home := t.TempDir()
+	ids := []string{
+		"0a000000-1111-4a2b-9c3d-000000000001", "0a000000-1111-4a2b-9c3d-000000000002",
+		"0b000000-1111-4a2b-9c3d-000000000003", "1c000000-1111-4a2b-9c3d-000000000004",
+	}
+	for _, id := range ids {
+		write(t, home, "agents/agent-"+id+"/sessions/"+id+".jsonl", transcript(id, 1))
+	}
+	whole, err := SessionManifestFiles(home+"/agents", nil, 0)
+	if err != nil || len(whole) != 2 {
+		t.Fatalf("unsplit = %+v (%v)", whole, err)
+	}
+	// Room for about two sessions per shard: "0" (three sessions) splits into
+	// "0a" and "0b"; "1" fits as it is.
+	limit := int64(len(whole[1].Content)) + 300
+	files, err := SessionManifestFiles(home+"/agents", nil, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	listed := 0
+	for _, file := range files {
+		paths = append(paths, file.Path)
+		if int64(len(file.Content)) > limit {
+			t.Fatalf("%s is %d bytes, over %d", file.Path, len(file.Content), limit)
+		}
+		var shard manifestShard
+		if err := json.Unmarshal(file.Content, &shard); err != nil {
+			t.Fatal(err)
+		}
+		listed += len(shard.Sessions)
+	}
+	if strings.Join(paths, ",") != ".pdw/session-manifest/0a.json,.pdw/session-manifest/0b.json,.pdw/session-manifest/1.json" || listed != 4 {
+		t.Fatalf("paths = %v, listed = %d", paths, listed)
+	}
+}
+
+func TestAnOversizedGeneratedRecordIsRefusedNotUploaded(t *testing.T) {
+	home := t.TempDir()
+	transport := &fakeTransport{}
+	ws := newWorkspace(t, home, transport, openState(t))
+	ws.MaxInlineBytes = 16
+	ws.Generated = []GeneratedFile{{Path: ".pdw/session-manifest/0.json", Content: []byte(strings.Repeat("x", 17))}}
+	summary, err := ws.Sync()
+	if err != nil || summary.GeneratedTooLarge != 1 || summary.GeneratedSent != 0 || len(transport.batches) != 0 {
+		t.Fatalf("summary = %+v err = %v batches = %d", summary, err, len(transport.batches))
+	}
+}
+
+func TestTheManifestCacheLivesInTheWorkspaceState(t *testing.T) {
+	state := openState(t)
+	cache := state.ManifestCache()
+	if _, ok := cache.Lookup("/a.jsonl", 10, 5); ok {
+		t.Fatal("hit on an empty cache")
+	}
+	if err := cache.Store("/a.jsonl", 10, 5, agentsessions.MuseManifestCounts{EventCount: 3, LastTimestamp: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := cache.Lookup("/a.jsonl", 10, 5); !ok || got.EventCount != 3 || got.LastTimestamp != "t" {
+		t.Fatalf("lookup = %+v %v", got, ok)
+	}
+	if _, ok := cache.Lookup("/a.jsonl", 11, 5); ok {
+		t.Fatal("hit after the file grew")
+	}
+	if err := cache.Retain(map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.Lookup("/a.jsonl", 10, 5); ok {
+		t.Fatal("hit after the file was dropped")
 	}
 }

@@ -333,7 +333,8 @@ unit with its paths pointed at the runtime, reloads, and restarts the service wh
 changed; it refuses a host whose unit runs a checkout (mew-dev, openclaw). A
 `10-host.conf` drop-in holds what is per-host: `EnvironmentFile=%h/.config/pdw/ingest.env`
 (0600, `PDW_SECRET_TOKEN`, the same signing secret mew-dev uses), `PDW_API_URL`,
-`PDW_INGEST_TAILSCALE_HOST=mew-coolify`, `AGENT_SESSIONS_ACCOUNT`,
+`PDW_INGEST_TAILSCALE_HOST=mew-coolify`, `PDW_INGEST_MAX_OBJECT_BYTES` (mew-dev's value),
+`AGENT_SESSIONS_ACCOUNT`,
 `AGENT_SESSIONS_DEVICE=mew` and `AGENT_SESSIONS_HEARTBEAT_PIPELINES=claude_code,codex`.
 The user needs `Linger=yes` so the unit runs without a login. `pdw` is a release binary at
 `~/.local/bin/pdw`, kept current by its own auto-update.
@@ -449,7 +450,14 @@ transcripts, so each `pdw ingest muse` run also publishes a metadata-only manife
 generated `base_muse.files` rows, `.pdw/session-manifest/<first hex digit of the session
 id>.json`: `{"format": "pdw.muse.session_manifest.v1", "shard", "sessions": [{session_id,
 agent_id, event_count, last_timestamp, size_bytes, modified_at}]}`. No transcript text, and
-nothing is written on the VM (`.pdw/` is a dot directory the walk never enters).
+no new files on the VM: the shards are built in memory (`.pdw/` is a dot directory the walk
+never enters), and the only VM-side change is new rows in the uploader's existing state file
+(`~/.local/state/pdw/muse-workspace-state.sqlite`, table `manifest_files`), which caches
+each transcript's count by size and mtime so an unchanged transcript is not read again. A
+shard whose JSON would pass the 1 MiB inline cap is split by the next character of the
+session id (`0a.json`, `0b.json`, ...), so the files under `.pdw/session-manifest/` together
+are the manifest whatever their names. The `muse_file` timeline adapter skips `.pdw/` paths:
+they are bookkeeping, not the agent's workspace.
 `event_count` is the number of `base_muse.events` rows the warehouse keeps for the session:
 lines are read with the uploader's own rule (`parseLine`: complete, non-blank, a JSON
 object) and keyed as `muse_event_row` keys them, so a repeated `seq` or compaction is one

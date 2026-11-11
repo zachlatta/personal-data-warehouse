@@ -4003,6 +4003,7 @@ def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehous
     # A realistic workspace: the prune guard refuses to leave fewer than
     # PRUNE_MIN_KEEP rows standing, so two files alone would never prune.
     files = [("workspace/user/receipt.pdf", "workspace/user"), ("MEMORY.md", "")]
+    files += [(".pdw/session-manifest/0.json", ".pdw/session-manifest")]
     files += [(f"memory/people/p{i}.md", "memory/people") for i in range(60)]
     for path, directory in files:
         warehouse._command(
@@ -4035,6 +4036,11 @@ def test_muse_chats_are_self_and_its_background_loops_and_files_are_not(warehous
     assert priority_of("agent_session", "muse|sub") == "background"
     assert priority_of("muse_file", "z@x.test|workspace/user/receipt.pdf") == "self"
     assert priority_of("muse_file", "z@x.test|MEMORY.md") == "background"
+    # The uploader's own session manifest is bookkeeping, not the workspace.
+    assert not warehouse._query(
+        "SELECT 1 FROM @timeline_events WHERE adapter = 'muse_file' AND event_id LIKE %s",
+        ("%|.pdw/%",),
+    )
 
     # A path the uploader tombstoned leaves the timeline.
     warehouse._command(

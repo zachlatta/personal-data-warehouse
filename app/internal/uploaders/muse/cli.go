@@ -164,7 +164,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		}
 		// Built after the transcripts above shipped, so it describes what
 		// this run uploaded.
-		manifest, err := SessionManifestFiles(filepath.Join(root, "agents"))
+		manifest, err := SessionManifestFiles(filepath.Join(root, "agents"), state.ManifestCache(), DefaultMaxInlineBytes)
 		if err != nil {
 			state.Close()
 			fmt.Fprintf(stderr, "pdw ingest muse: session manifest: %v\n", err)

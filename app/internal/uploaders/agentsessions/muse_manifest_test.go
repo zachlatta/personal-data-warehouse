@@ -41,7 +41,7 @@ func layoutManifestFixture(t *testing.T) string {
 
 func TestMuseManifestCountsTheRowsTheWarehouseKeeps(t *testing.T) {
 	agents := layoutManifestFixture(t)
-	entries := MuseManifest(agents)
+	entries, _ := MuseManifest(agents, nil)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %+v", entries)
 	}
@@ -81,7 +81,7 @@ func TestMuseManifestListsExactlyTheSessionsTheUploaderShips(t *testing.T) {
 			lines++
 		}
 	}
-	entries := MuseManifest(agents)
+	entries, _ := MuseManifest(agents, nil)
 	if len(shipped) != len(entries) || !shipped[entries[0].SessionID] {
 		t.Fatalf("shipped %v, manifest %+v", shipped, entries)
 	}
@@ -93,10 +93,10 @@ func TestMuseManifestListsExactlyTheSessionsTheUploaderShips(t *testing.T) {
 }
 
 func TestMuseManifestIsEmptyWithoutAnAgentsDirectory(t *testing.T) {
-	if entries := MuseManifest(filepath.Join(t.TempDir(), "missing")); len(entries) != 0 {
+	if entries, _ := MuseManifest(filepath.Join(t.TempDir(), "missing"), nil); len(entries) != 0 {
 		t.Fatalf("entries = %+v", entries)
 	}
-	if entries := MuseManifest(""); len(entries) != 0 {
+	if entries, _ := MuseManifest("", nil); len(entries) != 0 {
 		t.Fatalf("entries = %+v", entries)
 	}
 }
@@ -114,5 +114,104 @@ func TestPythonIntMatchesTheWarehouse(t *testing.T) {
 		if got := pythonInt(c.in); got != c.want {
 			t.Errorf("pythonInt(%#v) = %d, want %d", c.in, got, c.want)
 		}
+	}
+}
+
+type memoryManifestCache struct {
+	entries map[string]struct {
+		size, mtime int64
+		counts      MuseManifestCounts
+	}
+}
+
+func (c *memoryManifestCache) Lookup(path string, size, mtime int64) (MuseManifestCounts, bool) {
+	e, ok := c.entries[path]
+	if !ok || e.size != size || e.mtime != mtime {
+		return MuseManifestCounts{}, false
+	}
+	return e.counts, true
+}
+
+func (c *memoryManifestCache) Store(path string, size, mtime int64, counts MuseManifestCounts) error {
+	c.entries[path] = struct {
+		size, mtime int64
+		counts      MuseManifestCounts
+	}{size, mtime, counts}
+	return nil
+}
+
+func (c *memoryManifestCache) Retain(keep map[string]bool) error {
+	for path := range c.entries {
+		if !keep[path] {
+			delete(c.entries, path)
+		}
+	}
+	return nil
+}
+
+func TestMuseManifestReadsOnlyTranscriptsThatChanged(t *testing.T) {
+	agents := layoutManifestFixture(t)
+	other := "0b5e8c1a-1111-4a2b-9c3d-000000000002"
+	otherPath := filepath.Join(agents, "agent-"+other, "sessions", other+".jsonl")
+	os.MkdirAll(filepath.Dir(otherPath), 0o755)
+	os.WriteFile(otherPath, []byte(`{"type":"session_header"}`+"\n"), 0o644)
+
+	reads := map[string]int{}
+	readMuseTranscript = func(path string) ([]byte, error) {
+		reads[filepath.Base(path)]++
+		return os.ReadFile(path)
+	}
+	t.Cleanup(func() { readMuseTranscript = os.ReadFile })
+	cache := &memoryManifestCache{entries: map[string]struct {
+		size, mtime int64
+		counts      MuseManifestCounts
+	}{}}
+
+	first, err := MuseManifest(agents, cache)
+	if err != nil || len(first) != 2 || first[0].EventCount != 7 || first[1].EventCount != 1 {
+		t.Fatalf("first = %+v, %v", first, err)
+	}
+	second, err := MuseManifest(agents, cache)
+	if err != nil || len(reads) != 2 || reads[other+".jsonl"] != 1 || reads[manifestFixtureID+".jsonl"] != 1 {
+		t.Fatalf("an unchanged run re-read transcripts: %v (%v)", reads, err)
+	}
+	if second[0] != first[0] || second[1] != first[1] {
+		t.Fatalf("cached entries differ: %+v vs %+v", second, first)
+	}
+
+	// Appending a line re-reads that file alone and counts it.
+	handle, _ := os.OpenFile(otherPath, os.O_APPEND|os.O_WRONLY, 0)
+	handle.WriteString(`{"type":"item","seq":0}` + "\n")
+	handle.Close()
+	third, _ := MuseManifest(agents, cache)
+	if reads[other+".jsonl"] != 2 || reads[manifestFixtureID+".jsonl"] != 1 || third[1].EventCount != 2 {
+		t.Fatalf("reads=%v third=%+v", reads, third)
+	}
+
+	// A transcript that is gone leaves the cache.
+	os.Remove(otherPath)
+	if _, err := MuseManifest(agents, cache); err != nil || len(cache.entries) != 1 {
+		t.Fatalf("cache = %v (%v)", cache.entries, err)
+	}
+}
+
+func TestMuseManifestCountsASessionSplitAcrossFilesOverItsUnion(t *testing.T) {
+	agents := t.TempDir()
+	id := "0b5e8c1a-1111-4a2b-9c3d-000000000003"
+	for i, agent := range []string{"a", "b"} {
+		path := filepath.Join(agents, "agent-"+agent, "sessions", id+".jsonl")
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		body := `{"type":"session_header"}` + "\n" + `{"type":"item","seq":0}` + "\n"
+		if i == 1 {
+			body += `{"type":"item","seq":1}` + "\n"
+		}
+		os.WriteFile(path, []byte(body), 0o644)
+	}
+	entries, err := MuseManifest(agents, &memoryManifestCache{entries: map[string]struct {
+		size, mtime int64
+		counts      MuseManifestCounts
+	}{}})
+	if err != nil || len(entries) != 1 || entries[0].EventCount != 3 {
+		t.Fatalf("entries = %+v (%v)", entries, err)
 	}
 }

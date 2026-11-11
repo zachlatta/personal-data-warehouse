@@ -3119,7 +3119,9 @@ _MUSE_FILE = _simple_adapter(
     source="muse",
     kind="muse_file",
     from_sql="@muse_files t",
-    where="t.is_deleted = 0",
+    # .pdw/ holds rows the uploader generates about the VM (the session
+    # manifest: ids and counts as JSON), not the agent's workspace.
+    where="t.is_deleted = 0 AND left(t.path, 5) <> '.pdw/'",
     event_id="concat_ws('|', t.account, t.path)",
     event_ts=_real_ts("t.modified_at", "t.ingested_at"),
     ingest_ts="t.ingested_at",
@@ -3139,7 +3141,8 @@ _MUSE_FILE = _simple_adapter(
     ),
     search_text=_search_concat("t.path", "t.content_text"),
     prune_sql=(
-        "SELECT concat_ws('|', t.account, t.path) FROM @muse_files t WHERE t.is_deleted = 0"
+        "SELECT concat_ws('|', t.account, t.path) FROM @muse_files t "
+        "WHERE t.is_deleted = 0 AND left(t.path, 5) <> '.pdw/'"
     ),
     # workspace/user/ is where Muse puts what Zach attached in a chat, so those
     # files are his. Everything else here the agent wrote -- its memory, its

@@ -41,37 +41,67 @@ type manifestShard struct {
 	Sessions []agentsessions.MuseManifestEntry `json:"sessions"`
 }
 
-// SessionManifestFiles builds the manifest shards for agentsRoot.
-func SessionManifestFiles(agentsRoot string) ([]GeneratedFile, error) {
-	shards := map[string][]agentsessions.MuseManifestEntry{}
-	for _, entry := range agentsessions.MuseManifest(agentsRoot) {
-		key := manifestShardKey(entry.SessionID)
-		shards[key] = append(shards[key], entry)
+// SessionManifestFiles builds the manifest shards for agentsRoot. Each shard
+// holds the sessions whose ids share a prefix, starting at one character; a
+// shard whose JSON would exceed maxBytes (the inline text cap) is split by
+// the next character, so no shard is ever too large to ride inline. cache
+// may be nil.
+func SessionManifestFiles(agentsRoot string, cache agentsessions.MuseManifestCache, maxBytes int64) ([]GeneratedFile, error) {
+	entries, err := agentsessions.MuseManifest(agentsRoot, cache)
+	if err != nil {
+		return nil, err
 	}
-	keys := make([]string, 0, len(shards))
-	for key := range shards {
-		keys = append(keys, key)
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxInlineBytes
 	}
-	sort.Strings(keys)
-	files := make([]GeneratedFile, 0, len(keys))
-	for _, key := range keys {
-		content, err := json.Marshal(manifestShard{Format: ManifestFormat, Shard: key, Sessions: shards[key]})
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, GeneratedFile{Path: ManifestDir + "/" + key + ".json", MimeType: "application/json", Content: content})
+	var files []GeneratedFile
+	if err := appendManifestShards(&files, entries, 1, maxBytes); err != nil {
+		return nil, err
 	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return files, nil
 }
 
-// manifestShardKey is the lowercase first hex digit of a session id, or "_".
-func manifestShardKey(sessionID string) string {
-	if sessionID == "" {
-		return "_"
+func appendManifestShards(files *[]GeneratedFile, entries []agentsessions.MuseManifestEntry, prefixLen int, maxBytes int64) error {
+	groups := map[string][]agentsessions.MuseManifestEntry{}
+	for _, entry := range entries {
+		key := manifestShardKey(entry.SessionID, prefixLen)
+		groups[key] = append(groups[key], entry)
 	}
-	first := strings.ToLower(sessionID[:1])
-	if strings.ContainsAny(first, "0123456789abcdef") {
-		return first
+	for key, group := range groups {
+		content, err := json.Marshal(manifestShard{Format: ManifestFormat, Shard: key, Sessions: group})
+		if err != nil {
+			return err
+		}
+		// Split while a longer prefix can still separate the group; a lone
+		// session too large to fit is shipped and refused by the uploader.
+		if int64(len(content)) > maxBytes && len(group) > 1 && prefixLen < manifestMaxPrefix {
+			if err := appendManifestShards(files, group, prefixLen+1, maxBytes); err != nil {
+				return err
+			}
+			continue
+		}
+		*files = append(*files, GeneratedFile{Path: ManifestDir + "/" + key + ".json", MimeType: "application/json", Content: content})
 	}
-	return "_"
+	return nil
+}
+
+// manifestMaxPrefix bounds the split; a UUID's first eight characters are hex.
+const manifestMaxPrefix = 8
+
+// manifestShardKey is the session id's first n characters, lowercased, each
+// kept when it is a hex digit and "_" otherwise.
+func manifestShardKey(sessionID string, n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		c := byte('_')
+		if i < len(sessionID) {
+			c = strings.ToLower(sessionID[i : i+1])[0]
+			if !strings.ContainsRune("0123456789abcdef", rune(c)) {
+				c = '_'
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
