@@ -258,6 +258,14 @@ see [docs/feed.md](docs/feed.md)), the same credential the CLI and the phone use
 separate review password any more: `PDW_MUTATION_UI_PASSWORD`, `PDW_MUTATION_UI_SESSION_SECRET`
 and `PDW_MUTATION_UI_SESSION_TTL_SECONDS` are ignored and reported as deprecated at startup.
 
+Every browser page shares one stylesheet, `app/internal/webapp/static/app.css`: the SPA, the
+server-rendered `/pipelines` dashboard and the `/oauth/authorize` consent page all link it, and
+`/pipelines` carries the same header and tabs as the SPA. The look is a calm admin console — a
+neutral palette, one blue accent, colour kept for status, white cards, sentence-case labels,
+monospace only for identifiers — with a dark variant from `prefers-color-scheme`. Every colour,
+radius and shadow is a token in its `:root`; `TestDesignTokensAreDefinedOnceInAppCSS` fails if
+another file declares a palette or reads a token `app.css` does not define.
+
 Approval URLs returned by MCP tools point at `/mutation-review/requests/<request_id>`, which
 opens that request directly. The review view shows each mutation the way it will be applied —
 an editable Gmail composer (recipients, subject, rich body, proposed variants, send-vs-draft),

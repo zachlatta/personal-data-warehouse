@@ -411,3 +411,26 @@ func TestProtectedResourceMetadataAndChallenge(t *testing.T) {
 		t.Fatalf("missing metadata challenge: %q", rec.Header().Get("WWW-Authenticate"))
 	}
 }
+
+// The connector consent page is part of the web app's look: it links the app's
+// one stylesheet instead of carrying a private palette, and keeps the warning
+// that connected tools can write without mutation review where it is seen.
+func TestAuthorizePageUsesTheSharedStylesheet(t *testing.T) {
+	svc := NewService([]byte("setup-secret"), func() time.Time { return time.Unix(1000, 0) })
+	mux := http.NewServeMux()
+	svc.RegisterHandlers(mux, "https://mcp.example.com")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/oauth/authorize?client_id=abc&state=xyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorize page status = %d", rec.Code)
+	}
+	page := rec.Body.String()
+	for _, needle := range []string{`href="/app/app.css"`, `class="auth-card"`, `class="brand-mark"`, `name="client_name"`, `name="secret_token"`, `name="state" value="xyz"`, "without PDW mutation review"} {
+		if !strings.Contains(page, needle) {
+			t.Fatalf("authorize page is missing %q", needle)
+		}
+	}
+	if strings.Contains(page, "<style") {
+		t.Fatal("authorize page carries its own <style>; it belongs in /app/app.css")
+	}
+}

@@ -26,7 +26,10 @@ function errorText(err) {
 
 // --- shared bits ---------------------------------------------------------------
 
-function pill(status) { return h("span", "mpill s-" + (status || "unknown"), status || "unknown"); }
+function pill(status) {
+  const label = (status || "unknown").replace(/_/g, " ");
+  return h("span", "mpill s-" + (status || "unknown"), label.charAt(0).toUpperCase() + label.slice(1));
+}
 
 function pre(value) { return h("pre", "blob", typeof value === "string" ? value : V.prettyJSON(value)); }
 
@@ -1293,7 +1296,7 @@ function renderRequestTable(title, requests, emptyText) {
   if (!requests.length) { sect.appendChild(h("p", "m", emptyText)); return sect; }
   const table = h("table", "rtable");
   const thead = h("thead"); const hr = h("tr");
-  ["status", "request", "mutations", "created"].forEach((t) => hr.appendChild(h("th", "", t)));
+  ["Status", "Request", "Mutations", "Created"].forEach((t) => hr.appendChild(h("th", "", t)));
   thead.appendChild(hr); table.appendChild(thead);
   const tbody = h("tbody");
   for (const request of requests) {
@@ -1315,7 +1318,7 @@ function renderRequestTable(title, requests, emptyText) {
 async function renderList(root, ctx, alive) {
   ctx.setSubtitle("mutation review");
   ctx.setStats("");
-  const refresh = button("refresh", "", () => renderList(root, ctx, alive));
+  const refresh = button("Refresh", "", () => renderList(root, ctx, alive));
   ctx.setControls(refresh);
   function paint(requests, refreshing) {
     const { pending, past } = V.splitRequestsForList(requests);
@@ -1492,7 +1495,7 @@ function renderSlackBatch(request, list) {
 
 async function renderDetail(root, ctx, id, alive) {
   ctx.setSubtitle("mutation review");
-  ctx.setControls(link(LIST_PATH, "← all requests"));
+  ctx.setControls(link(LIST_PATH, "← All requests"));
   const actions = { reload() { if (alive()) renderDetail(root, ctx, id, alive); } };
   const query = V.mutationPageQuery(V.mutationPageFromSearch(location.search));
   // A request already read this session paints from memory while the API
@@ -1507,7 +1510,7 @@ async function renderDetail(root, ctx, id, alive) {
     if (!alive()) return;
     if (cached) { ctx.setStats(errorText(err) || "could not refresh"); return; }
     clear(root);
-    root.appendChild(link(LIST_PATH, "← all requests", "back"));
+    root.appendChild(link(LIST_PATH, "← All requests", "back"));
     root.appendChild(h("p", "bad", errorText(err) || "could not load request"));
     return;
   }
@@ -1536,7 +1539,7 @@ function paintDetail(root, ctx, request, actions, refreshing) {
   const total = V.requestMutationCount(request);
   ctx.setStats(total + " mutation" + V.plural(total) + " · " + V.requestListStatus(request) + (refreshing ? " · refreshing…" : ""));
   clear(root);
-  root.appendChild(link(LIST_PATH, "← all requests", "back"));
+  root.appendChild(link(LIST_PATH, "← All requests", "back"));
   root.appendChild(renderRequestHeader(request));
   const decision = renderDecisionDock(request, actions);
   if (decision) root.appendChild(decision);

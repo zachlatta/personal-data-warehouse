@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -266,5 +267,77 @@ func TestAssetLinksNameTheAndroidApp(t *testing.T) {
 		if len(fp) != 95 || strings.ToUpper(fp) != fp {
 			t.Fatalf("fingerprint %q is not upper-case colon-separated SHA-256", fp)
 		}
+	}
+}
+
+// The design lives in one set of tokens at the top of app.css: every page,
+// including the server-rendered /pipelines and /oauth/authorize, links that
+// file, so a colour or a radius is changed in one place. Nothing else may
+// declare its own palette, and every token a stylesheet or script reads must
+// be one app.css defines (or one a script sets on an element itself).
+func TestDesignTokensAreDefinedOnceInAppCSS(t *testing.T) {
+	appCSS, err := fs.ReadFile(staticFS, "static/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(appCSS)
+	for _, contract := range []string{":root {", "@media (prefers-color-scheme: dark)", "--font:", "--mono:", "--accent:", "--ok:", "--warn:", "--danger:"} {
+		if !strings.Contains(app, contract) {
+			t.Fatalf("app.css is missing the design token contract %q", contract)
+		}
+	}
+	defined := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(--[a-z0-9-]+)\s*:`).FindAllStringSubmatch(app, -1) {
+		defined[m[1]] = true
+	}
+	sub, _ := fs.Sub(staticFS, "static")
+	files := map[string]string{}
+	err = fs.WalkDir(sub, ".", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || strings.HasPrefix(name, "tests/") {
+			return err
+		}
+		if strings.HasSuffix(name, ".css") || strings.HasSuffix(name, ".js") {
+			data, _ := fs.ReadFile(sub, name)
+			files[name] = string(data)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A script may set a token on an element (a row's source colour); CSS reads it.
+	for _, text := range files {
+		for _, m := range regexp.MustCompile(`setProperty\("(--[a-z0-9-]+)"`).FindAllStringSubmatch(text, -1) {
+			defined[m[1]] = true
+		}
+	}
+	for name, text := range files {
+		if name != "app.css" && strings.Contains(text, ":root") {
+			t.Errorf("%s declares its own :root palette; tokens belong in app.css", name)
+		}
+		for _, legacy := range []string{"--amber", "--bg2", "--surface2", "#0e1116", "#e8b45a", "#10131a"} {
+			if strings.Contains(text, legacy) {
+				t.Errorf("%s still uses the retired dark/amber palette (%s)", name, legacy)
+			}
+		}
+		for _, m := range regexp.MustCompile(`var\((--[a-z0-9-]+)`).FindAllStringSubmatch(text, -1) {
+			if !defined[m[1]] {
+				t.Errorf("%s reads %s, which app.css does not define", name, m[1])
+			}
+		}
+	}
+}
+
+// Every page carries the same header: the brand and one tab per top-level page.
+func TestShellHeaderLinksEveryPage(t *testing.T) {
+	srv := newServer(t)
+	_, shell := get(t, srv.URL+"/timeline")
+	for _, route := range append(append([]string{}, Routes...), "/pipelines") {
+		if !strings.Contains(shell, `href="`+route+`"`) {
+			t.Fatalf("the header has no tab for %s", route)
+		}
+	}
+	if !strings.Contains(shell, `class="brand-mark"`) {
+		t.Fatal("the header has no brand mark")
 	}
 }

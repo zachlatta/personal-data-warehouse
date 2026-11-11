@@ -12,13 +12,13 @@ export function mount(container, ctx) {
         <div class="srow">
           <input id="sq" type="search" placeholder="a few distinctive words the record would contain — a name, an id, an amount" autocomplete="off" autofocus>
           <select id="smode"></select>
-          <button class="primary" type="submit">search</button>
+          <button class="primary" type="submit">Search</button>
         </div>
         <div class="srow sopts">
-          <span class="lab">priority</span><span id="spri"></span>
-          <span class="lab">sources</span><input id="ssrc" placeholder="gmail, slack, apple_messages…">
-          <span class="lab">since</span><input id="ssince" type="date">
-          <span class="lab">depth</span><input id="sdepth" type="number" min="1" max="200" value="30">
+          <span class="lab">Priority</span><span id="spri"></span>
+          <span class="lab">Sources</span><input id="ssrc" placeholder="gmail, slack, apple_messages…">
+          <span class="lab">Since</span><input id="ssince" type="date">
+          <span class="lab">Depth</span><input id="sdepth" type="number" min="1" max="200" value="30">
         </div>
       </form>
       <div id="shint"></div>
@@ -54,13 +54,12 @@ export function mount(container, ctx) {
 
   function hitRow(hit, index, isCurrent) {
     const row = h("div", "row p-" + (hit.priority || "unclassified"));
-    row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
+    row.style.setProperty("--src", hue(hit.source));
     const when = hit.occurred_at;
     row.appendChild(h("div", "t", dayOf(when).slice(5) + " " + fmtTime(when)));
-    const tick = h("div", "tick"); tick.style.background = hue(hit.source); row.appendChild(tick);
+    row.appendChild(h("div", "tick"));
     const who = h("div", "who");
-    const src = h("div", "src", hit.source + (hit.subsource ? " / " + hit.subsource : "")); src.style.color = hue(hit.source);
-    who.appendChild(src); who.appendChild(h("div", "actor", hit.who || "—"));
+    who.appendChild(h("div", "src", hit.source + (hit.subsource ? " / " + hit.subsource : ""))); who.appendChild(h("div", "actor", hit.who || "—"));
     row.appendChild(who);
     const body = h("div", "body");
     if (hit.title) body.appendChild(h("div", "title", hit.title));
@@ -149,7 +148,7 @@ export function mount(container, ctx) {
     ctx.setStats("");
     el("sq").focus();
   }
-  ctx.setControls(button("clear", "", clearSearch));
+  ctx.setControls(button("Clear", "", clearSearch));
   if (restoreError) el("shint").textContent = restoreError;
   else if (el("sq").value) run();
 

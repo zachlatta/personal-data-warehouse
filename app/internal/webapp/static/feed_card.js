@@ -277,23 +277,31 @@ export function articleDocument(article, nonce) {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data:; media-src https: http:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'">
 <style>
 html, body { overflow: hidden; }
-body { margin: 0; background: #0e1116; color: #d8dde5; font: 17px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; overflow-wrap: break-word; }
+body { margin: 0; background: #ffffff; color: #1c1b1a; font: 17px/1.65 Inter, "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: break-word; }
 #root { padding: 1px 16px; }
 p, ul, ol, blockquote, figure, pre, table { margin: 0 0 1em; }
 h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.3em 0 0.5em; }
 h1 { font-size: 1.45em; } h2 { font-size: 1.3em; } h3 { font-size: 1.15em; } h4, h5, h6 { font-size: 1em; }
-a { color: #e8b45a; text-decoration: none; }
+a { color: #3b63d4; text-decoration: none; }
 a:hover { text-decoration: underline; }
 img, video, picture { display: block; max-width: 100%; height: auto; border-radius: 10px; margin: 0 auto; }
 figure { margin-left: 0; margin-right: 0; }
-figcaption { color: #8b94a1; font-size: 0.8em; line-height: 1.4; margin-top: 6px; }
-blockquote { border-left: 3px solid #2f3844; margin-left: 0; padding-left: 14px; color: #8b94a1; }
+figcaption { color: #5a5753; font-size: 0.8em; line-height: 1.4; margin-top: 6px; }
+blockquote { border-left: 3px solid #e7e5e2; margin-left: 0; padding-left: 14px; color: #5a5753; }
 pre, code { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
-pre { background: #161b23; padding: 12px; border-radius: 8px; overflow-x: auto; }
-:not(pre) > code { background: #161b23; padding: 1px 4px; border-radius: 4px; }
+pre { background: #f8f8f7; border: 1px solid #e7e5e2; padding: 12px; border-radius: 8px; overflow-x: auto; }
+:not(pre) > code { background: #f8f8f7; padding: 1px 4px; border-radius: 4px; }
 table { display: block; overflow-x: auto; border-collapse: collapse; font-size: 0.9em; }
-td, th { border: 1px solid #2f3844; padding: 6px 8px; }
-hr { border: 0; border-top: 1px solid #2f3844; margin: 1.5em 0; }
+td, th { border: 1px solid #e7e5e2; padding: 6px 8px; }
+hr { border: 0; border-top: 1px solid #e7e5e2; margin: 1.5em 0; }
+/* The frame cannot read the app's tokens, so its dark palette is spelled here. */
+@media (prefers-color-scheme: dark) {
+  body { background: #1d1d1c; color: #ecebe9; }
+  a { color: #6d8ff0; }
+  figcaption, blockquote { color: #b0ada8; }
+  blockquote, td, th, hr, pre { border-color: #3d3d3b; }
+  pre, :not(pre) > code { background: #222221; }
+}
 </style></head><body><div id="root">${lead}${article.html}</div>
 <script nonce="${nonce}">
 (function () {

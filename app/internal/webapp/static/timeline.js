@@ -8,13 +8,13 @@ export function mount(container, ctx) {
   container.innerHTML = `
     <div id="tl">
       <div id="rail">
-        <div class="rail-h">priority <span class="clear" id="clearsrc">reset</span></div>
+        <div class="rail-h">Priority <span class="clear" id="clearsrc">Reset</span></div>
         <div id="prioritylist"></div>
-        <div class="rail-h">sources</div>
+        <div class="rail-h">Sources</div>
         <div id="srclist"></div>
-        <div class="rail-h">kinds</div>
+        <div class="rail-h">Kinds</div>
         <div id="kindlist"></div>
-        <div class="rail-h">sync horizon</div>
+        <div class="rail-h">Sync horizon</div>
         <div id="synclist"></div>
       </div>
       <div id="main">
@@ -27,9 +27,9 @@ export function mount(container, ctx) {
     </div>`;
 
   const controls = h("div", "ctl");
-  const jumpLabel = h("label", "", "jump");
+  const jumpLabel = h("label", "", "Jump to");
   const jump = h("input"); jump.type = "date"; jump.id = "jump";
-  const latest = h("button", "", "latest"); latest.type = "button";
+  const latest = h("button", "", "Latest"); latest.type = "button";
   controls.appendChild(jumpLabel); controls.appendChild(jump); controls.appendChild(latest);
   ctx.setControls(controls);
 
@@ -48,7 +48,7 @@ export function mount(container, ctx) {
     catalog.forEach((entry) => {
       const chip = h("div", "chip" + (map[entry.name] ? " on" : ""));
       const dot = h("span", "dot");
-      dot.style.background = colorize ? hue(entry.name) : "var(--line2)";
+      dot.style.background = colorize ? hue(entry.name) : "var(--border-strong)";
       chip.appendChild(dot);
       chip.appendChild(h("span", "nm", entry.label || entry.name));
       chip.appendChild(h("span", "ct", countLabel(entry.count)));
@@ -264,16 +264,12 @@ export function mount(container, ctx) {
 // rowNode renders one ledger row; shared with the search results list.
 export function rowNode(item, index, onClick) {
   const row = h("div", "row p-" + (item.priority || "unclassified"));
-  row.style.animationDelay = Math.min(index, 12) * 12 + "ms";
+  row.style.setProperty("--src", hue(item.source));
   row.appendChild(h("div", "t", fmtTime(item.occurred_at)));
-  const tick = h("div", "tick");
-  tick.style.background = hue(item.source);
-  row.appendChild(tick);
+  row.appendChild(h("div", "tick"));
 
   const who = h("div", "who");
-  const src = h("div", "src", item.source);
-  src.style.color = hue(item.source);
-  who.appendChild(src);
+  who.appendChild(h("div", "src", item.source));
   who.appendChild(h("div", "actor", item.actor || "—"));
   row.appendChild(who);
 

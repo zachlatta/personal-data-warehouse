@@ -15,162 +15,36 @@ const pipelinesPageHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pdw — pipeline freshness</title>
-<style>
-:root {
-  --bg: #0e1116; --bg2: #12161d; --surface: #161b23; --surface2: #1b212b;
-  --line: #252c37; --line2: #2f3844;
-  --text: #d8dde5; --dim: #8b94a1; --faint: #5d6673;
-  --amber: #e8b45a; --amber-dim: #a97f35;
-  --ok: #62c98d; --late: #e8b45a; --stale: #e06c5f; --failing: #ff5f52;
-  --attention: #e8975a; --manual: #7fa8d0; --nodata: #5d6673; --unknown: #b78ae8;
-  --mono: "Berkeley Mono", "JetBrains Mono", "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html { height: 100%; }
-body {
-  min-height: 100%; background: var(--bg); color: var(--text);
-  font: 13px/1.45 var(--mono);
-  background-image: repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px);
-}
-::selection { background: rgba(232,180,90,.25); }
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 5px; border: 2px solid var(--bg); }
-a { color: var(--amber); text-decoration: none; }
-a:hover { text-decoration: underline; }
-
-#topbar {
-  position: sticky; top: 0; z-index: 30; height: 46px; display: flex; align-items: center; gap: 14px;
-  border-bottom: 1px solid var(--line); background: var(--bg2); padding: 0 14px;
-}
-#wordmark { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-#wordmark .glyph { color: var(--amber); font-weight: 700; }
-#wordmark .name { letter-spacing: .18em; font-weight: 700; font-size: 12px; }
-#wordmark .sub { color: var(--faint); font-size: 11px; letter-spacing: .08em; }
-#spacer { flex: 1; }
-#snapshot { color: var(--dim); font-size: 11px; letter-spacing: .04em; white-space: nowrap; }
-#snapshot b { color: var(--amber); font-weight: 600; }
-button {
-  background: var(--surface); color: var(--dim); border: 1px solid var(--line2);
-  border-radius: 3px; padding: 4px 10px; font: 11px var(--mono); letter-spacing: .06em; cursor: pointer;
-}
-button:hover { color: var(--text); border-color: var(--amber-dim); }
-button.primary { color: #10131a; background: var(--amber); border-color: var(--amber); font-weight: 700; }
-button.on { color: var(--text); border-color: var(--amber); }
-input[type="password"] {
-  background: var(--surface); color: var(--text); border: 1px solid var(--line2);
-  border-radius: 3px; padding: 4px 7px; font: 12px var(--mono);
-}
-
-#page { max-width: 1180px; margin: 0 auto; padding: 16px 16px 90px; }
-
-/* ---- status tiles ---- */
-#tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
-.tile {
-  flex: 1 1 116px; background: var(--surface); border: 1px solid var(--line);
-  border-left: 3px solid var(--line2); border-radius: 4px; padding: 9px 11px; cursor: pointer;
-}
-.tile:hover { background: var(--surface2); }
-.tile.on { border-color: var(--line2); background: var(--surface2); box-shadow: inset 0 0 0 1px var(--line2); }
-.tile .n { font-size: 21px; font-weight: 700; letter-spacing: .02em; }
-.tile .k { color: var(--faint); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; margin-top: 2px; }
-
-/* ---- pipeline groups ---- */
-.group { margin-bottom: 22px; }
-.group > h2 {
-  color: var(--faint); font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
-  display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px;
-}
-.group > h2 .rule { flex: 1; border-top: 1px dashed var(--line2); transform: translateY(-3px); }
-.group > h2 .n { color: var(--faint); letter-spacing: .04em; }
-
-.pl {
-  border: 1px solid var(--line); border-left: 3px solid var(--line2); border-radius: 4px;
-  background: var(--surface); margin-bottom: 5px; cursor: pointer;
-}
-.pl:hover { background: var(--surface2); }
-.pl.open { background: var(--surface2); }
-.plhead {
-  display: grid; grid-template-columns: 10px 1fr 132px 132px 116px 92px 74px;
-  gap: 0 12px; align-items: baseline; padding: 8px 11px;
-}
-.pl .dot { width: 9px; height: 9px; border-radius: 50%; align-self: center; }
-.pl .nm { overflow: hidden; }
-.pl .nm .lb { font-size: 13px; font-weight: 600; }
-.pl .nm .id { color: var(--faint); font-size: 10.5px; margin-left: 7px; }
-.pl .nm .cad { color: var(--dim); font-size: 10.5px; margin-top: 1px; }
-.pl .col .l { color: var(--faint); font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
-.pl .col .v { font-size: 12px; white-space: nowrap; }
-.pl .col .v.dimv { color: var(--dim); }
-.pl .st { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; text-align: right; font-weight: 700; }
-.pl .num { text-align: right; }
-.bar { grid-column: 2 / -1; height: 3px; background: rgba(255,255,255,.05); border-radius: 2px; margin-top: 2px; overflow: hidden; }
-.bar i { display: block; height: 100%; }
-.plerr {
-  color: var(--failing); font-size: 11px; padding: 0 11px 8px 33px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.plnote { color: var(--faint); font-size: 10.5px; padding: 0 11px 8px 33px; }
-
-/* ---- expanded detail ---- */
-.detail { border-top: 1px solid var(--line); padding: 9px 11px 11px 33px; cursor: default; }
-.detail .meta { color: var(--dim); font-size: 11px; margin-bottom: 8px; }
-.detail .meta b { color: var(--faint); font-weight: 400; letter-spacing: .1em; text-transform: uppercase; font-size: 9px; }
-table.tbl { width: 100%; border-collapse: collapse; }
-table.tbl th {
-  color: var(--faint); font-size: 9px; letter-spacing: .13em; text-transform: uppercase;
-  text-align: left; font-weight: 400; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line);
-}
-table.tbl td { padding: 3px 8px 3px 0; font-size: 11.5px; border-bottom: 1px dotted var(--line); vertical-align: top; }
-table.tbl td.n { text-align: right; }
-table.tbl td.rel { color: var(--dim); }
-table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
-.rolechip {
-  font-size: 8.5px; letter-spacing: .1em; text-transform: uppercase; border: 1px solid var(--line2);
-  border-radius: 2px; padding: 0 4px; color: var(--faint);
-}
-.probe { font-size: 10px; color: var(--faint); }
-.probe.warn { color: var(--late); }
-.probe.bad { color: var(--stale); }
-
-#status { color: var(--faint); font-size: 11px; padding: 20px 2px; letter-spacing: .06em; }
-#legend { color: var(--faint); font-size: 10.5px; line-height: 1.7; border-top: 1px dashed var(--line2); padding-top: 12px; }
-#legend b { color: var(--dim); font-weight: 600; }
-
-/* ---- token overlay ---- */
-#gate {
-  position: fixed; inset: 0; z-index: 100; display: none; align-items: center; justify-content: center;
-  background: rgba(10,12,16,.92); backdrop-filter: blur(3px);
-}
-#gate.open { display: flex; }
-#gate .card {
-  width: 420px; background: var(--surface); border: 1px solid var(--line2); border-radius: 6px;
-  padding: 26px; box-shadow: 0 30px 80px rgba(0,0,0,.6);
-}
-#gate h2 { font-size: 13px; letter-spacing: .16em; margin-bottom: 6px; color: var(--amber); }
-#gate p { color: var(--dim); font-size: 11.5px; margin-bottom: 14px; }
-#gate form { display: flex; gap: 8px; }
-#gate input { flex: 1; }
-#gate .bad { color: var(--stale); font-size: 11px; margin-top: 10px; display: none; }
-
-@media (max-width: 900px) {
-  .plhead { grid-template-columns: 10px 1fr 110px 74px; }
-  .pl .col.hide, .pl .num.hide { display: none; }
-}
-</style>
+<title>Pipelines · PDW</title>
+<link rel="stylesheet" href="/app/app.css">
 </head>
-<body>
-<div id="topbar">
-  <div id="wordmark"><span class="glyph">◍</span><span class="name">PDW/PIPELINES</span><span class="sub">what is still arriving</span></div>
-  <div id="spacer"></div>
-  <div id="snapshot">—</div>
-  <button id="attention">needs attention</button>
-  <button id="reload">reload</button>
-  <a href="/timeline"><button>▤ timeline</button></a>
-  <button id="lock" title="change access token">⌁ token</button>
-</div>
+<body class="pipelines-page">
+<header id="topbar">
+  <div class="bar-top">
+    <a id="wordmark" href="/timeline"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="name">PDW</span></a>
+    <div id="spacer"></div>
+    <div id="snapshot">—</div>
+    <button id="lock" title="Change access token"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>Lock</button>
+  </div>
+  <div class="bar-tabs">
+    <nav id="nav">
+      <a href="/timeline">Timeline</a>
+      <a href="/feed">Feed</a>
+      <a href="/search">Search</a>
+      <a href="/mutation-review">Review</a>
+      <a href="/notifications">Alerts</a>
+      <a href="/connections">Connections</a>
+      <a href="/pipelines" class="on" aria-current="page">Pipelines</a>
+    </nav>
+    <div id="topctl">
+      <button id="attention">Needs attention</button>
+      <button id="reload">Reload</button>
+    </div>
+  </div>
+</header>
 
 <div id="page">
+  <div class="page-head"><h1>Pipelines</h1><p class="m">What is still arriving: every source, mart, timeline adapter and integrity check, worst first.</p></div>
   <div id="tiles"></div>
   <div id="groups"></div>
   <div id="marts"></div>
@@ -191,13 +65,13 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 
 <div id="gate">
   <div class="card">
-    <h2>◍ PDW/PIPELINES</h2>
+    <h2><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>Unlock pipelines</h2>
     <p>This dashboard reads the warehouse through the app's bearer-protected API. Paste the app secret token (PDW_SECRET_TOKEN); it stays in this browser's localStorage.</p>
     <form id="gateform">
-      <input type="password" id="gatetoken" placeholder="secret token" autocomplete="off">
-      <button class="primary" type="submit">unlock</button>
+      <input type="password" id="gatetoken" placeholder="Secret token" autocomplete="off">
+      <button class="primary" type="submit">Unlock</button>
     </form>
-    <div class="bad" id="gatebad">rejected — check the token and try again.</div>
+    <div class="bad" id="gatebad">Rejected — check the token and try again.</div>
   </div>
 </div>
 
@@ -212,10 +86,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     "backfilling", "no_data", "unmeasured", "unmonitored", "quiet", "manual", "paused", "ok"
   ];
   var COLORS = {
-    ok: "var(--ok)", late: "var(--late)", stale: "var(--stale)", failing: "var(--failing)",
-    attention: "var(--attention)", manual: "var(--manual)", quiet: "var(--manual)", no_data: "var(--nodata)",
-    paused: "var(--manual)", unknown: "var(--unknown)", backfilling: "var(--manual)",
-    unmeasured: "var(--nodata)", unmonitored: "var(--nodata)"
+    ok: "var(--ok)", late: "var(--warn)", stale: "var(--danger)", failing: "var(--danger)",
+    attention: "var(--orange)", manual: "var(--info)", quiet: "var(--info)", no_data: "var(--text-3)",
+    paused: "var(--info)", unknown: "var(--violet)", backfilling: "var(--info)",
+    unmeasured: "var(--text-3)", unmonitored: "var(--text-3)"
   };
   var KINDS = [
     ["source", "sources — data coming in from the outside world"],
@@ -411,7 +285,6 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     SEVERITY.forEach(function (status) {
       if (!counts[status]) return;
       var tile = h("div", "tile" + (state.filter === status ? " on" : ""));
-      tile.style.borderLeftColor = COLORS[status];
       var n = h("div", "n", String(counts[status]));
       n.style.color = COLORS[status];
       tile.appendChild(n);
@@ -436,11 +309,10 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
 
   function pipelineNode(p) {
     var wrap = h("div", "pl" + (state.open[p.pipeline] ? " open" : ""));
-    wrap.style.borderLeftColor = COLORS[p.status] || "var(--line2)";
 
     var head = h("div", "plhead");
     var dot = h("div", "dot");
-    dot.style.background = COLORS[p.status] || "var(--nodata)";
+    dot.style.background = COLORS[p.status] || "var(--text-3)";
     head.appendChild(dot);
 
     var nm = h("div", "nm");
@@ -490,8 +362,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
       fill.style.width = Math.min(100, Math.max(2, (dataAge / (expected * 6)) * 100)) + "%";
       fill.style.background = COLORS[p.status];
       bar.appendChild(fill);
-      var barWrap = h("div", "plhead");
-      barWrap.style.padding = "0 11px 7px";
+      var barWrap = h("div", "plhead plbar");
       barWrap.appendChild(h("div"));
       barWrap.appendChild(bar);
       wrap.appendChild(barWrap);
@@ -636,10 +507,9 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
   // readable at a glance and scanning worst-first the same way.
   function healthRow(item, name, subtitle, columns, detail) {
     var wrap = h("div", "pl");
-    wrap.style.borderLeftColor = COLORS[item.status] || "var(--line2)";
     var head = h("div", "plhead");
     var dot = h("div", "dot");
-    dot.style.background = COLORS[item.status] || "var(--nodata)";
+    dot.style.background = COLORS[item.status] || "var(--text-3)";
     head.appendChild(dot);
 
     var nm = h("div", "nm");
@@ -1036,7 +906,7 @@ table.tbl tr.support td, table.tbl tr.state td { color: var(--dim); }
     var age = ageOf(newest);
     node.appendChild(document.createTextNode("measured "));
     var b = h("b", "", ago(age) + " ago");
-    if (age > 3600) b.style.color = "var(--unknown)";
+    if (age > 3600) b.style.color = "var(--violet)";
     node.appendChild(b);
     node.appendChild(document.createTextNode(" · " + state.pipelines.length + " pipelines · " +
       state.tables.length + " tables · " + state.marts.length + " marts · " +

@@ -11,6 +11,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/webapp"
 )
 
 var errFakeQuery = errors.New("snapshot query exploded")
@@ -183,7 +184,7 @@ func TestPipelinesPageIsServedUnauthenticated(t *testing.T) {
 		t.Fatalf("expected the page shell to render without a bearer token, got %d", resp.StatusCode)
 	}
 	page := string(body)
-	for _, needle := range []string{"PDW/PIPELINES", "/api/pipelines", "marts_ops.pipeline_health"} {
+	for _, needle := range []string{"<title>Pipelines · PDW</title>", "/api/pipelines", "marts_ops.pipeline_health"} {
 		if !strings.Contains(page, needle) {
 			t.Fatalf("page is missing %q", needle)
 		}
@@ -202,6 +203,26 @@ func TestTimelinePageLinksToPipelines(t *testing.T) {
 	}
 	if !strings.Contains(pipelinesPageHTML, `href="/timeline"`) {
 		t.Fatal("the pipelines page must link back to the timeline")
+	}
+}
+
+// The dashboard is a page of the web app, not a separate tool: it links the
+// app's stylesheet rather than carrying its own palette, and its header is the
+// app's header, with a tab for every page and its own tab marked current.
+func TestPipelinesPageSharesTheAppDesign(t *testing.T) {
+	if !strings.Contains(pipelinesPageHTML, `href="/app/app.css"`) {
+		t.Fatal("the pipelines page must link the shared /app/app.css")
+	}
+	if strings.Contains(pipelinesPageHTML, ":root") {
+		t.Fatal("the pipelines page declares its own palette; tokens belong in app.css")
+	}
+	for _, route := range webapp.Routes {
+		if !strings.Contains(pipelinesPageHTML, `href="`+route+`"`) {
+			t.Fatalf("the pipelines header has no tab for %s", route)
+		}
+	}
+	if !strings.Contains(pipelinesPageHTML, `href="/pipelines" class="on" aria-current="page"`) {
+		t.Fatal("the pipelines tab must be marked current")
 	}
 }
 
@@ -572,7 +593,9 @@ func TestPipelinesPageCoversEveryOpsHealthView(t *testing.T) {
 func TestPipelinesPageTreatsPausedAsIntentional(t *testing.T) {
 	for _, fragment := range []string{
 		`"manual", "paused", "ok"`,
-		`paused: "var(--manual)"`,
+		// paused reads like manual: a calm, expected state, not an alarm.
+		`manual: "var(--info)"`,
+		`paused: "var(--info)"`,
 		`paused: "intentionally paused`,
 		`["ok", "manual", "paused", "unmonitored", "unmeasured"]`,
 	} {

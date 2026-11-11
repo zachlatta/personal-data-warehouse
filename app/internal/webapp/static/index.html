@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pdw</title>
+<title>PDW</title>
 <link rel="stylesheet" href="/app/app.css?v=__ASSET_VERSION__">
 <link rel="stylesheet" href="/app/mutations.css?v=__ASSET_VERSION__">
 <!-- The router imports every view; preloading the graph fetches it in one
@@ -26,23 +26,27 @@
 </head>
 <body>
 <div id="app">
-  <div id="topbar">
-    <a id="wordmark" href="/timeline" data-link><span class="glyph">▤</span><span class="name">PDW</span><span class="sub" id="subtitle">timeline</span></a>
-    <nav id="nav">
-      <a href="/timeline" data-link data-nav="timeline">timeline</a>
-      <a href="/feed" data-link data-nav="feed">feed</a>
-      <a href="/search" data-link data-nav="search">search</a>
-      <a href="/mutation-review" data-link data-nav="mutation-review">review<span id="pendingcount" class="count" hidden></span></a>
-      <a href="/notifications" data-link data-nav="notifications" aria-label="notifications">alerts</a>
-      <a href="/external-feeds" data-link data-nav="external-feeds">External feeds</a>
-      <a href="/connections" data-link data-nav="connections">connections</a>
-      <a href="/pipelines">pipelines</a>
-    </nav>
-    <div id="topctl"></div>
-    <div id="spacer"></div>
-    <div id="stats"></div>
-    <button id="lock" title="change token">⚿</button>
-  </div>
+  <header id="topbar">
+    <div class="bar-top">
+      <a id="wordmark" href="/timeline" data-link><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="name">PDW</span><span class="sub" id="subtitle">timeline</span></a>
+      <div id="spacer"></div>
+      <div id="stats"></div>
+      <button id="lock" title="Change token"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>Lock</button>
+    </div>
+    <div class="bar-tabs">
+      <nav id="nav">
+        <a href="/timeline" data-link data-nav="timeline">Timeline</a>
+        <a href="/feed" data-link data-nav="feed">Feed</a>
+        <a href="/search" data-link data-nav="search">Search</a>
+        <a href="/mutation-review" data-link data-nav="mutation-review">Review<span id="pendingcount" class="count" hidden></span></a>
+        <a href="/notifications" data-link data-nav="notifications">Alerts</a>
+        <a href="/external-feeds" data-link data-nav="external-feeds">External feeds</a>
+        <a href="/connections" data-link data-nav="connections">Connections</a>
+        <a href="/pipelines">Pipelines</a>
+      </nav>
+      <div id="topctl"></div>
+    </div>
+  </header>
   <div id="view"></div>
 </div>
 
@@ -50,20 +54,20 @@
   <div id="dhead">
     <span class="k" id="dkind">—</span>
     <span class="t" id="dtitle">—</span>
-    <button id="dclose">esc ✕</button>
+    <button id="dclose" title="Close (Esc)">Close</button>
   </div>
   <div id="dbody"></div>
 </div>
 
 <div id="gate">
   <div class="card">
-    <h2>▤ PDW</h2>
+    <h2><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>Unlock PDW</h2>
     <p>This app reads the warehouse through the bearer-protected API — the same one the phone uses. Paste the app secret token (PDW_SECRET_TOKEN); it stays in this browser's localStorage.</p>
     <form id="gateform">
-      <input type="password" id="gatetoken" placeholder="secret token" autocomplete="off">
-      <button class="primary" type="submit">unlock</button>
+      <input type="password" id="gatetoken" placeholder="Secret token" autocomplete="off">
+      <button class="primary" type="submit">Unlock</button>
     </form>
-    <div class="bad" id="gatebad">rejected — check the token and try again.</div>
+    <div class="bad" id="gatebad">Rejected — check the token and try again.</div>
   </div>
 </div>
 

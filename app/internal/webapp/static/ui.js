@@ -21,7 +21,7 @@ export function frag(...children) {
 
 export function section(title, copyValue) {
   const sect = h("div", "sect");
-  const head = h("h3", "", title);
+  const head = h("h3", "", title ? title.charAt(0).toUpperCase() + title.slice(1) : title);
   if (copyValue !== undefined) {
     const copy = h("span", "copy", "copy");
     copy.addEventListener("click", () => {

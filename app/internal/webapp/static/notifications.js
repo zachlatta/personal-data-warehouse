@@ -19,6 +19,7 @@ export function mount(container) {
   async function load() {
     try {
       const next = await request("/api/notifications"); if (stopped) return; state = next;
+      health.className = "notification-health " + (state.enabled ? (state.error ? "bad" : "on") : "off");
       health.textContent = `Experiment ${state.enabled ? "on" : "paused"} · ${state.status}${state.error ? " · " + state.error : ""}`;
       toggle.textContent = state.enabled ? "Pause all timeline notifications" : "Start experiment";
       register.disabled = !state.web_public_key || !("serviceWorker" in navigator) || !("PushManager" in window);
