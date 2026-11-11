@@ -37,6 +37,12 @@ _MAX_APPROVAL_AGE = timedelta(hours=1)
 _READ_BACK_ATTEMPTS = 10
 _READ_BACK_INTERVAL_SECONDS = 3
 _RESULT_COLUMNS = ("indoor_temperature", "heat_setpoint", "cool_setpoint", "system_mode", "setpoint_status")
+# A fixed cap on what a mutation policy may approve, whatever the policy says:
+# a second check, in another file and language than the Go policy engine, so
+# one bad change to the policy code is not enough to overheat or freeze the
+# house. Only Zach's own approval reaches past it.
+POLICY_APPROVED_HEAT_RANGE = (50.0, 72.0)
+_POLICY_ACTOR_PREFIX = "policy:"
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,15 @@ class ResideoMutationExecutor:
         if not targets:
             raise ResideoRequestError("the mutation names no setpoint")
 
+        if str(mutation.get("approved_by") or "").startswith(_POLICY_ACTOR_PREFIX):
+            low, high = POLICY_APPROVED_HEAT_RANGE
+            if COOL in targets:
+                raise ResideoRequestError("a mutation policy may not set a cool setpoint; this needs Zach's own approval")
+            heat = targets.get(HEAT)
+            if heat is not None and not low <= heat <= high:
+                raise ResideoRequestError(
+                    f"a policy-approved heat setpoint must be {low:g} to {high:g}, not {heat:g}; this needs Zach's own approval"
+                )
         client = self._client_factory()
         configuration = client.get_configuration(device_id)
         before = thermostat_state(client.get_device(device_id), configuration)

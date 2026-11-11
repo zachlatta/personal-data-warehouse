@@ -105,6 +105,13 @@ export const mutations = {
   // page: { offset, limit } — the window of the request's mutations to read.
   async get(id, page) { return (await request(requestPath(id), { params: page || {} })).request; },
   async approve(id) { return (await request(requestPath(id, "approve"), { method: "POST" })).request; },
+  // Mutation policies: GET lists them with their grants and the kill switch;
+  // the two writes are reviewer-only switches.
+  async policies() { return request("/api/mutations/policies"); },
+  async setPolicyMode(id, mode) { return request("/api/mutations/policies/" + encodeURIComponent(id) + "/mode", { method: "POST", body: { mode } }); },
+  async setAutoApprove(enabled) { return request("/api/mutations/policies/settings", { method: "POST", body: { auto_approve: enabled } }); },
+  // Undo a thermostat change that ran: the answer is the new request.
+  async undo(id) { return (await request(requestPath(id, "undo"), { method: "POST" })).request; },
   async reject(id, reason) { return (await request(requestPath(id, "reject"), { method: "POST", body: { reason: reason || "" } })).request; },
   async supersede(id, supersededBy) {
     return (await request(requestPath(id, "supersede"), { method: "POST", body: { superseded_by: supersededBy } })).request;

@@ -292,6 +292,31 @@ def test_an_approval_too_old_to_mean_now_is_never_applied():
     assert "propose" in result.error
 
 
+def test_a_policy_approved_setpoint_outside_the_fixed_cap_is_refused_without_a_write():
+    """The executor's own cap (heat 50 to 72) holds whatever a policy says."""
+
+    for payload in ({"heat_setpoint": 74.0}, {"heat_setpoint": 49.0}, {"heat_setpoint": None, "cool_setpoint": 76.0}):
+        client = FakeClient([shadow()])
+        capped = mutation(**payload)
+        capped["approved_by"] = "policy:heating-winter@3"
+        result = executor(client).execute(capped)
+        assert client.writes == [], payload
+        assert result.status == "failed_terminal", payload
+        assert "Zach's own approval" in result.error
+
+    # The same value approved by Zach is applied: the cap is only on policies.
+    client = FakeClient([shadow(), shadow(heat=74.0, status="TemporaryHold")])
+    by_hand = mutation(heat_setpoint=74.0)
+    by_hand["approved_by"] = "app:test-phone"
+    assert executor(client).execute(by_hand).status == "succeeded"
+    assert client.writes == [("heat", 74.0, "TemporaryHold")]
+
+    client = FakeClient([shadow(), shadow(heat=55.0, status="TemporaryHold")])
+    inside = mutation(heat_setpoint=55.0)
+    inside["approved_by"] = "policy:heating-winter@3"
+    assert executor(client).execute(inside).status == "succeeded"
+
+
 @pytest.mark.parametrize(
     ("error", "status"),
     [

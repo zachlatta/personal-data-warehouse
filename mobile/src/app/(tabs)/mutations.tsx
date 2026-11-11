@@ -5,6 +5,7 @@ import { Pressable, RefreshControl, SectionList, StyleSheet } from 'react-native
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { InboxRow } from '@/components/inbox-row';
+import { PolicySwitches } from '@/components/policy-switches';
 import { STATUS_COLORS } from '@/components/status-pill';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { Spacing } from '@/constants/theme';
@@ -92,6 +93,7 @@ export default function MutationsScreen() {
       <SectionList
         contentContainerStyle={{ paddingBottom: tabSpace }}
         sections={sections}
+        ListFooterComponent={<PolicySwitches config={config} />}
         keyExtractor={(item) => item.id}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} />}
         renderSectionHeader={({ section }) => (

@@ -151,6 +151,12 @@ func requestTokenID(ctx context.Context) string {
 }
 
 func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (ProposalResponse, error) {
+	return s.createRequestNotifying(ctx, input, true)
+}
+
+// createRequestNotifying is createRequest; notify false skips the review
+// alert, for a request the caller approves at once (an undo).
+func (s *Service) createRequestNotifying(ctx context.Context, input CreateRequestInput, notify bool) (ProposalResponse, error) {
 	if s == nil || s.store == nil {
 		return ProposalResponse{}, errors.New("mutation store is not configured")
 	}
@@ -166,7 +172,7 @@ func (s *Service) createRequest(ctx context.Context, input CreateRequestInput) (
 	if err != nil {
 		return ProposalResponse{}, err
 	}
-	if s.cfg.RequestCreated != nil {
+	if notify && s.cfg.RequestCreated != nil {
 		s.cfg.RequestCreated(ctx, request)
 	}
 	response := s.responseForRequest(request)

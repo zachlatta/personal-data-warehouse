@@ -267,8 +267,15 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 		push.NewHandler(pushStore, notifier, time.Now, logger).Register(mux, authSvc.RequireStaticBearer())
 		if mutationSvc != nil {
 			mutationSvc.SetRequestCreated(func(_ context.Context, request mutations.Request) {
+				// A request a policy approved is not waiting on Zach: it gets
+				// the quiet alert after it runs, through the notification outbox
+				// (mutations.ClaimPolicyOutcomes queues it).
+				if request.Status != mutations.StatusPendingReview {
+					return
+				}
 				notifier.NotifyAsync(mutationNotification(request, mutationSvc.RequestJSON))
 			})
+			go mutationSvc.RunPolicyOutcomes(ctx, policyOutcomeInterval)
 			mutationSvc.SetRequestWithdrawn(func(_ context.Context, request mutations.Request) {
 				notifier.NotifyAsync(mutationWithdrawnNotification(request))
 			})
@@ -753,7 +760,7 @@ func mutationNotification(request mutations.Request, encode func(mutations.Reque
 		// One alert per request: a withdrawal later replaces this alert in
 		// place instead of leaving an Approve button on a request that no
 		// longer exists to approve.
-		CollapseID: mutationCollapseID(request.ID),
+		CollapseID: push.MutationCollapseID(request.ID),
 		// A request waits on a human, so it may break through a Focus
 		// that allows time-sensitive alerts; it is not critical (which
 		// would bypass silent mode).
@@ -775,6 +782,11 @@ func mutationNotification(request mutations.Request, encode func(mutations.Reque
 	delete(n.Data, "request")
 	return n
 }
+
+// policyOutcomeInterval is how often the app queues what policy-approved
+// requests did into the notification outbox; the worker applies a change
+// within seconds of approval.
+const policyOutcomeInterval = 10 * time.Second
 
 // partialRequestJSON marks a list-shaped request as one whose mutations the
 // phone still has to fetch, so it renders a loading row rather than "no
@@ -857,8 +869,6 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-func mutationCollapseID(requestID string) string { return "mutation-request:" + requestID }
-
 // mutationWithdrawnNotification replaces the review alert for a request an
 // agent withdrew. It is passive — nothing is waiting on the reader — and it
 // carries no action category, so a stale Approve cannot be tapped; the
@@ -880,7 +890,7 @@ func mutationWithdrawnNotification(request mutations.Request) push.Notification 
 		Body:              body,
 		Route:             "/mutations/" + request.ID,
 		ThreadID:          "mutations",
-		CollapseID:        mutationCollapseID(request.ID),
+		CollapseID:        push.MutationCollapseID(request.ID),
 		InterruptionLevel: push.InterruptionPassive,
 		Data: map[string]any{
 			"request_id": request.ID,

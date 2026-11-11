@@ -57,6 +57,7 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 	if json.Unmarshal(d.Endpoint, &sub) != nil || !validEndpoint(sub.Endpoint) {
 		return Result{Status: "failed", Error: "invalid stored web push endpoint"}
 	}
+	a = webAlert(a)
 	a.Android = nil // the browser draws its own alert; the style is Android-native only
 	raw, err := json.Marshal(a)
 	if err != nil || len(raw) > 3800 {
@@ -92,6 +93,11 @@ func (t *Transport) Send(ctx context.Context, d Delivery) Result {
 func expoMessage(token, platform, capabilities string, d Delivery) push.Message {
 	a := d.Alert
 	data := map[string]any{"kind": "timeline_notification", "route": a.Route, "open": a.Open, "delivery_id": d.ID, "open_proof": a.OpenProof}
+	if a.Kind != "" {
+		// A mutation alert: the phone's Undo / Approve buttons read kind and
+		// request_id (mobile/src/lib/push.ts), not a timeline open link.
+		data["kind"], data["request_id"] = a.Kind, a.RequestID
+	}
 	native := push.DrawsAlertsNatively(platform, capabilities)
 	if a.Android != nil && native {
 		style := map[string]any{}
@@ -104,6 +110,19 @@ func expoMessage(token, platform, capabilities string, d Delivery) push.Message 
 		return push.Message{To: token, Priority: "high", Data: data}
 	}
 	m := push.Message{To: token, Title: a.Title, Subtitle: a.Subtitle, Body: a.Body, Priority: "high", Sound: "default", CategoryID: push.CategoryLink, CollapseID: d.NotificationID, ThreadID: a.ThreadID, ChannelID: push.AndroidChannelID, Data: data}
+	if a.Category != "" {
+		m.CategoryID = a.Category
+	}
+	if a.RequestID != "" {
+		m.CollapseID = push.MutationCollapseID(a.RequestID)
+	}
+	if a.Category == push.CategoryMutationReview {
+		// Back for review: it waits on Zach, like the first review alert.
+		m.InterruptionLevel = push.InterruptionTimeSensitive
+	}
+	if a.Quiet {
+		m.Sound, m.InterruptionLevel = "", push.InterruptionPassive
+	}
 	if a.Icon != "" {
 		m.MutableContent = true
 		m.RichContent = &push.RichContent{Image: a.Icon}
@@ -199,4 +218,14 @@ func ValidateVAPID(publicKey, privateKey string) error {
 		return errors.New("invalid or mismatched web push VAPID keys")
 	}
 	return nil
+}
+
+// webAlert is the alert a browser gets: a mutation alert opens the web review
+// (/mutation-review/requests/<id>), since its Route is the phone app's
+// /mutations/<id>, which the web app does not serve.
+func webAlert(a Alert) Alert {
+	if a.Kind != "" && a.RequestID != "" {
+		a.Route = "/mutation-review/requests/" + url.PathEscape(a.RequestID)
+	}
+	return a
 }

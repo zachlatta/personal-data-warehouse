@@ -253,3 +253,91 @@ func TestPostgresNotifications(t *testing.T) {
 		t.Fatalf("bad cursor accepted: %d", w.Code)
 	}
 }
+
+// A mutation alert (adapter mutation_policy: Undo after an automatic change,
+// a send-back, a policy turned off) is not part of the timeline-notification
+// experiment: it is fanned out and delivered while that switch is off,
+// switching it off does not cancel it, and it is not listed among the
+// timeline notifications.
+func TestPostgresNotificationsDeliverMutationAlertsWhateverTheTimelineSwitch(t *testing.T) {
+	url := os.Getenv("PDW_NOTIFICATION_TEST_URL")
+	if url == "" {
+		t.Skip("run through tests/test_timeline_notifications.py for managed Postgres")
+	}
+	ctx := context.Background()
+	sender := &fakeSender{result: Result{Status: "retry", Error: "push service unavailable"}, receipt: Result{Status: "provider_accepted"}}
+	s, err := New(url, []byte("test-secret"), sender, func(row map[string]any) Alert {
+		return Alert{Title: "Heat set to 55°", Route: "/mutations/req-1", Kind: "mutation_applied", RequestID: "req-1", Category: "mutation_applied", Quiet: true}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var relations map[string]string
+	if err = json.Unmarshal([]byte(os.Getenv("PDW_NOTIFICATION_TEST_RELATIONS")), &relations); err != nil {
+		t.Fatal(err)
+	}
+	s.Expand = func(q string) string {
+		for k, v := range relations {
+			q = strings.ReplaceAll(q, "@"+k, v)
+		}
+		return q
+	}
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := s.DB.ExecContext(ctx, s.q(q), args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := func(q string) int {
+		t.Helper()
+		var n int
+		if err := s.DB.QueryRowContext(ctx, s.q(q)).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	exec(`UPDATE @notification_state SET enabled=0 WHERE id='timeline'`)
+	exec(`INSERT INTO @push_devices (expo_push_token) VALUES ('ExponentPushToken[mutation]') ON CONFLICT DO NOTHING`)
+	exec(`INSERT INTO @notification_events (adapter, event_id, source, priority, event_ts, landed_at, payload)
+	      VALUES ('mutation_policy', 'req-1:applied:0:0', 'pdw_mutations', 'self', now(), now(),
+	              '{"adapter":"mutation_policy","title":"Heat set to 55°","snippet":"Tap Undo","route":"/mutations/req-1","request_id":"req-1"}')`)
+	// Paused: still fanned out and sent (the transport fails this time).
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("a mutation alert waited for the timeline switch: %d sends", len(sender.sent))
+	}
+	// Switching timeline notifications off mid-flight cancels timeline work
+	// only; the mutation alert keeps retrying.
+	mux := http.NewServeMux()
+	s.Register(mux, func(h http.Handler) http.Handler { return h })
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+		return w
+	}
+	if w := do(http.MethodPost, APIPath+"/settings", `{"enabled":false}`); w.Code != 200 {
+		t.Fatalf("settings: %d", w.Code)
+	}
+	if count(`SELECT count(*) FROM @notification_deliveries d JOIN @notification_events e ON e.id = d.notification_id WHERE e.adapter='mutation_policy' AND d.status='cancelled'`) != 0 {
+		t.Fatal("switching timeline notifications off cancelled a mutation alert")
+	}
+	sender.result = Result{Status: "accepted", TicketID: "t"}
+	exec(`UPDATE @notification_deliveries SET next_attempt_at=now()-interval '1 second'`)
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count(`SELECT count(*) FROM @notification_deliveries d JOIN @notification_events e ON e.id = d.notification_id WHERE e.adapter='mutation_policy' AND d.status='accepted'`) != 1 {
+		t.Fatal("the mutation alert was not delivered after the retry while paused")
+	}
+	// The timeline notifications page neither breaks on nor lists it.
+	w := do(http.MethodGet, APIPath, "")
+	if w.Code != 200 {
+		t.Fatalf("GET %s = %d: %s", APIPath, w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "req-1:applied") || strings.Contains(w.Body.String(), "Heat set to 55") {
+		t.Fatalf("a mutation alert is listed among timeline notifications: %s", w.Body.String())
+	}
+}

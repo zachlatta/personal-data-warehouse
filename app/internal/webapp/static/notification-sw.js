@@ -44,7 +44,10 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const alert = event.notification.data || {};
   // Open immediately, before any network call can consume user activation.
-  let target = new URL(typeof alert.route === "string" && alert.route.startsWith("/timeline/") ? alert.route : "/notifications", self.location.origin).href;
+  // A timeline alert opens its event; a mutation alert (Undo, sent back,
+  // policy off) opens the web review of its request.
+  const route = typeof alert.route === "string" ? alert.route : "";
+  let target = new URL(route.startsWith("/timeline/") || route.startsWith("/mutation-review/") ? route : "/notifications", self.location.origin).href;
   try { const source = new URL(alert.open?.url); if (source.protocol === "https:") target = source.href; } catch { /* exact PDW event is the fallback */ }
   const open = clients.openWindow(target);
   event.waitUntil(Promise.all([open, (async () => {

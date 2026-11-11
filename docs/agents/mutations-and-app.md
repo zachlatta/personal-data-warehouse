@@ -803,3 +803,76 @@ Tables (ops schema, app-only; Go `mutationPolicySchemaStatements`, Python twin i
 `limits_json`, `mode`, `valid_from`, `valid_until`, who created and approved it),
 `mutation_policy_grants`, `mutation_policy_evaluations`, `mutation_policy_settings` (the
 kill switch).
+
+### Enforcement
+
+When the decision is `approved` (an `enforce` policy, every check passed),
+`approveByPolicy` approves the request **in the proposal's transaction**: status
+`approved`, `approved_by = policy:<id>@<version>`, `approved` events with
+`actor_type = 'policy'` carrying the evaluation, and the `pg_notify` that wakes the
+resident worker. The agent's `propose_mutation` answer then says `status: approved`. No
+review alert is pushed for it (`server.go` sends one only for `pending_review`).
+
+**Kill switches.** One global switch: the `auto_approve` row of
+`ops.mutation_policy_settings` (`{"enabled": false}`), with `PDW_MUTATION_AUTO_APPROVE=0`
+in the environment winning over it. The environment variable is read by the Go app (at
+proposal) and by the Dagster/resident worker (at claim); set it on **both** Coolify apps.
+Each policy also has its `mode`. Reviewers flip both from the web review list
+("Automatic approvals") or the phone's Mutations tab, over the reviewer-only
+`POST /api/mutations/policies/settings {auto_approve}` and
+`POST /api/mutations/policies/<id>/mode {mode}`; a mode change writes a new version.
+
+**One lock.** Every writer of a policy (a new version, a mode change, the auto-off), of
+its grants, and of the kill switch takes the policy's transaction-scoped advisory lock
+(`hashtextextended('pdw_mutation_policy:' || <id>)`, and `pdw_mutation_policy:*settings`
+for the switch: settings first, then policy ids sorted), and so does the claim below
+(`lock_policy_state`). A switch-off, revoke or new version either commits before a claim
+reads it, or waits for that claim to commit; `FOR SHARE` alone could not stop a new
+version row or a first settings row from being inserted.
+
+**Claim-time re-check.** `claim_approved_upstream_mutations` (Python) picks rows, takes the
+locks above, re-checks every policy-approved one
+(`upstream_mutation_policy.policy_recheck_failure`) and claims each as it passes, in
+**one transaction**, so the next candidate's limits count it (a delayed queue of several
+changes under a one-per-hour policy runs one). It reads the settings, policy and grant rows:
+kill switch, policy still `enforce` at the version that approved it and inside its dates,
+the proposing token's grant still active, the rate limits over what other requests under
+the policy have claimed, that the request holds one change, and no hand change inside the
+pause window (the same SQL as the
+Go `thermostatManualChangeSQL`). A failure sends the whole request back to
+`pending_review` with the reason in `error` and a `policy_recheck_failed` event; a switch
+or revoke that commits before the claim always wins, one that commits after waits on the
+locks and does not stop that one write (Undo and the next run correct it). A request Zach
+approved by hand is never re-checked; to stop one, cancel it. Only the Python cloud worker
+claims auto-approvable types; the Go device workers claim types no policy may approve.
+
+**After it runs.** The app's policy outcome loop (`Service.RunPolicyOutcomes`, every 10 s)
+selects only requests with something to report (so reported or still-waiting rows never
+fill a page) and, in one transaction, marks each report with a request event and queues it
+as a row of the timeline notification outbox (`ops.notification_events`, adapter
+`mutation_policy`, priority `self`). The outbox worker (`internal/notifications`) delivers
+it with its fan-out per device, leases, retries with backoff and receipts, so a crash or a
+push failure loses nothing; `renderTimelineNotification` draws the row with its action
+category and request id. A mutation alert is **not part of the timeline-notification
+experiment** (`notifications.MutationAdapter`): it is fanned out and delivered whether or
+not `ops.notification_state` (id `timeline`) is on, switching that off never cancels it,
+and the timeline notifications page (`GET /api/notifications`) does not list it. On the
+phone a tap opens `/mutations/<id>`; a Web Push click opens
+`/mutation-review/requests/<id>`. Every alert about one request shares
+`push.MutationCollapseID`, whichever path sent it, so a withdrawal replaces a sent-back
+review alert as it does the first one. The Go app creates the outbox table itself when the
+Python ensure path has not yet (`notificationOutboxStatements`). The reports are:
+a quiet alert (passive, no sound, category `mutation_applied` with **Undo**) when a change
+ran; an ordinary alert when it failed; the review alert again when the claim sent it back;
+and "Policy … turned off" when the policy's last three finished runs all failed, which
+writes a new version with mode `off` (`created_by = pdw:auto-off`). **Undo**
+(`POST /api/mutations/requests/<id>/undo`, reviewer-only, also a button on the web and
+phone review of any thermostat request that ran) proposes the inverse from the
+`result.previous` the worker recorded and approves it as the reviewer; a second Undo
+returns the same request. Android draws no action buttons, so there a tap on the alert
+opens the review, which has the Undo button.
+
+**Executor cap.** `resideo_mutations.py` refuses any policy-approved thermostat write with
+heat outside 50 to 72°F, or any cool setpoint, whatever the policy says
+(`POLICY_APPROVED_HEAT_RANGE`); only Zach's own approval reaches past it. It is a second
+check in another language, so one bad change to the Go policy code is not enough.

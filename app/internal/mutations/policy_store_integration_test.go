@@ -3,7 +3,10 @@ package mutations
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
@@ -199,5 +202,391 @@ func TestDryRunDecisionsCountAgainstLimitsAfterSwitchingToEnforce(t *testing.T) 
 	request, _ := f.store.GetRequest(ctx, second.RequestID, AllMutations)
 	if request.Status != StatusPendingReview || request.Policy["decision"] != PolicyDecisionReview {
 		t.Fatalf("a change inside the hour after a dry-run approval was approved: %s %#v", request.Status, request.Policy)
+	}
+}
+
+func TestAnEnforcedPolicyApprovesInTheProposalTransaction(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	proposal, err := f.propose(t, f.tokenID, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := f.store.GetRequest(ctx, proposal.RequestID, AllMutations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := PolicyActorPrefix + f.policyID + "@1"
+	if request.Status != "approved" || request.ApprovedBy != actor || request.Mutations[0].ApprovedBy != actor || request.Mutations[0].Status != "approved" {
+		t.Fatalf("request %s by %q; mutation %s by %q", request.Status, request.ApprovedBy, request.Mutations[0].Status, request.Mutations[0].ApprovedBy)
+	}
+	var actorType string
+	if err := queryRowContext(ctx, f.store.db, `SELECT actor_type FROM @upstream_mutation_request_events WHERE request_id = $1 AND event_type = 'approved'`, request.ID).Scan(&actorType); err != nil || actorType != "policy" {
+		t.Fatalf("approved event actor_type %q, %v", actorType, err)
+	}
+	// Another token's identical proposal waits for Zach.
+	other, err := f.propose(t, "tok_not_granted", 68)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := f.store.GetRequest(ctx, other.RequestID, AllMutations); again.Status != StatusPendingReview {
+		t.Fatalf("an ungranted token was approved: %s", again.Status)
+	}
+}
+
+func TestTwoConcurrentProposalsCannotBothPassTheHourlyLimit(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	results := make(chan string, 2)
+	for _, heat := range []float64{55, 68} {
+		go func(heat float64) {
+			proposal, err := f.propose(t, f.tokenID, heat)
+			if err != nil {
+				results <- "error: " + err.Error()
+				return
+			}
+			request, _ := f.store.GetRequest(ctx, proposal.RequestID, AllMutations)
+			results <- request.Status
+		}(heat)
+	}
+	statuses := map[string]int{}
+	for range 2 {
+		statuses[<-results]++
+	}
+	if statuses["approved"] != 1 || statuses[StatusPendingReview] != 1 {
+		t.Fatalf("statuses = %v, want one approved and one for review", statuses)
+	}
+}
+
+func TestUndoRestoresThePreviousSetpointAsAReviewerApproval(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	proposal, err := f.propose(t, f.tokenID, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The worker ran it: succeeded, with the device state it found first.
+	if _, err := execContext(ctx, f.store.db, `
+		UPDATE @upstream_mutations SET status = 'succeeded', executed_at = now(),
+		       result_json = '{"verified":true,"previous":{"heat_setpoint":68,"cool_setpoint":78,"setpoint_status":"PermanentHold"},"current":{"heat_setpoint":55}}'::jsonb
+		 WHERE request_id = $1`, proposal.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	setRequestStatus(t, f.store, proposal.RequestID, "succeeded")
+	request, _ := f.store.GetRequest(ctx, proposal.RequestID, AllMutations)
+	if !canUndo(request) {
+		t.Fatal("a thermostat change that ran must offer Undo")
+	}
+	reviewer := auth.WithPrincipal(ctx, auth.Principal{Scope: auth.ScopeReviewer, TokenID: "phone", ClientName: "pixel"})
+	undone, err := f.service.UndoRequest(reviewer, proposal.RequestID, "app:pixel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if undone.Status != "approved" || undone.ApprovedBy != "app:pixel" {
+		t.Fatalf("undo request %s by %q", undone.Status, undone.ApprovedBy)
+	}
+	payload := undone.Mutations[0].Payload
+	if payload["heat_setpoint"] != 68.0 || payload["hold"] != thermostatHoldPermanent || payload["device_id"] != f.device {
+		t.Fatalf("undo payload = %#v", payload)
+	}
+	// Undo twice is the same request, not a second change.
+	again, err := f.service.UndoRequest(reviewer, proposal.RequestID, "app:pixel")
+	if err != nil || again.ID != undone.ID {
+		t.Fatalf("second undo: %v %s vs %s", err, again.ID, undone.ID)
+	}
+}
+
+func TestPolicyOutcomesAreReportedOnceAndThreeFailuresTurnThePolicyOff(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	// Each failed run is its own request, approved by the policy.
+	var ids []string
+	for i := range 3 {
+		if i > 0 {
+			// Clear the rate limits between runs; this test is about outcomes.
+			if _, err := execContext(ctx, f.store.db, `DELETE FROM @mutation_policy_evaluations WHERE policy_id = $1`, f.policyID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		proposal, err := f.propose(t, f.tokenID, float64(55+i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, proposal.RequestID)
+		setRequestStatus(t, f.store, proposal.RequestID, "failed_terminal")
+	}
+	var mine []PolicyOutcome
+	for range 5 {
+		outcomes, err := f.store.ClaimPolicyOutcomes(ctx, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, outcome := range outcomes {
+			if outcome.PolicyID == f.policyID {
+				mine = append(mine, outcome)
+			}
+		}
+	}
+	kinds := map[string]int{}
+	for _, outcome := range mine {
+		kinds[outcome.Kind]++
+	}
+	if kinds[PolicyOutcomeFailed] != 3 || kinds[PolicyOutcomePolicyDisabled] != 1 {
+		t.Fatalf("outcomes = %v (each reported once; the policy turned off once)", kinds)
+	}
+	var mode, createdBy string
+	if err := queryRowContext(ctx, f.store.db, `SELECT mode, created_by FROM @mutation_policies WHERE id = $1 ORDER BY version DESC LIMIT 1`, f.policyID).Scan(&mode, &createdBy); err != nil {
+		t.Fatal(err)
+	}
+	if mode != PolicyModeOff || createdBy != PolicyAutoOffActor {
+		t.Fatalf("policy mode %s by %s", mode, createdBy)
+	}
+	// Now a change inside the old policy waits for Zach.
+	if _, err := execContext(ctx, f.store.db, `DELETE FROM @mutation_policy_evaluations WHERE policy_id = $1`, f.policyID); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := f.propose(t, f.tokenID, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request, _ := f.store.GetRequest(ctx, proposal.RequestID, AllMutations); request.Status != StatusPendingReview {
+		t.Fatalf("an off policy approved: %s", request.Status)
+	}
+}
+
+func TestAKillSwitchRowSendsAProposalToReview(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	if err := f.store.SetAutoApprove(ctx, false, "app:test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.store.SetAutoApprove(context.Background(), true, "app:test") })
+	proposal, err := f.propose(t, f.tokenID, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := f.store.GetRequest(ctx, proposal.RequestID, AllMutations)
+	if request.Status != StatusPendingReview || request.Policy["decision"] != PolicyDecisionReview {
+		t.Fatalf("kill switch off: %s %#v", request.Status, request.Policy)
+	}
+	overview, err := f.store.ListPolicies(ctx)
+	if err != nil || overview.AutoApproveEnabled {
+		t.Fatalf("overview %+v %v", overview.AutoApproveEnabled, err)
+	}
+}
+
+// holdLock takes an advisory lock the way the worker's claim does (Python,
+// upstream_mutation_policy.lock_policy_state) and returns its release.
+func holdLock(t *testing.T, store *PostgresStore, key string) func() {
+	t.Helper()
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = tx.Rollback() }
+}
+
+// waitsFor runs write and reports whether it was still blocked after a pause
+// while the lock was held, and that it finished once released.
+func waitsFor(t *testing.T, release func(), write func() error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- write() }()
+	select {
+	case err := <-done:
+		release()
+		t.Fatalf("the write did not wait for the claim's lock (err %v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the write never finished after the lock was released")
+	}
+}
+
+func TestPolicyWritersWaitForTheClaimsLock(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = f.store.SetAutoApprove(context.Background(), true, "test") })
+	waitsFor(t, holdLock(t, f.store, policyLockPrefix+policySettingsLockID), func() error {
+		return f.store.SetAutoApprove(ctx, false, "app:test")
+	})
+	waitsFor(t, holdLock(t, f.store, policyLockPrefix+f.policyID), func() error {
+		_, err := f.store.SetPolicyMode(ctx, f.policyID, PolicyModeOff, "app:test")
+		return err
+	})
+	waitsFor(t, holdLock(t, f.store, policyLockPrefix+f.policyID), func() error {
+		tx, err := f.store.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		for range PolicyAutoOffAfterFailures {
+			if _, err := execContext(ctx, tx, `INSERT INTO @upstream_mutation_requests (id, status, approved_by, updated_at) VALUES ($1, 'failed_terminal', $2, now())`, randomSuffix(t), PolicyActorPrefix+f.policyID+"@1"); err != nil {
+				return err
+			}
+		}
+		// Back to enforce first, so the auto-off has a change to make.
+		if _, err := setPolicyMode(ctx, tx, f.policyID, PolicyModeEnforce, "test", "", time.Now()); err != nil {
+			return err
+		}
+		_, err = disablePolicyAfterFailures(ctx, tx, f.policyID)
+		return err
+	})
+}
+
+// The Python claim takes the same keys; a typo on either side would make the
+// locks unrelated.
+func TestTheClaimUsesTheSameLockKeys(t *testing.T) {
+	source, err := os.ReadFile("../../../src/personal_data_warehouse/upstream_mutation_policy.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`POLICY_LOCK_PREFIX = "` + policyLockPrefix + `"`, `SETTINGS_LOCK_ID = "` + policySettingsLockID + `"`} {
+		if !strings.Contains(string(source), want) {
+			t.Fatalf("upstream_mutation_policy.py does not declare %s", want)
+		}
+	}
+}
+
+// ClaimPolicyOutcomes takes the locks of every policy it may turn off up
+// front, in sorted order like every other writer, never one at a time in the
+// order the requests happen to sort: while it waits for policy B it already
+// holds A, though B's failures are the older ones.
+func TestPolicyOutcomesTakePolicyLocksInSortedOrder(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	a, b := "aaa-"+strings.ReplaceAll(randomSuffix(t), "_", ""), "zzz-"+strings.ReplaceAll(randomSuffix(t), "_", "")
+	for i, id := range []string{b, a} {
+		if _, err := execContext(ctx, f.store.db, `
+			INSERT INTO @mutation_policies (id, version, operation, account, mode) VALUES ($1, 1, $2, 'home', 'enforce')`, id, ResideoSetThermostatOperation); err != nil {
+			t.Fatal(err)
+		}
+		for range PolicyAutoOffAfterFailures {
+			if _, err := execContext(ctx, f.store.db, `
+				INSERT INTO @upstream_mutation_requests (id, status, approved_by, updated_at)
+				VALUES ($1, 'failed_terminal', $2, now() - make_interval(mins => $3))`, randomSuffix(t), PolicyActorPrefix+id+"@1", 30-i*10); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	release := holdLock(t, f.store, policyLockPrefix+b)
+	done := make(chan error, 1)
+	go func() { _, err := f.store.ClaimPolicyOutcomes(ctx, 500); done <- err }()
+	time.Sleep(300 * time.Millisecond)
+	var free bool
+	if err := f.store.db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1, 0))`, policyLockPrefix+a).Scan(&free); err != nil {
+		t.Fatal(err)
+	}
+	if free {
+		_, _ = f.store.db.ExecContext(ctx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, policyLockPrefix+a)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if free {
+		t.Fatal("while waiting for policy B the outcome loop did not hold policy A: locks were not taken in sorted order")
+	}
+}
+
+// Reported outcomes and requests still waiting to run must not fill the page:
+// a newer failure is found however many of those sort before it, so its push
+// and the three-failure shutoff are never starved.
+func TestPolicyOutcomesFilterBeforeTheLimit(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	actor := PolicyActorPrefix + f.policyID + "@1"
+	for i := range 12 {
+		id := "old-" + randomSuffix(t)
+		status := "succeeded"
+		if i%3 == 0 {
+			status = "approved" // a scheduled step still waiting
+		}
+		if _, err := execContext(ctx, f.store.db, `
+			INSERT INTO @upstream_mutation_requests (id, status, approved_by, updated_at) VALUES ($1, $2, $3, now() - interval '1 day')`, id, status, actor); err != nil {
+			t.Fatal(err)
+		}
+		if status == "succeeded" {
+			if _, err := execContext(ctx, f.store.db, `
+				INSERT INTO @upstream_mutation_request_events (request_id, event_index, event_type, actor_type, actor_id)
+				VALUES ($1, 0, 'policy_outcome_reported', 'policy', $2)`, id, actor); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	newer := "new-" + randomSuffix(t)
+	if _, err := execContext(ctx, f.store.db, `
+		INSERT INTO @upstream_mutation_requests (id, title, status, approved_by, updated_at) VALUES ($1, 'Heat to away', 'failed_terminal', $2, now())`, newer, actor); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for page := range 3 {
+		outcomes, err := f.store.ClaimPolicyOutcomes(ctx, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range outcomes {
+			if o.Request.ID == newer {
+				found = true
+			}
+			if strings.HasPrefix(o.Request.ID, "old-") {
+				t.Fatalf("page %d reported a row with nothing to report: %+v", page, o)
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Fatal("a newer failure was starved by reported and waiting rows")
+	}
+}
+
+// An outcome is queued in the timeline notification outbox in the same
+// transaction that marks it reported, never pushed in passing: the outbox
+// worker delivers it with its own retries and leases.
+func TestAPolicyOutcomeIsQueuedInTheNotificationOutbox(t *testing.T) {
+	f := newPolicyFixture(t, PolicyModeEnforce)
+	ctx := context.Background()
+	id := "ran-" + randomSuffix(t)
+	if _, err := execContext(ctx, f.store.db, `
+		INSERT INTO @upstream_mutation_requests (id, title, reason, status, approved_by, updated_at)
+		VALUES ($1, 'Set the thermostat: heat to 55°', 'You left home.', 'succeeded', $2, now())`, id, PolicyActorPrefix+f.policyID+"@1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ClaimPolicyOutcomes(ctx, 500); err != nil {
+		t.Fatal(err)
+	}
+	var adapter, status string
+	var payload []byte
+	if err := queryRowContext(ctx, f.store.db, `SELECT adapter, status, payload FROM @notification_events WHERE payload->>'request_id' = $1`, id).Scan(&adapter, &status, &payload); err != nil {
+		t.Fatalf("no outbox row: %v", err)
+	}
+	row := decodeJSONMap(payload)
+	if row["actor"] != "PDW" {
+		t.Fatalf("an outbox row needs an actor: %#v", row)
+	}
+	if adapter != PolicyOutcomeAdapter || status != "pending" || row["category"] != "mutation_applied" || row["kind"] != "mutation_applied" || row["route"] != "/mutations/"+id || row["quiet"] != true {
+		t.Fatalf("outbox row %s %s %#v", adapter, status, row)
+	}
+	if !strings.Contains(stringFromAny(row["snippet"]), "Undo") {
+		t.Fatalf("body %q", row["snippet"])
+	}
+	// Reported once: a second pass queues nothing more.
+	if _, err := f.store.ClaimPolicyOutcomes(ctx, 500); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := queryRowContext(ctx, f.store.db, `SELECT count(*) FROM @notification_events WHERE payload->>'request_id' = $1`, id).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("outbox rows %d %v", n, err)
 	}
 }

@@ -26,6 +26,8 @@ func (s *Service) APIHandler(requireAuth func(http.Handler) http.Handler) http.H
 	mux := http.NewServeMux()
 	mux.Handle(APIPath+"/requests", requireAuth(http.HandlerFunc(s.apiListRequests)))
 	mux.Handle(APIPath+"/requests/", requireAuth(http.HandlerFunc(s.apiRequestRoute)))
+	mux.Handle(PolicyAPIPath, requireAuth(http.HandlerFunc(s.apiPolicies)))
+	mux.Handle(PolicyAPIPath+"/", requireAuth(http.HandlerFunc(s.apiPolicies)))
 	return mux
 }
 
@@ -140,6 +142,20 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.apiWriteRequestPage(w, r, requestID, page)
+	case len(parts) == 2 && parts[1] == "undo" && r.Method == http.MethodPost:
+		// Undo proposes and approves the inverse of a thermostat change that
+		// ran; the answer is the new request, not the undone one.
+		undone, err := s.UndoRequest(r.Context(), requestID, actor)
+		if err != nil {
+			var inputErr *proposalInputError
+			if errors.As(err, &inputErr) {
+				apiError(w, http.StatusConflict, err.Error())
+				return
+			}
+			apiStoreError(w, err)
+			return
+		}
+		s.apiWriteRequestPage(w, r, undone.ID, page)
 	case len(parts) == 2 && parts[1] == "reject" && r.Method == http.MethodPost:
 		var body struct {
 			Reason string `json:"reason"`
@@ -377,6 +393,7 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 			mutations = append(mutations, mutationJSON(mutation))
 		}
 		item["mutations"] = mutations
+		item["can_undo"] = canUndo(request)
 	}
 	return item
 }

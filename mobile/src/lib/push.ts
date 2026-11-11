@@ -7,7 +7,7 @@ import { openDeepLink } from './deep-link';
 import { OpenQueue, notificationOpenLink, prepareNotificationOpen } from './notification-open-queue';
 import { rememberMutationRequest, seedMutationRequestFromNotification } from './mutation-cache';
 
-import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest } from './api';
+import { approveMutationRequest, fetchPushCategories, registerPushDevice, rejectMutationRequest, undoMutationRequest } from './api';
 import type { AppConfig } from './config';
 import { pushCapabilities } from './push-capabilities';
 
@@ -198,6 +198,15 @@ export async function handleNotificationResponse(
       return { route: null, message: 'Denied from the notification.' };
     } catch (error) {
       // The decision did not land; open the review screen so it can be made there.
+      return { route: route ?? `/mutations/${requestId}`, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  if (requestId && action === 'undo') {
+    // The quiet alert after a policy-approved change ran.
+    try {
+      rememberMutationRequest(await undoMutationRequest(config, requestId));
+      return { route: null, message: 'Undone from the notification.' };
+    } catch (error) {
       return { route: route ?? `/mutations/${requestId}`, message: error instanceof Error ? error.message : String(error) };
     }
   }

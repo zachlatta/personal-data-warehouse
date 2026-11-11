@@ -147,6 +147,14 @@ func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+warehouse.QuoteIdent(warehouse.SchemaOf("notification_events"))); err != nil {
+		return err
+	}
+	for _, statement := range notificationOutboxStatements {
+		if _, err := execContext(ctx, s.db, statement); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -263,17 +271,19 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if err != nil {
 		return Request{}, fmt.Errorf("evaluate mutation policy: %w", err)
 	}
-	if evaluation.Decision == PolicyDecisionApproved {
-		// Phase 1 is dry run only: an enforced policy is recorded as what it
-		// would do until enforcement ships.
-		evaluation.Decision = PolicyDecisionWouldApprove
-		evaluation.Reasons = append(evaluation.Reasons, "enforcement is not built yet; recorded as a dry run")
-	}
 	if evaluation.Decision == PolicyDecisionRefused {
 		return Request{}, invalidProposalInput(fmt.Errorf("refused: %s", strings.Join(evaluation.Reasons, "; ")))
 	}
 	if evaluation.Relevant() {
 		if err := recordPolicyEvaluation(ctx, tx, requestID, "propose", evaluation); err != nil {
+			return Request{}, err
+		}
+	}
+	if evaluation.Decision == PolicyDecisionApproved {
+		// An enforced policy approves in the proposal's own transaction: the
+		// request never sits in review, and a worker is woken only once the
+		// approval is committed.
+		if err := approveByPolicy(ctx, tx, requestID, evaluation, now); err != nil {
 			return Request{}, err
 		}
 	}

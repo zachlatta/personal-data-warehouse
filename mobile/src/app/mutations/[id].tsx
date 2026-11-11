@@ -19,7 +19,7 @@ import { SlackSendMessageCard } from '@/components/slack-send-review';
 import { TextMessageCard } from '@/components/text-message-review';
 import { UndoBar, useDecidedRequestIds } from '@/components/undo-bar';
 import { StatusPill } from '@/components/status-pill';
-import { approveMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, updateTextMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput, type UpdateTextMessageMutationInput } from '@/lib/api';
+import { approveMutationRequest, undoMutationRequest, getMutationRequest, listMutationRequests, rejectMutationRequest, removeMutation, restoreMutation, updateEmailMutation, updateSlackMessageMutation, updateTextMessageMutation, type Mutation, type MutationRequest, type UpdateEmailMutationInput, type UpdateSlackMessageMutationInput, type UpdateTextMessageMutationInput } from '@/lib/api';
 import { formatWhen, pretty } from '@/lib/format';
 import {
   MUTATION_PAGE_SIZE,
@@ -465,6 +465,21 @@ function MutationReview({ id }: { id: string | undefined }) {
     }
     await decide(current, requestDecision(current).doneLabel, () => approveMutationRequest(config, current.id));
   };
+  // Undo a thermostat change that ran (a policy's automatic change, usually):
+  // the server proposes and approves the inverse, and the screen moves to it.
+  const undo = async () => {
+    if (!request) return;
+    setBusy(true);
+    try {
+      const undone = rememberMutationRequest(await undoMutationRequest(config, request.id));
+      setError(null);
+      router.replace({ pathname: '/mutations/[id]', params: { id: undone.id } });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
   const deny = async () => {
     if (!request) return;
     const current = request;
@@ -753,6 +768,15 @@ function MutationReview({ id }: { id: string | undefined }) {
               </Pressable>
               <Pressable accessibilityRole="button" onPress={approve} disabled={busy || decision.running === 0} style={[styles.button, styles.approve, (busy || decision.running === 0) && styles.disabled]}>
                 {busy ? <ActivityIndicator color="#fff" /> : <ThemedText style={styles.buttonText}>{pendingApproveLabel(decision, pendingSummary)}</ThemedText>}
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+        {!pending && request?.can_undo ? (
+          <View style={[styles.actions, { backgroundColor: theme.background, paddingBottom: Spacing.two + insets.bottom }]}>
+            <View style={styles.actionButtons}>
+              <Pressable accessibilityRole="button" onPress={undo} disabled={busy} style={[styles.button, { backgroundColor: theme.surface, borderColor: theme.surfaceBorder, borderWidth: StyleSheet.hairlineWidth }, busy && styles.disabled]}>
+                {busy ? <ActivityIndicator /> : <ThemedText style={[styles.buttonText, styles.denyText]}>Undo</ThemedText>}
               </Pressable>
             </View>
           </View>

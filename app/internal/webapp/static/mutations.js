@@ -1336,7 +1336,11 @@ async function renderList(root, ctx, alive) {
     clear(root);
     root.appendChild(renderRequestTable("Pending review", pending, "No requests are waiting for review."));
     root.appendChild(renderRequestTable("Past requests", past, "No approved or denied requests yet."));
+    root.appendChild(policyPanel);
   }
+  // Automatic approvals: the kill switch and each policy's mode.
+  const policyPanel = h("section", "rsect policy-panel");
+  renderPolicyPanel(policyPanel);
   // The last answer paints at once; the fetch below replaces it.
   const cached = cache.peekList();
   if (cached) paint(cached, true); else clear(root).appendChild(h("p", "m", "loading…"));
@@ -1349,6 +1353,56 @@ async function renderList(root, ctx, alive) {
   }
   if (!alive()) return;
   paint(cache.rememberList(requests), false);
+}
+
+async function renderPolicyPanel(sect) {
+  clear(sect);
+  sect.appendChild(h("h2", "", "Automatic approvals"));
+  let overview;
+  try { overview = await mutations.policies(); } catch (err) {
+    sect.appendChild(h("p", "m", errorText(err) || "could not load policies"));
+    return;
+  }
+  const errorNode = h("p", "bad");
+  const act = (fn) => async () => {
+    errorNode.textContent = "";
+    try { if ((await fn()) === false) return; await renderPolicyPanel(sect); } catch (err) { errorNode.textContent = errorText(err); }
+  };
+  const top = h("p", "policy-switch");
+  if (overview.auto_approve_forced_off) {
+    top.appendChild(h("strong", "", "Off (PDW_MUTATION_AUTO_APPROVE=0 on the deployment)"));
+  } else if (overview.auto_approve) {
+    top.appendChild(h("strong", "", "On. "));
+    top.appendChild(button("Switch every automatic approval off", "danger", act(() => mutations.setAutoApprove(false))));
+  } else {
+    top.appendChild(h("strong", "", "Off: everything comes to you. "));
+    top.appendChild(button("Switch on", "", act(() => {
+      if (!confirmDialog("Switch automatic approvals back on?")) return false;
+      return mutations.setAutoApprove(true);
+    })));
+  }
+  sect.appendChild(top);
+  const policies = overview.policies || [];
+  if (!policies.length) sect.appendChild(h("p", "m", "No policies yet. An agent proposes one as a pdw.mutation_policy request."));
+  for (const policy of policies) {
+    const row = h("div", "policy-row");
+    row.appendChild(h("strong", "", policy.id + " v" + policy.version));
+    row.appendChild(h("span", "m", " " + policy.operation + " · " + String(policy.mode).replace("_", " ")));
+    if (policy.unreadable) row.appendChild(h("span", "bad", " unreadable: " + policy.unreadable));
+    for (const mode of ["off", "dry_run", "enforce"]) {
+      if (mode === policy.mode) continue;
+      row.appendChild(button(mode.replace("_", " "), mode === "off" ? "danger" : "", act(() => {
+        if (mode === "enforce" && !confirmDialog("Enforce " + policy.id + "? Changes inside it will run without asking you.")) return false;
+        return mutations.setPolicyMode(policy.id, mode);
+      })));
+    }
+    const grants = (overview.grants || []).filter((grant) => grant.policy_id === policy.id);
+    for (const grant of grants) {
+      row.appendChild(h("div", "m", "grant " + (grant.label || grant.id) + " → token " + grant.token_id + (grant.active ? " (active" + (grant.expires_at ? ", until " + formatWhen(grant.expires_at) : "") + ")" : " (inactive)")));
+    }
+    sect.appendChild(row);
+  }
+  sect.appendChild(errorNode);
 }
 
 function renderRequestHeader(request) {
@@ -1436,6 +1490,22 @@ function renderDecisionDock(request, actions) {
     controls.appendChild(button("Deny", "danger", async () => {
       errorNode.textContent = "";
       try { await mutations.reject(request.id, reason.value.trim()); mutationsChanged(); actions.reload(); } catch (err) { errorNode.textContent = errorText(err); }
+    }));
+    dock.appendChild(controls);
+  } else if (request.can_undo === true) {
+    const copy = h("div", "decision-copy");
+    copy.appendChild(h("strong", "", "Ran"));
+    copy.appendChild(h("span", "", "Undo puts the thermostat back to what it was before"));
+    dock.appendChild(copy);
+    const controls = h("div", "decision-controls");
+    controls.appendChild(button("Undo", "danger", async () => {
+      if (!confirmDialog("Undo? The thermostat goes back to its previous setpoint.")) return;
+      errorNode.textContent = "";
+      try {
+        const undone = await mutations.undo(request.id);
+        mutationsChanged();
+        window.location.assign(requestPath(undone.id));
+      } catch (err) { errorNode.textContent = errorText(err); }
     }));
     dock.appendChild(controls);
   } else if (!V.trimStr(request.superseded_by) && request.can_supersede === true) {

@@ -39,12 +39,22 @@ const (
 	// comes back to the app as userText with data intact, for a future
 	// reply-from-the-notification flow.
 	CategoryReply = "reply"
+	// CategoryMutationApplied is the quiet alert after a policy approved a
+	// change and it ran: Undo puts it back without opening the app.
+	CategoryMutationApplied = "mutation_applied"
 
 	ActionApprove = "approve"
 	ActionDeny    = "deny"
 	ActionOpen    = "open"
 	ActionReply   = "reply"
+	ActionUndo    = "undo"
 )
+
+// MutationCollapseID is the collapse id of every alert about one mutation
+// request, wherever it is sent from (the review and withdrawal alerts in
+// server, a policy outcome in the notification outbox): one alert per
+// request, so a later one replaces an Approve button that no longer applies.
+func MutationCollapseID(requestID string) string { return "mutation-request:" + requestID }
 
 // Categories lists every category the app registers, in a stable order.
 func Categories() []Category {
@@ -53,6 +63,10 @@ func Categories() []Category {
 			{ID: ActionApprove, Title: "Approve"},
 			{ID: ActionDeny, Title: "Deny", Destructive: true},
 			{ID: ActionOpen, Title: "Review", OpensApp: true},
+		}},
+		{ID: CategoryMutationApplied, Actions: []Action{
+			{ID: ActionUndo, Title: "Undo", Destructive: true},
+			{ID: ActionOpen, Title: "Open", OpensApp: true},
 		}},
 		{ID: CategoryLink, Actions: []Action{
 			{ID: ActionOpen, Title: "Open", OpensApp: true},

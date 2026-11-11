@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -70,6 +69,24 @@ var mutationPolicySchemaStatements = []string{
 		updated_by text NOT NULL DEFAULT '',
 		updated_at timestamptz NOT NULL DEFAULT now()
 	)`,
+}
+
+// notificationOutboxStatements create the timeline notification outbox
+// table the policy outcome loop writes to, so a fresh database where the Go
+// app starts before the Python ensure path has one. The Python ensure path
+// (notifications.py STATEMENTS) owns it and declares the same table; held
+// equal by tests/test_mutation_policies.py.
+var notificationOutboxStatements = []string{
+	`CREATE TABLE IF NOT EXISTS @notification_events (
+        id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        adapter text NOT NULL, event_id text NOT NULL, source text NOT NULL,
+        priority text NOT NULL CHECK (priority IN ('self','direct','cc')),
+        event_ts timestamptz NOT NULL, landed_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        payload jsonb NOT NULL, status text NOT NULL DEFAULT 'pending',
+        UNIQUE (adapter, event_id)
+    )`,
+	"CREATE INDEX IF NOT EXISTS notification_events_pending_idx ON @notification_events (created_at, id) WHERE status = 'pending'",
 }
 
 // ErrPolicyInputUnavailable means a limit's input could not be read; the
@@ -162,7 +179,7 @@ func grantsForPolicies(ctx context.Context, tx *sql.Tx, policyIDs []string) ([]P
 // autoApproveEnabled reads the global kill switch: the environment variable
 // wins, then the settings row (locked FOR SHARE); no row means on.
 func autoApproveEnabled(ctx context.Context, tx *sql.Tx) (bool, error) {
-	if value := strings.TrimSpace(os.Getenv(AutoApproveEnv)); value == "0" || strings.EqualFold(value, "false") || strings.EqualFold(value, "off") {
+	if autoApproveForcedOffByEnv() {
 		return false, nil
 	}
 	var raw []byte
@@ -173,27 +190,42 @@ func autoApproveEnabled(ctx context.Context, tx *sql.Tx) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var setting struct {
-		Enabled *bool `json:"enabled"`
-	}
-	if err := json.Unmarshal(raw, &setting); err != nil || setting.Enabled == nil {
-		// An unreadable switch is off: it can only send things to review.
-		return false, nil
-	}
-	return *setting.Enabled, nil
+	// An unreadable switch is off: it can only send things to review.
+	return settingEnabled(raw), nil
 }
 
 // lockPolicies takes each policy's transaction-scoped advisory lock in a
 // fixed order, so the limits two concurrent proposals count are serialized.
+//
+// It is THE per-policy lock: every writer of a policy (a new version, a mode
+// change, the auto-off), of its grants, and the worker's claim-time re-check
+// (upstream_mutation_policy.py, POLICY_LOCK_PREFIX) take it, so a write and a
+// claim never interleave. Callers that also need the kill switch take
+// lockPolicySettings first: settings, then policy ids sorted, everywhere.
 func lockPolicies(ctx context.Context, tx *sql.Tx, policyIDs []string) error {
 	ids := append([]string(nil), policyIDs...)
 	sort.Strings(ids)
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('pdw_mutation_policy:' || $1, 0))`, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, policyLockPrefix+id); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// policyLockPrefix and policySettingsLockID name the advisory locks; the
+// Python claim uses the same strings. The settings id cannot be a policy id.
+const (
+	policyLockPrefix     = "pdw_mutation_policy:"
+	policySettingsLockID = "*settings"
+)
+
+// lockPolicySettings takes the kill switch's advisory lock. Inserting the
+// settings row for the first time has no row to lock FOR SHARE, so the
+// switch and the claim serialize on this lock instead.
+func lockPolicySettings(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, policyLockPrefix+policySettingsLockID)
+	return err
 }
 
 // txPolicyLedger answers limits inside the proposal's transaction.
@@ -237,7 +269,7 @@ func (l txPolicyLedger) ManualChangeSince(policy Policy, target string, since ti
 		return time.Time{}, false, ErrPolicyInputUnavailable
 	}
 	var at time.Time
-	err := queryRowContext(l.ctx, l.tx, thermostatManualChangeSQL, ResideoAccount, target, since, PolicyActorPrefix+policy.ID+"@%").Scan(&at)
+	err := queryRowContext(l.ctx, l.tx, thermostatManualChangeSQL, ResideoAccount, target, since, PolicyActorPrefix+policy.ID+"@").Scan(&at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return time.Time{}, false, nil
 	}
@@ -248,7 +280,7 @@ func (l txPolicyLedger) ManualChangeSince(policy Policy, target string, since ti
 }
 
 // thermostatManualChangeSQL: $1 account, $2 device, $3 since, $4 the policy's
-// approved_by pattern. A change is explained when a succeeded mutation this
+// approved_by prefix (policy:<id>@, matched exactly, never with LIKE). A change is explained when a succeeded mutation this
 // policy approved set that value and ran within 30 minutes before the
 // reading (or 5 after: the executor records its own read-back first).
 const thermostatManualChangeSQL = `
@@ -269,7 +301,7 @@ const thermostatManualChangeSQL = `
 		SELECT 1 FROM @upstream_mutations AS mutation
 		WHERE mutation.operation = 'resideo.set_thermostat'
 		  AND mutation.status = 'succeeded'
-		  AND mutation.approved_by LIKE $4
+		  AND starts_with(mutation.approved_by, $4)
 		  AND mutation.payload_json->>'device_id' = $2
 		  AND (NOT (mutation.payload_json ? 'heat_setpoint')
 		       OR (mutation.payload_json->>'heat_setpoint')::float8 = readings.heat_setpoint)
@@ -313,6 +345,9 @@ func evaluateRequestPolicy(ctx context.Context, tx *sql.Tx, tokenID string, norm
 		candidateIDs = append(candidateIDs, id)
 	}
 	rows.Close()
+	if err := lockPolicySettings(ctx, tx); err != nil {
+		return PolicyEvaluation{}, err
+	}
 	if err := lockPolicies(ctx, tx, candidateIDs); err != nil {
 		return PolicyEvaluation{}, err
 	}
@@ -375,4 +410,40 @@ func nonNilStrings(values []string) []string {
 		return []string{}
 	}
 	return values
+}
+
+// approveByPolicy approves a just-proposed request for policy. It writes what
+// a human approval writes (status, approved_by, approved events, the worker
+// wake-up), with approved_by = policy:<id>@<version> and actor type policy.
+func approveByPolicy(ctx context.Context, tx *sql.Tx, requestID string, eval PolicyEvaluation, now time.Time) error {
+	actor := fmt.Sprintf("%s%s@%d", PolicyActorPrefix, eval.PolicyID, eval.PolicyVersion)
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutation_requests
+		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
+		 WHERE id = $3 AND status = 'pending_review'
+	`, actor, now, requestID); err != nil {
+		return err
+	}
+	pendingIDs, err := pendingMutationIDsForUpdate(ctx, tx, requestID)
+	if err != nil {
+		return err
+	}
+	if _, err := execContext(ctx, tx, `
+		UPDATE @upstream_mutations
+		   SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
+		 WHERE request_id = $3 AND status = 'pending_review'
+	`, actor, now, requestID); err != nil {
+		return err
+	}
+	audit := map[string]any{"request_id": requestID, "policy": eval.JSON()}
+	for _, mutationID := range pendingIDs {
+		if err := appendMutationEvent(ctx, tx, mutationID, "approved", "policy", actor, audit); err != nil {
+			return err
+		}
+	}
+	if err := appendRequestEvent(ctx, tx, requestID, "approved", "policy", actor, map[string]any{"approved_mutation_ids": pendingIDs, "policy": eval.JSON()}); err != nil {
+		return err
+	}
+	_, err = execContext(ctx, tx, upstreamMutationApprovalNotificationStatement, UpstreamMutationNotificationChannel, requestID)
+	return err
 }

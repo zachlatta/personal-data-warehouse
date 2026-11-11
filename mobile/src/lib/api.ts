@@ -177,6 +177,8 @@ export type MutationRequest = {
   // The mutation policy's decision (decision, label, reasons, policy_id,
   // mode); null when no policy could touch the request.
   policy?: Record<string, unknown> | null;
+  // The detail read says whether Undo applies: a thermostat change that ran.
+  can_undo?: boolean;
   // true on the copy a push alert carries when the request was too big for
   // the 4 KB notification: the header is real, the mutations still need a read.
   partial?: boolean;
@@ -200,6 +202,43 @@ export async function getMutationRequest(config: AppConfig, id: string, page?: {
 
 export async function approveMutationRequest(config: AppConfig, id: string): Promise<MutationRequest> {
   const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+  });
+  return body.request;
+}
+
+// Mutation policies (automatic approvals): the kill switch and each policy's
+// mode. Reading is open; both writes need this reviewer token.
+export type MutationPolicyOverview = {
+  auto_approve: boolean;
+  auto_approve_forced_off: boolean;
+  policies: { id: string; version: number; operation: string; mode: 'off' | 'dry_run' | 'enforce'; unreadable: string }[];
+  grants: { id: string; policy_id: string; token_id: string; label: string; active: boolean; expires_at: string | null }[];
+};
+
+export async function getMutationPolicies(config: AppConfig): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, '/api/mutations/policies');
+}
+
+export async function setMutationPolicyMode(config: AppConfig, id: string, mode: string): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, `/api/mutations/policies/${encodeURIComponent(id)}/mode`, {
+    method: 'POST',
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function setAutoApprove(config: AppConfig, enabled: boolean): Promise<MutationPolicyOverview> {
+  return request<MutationPolicyOverview>(config, '/api/mutations/policies/settings', {
+    method: 'POST',
+    body: JSON.stringify({ auto_approve: enabled }),
+  });
+}
+
+// Undo puts back what a thermostat request changed: the server proposes the
+// inverse from the device state the worker recorded and approves it as this
+// reviewer. The answer is the new request.
+export async function undoMutationRequest(config: AppConfig, id: string): Promise<MutationRequest> {
+  const body = await request<{ request: MutationRequest }>(config, `/api/mutations/requests/${encodeURIComponent(id)}/undo`, {
     method: 'POST',
   });
   return body.request;

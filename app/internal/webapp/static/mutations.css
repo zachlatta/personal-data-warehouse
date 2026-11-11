@@ -501,3 +501,8 @@ summary.slack-group-summary::-webkit-details-marker, summary.slack-review-summar
   .mv .mutation-pager .pager-where { order: -1; flex-basis: 100%; }
   .mv .mutation-pager .pager-link { min-height: 44px; flex: 1; justify-content: center; }
 }
+
+/* automatic approvals: the kill switch and each policy's mode */
+.policy-panel .policy-switch { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.policy-panel .policy-row { padding: 8px 0; border-top: 1px solid var(--border); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.policy-panel .policy-row > div { flex-basis: 100%; }

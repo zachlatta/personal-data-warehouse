@@ -14,7 +14,7 @@ import (
 // stop this attempt; they must never turn into an unchecked send.
 func (s *Service) suppressionReason(ctx context.Context, d Delivery) (string, error) {
 	var source, raw string
-	if err := s.DB.QueryRowContext(ctx, s.q(`SELECT payload->>'source',COALESCE(payload->>'source_pk','{}') FROM @notification_events WHERE id=$1`), d.NotificationID).Scan(&source, &raw); err != nil {
+	if err := s.DB.QueryRowContext(ctx, s.q(`SELECT COALESCE(payload->>'source',''),COALESCE(payload->>'source_pk','{}') FROM @notification_events WHERE id=$1`), d.NotificationID).Scan(&source, &raw); err != nil {
 		return "", err
 	}
 	reason, err := s.sourceSuppression(ctx, source, raw)

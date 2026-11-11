@@ -219,6 +219,11 @@ from personal_data_warehouse.schema import (
     SyncState,
 )
 from personal_data_warehouse.chatgpt_backend import token_expiry_warning
+from personal_data_warehouse.upstream_mutation_policy import (
+    lock_policy_state,
+    parse_policy_actor,
+    policy_recheck_failure,
+)
 from personal_data_warehouse.config import normalize_postgres_url
 from personal_data_warehouse.pipeline_health import (
     ACCOUNT_BASELINE_GAPS,
@@ -9875,10 +9880,17 @@ class PostgresWarehouse:
             exclude_providers=exclude_providers,
         )
         now = datetime.now(tz=UTC)
-        rows = self._query_dicts(
-            f"""
-            WITH candidates AS (
-                SELECT id
+        # One transaction: pick the rows, re-check every policy-approved one
+        # with the policy, grant and kill-switch rows locked FOR SHARE, and
+        # claim the rest. A switch-off or revoke committed before this point
+        # sends the request back to review; one committed after it waits on
+        # these locks and does not stop the write already claimed.
+        sent_back: dict[str, str] = {}
+        self._command("BEGIN")
+        try:
+            candidates = self._query_dicts(
+                f"""
+                SELECT id, request_id, approved_by, operation, payload_json
                 FROM @upstream_mutations
                 WHERE status = ANY(%s)
                   {provider_filter}
@@ -9888,26 +9900,55 @@ class PostgresWarehouse:
                 ORDER BY approved_at ASC, created_at ASC, request_id ASC, request_index ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
+                """,
+                (list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES), *provider_params, int(limit)),
             )
-            UPDATE @upstream_mutations AS mutation
-               SET status = 'executing',
-                   claimed_by = %s,
-                   claimed_at = %s,
-                   updated_at = %s,
-                   attempt_count = attempt_count + 1
-              FROM candidates
-             WHERE mutation.id = candidates.id
-            RETURNING mutation.*
-            """,
-            (
-                list(UPSTREAM_MUTATION_CLAIMABLE_STATUSES),
-                *provider_params,
-                int(limit),
-                claimed_by,
-                now,
-                now,
-            ),
-        )
+            # The same locks every policy writer takes (kill switch, then each
+            # policy id, sorted), held to commit: a switch-off, a revoke or a
+            # new version either commits before this claim reads it, or waits
+            # for the claim to finish.
+            policy_ids = [
+                parsed[0] for candidate in candidates if (parsed := parse_policy_actor(str(candidate.get("approved_by") or "")))
+            ]
+            if policy_ids:
+                lock_policy_state(self._query_dicts, policy_ids)
+            rows: list[dict[str, Any]] = []
+            for candidate in candidates:
+                request_id = str(candidate.get("request_id") or "")
+                if request_id in sent_back:
+                    continue
+                reason = policy_recheck_failure(
+                    self._query_dicts, candidate, now=now, relation_exists=self._relation_exists
+                )
+                if reason:
+                    sent_back[request_id] = reason
+                    continue
+                # Claimed one by one, so the next candidate's limits count this
+                # one: two queued changes under a one-per-hour policy never
+                # both run in one pass.
+                rows.extend(
+                    self._query_dicts(
+                        """
+                        UPDATE @upstream_mutations AS mutation
+                           SET status = 'executing',
+                               claimed_by = %s,
+                               claimed_at = %s,
+                               updated_at = %s,
+                               attempt_count = attempt_count + 1
+                         WHERE mutation.id = %s
+                        RETURNING mutation.*
+                        """,
+                        (claimed_by, now, now, str(candidate["id"])),
+                    )
+                )
+            if sent_back:
+                self._send_policy_requests_back_to_review(sent_back, now=now)
+            self._command("COMMIT")
+        except BaseException:
+            self._command("ROLLBACK")
+            raise
+        for request_id in sorted(sent_back):
+            self._refresh_upstream_mutation_request_status(request_id)
         # UPDATE ... RETURNING comes back in heap order, not the CTE's.
         rows.sort(
             key=lambda row: (
@@ -10928,6 +10969,51 @@ class PostgresWarehouse:
             else:
                 return False
         return True
+
+    def _send_policy_requests_back_to_review(self, reasons: dict[str, str], *, now: datetime) -> None:
+        """Return policy-approved requests to Zach's review (inside the claim
+        transaction): every still-approved mutation goes back to
+        pending_review, approved_by is cleared, and the reason is the request's
+        error and a policy_recheck_failed event, which the app reports."""
+        for request_id, reason in reasons.items():
+            moved = self._query_dicts(
+                """
+                UPDATE @upstream_mutations
+                   SET status = 'pending_review', approved_by = '', approved_at = '1970-01-01 00:00:00+00'::timestamptz,
+                       updated_at = %s
+                 WHERE request_id = %s AND status IN ('approved', 'failed_retryable')
+                RETURNING id, approved_by
+                """,
+                (now, request_id),
+            )
+            self._command(
+                """
+                UPDATE @upstream_mutation_requests
+                   SET status = 'pending_review', approved_by = '', approved_at = '1970-01-01 00:00:00+00'::timestamptz,
+                       error = %s, updated_at = %s
+                 WHERE id = %s
+                """,
+                (reason, now, request_id),
+            )
+            for row in moved:
+                self._append_upstream_mutation_event(
+                    str(row["id"]),
+                    event_type="policy_recheck_failed",
+                    actor_type="policy",
+                    actor_id="pdw-policy-engine",
+                    event_json={"reason": reason},
+                )
+            self._command(
+                """
+                INSERT INTO @upstream_mutation_request_events (
+                    request_id, event_index, event_type, actor_type, actor_id, event_json, created_at
+                )
+                SELECT %s, COALESCE(max(event_index) + 1, 0), 'policy_recheck_failed', 'policy', 'pdw-policy-engine', %s, %s
+                FROM @upstream_mutation_request_events
+                WHERE request_id = %s
+                """,
+                (request_id, _jsonb_param({"reason": reason, "mutation_ids": [str(row["id"]) for row in moved]}), now, request_id),
+            )
 
     def _append_upstream_mutation_event(
         self,
