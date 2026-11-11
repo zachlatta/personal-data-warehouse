@@ -88,8 +88,22 @@ func TestRunShipsTranscriptsAndWorkspaceThroughTheApp(t *testing.T) {
 	for _, record := range files {
 		shipped = append(shipped, record["record"].(map[string]any)["path"].(string))
 	}
-	if strings.Join(shipped, ",") != "MEMORY.md,workspace/podcasts/ep.mp3" {
+	if strings.Join(shipped, ",") != "MEMORY.md,workspace/podcasts/ep.mp3,.pdw/session-manifest/9.json" {
 		t.Fatalf("workspace paths = %v", shipped)
+	}
+	// The manifest says what the warehouse should now hold for the session.
+	manifest := files[2]["record"].(map[string]any)
+	text := manifest["content_text"].(string)
+	want := `{"format":"pdw.muse.session_manifest.v1","shard":"9","sessions":[{"session_id":"9f2189a3-3d40-4253-b3c3-f6342cd83882","agent_id":"9f2189a3-3d40-4253-b3c3-f6342cd83882","event_count":2,"last_timestamp":"2026-09-27T21:00:00Z",`
+	if !strings.HasPrefix(text, want) || manifest["is_text"] != true || manifest["mime_type"] != "application/json" {
+		t.Fatalf("manifest record = %v", manifest)
+	}
+	if strings.Contains(text, "hi Muse") {
+		t.Fatalf("manifest carries transcript text: %s", text)
+	}
+	// Nothing was written on the VM for it.
+	if _, err := os.Stat(filepath.Join(home, ".pdw")); !os.IsNotExist(err) {
+		t.Fatalf("manifest written to the Muse home: %v", err)
 	}
 	// State lives inside the Muse home, which is what survives a VM restart.
 	if _, err := os.Stat(filepath.Join(home, ".local", "state", "pdw", "muse-workspace-state.sqlite")); err != nil {

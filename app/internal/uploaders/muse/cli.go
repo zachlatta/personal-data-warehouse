@@ -28,7 +28,11 @@ under <home>/agents/*/sessions/ into /ingest/agent-sessions/batch (source
 "muse"), then snapshots the agent's persistent workspace -- memory, goals,
 feed, podcasts, deliverables, uploads -- into the same batches, with any
 binary or large file posted to /ingest/muse/file. Credentials, the browser
-profile, Meta's product docs and runtime plumbing are never read.
+profile, Meta's product docs and runtime plumbing are never read. With the
+files it publishes a metadata-only session manifest (session id, event
+count, newest line timestamp, size, mtime; no transcript text) as
+base_muse.files paths .pdw/session-manifest/<0-f>.json, so the warehouse can
+check every transcript landed. Nothing is written on the VM.
 
 FLAGS
   --home DIR          The Muse home (default $MUSE_HOME, else /home/hatch).
@@ -36,7 +40,7 @@ FLAGS
   --limit N           Maximum transcript lines, and separately changed files,
                       to upload this run; 0 (default) is unlimited.
   --no-transcripts    Skip the transcripts.
-  --no-files          Skip the workspace files.
+  --no-files          Skip the workspace files and the session manifest.
   --state-dir DIR     Incremental state and the run lock (default
                       <home>/.local/state/pdw, which survives a VM restart).
 
@@ -158,6 +162,14 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			fmt.Fprintf(stderr, "pdw ingest muse: %v\n", err)
 			return common.ExitFailure
 		}
+		// Built after the transcripts above shipped, so it describes what
+		// this run uploaded.
+		manifest, err := SessionManifestFiles(filepath.Join(root, "agents"))
+		if err != nil {
+			state.Close()
+			fmt.Fprintf(stderr, "pdw ingest muse: session manifest: %v\n", err)
+			return common.ExitFailure
+		}
 		ws := &Workspace{
 			Home:        root,
 			Account:     account,
@@ -166,11 +178,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			UploadBlob: func(content []byte, extension, contentType string) (ingestclient.StoredObject, error) {
 				return client.UploadMuseFile(content, extension, contentType)
 			},
-			Logger:       logger,
-			State:        state,
-			Mode:         *mode,
-			Limit:        *limit,
-			MaxBlobBytes: client.EffectiveMaxUploadBytes(),
+			Logger:               logger,
+			State:                state,
+			Mode:                 *mode,
+			Limit:                *limit,
+			MaxBlobBytes:         client.EffectiveMaxUploadBytes(),
+			Generated:            manifest,
+			GeneratedMinInterval: DefaultManifestInterval,
 		}
 		workspace, err = ws.Sync()
 		state.Close()

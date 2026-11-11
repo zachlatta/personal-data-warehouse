@@ -322,6 +322,22 @@ Claude/Codex/pi scans on (it only sets `AGENT_SESSIONS_ACCOUNT=zach@zachlatta.co
 0600 `EnvironmentFile`, so the interactive `pdw` CLI there keeps its own issued token. `device`
 resolves to `mew-dev`.
 
+### mew (the hypervisor) and other runtime-only Linux hosts
+
+`mew` runs Claude Code and Codex but is not a development host, so it has no checkout. Like
+porygon's LaunchAgents, its uploader runs from a runtime directory,
+`~/.local/share/personal-data-warehouse/` (`bin/` holds `_pdw-upload-lib.sh` and the
+`*-systemd` wrappers; an optional 0600 `.env` beside it), installed and refreshed from
+mew-dev with `bin/sync-linux-device-runtime mew [--enable]`. That writes the checked-in
+unit with its paths pointed at the runtime, reloads, and restarts the service when the unit
+changed; it refuses a host whose unit runs a checkout (mew-dev, openclaw). A
+`10-host.conf` drop-in holds what is per-host: `EnvironmentFile=%h/.config/pdw/ingest.env`
+(0600, `PDW_SECRET_TOKEN`, the same signing secret mew-dev uses), `PDW_API_URL`,
+`PDW_INGEST_TAILSCALE_HOST=mew-coolify`, `AGENT_SESSIONS_ACCOUNT`,
+`AGENT_SESSIONS_DEVICE=mew` and `AGENT_SESSIONS_HEARTBEAT_PIPELINES=claude_code,codex`.
+The user needs `Linger=yes` so the unit runs without a login. `pdw` is a release binary at
+`~/.local/bin/pdw`, kept current by its own auto-update.
+
 ### Muse Code (the Muse models' coding CLI)
 
 Muse Code (`muse`, source `muse_code`, `base_muse_code.events`) is a local coding CLI like
@@ -427,6 +443,24 @@ keyed by `entrypoint`: `Muse self-improvement run`, `Muse hourly feed run`,
 usage at all, so `input_tokens`/`output_tokens` are 0 by fact, not by a mapping gap. Reasoning items stay in `raw_json`
 only, as for every provider; Meta's own `muse.db` tool withholds them, but they are in
 the transcript files on Zach's VM.
+
+**The session manifest makes hosted Muse checkable.** Nothing outside the VM can list its
+transcripts, so each `pdw ingest muse` run also publishes a metadata-only manifest as
+generated `base_muse.files` rows, `.pdw/session-manifest/<first hex digit of the session
+id>.json`: `{"format": "pdw.muse.session_manifest.v1", "shard", "sessions": [{session_id,
+agent_id, event_count, last_timestamp, size_bytes, modified_at}]}`. No transcript text, and
+nothing is written on the VM (`.pdw/` is a dot directory the walk never enters).
+`event_count` is the number of `base_muse.events` rows the warehouse keeps for the session:
+lines are read with the uploader's own rule (`parseLine`: complete, non-blank, a JSON
+object) and keyed as `muse_event_row` keys them, so a repeated `seq` or compaction is one
+row. `tests/test_agent_sessions_drive_ingest.py` and `muse_manifest_test.go` share a
+fixture to hold the two sides together. A shard is re-sent only when its content changed,
+at most once an hour (`DefaultManifestInterval`); `modified_at` on its row is that upload's
+time. Reconcile a session whose file's `modified_at` is at least 15 minutes older than its
+shard's: it must be in `marts_ai_conversations.sessions` (`source = 'muse'`) with the same
+`event_count`, unless the session has grown since (`ended_at` after the shard's
+`modified_at`). The VM's `pdw` does not self-update (the hook sets `PDW_NO_AUTO_UPDATE=1`):
+ask Muse to run `PDW_NO_AUTO_UPDATE=1 ~/.local/bin/pdw update` after a release.
 
 What PDW does **not** get: Muse's Postgres (feed, goals, ideas, device and health tables)
 is reachable only through the agent's own read-only `muse.db` tool, not from a shell, and

@@ -269,16 +269,9 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 		offset += int64(len(raw))
 		seq := lineNo
 		lineNo++
-		text := strings.TrimSpace(string(bytes.ToValidUTF8(raw, []byte("�"))))
-		if text == "" {
-			result.skipped++
-			continue
-		}
-		var parsed map[string]any
-		if err := json.Unmarshal([]byte(text), &parsed); err != nil || parsed == nil {
-			if err != nil && !looksLikeJSONObject(text) {
-				r.Logger.Warningf("Skipping unparseable line %d in %s", seq, file.Path)
-			} else if err != nil {
+		parsed, blank := parseLine(raw)
+		if parsed == nil {
+			if !blank {
 				r.Logger.Warningf("Skipping unparseable line %d in %s", seq, file.Path)
 			}
 			result.skipped++
@@ -307,7 +300,21 @@ func (r *Runner) readFile(file SessionFile, batch *pendingBatch, remaining int, 
 	return result, true, nil
 }
 
-func looksLikeJSONObject(text string) bool { return strings.HasPrefix(text, "{") }
+// parseLine is the one rule for which transcript lines become events: a
+// complete line, invalid UTF-8 replaced, trimmed, that decodes to a non-null
+// JSON object. blank reports an empty line, which is skipped silently. The
+// Muse session manifest counts with this same function, so its counts are
+// the warehouse's by construction.
+func parseLine(raw []byte) (parsed map[string]any, blank bool) {
+	text := strings.TrimSpace(string(bytes.ToValidUTF8(raw, []byte("�"))))
+	if text == "" {
+		return nil, true
+	}
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		return nil, false
+	}
+	return parsed, false
+}
 
 func readFull(handle *os.File, data []byte) (int, error) {
 	total := 0
