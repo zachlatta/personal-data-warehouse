@@ -672,7 +672,7 @@ def c9_one_way() -> Verdict:
         return _unavailable("C9", title, "pdw list")
     tools = set(re.findall(r"^\s*([a-z_]+)\b", out, re.M))
     # context joined on 2026-10-01: the one way to read a hit's conversation.
-    expected = {"search", "context", "sql", "schema_overview", "describe_table"}
+    expected = {"search", "context", "sql", "schema_overview", "describe_table", "run"}
     forbidden = {"query", "search_hybrid", "grep_rows"}
     ok = expected <= tools and not (forbidden & tools)
     return Verdict("C9", title, GREEN if ok else RED, f"CLI tools {sorted(tools & (expected | forbidden))}")

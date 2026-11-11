@@ -2121,6 +2121,7 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     ),
     "uploader_heartbeats": _data("uploader_heartbeats", "updated_at", "ran_at"),
     "search_request_timings": _data("search_requests", "occurred_at", "occurred_at"),
+    "script_runs": _support("agent_usage", "occurred_at", "occurred_at", note="traffic-dependent script telemetry; no calls is not a collector outage"),
     "search_request_timing_state": _state("search_requests", "ticked_at"),
     "timeline_priority_mix": _support("pipeline_health", "collected_at", note="per-source tier mix, last 7 days"),
     "agent_usage": _data("agent_usage", "collected_at", "newest_session_at"),

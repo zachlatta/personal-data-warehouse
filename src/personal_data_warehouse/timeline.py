@@ -4404,6 +4404,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "search_request_timings": _state(
         "per-search latency, leg timings and host pressure (C6 evidence; no query text)"
     ),
+    "script_runs": _state("script execution telemetry, not real-world activity; daily summary in marts_ops.script_runs"),
     "search_request_timing_state": _state("the search-timing writer's ten-minute heartbeat"),
     "timeline_priority_mix": _state("per-source priority-tier counts over the last seven days (collector snapshot)"),
     "agent_usage": _state("how agents use PDW over a trailing window (daily collector snapshot)"),

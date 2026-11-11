@@ -955,6 +955,7 @@ class IndexSpec:
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
+    "script_runs": TableSpec(("occurred_at", "run_id", "client", "token_id", "surface", "duration_ms", "operations_json", "inner_errors", "bytes_returned", "truncated", "outcome"), ("run_id",), "occurred_at"),
     "external_feed_items": TableSpec(
         ("feed", "item_key", "sync_version", "payload_json", "recorded_at"),
         ("feed", "item_key"),
@@ -1589,6 +1590,7 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
 
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    IndexSpec("script_runs_occurred_at_idx", "script_runs", "CREATE INDEX IF NOT EXISTS script_runs_occurred_at_idx ON @script_runs (occurred_at)"),
     IndexSpec(
         "external_feed_items_cursor_idx", "external_feed_items",
         "CREATE INDEX IF NOT EXISTS external_feed_items_cursor_idx ON @external_feed_items (feed, sync_version)",
@@ -6555,6 +6557,7 @@ class PostgresWarehouse:
                 *PIPELINE_HEALTH_SNAPSHOT_TABLES,
                 "search_benchmark_history",
                 "search_request_timings",
+                "script_runs",
                 "search_request_timing_state",
                 "answer_benchmark_questions",
                 "answer_benchmark_results",
@@ -7387,6 +7390,28 @@ class PostgresWarehouse:
             FROM ranked r
             LEFT JOIN ranked p
               ON p.week_start = r.week_start - 7 AND p.shape = r.shape AND p.rank <= {AGENT_TOP_FAILURES}
+            """,
+        )
+
+        self._ensure_view(
+            "marts_script_runs",
+            """
+            CREATE OR REPLACE VIEW @marts_script_runs AS
+            SELECT date_trunc('day', occurred_at) AS day, client, surface,
+                   count(*) AS runs,
+                   count(*) FILTER (WHERE outcome = 'ok') AS successful_runs,
+                   count(*) FILTER (WHERE outcome <> 'ok') AS failed_runs,
+                   sum(jsonb_array_length(coalesce(nullif(operations_json,''),'[]')::jsonb)) AS inner_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='search')) AS search_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='context')) AS context_operations,
+                   sum((SELECT count(*) FROM jsonb_array_elements(coalesce(nullif(operations_json,''),'[]')::jsonb) o WHERE o->>'method'='sql')) AS sql_operations,
+                   sum(inner_errors) AS inner_errors,
+                   sum(bytes_returned) AS bytes_returned,
+                   sum(truncated) AS truncated_runs,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS duration_p50_ms,
+                   percentile_cont(0.9) WITHIN GROUP (ORDER BY duration_ms) AS duration_p90_ms,
+                   max(occurred_at) AS newest_run_at
+            FROM @script_runs GROUP BY 1, 2, 3
             """,
         )
 
@@ -21153,6 +21178,8 @@ def _literal(value: str) -> str:
 
 
 def _postgres_type(column: str, *, table: str | None = None) -> str:
+    if table == "script_runs" and column in {"inner_errors", "bytes_returned", "truncated"}:
+        return "bigint"
     # The timeline's priority tier is a self-describing native enum (see
     # timeline.py). The marker resolves to the timeline schema when the CREATE
     # TABLE runs through relation expansion.
@@ -21216,6 +21243,8 @@ UNMEASURED_SENTINEL_COLUMNS_BY_TABLE: dict[str, tuple[str, ...]] = {
 
 
 def _default_sql(column: str, *, table: str | None = None) -> str:
+    if table == "script_runs" and column in {"inner_errors", "bytes_returned", "truncated"}:
+        return "0"
     if column in UNMEASURED_SENTINEL_COLUMNS_BY_TABLE.get(table or "", ()):
         return "-1"
     if table == "timeline_events" and column == "priority":

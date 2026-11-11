@@ -124,7 +124,7 @@ _KNOWN = "|".join(PDW_READ_SUBCOMMANDS + PDW_ADMIN_SUBCOMMANDS)
 CLI_INVENTED_RE = (
     _CLI_BEFORE + r"(?!(" + _KNOWN + r")" + _CLI_AFTER + r")[-a-z]"
     + "|"
-    + _cli_re("call") + r"(sql|query|search|context|schema_overview|describe_table)" + _CLI_AFTER
+    + _cli_re("call") + r"(sql|query|search|context|schema_overview|describe_table|run)" + _CLI_AFTER
 )
 CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")
@@ -538,12 +538,14 @@ calls AS (
       AND next_subtype = 'item_completed'
     )
 ),
-pdw AS (
+classified AS (
   SELECT *,
     CASE
       WHEN NOT is_mcp AND inp ~ '{invented}' THEN 'invented'
       WHEN (is_mcp AND tool_name ~* '{mcp_connection}')
         OR (NOT is_mcp AND inp ~ '{connection}') THEN 'connection'
+      WHEN tool_name ~* '(__|[.])run$'
+        OR (NOT is_mcp AND inp ~ '{script}') THEN 'run'
       WHEN tool_name ILIKE '%%__search' OR tool_name ILIKE '%%.search'
         OR (NOT is_mcp AND inp ~ '{search}') THEN 'search'
       WHEN tool_name ILIKE '%%__query' OR tool_name ILIKE '%%.query'
@@ -557,6 +559,37 @@ pdw AS (
       ELSE 'other_read'
     END AS kind
   FROM calls
+),
+script_calls AS (
+  SELECT c.*, r.operations_json, r.outcome,
+         r.run_id AS script_run_id
+  FROM classified c
+  JOIN @script_runs r ON r.run_id =
+    (regexp_match(replace(c.result, chr(92), ''), '"run_id"[[:space:]]*:[[:space:]]*"([0-9a-f]{32})"'))[1]
+  WHERE c.kind = 'run'
+),
+pdw AS (
+  SELECT source, session_id, seq::numeric, occurred_at, tool_name, inp, result, is_mcp, kind
+  FROM classified WHERE kind <> 'run'
+  UNION ALL
+  -- The outer run is composition, not an extra read. Expand only telemetry
+  -- operations, never execute or parse source text to guess what a script did.
+  SELECT s.source, s.session_id, s.seq + o.ordinality::numeric / 100,
+         s.occurred_at, 'personal_data_warehouse__' || (o.item->>'method'),
+         jsonb_build_object('priorities', coalesce(o.item->'priorities','[]'::jsonb))::text,
+         CASE WHEN o.item ? 'error' THEN 'ERROR: script operation failed (' ||
+              coalesce(nullif(o.item->'error'->>'message',''),o.item->'error'->>'code') || ')'
+              ELSE jsonb_build_object('priority_scope', CASE WHEN jsonb_array_length(coalesce(o.item->'priorities','[]'::jsonb)) > 0 THEN 'selected' ELSE 'all' END,
+                   'selected_priorities',coalesce(o.item->'priorities','[]'::jsonb),
+                   'returned_priority_counts',coalesce(o.item->'returned_priority_counts','{}'::jsonb))::text END,
+         true, CASE WHEN o.item->>'method' IN ('columns','schema') THEN 'schema' ELSE o.item->>'method' END
+  FROM script_calls s CROSS JOIN LATERAL jsonb_array_elements(s.operations_json::jsonb) WITH ORDINALITY o(item,ordinality)
+  UNION ALL
+  SELECT s.source,s.session_id,s.seq + 0.99,s.occurred_at,s.tool_name,'',s.outcome,true,'script_error'
+  FROM script_calls s WHERE s.outcome <> 'ok'
+  UNION ALL
+  SELECT c.source,c.session_id,c.seq::numeric,c.occurred_at,c.tool_name,c.inp,c.result,c.is_mcp,'other_read'
+  FROM classified c WHERE c.kind='run' AND NOT EXISTS (SELECT 1 FROM script_calls s WHERE s.source=c.source AND s.session_id=c.session_id AND s.seq=c.seq)
 )
 """
 
@@ -637,6 +670,7 @@ def _expand_agent_usage_regexes(statement: str) -> str:
     return (
         statement.replace("{invoked}", CLI_INVOKED_RE)
         .replace("{invented}", CLI_INVENTED_RE)
+        .replace("{script}", _cli_re("run"))
         .replace("{search}", CLI_SEARCH_RE)
         .replace("{sql}", CLI_SQL_RE)
         .replace("{schema}", CLI_SCHEMA_RE)
@@ -656,10 +690,10 @@ AGENT_FAILURE_CALLS_SQL = _AGENT_USAGE_CALLS_CTE + """
 SELECT source, session_id, seq, occurred_at, kind, left(inp, 4000) AS inp,
        CASE WHEN kind = 'sql'
             THEN substring(result from greatest(position('SQLSTATE' in result) - 600, 1) for 640)
-            ELSE '' END AS error
+            WHEN kind = 'script_error' THEN result ELSE '' END AS error
 FROM pdw
 WHERE occurred_at >= %(since)s
-  AND (kind = 'invented' OR (kind = 'sql' AND result ~ 'SQLSTATE [0-9A-Z]{5}'))
+  AND (kind IN ('invented','script_error') OR (kind = 'sql' AND result ~ 'SQLSTATE [0-9A-Z]{5}'))
 ORDER BY occurred_at, source, session_id, seq
 """
 
@@ -699,6 +733,8 @@ def failure_shape(kind: str, inp: str, error: str) -> tuple[str, str, str] | Non
     is what a guide line, a hint or a CLI message has to name to fix all of
     them. None when the call did not actually fail.
     """
+    if kind == "script_error":
+        return "script_error", "", "script " + re.sub(r"[^a-z_]", "", error)[:60]
     if kind == "invented":
         match = _PY_INVENTED_RE.search(inp)
         if not match:

@@ -19,9 +19,12 @@ import (
 )
 
 type Options struct {
-	MaxRows       int
-	MaxFieldChars int
-	Logger        *slog.Logger
+	// ScriptRecorder is installed by server wiring without coupling query to
+	// the script worker package (which consumes this service).
+	ScriptRecorder any
+	MaxRows        int
+	MaxFieldChars  int
+	Logger         *slog.Logger
 	// SearchEmbedder powers the search tool's hybrid mode. Nil means
 	// embeddings are unconfigured and hybrid searches fall back to keyword.
 	SearchEmbedder Embedder
@@ -445,7 +448,7 @@ func (s *Service) SchemaOverviewFiltered(ctx context.Context, filter string) Res
 		failure := fmt.Sprintf("schema filter %q must be a schema name or prefix such as marts, marts_finance or base_", filter)
 		return Response{Results: []Result{{SQL: "schema_overview", Error: failure, CSV: errorCSV(failure)}}}
 	}
-	showTablesSQL := "SELECT table_schema AS schema, table_name AS name FROM information_schema.tables WHERE table_schema = ANY(" + queryableSchemaArraySQL() + ") AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_schema, table_name"
+	showTablesSQL := schemaRelationsSQL() + " ORDER BY table_schema, table_name"
 	const currentDatabaseSQL = "SELECT current_database() AS database"
 	started := time.Now()
 	schemaResult := Result{SQL: "SELECT current_database() + information_schema.tables + SELECT * FROM <each table> LIMIT 3"}

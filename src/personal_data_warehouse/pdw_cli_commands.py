@@ -12,7 +12,7 @@ from __future__ import annotations
 
 #: Questions to the warehouse: the commands a session's first move is judged by.
 PDW_CLI_READ_SUBCOMMANDS: tuple[str, ...] = (
-    "search", "sql", "schema", "columns", "context", "call", "list", "describe",
+    "search", "sql", "schema", "columns", "context", "call", "list", "describe", "run",
 )
 
 #: Setup, credentials, local workers and the manual: never a question, so they

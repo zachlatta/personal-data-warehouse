@@ -132,7 +132,8 @@ that, not from this prose.
 - **C9 — one obvious way to do a thing, on both surfaces.** One hybrid search, one SQL
   entry point per surface, one schema-discovery call, one way to read a hit's
   conversation (the `context` tool / `pdw context`). *Held up by* `tool.Surface`, the
-  `runCall` fence that refuses `pdw call sql|query|search|context|schema_overview|describe_table`
+  one composition entry point (`run` / `pdw run`) over those same reads, and the
+  `runCall` fence that refuses `pdw call sql|query|search|context|schema_overview|describe_table|run`
   with the real command, and `app/cmd/pdw-cli/usage_test.go`.
 - **C10 — the database is healthy, backed up, and a restore has actually been performed.**
   pgBackRest ships WAL continuously to SFTP on `slowking`, takes periodic backups, and

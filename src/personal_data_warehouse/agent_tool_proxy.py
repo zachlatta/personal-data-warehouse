@@ -30,7 +30,7 @@ from urllib import error, parse, request
 # appears on the HTTP/CLI surface. Search must be present: agent instructions
 # deliberately make ``pdw search --priority ...`` their first warehouse call.
 DEFAULT_AGENT_TOOL_ALLOWLIST = frozenset(
-    {"search", "sql", "schema_overview", "describe_table", "get_object"}
+    {"search", "sql", "schema_overview", "describe_table", "get_object", "run"}
 )
 
 DEFAULT_AGENT_TOOL_PROXY_MAX_ROWS = 50
@@ -313,6 +313,9 @@ def run_agent_tool_proxy(
             self._write_json(payload, status=status)
 
         def _shape_tool_output(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
+            if name == "run":
+                counts.add("sql_rows_dropped", int(data.get("dropped_rows") or 0))
+                data = {key: value for key, value in data.items() if key != "dropped_rows"}
             if exclusions.enabled and name in {"search", "context", "sql"}:
                 data, dropped = exclusions.filter_rows(data, match_cells=name == "sql")
                 counts.add(name + "_rows_dropped", dropped)
@@ -330,6 +333,10 @@ def run_agent_tool_proxy(
             }
             if body:
                 headers["content-type"] = "application/json"
+            if path == API_TOOLS_PATH + "/run" and exclusions.enabled:
+                headers["X-PDW-Source-Exclusions"] = json.dumps({
+                    "adapters": sorted(exclusions.adapters), "refs": sorted(exclusions.refs),
+                }, separators=(",", ":"))
             req = request.Request(upstream.base_url + path, data=body or None, headers=headers, method=method)
             with upstream_lock:
                 try:

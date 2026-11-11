@@ -28,6 +28,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/objectstore"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/push"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/scripts"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/slacksession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/tool"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
@@ -46,6 +47,9 @@ func mcpToolHooks(logger *slog.Logger) tool.Hooks {
 				return
 			}
 			logged := marshalToolOutput(output)
+			if name == "run" {
+				logged = "<not logged>"
+			}
 			if redactedResultTools[name] && !isError {
 				logged = "[redacted: the result is a credential]"
 			}
@@ -165,6 +169,7 @@ func NewMCPServerWithMutations(runner query.Runner, opts query.Options, mutation
 func buildRegistry(runner query.Runner, opts query.Options, mutationSvc *mutations.Service, _ *slog.Logger, extra ...tool.Tool) (*tool.Registry, *query.Service) {
 	svc := query.NewService(runner, opts)
 	tools := readOnlyTools(svc)
+	tools = append(tools, scriptTool(runner, opts))
 	tools = append(tools, extra...)
 	return tool.NewRegistry(tools, mutations.Tools(mutationSvc)), svc
 }
@@ -334,6 +339,15 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 		logger.Warn("ignoring deprecated environment variable", "variable", deprecated)
 	}
 	queryOpts := query.Options{MaxRows: cfg.MaxRows, MaxFieldChars: cfg.MaxFieldChars, Logger: slog.Default()}
+	var closeScriptStore func()
+	if cfg.PostgresDatabaseURL != "" {
+		if scriptStore, err := scripts.NewStore(cfg.PostgresDatabaseURL); err == nil {
+			queryOpts.ScriptRecorder = scripts.Recorder(scriptStore.Record)
+			closeScriptStore = func() { _ = scriptStore.Close() }
+		} else {
+			logger.Error("script telemetry initialization failed", "error", err)
+		}
+	}
 	if embedder := query.NewEmbeddingsClient(query.EmbeddingsOptions{
 		BaseURL:     cfg.SearchEmbeddingsBaseURL,
 		APIKey:      cfg.SearchEmbeddingsAPIKey,
@@ -601,7 +615,7 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 		}
 		return current.Filter(toolShowsOnCLI), nil
 	}, slog.Default())
-	apiProtected := authSvc.RequireStaticBearer()(apiHandler)
+	apiProtected := authSvc.RequireStaticBearer()(withScriptExclusions(apiHandler))
 	apiTraced := withSearchSurface("api", mcpproxy.TraceMiddleware(apiProtected))
 	mux.Handle("/api/tools", apiTraced)
 	mux.Handle("/api/tools/", apiTraced)
@@ -653,7 +667,13 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 		logger.Info("pipeline freshness endpoints enabled", "page", pipelinesPagePath)
 	}
 
-	return logRequests(logger, mux), cleanup
+	closeProxy := cleanup
+	return logRequests(logger, mux), func() {
+		closeProxy()
+		if closeScriptStore != nil {
+			closeScriptStore()
+		}
+	}
 }
 
 // newAccessTokenService keeps tokens in Postgres when the app has it. Without

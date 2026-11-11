@@ -424,6 +424,8 @@ var Objects = []CatalogObject{
 	{ID: "external_feed_seq", Kind: "sequence", Layer: "ops", Domain: "ops", Schema: "ops", Name: "external_feed_seq", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
 	{ID: "app_access_tokens", Kind: "table", Layer: "private", Domain: "private", Schema: "private", Name: "app_access_tokens", Discoverable: false, QueryAccess: "denied", Secret: true, Comment: ""},
 	{ID: "android_location_samples", Kind: "table", Layer: "base", Domain: "android_location", Schema: "base_android_location", Name: "samples", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
+	{ID: "script_runs", Kind: "table", Layer: "ops", Domain: "ops", Schema: "ops", Name: "script_runs", Discoverable: false, QueryAccess: "denied", Secret: false, Comment: ""},
+	{ID: "marts_script_runs", Kind: "view", Layer: "marts", Domain: "ops", Schema: "marts_ops", Name: "script_runs", Discoverable: true, QueryAccess: "public", Secret: false, Comment: ""},
 }
 
 // PreviousLocations maps each object's pre-reorganization physical

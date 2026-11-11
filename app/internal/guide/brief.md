@@ -97,6 +97,8 @@ Absence is not evidence: check freshness before reporting a negative, and state 
 
 ## Topics
 
+{{if .CLI}}`pdw run script.js`{{else}}`run`{{end}} composes dependent reads in server-side JavaScript; topic `scripts` has the API and limits.
+
 {{range .Topics}}- `{{.Name}}` — {{.Summary}}
 {{end}}
 {{if .CLI}}Read one with `pdw readme <topic>`; `pdw readme full` is the complete guide.{{else}}Read one with `readme` and `{"topic": "<name>"}`; `{"topic": "full"}` is the complete guide.{{end}}

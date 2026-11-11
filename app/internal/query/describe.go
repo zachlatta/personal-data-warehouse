@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"slices"
@@ -386,6 +387,9 @@ func int64Value(value any) (int64, bool) {
 	switch v := value.(type) {
 	case int64:
 		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
 	case int:
 		return int64(v), true
 	case int32:
