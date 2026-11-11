@@ -20265,19 +20265,23 @@ class PostgresWarehouse:
                 -- not land twice on the timeline or be enriched twice. The
                 -- first copy ingested is the original and keeps its identity
                 -- (and the transcript and enrichment keyed to it). A row with
-                -- no hash cannot be matched and stands alone. Paid
+                -- no hash cannot be matched and stands alone, and so does a
+                -- row whose bytes are EMPTY: the SHA-256 of nothing is one
+                -- value, so until 2026-11-11 every zero-byte recording of
+                -- every source collapsed into one row (distinct memos read
+                -- as one). Paid
                 -- transcription is deduplicated by the same bytes one layer
                 -- down, in derived_enrichment.audio_transcripts.
                 SELECT DISTINCT ON (
                     CASE
-                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        WHEN COALESCE(content_sha256, '') NOT IN ('', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') THEN content_sha256
                         ELSE source || '/' || account || '/' || recording_id
                     END
                 ) *
                 FROM source_recordings
                 ORDER BY
                     CASE
-                        WHEN COALESCE(content_sha256, '') <> '' THEN content_sha256
+                        WHEN COALESCE(content_sha256, '') NOT IN ('', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855') THEN content_sha256
                         ELSE source || '/' || account || '/' || recording_id
                     END,
                     ingested_at ASC NULLS LAST,
