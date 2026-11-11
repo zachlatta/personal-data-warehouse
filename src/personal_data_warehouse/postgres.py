@@ -20435,22 +20435,35 @@ class PostgresWarehouse:
         reads the session enrichment written over all its members; until that
         lands (merge_status 'pending') it falls back to the first member's
         title and summary. The transcript is always every member's, in order.
-        The previous recording is the one before it among non-deleted rows, so
-        a judgment for a pair that a deletion has since separated is ignored.
+        The previous recording is the one before it among non-deleted rows
+        WITH SPEECH, exactly as load_continuity_pair_candidates pairs them, so
+        a judgment for a pair that a deletion has since separated is ignored
+        and a silent clip between two halves of one event neither splits the
+        session nor joins it: it stays a session of one. Until 2026-11-11 the
+        silent clip counted as the previous recording, and the pair around it
+        was never even judged.
         """
         self._ensure_view(
             "marts_voice_memos_sessions",
             f"""
             CREATE OR REPLACE VIEW @marts_voice_memos_sessions AS
-            WITH ordered AS (
+            WITH spoken AS (
                 SELECT
                     r.*,
-                    LAG(r.recording_id) OVER (
-                        PARTITION BY r.source, r.account
-                        ORDER BY r.recorded_at NULLS FIRST, r.recording_id
-                    ) AS previous_recording_id
+                    (NULLIF(btrim(r.transcript), '') IS NOT NULL) AS has_speech
                 FROM @marts_voice_memos_recordings r
                 WHERE r.is_deleted = 0
+            ),
+            ordered AS (
+                SELECT
+                    s.*,
+                    CASE WHEN s.has_speech THEN
+                        LAG(s.recording_id) OVER (
+                            PARTITION BY s.source, s.account, s.has_speech
+                            ORDER BY s.recorded_at NULLS FIRST, s.recording_id
+                        )
+                    END AS previous_recording_id
+                FROM spoken s
             ),
             linked AS (
                 SELECT
@@ -20471,8 +20484,11 @@ class PostgresWarehouse:
             numbered AS (
                 SELECT
                     l.*,
+                    -- Numbered among recordings with speech, so a silent clip
+                    -- inside a session does not break the run; each silent
+                    -- clip is its own session (it never continues anything).
                     SUM(CASE WHEN l.continues_previous THEN 0 ELSE 1 END) OVER (
-                        PARTITION BY l.source, l.account
+                        PARTITION BY l.source, l.account, l.has_speech
                         ORDER BY l.recorded_at NULLS FIRST, l.recording_id
                         ROWS UNBOUNDED PRECEDING
                     ) AS session_seq
@@ -20501,7 +20517,7 @@ class PostgresWarehouse:
                     max(n.enriched_at) AS members_enriched_at,
                     count(*) FILTER (WHERE n.enriched_at IS NULL) AS members_unenriched
                 FROM numbered n
-                GROUP BY n.source, n.account, n.session_seq
+                GROUP BY n.source, n.account, n.has_speech, n.session_seq
             )
             SELECT
                 s.source,

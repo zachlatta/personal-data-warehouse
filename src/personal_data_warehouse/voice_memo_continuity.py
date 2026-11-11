@@ -79,6 +79,15 @@ def load_continuity_pair_candidates(
 ) -> list[dict[str, Any]]:
     """Consecutive enriched recordings, close in time, with no current judgment.
 
+    Consecutive among recordings WITH SPEECH: a recording whose transcript is
+    empty (a pocket clip, a stop pressed a second after start, a provider
+    rejection) has nothing to judge and is not a seam. Until 2026-11-11 the
+    LAG() ran over every recording and the empty-transcript filter came after
+    it, so a silent clip between two halves of one event hid the pair, and
+    back-to-back transcribed pairs were never judged. marts_voice_memos.sessions
+    pairs recordings the same way, or a judgment would never join the session
+    it decides.
+
     A judgment is current while both transcripts it read are still the ones
     the mart serves, so re-transcribing either recording asks again. Newest
     pairs first: the memo Zach just recorded matters more than the backlog.
@@ -114,6 +123,7 @@ def load_continuity_pair_candidates(
             FROM @marts_voice_memos_recordings r
             WHERE r.is_deleted = 0
               AND r.recorded_at IS NOT NULL
+              AND NULLIF(btrim(r.transcript), '') IS NOT NULL
             WINDOW w AS (PARTITION BY r.source, r.account ORDER BY r.recorded_at, r.recording_id)
         ),
         pairs AS (
@@ -134,8 +144,6 @@ def load_continuity_pair_candidates(
          AND j.previous_recording_id = p.previous_recording_id
          AND j.recording_id = p.recording_id
         WHERE p.gap_seconds <= {float(max_gap_seconds)}
-          AND NULLIF(p.transcript, '') IS NOT NULL
-          AND NULLIF(p.previous_transcript, '') IS NOT NULL
           AND p.enriched_at IS NOT NULL
           AND p.previous_enriched_at IS NOT NULL
           AND NOT (
@@ -162,8 +170,8 @@ def load_session_merge_candidates(
     """Multi-recording sessions whose merged enrichment is missing or stale.
 
     Stale means a member was enriched again after the merge. A session that
-    could still grow (it ended inside the candidate window and nothing was
-    recorded after it) waits, so a run of three restarts is merged once.
+    could still grow (it ended inside the candidate window and no recording
+    with speech came after it) waits, so a run of three restarts is merged once.
     """
     limit_sql = f"LIMIT {int(limit)}" if limit is not None and limit > 0 else ""
     error_sql = (
@@ -198,6 +206,9 @@ def load_session_merge_candidates(
                     AND later.account = s.account
                     AND later.is_deleted = 0
                     AND later.recorded_at > s.ended_at
+                    -- Only a recording with speech can join a session, so a
+                    -- silent clip after it does not close one early.
+                    AND NULLIF(btrim(later.transcript), '') IS NOT NULL
               )
           )
           {error_sql}

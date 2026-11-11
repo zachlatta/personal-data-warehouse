@@ -329,13 +329,16 @@ them together under `sources => ARRAY['transcript']`.
 able to transition them over"; it must understand the content, not guess from timing). The
 `voice_memo_continuity` asset runs after enrichment (hourly :47 plus a two-minute backlog
 sensor; `VOICE_MEMO_CONTINUITY_ENABLED=0` turns it off). Step one: every pair of consecutive
-recordings of one source and account that sit within 30 minutes
+recordings with speech of one source and account that sit within 30 minutes
 (`VOICE_MEMO_CONTINUITY_MAX_GAP_SECONDS`) goes to the fleet agent with the end of the first
 transcript, the start of the second and both summaries; it answers `same_event` or `separate`
 with a confidence and reason, stored per pair in `derived_voice_memos.continuity_judgments`
 and asked again when either transcript changes. Time only proposes: measured over 60 days,
 the window holds every real restart (a lecture split by 3 s, a demo session by 8 s) and
-dozens of unrelated task memos a minute apart. Step two: a run of recordings joined by
+dozens of unrelated task memos a minute apart. A recording with an empty transcript (a
+pocket clip, a provider rejection) is skipped when pairing, never a seam: until 2026-11-11
+one between two halves of an event hid the pair, so back-to-back pairs went unjudged. It
+stays a session of one. Step two: a run of recordings joined by
 `same_event` at confidence 0.7 or more is a session, and a session of two or more gets one
 enrichment written over all its members (`derived_voice_memos.session_enrichments`, keyed by
 the member list, redone when a member is re-enriched). A session that ended inside the window

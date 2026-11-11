@@ -198,6 +198,71 @@ def test_the_agent_verdict_joins_a_restarted_event_and_keeps_a_task_memo_apart(
     assert task["summary"] == "Summary task"
 
 
+def _seed_silent_clip(wh: PostgresWarehouse, recording_id: str, recorded_at: datetime, duration: float) -> None:
+    """A recording transcribed to no words (a pocket clip): no enrichment."""
+    wh.insert_apple_voice_memos_files(
+        [
+            _row(
+                VOICE_MEMO_FILE_COLUMNS,
+                account="zach",
+                recording_id=recording_id,
+                title=recording_id,
+                filename=f"{recording_id}.m4a",
+                content_type="audio/mp4",
+                content_sha256=f"sha-{recording_id}",
+                recorded_at=recorded_at,
+                raw_metadata_json=json.dumps({"recording": {"duration_seconds": duration}}),
+                ingested_at=recorded_at,
+                sync_version=1,
+            )
+        ]
+    )
+    completed_at = recorded_at + timedelta(minutes=1)
+    wh.insert_apple_voice_memos_transcription_runs(
+        [
+            _row(
+                VOICE_MEMO_TRANSCRIPTION_RUN_COLUMNS,
+                source="apple_voice_memos",
+                account="zach",
+                recording_id=recording_id,
+                content_sha256=f"sha-{recording_id}",
+                provider="assemblyai",
+                provider_transcript_id=f"tid-{recording_id}",
+                status="completed",
+                transcript_text="  ",
+                requested_at=completed_at,
+                completed_at=completed_at,
+                sync_version=1,
+            )
+        ]
+    )
+
+
+def test_a_silent_clip_between_two_halves_does_not_hide_the_pair(warehouse: PostgresWarehouse) -> None:
+    """Until 2026-11-11 transcribed back-to-back pairs could go unjudged.
+
+    LAG() ran over every recording before the empty-transcript filter, so a
+    silent clip between two halves of one event became each half's neighbour
+    and the pair that mattered was never a candidate. The session view pairs
+    the same way, so the judgment also has to join the two halves there.
+    """
+    _seed(warehouse, [("half-1", START, 600.0, "the first half of the call")])
+    _seed_silent_clip(warehouse, "pocket", START + timedelta(seconds=602), 2.0)
+    _seed(warehouse, [("half-2", START + timedelta(seconds=610), 300.0, "the second half of the call")])
+
+    pairs = load_continuity_pair_candidates(warehouse, limit=None)
+    assert [(p["previous_recording_id"], p["recording_id"]) for p in pairs] == [("half-1", "half-2")]
+
+    client = FakeClient({("half-1", "half-2")})
+    summary = _runner(warehouse, client).sync(limit=None)
+    assert (summary.pairs_judged, summary.pairs_same_event, summary.sessions_merged) == (1, 1, 1)
+
+    sessions = _sessions(warehouse)
+    assert [s["recording_ids"] for s in sessions] == [["half-1", "half-2"], ["pocket"]]
+    assert sessions[0]["merge_status"] == "merged"
+    assert sessions[1]["merge_status"] == "single"
+
+
 def test_a_second_pass_redoes_nothing_until_a_transcript_changes(warehouse: PostgresWarehouse) -> None:
     _seed(warehouse, LECTURE)
     _runner(warehouse, FakeClient({("lecture-1", "lecture-2")})).sync(limit=None)
