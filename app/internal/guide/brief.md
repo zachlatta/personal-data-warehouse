@@ -15,7 +15,7 @@ including this page. This is the brief; {{if .CLI}}`pdw readme full`{{else}}`rea
    neighbouring agent turns):
 {{if .CLI}}   `pdw context '<ref>'` (`--full` for whole texts); a hit's `sql:` line reads its source row verbatim{{else}}   `context` `{"ref": "<ref>"}` (`before`/`after` default 5, `full: true` for whole texts); a hit's `drill_sql` reads its source row verbatim{{end}}
 3. **SQL** only for aggregates, joins, predicates and drill-down, walking
-   `timeline.events` (bounded, priority-filtered) → `marts_*` → `base_*`.
+   `timeline.events` (bounded, priority-filtered) → `marts_*`/`derived_*` → `base_*`.
 4. **Columns before SQL, every time, and wait for them:** {{if .CLI}}`pdw columns <schema.relation>`; `pdw schema` only to find a relation you do not know.{{else}}`describe_table` `{"relation": "<schema.relation>"}`; `schema_overview` only to find a relation you do not know.{{end}}
    Read the output before writing the query: a columns call run in parallel with the SQL, or
    as a fallback after it, is still a guess.

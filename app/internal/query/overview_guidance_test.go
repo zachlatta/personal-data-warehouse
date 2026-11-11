@@ -306,3 +306,27 @@ func TestOverviewRelationCommentIsCappedAndPointsAtDescribeTable(t *testing.T) {
 		t.Fatal("capRunes must not split multi-byte runes")
 	}
 }
+
+// TestOverviewLayerListGivesTheTimelineFirstReadingOrder pins the SCHEMA
+// LAYERS header to the same reading order every other surface teaches. The
+// layers sort base → derived → marts → timeline, and until 2026-11-11 the header
+// said that sort order "is also the order to reach for them" — base first, the
+// opposite of the brief, the MCP instructions and the START HERE comments.
+func TestOverviewLayerListGivesTheTimelineFirstReadingOrder(t *testing.T) {
+	overview := renderTestOverview(t)
+	start := strings.Index(overview, "SCHEMA LAYERS")
+	end := strings.Index(overview, "HOW TO USE THIS")
+	if start < 0 || end < start {
+		t.Fatalf("overview has no SCHEMA LAYERS block:\n%s", overview)
+	}
+	block := strings.ToLower(overview[start:end])
+	for _, wrong := range []string{"order to reach for them", "also the order to"} {
+		if strings.Contains(block, wrong) {
+			t.Fatalf("SCHEMA LAYERS must not call the base-first sort order the reading order (%q):\n%s", wrong, block)
+		}
+	}
+	const order = "read them timeline → marts_*/derived_* → base_*"
+	if !strings.Contains(block, order) {
+		t.Fatalf("SCHEMA LAYERS must state the reading order %q:\n%s", order, block)
+	}
+}

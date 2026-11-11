@@ -254,3 +254,31 @@ func TestCLIGuidesExplainOtherToolOutput(t *testing.T) {
 		}
 	}
 }
+
+// TestGuideWalksTheLayersTimelineFirst pins the reading order every surface
+// teaches: timeline, then marts_*/derived_*, then base_*. The layers SORT the
+// other way (base → derived → marts → timeline); no page may present that sort
+// order as the order to read them.
+func TestGuideWalksTheLayersTimelineFirst(t *testing.T) {
+	for _, surface := range []Surface{SurfaceCLI, SurfaceMCP} {
+		for name, text := range map[string]string{
+			"brief": mustRender(t, surface, ""),
+			"full":  mustRender(t, surface, "full"),
+		} {
+			flat := strings.Join(strings.Fields(text), " ")
+			timeline := strings.Index(flat, "`timeline.events` (bounded")
+			if name == "full" {
+				timeline = strings.Index(flat, "timeline first: bounded `timeline.events`")
+			}
+			marts := strings.Index(flat, "`marts_*`")
+			derived := strings.Index(flat, "`derived_*`")
+			base := strings.Index(flat, "→ `base_*`")
+			if timeline < 0 || marts < timeline || derived < marts || base < derived {
+				t.Fatalf("%s guide (%v) must walk timeline → marts_*/derived_* → base_*:\n%s", name, surface, flat)
+			}
+			if strings.Contains(strings.ToLower(flat), "order to reach for") {
+				t.Fatalf("%s guide (%v) presents the sort order as the reading order", name, surface)
+			}
+		}
+	}
+}

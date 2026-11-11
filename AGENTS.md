@@ -85,7 +85,7 @@ that, not from this prose.
   `marts_ops.timeline_priority_mix`. *Gap:* which valid tier an adapter assigns is a
   judgement no test makes. See [Timeline priority tiers](#timeline-priority-tiers).
 - **C3 — agents start at the timeline and filter by priority.** The `search` tool or
-  `timeline.events` in SQL first, then `marts_*`, then `base_*`; every search entry point
+  `timeline.events` in SQL first, then `marts_*`/`derived_*`, then `base_*`; every search entry point
   takes `priorities`, and every hit names its tier. The manual is `pdw readme` / the MCP
   `readme` tool, rendered from `app/internal/guide/` (see [The agent guide](#the-agent-guide)).
   *Held up by* the guide tests, `test_schema_comments_publish_the_start_here_guidance`, and
@@ -100,7 +100,7 @@ that, not from this prose.
   `test_python_untrusted_reader_refuses_superuser_url`, the Go runner's per-transaction
   login check, and the catalog's per-layer query-access policy.
 - **C5 — multi-source concepts layer `base_* → derived_*/marts_* → timeline`; consumers read
-  `timeline → marts_* → base_*`.** **An intelligent transformation must READ from the
+  `timeline → marts_*/derived_* → base_*`.** **An intelligent transformation must READ from the
   intermediate layer, not one source's raw table**, so a second source is covered the day
   it lands: `base_alice_voice_recordings` sat at 53 recordings and 0 transcripts while every
   registry passed, because transcription scanned the Apple table by name. *Held up by*
