@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -89,15 +90,26 @@ func TestSourceObservationIngestRejectsAnUnsignedPost(t *testing.T) {
 	}
 }
 
+// testdata/source_upstream_observations.ddl is the Python TableSpec, kept equal
+// to it by tests/test_source_sla.py; the app's DDL must be that, line for line,
+// because whichever side provisions first defines the table for both.
 func TestSourceObservationDDLMatchesThePythonTableSpec(t *testing.T) {
-	ddl := strings.Join(sourceObservationDDL("ops", `"ops"."source_upstream_observations"`), "\n")
-	for _, column := range []string{
-		"pipeline text", "scope text", "upstream_newest_at timestamptz", "upstream_newest_id text",
-		"detail text", "observed_at timestamptz", "updated_at timestamptz", "sync_version bigint",
-		"PRIMARY KEY (pipeline, scope)",
-	} {
-		if !strings.Contains(ddl, column) {
-			t.Fatalf("DDL is missing %q:\n%s", column, ddl)
+	golden, err := os.ReadFile("testdata/source_upstream_observations.ddl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Split(strings.TrimSpace(string(golden)), "\n")
+	ddl := sourceObservationDDL("ops", `"ops"."source_upstream_observations"`)
+	create := ddl[len(ddl)-1]
+	body := create[strings.Index(create, "(")+1 : strings.LastIndex(create, ")")]
+	var got []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if line != "" {
+			got = append(got, line)
 		}
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("app DDL drifted from the Python TableSpec:\n got: %q\nwant: %q", got, want)
 	}
 }

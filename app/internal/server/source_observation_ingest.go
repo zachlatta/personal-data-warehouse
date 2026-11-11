@@ -88,6 +88,7 @@ func sourceObservationDDL(schema, relation string) []string {
 	upstream_newest_id text NOT NULL DEFAULT '',
 	detail text NOT NULL DEFAULT '',
 	observed_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+	pending_since timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 	updated_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
 	sync_version bigint NOT NULL DEFAULT 0,
 	PRIMARY KEY (pipeline, scope)
@@ -125,7 +126,8 @@ func (s *sourceObservationStore) upsert(ctx context.Context, obs sourceObservati
 			newestAt = parsed
 		}
 	}
-	// A replayed older observation never overwrites a newer one.
+	// A replayed older observation never overwrites a newer one, and
+	// pending_since is the pipeline_health collector's: never set here.
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO `+s.relation+` AS o
 			(pipeline, scope, upstream_newest_at, upstream_newest_id, detail, observed_at, updated_at, sync_version)

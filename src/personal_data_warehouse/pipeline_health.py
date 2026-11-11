@@ -2610,6 +2610,7 @@ class PipelineHealthCollector:
         # concurrent rewrite holding pages hostage). A probe that trips it is
         # recorded as a timeout instead of stretching the collection window.
         with self._probe_budget(PROBE_STATEMENT_TIMEOUT_MS):
+            self._advance_source_upstream_pending()
             tables = [
                 self._probe_table(table_id, coverage, stats, indexed)
                 for table_id, coverage in sorted(TABLE_PIPELINES.items())
@@ -3158,6 +3159,15 @@ class PipelineHealthCollector:
         if entry.id == "screen_timelapse":
             self._apply_screen_timelapse_device_freshness(snapshot)
         return snapshot
+
+    def _advance_source_upstream_pending(self) -> None:
+        """Carry each source's oldest unlanded item before the detectors are read."""
+        try:
+            self._warehouse.advance_source_upstream_pending()
+        except psycopg2.Error as error:
+            # The view appears with the first ensure that sees every input
+            # table; until then there is nothing to carry.
+            logger.warning("source upstream pending advance failed: %s", error)
 
     def _detector_status(self, entry: Pipeline) -> str:
         """The worst status the pipeline's own C11 detector reports right now.

@@ -38,7 +38,11 @@ from personal_data_warehouse.agent_usage import (
     SQL_ERROR_SESSION_CEILING,
     AGENT_TOP_FAILURES,
 )
-from personal_data_warehouse.source_sla import SOURCE_UPSTREAM_INPUT_TABLES, source_upstream_health_view_sql
+from personal_data_warehouse.source_sla import (
+    LANDED_SLACK_SECONDS,
+    SOURCE_UPSTREAM_INPUT_TABLES,
+    source_upstream_health_view_sql,
+)
 from personal_data_warehouse.schema import (
     ANSWER_BENCHMARK_QUESTION_COLUMNS,
     ANSWER_BENCHMARK_RESULT_COLUMNS,
@@ -3328,6 +3332,7 @@ TIMESTAMP_COLUMNS = {
     "failing_since",
     # ops.source_upstream_observations: the source's own newest item (C11).
     "upstream_newest_at",
+    "pending_since",
     # Muse workspace files: when a path stopped existing (epoch while it does).
     "deleted_at",
     # SimpleFIN: the bridge's own balance stamp, the day a transaction
@@ -14851,21 +14856,58 @@ class PostgresWarehouse:
         if not self._source_upstream_observations_ensured:
             self._ensure_table_group(["source_upstream_observations"])
             self._source_upstream_observations_ensured = True
-        self._insert_rows(
-            "source_upstream_observations",
-            [
-                {
-                    "pipeline": pipeline,
-                    "scope": scope,
-                    "upstream_newest_at": upstream_newest_at or EPOCH_UTC,
-                    "upstream_newest_id": upstream_newest_id,
-                    "detail": detail[:500],
-                    "observed_at": observed,
-                    "updated_at": datetime.now(tz=UTC),
-                    "sync_version": int(observed.timestamp() * 1_000_000),
-                }
-            ],
-            SOURCE_UPSTREAM_OBSERVATION_COLUMNS,
+        # Names its columns, like the app's upsert: pending_since belongs to
+        # the collector (advance_source_upstream_pending) and a fresh look
+        # must never reset it.
+        self._command(
+            """
+            INSERT INTO @source_upstream_observations AS o
+                (pipeline, scope, upstream_newest_at, upstream_newest_id, detail,
+                 observed_at, updated_at, sync_version)
+            VALUES (%s, %s, %s, %s, %s, %s, now(), %s)
+            ON CONFLICT (pipeline, scope) DO UPDATE SET
+                upstream_newest_at = EXCLUDED.upstream_newest_at,
+                upstream_newest_id = EXCLUDED.upstream_newest_id,
+                detail = EXCLUDED.detail,
+                observed_at = EXCLUDED.observed_at,
+                updated_at = now(),
+                sync_version = EXCLUDED.sync_version
+            WHERE o.sync_version <= EXCLUDED.sync_version
+            """,
+            (
+                pipeline,
+                scope,
+                upstream_newest_at or EPOCH_UTC,
+                upstream_newest_id,
+                detail[:500],
+                observed,
+                int(observed.timestamp() * 1_000_000),
+            ),
+        )
+
+    def advance_source_upstream_pending(self) -> None:
+        """Carry each source's oldest unlanded item until PDW passes it (C11).
+
+        Run by the pipeline_health collector every ten minutes. A row whose
+        newest item has landed clears; one whose pending item PDW has passed
+        (or that had none) starts a new pending period at the current newest
+        item; otherwise the pending item stays, so a stall keeps ageing while
+        a busy source names a fresher newest item on every look.
+        """
+        epoch = "'1970-01-01 00:00:00+00'::timestamptz"
+        self._command(
+            f"""
+            UPDATE @source_upstream_observations AS o SET pending_since = CASE
+                WHEN h.landed = 1 THEN {epoch}
+                WHEN o.pending_since = {epoch}
+                  OR COALESCE(h.pdw_newest_at >= o.pending_since
+                        - make_interval(secs => {LANDED_SLACK_SECONDS}), false)
+                    THEN o.upstream_newest_at
+                ELSE o.pending_since
+            END
+            FROM @marts_ops_source_upstream_health AS h
+            WHERE h.pipeline = o.pipeline AND h.scope = o.scope
+            """
         )
 
     def insert_sync_state(

@@ -2969,6 +2969,11 @@ SOURCE_UPSTREAM_OBSERVATION_COLUMNS = (
     "upstream_newest_id",
     "detail",
     "observed_at",
+    # The oldest upstream item PDW has not caught up with, carried by the
+    # pipeline_health collector until PDW passes it (epoch when none). Writers
+    # never set it: without it a busy source reads ok through a days-long
+    # stall, because every look names a fresher newest item.
+    "pending_since",
     "updated_at",
     "sync_version",
 )

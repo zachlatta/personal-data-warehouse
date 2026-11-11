@@ -168,7 +168,7 @@ def source_upstream_health_view_sql() -> str:
         branches.append(
             f"""
             SELECT o.pipeline, o.scope, o.upstream_newest_at, o.upstream_newest_id,
-                   o.detail, o.observed_at,
+                   o.detail, o.observed_at, o.pending_since,
                    {check.pdw_newest_sql} AS pdw_newest_at,
                    {_seconds(check.tolerance)}::bigint AS tolerance_seconds,
                    {_seconds(check.observation_interval)}::bigint AS expected_observation_seconds
@@ -189,6 +189,7 @@ def source_upstream_health_view_sql() -> str:
                 NULLIF(upstream_newest_id, '') AS upstream_newest_id,
                 NULLIF(pdw_newest_at, {epoch}) AS pdw_newest_at,
                 NULLIF(observed_at, {epoch}) AS observed_at,
+                NULLIF(pending_since, {epoch}) AS carried_pending_since,
                 NULLIF(detail, '') AS detail,
                 tolerance_seconds, expected_observation_seconds
             FROM observed
@@ -202,6 +203,25 @@ def source_upstream_health_view_sql() -> str:
                  OR COALESCE(pdw_newest_at >= upstream_newest_at
                         - make_interval(secs => {LANDED_SLACK_SECONDS}), false)) AS landed
             FROM judged
+        ),
+        pending AS (
+            -- How long has the OLDEST unlanded item been missing? The newest
+            -- item's own age cannot say: on a busy source every look names a
+            -- fresher one, so a stall of days read ok. The collector carries
+            -- the first item PDW did not catch up with (pending_since) until
+            -- PDW passes it; until it has, the stall is measured from there.
+            SELECT
+                measured.*,
+                CASE
+                    WHEN landed THEN NULL
+                    WHEN carried_pending_since IS NOT NULL
+                     AND (pdw_newest_at IS NULL
+                          OR pdw_newest_at < carried_pending_since
+                                - make_interval(secs => {LANDED_SLACK_SECONDS}))
+                        THEN LEAST(carried_pending_since, upstream_newest_at)
+                    ELSE upstream_newest_at
+                END AS pending_since
+            FROM measured
         )
         SELECT
             pipeline,
@@ -211,9 +231,9 @@ def source_upstream_health_view_sql() -> str:
                   OR now() - observed_at > make_interval(secs => expected_observation_seconds)
                     THEN 'unknown'
                 WHEN landed THEN 'ok'
-                WHEN now() - upstream_newest_at > make_interval(
+                WHEN now() - pending_since > make_interval(
                         secs => tolerance_seconds * {FAILING_MULTIPLIER}) THEN 'failing'
-                WHEN now() - upstream_newest_at > make_interval(secs => tolerance_seconds)
+                WHEN now() - pending_since > make_interval(secs => tolerance_seconds)
                     THEN 'late'
                 ELSE 'ok'
             END AS status,
@@ -221,17 +241,16 @@ def source_upstream_health_view_sql() -> str:
             upstream_newest_at,
             upstream_newest_id,
             pdw_newest_at,
-            -- How long the source's newest item has existed without landing;
-            -- NULL once it has.
-            CASE WHEN landed THEN NULL
-                 ELSE (EXTRACT(EPOCH FROM now() - upstream_newest_at))::bigint
-            END AS missing_seconds,
+            pending_since,
+            -- How long the oldest unlanded item has been missing; NULL once
+            -- PDW holds the source's newest.
+            (EXTRACT(EPOCH FROM now() - pending_since))::bigint AS missing_seconds,
             tolerance_seconds,
             observed_at,
             (EXTRACT(EPOCH FROM now() - observed_at))::bigint AS observation_age_seconds,
             expected_observation_seconds,
             detail
-        FROM measured
+        FROM pending
     """
 
 

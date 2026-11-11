@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
@@ -22,7 +23,7 @@ from personal_data_warehouse.pipeline_health import (
     PipelineHealthCollector,
     worst_detector_status,
 )
-from personal_data_warehouse.postgres import PostgresWarehouse
+from personal_data_warehouse.postgres import POSTGRES_TABLES, PostgresWarehouse, _default_sql, _postgres_type
 from personal_data_warehouse.relations import CATALOG, relation
 from personal_data_warehouse.source_sla import (
     SOURCE_UPSTREAM_CHECKS,
@@ -31,6 +32,7 @@ from personal_data_warehouse.source_sla import (
     upstream_check,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCES = [entry for entry in PIPELINES if entry.kind == "source"]
 
 
@@ -166,9 +168,17 @@ def test_upstream_health_compares_each_sources_newest_item_with_what_landed(ware
              newest_id="f1", observed_at=now)
     # WhatsApp: nothing new arrived, but the client has not looked in a day.
     _observe(warehouse, "whatsapp", "a@x.test", newest_at=None, observed_at=now - timedelta(days=1))
-    # Apple Messages: a message newer than anything landed, inside tolerance.
+    # Apple Messages: a quiet chat wakes up. PDW's newest is three days old and
+    # the Mac's newest arrived two minutes ago: missing, but only for two
+    # minutes, which is landing time, not an outage.
+    warehouse._command(
+        "INSERT INTO @apple_messages (account, message_id, message_at, is_deleted)"
+        " VALUES ('a@x.test', 'old', %s, 0)",
+        (now - timedelta(days=3),),
+    )
     _observe(warehouse, "apple_messages", "a@x.test", newest_at=now - timedelta(minutes=2),
              observed_at=now)
+    warehouse.advance_source_upstream_pending()
 
     rows = _health(warehouse)
     assert rows[("gmail", "a@x.test")]["status"] == "ok"
@@ -186,9 +196,63 @@ def test_upstream_health_compares_each_sources_newest_item_with_what_landed(ware
     assert rows[("whatsapp", "a@x.test")]["status"] == "unknown"
     # Absence is the epoch in ops and NULL in marts.
     assert rows[("whatsapp", "a@x.test")]["upstream_newest_at"] is None
-    assert rows[("apple_messages", "a@x.test")]["status"] == "ok"
-    assert rows[("apple_messages", "a@x.test")]["landed"] == 0
-    assert rows[("apple_messages", "a@x.test")]["pdw_newest_at"] is None
+    woke = rows[("apple_messages", "a@x.test")]
+    assert woke["status"] == "ok"
+    assert woke["landed"] == 0
+    assert 60 <= woke["missing_seconds"] <= 300, "missing since the item appeared, not since PDW's last row"
+
+
+def test_a_busy_source_whose_pdw_side_stalled_for_days_reads_failing(warehouse):
+    """Each observation names a fresher newest item; the stall must still accumulate.
+
+    Judging only the newest item's age reads a busy source ok forever: Gmail's
+    newest is always minutes old even while nothing has landed for days. The
+    pending item is carried from the first observation PDW did not catch up
+    with until PDW passes it, by the collector, so its age is the stall.
+    """
+    _provision_everything(warehouse)
+    now = datetime.now(tz=UTC)
+    warehouse._command(
+        "INSERT INTO @gmail_messages (account, message_id, internal_date, synced_at)"
+        " VALUES ('a@x.test', 'last-landed', %s, %s)",
+        (now - timedelta(days=3), now - timedelta(days=3)),
+    )
+    # Two days ago the API listed a message PDW never wrote; the collector ran.
+    _observe(warehouse, "gmail", "a@x.test", newest_at=now - timedelta(days=2), newest_id="m1",
+             observed_at=now - timedelta(days=2))
+    warehouse.advance_source_upstream_pending()
+    # Mail kept arriving: every later look names a message minutes old.
+    for minutes in (600, 120, 2):
+        _observe(warehouse, "gmail", "a@x.test", newest_at=now - timedelta(minutes=minutes),
+                 newest_id=f"m-{minutes}", observed_at=now - timedelta(minutes=minutes) + timedelta(seconds=30))
+        warehouse.advance_source_upstream_pending()
+
+    stalled = _health(warehouse)[("gmail", "a@x.test")]
+    assert stalled["status"] == "failing"
+    assert stalled["missing_seconds"] >= timedelta(days=2).total_seconds() - 60
+    assert stalled["pending_since"] is not None
+
+    # PDW catches up past the pending item but not the newest: a new, short
+    # pending period, not the old one.
+    warehouse._command(
+        "INSERT INTO @gmail_messages (account, message_id, internal_date, synced_at)"
+        " VALUES ('a@x.test', 'm-600', %s, %s)",
+        (now - timedelta(minutes=600), now),
+    )
+    caught_up = _health(warehouse)[("gmail", "a@x.test")]
+    assert caught_up["status"] == "ok"
+    assert caught_up["missing_seconds"] < upstream_check("gmail").tolerance.total_seconds()
+    warehouse.advance_source_upstream_pending()
+    assert _health(warehouse)[("gmail", "a@x.test")]["status"] == "ok"
+
+
+def test_a_writer_never_clobbers_the_pending_item(warehouse):
+    _provision_everything(warehouse)
+    now = datetime.now(tz=UTC)
+    _observe(warehouse, "gmail", "a@x.test", newest_at=now - timedelta(days=1), observed_at=now - timedelta(days=1))
+    warehouse.advance_source_upstream_pending()
+    _observe(warehouse, "gmail", "a@x.test", newest_at=now, observed_at=now)
+    assert _health(warehouse)[("gmail", "a@x.test")]["pending_since"] is not None
 
 
 def test_an_older_observation_never_overwrites_a_newer_one(warehouse):
@@ -242,3 +306,33 @@ def test_the_query_role_can_read_the_detector(warehouse, query_login):
             assert cursor.fetchall() == [("ok",)]
     finally:
         connection.close()
+
+
+# --- the app's copy of the table -------------------------------------------------
+
+SOURCE_OBSERVATION_DDL_GOLDEN = (
+    REPO_ROOT / "app" / "internal" / "server" / "testdata" / "source_upstream_observations.ddl"
+)
+
+
+def _tablespec_ddl_lines() -> list[str]:
+    table = "source_upstream_observations"
+    spec = POSTGRES_TABLES[table]
+    lines = [
+        f"{column} {_postgres_type(column, table=table)} NOT NULL DEFAULT {_default_sql(column, table=table)}"
+        for column in spec.columns
+    ]
+    lines.append(f"PRIMARY KEY ({', '.join(spec.primary_key)})")
+    return lines
+
+
+def test_the_apps_source_observation_ddl_golden_is_the_python_tablespec():
+    """The app creates this table too (it deploys first). Go's
+    TestSourceObservationDDLMatchesThePythonTableSpec compares its DDL with this
+    golden file line by line; this test keeps the golden file equal to the
+    TableSpec, so the two definitions cannot drift apart. Regenerate with
+    PDW_UPDATE_GOLDEN=1 uv run pytest tests/test_source_sla.py -k golden."""
+    expected = "\n".join(_tablespec_ddl_lines()) + "\n"
+    if os.environ.get("PDW_UPDATE_GOLDEN") == "1":
+        SOURCE_OBSERVATION_DDL_GOLDEN.write_text(expected, encoding="utf-8")
+    assert SOURCE_OBSERVATION_DDL_GOLDEN.read_text(encoding="utf-8") == expected
