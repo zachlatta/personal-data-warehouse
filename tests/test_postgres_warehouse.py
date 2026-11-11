@@ -6763,6 +6763,42 @@ def test_voice_mart_serves_the_newest_bytes_of_a_revised_note_recording(warehous
     assert (candidate["recording_id"], candidate["content_sha256"]) == ("att-audio", "sha-new")
 
 
+def test_voice_mart_never_replaces_a_note_recording_with_a_newer_empty_revision(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The newest NONEMPTY revision is the recording.
+
+    A later note revision whose copy of the attachment is 0 bytes (an iCloud
+    stub, a failed export) carries the SHA-256 of empty bytes, not an empty
+    hash, so a hash check alone let it replace good audio.
+    """
+    now = datetime(2026, 10, 15, 20, tzinfo=UTC)
+    warehouse.ensure_apple_notes_tables()
+    revisions = [("r-good", now, 1000, "sha-good"),
+                 ("r-empty", now + timedelta(days=1), 0, hashlib.sha256(b"").hexdigest())]
+    warehouse.insert_apple_note_revisions(
+        [
+            _default_row(APPLE_NOTE_REVISION_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         title="Meeting", modified_at=at, ingested_at=at)
+            for rev, at, _size, _sha in revisions
+        ]
+    )
+    warehouse.insert_apple_note_attachments(
+        [
+            _default_row(APPLE_NOTE_ATTACHMENT_COLUMNS, account="z", note_id="n1", revision_id=rev,
+                         attachment_id="att-audio", filename="Recording.m4a", content_type="audio/mp4",
+                         size_bytes=size, content_sha256=sha, is_missing=0,
+                         storage_file_id=f"drive-{rev}", ingested_at=at)
+            for rev, at, size, sha in revisions
+        ]
+    )
+
+    (row,) = warehouse._query_dicts(
+        "SELECT content_sha256, size_bytes FROM @marts_voice_memos_recordings WHERE source = 'apple_notes'"
+    )
+    assert (row["content_sha256"], row["size_bytes"]) == ("sha-good", 1000)
+
+
 def test_postgres_sync_state_round_trips_latest_update(warehouse: PostgresWarehouse) -> None:
     warehouse.ensure_tables()
     older = datetime(2026, 5, 19, 11, tzinfo=UTC)

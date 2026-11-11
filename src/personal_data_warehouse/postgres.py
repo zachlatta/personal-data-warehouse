@@ -20247,7 +20247,11 @@ class PostgresWarehouse:
                 FROM @apple_note_attachments a
                 LEFT JOIN @apple_note_revisions n
                   ON n.account = a.account AND n.note_id = a.note_id AND n.revision_id = a.revision_id
+                -- Only revisions that hold the audio: a newer 0-byte copy (an
+                -- iCloud stub, a failed export) carries the SHA-256 of empty
+                -- bytes, not an empty hash, and must never replace good audio.
                 WHERE a.is_missing = 0
+                  AND a.size_bytes > 0
                   AND a.content_sha256 <> ''
                   AND (
                       lower(a.content_type) LIKE 'audio/%'
