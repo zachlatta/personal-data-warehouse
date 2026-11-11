@@ -7,12 +7,74 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 func testService() *Service {
 	return newTestService(func(ctx context.Context, method string, input json.RawMessage) (any, error) {
 		return map[string]any{"rows": []any{map[string]any{"ref": "test:1", "priority": "self", "large": int64(9007199254740993)}}}, nil
 	}, true, nil)
+}
+
+func TestClientNamesDivideSharedCredentialCapacity(t *testing.T) {
+	started, release := make(chan struct{}, 2), make(chan struct{})
+	s := newTestService(func(ctx context.Context, _ string, _ json.RawMessage) (any, error) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}, true, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	done := make(chan struct{}, 2)
+	defer func() {
+		close(release)
+		cancel()
+		for i := 0; i < 2; i++ {
+			<-done
+		}
+	}()
+	a := auth.WithClientNameHolder(ctx)
+	auth.SetClientName(a, "client-a")
+	b := auth.WithClientNameHolder(ctx)
+	auth.SetClientName(b, "client-b")
+	// Fill both slots with real blocked reads; another client sharing the
+	// credential can still execute within the global four-run cap.
+	for i := 0; i < 2; i++ {
+		go func() { s.Run(a, Input{Code: `return await pdw.search({query:'hold'});`}); done <- struct{}{} }()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("reads did not start")
+		}
+	}
+	if r := s.Run(a, Input{Code: `return 1;`}); r.Error == nil || r.Error.Code != "busy" {
+		t.Fatalf("same client: %+v", r)
+	}
+	if r := s.Run(b, Input{Code: `return 2;`}); r.Error != nil || string(r.Value) != "2" {
+		t.Fatalf("other client: %+v", r)
+	}
+}
+
+func TestRealClockAndCatchableStackLimit(t *testing.T) {
+	r := testService().Run(context.Background(), Input{Code: `return Date.now();`})
+	var now int64
+	if r.Error != nil || json.Unmarshal(r.Value, &now) != nil || time.Since(time.UnixMilli(now)).Abs() > 5*time.Second {
+		t.Fatalf("clock: %+v", r)
+	}
+	r = testService().Run(context.Background(), Input{Code: `try { function f(){return f()}; f(); } catch(e) {return e.name+':'+e.message;}`})
+	if r.Error != nil || string(r.Value) != `"InternalError:stack overflow"` {
+		t.Fatalf("stack: %+v", r)
+	}
+	r = testService().Run(context.Background(), Input{Code: `function f(){return f()}; f();`})
+	if r.Error == nil || r.Error.Code != "stack_limit" {
+		t.Fatalf("uncaught stack: %+v", r)
+	}
 }
 
 // Race instrumentation needs its shadow heap; use a plain production worker

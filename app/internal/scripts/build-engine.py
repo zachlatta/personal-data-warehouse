@@ -18,7 +18,9 @@ quickjs, sdk = quickjs.resolve(), sdk.resolve()
 subprocess.run([
     str(sdk / 'bin/clang'), '--sysroot=' + str(sdk / 'share/wasi-sysroot'),
     # dtoa.c includes setjmp.h but never uses it; WASI has no setjmp.
-    '-O2', '-mexec-model=reactor', '-D_SETJMP_H', '-D_GNU_SOURCE', '-D__EMSCRIPTEN__', '-DCONFIG_VERSION="2026-06-04"', '-I'+str(quickjs),
+    # Emscripten disables OS atomics AND stack checks; restore the latter so
+    # JS recursion throws RangeError before exhausting the Wasm native stack.
+    '-O2', '-mexec-model=reactor', '-D_SETJMP_H', '-D_GNU_SOURCE', '-D__EMSCRIPTEN__', '-DCONFIG_STACK_CHECK', '-DCONFIG_VERSION="2026-06-04"', '-I'+str(quickjs),
     '-ffile-prefix-map='+str(quickjs)+'=quickjs',
     '-ffile-prefix-map='+str(ROOT)+'=pdw-scripts',
     '-Wl,--no-entry', '-Wl,--export=initialize', '-Wl,--export=poll',
@@ -28,6 +30,7 @@ subprocess.run([
         ['quickjs.c','libregexp.c','libunicode.c','cutils.c','dtoa.c']],
     '-lm', '-o', str(ROOT/'engine.wasm'),
 ], check=True)
+(ROOT / 'engine.wasm').chmod(0o644)
 actual = hashlib.sha256((ROOT / 'engine.wasm').read_bytes()).hexdigest()
 expected = (ROOT / 'engine.sha256').read_text().strip()
 if actual != expected:

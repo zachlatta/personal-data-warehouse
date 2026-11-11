@@ -66,9 +66,9 @@ func worker() (err error) {
 	if _, err = wasi_snapshot_preview1.Instantiate(ctx, rt); err != nil {
 		return err
 	}
-	// No filesystem mounts, environment, clocks, sleep, network, stdin or stdout
+	// Real clocks support Date.now/date arithmetic. No filesystem mounts, environment, sleep, network, stdin or stdout
 	// are wired into WASI. Only the Go driver holds the two protocol pipes.
-	mod, err := rt.InstantiateWithConfig(ctx, wasm, wazero.NewModuleConfig().WithStartFunctions("_initialize"))
+	mod, err := rt.InstantiateWithConfig(ctx, wasm, wazero.NewModuleConfig().WithStartFunctions("_initialize").WithSysWalltime().WithSysNanotime())
 	if err != nil {
 		return err
 	}

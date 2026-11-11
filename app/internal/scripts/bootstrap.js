@@ -9,7 +9,7 @@
   const freeze = Object.freeze;
   const NativePromise = Promise;
   const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-  const error = (e) => ({code: typeof e?.code === 'string' ? e.code : 'script_error',
+  const error = (e) => ({code: e?.name === 'InternalError' && e?.message === 'stack overflow' ? 'stack_limit' : typeof e?.code === 'string' ? e.code : 'script_error',
     message: String(e?.message ?? e).slice(0,1000), hint: String(e?.hint ?? '').slice(0,1000)});
   const encode = v => stringify(v, (_, x) => typeof x === 'bigint' ? String(x) : x);
   const immutable = x => {if(x && typeof x === 'object') {for(const k of keys(x)) immutable(x[k]); freeze(x);}return x;};

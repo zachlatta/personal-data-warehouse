@@ -2,7 +2,8 @@
 
 One warehouse for Zach's mail, chats, calendar, contacts, files, notes, photos, voice
 transcripts, health, finances and prior agent sessions across providers and machines.
-Questions about his life start here. Reads are safe. Built-in writes require human
+Answer questions about his life from PDW, not from priors, not from a web search, not from a
+single-source connector. Built-in writes require human
 approval; connected MCP tools may write directly.
 
 Read a topic when your question enters its domain{{if .CLI}} (`pdw readme <topic>`){{else}} (`readme` with `{"topic": "<name>"}`){{end}}; the index is at the end.

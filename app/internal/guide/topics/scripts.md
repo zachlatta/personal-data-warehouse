@@ -15,6 +15,7 @@ The source is an async function body. Use `await` and `return`. Globals are a fr
 timers, connections, mutations and approval APIs are unavailable. Dates are ISO strings;
 unsafe bigint integers and exact decimals are strings. Do not convert them to Number
 when exact values matter. JavaScript BigInt results serialize as strings too.
+`Date.now()` and `new Date()` use the real server clock (UTC); timers remain unavailable.
 
 | Method | Input | Result |
 |---|---|---|
@@ -63,7 +64,7 @@ No results is not evidence of absence: preserve freshness and truncation warning
 | Wall time | 30s default; 60s maximum |
 | Worker CPU / guest memory | 2s cumulative CPU watchdog (3s OS kill); 32 MiB Wasm memory |
 | Worker RSS | 128 MiB watchdog; not a cgroup memory reservation |
-| Calls | 12 per run, four runs globally, two per authenticated caller |
+| Calls | 12 per run, four runs globally, two per token-and-client pair (root uses client name) |
 | Parallel reads | Six globally; hybrid search has its own parallel query legs |
 | Per-operation query | 15s; at most 1,000 rows and 1 MiB wire data |
 | Aggregate rows / data | 5,000 / 4 MiB |
@@ -72,9 +73,12 @@ No results is not evidence of absence: preserve freshness and truncation warning
 Limits are errors rather than silent partial results. Narrow an exhausted query; do
 not automatically retry the same script. `Promise.all` can overlap independent reads;
 it cannot raise server limits. Scripts require Linux sandbox support and the configured
-`pdw_query` role; a missing sandbox fails closed.
+query role and a verified, dedicated unprivileged database login; unsafe or missing
+configuration fails closed for both SQL and scripts. Recursion is catchable as QuickJS's
+`InternalError: stack overflow`; uncaught recursion returns `stack_limit`.
 
 The all-client pilot is reviewed after one week. Read `marts_ops.script_runs` for daily
-runs, inner calls, errors, bytes and latency, alongside `marts_ops.agent_usage` and
+runs by outcome (including `busy`, `cpu_limit`, `script_error` and `stack_limit`), inner
+calls, errors, bytes and latency, alongside `marts_ops.agent_usage` and
 `marts_ops.agent_top_failures`. Count outer round trips and inner reads separately.
 Telemetry retains method/error categories and timing, not source code, arguments or results.

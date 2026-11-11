@@ -21,15 +21,18 @@ the upstream change and replace the pin. Builds run only this repository's
 adapter plus QuickJS core, regexp, unicode, dtoa and utilities. The libc/OS
 modules, CLI, module loader and worker support are not linked. The Emscripten
 configuration disables thread-dependent atomics. The unused setjmp header in
-dtoa is suppressed because WASI does not provide setjmp. Wasm traps bound the
-stack. The runtime enables wazero context cancellation and uses the interpreter.
+dtoa is suppressed because WASI does not provide setjmp. `CONFIG_STACK_CHECK` is
+explicitly restored: recursion is catchable as QuickJS's InternalError and becomes
+`stack_limit` if uncaught, before the Wasm stack trap. The runtime enables wazero
+context cancellation and uses the interpreter.
 
 Each worker is the application executable with a private worker argument. It
 gets no credentials or inherited environment. A Linux seccomp filter is applied
 with TSYNC to every runtime thread and inherited by later threads. Setup fails
 closed. Open, socket, execution, namespace, ptrace, process-memory, io_uring,
 memfd and related escape interfaces are refused. WASI has no mounts, environment,
-network, real clocks, sleep, or protocol descriptors. The JavaScript controller
+network, sleep, or protocol descriptors. Real wall/monotonic clocks are enabled
+for JavaScript Date; timers remain unavailable. The JavaScript controller
 is held by the native adapter outside the script global object; its messages
 are nevertheless validated by the parent broker before dispatch.
 
@@ -42,13 +45,34 @@ deployment's user and container boundary. It is not a general-purpose native
 code sandbox. Supported Linux architectures are amd64 and arm64; other hosts
 fail closed. `go test -race` covers the parent broker separately.
 
-The parent allows four runs, two per authenticated caller, twelve operations
+The parent allows four runs, two per token-and-client pair (root uses client name), twelve operations
 per run and six globally concurrent inner reads. Hybrid search can need three
 database connections per inner read; six leaves headroom in the 25-connection
 query pool. Query wrappers bound serialized results in Postgres before the
 driver materializes them. Caller cancellation, worker death and watchdog limits
 cancel outstanding database contexts. SQL uses the existing validator and role
-runner and requires `pdw_query`. Tool dispatch never exposes the full registry.
+runner and requires a configured query role plus a verified unprivileged login.
+The role name is configurable. Each query checks its actual session's attributes,
+memberships, object ownership and direct object grants before assuming that role;
+script admission checks too. A superuser login is refused, even for a script with
+no SQL calls. Tool dispatch never exposes the full registry.
+
+Set `PDW_QUERY_POSTGRES_URL` on the Go service to a separate login URL. Its
+`POSTGRES_DATABASE_URL` remains the writer/admin URL for trusted app services.
+Python warehouse construction provisions the login when
+`PDW_QUERY_POSTGRES_PASSWORD` (at least 32 random ASCII characters) is present;
+`PDW_QUERY_POSTGRES_LOGIN` defaults to `pdw_query_login`. It creates a NOINHERIT,
+non-superuser login with only SET membership in `PDW_QUERY_POSTGRES_ROLE`.
+It refuses preexisting privileged/multi-role logins. A drift probe compares SCRAM
+stored keys, so password rotation writes once under the query-role setup lock.
+Do not put the provisioning secret on device uploaders or in committed files.
+
+Roll out Python provisioning first, verify the dedicated login, set the Go query
+URL, then deploy Go. SQL and scripts both fail closed if the login is unsafe;
+there is no superuser compatibility mode. A missing query URL logs an error and
+the fallback writer URL is still subjected to the same safety checks. Other
+trusted services retain their separate writer pools. The telemetry writer still
+ensures its table; that does not replace this credential rollout ordering.
 
 Run metadata is written synchronously with a separate three-second budget. The
 writer ensures the cataloged table itself before its first insert, so deployment
@@ -59,7 +83,7 @@ messages are reduced to SQLSTATE and fixed categories. Search priorities are
 restricted to known tiers. Normal API/MCP result logging is suppressed for run.
 
 Python ensure creates the timestamp index and `marts_ops.script_runs` daily
-summary. It also grants query access through the normal catalog policy. The
+summary grouped by outcome. It also grants query access through the normal catalog policy. The
 view is available after that ensure cycle. Existing collectors expand run
 telemetry linked by run id into inner operations, without counting the outer
 composition request as a second read. Failed executions also enter C17's shape
