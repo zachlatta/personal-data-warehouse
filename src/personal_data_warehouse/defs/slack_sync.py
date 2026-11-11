@@ -203,7 +203,7 @@ def run_slack_freshness_sync(*, settings, warehouse, logger) -> list[SlackSyncSu
             history_window=max(window_by_type.values()),
             freshness_window_by_type=window_by_type,
             freshness_limit_by_type=limit_by_type,
-            # Conversations active inside this window are due every 15 minutes
+            # Conversations active inside this window are due every ten minutes
             # (SLACK_FRESHNESS_DUE_INTERVALS); within a year every two hours;
             # older every twelve.
             freshness_warm_window=timedelta(
@@ -312,13 +312,15 @@ def run_slack_public_sweep_sync(*, settings, warehouse, logger) -> list[SlackSyn
     The per-run limits are a rate budget, not a preference. Each candidate costs
     one ``conversations.history`` call when nothing happened in it, so
     hot + cold per five minutes is the sustained call rate this stage adds
-    (~12/min at the defaults) against a measured ~39/min ceiling shared with
-    freshness, threads and coverage. Cold is the larger of the two on purpose:
-    hot is ~1.5k channels and cold is ~11.8k, so 40 cold per run is what makes
-    the full rotation about a day, inside the four-day SLA
+    (~8/min at the defaults) against the ceiling it shares with freshness and
+    coverage -- and freshness, where a DM is waiting, is the stage that runs
+    out (every pass stopped at the rate limit on 2026-11-11). The split follows
+    the buckets' sizes: 9,395 non-member channels active within the week and
+    5,549 quieter ones that day, so 30 hot and 10 cold put each rotation at
+    about 26 and 46 hours, inside the four-day cycle
     marts_ops.slack_conversation_health judges. Raise them for a catch-up, not
     forever; every stage aborts gracefully on the shared rate-limit budget, so
-    over-asking here does not fail runs, it just slows every other stage down.
+    over-asking here does not fail runs, it starves the freshness pass.
     """
     return SlackSyncRunner(
         settings=settings,
@@ -328,8 +330,8 @@ def run_slack_public_sweep_sync(*, settings, warehouse, logger) -> list[SlackSyn
         sync_members=False,
         sync_public_sweep_only=True,
         sweep_hot_within_days=_int_env("SLACK_ASSET_SWEEP_HOT_DAYS", 7),
-        sweep_hot_limit=_int_env("SLACK_ASSET_SWEEP_HOT_LIMIT", 20),
-        sweep_cold_limit=_int_env("SLACK_ASSET_SWEEP_COLD_LIMIT", 40),
+        sweep_hot_limit=_int_env("SLACK_ASSET_SWEEP_HOT_LIMIT", 30),
+        sweep_cold_limit=_int_env("SLACK_ASSET_SWEEP_COLD_LIMIT", 10),
         skip_known_errors=True,
         # Decoupled from replies, like coverage and for the same reason: a page
         # of 200 parents can carry dozens of threads, and fetching each one

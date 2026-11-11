@@ -4890,39 +4890,73 @@ def test_postgres_public_sweep_offers_hot_channels_then_the_least_recently_polle
     assert [payload["id"] for payload in both] == ["C-hot", "C-cold", "C-cold-polled"]
 
 
-def test_postgres_public_sweep_skips_a_conversation_known_gone(
+def test_postgres_a_gone_verdict_holds_only_while_the_conversation_is_archived(
     warehouse: PostgresWarehouse,
 ) -> None:
+    """Slack listing a conversation again overrules an old channel_not_found.
+
+    A gone-code failure marks the conversation archived; only conversations.list
+    can set it live again, and it does so only for a conversation Slack lists.
+    Measured 2026-11-11: eleven public channels carried a 'gone' verdict from
+    May to October while discovery kept re-listing them as live, so
+    marts_ops.slack_conversation_health counted them as live and unpolled (the
+    oldest since 2026-05-28) -- and ten of the eleven answered
+    conversations.history normally that day. The verdict was a transient
+    channel_not_found that nothing ever retried.
+    """
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_conversations(
         [
             _slack_conversation_row(
-                conversation_id="C-gone",
+                conversation_id="C-relisted",
                 conversation_type="public_channel",
                 is_member=0,
-                raw_json='{"id":"C-gone"}',
-            )
+                raw_json='{"id":"C-relisted"}',
+            ),
+            _slack_conversation_row(
+                conversation_id="C-archived",
+                conversation_type="public_channel",
+                is_member=0,
+                is_archived=1,
+                raw_json='{"id":"C-archived","is_archived":true}',
+            ),
+            _slack_conversation_row(
+                conversation_id="G-relisted",
+                conversation_type="private_channel",
+                raw_json='{"id":"G-relisted","is_private":true}',
+            ),
         ]
     )
-    warehouse.insert_slack_sync_state(
-        account="zrl",
-        team_id="T1",
-        object_type="conversation",
-        object_id="C-gone",
-        cursor_ts="",
-        last_sync_type="full",
-        status="gone",
-        error="channel_not_found",
-        updated_at=datetime(2026, 5, 1, tzinfo=UTC),
-        sync_version=1,
-    )
-
-    assert (
-        warehouse.load_slack_public_sweep_candidate_payloads(
-            account="zrl", team_id="T1", hot_limit=10, cold_limit=10
+    for conversation_id in ("C-relisted", "C-archived", "G-relisted"):
+        warehouse.insert_slack_sync_state(
+            account="zrl",
+            team_id="T1",
+            object_type="conversation",
+            object_id=conversation_id,
+            cursor_ts="",
+            last_sync_type="partial",
+            status="gone",
+            error="conversations.history failed: channel_not_found",
+            updated_at=datetime(2026, 5, 28, tzinfo=UTC),
+            sync_version=1,
         )
-        == []
+
+    swept = warehouse.load_slack_public_sweep_candidate_payloads(
+        account="zrl", team_id="T1", hot_limit=10, cold_limit=10
     )
+    assert [payload["id"] for payload in swept] == ["C-relisted"]
+
+    live = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", skip_known_errors=True
+    )
+    assert sorted(payload["id"] for payload in live) == ["C-relisted", "G-relisted"]
+
+    # The archived-only coverage stages still never retry an archived channel
+    # that Slack reported gone: nothing would list it live again.
+    archived = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", archived_only=True, skip_known_errors=True
+    )
+    assert archived == []
 
 
 def test_postgres_touch_slack_conversation_sync_state_keeps_the_cursor_and_moves_the_clock(
@@ -4982,6 +5016,39 @@ def test_postgres_touch_slack_conversation_sync_state_keeps_the_cursor_and_moves
         ("zrl", "T1", "C2"),
     )
     assert fresh == [("", "sweep", "ok")]
+
+    # A poll that answered proves the conversation is reachable, so a 'gone'
+    # verdict from an earlier channel_not_found is cleared -- otherwise the
+    # tombstone outlives the conversation's return. The cursor and sync type
+    # are still preserved.
+    warehouse.insert_slack_sync_state(
+        account="zrl",
+        team_id="T1",
+        object_type="conversation",
+        object_id="C3",
+        cursor_ts="1770000000.000011",
+        last_sync_type="partial",
+        status="gone",
+        error="conversations.history failed: channel_not_found",
+        updated_at=datetime(2026, 5, 1, tzinfo=UTC),
+        sync_version=1,
+    )
+    warehouse.touch_slack_conversation_sync_state(
+        account="zrl",
+        team_id="T1",
+        conversation_id="C3",
+        updated_at=polled_at,
+        sync_version=3,
+    )
+    healed = warehouse._query(
+        """
+        SELECT cursor_ts, last_sync_type, status, error, updated_at
+        FROM @slack_sync_state
+        WHERE account = %s AND team_id = %s AND object_type = 'conversation' AND object_id = %s
+        """,
+        ("zrl", "T1", "C3"),
+    )
+    assert healed == [("1770000000.000011", "partial", "ok", "", polled_at)]
 
 
 def test_postgres_mark_slack_conversation_inactive_excludes_it_from_active_loads(
@@ -5365,10 +5432,14 @@ def test_postgres_slack_thread_parent_refs_skip_gone_but_retry_errors(
 def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
     warehouse: PostgresWarehouse,
 ) -> None:
+    # The archived-only coverage stages: a gone verdict on an archived
+    # conversation is never retried, a transient error always is. (A live
+    # conversation's gone verdict is retried; see
+    # test_postgres_a_gone_verdict_holds_only_while_the_conversation_is_archived.)
     warehouse.ensure_slack_tables()
     warehouse.insert_slack_conversations(
         [
-            _slack_conversation_row(conversation_id=cid, raw_json=f'{{"id":"{cid}"}}')
+            _slack_conversation_row(conversation_id=cid, is_archived=1, raw_json=f'{{"id":"{cid}"}}')
             for cid in ("C-gone", "C-error", "C-fresh")
         ]
     )
@@ -5387,7 +5458,9 @@ def test_postgres_slack_conversation_payloads_skip_gone_but_retry_errors(
         error="conversations.history failed: fatal_error",
     )
 
-    payloads = warehouse.load_slack_conversation_payloads(account="zrl", team_id="T1", skip_known_errors=True)
+    payloads = warehouse.load_slack_conversation_payloads(
+        account="zrl", team_id="T1", archived_only=True, skip_known_errors=True
+    )
 
     assert sorted(p["id"] for p in payloads) == ["C-error", "C-fresh"]
 

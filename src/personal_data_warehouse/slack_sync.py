@@ -28,17 +28,21 @@ SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: How long a poll-only freshness pass waits before asking a quiet conversation
 #: again: active inside the warm window (14 days), inside a year, and older.
 #: Sized for the workspace OAuth token, which ends a pass at the rate limit
-#: after ~210-250 conversations.history calls (measured 2026-10-03): with ~180
-#: warm, ~1,230 cool and ~5,500 cold DMs, group DMs and private channels this is
-#: ~150 polls a pass, leaving the rest for conversations active right now. The
-#: pasted session (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
+#: after ~210-250 conversations.history calls (measured 2026-10-03 and again
+#: 2026-11-11). Warm is ten minutes so a DM waking after hours or days of quiet
+#: lands inside the fifteen-minute target: one interval of waiting plus the
+#: pass that fetches it (~3.5 minutes to the timeline). With ~160 warm, ~1,020
+#: cool and ~5,620 cold DMs and group DMs that is ~160 polls a pass, which fits
+#: because due DMs and group DMs go before every channel (see
+#: SlackSyncRunner._sync_account_freshness_priority). The pasted session
+#: (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
 #: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
-SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=15), timedelta(hours=2), timedelta(hours=12))
+SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=10), timedelta(hours=2), timedelta(hours=12))
 #: The activity windows those intervals are chosen by: a DM or group DM whose
 #: newest known message is inside the hot window is polled every pass (the
 #: Dagster default for SLACK_ASSET_DM_WINDOW_MINUTES and
 #: SLACK_ASSET_MPIM_WINDOW_MINUTES), inside the warm window it is due every
-#: fifteen minutes, inside the cool window every two hours, and older every
+#: ten minutes, inside the cool window every two hours, and older every
 #: twelve. marts_ops.slack_conversation_health reads the same numbers to tell a
 #: quiet DM waking up on schedule from a DM landing late.
 SLACK_IM_FRESHNESS_WINDOW = timedelta(hours=4)
@@ -1054,24 +1058,44 @@ class SlackSyncRunner:
         # first, and one not yet due is not polled, which is what leaves
         # budget for the quiet ones. Every poll is stamped below.
         #
-        # Public channels go after every DM, group DM and private channel, hot
-        # or due: on the OAuth token a pass ends at the rate limit after
-        # ~210-250 polls, and ~95 of them went to public channels active in the
-        # last two hours -- mostly chatter not aimed at Zach -- while due DMs
-        # waited (2026-10-03). The public sweep covers what a pass misses.
-        # A public channel Zach is a member of is not that chatter, so it is
-        # scheduled with the DMs by how overdue it is.
+        # The pass is a permanent backlog on the OAuth token: every pass from
+        # 2026-11-10 to 11-11 stopped at the rate limit after 209-249 polls
+        # with 789-1,214 due. So the order is a priority, in four lanes:
+        #
+        #   0. hot DMs, group DMs and private channels -- every pass;
+        #   1. due DMs and group DMs, most overdue first -- a person is waiting
+        #      on the other end. Ordered only by how overdue, warm DMs waited
+        #      behind channels as overdue as themselves and were polled p50 24 /
+        #      p95 39 minutes apart against a 15-minute interval; im landing
+        #      read p95 2,626s;
+        #   2. channels Zach is in -- due private channels, and member public
+        #      channels hot or due -- by how overdue, sharing what is left. A
+        #      hot member public channel is due every pass, not ahead of due DMs
+        #      (33 of them took a seventh of every pass on 2026-11-11);
+        #   3. public channels he is not in: ~95 polls a pass went to that
+        #      chatter while due DMs waited (2026-10-03). The public sweep covers
+        #      what a pass misses.
         scheduled = []
         for entry in planned:
             conversation, group, oldest_ts = entry
-            public = 1 if group[0] == "public_channel" and not _public_member(conversation) else 0
+            kind = group[0]
+            if kind == "public_channel" and not _public_member(conversation):
+                lane = 3
+            elif kind == "public_channel":
+                lane = 2
+            elif _hot(conversation, oldest_ts):
+                lane = 0
+            elif kind in ("im", "mpim"):
+                lane = 1
+            else:
+                lane = 2
             if _hot(conversation, oldest_ts):
-                scheduled.append(((public, 0, _last_polled(conversation), type_rank[group]), entry))
-                continue
-            due = _last_polled(conversation) + _interval(conversation)
-            if due > now_ts:
-                continue
-            scheduled.append(((public, 1, due, type_rank[group]), entry))
+                due = _last_polled(conversation)
+            else:
+                due = _last_polled(conversation) + _interval(conversation)
+                if due > now_ts:
+                    continue
+            scheduled.append(((lane, due, type_rank[group]), entry))
         scheduled.sort(key=lambda item: item[0])
         planned = [entry for _key, entry in scheduled]
 

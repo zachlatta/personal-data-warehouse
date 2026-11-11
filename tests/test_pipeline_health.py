@@ -3100,8 +3100,8 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     Live on 2026-10-25 the im row read p95 5,049s and S1 red because three
     messages woke two DMs quiet 16.5 and 19 days; they landed inside the 2h
     interval SLACK_FRESHNESS_DUE_INTERVALS gives them. The next night three
-    DMs quiet 7-39 hours -- warm, polled every 15 minutes, not every pass --
-    read p95 1,669s the same way. Such a wake-up -- and any message written
+    DMs quiet 7-39 hours -- warm, polled every 15 minutes then (ten since
+    2026-11-11), not every pass -- read p95 1,669s the same way. Such a wake-up -- and any message written
     before it lands -- leaves the 15-minute sample. A message into a DM
     active inside the four-hour hot window, a wake-up later than its own tier
     allows, and a brand-new conversation are still judged, so a tier that
@@ -3122,12 +3122,12 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     fresh = now - timedelta(minutes=30)
     conversations = {
         "D_WARM": "im",  # quiet 3 days, woke 2h ago, then a hot reply: judged
-        "D_WARM_WOKE": "im",  # quiet 3 days, wake landing inside 15m + margin
+        "D_WARM_WOKE": "im",  # quiet 3 days, wake landing inside 10m + margin
         "D_WOKE": "im",  # quiet 16 days, two-message wake landing inside 2h
         "D_COLD": "im",  # quiet 400 days, wake landing inside 12h
         "D_ANSWERED": "im",  # a wake, then a reply written after it landed
         "G_OVERDUE": "mpim",  # quiet 16 days, landed 5h later: past its tier
-        "G_WARM_SLOW": "mpim",  # quiet 3 days, landed 40m later: past 15m + margin
+        "G_WARM_SLOW": "mpim",  # quiet 3 days, landed 40m later: past 10m + margin
         "G_NEW": "mpim",  # no earlier message: discovery polls it at once
     }
     warehouse.insert_slack_conversations(
@@ -3136,7 +3136,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     _poll_every_health_conversation(warehouse)
     written = {
         "D_WARM": [timedelta(days=3), timedelta(hours=2), timedelta(minutes=3)],
-        "D_WARM_WOKE": [timedelta(days=3), timedelta(minutes=25)],
+        "D_WARM_WOKE": [timedelta(days=3), timedelta(minutes=20)],
         "D_WOKE": [timedelta(days=16), timedelta(minutes=90), timedelta(minutes=80)],
         "D_COLD": [timedelta(days=400), timedelta(hours=6)],
         "D_ANSWERED": [timedelta(days=16), timedelta(hours=4), timedelta(minutes=20)],
@@ -3198,7 +3198,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     im = rows["im"]
     # Judged: D_WARM's 3-minute hot reply and D_ANSWERED's 20-minute reply.
     # Left out: D_WOKE's two, D_COLD's one, D_ANSWERED's wake, and the warm
-    # wakes of D_WARM (1 minute) and D_WARM_WOKE (25 minutes).
+    # wakes of D_WARM (1 minute) and D_WARM_WOKE (20 minutes).
     assert im["landing_sample_24h"] == 2, im
     assert im["landing_wakeups_excluded_24h"] == 6, im
     assert abs(im["landing_wakeup_max_seconds"] - 6 * 3600) <= 120, im
@@ -3206,7 +3206,7 @@ def test_slack_dm_landing_leaves_out_quiet_dms_waking_inside_their_poll_interval
     assert im["landing_status"] == "late", "the reply came after the wake landed and is judged"
 
     mpim = rows["mpim"]
-    # G_OVERDUE, G_WARM_SLOW (40 minutes is past 15m + margin) and G_NEW.
+    # G_OVERDUE, G_WARM_SLOW (40 minutes is past 10m + margin) and G_NEW.
     assert mpim["landing_sample_24h"] == 3, mpim
     assert mpim["landing_wakeups_excluded_24h"] == 0 and mpim["landing_wakeup_max_seconds"] is None, mpim
     assert mpim["landing_p95_seconds"] > SLACK_DM_LANDING_LATE_P95_SECONDS

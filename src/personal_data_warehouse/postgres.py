@@ -872,7 +872,7 @@ SLACK_ACCOUNT_STATE_ITEM_WINDOW = timedelta(days=30)
 SLACK_FINGERPRINT_THUMB_SIZES = (1024, 960, 800, 720, 480, 360, 160)
 SLACK_DM_LANDING_P95_SECONDS = 900
 SLACK_DM_LANDING_LATE_P95_SECONDS = 3600
-# A DM quiet past the four-hour hot window is polled every fifteen minutes,
+# A DM quiet past the four-hour hot window is polled every ten minutes,
 # every two hours once quiet two weeks, every twelve once quiet a year
 # (SLACK_FRESHNESS_DUE_INTERVALS), so the message that wakes it -- and any
 # written before it lands -- arrives up to that late by design. Live on
@@ -14929,10 +14929,14 @@ class PostgresWarehouse:
         if zero_messages_only:
             where.append("COALESCE(m.message_count, 0) = 0")
         if skip_known_errors:
-            # 'gone' is terminal (deleted/archived/left channel) so retrying is a
-            # guaranteed identical failure; a transient 'error' stays in the
-            # candidate set so it can heal to 'ok' on the next attempt.
-            where.append("COALESCE(s.status, '') != 'gone'")
+            # 'gone' (deleted/archived/left channel) is terminal only while the
+            # conversation stays archived: the failure marked it so, and only a
+            # conversations.list that names it live can undo that. A live row
+            # with a gone verdict is one Slack listed again, so it is retried --
+            # eleven public channels sat 'gone' from May to October while
+            # discovery re-listed them, ten of them readable all along
+            # (2026-11-11). A transient 'error' always stays in the candidate set.
+            where.append("(COALESCE(s.status, '') != 'gone' OR c.is_archived = 0)")
         limit_clause = "LIMIT %s" if limit is not None else ""
         if limit is not None:
             params.append(int(limit))
@@ -15064,7 +15068,9 @@ class PostgresWarehouse:
                   AND c.team_id = %s
                   AND c.conversation_type = 'public_channel'
                   AND c.is_archived = 0
-                  AND COALESCE(s.status, '') <> 'gone'
+                  -- No 'gone' filter: a gone-code failure archives the row, so
+                  -- a live row with a gone verdict is one discovery re-listed,
+                  -- and the verdict is stale (load_slack_conversation_payloads).
                   AND {activity_predicate}
                 ORDER BY s.updated_at ASC NULLS FIRST, c.conversation_id
                 LIMIT %s
@@ -15095,17 +15101,21 @@ class PostgresWarehouse:
         Without this a quiet channel is re-polled every run and the rest of the
         workspace is never reached. The existing cursor, sync type and status are
         preserved on conflict: this says when we last looked, not what we know.
+        The one exception is a 'gone' verdict, which a poll that answered has
+        just disproved, so it becomes 'ok' and its error is cleared.
         """
         self._command(
             """
-            INSERT INTO @slack_sync_state (
+            INSERT INTO @slack_sync_state AS s (
                 account, team_id, object_type, object_id,
                 cursor_ts, last_sync_type, status, error, updated_at, sync_version
             )
             VALUES (%s, %s, 'conversation', %s, '', 'sweep', 'ok', '', %s, %s)
             ON CONFLICT (account, team_id, object_type, object_id) DO UPDATE
                SET updated_at = EXCLUDED.updated_at,
-                   sync_version = EXCLUDED.sync_version
+                   sync_version = EXCLUDED.sync_version,
+                   status = CASE WHEN s.status = 'gone' THEN 'ok' ELSE s.status END,
+                   error = CASE WHEN s.status = 'gone' THEN '' ELSE s.error END
             """,
             (account, team_id, conversation_id, _ensure_utc(updated_at), int(sync_version)),
         )
@@ -15691,7 +15701,7 @@ class PostgresWarehouse:
             landing_classified AS (
                 -- A scheduled wake-up: the anchor is older than the hot
                 -- window, so the conversation was not polled every pass but
-                -- due every fifteen minutes (two hours past the warm window,
+                -- due every ten minutes (two hours past the warm window,
                 -- twelve past the cool one), and the message landed inside
                 -- that interval plus a margin. A message into a hot DM is
                 -- always judged (the CASE is NULL). A brand-new conversation

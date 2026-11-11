@@ -120,15 +120,18 @@ carry dozens of threads, and one busy channel would eat the whole run. They are
 drained by `slack_workspace_thread_backfill_sync`, which selects parents whose
 replies we do not hold from any conversation, newest first.
 
-`SLACK_ASSET_SWEEP_HOT_LIMIT` (20) and `SLACK_ASSET_SWEEP_COLD_LIMIT` (40) are a
+`SLACK_ASSET_SWEEP_HOT_LIMIT` (30) and `SLACK_ASSET_SWEEP_COLD_LIMIT` (10) are a
 **rate budget, not a preference**: they are the sustained call rate this stage
-adds (~12/min) against a measured ~39/min `conversations.history` ceiling shared
-with freshness, threads, coverage and read-state. Cold is the larger bucket
-because there are ~11.8k cold channels to ~1.5k hot ones, which puts the full
-rotation at about a day — inside the four-day SLA the health view judges. Raise
-them for a catch-up and put them back; every stage aborts gracefully on the
-shared rate-limit budget, so over-asking does not fail runs, it starves the
-other stages.
+adds (~8/min) against the `conversations.history` ceiling it shares with
+freshness and coverage. They were 20 and 40 while the hot bucket was ~1.5k
+channels; on 2026-11-11 it was 9,395 (active within the week) to 5,549 cold,
+so 30 and 10 put the two rotations at about 26 and 46 hours, inside the
+four-day SLA the health view judges, and give twenty calls a run back to the
+freshness pass, which was stopping at the rate limit on every run (see
+[Polling](#polling-how-the-sync-finds-new-messages)). Raise them for a
+catch-up and put them back; every stage aborts gracefully on the shared
+rate-limit budget, so over-asking does not fail runs, it starves the freshness
+pass, where a DM is waiting.
 
 - **Membership is deliberately not a filter, and `is_member` is not trustworthy
   anyway.** `base_slack.conversations.is_member` said 202 while Slack's own client
@@ -139,6 +142,17 @@ other stages.
   preserves the cursor, sync type and status). The candidate order is by last
   poll, so an unstamped poll re-picks the same channels forever and the tail is
   never reached. This is the one invariant that makes the rotation a rotation.
+- **A `gone` verdict holds only while the conversation is archived.** A gone-code
+  failure (`channel_not_found`, `not_in_channel`, …) records `status = 'gone'` and
+  marks the row archived; only `conversations.list` naming it live can unarchive it.
+  So a live row with a `gone` verdict is one Slack listed again, and every loader
+  retries it; a poll that answers clears the verdict back to `ok`. Until 2026-11-11
+  the verdict was permanent while discovery kept re-listing the channel: eleven
+  public channels sat unpolled, the oldest since 2026-05-28, as the whole
+  `public_channel` shortfall of `history_polled_fraction`, and ten of them answered
+  `conversations.history` normally that day. The eleventh really was gone; its
+  retry marks it archived, which takes it out of `live_count`. A channel Slack lists
+  but never serves costs one call per discovery cycle.
 - **`marts_ops.slack_conversation_health` now judges both halves.**
   `history_polled_fraction` is the share of live conversations asked for new
   messages within a cycle, judged for every type since 2026-10-01 (polling is the
@@ -228,10 +242,12 @@ three things:
   ~8 hours to land.
 - **It polls each conversation when it is due** (`SLACK_FRESHNESS_DUE_INTERVALS`): active
   inside the freshness window (four hours for DMs and group DMs) every pass, within 14 days
-  every 15 minutes, within a year every two hours, older every twelve hours
+  every ten minutes, within a year every two hours, older every twelve hours
   (`SLACK_ASSET_FRESHNESS_DUE_MINUTES=warm,cool,cold` overrides; the session allowed
-  `15,60,360`). DMs, group DMs and private channels go before any public channel, and
-  within each the most overdue go first; one not yet due is skipped. Before this the pass polled every candidate in tier order,
+  `15,60,360`). The order is four lanes, each most overdue first: hot DMs, group DMs and
+  private channels; then due DMs and group DMs; then the channels Zach is in (due private
+  channels, member public channels hot or due); then public channels he is not in. One
+  not yet due is skipped. Before this the pass polled every candidate in tier order,
   spent its budget on the ~250 conversations active in the last fortnight, and never reached
   the rest: in the 24 hours to 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group DMs
   were polled at all, and a group DM quiet since 09-10 took 28 hours to land.
@@ -268,11 +284,31 @@ Zach's to set up.
 inside the four-hour hot window (`SLACK_IM_FRESHNESS_WINDOW`) is polled every pass, so its
 messages are held to the 15-minute p95. A message that wakes a quieter DM -- and any written
 before that wake lands -- is a scheduled wake-up when it lands inside its tier's interval
-plus `SLACK_DM_WAKEUP_MARGIN_SECONDS`: 15m + 15m when warm (4h-14d), 2h + 15m when cool,
+plus `SLACK_DM_WAKEUP_MARGIN_SECONDS`: 10m + 15m when warm (4h-14d), 2h + 15m when cool,
 12h + 15m when cold. Those leave `landing_p95_seconds` and are counted in
 `landing_wakeups_excluded_24h` / `landing_wakeup_max_seconds`; one later than its tier
 allows is still judged. Without the warm tier, three DMs quiet 7-39 hours read the im row
 `late` at p95 1,669s on 2026-10-26.
+
+**Due DMs go before every channel, because every pass ends at the rate limit
+(2026-11-11).** Every five-minute pass for the 24 hours to 2026-11-11 19:00Z stopped at the
+120-second rate-limit sleep budget after 209-249 `conversations.history` calls, with 789-1,214
+conversations due: the schedule asked for ~240 polls a pass and the token gives ~230, so it
+was a permanent backlog ordered only by how overdue each conversation was. Warm DMs, due
+every 15 minutes, waited behind channels as overdue as themselves and were polled p50 24 /
+p95 39 minutes apart, so a DM quiet for a few hours landed 20-40 minutes late -- past the
+wake-up allowance below -- and the im row read `late` at p95 2,626s with every other
+number green. The run was not queued (p50 7s) or slow (p50 199s); the budget went to the
+wrong conversations. So due DMs and group DMs now have their own lane ahead of every
+channel, and the warm interval is ten minutes, so a warm wake-up lands inside fifteen
+(one interval plus the ~3.5 minutes from pass start to the timeline fast lane). Their
+demand is ~180 polls a pass (~20 hot, ~80 warm, ~40 cool, ~40 cold), and the channels Zach
+is in share the rest by how overdue they are -- including a member public channel active
+in the last two hours, which used to be polled every pass ahead of DMs (33 of them, a
+seventh of every pass). The public sweep gave twenty calls a run back to make room.
+Nothing cheaper can tell PDW which DMs moved: on 2026-11-11 the workspace token got
+`not_allowed_token_type` from both `client.counts` and `users.counts`, and the session is
+off polling (below).
 
 **"Public channels go last" means public channels Zach is not in (2026-10-17).** The pass
 caps public candidates at the 100 most recently active (`SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT`)
@@ -280,8 +316,8 @@ out of ~14,500, and Zach's own channel ranked 223rd that day, so no pass ever po
 sweep reached it nine hours after its previous poll, and a 168-reply thread he posted in was
 not in PDW. The median member public channel active in the last fortnight was 10.5 hours past
 its last poll. Public channels with `is_member` set (218 that day, ~58 polls a pass) are now
-never capped and are scheduled with the DMs, group DMs and private channels by how overdue
-they are. Only non-member public channels go last.
+never capped and are scheduled with the private channels by how overdue they are, after
+due DMs and group DMs. Only non-member public channels go last.
 
 **Read state rotates; it is not refreshed by activity.** `last_read` (what the inbox's
 unread state is computed from) arrives only through `conversations.info`, which the

@@ -401,10 +401,14 @@ def test_slack_public_sweep_polls_public_channels_regardless_of_membership(monke
     assert len(summaries) == 1
     call = calls[0]
     assert call["sync_public_sweep_only"] is True
-    assert call["sweep_hot_limit"] == 20
-    # Cold is the bigger bucket because there are ~11.8k cold channels to ~1.5k
-    # hot ones; this is what makes the full rotation about a day.
-    assert call["sweep_cold_limit"] == 40
+    # Forty polls a run, split by where the channels are: measured 2026-11-11
+    # there were 9,395 non-member channels active within the week and 5,549
+    # quieter ones, so thirty and ten put each bucket's rotation at about 26
+    # and 46 hours, inside the four-day cycle. It was sixty (twenty hot, forty
+    # cold) when the hot bucket was ~1.5k; the twenty calls it gives back go
+    # to the freshness pass, which shares the conversations.history budget.
+    assert call["sweep_hot_limit"] == 30
+    assert call["sweep_cold_limit"] == 10
     assert call["sweep_hot_within_days"] == 7
     assert call["skip_known_errors"] is True
     # Replies are left to the thread-backfill drain, as coverage does: fetching
