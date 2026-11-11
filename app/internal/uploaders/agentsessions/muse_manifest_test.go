@@ -215,3 +215,43 @@ func TestMuseManifestCountsASessionSplitAcrossFilesOverItsUnion(t *testing.T) {
 		t.Fatalf("entries = %+v (%v)", entries, err)
 	}
 }
+
+func TestMuseManifestTakesTheNewestTimestampOfASplitSession(t *testing.T) {
+	agents := t.TempDir()
+	id := "0b5e8c1a-1111-4a2b-9c3d-000000000004"
+	// agent-a sorts first in the walk but holds the newer line (epoch
+	// seconds for 2026-11-10T12:00:00Z); agent-b's ISO line is older.
+	bodies := map[string]string{
+		"a": `{"type":"item","seq":0,"created_at":1794312000}` + "\n",
+		"b": `{"type":"item","seq":1,"created_at":"2026-11-10T09:00:00Z"}` + "\n",
+	}
+	for agent, body := range bodies {
+		path := filepath.Join(agents, "agent-"+agent, "sessions", id+".jsonl")
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		os.WriteFile(path, []byte(body), 0o644)
+	}
+	entries, err := MuseManifest(agents, nil)
+	if err != nil || len(entries) != 1 || entries[0].LastTimestamp != "1794312000" {
+		t.Fatalf("entries = %+v (%v)", entries, err)
+	}
+}
+
+func TestMuseStampAfterComparesTimesNotText(t *testing.T) {
+	for _, c := range []struct {
+		stamp, current string
+		want           bool
+	}{
+		{"2026-11-10T10:00:00Z", "", true},
+		{"", "2026-11-10T10:00:00Z", false},
+		{"2026-11-10T10:00:00Z", "2026-11-10T09:00:00Z", true},
+		{"2026-11-10T09:00:00Z", "2026-11-10T10:00:00Z", false},
+		{"2026-11-10T09:00:00-05:00", "2026-11-10T10:00:00Z", true},
+		{"1794312000", "2026-11-10T11:59:59Z", true},
+		{"garbled", "2026-11-10T10:00:00Z", false},
+		{"2026-11-10T10:00:00Z", "garbled", true},
+	} {
+		if got := museStampAfter(c.stamp, c.current); got != c.want {
+			t.Errorf("museStampAfter(%q, %q) = %v, want %v", c.stamp, c.current, got, c.want)
+		}
+	}
+}

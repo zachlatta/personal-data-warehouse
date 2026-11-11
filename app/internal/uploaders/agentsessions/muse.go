@@ -240,7 +240,7 @@ func MuseManifest(agentsRoot string, cache MuseManifestCache) ([]MuseManifestEnt
 		} else {
 			keys := map[string]bool{}
 			for _, file := range group {
-				if stamp, err := countMuseFile(file.path, keys); err == nil && stamp != "" {
+				if stamp, err := countMuseFile(file.path, keys); err == nil && museStampAfter(stamp, entry.LastTimestamp) {
 					entry.LastTimestamp = stamp
 				}
 			}
@@ -317,6 +317,36 @@ func pythonInt(value any) int64 {
 	default:
 		return 0
 	}
+}
+
+// museStampAfter reports whether stamp is later than current, both as
+// museTimestampText writes them (RFC 3339 text or epoch seconds). A stamp
+// that does not parse never replaces one that does; between two that do not,
+// the later in walk order wins.
+func museStampAfter(stamp, current string) bool {
+	if stamp == "" {
+		return false
+	}
+	at, ok := museStampTime(stamp)
+	was, wasOK := museStampTime(current)
+	switch {
+	case current == "":
+		return true
+	case ok && wasOK:
+		return at.After(was)
+	default:
+		return ok || !wasOK
+	}
+}
+
+func museStampTime(stamp string) (time.Time, bool) {
+	if at, err := time.Parse(time.RFC3339Nano, stamp); err == nil {
+		return at, true
+	}
+	if seconds, err := strconv.ParseFloat(stamp, 64); err == nil && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+		return time.Unix(0, int64(seconds*1e9)).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 // museTimestampText is a line's created_at as written (ISO text on most

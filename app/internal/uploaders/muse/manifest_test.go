@@ -205,3 +205,43 @@ func TestTheManifestCacheLivesInTheWorkspaceState(t *testing.T) {
 		t.Fatal("hit after the file was dropped")
 	}
 }
+
+func TestANewManifestRuleDropsOnlyTheManifestCache(t *testing.T) {
+	path := t.TempDir() + "/state.sqlite"
+	open := func() *WorkspaceState {
+		t.Helper()
+		state, err := OpenWorkspaceState(path, "z@x", "/home/hatch")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	state := open()
+	if err := state.ManifestCache().Store("/a.jsonl", 10, 5, agentsessions.MuseManifestCounts{EventCount: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Record("MEMORY.md", 9, 1, "sha", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	state.Close()
+
+	// Reopening under the same rule keeps both.
+	state = open()
+	if _, ok := state.ManifestCache().Lookup("/a.jsonl", 10, 5); !ok {
+		t.Fatal("same rule dropped the cache")
+	}
+	state.Close()
+
+	previous := manifestCacheRuleVersion
+	manifestCacheRuleVersion = "test-next"
+	t.Cleanup(func() { manifestCacheRuleVersion = previous })
+	state = open()
+	defer state.Close()
+	if _, ok := state.ManifestCache().Lookup("/a.jsonl", 10, 5); ok {
+		t.Fatal("a new rule kept counts made by the old one")
+	}
+	all, err := state.All()
+	if err != nil || all["MEMORY.md"].ContentSHA256 != "sha" {
+		t.Fatalf("workspace state lost: %v (%v)", all, err)
+	}
+}

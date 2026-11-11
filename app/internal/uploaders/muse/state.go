@@ -10,6 +10,12 @@ import (
 
 const workspaceStateSchemaVersion = "1"
 
+// manifestCacheRuleVersion names the rule the cached manifest counts were
+// made by (agentsessions.MuseManifest: line parsing and event keys). Bump it
+// when that rule changes: opening the state then drops manifest_files alone,
+// so every transcript is recounted and workspace_files is kept.
+var manifestCacheRuleVersion = "1"
+
 // FileProgress is what the last successful upload knew about one path.
 type FileProgress struct {
 	SizeBytes     int64
@@ -47,6 +53,10 @@ func OpenWorkspaceState(path, account, home string) (*WorkspaceState, error) {
 		)`,
 	}, map[string]string{"schema_version": workspaceStateSchemaVersion, "account": account, "home": home}, []string{"workspace_files", "manifest_files"})
 	if err != nil {
+		return nil, err
+	}
+	if err := resetManifestCacheOnNewRule(db); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return &WorkspaceState{db: db}, nil
@@ -92,6 +102,24 @@ func (s *WorkspaceState) Forget(path string) error {
 // file (agentsessions.MuseManifestCache).
 func (s *WorkspaceState) ManifestCache() agentsessions.MuseManifestCache {
 	return manifestCache{s.db}
+}
+
+// resetManifestCacheOnNewRule empties manifest_files when it was filled under
+// another manifestCacheRuleVersion (or none, as before the version existed).
+func resetManifestCacheOnNewRule(db *common.StateDB) error {
+	rows, err := common.Query(db.DB, "SELECT value FROM metadata WHERE key = 'manifest_rule_version'")
+	if err != nil {
+		return err
+	}
+	if len(rows) == 1 && rows[0].String("value") == manifestCacheRuleVersion {
+		return nil
+	}
+	if _, err := db.DB.Exec("DELETE FROM manifest_files"); err != nil {
+		return err
+	}
+	_, err = db.DB.Exec(`INSERT INTO metadata (key, value) VALUES ('manifest_rule_version', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, manifestCacheRuleVersion)
+	return err
 }
 
 type manifestCache struct{ db *common.StateDB }

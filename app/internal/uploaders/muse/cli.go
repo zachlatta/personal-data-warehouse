@@ -53,6 +53,9 @@ ENVIRONMENT
 const skipMessage = "Muse upload skipped: another uploader run is active"
 
 // Run is the `pdw ingest muse` entry point.
+// sessionManifestFiles is SessionManifestFiles; tests make it fail.
+var sessionManifestFiles = SessionManifestFiles
+
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string, cfg ingestclient.Config) int {
 	fs := common.NewFlagSet("pdw ingest muse")
 	home := fs.String("home", "", "")
@@ -164,11 +167,12 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 		}
 		// Built after the transcripts above shipped, so it describes what
 		// this run uploaded.
-		manifest, err := SessionManifestFiles(filepath.Join(root, "agents"), state.ManifestCache(), DefaultMaxInlineBytes)
-		if err != nil {
-			state.Close()
-			fmt.Fprintf(stderr, "pdw ingest muse: session manifest: %v\n", err)
-			return common.ExitFailure
+		// A manifest failure must not cost the workspace its sync: the run
+		// goes on without it and leaves the shards the warehouse holds alone.
+		manifest, manifestErr := sessionManifestFiles(filepath.Join(root, "agents"), state.ManifestCache(), DefaultMaxInlineBytes)
+		if manifestErr != nil {
+			logger.Warningf("Muse session manifest skipped this run: %v", manifestErr)
+			manifest = nil
 		}
 		ws := &Workspace{
 			Home:        root,
@@ -185,6 +189,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			MaxBlobBytes:         client.EffectiveMaxUploadBytes(),
 			Generated:            manifest,
 			GeneratedMinInterval: DefaultManifestInterval,
+			KeepGenerated:        manifestErr != nil,
 		}
 		workspace, err = ws.Sync()
 		state.Close()

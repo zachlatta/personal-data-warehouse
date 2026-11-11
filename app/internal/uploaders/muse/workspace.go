@@ -68,6 +68,10 @@ type Workspace struct {
 	// GeneratedMinInterval is how long a generated path that changed waits
 	// after its last upload before it is sent again; 0 sends every change.
 	GeneratedMinInterval time.Duration
+	// KeepGenerated leaves every generated path the warehouse already holds
+	// as it is: set when this run could not build Generated, so a failure is
+	// not mistaken for every shard having gone.
+	KeepGenerated bool
 }
 
 // GeneratedDir is the top-level directory generated records live under. It is
@@ -276,6 +280,9 @@ func (w *Workspace) Sync() (WorkspaceSummary, error) {
 	if !summary.LimitReached && w.State != nil {
 		var gone []string
 		for path := range known {
+			if w.KeepGenerated && strings.HasPrefix(path, GeneratedDir+"/") {
+				continue
+			}
 			if !seen[path] {
 				gone = append(gone, path)
 			}

@@ -2,12 +2,15 @@ package muse
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/ingestclient"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/agentsessions"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/common"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/uploaders/testfixtures"
 )
@@ -118,6 +121,37 @@ func TestRunShipsTranscriptsAndWorkspaceThroughTheApp(t *testing.T) {
 	code, _, errOut = runMuse(t, []string{"--home", home}, museEnv(home), cfg)
 	if code != 0 || len(app.Calls()) != 5 || app.Paths()[4] != "/ingest/source-observation" {
 		t.Fatalf("idle run code=%d calls=%d stderr=%q", code, len(app.Calls()), errOut)
+	}
+}
+
+func TestAManifestFailureStillSyncsTheWorkspaceAndKeepsTheShards(t *testing.T) {
+	home := museHome(t)
+	app := testfixtures.NewFakeApp(t)
+	cfg := ingestclient.Config{BaseURL: app.URL(), Token: "secret"}
+	if code, _, errOut := runMuse(t, []string{"--home", home}, museEnv(home), cfg); code != 0 {
+		t.Fatalf("first run stderr=%q", errOut)
+	}
+	before := len(app.Calls())
+
+	sessionManifestFiles = func(string, agentsessions.MuseManifestCache, int64) ([]GeneratedFile, error) {
+		return nil, errors.New("disk I/O error")
+	}
+	t.Cleanup(func() { sessionManifestFiles = SessionManifestFiles })
+	write(t, home, "NOTES.md", []byte("new\n"))
+	code, out, errOut := runMuse(t, []string{"--home", home}, museEnv(home), cfg)
+	if code != 0 || !strings.Contains(out, "session manifest skipped") || !strings.Contains(out, "disk I/O error") {
+		t.Fatalf("code=%d out=%q stderr=%q", code, out, errOut)
+	}
+	var shipped []string
+	for _, call := range app.Calls()[before:] {
+		for _, record := range testfixtures.DecodeGzipJSONL(call.Body) {
+			inner := record["record"].(map[string]any)
+			shipped = append(shipped, inner["path"].(string)+" deleted="+fmt.Sprint(inner["deleted"]))
+		}
+	}
+	// The new file shipped; the shard the warehouse holds was not tombstoned.
+	if strings.Join(shipped, ",") != "NOTES.md deleted=false" {
+		t.Fatalf("shipped = %v", shipped)
 	}
 }
 

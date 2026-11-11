@@ -453,7 +453,10 @@ agent_id, event_count, last_timestamp, size_bytes, modified_at}]}`. No transcrip
 no new files on the VM: the shards are built in memory (`.pdw/` is a dot directory the walk
 never enters), and the only VM-side change is new rows in the uploader's existing state file
 (`~/.local/state/pdw/muse-workspace-state.sqlite`, table `manifest_files`), which caches
-each transcript's count by size and mtime so an unchanged transcript is not read again. A
+each transcript's count by size and mtime so an unchanged transcript is not read again
+(`manifestCacheRuleVersion` in `state.go` names the counting rule; bump it with the rule and
+the next run drops that table alone and recounts). A run that cannot build the manifest logs
+a warning and syncs the workspace without it, leaving the shards already uploaded in place. A
 shard whose JSON would pass the 1 MiB inline cap is split by the next character of the
 session id (`0a.json`, `0b.json`, ...), so the files under `.pdw/session-manifest/` together
 are the manifest whatever their names. The `muse_file` timeline adapter skips `.pdw/` paths:
