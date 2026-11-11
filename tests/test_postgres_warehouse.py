@@ -8271,21 +8271,34 @@ def test_a_non_subset_priority_call_keeps_the_general_indexes() -> None:
     import personal_data_warehouse.postgres as postgres_module
 
     sql = _search_text_function_sql()
-    pool = sql[
-        sql.index("set_config('enable_sort', 'off', true)") : sql.index(
-            "set_config('enable_sort', 'on', true)"
-        )
-    ]
-    # The attention pool sits under a guard; the general pool is the ELSE.
+    # The attention pool sits under a guard, passed to search_text_pool as
+    # its `attention` flag; the general pool is that function's ELSE.
     guard = "priorities <@ ARRAY[" + postgres_module.SEARCH_TEXT_ATTENTION_PRIORITIES_SQL + "]"
-    assert guard in pool
-    general = pool[pool.index("ELSE", pool.index(guard)) :]
-    assert "attention" not in general, (
-        "the fallback pool must not name an attention index: it cannot answer "
-        "a call for noise/cc/background at all"
+    window = _search_text_pool_window_sql()
+    assert "priorities IS NOT NULL" in window and guard in window
+    pool_fn = sql[sql.index("CREATE OR REPLACE FUNCTION @search_text_pool(") :]
+    pool_fn = pool_fn[: pool_fn.index("$pool$;")]
+    general = pool_fn[pool_fn.index("ELSE") :]
+    general_parts = {
+        int(part) for part in re.findall(r"@search_text_pool_partition\(\$1, (\d+),", general)
+    }
+    assert general_parts == {
+        postgres_module.SEARCH_TEXT_POOL_PART_HIGH_VOLUME,
+        postgres_module.SEARCH_TEXT_POOL_PART_LOW_VOLUME,
+    }
+    partitions = _search_text_pool_partitions_sql()
+    for part in general_parts:
+        branch = partitions[partitions.index(f"WHEN {part} THEN") :]
+        branch = branch[: branch.index("$part$", branch.index("$part$") + 1)]
+        assert "attention" not in branch, (
+            "the fallback pool must not name an attention index: it cannot answer "
+            "a call for noise/cc/background at all"
+        )
+    general_sql = "".join(
+        partitions[partitions.index(f"WHEN {part} THEN") :][:4000] for part in general_parts
     )
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')" in general
-    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_lowvol_idx')" in general
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_idx')" in general_sql
+    assert "to_bm25query(%1$L, 'timeline_events_search_text_bm25_lowvol_idx')" in general_sql
 
 
 def test_search_schema_signature_covers_the_attention_tiers() -> None:
