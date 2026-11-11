@@ -9582,6 +9582,10 @@ class PostgresWarehouse:
             "upstream_mutation_events",
             "upstream_mutation_request_events",
             "push_devices",
+            "mutation_policies",
+            "mutation_policy_grants",
+            "mutation_policy_evaluations",
+            "mutation_policy_settings",
         ):
             self._apply_catalog_grant(logical)
         self.ensure_app_access_token_tables()
@@ -9732,6 +9736,69 @@ class PostgresWarehouse:
             "CREATE INDEX IF NOT EXISTS upstream_mutations_status_updated_idx ON @upstream_mutations (status, updated_at)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_request_events_request_idx ON @upstream_mutation_request_events (request_id, event_index)",
             "CREATE INDEX IF NOT EXISTS upstream_mutation_events_mutation_idx ON @upstream_mutation_events (mutation_id, event_index)",
+            # Mutation policies (app/internal/mutations/policy_store.go owns
+            # every read and write; this is the twin of its DDL so a fresh
+            # warehouse matches the catalog). See docs/agents/mutations-and-app.md.
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policies (
+                id text NOT NULL,
+                version bigint NOT NULL,
+                operation text NOT NULL DEFAULT '',
+                account text NOT NULL DEFAULT '',
+                match_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                deny_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                limits_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                mode text NOT NULL DEFAULT 'off',
+                valid_from timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                valid_until timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                created_by text NOT NULL DEFAULT '',
+                approved_by text NOT NULL DEFAULT '',
+                change_request_id text NOT NULL DEFAULT '',
+                note text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (id, version)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policies_operation_idx ON @mutation_policies (operation, id, version)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_grants (
+                id text PRIMARY KEY,
+                policy_id text NOT NULL,
+                token_id text NOT NULL,
+                label text NOT NULL DEFAULT '',
+                expires_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                revoked_at timestamptz NOT NULL DEFAULT '1970-01-01 00:00:00+00'::timestamptz,
+                revoked_by text NOT NULL DEFAULT '',
+                created_by text NOT NULL DEFAULT '',
+                change_request_id text NOT NULL DEFAULT '',
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policy_grants_policy_idx ON @mutation_policy_grants (policy_id, token_id)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_evaluations (
+                request_id text NOT NULL,
+                phase text NOT NULL DEFAULT 'propose',
+                policy_id text NOT NULL DEFAULT '',
+                policy_version bigint NOT NULL DEFAULT 0,
+                token_id text NOT NULL DEFAULT '',
+                decision text NOT NULL DEFAULT '',
+                reasons_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+                inputs_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                evaluated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS mutation_policy_evaluations_policy_idx ON @mutation_policy_evaluations (policy_id, evaluated_at)",
+            "CREATE INDEX IF NOT EXISTS mutation_policy_evaluations_request_idx ON @mutation_policy_evaluations (request_id, evaluated_at)",
+            """
+            CREATE TABLE IF NOT EXISTS @mutation_policy_settings (
+                key text PRIMARY KEY,
+                value jsonb NOT NULL DEFAULT 'null'::jsonb,
+                updated_by text NOT NULL DEFAULT '',
+                updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
             # Devices registered by the PDW iOS app for push notifications. The
             # Go app owns the writes (POST /api/push/register) and the sends; the
             # idempotent twin of this DDL lives in app/internal/push/store.go.

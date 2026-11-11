@@ -755,3 +755,51 @@ moment of one device; a general warehouse-row purge would be its own design.
   race with enrichment on two connections, and the Go proposal half run against an
   isolated database through `TestScreenTimelapsePurgeProposalReviewApproval`), and
   `app/internal/mutations/screen_timelapse_purge_test.go` for validation.
+
+## Mutation policies (auto-approval)
+
+A **policy** is a named, versioned rule for one mutation type that only Zach can create,
+widen or extend; a **grant** gives one authenticated token (one workflow's identity,
+`requested_by_token_id`, see [access tokens](access-tokens.md#workflow-identities-and-requested_by_token_id))
+the right to use it until the grant expires. PDW decides, inside the proposal's own
+transaction (`PostgresStore.CreateRequest` → `evaluateRequestPolicy`, `app/internal/mutations/policy*.go`):
+
+1. **Type rules** (`typeRules`, in code). A type is proposable and never auto-approved
+   unless listed; only `resideo.set_thermostat` is auto-approvable today. No policy can
+   approve a type the table does not mark auto-approvable.
+2. **Deny rules** (`deny_json`: `below`, `above`, `in` per field). An enforced policy's deny
+   rule refuses the proposal with the rule named; a dry-run one records `would_refuse`.
+3. **Grant match.** The proposer's token holds an active grant (not revoked, not past its
+   required `expires_at`), the policy is inside `valid_from`..`valid_until`, every field of
+   `match_json` (`min`/`max`, `in`, `absent`) passes on the type's facts
+   (`policyFactsFor`; for the thermostat `thermostatPolicyFacts`: `device_id`,
+   `heat_setpoint`, `cool_setpoint`, `hold`), and every limit in `limits_json` passes:
+   `max_per_day`, `max_per_hour`, `min_interval_minutes`, `input_max_age_minutes` (the
+   thermostat poll the proposal was judged against) and `pause_after_manual_change_hours`
+   (any setpoint change in `base_resideo.thermostat_readings` that no mutation this policy
+   approved explains). Limits are counted under the policy's advisory lock, over the policy's
+   `approved` **and** dry-run `would_approve` decisions: a dry run exercises the limits, and
+   switching a policy to `enforce` never lets more changes through in the next hour or day
+   than the limits allow.
+4. **Otherwise review**, with the closest policy's reasons ("heat_setpoint 74 is above this
+   policy's 72"). A policy approves **one change per request**: its limits count
+   changes, so a batch of several changes, even one wholly inside the policy, goes to
+   review whole.
+
+The policy JSON is parsed strictly: an unknown rule, limit or field never matches, because
+ignoring it would widen the policy. Policy rows are never updated; a change is a new
+version, and every decision names `policy:<id>@<version>`.
+
+Each decision is stored three ways: a row of `ops.mutation_policy_evaluations` (phase
+`propose`), `context.policy` on the request (served as `request.policy`), and a
+`policy_evaluated` request event with `actor_type = 'policy'`. A policy's `mode` is `off`,
+`dry_run` or `enforce`; in `dry_run` the review shows a **"Would auto-approve"** badge (web
+`policyBadge`, phone `policyBadge` in `mobile/src/lib/mutation-review.ts`) and the request
+still waits for Zach. A request no policy could touch carries no note.
+
+Tables (ops schema, app-only; Go `mutationPolicySchemaStatements`, Python twin in
+`ensure_upstream_mutation_tables`, held equal by `tests/test_mutation_policies.py`):
+`mutation_policies` (`id`, `version`, `operation`, `account`, `match_json`, `deny_json`,
+`limits_json`, `mode`, `valid_from`, `valid_until`, who created and approved it),
+`mutation_policy_grants`, `mutation_policy_evaluations`, `mutation_policy_settings` (the
+kill switch).

@@ -3601,6 +3601,50 @@
       }
     },
     {
+      "id": "mutation_policies",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policies",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_grants",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_grants",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_evaluations",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_evaluations",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
+      "id": "mutation_policy_settings",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "mutation_policy_settings",
+      "discoverable": false,
+      "query_access": "app_only",
+      "secret": false
+    },
+    {
       "id": "search_benchmark_labels",
       "kind": "table",
       "layer": "private",

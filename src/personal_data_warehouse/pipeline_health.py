@@ -2297,6 +2297,10 @@ TABLE_PIPELINES: dict[str, TableFreshness] = {
     "app_access_tokens": _state("mcp_proxy", "updated_at", "hashed issued bearer tokens and cli_authorize codes, written by the app on issue, use and revoke"),
     "external_feed_items": _state("mcp_proxy", "recorded_at", "bounded outgoing projections refreshed on authenticated pulls; source freshness is measured by the source pipelines"),
     "push_devices": _state("upstream_mutations", "updated_at", "iOS app devices registered for push notifications"),
+    "mutation_policies": _state("upstream_mutations", "created_at", "versioned auto-approval policies; a change is a new row"),
+    "mutation_policy_grants": _state("upstream_mutations", "updated_at", "per-token grants on mutation policies"),
+    "mutation_policy_evaluations": _state("upstream_mutations", "evaluated_at", "policy decisions on proposals and at claim time"),
+    "mutation_policy_settings": _state("upstream_mutations", "updated_at", "the auto-approval kill switch"),
     # This snapshot itself
     "pipeline_health": _data("pipeline_health", "collected_at"),
     "pipeline_table_freshness": _support("pipeline_health", "collected_at"),

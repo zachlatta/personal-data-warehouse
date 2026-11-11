@@ -30,6 +30,17 @@
 .mpill.s-succeeded, .mpill.s-observed, .mpill.s-executed, .mpill.cal-succeeded { color: var(--ok); background: var(--ok-soft); }
 .mpill.s-rejected, .mpill.s-denied, .mpill.s-failed_terminal, .mpill.s-blocked_missing_credentials, .mpill.cal-failed { color: var(--danger); background: var(--danger-soft); }
 .mpill.s-failed_retryable, .mpill.cal-retry { color: var(--orange); background: var(--orange-soft); }
+
+/* the mutation policy's decision: "would auto-approve" in dry run */
+.policy-badge {
+  display: inline-block; margin-top: 4px; padding: 0 8px; border-radius: 999px; line-height: 20px;
+  font-size: 12px; font-weight: 500; color: var(--text-2); background: var(--surface-3);
+}
+.policy-badge.policy-ok { color: var(--ok); background: var(--ok-soft); }
+.policy-badge.policy-info { color: var(--info); background: var(--info-soft); }
+.policy-badge.policy-warn { color: var(--warn); background: var(--warn-soft); }
+.policy-badge.policy-bad { color: var(--danger); background: var(--danger-soft); }
+.policy-line { margin: 6px 0 0; }
 .mpill.s-withdrawn { color: var(--text-3); background: var(--surface-3); }
 
 /* the request list: a console table in a card */

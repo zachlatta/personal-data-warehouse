@@ -361,6 +361,8 @@ func (s *Service) requestJSON(request Request, withMutations bool) map[string]an
 		// Only a request nothing else can move may be closed out by naming
 		// its replacement; the status list lives here, not in each client.
 		"can_supersede": strings.TrimSpace(request.SupersededBy) == "" && requestIsSupersedable(request.Status),
+		// The policy's decision: the review's "would auto-approve" badge.
+		"policy": request.Policy,
 	}
 	// context and result are review detail, not list columns: a request's
 	// context is the agent's whole proposal snapshot and result carries a

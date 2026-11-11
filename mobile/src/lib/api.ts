@@ -174,6 +174,9 @@ export type MutationRequest = {
   // mutations_page says which, and where the next one starts.
   mutations?: Mutation[];
   mutations_page?: { offset: number; limit: number; total: number; next_offset: number | null };
+  // The mutation policy's decision (decision, label, reasons, policy_id,
+  // mode); null when no policy could touch the request.
+  policy?: Record<string, unknown> | null;
   // true on the copy a push alert carries when the request was too big for
   // the 4 KB notification: the header is real, the mutations still need a read.
   partial?: boolean;

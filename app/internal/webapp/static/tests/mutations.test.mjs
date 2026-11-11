@@ -765,3 +765,17 @@ test("gmailSettingsView reads label changes", () => {
   assert.equal(create.heading, "New Gmail label \"pdw-test\"");
   assert.deepEqual(create.color, { background: "#16a766", text: "#ffffff" });
 });
+
+test("policyBadge names a dry run's would-approve and why a policy did not cover a request", () => {
+  assert.equal(V.policyBadge({}), null);
+  assert.equal(V.policyBadge({ policy: {} }), null);
+  const would = V.policyBadge({ policy: { decision: "would_approve", label: "Would auto-approve (policy heating-winter v1, dry run)", reasons: ["inside policy heating-winter v1"], policy_id: "heating-winter", mode: "dry_run" } });
+  assert.equal(would.tone, "info");
+  assert.match(would.label, /Would auto-approve/);
+  assert.equal(would.policyId, "heating-winter");
+  const review = V.policyBadge({ policy: { decision: "review", reasons: ["heat_setpoint 74 is above this policy's 72"] } });
+  assert.equal(review.tone, "muted");
+  assert.deepEqual(review.reasons, ["heat_setpoint 74 is above this policy's 72"]);
+  // The decision is shown as a badge, not again as raw context.
+  assert.equal("policy" in V.splitRequestContext({ policy: { decision: "review" }, note: "x" }).leftover, false);
+});

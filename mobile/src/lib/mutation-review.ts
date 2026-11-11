@@ -2348,3 +2348,32 @@ export function gmailSettingsReview(mutation: MutationLike): GmailSettingsReview
     labelFacts,
   };
 }
+
+// The mutation policy's decision on a request (request.policy): "would
+// auto-approve" for a dry run, the approving policy for an enforced one, and
+// why a policy did not cover it. Null when no policy could touch the request.
+export type PolicyBadge = {
+  decision: string;
+  tone: 'ok' | 'info' | 'muted' | 'warn' | 'bad';
+  label: string;
+  reasons: string[];
+};
+
+const POLICY_TONES: Record<string, PolicyBadge['tone']> = {
+  approved: 'ok',
+  would_approve: 'info',
+  review: 'muted',
+  would_refuse: 'warn',
+  refused: 'bad',
+};
+
+export function policyBadge(request: { policy?: unknown } | null | undefined): PolicyBadge | null {
+  const policy = request && request.policy && typeof request.policy === 'object' ? (request.policy as Record<string, unknown>) : {};
+  const decision = typeof policy.decision === 'string' ? policy.decision.trim() : '';
+  if (!decision) return null;
+  const reasons = Array.isArray(policy.reasons)
+    ? policy.reasons.filter((line): line is string => typeof line === 'string' && line.trim() !== '').map((line) => line.trim())
+    : [];
+  const label = typeof policy.label === 'string' && policy.label.trim() ? policy.label.trim() : decision.replace(/_/g, ' ');
+  return { decision, tone: POLICY_TONES[decision] ?? 'muted', label, reasons };
+}

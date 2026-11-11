@@ -312,3 +312,42 @@ func (s *PostgresStore) hydrateThermostatPreviews(ctx context.Context, mutations
 		mutations[index].Preview = preview
 	}
 }
+
+// thermostatPolicyFields is every fact a thermostat change exposes to a
+// mutation policy. A policy rule on any other field never matches.
+var thermostatPolicyFields = map[string]bool{
+	"device_id": true, "heat_setpoint": true, "cool_setpoint": true, "hold": true,
+}
+
+// thermostatPolicyFacts is what a policy may check on resideo.set_thermostat:
+// the device, each setpoint (absent when the change leaves it alone) and the
+// hold, plus when the warehouse last read the thermostat (from the proposal's
+// preview, written by enrichThermostatChanges) for the freshness limit. The
+// policy never parses the raw payload itself.
+func thermostatPolicyFacts(mutation storedMutation) (PolicyFacts, bool) {
+	change, ok := thermostatChangeFromPayload(mutation.Payload)
+	if !ok {
+		return PolicyFacts{}, false
+	}
+	facts := map[string]any{"device_id": change.DeviceID, "hold": change.Hold}
+	if change.Heat != nil {
+		facts["heat_setpoint"] = *change.Heat
+	}
+	if change.Cool != nil {
+		facts["cool_setpoint"] = *change.Cool
+	}
+	out := PolicyFacts{Facts: facts, Fields: thermostatPolicyFields, Target: change.DeviceID, Inputs: map[string]any{}}
+	if preview, ok := mutation.Preview["thermostat"].(map[string]any); ok {
+		if current, ok := preview["current"].(map[string]any); ok {
+			if asOf, err := time.Parse(time.RFC3339, stringFromAny(current["as_of"])); err == nil {
+				out.InputObservedAt = asOf
+			}
+			for _, key := range []string{"heat_setpoint", "cool_setpoint", "system_mode", "indoor_temperature"} {
+				if value, ok := current[key]; ok {
+					out.Inputs["current_"+key] = value
+				}
+			}
+		}
+	}
+	return out, true
+}

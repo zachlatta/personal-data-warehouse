@@ -39,6 +39,7 @@ import {
   mergeMutationPage,
   mutationReviewContext,
   pendingApproveLabel,
+  policyBadge,
   requestDecision,
   requestKindLabel,
   requestLifecycle,
@@ -171,6 +172,7 @@ function RequestOverview({
 }) {
   const theme = useTheme();
   const context = mutationReviewContext(request.context);
+  const policy = policyBadge(request);
   const lifecycle = requestLifecycle(request);
   const mutations = request.mutations ?? [];
   // An email's source line ("Gmail … thread 1a0e…, 12:35pm ET") says what
@@ -198,6 +200,11 @@ function RequestOverview({
           <ThemedText type="small" themeColor="textSecondary">
             {formatWhen(request.created_at)} · by {request.requested_by || 'unknown'}
           </ThemedText>
+          {policy ? (
+            <ThemedText type="small" themeColor={policy.tone === 'muted' ? 'textSecondary' : 'text'} style={styles.requestReason}>
+              {policy.label}{policy.reasons.length && policy.decision !== 'would_approve' && policy.decision !== 'approved' ? ` · ${policy.reasons.join('; ')}` : ''}
+            </ThemedText>
+          ) : null}
         </View>
       </View>
 

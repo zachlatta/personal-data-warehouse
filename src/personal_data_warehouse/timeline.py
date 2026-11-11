@@ -4384,6 +4384,11 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "notification_deliveries": _state("per-device notification transport and open telemetry; keyed to the original event"),
     "web_push_devices": _state("private browser push subscriptions"),
     "push_devices": _state("iOS app devices registered for push notifications"),
+    # Mutation policies: Zach's auto-approval rules and their audit, not events.
+    "mutation_policies": _state("versioned mutation auto-approval policies (Zach's rules)"),
+    "mutation_policy_grants": _state("which workflow token may use which mutation policy"),
+    "mutation_policy_evaluations": _state("each policy decision on a mutation request; detail under the request's event"),
+    "mutation_policy_settings": _state("the auto-approval kill switch"),
     # Search surfaces
     "search_schema_state": _state("search_text DDL signature cache"),
     "search_chunks": _state("derived retrieval chunks behind timeline.search_hybrid()"),
@@ -4451,6 +4456,10 @@ RAW_DDL_TABLES: tuple[str, ...] = (
     "upstream_mutation_request_events",
     "push_devices",
     "app_access_tokens",
+    "mutation_policies",
+    "mutation_policy_grants",
+    "mutation_policy_evaluations",
+    "mutation_policy_settings",
     # The Feed tab (feed.py): written by the Go app, declared in raw DDL.
     "feed_items", "feed_events", "feed_item_versions",
     "search_schema_state",

@@ -293,7 +293,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
         # +1 ops: ops.source_upstream_observations, what each source itself
         # says is its newest item (C11).
-            "ops": 50,  # outgoing feed projection and script-run telemetry
+        # +4 ops: mutation auto-approval policies, their grants, every policy
+        # decision, and the kill switch (app/internal/mutations/policy_store.go).
+            "ops": 54,  # outgoing feed projection and script-run telemetry
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).
@@ -447,6 +449,10 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
         "upstream_mutation_requests",
         "upstream_mutation_events",
         "upstream_mutation_request_events",
+        "mutation_policies",
+        "mutation_policy_grants",
+        "mutation_policy_evaluations",
+        "mutation_policy_settings",
         "agent_runs",
         "agent_run_events",
         "agent_run_tool_calls",

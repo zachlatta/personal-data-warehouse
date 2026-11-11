@@ -60,6 +60,20 @@ export function requestListStatus(request) {
   return status + (request.status === "withdrawn" ? " (replaced)" : " (superseded)");
 }
 
+// policyBadge is the mutation policy's decision as a badge: "would
+// auto-approve" for a dry run, who approved it for an enforced policy, and
+// why a policy did not cover it. Null when no policy could touch the request.
+export function policyBadge(request) {
+  const policy = asMap(request && request.policy);
+  const decision = trimStr(policy.decision);
+  if (!decision) return null;
+  const tone = {
+    approved: "ok", would_approve: "info", review: "muted", would_refuse: "warn", refused: "bad",
+  }[decision] || "muted";
+  const reasons = stringSlice(policy.reasons).map((line) => line.trim()).filter(Boolean);
+  return { decision, tone, label: trimStr(policy.label) || decision.replace(/_/g, " "), reasons, policyId: trimStr(policy.policy_id), mode: trimStr(policy.mode) };
+}
+
 // requestLifecycle is what happened to a request after it was proposed, for
 // the header: an agent withdrawal (who, why, and the request that stands in
 // for it), a human's supersede link on a dead request, and the request this
@@ -737,7 +751,8 @@ export function splitRequestContext(ctx) {
   ctx = asMap(ctx);
   const source = trimStr(ctx.source); const note = trimStr(ctx.note);
   const identifications = mapSlice(ctx.identifications);
-  const handled = new Set();
+  // The policy decision has its own badge in the header.
+  const handled = new Set(["policy"]);
   if (source) handled.add("source");
   if (note) handled.add("note");
   if (identifications.length) handled.add("identifications");
@@ -1310,7 +1325,7 @@ export function mutationReviewContext(value) {
     counts.push({ key, label: humanContextCountLabel(key), icon: "•", count: intFromAny(rawCounts[key]) });
   }
   const leftover = { ...context };
-  for (const key of ["source", "snapshot_utc", "total_conversations", "candidate_counts", "selection", "preserved"]) delete leftover[key];
+  for (const key of ["source", "snapshot_utc", "total_conversations", "candidate_counts", "selection", "preserved", "policy"]) delete leftover[key];
   return {
     source: trimStr(context.source),
     snapshotAt: trimStr(context.snapshot_utc),

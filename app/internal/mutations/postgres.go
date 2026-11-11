@@ -142,6 +142,11 @@ func (s *PostgresStore) ensureTablesNow(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, statement := range mutationPolicySchemaStatements {
+		if _, err := execContext(ctx, s.db, statement); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -252,6 +257,26 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 			return Request{}, err
 		}
 	}
+	// The policy decision rides in the proposal's transaction, under the
+	// policies' advisory locks, so its rate limits count exactly.
+	evaluation, err := evaluateRequestPolicy(ctx, tx, input.RequestedByTokenID, normalized, now)
+	if err != nil {
+		return Request{}, fmt.Errorf("evaluate mutation policy: %w", err)
+	}
+	if evaluation.Decision == PolicyDecisionApproved {
+		// Phase 1 is dry run only: an enforced policy is recorded as what it
+		// would do until enforcement ships.
+		evaluation.Decision = PolicyDecisionWouldApprove
+		evaluation.Reasons = append(evaluation.Reasons, "enforcement is not built yet; recorded as a dry run")
+	}
+	if evaluation.Decision == PolicyDecisionRefused {
+		return Request{}, invalidProposalInput(fmt.Errorf("refused: %s", strings.Join(evaluation.Reasons, "; ")))
+	}
+	if evaluation.Relevant() {
+		if err := recordPolicyEvaluation(ctx, tx, requestID, "propose", evaluation); err != nil {
+			return Request{}, err
+		}
+	}
 	// Closing out the replaced request rides in this transaction on purpose:
 	// the new proposal and the old one's withdrawal are one fact. If the old
 	// request turns out to have been approved, nothing is created.
@@ -300,7 +325,10 @@ func (s *PostgresStore) ListRequests(ctx context.Context, filter RequestFilter) 
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count,
-		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count,
+		       -- The policy decision is a badge on the list, so it rides apart
+		       -- from the context it is stored in.
+		       request.context_json->'policy' AS policy_json
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		%s
@@ -998,7 +1026,10 @@ func (s *PostgresStore) getRequest(ctx context.Context, id string) (Request, err
 		       request.created_at, request.updated_at,
 		       request.approved_at, request.executed_at, request.observed_at, request.withdrawn_at,
 		       count(mutation.id)::bigint AS mutation_count,
-		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count
+		       count(mutation.id) FILTER (WHERE mutation.status = 'pending_review')::bigint AS pending_mutation_count,
+		       -- The policy decision is a badge on the list, so it rides apart
+		       -- from the context it is stored in.
+		       request.context_json->'policy' AS policy_json
 		FROM @upstream_mutation_requests AS request
 		LEFT JOIN @upstream_mutations AS mutation ON mutation.request_id = request.id
 		WHERE request.id = $1
@@ -1676,6 +1707,7 @@ func scanRequest(row scanner) (Request, error) {
 	var request Request
 	var contextJSON, resultJSON []byte
 	var mutationCount, pendingMutationCount int64
+	var policyJSON []byte
 	err := row.Scan(
 		&request.ID,
 		&request.Status,
@@ -1700,9 +1732,13 @@ func scanRequest(row scanner) (Request, error) {
 		&request.WithdrawnAt,
 		&mutationCount,
 		&pendingMutationCount,
+		&policyJSON,
 	)
 	if err != nil {
 		return Request{}, err
+	}
+	if len(policyJSON) > 0 {
+		request.Policy = decodeJSONMap(policyJSON)
 	}
 	request.Context = decodeJSONMap(contextJSON)
 	request.Result = decodeJSONMap(resultJSON)

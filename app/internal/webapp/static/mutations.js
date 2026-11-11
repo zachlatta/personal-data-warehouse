@@ -31,6 +31,14 @@ function pill(status) {
   return h("span", "mpill s-" + (status || "unknown"), label.charAt(0).toUpperCase() + label.slice(1));
 }
 
+function policyBadgeNode(request) {
+  const badge = V.policyBadge(request);
+  if (!badge) return null;
+  const node = h("span", "policy-badge policy-" + badge.tone, badge.label);
+  if (badge.reasons.length) node.title = badge.reasons.join("\n");
+  return node;
+}
+
 function pre(value) { return h("pre", "blob", typeof value === "string" ? value : V.prettyJSON(value)); }
 
 function details(summaryText, cls, open) {
@@ -1305,6 +1313,8 @@ function renderRequestTable(title, requests, emptyText) {
     const td = h("td", "rtitle");
     td.appendChild(link(requestPath(request.id), request.title || request.id));
     if (request.reason) td.appendChild(h("div", "m", request.reason));
+    const badge = policyBadgeNode(request);
+    if (badge) td.appendChild(badge);
     tr.appendChild(td);
     tr.appendChild(h("td", "num", V.requestMutationCount(request)));
     const created = h("td", "m", formatWhen(request.created_at)); created.title = fmtFull(request.created_at);
@@ -1351,6 +1361,14 @@ function renderRequestHeader(request) {
   main.appendChild(eyebrow);
   main.appendChild(h("h1", "", request.title || request.id));
   if (request.reason) main.appendChild(h("p", "mreason", request.reason));
+  const badge = policyBadgeNode(request);
+  if (badge) {
+    const line = h("p", "policy-line");
+    line.appendChild(badge);
+    const reasons = V.policyBadge(request).reasons;
+    if (reasons.length) line.appendChild(h("span", "m", " " + reasons.join("; ")));
+    main.appendChild(line);
+  }
   const meta = h("div", "request-meta");
   const metaPairs = [
     ["By", request.requested_by, ""], ["Created", formatWhen(request.created_at), request.created_at],

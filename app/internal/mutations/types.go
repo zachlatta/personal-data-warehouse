@@ -270,6 +270,9 @@ type Request struct {
 	PendingMutationCount int
 	// Mutations is the page GetRequest was asked for, in request order.
 	Mutations []Mutation
+	// Policy is the mutation policy's decision on the request
+	// (context.policy), nil when no policy could touch it.
+	Policy map[string]any
 }
 
 type Mutation struct {

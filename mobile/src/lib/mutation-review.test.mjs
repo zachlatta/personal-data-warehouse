@@ -1329,3 +1329,15 @@ test('an unchecked Pixel text warns, and a sent one names its protocol', () => {
   assert.deepEqual(review.sent, { protocol: 'RCS', alreadySent: false, state: 'delivered' });
   assert.equal(isTextMessageSendMutation({ provider: 'apple_messages', operation: 'apple_messages.send_message' }), false);
 });
+
+test('policyBadge shows a dry run as would auto-approve and says why a policy did not cover a request', async () => {
+  const { policyBadge } = await import('./mutation-review.ts');
+  assert.equal(policyBadge({}), null);
+  assert.equal(policyBadge(null), null);
+  const would = policyBadge({ policy: { decision: 'would_approve', label: 'Would auto-approve (policy heating-winter v1, dry run)', reasons: ['inside'] } });
+  assert.equal(would.tone, 'info');
+  assert.match(would.label, /Would auto-approve/);
+  const review = policyBadge({ policy: { decision: 'review', reasons: ['heat_setpoint 74 is above this policy\'s 72', 7] } });
+  assert.equal(review.tone, 'muted');
+  assert.deepEqual(review.reasons, ['heat_setpoint 74 is above this policy\'s 72']);
+});
