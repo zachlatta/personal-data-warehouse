@@ -181,8 +181,9 @@ var Instructions = `Publish a Slack web session for the warehouse's Slack pollin
 4. In DevTools > Application > Cookies > https://app.slack.com, copy the value
    of the cookie named "d" (it starts with xoxd-). Paste it here and press Enter.
 
-pdw sends nothing to Slack. The warehouse first uses the session on its next
-Slack freshness pass (every five minutes).
+pdw sends nothing to Slack. The warehouse first uses the session for the next
+reviewed Slack write (a send or mark-read you approve); polling uses the
+workspace token.
 `
 
 const usage = `usage: pdw slack publish-session [--account LABEL] [--session-key KEY] [--team-id ID] [--user-id ID] [--dry-run]
@@ -191,9 +192,10 @@ Read a Slack web session from stdin and publish it to the warehouse.
 
 `
 
-// verifyHint says when the session is first used: the next freshness pass,
-// which polls with it (Zach's choice, 2026-10-01).
-const verifyHint = `the warehouse polls with this session on its next Slack freshness pass (every five minutes); if Slack refuses it, that pass logs so and falls back to the slower workspace token`
+// verifyHint says when the session is first used. Polling spent it from
+// 2026-10-01 until Slack flagged the volume; since 2026-10-03 the deployment
+// sets SLACK_ASSET_FRESHNESS_USE_SESSION=0, so only reviewed writes use it.
+const verifyHint = `the warehouse uses this session for the next reviewed Slack write (a send or mark-read you approve); the freshness pass polls with the workspace token`
 
 // Run is the `pdw slack` entry point; args start with the verb.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(string) string, cfg ingestclient.Config) int {

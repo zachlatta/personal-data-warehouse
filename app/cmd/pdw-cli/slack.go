@@ -17,18 +17,18 @@ const slackUsage = `pdw slack - manage the Slack web session the warehouse syncs
 USAGE
   pdw slack publish-session [flags] < paste
 
-The warehouse polls your DMs, group DMs and channels with this session every
-five minutes (Slack rate-limits it far less than the workspace token), and
-reviewed Slack writes -- a message sent as you, a conversation marked read --
-use it too.
+Reviewed Slack writes -- a message sent as you, a conversation marked read --
+use this session. The freshness pass polls your DMs, group DMs and channels
+with the workspace token: Slack flagged the session's polling volume, so the
+deployment sets SLACK_ASSET_FRESHNESS_USE_SESSION=0 (2026-10-03).
 
 publish-session reads that session from what you paste -- the JSON a DevTools
 console snippet copies on app.slack.com, then the "d" cookie -- and publishes
 it to the warehouse. It sends nothing to Slack: the old hourly capture from the
 Slack desktop app called Slack with your desktop login from a Go program, and
 Slack signed you out of every device each time it ran. Run it once from a
-terminal to see the steps; re-run it when the freshness pass logs that Slack
-refused the session (it falls back to the slower workspace token meanwhile).
+terminal to see the steps; re-run it when a reviewed Slack write fails because
+Slack refused the session.
 
 FLAGS (see "pdw slack publish-session --help")
   --account LABEL     Account the credential is stored under.

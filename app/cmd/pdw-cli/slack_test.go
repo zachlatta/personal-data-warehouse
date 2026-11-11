@@ -50,6 +50,20 @@ func TestSlackRequiresSubcommandAndPrintsHelp(t *testing.T) {
 	}
 }
 
+// Slack flagged the session's polling volume and polling went back to the
+// workspace token on 2026-10-03; the help kept saying the warehouse polls with
+// the session every five minutes. It now says what the session is for.
+func TestSlackHelpDoesNotClaimTheSessionPolls(t *testing.T) {
+	if strings.Contains(slackUsage, "with this session every") {
+		t.Fatalf("help still says the warehouse polls with the session: %s", slackUsage)
+	}
+	for _, want := range []string{"workspace token", "SLACK_ASSET_FRESHNESS_USE_SESSION"} {
+		if !strings.Contains(slackUsage, want) {
+			t.Fatalf("help lacks %q: %s", want, slackUsage)
+		}
+	}
+}
+
 func TestRunDispatchesSlackWithoutAPIConfig(t *testing.T) {
 	cap := withFakeSlack(t, 3)
 	var out, errBuf bytes.Buffer

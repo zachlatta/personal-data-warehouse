@@ -142,8 +142,7 @@ COMMANDS
                              by default, one batch with --once. Providers:
                              apple-notes, apple-contacts. See "pdw mutations --help".
   slack publish-session      Publish a Slack web session pasted from a browser,
-                             so the sync can ask Slack what changed in one
-                             request instead of polling every conversation.
+                             for reviewed Slack writes (sends, mark-reads).
                              Talks to nothing but the warehouse. See
                              "pdw slack --help".
   chatgpt publish-session    Publish this Mac's chatgpt.com browser session so
