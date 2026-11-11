@@ -26,16 +26,19 @@ func (r ScriptRunner) QueryArgs(ctx context.Context, statement string, args []an
 		return RawResult{}, err
 	}
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(statement), ";"))
-	upper := strings.ToUpper(trimmed)
-	if !strings.HasPrefix(upper, "SELECT") && !strings.HasPrefix(upper, "WITH") {
+	// Judge the first keyword after comments, as ValidateReadOnlySQL does.
+	if words := sqlWords(trimmed); len(words) == 0 || (words[0] != "SELECT" && words[0] != "WITH") {
 		return RawResult{}, fmt.Errorf("scripts support SELECT and WITH only")
 	}
 	if maxRows <= 0 || maxRows > 1000 {
 		maxRows = 1000
 	}
 	// Filter before aggregation: never serialize an oversized aggregate to the
-	// driver, even when a query returns many long text fields.
-	sql := fmt.Sprintf(`WITH __pdw_rows AS MATERIALIZED (SELECT to_jsonb(t) AS j FROM (%s) t LIMIT %d),
+	// driver, even when a query returns many long text fields. The statement
+	// sits on its own lines so a trailing -- comment cannot swallow ") t".
+	sql := fmt.Sprintf(`WITH __pdw_rows AS MATERIALIZED (SELECT to_jsonb(t) AS j FROM (
+%s
+) t LIMIT %d),
  __pdw_sized AS (SELECT j, sum(octet_length(j::text)) OVER () AS bytes FROM __pdw_rows)
  SELECT coalesce(jsonb_agg(j) FILTER (WHERE bytes <= 1048576), '[]'::jsonb)::text AS script_rows,
  coalesce(max(bytes),0)>1048576 AS script_oversize, count(*)>%d AS script_truncated FROM __pdw_sized`, trimmed, maxRows+1, maxRows)

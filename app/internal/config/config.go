@@ -175,7 +175,7 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
 		BaseURL:                  strings.TrimRight(strings.TrimSpace(getenv("MCP_BASE_URL")), "/"),
 		PostgresDatabaseURL:      normalizePostgresURL(getenv("POSTGRES_DATABASE_URL")),
 		QueryPostgresRole:        valueOrDefault(strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_ROLE")), "pdw_query"),
-		QueryPostgresDatabaseURL: strings.TrimSpace(getenv("PDW_QUERY_POSTGRES_URL")),
+		QueryPostgresDatabaseURL: normalizePostgresURL(getenv("PDW_QUERY_POSTGRES_URL")),
 		TimelineDatabaseURL:      normalizePostgresURL(getenv("PDW_TIMELINE_DATABASE_URL")),
 		TimelineMediaBaseURL:     strings.TrimRight(strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_BASE_URL")), "/"),
 		TimelineMediaSigningKey:  strings.TrimSpace(getenv("PDW_TIMELINE_MEDIA_SIGNING_KEY")),

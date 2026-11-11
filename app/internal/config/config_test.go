@@ -31,7 +31,7 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 		"MCP_DEBUG_CACHE_TOOL":           "true",
 		"MCP_QUERY_TIMEOUT":              "42s",
 		"PDW_QUERY_POSTGRES_ROLE":        "warehouse_reader",
-		"PDW_QUERY_POSTGRES_URL":         "postgresql://warehouse_login:example@example.com/default",
+		"PDW_QUERY_POSTGRES_URL":         "postgres://warehouse_login:example@example.com/default",
 		"PDW_MUTATION_UI_PASSWORD":       "review-password",
 		"GMAIL_ACCOUNTS":                 "zach@example.test, work@example.test",
 		"CONTACT_GOOGLE_ACCOUNTS":        "contacts@example.test",
@@ -67,8 +67,8 @@ func TestLoadFromEnvDefaultsAndOverrides(t *testing.T) {
 	if cfg.QueryPostgresRole != "warehouse_reader" {
 		t.Fatalf("QueryPostgresRole = %q", cfg.QueryPostgresRole)
 	}
-	if cfg.QueryPostgresDatabaseURL != env["PDW_QUERY_POSTGRES_URL"] {
-		t.Fatal("dedicated query URL was not loaded")
+	if cfg.QueryPostgresDatabaseURL != "postgresql://warehouse_login:example@example.com/default" {
+		t.Fatalf("QueryPostgresDatabaseURL = %q, want the normalized dedicated login URL", cfg.QueryPostgresDatabaseURL)
 	}
 	// The review UI's own password is gone: the web app authenticates with
 	// the API token. A still-set value is reported, never silently ignored.
