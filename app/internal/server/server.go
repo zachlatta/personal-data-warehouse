@@ -512,12 +512,7 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 								return
 							}
 						}
-						run := uploaderHeartbeat{Pipeline: "mcp_proxy", Device: "app", RanAt: time.Now().UTC().Format(time.RFC3339)}
-						if refreshErr != nil {
-							run.ExitCode = 1
-							run.Error = refreshErr.Error()
-						}
-						if _, err := hb.upsert(ctx, run); err != nil {
+						if err := recordMCPRefreshHeartbeat(ctx, hb, cfg.QueryTimeout, refreshErr); err != nil {
 							logger.Error("MCP refresh heartbeat could not be recorded")
 						}
 					})
