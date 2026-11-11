@@ -2308,7 +2308,7 @@ def test_search_hybrid_semantic_helper_can_override_its_candidate_pool() -> None
     assert "candidate_limit integer DEFAULT NULL" in semantic
     assert "requested_candidates integer" in semantic
     assert "USING embedding_model, sem_adapters, since, qvec, requested_candidates" in semantic
-    assert semantic.count("LIMIT $5") == 3  # exact branch, graph branch, merge
+    assert semantic.count("LIMIT $5") == 4  # exact branch, graph branch, parallel walks, merge
     assert "DROP FUNCTION IF EXISTS @search_hybrid_semantic(text, text, integer, text[], timestamptz)" in sql
 
 

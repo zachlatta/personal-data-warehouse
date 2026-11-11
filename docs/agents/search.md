@@ -605,6 +605,34 @@ resident in shared buffers and barely more in the page cache 9 hours after a ful
 the semantic leg's time was all read wait. The median is a residency question; read
 `cache_residency` beside the latency before deciding what a slow median needs.
 
+**2026-11-11: the legs ran on one core each, and JIT taxed every scoped search.** Real
+traffic read 24h p50 5.4 s / p90 16.2 s, and 45% of slow requests were on a host the
+guest saw as idle. Two plan faults, both fixed in the functions themselves:
+
+- *The semantic leg walked its four HNSW graphs one after another.* Unscoped,
+  `EXPLAIN (ANALYZE, BUFFERS)` read 12,456 pages in 6.47 s, 6.08 s of it read wait, as a
+  Merge Append whose walks took 1.45 + 2.98 + 1.81 + 0.23 s in one backend. Postgres never
+  plans a LIMIT subquery on a worker (`set_rel_consider_parallel`), so each walk is now
+  `internal.search_hybrid_semantic_walk(part, ...)`, a PARALLEL SAFE function, and two or more
+  walks are the non-partial children of one Gather → Parallel Append: the leg costs its
+  slowest walk. The same four walks from four sessions against one session: median 4.6 s
+  against 9.9 s over five fresh vectors, on a disk saturated by a neighbour (see below).
+  The rows are the inline walks' rows, so ranking and MRR do not move.
+- *JIT compiled the priority-scoped lexical pool on every call.* That plan is costed at
+  5.5M, past `jit_above_cost`, so it paid ~600 ms of inlining and optimization (22
+  functions) for a scan that runs in ~200 ms warm: 811-868 ms with JIT against 185-215 ms
+  without. Every `timeline.search*` plpgsql function now carries `SET jit = off`
+  (`test_every_search_function_runs_with_jit_off`). This was most of why scoped searches
+  were slower than unscoped ones.
+
+What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
+guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),
+which it shares with `mew-dev`: in a 10 s sample `md0` was 98.5% busy, mew-dev read
+262 MB/s and wrote 53 MB/s against production's 27 MB/s, and the Viper's reads waited
+1.9 ms. A guest-side `idle` reading does not mean the disk was idle. Check the hypervisor
+(`iostat -x` and `virsh domblkstat` on mew) before reading a slow idle-host search as a
+plan problem.
+
 **The query tool warns before the timeout, not after.** A statement that pattern-matches
 (`ILIKE`, `LIKE`, `~`, `regexp_*`, `position()`) over a raw `base_*` table with no `timeline.`
 reference gets a `hint` attached to its result before it runs — that shape was every

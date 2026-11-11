@@ -3059,6 +3059,17 @@
       "secret": false
     },
     {
+      "id": "search_hybrid_semantic_walk",
+      "kind": "function",
+      "layer": "internal",
+      "domain": "internal",
+      "schema": "internal",
+      "name": "search_hybrid_semantic_walk",
+      "discoverable": false,
+      "query_access": "execute_only",
+      "secret": false
+    },
+    {
       "id": "timeline_context",
       "kind": "function",
       "layer": "timeline",

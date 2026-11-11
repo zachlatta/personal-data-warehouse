@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -1361,6 +1362,71 @@ def test_semantic_leg_scopes_by_source_and_time_on_both_routes(
         "gmail_email:gmail_email|near-new#0-event",
         "gmail_email:gmail_email|far-new#0-event",
     ]
+
+
+def test_the_semantic_leg_walks_its_partition_graphs_on_parallel_workers(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """Contract C6: a graph walk is a chain of synchronous page reads, and
+    walking four of them one after another in one backend made the unscoped
+    semantic leg cost their sum (6.47 s cold on production, 2026-11-11, with
+    27 idle cores). The walks must run as the children of one Parallel Append,
+    each on its own process, and return exactly what the serial walks did."""
+
+    _provision(warehouse)
+    if not _pgvector_usable(warehouse):
+        pytest.skip("pgvector is not installed on this Postgres host")
+    ts = datetime(2026, 7, 5, tzinfo=UTC)
+    chunks = [
+        (f"{adapter}|{name}#0", adapter, axis)
+        for adapter in ("gmail_email", "slack_message", "slack_file", "voice_memo")
+        for name, axis in (("near", 0.0), ("mid", 0.5), ("far", 3.0))
+    ]
+    for chunk_id, adapter, axis in chunks:
+        _insert_chunk(warehouse, chunk_id, adapter, f"sha-{chunk_id}", ts)
+        _insert_embedding(warehouse, f"sha-{chunk_id}", axis=axis)
+    warehouse._command("DELETE FROM @search_schema_state")
+    warehouse._ensure_search_views_if_possible()
+    query = vector_literal([1.0] + [0.0] * (SEARCH_EMBEDDING_DIMENSIONS - 1))
+
+    connection = warehouse._connection
+    warehouse._command("LOAD 'auto_explain'")
+    warehouse._command("SET auto_explain.log_min_duration = 0")
+    warehouse._command("SET auto_explain.log_analyze = on")
+    warehouse._command("SET auto_explain.log_nested_statements = on")
+    warehouse._command("SET client_min_messages = log")
+    del connection.notices[:]
+    try:
+        rows = warehouse._query(
+            "SELECT ref, best FROM @search_hybrid_semantic(%s, 'fake-model', 10, NULL, NULL)"
+            " ORDER BY best",
+            (query,),
+        )
+        plans = "".join(connection.notices)
+    finally:
+        warehouse._command("RESET client_min_messages")
+        warehouse._command("RESET auto_explain.log_min_duration")
+
+    assert "Parallel Append" in plans, plans
+    assert plans.count("Function Scan on search_hybrid_semantic_walk") == 4, plans
+    launched = [int(n) for n in re.findall(r"Workers Launched: (\d+)", plans)]
+    assert launched and max(launched) >= 1, plans
+
+    serial = warehouse._query(
+        " UNION ALL ".join(
+            f"SELECT * FROM @search_hybrid_semantic_walk({part}, 'fake-model', NULL, NULL,"
+            " %s::public.halfvec, 400)"
+            for part in range(1, 5)
+        ),
+        (query,) * 4,
+    )
+    assert len(serial) == len(chunks)
+    assert len(rows) == len(chunks)
+    nearest_first = [f"{adapter}:{chunk_id}-event" for chunk_id, adapter, _ in chunks]
+    assert {ref for ref, _ in rows} == set(nearest_first)
+    assert {ref for ref, best in rows if best <= 4} == {
+        ref for ref in nearest_first if "|near#" in ref
+    }
 
 
 def test_a_chunk_and_its_first_vector_committing_together_still_meet(

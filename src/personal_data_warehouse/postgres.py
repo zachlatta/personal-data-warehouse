@@ -2816,6 +2816,87 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
 
 # Indexes that used to exist but have been superseded. Dropped idempotently
 # during _ensure_indexes so existing deployments converge with fresh installs.
+#: One partition's graph walk: the rows of its HNSW top-$5 for vector $4.
+#: search_hybrid_semantic inlines it for a lone walk; the walk function runs
+#: it per partition so several walks can share a Parallel Append. Both format
+#: it with (relation, scope) from _semantic_partition_scope_sql.
+SEMANTIC_ANN_BRANCH_SQL = """(SELECT v.adapter, v.event_id, v.chunk_id,
+                        v.embedding OPERATOR(public.<=>) $4 AS distance
+                    FROM %s v WHERE v.model = $1%s
+                    ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5)"""
+
+
+def _semantic_partition_scope_sql(adapters: tuple[str, ...]) -> str:
+    """The plpgsql expression for one partition's WHERE suffix.
+
+    A dedicated partition holds one adapter, so only ``since`` narrows it; the
+    default partition also filters ``sem_adapters``. Reads the plpgsql
+    variables ``sem_adapters`` and ``since`` and emits ``$2``/``$3``.
+    """
+    if adapters:
+        return "CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
+    return (
+        "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
+        " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
+    )
+
+
+def _semantic_walk_function_sql() -> str:
+    """search_hybrid_semantic_walk: one partition's graph walk as a function.
+
+    PARALLEL SAFE so the semantic leg can hand each walk to its own worker
+    (a LIMIT subquery is never planned on a worker). ``part`` is the
+    1-based position in SEARCH_VECTOR_PARTITIONS.
+    """
+    whens = "\n                        ".join(
+        f"WHEN {position} THEN $q$@{table}$q$"
+        for position, (table, _) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1)
+    )
+    scopes = "\n                        ".join(
+        f"WHEN {position} THEN {_semantic_partition_scope_sql(adapters)}"
+        for position, (_, adapters) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1)
+    )
+    return f"""
+            CREATE OR REPLACE FUNCTION @search_hybrid_semantic_walk(
+                part integer,
+                embedding_model text,
+                sem_adapters text[],
+                since timestamptz,
+                qvec public.halfvec({SEARCH_EMBEDDING_DIMENSIONS}),
+                lim integer
+            )
+            RETURNS TABLE (adapter text, event_id text, chunk_id text, distance double precision)
+            LANGUAGE plpgsql
+            SET jit = off
+            STABLE
+            -- Reads only and sets nothing (the caller sets hnsw.* before the
+            -- walks start; workers inherit it), so a worker may run it.
+            PARALLEL SAFE
+            -- A walk reads thousands of pages cold; the cost makes the
+            -- planner hand two or more of them to workers.
+            COST 1000000
+            ROWS {SEARCH_HYBRID_MAX_CANDIDATES}
+            AS $walk$
+            DECLARE
+                relation text := CASE part
+                        {whens}
+                    END;
+            BEGIN
+                IF relation IS NULL THEN
+                    RAISE EXCEPTION 'search_hybrid_semantic_walk: no partition %', part;
+                END IF;
+                RETURN QUERY EXECUTE format(
+                    $q${SEMANTIC_ANN_BRANCH_SQL}$q$,
+                    relation,
+                    CASE part
+                        {scopes}
+                    END
+                ) USING embedding_model, sem_adapters, since, qvec, lim;
+            END;
+            $walk$;
+            """
+
+
 def _semantic_partition_branches_sql() -> str:
     """search_hybrid_semantic's per-partition routing, one IF block each.
 
@@ -2828,23 +2909,19 @@ def _semantic_partition_branches_sql() -> str:
     listed = [adapter for _, adapters in SEARCH_VECTOR_PARTITIONS for adapter in adapters]
     listed_array = "ARRAY[" + ", ".join(f"'{a}'" for a in listed) + "]::text[]"
     blocks = []
-    for table, adapters in SEARCH_VECTOR_PARTITIONS:
+    for position, (table, adapters) in enumerate(SEARCH_VECTOR_PARTITIONS, start=1):
+        scope = _semantic_partition_scope_sql(adapters)
         if adapters:
             in_scope = (
                 "sem_adapters IS NULL OR sem_adapters && ARRAY["
                 + ", ".join(f"'{a}'" for a in adapters)
                 + "]::text[]"
             )
-            scope = "CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             whole = "since IS NULL"
         else:
             in_scope = (
                 "sem_adapters IS NULL OR EXISTS (SELECT 1 FROM unnest(sem_adapters) a"
                 f" WHERE a <> ALL ({listed_array}))"
-            )
-            scope = (
-                "CASE WHEN sem_adapters IS NULL THEN '' ELSE ' AND v.adapter = ANY ($2)' END"
-                " || CASE WHEN since IS NULL THEN '' ELSE ' AND v.occurred_at >= $3' END"
             )
             whole = "sem_adapters IS NULL AND since IS NULL"
         blocks.append(
@@ -2866,7 +2943,8 @@ def _semantic_partition_branches_sql() -> str:
                     IF part_exact THEN
                         exact_scans := exact_scans || format(exact_scan, $q$@{table}$q$, part_scope);
                     ELSE
-                        branches := branches || format(ann_branch, $q$@{table}$q$, part_scope);
+                        ann_branches := ann_branches || format(ann_branch, $q$@{table}$q$, part_scope);
+                        walk_parts := walk_parts || {position};
                     END IF;
                 END IF;"""
         )
@@ -17083,6 +17161,8 @@ class PostgresWarehouse:
                 str(SEARCH_VECTOR_EXACT_SLICE_ROWS),
                 str(SEARCH_VECTOR_EXACT_SCAN_WORKERS),
                 repr(SEARCH_VECTOR_PARTITIONS),
+                _semantic_partition_branches_sql(),
+                _semantic_walk_function_sql(),
                 hybrid_state,
             ]
         )
@@ -18677,6 +18757,7 @@ class PostgresWarehouse:
             # their wall times inside one backend. search_hybrid() below remains
             # the direct-SQL compatibility entry point and composes these same
             # helpers -- there is no second legacy ranking flow to drift.
+            self._command(_semantic_walk_function_sql())
             self._command(
                 r"""
             -- CREATE OR REPLACE with a new parameter OVERLOADS rather than
@@ -18715,6 +18796,8 @@ class PostgresWarehouse:
                 part_exact boolean;
                 branches text[] := '{}';
                 exact_scans text[] := '{}';
+                ann_branches text[] := '{}';
+                walk_parts integer[] := '{}';
                 -- "+ 0" is the exact scan's plan barrier: the sort key no
                 -- longer matches the HNSW ordering operator, so the planner
                 -- cannot turn it back into an ANN scan. An OFFSET 0 subquery
@@ -18723,10 +18806,7 @@ class PostgresWarehouse:
                 exact_scan constant text := $q$SELECT v.adapter, v.event_id, v.chunk_id,
                         (v.embedding OPERATOR(public.<=>) $4) + 0 AS distance
                     FROM %s v WHERE v.model = $1%s$q$;
-                ann_branch constant text := $q$(SELECT v.adapter, v.event_id, v.chunk_id,
-                        v.embedding OPERATOR(public.<=>) $4 AS distance
-                    FROM %s v WHERE v.model = $1%s
-                    ORDER BY v.embedding OPERATOR(public.<=>) $4 LIMIT $5)$q$;
+                ann_branch constant text := $q$""" + SEMANTIC_ANN_BRANCH_SQL + r"""$q$;
                 qvec public.halfvec("""
                 + str(SEARCH_EMBEDDING_DIMENSIONS)
                 + r""");
@@ -18817,6 +18897,34 @@ class PostgresWarehouse:
                         '(SELECT e.* FROM (%s) e ORDER BY e.distance LIMIT $5)',
                         array_to_string(exact_scans, ' UNION ALL ')
                     );
+                END IF;
+                -- Graph walks run side by side, one per worker. A walk is a
+                -- chain of synchronous random page reads, so walked one after
+                -- another in a single backend the leg cost the SUM of the
+                -- walks: production, 2026-11-11, unscoped, 6.47 s of which
+                -- 6.08 s was read wait (walks of 1.45 + 2.98 + 1.81 + 0.23 s)
+                -- on a host whose other 27 cores sat idle. Postgres will not
+                -- plan a LIMIT subquery on a worker, so each walk is a
+                -- PARALLEL SAFE function scan and the walks are the
+                -- non-partial children of one Parallel Append: the leg costs
+                -- the slowest walk. Rows are exactly the inline branches'.
+                IF coalesce(array_length(walk_parts, 1), 0) = 1 THEN
+                    branches := ann_branches || branches;
+                ELSIF coalesce(array_length(walk_parts, 1), 0) > 1 THEN
+                    IF current_setting('max_parallel_workers_per_gather')::integer
+                            < array_length(walk_parts, 1) THEN
+                        PERFORM set_config(
+                            'max_parallel_workers_per_gather',
+                            array_length(walk_parts, 1)::text, true
+                        );
+                    END IF;
+                    branches := ARRAY[format(
+                        '(SELECT w.* FROM (%s) w ORDER BY w.distance LIMIT $5)',
+                        (SELECT string_agg(
+                                    format($q$SELECT * FROM @search_hybrid_semantic_walk(%s, $1, $2, $3, $4, $5)$q$, p),
+                                    ' UNION ALL ' ORDER BY o)
+                           FROM unnest(walk_parts) WITH ORDINALITY AS u(p, o))
+                    )] || branches;
                 END IF;
                 IF coalesce(array_length(branches, 1), 0) = 0 THEN
                     RETURN;
