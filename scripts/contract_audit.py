@@ -852,21 +852,69 @@ def s3_finance() -> Verdict:
 #: C12's cap, shared with test_agents_md_fits_one_sitting: AGENTS.md is loaded
 #: into every session in this repository.
 AGENTS_MD_MAX_BYTES = 48 * 1024
+#: CLAUDE.md is a symlink to it.
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
+
+# A cited test file. With a directory it must exist at exactly that path: any
+# .py under tests/ (helpers like tests/local_test_runtime.py included) or a Go
+# *_test.go under app/. Bare (`test_timeline.py`, `guide_test.go`) it must
+# exist somewhere under tests/ or app/ by that name.
+_CITED_TEST_PATH = re.compile(
+    r"(?<![\w./-])(tests/[\w./-]*?\.py|app/[\w./-]*?_test\.go|test_\w+\.py|\w+_test\.go)(?![\w.-])"
+)
+# A cited test function: Python `test_snake_case` or Go `TestCamelCase`. The
+# lookahead keeps a file name's stem (test_timeline in test_timeline.py) out.
+_CITED_TEST_NAME = re.compile(r"\b(test_\w+|Test[A-Z]\w*)\b(?!\.py)")
+
+
+def cited_test_names(text: str) -> set[str]:
+    """Every Python or Go test function a document names."""
+    return set(_CITED_TEST_NAME.findall(text))
+
+
+def cited_test_paths(text: str) -> set[str]:
+    """Every test file a document names, as written (path or bare file name)."""
+    return set(_CITED_TEST_PATH.findall(text))
+
+
+def defined_test_names(root: Path = REPO_ROOT) -> set[str]:
+    """Python test functions under tests/ (methods of test classes included)
+    and Go test functions under app/."""
+    defined: set[str] = set()
+    for path in (root / "tests").rglob("*.py"):
+        defined.update(
+            re.findall(r"^[ \t]*(?:async[ \t]+)?def[ \t]+(test_\w+)\(", path.read_text(encoding="utf-8"), re.M)
+        )
+    for path in (root / "app").rglob("*_test.go"):
+        defined.update(re.findall(r"^func (Test\w+)\(", path.read_text(encoding="utf-8"), re.M))
+    return defined
+
+
+def dangling_test_citations(text: str, root: Path = REPO_ROOT) -> list[str]:
+    """The test names and test-file paths a document cites that do not exist."""
+    defined = defined_test_names(root)
+    missing = sorted(name for name in cited_test_names(text) if name not in defined)
+    for cited in sorted(cited_test_paths(text)):
+        if "/" in cited:
+            found = (root / cited).is_file()
+        else:
+            where = root / ("app" if cited.endswith("_test.go") else "tests")
+            found = next(where.rglob(cited), None) is not None
+        if not found:
+            missing.append(cited)
+    return missing
 
 
 def c12_future_developers() -> Verdict:
     """Future developers can read the contracts in one sitting, and every test
-    a contract names still exists (a rename must rename its mention)."""
+    AGENTS.md names, in any section, still exists (a rename must rename its
+    mention, and a 'copy this test' pointer must point at a real test)."""
     title = "future developers understand and honor the contracts"
-    agents = REPO_ROOT / "AGENTS.md"
-    text = agents.read_text(encoding="utf-8")
+    text = AGENTS_MD.read_text(encoding="utf-8")
     size = len(text.encode("utf-8"))
     section = text.split("## The contracts", 1)[1].split("\n## ", 1)[0] if "## The contracts" in text else ""
-    named = set(re.findall(r"`(?:[\w./-]+::)?(test_[A-Za-z0-9_]+)`", re.sub(r"\n[ \t]+", " ", section)))
-    defined: set[str] = set()
-    for path in (REPO_ROOT / "tests").rglob("test_*.py"):
-        defined.update(re.findall(r"^def (test_[A-Za-z0-9_]+)\(", path.read_text(encoding="utf-8"), re.M))
-    missing = sorted(named - defined)
+    named = cited_test_names(text) | cited_test_paths(text)
+    missing = dangling_test_citations(text)
     unindexed = sorted(
         p.name for p in (REPO_ROOT / "docs/agents").glob("*.md") if f"docs/agents/{p.name}" not in text
     )
@@ -878,7 +926,7 @@ def c12_future_developers() -> Verdict:
     if missing or unindexed:
         grades.append(YELLOW)
     evidence = (
-        f"AGENTS.md {size} bytes (cap {AGENTS_MD_MAX_BYTES}); contracts name {len(named)} tests"
+        f"AGENTS.md {size} bytes (cap {AGENTS_MD_MAX_BYTES}); cites {len(named)} tests and test files"
         f"{', missing: ' + ', '.join(missing) if missing else ', all exist'}"
         f"{'; docs/agents not indexed: ' + ', '.join(unindexed) if unindexed else ''}"
     )

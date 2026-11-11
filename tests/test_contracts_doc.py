@@ -3,29 +3,25 @@
 A contract whose named test no longer exists is one refactor away from quietly
 becoming untrue -- the document itself says so. The same goes for every other
 section: "copy this test" pointing at a test nobody ever wrote sends the next
-reader hunting for a shape that is not there. So this reads every test name
-cited anywhere in AGENTS.md (CLAUDE.md is a symlink to it) -- Python
-``test_*`` functions, Go ``Test*`` functions and ``tests/*.py`` files -- and
-requires each to be defined in the repository, so a rename breaks the document
-rather than the rule.
+reader hunting for a shape that is not there. So this reads every test cited
+anywhere in AGENTS.md (CLAUDE.md is a symlink to it) -- Python ``test_*``
+functions, Go ``Test*`` functions, ``tests/`` files and Go ``*_test.go`` files
+-- and requires each to exist, so a rename breaks the document rather than the
+rule. The extractor is the one C12's living audit grades with
+(``scripts/contract_audit.py``), so the test and the grade cannot disagree.
 """
 
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-AGENTS_MD = REPO_ROOT / "AGENTS.md"
-TESTS_DIR = REPO_ROOT / "tests"
-APP_DIR = REPO_ROOT / "app"
-
-# A test file path, with or without its tests/ directory: `tests/test_timeline.py`
-# and the bare `test_timeline.py` the prose sometimes uses.
-_TEST_FILE = re.compile(r"\b(?:tests/)?(test_[A-Za-z0-9_]+\.py)\b")
-# A test function: Python `test_snake_case` or Go `TestCamelCase`. The lookahead
-# keeps the stem of a file name (test_timeline in test_timeline.py) out.
-_TEST_NAME = re.compile(r"\b(test_[A-Za-z0-9_]+|Test[A-Z][A-Za-z0-9_]*)\b(?!\.py)")
+from scripts.contract_audit import (
+    AGENTS_MD,
+    cited_test_names,
+    cited_test_paths,
+    dangling_test_citations,
+    defined_test_names,
+)
 
 
 def _document() -> str:
@@ -39,38 +35,34 @@ def _contracts_section(text: str) -> str:
     return re.sub(r"\n[ \t]+", " ", text[start:end])
 
 
-def _cited_test_files(text: str) -> set[str]:
-    return set(_TEST_FILE.findall(text))
-
-
-def _cited_tests(text: str) -> set[str]:
-    return set(_TEST_NAME.findall(text))
-
-
-def _defined_tests() -> set[str]:
-    defined: set[str] = set()
-    for path in TESTS_DIR.rglob("*.py"):
-        # Module-level functions and methods of test classes alike.
-        defined.update(
-            re.findall(r"^[ \t]*(?:async[ \t]+)?def[ \t]+(test_[A-Za-z0-9_]+)\(", path.read_text(encoding="utf-8"), re.M)
-        )
-    for path in APP_DIR.rglob("*_test.go"):
-        defined.update(re.findall(r"^func (Test[A-Za-z0-9_]+)\(", path.read_text(encoding="utf-8"), re.M))
-    return defined
-
-
 def test_the_extractor_finds_python_go_and_file_citations() -> None:
     sample = (
         "copy `test_a_view_reads_null` and run `go test` for `TestBudget`; "
-        "see `tests/test_timeline.py`, also test_timeline.py and "
+        "see `tests/test_timeline.py`, also test_timeline.py, `tests/local_test_runtime.py`, "
+        "`app/internal/guide/guide_test.go`, `guide_test.go`, `postgres.py`, `.pytest_cache` and "
         "`tests/test_repo_contracts.py::test_every_token`."
     )
-    assert _cited_tests(sample) == {"test_a_view_reads_null", "TestBudget", "test_every_token"}
-    assert _cited_test_files(sample) == {"test_timeline.py", "test_repo_contracts.py"}
+    assert cited_test_names(sample) == {"test_a_view_reads_null", "TestBudget", "test_every_token"}
+    assert cited_test_paths(sample) == {
+        "tests/test_timeline.py",
+        "test_timeline.py",
+        "tests/local_test_runtime.py",
+        "app/internal/guide/guide_test.go",
+        "guide_test.go",
+        "tests/test_repo_contracts.py",
+    }
+
+
+def test_a_cited_path_must_exist_at_that_path_not_just_by_name() -> None:
+    assert dangling_test_citations("`tests/test_timeline.py` and `test_timeline.py`") == []
+    assert dangling_test_citations("`tests/unit/test_timeline.py`") == ["tests/unit/test_timeline.py"]
+    assert dangling_test_citations("`tests/no_such_helper.py`") == ["tests/no_such_helper.py"]
+    assert dangling_test_citations("`app/internal/no_such_test.go`") == ["app/internal/no_such_test.go"]
+    assert dangling_test_citations("`no_such_test.go`") == ["no_such_test.go"]
 
 
 def test_the_definition_scan_sees_class_methods_and_go_tests() -> None:
-    defined = _defined_tests()
+    defined = defined_test_names()
     assert "test_every_test_agents_md_cites_exists" in defined
     # A method of tests/test_search_benchmark.py's TestPredicateMatching class.
     assert "test_source_predicate_accepts_listed_source" in defined
@@ -80,12 +72,10 @@ def test_the_definition_scan_sees_class_methods_and_go_tests() -> None:
 def test_every_test_agents_md_cites_exists() -> None:
     text = _document()
     contracts = _contracts_section(text)
-    assert len(_cited_tests(contracts)) + len(_cited_test_files(contracts)) >= 8, (
+    assert len(cited_test_names(contracts)) + len(cited_test_paths(contracts)) >= 8, (
         "the contracts section should name the tests that hold it up"
     )
-    defined = _defined_tests()
-    missing = sorted(name for name in _cited_tests(text) if name not in defined)
-    missing += sorted(name for name in _cited_test_files(text) if not (TESTS_DIR / name).exists())
+    missing = dangling_test_citations(text)
     assert missing == [], (
         "AGENTS.md cites tests that do not exist; a renamed test must rename its mention, "
         "or the rule it holds up is unenforced without anyone noticing, and a 'copy this "

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -660,6 +661,32 @@ def test_c12_is_green_while_agents_md_fits_and_names_live_tests() -> None:
 def test_c12_is_red_when_agents_md_outgrows_one_sitting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(contract_audit, "AGENTS_MD_MAX_BYTES", 100)
     assert contract_audit.c12_future_developers().status == contract_audit.RED
+
+
+@pytest.mark.parametrize(
+    "citation",
+    [
+        "`test_a_shape_nobody_ever_wrote`",
+        "`TestAGoShapeNobodyEverWrote`",
+        "`tests/no_such_helper.py`",
+        "`app/internal/guide/no_such_test.go`",
+        # The basename exists (tests/test_timeline.py); this path does not.
+        "`tests/unit/test_timeline.py`",
+    ],
+)
+def test_c12_flags_a_dangling_test_citation_outside_the_contracts_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, citation: str
+) -> None:
+    """A 'copy this test' pointer anywhere in the file is graded, not only a contract's."""
+    real = contract_audit.AGENTS_MD.read_text(encoding="utf-8")
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(real + f"\n## Some later rule\n\n{citation} is the shape to copy.\n", encoding="utf-8")
+    monkeypatch.setattr(contract_audit, "AGENTS_MD", agents)
+
+    verdict = contract_audit.c12_future_developers()
+
+    assert verdict.status == contract_audit.YELLOW, verdict.evidence
+    assert citation.strip("`") in verdict.evidence
 
 
 # --- C4/C10 must see the database's own integrity -----------------------------
