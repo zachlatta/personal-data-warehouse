@@ -306,7 +306,9 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # derived_search.chunk_vectors in step with chunks and embeddings.
         # +2 internal: the Feed tab's card-versioning trigger and the guard
         # that keeps base_feed.item_versions append-only.
-        "internal": 7,
+        # +1 internal: internal.search_hybrid_semantic_walk, one partition's
+        # graph walk as a PARALLEL SAFE function so the walks share workers.
+        "internal": 8,
     }
 
 
@@ -450,6 +452,7 @@ def test_query_access_policy_matches_the_layer_contract() -> None:
     assert {obj.id for obj in CATALOG.objects if obj.query_access == "execute_only"} == {
         "utf8_byte_prefix",
         "search_text_preview",
+        "search_hybrid_semantic_walk",
     }
     assert set(CATALOG.denied_schemas()) == {"private"}
 
