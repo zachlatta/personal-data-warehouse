@@ -35,6 +35,7 @@ func (s *memoryStore) Update(ctx context.Context, id string, fn func(*record) er
 		_ = json.Unmarshal(raw, &c)
 	}
 	before, _ := json.Marshal(c)
+	beforeConfig, _ := json.Marshal(c.configuration())
 	if err := fn(&c); err != nil {
 		return err
 	}
@@ -42,7 +43,10 @@ func (s *memoryStore) Update(ctx context.Context, id string, fn func(*record) er
 	if bytes.Equal(before, after) && s.data[id] != nil {
 		return nil
 	}
-	c.Version++
+	afterConfig, _ := json.Marshal(c.configuration())
+	if s.data[id] == nil || !bytes.Equal(beforeConfig, afterConfig) {
+		c.Version++
+	}
 	c.UpdatedAt = time.Now()
 	raw, err := json.Marshal(c)
 	if err == nil {

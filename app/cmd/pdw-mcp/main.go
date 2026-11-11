@@ -75,7 +75,8 @@ func main() {
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); notificationSvc.Run(ctx) }()
 	logger.Info("personal data warehouse MCP server listening", "addr", cfg.Addr)
-	httpServer := &http.Server{Addr: cfg.Addr, Handler: server.NewMuxWithBackground(ctx, cfg, authSvc, runner, notificationSvc, mutationSvc), ReadHeaderTimeout: 10 * time.Second}
+	handler, closeConnections := server.NewMuxWithBackground(ctx, cfg, authSvc, runner, notificationSvc, mutationSvc)
+	httpServer := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -93,6 +94,7 @@ func main() {
 	cancel()
 	<-workerDone
 	<-shutdownDone
+	closeConnections()
 	if failed {
 		os.Exit(1)
 	}

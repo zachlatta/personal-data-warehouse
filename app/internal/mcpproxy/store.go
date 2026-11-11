@@ -63,6 +63,17 @@ type record struct {
 	DiscoveryStatus        string
 }
 
+// configuration is the optimistic-lock surface edited by administrators.
+// Discovery snapshots, health, OAuth handshakes and token rotation are runtime
+// state: persisting them must not invalidate an administrator's loaded page.
+func (c record) configuration() any {
+	return struct {
+		Generation, Name, URL                  string
+		Enabled, AllClients, Loopback, Deleted bool
+		Clients                                []string
+	}{c.Generation, c.Name, c.URL, c.Enabled, c.AllClients, c.Loopback, c.Deleted, c.Clients}
+}
+
 // Store serializes all changes to a connection, including rotating refresh
 // tokens. Implementations must roll back when the callback returns an error.
 type Store interface {
@@ -261,6 +272,10 @@ func (s *PostgresStore) update(ctx context.Context, id string, fn func(*record) 
 	if err != nil {
 		return err
 	}
+	beforeConfig, err := json.Marshal(c.configuration())
+	if err != nil {
+		return err
+	}
 	if err = fn(&c); err != nil {
 		return err
 	}
@@ -272,9 +287,14 @@ func (s *PostgresStore) update(ctx context.Context, id string, fn func(*record) 
 	if unchanged && sealedCurrent {
 		return tx.Commit()
 	}
-	if !unchanged {
-		// A re-encryption alone is not a change to the connection.
+	afterConfig, err := json.Marshal(c.configuration())
+	if err != nil {
+		return err
+	}
+	if payload == "" || !bytes.Equal(beforeConfig, afterConfig) {
 		c.Version++
+	}
+	if !unchanged {
 		c.UpdatedAt = time.Now().UTC()
 	}
 	raw, err := json.Marshal(c)
