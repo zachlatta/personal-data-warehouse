@@ -390,12 +390,17 @@ type statsTimelineRunner struct {
 	calls  []fakeArgsCall
 	oldest string
 	newest string
+	fail   error
 }
 
 func (f *statsTimelineRunner) QueryArgs(_ context.Context, sql string, args []any, _ int) (query.RawResult, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, fakeArgsCall{SQL: sql, Args: args})
+	fail := f.fail
 	f.mu.Unlock()
+	if fail != nil {
+		return query.RawResult{}, fail
+	}
 	switch sql {
 	case timelineCountStatsSQL:
 		return query.RawResult{Rows: f.stats}, nil
@@ -953,5 +958,42 @@ func TestTimelineChildPagingNormalizesRenamedSourceTables(t *testing.T) {
 		"/api/timeline/item/children?adapter=gmail_email&event_id=renamed-1&child="+children[0].name+"&offset=0", true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("paging a renamed source table got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestTimelineSourcesServeTheLastGoodCountsWhenARefreshFails(t *testing.T) {
+	runner := &statsTimelineRunner{
+		stats:  []map[string]any{{"dimension": "total", "name": "", "count": int64(42)}},
+		exact:  map[string]int64{},
+		oldest: "2020-01-01T00:00:00Z",
+		newest: "2026-11-11T00:00:00Z",
+	}
+	svc := newTimelineService(runner, runner, nil, slog.Default())
+	get := func(path string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		svc.handleSources(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		return recorder
+	}
+	first := get("/api/timeline/sources")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first read = %d: %s", first.Code, first.Body.String())
+	}
+
+	runner.mu.Lock()
+	runner.fail = fmt.Errorf("canceling statement due to statement timeout")
+	runner.mu.Unlock()
+	refreshed := get("/api/timeline/sources?refresh=1")
+	if refreshed.Code != http.StatusOK {
+		t.Fatalf("a failed refresh with counts cached = %d, want the cached payload", refreshed.Code)
+	}
+	if refreshed.Body.String() != first.Body.String() {
+		t.Fatalf("served %s, want the last good payload %s", refreshed.Body.String(), first.Body.String())
+	}
+
+	cold := newTimelineService(runner, runner, nil, slog.Default())
+	recorder := httptest.NewRecorder()
+	cold.handleSources(recorder, httptest.NewRequest(http.MethodGet, "/api/timeline/sources", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("a failure with nothing cached = %d, want 500", recorder.Code)
 	}
 }

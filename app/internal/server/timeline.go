@@ -364,6 +364,13 @@ func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) 
 	}
 	payload, err := s.buildSourcesPayload(r.Context())
 	if err != nil {
+		// Stale counts beat an empty sidebar: serve the last good payload.
+		if cached != nil {
+			s.logger.WarnContext(r.Context(), "timeline sources refresh failed; serving the cached counts", "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(cached)
+			return
+		}
 		s.logger.ErrorContext(r.Context(), "timeline sources query failed", "error", err)
 		httpError(w, http.StatusInternalServerError, "timeline sources query failed")
 		return

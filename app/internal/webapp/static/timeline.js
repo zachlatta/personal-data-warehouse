@@ -42,7 +42,10 @@ export function mount(container, ctx) {
 
   /* ---- filters ---- */
   function activeCSV(map) { return Object.keys(map).filter((key) => map[key]).join(","); }
-  function countLabel(count) { return (typeof count === "number" && isFinite(count)) ? count.toLocaleString() : "…"; }
+  function countLabel(count, estimated) {
+    if (!(typeof count === "number" && isFinite(count))) return "…";
+    return (estimated ? "≈" : "") + count.toLocaleString();
+  }
   function renderChips(listNode, catalog, map, colorize) {
     clear(listNode);
     catalog.forEach((entry) => {
@@ -51,7 +54,9 @@ export function mount(container, ctx) {
       dot.style.background = colorize ? hue(entry.name) : "var(--border-strong)";
       chip.appendChild(dot);
       chip.appendChild(h("span", "nm", entry.label || entry.name));
-      chip.appendChild(h("span", "ct", countLabel(entry.count)));
+      const ct = h("span", "ct", countLabel(entry.count, entry.estimated));
+      if (entry.estimated) ct.title = "estimated from Postgres statistics";
+      chip.appendChild(ct);
       chip.addEventListener("click", () => {
         map[entry.name] = !map[entry.name];
         chip.classList.toggle("on");
@@ -77,6 +82,7 @@ export function mount(container, ctx) {
       const list = (rows || []).map((row) => ({
         name: row[key],
         count: (typeof row.count === "number" && isFinite(row.count)) ? row.count : null,
+        estimated: row.estimated === true,
       }));
       list.sort((a, b) => {
         const ak = typeof a.count === "number", bk = typeof b.count === "number";
@@ -88,7 +94,7 @@ export function mount(container, ctx) {
     }
     renderChips(el("srclist"), toCatalog(body.sources, "source"), state.sources, true);
     renderChips(el("kindlist"), toCatalog(body.kinds, "kind"), state.kinds, false);
-    const priorityCatalog = (body.priorities || []).map((row) => ({ name: row.priority, label: row.priority, count: row.count }));
+    const priorityCatalog = (body.priorities || []).map((row) => ({ name: row.priority, label: row.priority, count: row.count, estimated: row.estimated === true }));
     renderChips(el("prioritylist"), priorityCatalog, state.priorities, false);
     const total = typeof body.total === "number" ? body.total : 0;
     const oldest = body.oldest || "", newest = body.newest || "";
