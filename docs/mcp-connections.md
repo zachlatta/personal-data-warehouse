@@ -67,7 +67,21 @@ PDW's own mutation-review flow does not intercept them. Tools are hidden until e
 shared with named clients or all authenticated PDW clients. Disable/remove recheck at call
 time, including for stale client tool lists. Calls already executing cannot be undone.
 
-Discovery is explicit (after auth or Refresh tools), bounded to 1,000 tools per connection.
+The Go proxy discovers tools on app startup and every five minutes for every enabled
+connection, whether shared or private. Up to four independent discoveries run concurrently;
+a failure retains that connection's previous snapshot and does not stop the others.
+Authentication and Refresh tools use this same discovery path for immediate refreshes.
+Each successful discovery replaces the complete set, including removals and changed schemas,
+bounded to 1,000 tools per connection. Disabled/deleted connections are not polled.
+No separate scheduler or environment variables are required. Shutdown cancels discovery.
+The five-minute interval keeps tool changes current without polling on user requests.
+
+Discovery status and last-success time are separate from call status on `/connections`.
+Each completed sweep (including an empty sweep) records the existing app heartbeat in
+`ops.uploader_heartbeats` for the `mcp_proxy` pipeline. Partial failures name the failed
+connections without exposing credentials or upstream bodies. `marts_ops.pipeline_health`
+and `/pipelines` detect failures and a stopped refresher (10-minute run expectation,
+matching the health collector's observation interval). No new database objects are needed.
 Calls and discovery have a 60-second budget, responses are capped at 32 MiB, and calls
 are not automatically retried.
 Results preserve MCP content blocks, structured content and `isError`. An ambiguous failed

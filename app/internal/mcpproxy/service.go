@@ -167,10 +167,32 @@ func validSchema(schema any) bool {
 }
 
 // Refresh replaces the complete snapshot, leaving the previous set on failure.
-func (s *Service) Refresh(ctx context.Context, id string) error {
+func (s *Service) Refresh(ctx context.Context, id string) (refreshErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	c, client, err := s.prepare(ctx, id, nil)
+	var original record
+	c, client, err := s.prepare(ctx, id, func(c *record) error {
+		if !c.Enabled {
+			return errUnavailable
+		}
+		original = *c
+		c.LastDiscoveryAttemptAt = time.Now().UTC()
+		return nil
+	})
+	defer func() {
+		if refreshErr == nil || original.Version == 0 {
+			return
+		}
+		statusCtx, done := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer done()
+		_ = s.store.Update(statusCtx, id, func(current *record) error {
+			if current.Deleted || current.Generation != original.Generation || current.URL != original.URL {
+				return errUnavailable
+			}
+			current.DiscoveryStatus = "error"
+			return nil
+		})
+	}()
 	if err != nil {
 		return err
 	}
@@ -195,11 +217,13 @@ func (s *Service) Refresh(ctx context.Context, id string) error {
 		defs = append(defs, def)
 	}
 	return s.store.Update(ctx, id, func(current *record) error {
-		if current.Deleted || current.Generation != c.Generation || current.URL != c.URL {
+		if current.Deleted || !current.Enabled || current.Generation != c.Generation || current.URL != c.URL {
 			return errUnavailable
 		}
 		current.Tools = defs
 		current.Status = "connected"
+		current.DiscoveryStatus = "ok"
+		current.LastDiscoveredAt = time.Now().UTC()
 		return nil
 	})
 }

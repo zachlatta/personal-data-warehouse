@@ -201,6 +201,16 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 }
 
 func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) http.Handler {
+	handler, _ := NewMuxWithBackground(nil, cfg, authSvc, runner, notificationSvc, mutationSvcs...)
+	return handler
+}
+
+// NewMuxWithBackground attaches periodic proxy discovery to the app lifecycle.
+// A nil context builds a request-only mux for tests and embedded callers.
+// The caller must invoke cleanup after HTTP shutdown has finished draining
+// requests. Cancelling ctx stops discovery but does not close the shared store.
+func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) (http.Handler, func()) {
+	cleanup := func() {}
 	logger := slog.Default().With("component", "http")
 	mux := http.NewServeMux()
 	if notificationSvc != nil {
@@ -517,6 +527,33 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			}
 			proxy = mcpproxy.New(store, baseURL, nil)
 			proxy.Register(mux, authSvc.RequireStaticBearer())
+			cleanup = func() { _ = store.Close() }
+			if ctx != nil {
+				refreshDone := make(chan struct{})
+				cleanup = func() { <-refreshDone; _ = store.Close() }
+				go func() {
+					defer close(refreshDone)
+					var hb *uploaderHeartbeatStore
+					defer func() {
+						if hb != nil {
+							_ = hb.Close()
+						}
+					}()
+					proxy.RunRefreshLoop(ctx, func(refreshErr error) {
+						if hb == nil {
+							var err error
+							hb, err = newUploaderHeartbeatStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+							if err != nil {
+								logger.Error("MCP refresh heartbeat store unavailable")
+								return
+							}
+						}
+						if err := recordMCPRefreshHeartbeat(ctx, hb, cfg.QueryTimeout, refreshErr); err != nil {
+							logger.Error("MCP refresh heartbeat could not be recorded")
+						}
+					})
+				}()
+			}
 		}
 	}
 	if proxy == nil {
@@ -616,7 +653,7 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 		logger.Info("pipeline freshness endpoints enabled", "page", pipelinesPagePath)
 	}
 
-	return logRequests(logger, mux)
+	return logRequests(logger, mux), cleanup
 }
 
 // newAccessTokenService keeps tokens in Postgres when the app has it. Without
