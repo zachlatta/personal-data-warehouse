@@ -47,6 +47,15 @@ const (
 		"or raise max_results for more recall. Do not fall back to ILIKE over raw body columns."
 )
 
+// SearchUnscopedGuidance follows a search that ran without priorities and
+// found something: the next call copies this one's shape, so the response
+// names the scope C3 asks for. Exported so the CLI, which says the same thing
+// on its Scope line, can drop exactly this sentence.
+var SearchUnscopedGuidance = "This search ran over all tiers (no priorities). For the next one, pass " +
+	"priorities [\"" + strings.Join(warehouse.TimelineAttentionPriorities(), "\",\"") + "\"] for attention or correspondence, or [\"" +
+	strings.Join(warehouse.TimelineAgentWorkPriorities(), "\",\"") + "\"] " +
+	"for prior agent work; omit them only when every tier matters."
+
 // searchPhrasingHint is advice for the caller's NEXT search, not an error. The
 // caller here is itself a language model, which is why query rewriting lives in
 // guidance rather than in another model inside the search path: it costs
@@ -476,6 +485,11 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) SearchResponse 
 		resp.Guidance = searchEmptyGuidance
 	} else {
 		resp.Guidance = searchHitGuidance
+	}
+	// Not on an empty result (narrowing a miss contradicts the empty
+	// guidance) and not beside the attention hint, which already says it.
+	if len(req.Priorities) == 0 && resp.TotalRows > 0 && !slices.Contains(resp.HintCodes, "consider_attention_scope") {
+		resp.Guidance += " " + SearchUnscopedGuidance
 	}
 	capSearchPreviews(raw.Rows)
 	resp.Rows, resp.Truncations, err = s.formatRows(raw.Columns, raw.Rows, 0, len(raw.Rows), "json")

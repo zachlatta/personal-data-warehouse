@@ -122,6 +122,25 @@ func TimelineAttentionPriorities() []string {
 	return append([]string(nil), TimelinePriorities.AttentionPriorities...)
 }
 
+// TimelineAgentWorkPriorities returns the selection guide's scope for prior
+// agent conclusions, so guidance that names it reads the catalog instead of
+// keeping its own copy.
+func TimelineAgentWorkPriorities() []string {
+	return timelineSelectionPriorities("prior agent conclusions")
+}
+
+// timelineSelectionPriorities returns one selection guide row's priorities.
+// An unknown intent panics: a renamed catalog row must fail the build's tests,
+// not silently drop a scope from every instruction surface.
+func timelineSelectionPriorities(intent string) []string {
+	for _, selection := range TimelinePriorities.SelectionGuide {
+		if selection.Intent == intent {
+			return append([]string(nil), selection.Priorities...)
+		}
+	}
+	panic(fmt.Sprintf("timeline priority selection guide has no intent %q", intent))
+}
+
 // TimelinePriorityEqualsDefinitions renders prose for instruction surfaces.
 func TimelinePriorityEqualsDefinitions() string {
 	parts := make([]string, 0, len(TimelinePriorities.Tiers))

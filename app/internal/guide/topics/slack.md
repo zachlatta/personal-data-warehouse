@@ -10,7 +10,9 @@ somebody else. Confirm any id you build a who-said-what query on from `base_slac
 
 ## Relations
 
-- `base_slack.messages` — time column `message_datetime`; `thread_ts` marks a reply;
+- `base_slack.messages` — keyed by `conversation_id` + `message_ts` (no `channel_id`, no bare
+  `id`); the sender is `user_id` / `username` (no `user_name`; names are in `base_slack.users`,
+  channel names in `base_slack.conversations.name`); time column `message_datetime`; `thread_ts` marks a reply;
   `subtype` carries Slack's own message kinds. A permalink is
   `https://<team_domain>.slack.com/archives/<conversation_id>/p<ts without the dot>`
   (with `?thread_ts=…&cid=…` for a reply); the team domain is in `base_slack.teams`.

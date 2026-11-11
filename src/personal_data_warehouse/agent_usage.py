@@ -129,7 +129,8 @@ CLI_INVENTED_RE = (
 CLI_SEARCH_RE = _cli_re("search")
 CLI_SQL_RE = _cli_re("sql")
 CLI_SCHEMA_RE = _cli_re("schema|columns")
-CLI_OTHER_READ_RE = _cli_re("context|call|list|describe")
+#: `list` and `describe` are connection discovery or help (below), not reads.
+CLI_OTHER_READ_RE = _cli_re("context|call")
 #: `pdw call <connection>__<tool>`: a question to ANOTHER system (the Hack Club
 #: warehouse, Airtable, Orchard, ...) reached through PDW's MCP proxy. 316 of
 #: the fortnight's calls to 2026-09-30 were Hack Club warehouse queries, and
@@ -140,6 +141,51 @@ CLI_CONNECTION_RE = _CLI_BEFORE + r"call[[:space:]]+[A-Za-z0-9_-]+__[A-Za-z0-9_]
 #: `<pdw>__<connection>__<tool>` names older clients still list.
 MCP_CONNECTION_TOOL_RE = r"personal_data_warehouse__(connection_call|connections)$|personal_data_warehouse__[A-Za-z0-9_]+__"
 CLI_ADMIN_RE = _cli_re("|".join(PDW_ADMIN_SUBCOMMANDS))
+#: Tool discovery for another system: `pdw list` is the CLI spelling of the MCP
+#: `connections` tool (already a connection call), and `pdw describe
+#: <connection>__<tool>` reads that system's tool schema. An agent checking
+#: `file_share__create_upload_url` or `skills__skill_edit` arguments is not
+#: starting a warehouse question anywhere.
+CLI_CONNECTION_DISCOVERY_RE = (
+    _cli_re("list")
+    + "|" + _CLI_BEFORE + r"describe[[:space:]]+[A-Za-z0-9_-]+__[A-Za-z0-9_]"
+)
+#: Calls that write or read help, not ask: `pdw describe <pdw tool>`,
+#: `pdw call --help` and `propose_mutation_help` (argument help, like
+#: `pdw readme`), and the WRITE tools -- reviewed writes, notify, the CLI
+#: bootstrap and Feed writes. Like an uploader run, they say nothing about where
+#: a question starts, so they are admin calls outside the denominator. Reads
+#: stay reads: `get_mutation` and the Feed reads (list, get, history, stats,
+#: events) are other_read, so a session that opens on one does not count as
+#: search-first.
+_ACTION_TOOLS = (
+    "propose_mutation|propose_mutation_help|withdraw_mutation|notify|cli_authorize"
+    "|feed_(push|update|remove|restore|rank|save)"
+)
+CLI_NON_QUESTION_RE = (
+    _CLI_BEFORE + r"describe[[:space:]]"
+    + "|" + _CLI_BEFORE + r"call[[:space:]]+(-h|--help)" + _CLI_AFTER
+    + "|" + _CLI_BEFORE + r"call[[:space:]]+(" + _ACTION_TOOLS + ")" + _CLI_AFTER
+)
+MCP_NON_QUESTION_TOOL_RE = r"(__|[.])(readme|" + _ACTION_TOOLS + r")$"
+#: `pdw feed` is an admin subcommand (its writes), but its reads are reads.
+CLI_FEED_READ_RE = _CLI_BEFORE + r"feed[[:space:]]+(list|get|history|stats|events)" + _CLI_AFTER
+#: SQL that starts at the timeline. C3's first sentence is "the search tool or
+#: `timeline.events` in SQL first": a `pdw sql` / MCP `query` over the event
+#: stream or its search functions is a timeline start, and counts with search
+#: in `first_search` (the view's "search-first" share is the timeline-first
+#: share). SQL that never names the timeline schema still counts as `first_sql`.
+TIMELINE_SQL_RE = r"(^|[^A-Za-z0-9_])timeline[.](events|search_text|search_text_exact)([^A-Za-z0-9_]|$)"
+#: Modern Codex writes a command and its whole output in one item_completed
+#: row. Only the command is the call: matching the raw row also matched text
+#: the command PRINTED -- `cat`-ing a skill or `pdw readme` puts `pdw sql` and
+#: `pdw search` at line starts -- and every agent message and reasoning item
+#: that named a command in backticks. None of those ran anything.
+CODEX_COMMAND_RE = (
+    r'"command":[[:space:]]*('
+    r'\[[[:space:]]*"(?:[^"\\]|\\.)*"(?:[[:space:]]*,[[:space:]]*"(?:[^"\\]|\\.)*")*[[:space:]]*\]'
+    r'|"(?:[^"\\]|\\.)*")'
+)
 #: Any real invocation at all -- what makes a session a PDW session.
 CLI_INVOKED_RE = _CLI_BEFORE
 
@@ -488,7 +534,8 @@ _AGENT_USAGE_CALLS_CTE = """
 WITH ev AS (
   SELECT source, session_id, seq, occurred_at, subtype, tool_name, turn_id,
          CASE WHEN source = 'codex' AND subtype = 'item_completed'
-              THEN raw_json ELSE tool_input_json END AS inp0,
+              THEN coalesce('{"command":' || substring(raw_json from '{codex_command}') || '}', '')
+              ELSE tool_input_json END AS inp0,
          CASE WHEN source = 'codex' THEN raw_json ELSE tool_result_json END AS res0
   FROM @ai_conversation_events
   WHERE occurred_at >= now() - make_interval(days => %(days)s)
@@ -552,10 +599,12 @@ classified AS (
         OR (NOT is_mcp AND inp ~ '{sql}') THEN 'sql'
       WHEN tool_name ILIKE '%%schema_overview' OR tool_name ILIKE '%%describe_table'
         OR (NOT is_mcp AND inp ~ '{schema}') THEN 'schema'
-      WHEN NOT is_mcp AND inp ~ '{admin}' THEN 'admin'
-      -- Every remaining MCP tool (get_object, notify, propose_mutation) and
-      -- `pdw call|list|describe` is a warehouse
-      -- call that is not one of the three named entry points.
+      WHEN NOT is_mcp AND inp ~ '{connection_discovery}' THEN 'connection'
+      WHEN NOT is_mcp AND inp ~ '{feed_read}' THEN 'other_read'
+      WHEN (is_mcp AND tool_name ~* '{mcp_non_question}')
+        OR (NOT is_mcp AND (inp ~ '{admin}' OR inp ~ '{non_question}')) THEN 'admin'
+      -- Every remaining MCP tool (get_object, context) and `pdw context|call`
+      -- is a warehouse read that is not one of the three named entry points.
       ELSE 'other_read'
     END AS kind
   FROM calls
@@ -601,9 +650,10 @@ reads AS (
 ),
 per_session AS (
   SELECT source, session_id,
-         max(CASE WHEN nth = 1 AND kind = 'search' THEN 1 ELSE 0 END) AS first_search,
+         max(CASE WHEN nth = 1 AND (kind = 'search' OR (kind = 'sql' AND inp ~* '{timeline_sql}'))
+                  THEN 1 ELSE 0 END) AS first_search,
          max(CASE WHEN nth = 1 AND kind = 'schema' THEN 1 ELSE 0 END) AS first_schema,
-         max(CASE WHEN nth = 1 AND kind = 'sql' THEN 1 ELSE 0 END) AS first_sql,
+         max(CASE WHEN nth = 1 AND kind = 'sql' AND inp !~* '{timeline_sql}' THEN 1 ELSE 0 END) AS first_sql,
          max(CASE WHEN nth = 1 AND kind = 'invented' THEN 1 ELSE 0 END) AS first_invented,
          count(*) FILTER (WHERE kind = 'search') AS search_calls,
          count(*) FILTER (WHERE kind = 'sql') AS sql_calls,
@@ -678,6 +728,12 @@ def _expand_agent_usage_regexes(statement: str) -> str:
         .replace("{connection}", CLI_CONNECTION_RE)
         .replace("{mcp_connection}", MCP_CONNECTION_TOOL_RE)
         .replace("{sql_error}", SQL_ERROR_RE)
+        .replace("{connection_discovery}", CLI_CONNECTION_DISCOVERY_RE)
+        .replace("{non_question}", CLI_NON_QUESTION_RE)
+        .replace("{feed_read}", CLI_FEED_READ_RE)
+        .replace("{mcp_non_question}", MCP_NON_QUESTION_TOOL_RE)
+        .replace("{timeline_sql}", TIMELINE_SQL_RE)
+        .replace("{codex_command}", CODEX_COMMAND_RE)
     )
 
 

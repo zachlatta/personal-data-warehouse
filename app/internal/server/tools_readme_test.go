@@ -92,6 +92,10 @@ func TestServerInstructionsOpenWithTheReadmeTool(t *testing.T) {
 	if !strings.HasPrefix(serverInstructions, "Call the readme tool first") {
 		t.Fatalf("instructions should send an agent to readme before anything else: %q", serverInstructions[:80])
 	}
+	// The first data call is a priority-scoped search (contract C3).
+	if !strings.Contains(serverInstructions, `Pass priorities on the first search, not only after a noisy result: ["self","direct","cc"]`) {
+		t.Fatalf("instructions should scope the first search by priority: %q", serverInstructions)
+	}
 	for _, name := range guide.TopicNames(guide.SurfaceMCP) {
 		if !strings.Contains(readmeDescription, name) {
 			t.Fatalf("readme description omits topic %q", name)

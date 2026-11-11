@@ -558,6 +558,35 @@ func TestSearchResponseGuidesTheNextStep(t *testing.T) {
 	}
 }
 
+func TestUnscopedSearchGuidesTheNextSearchToAPriorityScope(t *testing.T) {
+	runner := &fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: searchHit()}}
+	svc := NewService(runner, Options{})
+	resp := svc.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	for _, want := range []string{"all tiers", `["self","direct","cc"]`, `["self","background"]`} {
+		if !strings.Contains(resp.Guidance, want) {
+			t.Fatalf("unscoped guidance missing %q: %q", want, resp.Guidance)
+		}
+	}
+	resp = svc.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword", Priorities: []string{"self"}})
+	if strings.Contains(resp.Guidance, "all tiers") {
+		t.Fatalf("a scoped search must not be told it was unscoped: %q", resp.Guidance)
+	}
+	// A miss is told to drop words, not to narrow further.
+	empty := NewService(&fakeSearchRunner{argsResults: map[string]RawResult{searchTextSQL: {}}}, Options{})
+	resp = empty.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if strings.Contains(resp.Guidance, "all tiers") {
+		t.Fatalf("an empty search must not be told to scope further: %q", resp.Guidance)
+	}
+	// The attention hint already names the scope; the guidance does not repeat it.
+	noisy := NewService(&fakeSearchRunner{argsResults: map[string]RawResult{
+		searchTextSQL: bulkHits("noise", "noise", "background", "direct", "self", "noise"),
+	}}, Options{})
+	resp = noisy.Search(context.Background(), SearchRequest{Query: "offer letter", Mode: "keyword"})
+	if !slices.Contains(resp.HintCodes, "consider_attention_scope") || strings.Contains(resp.Guidance, "all tiers") {
+		t.Fatalf("unscoped guidance repeats the attention hint: codes=%#v guidance=%q", resp.HintCodes, resp.Guidance)
+	}
+}
+
 func TestSearchHintsWhenTheQueryIsPhrasedAsASentence(t *testing.T) {
 	// The caller is itself an LLM, so query rewriting belongs in guidance, not
 	// in an extra model in the search path. It is worth guiding: on the labeled

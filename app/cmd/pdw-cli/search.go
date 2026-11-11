@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -347,6 +348,16 @@ func isNumeric(s string) bool {
 	return true
 }
 
+// unscopedSearchScopeLine names the scope a search ran with when it had no
+// --priority, plus the two scopes attention and agent-work questions want. An
+// agent repeats the shape of its first search, and the scope line is the one
+// line of every result it reads, so it carries the next call's flag.
+var unscopedSearchScopeLine = "Scope: all tiers (no --priority). Next search: --priority " +
+	strings.Join(warehouse.TimelineAttentionPriorities(), ",") +
+	" for attention or correspondence, --priority " +
+	strings.Join(warehouse.TimelineAgentWorkPriorities(), ",") +
+	" for prior agent work; omit only when every tier matters."
+
 func printSearchText(w io.Writer, resp cliSearchResponse, full bool) {
 	noun := "results"
 	if resp.TotalRows == 1 {
@@ -355,6 +366,10 @@ func printSearchText(w io.Writer, resp cliSearchResponse, full bool) {
 	fmt.Fprintf(w, "Search: %q — %d %s (%s)\n", resp.Query, resp.TotalRows, noun, resp.Mode)
 	if resp.PriorityScope == "selected" || resp.PriorityScope == "invalid" {
 		fmt.Fprintf(w, "Scope: %s\n", strings.Join(resp.SelectedPriorities, ", "))
+	} else if resp.TotalRows > 0 && !slices.Contains(resp.HintCodes, "consider_attention_scope") {
+		// Like the server's guidance: not on a miss, and not beside the
+		// attention hint, which already names the scope.
+		fmt.Fprintln(w, unscopedSearchScopeLine)
 	} else {
 		fmt.Fprintln(w, "Scope: all tiers")
 	}
@@ -405,7 +420,12 @@ func printSearchHitRefs(w io.Writer, hit cliSearchHit) {
 
 // cliSearchGuidance speaks the CLI's own commands: the server's guidance is
 // shared with MCP, which calls timeline.context and reads drill_sql fields.
+// The server's unscoped-scope sentence is dropped: the CLI's Scope line
+// already names the --priority flags.
 func cliSearchGuidance(guidance string) string {
+	if i := strings.Index(guidance, " This search ran over all tiers"); i >= 0 {
+		guidance = guidance[:i] // TestCLISearchGuidanceDropsTheServersUnscopedSentence pins the marker
+	}
 	guidance = strings.ReplaceAll(guidance, "timeline.context(ref, 5, 5)", "pdw context '<ref>' (--full for whole texts)")
 	return strings.ReplaceAll(guidance, "run its drill_sql verbatim", "run its sql: line verbatim")
 }

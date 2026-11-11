@@ -1060,6 +1060,40 @@ func TestSearchCommandPrintsTheEffectiveScopeAndReturnedMix(t *testing.T) {
 	if code != 0 || errOut != "" || !strings.Contains(out, "Scope: all tiers") {
 		t.Fatalf("all-tier scope is not visible: code=%d stderr=%q stdout=%q", code, errOut, out)
 	}
+	// A miss is not told to narrow further.
+	if strings.Contains(out, "Next search:") {
+		t.Fatalf("an empty unscoped search must not carry the scope nudge:\n%s", out)
+	}
+	// An unscoped result with hits names the flag the next search most likely wants.
+	srvHits := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget","mode":"hybrid","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{"self":2},"hint_codes":[],"suggested_priorities":[],"total_rows":2,"rows":[]}}`)
+	})
+	out, _, _ = runCLI(t, srvHits.URL, "", "search", "budget")
+	if !strings.Contains(out, "--priority self,direct,cc") || !strings.Contains(out, "--priority self,background") {
+		t.Fatalf("unscoped search does not name the attention and agent-work scopes:\n%s", out)
+	}
+	// The attention hint already names the scope; the Scope line does not repeat it.
+	srvNoisy := newStubServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"query":"budget","mode":"hybrid","priority_scope":"all","selected_priorities":[],"returned_priority_counts":{"noise":6},"hint":"re-issue with priorities","hint_codes":["consider_attention_scope"],"suggested_priorities":["self","direct","cc"],"total_rows":6,"rows":[]}}`)
+	})
+	out, _, _ = runCLI(t, srvNoisy.URL, "", "search", "budget")
+	if strings.Contains(out, "Next search:") {
+		t.Fatalf("the scope nudge must not repeat the attention hint:\n%s", out)
+	}
+	out, _, _ = runCLI(t, srv.URL, "", "search", "budget", "--priority", "self,direct")
+	if strings.Contains(out, "Next search:") {
+		t.Fatalf("a scoped search must not carry the unscoped nudge:\n%s", out)
+	}
+}
+
+func TestCLISearchGuidanceDropsTheServersUnscopedSentence(t *testing.T) {
+	// The CLI's Scope line already names the --priority flags, so the server's
+	// MCP-spelled sentence is cut. Pinned to the server's text so a rewording
+	// there cannot silently leave both in the CLI output.
+	got := cliSearchGuidance("Read the hit. " + query.SearchUnscopedGuidance)
+	if got != "Read the hit." {
+		t.Fatalf("server's unscoped sentence was not dropped: %q", got)
+	}
 }
 
 func TestCallRedirectsContextToContextCommand(t *testing.T) {
