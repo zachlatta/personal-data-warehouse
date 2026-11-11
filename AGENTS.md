@@ -94,9 +94,11 @@ that, not from this prose.
   list is pinned to the Go dispatcher by
   `test_the_python_subcommand_lists_are_the_go_dispatchers_commands`.
 - **C4 — raw source data for every source is queryable via SQL.** `base_<source>` is a
-  faithful copy readable by the `pdw_query` role. *Held up by*
-  `test_query_role_reads_public_relations_and_is_denied_private` and the catalog's
-  per-layer query-access policy.
+  faithful copy readable by the `pdw_query` role, which every agent read assumes from the
+  unprivileged `pdw_query_login` (`PDW_QUERY_POSTGRES_URL`), never a superuser session.
+  *Held up by* `test_query_role_reads_public_relations_and_is_denied_private`,
+  `test_python_untrusted_reader_refuses_superuser_url`, the Go runner's per-transaction
+  login check, and the catalog's per-layer query-access policy.
 - **C5 — multi-source concepts layer `base_* → derived_*/marts_* → timeline`; consumers read
   `timeline → marts_* → base_*`.** **An intelligent transformation must READ from the
   intermediate layer, not one source's raw table**, so a second source is covered the day
