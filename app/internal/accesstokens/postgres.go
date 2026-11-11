@@ -263,6 +263,6 @@ func (s *PostgresStore) RecordFeedUse(ctx context.Context, id string, at time.Ti
 		return err
 	}
 	defer cancel()
-	_, err = s.db.ExecContext(ctx, warehouse.ExpandRelations(`UPDATE @app_access_tokens SET request_count=request_count+1,last_used_at=GREATEST(last_used_at,$2),updated_at=GREATEST(updated_at,$2) WHERE id=$1`), id, at)
+	_, err = s.db.ExecContext(ctx, warehouse.ExpandRelations(`UPDATE @app_access_tokens SET request_count=request_count+1,last_used_at=GREATEST(last_used_at,$2) WHERE id=$1`), id, at)
 	return err
 }

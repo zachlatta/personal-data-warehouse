@@ -168,21 +168,43 @@ feed; issue a dedicated key. Feed keys have no idle expiry; an optional
 `expires_at` (RFC3339, in the future) is a hard deadline. Revocation and expiry
 are checked on every request, including conditional requests.
 
-The response is `{feed: "voice-memos", recordings: [...], next_offset: null}`.
+The response is `{feed: "feed:voice-memos", recordings: [...], next_cursor: "...", has_more: false}`.
 Each recording includes `source`, `account`, `recording_id`, `content_sha256`,
 `recorded_at`, duration, title, summary, transcript, participants/action-items/evidence
 JSON text, calendar result and transcription/enrichment timestamps. Storage URLs
 and audio credentials are excluded. Identity is the source/account/recording-id
 triple; use `enriched_at` to detect revised enrichment.
 
-Poll once per second. Retain each page's `ETag` and send `If-None-Match`; unchanged
-pages return 304. A response has at most 200 recordings, newest enrichment first;
-follow `?offset=<next_offset>` until null. Rescan pages after a first-page change
-and periodically, deduplicating by identity and enrichment timestamp (pages are
-live, not snapshot cursors). The process shares a one-second page cache and limits
-each database read to two seconds. The 48-hour window is based on recording time,
-not enrichment or upload time. Cached pages expire at the earliest recording
-cutoff or after one second. Usage counts every authorized GET, including 304 and
-failed feed reads, and stamps last use on each request. Counters are constant space per key;
-there is no unbounded per-poll log. If usage cannot be recorded, the feed returns
-503 rather than serving an untracked request.
+Start with a GET without `since`. After processing a response, persist its opaque
+`next_cursor` and pass it as `?since=<next_cursor>`. Drain pages immediately while
+`has_more` is true; otherwise poll once per second with that cursor. Each response
+has at most 200 recordings in arrival order. Keep the cursor on a 304 or error;
+only advance after processing a successful response. Retain the ETag for the
+same request URL and send `If-None-Match`; unchanged results return 304.
+
+`ops.external_feed_items` stores only the current ready version of each item.
+Refreshes read the unified mart, remove ineligible items, and allocate new arrival
+numbers from `ops.external_feed_seq` when a memo becomes ready or its payload
+changes. A transaction advisory lock covers allocation through commit, so a reader
+cannot advance past an uncommitted arrival. Late/backdated enrichments and arrivals
+between pages receive later numbers and cannot be skipped by cursor paging.
+The indexed `(feed, sync_version)` read is bounded to 201 rows (one lookahead);
+the entire refresh/read has a two-second deadline. The 48-hour window remains
+based on recording time. A consumer offline beyond that window cannot recover
+expired recordings from this endpoint.
+
+Voice enrichment must postdate its latest transcription (`enriched_at >= transcribed_at`).
+A re-transcribed memo disappears until re-enrichment finishes. Calendar matching
+is part of enrichment; unmatched outcomes qualify. Session joining does not hold
+recordings back, so a stopped-and-restarted memo may arrive as separate parts.
+
+The registry in `app/internal/externalfeeds/registry.go` supplies scope, endpoint,
+display name, source query and handler. Authentication, server mounting and the
+web UI consume it; the UI discovers definitions at `GET /api/external-feeds`.
+Voice memos are the only registered feed.
+
+Usage counts every authorized GET, including 304 and failed feed reads, and stamps
+last use on each request. Per-poll writes change only unindexed `request_count`
+and `last_used_at`, allowing HOT updates rather than churning the `updated_at`
+index. Counters are exact and constant space per key; there is no per-poll log.
+If usage cannot be recorded, the feed returns 503 rather than serving an untracked request.

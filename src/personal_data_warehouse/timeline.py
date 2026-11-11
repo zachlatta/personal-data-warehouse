@@ -4321,6 +4321,7 @@ TIMELINE_TABLE_COVERAGE: dict[str, TableCoverage] = {
     "whoop_private_sync_state": _state("per-collection private-API scan watermark"),
     "mcp_connections": _state("encrypted MCP proxy connection configuration and OAuth credentials; not synced source events"),
     "app_access_tokens": _state("hashed bearer tokens issued beside PDW_SECRET_TOKEN and single-use cli_authorize codes; not synced source events"),
+    "external_feed_items": _state("bounded outgoing feed projections; authoritative recordings remain reachable through the voice timeline adapter and marts_voice_memos.recordings"),
     "slack_sessions": _state("pasted Slack web session credential (xoxc token + `d` cookie)"),
     "whoop_private_sessions": _state("rotating private-API browser session credential"),
     # Plaid finance data is queryable through base_plaid.* and marts_finance.* but

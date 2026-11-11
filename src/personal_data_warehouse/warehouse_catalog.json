@@ -4436,6 +4436,29 @@
       "secret": true
     },
     {
+      "id": "external_feed_items",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "external_feed_items",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false,
+      "comment": "Bounded current-ready projections for outgoing feeds, read through their scoped HTTP endpoints; not source events."
+    },
+    {
+      "id": "external_feed_seq",
+      "kind": "sequence",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "external_feed_seq",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "app_access_tokens",
       "kind": "table",
       "layer": "private",

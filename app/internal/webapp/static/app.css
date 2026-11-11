@@ -287,6 +287,8 @@ a.filelink:hover { text-decoration: underline; }
 .connection-card { border: 1px solid var(--line, #ddd); border-radius: 8px; padding: 20px; margin: 18px 0; }
 .connection-field { display: flex; flex-direction: column; gap: 7px; margin: 14px 0; font-size: 13px; }
 .connection-field input:not([type=checkbox]) { width: 100%; padding: 9px 10px; box-sizing: border-box; }
+.connection-field select { width: 100%; padding: 9px 10px; box-sizing: border-box; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+.external-feed-secret { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--line); border-radius: 4px; }
 .connection-field:has(input[type=checkbox]) { flex-direction: row-reverse; justify-content: flex-end; align-items: flex-start; }
 .connection-field input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
 .connection-paste:not(:empty) { margin-top: 12px; }

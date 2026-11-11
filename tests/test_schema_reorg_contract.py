@@ -288,7 +288,7 @@ def test_catalog_object_counts_match_the_target_map() -> None:
         # +2 ops: ops.search_request_timings (one row per real search, C6) and
         # ops.search_request_timing_state (its writer's heartbeat).
         # +1 ops: ops.answer_benchmark_runs, one row of counts per C16 run.
-            "ops": 46,
+            "ops": 48,  # outgoing feed projection and its arrival sequence
         # +1 private: push_devices, the iOS app's registered push tokens.
         # +1 private: private.search_benchmark_labels, the benchmark's labels kept
         # where a lost gitignored directory cannot take them (C8's stated gap).

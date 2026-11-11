@@ -489,9 +489,13 @@ the LaunchAgent again.
 `GET /api/external-feeds/voice-memos`. See [access tokens](access-tokens.md#external-feeds)
 for authentication, polling and pagination. This reads the unified recordings mart,
 so all voice sources share its deduplication and resolved contents. Eligibility
-requires completed transcription AND completed recording enrichment, a nonempty
+requires completed transcription AND current completed recording enrichment
+(`enriched_at >= transcribed_at`), a nonempty
 transcript, a nondeleted recording, and a recording timestamp in the last 48 hours.
 Calendar matching is part of recording enrichment: an unmatched outcome is eligible.
 Session continuity and merged-session enrichment are separate passes and do not
 hold back individual recordings; a later recording can change a session's membership.
-This is a recording feed, not a merged-session feed.
+A consumer may therefore receive parts of a stopped-and-restarted memo separately.
+A new transcription hides the old enrichment until re-enrichment completes.
+Use `next_cursor` as `?since=` to read new arrivals without skipping recordings
+when new enrichments land between pages. This is a recording feed, not a merged-session feed.

@@ -12,16 +12,16 @@ import (
 
 func TestExternalFeedCredentialLifecycle(t *testing.T) {
 	svc, clock := newTestService(t)
-	issued := mustIssue(t, svc, IssueRequest{ClientName: "consumer", Scope: pdwauth.ScopeVoiceFeed, TTL: time.Hour})
+	issued := mustIssue(t, svc, IssueRequest{ClientName: "consumer", Scope: pdwauth.Scope("feed:voice-memos"), TTL: time.Hour})
 	_, hash, _ := svc.store.Get(context.Background(), issued.Token.ID)
 	if strings.Contains(issued.Secret, hash) || len(hash) != 64 {
 		t.Fatal("secret must be stored hashed")
 	}
 	p, err := authenticate(svc, issued.Secret)
-	if err != nil || !p.Allows(pdwauth.VoiceFeedPath) {
+	if err != nil || !p.Allows("/api/external-feeds/voice-memos") {
 		t.Fatalf("feed denied: %v", err)
 	}
-	for _, path := range []string{"/api/tools", "/api/auth/tokens", "/api/connections", pdwauth.VoiceFeedPath + "/other"} {
+	for _, path := range []string{"/api/tools", "/api/auth/tokens", "/api/connections", "/api/external-feeds/voice-memos" + "/other"} {
 		if p.Allows(path) {
 			t.Fatalf("feed key allowed %s", path)
 		}
@@ -42,7 +42,7 @@ func TestExternalFeedCredentialLifecycle(t *testing.T) {
 	if _, err := authenticate(svc, issued.Secret); err == nil {
 		t.Fatal("expired key accepted")
 	}
-	second := mustIssue(t, svc, IssueRequest{ClientName: "consumer", Scope: pdwauth.ScopeVoiceFeed})
+	second := mustIssue(t, svc, IssueRequest{ClientName: "consumer", Scope: pdwauth.Scope("feed:voice-memos")})
 	if err := svc.Revoke(context.Background(), second.Token.ID); err != nil {
 		t.Fatal(err)
 	}

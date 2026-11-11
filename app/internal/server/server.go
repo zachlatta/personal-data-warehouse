@@ -19,6 +19,7 @@ import (
 	"github.com/zachlatta/personal-data-warehouse/app/internal/chatgptsession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/clirelease"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/config"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/feed"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/hackernewssession"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/mcpproxy"
@@ -267,21 +268,41 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 	authSvc.SetTokenAuthenticator(tokenSvc)
 	authSvc.SetOAuthGrants(tokenSvc)
 	accesstokens.Register(mux, tokenSvc, authSvc.RequireStaticBearer(), baseURL)
-	voiceFeed := newVoiceFeed(runner)
-	mux.Handle(pdwauth.VoiceFeedPath, authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p, _ := pdwauth.PrincipalFromContext(r.Context())
-		if p.Scope != pdwauth.ScopeVoiceFeed {
-			http.Error(w, "use a dedicated voice-memos feed key", http.StatusForbidden)
+	var feedStore externalfeeds.Store = externalfeeds.NewMemoryStore()
+	if cfg.PostgresDatabaseURL != "" {
+		store, err := externalfeeds.NewPostgresStore(cfg.PostgresDatabaseURL)
+		if err != nil {
+			logger.Error("external feed store initialization failed", "error", err)
+			feedStore = externalfeeds.UnavailableStore{}
+		} else {
+			feedStore = store
+		}
+	}
+	mux.Handle("/api/external-feeds", authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
 			return
 		}
-		if r.Method == http.MethodGet {
-			if err := tokenSvc.RecordFeedUse(r.Context(), p.TokenID); err != nil {
-				http.Error(w, "usage store unavailable", 503)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"feeds": externalfeeds.All()})
+	})))
+	for _, feed := range externalfeeds.All() {
+		handler := feed.Handler(feed, feedStore)
+		mux.Handle(feed.Path, authSvc.RequireStaticBearer()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p, _ := pdwauth.PrincipalFromContext(r.Context())
+			if string(p.Scope) != feed.Scope {
+				http.Error(w, "use a dedicated key for this feed", 403)
 				return
 			}
-		}
-		voiceFeed.ServeHTTP(w, r)
-	})))
+			if r.Method == http.MethodGet {
+				if err := tokenSvc.RecordFeedUse(r.Context(), p.TokenID); err != nil {
+					http.Error(w, "usage store unavailable", 503)
+					return
+				}
+			}
+			handler.ServeHTTP(w, r)
+		})))
+	}
 	// The pdw installer and its release, proxied from GitHub so a sandbox
 	// whose egress GitHub refuses can still install the CLI.
 	clirelease.Register(mux, clirelease.New(clirelease.Options{Logger: logger.With("component", "cli_release")}), baseURL)

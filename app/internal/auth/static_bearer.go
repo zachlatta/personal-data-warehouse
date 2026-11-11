@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/subtle"
 	"errors"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 	"net/http"
 	"strings"
 )
@@ -70,8 +71,8 @@ func (s *Service) RequireStaticBearer() func(http.Handler) http.Handler {
 			}
 			if !principal.Allows(r.URL.Path) {
 				s.logger.WarnContext(r.Context(), "static bearer scope denied", "client", name, "token_id", principal.TokenID, "scope", principal.Scope, "path", r.URL.Path)
-				if principal.Scope == ScopeVoiceFeed {
-					http.Error(w, "this token reaches only "+VoiceFeedPath, http.StatusForbidden)
+				if feed, ok := externalfeeds.Lookup(string(principal.Scope)); ok {
+					http.Error(w, "this token reaches only "+feed.Path, http.StatusForbidden)
 					return
 				}
 				http.Error(w, "this token's scope ("+string(principal.Scope)+") reaches only "+agentToolsPath+", the warehouse tools API the pdw CLI uses", http.StatusForbidden)

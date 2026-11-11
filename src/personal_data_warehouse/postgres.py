@@ -955,6 +955,10 @@ class IndexSpec:
 
 
 POSTGRES_TABLES: dict[str, TableSpec] = {
+    "external_feed_items": TableSpec(
+        ("feed", "item_key", "sync_version", "payload_json", "recorded_at"),
+        ("feed", "item_key"),
+    ),
     "gmail_messages": TableSpec(
         MESSAGE_COLUMNS,
         ("account", "message_id"),
@@ -1585,6 +1589,10 @@ def _ai_conversation_event_index_specs() -> tuple[IndexSpec, ...]:
 
 
 POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
+    IndexSpec(
+        "external_feed_items_cursor_idx", "external_feed_items",
+        "CREATE INDEX IF NOT EXISTS external_feed_items_cursor_idx ON @external_feed_items (feed, sync_version)",
+    ),
     # The external voice feed reads the mart's newest completed attempt per
     # recording on every poll. Match its DISTINCT ON ordering, including ties.
     IndexSpec(
@@ -9296,6 +9304,11 @@ class PostgresWarehouse:
         ):
             self._command(sql)
         self._apply_catalog_grant("app_access_tokens")
+        self.ensure_external_feed_tables()
+
+    def ensure_external_feed_tables(self) -> None:
+        self._ensure_table_group(["external_feed_items"])
+        self._command("CREATE SEQUENCE IF NOT EXISTS @external_feed_seq")
 
     def _ensure_upstream_mutation_tables_ddl(self) -> None:
         self._command(

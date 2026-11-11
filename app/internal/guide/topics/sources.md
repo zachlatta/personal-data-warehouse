@@ -273,5 +273,7 @@ and old measurements must not be treated as proof of presence or absence.
 
 External consumers: the web app's `/external-feeds` page issues scoped voice-memo
 keys. `GET /api/external-feeds/voice-memos` exposes only the last 48 hours after
-transcription and recording enrichment, including unmatched calendar outcomes;
-merged-session enrichment is separate. Feed keys cannot access warehouse tools.
+transcription and current recording enrichment, including unmatched calendar outcomes.
+Pass `next_cursor` as `?since=` to poll new arrivals. Session joining does not hold
+memos back: parts of a stopped-and-restarted memo may arrive separately.
+Feed keys cannot access warehouse tools.

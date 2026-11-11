@@ -19,6 +19,7 @@ import (
 	"time"
 
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
+	"github.com/zachlatta/personal-data-warehouse/app/internal/externalfeeds"
 )
 
 const (
@@ -164,16 +165,16 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 		scope = pdwauth.ScopeFull
 	}
 	if !scope.Issuable() {
-		return Issued{}, fmt.Errorf("scope must be %q, %q or %q", pdwauth.ScopeFull, pdwauth.ScopeAgent, pdwauth.ScopeVoiceFeed)
+		return Issued{}, fmt.Errorf("scope must be full, agent or a registered external feed scope")
 	}
 	idle := req.IdleTimeout
 	if idle == 0 {
 		idle = DefaultIdleTimeout
 	}
-	if scope == pdwauth.ScopeVoiceFeed {
+	if externalfeeds.IsScope(string(scope)) {
 		idle = 0
 	}
-	if scope != pdwauth.ScopeVoiceFeed && (idle < MinIdleTimeout || idle > MaxIdleTimeout) {
+	if !externalfeeds.IsScope(string(scope)) && (idle < MinIdleTimeout || idle > MaxIdleTimeout) {
 		return Issued{}, fmt.Errorf("idle timeout must be between %s and %s", MinIdleTimeout, MaxIdleTimeout)
 	}
 	if req.TTL < 0 {
@@ -229,7 +230,7 @@ func (s *Service) AuthenticateToken(ctx context.Context, raw string) (pdwauth.Pr
 	if status := token.Status(now); status != StatusActive {
 		return pdwauth.Principal{}, &pdwauth.TokenRejectedError{Reason: rejectionReason(token, status)}
 	}
-	if token.Scope != pdwauth.ScopeVoiceFeed && now.Sub(token.LastUsedAt) >= touchEvery {
+	if !externalfeeds.IsScope(string(token.Scope)) && now.Sub(token.LastUsedAt) >= touchEvery {
 		if err := s.store.Touch(ctx, id, now); err != nil {
 			// A missed touch costs at most a minute of idle clock; it is not
 			// worth failing an otherwise valid request over.
