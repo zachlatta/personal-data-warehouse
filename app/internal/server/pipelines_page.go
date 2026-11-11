@@ -33,6 +33,7 @@ const pipelinesPageHTML = `<!doctype html>
       <a href="/search">Search</a>
       <a href="/mutation-review">Review</a>
       <a href="/notifications">Alerts</a>
+      <a href="/external-feeds">External feeds</a>
       <a href="/connections">Connections</a>
       <a href="/pipelines" class="on" aria-current="page">Pipelines</a>
     </nav>
