@@ -233,3 +233,6 @@ __marimo__/
 # Public repo: agent work items (reports, audits, query output) belong in a private repository.
 /work/
 /scratch/
+
+# Private factory research and deliverables.
+.factory-scratch/
