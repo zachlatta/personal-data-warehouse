@@ -41,6 +41,8 @@ func TestExternalFeedCredentialLifecycle(t *testing.T) {
 	clock.Advance(time.Hour)
 	if _, err := authenticate(svc, issued.Secret); err == nil {
 		t.Fatal("expired key accepted")
+	} else if !strings.Contains(err.Error(), "/external-feeds") || strings.Contains(err.Error(), "pdw token create") {
+		t.Fatalf("wrong feed renewal hint: %v", err)
 	}
 	second := mustIssue(t, svc, IssueRequest{ClientName: "consumer", Scope: pdwauth.Scope("feed:voice-memos")})
 	if err := svc.Revoke(context.Background(), second.Token.ID); err != nil {
@@ -48,5 +50,7 @@ func TestExternalFeedCredentialLifecycle(t *testing.T) {
 	}
 	if _, err := authenticate(svc, second.Secret); err == nil {
 		t.Fatal("revoked key accepted")
+	} else if !strings.Contains(err.Error(), "/external-feeds") || strings.Contains(err.Error(), "pdw token create") {
+		t.Fatalf("wrong feed renewal hint: %v", err)
 	}
 }

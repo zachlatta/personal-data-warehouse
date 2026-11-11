@@ -25,7 +25,6 @@ type PostgresStore struct {
 	db      *sql.DB
 	mu      sync.Mutex
 	ensured bool
-	expand  func(string) string
 }
 
 func NewPostgresStore(url string) (*PostgresStore, error) {
@@ -33,7 +32,7 @@ func NewPostgresStore(url string) (*PostgresStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PostgresStore{db: db, expand: warehouse.ExpandRelations}, nil
+	return &PostgresStore{db: db}, nil
 }
 func (s *PostgresStore) Close() error { return s.db.Close() }
 func (s *PostgresStore) ensure(ctx context.Context) error {
@@ -43,7 +42,7 @@ func (s *PostgresStore) ensure(ctx context.Context) error {
 		return nil
 	}
 	for _, q := range ensureStatements {
-		if _, err := s.db.ExecContext(ctx, s.expand(q)); err != nil {
+		if _, err := s.db.ExecContext(ctx, warehouse.ExpandRelations(q)); err != nil {
 			return err
 		}
 	}
@@ -63,24 +62,17 @@ func (s *PostgresStore) Page(ctx context.Context, feed Definition, since uint64,
 	// Every refresh takes the same transaction lock BEFORE allocating arrival
 	// numbers. A later reader cannot advance past an earlier uncommitted arrival.
 	// Scope the lock by physical table so isolated warehouses do not contend.
-	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, s.expand("@external_feed_items")); err != nil {
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, warehouse.SQLRelation("external_feed_items")); err != nil {
 		return nil, since, false, err
 	}
-	source := s.expand(feed.SourceSQL)
-	_, err = tx.ExecContext(ctx, s.expand(`INSERT INTO @external_feed_items AS old(feed,item_key,sync_version,payload_json,recorded_at)
- SELECT $1,item_key,nextval('@external_feed_seq'::regclass),payload_json,recorded_at FROM (`)+source+`) eligible
- ON CONFLICT(feed,item_key) DO UPDATE SET sync_version=EXCLUDED.sync_version,payload_json=EXCLUDED.payload_json,recorded_at=EXCLUDED.recorded_at
- WHERE old.payload_json IS DISTINCT FROM EXCLUDED.payload_json`, feed.Scope)
+	// Materialize the source ONCE, and compare before inserting. ON CONFLICT's
+	// WHERE alone would still lock unchanged tuples and evaluate nextval, writing
+	// WAL on every idle poll. Neither happens when changed is empty.
+	_, err = tx.ExecContext(ctx, refreshSQL(feed.SourceSQL), feed.Scope, warehouse.SQLRelation("external_feed_seq"))
 	if err != nil {
 		return nil, since, false, err
 	}
-	// Removing a stale transcription, deleted memo or aged-out item cannot move
-	// another item's cursor. If it becomes ready again it gets a NEW arrival.
-	_, err = tx.ExecContext(ctx, s.expand(`DELETE FROM @external_feed_items stored WHERE feed=$1 AND NOT EXISTS (SELECT 1 FROM (`)+source+`) eligible WHERE eligible.item_key=stored.item_key)`, feed.Scope)
-	if err != nil {
-		return nil, since, false, err
-	}
-	result, err := tx.QueryContext(ctx, s.expand(`SELECT sync_version,payload_json FROM @external_feed_items WHERE feed=$1 AND sync_version>$2 ORDER BY sync_version LIMIT $3`), feed.Scope, since, limit+1)
+	result, err := tx.QueryContext(ctx, warehouse.ExpandRelations(`SELECT sync_version,payload_json FROM @external_feed_items WHERE feed=$1 AND sync_version>$2 ORDER BY sync_version LIMIT $3`), feed.Scope, since, limit+1)
 	if err != nil {
 		return nil, since, false, err
 	}
@@ -115,4 +107,19 @@ func (s *PostgresStore) Page(ctx context.Context, feed Definition, since uint64,
 		return nil, since, false, err
 	}
 	return rows, since, more, nil
+}
+
+func refreshSQL(source string) string {
+	return warehouse.ExpandRelations(`WITH eligible AS MATERIALIZED (` + source + `),
+ changed AS MATERIALIZED (
+  SELECT e.* FROM eligible e LEFT JOIN @external_feed_items old
+   ON old.feed=$1 AND old.item_key=e.item_key
+  WHERE old.item_key IS NULL OR old.payload_json IS DISTINCT FROM e.payload_json
+ ), upserted AS (
+  INSERT INTO @external_feed_items AS old(feed,item_key,sync_version,payload_json,recorded_at)
+  SELECT $1,item_key,nextval($2::regclass),payload_json,recorded_at FROM changed
+  ON CONFLICT(feed,item_key) DO UPDATE SET sync_version=EXCLUDED.sync_version,
+   payload_json=EXCLUDED.payload_json,recorded_at=EXCLUDED.recorded_at
+ ) DELETE FROM @external_feed_items stored WHERE feed=$1 AND NOT EXISTS
+ (SELECT 1 FROM eligible WHERE eligible.item_key=stored.item_key)`)
 }

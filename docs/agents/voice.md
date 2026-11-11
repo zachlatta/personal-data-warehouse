@@ -497,5 +497,8 @@ Session continuity and merged-session enrichment are separate passes and do not
 hold back individual recordings; a later recording can change a session's membership.
 A consumer may therefore receive parts of a stopped-and-restarted memo separately.
 A new transcription hides the old enrichment until re-enrichment completes.
+When it re-qualifies, the memo is delivered again at a new cursor position;
+consumers should upsert/deduplicate by `(source, account, recording_id)`.
+Disappearing or aged-out memos produce no deletion notices or tombstones.
 Use `next_cursor` as `?since=` to read new arrivals without skipping recordings
 when new enrichments land between pages. This is a recording feed, not a merged-session feed.

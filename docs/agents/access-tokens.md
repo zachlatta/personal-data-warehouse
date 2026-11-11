@@ -193,10 +193,21 @@ the entire refresh/read has a two-second deadline. The 48-hour window remains
 based on recording time. A consumer offline beyond that window cannot recover
 expired recordings from this endpoint.
 
+Each refresh materializes the mart query once and filters changed payloads before
+calling `nextval` or upserting. An unchanged refresh neither allocates sequence
+values nor locks/writes item tuples; only the separate per-key usage counter is
+written. The sequence's catalog-qualified name is bound as a regclass parameter,
+not placed inside a quoted relation marker.
+
 Voice enrichment must postdate its latest transcription (`enriched_at >= transcribed_at`).
 A re-transcribed memo disappears until re-enrichment finishes. Calendar matching
 is part of enrichment; unmatched outcomes qualify. Session joining does not hold
 recordings back, so a stopped-and-restarted memo may arrive as separate parts.
+There are no deletion notices or tombstones when a memo disappears or ages out.
+A memo that re-qualifies after re-transcription and re-enrichment is delivered
+again at a new cursor position. Consumers should upsert/deduplicate by the stable
+`(source, account, recording_id)` identity, rather than treating each delivery as
+a different recording.
 
 The registry in `app/internal/externalfeeds/registry.go` supplies scope, endpoint,
 display name, source query and handler. Authentication, server mounting and the

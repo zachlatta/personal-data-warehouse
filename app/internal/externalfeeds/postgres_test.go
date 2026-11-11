@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"strings"
 	"testing"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
 
 func TestPostgresProjectionCursor(t *testing.T) {
@@ -18,16 +19,6 @@ func TestPostgresProjectionCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	var relations map[string]string
-	if err = json.Unmarshal([]byte(os.Getenv("PDW_EXTERNAL_FEED_TEST_RELATIONS")), &relations); err != nil {
-		t.Fatal(err)
-	}
-	store.expand = func(q string) string {
-		for id, physical := range relations {
-			q = strings.ReplaceAll(q, "@"+id, physical)
-		}
-		return q
-	}
 	store.db.SetMaxOpenConns(1)
 	ctx := context.Background()
 	exec := func(q string) {
@@ -65,7 +56,11 @@ func TestPostgresProjectionCursor(t *testing.T) {
 	}
 	// An unchanged poll must not create a new delivery or write row versions.
 	var before string
-	if err := store.db.QueryRowContext(ctx, store.expand(`SELECT xmin::text FROM @external_feed_items WHERE item_key='b'`)).Scan(&before); err != nil {
+	var sequenceBefore, sequenceAfter int64
+	if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT last_value FROM @external_feed_seq`)).Scan(&sequenceBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT xmin::text || '/' || xmax::text FROM @external_feed_items WHERE item_key='b'`)).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
 	rows, next, _, err := store.Page(ctx, feed, cursor, 10)
@@ -73,12 +68,44 @@ func TestPostgresProjectionCursor(t *testing.T) {
 		t.Fatalf("unchanged poll %v %v", rows, err)
 	}
 	var after string
-	if err := store.db.QueryRowContext(ctx, store.expand(`SELECT xmin::text FROM @external_feed_items WHERE item_key='b'`)).Scan(&after); err != nil {
+	if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT xmin::text || '/' || xmax::text FROM @external_feed_items WHERE item_key='b'`)).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
 	if before != after {
-		t.Fatal("unchanged projection wrote a row version")
+		t.Fatal("unchanged projection wrote or locked a tuple")
 	}
+	if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT last_value FROM @external_feed_seq`)).Scan(&sequenceAfter); err != nil {
+		t.Fatal(err)
+	}
+	if sequenceBefore != sequenceAfter {
+		t.Fatal("idle poll allocated sequence values")
+	}
+	// EXPLAIN's WAL accounting isolates this statement from other test workers.
+	var plan []byte
+	if err := store.db.QueryRowContext(ctx, "EXPLAIN (ANALYZE,WAL,FORMAT JSON) "+refreshSQL(feed.SourceSQL), feed.Scope, warehouse.SQLRelation("external_feed_seq")).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	var nodes any
+	if err := json.Unmarshal(plan, &nodes); err != nil {
+		t.Fatal(err)
+	}
+	var checkWAL func(any)
+	checkWAL = func(v any) {
+		switch n := v.(type) {
+		case map[string]any:
+			for key, value := range n {
+				if (key == "WAL Records" || key == "WAL Bytes") && value.(float64) != 0 {
+					t.Fatalf("idle refresh wrote WAL: %s", plan)
+				}
+				checkWAL(value)
+			}
+		case []any:
+			for _, child := range n {
+				checkWAL(child)
+			}
+		}
+	}
+	checkWAL(nodes)
 	// Re-transcription hides the stored enrichment until it is ready again.
 	exec(`UPDATE feed_source SET ready=false WHERE item_key='b'`)
 	rows, _, _, err = store.Page(ctx, feed, 0, 10)

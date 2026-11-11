@@ -145,13 +145,14 @@ func NewService(store Store, now func() time.Time, logger *slog.Logger) *Service
 }
 
 // IssueRequest asks for a long-lived token. Zero IdleTimeout means
-// DefaultIdleTimeout; zero TTL means no hard expiry; zero Scope means full.
+// DefaultIdleTimeout; zero TTL and ExpiresAt mean no hard expiry; zero Scope means full.
 type IssueRequest struct {
 	ClientName  string
 	Label       string
 	Scope       pdwauth.Scope
 	IdleTimeout time.Duration
 	TTL         time.Duration
+	ExpiresAt   time.Time // absolute deadline; takes precedence over TTL
 	CreatedBy   string
 }
 
@@ -181,6 +182,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 		return Issued{}, errors.New("ttl must not be negative")
 	}
 	now := s.now().UTC()
+	if !req.ExpiresAt.IsZero() && !req.ExpiresAt.After(now) {
+		return Issued{}, errors.New("expires_at must be in the future")
+	}
 	token := Token{
 		Kind:        KindAccess,
 		Scope:       scope,
@@ -193,6 +197,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 	}
 	if req.TTL > 0 {
 		token.ExpiresAt = now.Add(req.TTL)
+	}
+	if !req.ExpiresAt.IsZero() {
+		token.ExpiresAt = req.ExpiresAt.UTC()
 	}
 	return s.insert(ctx, token, accessPrefix)
 }
@@ -254,6 +261,9 @@ func rejectionReason(token Token, status string) string {
 	}
 	if token.Scope == pdwauth.ScopeAgent {
 		return reason + "; ask for a new one with the cli_authorize MCP tool"
+	}
+	if externalfeeds.IsScope(string(token.Scope)) {
+		return reason + "; issue a new feed key on the /external-feeds page"
 	}
 	return reason + "; issue a new one with `pdw token create`"
 }

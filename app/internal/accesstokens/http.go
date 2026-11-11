@@ -151,9 +151,10 @@ func (s *Service) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "ttl: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		var expires time.Time
 		if body.ExpiresAt != nil {
-			ttl = body.ExpiresAt.Sub(s.now())
-			if ttl <= 0 {
+			expires = *body.ExpiresAt
+			if expires.IsZero() {
 				http.Error(w, "expires_at must be in the future", 400)
 				return
 			}
@@ -164,6 +165,7 @@ func (s *Service) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			Scope:       pdwauth.Scope(body.Scope),
 			IdleTimeout: idle,
 			TTL:         ttl,
+			ExpiresAt:   expires,
 			CreatedBy:   pdwauth.ClientNameFromContext(r.Context()),
 		})
 		if err != nil {
