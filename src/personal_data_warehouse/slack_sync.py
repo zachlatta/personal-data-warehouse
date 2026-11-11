@@ -1079,17 +1079,16 @@ class SlackSyncRunner:
         for entry in planned:
             conversation, group, oldest_ts = entry
             kind = group[0]
-            if kind == "public_channel" and not _public_member(conversation):
-                lane = 3
-            elif kind == "public_channel":
-                lane = 2
-            elif _hot(conversation, oldest_ts):
+            hot = _hot(conversation, oldest_ts)
+            if kind == "public_channel":
+                lane = 2 if _public_member(conversation) else 3
+            elif hot:
                 lane = 0
             elif kind in ("im", "mpim"):
                 lane = 1
             else:
                 lane = 2
-            if _hot(conversation, oldest_ts):
+            if hot:
                 due = _last_polled(conversation)
             else:
                 due = _last_polled(conversation) + _interval(conversation)
