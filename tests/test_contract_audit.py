@@ -776,9 +776,10 @@ def test_c10_and_c4_detect_index_or_heap_corruption_with_clean_page_checksums(
 def test_c11_grades_failing_derived_or_enrichment_pipelines(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, str] = {}
     rows = {
-        "slack health": [{"conversation_type": "im", "status": "ok"}],
-        "plaid health": [{"institution_name": "Bank", "status": "ok"}],
-        "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
+        "source slas": [
+            {"pipeline": "gmail", "data_basis": "measured", "sla_detector": "marts_ops.source_upstream_health",
+             "sla_detector_status": "ok", "sla_exemption": None},
+        ],
         "source pipeline health": [
             {"pipeline": "finance_ledger", "status": "failing"},
             {"pipeline": "receipt_enrichment", "status": "stale"},

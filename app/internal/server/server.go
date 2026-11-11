@@ -518,6 +518,23 @@ func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwau
 			mux.Handle(uploaderHeartbeatEndpoint, hbSvc.handler())
 			logger.Info("uploader heartbeat ingestion enabled", "endpoint", uploaderHeartbeatEndpoint)
 		}
+
+		// C11: a device's own newest item, posted by the uploader that read it,
+		// so marts_ops.source_upstream_health can compare it with base_*.
+		obsStore, obsErr := newSourceObservationStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+		if obsErr != nil {
+			logger.Error("source observation store failed to initialize; source observations disabled", "error", obsErr.Error())
+		} else {
+			obsSvc := &sourceObservationIngestService{
+				store:    obsStore,
+				signer:   authSvc,
+				maxBytes: cfg.IngestMaxObjectBytes,
+				timeout:  cfg.QueryTimeout,
+				logger:   logger,
+			}
+			mux.Handle(sourceObservationEndpoint, obsSvc.handler())
+			logger.Info("source observation ingestion enabled", "endpoint", sourceObservationEndpoint)
+		}
 	}
 	// The Feed tab (docs/feed.md): an optional module, off with PDW_FEED_ENABLED=0.
 	extra = append(extra, feed.Register(mux, feed.Options{DatabaseURL: cfg.PostgresDatabaseURL, Timeout: cfg.QueryTimeout, Auth: authSvc.RequireStaticBearer(), Getenv: os.Getenv, Logger: logger})...)

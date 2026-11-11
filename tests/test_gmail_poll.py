@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -151,6 +152,10 @@ class FakeWarehouse:
         self.messages: dict[tuple[str, str], dict] = {}
         self.ensure_calls = 0
         self.backfill_requests = 0
+        self.observations: list[dict] = []
+
+    def record_source_upstream_observation(self, **observation) -> None:
+        self.observations.append(observation)
 
     def ensure_tables(self) -> None:
         self.ensure_calls += 1
@@ -353,6 +358,43 @@ def test_reconcile_fetches_recent_mail_that_history_never_reported(settings) -> 
     assert summary.reconciled_messages == 1
     assert landed == [1]
     assert mailboxes[ACCOUNT].list_calls == 1, "reconcile runs on its own interval, not every tick"
+
+
+def test_reconcile_records_gmails_own_newest_message_before_writing(settings) -> None:
+    """C11: the detector compares what Gmail lists first with what PDW holds."""
+    mailboxes = {ACCOUNT: FakeMailbox(), OTHER: FakeMailbox()}
+    mailboxes[ACCOUNT].deliver("ghost", record_history=False)
+    warehouse = FakeWarehouse({ACCOUNT: 100, OTHER: 100})
+    order: list[str] = []
+    original_insert = warehouse.insert_messages
+    warehouse.insert_messages = lambda rows: (order.append("write"), original_insert(rows))
+    original_record = warehouse.record_source_upstream_observation
+    warehouse.record_source_upstream_observation = lambda **o: (order.append("observe"), original_record(**o))
+
+    _runner(settings, warehouse, mailboxes, clock=FakeClock()).run(config=_config(window_seconds=30.0))
+
+    by_scope = {o["scope"]: o for o in warehouse.observations}
+    assert by_scope[ACCOUNT]["pipeline"] == "gmail"
+    assert by_scope[ACCOUNT]["upstream_newest_id"] == "ghost"
+    assert by_scope[ACCOUNT]["upstream_newest_at"] == datetime(2024, 4, 23, 12, 30, tzinfo=UTC)
+    assert order.index("observe") < order.index("write")
+    # An empty reconcile window is still a fresh look: nothing newer upstream.
+    assert by_scope[OTHER]["upstream_newest_at"] is None
+
+
+def test_a_failed_observation_never_fails_the_mailbox(settings) -> None:
+    mailboxes = {ACCOUNT: FakeMailbox(), OTHER: FakeMailbox()}
+    mailboxes[ACCOUNT].deliver("ghost", record_history=False)
+    warehouse = FakeWarehouse({ACCOUNT: 100, OTHER: 100})
+
+    def broken(**_observation):
+        raise RuntimeError("observation table unavailable")
+
+    warehouse.record_source_upstream_observation = broken
+    summary = _runner(settings, warehouse, mailboxes, clock=FakeClock()).run(config=_config(window_seconds=30.0))
+
+    assert (ACCOUNT, "ghost") in warehouse.messages
+    assert summary.failed_ticks == 0
 
 
 def test_reconcile_and_attachment_backfill_run_on_their_own_intervals(settings) -> None:

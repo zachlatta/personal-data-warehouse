@@ -2648,6 +2648,12 @@ PIPELINE_HEALTH_COLUMNS = (
     "last_error",
     "last_error_at",
     "collected_at",
+    # C11: the catalog id of the marts_ops view that compares this source with
+    # the source itself, its worst status at collection, or (for a source with
+    # no such comparison) the stated reason and what one would need.
+    "sla_detector",
+    "sla_detector_status",
+    "sla_exemption",
 )
 
 PIPELINE_TABLE_FRESHNESS_COLUMNS = (
@@ -2951,6 +2957,22 @@ TIMELINE_PRIORITY_MIX_COLUMNS = (
 # wrapper after the uploader exits. It is the only in-warehouse heartbeat a
 # laptop uploader has; without it a run that fires every five minutes and
 # fails every time is indistinguishable from a quiet source.
+# What a source itself says is its newest item, recorded by the collector that
+# talks to it (C11): Gmail's newest message, a calendar's last modification,
+# Drive's newest modified file, the WhatsApp linked device's newest message,
+# the Mac's own chat.db. One row per (pipeline, scope), upserted on every look.
+# marts_ops.source_upstream_health compares it with what landed in base_*.
+SOURCE_UPSTREAM_OBSERVATION_COLUMNS = (
+    "pipeline",
+    "scope",
+    "upstream_newest_at",
+    "upstream_newest_id",
+    "detail",
+    "observed_at",
+    "updated_at",
+    "sync_version",
+)
+
 UPLOADER_HEARTBEAT_COLUMNS = (
     "pipeline",
     "device",

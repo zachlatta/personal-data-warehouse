@@ -73,6 +73,11 @@ class FakeDriveClient:
         self.download_calls.append(file_id)
         return self.downloads[file_id]
 
+    def newest_file(self):
+        listed = [*self.files, *(change.get("file") or {} for change in self._changes)]
+        dated = [f for f in listed if f.get("modifiedTime") and not f.get("trashed")]
+        return max(dated, key=lambda f: f["modifiedTime"]) if dated else None
+
 
 class RecordingWarehouse:
     def __init__(self, *, initial_states=None, docx_backfill_files=None):
@@ -82,6 +87,12 @@ class RecordingWarehouse:
         self.sync_states: list[dict] = []
         self.initial_states = initial_states or {}
         self.docx_backfill_files = docx_backfill_files or []
+        self.events: list[str] = []
+        self.observations: list[dict] = []
+
+    def record_source_upstream_observation(self, **observation):
+        self.events.append("observe")
+        self.observations.append(observation)
 
     def ensure_google_drive_source_tables(self):
         pass
@@ -96,6 +107,7 @@ class RecordingWarehouse:
         return list(self.docx_backfill_files[:limit])
 
     def insert_google_drive_files(self, rows):
+        self.events.append("write")
         self.file_batches.append(len(rows))
 
     def insert_google_drive_file_texts(self, rows):
@@ -527,6 +539,58 @@ def test_incremental_upserts_and_soft_deletes(warehouse):
     state = warehouse.load_google_drive_sync_state()["zach@hackclub.com"]
     assert state.start_page_token == "token-2"
     assert state.last_sync_type == "incremental"
+
+
+def test_each_run_records_drives_own_newest_file_before_writing():
+    """C11: files.list's newest modified file is what the detector compares with."""
+    changes = [
+        {
+            "fileId": "f2",
+            "file": {
+                "id": "f2",
+                "name": "b.txt",
+                "mimeType": "text/plain",
+                "parents": ["root"],
+                "size": "10",
+                "modifiedTime": "2026-06-10T00:00:00Z",
+            },
+        }
+    ]
+    client = FakeDriveClient(
+        folders=[{"id": "root", "name": "My Drive", "parents": []}],
+        files=[],
+        changes=changes,
+        downloads={"f2": b"text"},
+    )
+    warehouse = RecordingWarehouse(
+        initial_states={"zach@hackclub.com": SimpleNamespace(start_page_token="token-1", full_crawled_at=_now())}
+    )
+
+    _runner(warehouse, client).sync_all()
+
+    assert warehouse.observations == [
+        {
+            "pipeline": "google_drive",
+            "scope": "zach@hackclub.com",
+            "upstream_newest_at": datetime(2026, 6, 10, tzinfo=UTC),
+            "upstream_newest_id": "f2",
+            "detail": "files.list(orderBy='modifiedTime desc', pageSize=1)",
+        }
+    ]
+    assert warehouse.events.index("observe") < warehouse.events.index("write")
+
+
+def test_a_failed_newest_file_probe_does_not_fail_the_sync():
+    client = FakeDriveClient(folders=[], files=[])
+
+    def broken():
+        raise RuntimeError("quota")
+
+    client.newest_file = broken
+    warehouse = RecordingWarehouse()
+    summary = _runner(warehouse, client).sync_all()[0]
+    assert summary.status == "ok"
+    assert warehouse.observations == []
 
 
 def test_incremental_skips_reextraction_when_unchanged(warehouse):

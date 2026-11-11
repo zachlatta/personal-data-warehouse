@@ -153,9 +153,12 @@ that, not from this prose.
   `XX001`/`XX002`, reads `failing`). Runbook:
   `~/dev/zachlatta/sysadmin` (`backup-health.md`, `slowking/`).
 - **C11 — a source's own SLA is stated and detected, not inferred from the pipeline being
-  green.** *Held up by* per-source detectors: `marts_ops.slack_conversation_health`,
-  `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`, and
-  `marts_finance.net_worth.staleness`. *Gap:* every other source rides aggregate freshness.
+  green.** Each source row of `marts_ops.pipeline_health` states its SLA (`data_basis`) and
+  names its detector (`sla_detector`, verdict in `sla_detector_status`):
+  `marts_ops.source_upstream_health` compares the provider's own newest item with `base_*`
+  (Gmail, Calendar, Drive, WhatsApp, Apple Messages); Slack, Plaid, SimpleFIN and voice
+  landing have their own views. *Held up by* `tests/test_source_sla.py`. *Exceptions:* a
+  source with no detector names why and what one needs in `sla_exemption`.
 - **C12 — future developers understand these contracts and honor them.** This file is
   loaded into every session in this repository, so it holds only the contracts and the
   rules every change needs; per-source and incident detail lives in `docs/agents/` and is

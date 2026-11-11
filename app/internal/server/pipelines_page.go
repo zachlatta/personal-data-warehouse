@@ -61,6 +61,8 @@ const pipelinesPageHTML = `<!doctype html>
   <div id="agents"></div>
   <div id="slack"></div>
   <div id="plaid"></div>
+  <div id="sources"></div>
+  <div id="source_slas"></div>
   <div id="collation"></div>
   <div id="status"></div>
   <div id="legend"></div>
@@ -86,13 +88,13 @@ const pipelinesPageHTML = `<!doctype html>
   // both the tiles and the sort inside every group.
   var SEVERITY = [
     "failing", "stale", "attention", "late", "unknown",
-    "backfilling", "no_data", "unmeasured", "unmonitored", "quiet", "manual", "paused", "ok"
+    "backfilling", "no_data", "unmeasured", "unmonitored", "exempt", "quiet", "manual", "paused", "ok"
   ];
   var COLORS = {
     ok: "var(--ok)", late: "var(--warn)", stale: "var(--danger)", failing: "var(--danger)",
     attention: "var(--orange)", manual: "var(--info)", quiet: "var(--info)", no_data: "var(--text-3)",
     paused: "var(--info)", unknown: "var(--violet)", backfilling: "var(--info)",
-    unmeasured: "var(--text-3)", unmonitored: "var(--text-3)"
+    unmeasured: "var(--text-3)", unmonitored: "var(--text-3)", exempt: "var(--text-3)"
   };
   var KINDS = [
     ["source", "sources — data coming in from the outside world"],
@@ -113,7 +115,8 @@ const pipelinesPageHTML = `<!doctype html>
     unknown: "the freshness snapshot itself is stale — check the pipeline_health asset",
     backfilling: "still working through its historical backlog",
     unmeasured: "we did not look — the probe was too expensive to afford, which is not the same claim as no data",
-    unmonitored: "nothing declares an expectation here, so there is nothing to be late against"
+    unmonitored: "nothing declares an expectation here, so there is nothing to be late against",
+    exempt: "no detector compares this source with the source itself yet; the row says why and what one would need"
   };
   // The four levels this dashboard covers, worst first inside each. They are
   // deliberately separate surfaces rather than one flat list: a pipeline, a
@@ -139,12 +142,19 @@ const pipelinesPageHTML = `<!doctype html>
     // what healthy means.
     ["slack", "slack conversations — the SHARE re-listed per type, not the newest stamp"],
     ["plaid", "plaid items — which institution stops updating when it breaks"],
-    ["collation", "integrity — collation drift and unique-index divergence"]
+    ["collation", "integrity — collation drift and unique-index divergence"],
+    // Contract C11: a green pipeline row says the pipeline RAN. These say
+    // whether what the source itself holds has landed: the provider's own
+    // newest item against the newest in base_*, and every source's stated SLA
+    // with its detector or the reason it has none.
+    ["sources", "source vs PDW — has the newest item the SOURCE reports landed (marts_ops.source_upstream_health)"],
+    ["source_slas", "source SLAs — every source's stated SLA, and the detector that checks it against the source itself"]
   ];
 
   var state = {
     token: localStorage.getItem("pdw_timeline_token") || "",
     pipelines: [], tables: [], marts: [], adapters: [], search: [], slack: [], plaid: [], collation: [],
+    sources: [], source_slas: [],
     backups: [], notifications: [], priority: [], agents: [], benchmark: [], search_latency: [],
     skew: 0, filter: "", attentionOnly: false, open: {}
   };
@@ -266,6 +276,7 @@ const pipelinesPageHTML = `<!doctype html>
       .concat(state.search_latency)
       .concat(state.slack)
       .concat(state.plaid)
+      .concat(state.sources)
       .concat(state.collation);
   }
 
@@ -846,6 +857,31 @@ const pipelinesPageHTML = `<!doctype html>
         : ""));
   }
 
+  function sourceUpstreamNode(o) {
+    var missing = o.missing_seconds === null || o.missing_seconds === undefined
+      ? "landed" : ago(Number(o.missing_seconds)) + " missing";
+    return healthRow(o, o.pipeline + " · " + o.scope, "",
+      [
+        ["source newest", o.upstream_newest_at ? ago(ageOf(o.upstream_newest_at)) + " ago" : "nothing",
+          "what the source itself reports as its newest item" + (o.upstream_newest_id ? " (" + o.upstream_newest_id + ")" : ""), false],
+        ["PDW newest", o.pdw_newest_at ? ago(ageOf(o.pdw_newest_at)) + " ago" : "none",
+          "the newest matching row in base_*", false],
+        ["gap", missing,
+          "late once the source's newest item has been missing for " + ago(Number(o.tolerance_seconds)), false],
+        ["looked", o.observed_at ? ago(ageOf(o.observed_at)) + " ago" : "never",
+          "unknown once older than " + ago(Number(o.expected_observation_seconds)) + ": a detector that stopped looking is not evidence of health", true]
+      ], o.detail || "");
+  }
+
+  function sourceSLANode(p) {
+    return healthRow(p, p.label || p.pipeline, p.pipeline,
+      [
+        ["detector", p.sla_detector || "none", p.sla_detector ? "compares PDW with the source itself" : "exempt", false]
+      ],
+      p.sla_detector ? "SLA: " + (p.data_basis || "unstated") : "exempt: " + (p.sla_exemption || "no reason recorded") +
+        " · SLA: " + (p.data_basis || "unstated"));
+  }
+
   function renderSection(id, heading, items, nodeFn, sortFn) {
     var node = el(id);
     node.textContent = "";
@@ -884,6 +920,8 @@ const pipelinesPageHTML = `<!doctype html>
       });
     renderSection("slack", LEVELS[7][1], state.slack, slackConversationNode);
     renderSection("plaid", LEVELS[8][1], state.plaid, plaidItemNode);
+    renderSection("sources", LEVELS[10][1], state.sources, sourceUpstreamNode);
+    renderSection("source_slas", LEVELS[11][1], state.source_slas, sourceSLANode);
     // The database's own collation row first: it is the finding the other rows
     // corroborate, and it is the one that says this database cannot warn itself.
     renderSection("collation", LEVELS[9][1], state.collation, collationNode,
@@ -997,6 +1035,11 @@ const pipelinesPageHTML = `<!doctype html>
       state.agents = body.agents || [];
       state.slack = body.slack || [];
       state.plaid = body.plaid || [];
+      state.sources = body.sources || [];
+      // A source with no detector has no detector status: it reads exempt.
+      state.source_slas = (body.source_slas || []).map(function (p) {
+        return Object.assign({}, p, { status: p.sla_detector ? (p.status || "unknown") : "exempt" });
+      });
       state.collation = body.collation || [];
       state.skew = body.server_now ? new Date(body.server_now).getTime() - Date.now() : 0;
       el("status").textContent = "";

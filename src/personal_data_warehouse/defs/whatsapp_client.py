@@ -87,6 +87,7 @@ def _whatsapp_object_store(settings):
 def whatsapp_client(context) -> MaterializeResult:
     # Heavy native deps (goneonize, libmagic) load on import; keep them out of
     # code-location load by importing here.
+    from personal_data_warehouse.source_sla import record_upstream_observation
     from personal_data_warehouse_whatsapp.client import WhatsAppClientRunner
     from personal_data_warehouse_whatsapp.session_store import PostgresWhatsAppSessionStore
     from personal_data_warehouse_whatsapp.state import WhatsAppUploadState, default_state_file
@@ -134,6 +135,17 @@ def whatsapp_client(context) -> MaterializeResult:
                     client_id=client_id,
                     session_snapshot_callback=lambda: session_store.snapshot_from_path(session_path, client_id=client_id),
                     session_status_callback=session_store.record_status,
+                    # C11: what WhatsApp delivered to the linked device, so
+                    # marts_ops.source_upstream_health can see a batch stuck
+                    # between this client and base_whatsapp.messages.
+                    upstream_observation_callback=lambda newest: record_upstream_observation(
+                        warehouse,
+                        context.log,
+                        pipeline="whatsapp",
+                        scope=settings.whatsapp.account,
+                        upstream_newest_at=newest,
+                        detail="newest message delivered to the linked device this run window",
+                    ),
                     download_history_media=settings.whatsapp.download_history_media,
                 ).run()
             finally:

@@ -63,6 +63,7 @@ from personal_data_warehouse.relations import (
     CATALOG,
     relation as canonical_relation,
 )
+from personal_data_warehouse.source_sla import SOURCE_UPSTREAM_HEALTH_VIEW
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +434,14 @@ class Pipeline:
     #: the only detector, so it must declare one. ``data=None`` is not the same
     #: thing: that reads ``manual``, a claim that no cadence exists at all.
     freshness_escalates: bool = True
+    #: C11. A source's own SLA is detected by asking the source, not inferred
+    #: from this row being green. Every ``kind="source"`` pipeline names either
+    #: the catalog id of the ``marts_ops`` view that compares PDW with the
+    #: source itself (``detector``), or says why no such comparison is possible
+    #: yet and what it would take (``sla_exemption``). Never both, never
+    #: neither: ``tests/test_source_sla.py``.
+    detector: str = ""
+    sla_exemption: str = ""
 
     @property
     def event_interval(self) -> timedelta | None:
@@ -522,6 +531,8 @@ def _source(
     state: StateSource | None = None,
     note: str = "",
     freshness_escalates: bool = True,
+    detector: str = "",
+    exemption: str = "",
 ) -> Pipeline:
     return Pipeline(
         id=id,
@@ -536,6 +547,8 @@ def _source(
         state=state,
         note=note,
         freshness_escalates=freshness_escalates,
+        detector=detector,
+        sla_exemption=exemption,
     )
 
 
@@ -606,6 +619,13 @@ PIPELINES: tuple[Pipeline, ...] = (
             status_column="status",
             error_column="error",
         ),
+        basis=(
+            "measured 2026-11-11: p95 0.11d, max 1.04d -- mail arrives "
+            "around the clock, so 6h (late at 12h) is already a real outage; the API "
+            "probe in marts_ops.source_upstream_health catches a missing message in 15 "
+            "min"
+        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "gmail_settings",
@@ -623,6 +643,16 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="the review of a gmail.*_filter / *_label mutation reads these tables; a failing row means reviews show stale rules",
+        basis=(
+            "every half-hourly run rewrites the full label and filter snapshot, so 3h "
+            "is six missed runs; a label change itself is rare and is not what this "
+            "judges"
+        ),
+        exemption=(
+            "every run is a full snapshot of users.labels.list and "
+            "users.settings.filters.list, so a successful run already is the comparison "
+            "with Gmail; the run heartbeat is the detector"
+        ),
     ),
     _source(
         "google_calendar",
@@ -638,6 +668,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="calendar edits are bursty; the run heartbeat is the real signal",
+        basis=(
+            "measured 2026-11-11: p95 0.68d, max 1.42d -- edits are bursty, "
+            "so 3d (late at 6d) leaves room for a quiet weekend; the calendar's own "
+            "`updated` stamp in marts_ops.source_upstream_health is the sharper signal"
+        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "google_contacts",
@@ -660,6 +696,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="data goes quiet for months by nature; judge this one on last_run_at",
+        exemption=(
+            "the People API sync token returns every change since the last run, and "
+            "edits are weeks apart; a detector needs connections.list sorted "
+            "LAST_MODIFIED_DESCENDING (pageSize=1) recorded in "
+            "source_upstream_observations"
+        ),
     ),
     _source(
         "apple_contacts",
@@ -676,6 +718,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/apple-contacts-upload-launchd",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("apple_contacts"),
+        exemption=(
+            "the Mac's AddressBook is read only by the uploader; a detector needs it to "
+            "post the store's newest modification date to /ingest/source-observation, "
+            "as apple_messages does"
+        ),
     ),
     _source(
         "browser_history",
@@ -692,6 +739,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/browser-history-upload-launchd",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("browser_history"),
+        exemption=(
+            "History.db is on the Mac and read only by the uploader; a detector needs "
+            "it to post the newest visit time to /ingest/source-observation, as "
+            "apple_messages does"
+        ),
     ),
     _source(
         "screen_timelapse",
@@ -718,6 +770,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("screen_timelapse"),
+        exemption=(
+            "PDW's own capture loop makes the frames, so there is no upstream; per-"
+            "device frame age against the phone's usage events is already judged on "
+            "this row"
+        ),
     ),
     _source(
         "feed",
@@ -730,6 +787,10 @@ PIPELINES: tuple[Pipeline, ...] = (
             " only when Zach opens the feed, so a quiet week is not an outage"
         ),
         note="optional module (docs/feed.md); PDW_FEED_ENABLED=0 turns the app side off",
+        exemption=(
+            "PDW is the source: agents and the app write the feed directly, so there is "
+            "nothing upstream to compare with"
+        ),
     ),
     _source(
         "google_drive",
@@ -744,6 +805,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             status_column="status",
             error_column="error",
         ),
+        basis=(
+            "measured 2026-11-11: p95 0.02d, max 0.46d -- PDW's own inbox "
+            "writes keep Drive busy, so 2d is generous; the newest-file probe catches a "
+            "stuck changes feed"
+        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "slack",
@@ -758,6 +825,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             status_column="status",
             error_column="error",
         ),
+        basis=(
+            "Slack carries ~19k messages a day across public channels, so 6h with no "
+            "write is an outage, not a quiet spell; per-type coverage is judged in "
+            "marts_ops.slack_conversation_health"
+        ),
+        detector="marts_ops_slack_conversation_health",
     ),
     _source(
         "apple_messages",
@@ -768,6 +841,13 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/apple-messages-upload-launchd",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("apple_messages"),
+        basis=(
+            "measured 2026-11-11: p95 1.00d, max 10.97d -- since the Pixel "
+            "took SMS (2026-10-23) the Mac carries iMessage only, so 2d (late at 4d) is "
+            "the floor; the Mac's own chat.db is compared in "
+            "marts_ops.source_upstream_health"
+        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "whatsapp",
@@ -787,6 +867,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             " device was removed and needs a re-pair (WhatsApp > Settings > Linked Devices,"
             " pairing code from the newest whatsapp_client_job run log)"
         ),
+        basis=(
+            "measured 2026-11-11: p95 0.15d, max 10.40d (the 2026-09 re-"
+            "pair outage) -- 2d (late at 4d) catches that; the linked device's own "
+            "newest message is compared in marts_ops.source_upstream_health"
+        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "apple_notes",
@@ -797,6 +883,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="quiet usually means iCloud stopped delivering to the Mac, not that nothing changed",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("apple_notes"),
+        basis=(
+            "measured 2026-11-11: p95 1.65d, max 23.75d -- notes are edited "
+            "most days, so 3d (late at 6d) is a real silence"
+        ),
+        exemption=(
+            "a Mac-side probe would see only what iCloud delivered to the Mac, which is "
+            "the usual failure; a detector needs the uploader to post NoteStore's "
+            "newest modification date to /ingest/source-observation, as apple_messages "
+            "does"
+        ),
     ),
     _source(
         "apple_voice_memos",
@@ -819,6 +915,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         state=_uploader_heartbeat("apple_voice_memos"),
         # Zach records on the Pixel now: a quiet Mac library is not an outage.
         freshness_escalates=False,
+        detector="marts_ops_voice_memo_landing_health",
     ),
     _source(
         "google_recorder",
@@ -838,6 +935,7 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/google-recorder-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("google_recorder"),
+        detector="marts_ops_voice_memo_landing_health",
     ),
     _source(
         "android_photos",
@@ -858,6 +956,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-photos-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_photos"),
+        exemption=(
+            "MediaStore is on the phone and read only by the uploader; a detector needs "
+            "it to post the newest DATE_ADDED to /ingest/source-observation, as "
+            "apple_messages does"
+        ),
     ),
     _source(
         "android_notifications",
@@ -878,6 +981,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-notifications-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_notifications"),
+        exemption=(
+            "Android keeps no history of a notification once dismissed, so the "
+            "listener's spool is the only record; a detector needs the spool's oldest "
+            "unsent entry posted to /ingest/source-observation, as apple_messages does"
+        ),
     ),
     _source(
         "android_messages",
@@ -897,6 +1005,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-messages-upload-android on the phone",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_messages"),
+        exemption=(
+            "bugle_db is on the phone and read only by the uploader; a detector needs "
+            "it to post the newest message timestamp to /ingest/source-observation, as "
+            "apple_messages does"
+        ),
     ),
     _source(
         "android_location", "Android approximate location",
@@ -907,6 +1020,10 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="Uploader run heartbeat and measurement freshness are independent",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_location"),
+        exemption=(
+            "PDW's own helper makes the samples, so there is no upstream; the "
+            "measurement age in data_basis already catches stale fixes"
+        ),
     ),
     _source(
         "android_screen_time",
@@ -925,6 +1042,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="run heartbeat posted by bin/android-screen-time-upload-android on each device",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_screen_time"),
+        exemption=(
+            "UsageStatsManager is read only by PDW's exporter on the phone; a detector "
+            "needs it to post the newest usage event time to /ingest/source-"
+            "observation, as apple_messages does"
+        ),
     ),
     _source(
         "scans",
@@ -944,6 +1066,10 @@ PIPELINES: tuple[Pipeline, ...] = (
         note="heartbeat posted by pdw ingest scanner itself (a long-running service, not a run)",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("scans"),
+        exemption=(
+            "a scan that never reached the service exists nowhere else; PDW is the end "
+            "of the scanner's Scan to PC"
+        ),
     ),
     _source(
         "alice_voice_recordings",
@@ -978,6 +1104,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             "quiet means Zach is not recording, so data age never colours"
             " status; the daily poll's own heartbeat says the poller is alive"
         ),
+        exemption=(
+            "usage-driven (34 days of use in 17 months), so the poller's daily run "
+            "heartbeat is the signal; a detector needs the Alice listing's newest "
+            "recording time recorded in source_upstream_observations"
+        ),
     ),
     _source(
         "apple_photos",
@@ -987,6 +1118,17 @@ PIPELINES: tuple[Pipeline, ...] = (
         data=3 * DAY,
         run=2 * HOUR,
         state=_uploader_heartbeat("apple_photos"),
+        basis=(
+            "measured 2026-11-11: p95 0.75d, max 7.99d -- but the Pixel "
+            "replaced the iPhone on 2026-10-23, so new photos arrive via android_photos "
+            "and this row going stale is the expected end of the iPhone library, not a "
+            "fault"
+        ),
+        exemption=(
+            "the iPhone library stopped growing on 2026-10-23; a detector needs the "
+            "PhotoKit exporter to post the library's newest creation date to "
+            "/ingest/source-observation, as apple_messages does"
+        ),
     ),
     _source(
         "claude_code",
@@ -996,6 +1138,15 @@ PIPELINES: tuple[Pipeline, ...] = (
         data=2 * DAY,
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("claude_code"),
+        basis=(
+            "measured 2026-11-11: p95 0.02d, max 1.96d -- 2d covers the "
+            "longest pause on record"
+        ),
+        exemption=(
+            "session files are on the device and tailed only by the uploader; a "
+            "detector needs it to post the newest session file mtime to /ingest/source-"
+            "observation, as apple_messages does"
+        ),
     ),
     _source(
         "codex",
@@ -1006,6 +1157,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis="measured: 2,479 gaps, p95 0.06d, max 3.94d — 7d leaves ample headroom",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("codex"),
+        exemption=(
+            "session files are on the device and tailed only by the uploader; a "
+            "detector needs it to post the newest session file mtime to /ingest/source-"
+            "observation, as apple_messages does"
+        ),
     ),
     _source(
         "openclaw",
@@ -1016,6 +1172,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         basis="measured: 5,558 gaps, p95 0.02d, max 1.14d — 7d leaves ample headroom",
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("openclaw"),
+        exemption=(
+            "session files are on the VM and tailed only by its timer; a detector needs "
+            "it to post the newest session file mtime to /ingest/source-observation, as "
+            "apple_messages does"
+        ),
     ),
     _source(
         "pi",
@@ -1043,6 +1204,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             "quiet means Zach is not using pi, so data age is shown but never"
             " colours status; the run heartbeat says the uploader is alive"
         ),
+        exemption=(
+            "usage-driven; session files are on the Mac and tailed only by the "
+            "uploader; a detector needs it to post the newest session file mtime to "
+            "/ingest/source-observation, as apple_messages does"
+        ),
     ),
     _source(
         "muse_code",
@@ -1066,6 +1232,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             " hosted agent, pipeline muse); quiet means Zach is not using it,"
             " so data age never colours status, and the run heartbeat says the"
             " uploader is alive"
+        ),
+        exemption=(
+            "usage-driven; session files are on the Mac and tailed only by the "
+            "uploader; a detector needs it to post the newest session file mtime to "
+            "/ingest/source-observation, as apple_messages does"
         ),
     ),
     _source(
@@ -1091,6 +1262,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             " quiet means Zach is not using it, so data age never colours"
             " status, and the run heartbeat says the uploader is alive"
         ),
+        exemption=(
+            "usage-driven; session files are on the Mac and tailed only by the "
+            "uploader; a detector needs it to post the newest session file mtime to "
+            "/ingest/source-observation, as apple_messages does"
+        ),
     ),
     _source(
         "muse",
@@ -1114,6 +1290,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         ),
         run=12 * HOUR,
         state=_uploader_heartbeat("muse"),
+        exemption=(
+            "transcripts are on the Muse VM and read only by its hook; a detector needs "
+            "the hook to post the newest transcript time to /ingest/source-observation, "
+            "as apple_messages does"
+        ),
     ),
     _source(
         "claude_desktop",
@@ -1133,6 +1314,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             "the Mac re-pushes the session key hourly and the poller stamps its own verdict"
             " on the same row: action_required means claude.ai rejected the key and the"
             " desktop app needs a sign-in"
+        ),
+        exemption=(
+            "the poller's 3h run heartbeat and credential state are the signal; a "
+            "detector needs the conversation list's newest updated_at recorded in "
+            "source_upstream_observations"
         ),
     ),
     _source(
@@ -1155,6 +1341,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             " days, so action_required means either an imminent expiry (still"
             " polling - sign in again) or a rejected token (polling stopped until"
             " a different token is published)"
+        ),
+        exemption=(
+            "the poller's 3h run heartbeat and session state are the signal; a detector "
+            "needs the conversation list's newest update_time recorded in "
+            "source_upstream_observations"
         ),
     ),
     _source(
@@ -1182,6 +1373,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             "the token is a 90-day JWT with no refresh; action_required means it expires within 14 days"
             " (still polling) or was refused: sign in at connect.comma.ai and set COMMA_API_TOKEN"
         ),
+        exemption=(
+            "drives upload from the car only on Wi-Fi, so comma's own list lags the "
+            "car; a detector needs the device's newest route time recorded in "
+            "source_upstream_observations"
+        ),
     ),
     _source(
         "resideo",
@@ -1199,6 +1395,15 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="action_required means sign in again with `personal-data-warehouse-resideo-auth`",
+        basis=(
+            "measured 2026-11-11: p95 0.03d, max 0.06d -- a reading lands "
+            "only on a change, yet the thermostat changes hourly, so 1d is generous"
+        ),
+        exemption=(
+            "the API returns only the thermostat's current state, which every 5-minute "
+            "run already compares with the last reading; there is no upstream history "
+            "to diff"
+        ),
     ),
     _source(
         "whoop",
@@ -1216,6 +1421,16 @@ PIPELINES: tuple[Pipeline, ...] = (
         note=(
             "action_required remains visible on /pipelines while repeated calls"
             " are skipped; re-authorize WHOOP with `personal-data-warehouse-whoop-auth --install`"
+        ),
+        basis=(
+            "measured 2026-11-11 on cycles: p95 1.39d, max 9.13d -- WHOOP "
+            "closes a cycle every day the strap is worn, so 2d (late at 4d) is a missed "
+            "sync"
+        ),
+        exemption=(
+            "the API's collections are newest-first, but the run heartbeat and "
+            "action_required are the signal today; a detector needs the newest cycle's "
+            "updated_at recorded in source_upstream_observations"
         ),
     ),
     _source(
@@ -1239,6 +1454,15 @@ PIPELINES: tuple[Pipeline, ...] = (
             " every refresh, so the source is hands-off until the refresh window"
             " lapses; action_required means the captured browser session is dead —"
             " re-publish it with `pdw whoop publish-session`"
+        ),
+        basis=(
+            "measured 2026-11-11 on cycles: p95 1.08d, max 1.17d -- 2d covers "
+            "the longest gap on record"
+        ),
+        exemption=(
+            "the browser-session API is unofficial and rotates its token; a detector "
+            "needs the newest cycle's updated_at recorded in "
+            "source_upstream_observations"
         ),
     ),
     _source(
@@ -1265,6 +1489,10 @@ PIPELINES: tuple[Pipeline, ...] = (
         note=(
             "action_required means GitHub rejected a token in GITHUB_SOURCE_TOKENS —"
             " replace it on the Dagster deployment; the other credentials keep running"
+        ),
+        exemption=(
+            "the events feed is newest-first and capped at 300 events; a detector needs "
+            "its newest event id and time recorded in source_upstream_observations"
         ),
     ),
     _source(
@@ -1293,6 +1521,10 @@ PIPELINES: tuple[Pipeline, ...] = (
             " news.ycombinator.com session answered a login page — re-publish it with"
             " `pdw hn publish-session`; the public lists and item walk keep running"
         ),
+        exemption=(
+            "every run re-lists the newest page of each list, so a successful run "
+            "already is the comparison with the source"
+        ),
     ),
     _source(
         "plaid",
@@ -1308,6 +1540,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="action_required means an Item needs `pdw ingest plaid link` again",
+        basis=(
+            "measured 2026-11-11 on transactions: p95 2.33d, max 8.35d -- 2d "
+            "is tighter than the card-spend p95 on purpose; each Item is judged on its "
+            "own in marts_ops.plaid_item_health"
+        ),
+        detector="marts_ops_plaid_item_health",
     ),
     _source(
         "simplefin",
@@ -1333,6 +1571,12 @@ PIPELINES: tuple[Pipeline, ...] = (
             "action_required means the access URL was refused: claim a new setup token"
             " (`python -m personal_data_warehouse.simplefin_sync claim`) and set SIMPLEFIN_ACCESS_URL"
         ),
+        basis=(
+            "the bridge refreshes each institution about once a day, so 2d (late at 4d) "
+            "is two missed refreshes; no gap history yet (one account row, added "
+            "2026-10)"
+        ),
+        detector="marts_ops_simplefin_account_health",
     ),
     _source(
         "manual_finance",
@@ -1340,6 +1584,14 @@ PIPELINES: tuple[Pipeline, ...] = (
         cadence="manual upload",
         transport="`pdw ingest manual-finance <files>` → /ingest/manual-finance/* → Drive inbox",
         data=None,
+        basis=(
+            "no expectation: a document exists only when one is uploaded by hand, so a "
+            "quiet month is not a fault"
+        ),
+        exemption=(
+            "manual: a document exists only when one is uploaded, so nothing upstream "
+            "exists to compare with"
+        ),
     ),
     Pipeline(
         id="attachment_enrichment",
@@ -2243,6 +2495,11 @@ class PipelineSnapshot:
     state_attention_rows: int
     last_error: str
     last_error_at: datetime | None
+    #: C11: the source's own detector, its worst status at collection time,
+    #: or the stated reason there is none.
+    sla_detector: str = ""
+    sla_detector_status: str = ""
+    sla_exemption: str = ""
 
 
 @dataclass(frozen=True)
@@ -2333,10 +2590,13 @@ class PipelineHealthCollector:
     def __init__(self, warehouse, *, now: Any = None) -> None:
         self._warehouse = warehouse
         self._now = now or (lambda: datetime.now(tz=UTC))
+        #: Each detector view is read once per collection, then filtered.
+        self._detector_rows: dict[str, list[tuple[str, str]]] | None = None
 
     # -- collection --------------------------------------------------------
 
     def collect(self) -> tuple[list[PipelineSnapshot], list[TableSnapshot]]:
+        self._detector_rows = None
         stats = self._relation_stats()
         indexed = self._indexed_leading_columns()
         # The cost guard above keeps probes cheap in the expected case; the
@@ -2885,10 +3145,47 @@ class PipelineHealthCollector:
             state_attention_rows=int(state.get("attention_rows", 0) or 0),
             last_error=str(state.get("last_error", "") or ""),
             last_error_at=_real(state.get("last_error_at")),
+            sla_detector=_detector_relation(entry.detector),
+            sla_detector_status=self._detector_status(entry),
+            sla_exemption=entry.sla_exemption,
         )
         if entry.id == "screen_timelapse":
             self._apply_screen_timelapse_device_freshness(snapshot)
         return snapshot
+
+    def _detector_status(self, entry: Pipeline) -> str:
+        """The worst status the pipeline's own C11 detector reports right now.
+
+        A detector view with a ``pipeline`` or ``source`` column is shared by
+        several sources and is read for this pipeline's rows only. No rows, or
+        a view that cannot be read, is ``unknown``: a detector that says
+        nothing is not evidence of health.
+        """
+        if not entry.detector:
+            return ""
+        if self._detector_rows is None:
+            self._detector_rows = {}
+        if entry.detector not in self._detector_rows:
+            scope = DETECTOR_SCOPE_COLUMNS.get(entry.detector)
+            select = f"{scope}::text AS scope" if scope else "''::text AS scope"
+            try:
+                with self._probe_budget(PROBE_STATEMENT_TIMEOUT_MS):
+                    rows = self._warehouse._query_dicts(
+                        f"SELECT {select}, status::text AS status FROM @{entry.detector}"
+                    )
+            except psycopg2.Error as error:
+                logger.warning("source detector %s unreadable: %s", entry.detector, error)
+                rows = []
+            self._detector_rows[entry.detector] = [
+                (str(row["scope"] or ""), str(row["status"] or "unknown")) for row in rows
+            ]
+        scope = DETECTOR_SCOPE_COLUMNS.get(entry.detector)
+        statuses = [
+            status
+            for row_scope, status in self._detector_rows[entry.detector]
+            if not scope or row_scope == entry.id
+        ]
+        return worst_detector_status(statuses)
 
     def _apply_screen_timelapse_device_freshness(self, snapshot: PipelineSnapshot) -> None:
         """Flag screen_timelapse attention when one active device stops delivering frames.
@@ -3081,6 +3378,54 @@ class PipelineHealthCollector:
         if row.get("last_error"):
             row["last_error"] = _one_line(str(row["last_error"]))[:500]
         return row
+
+
+#: Detector views shared by several pipelines, and the column naming which
+#: pipeline a row belongs to. A view absent here describes one pipeline whole.
+DETECTOR_SCOPE_COLUMNS: dict[str, str] = {
+    "marts_ops_source_upstream_health": "pipeline",
+    "marts_ops_voice_memo_landing_health": "source",
+}
+
+#: Worst first. The detectors predate one vocabulary: Slack says stale/late,
+#: Plaid action_required, SimpleFIN attention, voice memos quiet/unmeasured.
+#: A word not listed ranks just above ``ok``, so a new one is never hidden.
+DETECTOR_STATUS_SEVERITY: tuple[str, ...] = (
+    "failing",
+    "error",
+    "stale",
+    "action_required",
+    "duplicate",
+    "late",
+    "attention",
+    "unknown",
+    "unmeasured",
+)
+DETECTOR_HEALTHY_STATUSES: frozenset[str] = frozenset({"ok", "quiet"})
+
+
+def _detector_relation(detector: str) -> str:
+    """A detector's ``schema.name`` as an agent queries it, not its catalog id."""
+    if not detector:
+        return ""
+    rel = canonical_relation(detector)
+    return f"{rel.schema}.{rel.name}"
+
+
+def worst_detector_status(statuses: Iterable[str]) -> str:
+    """Fold a detector view's per-row statuses into the pipeline's one word."""
+    seen = [status for status in statuses if status]
+    if not seen:
+        return "unknown"
+
+    def rank(status: str) -> int:
+        if status in DETECTOR_STATUS_SEVERITY:
+            return DETECTOR_STATUS_SEVERITY.index(status)
+        if status in DETECTOR_HEALTHY_STATUSES:
+            return len(DETECTOR_STATUS_SEVERITY) + 1
+        return len(DETECTOR_STATUS_SEVERITY)
+
+    return min(seen, key=rank)
 
 
 def _worst_probe_status(statuses: Iterable[str]) -> str:

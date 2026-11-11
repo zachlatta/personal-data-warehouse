@@ -29,6 +29,7 @@ type Summary struct {
 type Uploader interface {
 	UploadAppleMessagesBatch(gzipBytes []byte, exportedAt string) (ingestclient.StoredObject, error)
 	UploadAppleMessagesAttachment(content []byte, a ingestclient.AppleMessagesAttachment) (ingestclient.StoredObject, error)
+	PostSourceObservation(o ingestclient.SourceObservation) (map[string]any, error)
 }
 
 // Runner uploads the manifest and a bounded slice of attachment bytes.
@@ -117,6 +118,7 @@ func (r *Runner) Sync() (Summary, error) {
 	}
 
 	exportedAt := r.Now()
+	r.observeNewest(snapshot, exportedAt)
 	records, marks, skipped, err := r.selectedManifestRecords(snapshot, exportedAt)
 	if err != nil {
 		return Summary{}, err
@@ -185,6 +187,33 @@ func (r *Runner) Sync() (Summary, error) {
 	r.Logger.Infof("Apple Messages upload summary: handles=%d chats=%d messages=%d attachments=%d selected=%d skipped=%d batches=%d attachment_uploads=%d",
 		summary.HandlesSeen, summary.ChatsSeen, summary.MessagesSeen, summary.AttachmentsSeen, summary.RecordsSelected, summary.RecordsSkipped, summary.BatchesUploaded, summary.AttachmentsUploaded)
 	return summary, nil
+}
+
+// observeNewest posts what this Mac's own chat.db says is its newest message
+// (contract C11), before anything is uploaded, so the warehouse can tell "the
+// Mac holds a message PDW does not" from "the uploader ran". Best effort: a
+// failed post is a warning, and the observation then ages to `unknown`.
+func (r *Runner) observeNewest(snapshot *Snapshot, observedAt time.Time) {
+	var newest *Message
+	for i := range snapshot.Messages {
+		m := &snapshot.Messages[i]
+		if newest == nil || m.MessageAt.After(newest.MessageAt) {
+			newest = m
+		}
+	}
+	obs := ingestclient.SourceObservation{
+		Pipeline:   "apple_messages",
+		Scope:      r.Account,
+		Detail:     fmt.Sprintf("chat.db snapshot: newest of %d messages", len(snapshot.Messages)),
+		ObservedAt: common.ISOFormat(observedAt),
+	}
+	if newest != nil && !newest.MessageAt.IsZero() {
+		obs.NewestAt = common.ISOFormat(newest.MessageAt)
+		obs.NewestID = newest.MessageID
+	}
+	if _, err := r.Client.PostSourceObservation(obs); err != nil {
+		r.Logger.Warningf("Could not post the Apple Messages source observation: %v", err)
+	}
 }
 
 func dirOf(path string) string {

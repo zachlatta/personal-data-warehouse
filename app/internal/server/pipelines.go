@@ -25,6 +25,7 @@ const (
 	pipelinesCollationMaxRows = 2000
 	pipelinesSearchMaxRows    = 10
 	pipelinesSlackMaxRows     = 100
+	pipelinesSourcesMaxRows   = 200
 	pipelinesPlaidMaxRows     = 200
 	pipelinesBackupMaxRows    = 20
 	pipelinesPriorityMaxRows  = 500
@@ -114,6 +115,24 @@ SELECT account, item_id, institution_name, linked_at, synced_at,
        account_names, newest_transaction_at, transaction_age_seconds
 FROM ` + warehouse.SQLRelation("marts_ops_plaid_item_health") + `
 ORDER BY status, institution_name`
+
+// Contract C11: a source's own SLA, detected by asking the source. One row
+// per (pipeline, scope) comparing what the provider says is its newest item
+// with what landed in base_*, plus every source's stated SLA and its detector
+// verdict or the reason it has none. Both are read through optionalRows: the
+// app deploys before the Python ensure path creates the view and the columns.
+var pipelineSourceUpstreamHealthSQL = `
+SELECT pipeline, scope, status, landed, upstream_newest_at, upstream_newest_id,
+       pdw_newest_at, missing_seconds, tolerance_seconds, observed_at,
+       observation_age_seconds, expected_observation_seconds, detail
+FROM ` + warehouse.SQLRelation("marts_ops_source_upstream_health") + `
+ORDER BY pipeline, scope`
+
+var pipelineSourceSLASQL = `
+SELECT pipeline, label, data_basis, sla_detector, sla_detector_status AS status, sla_exemption
+FROM ` + warehouse.SQLRelation("marts_pipeline_health") + `
+WHERE kind = 'source'
+ORDER BY pipeline`
 
 // Backups. The level with no Dagster collector: only the pgBackRest loop
 // inside the Postgres container can ask pgbackrest anything, so it writes its
@@ -223,6 +242,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 				"agents":         []map[string]any{},
 				"slack":          []map[string]any{},
 				"plaid":          []map[string]any{},
+				"sources":        []map[string]any{},
+				"source_slas":    []map[string]any{},
 				"backups":        []map[string]any{},
 				"server_now":     s.now().UTC().Format(time.RFC3339Nano),
 				"pending":        true,
@@ -255,6 +276,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 	agents := s.optionalRows(r, "agent usage", pipelineAgentUsageSQL, pipelinesAgentsMaxRows)
 	slack := s.optionalRows(r, "slack conversation health", pipelineSlackConversationHealthSQL, pipelinesSlackMaxRows)
 	plaid := s.optionalRows(r, "plaid item health", pipelinePlaidItemHealthSQL, pipelinesPlaidMaxRows)
+	sources := s.optionalRows(r, "source upstream health", pipelineSourceUpstreamHealthSQL, pipelinesSourcesMaxRows)
+	sourceSLAs := s.optionalRows(r, "source SLAs", pipelineSourceSLASQL, pipelinesSourcesMaxRows)
 	notifications := s.optionalRows(r, "notification health", pipelineNotificationHealthSQL, 1)
 	backups := s.optionalRows(r, "backup health", pipelineBackupHealthSQL, pipelinesBackupMaxRows)
 	writeJSON(w, map[string]any{
@@ -270,6 +293,8 @@ func (s *pipelineService) handlePipelines(w http.ResponseWriter, r *http.Request
 		"agents":         agents,
 		"slack":          slack,
 		"plaid":          plaid,
+		"sources":        sources,
+		"source_slas":    sourceSLAs,
 		"backups":        backups,
 		"notifications":  notifications,
 		"server_now":     s.now().UTC().Format(time.RFC3339Nano),

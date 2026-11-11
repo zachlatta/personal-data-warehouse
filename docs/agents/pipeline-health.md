@@ -255,6 +255,57 @@ hand-written migration gave the host-saturation gauges the `-1` "unmeasured" def
 freshly created table gave them `0`, which the view reads as an **idle host**, the one
 verdict C6 acts on. `UNMEASURED_SENTINEL_COLUMNS_BY_TABLE` is now the single source for both.
 
+## A source's own SLA (C11)
+
+A green pipeline row says the pipeline **ran and wrote**. It cannot say that PDW holds what
+the source holds: a history cursor that skips a change, a Drive changes feed capped behind a
+backlog, a WhatsApp batch stuck between the linked device and the Drive inbox all leave the
+row green. Until 2026-11-11 only Slack, Plaid, SimpleFIN and voice memos had a detector of
+their own, and 16 of 41 sources did not even state where their interval came from.
+
+Every `kind="source"` entry in `PIPELINES` now carries three things, enforced by
+`tests/test_source_sla.py`:
+
+- `data_basis` — the stated SLA: a measurement (the gap query in `pipeline_health.py`,
+  re-run 2026-11-11 for the sources that had none) or the reason there is no cadence.
+- `detector` — the catalog id of the `marts_ops` view that compares PDW with the source
+  itself; **or** `sla_exemption` — why no such comparison exists yet and what one would
+  need. Exactly one, and an exemption of at least a sentence (no "n/a").
+
+The collector reads each detector view once per collection (filtered to the pipeline by its
+`pipeline` or `source` column, `DETECTOR_SCOPE_COLUMNS`) and writes its worst row into
+`marts_ops.pipeline_health.sla_detector_status`; a detector with no row for the pipeline is
+`unknown`, because silence is not health. It does **not** colour `status` — that stays C7's
+claim about the pipeline; C11 grades `sla_detector_status` (`scripts/contract_audit.py`).
+
+**`marts_ops.source_upstream_health`** is the detector for Gmail, Google Calendar, Google
+Drive, WhatsApp and Apple Messages. Each collector records what the provider itself says
+is its newest item in `ops.source_upstream_observations` (one row per pipeline and scope),
+before writing what it fetched:
+
+| source | upstream evidence | compared with |
+| --- | --- | --- |
+| `gmail` | `messages.list` first id + `messages.get(format=minimal)` `internalDate`, every reconcile pass (10 min) | `base_gmail.messages.internal_date` per account |
+| `google_calendar` | the top-level `updated` of the sync's own `events.list` response (present even on an empty incremental page; checked 2026-11-11), every run | `base_google_calendar.events.updated_at` per account/calendar |
+| `google_drive` | `files.list(orderBy='modifiedTime desc', pageSize=1)` over the files the sync crawls, every run | `base_google_drive.files.modified_time`, plus that file by id (it may be excluded) |
+| `whatsapp` | the linked-device client's newest delivered message, every 5 min while connected | `base_whatsapp.messages.message_at` |
+| `apple_messages` | `pdw ingest apple-messages` posts the newest message in the chat.db snapshot it just read to `/ingest/source-observation` | `base_apple_messages.messages.message_at` |
+
+The view is live: a row is `ok` once PDW's newest is at least the source's newest (1 s
+slack), `late` when the source's newest item has been missing for longer than the check's
+`tolerance` (`SOURCE_UPSTREAM_CHECKS` in `source_sla.py`), `failing` past six times that,
+and `unknown` once the observation is older than the collector's own interval — a detector
+that stopped looking is not evidence. Each comparison is one indexed lookup. On 2026-11-11
+the Calendar API's `updated` matched `max(updated_at)` exactly on both calendars and the
+Gmail API's newest message matched `max(internal_date)` to the second on both mailboxes.
+
+Adding a source-side check for another source: record an observation from the collector
+(Python: `source_sla.record_upstream_observation`; a device uploader: `POST
+/ingest/source-observation` through `ingestclient.PostSourceObservation`), add an
+`UpstreamCheck`, and point the pipeline's `detector` at
+`SOURCE_UPSTREAM_HEALTH_VIEW`. Each exemption in `PIPELINES` already says which evidence
+that source would need.
+
 ## Collation drift and index corruption
 
 **This database cannot warn you about collation changes, and one has already happened.**

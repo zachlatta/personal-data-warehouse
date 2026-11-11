@@ -717,27 +717,46 @@ def c10_backups() -> Verdict:
 
 def c11_source_slas() -> Verdict:
     title = "a source's own SLA is stated and detected"
-    slack = pdw_sql("slack health", "SELECT conversation_type, status FROM marts_ops.slack_conversation_health")
-    plaid = pdw_sql("plaid health", "SELECT institution_name, status FROM marts_ops.plaid_item_health")
-    # Every other source, derived or enrichment pipeline has no dedicated
-    # detector of its own yet, so its pipeline status is its SLA:
-    # browser_history failed for nine days in October 2026 with C7 (which defers
-    # current state here) and C11 both green. Manual pipelines never go stale,
-    # unknown is C7's grade, and internal pipelines (pgbackrest,
-    # collation_health) are C10's.
+    # Every source states its SLA (data_basis) and names the marts_ops view
+    # that compares PDW with the source itself (sla_detector), or the reason
+    # none exists yet and what one would need (sla_exemption). The collector
+    # folds each detector's rows into sla_detector_status, so Slack, Plaid,
+    # SimpleFIN, voice landing and the upstream comparison
+    # (marts_ops.source_upstream_health) are all read here.
+    slas = pdw_sql("source slas", """
+        SELECT pipeline, data_basis, sla_detector, sla_detector_status, sla_exemption
+        FROM marts_ops.pipeline_health WHERE kind = 'source' ORDER BY pipeline""")
+    # A pipeline being down is still part of C11: browser_history failed for
+    # nine days in October 2026 with C7 (which defers current state here) and
+    # C11 both green. Manual pipelines never go stale, unknown is C7's grade,
+    # and internal pipelines (pgbackrest, collation_health) are C10's.
     pipelines = pdw_sql("source pipeline health", """
         SELECT pipeline, status FROM marts_ops.pipeline_health
         WHERE kind IN ('source', 'derived', 'enrichment') AND status NOT IN ('ok', 'manual', 'unknown')
         ORDER BY pipeline""")
-    if slack is None or plaid is None or pipelines is None:
-        return _unavailable("C11", title, "slack_conversation_health / plaid_item_health / pipeline_health")
-    simplefin = pdw_sql("simplefin health", "SELECT org_name, name, status, shared_with_plaid FROM marts_ops.simplefin_account_health") or []
-    bad_simplefin = [f"simplefin:{r['org_name']}/{r['name']}={r['status']}" for r in simplefin if r["status"] != "ok"]
-    bad = [f"slack:{r['conversation_type']}={r['status']}" for r in slack if r["status"] != "ok"]
-    bad += [f"plaid:{r['institution_name']}={r['status']}" for r in plaid if r["status"] not in ("ok",)]
-    bad += bad_simplefin
+    if slas is None or pipelines is None:
+        return _unavailable("C11", title, "marts_ops.pipeline_health (sla_detector, sla_exemption)")
+    unstated = [r["pipeline"] for r in slas if not (r.get("data_basis") or "").strip()]
+    undetected = [r["pipeline"] for r in slas if not r.get("sla_detector") and not (r.get("sla_exemption") or "").strip()]
+    detected = [r for r in slas if r.get("sla_detector")]
+    exempt = [r["pipeline"] for r in slas if not r.get("sla_detector") and (r.get("sla_exemption") or "").strip()]
+    bad = [f"{r['pipeline']}:{r['sla_detector']}={r.get('sla_detector_status') or 'unknown'}"
+           for r in detected if (r.get("sla_detector_status") or "unknown") not in ("ok", "quiet")]
     bad += [f"pipeline:{r['pipeline']}={r['status']}" for r in pipelines]
-    return Verdict("C11", title, YELLOW if bad else GREEN, f"slack types {len(slack)}, plaid items {len(plaid)}, simplefin accounts {len(simplefin)} ({sum(int(r['shared_with_plaid'] or 0) for r in simplefin)} shared with plaid), pipelines down {len(pipelines)}; not ok: {bad or 'none'}")
+    if not slas or unstated or undetected:
+        status = RED
+    elif bad:
+        status = YELLOW
+    else:
+        status = GREEN
+    return Verdict(
+        "C11",
+        title,
+        status,
+        f"{len(slas)} sources: {len(detected)} detected against the source, {len(exempt)} exempt with a stated reason"
+        f" ({', '.join(exempt) or 'none'}); no stated SLA: {unstated or 'none'}; neither detector nor exemption:"
+        f" {undetected or 'none'}; pipelines down {len(pipelines)}; not ok: {bad or 'none'}",
+    )
 
 
 def s1_slack() -> Verdict:

@@ -38,6 +38,7 @@ from personal_data_warehouse.agent_usage import (
     SQL_ERROR_SESSION_CEILING,
     AGENT_TOP_FAILURES,
 )
+from personal_data_warehouse.source_sla import SOURCE_UPSTREAM_INPUT_TABLES, source_upstream_health_view_sql
 from personal_data_warehouse.schema import (
     ANSWER_BENCHMARK_QUESTION_COLUMNS,
     ANSWER_BENCHMARK_RESULT_COLUMNS,
@@ -140,6 +141,7 @@ from personal_data_warehouse.schema import (
     COLLATION_HEALTH_COLUMNS,
     PGBACKREST_HEALTH_COLUMNS,
     UPLOADER_HEARTBEAT_COLUMNS,
+    SOURCE_UPSTREAM_OBSERVATION_COLUMNS,
     SEARCH_REQUEST_TIMING_COLUMNS,
     SEARCH_REQUEST_TIMING_STATE_COLUMNS,
     TIMELINE_PRIORITY_MIX_COLUMNS,
@@ -1450,6 +1452,12 @@ POSTGRES_TABLES: dict[str, TableSpec] = {
     "collation_health": TableSpec(COLLATION_HEALTH_COLUMNS, ("object_id",), "collected_at"),
     "pgbackrest_health": TableSpec(PGBACKREST_HEALTH_COLUMNS, ("stanza",), "collected_at"),
     "uploader_heartbeats": TableSpec(UPLOADER_HEARTBEAT_COLUMNS, ("pipeline", "device")),
+    # C11: what each source itself says is its newest item, upserted by the
+    # collector that looked (and by the app for device uploaders, which
+    # creates it with the same DDL because it deploys first).
+    "source_upstream_observations": TableSpec(
+        SOURCE_UPSTREAM_OBSERVATION_COLUMNS, ("pipeline", "scope")
+    ),
     # C6's per-request evidence, appended by the app after every search and
     # pruned after SEARCH_REQUEST_TIMING_RETENTION_DAYS; the state row is the
     # writer's heartbeat. The app creates both itself too (same DDL), because
@@ -1492,6 +1500,7 @@ PIPELINE_HEALTH_SNAPSHOT_TABLES = (
     "search_health",
     "pgbackrest_health",
     "uploader_heartbeats",
+    "source_upstream_observations",
     "timeline_priority_mix",
     "agent_usage",
     "agent_failure_shapes",
@@ -3317,6 +3326,8 @@ TIMESTAMP_COLUMNS = {
     "conversation_started_at",
     # ops.uploader_heartbeats: when the current run-failure streak began.
     "failing_since",
+    # ops.source_upstream_observations: the source's own newest item (C11).
+    "upstream_newest_at",
     # Muse workspace files: when a path stopped existing (epoch while it does).
     "deleted_at",
     # SimpleFIN: the bridge's own balance stamp, the day a transaction
@@ -6670,6 +6681,19 @@ class PostgresWarehouse:
                 "widened search_benchmark_history with %s", ", ".join(added)
             )
         self._ensure_pipeline_health_mart_views()
+        self.ensure_source_upstream_health_view_if_possible()
+
+    def ensure_source_upstream_health_view_if_possible(self) -> None:
+        """C11's detector view, once every base table it compares against exists.
+
+        It reads five sources' base tables, provisioned by five ensure paths
+        that run in any order; each of those calls this too, so whichever runs
+        last creates it, and the ten-minute pipeline_health ensure keeps it
+        current in production.
+        """
+        if not all(self._relation_exists(table) for table in SOURCE_UPSTREAM_INPUT_TABLES):
+            return
+        self._ensure_view("marts_ops_source_upstream_health", source_upstream_health_view_sql())
 
     def _ensure_pipeline_health_mart_views(self) -> None:
         """Publish pipeline freshness with a status computed at read time.
@@ -6719,7 +6743,10 @@ class PostgresWarehouse:
                     state_table, state_rows, state_error_rows, state_attention_rows,
                     NULLIF(last_error, '') AS last_error,
                     NULLIF(last_error_at, {epoch}) AS last_error_at,
-                    NULLIF(collected_at, {epoch}) AS collected_at
+                    NULLIF(collected_at, {epoch}) AS collected_at,
+                    NULLIF(sla_detector, '') AS sla_detector,
+                    NULLIF(sla_detector_status, '') AS sla_detector_status,
+                    NULLIF(sla_exemption, '') AS sla_exemption
                 FROM @pipeline_health
             ),
             judged AS (
@@ -6835,7 +6862,19 @@ class PostgresWarehouse:
                 last_error_at,
                 collected_at,
                 (EXTRACT(EPOCH FROM now() - collected_at))::bigint AS snapshot_age_seconds,
-                note
+                note,
+                -- C11, appended so CREATE OR REPLACE keeps the old columns.
+                sla_detector,
+                -- A detector status older than the snapshot guard is a claim
+                -- about the collector, exactly like status above.
+                CASE
+                    WHEN sla_detector IS NULL THEN NULL
+                    WHEN collected_at IS NULL
+                      OR now() - collected_at > make_interval(
+                            secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
+                    ELSE sla_detector_status
+                END AS sla_detector_status,
+                sla_exemption
             FROM classified
             """,
         )
@@ -14786,6 +14825,48 @@ class PostgresWarehouse:
             if isinstance(parsed, dict):
                 payloads[str(message_id)] = parsed
         return payloads
+
+    _source_upstream_observations_ensured: bool = False
+
+    def record_source_upstream_observation(
+        self,
+        *,
+        pipeline: str,
+        scope: str,
+        upstream_newest_at: datetime | None,
+        upstream_newest_id: str = "",
+        detail: str = "",
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Store what a source itself says is its newest item (C11).
+
+        Written by the collector that just asked the provider, BEFORE it writes
+        what it fetched, so ``marts_ops.source_upstream_health`` can tell "the
+        provider has something PDW does not" from "the pipeline ran". A source
+        with nothing at all reports ``upstream_newest_at=None`` (stored as the
+        epoch), which is still a fresh observation. Idempotent per
+        (pipeline, scope); an older observation never overwrites a newer one.
+        """
+        observed = observed_at or datetime.now(tz=UTC)
+        if not self._source_upstream_observations_ensured:
+            self._ensure_table_group(["source_upstream_observations"])
+            self._source_upstream_observations_ensured = True
+        self._insert_rows(
+            "source_upstream_observations",
+            [
+                {
+                    "pipeline": pipeline,
+                    "scope": scope,
+                    "upstream_newest_at": upstream_newest_at or EPOCH_UTC,
+                    "upstream_newest_id": upstream_newest_id,
+                    "detail": detail[:500],
+                    "observed_at": observed,
+                    "updated_at": datetime.now(tz=UTC),
+                    "sync_version": int(observed.timestamp() * 1_000_000),
+                }
+            ],
+            SOURCE_UPSTREAM_OBSERVATION_COLUMNS,
+        )
 
     def insert_sync_state(
         self,

@@ -15,7 +15,7 @@ app's `/pipelines` page.
 | agent usage | `marts_ops.agent_usage` | are agents starting at the timeline and scoping by tier, per agent source |
 | search | `marts_ops.search_health`, `marts_ops.search_request_latency`, `marts_ops.search_benchmark`, `marts_ops.search_benchmark_history` | chunk/embedding convergence, BM25 index integrity, cache residency; real-traffic p50/p90 and slow-host mixes; weekly latency and MRR |
 | answers | `marts_ops.answer_benchmark` | does a fresh agent with only PDW answer real past questions right, cite the right source, in few calls (C16) |
-| per-source SLAs | `marts_ops.slack_conversation_health`, `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`, `marts_ops.voice_memo_landing_health` | Slack per conversation type; each Plaid institution (a `duplicate` or dead Item is a named row); each SimpleFIN account and which ledger account it reconciled onto; how many seconds a voice memo takes to become a transcript, PDW's part apart from iCloud's |
+| per-source SLAs | `marts_ops.source_upstream_health`, `marts_ops.slack_conversation_health`, `marts_ops.plaid_item_health`, `marts_ops.simplefin_account_health`, `marts_ops.voice_memo_landing_health` | has the newest item the source itself reports (Gmail, Calendar, Drive, WhatsApp, the Mac's Messages) landed in `base_*` (`missing_seconds`); Slack per conversation type; each Plaid institution (a `duplicate` or dead Item is a named row); each SimpleFIN account and which ledger account it reconciled onto; how many seconds a voice memo takes to become a transcript, PDW's part apart from iCloud's |
 | integrity and backups | `marts_ops.collation_health`, `marts_ops.pgbackrest_health` | did a page fail its checksum (row `data_checksums`) or the sort order move under an index; is the database backed up, is the newest backup clean (`integrity_status`), has a restore been drilled |
 
 {{if .CLI}}Run these with `pdw sql --output json -q '<why>' '<SQL>'`.{{else}}Run these through `query`.{{end}}
@@ -23,6 +23,10 @@ app's `/pipelines` page.
 ```sql
 SELECT pipeline, status, last_write_at, last_error
 FROM marts_ops.pipeline_health WHERE status NOT IN ('ok','manual') ORDER BY status;
+
+-- every source's stated SLA and its detector's verdict, or why it has none
+SELECT pipeline, data_basis, sla_detector, sla_detector_status, sla_exemption
+FROM marts_ops.pipeline_health WHERE kind = 'source' ORDER BY sla_detector_status NULLS LAST;
 
 SELECT view_schema, view_name, status, stalest_pipeline, stalest_pipeline_at
 FROM marts_ops.mart_view_health WHERE status <> 'ok' ORDER BY status;

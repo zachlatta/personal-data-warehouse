@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,11 +99,21 @@ func TestScanMatchesPythonGoldens(t *testing.T) {
 }
 
 type fakeClient struct {
-	batches     [][]map[string]any
-	attachments []ingestclient.AppleMessagesAttachment
+	batches      [][]map[string]any
+	attachments  []ingestclient.AppleMessagesAttachment
+	observations []ingestclient.SourceObservation
+	calls        []string
+	observeErr   error
+}
+
+func (f *fakeClient) PostSourceObservation(o ingestclient.SourceObservation) (map[string]any, error) {
+	f.calls = append(f.calls, "observe")
+	f.observations = append(f.observations, o)
+	return map[string]any{"ok": true}, f.observeErr
 }
 
 func (f *fakeClient) UploadAppleMessagesBatch(gz []byte, exportedAt string) (ingestclient.StoredObject, error) {
+	f.calls = append(f.calls, "batch")
 	f.batches = append(f.batches, testfixtures.DecodeGzipJSONL(gz))
 	return ingestclient.StoredObject{StorageKey: "apple-messages/inbox/batch"}, nil
 }
@@ -160,6 +171,50 @@ func TestRunnerUploadsManifestAndAttachmentThenSkipsUnchanged(t *testing.T) {
 	entry, _ := state.EntryFor("attachment_blob", "att-2")
 	if entry == nil || !entry.Complete || entry.StorageKey != "apple-messages/inbox/attachments/att-2" {
 		t.Fatalf("blob state = %+v", entry)
+	}
+}
+
+func TestRunnerPostsTheMacsOwnNewestMessageBeforeUploading(t *testing.T) {
+	state, err := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "zach@example.com", "/store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	client := &fakeClient{}
+	snapshot := scanFixture(t)
+	runner := &Runner{Account: "zach@example.com", Client: client, Logger: &common.RecordingLogger{}, State: state,
+		Now:             func() time.Time { return time.Date(2026, 5, 21, 13, 0, 0, 0, time.UTC) },
+		snapshotForTest: snapshot}
+	if _, err := runner.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	var newest Message
+	for _, m := range snapshot.Messages {
+		if m.MessageAt.After(newest.MessageAt) {
+			newest = m
+		}
+	}
+	if len(client.observations) != 1 {
+		t.Fatalf("observations = %+v", client.observations)
+	}
+	got := client.observations[0]
+	if got.Pipeline != "apple_messages" || got.Scope != "zach@example.com" || got.NewestID != newest.MessageID ||
+		got.NewestAt != common.ISOFormat(newest.MessageAt) || got.ObservedAt != "2026-05-21T13:00:00+00:00" {
+		t.Fatalf("observation = %+v, newest %s at %s", got, newest.MessageID, newest.MessageAt)
+	}
+	if client.calls[0] != "observe" {
+		t.Fatalf("calls = %v: observe before the batch upload", client.calls)
+	}
+}
+
+func TestAFailedObservationDoesNotFailTheUpload(t *testing.T) {
+	state, _ := OpenState(filepath.Join(t.TempDir(), "s.sqlite"), "z", "/store")
+	defer state.Close()
+	client := &fakeClient{observeErr: errors.New("app unreachable")}
+	runner := &Runner{Account: "z", Client: client, Logger: &common.RecordingLogger{}, State: state, snapshotForTest: scanFixture(t)}
+	summary, err := runner.Sync()
+	if err != nil || summary.BatchesUploaded != 1 {
+		t.Fatalf("summary = %+v, err = %v", summary, err)
 	}
 }
 

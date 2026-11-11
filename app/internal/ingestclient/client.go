@@ -714,6 +714,34 @@ func (c *Client) PostHeartbeat(h Heartbeat) (map[string]any, error) {
 	return c.SignedPost("/ingest/heartbeat", body, "application/json", nil)
 }
 
+// SourceObservation is what a device's own store says is its newest item
+// (contract C11). NewestAt is RFC 3339, or empty when the store holds nothing.
+type SourceObservation struct {
+	Pipeline   string
+	Scope      string
+	NewestAt   string
+	NewestID   string
+	Detail     string
+	ObservedAt string
+}
+
+// PostSourceObservation records it in ops.source_upstream_observations, where
+// marts_ops.source_upstream_health compares it with what landed in base_*.
+func (c *Client) PostSourceObservation(o SourceObservation) (map[string]any, error) {
+	body, err := common.CanonicalJSON(map[string]any{
+		"pipeline":           o.Pipeline,
+		"scope":              o.Scope,
+		"upstream_newest_at": o.NewestAt,
+		"upstream_newest_id": o.NewestID,
+		"detail":             o.Detail,
+		"observed_at":        o.ObservedAt,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return c.SignedPost("/ingest/source-observation", body, "application/json", nil)
+}
+
 // SignObjectUpload exposes the signature for tests that verify the wire shape.
 func (c *Client) SignObjectUpload(endpoint, contentSHA256 string, exp time.Time) string {
 	return c.signer.SignObjectUpload(endpoint, contentSHA256, exp)

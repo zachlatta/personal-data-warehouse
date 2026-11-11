@@ -85,19 +85,21 @@ func TestRunUploadsManifestAndAttachmentsThroughTheApp(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q out=%q", code, errOut, out)
 	}
 	paths := app.Paths()
-	var batches, attachments int
+	var batches, attachments, observations int
 	for _, path := range paths {
 		switch path {
 		case "/ingest/apple-messages/batch":
 			batches++
 		case "/ingest/apple-messages/attachment":
 			attachments++
+		case "/ingest/source-observation":
+			observations++
 		default:
 			t.Fatalf("unexpected endpoint %s", path)
 		}
 	}
-	if batches != 1 || attachments == 0 {
-		t.Fatalf("batches=%d attachments=%d (%v)", batches, attachments, paths)
+	if batches != 1 || attachments == 0 || observations != 1 {
+		t.Fatalf("batches=%d attachments=%d observations=%d (%v)", batches, attachments, observations, paths)
 	}
 	if !strings.Contains(out, "Apple Messages upload complete: messages=") || !strings.Contains(out, "batches=1") {
 		t.Fatalf("summary missing: %q", out)

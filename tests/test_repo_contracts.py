@@ -335,14 +335,21 @@ def test_s2_backlog_is_overdue_only_two_days_after_pdw_ingested_the_recording(mo
         assert "ingested_at < now() - interval '2 days'" in expression, column
 
 
-def _fake_c11_sql(monkeypatch, pipelines: list[dict] | None) -> dict[str, str]:
+def _c11_sla_row(pipeline: str, *, detector: str | None = None, status: str | None = None,
+                 exemption: str | None = None, basis: str = "measured") -> dict:
+    return {"pipeline": pipeline, "data_basis": basis, "sla_detector": detector,
+            "sla_detector_status": status, "sla_exemption": exemption}
+
+
+def _fake_c11_sql(monkeypatch, pipelines: list[dict] | None, slas: list[dict] | None = None) -> dict[str, str]:
     from scripts import contract_audit
 
     seen: dict[str, str] = {}
     rows = {
-        "slack health": [{"conversation_type": "im", "status": "ok"}],
-        "plaid health": [{"institution_name": "Bank", "status": "ok"}],
-        "simplefin health": [{"org_name": "Org", "name": "Checking", "status": "ok", "shared_with_plaid": 0}],
+        "source slas": slas if slas is not None else [
+            _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="ok"),
+            _c11_sla_row("hacker_news", exemption="every run re-lists the newest page of each list"),
+        ],
         "source pipeline health": pipelines,
     }
 
@@ -382,12 +389,44 @@ def test_c11_reads_only_source_pipelines_that_are_down(monkeypatch) -> None:
     assert "FROM marts_ops.pipeline_health" in sql
     assert "kind IN ('source', 'derived', 'enrichment')" in sql
     assert "status NOT IN ('ok', 'manual', 'unknown')" in sql
+    assert "kind = 'source'" in " ".join(seen["source slas"].split())
+
+
+def test_c11_is_red_while_a_source_has_no_stated_sla_or_no_detector_and_no_exemption(monkeypatch) -> None:
+    """The 2026-11-11 run: 16 of 41 sources stated no basis and most had no detector."""
+    from scripts import contract_audit
+
+    _fake_c11_sql(monkeypatch, [], slas=[_c11_sla_row("gmail", basis="")])
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.RED
+    assert "no stated SLA: ['gmail']" in verdict.evidence
+    assert "neither detector nor exemption: ['gmail']" in verdict.evidence
+
+
+def test_c11_grades_a_detector_that_is_not_ok_yellow(monkeypatch) -> None:
+    from scripts import contract_audit
+
+    _fake_c11_sql(monkeypatch, [], slas=[
+        _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="late"),
+        _c11_sla_row("slack", detector="marts_ops.slack_conversation_health", status=None),
+        _c11_sla_row("apple_voice_memos", detector="marts_ops.voice_memo_landing_health", status="quiet"),
+    ])
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.YELLOW
+    assert "gmail:marts_ops.source_upstream_health=late" in verdict.evidence
+    # A detector that has said nothing is not health.
+    assert "slack:marts_ops.slack_conversation_health=unknown" in verdict.evidence
+    assert "apple_voice_memos" not in verdict.evidence.split("not ok:")[1]
 
 
 def test_c11_withholds_its_verdict_when_pipeline_health_is_unreadable(monkeypatch) -> None:
+    """Before the sla_* columns are deployed the query fails: withheld, not green."""
     from scripts import contract_audit
 
-    _fake_c11_sql(monkeypatch, None)
+    monkeypatch.setattr(
+        contract_audit, "pdw_sql",
+        lambda intent, sql, **_k: None if intent == "source slas" else [],
+    )
     verdict = contract_audit.c11_source_slas()
 
     assert verdict.status == contract_audit.YELLOW

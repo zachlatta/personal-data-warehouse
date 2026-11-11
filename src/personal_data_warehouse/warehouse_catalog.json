@@ -2667,6 +2667,17 @@
       "secret": false
     },
     {
+      "id": "source_upstream_observations",
+      "kind": "table",
+      "layer": "ops",
+      "domain": "ops",
+      "schema": "ops",
+      "name": "source_upstream_observations",
+      "discoverable": false,
+      "query_access": "denied",
+      "secret": false
+    },
+    {
       "id": "uploader_heartbeats",
       "kind": "table",
       "layer": "ops",
@@ -2877,6 +2888,18 @@
       "query_access": "public",
       "secret": false,
       "comment": "Per SimpleFIN account: bridge balance age, sync verdict (`action_required` = claim a new setup token), and which ledger account it reconciled onto (`shared_with_plaid = 0` at a Plaid institution = possible double count)."
+    },
+    {
+      "id": "marts_ops_source_upstream_health",
+      "kind": "view",
+      "layer": "marts",
+      "domain": "ops",
+      "schema": "marts_ops",
+      "name": "source_upstream_health",
+      "discoverable": true,
+      "query_access": "public",
+      "secret": false,
+      "comment": "C11 detector. Per (pipeline, scope): the provider's own newest item vs the newest that landed in base_*. status: ok, late, failing (newest upstream item missing past tolerance), unknown (source not observed lately)."
     },
     {
       "id": "marts_ops_voice_memo_landing_health",
