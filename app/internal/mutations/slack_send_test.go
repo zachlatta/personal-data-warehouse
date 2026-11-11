@@ -366,7 +366,7 @@ func TestAPIUpdateSlackMessageEditsTheTextWithTheAppActor(t *testing.T) {
 			Payload: map[string]any{"conversation_id": "D1", "text": "old"}}},
 	})}
 	service := NewService(store, Config{})
-	srv := httptest.NewServer(service.APIHandler(func(next http.Handler) http.Handler { return next }))
+	srv := httptest.NewServer(service.APIHandler(passthrough))
 	defer srv.Close()
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+APIPath+"/requests/req-slack/mutations/mut-slack/update-slack-message", strings.NewReader(`{"text":"new words"}`))

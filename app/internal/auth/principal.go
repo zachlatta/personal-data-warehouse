@@ -23,6 +23,11 @@ const (
 	// tools API only, which is everything the pdw CLI calls. It cannot reach
 	// mutation review, so an agent cannot approve its own proposal.
 	ScopeAgent Scope = "agent"
+	// ScopeReviewer is an issued token for Zach's own review surfaces (the
+	// phone app): every surface full reaches, plus the mutation review
+	// decisions (approve, deny, edit, undo). A host CLI never holds one, so an
+	// agent on a host cannot approve its own proposal.
+	ScopeReviewer Scope = "reviewer"
 	// ScopeOAuthQuery is an OAuth MCP connector grant (/mcp only). It is
 	// never a static bearer: the token store refuses it there.
 	ScopeOAuthQuery Scope = "query"
@@ -31,7 +36,7 @@ const (
 // Issuable reports whether s is one of the scopes an issued token may carry.
 // Root is never issued: it is the master secret.
 func (s Scope) Issuable() bool {
-	return s == ScopeFull || s == ScopeAgent || externalfeeds.IsScope(string(s))
+	return s == ScopeFull || s == ScopeAgent || s == ScopeReviewer || externalfeeds.IsScope(string(s))
 }
 
 // agentToolsPath is the whole surface an agent-scoped token reaches.
@@ -50,10 +55,26 @@ func (p Principal) Allows(path string) bool {
 		return path == feed.Path
 	}
 	switch p.Scope {
-	case ScopeRoot, ScopeFull:
+	case ScopeRoot, ScopeFull, ScopeReviewer:
 		return true
 	case ScopeAgent:
 		return path == agentToolsPath || strings.HasPrefix(path, agentToolsPath+"/")
+	}
+	return false
+}
+
+// CanReview reports whether this principal may decide a mutation request:
+// approve, deny, supersede, undo, or edit one before it runs. Only the master
+// secret (the web app) and a reviewer token (the phone app) may; a full,
+// agent or feed token may propose and withdraw, never decide.
+func (p Principal) CanReview() bool {
+	switch p.Scope {
+	case ScopeRoot, ScopeReviewer:
+		return true
+	case ScopeFull:
+		// Transition: full tokens keep review until the phone's token is
+		// moved to the reviewer scope; the next commit removes this.
+		return true
 	}
 	return false
 }
@@ -97,6 +118,16 @@ func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 		return *h.principal, true
 	}
 	return Principal{}, false
+}
+
+// WithPrincipal returns ctx carrying p as the static-bearer principal, as
+// RequireStaticBearer would set it. Handlers under test use it.
+func WithPrincipal(ctx context.Context, p Principal) context.Context {
+	if !hasClientNameHolder(ctx) {
+		ctx = WithClientNameHolder(ctx)
+	}
+	setPrincipal(ctx, p)
+	return ctx
 }
 
 func setPrincipal(ctx context.Context, p Principal) {

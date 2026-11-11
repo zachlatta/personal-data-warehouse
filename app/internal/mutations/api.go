@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 // APIPath is the JSON surface the iOS app reviews mutations through. It is
@@ -120,6 +122,10 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	if actor == apiReviewerActorPrefix {
 		actor = apiReviewerActorPrefix + "ios"
 	}
+	if r.Method != http.MethodGet && !requestCanReview(r) {
+		apiError(w, http.StatusForbidden, reviewerOnlyMessage)
+		return
+	}
 	page, err := apiMutationPage(r)
 	if err != nil {
 		apiError(w, http.StatusBadRequest, err.Error())
@@ -218,6 +224,17 @@ func (s *Service) apiRequestRoute(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// reviewerOnlyMessage is the 403 an agent sees when it calls a review route.
+const reviewerOnlyMessage = "only Zach's web or phone session can approve, deny, supersede, undo or edit a mutation request; " +
+	"an agent proposes with propose_mutation and withdraws with withdraw_mutation"
+
+// requestCanReview reports whether the request's static-bearer principal may
+// decide a mutation request. A request with no principal never may.
+func requestCanReview(r *http.Request) bool {
+	principal, ok := auth.PrincipalFromContext(r.Context())
+	return ok && principal.CanReview()
 }
 
 // apiMutationPage reads ?offset=&limit= — the window of the request's

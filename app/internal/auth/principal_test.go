@@ -156,7 +156,7 @@ func TestRequireRootAdmitsOnlyTheMasterSecret(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})))
 	for authz, want := range map[string]int{
-		"Bearer codex:" + testMaster:  http.StatusNoContent,
+		"Bearer codex:" + testMaster: http.StatusNoContent,
 		"Bearer codex:pdw_gggg_full": http.StatusForbidden,
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/api/auth/tokens", nil)
@@ -166,6 +166,30 @@ func TestRequireRootAdmitsOnlyTheMasterSecret(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		if rec.Code != want {
 			t.Fatalf("%s: status = %d, want %d", authz, rec.Code, want)
+		}
+	}
+}
+
+func TestReviewerScopeReachesWhatFullDoesAndMayDecideMutations(t *testing.T) {
+	svc := newStaticBearerService(testMaster)
+	svc.SetTokenAuthenticator(&fakeTokens{principals: map[string]Principal{
+		"pdw_rrrr_reviewer": {Scope: ScopeReviewer, TokenID: "rrrr"},
+	}})
+	for _, path := range []string{"/api/tools", "/api/timeline", "/api/mutations/requests/abc/approve", "/api/push/register"} {
+		rec, p, _ := serveStatic(t, svc, path, "Bearer pixel:pdw_rrrr_reviewer")
+		if rec.Code != http.StatusOK || !p.CanReview() || p.TokenID != "rrrr" {
+			t.Fatalf("%s: status = %d, principal %+v", path, rec.Code, p)
+		}
+	}
+	if !ScopeReviewer.Issuable() {
+		t.Fatal("a reviewer token must be issuable for the phone app")
+	}
+	if (Principal{Scope: ScopeRoot}).CanReview() != true {
+		t.Fatal("the master secret (the web app) must be able to review")
+	}
+	for _, scope := range []Scope{ScopeAgent, ScopeOAuthQuery, Scope("feed:voice-memos"), Scope("")} {
+		if (Principal{Scope: scope}).CanReview() {
+			t.Fatalf("scope %q must not review mutations", scope)
 		}
 	}
 }

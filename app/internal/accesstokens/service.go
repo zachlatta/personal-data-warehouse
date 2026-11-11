@@ -166,7 +166,7 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (Issued, error) {
 		scope = pdwauth.ScopeFull
 	}
 	if !scope.Issuable() {
-		return Issued{}, fmt.Errorf("scope must be full, agent or a registered external feed scope")
+		return Issued{}, fmt.Errorf("scope must be full, agent, reviewer or a registered external feed scope")
 	}
 	idle := req.IdleTimeout
 	if idle == 0 {

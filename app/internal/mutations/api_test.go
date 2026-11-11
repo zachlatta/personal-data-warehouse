@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 )
 
 type apiFakeStore struct {
@@ -123,7 +125,93 @@ func (s *apiFakeStore) SupersedeRequest(context.Context, string, string, string)
 	return Request{}, errors.New("not used")
 }
 
-func passthrough(next http.Handler) http.Handler { return next }
+// passthrough stands in for the static bearer: it authenticates every
+// request as the phone's reviewer token.
+func passthrough(next http.Handler) http.Handler {
+	return asPrincipal(auth.Principal{Scope: auth.ScopeReviewer, TokenID: "phonetoken", ClientName: "pixel"})(next)
+}
+
+func asPrincipal(p auth.Principal) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
+		})
+	}
+}
+
+func unauthenticated(next http.Handler) http.Handler { return next }
+
+func newAPIServerAs(t *testing.T, store Store, requireAuth func(http.Handler) http.Handler) *httptest.Server {
+	t.Helper()
+	svc := NewService(store, Config{BaseURL: "https://pdw.example"})
+	mux := http.NewServeMux()
+	svc.RegisterAPI(mux, requireAuth)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// reviewRoutes is every route that decides or edits a request. A new one
+// must be added here, so the 403 test below covers it.
+var reviewRoutes = []string{
+	"/requests/req-1/approve",
+	"/requests/req-1/reject",
+	"/requests/req-1/supersede",
+	"/requests/req-1/mutations/mut-1/update-email",
+	"/requests/req-1/mutations/mut-1/update-slack-message",
+	"/requests/req-1/mutations/mut-1/update-text-message",
+	"/requests/req-1/mutations/mut-1/remove",
+	"/requests/req-1/mutations/mut-1/restore",
+}
+
+func TestOnlyAReviewerPrincipalReachesAReviewRoute(t *testing.T) {
+	nonReviewers := map[string]func(http.Handler) http.Handler{
+		"no principal": unauthenticated,
+		"agent token":  asPrincipal(auth.Principal{Scope: auth.ScopeAgent, TokenID: "agenttoken", ClientName: "pixel"}),
+		"feed token":   asPrincipal(auth.Principal{Scope: auth.Scope("feed:voice-memos"), TokenID: "feedtoken", ClientName: "web"}),
+	}
+	for name, requireAuth := range nonReviewers {
+		store := newAPIFakeStore(pendingFixture())
+		srv := newAPIServerAs(t, store, requireAuth)
+		for _, route := range reviewRoutes {
+			resp, err := http.Post(srv.URL+APIPath+route, "application/json", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := decodeBody(t, resp)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("%s: POST %s = %d, want 403 (%v)", name, route, resp.StatusCode, body)
+			}
+		}
+		if len(store.approved) != 0 || len(store.rejected) != 0 || len(store.removed) != 0 || len(store.restored) != 0 {
+			t.Fatalf("%s: a refused call still reached the store: %+v", name, store)
+		}
+		// Reading stays open: an agent may check what became of its proposal.
+		resp, err := http.Get(srv.URL + APIPath + "/requests/req-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: GET detail = %d, want 200", name, resp.StatusCode)
+		}
+	}
+	for name, p := range map[string]auth.Principal{
+		"master secret (web)": {Scope: auth.ScopeRoot, ClientName: "web"},
+		"reviewer (phone)":    {Scope: auth.ScopeReviewer, TokenID: "phonetoken", ClientName: "pixel"},
+	} {
+		store := newAPIFakeStore(pendingFixture())
+		srv := newAPIServerAs(t, store, asPrincipal(p))
+		resp, err := http.Post(srv.URL+APIPath+"/requests/req-1/approve", "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || len(store.approved) != 1 {
+			t.Fatalf("%s: approve = %d, approved %v", name, resp.StatusCode, store.approved)
+		}
+	}
+}
 
 func newAPIServer(t *testing.T, store Store) *httptest.Server {
 	t.Helper()

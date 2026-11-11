@@ -23,7 +23,7 @@ docs/agents/access-tokens.md. Managing them needs the master secret: an
 issued token cannot list, mint or revoke tokens.
 
   pdw token list [--output text|json]
-  pdw token create --name CLIENT [--label TEXT] [--idle 30d] [--ttl DURATION] [--scope full|agent]
+  pdw token create --name CLIENT [--label TEXT] [--idle 30d] [--ttl DURATION] [--scope full|agent|reviewer]
         Print a new token once. It dies after --idle without use (default 30d)
         and, with --ttl, at a hard expiry. Use it with "pdw login --token" or
         paste it into the iOS app or a web page.
@@ -66,7 +66,7 @@ func runToken(client *cliclient.Client, args []string, stdout, stderr io.Writer)
 		label := fs.String("label", "", "free-text note")
 		idle := fs.String("idle", "", "idle timeout, e.g. 30d")
 		ttl := fs.String("ttl", "", "hard expiry, e.g. 90d")
-		scope := fs.String("scope", "", "full (default) or agent")
+		scope := fs.String("scope", "", "full (default), agent, or reviewer (the phone app: may approve mutations)")
 		if err := fs.Parse(args[1:]); err != nil || fs.NArg() > 0 || strings.TrimSpace(*name) == "" {
 			fmt.Fprint(stderr, tokenUsage)
 			return 2
