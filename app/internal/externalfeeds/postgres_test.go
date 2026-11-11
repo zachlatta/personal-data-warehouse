@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
 )
@@ -122,4 +123,46 @@ func TestPostgresProjectionCursor(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0]["transcript"] != "new" {
 		t.Fatalf("re-enriched memo %v %v", rows, err)
 	}
+	t.Run("overlapping refresh waits before allocating arrivals", func(t *testing.T) {
+		probe := feed
+		probe.SourceSQL = `SELECT 'probe'::text AS item_key, now() AS recorded_at, '{"id":"probe"}'::text AS payload_json`
+		// A separate pool models an earlier poll on another app instance. The
+		// existing store has only one connection, so sharing it would test pool
+		// contention rather than the database advisory lock.
+		earlier, err := NewPostgresStore(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer earlier.Close()
+		tx, err := earlier.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, warehouse.SQLRelation("external_feed_items")); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT last_value FROM @external_feed_seq`)).Scan(&sequenceBefore); err != nil {
+			t.Fatal(err)
+		}
+		blocked, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer cancel()
+		_, _, _, err = store.Page(blocked, probe, cursor, 10)
+		if err == nil || blocked.Err() != context.DeadlineExceeded {
+			t.Fatalf("overlapping refresh did not wait for the earlier transaction: %v", err)
+		}
+		if err := store.db.QueryRowContext(ctx, warehouse.ExpandRelations(`SELECT last_value FROM @external_feed_seq`)).Scan(&sequenceAfter); err != nil {
+			t.Fatal(err)
+		}
+		if sequenceAfter != sequenceBefore {
+			t.Fatal("blocked refresh allocated arrivals before obtaining the lock")
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		rows, _, _, err := store.Page(ctx, probe, cursor, 10)
+		if err != nil || len(rows) != 1 || rows[0]["id"] != "probe" {
+			t.Fatalf("refresh did not recover after lock release: %v %v", rows, err)
+		}
+	})
 }
