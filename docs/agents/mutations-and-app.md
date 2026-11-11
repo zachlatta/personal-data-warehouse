@@ -921,3 +921,34 @@ and also when there is no location in the window, because missing data must neve
 the house to away. Home is `PDW_HOME_LATITUDE` / `PDW_HOME_LONGITUDE` /
 `PDW_HOME_RADIUS_METERS` (default 1000) on the Dagster deployment, never in Git; with none
 set the step is skipped.
+
+### Forbidden types and policy changes
+
+**Forbidden.** `TypeRuleFor` marks some kinds of change not agent-proposable whatever
+type name a later commit gives them: door locks (`lock.*`, `door_lock.*`), garage doors
+(`garage.*`, `garage_door.*`) and payments (`payment.*`, `payments.*`, `bank.*`,
+`money.*`). `ProposeMutation` refuses them before anything else ("…is forbidden: agents may
+never propose …"). No such type exists; the rule is there so adding one cannot make it
+agent-proposable by accident.
+
+**`pdw.mutation_policy`** is how a policy changes (`policy_change.go`). Agents may
+propose it; it is never auto-approvable. Actions: `put_policy` (a new policy or a new
+version; strict spec, and a live policy needs match rules, both rate limits and valid
+dates), `set_mode`, `grant` (to an issued token id, with a required `expires_at`),
+`revoke_grant`, `set_auto_approve`. A request that changes policies holds nothing else.
+At proposal PDW compares the change with the current state field by field
+(`policyNarrowing`) and stores the diff in the preview; the web and
+phone review show it with PDW's verdict. A change is a narrowing only when every action
+the new version allows was allowed before: a range only shrinks (so lowering the minimum
+from 55 to 50 widens), allowed values only shrink, deny rules only grow, limits only
+tighten (0 is "no limit"), dates only shrink, mode only moves enforce → dry_run → off, a
+grant is revoked or expires earlier, or the kill switch goes off. Anything not comparable
+is not a narrowing. A request of narrowings only is approved at once as `pdw:narrowing`
+and applied in the proposal's transaction: it takes every lock its changes touch (kill
+switch, then policy ids sorted, the same locks as the claim) and judges each change again
+against the state as it is under them, so two agents shortening one grant at once never
+lengthen it (the second is applied only if it still narrows, otherwise it waits for Zach);
+Zach still gets a quiet "Policy narrowed" push. Everything else waits for him, and an
+approval applies the change in the approving transaction (no worker claims it); one
+whose policy, grant or switch has changed since Zach read its diff is refused ("propose it
+again").

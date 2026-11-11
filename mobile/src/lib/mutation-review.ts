@@ -2408,3 +2408,28 @@ export function requestSchedule(request: { not_before?: string | null; not_after
     deadline: typeof request?.not_after === 'string' ? request.not_after.trim() : '',
   };
 }
+
+// A pdw.mutation_policy change as Zach reads it: PDW's verdict (does it only
+// narrow what runs without him?), why not, and the field-by-field diff.
+export type PolicyChangeReview = {
+  narrowing: boolean;
+  summary: string;
+  widens: string[];
+  diff: { field: string; before: string; after: string; verdict: string }[];
+};
+
+export function policyChangeReview(mutation: { operation?: string; preview?: unknown }): PolicyChangeReview | null {
+  if (mutation.operation !== 'pdw.mutation_policy') return null;
+  const preview = mutation.preview && typeof mutation.preview === 'object' ? (mutation.preview as Record<string, unknown>) : {};
+  const change = preview.policy_change && typeof preview.policy_change === 'object' ? (preview.policy_change as Record<string, unknown>) : {};
+  const show = (value: unknown) => (value === null || value === undefined ? 'none' : typeof value === 'string' ? value : JSON.stringify(value));
+  const diff = Array.isArray(change.diff) ? change.diff : [];
+  return {
+    narrowing: change.narrowing === true,
+    summary: typeof change.summary === 'string' ? change.summary : '',
+    widens: Array.isArray(change.widens) ? change.widens.filter((line): line is string => typeof line === 'string') : [],
+    diff: diff
+      .filter((line): line is Record<string, unknown> => !!line && typeof line === 'object')
+      .map((line) => ({ field: String(line.field ?? ''), before: show(line.before), after: show(line.after), verdict: String(line.verdict ?? '') })),
+  };
+}

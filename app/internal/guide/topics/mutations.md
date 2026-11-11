@@ -29,7 +29,8 @@ Supported types: `gmail.send_email`, `gmail.archive_threads`, `gmail.unarchive_t
 `calendar.delete_event`, `google_people.contacts`, `contacts.batch_mutation`, `slack.mark_conversation_read`,
 `slack.send_message`, `apple_notes.create_note`, `apple_notes.update_note`, `apple_contacts.create_contact`,
 `apple_contacts.update_contact`, `apple_contacts.merge_contacts`, `android_messages.send_message`,
-`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`. The help call is
+`apple_messages.mark_read`, `screen_timelapse.purge_moment`, `printer.print_document`, `resideo.set_thermostat`,
+`pdw.mutation_policy`. The help call is
 authoritative when this list and it disagree.
 
 ## Rules
@@ -144,6 +145,11 @@ authoritative when this list and it disagree.
 on) or `permanent`. It does not change the
   mode (heat, cool, off). The review shows the temperature and mode now and warns when the mode
   makes the change do nothing. An approval over an hour old is not applied: propose again.
+- **Never proposable:** door locks, garage doors and payments are forbidden types; the
+  proposal is refused. **Policies** change only through `pdw.mutation_policy` (see its help):
+  PDW, not you, decides whether a change only narrows (then it applies at once) or needs Zach
+  (a new policy or grant, any widening, switching auto-approval on). Turning a policy off or
+  the kill switch off always narrows, so do it when automation is misbehaving.
 - **Approve now, run later:** any entry may carry `not_before` / `not_after` (RFC 3339 with a
   zone). A `resideo.set_thermostat` entry may also carry `precondition`
   `{"kind": "not_home", "within_minutes": 120}` (skipped, never run, when recent phone

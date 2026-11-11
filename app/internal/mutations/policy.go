@@ -72,6 +72,24 @@ type TypeRule struct {
 // needs Zach's approval until it is listed here as auto-approvable.
 var typeRules = map[string]TypeRule{
 	ResideoSetThermostatOperation: {AgentProposable: true, AutoApprovable: true},
+	// A policy change: agents may propose one, no policy may approve one.
+	// Only a change PDW proves a narrowing applies without Zach.
+	PolicyChangeOperation: {AgentProposable: true, AutoApprovable: false},
+}
+
+// forbiddenCategories are kinds of change agents may never propose, whatever
+// type a later commit names them with: unlocking a door, opening a garage,
+// moving money. The key is the type's provider (the part before the dot).
+var forbiddenCategories = map[string]string{
+	"lock":        "door locks",
+	"door_lock":   "door locks",
+	"doorlock":    "door locks",
+	"garage":      "garage doors",
+	"garage_door": "garage doors",
+	"payment":     "payments",
+	"payments":    "payments",
+	"bank":        "payments",
+	"money":       "payments",
 }
 
 // TypeRuleFor returns the rule for an operation.
@@ -79,7 +97,18 @@ func TypeRuleFor(operation string) TypeRule {
 	if rule, ok := typeRules[operation]; ok {
 		return rule
 	}
+	if _, forbidden := ForbiddenCategory(operation); forbidden {
+		return TypeRule{AgentProposable: false, AutoApprovable: false}
+	}
 	return TypeRule{AgentProposable: true, AutoApprovable: false}
+}
+
+// ForbiddenCategory names what a forbidden operation is (door locks, garage
+// doors, payments), and false for any other operation.
+func ForbiddenCategory(operation string) (string, bool) {
+	provider, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(operation)), ".")
+	category, ok := forbiddenCategories[provider]
+	return category, ok
 }
 
 // FieldRule is one field's limit. In a policy's match rules it says what the

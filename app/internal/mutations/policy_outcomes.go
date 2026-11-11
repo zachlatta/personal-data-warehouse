@@ -22,6 +22,9 @@ const (
 	// PolicyOutcomeSkipped: a scheduled step's precondition failed, so the
 	// worker skipped it (any request, approved by a policy or by Zach).
 	PolicyOutcomeSkipped = "skipped_precondition"
+	// PolicyOutcomeNarrowed: a policy change PDW proved a narrowing applied
+	// without review; Zach is still told.
+	PolicyOutcomeNarrowed = "narrowed"
 
 	// PolicyAutoOffAfterFailures is how many failed runs in a row turn a
 	// policy off.
@@ -80,11 +83,13 @@ func (s *PostgresStore) ClaimPolicyOutcomes(ctx context.Context, limit int) ([]P
 			WHERE e.request_id = request.id
 		) AS flags
 		WHERE request.updated_at >= now() - interval '2 days'
-		  AND (starts_with(request.approved_by, 'policy:') OR request.status = 'pending_review' OR flags.skipped_index >= 0)
+		  AND (starts_with(request.approved_by, 'policy:') OR request.approved_by = 'pdw:narrowing'
+		       OR request.status = 'pending_review' OR flags.skipped_index >= 0)
 		  AND ((flags.recheck_index > flags.reported_recheck AND request.status = 'pending_review')
 		       OR flags.skipped_index > flags.reported_skip
 		       OR (NOT flags.outcome_reported AND starts_with(request.approved_by, 'policy:')
-		           AND request.status IN ('succeeded', 'observed', 'failed_terminal', 'blocked_missing_credentials')))
+		           AND request.status IN ('succeeded', 'observed', 'failed_terminal', 'blocked_missing_credentials'))
+		       OR (NOT flags.outcome_reported AND request.approved_by = 'pdw:narrowing' AND request.status = 'succeeded'))
 		ORDER BY request.updated_at
 		LIMIT $1
 		FOR UPDATE OF request SKIP LOCKED
@@ -140,6 +145,11 @@ func (s *PostgresStore) ClaimPolicyOutcomes(ctx context.Context, limit int) ([]P
 				return nil, err
 			}
 			outcomes = append(outcomes, PolicyOutcome{Kind: PolicyOutcomeSentBack, Request: Request{ID: c.id}})
+		case !c.outcomeReported && c.approvedBy == NarrowingActor && c.status == "succeeded":
+			if err := appendRequestEvent(ctx, tx, c.id, "policy_outcome_reported", "pdw", NarrowingActor, map[string]any{"status": c.status, "kind": PolicyOutcomeNarrowed}); err != nil {
+				return nil, err
+			}
+			outcomes = append(outcomes, PolicyOutcome{Kind: PolicyOutcomeNarrowed, Request: Request{ID: c.id}})
 		case !c.outcomeReported && strings.HasPrefix(c.approvedBy, PolicyActorPrefix) && (undoableStatuses[c.status] || policyFailedStatuses[c.status]):
 			policyID := policyIDFromActor(c.approvedBy)
 			kind := PolicyOutcomeApplied
@@ -282,6 +292,10 @@ func PolicyOutcomeAlert(outcome PolicyOutcome) map[string]any {
 		alert["title"] = "Back for your review: " + request.Title
 		alert["snippet"] = firstNonEmpty(request.Error, "an automatic approval no longer held when it was about to run")
 		alert["category"], alert["kind"] = "mutation_review", "mutation_request"
+	case PolicyOutcomeNarrowed:
+		alert["title"] = "Policy narrowed: " + request.Title
+		alert["snippet"] = strings.TrimSpace("PDW applied it without asking you because it only narrows what may run on its own. " + request.Reason)
+		alert["quiet"] = true
 	case PolicyOutcomeSkipped:
 		alert["title"] = "Skipped: " + request.Title
 		alert["snippet"] = firstNonEmpty(outcome.Detail, request.Error, "Its precondition did not hold, so it did not run.")

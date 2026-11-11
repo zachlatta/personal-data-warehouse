@@ -1211,7 +1211,34 @@ function renderMutation(request, mutation, actions) {
   return card;
 }
 
+function renderPolicyChange(mutation) {
+  const view = V.policyChangeView(mutation);
+  const article = h("article", "mut policy-change");
+  article.appendChild(mutationHead("pdw", mutation.title || "Change mutation policies", mutation.status));
+  article.appendChild(h("p", view.narrowing ? "ok" : "warn", view.narrowing
+    ? "PDW checked this only narrows what may run without you."
+    : "Widens what may run without you: " + (view.widens.join("; ") || "not provably a narrowing")));
+  if (view.summary) article.appendChild(h("p", "mreason", view.summary));
+  if (mutation.reason) article.appendChild(h("p", "m", mutation.reason));
+  if (mutation.error) article.appendChild(h("p", "bad", mutation.error));
+  const diff = V.policyChangeTable(view);
+  const table = h("table", diff.className);
+  const thead = h("thead"); const head = h("tr");
+  diff.headers.forEach((t) => head.appendChild(h("th", "", t)));
+  thead.appendChild(head); table.appendChild(thead);
+  const tbody = h("tbody");
+  for (const row of diff.rows) {
+    const tr = h("tr", row.widens ? "widens" : "");
+    row.cells.forEach((cell, i) => tr.appendChild(h("td", i === row.cells.length - 1 ? (row.widens ? "bad" : "m") : "", cell)));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  article.appendChild(table);
+  return article;
+}
+
 function renderMutationCard(request, mutation, actions) {
+  if (V.policyChangeView(mutation)) return renderPolicyChange(mutation);
   if (V.isGmailEmailMutation(mutation)) return renderGmailEmail(request, mutation, actions);
   if (V.isGmailSettingsMutation(mutation)) return renderGmailSettings(mutation);
   if (V.isCalendarMutation(mutation)) return renderCalendar(mutation);

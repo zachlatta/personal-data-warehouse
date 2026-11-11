@@ -1356,3 +1356,14 @@ test('mutationSchedule shows each step its own runs-at, deadline and preconditio
   assert.match(step.precondition, /at home .*120 minutes/);
   assert.deepEqual(mutationSchedule({}), { runsAt: '', deadline: '', precondition: '' });
 });
+
+test('policyChangeReview shows the verdict and the diff of a policy change', async () => {
+  const { policyChangeReview } = await import('./mutation-review.ts');
+  assert.equal(policyChangeReview({ operation: 'gmail.send_email' }), null);
+  const review = policyChangeReview({ operation: 'pdw.mutation_policy', preview: { policy_change: {
+    narrowing: false, widens: ['match.heat_setpoint: a lower or removed minimum'],
+    diff: [{ field: 'match.heat_setpoint', before: 'min 55, max 72', after: 'min 50, max 72', verdict: 'widens' }],
+  } } });
+  assert.equal(review.narrowing, false);
+  assert.equal(review.diff[0].verdict, 'widens');
+});

@@ -674,6 +674,30 @@ func MutationHelp() MutationHelpDocument {
 					"The worker re-reads the thermostat, skips a setpoint already held, writes, and reads back to report verified. An approval over an hour old is not applied: propose again. Status lives in ops.upstream_mutation_operations; the change appears in base_resideo.thermostat_readings.",
 			},
 			{
+				Type:    PolicyChangeOperation,
+				Summary: "Change Zach's mutation auto-approval policies: create or change a policy, set its mode, grant or revoke a workflow token, or flip the kill switch. Never auto-approved; PDW applies at once only a change it proves narrows.",
+				Fields: []MutationHelpArg{
+					{Name: "type", JSONType: "string", Required: true, Description: "literal " + PolicyChangeOperation},
+					{Name: "action", JSONType: "string", Required: true, Description: "put_policy, set_mode, grant, revoke_grant or set_auto_approve"},
+					{Name: "policy", JSONType: "object", Required: false, Description: "put_policy: {id, operation, account, match, deny, limits, mode, valid_from, valid_until}. match per field: {min, max} (inclusive), {in: [...]} or {absent: true}; deny per field: {below}, {above} or {in}; limits: max_per_day, max_per_hour, min_interval_minutes, input_max_age_minutes, pause_after_manual_change_hours. A policy that is not off needs match, both rate limits and valid dates"},
+					{Name: "policy_id", JSONType: "string", Required: false, Description: "set_mode: the policy"},
+					{Name: "mode", JSONType: "string", Required: false, Description: "set_mode: off, dry_run or enforce"},
+					{Name: "grant", JSONType: "object", Required: false, Description: "grant: {id, policy_id, token_id (an issued agent token's id from pdw token list, never a client name), label, expires_at}"},
+					{Name: "grant_id", JSONType: "string", Required: false, Description: "revoke_grant: the grant"},
+					{Name: "enabled", JSONType: "boolean", Required: false, Description: "set_auto_approve: false switches every automatic approval off"},
+					{Name: "reason", JSONType: "string", Required: true, Description: "why the policy changes"},
+				},
+				Example: map[string]any{
+					"type":      PolicyChangeOperation,
+					"action":    "set_mode",
+					"policy_id": "heating-winter",
+					"mode":      "off",
+					"reason":    "the house sitter is staying this week",
+				},
+				ExtraNotes: "A request that changes policies holds only policy changes. PDW compares the proposal with the current policy field by field and applies it at once only when every action the new version allows was allowed before: a range only shrinks, allowed values only shrink, deny rules only grow, limits only tighten, dates only shrink, mode only moves enforce → dry_run → off, a grant is revoked or expires earlier, or the kill switch goes off. " +
+					"Lowering a minimum is a widening even though a number got lower. Anything else (a new policy or grant, a widening, switching on) waits for Zach, who sees the diff. A change approved later is refused if the policy changed since it was proposed.",
+			},
+			{
 				Type:    PrinterPrintDocumentOperation,
 				Summary: "Print one PDF on Zach's home printer (the Brother MFC-L2710DW), one-sided, black and white, on US Letter. Executed at home beside the scanner, not in the cloud.",
 				Fields: []MutationHelpArg{

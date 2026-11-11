@@ -27,7 +27,7 @@ func newPolicyFixture(t *testing.T, mode string) policyFixture {
 	store := testStore(t)
 	ctx := context.Background()
 	suffix := randomSuffix(t)
-	f := policyFixture{store: store, service: NewService(store, Config{}), device: "DEV" + suffix, policyID: "heating-" + suffix, tokenID: "tok_" + suffix}
+	f := policyFixture{store: store, service: NewService(store, Config{}), device: "DEV" + suffix, policyID: "heating-" + strings.ReplaceAll(suffix, "_", ""), tokenID: "tok_" + suffix}
 	for _, statement := range []string{
 		`CREATE SCHEMA IF NOT EXISTS base_resideo`,
 		`CREATE TABLE IF NOT EXISTS base_resideo.thermostats (

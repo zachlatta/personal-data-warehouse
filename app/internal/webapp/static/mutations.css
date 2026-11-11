@@ -506,3 +506,9 @@ summary.slack-group-summary::-webkit-details-marker, summary.slack-review-summar
 .policy-panel .policy-switch { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .policy-panel .policy-row { padding: 8px 0; border-top: 1px solid var(--border); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .policy-panel .policy-row > div { flex-basis: 100%; }
+
+/* a policy change's diff: four left-aligned columns, never the request list's
+   rtable column rules (which right-align and hide its 3rd and 4th columns) */
+table.policy-diff { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+table.policy-diff th, table.policy-diff td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.policy-diff th { font-weight: 500; color: var(--text-2); }

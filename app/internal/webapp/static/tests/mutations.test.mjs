@@ -792,3 +792,30 @@ test("mutationSchedule shows each step its own runs-at, deadline and preconditio
   assert.match(step.precondition, /at home .*120 minutes/);
   assert.deepEqual(V.mutationSchedule({}), { runsAt: "", deadline: "", precondition: "" });
 });
+
+test("policyChangeView shows PDW's verdict and the diff a reviewer approves", () => {
+  assert.equal(V.policyChangeView({ operation: "gmail.send_email" }), null);
+  const view = V.policyChangeView({ operation: "pdw.mutation_policy", preview: { policy_change: {
+    narrowing: false, summary: "changes policy heating-winter (v1 → v2)",
+    widens: ["match.heat_setpoint: a lower or removed minimum"],
+    diff: [{ field: "match.heat_setpoint", before: "min 55, max 72", after: "min 50, max 72", verdict: "widens" }],
+  } } });
+  assert.equal(view.narrowing, false);
+  assert.deepEqual(view.widens, ["match.heat_setpoint: a lower or removed minimum"]);
+  assert.equal(view.diff[0].after, "min 50, max 72");
+});
+
+test("policyChangeTable lines each value up under its own header, apart from the request list's column rules", () => {
+  const view = V.policyChangeView({ operation: "pdw.mutation_policy", preview: { policy_change: {
+    narrowing: false,
+    diff: [{ field: "match.heat_setpoint", before: "min 55, max 72", after: "min 50, max 72", verdict: "widens" }],
+  } } });
+  const table = V.policyChangeTable(view);
+  // The request list's table class right-aligns and (on phones) hides its
+  // 3rd and 4th columns, which put "After" over the verdict column.
+  assert.notEqual(table.className, "rtable");
+  assert.deepEqual(table.headers, ["Field", "Before", "After", "Verdict"]);
+  for (const row of table.rows) assert.equal(row.cells.length, table.headers.length);
+  assert.deepEqual(table.rows[0].cells, ["match.heat_setpoint", "min 55, max 72", "min 50, max 72", "widens"]);
+  assert.equal(table.rows[0].widens, true);
+});

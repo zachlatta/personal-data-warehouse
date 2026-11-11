@@ -42,6 +42,7 @@ import {
   policyBadge,
   requestSchedule,
   mutationSchedule,
+  policyChangeReview,
   requestDecision,
   requestKindLabel,
   requestLifecycle,
@@ -122,6 +123,28 @@ function MutationCardBody({ mutation, pending, busy, onRemove, onSaveSlackMessag
   if (isCalendarCreateMutation(mutation)) return <CalendarMutationCard mutation={mutation} requestReason={requestReason} />;
   if (isContactMutation(mutation)) return <ContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
   if (isAppleContactsMutation(mutation)) return <AppleContactMutationCard mutation={mutation} pending={pending} onRemove={onRemove} requestReason={requestReason} />;
+  const policyChange = policyChangeReview(mutation);
+  if (policyChange) {
+    return (
+      <View style={[styles.card, { backgroundColor: theme.backgroundElement }]}>
+        <View style={styles.cardHeader}>
+          <ThemedText type="smallBold">{mutation.title || 'Change mutation policies'}</ThemedText>
+          <StatusPill status={mutation.status} />
+        </View>
+        <ThemedText type="small" style={policyChange.narrowing ? undefined : styles.error}>
+          {policyChange.narrowing ? 'PDW checked this only narrows what may run without you.' : `Widens what may run without you: ${policyChange.widens.join('; ') || 'not provably a narrowing'}`}
+        </ThemedText>
+        {policyChange.summary ? <ThemedText type="small" themeColor="textSecondary">{policyChange.summary}</ThemedText> : null}
+        {policyChange.diff.map((line) => (
+          <View key={line.field} style={styles.field}>
+            <ThemedText type="small" themeColor="textSecondary">{line.field} · {line.verdict}</ThemedText>
+            <ThemedText type="small" selectable>{line.before} → {line.after}</ThemedText>
+          </View>
+        ))}
+        {mutation.error ? <ThemedText style={styles.error}>{mutation.error}</ThemedText> : null}
+      </View>
+    );
+  }
   const merged = flattenPayload(mutation.payload ?? {});
   const headline = HEADLINE_KEYS.filter((key) => merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);
   const rest = Object.keys(merged).filter((key) => !HEADLINE_KEYS.includes(key) && merged[key] !== undefined && merged[key] !== '' && merged[key] !== null);

@@ -186,6 +186,9 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	if normalized, err = s.enrichThermostatChanges(ctx, normalized); err != nil {
 		return Request{}, err
 	}
+	if normalized, err = s.enrichPolicyChanges(ctx, normalized); err != nil {
+		return Request{}, err
+	}
 	s.enrichContactPreviews(ctx, normalized)
 	s.enrichSlackMarkReadPreviews(ctx, normalized)
 	s.enrichSlackSendMessagePreviews(ctx, normalized)
@@ -281,6 +284,13 @@ func (s *PostgresStore) CreateRequest(ctx context.Context, input CreateRequestIn
 	}
 	if evaluation.Relevant() {
 		if err := recordPolicyEvaluation(ctx, tx, requestID, "propose", evaluation); err != nil {
+			return Request{}, err
+		}
+	}
+	if allNarrowings(normalized) {
+		// A policy change PDW proved only narrows (or a kill switch) applies
+		// at once, judged again under the policy's lock as it is applied.
+		if err := approveAsNarrowing(ctx, tx, requestID, now); err != nil {
 			return Request{}, err
 		}
 	}
@@ -940,6 +950,10 @@ func (s *PostgresStore) ApproveRequest(ctx context.Context, id string, actor str
 		}
 	}
 	if err := appendRequestEvent(ctx, tx, id, "approved", "human", actor, map[string]any{"approved_mutation_ids": pendingIDs}); err != nil {
+		return Request{}, err
+	}
+	// A policy change applies in this transaction: nothing claims it.
+	if err := applyPolicyChanges(ctx, tx, id, actor, false, now); err != nil {
 		return Request{}, err
 	}
 	// PostgreSQL delivers NOTIFY only after this transaction commits, so a
@@ -2083,6 +2097,19 @@ func normalizeForStorage(input CreateRequestInput) ([]storedMutation, error) {
 				Title:     optionalTitle(mutation.Title, thermostatChangeTitle(change)),
 				Reason:    reason,
 				Payload:   thermostatChangePayload(change),
+			})
+		case PolicyChangeOperation:
+			payload, err := policyChangeFromInput(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("mutation %d %w", index, err)
+			}
+			out = append(out, storedMutation{
+				Provider:  PolicyChangeProvider,
+				Operation: PolicyChangeOperation,
+				Account:   PolicyChangeAccount,
+				Title:     optionalTitle(mutation.Title, "Change mutation policies: "+stringFromAny(payload["action"])),
+				Reason:    reason,
+				Payload:   payload,
 			})
 		case PrinterPrintDocumentOperation:
 			doc, err := printDocumentFromInput(mutation)

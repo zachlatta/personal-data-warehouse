@@ -86,6 +86,32 @@ export function requestSchedule(request) {
   return { runsAt: trimStr(r.not_before), deadline: trimStr(r.not_after) };
 }
 
+// policyChangeView is a pdw.mutation_policy change as the reviewer reads it:
+// PDW's verdict (narrowing or not), why not, and the field-by-field diff.
+export function policyChangeView(mutation) {
+  if (!mutation || mutation.operation !== "pdw.mutation_policy") return null;
+  const change = asMap(asMap(mutation.preview).policy_change);
+  const show = (value) => (value === null || value === undefined) ? "none" : (typeof value === "string" ? value : JSON.stringify(value));
+  return {
+    narrowing: change.narrowing === true,
+    summary: trimStr(change.summary),
+    widens: stringSlice(change.widens).map((line) => line.trim()).filter(Boolean),
+    diff: mapSlice(change.diff).map((line) => ({ field: trimStr(line.field), before: show(line.before), after: show(line.after), verdict: trimStr(line.verdict) })),
+  };
+}
+
+// policyChangeTable is the diff of a policy change as a table: one header per
+// column and the same four cells in every row. Its own class: the request
+// list's "rtable" right-aligns its 3rd column and hides the 3rd and 4th on a
+// phone, which shifted "After" over the verdict.
+export function policyChangeTable(view) {
+  return {
+    className: "policy-diff",
+    headers: ["Field", "Before", "After", "Verdict"],
+    rows: (view ? view.diff : []).map((line) => ({ cells: [line.field, line.before, line.after, line.verdict], widens: line.verdict === "widens" })),
+  };
+}
+
 // policyBadge is the mutation policy's decision as a badge: "would
 // auto-approve" for a dry run, who approved it for an enforced policy, and
 // why a policy did not cover it. Null when no policy could touch the request.
