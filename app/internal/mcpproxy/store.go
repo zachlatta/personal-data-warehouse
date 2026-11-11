@@ -47,17 +47,20 @@ type record struct {
 	Clients    []string
 	// Loopback redirects OAuth to loopbackRedirectURL instead of PDW's
 	// callback, for providers that accept only local clients' redirects.
-	Loopback  bool
-	Deleted   bool
-	Version   int64
-	Token     oauth2.Token
-	OAuth     oauth2.Config
-	Resource  string
-	Issuer    string
-	Pending   *pendingAuth
-	Tools     []*mcp.Tool
-	Status    string
-	UpdatedAt time.Time
+	Loopback               bool
+	Deleted                bool
+	Version                int64
+	Token                  oauth2.Token
+	OAuth                  oauth2.Config
+	Resource               string
+	Issuer                 string
+	Pending                *pendingAuth
+	Tools                  []*mcp.Tool
+	Status                 string
+	UpdatedAt              time.Time
+	LastDiscoveryAttemptAt time.Time
+	LastDiscoveredAt       time.Time
+	DiscoveryStatus        string
 }
 
 // Store serializes all changes to a connection, including rotating refresh

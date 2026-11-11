@@ -200,6 +200,12 @@ func NewMux(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, mu
 }
 
 func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) http.Handler {
+	return NewMuxWithBackground(nil, cfg, authSvc, runner, notificationSvc, mutationSvcs...)
+}
+
+// NewMuxWithBackground attaches periodic proxy discovery to the app lifecycle.
+// A nil context builds a request-only mux for tests and embedded callers.
+func NewMuxWithBackground(ctx context.Context, cfg config.Config, authSvc *pdwauth.Service, runner query.Runner, notificationSvc *notifications.Service, mutationSvcs ...*mutations.Service) http.Handler {
 	logger := slog.Default().With("component", "http")
 	mux := http.NewServeMux()
 	if notificationSvc != nil {
@@ -481,6 +487,35 @@ func NewMuxWithNotifications(cfg config.Config, authSvc *pdwauth.Service, runner
 			}
 			proxy = mcpproxy.New(store, baseURL, nil)
 			proxy.Register(mux, authSvc.RequireStaticBearer())
+			if ctx != nil {
+				go func() {
+					defer store.Close()
+					var hb *uploaderHeartbeatStore
+					defer func() {
+						if hb != nil {
+							_ = hb.Close()
+						}
+					}()
+					proxy.RunRefreshLoop(ctx, func(refreshErr error) {
+						if hb == nil {
+							var err error
+							hb, err = newUploaderHeartbeatStore(cfg.PostgresDatabaseURL, cfg.QueryTimeout)
+							if err != nil {
+								logger.Error("MCP refresh heartbeat store unavailable")
+								return
+							}
+						}
+						run := uploaderHeartbeat{Pipeline: "mcp_proxy", Device: "app", RanAt: time.Now().UTC().Format(time.RFC3339)}
+						if refreshErr != nil {
+							run.ExitCode = 1
+							run.Error = refreshErr.Error()
+						}
+						if _, err := hb.upsert(ctx, run); err != nil {
+							logger.Error("MCP refresh heartbeat could not be recorded")
+						}
+					})
+				}()
+			}
 		}
 	}
 	if proxy == nil {

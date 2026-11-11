@@ -63,6 +63,7 @@ export function mount(container, ctx) {
       for (const c of data.connections) {
         const card = h("section", "connection-card");
         card.append(h("h2", "", c.name), h("p", "connection-url", c.url), h("p", "", `${c.enabled ? c.status.replaceAll("_", " ") : "disabled"} · ${c.tool_count} tools · prefix ${c.name}__${c.loopback ? " · loopback sign-in" : ""}`));
+        card.append(h("p", "", `Tool discovery: ${c.discovery_status || "not yet run"} · last success: ${c.last_discovered_at && !c.last_discovered_at.startsWith("0001") ? new Date(c.last_discovered_at).toLocaleString() : "never"}. Refreshes automatically every five minutes.`));
         const paste = h("div", "connection-paste");
         const controls = h("div", "connection-actions");
         const authenticate = button("Authenticate", "primary");

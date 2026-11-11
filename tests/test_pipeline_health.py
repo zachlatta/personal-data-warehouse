@@ -704,9 +704,10 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
         VALUES
             ('apple_notes', 'porygon', %s, 'error', 'PermissionError: Operation not permitted', 1, 3, %s, 2),
             ('apple_messages', 'porygon', %s, 'ok', '', 0, 5, %s, 2),
-            ('claude_code', 'porygon', %s, 'ok', '', 0, 5, %s, 2)
+            ('claude_code', 'porygon', %s, 'ok', '', 0, 5, %s, 2),
+            ('mcp_proxy', 'app', %s, 'error', 'example: discovery failed', 1, 0, %s, 2)
         """,
-        (now, now, now, now, now - timedelta(hours=5), now - timedelta(hours=5)),
+        (now, now, now, now, now - timedelta(hours=5), now - timedelta(hours=5), now, now),
     )
     PipelineHealthCollector(warehouse).run()
 
@@ -715,7 +716,7 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
         for row in warehouse._query_dicts(
             "SELECT pipeline, status, run_status, state_rows, state_error_rows, last_error, last_run_at"
             " FROM @marts_pipeline_health"
-            " WHERE pipeline IN ('apple_notes', 'apple_messages', 'claude_code', 'codex', 'uploader_heartbeats')"
+            " WHERE pipeline IN ('apple_notes', 'apple_messages', 'claude_code', 'codex', 'uploader_heartbeats', 'mcp_proxy')"
         )
     }
     assert rows["apple_notes"]["status"] == "failing"
@@ -724,6 +725,8 @@ def test_uploader_heartbeats_give_each_uploader_pipeline_its_own_run_status(ware
     # Only its own row: the notes failure does not leak into messages.
     assert rows["apple_messages"]["state_error_rows"] == 0
     assert rows["apple_messages"]["run_status"] == "ok"
+    assert rows["mcp_proxy"]["status"] == "failing"
+    assert rows["mcp_proxy"]["last_error"] == "example: discovery failed"
     # A heartbeat five hours old on a thirty-minute cadence is past stale (6x).
     assert rows["claude_code"]["run_status"] == "stale"
     # No row at all is not a failure, it is the absence of a heartbeat.
@@ -738,6 +741,17 @@ INGEST_HEARTBEAT_EXEMPT_PIPELINES: dict[str, str] = {
     ),
     "uploader_heartbeats": "the internal heartbeat collector meta-pipeline itself",
 }
+
+
+def test_mcp_discovery_has_a_scoped_scheduled_heartbeat():
+    entry = pipeline("mcp_proxy")
+    assert entry.expected_run_interval == timedelta(minutes=10)
+    assert entry.state is not None
+    assert entry.state.table == "uploader_heartbeats"
+    assert entry.state.scope_column == "pipeline"
+    assert entry.state.scope_value == "mcp_proxy"
+    assert entry.state.status_column == "status"
+    assert entry.state.error_column == "error"
 
 
 def test_every_remote_device_uploader_declares_a_run_heartbeat():

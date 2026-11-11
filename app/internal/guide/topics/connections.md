@@ -67,4 +67,9 @@ separate tool calls. Use the provider's Streamable HTTP endpoint, not its websit
 
 Connection status and tool counts are on `/connections`. Other PDW tools remain available
 when an upstream fails. A failed discovery retains the previous tool set and reports the
-failure. The tools are a discovery snapshot: click Refresh tools after upstream changes.
+failure. PDW refreshes every enabled connection on app startup and every five minutes,
+with up to four discoveries in parallel and a 60-second budget each. Added, removed and
+changed tools replace the snapshot automatically; Refresh tools uses the same discovery
+path for an immediate check. Disabled connections are not polled. `/connections` shows
+discovery status and last success separately from call status; `/pipelines` reports
+the sweep heartbeat and failures. Clients caching definitions may need to reconnect.
