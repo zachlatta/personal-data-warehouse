@@ -435,6 +435,14 @@ This Mac is intended to run the local Voice Memos uploader through a user Launch
 - Heartbeat file: `~/Library/Logs/personal-data-warehouse/voice-memos-upload.heartbeat`
 - Status helper: `bin/voice-memos-upload-status`
 
+**A quiet Mac library reads `quiet`, not `late` (2026-11-11).** Since the Pixel replaced the
+iPhone, new memos are Google Recorder recordings and a Mac memo is occasional, so
+`apple_voice_memos` is usage-driven in `marts_ops.pipeline_health` (`freshness_escalates=False`):
+past its 7-day interval the data age reads `quiet` and the uploader heartbeat colours the row.
+That is a real detector: the uploader exits non-zero when a settled, nonempty memo in the
+Recordings folder fails to upload, and a stopped LaunchAgent reads `late`/`stale` on run age.
+What it cannot see is a memo iCloud never materializes on the Mac (deferred with exit 0).
+
 Each run also performs the **enriched-title write-back**: memos that still carry an
 app-assigned name ("New Recording N" / geocoded location names — detected by the
 `0x1000` auto-named bit in `ZFLAGS`, or the literal `New Recording N` pattern for

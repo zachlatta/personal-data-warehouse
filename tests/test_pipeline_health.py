@@ -2878,7 +2878,15 @@ def test_a_failing_search_health_component_fails_the_search_index_pipeline(wareh
 # {pi}. pi's 45d interval put late at 90 days of Zach not using a CLI, which is
 # not a pipeline fact; muse_code and argon copied it.
 
-USAGE_DRIVEN_PIPELINES = {"pi", "muse_code", "argon", "alice_voice_recordings", "search_requests"}
+USAGE_DRIVEN_PIPELINES = {
+    "pi",
+    "muse_code",
+    "argon",
+    "alice_voice_recordings",
+    "search_requests",
+    # Since the Pixel replaced the iPhone (2026-10-23) a Mac memo is occasional.
+    "apple_voice_memos",
+}
 
 
 def test_exactly_the_usage_driven_sources_skip_freshness_escalation():
@@ -2942,6 +2950,59 @@ def test_a_usage_driven_source_with_a_stale_heartbeat_reads_stale(warehouse):
     row = _pi_row(warehouse)
     assert row["run_status"] == "stale"
     assert row["status"] == "stale"
+
+
+def _seed_apple_voice_memos(warehouse, *, written_ago: timedelta, heartbeat_ago: timedelta, status: str) -> None:
+    now = datetime.now(tz=UTC)
+    warehouse.ensure_apple_voice_memos_tables(backfill_content_hashes=False)
+    warehouse._command(
+        """
+        INSERT INTO @apple_voice_memos_files (account, recording_id, recorded_at, ingested_at, sync_version)
+        VALUES ('z', 'memo-1', %s, %s, 1)
+        """,
+        (now - written_ago, now - written_ago),
+    )
+    warehouse._command(
+        """
+        INSERT INTO @uploader_heartbeats
+            (pipeline, device, ran_at, status, error, exit_code, duration_seconds, updated_at, sync_version)
+        VALUES ('apple_voice_memos', 'porygon', %s, %s, %s, %s, 5, %s, 2)
+        """,
+        (
+            now - heartbeat_ago,
+            status,
+            "" if status == "ok" else "upload failed: 502",
+            0 if status == "ok" else 1,
+            now - heartbeat_ago,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_ago", "heartbeat_status", "expected"),
+    [
+        # Weeks without a Mac memo (Zach records on the Pixel now) and a
+        # clean uploader every few minutes read `late`.
+        (timedelta(minutes=5), "ok", {"status": "ok", "data_status": "quiet", "run_status": "ok"}),
+        # A memo that will not upload exits non-zero: still red.
+        (timedelta(minutes=5), "error", {"status": "failing", "data_status": "quiet", "run_status": "ok"}),
+        # The LaunchAgent stopped firing: still caught by the heartbeat.
+        (timedelta(hours=5), "ok", {"status": "stale", "data_status": "quiet", "run_status": "stale"}),
+    ],
+)
+def test_a_quiet_mac_voice_memos_library_is_ok_while_its_uploader_runs_clean(
+    warehouse, heartbeat_ago, heartbeat_status, expected
+):
+    _provision_every_table(warehouse)
+    _seed_apple_voice_memos(
+        warehouse, written_ago=timedelta(days=21), heartbeat_ago=heartbeat_ago, status=heartbeat_status
+    )
+    PipelineHealthCollector(warehouse).run_all()
+
+    (row,) = warehouse._query_dicts(
+        "SELECT status, data_status, run_status FROM @marts_pipeline_health WHERE pipeline = 'apple_voice_memos'"
+    )
+    assert row == expected
 
 
 # --- search request timings (C6): the app appends, the writer's heartbeat judges --

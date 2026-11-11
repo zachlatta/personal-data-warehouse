@@ -805,12 +805,20 @@ PIPELINES: tuple[Pipeline, ...] = (
         transport="Mac LaunchAgent → /ingest/voice-memos/* → Drive inbox → Dagster",
         data=7 * DAY,
         basis=(
-            "measured: 145 gaps, p95 3.86d, max 6.56d — a person does not record"
-            " a voice memo hourly, but two years of history says they have never"
-            " gone a week. 7d puts late at 14d and stale at 42d"
+            "measured: 145 gaps, p95 3.86d, max 6.56d — two years of iPhone"
+            " history. Since the Pixel replaced the iPhone on 2026-10-23 new memos"
+            " are Google Recorder recordings, and a Mac memo is occasional. So past"
+            " 7d the age reads 'quiet', and the run heartbeat is the detector"
+        ),
+        note=(
+            "usage-driven since 2026-10-23; the uploader exits non-zero when a settled,"
+            " nonempty memo in the Mac's Recordings folder fails to upload, so a clean"
+            " heartbeat means nothing newer is waiting there"
         ),
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("apple_voice_memos"),
+        # Zach records on the Pixel now: a quiet Mac library is not an outage.
+        freshness_escalates=False,
     ),
     _source(
         "google_recorder",
@@ -1454,9 +1462,15 @@ PIPELINES: tuple[Pipeline, ...] = (
         kind="enrichment",
         cadence="hourly :47 + backlog sensor",
         transport="Dagster voice_memo_continuity → agent container",
-        expected_data_interval=None,
+        # It runs on a schedule and a backlog sensor, so it has a cadence; it
+        # read 'manual' (no interval declared) while a candidate bug left
+        # pairs unjudged for weeks, and 'manual' could not say so.
+        expected_data_interval=7 * DAY,
         expected_run_interval=None,
-        note="only runs when two recordings sit back to back; a quiet week writes nothing",
+        data_basis=(
+            "same 7d as voice_memo_enrichment, whose output it follows"
+        ),
+        note="writes only when two recordings with speech sit back to back",
         # One judgment row per recording pair, overwritten on retry: an agent
         # failure lands as status='error' with the exception text.
         state=StateSource(
