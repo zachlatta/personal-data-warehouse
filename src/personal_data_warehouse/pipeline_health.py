@@ -442,6 +442,12 @@ class Pipeline:
     #: neither: ``tests/test_source_sla.py``.
     detector: str = ""
     sla_exemption: str = ""
+    #: Every exemption is one of two kinds. ``structural``: no comparison with
+    #: the source can exist (PDW is the source, nothing upstream keeps history,
+    #: or every run already is the full comparison). ``deferred``: one can be
+    #: built and has not been; C11 grades yellow while any remain, and AGENTS.md
+    #: names them as the gap.
+    sla_exemption_kind: str = ""
 
     @property
     def event_interval(self) -> timedelta | None:
@@ -533,6 +539,7 @@ def _source(
     freshness_escalates: bool = True,
     detector: str = "",
     exemption: str = "",
+    exemption_kind: str = "",
 ) -> Pipeline:
     return Pipeline(
         id=id,
@@ -549,6 +556,7 @@ def _source(
         freshness_escalates=freshness_escalates,
         detector=detector,
         sla_exemption=exemption,
+        sla_exemption_kind=exemption_kind,
     )
 
 
@@ -653,6 +661,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "users.settings.filters.list, so a successful run already is the comparison "
             "with Gmail; the run heartbeat is the detector"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "google_calendar",
@@ -696,12 +705,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             error_column="error",
         ),
         note="data goes quiet for months by nature; judge this one on last_run_at",
-        exemption=(
-            "the People API sync token returns every change since the last run, and "
-            "edits are weeks apart; a detector needs connections.list sorted "
-            "LAST_MODIFIED_DESCENDING (pageSize=1) recorded in "
-            "source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "apple_contacts",
@@ -723,6 +727,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "post the store's newest modification date to /ingest/source-observation, "
             "as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "browser_history",
@@ -744,6 +749,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "it to post the newest visit time to /ingest/source-observation, as "
             "apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "screen_timelapse",
@@ -775,6 +781,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "device frame age against the phone's usage events is already judged on "
             "this row"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "feed",
@@ -791,6 +798,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "PDW is the source: agents and the app write the feed directly, so there is "
             "nothing upstream to compare with"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "google_drive",
@@ -893,6 +901,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "newest modification date to /ingest/source-observation, as apple_messages "
             "does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "apple_voice_memos",
@@ -961,6 +970,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "it to post the newest DATE_ADDED to /ingest/source-observation, as "
             "apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "android_notifications",
@@ -982,10 +992,11 @@ PIPELINES: tuple[Pipeline, ...] = (
         run=UPLOADER_RUN_INTERVAL,
         state=_uploader_heartbeat("android_notifications"),
         exemption=(
-            "Android keeps no history of a notification once dismissed, so the "
-            "listener's spool is the only record; a detector needs the spool's oldest "
-            "unsent entry posted to /ingest/source-observation, as apple_messages does"
+            "Android keeps no history of a notification once it is dismissed, so "
+            "nothing upstream exists to compare with; the listener's spool is PDW's own "
+            "buffer, not a source"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "android_messages",
@@ -1010,6 +1021,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "it to post the newest message timestamp to /ingest/source-observation, as "
             "apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "android_location", "Android approximate location",
@@ -1024,6 +1036,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "PDW's own helper makes the samples, so there is no upstream; the "
             "measurement age in data_basis already catches stale fixes"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "android_screen_time",
@@ -1047,6 +1060,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "needs it to post the newest usage event time to /ingest/source-"
             "observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "scans",
@@ -1070,6 +1084,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "a scan that never reached the service exists nowhere else; PDW is the end "
             "of the scanner's Scan to PC"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "alice_voice_recordings",
@@ -1104,11 +1119,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "quiet means Zach is not recording, so data age never colours"
             " status; the daily poll's own heartbeat says the poller is alive"
         ),
-        exemption=(
-            "usage-driven (34 days of use in 17 months), so the poller's daily run "
-            "heartbeat is the signal; a detector needs the Alice listing's newest "
-            "recording time recorded in source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "apple_photos",
@@ -1125,10 +1136,11 @@ PIPELINES: tuple[Pipeline, ...] = (
             "fault"
         ),
         exemption=(
-            "the iPhone library stopped growing on 2026-10-23; a detector needs the "
-            "PhotoKit exporter to post the library's newest creation date to "
-            "/ingest/source-observation, as apple_messages does"
+            "the iPhone library stopped growing when the Pixel replaced it on "
+            "2026-10-23; new photos arrive through android_photos, so there is no live "
+            "upstream left to compare with"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "claude_code",
@@ -1147,6 +1159,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "detector needs it to post the newest session file mtime to /ingest/source-"
             "observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "codex",
@@ -1162,6 +1175,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "detector needs it to post the newest session file mtime to /ingest/source-"
             "observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "openclaw",
@@ -1177,6 +1191,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "it to post the newest session file mtime to /ingest/source-observation, as "
             "apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "pi",
@@ -1209,6 +1224,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "uploader; a detector needs it to post the newest session file mtime to "
             "/ingest/source-observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "muse_code",
@@ -1238,6 +1254,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "uploader; a detector needs it to post the newest session file mtime to "
             "/ingest/source-observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "argon",
@@ -1267,6 +1284,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "uploader; a detector needs it to post the newest session file mtime to "
             "/ingest/source-observation, as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "muse",
@@ -1295,6 +1313,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "the hook to post the newest transcript time to /ingest/source-observation, "
             "as apple_messages does"
         ),
+        exemption_kind="deferred",
     ),
     _source(
         "claude_desktop",
@@ -1315,11 +1334,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             " on the same row: action_required means claude.ai rejected the key and the"
             " desktop app needs a sign-in"
         ),
-        exemption=(
-            "the poller's 3h run heartbeat and credential state are the signal; a "
-            "detector needs the conversation list's newest updated_at recorded in "
-            "source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "chatgpt",
@@ -1342,11 +1357,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             " polling - sign in again) or a rejected token (polling stopped until"
             " a different token is published)"
         ),
-        exemption=(
-            "the poller's 3h run heartbeat and session state are the signal; a detector "
-            "needs the conversation list's newest update_time recorded in "
-            "source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "comma",
@@ -1373,11 +1384,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "the token is a 90-day JWT with no refresh; action_required means it expires within 14 days"
             " (still polling) or was refused: sign in at connect.comma.ai and set COMMA_API_TOKEN"
         ),
-        exemption=(
-            "drives upload from the car only on Wi-Fi, so comma's own list lags the "
-            "car; a detector needs the device's newest route time recorded in "
-            "source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "resideo",
@@ -1404,6 +1411,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "run already compares with the last reading; there is no upstream history "
             "to diff"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "whoop",
@@ -1427,11 +1435,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "closes a cycle every day the strap is worn, so 2d (late at 4d) is a missed "
             "sync"
         ),
-        exemption=(
-            "the API's collections are newest-first, but the run heartbeat and "
-            "action_required are the signal today; a detector needs the newest cycle's "
-            "updated_at recorded in source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "whoop_private",
@@ -1459,11 +1463,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "measured 2026-11-11 on cycles: p95 1.08d, max 1.17d -- 2d covers "
             "the longest gap on record"
         ),
-        exemption=(
-            "the browser-session API is unofficial and rotates its token; a detector "
-            "needs the newest cycle's updated_at recorded in "
-            "source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "github",
@@ -1490,10 +1490,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "action_required means GitHub rejected a token in GITHUB_SOURCE_TOKENS —"
             " replace it on the Dagster deployment; the other credentials keep running"
         ),
-        exemption=(
-            "the events feed is newest-first and capped at 300 events; a detector needs "
-            "its newest event id and time recorded in source_upstream_observations"
-        ),
+        detector=SOURCE_UPSTREAM_HEALTH_VIEW,
     ),
     _source(
         "hacker_news",
@@ -1525,6 +1522,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "every run re-lists the newest page of each list, so a successful run "
             "already is the comparison with the source"
         ),
+        exemption_kind="structural",
     ),
     _source(
         "plaid",
@@ -1592,6 +1590,7 @@ PIPELINES: tuple[Pipeline, ...] = (
             "manual: a document exists only when one is uploaded, so nothing upstream "
             "exists to compare with"
         ),
+        exemption_kind="structural",
     ),
     Pipeline(
         id="attachment_enrichment",
@@ -2506,6 +2505,7 @@ class PipelineSnapshot:
     sla_detector: str = ""
     sla_detector_status: str = ""
     sla_exemption: str = ""
+    sla_exemption_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -3155,6 +3155,7 @@ class PipelineHealthCollector:
             sla_detector=_detector_relation(entry.detector),
             sla_detector_status=self._detector_status(entry),
             sla_exemption=entry.sla_exemption,
+            sla_exemption_kind=entry.sla_exemption_kind,
         )
         if entry.id == "screen_timelapse":
             self._apply_screen_timelapse_device_freshness(snapshot)

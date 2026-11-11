@@ -34,6 +34,7 @@ from personal_data_warehouse.source_sla import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCES = [entry for entry in PIPELINES if entry.kind == "source"]
+PIPELINES_BY_ID = {entry.id: entry for entry in PIPELINES}
 
 
 def _postgres_url() -> str:
@@ -74,6 +75,35 @@ def test_an_exemption_is_a_reason_not_a_placeholder(entry):
     # "n/a" or "todo" is how a gap hides inside a filled-in field.
     assert len(entry.sla_exemption) >= 80, entry.id
     assert not any(word in entry.sla_exemption.lower() for word in ("todo", "tbd", "n/a")), entry.id
+
+
+#: The exemptions accepted as structural: PDW is the source, nothing upstream
+#: keeps history, or every run already is the whole comparison. Anything else
+#: without a detector is deferred work, and C11 reads yellow while it remains.
+STRUCTURAL_EXEMPTIONS = {
+    "feed", "scans", "screen_timelapse", "android_location", "manual_finance",
+    "gmail_settings", "hacker_news", "resideo", "apple_photos", "android_notifications",
+}
+
+
+@pytest.mark.parametrize("entry", SOURCES, ids=[entry.id for entry in SOURCES])
+def test_an_exemption_says_whether_it_is_structural_or_deferred(entry):
+    if entry.detector:
+        assert entry.sla_exemption_kind == "", entry.id
+    elif entry.id in STRUCTURAL_EXEMPTIONS:
+        assert entry.sla_exemption_kind == "structural", entry.id
+    else:
+        # "Not built yet" is never structural: it is the stated C11 gap.
+        assert entry.sla_exemption_kind == "deferred", entry.id
+
+
+def test_the_server_side_pollers_compare_with_the_source_not_their_own_heartbeat():
+    """A Python poller that already talks to the provider has no excuse for an exemption."""
+    for pipeline in (
+        "google_contacts", "whoop", "whoop_private", "github", "chatgpt",
+        "claude_desktop", "comma", "alice_voice_recordings",
+    ):
+        assert PIPELINES_BY_ID[pipeline].detector == SOURCE_UPSTREAM_HEALTH_VIEW, pipeline
 
 
 def test_a_detector_is_a_cataloged_marts_ops_view():
@@ -255,6 +285,44 @@ def test_a_writer_never_clobbers_the_pending_item(warehouse):
     assert _health(warehouse)[("gmail", "a@x.test")]["pending_since"] is not None
 
 
+def test_the_server_side_pollers_lookups_read_what_landed(warehouse):
+    """Each new check's PDW-side lookup, against a real row: landed reads ok."""
+    _provision_everything(warehouse)
+    now = datetime.now(tz=UTC)
+    at = now - timedelta(hours=1)
+    warehouse._command(
+        "INSERT INTO @claude_desktop_events (source, session_id, event_uuid, account, seq, event_type, raw_json)"
+        " VALUES ('claude_desktop', 'c1', 'c1', 'a@x.test', 0, 'conversation', %s)",
+        ('{"updated_at": "' + at.isoformat() + '"}',),
+    )
+    warehouse.record_chatgpt_conversation_synced(
+        account="a@x.test", session_id="g1", update_time=at.timestamp(), event_count=1
+    )
+    warehouse._command(
+        "INSERT INTO @contact_cards (source, account, source_kind, address_book_id, card_id, source_updated_at)"
+        " VALUES ('google_people', 'a@x.test', 'google_contacts', 'people/me', 'people/c1', %s)",
+        (at,),
+    )
+    warehouse._command(
+        "INSERT INTO @comma_routes (account, dongle_id, route_name, start_at) VALUES ('u1', 'd1', 'r1', %s)", (at,)
+    )
+    for pipeline, scope, newest_id in (
+        ("claude_desktop", "a@x.test", "c1"),
+        ("chatgpt", "a@x.test", "g1"),
+        ("google_contacts", "a@x.test", "people/c1"),
+        ("comma", "u1/d1", "r1"),
+    ):
+        _observe(warehouse, pipeline, scope, newest_at=at, newest_id=newest_id, observed_at=now)
+    # Upstream is ahead of what landed: a missing item for each.
+    _observe(warehouse, "whoop", "a@x.test", newest_at=now - timedelta(hours=2), observed_at=now)
+    warehouse.advance_source_upstream_pending()
+
+    rows = _health(warehouse)
+    for key in (("claude_desktop", "a@x.test"), ("chatgpt", "a@x.test"), ("google_contacts", "a@x.test"), ("comma", "u1/d1")):
+        assert (rows[key]["status"], rows[key]["landed"]) == ("ok", 1), key
+    assert rows[("whoop", "a@x.test")]["status"] == "late"
+
+
 def test_an_older_observation_never_overwrites_a_newer_one(warehouse):
     _provision_everything(warehouse)
     now = datetime.now(tz=UTC)
@@ -273,8 +341,8 @@ def test_the_collector_writes_each_sources_detector_verdict_or_exemption(warehou
     rows = {
         row["pipeline"]: row
         for row in warehouse._query_dicts(
-            "SELECT pipeline, kind, data_basis, sla_detector, sla_detector_status, sla_exemption"
-            " FROM @marts_pipeline_health"
+            "SELECT pipeline, kind, data_basis, sla_detector, sla_detector_status, sla_exemption,"
+            " sla_exemption_kind FROM @marts_pipeline_health"
         )
     }
     calendar = rows["google_calendar"]
@@ -286,6 +354,9 @@ def test_the_collector_writes_each_sources_detector_verdict_or_exemption(warehou
     assert rows["hacker_news"]["sla_detector"] is None
     assert rows["hacker_news"]["sla_detector_status"] is None
     assert "re-lists" in rows["hacker_news"]["sla_exemption"]
+    assert rows["hacker_news"]["sla_exemption_kind"] == "structural"
+    assert rows["codex"]["sla_exemption_kind"] == "deferred"
+    assert rows["gmail"]["sla_exemption_kind"] is None
     for row in rows.values():
         if row["kind"] == "source":
             assert row["data_basis"], row["pipeline"]

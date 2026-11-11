@@ -33,6 +33,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any
 
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.github_api import (
     EPOCH,
     SEARCH_RESULT_CAP,
@@ -226,9 +227,23 @@ class GitHubSyncRunner:
         stored = 0
         for page in range(1, MAX_EVENT_PAGES + 1):
             events = client.user_events(self._account, page=page)
+            rows = [event_row(self._account, e, now=now) for e in events]
+            if page == 1:
+                # C11: the feed is newest first, so page one's newest event is
+                # GitHub's own newest for this credential, recorded before
+                # writing. An empty feed (90 days with nothing) is a fresh look.
+                newest = max(rows, key=lambda r: r["created_at"], default=None)
+                record_upstream_observation(
+                    self._wh,
+                    self._log,
+                    pipeline="github",
+                    scope=f"{self._account}/{client.scope}",
+                    upstream_newest_at=newest["created_at"] if newest else None,
+                    upstream_newest_id=newest["event_id"] if newest else "",
+                    detail="/users/<login>/events page 1: the newest event",
+                )
             if not events:
                 break
-            rows = [event_row(self._account, e, now=now) for e in events]
             known = self._wh.github_known_event_ids(account=self._account, event_ids=[r["event_id"] for r in rows])
             self._wh.upsert_github_events(dedupe(rows, lambda r: (r["event_id"],)))
             stored += len(rows) - len(known)

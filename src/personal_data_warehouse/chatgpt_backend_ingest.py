@@ -22,6 +22,7 @@ from personal_data_warehouse.agent_sessions_drive_ingest import (
     chatgpt_conversation_to_event_rows,
 )
 from personal_data_warehouse.chatgpt_backend import ChatGPTBackendClient, ChatGPTRateLimitError
+from personal_data_warehouse.source_sla import record_upstream_observation
 
 # A conversation is re-fetched when its backend ``update_time`` exceeds the
 # synced value by more than this slack, which absorbs float-rounding noise.
@@ -135,6 +136,19 @@ class ChatGPTBackendIngestRunner:
         self._logger = logger
         self._now = now or (lambda: datetime.now(tz=UTC))
 
+    def _observe_newest(self, ref) -> None:
+        """C11: the list is newest-first by update_time, so its first entry is
+        ChatGPT's own newest conversation; recorded before anything is written."""
+        record_upstream_observation(
+            self._warehouse,
+            self._logger,
+            pipeline="chatgpt",
+            scope=self._account,
+            upstream_newest_at=_observed_at(ref.update_time),
+            upstream_newest_id=ref.id,
+            detail="/backend-api/conversations?order=updated: the first conversation's update_time",
+        )
+
     def sync(self) -> ChatGPTBackendIngestSummary:
         self._warehouse.ensure_agent_sessions_tables()
         ingested_at = self._now()
@@ -168,6 +182,8 @@ class ChatGPTBackendIngestRunner:
             refs = self._client.iter_conversation_refs(page_size=self._page_size)
             for ref in refs:
                 conversations_seen += 1
+                if conversations_seen == 1:
+                    self._observe_newest(ref)
                 if not ref.id:
                     continue
                 if high_water is not None and ref.update_time <= high_water + _UPDATE_EPSILON_SECONDS:
@@ -238,6 +254,10 @@ class ChatGPTBackendIngestRunner:
             rate_limited=rate_limited,
             stopped_at_high_water=stopped_at_high_water,
         )
+
+
+def _observed_at(update_time: float) -> datetime | None:
+    return datetime.fromtimestamp(update_time, tz=UTC) if update_time > 0 else None
 
 
 def _retry_suffix(exc: ChatGPTRateLimitError) -> str:

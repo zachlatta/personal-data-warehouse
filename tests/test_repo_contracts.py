@@ -336,9 +336,10 @@ def test_s2_backlog_is_overdue_only_two_days_after_pdw_ingested_the_recording(mo
 
 
 def _c11_sla_row(pipeline: str, *, detector: str | None = None, status: str | None = None,
-                 exemption: str | None = None, basis: str = "measured") -> dict:
+                 exemption: str | None = None, kind: str | None = None, basis: str = "measured") -> dict:
     return {"pipeline": pipeline, "data_basis": basis, "sla_detector": detector,
-            "sla_detector_status": status, "sla_exemption": exemption}
+            "sla_detector_status": status, "sla_exemption": exemption,
+            "sla_exemption_kind": kind if kind is not None else ("structural" if exemption else None)}
 
 
 def _fake_c11_sql(monkeypatch, pipelines: list[dict] | None, slas: list[dict] | None = None) -> dict[str, str]:
@@ -417,6 +418,50 @@ def test_c11_grades_a_detector_that_is_not_ok_yellow(monkeypatch) -> None:
     # A detector that has said nothing is not health.
     assert "slack:marts_ops.slack_conversation_health=unknown" in verdict.evidence
     assert "apple_voice_memos" not in verdict.evidence.split("not ok:")[1]
+
+
+def test_c11_is_red_on_a_source_with_neither_detector_nor_exemption(monkeypatch) -> None:
+    from scripts import contract_audit
+
+    _fake_c11_sql(monkeypatch, [], slas=[
+        _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="ok"),
+        _c11_sla_row("whoop"),
+    ])
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.RED
+    assert "neither detector nor exemption: ['whoop']" in verdict.evidence
+
+
+def test_c11_grades_an_unknown_detector_yellow(monkeypatch) -> None:
+    from scripts import contract_audit
+
+    _fake_c11_sql(monkeypatch, [], slas=[
+        _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="unknown"),
+    ])
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.YELLOW
+    assert "gmail:marts_ops.source_upstream_health=unknown" in verdict.evidence
+
+
+def test_c11_stays_yellow_while_a_deferred_exemption_remains(monkeypatch) -> None:
+    """A detector that could be built and was not is the contract's open gap, not green."""
+    from scripts import contract_audit
+
+    _fake_c11_sql(monkeypatch, [], slas=[
+        _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="ok"),
+        _c11_sla_row("hacker_news", exemption="every run re-lists", kind="structural"),
+        _c11_sla_row("codex", exemption="needs the uploader to post its newest line", kind="deferred"),
+    ])
+    verdict = contract_audit.c11_source_slas()
+    assert verdict.status == contract_audit.YELLOW
+    assert "1 deferred (detector not built: codex)" in verdict.evidence
+    assert "1 structurally exempt (hacker_news)" in verdict.evidence
+
+    _fake_c11_sql(monkeypatch, [], slas=[
+        _c11_sla_row("gmail", detector="marts_ops.source_upstream_health", status="ok"),
+        _c11_sla_row("hacker_news", exemption="every run re-lists", kind="structural"),
+    ])
+    assert contract_audit.c11_source_slas().status == contract_audit.GREEN
 
 
 def test_c11_withholds_its_verdict_when_pipeline_health_is_unreadable(monkeypatch) -> None:

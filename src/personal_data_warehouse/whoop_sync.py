@@ -14,6 +14,7 @@ import requests
 
 from personal_data_warehouse.config import Settings, WhoopConfig, load_settings
 from personal_data_warehouse.warehouse import warehouse_from_settings
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.whoop_auth import WhoopOAuthError, refresh_whoop_token
 
 EPOCH_UTC = datetime.fromtimestamp(0, tz=UTC)
@@ -327,6 +328,7 @@ class WhoopSyncRunner:
             raise WhoopActionRequiredError(skip_reason)
         runtime_config = replace(config, token_json=runtime_token_json)
         client = self._build_client(runtime_config, persist_rotated_token=True)
+        self._observe_newest_cycle(account=account, client=client)
         collections_written: dict[str, int] = {}
         failures: list[str] = []
         action_required_count = 0
@@ -482,6 +484,29 @@ class WhoopSyncRunner:
             config,
             token_refresher=token_refresher,
             refresh_enabled=persist_rotated_token,
+        )
+
+    def _observe_newest_cycle(self, *, account: str, client) -> None:
+        """C11: WHOOP's own newest cycle, asked with no window, before this run writes.
+
+        Collections list newest-first, so ``limit=1`` with no start/end is the
+        newest cycle WHOOP has; a sync window computed wrong cannot hide it.
+        """
+        try:
+            records = client.get_json("/v2/cycle", params={"limit": 1}).get("records") or []
+        except Exception as exc:  # noqa: BLE001 - the probe must not fail the sync
+            self._logger.warning("WHOOP newest-cycle probe failed for %s: %s", account, exc)
+            return
+        newest = records[0] if records and isinstance(records[0], Mapping) else None
+        start = parse_rfc3339(newest.get("start")) if newest else EPOCH_UTC
+        record_upstream_observation(
+            self._warehouse,
+            self._logger,
+            pipeline="whoop",
+            scope=account,
+            upstream_newest_at=None if start == EPOCH_UTC else start,
+            upstream_newest_id=_text(newest.get("id")) if newest else "",
+            detail="GET /v2/cycle?limit=1: the newest cycle's start",
         )
 
     def _sync_profile(self, *, account: str, client, synced_at: datetime) -> int:

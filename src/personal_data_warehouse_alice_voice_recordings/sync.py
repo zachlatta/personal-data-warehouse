@@ -199,6 +199,21 @@ class AliceVoiceRecordingsImportRunner:
         )
 
 
+def newest_upload_request(upload_requests: Iterable[Mapping[str, Any]]) -> tuple[datetime | None, str]:
+    """C11: Alice's own newest recording (its created_at, which PDW stores as
+    ``recorded_at``) and its id, from the listing the poll already reads."""
+    newest_at: datetime | None = None
+    newest_id = ""
+    for upload_request in upload_requests:
+        created_at = parse_datetime(str(upload_request.get("created_at", "")))
+        if created_at is not None and created_at.timestamp() > 0 and (newest_at is None or created_at > newest_at):
+            newest_at = created_at
+            newest_id = recording_id_from_upload_request(
+                upload_request, recording_url=media_url_from_recording(upload_request)
+            )
+    return newest_at, newest_id
+
+
 def _has_alice_object(object_store: ObjectStore, *, kind: str, recording_id: str) -> bool:
     return object_store_has_object(object_store, kind=kind, key="alice_upload_id", value=recording_id)
 

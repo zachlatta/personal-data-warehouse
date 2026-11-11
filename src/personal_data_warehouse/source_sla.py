@@ -124,6 +124,95 @@ SOURCE_UPSTREAM_CHECKS: tuple[UpstreamCheck, ...] = (
         observation_interval=4 * HOUR,
     ),
     UpstreamCheck(
+        pipeline="google_contacts",
+        scope="account",
+        evidence=(
+            "connections.list(personFields=metadata), every page: the newest CONTACT-source"
+            " updateTime, every run (hourly)"
+        ),
+        pdw_newest_sql="""(SELECT max(c.source_updated_at) FROM @contact_cards c
+            WHERE c.source = 'google_people' AND c.account = o.scope)""",
+        tolerance=3 * HOUR,
+        observation_interval=4 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="comma",
+        scope="account/dongle_id",
+        evidence="routes_segments over the retained window: the newest route's start, every poll (15 min)",
+        pdw_newest_sql="""(SELECT max(r.start_at) FROM @comma_routes r
+            WHERE r.account = split_part(o.scope, '/', 1)
+              AND r.dongle_id = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2))""",
+        tolerance=HOUR,
+        observation_interval=HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="whoop",
+        scope="account",
+        evidence="GET /v2/cycle?limit=1 with no window: the newest cycle's start, every run (5 min)",
+        pdw_newest_sql="""(SELECT max(c.start_at) FROM @whoop_cycles c WHERE c.account = o.scope)""",
+        tolerance=HOUR,
+        observation_interval=HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="whoop_private",
+        scope="account",
+        evidence="cycles/details over the last three days: the newest cycle's start, every run (15 min)",
+        pdw_newest_sql="""(SELECT max(c.start_at) FROM @whoop_private_cycles c WHERE c.account = o.scope)""",
+        tolerance=2 * HOUR,
+        observation_interval=2 * HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="github",
+        scope="account/credential",
+        evidence="/users/<login>/events page 1 (newest first): the newest event, every run (15 min)",
+        pdw_newest_sql="""(SELECT max(e.created_at) FROM @github_events e
+            WHERE e.account = split_part(o.scope, '/', 1))""",
+        tolerance=HOUR,
+        observation_interval=HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="chatgpt",
+        scope="account",
+        evidence=(
+            "/backend-api/conversations?order=updated: the first conversation's update_time,"
+            " every poll (5 min)"
+        ),
+        # The poller stores each conversation's listed update_time only after
+        # its events are written, so this is what has landed.
+        pdw_newest_sql="""(SELECT to_timestamp(max(c.update_time)) FROM @chatgpt_conversation_sync c
+            WHERE c.account = o.scope)""",
+        # A rate-limited poll stops and resumes on the next tick.
+        tolerance=2 * HOUR,
+        observation_interval=HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="claude_desktop",
+        scope="account",
+        evidence=(
+            "claude.ai chat_conversations (newest-updated first): the first conversation's"
+            " updated_at, every poll (5 min)"
+        ),
+        # The conversation header row (seq 0) carries the updated_at of the
+        # version that landed; one indexed lookup by the newest conversation.
+        pdw_newest_sql="""(SELECT max(NULLIF(e.raw_json::jsonb ->> 'updated_at', '')::timestamptz)
+            FROM @claude_desktop_events e
+            WHERE e.session_id = o.upstream_newest_id AND e.seq = 0
+              AND e.event_type = 'conversation' AND e.account = o.scope)""",
+        # Uploaded to the Drive inbox, then the agent-sessions reader.
+        tolerance=2 * HOUR,
+        observation_interval=HOUR,
+    ),
+    UpstreamCheck(
+        pipeline="alice_voice_recordings",
+        scope="account",
+        evidence="/api/v2/recordings, whole listing: the newest created_at, every daily poll",
+        pdw_newest_sql="""(SELECT max(r.recorded_at) FROM @alice_voice_recordings r
+            WHERE r.account = o.scope)""",
+        # A daily poll, then the Drive ingest.
+        tolerance=48 * HOUR,
+        observation_interval=36 * HOUR,
+    ),
+    UpstreamCheck(
         pipeline="apple_messages",
         scope="account",
         evidence=(
@@ -146,6 +235,14 @@ SOURCE_UPSTREAM_INPUT_TABLES: tuple[str, ...] = (
     "google_drive_files",
     "whatsapp_messages",
     "apple_messages",
+    "contact_cards",
+    "comma_routes",
+    "whoop_cycles",
+    "whoop_private_cycles",
+    "github_events",
+    "chatgpt_conversation_sync",
+    "claude_desktop_events",
+    "alice_voice_recordings",
 )
 
 

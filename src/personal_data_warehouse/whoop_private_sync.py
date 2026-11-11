@@ -47,6 +47,7 @@ import logging
 import re
 
 from personal_data_warehouse.config import Settings, WhoopPrivateConfig, load_settings
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.warehouse import warehouse_from_settings
 from personal_data_warehouse.whoop_private_healthspan import (
     HealthspanWeek,
@@ -105,6 +106,8 @@ WHOOP_PRIVATE_HEALTHSPAN_PILLARS = ("SLEEP", "STRAIN", "FITNESS")
 #: Labs change when a test lands, months apart; the ~50 requests a full labs
 #: pass costs are spent at most once a day.
 WHOOP_PRIVATE_LABS_REFRESH = timedelta(hours=24)
+#: How far back the C11 newest-cycle probe looks (see _observe_newest_cycle).
+NEWEST_CYCLE_PROBE_SPAN = timedelta(days=3)
 #: Coach conversations fetched per run. The newest few are always re-read (a
 #: conversation can continue for days); the rest of the budget walks the ones
 #: never stored, so 190 conversations land in four runs.
@@ -971,6 +974,7 @@ class WhoopPrivateSyncRunner:
         account = config.account
         self._sleep_ids = []
         self._workout_windows = []
+        self._observe_newest_cycle(config=config, client=client, identity=identity, now=synced_at)
         written = 0
         for window in plan.windows:
             payload = client.cycles_details(
@@ -993,6 +997,38 @@ class WhoopPrivateSyncRunner:
         # what was asked about most recently.
         self._workout_windows.sort(key=lambda item: item[1], reverse=True)
         return written, plan.sync_type, plan.next_cursor
+
+    def _observe_newest_cycle(self, *, config, client, identity, now: datetime) -> None:
+        """C11: WHOOP's own newest cycle over the last three days, before writing.
+
+        Asked independently of the plan's windows, so a cursor that stopped
+        advancing cannot hide the newest cycle. The strap opens a cycle every
+        day it is worn; three days with none says the strap was off.
+        """
+        try:
+            records = _records(
+                client.cycles_details(
+                    user_id=identity.user_id, start=now - NEWEST_CYCLE_PROBE_SPAN, end=now, limit=10
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - the probe must not fail the sync
+            self._logger.warning("WHOOP private newest-cycle probe failed: %s", exc)
+            return
+        rows = [
+            cycle_to_row(account=config.account, payload=_mapping(record.get("cycle")), synced_at=now)
+            for record in records
+            if _mapping(record.get("cycle"))
+        ]
+        newest = max(rows, key=lambda row: row["start_at"], default=None)
+        record_upstream_observation(
+            self._warehouse,
+            self._logger,
+            pipeline="whoop_private",
+            scope=config.account,
+            upstream_newest_at=newest["start_at"] if newest else None,
+            upstream_newest_id=newest["cycle_id"] if newest else "",
+            detail=f"cycles/details over the last {NEWEST_CYCLE_PROBE_SPAN.days} days: the newest cycle's start",
+        )
 
     def _write_cycle_records(self, *, account: str, records: Sequence[Mapping[str, Any]], synced_at) -> int:
         cycles, sleeps, recoveries, workouts = [], [], [], []

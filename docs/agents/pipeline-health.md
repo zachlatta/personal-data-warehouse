@@ -269,8 +269,12 @@ Every `kind="source"` entry in `PIPELINES` now carries three things, enforced by
 - `data_basis` — the stated SLA: a measurement (the gap query in `pipeline_health.py`,
   re-run 2026-11-11 for the sources that had none) or the reason there is no cadence.
 - `detector` — the catalog id of the `marts_ops` view that compares PDW with the source
-  itself; **or** `sla_exemption` — why no such comparison exists yet and what one would
-  need. Exactly one, and an exemption of at least a sentence (no "n/a").
+  itself; **or** `sla_exemption` with its `exemption_kind`. Exactly one, and an exemption of
+  at least a sentence (no "n/a"). A `structural` exemption says why no comparison can exist
+  (PDW is the source, nothing upstream keeps history, or every run is already the whole
+  comparison). A `deferred` one is a detector that could be built and has not been, with
+  what it needs; C11 reads yellow while any remain. Every server-side poller has a detector;
+  the 13 deferred are the device-file uploaders.
 
 The collector reads each detector view once per collection (filtered to the pipeline by its
 `pipeline` or `source` column, `DETECTOR_SCOPE_COLUMNS`) and writes its worst row into
@@ -278,10 +282,10 @@ The collector reads each detector view once per collection (filtered to the pipe
 `unknown`, because silence is not health. It does **not** colour `status` — that stays C7's
 claim about the pipeline; C11 grades `sla_detector_status` (`scripts/contract_audit.py`).
 
-**`marts_ops.source_upstream_health`** is the detector for Gmail, Google Calendar, Google
-Drive, WhatsApp and Apple Messages. Each collector records what the provider itself says
-is its newest item in `ops.source_upstream_observations` (one row per pipeline and scope),
-before writing what it fetched:
+**`marts_ops.source_upstream_health`** is the detector for every source below. Each
+collector records what the provider itself says is its newest item in
+`ops.source_upstream_observations` (one row per pipeline and scope), before writing what it
+fetched:
 
 | source | upstream evidence | compared with |
 | --- | --- | --- |
@@ -290,12 +294,24 @@ before writing what it fetched:
 | `google_drive` | `files.list(orderBy='modifiedTime desc', pageSize=1)` over the files the sync crawls, every run | `base_google_drive.files.modified_time`, plus that file by id (it may be excluded) |
 | `whatsapp` | the linked-device client's newest delivered message, every 5 min while connected | `base_whatsapp.messages.message_at` |
 | `apple_messages` | `pdw ingest apple-messages` posts the newest message in the chat.db snapshot it just read to `/ingest/source-observation` | `base_apple_messages.messages.message_at` |
+| `google_contacts` | `connections.list(personFields=metadata)`, every page: the newest CONTACT-source `updateTime` (the API's own last-modified order ranks PROFILE churn first) | `base_google_contacts.cards.source_updated_at` |
+| `whoop` / `whoop_private` | `GET /v2/cycle?limit=1` with no window / `cycles/details` over three days: the newest cycle's start | `base_whoop.cycles` / `base_whoop_private.cycles` `start_at` |
+| `github` | page one of the newest-first `/users/<login>/events` feed, per credential | `base_github.events.created_at` |
+| `chatgpt` | the first conversation of `order=updated` | the poller's per-conversation `update_time`, stored after its events land |
+| `claude_desktop` | the first conversation of claude.ai's newest-updated list | that conversation's header row (`seq = 0`) `updated_at` in `base_claude_desktop.events` |
+| `comma` | the newest route in the retained `routes_segments` window | `base_comma.routes.start_at` |
+| `alice_voice_recordings` | the newest `created_at` in the daily listing | `base_alice_voice_recordings.recordings.recorded_at` |
 
 The view is live: a row is `ok` once PDW's newest is at least the source's newest (1 s
-slack), `late` when the source's newest item has been missing for longer than the check's
-`tolerance` (`SOURCE_UPSTREAM_CHECKS` in `source_sla.py`), `failing` past six times that,
-and `unknown` once the observation is older than the collector's own interval — a detector
-that stopped looking is not evidence. Each comparison is one indexed lookup. On 2026-11-11
+slack), `late` when the **oldest** item PDW has not caught up with has been missing for
+longer than the check's `tolerance` (`SOURCE_UPSTREAM_CHECKS` in `source_sla.py`), `failing`
+past six times that, and `unknown` once the observation is older than the collector's own
+interval — a detector that stopped looking is not evidence. The oldest, not the newest:
+on a busy source every look names a fresher newest item, so judging the newest read a
+three-day Gmail stall as `ok` (`missing_seconds = 120`). The pipeline_health collector
+carries `pending_since`, the first upstream item PDW did not catch up with, until PDW
+passes it (`advance_source_upstream_pending`); writers never set it, and the app's DDL for
+the table is checked line by line against a golden file the Python TableSpec generates. Each comparison is one indexed lookup. On 2026-11-11
 the Calendar API's `updated` matched `max(updated_at)` exactly on both calendars and the
 Gmail API's newest message matched `max(internal_date)` to the second on both mailboxes.
 

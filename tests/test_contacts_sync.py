@@ -45,6 +45,10 @@ class FakeConnectionsResource:
         self._service = service
 
     def list(self, **kwargs):
+        if kwargs.get("personFields") == "metadata":
+            # The C11 newest-edit probe, kept apart from the sync's own pages.
+            self._service.probe_calls.append(kwargs)
+            return FakeContactsRequest(self._service, response=self._service.probe_response)
         self._service.list_calls.append(kwargs)
         if self._service.errors and len(self._service.list_calls) > self._service.errors_after_responses:
             return FakeContactsRequest(self._service, error=self._service.errors.pop(0))
@@ -65,6 +69,8 @@ class FakeContactsService:
         self.errors = list(errors or [])
         self.errors_after_responses = errors_after_responses
         self.list_calls = []
+        self.probe_calls = []
+        self.probe_response: dict = {"connections": []}
 
     def people(self):
         return FakePeopleResource(self)
@@ -78,6 +84,10 @@ class FakeContactsWarehouse:
         self.ensure_contacts_tables_called = False
         self.missing_tombstone_calls = []
         self.missing_tombstone_count = 0
+        self.observations = []
+
+    def record_source_upstream_observation(self, **observation) -> None:
+        self.observations.append(observation)
 
     def ensure_contacts_tables(self) -> None:
         self.ensure_contacts_tables_called = True
@@ -230,6 +240,38 @@ def test_runner_full_sync_writes_cards_tombstones_and_state(monkeypatch) -> None
     assert warehouse.missing_tombstone_calls[0]["active_card_ids"] == {"people/c1"}
     assert warehouse.state_rows[0]["sync_token"] == "next"
     assert warehouse.state_rows[0]["status"] == "ok"
+
+
+def test_runner_records_the_newest_contact_edit_not_the_newest_profile_change(monkeypatch) -> None:
+    """C11: the CONTACT source's updateTime is what PDW stores; PROFILE churn is not an edit."""
+    monkeypatch.setenv("CONTACT_GOOGLE_ACCOUNTS", "zach@example.com")
+    settings = load_settings(require_postgres=False, require_gmail=False, require_contacts=True)
+    service = FakeContactsService([{"connections": [], "nextSyncToken": "next"}])
+    service.probe_response = {
+        "connections": [
+            {"resourceName": "people/c-profile", "metadata": {"sources": [
+                {"type": "CONTACT", "updateTime": "2026-06-01T00:00:00Z"},
+                {"type": "PROFILE", "updateTime": "2026-11-11T00:00:00Z"},
+            ]}},
+            {"resourceName": "people/c-edited", "metadata": {"sources": [
+                {"type": "CONTACT", "updateTime": "2026-10-28T15:47:09Z"},
+            ]}},
+        ]
+    }
+    warehouse = FakeContactsWarehouse()
+    ContactsSyncRunner(
+        settings=settings, warehouse=warehouse, logger=FakeLogger(), service_factory=lambda account: service
+    ).sync_all()
+
+    assert warehouse.observations == [
+        {
+            "pipeline": "google_contacts",
+            "scope": "zach@example.com",
+            "upstream_newest_at": datetime(2026, 10, 28, 15, 47, 9, tzinfo=UTC),
+            "upstream_newest_id": "people/c-edited",
+            "detail": "connections.list(personFields=metadata): newest CONTACT updateTime of 2",
+        }
+    ]
 
 
 def test_runner_incremental_sync_uses_existing_sync_token(monkeypatch) -> None:

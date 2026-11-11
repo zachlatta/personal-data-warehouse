@@ -200,6 +200,15 @@ def test_a_first_run_backfills_all_history_and_every_thread(warehouse) -> None:
     assert state["threads@all"]["status"] == "ok"
 
 
+def test_the_events_feed_records_githubs_own_newest_event(warehouse) -> None:
+    """C11: page one of the newest-first feed is what the detector compares with."""
+    run(warehouse, seeded())
+    rows = warehouse._query(
+        "SELECT pipeline, scope, upstream_newest_id, upstream_newest_at FROM @source_upstream_observations"
+    )
+    assert rows == [("github", f"{ACCOUNT}/proxy", "e1", NOW)]
+
+
 def test_a_later_run_reads_only_what_moved(warehouse) -> None:
     fake = seeded()
     run(warehouse, fake)

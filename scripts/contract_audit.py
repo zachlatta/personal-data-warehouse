@@ -724,7 +724,7 @@ def c11_source_slas() -> Verdict:
     # SimpleFIN, voice landing and the upstream comparison
     # (marts_ops.source_upstream_health) are all read here.
     slas = pdw_sql("source slas", """
-        SELECT pipeline, data_basis, sla_detector, sla_detector_status, sla_exemption
+        SELECT pipeline, data_basis, sla_detector, sla_detector_status, sla_exemption, sla_exemption_kind
         FROM marts_ops.pipeline_health WHERE kind = 'source' ORDER BY pipeline""")
     # A pipeline being down is still part of C11: browser_history failed for
     # nine days in October 2026 with C7 (which defers current state here) and
@@ -739,13 +739,17 @@ def c11_source_slas() -> Verdict:
     unstated = [r["pipeline"] for r in slas if not (r.get("data_basis") or "").strip()]
     undetected = [r["pipeline"] for r in slas if not r.get("sla_detector") and not (r.get("sla_exemption") or "").strip()]
     detected = [r for r in slas if r.get("sla_detector")]
-    exempt = [r["pipeline"] for r in slas if not r.get("sla_detector") and (r.get("sla_exemption") or "").strip()]
+    exempt = [r for r in slas if not r.get("sla_detector") and (r.get("sla_exemption") or "").strip()]
+    # A structural exemption is accepted (no comparison can exist); a deferred
+    # one is a detector not built yet, which is the contract's open gap.
+    structural = [r["pipeline"] for r in exempt if r.get("sla_exemption_kind") == "structural"]
+    deferred = [r["pipeline"] for r in exempt if r.get("sla_exemption_kind") != "structural"]
     bad = [f"{r['pipeline']}:{r['sla_detector']}={r.get('sla_detector_status') or 'unknown'}"
            for r in detected if (r.get("sla_detector_status") or "unknown") not in ("ok", "quiet")]
     bad += [f"pipeline:{r['pipeline']}={r['status']}" for r in pipelines]
     if not slas or unstated or undetected:
         status = RED
-    elif bad:
+    elif bad or deferred:
         status = YELLOW
     else:
         status = GREEN
@@ -753,8 +757,9 @@ def c11_source_slas() -> Verdict:
         "C11",
         title,
         status,
-        f"{len(slas)} sources: {len(detected)} detected against the source, {len(exempt)} exempt with a stated reason"
-        f" ({', '.join(exempt) or 'none'}); no stated SLA: {unstated or 'none'}; neither detector nor exemption:"
+        f"{len(slas)} sources: {len(detected)} detected against the source, {len(structural)} structurally exempt"
+        f" ({', '.join(structural) or 'none'}), {len(deferred)} deferred (detector not built: {', '.join(deferred) or 'none'});"
+        f" no stated SLA: {unstated or 'none'}; neither detector nor exemption:"
         f" {undetected or 'none'}; pipelines down {len(pipelines)}; not ok: {bad or 'none'}",
     )
 

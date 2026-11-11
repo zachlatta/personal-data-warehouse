@@ -2654,6 +2654,7 @@ PIPELINE_HEALTH_COLUMNS = (
     "sla_detector",
     "sla_detector_status",
     "sla_exemption",
+    "sla_exemption_kind",
 )
 
 PIPELINE_TABLE_FRESHNESS_COLUMNS = (

@@ -23,13 +23,18 @@ from personal_data_warehouse.config import load_settings
 from personal_data_warehouse.gmail_sync import build_gmail_service
 from personal_data_warehouse.objectstore import build_object_store, google_drive_spec
 from personal_data_warehouse.schedule_guards import skip_if_job_active
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse_alice_voice_recordings.api import AliceApiClient
 from personal_data_warehouse_alice_voice_recordings.gmail_recovery import (
     AliceGmailRecoveryRunner,
     load_alice_gmail_transcript_emails,
 )
-from personal_data_warehouse_alice_voice_recordings.sync import SOURCE, AliceVoiceRecordingsImportRunner
+from personal_data_warehouse_alice_voice_recordings.sync import (
+    SOURCE,
+    AliceVoiceRecordingsImportRunner,
+    newest_upload_request,
+)
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
 ALICE_VOICE_RECORDINGS_IMPORT_POSTGRES_LOCK_ID = 7_403_111_845
@@ -127,9 +132,22 @@ def alice_voice_recordings_import(context) -> MaterializeResult:
             warehouse = warehouse_from_settings(settings)
             warehouse.ensure_alice_voice_recordings_tables()
             try:
+                # Listed once (tens of recordings), so the newest can be
+                # recorded for C11 before anything is archived.
+                upload_requests = list(client.iter_recordings())
+                newest_at, newest_id = newest_upload_request(upload_requests)
+                record_upstream_observation(
+                    warehouse,
+                    context.log,
+                    pipeline="alice_voice_recordings",
+                    scope=config.account,
+                    upstream_newest_at=newest_at,
+                    upstream_newest_id=newest_id,
+                    detail=f"/api/v2/recordings: the newest created_at of {len(upload_requests)}",
+                )
                 summary = AliceVoiceRecordingsImportRunner(
                     account=config.account,
-                    upload_requests=client.iter_recordings(),
+                    upload_requests=upload_requests,
                     object_store=alice_object_store(config, settings),
                     logger=context.log,
                     mode="incremental",

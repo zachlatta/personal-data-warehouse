@@ -36,6 +36,7 @@ from personal_data_warehouse.ingest_client import (
     ingest_upload_config_problem,
 )
 from personal_data_warehouse.schedule_guards import skip_if_job_in_progress
+from personal_data_warehouse.source_sla import record_upstream_observation
 from personal_data_warehouse.sync_locks import exclusive_sync_lock
 from personal_data_warehouse.warehouse import warehouse_from_settings
 
@@ -142,6 +143,15 @@ def claude_desktop_client(context) -> MaterializeResult:
                         ),
                         logger=context.log,
                         upload_state=WarehouseSyncState(warehouse=warehouse, account=sync_account),
+                        upstream_observation_callback=lambda newest, conversation_id: record_upstream_observation(
+                            warehouse,
+                            context.log,
+                            pipeline="claude_desktop",
+                            scope=sync_account,
+                            upstream_newest_at=newest,
+                            upstream_newest_id=conversation_id,
+                            detail="claude.ai chat_conversations: the newest-updated conversation",
+                        ),
                     )
                     try:
                         summary = runner.sync()

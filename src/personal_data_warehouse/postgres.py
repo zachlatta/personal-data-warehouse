@@ -6696,6 +6696,9 @@ class PostgresWarehouse:
         last creates it, and the ten-minute pipeline_health ensure keeps it
         current in production.
         """
+        # The ChatGPT poller creates its sync table on first use; the view reads
+        # it, so make sure it exists rather than leave the detector unbuilt.
+        self.ensure_chatgpt_conversation_sync_table()
         if not all(self._relation_exists(table) for table in SOURCE_UPSTREAM_INPUT_TABLES):
             return
         self._ensure_view("marts_ops_source_upstream_health", source_upstream_health_view_sql())
@@ -6751,7 +6754,8 @@ class PostgresWarehouse:
                     NULLIF(collected_at, {epoch}) AS collected_at,
                     NULLIF(sla_detector, '') AS sla_detector,
                     NULLIF(sla_detector_status, '') AS sla_detector_status,
-                    NULLIF(sla_exemption, '') AS sla_exemption
+                    NULLIF(sla_exemption, '') AS sla_exemption,
+                    NULLIF(sla_exemption_kind, '') AS sla_exemption_kind
                 FROM @pipeline_health
             ),
             judged AS (
@@ -6879,7 +6883,10 @@ class PostgresWarehouse:
                             secs => {COLLECTOR_STALE_SECONDS}) THEN 'unknown'
                     ELSE sla_detector_status
                 END AS sla_detector_status,
-                sla_exemption
+                sla_exemption,
+                -- structural: no comparison can exist; deferred: one can and
+                -- has not been built (C11 reads yellow while any remain).
+                sla_exemption_kind
             FROM classified
             """,
         )
