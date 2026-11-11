@@ -3982,6 +3982,43 @@ def test_search_text_returns_hits_under_default_search_path(warehouse: PostgresW
     assert rows == [("slack_message:dp1",)]
 
 
+def test_every_search_function_runs_with_jit_off(warehouse: PostgresWarehouse) -> None:
+    """Measured 2026-11-11 on prod: a priority-scoped lexical pool scan is
+    costed at 5.5M, so Postgres JIT-compiled it on every call (22 functions,
+    ~600 ms of inlining and optimization) for a statement that then ran in
+    ~200 ms warm: 811-868 ms with JIT against 185-215 ms without. Every
+    search statement returns a page of rows, never the long analytic scan JIT
+    pays off on, so each search function pins jit off for everything it runs.
+    The test database already sets jit off per role, which is why only the
+    catalog can show this."""
+    if not _pg_textsearch_usable(warehouse):
+        pytest.skip("pg_textsearch is not installed/preloaded on this Postgres host")
+
+    _ensure_all_table_groups(warehouse)
+    rows = warehouse._query(
+        """
+        SELECT p.proname, coalesce(p.proconfig, '{}')
+        FROM pg_proc p
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE p.pronamespace = to_regnamespace(%s)
+          AND l.lanname = 'plpgsql'
+          AND p.proname LIKE 'search%%'
+        ORDER BY p.proname
+        """,
+        (warehouse._object_schema("search_text"),),
+    )
+    names = {name for name, _config in rows}
+    assert {
+        "search_text",
+        "search_text_exact",
+        "search_hybrid",
+        "search_hybrid_semantic",
+        "search_hybrid_exact",
+        "search_hybrid_fuse",
+    } <= names
+    assert [name for name, config in rows if "jit=off" not in config] == []
+
+
 def test_search_text_preview_strips_tracking_urls_and_table_scaffolding(warehouse: PostgresWarehouse) -> None:
     # Measured 2026-09-22: a newsletter hit's whole 800-char preview was
     # squarespace-mail.com redirect URLs and `| | --- |` markdown-table debris,

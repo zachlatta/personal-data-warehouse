@@ -17846,6 +17846,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             -- Deliberately NOT parallel safe/restricted: this function calls
             -- set_config() below, and set_config raises "cannot set parameters
@@ -18129,6 +18130,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             -- Same reason as search_text: this body calls set_config(), which
             -- raises under IsInParallelMode() in the leader as well as in a
@@ -18695,6 +18697,7 @@ class PostgresWarehouse:
             )
             RETURNS TABLE (ref text, best bigint, fuse double precision, chunk_id text)
             LANGUAGE plpgsql
+            SET jit = off
             -- VOLATILE only because the router EXPLAINs the scoped slice,
             -- which Postgres refuses inside a STABLE function. It reads only.
             VOLATILE
@@ -18874,6 +18877,7 @@ class PostgresWarehouse:
             )
             RETURNS TABLE (ref text, rnk bigint)
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $exact$
             DECLARE
@@ -19210,6 +19214,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $fuse$
             DECLARE
@@ -19332,6 +19337,7 @@ class PostgresWarehouse:
             )
             RETURNS SETOF @search_text_hit
             LANGUAGE plpgsql
+            SET jit = off
             STABLE
             AS $hybrid$
             DECLARE
