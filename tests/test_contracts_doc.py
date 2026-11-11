@@ -72,6 +72,8 @@ def test_the_extractor_finds_python_go_and_file_citations() -> None:
 def test_the_definition_scan_sees_class_methods_and_go_tests() -> None:
     defined = _defined_tests()
     assert "test_every_test_agents_md_cites_exists" in defined
+    # A method of tests/test_search_benchmark.py's TestPredicateMatching class.
+    assert "test_source_predicate_accepts_listed_source" in defined
     assert "TestOverviewGuidanceStaysWithinBudget" in defined
 
 
