@@ -240,14 +240,17 @@ three things:
   only the ids never cached, and streams those in full in the same pass. Before this a new
   conversation waited for the rotating discovery walk: group DMs created on 2026-09-30 took
   ~8 hours to land.
-- **It polls each conversation when it is due** (`SLACK_FRESHNESS_DUE_INTERVALS`): active
-  inside the freshness window (four hours for DMs and group DMs) every pass, within 14 days
-  every ten minutes, within a year every two hours, older every twelve hours
-  (`SLACK_ASSET_FRESHNESS_DUE_MINUTES=warm,cool,cold` overrides; the session allowed
-  `15,60,360`). The order is four lanes, each most overdue first: hot DMs, group DMs and
-  private channels; then due DMs and group DMs; then the channels Zach is in (due private
-  channels, member public channels hot or due); then public channels he is not in. One
-  not yet due is skipped. Before this the pass polled every candidate in tier order,
+- **It polls each conversation when it is due.** DMs and group DMs
+  (`SLACK_FRESHNESS_DUE_INTERVALS`): active inside the freshness window (four hours)
+  every pass, within 14 days every ten minutes, within a year every two hours, older every
+  twelve hours (`SLACK_ASSET_FRESHNESS_DUE_MINUTES=warm,cool,cold` overrides these; the
+  session allowed `15,60,360`). Never-written ones are polled on first contact and every
+  six hours otherwise. Channels Zach is in follow `SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS`
+  (30 minutes, two hours, twelve), plus every pass for a private channel active in the
+  last three hours. The order is four lanes, each most overdue first: hot DMs, group DMs
+  and private channels, and first contacts; then due DMs and group DMs; then due channels
+  Zach is in; then public channels he is not in. One not yet due (allowing half a tick)
+  is skipped. Before this the pass polled every candidate in tier order,
   spent its budget on the ~250 conversations active in the last fortnight, and never reached
   the rest: in the 24 hours to 2026-10-01 only 108 of 3,717 DMs and 114 of 2,889 group DMs
   were polled at all, and a group DM quiet since 09-10 took 28 hours to land.
@@ -314,27 +317,51 @@ Nothing cheaper can tell PDW which DMs moved: on 2026-11-11 the workspace token 
 `not_allowed_token_type` from both `client.counts` and `users.counts`, and the session is
 off polling (below).
 
-**Two things kept warm DMs at fifteen minutes after that (2026-11-11, an hour after
-deploy).** First, **a conversation that never held a message was dated by Slack's
-`updated`**. 2,198 of ~6,800 DMs and group DMs had never held a message, so they had no
-cursor, and the scheduler fell back to `conversations.list`'s `updated`. That field tracks
-profile and membership edits, not messages, and it put ~2,140 of them inside the year:
-polled every two hours, 1,029 of them in one hour, ~90 of each pass's ~250 polls. A polled
-conversation with no message is now dated by its creation when that is inside the warm
-window (opened lately, so a first message is likely) and is otherwise treated as silent
-for a year, due every twelve hours. `marts_ops.slack_conversation_health` anchors a first
-message the same way, so a long-empty DM waking inside 12h + margin is a cold wake-up and a
-brand-new conversation's first message is still judged. Second, **a due time between two
-passes was met by the later one.** Passes start every five minutes give or take half a
-minute, so a DM due ten minutes after its poll was often checked a few seconds early by the
-pass two ticks on, and polled a third tick later. A conversation due within
-`SLACK_FRESHNESS_DUE_TOLERANCE` (150s, half a tick) of a pass's start is now polled by that
-pass, so the warm interval is two passes. The budget that leaves, from that hour's numbers:
-DMs and group DMs ~195 polls a pass (~13 hot, ~100 warm, ~42 within the year, ~39 older or
-empty) against the 235-277 a 180-second pass made, so a warm DM is polled every ten minutes
-and lands within ~14 (p95 inside fifteen). The channels Zach is in share the remaining
-~40-80 a pass by how overdue they are, so his active member channels can lag DMs by tens
-of minutes.
+**Three things kept warm DMs at fifteen minutes after that (2026-11-11, an hour after
+deploy).**
+
+- **A DM that never held a message was dated by Slack's `updated`.** 2,198 of ~6,800 DMs
+  and group DMs had never held a message, so they had no cursor, and the scheduler fell back
+  to `conversations.list`'s `updated` (profile and membership edits, not messages). That put
+  ~2,140 of them inside the year: polled every two hours, ~90 of each pass's ~250 polls.
+- **First contact is the case that matters.** Someone DMing Zach for the first time, in a DM
+  Slack opened long ago, is where landing speed counts. Over 30 days, 14 first messages
+  arrived in DMs opened 39-338 days earlier, 8 of them from other people. At the two-hour
+  cadence they landed p50 47 / p95 124 minutes.
+- **Slack moves `updated` to the first message.** Listed live that day, `updated` equalled
+  the first message's time in 10 of the 14 and was at or after it in 12 (7 of the 8 from
+  other people). It matched the stored value for every one of the 2,198 untouched DMs. The
+  pass already lists every DM and group DM each run, so a never-written conversation listed
+  with `updated` at or after its last poll is polled that pass, in the first lane. The rest
+  rotate every six hours (`SLACK_FRESHNESS_NEVER_WRITTEN_INTERVAL`), a backstop for the
+  rare first message Slack does not mark.
+- **First messages are judged.** In `marts_ops.slack_conversation_health` a first message
+  has no anchor and always counts in `landing_p95_seconds`, never as a wake-up. Expected:
+  a marked first contact lands within one pass plus the timeline fast lane, under ~9
+  minutes. An unmarked one takes up to six hours.
+- **A due time between two passes was met by the later one.** Passes start every five
+  minutes give or take half a minute, so a DM due ten minutes after its poll was often
+  checked a few seconds early by the pass two ticks on, and polled a third tick later. A
+  conversation due within `SLACK_FRESHNESS_DUE_TOLERANCE` (150s, half a tick) of a pass's
+  start is now polled by that pass.
+- **Channels have their own, slower intervals** (`SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS`).
+  Private channels and member public channels active within two weeks are polled every 30
+  minutes, within a year every two hours, older every twelve. A member public channel is
+  never polled every pass; a private channel active in the last three hours still is. On
+  the DM intervals, channels Zach is in asked for ~110 more polls a pass than the budget
+  had. Warm private channels went p50 58 / max 106 minutes between polls.
+
+The budget from that day's counts, per five-minute pass:
+
+| what | polls |
+| --- | --- |
+| DMs and group DMs | ~187: 7 hot, 83 warm, 42 within the year, 24 older, 31 never written |
+| private channels | ~20 |
+| member public channels | ~25 |
+| total | ~232 |
+
+A 180-second pass makes 235-277, so the intervals hold: a warm DM is polled every ten
+minutes and lands within ~14, and a warm private channel every thirty.
 
 **"Public channels go last" means public channels Zach is not in (2026-10-17).** The pass
 caps public candidates at the 100 most recently active (`SLACK_ASSET_PUBLIC_FRESHNESS_LIMIT`)

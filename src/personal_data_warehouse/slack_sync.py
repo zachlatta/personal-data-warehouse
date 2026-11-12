@@ -38,6 +38,16 @@ SLACK_DIRECT_DISCOVERY_PAGE_SIZE = 1000
 #: (SLACK_ASSET_FRESHNESS_USE_SESSION) allowed 15m/1h/6h;
 #: SLACK_ASSET_FRESHNESS_DUE_MINUTES overrides these.
 SLACK_FRESHNESS_DUE_INTERVALS = (timedelta(minutes=10), timedelta(hours=2), timedelta(hours=12))
+#: Channels Zach is in (private, and public with is_member) are due less often
+#: than DMs: they share what due DMs and group DMs leave of a pass (~40 of ~250
+#: polls on 2026-11-11). Warm (active within 14 days) every thirty minutes; a
+#: member public channel is never polled every pass. A private channel active
+#: inside its hot window still is.
+SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS = (timedelta(minutes=30), timedelta(hours=2), timedelta(hours=12))
+#: A DM or group DM that has been polled and never held a message is polled at
+#: once when conversations.list shows its `updated` moved (a first message) and
+#: otherwise every six hours, as a backstop.
+SLACK_FRESHNESS_NEVER_WRITTEN_INTERVAL = timedelta(hours=6)
 #: A conversation due within this much of a pass's start is polled by that pass
 #: rather than the next: half the five-minute schedule, so an interval of N
 #: ticks is N passes however the passes' start times jitter.
@@ -817,8 +827,12 @@ class SlackSyncRunner:
         client,
         synced_at: datetime,
         conversations: list,
-    ) -> tuple[list, set[str]]:
+    ) -> tuple[list, set[str], dict[str, float]]:
         """List every DM, group DM and private channel, and return the ones never cached.
+
+        Also returns each listed conversation's `updated` (seconds), which is how
+        the pass learns that a DM that never held a message got its first one:
+        Slack moves `updated` to the first message (see _sync_account_freshness_priority).
 
         Nothing else names a conversation created since the paged discovery walk
         last passed (the client.counts change feed that did was refused with
@@ -832,6 +846,7 @@ class SlackSyncRunner:
         """
         newly_discovered: set[str] = set()
         listed: list[Mapping[str, object]] = []
+        listed_updated: dict[str, float] = {}
         try:
             for page, _cursor in iter_cursor_pages_with_cursor(
                 client,
@@ -846,9 +861,13 @@ class SlackSyncRunner:
         except (SlackApiCallError, SlackRateLimitBudgetExceeded) as exc:
             self._logger.warning("Could not list Slack direct conversations for discovery: %s", exc)
             if not listed:
-                return conversations, newly_discovered
+                return conversations, newly_discovered, listed_updated
+        for item in listed:
+            updated = conversation_updated_ts(item)
+            if updated is not None:
+                listed_updated[str(item["id"])] = updated
         if not listed or not hasattr(self._warehouse, "load_slack_known_conversation_ids"):
-            return conversations, newly_discovered
+            return conversations, newly_discovered, listed_updated
         known = self._warehouse.load_slack_known_conversation_ids(
             account=account,
             team_id=team_id,
@@ -856,7 +875,7 @@ class SlackSyncRunner:
         )
         new = [item for item in listed if str(item["id"]) not in known]
         if not new:
-            return conversations, newly_discovered
+            return conversations, newly_discovered, listed_updated
         self._warehouse.insert_slack_conversations(
             [
                 conversation_to_row(account=account, team_id=team_id, conversation=item, synced_at=synced_at)
@@ -871,7 +890,7 @@ class SlackSyncRunner:
                 continue
             conversations = [*conversations, item]
             newly_discovered.add(str(item["id"]))
-        return conversations, newly_discovered
+        return conversations, newly_discovered, listed_updated
 
     def _sync_account_freshness_priority(
         self,
@@ -893,8 +912,9 @@ class SlackSyncRunner:
             )
             self._logger.info("Freshness loaded %s cached active Slack conversations for %s", len(conversations), account.account)
             newly_discovered_ids: set[str] = set()
+            listed_updated: dict[str, float] = {}
             if self._discover_new_direct_conversations:
-                conversations, listed_new_ids = self._discover_unlisted_direct_conversations(
+                conversations, listed_new_ids, listed_updated = self._discover_unlisted_direct_conversations(
                     account=account.account,
                     team_id=team_id,
                     client=client,
@@ -910,6 +930,7 @@ class SlackSyncRunner:
                 synced_at=synced_at,
             )
             newly_discovered_ids = set()
+            listed_updated = {}
 
         # Conversations whose own cursor was lost — e.g. clobbered to '' by the
         # pre-"Preserve Slack cursor on empty partial sync" empty-window bug, which
@@ -1020,8 +1041,9 @@ class SlackSyncRunner:
             else None
         )
         cool_floor = now_ts - self._freshness_cool_window.total_seconds()
-        warm_interval, cool_interval, cold_interval = (
-            interval.total_seconds() for interval in self._freshness_due_intervals
+        dm_intervals = tuple(interval.total_seconds() for interval in self._freshness_due_intervals)
+        channel_intervals = tuple(
+            interval.total_seconds() for interval in SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS
         )
         type_rank = {group: index for index, group in enumerate(priority_groups)}
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
@@ -1035,38 +1057,52 @@ class SlackSyncRunner:
                 updated = updated.replace(tzinfo=UTC)
             return updated.timestamp()
 
-        def _activity(conversation: Mapping[str, object]) -> float:
-            cursor_ts = _conversation_cursor_ts(conversation)
-            if cursor_ts is not None:
-                return cursor_ts
-            if _last_polled(conversation) == float("-inf"):
-                # Never polled: it is due at once whatever this says.
-                return conversation_activity_ts(conversation)
-            # Polled, and holding no message: conversations.list's `updated`
-            # is metadata (profile and membership edits), not a message, and
-            # dated 2,140 empty DMs and group DMs inside the year on
-            # 2026-11-11, so they were polled every two hours -- ~90 of each
-            # pass's ~250 polls. One opened inside the warm window may get its
-            # first message soon and is dated by its creation; any other is
-            # as quiet as a conversation silent for a year.
-            created = conversation.get("created")
-            created_ts = float(str(created)) if created not in (None, "") else 0.0
-            if warm_floor is not None and created_ts >= warm_floor:
-                return created_ts
-            return 0.0
+        def _never_written(conversation: Mapping[str, object]) -> bool:
+            # Polled, and still holding no message: no cursor and no stored
+            # message to derive one from.
+            return (
+                _conversation_cursor_ts(conversation) is None
+                and _last_polled(conversation) != float("-inf")
+            )
+
+        def _first_contact(conversation: Mapping[str, object]) -> bool:
+            # Slack moves a DM's `updated` to its first message: of 14 first
+            # messages in 30 days in DMs opened 39-338 days earlier,
+            # conversations.list showed `updated` equal to the first message in
+            # 10 and at or after it in 12 (2026-11-11), while it never moved for
+            # any of the 2,198 still untouched. The pass lists them every five
+            # minutes anyway, so a first message is noticed by the next pass.
+            updated = listed_updated.get(str(conversation["id"]))
+            return updated is not None and updated >= _last_polled(conversation)
 
         def _hot(conversation: Mapping[str, object], oldest_ts: float) -> bool:
             if str(conversation["id"]) in newly_discovered_ids:
                 return True
-            return _activity(conversation) >= oldest_ts
+            if _never_written(conversation):
+                return _first_contact(conversation)
+            return conversation_activity_ts(
+                conversation, cursor_ts=_conversation_cursor_ts(conversation)
+            ) >= oldest_ts
 
-        def _interval(conversation: Mapping[str, object]) -> float:
-            activity = _activity(conversation)
+        def _interval(conversation: Mapping[str, object], kind: str) -> float:
+            if _never_written(conversation):
+                # conversations.list's `updated` is metadata, not a message:
+                # dating these by it polled ~2,140 of them every two hours, ~90
+                # of each pass's ~250 polls (2026-11-11). A first message is
+                # caught by _first_contact; this rotation is the backstop for the
+                # rare one Slack does not mark (2 of 14 in 30 days).
+                return SLACK_FRESHNESS_NEVER_WRITTEN_INTERVAL.total_seconds()
+            warm, cool, cold = (
+                channel_intervals if kind in ("private_channel", "public_channel") else dm_intervals
+            )
+            activity = conversation_activity_ts(
+                conversation, cursor_ts=_conversation_cursor_ts(conversation)
+            )
             if warm_floor is not None and activity >= warm_floor:
-                return warm_interval
+                return warm
             if activity >= cool_floor:
-                return cool_interval
-            return cold_interval
+                return cool
+            return cold
 
         # Polling every candidate in tier order spent each pass on the ~250
         # conversations active in the last fortnight and never reached the
@@ -1082,16 +1118,18 @@ class SlackSyncRunner:
         # 2026-11-10 to 11-11 stopped at the rate limit after 209-249 polls
         # with 789-1,214 due. So the order is a priority, in four lanes:
         #
-        #   0. hot DMs, group DMs and private channels -- every pass;
+        #   0. hot DMs, group DMs and private channels, and a never-written DM
+        #      whose listed `updated` moved (a first message) -- every pass;
         #   1. due DMs and group DMs, most overdue first -- a person is waiting
         #      on the other end. Ordered only by how overdue, warm DMs waited
         #      behind channels as overdue as themselves and were polled p50 24 /
         #      p95 39 minutes apart against a 15-minute interval; im landing
         #      read p95 2,626s;
-        #   2. channels Zach is in -- due private channels, and member public
-        #      channels hot or due -- by how overdue, sharing what is left. A
-        #      hot member public channel is due every pass, not ahead of due DMs
-        #      (33 of them took a seventh of every pass on 2026-11-11);
+        #   2. channels Zach is in -- private channels and member public
+        #      channels, due on SLACK_FRESHNESS_CHANNEL_DUE_INTERVALS -- by how
+        #      overdue, sharing what is left. A member public channel is never
+        #      polled every pass (33 of them took a seventh of every pass on
+        #      2026-11-11);
         #   3. public channels he is not in: ~95 polls a pass went to that
         #      chatter while due DMs waited (2026-10-03). The public sweep covers
         #      what a pass misses.
@@ -1100,6 +1138,10 @@ class SlackSyncRunner:
             conversation, group, oldest_ts = entry
             kind = group[0]
             hot = _hot(conversation, oldest_ts)
+            if kind == "public_channel" and _public_member(conversation):
+                # Due on the channel interval like a private channel, never
+                # every pass: 33 active ones took a seventh of every pass.
+                hot = False
             if kind == "public_channel":
                 lane = 2 if _public_member(conversation) else 3
             elif hot:
@@ -1111,7 +1153,7 @@ class SlackSyncRunner:
             if hot:
                 due = _last_polled(conversation)
             else:
-                due = _last_polled(conversation) + _interval(conversation)
+                due = _last_polled(conversation) + _interval(conversation, kind)
                 # Due before the next pass would get to it: passes start every
                 # five minutes give or take half a minute, so a DM due ten
                 # minutes after its poll was often checked seconds early by the
@@ -2780,16 +2822,22 @@ def conversation_activity_ts(
     latest = conversation.get("latest")
     if isinstance(latest, Mapping) and latest.get("ts"):
         return float(str(latest["ts"]))
-    updated = conversation.get("updated")
-    if updated not in (None, ""):
-        updated_value = float(str(updated))
-        if updated_value > 10_000_000_000:
-            updated_value = updated_value / 1000
-        return updated_value
+    updated = conversation_updated_ts(conversation)
+    if updated is not None:
+        return updated
     created = conversation.get("created")
     if created not in (None, ""):
         return float(str(created))
     return 0.0
+
+
+def conversation_updated_ts(conversation: Mapping[str, object]) -> float | None:
+    """conversations.list's `updated`, in seconds (Slack sends milliseconds)."""
+    updated = conversation.get("updated")
+    if updated in (None, ""):
+        return None
+    value = float(str(updated))
+    return value / 1000 if value > 10_000_000_000 else value
 
 
 def thread_state_object_id(*, conversation_id: str, thread_ts: str) -> str:
