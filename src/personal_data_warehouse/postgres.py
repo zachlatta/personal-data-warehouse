@@ -338,12 +338,15 @@ SEARCH_TEXT_BROAD_SMALL_POOL = 800
 #: How the search cache warm reads the attention-tier timeline heap: a bitmap
 #: heap scan over timeline_events_priority_time_idx, which PostgreSQL 18
 #: prefetches through its read stream (an index walk reads one page at a
-#: time), under a statement budget so a saturated disk cannot hold the
-#: five-minute search health pass. Measured 2026-11-11 on production: 86% of
-#: a cold scoped lexical leg's reads were these heap pages (1,309 of 1,529),
-#: about 14% of the heap's 5.04M pages, ~5.6 GB.
+#: time). Measured 2026-11-11 on production: 86% of a cold scoped lexical
+#: leg's reads were these heap pages (1,309 of 1,529), about 14% of the heap's
+#: 5.04M pages, ~5.6 GB, read in 61 s on 4 workers. The warm runs inside the
+#: five-minute search_chunks job, after a chunk build of up to 240 s and while
+#: holding that job's lock, so its budget is 180 s (3x the measured warm): a
+#: saturated disk makes it a partial warm, never a run that outlives its tick
+#: by minutes. The job's dagster/max_runtime caps the rest.
 ATTENTION_HEAP_WARM_SETTINGS: tuple[tuple[str, str], ...] = (
-    ("statement_timeout", "600s"),
+    ("statement_timeout", "180s"),
     ("enable_seqscan", "off"),
     ("enable_indexscan", "off"),
     ("enable_indexonlyscan", "off"),
@@ -8179,12 +8182,24 @@ class PostgresWarehouse:
                 rows = int(cursor.fetchone()[0] or 0)
             except psycopg2.errors.QueryCanceled:
                 cursor.execute("ROLLBACK")
+                # A partial warm still counts: the pages it read are cached,
+                # and retrying at once would keep the disk saturated.
+                self._record_heap_prewarm()
                 return {"heap_rows": None, "timed_out": True}
             except Exception:
                 cursor.execute("ROLLBACK")
                 raise
             cursor.execute("COMMIT")
+        self._record_heap_prewarm()
         return {"heap_rows": rows, "timed_out": False}
+
+    def _record_heap_prewarm(self) -> None:
+        self._ensure_search_schema_state_table()
+        self._command(
+            "INSERT INTO @search_schema_state (id, signature, heap_prewarmed_at) "
+            "VALUES (1, '', clock_timestamp()) "
+            "ON CONFLICT (id) DO UPDATE SET heap_prewarmed_at = EXCLUDED.heap_prewarmed_at"
+        )
 
     def probe_bm25_indexes(self) -> dict[str, str]:
         """Scan rows through every BM25 index in the warehouse; return errors by name.
@@ -17267,6 +17282,8 @@ class PostgresWarehouse:
             "prewarmed_index_fingerprint text NOT NULL DEFAULT '', "
             "prewarmed_at timestamptz NOT NULL "
             "DEFAULT '1970-01-01 00:00:00+00'::timestamptz, "
+            "heap_prewarmed_at timestamptz NOT NULL "
+            "DEFAULT '1970-01-01 00:00:00+00'::timestamptz, "
             "CONSTRAINT search_schema_state_single_row CHECK (id = 1))"
         )
         rel = canonical_relation(self._SEARCH_SCHEMA_MARKER_TABLE).with_namespace(
@@ -17287,6 +17304,10 @@ class PostgresWarehouse:
             ),
             "prewarmed_index_fingerprint": "text NOT NULL DEFAULT ''",
             "prewarmed_at": (
+                "timestamptz NOT NULL DEFAULT "
+                "'1970-01-01 00:00:00+00'::timestamptz"
+            ),
+            "heap_prewarmed_at": (
                 "timestamptz NOT NULL DEFAULT "
                 "'1970-01-01 00:00:00+00'::timestamptz"
             ),
@@ -17403,6 +17424,14 @@ class PostgresWarehouse:
         if rows:
             return str(rows[0][0]), rows[0][1], str(rows[0][2])
         return "", datetime.fromtimestamp(0, tz=UTC), ""
+
+    def search_heap_prewarmed_at(self) -> datetime:
+        """When the attention-tier timeline heap was last warmed (the epoch if never)."""
+        self._ensure_search_schema_state_table()
+        rows = self._query("SELECT heap_prewarmed_at FROM @search_schema_state WHERE id = 1")
+        if rows and rows[0][0] is not None:
+            return rows[0][0]
+        return datetime.fromtimestamp(0, tz=UTC)
 
     def search_prewarmed_at(self) -> datetime:
         """When the search indexes were last warmed (the epoch if never)."""

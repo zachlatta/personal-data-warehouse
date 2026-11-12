@@ -456,8 +456,12 @@ def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_sca
     )
     warehouse._command("ANALYZE @timeline_events")
 
+    assert warehouse.search_heap_prewarmed_at() == datetime.fromtimestamp(0, tz=UTC)
     result = warehouse.warm_attention_heap()
     assert result == {"heap_rows": 90, "timed_out": False}
+    # The heap re-warm keeps its own clock, separate from the index warm's.
+    assert datetime.now(tz=UTC) - warehouse.search_heap_prewarmed_at() < timedelta(minutes=5)
+    assert warehouse.search_prewarmed_at() == datetime.fromtimestamp(0, tz=UTC)
 
     warehouse._command("BEGIN")
     try:
@@ -470,7 +474,9 @@ def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_sca
         warehouse._command("ROLLBACK")
     assert "Bitmap Heap Scan on events" in plan, plan
     assert "Bitmap Index Scan on timeline_events_priority_time_idx" in plan, plan
-    assert "statement_timeout" in dict(ATTENTION_HEAP_WARM_SETTINGS)
+    # The warm runs inside the five-minute search_chunks job, after a chunk
+    # build of up to 240 s: its budget must leave the tick room to finish.
+    assert dict(ATTENTION_HEAP_WARM_SETTINGS)["statement_timeout"] == "180s"
 
 
 def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(

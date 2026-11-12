@@ -22,9 +22,13 @@ from personal_data_warehouse.search_index import (
     SearchChunkBuilder,
     SearchEmbeddingRunner,
     _EmbedBudget,
+    SEARCH_HEAP_REWARM_FLOOR,
+    SEARCH_HEAP_REWARM_MIN_INTERVAL,
     record_search_cache_residency,
     rewarm_search_indexes_if_cold,
+    rewarm_timeline_heap_if_cold,
     should_rewarm_search_indexes,
+    should_rewarm_timeline_heap,
     split_text,
     vector_literal,
     window_start,
@@ -947,6 +951,65 @@ def test_a_cold_cache_is_rewarmed_within_the_working_day() -> None:
     assert not should_rewarm_search_indexes(
         resident_fraction=0.13, last_prewarmed_at=now - timedelta(hours=5), now=now
     )
+
+
+def test_a_cold_timeline_heap_is_rewarmed_on_its_own_hourly_clock() -> None:
+    """The attention heap decays within hours, and the index guard never sees it.
+
+    Measured on production 2026-11-11/12: a warm left the heap 18.1% resident
+    in shared buffers, and two hours later it read 3.2% there and 0.7% in the
+    page cache, with fresh scoped searches back at 1.3-8.0 s. The index guard
+    acts on index residency every six hours only, so the heap has its own
+    floor and a one-hour clock.
+    """
+    now = datetime(2026, 11, 12, 3, 0, tzinfo=UTC)
+    assert SEARCH_HEAP_REWARM_FLOOR == 0.10
+    assert SEARCH_HEAP_REWARM_MIN_INTERVAL == timedelta(hours=1)
+    cold = 0.05
+    assert should_rewarm_timeline_heap(
+        resident_fraction=cold, last_warmed_at=now - timedelta(minutes=61), now=now
+    )
+    assert not should_rewarm_timeline_heap(
+        resident_fraction=cold, last_warmed_at=now - timedelta(minutes=30), now=now
+    )
+    assert not should_rewarm_timeline_heap(
+        resident_fraction=0.15, last_warmed_at=now - timedelta(days=1), now=now
+    )
+    assert not should_rewarm_timeline_heap(
+        resident_fraction=-1, last_warmed_at=now - timedelta(days=1), now=now
+    )
+
+
+def test_rewarm_timeline_heap_warms_only_the_heap_and_says_why() -> None:
+    class Warehouse:
+        def __init__(self, warmed_at):
+            self.warmed_at = warmed_at
+            self.heap_warms = 0
+
+        def search_heap_prewarmed_at(self):
+            return self.warmed_at
+
+        def warm_attention_heap(self):
+            self.heap_warms += 1
+            return {"heap_rows": 42, "timed_out": False}
+
+        def prewarm_search_indexes_if_needed(self, **_kwargs):
+            raise AssertionError("a heap re-warm must not re-read the indexes")
+
+    now = datetime(2026, 11, 12, 3, 0, tzinfo=UTC)
+    cold = Warehouse(now - timedelta(hours=2))
+    result = rewarm_timeline_heap_if_cold(cold, {"resident_fraction": 0.032}, now=now)
+    assert cold.heap_warms == 1
+    assert result["warmed"] is True and result["heap_rows"] == 42
+    assert "0.03" in result["reason"]
+
+    recent = Warehouse(now - timedelta(minutes=10))
+    result = rewarm_timeline_heap_if_cold(recent, {"resident_fraction": 0.032}, now=now)
+    assert recent.heap_warms == 0 and result["warmed"] is False
+
+    unmeasured = Warehouse(now - timedelta(hours=2))
+    assert rewarm_timeline_heap_if_cold(unmeasured, None, now=now)["warmed"] is False
+    assert unmeasured.heap_warms == 0
 
 
 def test_rewarm_forces_a_prewarm_when_cold_and_records_why() -> None:

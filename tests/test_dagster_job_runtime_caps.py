@@ -18,6 +18,7 @@ import pytest
 from personal_data_warehouse.defs import contacts_sync, gmail_settings_sync, gmail_sync, google_drive_source_sync
 from personal_data_warehouse.defs import pipeline_health as pipeline_health_defs
 from personal_data_warehouse.defs import plaid_sync, simplefin_sync, slack_sync, timeline_sync
+from personal_data_warehouse.defs import search_index as search_index_defs
 
 MAX_RUNTIME_TAG = "dagster/max_runtime"
 
@@ -27,6 +28,8 @@ MAX_RUNTIME_TAG = "dagster/max_runtime"
     [
         (pipeline_health_defs.pipeline_health_job, 900),
         (timeline_sync.timeline_sync_job, 1800),
+        # Chunk build (240 s budget), index warm and the 180 s heap warm.
+        (search_index_defs.search_chunks_job, 1800),
         (slack_sync.slack_workspace_sync_job, 1800),
         (slack_sync.slack_workspace_coverage_sync_job, 3600),
         (gmail_sync.gmail_mailbox_sync_job, 3600),
