@@ -658,7 +658,7 @@ guest saw as idle. Two plan faults, both fixed in the functions themselves:
   `prewarm_search_indexes_if_needed`, so on every deploy, restart, REINDEX and six-hourly
   cold-cache re-warm, after the indexes. It visits every `self`/`direct`/`cc` row through
   a bitmap heap scan over `timeline_events_priority_time_idx`, which PostgreSQL 18
-  prefetches and parallelizes, unlike the pool's index walk, under a 600 s statement
+  prefetches and parallelizes, unlike the pool's index walk, under a 180 s statement
   budget (`ATTENTION_HEAP_WARM_SETTINGS`); a timeout is a partial warm, not a failure.
   Those rows sit on ~14% of the heap's pages, ~5.6 GB. Measured on production
   2026-11-11 with the same read-only SELECT: a Parallel Bitmap Heap Scan on 4 workers

@@ -159,7 +159,7 @@ def restore_search_cache_after_reconcile(
     and 17 HNSW loads in 24 hours on 2026-09-20 -- ~1.5 TB through an 18 GB
     cache, pg_prewarm the largest block reader on the host, residency 19.6%.
     Now the reconcile measures residency, publishes it, and warms only under
-    the same floor and daily interval the cold-cache guard uses.
+    the same floor and six-hour interval the cold-cache guard uses.
     """
     try:
         measured = record_search_cache_residency(warehouse)
