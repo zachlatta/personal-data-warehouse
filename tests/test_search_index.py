@@ -864,6 +864,9 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
                 "resident_fraction": 0.25,
             }
 
+        def measure_timeline_heap_residency(self):
+            return {"resident_bytes": 800, "total_bytes": 8_000, "resident_fraction": 0.1}
+
         def write_search_health(self, component, **facts):
             self.writes.append((component, facts))
 
@@ -877,6 +880,37 @@ def test_record_search_cache_residency_refreshes_the_living_health_row() -> None
     assert facts["caught_up"] == 1
     assert facts["last_error"] == ""
     assert facts["last_success_at"].tzinfo is UTC
+    # 86% of a cold scoped lexical leg's reads are timeline heap pages
+    # (2026-11-11), so the heap's residency is published beside the indexes'.
+    component, facts = warehouse.writes[1]
+    assert component == "timeline_heap_residency"
+    assert facts["resident_bytes"] == 800 and facts["total_bytes"] == 8_000
+    assert facts["resident_fraction"] == 0.1
+
+
+def test_timeline_heap_residency_is_measured_and_shown_beside_the_indexes(
+    warehouse: PostgresWarehouse,
+) -> None:
+    _provision(warehouse)
+    warehouse.ensure_pipeline_health_tables()
+    measured = warehouse.measure_timeline_heap_residency()
+    assert measured["total_bytes"] >= 0
+    assert 0.0 <= measured["resident_fraction"] <= 1.0
+    warehouse.write_search_health(
+        "timeline_heap_residency",
+        caught_up=1,
+        pending_count=0,
+        processed_rows=1,
+        resident_bytes=measured["resident_bytes"],
+        total_bytes=measured["total_bytes"],
+        resident_fraction=measured["resident_fraction"],
+        last_success_at=datetime.now(tz=UTC),
+        last_error="",
+    )
+    row = warehouse._query_dicts(
+        "SELECT * FROM @marts_search_health WHERE component = 'timeline_heap_residency'"
+    )[0]
+    assert row["status"] == "ok"
 
 
 def test_should_rewarm_only_when_cold_and_not_recently_warmed() -> None:

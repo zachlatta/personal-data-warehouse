@@ -39,6 +39,7 @@ from personal_data_warehouse.relations import relation
 from personal_data_warehouse.timeline import TimelineSyncEngine, adapter_by_name
 from personal_data_warehouse.postgres import (
     ARRAY_COLUMNS,
+    ATTENTION_HEAP_WARM_SETTINGS,
     ATTACHMENT_BACKFILL_STATE_COLUMNS,
     ATTACHMENT_COLUMNS,
     FLOAT_COLUMNS,
@@ -399,9 +400,19 @@ def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers
         lambda sql, params=None: state_updates.append((sql, params)),
     )
 
+    def warm_heap():
+        prewarm_calls.append(("timeline.events attention heap", "bitmap"))
+        return {"heap_rows": 7, "timed_out": False}
+
+    monkeypatch.setattr(warehouse, "warm_attention_heap", warm_heap)
+
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="new-signature")
 
     assert result["warmed"] is True
+    assert result["heap_rows"] == 7
+    # The heap the lexical pool visits is warmed LAST, after every index.
+    assert prewarm_calls[-1] == ("timeline.events attention heap", "bitmap")
+    prewarm_calls.pop()
     assert prewarm_calls[:4] == [
         (f"derived_search.search_chunk_vectors_{partition}_hnsw_idx", "read")
         for partition in ("gmail", "slack", "slack_file", "other")
@@ -417,6 +428,49 @@ def test_search_index_prewarm_reads_hnsw_then_every_bm25_index_and_never_buffers
         now,
         "new-fingerprint",
     )
+
+
+def test_attention_heap_warm_reads_the_tier_heap_through_a_prefetched_bitmap_scan(
+    warehouse: PostgresWarehouse,
+) -> None:
+    """The lexical pool's cold cost is the timeline heap, not its indexes.
+
+    Measured 2026-11-11 on production: of the 1,529 reads a cold
+    `search_text('boiler inspection', 20, self/direct/cc)` made, 1,309 (86%)
+    were `timeline.events` heap pages and 171 the attention BM25 index, so a
+    warm of the indexes alone leaves the leg cold. The attention-tier heap
+    (~14% of heap pages) is warmed by a bitmap heap scan over the priority
+    index, which PostgreSQL 18 prefetches through its read stream, instead of
+    an index walk that reads one page at a time.
+    """
+    _ensure_all_table_groups(warehouse)
+    warehouse._command(
+        """
+        INSERT INTO @timeline_events (adapter, event_id, source, kind, occurred_at, source_table,
+                                     search_text, priority, actor, title, snippet, context)
+        SELECT 'slack_message', 'hw-' || p || '-' || g, 'slack', 'message', now() - g * interval '1 minute',
+               'slack_messages', 'heap warm probe', p, 'a', 't', 's', 'c'
+        FROM generate_series(1, 30) g,
+             unnest(ARRAY['self', 'direct', 'cc', 'noise', 'background']::@timeline_priority[]) p
+        """
+    )
+    warehouse._command("ANALYZE @timeline_events")
+
+    result = warehouse.warm_attention_heap()
+    assert result == {"heap_rows": 90, "timed_out": False}
+
+    warehouse._command("BEGIN")
+    try:
+        for name, value in ATTENTION_HEAP_WARM_SETTINGS:
+            warehouse._command(f"SET LOCAL {name} = '{value}'")
+        plan = "\n".join(
+            row[0] for row in warehouse._query("EXPLAIN " + warehouse._attention_heap_warm_sql())
+        )
+    finally:
+        warehouse._command("ROLLBACK")
+    assert "Bitmap Heap Scan on events" in plan, plan
+    assert "Bitmap Index Scan on timeline_events_priority_time_idx" in plan, plan
+    assert "statement_timeout" in dict(ATTENTION_HEAP_WARM_SETTINGS)
 
 
 def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
@@ -460,9 +514,17 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
         lambda sql, params=None: calls.append(sql),
     )
 
+    heap_warms: list[bool] = []
+    monkeypatch.setattr(
+        warehouse,
+        "warm_attention_heap",
+        lambda: heap_warms.append(True) or {"heap_rows": 1, "timed_out": False},
+    )
+
     result = warehouse.prewarm_search_indexes_if_needed(schema_signature="sig")
 
     assert result == {"warmed": False, "reason": "current", "blocks": 0}
+    assert heap_warms == [], "a current cache reads no heap either"
     assert calls == []
 
     forced = warehouse.prewarm_search_indexes_if_needed(
@@ -470,6 +532,7 @@ def test_search_index_prewarm_is_skipped_for_same_postmaster_and_fingerprint(
     )
     assert forced["warmed"] is True
     assert prewarm_calls
+    assert heap_warms == [True]
     assert calls, "a forced post-maintenance warm must update the state marker"
 
 

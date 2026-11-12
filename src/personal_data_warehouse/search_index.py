@@ -209,6 +209,26 @@ def record_search_cache_residency(warehouse: Any) -> dict[str, int | float]:
         last_success_at=datetime.now(tz=UTC),
         last_error="",
     )
+    # The lexical pool's cold reads are mostly timeline heap pages, which the
+    # index gauge above cannot see (86% of them on 2026-11-11).
+    try:
+        heap = warehouse.measure_timeline_heap_residency()
+    except Exception as error:  # noqa: BLE001 - one gauge must not hide the other
+        warehouse.write_search_health("timeline_heap_residency", last_error=str(error)[:500])
+    else:
+        warehouse.write_search_health(
+            "timeline_heap_residency",
+            configured=1,
+            pgvector_available=1,
+            caught_up=1,
+            processed_rows=1,
+            pending_count=0,
+            resident_bytes=heap["resident_bytes"],
+            total_bytes=heap["total_bytes"],
+            resident_fraction=heap["resident_fraction"],
+            last_success_at=datetime.now(tz=UTC),
+            last_error="",
+        )
     return measured
 
 

@@ -111,8 +111,13 @@ class _FakeCacheWarehouse:
     def measure_search_cache_residency(self):
         return {"resident_fraction": self.resident_fraction, "resident_bytes": 1, "total_bytes": 10, "target_count": 2}
 
+    def measure_timeline_heap_residency(self):
+        return {"resident_fraction": 0.1, "resident_bytes": 1, "total_bytes": 10}
+
     def write_search_health(self, component, **facts):
-        self.health = (component, facts)
+        # The index gauge is written first; the timeline heap gauge follows.
+        self.health_writes = getattr(self, "health_writes", []) + [(component, facts)]
+        self.health = self.health_writes[0]
 
     def search_prewarmed_at(self):
         return self.prewarmed_at

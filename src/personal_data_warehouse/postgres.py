@@ -335,6 +335,20 @@ SEARCH_TEXT_BROAD_PER_BRANCH_CAP = 12
 # flattens. Re-measure with search_benchmark before moving it.
 SEARCH_TEXT_BROAD_POOL = 5000
 SEARCH_TEXT_BROAD_SMALL_POOL = 800
+#: How the search cache warm reads the attention-tier timeline heap: a bitmap
+#: heap scan over timeline_events_priority_time_idx, which PostgreSQL 18
+#: prefetches through its read stream (an index walk reads one page at a
+#: time), under a statement budget so a saturated disk cannot hold the
+#: five-minute search health pass. Measured 2026-11-11 on production: 86% of
+#: a cold scoped lexical leg's reads were these heap pages (1,309 of 1,529),
+#: about 14% of the heap's 5.04M pages, ~5.6 GB.
+ATTENTION_HEAP_WARM_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("statement_timeout", "600s"),
+    ("enable_seqscan", "off"),
+    ("enable_indexscan", "off"),
+    ("enable_indexonlyscan", "off"),
+    ("jit", "off"),
+)
 # Which BM25 index a pooled row was scanned through, carried on the row so the
 # ranking stage can score a candidate against the same corpus statistics the
 # merge was built on. Two partitions means two bm25 corpora, and a low-volume
@@ -8106,6 +8120,72 @@ class PostgresWarehouse:
             "resident_fraction": (resident / total if total else 0.0),
         }
 
+    def measure_timeline_heap_residency(self) -> dict[str, int | float]:
+        """Shared-buffer residency of the timeline heap the lexical pool visits.
+
+        Each pooled BM25 hit is a heap visit, and on 2026-11-11 those were 86%
+        of a cold scoped lexical leg's reads, so index residency alone cannot
+        explain a slow keyword search. The attention-tier rows the warm loads
+        are ~14% of the heap's pages; this reads the whole heap's fraction.
+        """
+        extension = self._query(
+            "SELECT n.nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace "
+            "WHERE e.extname = 'pg_buffercache'"
+        )
+        if not extension:
+            raise RuntimeError("pg_buffercache extension is not installed")
+        buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+        rows = self._query(
+            f"""
+            SELECT pg_relation_size(c.oid)::bigint,
+                   (SELECT count(*) FROM {buffer_view} b
+                     WHERE b.relfilenode = pg_relation_filenode(c.oid)
+                       AND b.relforknumber = 0
+                       AND b.reldatabase = (SELECT oid FROM pg_database
+                                            WHERE datname = current_database()))::bigint
+                       * current_setting('block_size')::bigint
+            FROM pg_class c WHERE c.oid = %s::regclass
+            """,
+            (self.sql_relation("timeline_events"),),
+        )
+        total, resident = (int(value or 0) for value in rows[0])
+        resident = min(resident, total)
+        return {
+            "total_bytes": total,
+            "resident_bytes": resident,
+            "resident_fraction": (resident / total if total else 0.0),
+        }
+
+    def _attention_heap_warm_sql(self) -> str:
+        return self._expand_relations(
+            "SELECT count(t.event_id) FROM @timeline_events t "
+            f"WHERE t.priority IN ({SEARCH_TEXT_ATTENTION_PRIORITIES_SQL})"
+        )
+
+    def warm_attention_heap(self) -> dict[str, int | bool | None]:
+        """Read the attention-tier timeline heap into the cache, prefetched.
+
+        Reading a column forces every heap page to be visited; the planner
+        settings force the prefetching bitmap scan. A statement timeout is a
+        partial warm, not a failure: the pages already read stay cached.
+        """
+        with self._connection.cursor() as cursor:
+            cursor.execute("BEGIN")
+            try:
+                for name, value in ATTENTION_HEAP_WARM_SETTINGS:
+                    cursor.execute(f"SET LOCAL {name} = '{value}'")
+                cursor.execute(self._attention_heap_warm_sql())
+                rows = int(cursor.fetchone()[0] or 0)
+            except psycopg2.errors.QueryCanceled:
+                cursor.execute("ROLLBACK")
+                return {"heap_rows": None, "timed_out": True}
+            except Exception:
+                cursor.execute("ROLLBACK")
+                raise
+            cursor.execute("COMMIT")
+        return {"heap_rows": rows, "timed_out": False}
+
     def probe_bm25_indexes(self) -> dict[str, str]:
         """Scan rows through every BM25 index in the warehouse; return errors by name.
 
@@ -8351,6 +8431,7 @@ class PostgresWarehouse:
             "bm25_indexes",
             "bm25_index_bloat",
             "cache_residency",
+            "timeline_heap_residency",
         }:
             raise ValueError(f"unknown search health component: {component}")
         now = datetime.now(tz=UTC)
@@ -17373,6 +17454,9 @@ class PostgresWarehouse:
             )
             if rows:
                 blocks += int(rows[0][0] or 0)
+        # Last: the heap rows the lexical pool visits (86% of a cold scoped
+        # leg's reads on 2026-11-11), which no index warm reaches.
+        heap = self.warm_attention_heap()
         self._command(
             "UPDATE @search_schema_state SET prewarmed_signature = %s, "
             "prewarmed_postmaster_started_at = %s, "
@@ -17384,6 +17468,8 @@ class PostgresWarehouse:
             "warmed": True,
             "reason": "forced" if force else "stale",
             "blocks": blocks,
+            "heap_rows": heap["heap_rows"],
+            "heap_timed_out": heap["timed_out"],
         }
 
     def _prewarm_search_indexes_best_effort(self, *, schema_signature: str) -> None:

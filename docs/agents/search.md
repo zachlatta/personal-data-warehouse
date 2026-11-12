@@ -649,9 +649,26 @@ guest saw as idle. Two plan faults, both fixed in the functions themselves:
   - The pool's depth is a measured ranking trade (2000/300 scored MRR 0.278 against
     0.292 at 5000/800; see `SEARCH_TEXT_BROAD_POOL`), so it is not shrunk to save reads.
 
-  So the cold lexical leg costs about one random read per pooled row. Two levers shorten
-  it without changing ranking: the disk read latency (below), and keeping the BM25
-  indexes resident (the six-hourly re-warm). A warm leg is ~200 ms.
+  So the cold lexical leg costs about one random read per pooled row, and those reads
+  are the timeline heap, not the index: of the 1,529 reads a cold
+  `search_text('boiler inspection', 20, self/direct/cc)` made, 1,309 (86%) were
+  `timeline.events` heap pages and 171 the attention BM25 index. Keeping the BM25 indexes
+  resident therefore barely moves it.
+- *The cache warm now reads the attention-tier heap.* `warm_attention_heap()` runs last in
+  `prewarm_search_indexes_if_needed`, so on every deploy, restart, REINDEX and six-hourly
+  cold-cache re-warm, after the indexes. It visits every `self`/`direct`/`cc` row through
+  a bitmap heap scan over `timeline_events_priority_time_idx`, which PostgreSQL 18
+  prefetches and parallelizes, unlike the pool's index walk, under a 600 s statement
+  budget (`ATTENTION_HEAP_WARM_SETTINGS`); a timeout is a partial warm, not a failure.
+  Those rows sit on ~14% of the heap's pages, ~5.6 GB. Measured on production
+  2026-11-11 with the same read-only SELECT: a Parallel Bitmap Heap Scan on 4 workers
+  read 2.69M rows in 61 s, and the heap's shared-buffer residency went from 5.0% to 18.1%.
+  Six fresh scoped searches took 2.6-3.8 s before it (median 3.1 s) and six others
+  0.38-0.72 s after (median 0.43 s). `marts_ops.search_health` carries the heap's
+  residency as `timeline_heap_residency` beside `cache_residency`; the attention rows are
+  ~14% of the heap, so ~15-20% there means they are warm. An unscoped search pools from
+  the whole heap, which does not fit in memory; it still pays the disk read latency
+  below.
 
 What it did not fix is the read wait itself. Cold reads ran 0.5-0.7 ms each because the
 guest's disk is a qcow2 on mew's `md0` RAID1 (a Samsung 970 EVO Plus and a Viper VPN100),
