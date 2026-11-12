@@ -144,6 +144,9 @@ func TestAManifestFailureStillSyncsTheWorkspaceAndKeepsTheShards(t *testing.T) {
 	}
 	var shipped []string
 	for _, call := range app.Calls()[before:] {
+		if call.Path == "/ingest/source-observation" {
+			continue // plain JSON, not a gzip record batch
+		}
 		for _, record := range testfixtures.DecodeGzipJSONL(call.Body) {
 			inner := record["record"].(map[string]any)
 			shipped = append(shipped, inner["path"].(string)+" deleted="+fmt.Sprint(inner["deleted"]))
