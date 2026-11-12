@@ -391,6 +391,8 @@ type statsTimelineRunner struct {
 	oldest string
 	newest string
 	fail   error
+	// gate, when set, holds the statistics query until it is closed.
+	gate chan struct{}
 }
 
 func (f *statsTimelineRunner) QueryArgs(_ context.Context, sql string, args []any, _ int) (query.RawResult, error) {
@@ -403,6 +405,9 @@ func (f *statsTimelineRunner) QueryArgs(_ context.Context, sql string, args []an
 	}
 	switch sql {
 	case timelineCountStatsSQL:
+		if f.gate != nil {
+			<-f.gate
+		}
 		return query.RawResult{Rows: f.stats}, nil
 	case timelineSpanSQL:
 		return query.RawResult{Rows: []map[string]any{{"oldest": f.oldest, "newest": f.newest}}}, nil
@@ -995,5 +1000,62 @@ func TestTimelineSourcesServeTheLastGoodCountsWhenARefreshFails(t *testing.T) {
 	cold.handleSources(recorder, httptest.NewRequest(http.MethodGet, "/api/timeline/sources", nil))
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("a failure with nothing cached = %d, want 500", recorder.Code)
+	}
+}
+
+func TestTimelineSourcesConcurrentRefreshesShareOneRebuild(t *testing.T) {
+	runner := &statsTimelineRunner{
+		stats:  []map[string]any{{"dimension": "total", "name": "", "count": int64(42)}},
+		exact:  map[string]int64{},
+		oldest: "2020-01-01T00:00:00Z",
+		newest: "2026-11-11T00:00:00Z",
+		gate:   make(chan struct{}),
+	}
+	svc := newTimelineService(runner, runner, nil, slog.Default())
+	const readers = 8
+	var wg sync.WaitGroup
+	codes := make([]int, readers)
+	for i := range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			svc.handleSources(recorder, httptest.NewRequest(http.MethodGet, "/api/timeline/sources", nil))
+			codes[i] = recorder.Code
+		}()
+	}
+	// Let every reader reach the rebuild before the first one can finish it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		runner.mu.Lock()
+		started := 0
+		for _, call := range runner.calls {
+			if call.SQL == timelineCountStatsSQL {
+				started++
+			}
+		}
+		runner.mu.Unlock()
+		if started >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(runner.gate)
+	wg.Wait()
+
+	statsCalls := 0
+	for _, call := range runner.calls {
+		if call.SQL == timelineCountStatsSQL {
+			statsCalls++
+		}
+	}
+	if statsCalls != 1 {
+		t.Fatalf("%d concurrent readers ran %d rebuilds, want 1", readers, statsCalls)
+	}
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("reader %d got %d", i, code)
+		}
 	}
 }

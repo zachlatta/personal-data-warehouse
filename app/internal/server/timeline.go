@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	pdwauth "github.com/zachlatta/personal-data-warehouse/app/internal/auth"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/query"
 	"github.com/zachlatta/personal-data-warehouse/app/internal/warehouse"
@@ -71,6 +73,7 @@ type timelineService struct {
 	mu             sync.Mutex
 	sourcesPayload []byte
 	sourcesFetched time.Time
+	sourcesFlight  singleflight.Group
 
 	linksMu            sync.Mutex
 	slackDomainCache   map[string]string
@@ -362,7 +365,20 @@ func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) 
 		_, _ = w.Write(cached)
 		return
 	}
-	payload, err := s.buildSourcesPayload(r.Context())
+	// Single flight: requests that arrive while a rebuild runs share it
+	// rather than each running the count queries. The rebuild is detached
+	// from any one caller, so a reader that disconnects cannot fail the rest.
+	shared, err, _ := s.sourcesFlight.Do("sources", func() (any, error) {
+		payload, err := s.buildSourcesPayload(context.WithoutCancel(r.Context()))
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.sourcesPayload = payload
+		s.sourcesFetched = time.Now()
+		s.mu.Unlock()
+		return payload, nil
+	})
 	if err != nil {
 		// Stale counts beat an empty sidebar: serve the last good payload.
 		if cached != nil {
@@ -375,12 +391,8 @@ func (s *timelineService) handleSources(w http.ResponseWriter, r *http.Request) 
 		httpError(w, http.StatusInternalServerError, "timeline sources query failed")
 		return
 	}
-	s.mu.Lock()
-	s.sourcesPayload = payload
-	s.sourcesFetched = time.Now()
-	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(payload)
+	_, _ = w.Write(shared.([]byte))
 }
 
 // timelineCount is one filter chip's count: nil when it is not known.
