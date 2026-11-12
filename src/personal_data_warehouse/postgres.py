@@ -2831,8 +2831,6 @@ POSTGRES_INDEXES: tuple[IndexSpec, ...] = (
     ),
 )
 
-# Indexes that used to exist but have been superseded. Dropped idempotently
-# during _ensure_indexes so existing deployments converge with fresh installs.
 #: One partition's graph walk: the rows of its HNSW top-$5 for vector $4.
 #: search_hybrid_semantic inlines it for a lone walk; the walk function runs
 #: it per partition so several walks can share a Parallel Append. Both format
@@ -8061,6 +8059,17 @@ class PostgresWarehouse:
             if spec.table == "timeline_events" and spec.requires_pg_textsearch
         ]
 
+    def _pg_buffercache_view(self) -> str:
+        """The qualified pg_buffercache view the residency gauges read."""
+        extension = self._query(
+            "SELECT n.nspname FROM pg_extension e "
+            "JOIN pg_namespace n ON n.oid = e.extnamespace "
+            "WHERE e.extname = 'pg_buffercache'"
+        )
+        if not extension:
+            raise RuntimeError("pg_buffercache extension is not installed")
+        return f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+
     def measure_search_cache_residency(self) -> dict[str, int | float]:
         """Measure shared-buffer residency for the search working-set indexes.
 
@@ -8071,14 +8080,7 @@ class PostgresWarehouse:
         actually warm rather than leaving the cause in an SSH transcript.
         """
 
-        extension = self._query(
-            "SELECT n.nspname FROM pg_extension e "
-            "JOIN pg_namespace n ON n.oid = e.extnamespace "
-            "WHERE e.extname = 'pg_buffercache'"
-        )
-        if not extension:
-            raise RuntimeError("pg_buffercache extension is not installed")
-        buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+        buffer_view = self._pg_buffercache_view()
 
         timeline_schema = self._object_schema("timeline_events")
         embeddings_schema = self._object_schema("search_chunk_vectors")
@@ -8131,14 +8133,7 @@ class PostgresWarehouse:
         explain a slow keyword search. The attention-tier rows the warm loads
         are ~14% of the heap's pages; this reads the whole heap's fraction.
         """
-        extension = self._query(
-            "SELECT n.nspname FROM pg_extension e "
-            "JOIN pg_namespace n ON n.oid = e.extnamespace "
-            "WHERE e.extname = 'pg_buffercache'"
-        )
-        if not extension:
-            raise RuntimeError("pg_buffercache extension is not installed")
-        buffer_view = f'{_identifier(str(extension[0][0]))}."pg_buffercache"'
+        buffer_view = self._pg_buffercache_view()
         rows = self._query(
             f"""
             SELECT pg_relation_size(c.oid)::bigint,
@@ -17782,7 +17777,6 @@ class PostgresWarehouse:
 
         search_text_pool_functions_sql = (
             r"""
-            DROP FUNCTION IF EXISTS @search_text_pool_partition(text, integer, text[], timestamptz);
             CREATE OR REPLACE FUNCTION @search_text_pool_partition(
                 query text,
                 partition_number integer,

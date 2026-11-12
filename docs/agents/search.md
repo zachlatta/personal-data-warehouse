@@ -607,7 +607,7 @@ the semantic leg's time was all read wait. The median is a residency question; r
 
 **2026-11-11: the legs ran on one core each, and JIT taxed every scoped search.** Real
 traffic read 24h p50 5.4 s / p90 16.2 s, and 45% of slow requests were on a host the
-guest saw as idle. Two plan faults, both fixed in the functions themselves:
+guest saw as idle. Three plan faults, fixed in the functions themselves, and a cache gap:
 
 - *The semantic leg walked its four HNSW graphs one after another.* Unscoped,
   `EXPLAIN (ANALYZE, BUFFERS)` read 12,456 pages in 6.47 s, 6.08 s of it read wait, as a
