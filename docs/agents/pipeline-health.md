@@ -54,12 +54,15 @@ minutes old, and `marts_ai_conversations.sessions` / `.events` read `late` with
 `cause_pipelines = {pi}`. So a **usage-driven** source declares `freshness_escalates=False`:
 past its interval its `data_status` / `event_status` read `quiet` — observed, never
 colouring `status`, a mart, or `stalest_pipeline` — and the run heartbeat alone escalates.
-That is pi, `muse_code`, `argon`, `alice_voice_recordings` and `search_requests` (searches
-stop when nobody searches; the app's timing writer beats every ten minutes), pinned by
-`test_exactly_the_usage_driven_sources_skip_freshness_escalation`, which also requires each
-to declare a heartbeat. `data=None` is not the same thing: it reads `manual`, a claim that
-no cadence exists at all. Sources with a real data SLA (contacts, browser history, voice
-memos) keep escalating.
+That is pi, `muse_code`, `argon`, `alice_voice_recordings`, `apple_voice_memos` (since the
+Pixel replaced the iPhone on 2026-10-23 a Mac memo is occasional), `voice_memo_continuity`
+(it writes only when two memos sit back to back; its Dagster run posts a heartbeat to
+`ops.uploader_heartbeats` under device `dagster`, see [voice.md](voice.md)) and
+`search_requests` (searches stop when nobody searches; the app's timing writer beats every
+ten minutes), pinned by `test_exactly_the_usage_driven_sources_skip_freshness_escalation`,
+which also requires each to declare a heartbeat. `data=None` is not the same thing: it reads
+`manual`, a claim that no cadence exists at all. Sources with a real data SLA (contacts,
+browser history) keep escalating.
 
 The rule both cases point at: **a loose data SLA is only honest when something else is
 tight.** Loosening one without a heartbeat is how `manual_finance` (`data=None`) made its own
