@@ -59,6 +59,10 @@ class UpstreamCheck:
     tolerance: timedelta
     #: How old an observation may be before the detector itself is ``unknown``.
     observation_interval: timedelta
+    #: How far PDW's newest may trail the source's newest stamp and still count
+    #: as the same item: a source whose newest stamp is not an item's own
+    #: field (a calendar's last modification) can stamp it a little later.
+    landed_slack: timedelta = timedelta(seconds=LANDED_SLACK_SECONDS)
 
 
 def _agent_session_check(pipeline: str, *, observation_interval: timedelta = HOUR) -> UpstreamCheck:
@@ -110,6 +114,10 @@ SOURCE_UPSTREAM_CHECKS: tuple[UpstreamCheck, ...] = (
               AND e.calendar_id = substr(o.scope, length(split_part(o.scope, '/', 1)) + 2))""",
         tolerance=30 * MINUTE,
         observation_interval=HOUR,
+        # Google stamps the calendar's `updated` after the event's own: on
+        # 2026-11-12 the calendar read 1.01 s past its newest event, so the
+        # shared one-second slack read a fully landed calendar as missing it.
+        landed_slack=timedelta(seconds=10),
     ),
     UpstreamCheck(
         pipeline="google_drive",
@@ -367,6 +375,18 @@ def _seconds(value: timedelta) -> int:
     return int(value.total_seconds())
 
 
+def landed_slack_seconds_sql(pipeline_column: str) -> str:
+    """Each check's landed slack, in seconds, for the pipeline in ``pipeline_column``."""
+    arms = " ".join(
+        f"WHEN '{check.pipeline}' THEN {_seconds(check.landed_slack)}"
+        for check in SOURCE_UPSTREAM_CHECKS
+        if check.landed_slack != timedelta(seconds=LANDED_SLACK_SECONDS)
+    )
+    if not arms:
+        return str(LANDED_SLACK_SECONDS)
+    return f"(CASE {pipeline_column} {arms} ELSE {LANDED_SLACK_SECONDS} END)"
+
+
 def source_upstream_health_view_sql() -> str:
     """The live detector: one row per observation, judged against base_*."""
     epoch = "'1970-01-01 00:00:00+00'::timestamptz"
@@ -378,7 +398,8 @@ def source_upstream_health_view_sql() -> str:
                    o.detail, o.observed_at, o.pending_since,
                    {check.pdw_newest_sql} AS pdw_newest_at,
                    {_seconds(check.tolerance)}::bigint AS tolerance_seconds,
-                   {_seconds(check.observation_interval)}::bigint AS expected_observation_seconds
+                   {_seconds(check.observation_interval)}::bigint AS expected_observation_seconds,
+                   {_seconds(check.landed_slack)}::bigint AS landed_slack_seconds
             FROM @source_upstream_observations o
             WHERE o.pipeline = '{check.pipeline}'"""
         )
@@ -398,7 +419,7 @@ def source_upstream_health_view_sql() -> str:
                 NULLIF(observed_at, {epoch}) AS observed_at,
                 NULLIF(pending_since, {epoch}) AS carried_pending_since,
                 NULLIF(detail, '') AS detail,
-                tolerance_seconds, expected_observation_seconds
+                tolerance_seconds, expected_observation_seconds, landed_slack_seconds
             FROM observed
         ),
         measured AS (
@@ -408,7 +429,7 @@ def source_upstream_health_view_sql() -> str:
                 -- source with nothing at all has nothing to land.
                 (upstream_newest_at IS NULL
                  OR COALESCE(pdw_newest_at >= upstream_newest_at
-                        - make_interval(secs => {LANDED_SLACK_SECONDS}), false)) AS landed
+                        - make_interval(secs => landed_slack_seconds), false)) AS landed
             FROM judged
         ),
         pending AS (
@@ -424,7 +445,7 @@ def source_upstream_health_view_sql() -> str:
                     WHEN carried_pending_since IS NOT NULL
                      AND (pdw_newest_at IS NULL
                           OR pdw_newest_at < carried_pending_since
-                                - make_interval(secs => {LANDED_SLACK_SECONDS}))
+                                - make_interval(secs => landed_slack_seconds))
                         THEN LEAST(carried_pending_since, upstream_newest_at)
                     ELSE upstream_newest_at
                 END AS pending_since

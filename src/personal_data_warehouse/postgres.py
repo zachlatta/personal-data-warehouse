@@ -39,7 +39,7 @@ from personal_data_warehouse.agent_usage import (
     AGENT_TOP_FAILURES,
 )
 from personal_data_warehouse.source_sla import (
-    LANDED_SLACK_SECONDS,
+    landed_slack_seconds_sql,
     SOURCE_UPSTREAM_INPUT_TABLES,
     source_upstream_health_view_sql,
 )
@@ -14905,7 +14905,7 @@ class PostgresWarehouse:
                 WHEN h.landed = 1 THEN {epoch}
                 WHEN o.pending_since = {epoch}
                   OR COALESCE(h.pdw_newest_at >= o.pending_since
-                        - make_interval(secs => {LANDED_SLACK_SECONDS}), false)
+                        - make_interval(secs => {landed_slack_seconds_sql("o.pipeline")}), false)
                     THEN o.upstream_newest_at
                 ELSE o.pending_since
             END

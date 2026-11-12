@@ -274,6 +274,35 @@ def test_a_busy_source_whose_pdw_side_stalled_for_days_reads_failing(warehouse):
     assert _health(warehouse)[("gmail", "a@x.test")]["status"] == "ok"
 
 
+def test_a_calendar_whose_stamp_trails_its_newest_event_by_a_second_has_landed(warehouse):
+    """Google stamps the calendar's top-level `updated` after the event's own.
+
+    Measured in production on 2026-11-12: the calendar read 02:33:58.004 while
+    its newest event's `updated` was 02:33:56.994. Under the shared one-second
+    slack that fully landed calendar carried a pending item forever and read
+    late, then failing.
+    """
+    _provision_everything(warehouse)
+    now = datetime.now(tz=UTC)
+    event_updated = now - timedelta(hours=2)
+    warehouse._command(
+        "INSERT INTO @calendar_events (account, calendar_id, event_id, updated_at, synced_at)"
+        " VALUES ('a@x.test', 'primary', 'e1', %s, %s)",
+        (event_updated, now),
+    )
+    _observe(warehouse, "google_calendar", "a@x.test/primary",
+             newest_at=event_updated + timedelta(milliseconds=1010), observed_at=now - timedelta(hours=2))
+    warehouse.advance_source_upstream_pending()
+    _observe(warehouse, "google_calendar", "a@x.test/primary",
+             newest_at=event_updated + timedelta(milliseconds=1010), observed_at=now)
+    warehouse.advance_source_upstream_pending()
+
+    row = _health(warehouse)[("google_calendar", "a@x.test/primary")]
+    assert (row["status"], row["landed"], row["pending_since"]) == ("ok", 1, None)
+    # The slack is the calendar's alone: Gmail still reads a one-second gap as missing.
+    assert upstream_check("gmail").landed_slack == timedelta(seconds=1)
+
+
 def test_a_writer_never_clobbers_the_pending_item(warehouse):
     _provision_everything(warehouse)
     now = datetime.now(tz=UTC)
