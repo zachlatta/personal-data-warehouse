@@ -79,7 +79,9 @@ thumbnail. See repository `docs/notifications.md` for rollout, limits and cohort
 
 Before each send/retry, the worker checks synced source state. In
 `marts_ops.notification_deliveries`, `status = 'suppressed'` is an intentional skip;
-`error` is `already_read` or `already_replied`, not a transport failure.
+`error` is `already_read`, `already_replied`, or (Android deliveries only)
+`already_notified`: another app on the phone already posted a notification for that
+event in `base_android_notifications.events`. None is a transport failure.
 Gmail uses message labels/sent thread messages, Slack uses conversation or explicit
 thread read cursors and same-thread replies, and Messages uses incoming read state
 and sent replies. Direct-chat later outgoing messages count as responses; unrelated

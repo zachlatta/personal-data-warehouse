@@ -81,6 +81,8 @@ type Service struct {
 	PublicKey string
 	Sender    Sender
 	Render    func(map[string]any) Alert
+	// WitnessTimeout bounds each phone lookup; zero is DefaultWitnessTimeout.
+	WitnessTimeout time.Duration
 	// Expand is overridden only by integration tests with isolated schemas.
 	Expand func(string) string
 }
@@ -175,13 +177,17 @@ func (s *Service) Tick(ctx context.Context) error {
 			result := Result{Status: "cancelled", Error: "device disabled or experiment paused"}
 			if active {
 				reason, err := s.suppressionReason(ctx, d)
-				if err != nil {
+				unchecked := errors.Is(err, errWitnessUnchecked)
+				if err != nil && !unchecked {
 					return err
 				}
 				if reason != "" {
 					result = Result{Status: "suppressed", Error: reason}
 				} else {
 					result = s.Sender.Send(ctx, d)
+					if unchecked && result.Error == "" {
+						result.Error = errWitnessUnchecked.Error()
+					}
 				}
 			}
 			if err = s.settle(ctx, d, result, false); err != nil {
@@ -226,7 +232,8 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 	}
 	var id string
 	var payload []byte
-	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload FROM @notification_events WHERE status='pending' AND EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1) ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`)).Scan(&id, &payload)
+	var phoneHoldUntil time.Time
+	err = tx.QueryRowContext(ctx, s.q(`SELECT id,payload,greatest(now(),`+phoneWitnessAnchor+`+$1::interval) FROM @notification_events WHERE status='pending' AND EXISTS (SELECT 1 FROM @notification_state WHERE id='timeline' AND enabled=1) ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`), interval(PhoneWitnessHold)).Scan(&id, &payload, &phoneHoldUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -276,7 +283,19 @@ func (s *Service) fanout(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw)
+		// An Android delivery waits for the phone's own apps to post and
+		// upload their notification for this event (see suppression.go).
+		var notBefore any
+		if isAndroid(d.endpoint) {
+			// Hold only a device whose phone is known: with no phone there is
+			// no evidence to wait for. A failed lookup holds nothing either.
+			if _, known, err := s.phoneOf(ctx, deviceID(d.transport+":"+d.id)); err != nil {
+				slog.Warn("phone lookup failed at fan-out; not holding", "notification_id", id, "error", err)
+			} else if known {
+				notBefore = phoneHoldUntil
+			}
+		}
+		_, err = tx.ExecContext(ctx, s.q(`INSERT INTO @notification_deliveries (id,notification_id,device_id,transport,endpoint,payload,next_attempt_at) VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::timestamptz,now())) ON CONFLICT (notification_id,device_id) DO NOTHING`), deliveryID, id, deviceID(d.transport+":"+d.id), d.transport, d.endpoint, raw, notBefore)
 		if err != nil {
 			return false, err
 		}
@@ -349,12 +368,13 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 			r.Status = "cancelled"
 		}
 	}
-	res, err := tx.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status=$3,error=$4,
+	// A receipt with nothing to say keeps the send's note (phone_witness_unchecked).
+	res, err := tx.ExecContext(ctx, s.q(`UPDATE @notification_deliveries SET status=$3,error=CASE WHEN $6 AND $4='' THEN error ELSE $4 END,
  ticket_id=CASE WHEN $5<>'' THEN $5 ELSE ticket_id END,
  accepted_at=CASE WHEN $3 IN ('accepted','provider_accepted') AND accepted_at='epoch'::timestamptz THEN now() ELSE accepted_at END,
  receipt_at=CASE WHEN $6 AND $3 NOT IN ('accepted','unknown') THEN now() ELSE receipt_at END,
  updated_at=now(),next_attempt_at=now()+$7::interval,lease_until='epoch',lease_id=''
- WHERE id=$1 AND lease_id=$2`), d.ID, d.LeaseID, r.Status, r.Error, r.TicketID, receipt, fmt.Sprintf("%f seconds", delay.Seconds()))
+ WHERE id=$1 AND lease_id=$2`), d.ID, d.LeaseID, r.Status, r.Error, r.TicketID, receipt, interval(delay))
 	if err != nil {
 		return err
 	}
@@ -378,6 +398,14 @@ func (s *Service) finish(ctx context.Context, d Delivery, r Result, receipt bool
 		}
 	}
 	return tx.Commit()
+}
+
+func interval(d time.Duration) string { return fmt.Sprintf("%f seconds", d.Seconds()) }
+
+func isAndroid(endpoint []byte) bool {
+	var e struct{ Platform string }
+	_ = json.Unmarshal(endpoint, &e)
+	return e.Platform == "android"
 }
 
 func endpointURL(raw []byte) string {

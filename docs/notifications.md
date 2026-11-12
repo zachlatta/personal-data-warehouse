@@ -89,6 +89,71 @@ These checks use **synced evidence**: reading/replying in an app can still race 
 next sync or the final provider request. Already accepted pushes cannot be recalled.
 Notification taps alone are not proof that source content was read.
 
+## Already shown on the Android phone
+
+An **Android** delivery is also skipped, with `error = already_notified`, when another
+app on **the recipient's own phone** already posted a notification for the same event
+(`base_android_notifications.events`, from the phone's notification listener). iOS and
+web deliveries are unaffected: the phone's evidence says nothing about them.
+
+**Which phone.** The app stamps every alert it draws with its delivery id
+(`pdw.delivery_id`, a string extra the listener uploads). A push device's phone is the
+listener `account`/`device` that recorded PDW's own alert for an earlier delivery to that
+push device, within the last seven days. A device with no such alert (an app build that
+does not stamp, a phone without the listener, nothing shown lately) has no known phone and
+gets every alert. Another phone's notifications never decide it. The stamp is native code
+(`mobile/plugins/with-messaging-notifications.js`): it reaches a phone with a new native
+build, not an OTA update, and until then that phone gets every alert.
+
+**Which event.** It is the same event when either:
+
+- the phone's notification is a MessagingStyle one carrying a message at the event's own
+  millisecond (chat apps stamp each message with its send time) **and** that message's
+  sender is the alert's actor or its text opens with the same 20 characters as the
+  alert's snippet. The millisecond alone is not enough, since two apps' messages can
+  share one; or
+- it shows the alert's title (an email app shows the subject) and the first 30
+  characters of the alert's text, of which there must be at least 10. A subject alone, or
+  a subject with an empty or very short body, is not proof of the same email.
+
+Any package but PDW's own counts, and group summaries do not. The notification must be
+posted between two minutes before the event and ten minutes after it: a later one that
+repeats the subject and body is another event, also when this alert is retried or
+recovered after it appeared.
+
+Which app showed it is deliberately not checked. The question is whether the phone
+already told Zach, not which sources have an app: an app can hold back some of its
+source's messages (Slack, for one, while the desktop is active, and per channel), so a
+per-source list would either drop messages nobody else showed or keep paging duplicates.
+The per-event check needs no edit when an app is installed, muted or removed.
+
+**Fail open.** If the phone's notifications cannot be read, the worker logs a warning
+and sends, and the delivery's `error` reads `phone_witness_unchecked` (an accepted
+delivery, not a failure; Expo's receipt keeps the note). Each phone lookup (which phone a
+device is, and whether that phone showed the event) has its own short deadline
+(`DefaultWitnessTimeout`), so a slow lookup ends as an unchecked send instead of spending
+the worker pass's deadline. The read/reply checks above, by contrast, stop the attempt.
+
+**Query shape.** The phone lookup (`phoneOfDevice`) reads PDW's own recent rows once,
+extracts each stamp once, and probes the delivery's primary key per stamp through
+`LATERAL ... LIMIT 1`. Joining the listener rows to the delivery table directly let the
+planner rescan the deliveries for every PDW row, parsing `raw_json` on each pair, which is
+slowest exactly when nothing is stamped yet. Check a change here with
+`EXPLAIN (ANALYZE, BUFFERS)` against production-sized tables, with the parameters hidden
+from the planner (`(SELECT 'value'::text)`), as a prepared statement's generic plan sees
+them.
+
+**The hold.** So the other app's notification can be posted and uploaded before the
+check runs, an Android delivery **to a device whose phone is known** is created with
+`next_attempt_at` 90 s after the event
+(`PhoneWitnessHold`), or after it landed when that was earlier or the event has no time (a
+calendar invite carries the meeting's start). A delivery fanned out later than that is not
+held, and neither is a device with no known phone (or whose lookup failed): there is no
+evidence to wait for, so it is sent as soon as it is fanned out. The hold must stay under the two minutes after which
+`marts_ops.notification_health` reads a pending delivery as stuck;
+`test_the_phone_witness_hold_ends_before_health_calls_a_pending_delivery_stuck` pins it.
+A witness that lands after the hold is missed, and the alert is sent.
+
 ## Capture, retry and evidence semantics
 
 - An AFTER INSERT trigger captures the bounded source snapshot in the source

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { notificationOutcome, summarizeNotifications } from './notifications.ts';
 
-const base = { id: 'n', source: 'gmail', priority: 'direct', created_at: '2026-09-10T12:00:00Z', actor: '', title: '', body: '', status: 'fanned_out', devices: 2, accepted: 0, opened: 0, failed: 0, suppressed_read: 0, suppressed_replied: 0 };
+const base = { id: 'n', source: 'gmail', priority: 'direct', created_at: '2026-09-10T12:00:00Z', actor: '', title: '', body: '', status: 'fanned_out', devices: 2, accepted: 0, opened: 0, failed: 0, suppressed_read: 0, suppressed_replied: 0, suppressed_notified: 0 };
 
 test('an opened notification reads as opened before anything else', () => {
   assert.deepEqual(notificationOutcome({ ...base, accepted: 2, opened: 1 }), { label: 'opened', tone: 'good' });
@@ -16,6 +16,8 @@ test('accepted by the push service is delivered, not seen', () => {
 test('a skip is named by its reason and is not a failure', () => {
   assert.deepEqual(notificationOutcome({ ...base, suppressed_read: 2 }), { label: 'skipped: already read', tone: 'muted' });
   assert.deepEqual(notificationOutcome({ ...base, suppressed_replied: 1, suppressed_read: 1 }), { label: 'skipped: already replied', tone: 'muted' });
+  assert.deepEqual(notificationOutcome({ ...base, suppressed_notified: 1 }), { label: 'skipped: already on phone', tone: 'muted' });
+  assert.deepEqual(notificationOutcome({ ...base, suppressed_notified: 1, accepted: 1 }), { label: 'delivered', tone: 'neutral' });
 });
 
 test('failures, no devices, cancellation and pending each read distinctly', () => {

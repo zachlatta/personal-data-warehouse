@@ -409,6 +409,9 @@ export type NotificationEvent = {
   failed: number;
   suppressed_read: number;
   suppressed_replied: number;
+  // Android deliveries skipped because another app on the phone already
+  // posted a notification for the same event.
+  suppressed_notified: number;
 };
 
 export type NotificationLedger = {
@@ -433,6 +436,7 @@ export async function fetchNotificationLedger(config: AppConfig, params: { limit
       ...event,
       suppressed_read: event.suppressed_read ?? 0,
       suppressed_replied: event.suppressed_replied ?? 0,
+      suppressed_notified: event.suppressed_notified ?? 0,
     })),
     has_more: body.has_more ?? false,
   };

@@ -513,6 +513,56 @@ def test_a_delivery_expo_has_not_confirmed_is_not_counted_against_the_phone(ware
     assert _android_health(wh) == NOTHING_EVALUATED
 
 
+def _health_status(wh):
+    return wh._query("SELECT status FROM @marts_notification_health")[0][0]
+
+
+@pytest.mark.parametrize(
+    "status,error",
+    [
+        # Another app on the phone already showed it: an intentional skip.
+        ("suppressed", "already_notified"),
+        # Sent without the phone check because the phone's notifications could
+        # not be read: delivered, and the note says so.
+        ("provider_accepted", "phone_witness_unchecked"),
+    ],
+)
+def test_a_phone_witness_outcome_is_not_a_notification_failure(warehouse, status, error):
+    wh = warehouse
+    _start_notifications(wh)
+    _seed_android_delivery(wh, "d", "now()", CHAT_ALERT[0], status=status)
+    wh._command("UPDATE @notification_deliveries SET error = %s", (error,))
+    assert _health_status(wh) == "ok"
+
+
+def test_an_android_delivery_held_for_the_phone_witness_is_not_stuck(warehouse):
+    wh = warehouse
+    _start_notifications(wh)
+    wh._command(
+        "INSERT INTO @notification_deliveries (id, notification_id, device_id, transport, endpoint, created_at, next_attempt_at) "
+        "VALUES ('held', 'n', 'pichu', 'expo', '{\"platform\":\"android\"}'::jsonb, now() - interval '89 seconds', now() + interval '1 second')"
+    )
+    assert _health_status(wh) == "ok"
+
+
+def test_the_phone_witness_hold_ends_before_health_calls_a_pending_delivery_stuck():
+    """A held delivery is `pending` from fan-out until the hold ends, plus up to one
+    worker tick. If that could pass the health view's pending threshold, every held
+    alert would read as a stuck delivery."""
+    root = Path(__file__).resolve().parent.parent
+    go = (root / "app/internal/notifications/suppression.go").read_text()
+    worker = (root / "app/internal/notifications/worker.go").read_text()
+    hold = int(re.search(r"const PhoneWitnessHold = (\d+) \* time\.Second", go).group(1))
+    tick = int(re.search(r"ticker := time\.NewTicker\((\d+) \* time\.Second\)", worker).group(1))
+    from personal_data_warehouse.notifications import STATEMENTS
+    health = next(s for s in STATEMENTS if "@marts_notification_health" in s)
+    stuck = re.search(
+        r"status IN \('pending','retry','sending'\)\s+AND created_at < now\(\) - interval '(\d+) minutes'", health
+    )
+    assert stuck, "the health view's pending threshold moved; re-pin it here"
+    assert hold + tick < int(stuck.group(1)) * 60
+
+
 @pytest.mark.parametrize(
     "surface",
     [

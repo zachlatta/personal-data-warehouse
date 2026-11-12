@@ -276,6 +276,17 @@ worker's `Render` under a one-second bound (`withAvatar`); a slow or failed look
 initial, never a late or lost alert. The phone side is `mobile/plugins/with-messaging-notifications.js`;
 see `mobile/README.md`.
 
+- **PDW does not repeat what another app on the phone already showed (2026-11-11).** An
+  Android delivery to a device whose phone is known waits 90 s from the event
+  (`PhoneWitnessHold`) and is then skipped as
+  `already_notified` when `base_android_notifications.events` holds another app's
+  notification for the same event (posted up to ten minutes after it): a MessagingStyle
+  message at the event's millisecond from the same sender or with the same opening text, or
+  the alert's title plus at least 10 characters of its text's opening. Only the recipient's
+  own phone counts: the app stamps each alert with `pdw.delivery_id`, and the listener row
+  carrying it names the phone. An unknown phone or a failed check sends. iOS still gets it.
+  See
+  [docs/notifications.md](../notifications.md#already-shown-on-the-android-phone).
 - **Android's 50-notification package cap and burst pacing (2026-11-05).** Joining the 861
   `provider_accepted` Android chat pushes (`857` through `2026-11-06 02:05Z`) and 715 non-chat
   pushes from `2026-10-28` to `2026-11-06` against `base_android_notifications.events` showed that
